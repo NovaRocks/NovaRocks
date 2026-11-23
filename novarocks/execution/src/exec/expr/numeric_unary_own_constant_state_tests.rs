@@ -68,7 +68,7 @@ fn check(maximum: bool) {
                     assert!(call.binding.phase.consumes_logical_arguments());
                     assert!(
                         value_type.nullable(),
-                        "both modes retain successful Int8 NEGATE NULL through the Int64 cast"
+                        "the TRY_CAST NULL flows through strict negation and the Int64 cast"
                     );
                     assert_eq!(call.arguments.len(), 1);
                     assert_eq!(

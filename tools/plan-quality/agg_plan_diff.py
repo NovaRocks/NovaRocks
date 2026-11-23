@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Collect FE-vs-NovaRocks aggregate split-shape EXPLAIN VERBOSE differences."""
+"""Collect FE-vs-NovaRocks aggregate split-shape EXPLAIN differences."""
 
 from __future__ import annotations
 

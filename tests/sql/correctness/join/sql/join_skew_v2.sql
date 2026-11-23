@@ -46,12 +46,12 @@ CREATE TABLE ${case_db}.t1 (
     c_int      INT,
     c_bigint   BIGINT,
     c_largeint LARGEINT,
-    c_float    FLOAT,
+    c_float    REAL,
     c_double   DOUBLE,
     c_decimal  DECIMAL(26,2),
     c_date     DATE,
-    c_datetime DATETIME,
-    c_string   STRING
+    c_datetime TIMESTAMP(6),
+    c_string   VARCHAR
 ) WITH (format_version = 3);
 
 -- query 4
@@ -63,12 +63,12 @@ CREATE TABLE ${case_db}.t2 (
     c_int      INT,
     c_bigint   BIGINT,
     c_largeint LARGEINT,
-    c_float    FLOAT,
+    c_float    REAL,
     c_double   DOUBLE,
     c_decimal  DECIMAL(26,2),
     c_date     DATE,
-    c_datetime DATETIME,
-    c_string   STRING
+    c_datetime TIMESTAMP(6),
+    c_string   VARCHAR
 ) WITH (format_version = 3);
 
 -- query 5
@@ -427,12 +427,12 @@ CREATE TABLE ${case_db}.skew_t1 (
     c_int      INT,
     c_bigint   BIGINT,
     c_largeint LARGEINT,
-    c_float    FLOAT,
+    c_float    REAL,
     c_double   DOUBLE,
     c_decimal  DECIMAL(26,2),
     c_date     DATE,
-    c_datetime DATETIME,
-    c_string   STRING
+    c_datetime TIMESTAMP(6),
+    c_string   VARCHAR
 ) WITH (format_version = 3);
 
 -- query 82

@@ -226,12 +226,12 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
     }
     let cast = TypedExpr {
         kind: ExprKind::Cast {
-            array_failure_mode: None,
+            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Try),
             expr: AstBox::new(text("not-an-integer")),
             target: DataType::Int64,
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
         },
-        value_type: ValueType::new(DataType::Int64, false),
+        value_type: ValueType::new(DataType::Int64, true),
     };
     let negate = crate::analyzer::negation_for_test(
         TypedExpr {

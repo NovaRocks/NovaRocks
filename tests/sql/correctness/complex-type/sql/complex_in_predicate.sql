@@ -23,7 +23,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.sc2 (
-  "v1" bigint(20),
+  "v1" BIGINT,
   "js" json ,
   "array1" ARRAY<INT> ,
   "array2" ARRAY<MAP<INT, INT>> ,

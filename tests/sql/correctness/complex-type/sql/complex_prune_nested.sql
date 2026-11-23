@@ -23,7 +23,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.sc3 (
-  "v1" bigint(20),
+  "v1" BIGINT,
   "a1" ARRAY<INT> ,
   "a2" ARRAY<ROW(a INT, b INT)> ,
   "m1" MAP<INT, INT> ,
@@ -111,8 +111,8 @@ select v1 from ${case_db}.sc3 where a1[1] not in (select tt.v1 from ${case_db}.s
 -- @skip_result_check=true
 -- Setup second table with dict-encoded string + complex columns
 CREATE TABLE ${case_db}.scs3 (
-  "v1" bigint(20),
-  "str" string,
+  "v1" BIGINT,
+  "str" VARCHAR,
   "a1" ARRAY<INT> ,
   "a2" ARRAY<ROW(a INT, b INT)> ,
   "m1" MAP<INT, INT> ,

@@ -32,6 +32,7 @@ use novarocks_type_contract::{
 };
 
 mod conversion;
+pub mod declaration;
 mod literal;
 mod route;
 #[doc(hidden)]
@@ -176,6 +177,7 @@ pub enum NodeShape<'a> {
     Row,
     MapSubscript,
     Operator(OperatorFunction),
+    Coalesce,
     UnaryPlus,
     And,
     Or,
@@ -215,6 +217,7 @@ impl ChildTyping {
 #[derive(Debug)]
 pub struct CarrierConversion {
     pub target: FunctionValueType,
+    pub mode: Option<novarocks_type_contract::TrinoCastMode>,
     pub decimal_overflow_policy: DecimalOverflowPolicy,
 }
 
@@ -269,6 +272,7 @@ pub enum TypingError {
     InvalidShape(&'static str),
     Binding(FunctionBindingError),
     Constant(ConstantError),
+    JsonLiteralValidation(novarocks_functions::KernelFailure),
     ValueType(ValueTypeError),
     CommonType(AssignmentCommonTypeError),
     Control(CompileControlError),
@@ -323,6 +327,7 @@ impl fmt::Display for TypingError {
             Self::InvalidShape(message) => f.write_str(message),
             Self::Binding(error) => error.fmt(f),
             Self::Constant(error) => error.fmt(f),
+            Self::JsonLiteralValidation(error) => error.fmt(f),
             Self::ValueType(error) => error.fmt(f),
             Self::CommonType(error) => error.fmt(f),
             Self::Control(error) => error.fmt(f),
@@ -335,6 +340,7 @@ impl std::error::Error for TypingError {
         match self {
             Self::Binding(error) => Some(error),
             Self::Constant(error) => Some(error),
+            Self::JsonLiteralValidation(error) => Some(error),
             Self::ValueType(error) => Some(error),
             Self::CommonType(error) => Some(error),
             Self::Control(error) => Some(error),
@@ -356,15 +362,21 @@ pub fn type_node(
         NodeShape::CatalogCall {
             name,
             expected_result,
-        } => {
-            let arguments = arguments(children, work)?;
-            work.flush()?;
-            let binding = context.catalog.select_scalar(
-                name,
-                request(&arguments, expected_result),
-                work.control(),
-            )?;
-            type_selected_call(context, binding, expected_result, children, work)?
+        } => type_catalog_call(context, name, expected_result, children, work)?,
+        NodeShape::Coalesce => {
+            let Some((first, remaining)) = children.split_first() else {
+                return Err(TypingError::InvalidShape("COALESCE requires operands"));
+            };
+            remaining
+                .iter()
+                .try_fold(first.value_type.clone(), |common, child| {
+                    novarocks_type_contract::assignment_common_value_type(
+                        &common,
+                        &child.value_type,
+                        work,
+                    )
+                })?;
+            type_catalog_call(context, "coalesce", None, children, work)?
         }
         NodeShape::Row => {
             let function = FunctionId::try_new("builtin.scalar/row/v1")
@@ -428,6 +440,13 @@ pub fn type_node(
                 work.control(),
             ) {
                 Err(FunctionBindingError::NoMatchingOverload) => {
+                    if operator == OperatorFunction::ArraySubscript {
+                        return Err(TypingError::TypeMismatch(format!(
+                            "cannot subscript {:?} with {:?}",
+                            children[0].value_type.data_type(),
+                            children[1].value_type.data_type(),
+                        )));
+                    }
                     if unary {
                         return Err(TypingError::TypeMismatch(format!(
                             "unary minus requires a supported numeric operand, got {:?}",
@@ -542,6 +561,23 @@ fn request<'a>(
     }
 }
 
+fn type_catalog_call(
+    context: &TypingContext<'_>,
+    name: &str,
+    expected_result: Option<&FunctionValueType>,
+    children: &[ChildTyping],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<NodeTyping, TypingError> {
+    let arguments = arguments(children, work)?;
+    work.flush()?;
+    let binding = context.catalog.select_scalar(
+        name,
+        request(&arguments, expected_result),
+        work.control(),
+    )?;
+    type_selected_call(context, binding, expected_result, children, work)
+}
+
 fn type_selected_call(
     context: &TypingContext<'_>,
     binding: ResolvedFunctionBinding,
@@ -584,6 +620,40 @@ fn type_selected_call(
             expected_result: expected_result.cloned(),
         },
         conversions,
+    })
+}
+
+/// Ask the selected value author for legality and possible successful SQL NULL.
+pub fn type_cast(
+    context: &TypingContext<'_>,
+    source: &FunctionValueType,
+    target: FunctionValueType,
+    mode: novarocks_type_contract::TrinoCastMode,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<CarrierConversion, TypingError> {
+    use novarocks_functions::{CastPrepareError, PreparedCastRecipe};
+
+    work.flush()?;
+    let nullable = PreparedCastRecipe::trino_result_nullable(source, &target, mode, work.control())
+        .map_err(|error| {
+            if let Some(cause) = error.control_error() {
+                return TypingError::Control(cause);
+            }
+            let message = format!(
+                "Cannot cast {:?} to {:?}: {error}",
+                source.value_type().kind(),
+                target.value_type().kind(),
+            );
+            match error {
+                CastPrepareError::Illegal => TypingError::TypeMismatch(message),
+                CastPrepareError::Unsupported => TypingError::Unsupported(message),
+                _ => TypingError::Binding(FunctionBindingError::InvalidBinding(message.into())),
+            }
+        })?;
+    Ok(CarrierConversion {
+        target: target.with_nullable(nullable)?,
+        mode: Some(mode),
+        decimal_overflow_policy: context.decimal_overflow_policy,
     })
 }
 
@@ -676,10 +746,9 @@ fn type_searched_case(
     {
         return Err(TypingError::InvalidShape("invalid searched CASE operands"));
     }
-    let (cases, otherwise) = children.split_at(2 * when_count);
-    let (pairs, _) = cases.as_chunks::<2>();
+    let (cases, otherwise) = children.as_chunks::<2>();
     let mut result = FunctionValueType::new(DataType::Null, true);
-    for branch in pairs.iter().map(|[_, value]| value).chain(otherwise) {
+    for branch in cases.iter().map(|[_, branch]| branch).chain(otherwise) {
         work.step()?;
         result = novarocks_type_contract::assignment_common_value_type(
             &result,
@@ -687,14 +756,10 @@ fn type_searched_case(
             work,
         )?;
     }
-    if result.data_type() == &DataType::Null {
-        result = FunctionValueType::new(DataType::Utf8, true);
-    }
-
     let mut conversions = Vec::with_capacity(children.len());
-    for [condition, value] in pairs {
+    for [condition, branch] in cases {
         conversions.push(boolean_operand(context, condition, "CASE WHEN", work)?);
-        conversions.push(conversion::assign(context, value, &result, work)?);
+        conversions.push(conversion::assign(context, branch, &result, work)?);
     }
     for branch in otherwise {
         conversions.push(conversion::assign(context, branch, &result, work)?);

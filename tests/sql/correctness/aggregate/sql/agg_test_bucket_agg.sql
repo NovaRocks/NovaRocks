@@ -131,7 +131,7 @@ select count(*) from (select distinct c0 from t0 limit 100) tb;
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t1" (
-  "c0" string DEFAULT NULL,
+  "c0" VARCHAR DEFAULT NULL,
   "c1" bigint DEFAULT NULL,
   "c2" bigint DEFAULT NULL
 ) WITH (format_version = 3);
@@ -139,7 +139,7 @@ CREATE TABLE "t1" (
 -- query 27
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 SELECT generate_series, 4096 - generate_series, generate_series FROM TABLE(sequence(1,  4096)) AS generate_series(generate_series);
+INSERT INTO t1 SELECT CAST(generate_series AS VARCHAR), 4096 - generate_series, generate_series FROM TABLE(sequence(1,  4096)) AS generate_series(generate_series);
 
 -- query 28
 -- @skip_result_check=true
@@ -162,7 +162,7 @@ select count(*) from (select distinct c0 from t1 limit 100) tb;
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t2" (
-  "c0" string DEFAULT NULL,
+  "c0" VARCHAR DEFAULT NULL,
   "c1" bigint DEFAULT NULL,
   "c2" bigint DEFAULT NULL
 ) WITH (format_version = 3);

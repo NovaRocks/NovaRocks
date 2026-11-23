@@ -278,12 +278,21 @@ fn expression(
             args,
             distinct,
             order_by,
+            filter,
             ..
-        } => aggregate(name, args, *distinct, order_by, out),
+        } => {
+            aggregate(name, args, *distinct, order_by, out)?;
+            if let Some(predicate) = filter {
+                out.append(" FILTER (WHERE ")?;
+                expression(predicate, false, out)?;
+                out.append(")")?;
+            }
+            Ok(())
+        }
         ExprKind::Cast {
             expr: inner,
             target,
-            array_failure_mode: None,
+            cast_mode: None,
             ..
         } if matches!(target, arrow::datatypes::DataType::List(_))
             && matches!(&inner.kind, ExprKind::FunctionCall { name, .. } if name == "__array_literal") =>
@@ -293,13 +302,11 @@ fn expression(
         ExprKind::Cast {
             expr: inner,
             target,
-            array_failure_mode,
+            cast_mode,
             ..
         } => {
             out.append(
-                if *array_failure_mode
-                    == Some(novarocks_type_contract::ArrayCastFailureMode::OutputNull)
-                {
+                if *cast_mode == Some(novarocks_type_contract::TrinoCastMode::Try) {
                     "try_cast("
                 } else {
                     "cast("

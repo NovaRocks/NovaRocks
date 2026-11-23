@@ -441,9 +441,7 @@ fn all_kinds() -> Fixture {
         ExprKind::Cast {
             expr: a,
             target: DataType::Int64,
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            allow_throw_exception: allow(u32::MAX),
-            array_failure_mode: None,
+            cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
         },
         ExprKind::IsNull {
             expr: a,
@@ -613,10 +611,7 @@ fn namespace_all_sixteen_scalar_kinds_preserve_dense_headers_and_ordered_occurre
         .unwrap()
         .carrier_type_id;
     assert_eq!(cast.target_carrier_type_id, original_carrier);
-    assert_eq!(
-        cast.allow_throw_exception.as_ref().unwrap().id,
-        Some(u32::MAX)
-    );
+    assert_eq!(cast.cast_mode, Some(wire::TrinoCastMode::Implicit as i32));
     assert_eq!(cast.expr_id, Some(0));
     assert_eq!(
         out[10].kind,
@@ -837,40 +832,6 @@ fn namespace_intrinsics_require_original_boolean_parameters_and_exact_presence()
                 .is_err()
         );
     }
-    let mut wrong = Fixture::single(ExprKind::Cast {
-        expr: ExprId::new(0),
-        target: DataType::Int64,
-        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        allow_throw_exception: SemanticParameterRef {
-            id: SemanticParameterId::new(0),
-            expected_key: SemanticParameterKey::TimeZone,
-        },
-        array_failure_mode: None,
-    });
-    assert!(
-        wrong
-            .run(&Control::default(), SOURCE, limits(), false)
-            .is_err()
-    );
-    wrong.replace(0, |n| {
-        if let ExprKind::Cast {
-            allow_throw_exception,
-            ..
-        } = &mut n.kind
-        {
-            *allow_throw_exception = allow(0)
-        }
-    });
-    wrong.parameters = SemanticParameters::try_new([(
-        SemanticParameterId::new(0),
-        SemanticParameterValue::GroupConcatLegacy(false),
-    )])
-    .unwrap();
-    assert!(
-        wrong
-            .run(&Control::default(), SOURCE, limits(), false)
-            .is_err()
-    );
     for present in [false, true] {
         let f = Fixture::single(ExprKind::Binary {
             left: ExprId::new(0),
@@ -1164,9 +1125,7 @@ fn namespace_prepare_and_consuming_emit_preserve_every_small_callback_and_ordina
     let f = Fixture::single(ExprKind::Cast {
         expr: ExprId::new(u32::MAX),
         target: DataType::Int64,
-        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        allow_throw_exception: allow(0),
-        array_failure_mode: None,
+        cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
     });
     prefixes(|c| f.run(c, SOURCE, limits(), false), true);
     prefixes(|c| f.run(c, SOURCE, limits(), true), true);
@@ -1443,8 +1402,8 @@ fn namespace_real_wide_lists_and_definitions_reject_original_quantum_without_rep
 mod caller_owned_tests;
 
 #[test]
-fn explicit_array_cast_modes_encode_separately_and_reject_foreign_source_shapes() {
-    use novarocks_type_contract::ArrayCastFailureMode as Mode;
+fn cast_modes_encode_separately_with_exact_target_carrier() {
+    use novarocks_type_contract::TrinoCastMode as Mode;
     let list = |item| {
         FunctionValueType::new(
             DataType::List(Arc::new(Field::new("declared-item", item, true))),
@@ -1454,9 +1413,10 @@ fn explicit_array_cast_modes_encode_separately_and_reject_foreign_source_shapes(
     let source = list(DataType::Int32);
     let target = list(DataType::Int64);
     for (mode, expected) in [
-        (None, None),
-        (Some(Mode::ReportError), Some(1)),
-        (Some(Mode::OutputNull), Some(2)),
+        (Mode::Implicit, Some(3)),
+        (Mode::Explicit, Some(1)),
+        (Mode::Try, Some(2)),
+        (Mode::StoreAssignment, Some(4)),
     ] {
         let mut fixture = Fixture::new(vec![
             node(0, ExprKind::Value(ValueId::new(44)), source.clone()),
@@ -1465,9 +1425,7 @@ fn explicit_array_cast_modes_encode_separately_and_reject_foreign_source_shapes(
                 ExprKind::Cast {
                     expr: ExprId::new(0),
                     target: target.data_type().clone(),
-                    decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                    allow_throw_exception: allow(0),
-                    array_failure_mode: mode,
+                    cast_mode: mode,
                 },
                 target.clone(),
             ),
@@ -1482,18 +1440,8 @@ fn explicit_array_cast_modes_encode_separately_and_reject_foreign_source_shapes(
         let Some(wire::expression_definition::Kind::Cast(cast)) = &wire[1].kind else {
             panic!("encoded CAST")
         };
-        assert_eq!(cast.array_failure_mode, expected);
+        assert_eq!(cast.cast_mode, expected);
         assert_eq!(cast.expr_id, Some(0));
-        if mode.is_some() {
-            // Keep the original namespace's source identity honest while changing its shape.
-            fixture.replace(0, |node| node.ty = int());
-            fixture.input[0].type_id = 0;
-            assert!(
-                fixture
-                    .run(&Control::default(), SOURCE, limits(), true)
-                    .is_err()
-            );
-        }
     }
 }
 

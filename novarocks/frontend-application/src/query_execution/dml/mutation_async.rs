@@ -529,10 +529,7 @@ fn mutation_write_assignments(
     Option<Arc<novarocks_sql::compiler::SqlWriteAssignments>>,
     novarocks_sql::compiler::SqlCompileError,
 > {
-    use novarocks_sql::compiler::{
-        SqlCompileError, SqlConstantExpressionSite, SqlWriteAssignmentSite, SqlWriteAssignments,
-        SqlWriteLiteralContext,
-    };
+    use novarocks_sql::compiler::{SqlCompileError, SqlWriteAssignmentSite, SqlWriteAssignments};
     use novarocks_type_contract::PureCompileControl;
     let (columns, old_start, wildcard) = match kind {
         DmlChangeStreamKind::Delete { .. } => return Ok(None),
@@ -577,7 +574,6 @@ fn mutation_write_assignments(
         })
     };
     let mut sites = Vec::new();
-    let mut contexts = Vec::new();
     for (ordinal, column) in columns.iter().enumerate() {
         let (input, storage) = declaration(column)?;
         sites.push(SqlWriteAssignmentSite::try_new(
@@ -586,15 +582,6 @@ fn mutation_write_assignments(
             storage,
             control,
         )?);
-        if !wildcard {
-            contexts.push(SqlWriteLiteralContext::new(
-                Vec::new(),
-                SqlConstantExpressionSite::SelectProjection {
-                    column: old_start + ordinal,
-                },
-                old_start + ordinal,
-            ));
-        }
     }
     let first_assignment = if wildcard {
         7
@@ -654,16 +641,11 @@ fn mutation_write_assignments(
             SqlWriteAssignmentSite::try_new(ordinal, input, storage, control)?
                 .with_source_span(expr.span()),
         );
-        contexts.push(SqlWriteLiteralContext::new(
-            Vec::new(),
-            SqlConstantExpressionSite::SelectProjection { column: index },
-            ordinal,
-        ));
     }
-    Ok(Some(Arc::new(
-        SqlWriteAssignments::try_new(sites.into_boxed_slice(), control)?
-            .with_literal_contexts(contexts.into_boxed_slice()),
-    )))
+    Ok(Some(Arc::new(SqlWriteAssignments::try_new(
+        sites.into_boxed_slice(),
+        control,
+    )?)))
 }
 
 #[cfg(test)]

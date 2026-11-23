@@ -434,7 +434,7 @@ fn canonical_window_table_none_and_null_keep_original_operational_presence() {
     for kind in [
         ExprKind::Nested(novarocks_parser::ast::AstBox::new(integer(7))),
         ExprKind::Cast {
-            array_failure_mode: None,
+            cast_mode: None,
             expr: novarocks_parser::ast::AstBox::new(integer(7)),
             target: DataType::Int64,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

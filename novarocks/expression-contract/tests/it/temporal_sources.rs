@@ -23,9 +23,8 @@ use novarocks_expression_contract::{
     TemporalSourceProjectionError as SourceError, temporal_source_definitions_observed as author,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
-    PureCompileControl, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
-    TemporalCastKind, TemporalSourceDefinitions, TemporalSourceFacts, TemporalSourceKind as Kind,
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, TemporalCastKind,
+    TemporalSourceDefinitions, TemporalSourceFacts, TemporalSourceKind as Kind,
 };
 use novarocks_type_contract::{FunctionId, FunctionKind, FunctionOverloadId};
 use std::sync::Mutex;
@@ -69,14 +68,9 @@ fn cast(id: u32, child: u32, target: DataType) -> ExprNode {
         id,
         target.clone(),
         ExprKind::Cast {
-            array_failure_mode: None,
+            cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
             expr: ExprId::new(child - 1),
             target,
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            allow_throw_exception: SemanticParameterRef {
-                id: SemanticParameterId::new(0),
-                expected_key: SemanticParameterKey::AllowThrowException,
-            },
         },
     )
 }
@@ -693,14 +687,9 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
         nodes.push(leaf(
             cast.get(),
             ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                 expr: call,
                 target: DataType::Utf8,
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: SemanticParameterRef {
-                    id: SemanticParameterId::new(0),
-                    expected_key: SemanticParameterKey::AllowThrowException,
-                },
             },
             utf8.clone(),
         ));

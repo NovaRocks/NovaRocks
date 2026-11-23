@@ -20,7 +20,7 @@
 
 CREATE TABLE ${case_db}.dict_observability_orders (
   order_id BIGINT,
-  status STRING,
+  status VARCHAR,
   amount INT
 ) WITH (format_version = 3);
 

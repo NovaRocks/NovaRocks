@@ -28,18 +28,18 @@ USE ${case_db};
 USE ${case_db};
 CREATE TABLE array_test (
 pk bigint not null ,
-s_1   Array<String>,
+s_1   Array<VARCHAR>,
 i_1   Array<BigInt>,
 f_1   Array<Double>,
 d_1   Array<DECIMAL(26, 2)>,
-d_2   Array<DECIMAL64(4, 3)>,
-d_3   Array<DECIMAL128(25, 19)>,
-d_4   Array<DECIMAL32(8, 5)> ,
+d_2   Array<DECIMAL(4, 3)>,
+d_3   Array<DECIMAL(25, 19)>,
+d_4   Array<DECIMAL(8, 5)> ,
 d_5   Array<DECIMAL(16, 3)>,
-d_6   Array<DECIMAL128(18, 6)> ,
+d_6   Array<DECIMAL(18, 6)> ,
 ai_1  Array<Array<BigInt>>,
-as_1  Array<Array<String>>,
-aas_1 Array<Array<Array<String>>>,
+as_1  Array<Array<VARCHAR>>,
+aas_1 Array<Array<Array<VARCHAR>>>,
 aad_1 Array<Array<Array<DECIMAL(26, 2)>>>
 ) WITH (format_version = 3);
 
@@ -558,9 +558,9 @@ select arrays_overlap([4, 3], [1, null]);
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t1" (
-  "k1" int(11) ,
-  "a1" array<String> ,
-  "a2" array<String>
+  "k1" INTEGER ,
+  "a1" array<VARCHAR> ,
+  "a2" array<VARCHAR>
 ) WITH (format_version = 3);
 
 -- query 120

@@ -29,7 +29,7 @@ USE iceberg_ddl_cat_${suite_uuid0}.schema_nullable_${uuid0};
 DROP TABLE IF EXISTS members;
 CREATE TABLE members (
   id INT,
-  email STRING
+  email VARCHAR
 ) WITH (format_version = 2);
 INSERT INTO members VALUES ROW(1, 'a@x.com'), ROW(2, 'b@x.com');
 

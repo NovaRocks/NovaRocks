@@ -27,8 +27,8 @@ USE ${case_db};
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "array_map_test" (
-  "id" tinyint(4) NOT NULL,
-  "arr_str" array<string>,
+  "id" TINYINT NOT NULL,
+  "arr_str" array<VARCHAR>,
   "arr_largeint" array<largeint>
 ) WITH (format_version = 3);
 
@@ -185,7 +185,7 @@ select transform([[[[[1,2]]]]], arg0 -> transform(arg0, arg1 -> transform(arg1, 
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "array_map_x" (
-  "id" tinyint(4) NOT NULL,
+  "id" TINYINT NOT NULL,
   "arr_str" array<varchar(65533)>,
   "arr_largeint" array<largeint(40)>
 ) WITH (format_version = 3);
@@ -197,7 +197,7 @@ insert into array_map_x values ROW(1, repeat('abcdefghasdasdasirnqwrq', 2), repe
 
 -- query 38
 USE ${case_db};
-select cast(if (1 > rand(), '[]', '') as array<string>) l , transform(arr_str, (x)-> (concat(x,l))) from array_map_x;
+select cast(if (1 > rand(), '[]', '') as ARRAY(VARCHAR)) l , transform(arr_str, (x)-> (concat(x,l))) from array_map_x;
 
 -- query 39
 -- @skip_result_check=true

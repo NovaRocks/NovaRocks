@@ -38,6 +38,13 @@ pub use array_common::{
 mod array_generate;
 mod assignment_common;
 pub use assignment_common::{AssignmentCommonTypeError, assignment_common_value_type};
+pub use novarocks_result_contract::{CharacterKind, CharacterType};
+mod trino_coercion;
+pub use trino_coercion::{
+    TrinoCastMode, trino_can_coerce, trino_can_coerce_scalar, trino_can_store_assign,
+    trino_common_scalar_kind, trino_common_type_with_construction, trino_decimal_widening_is_total,
+    trino_same_type,
+};
 mod call_context;
 mod carrier_parameters;
 mod coercion;

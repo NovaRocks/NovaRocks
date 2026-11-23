@@ -65,7 +65,7 @@ fn check(intermediate: bool) {
                 assert_eq!(value_type.data_type().clone(), DataType::Int8);
                 assert!(
                     value_type.nullable(),
-                    "both modes retain the successful Int8 NEGATE NULL guarantee in OWN ORDER"
+                    "OWN ORDER retains the nullable negation of the TRY_CAST result"
                 );
                 let FunctionArgumentType::Value(bound) =
                     &call.binding.function.argument_types[request.logical_argument_count]

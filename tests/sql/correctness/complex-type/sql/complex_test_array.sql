@@ -25,7 +25,7 @@ USE ${case_db};
 -- name: test_array_test01
 -- query 2
 USE ${case_db};
-select CAST([] AS ARRAY<INT>), [], CAST(['abc'] AS ARRAY<STRING>), [123, NULL, 1.0], ['abc', NULL];
+select CAST([] AS ARRAY<INT>), [], CAST(['abc'] AS ARRAY<VARCHAR>), [123, NULL, 1.0], ['abc', NULL];
 
 -- name: testArrayPredicate
 -- query 3
@@ -94,8 +94,8 @@ select * from (select transform([1,3], x -> x*2 + x*2) col1) t1 CROSS JOIN (sele
 USE ${case_db};
 CREATE TABLE array_data_type_1
     (c1 int,
-    c2  array<datetime>,
-    c3  array<float>,
+    c2  array<TIMESTAMP(6)>,
+    c3  array<REAL>,
     c4  array<varchar(10)>,
     c5  array<varchar(20)>,
     c6  array<array<varchar(10)>>) WITH (format_version = 3);
@@ -204,7 +204,7 @@ insert into array_exprr SELECT generate_series, generate_series FROM TABLE(seque
 
 -- query 33
 USE ${case_db};
-select count([CAST(if(c2 is null, c1 + c2, 0) as DECIMAL128(38,0)) + if(c1 is null, c2 ,0)] is null) from array_exprr;
+select count([CAST(if(c2 is null, c1 + c2, 0) as DECIMAL(38,0)) + if(c1 is null, c2 ,0)] is null) from array_exprr;
 
 -- name: testEmptyArray
 -- query 34
@@ -259,9 +259,9 @@ from (select c1 from (values ROW([])) as t(c1)) t;
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t2" (
-  "pk" bigint(20) NOT NULL,
+  "pk" BIGINT NOT NULL,
   "aas_1" array<array<array<varchar(65533)>>>,
-  "aad_1" array<array<array<DECIMAL128(26,2)>>>
+  "aad_1" array<array<array<DECIMAL(26,2)>>>
 ) WITH (format_version = 3);
 
 -- query 43

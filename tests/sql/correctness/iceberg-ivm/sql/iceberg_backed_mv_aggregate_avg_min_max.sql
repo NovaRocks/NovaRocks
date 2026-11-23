@@ -37,14 +37,14 @@ CREATE TABLE mv_agg2_${uuid0}.ns_${uuid0}.measurements (
   k INT,
   v BIGINT,
   d DECIMAL(20, 4),
-  s STRING,
-  ts DATETIME
+  s VARCHAR,
+  ts TIMESTAMP(6)
 ) WITH (format_version = 3);
 INSERT INTO mv_agg2_${uuid0}.ns_${uuid0}.measurements VALUES
-  ROW(1, 10,   100.5000, 'apple',  '2024-01-01 00:00:00'),
-  ROW(1, 20,   200.0000, 'banana', '2024-02-01 00:00:00'),
+  ROW(1, 10,   100.5000, 'apple',  TIMESTAMP '2024-01-01 00:00:00'),
+  ROW(1, 20,   200.0000, 'banana', TIMESTAMP '2024-02-01 00:00:00'),
   ROW(1, NULL, NULL,     NULL,     NULL),
-  ROW(2, 5,    50.2500,  'cherry', '2024-03-15 12:00:00');
+  ROW(2, 5,    50.2500,  'cherry', TIMESTAMP '2024-03-15 12:00:00');
 USE mv_agg2_${uuid0}.ns_${uuid0};
 
 -- query 2
@@ -76,8 +76,8 @@ ORDER BY k;
 -- query 5
 -- @skip_result_check=true
 INSERT INTO mv_agg2_${uuid0}.ns_${uuid0}.measurements VALUES
-  ROW(1, 30,   300.7500, 'date', '2024-06-01 09:00:00'),
-  ROW(3, 7,    70.0000,  'fig',  '2024-07-01 18:30:00');
+  ROW(1, 30,   300.7500, 'date', TIMESTAMP '2024-06-01 09:00:00'),
+  ROW(3, 7,    70.0000,  'fig',  TIMESTAMP '2024-07-01 18:30:00');
 
 -- query 6
 -- @skip_result_check=true
@@ -105,7 +105,7 @@ CREATE MATERIALIZED VIEW bad_min_star AS SELECT k, MIN(*) AS invalid_min FROM me
 -- query 11
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW measurements_mv;
+DROP MATERIALIZED VIEW IF EXISTS measurements_mv;
 DROP TABLE mv_agg2_${uuid0}.ns_${uuid0}.measurements ;
 DROP SCHEMA mv_agg2_${uuid0}.ns_${uuid0};
 DROP CATALOG mv_agg2_${uuid0};

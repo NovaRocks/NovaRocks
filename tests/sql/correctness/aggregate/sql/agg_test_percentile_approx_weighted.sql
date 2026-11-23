@@ -33,10 +33,10 @@ CREATE TABLE t1 (
     c4 int,
     c5 bigint,
     c6 largeint,
-    c7 string,
+    c7 VARCHAR,
     c8 double,
     c9 date,
-    c10 datetime,
+    c10 TIMESTAMP(6),
     c11 array<int>,
     c12 map<double, double>,
     c13 ROW(a bigint, b double)
@@ -470,8 +470,8 @@ with tt as (select (0.5) as v1, (4096) as v2, c1, c2 from t1) select  cast(perce
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t2" (
-  "k" int(11),
-  "v" int(11)
+  "k" INTEGER,
+  "v" INTEGER
 ) WITH (format_version = 3);
 
 -- query 105
@@ -522,7 +522,7 @@ select percentile_approx_weighted(k, v, []) from t2;
 
 -- query 115
 USE ${case_db};
-select  percentile_approx_weighted(k, v, CAST([0.0, 0.5, 1.0] AS array<float>)) from t2;
+select  percentile_approx_weighted(k, v, CAST([0.0, 0.5, 1.0] AS array<REAL>)) from t2;
 
 -- query 116
 USE ${case_db};
@@ -563,7 +563,7 @@ select percentile_approx_weighted(k, v, CAST([0.1, 0.5, 0.9] AS array<double>), 
 USE ${case_db};
 CREATE TABLE "test_sorted_streaming_agg_percentile_weighted"
 (
-    "id_int" int(11) NOT NULL,
+    "id_int" INTEGER NOT NULL,
     "value" double NOT NULL
 ) WITH (format_version = 3);
 
@@ -588,18 +588,18 @@ select  percentile_approx_weighted(value, value, CAST([0.5, 0.9] AS array<double
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t0_convert_to_serialize_format" (
-  "v1" bigint(20),
-  "v2" bigint(20),
-  "v3" bigint(20)
+  "v1" BIGINT,
+  "v2" BIGINT,
+  "v3" BIGINT
 ) WITH (format_version = 3);
 
 -- query 130
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t1_convert_to_serialize_format" (
-  "v4" bigint(20),
-  "v5" bigint(20),
-  "v6" bigint(20)
+  "v4" BIGINT,
+  "v5" BIGINT,
+  "v6" BIGINT
 ) WITH (format_version = 3);
 
 -- query 131

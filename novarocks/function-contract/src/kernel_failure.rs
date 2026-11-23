@@ -24,15 +24,11 @@
 use novarocks_failure_contract::{FailureReason, domain};
 use std::num::NonZeroU16;
 
-pub const NUMERIC_OUT_OF_RANGE: FailureReason =
-    FailureReason::new(domain::KERNEL, NonZeroU16::new(41).unwrap());
-pub const DIVISION_BY_ZERO: FailureReason =
-    FailureReason::new(domain::KERNEL, NonZeroU16::new(43).unwrap());
-pub const INVALID_CAST_ARGUMENT: FailureReason =
-    FailureReason::new(domain::KERNEL, NonZeroU16::new(44).unwrap());
-
-pub const INVALID_FUNCTION_ARGUMENT: FailureReason =
-    FailureReason::new(domain::KERNEL, NonZeroU16::new(45).unwrap());
+pub use novarocks_failure_contract::kernel_reason::{
+    DIVISION_BY_ZERO, INVALID_CAST_ARGUMENT, INVALID_FUNCTION_ARGUMENT, INVALID_JSON_LITERAL,
+    JSON_INPUT_CONVERSION_ERROR, JSON_OUTPUT_CONVERSION_ERROR, JSON_VALUE_RESULT_ERROR,
+    NUMERIC_OUT_OF_RANGE, PATH_EVALUATION_ERROR,
+};
 
 // These reasons belong to the actual pure-function preparation authors.
 // Consumers may preserve their identity; the constants select no SQL policy.

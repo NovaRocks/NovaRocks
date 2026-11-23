@@ -87,6 +87,7 @@ pub(crate) struct ColumnMeta {
     pub qualifier: Option<String>,
     pub value_type: novarocks_type_contract::FunctionValueType,
     pub logical_type: Option<novarocks_types::schema::SqlType>,
+    pub retired_read_fields: Vec<(String, novarocks_spi::connector::ConnectorRetiredReadField)>,
     pub json_list_provenance: bool,
 }
 
@@ -130,6 +131,7 @@ impl ColumnRefFactory {
             name,
             qualifier,
             json_list_provenance: false,
+            retired_read_fields: Vec::new(),
             value_type,
             logical_type: None,
         }));
@@ -173,6 +175,32 @@ impl ColumnRefFactory {
         self.columns
             .get(id.0.checked_sub(1)? as usize)
             .and_then(|column| column.as_ref().map(|column| &column.value_type))
+    }
+
+    pub(crate) fn register_retired_read_field(
+        &mut self,
+        id: ColumnId,
+        table: String,
+        field: novarocks_spi::connector::ConnectorRetiredReadField,
+    ) {
+        self.columns[(id.0 - 1) as usize]
+            .as_mut()
+            .expect("retired read field must use the original source column")
+            .retired_read_fields
+            .push((table, field));
+    }
+
+    pub(crate) fn retired_read_fields(
+        &self,
+        id: ColumnId,
+    ) -> &[(String, novarocks_spi::connector::ConnectorRetiredReadField)] {
+        let Some(index) = id.0.checked_sub(1) else {
+            return &[];
+        };
+        self.columns
+            .get(index as usize)
+            .and_then(Option::as_ref)
+            .map_or(&[], |column| column.retired_read_fields.as_slice())
     }
 
     pub(crate) fn set_logical_type(

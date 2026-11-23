@@ -118,6 +118,8 @@ pub(crate) enum ScalarNode {
         body: ScalarId,
     },
     AggregateCall {
+        occurrence: Option<crate::analysis::AggregateOccurrence>,
+        filter: Option<ScalarId>,
         name: String,
         args: Vec<ScalarId>,
         distinct: bool,
@@ -125,7 +127,7 @@ pub(crate) enum ScalarNode {
         resolved: crate::binding::SqlFunctionBinding,
     },
     Cast {
-        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+        cast_mode: Option<novarocks_type_contract::TrinoCastMode>,
         child: ScalarId,
         /// Carrier projection of the CAST target. The arena's complete result
         /// value type retains its logical identity and nullability.
@@ -1446,7 +1448,7 @@ mod bridge_tests {
         let function_args = vec![
             typed(
                 ExprKind::Cast {
-                    array_failure_mode: None,
+                    cast_mode: None,
                     expr: novarocks_parser::ast::AstBox::new(col(1, DataType::Int64)),
                     target: DataType::Utf8,
                     decimal_overflow_policy:
@@ -1488,6 +1490,8 @@ mod bridge_tests {
             ),
             typed(
                 ExprKind::AggregateCall {
+                    occurrence: crate::analysis::AggregateOccurrence::new(),
+                    filter: None,
                     name: "sum".to_string(),
                     args: (vec![col(5, DataType::Int64)]).into(),
                     distinct: true,
@@ -1626,7 +1630,7 @@ mod overflow_policy_tests {
             ));
             ids.push(arena.intern(
                 ScalarNode::Cast {
-                    array_failure_mode: None,
+                    cast_mode: None,
                     child,
                     target: DataType::Decimal128(9, 0),
                     decimal_overflow_policy: policy,

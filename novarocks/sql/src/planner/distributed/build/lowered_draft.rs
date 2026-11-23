@@ -519,11 +519,22 @@ impl<'a> SqlRelationalSourceFacts<'a> {
             ));
         }
         let expected_state = match entry.phase {
-            AggregatePhase::Single | AggregatePhase::Partial { .. } => {
-                AggregateRuntimeDemand::Update
-            }
+            AggregatePhase::Single | AggregatePhase::Partial { .. } => match source.filter_root {
+                Some(root) => {
+                    let input = novarocks_physical_plan::expression_value(fragment, node.id, root)
+                        .ok_or(SqlSourceJournalError::InvalidSource(
+                            "aggregate filter root no longer reads its original input",
+                        ))?;
+                    AggregateRuntimeDemand::FilteredUpdate { root, input }
+                }
+                None => AggregateRuntimeDemand::Update,
+            },
             AggregatePhase::Intermediate { .. } | AggregatePhase::Final { .. } => {
-                if source.arguments.len() != 1 || !source.order_by.is_empty() || source.distinct {
+                if source.arguments.len() != 1
+                    || !source.order_by.is_empty()
+                    || source.distinct
+                    || source.filter_root.is_some()
+                {
                     return Err(SqlSourceJournalError::InvalidSource(
                         "aggregate merge has invalid physical state channels",
                     ));
@@ -1109,8 +1120,17 @@ pub(super) enum AggregateSourceTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AggregateRuntimeDemand {
     Update,
+    FilteredUpdate {
+        root: novarocks_expression_contract::RootOrdinal,
+        input: ValueId,
+    },
     ExpressionState(ExprId),
     WriterState(ValueId),
+}
+impl AggregateRuntimeDemand {
+    pub(crate) const fn updates_rows(self) -> bool {
+        matches!(self, Self::Update | Self::FilteredUpdate { .. })
+    }
 }
 #[derive(Debug)]
 pub(super) enum LoweredAggregateLogicalSource {

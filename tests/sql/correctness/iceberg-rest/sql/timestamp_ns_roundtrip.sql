@@ -49,7 +49,7 @@ VALUES
 -- Nanosecond-precision assertion: CAST to STRING renders 9 fractional digits.
 -- The significant nanosecond digits (.789 and .001) must NOT be truncated to
 -- microseconds (.123456 / .000000).
-SELECT id, CAST(ts AS STRING) AS s
+SELECT id, CAST(ts AS VARCHAR) AS s
   FROM iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uuid0}
   ORDER BY id;
 
@@ -68,7 +68,7 @@ SELECT COUNT(*) AS cnt
 -- ts .123456789 → .123456 (789 sub-microsecond ns discarded)
 -- ts .000000001 → .000000 (1 sub-microsecond ns discarded)
 -- ts epoch     → no fractional part shown
-SELECT id, CAST(CAST(ts AS DATETIME) AS STRING) AS micros
+SELECT id, CAST(CAST(ts AS TIMESTAMP(6)) AS VARCHAR) AS micros
   FROM iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uuid0}
   ORDER BY id;
 

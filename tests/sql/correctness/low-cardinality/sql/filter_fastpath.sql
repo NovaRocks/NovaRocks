@@ -20,8 +20,8 @@
 -- selected and passthrough string columns.
 CREATE TABLE ${case_db}.dict_filter_fastpath_c1_t (
   id INT,
-  status STRING,
-  channel STRING
+  status VARCHAR,
+  channel VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.dict_filter_fastpath_c1_t VALUES
   ROW(1, 'PAID', 'web'),

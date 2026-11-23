@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Collect FE-vs-NovaRocks runtime-filter EXPLAIN VERBOSE differences."""
+"""Collect FE-vs-NovaRocks runtime-filter EXPLAIN differences."""
 
 from __future__ import annotations
 

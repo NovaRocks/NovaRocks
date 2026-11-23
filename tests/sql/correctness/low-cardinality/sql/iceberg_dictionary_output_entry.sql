@@ -19,7 +19,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.dictionary_output (label STRING) WITH (format_version = 3);
+CREATE TABLE ${case_db}.dictionary_output (label VARCHAR) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
@@ -47,7 +47,7 @@ SELECT label, count(*) AS n FROM ${case_db}.dictionary_output GROUP BY label ORD
 
 -- query 7
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.dictionary_plain_fallback (label STRING) WITH (format_version = 3);
+CREATE TABLE ${case_db}.dictionary_plain_fallback (label VARCHAR) WITH (format_version = 3);
 
 -- query 8
 -- @skip_result_check=true

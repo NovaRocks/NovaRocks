@@ -500,7 +500,7 @@ fn partial_elided_cast_nested_constants_keep_none_in_operational_and_final_captu
         },
         TypedExpr {
             kind: ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(integer(9)),
                 target: DataType::Int64,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

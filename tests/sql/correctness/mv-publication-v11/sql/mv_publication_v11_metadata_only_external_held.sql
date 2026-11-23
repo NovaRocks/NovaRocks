@@ -27,7 +27,7 @@
 -- @skip_result_check=true
 CREATE CATALOG mvfrozen_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 CREATE SCHEMA mvfrozen_${uuid0}.ns_${uuid0};
-CREATE TABLE mvfrozen_${uuid0}.ns_${uuid0}.fact (k STRING, v BIGINT) WITH (format_version = 3);
+CREATE TABLE mvfrozen_${uuid0}.ns_${uuid0}.fact (k VARCHAR, v BIGINT) WITH (format_version = 3);
 INSERT INTO mvfrozen_${uuid0}.ns_${uuid0}.fact VALUES ROW('east', 10);
 USE mvfrozen_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW target_mv WITH (refresh_policy = 'MANUAL') AS SELECT k, v FROM fact WHERE v > 0;

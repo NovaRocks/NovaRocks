@@ -441,6 +441,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
         },
         Pinned => match field {
             1 => repeated(Scalar),
+            2 => singular(Varint),
             _ => return None,
         },
         ReadDomain => match field {
@@ -1631,9 +1632,7 @@ fn encode_table(value: &IcebergTableHandle) -> dto::IcebergTableHandle {
             .collect(),
         pinned_data_files: value
             .pinned_data_files()
-            .map(|files| dto::IcebergPinnedDataFileSet {
-                paths: files.paths().iter().map(ToString::to_string).collect(),
-            }),
+            .map(crate::typed_read::IcebergPinnedDataFileSet::to_proto),
     }
 }
 
@@ -1656,7 +1655,7 @@ fn decode_table(
             .as_ref()
             .map(|files| {
                 observe_opaque(context, || {
-                    crate::typed_read::IcebergPinnedDataFileSet::try_new(&files.paths)
+                    crate::typed_read::IcebergPinnedDataFileSet::from_proto(files)
                 })?
                 .map_err(|error| domain_error("iceberg_table.pinned_data_files", error))
             })
@@ -3085,6 +3084,7 @@ mod tests {
         use crate::iceberg::spec::{
             FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, Transform, Type,
         };
+        use crate::typed_read::IcebergPinnedDataFileSet;
         use crate::typed_read::schema_binding::MutationMetadataSchema;
 
         let schema = Arc::new(
@@ -3119,6 +3119,12 @@ mod tests {
                 MutationMetadataSchema::from_endpoint(&endpoint, FormatVersion::V2, [spec])
                     .unwrap();
             let json = serde_json::to_string(mutation.partition_type()).unwrap();
+            let paths = ["s3://warehouse/events/data/file.parquet"];
+            let pinned = if partitioned {
+                IcebergPinnedDataFileSet::for_data_rewrite(paths).unwrap()
+            } else {
+                IcebergPinnedDataFileSet::try_new(paths).unwrap()
+            };
             let table = IcebergTableHandle::try_new(IcebergTableHandleParams {
                 schema_table_name: SchemaTableName::try_new("db", "events").unwrap(),
                 snapshot_id: Some(11),
@@ -3137,7 +3143,7 @@ mod tests {
                 name_mapping_json: None,
                 table_location: "s3://warehouse/events".into(),
                 storage_properties: Default::default(),
-                pinned_data_files: None,
+                pinned_data_files: Some(pinned.clone()),
                 read_domain: Some(Arc::new(ReadDomain::new(
                     ReadObservationId::try_new([3; 16]).unwrap(),
                     endpoint,
@@ -3153,6 +3159,8 @@ mod tests {
             let IcebergRuntimeRelation::Table(table) = decoded else {
                 panic!("expected a frozen Iceberg table");
             };
+            assert_eq!(table.pinned_data_files(), Some(&pinned));
+            assert_eq!(table.is_data_rewrite_read(), partitioned);
             assert_eq!(table.mutation_partition_type_json(), Some(json.as_str()));
             let decoded_type = table.mutation_metadata().unwrap().unwrap();
             assert_eq!(decoded_type.partition_type(), mutation.partition_type());

@@ -27,7 +27,7 @@
 DROP TABLE IF EXISTS ${case_db}.t_filter_project_sort_limit_combo;
 CREATE TABLE ${case_db}.t_filter_project_sort_limit_combo (
   id INT,
-  name STRING,
+  name VARCHAR,
   qty INT,
   price INT
 ) WITH (format_version = 3);

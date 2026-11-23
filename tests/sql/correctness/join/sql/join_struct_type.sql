@@ -32,12 +32,12 @@ DROP TABLE IF EXISTS ${case_db}.struct_test;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.struct_test (
   pk bigint not null,
-  s0 ROW(c0 int, c1 string),
+  s0 ROW(c0 int, c1 VARCHAR),
   s1 ROW(c0 DECIMAL(16, 3), c1 varchar(30)),
-  s2 ROW(c0 int, c1 array<string>),
-  s3 ROW(c0 string, c1 map<int, varchar(30)>),
+  s2 ROW(c0 int, c1 array<VARCHAR>),
+  s3 ROW(c0 VARCHAR, c1 map<int, varchar(30)>),
   s4 ROW(c0 int, c1 json),
-  s5 ROW(c0 INT, c1 ROW(c INT, b string))
+  s5 ROW(c0 INT, c1 ROW(c INT, b VARCHAR))
 ) WITH (format_version = 3);
 
 -- query 3

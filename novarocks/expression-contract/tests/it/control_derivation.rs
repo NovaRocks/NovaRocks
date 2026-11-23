@@ -22,6 +22,67 @@ use novarocks_type_contract::*;
 use std::collections::BTreeMap;
 
 #[test]
+fn try_body_has_its_own_region_and_value_demand() {
+    let ty = boolean(true);
+    let mut builder = BoundExprSetBuilder::new(limits());
+    let leaf = builder
+        .add(None, ty.clone(), ExprKind::Value(ValueId::new(9)))
+        .unwrap();
+    let function = function(
+        "fixture/unit/try",
+        vec![FunctionArgumentType::Value(ty.clone())],
+        ty.clone(),
+    );
+    let request = request(&function);
+    let root = builder
+        .add(
+            None,
+            ty.clone(),
+            ExprKind::FunctionCall {
+                function,
+                args: Box::new([leaf]),
+            },
+        )
+        .unwrap();
+    builder.request(root, request).unwrap();
+    builder
+        .definition_control(
+            root,
+            DefinitionControl {
+                shape: ControlShape::Try,
+                temporal_sources: None,
+            },
+        )
+        .unwrap();
+    builder
+        .root(root, EvaluationDemand::TruthOnly, RootScope::Port(0))
+        .unwrap();
+    let control = Control::good();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+    let sealed = builder
+        .seal(
+            vec![ExprPort {
+                values: Box::new([(ValueId::new(9), ty)]),
+            }],
+            &mut work,
+        )
+        .unwrap();
+    let root_use = sealed.root_use_ids()[0];
+    let owner = &sealed.uses()[&root_use];
+    let body = &sealed.uses()[&owner.arguments[0]];
+    assert_eq!(body.context.demand, EvaluationDemand::Value);
+    let scope = &sealed.control_flow().regions()[&body.context.region];
+    assert_eq!(scope.parent, Some(owner.context.region));
+    assert_eq!(
+        scope.guard,
+        Some(RegionGuard {
+            owner: root_use,
+            kind: GuardKind::TryBody,
+        }),
+    );
+}
+
+#[test]
 fn shared_if_retains_independent_value_truth_uses_and_hand_checked_guards() {
     let ty = boolean(true);
     let mut builder = BoundExprSetBuilder::new(limits());

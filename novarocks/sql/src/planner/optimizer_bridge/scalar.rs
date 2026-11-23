@@ -929,12 +929,19 @@ pub(crate) fn intern_typed(
             body: intern_typed(arena, body, control)?,
         },
         ExprKind::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
             order_by,
             resolved,
         } => ScalarNode::AggregateCall {
+            occurrence: Some(occurrence.clone()),
+            filter: filter
+                .as_deref()
+                .map(|expr| intern_typed(arena, expr, control))
+                .transpose()?,
             name: name.clone(),
             args: args
                 .iter()
@@ -948,12 +955,12 @@ pub(crate) fn intern_typed(
             resolved: resolved.clone(),
         },
         ExprKind::Cast {
-            array_failure_mode,
+            cast_mode,
             expr,
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
-            array_failure_mode: *array_failure_mode,
+            cast_mode: *cast_mode,
             child: intern_typed(arena, expr, control)?,
             target: target.clone(),
             decimal_overflow_policy: *decimal_overflow_policy,
@@ -1128,12 +1135,18 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             body: novarocks_parser::ast::AstBox::new(materialize(arena, *body)),
         },
         ScalarNode::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
             order_by,
             resolved,
         } => ExprKind::AggregateCall {
+            occurrence: occurrence
+                .clone()
+                .unwrap_or_else(crate::analysis::AggregateOccurrence::new),
+            filter: filter.map(|id| novarocks_parser::ast::AstBox::new(materialize(arena, id))),
             name: name.clone(),
             args: args.iter().map(|a| materialize(arena, *a)).collect(),
             distinct: *distinct,
@@ -1144,12 +1157,12 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             resolved: resolved.clone(),
         },
         ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child,
             target,
             decimal_overflow_policy,
         } => ExprKind::Cast {
-            array_failure_mode: *array_failure_mode,
+            cast_mode: *cast_mode,
             expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
             target: target.clone(),
             decimal_overflow_policy: *decimal_overflow_policy,

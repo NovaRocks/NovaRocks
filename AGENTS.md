@@ -293,7 +293,7 @@ SQL client
 
 - `novarocks/expression-contract/src/{unit,builder}.rs`
   `BoundExprSet` 已冻结有序端口、局部定义、根、控制流、调用声明与静态请求；
-  codec 用受检的中立 parts 构造单元。修订号 35 的 package 在 PhysicalNode 信封承载单元，
+  codec 用受检的中立 parts 构造单元。修订号 38 的 package 在 PhysicalNode 信封承载单元，
   类型、常量和函数绑定由 package 共享。节点字段的根与端口由 `physical-plan/src/node_roots.rs` 核对。
   见 [ADR-0238](docs/adr/ADR-0238-self-contained-expression-units-and-explicit-environments.md)。
 
@@ -346,6 +346,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `rebind_unpublished_nullability` 沿实际端口保留来源、控制与同一重载。开发文本入口在
   `novarocks/expression/src/testkit/expression_text.rs`，与 SQL 共用迁移判定并核对实际环境。
   见 [ADR-0245](docs/adr/ADR-0245-scalar-typing-finalizes-the-original-overload.md)。
+  CAST/TRY_CAST 的转换语境和 TRY 的错误作用域见 [ADR-0252](docs/adr/ADR-0252-trino-casts-and-row-error-scopes.md)。
 
 - `novarocks/type-contract/src/operator_function.rs` 冻结已迁入运算符的函数身份，Functions 保管隐藏定义、
   准确重载效应与整批 kernel。SQL 的 `common/negation.rs` 按身份读实参并保持渲染边界。
@@ -397,7 +398,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `novarocks/execution/src/runtime/function_set.rs`
   只封存真实 EngineFunctionCatalog metadata；不持有旧实现 map、legacy registry 或 implementation manifest。
-  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 17、test-only 为 13；旧执行实现摘要不再参与，
+  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 18、test-only 为 13；旧执行实现摘要不再参与，
   函数目录、pure 目录、descriptor、plan contract 与 Provider/carrier 事实仍保持 exact-island 判定。
 
 - `novarocks/execution/src/exec/operators/**`

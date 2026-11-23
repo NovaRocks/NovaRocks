@@ -68,14 +68,14 @@ CREATE TABLE ${case_db}.t1 (
     c_int_null int ,
     c_bigint bigint,
     c_bigint_null bigint ,
-    c_float float,
-    c_float_null float ,
+    c_float REAL,
+    c_float_null REAL ,
     c_double double,
     c_double_null double ,
     c_date date,
     c_date_null date ,
-    c_datetime datetime,
-    c_datetime_null datetime
+    c_datetime TIMESTAMP(6),
+    c_datetime_null TIMESTAMP(6)
 ) WITH (format_version = 3);
 
 -- query 8
@@ -220,4 +220,4 @@ from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null 
 -- join on datetime + cast(int as string)
 -- query 31
 select count(1)
-from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_datetime = t2.c_datetime and cast(t1.c_int as string) = cast(t2.c_int as string);
+from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_datetime = t2.c_datetime and cast(t1.c_int as VARCHAR) = cast(t2.c_int as VARCHAR);

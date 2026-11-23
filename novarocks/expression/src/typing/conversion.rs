@@ -50,6 +50,22 @@ pub(super) fn coerce_argument(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Conversion, TypingError> {
     let source = &child.value_type;
+    if novarocks_type_contract::trino_can_coerce(source.value_type(), target.value_type(), work)? {
+        if same_type(source, target, work)? {
+            return Ok(Conversion::Keep);
+        }
+        if is_null(child, work)? {
+            return typed_null(context, target.clone(), work);
+        }
+        return super::type_cast(
+            context,
+            source,
+            target.clone(),
+            novarocks_type_contract::TrinoCastMode::Implicit,
+            work,
+        )
+        .map(Conversion::Cast);
+    }
     let same_domain = source.same_value_domain_observed::<TypingError>(target, || {
         work.step()?;
         Ok(())
@@ -220,6 +236,7 @@ pub(super) fn assign(
                 context.decimal_overflow_policy
             };
         return Ok(Conversion::Cast(CarrierConversion {
+            mode: None,
             target: target.clone(),
             decimal_overflow_policy,
         }));
@@ -237,6 +254,7 @@ fn carrier_or_keep(
         Ok(Conversion::Keep)
     } else {
         Ok(Conversion::Cast(CarrierConversion {
+            mode: None,
             target,
             decimal_overflow_policy,
         }))
@@ -304,6 +322,7 @@ fn value_domain(
         None
     } else {
         Some(CarrierConversion {
+            mode: None,
             target: target.clone(),
             decimal_overflow_policy: context.decimal_overflow_policy,
         })

@@ -25,8 +25,7 @@ from
   ,customer_address
   ,call_center
 where
-    d_date between '2002-2-01' and 
-           date_add(cast('2002-2-01' as date), 60)
+    d_date BETWEEN DATE '2002-02-01' AND DATE '2002-04-02'
 and cs1.cs_ship_date_sk = d_date_sk
 and cs1.cs_ship_addr_sk = ca_address_sk
 and ca_state = 'GA'

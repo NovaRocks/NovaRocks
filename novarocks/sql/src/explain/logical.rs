@@ -176,6 +176,17 @@ fn visit(
                                 Some(diagnostic),
                             )?;
                             out.write_char(')')?;
+                            if let Some(predicate) = aggregate.source.filter() {
+                                out.write_str(" FILTER (WHERE ")?;
+                                expressions(
+                                    out,
+                                    std::slice::from_ref(predicate),
+                                    "",
+                                    0,
+                                    Some(diagnostic),
+                                )?;
+                                out.write_char(')')?;
+                            }
                         }
                         Ok(())
                     })
@@ -919,7 +930,13 @@ fn validate_node_expressions(kind: &LogicalPlanKind) -> Result<(), String> {
                 check(expr)?;
             }
             for aggregate in &node.aggregates {
-                for expr in aggregate.source.arguments() {
+                for expr in aggregate
+                    .source
+                    .arguments()
+                    .iter()
+                    .chain(aggregate.source.order_by().iter().map(|item| &item.expr))
+                    .chain(aggregate.source.filter())
+                {
                     check(expr)?;
                 }
             }

@@ -1,4 +1,9 @@
 -- query 1
--- types	boolean	boolean	boolean	boolean	boolean
-abs_eq_zero	bool_eq_one	bool_lt_one	dbl_gt_int	dec_eq_int
-false	true	true	true	true
+-- types	boolean	boolean	boolean
+abs_eq_zero	dbl_gt_int	dec_eq_int
+false	true	true
+
+-- query 2
+-- types	boolean	boolean
+bool_eq_one	bool_lt_one
+true	true

@@ -36,8 +36,8 @@ INSERT INTO ${case_db}.row_util SELECT row_number() over() AS idx FROM ${case_db
 
 CREATE TABLE ${case_db}.t1 (
   k1 BIGINT ,
-  c_str_1 STRING ,
-  c_str_2 STRING
+  c_str_1 VARCHAR ,
+  c_str_2 VARCHAR
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t1

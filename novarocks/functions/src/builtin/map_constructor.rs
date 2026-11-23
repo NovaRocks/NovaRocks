@@ -43,7 +43,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug)]
-// Design: ADR-0252 (docs/adr/ADR-0252-collection-calls-and-relational-sequence.md)
+// Design: ADR-0254 (docs/adr/ADR-0254-collection-calls-and-relational-sequence.md)
 pub(super) struct Recipe {
     keys: MapKeyOperations,
 }

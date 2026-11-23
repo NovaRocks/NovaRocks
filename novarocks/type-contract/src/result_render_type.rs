@@ -19,6 +19,38 @@
 //! preparation check compares the frozen type with its canonical storage
 //! schema; dictionary/view hydration remains an execution capability.
 
+use crate::{FunctionValueType, ValueKind, ValueTypeRef};
+use novarocks_result_contract::{NativeRenderType, RenderField};
+
+pub fn render_field_matches_declaration(
+    render: &RenderField,
+    declaration: &FunctionValueType,
+) -> bool {
+    render_field_matches_storage(render, declaration.data_type(), declaration.nullable())
+        && render_character_declarations_match(render, declaration.value_type())
+}
+
+fn render_character_declarations_match(render: &RenderField, value: &ValueTypeRef) -> bool {
+    use NativeRenderType as R;
+    match (&render.native_type, value.kind()) {
+        (R::BoundedCharacter(render), ValueKind::BoundedCharacter(declared)) => render == declared,
+        (R::BoundedCharacter(_), _) | (_, ValueKind::BoundedCharacter(_)) => false,
+        (R::List(render), ValueKind::List(item)) => {
+            render_character_declarations_match(render, item)
+        }
+        (R::Map { key, value }, ValueKind::Map { key: kt, value: vt }) => {
+            render_character_declarations_match(key, kt)
+                && render_character_declarations_match(value, vt)
+        }
+        (R::Struct(render), ValueKind::Struct(fields)) => {
+            render.iter().zip(fields).all(|(render, field)| {
+                render_character_declarations_match(&render.field, field.value_type())
+            })
+        }
+        _ => true,
+    }
+}
+
 pub fn render_field_matches_storage(
     render: &novarocks_result_contract::RenderField,
     data_type: &arrow_schema::DataType,
@@ -61,7 +93,8 @@ fn render_carrier_matches(
         | (R::LargeInt, D::FixedSizeBinary(16))
         | (R::Float32, D::Float32)
         | (R::Float64, D::Float64)
-        | (R::String | R::Json, D::Utf8)
+        | (R::String | R::BoundedCharacter(_), D::Utf8 | D::LargeUtf8)
+        | (R::Json, D::Utf8)
         | (R::Binary | R::Opaque(_), D::Binary)
         | (R::Variant, D::LargeBinary)
         | (R::Date, D::Date32) => true,

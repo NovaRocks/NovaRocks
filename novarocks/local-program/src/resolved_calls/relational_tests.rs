@@ -1035,6 +1035,7 @@ pub(crate) fn aggregate_node(
                     input: ProgramNodeId::new(0),
                     group_by: vec![crate::test_support::root(0, 0); group_roots],
                     functions: vec![StaticAggregateCall {
+                        filter_root: None,
                         frozen: Some(frozen_selection(owner)),
                         state_interpretation: None,
                         // Deliberately unrelated display text: it is never implementation authority.
@@ -1901,6 +1902,7 @@ fn resolved_relational_entry_and_positive_quantum_keep_all_three_typed_controls(
                     group_by: vec![],
                     functions: (0..count)
                         .map(|_| StaticAggregateCall {
+                            filter_root: None,
                             frozen: Some(frozen_selection(&owner)),
                             state_interpretation: None,
                             name: "display_alias_without_catalogue_entry".into(),

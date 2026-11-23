@@ -590,6 +590,7 @@ fn special_fixture_with_rows(input_rows: usize) -> RelationFixture {
             .unwrap();
         outputs.push(output);
         aggregates.push(AggregateCall {
+            filter_root: None,
             id,
             binding: AggregateBinding {
                 function: function(FunctionKind::Aggregate, integer()),
@@ -966,6 +967,7 @@ fn every_control_and_proof_variant_projects_exactly_including_higher_order() {
         ArgumentControl::TypeOnly,
         ArgumentControl::If,
         ArgumentControl::Coalesce,
+        ArgumentControl::Try,
         ArgumentControl::SimpleCase,
         ArgumentControl::SearchedCase,
         ArgumentControl::Aggregate,

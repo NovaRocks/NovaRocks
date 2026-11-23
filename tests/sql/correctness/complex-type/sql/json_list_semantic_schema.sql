@@ -17,14 +17,14 @@
 
 -- query 1
 SELECT [JSON '{"2:3": null}'] AS json_values,
-       [CAST(JSON '{"2:3": null}' AS VARCHAR)] AS string_values;
+       [CAST('{"2:3": null}' AS VARCHAR)] AS string_values;
 
 -- query 2
 SELECT array_agg(j ORDER BY k1 NULLS FIRST, ordinal) AS json_values,
        array_agg(s ORDER BY k1 NULLS FIRST, ordinal) AS string_values
 FROM (VALUES
-    (1, JSON '{"k": 1}', CAST(JSON '{"k": 1}' AS VARCHAR), 2),
-    (2, JSON '{"k": 2}', CAST(JSON '{"k": 2}' AS VARCHAR), 1)
+    (1, JSON '{"k": 1}', CAST('{"k": 1}' AS VARCHAR), 2),
+    (2, JSON '{"k": 2}', CAST('{"k": 2}' AS VARCHAR), 1)
 ) AS input_rows(ordinal, j, s, k1);
 
 -- query 3
@@ -57,17 +57,19 @@ SELECT TRY_CAST(['abc','{"k":1}','null',NULL] AS ARRAY<JSON>) AS json_values;
 SELECT CAST([JSON '100.0',JSON '1e2',JSON 'null',JSON '"a\n中"',NULL] AS ARRAY<VARCHAR>) AS string_values;
 
 -- query 9
--- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+-- @expect_trino_error=INVALID_LITERAL,USER_ERROR
 SELECT CAST([JSON '[1'] AS ARRAY<VARCHAR>);
 
 -- query 10
+-- @expect_trino_error=INVALID_LITERAL,USER_ERROR
 SELECT TRY_CAST([JSON '[1'] AS ARRAY<VARCHAR>) AS whole_array;
 
 -- query 11
--- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+-- @expect_trino_error=INVALID_LITERAL,USER_ERROR
 SELECT CAST([JSON '1e309'] AS ARRAY<VARCHAR>);
 
 -- query 12
+-- @expect_trino_error=INVALID_LITERAL,USER_ERROR
 SELECT TRY_CAST([JSON '1e309'] AS ARRAY<VARCHAR>) AS whole_array;
 
 -- query 13

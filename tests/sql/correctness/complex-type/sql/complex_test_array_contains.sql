@@ -28,9 +28,9 @@ USE ${case_db};
 USE ${case_db};
 CREATE TABLE t ( 
 pk bigint not null ,
-str string,
+str VARCHAR,
 arr_bigint array<bigint>,
-arr_str array<string>,
+arr_str array<VARCHAR>,
 arr_decimal array<decimal(38,5)>
 ) WITH (format_version = 3);
 
@@ -203,10 +203,10 @@ select array_position(v3, v2) from t;
 USE ${case_db};
 DROP TABLE IF EXISTS t;
 CREATE TABLE t (
-  k bigint(20) NOT NULL,
-  arr_0 array<bigint(20)> NOT NULL,
-  arr_1 array<bigint(20)>,
-  arr_2 array<bigint(20)>
+  k BIGINT NOT NULL,
+  arr_0 array<BIGINT> NOT NULL,
+  arr_1 array<BIGINT>,
+  arr_2 array<BIGINT>
 ) WITH (format_version = 3);
 
 -- query 42
@@ -342,14 +342,14 @@ CREATE TABLE test_array_contains (
     array_bigint ARRAY<BIGINT>,
     array_largeint ARRAY<DECIMAL(38, 0)>,
     array_decimalv2 ARRAY<DECIMAL(10, 2)>,
-    array_decimal32 ARRAY<DECIMAL32(9, 2)>,
-    array_decimal64 ARRAY<DECIMAL64(18, 2)>,
-    array_decimal128 ARRAY<DECIMAL128(38, 10)>,
-    array_float ARRAY<FLOAT>,
+    array_decimal32 ARRAY<DECIMAL(9, 2)>,
+    array_decimal64 ARRAY<DECIMAL(18, 2)>,
+    array_decimal128 ARRAY<DECIMAL(38, 10)>,
+    array_float ARRAY<REAL>,
     array_double ARRAY<DOUBLE>,
     array_varchar ARRAY<VARCHAR(100)>,
     array_date ARRAY<DATE>,
-    array_datetime ARRAY<DATETIME>
+    array_datetime ARRAY<TIMESTAMP(6)>
 ) WITH (format_version = 3);
 
 -- query 70
@@ -938,9 +938,9 @@ SELECT id FROM test_array_contains WHERE contains_sequence(array_varchar, ['a', 
 USE ${case_db};
 CREATE TABLE test_array_contains_complex_type (
     id INT,
-    array_map ARRAY<MAP<STRING, INT>>,
+    array_map ARRAY<MAP<VARCHAR, INT>>,
     array_json ARRAY<JSON>,
-    array_struct ARRAY<ROW(f1 INT, f2 STRING)>
+    array_struct ARRAY<ROW(f1 INT, f2 VARCHAR)>
 ) WITH (format_version = 3);
 
 -- query 197
@@ -1112,9 +1112,9 @@ USE ${case_db};
 DROP TABLE IF EXISTS t;
 CREATE TABLE t ( 
 pk bigint not null ,
-str string,
+str VARCHAR,
 arr_bigint array<bigint>,
-arr_str array<string>,
+arr_str array<VARCHAR>,
 arr_decimal array<decimal(38,5)>
 ) WITH (format_version = 3);
 

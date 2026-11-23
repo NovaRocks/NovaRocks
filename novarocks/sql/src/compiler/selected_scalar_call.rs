@@ -77,20 +77,14 @@ pub(crate) fn canonical_null_target(
 #[derive(Clone, Debug)]
 pub(crate) struct CarrierStep {
     target: FunctionValueType,
-    decimal_overflow_policy: DecimalOverflowPolicy,
-    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+    cast_mode: novarocks_type_contract::TrinoCastMode,
 }
 impl CarrierStep {
-    pub(crate) fn array_failure_mode(
-        &self,
-    ) -> Option<novarocks_type_contract::ArrayCastFailureMode> {
-        self.array_failure_mode
+    pub(crate) fn cast_mode(&self) -> novarocks_type_contract::TrinoCastMode {
+        self.cast_mode
     }
     pub(crate) fn target(&self) -> &FunctionValueType {
         &self.target
-    }
-    pub(crate) fn decimal_overflow_policy(&self) -> DecimalOverflowPolicy {
-        self.decimal_overflow_policy
     }
 }
 
@@ -110,25 +104,14 @@ pub(crate) fn plan_conversion(
     source: &FunctionValueType,
     target: &FunctionValueType,
     policy: DecimalOverflowPolicy,
-    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+    cast_mode: Option<novarocks_type_contract::TrinoCastMode>,
     control: &dyn PureCompileControl,
 ) -> Result<PlannedConversion, FunctionBindingError> {
-    if let Some(mode) = array_failure_mode {
+    if let Some(cast_mode) = cast_mode {
         control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
-        if !novarocks_type_contract::array_cast_mode_types_valid_observed(
-            source,
-            target,
-            mode,
-            || control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1),
-        )? {
-            return Err(FunctionBindingError::InvalidBinding(
-                "invalid explicit array CAST boundary".into(),
-            ));
-        }
         return Ok(PlannedConversion::Carrier(CarrierStep {
             target: target.clone(),
-            decimal_overflow_policy: policy,
-            array_failure_mode,
+            cast_mode,
         }));
     }
     if source == target {
@@ -147,9 +130,8 @@ pub(crate) fn plan_conversion(
     };
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let step = || CarrierStep {
-        array_failure_mode: None,
+        cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
         target: target.clone(),
-        decimal_overflow_policy: policy,
     };
     let Some(intermediate) = intermediate else {
         return Ok(PlannedConversion::Carrier(step()));

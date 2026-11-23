@@ -14,96 +14,35 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Actual compiler and selected evaluator for the exact Physical FSB16 profile.
-use super::*;
-use crate::EvaluationInput;
-use crate::testkit::PassThroughCallHost;
-use arrow::array::StringArray;
-use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
+
+use crate::testkit::numeric_fixtures::{Source, Wrap, cast_fixture_in_mode};
+use crate::{CallAuthorError, CapabilityRefusal};
+use arrow::datatypes::DataType;
+use novarocks_type_contract::{FunctionValueType, TrinoCastMode, ValueLogicalType};
+
 #[test]
-fn largeint_text_actual_compiler_sparse_slice_null_empty_and_effects() {
-    let input =
-        novarocks_functions::largeint::array_from_i128(&[Some(0), Some(i128::MIN), Some(42), None])
-            .unwrap()
-            .slice(1, 3);
-    for policy in [
-        DecimalOverflowPolicy::OutputNull,
-        DecimalOverflowPolicy::ReportError,
-    ] {
-        for allow in [false, true] {
-            let program = compiled(
-                FunctionValueType::new(DataType::FixedSizeBinary(16), true),
-                FunctionValueType::new(DataType::Utf8, true),
-                Source::Column,
-                Wrap::Bare,
-                policy,
-                allow,
-            );
-            let batch = RecordBatch::try_new(
-                program.input_schema().clone(),
-                vec![
-                    input.clone(),
-                    Arc::new(Int64Array::from(vec![42; 3])),
-                    Arc::new(BooleanArray::from(vec![true; 3])),
-                ],
-            )
-            .unwrap();
-            let mut evaluator = instance(&program);
-            let occurrence = cast_root_use(&program);
-            let summary = evaluator.effects[&occurrence];
-            assert!(
-                !summary
-                    .for_use(summary.context())
-                    .unwrap()
-                    .may_raise_row_error
-            );
-            let rows = [0, 1, 2];
-            let result = evaluator
-                .evaluate(
-                    EvaluationInput::Batch {
-                        batch: &batch,
-                        source: None,
-                    },
-                    {
-                        let selection = Selection::try_sparse(3, &rows).unwrap();
-                        ScalarInvocationScope::new(selection, selection)
-                    },
-                    ScalarInvocationActivation::Activated,
-                    &Control,
-                    &mut PassThroughCallHost,
-                )
-                .unwrap();
-            assert_eq!(
-                result.values().to_data(),
-                // Signed big-endian physical bytes represent MIN, 42, NULL.
-                // Decimal spelling is independent of either cast evaluator.
-                StringArray::from(vec![
-                    Some("-170141183460469231731687303715884105728"),
-                    Some("42"),
-                    None
-                ])
-                .to_data()
-            );
-            assert!(result.errors().is_empty());
-            let output = evaluator
-                .evaluate(
-                    EvaluationInput::Batch {
-                        batch: &batch,
-                        source: None,
-                    },
-                    {
-                        let selection = Selection::try_sparse(3, &[]).unwrap();
-                        ScalarInvocationScope::new(selection, selection)
-                    },
-                    ScalarInvocationActivation::Activated,
-                    &Control,
-                    &mut PassThroughCallHost,
-                )
-                .unwrap();
-            assert_eq!(
-                output.values().to_data(),
-                StringArray::from(Vec::<Option<&str>>::new()).to_data()
-            );
-        }
+fn retired_largeint_cannot_cast_to_varchar() {
+    let source = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap();
+    for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
+        let result = cast_fixture_in_mode(
+            source.clone(),
+            FunctionValueType::new(DataType::Utf8, true),
+            Source::Column,
+            Wrap::Bare,
+            mode,
+            false,
+        );
+        assert!(matches!(
+            result,
+            Err(CallAuthorError::Capability(CapabilityRefusal::Primitive {
+                cast: None,
+                ..
+            }))
+        ));
     }
 }

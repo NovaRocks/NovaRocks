@@ -71,3 +71,25 @@ SELECT GROUPING(k) AS g, -k AS negated
 FROM grouping_input
 GROUP BY GROUPING SETS ((k), ())
 ORDER BY g, negated;
+
+-- query 9
+WITH input(a, b) AS (
+    VALUES ROW(1, 10), ROW(1, 20), ROW(2, 30), ROW(CAST(NULL AS integer), 40)
+)
+SELECT CAST(GROUPING(a) AS integer) AS g, a,
+       count(*) FILTER (WHERE a IS NULL) AS original_nulls,
+       sum(b) FILTER (WHERE a > 0) AS positive_keys,
+       count(*) FILTER (WHERE false) AS none_count,
+       sum(b) FILTER (WHERE false) AS none_sum
+FROM input GROUP BY GROUPING SETS ((a), ())
+ORDER BY g, a NULLS FIRST;
+
+-- query 10
+WITH input(k) AS (SELECT 1)
+SELECT count(*) AS groups_seen, count(total) AS nonnull_values,
+       count(DISTINCT total) AS distinct_values
+FROM (
+    SELECT CAST(GROUPING(k) AS integer) AS g,
+           sum(random()) FILTER (WHERE k > 0) AS total
+    FROM input GROUP BY GROUPING SETS ((k), ())
+) AS grouped;

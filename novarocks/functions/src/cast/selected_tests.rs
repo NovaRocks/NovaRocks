@@ -80,8 +80,9 @@ fn policies() -> [DecimalOverflowPolicy; 2] {
 }
 
 #[test]
-fn explicit_byte_view_projection_preserves_selected_values_and_nulls() {
+fn byte_view_projection_preserves_selected_values_and_nulls() {
     use arrow_array::{BinaryViewArray, StringViewArray};
+    use novarocks_type_contract::TrinoCastMode;
 
     let strings = [Some("unselected"), None, Some("a retained long string")];
     let bytes = [Some(&b"unused"[..]), None, Some(&b"payload \xff"[..])];
@@ -96,24 +97,33 @@ fn explicit_byte_view_projection_preserves_selected_values_and_nulls() {
         ),
     ];
     for (input, expected) in fixtures {
-        let recipe = prepare(
+        let original = prepare(
             input.data_type().clone(),
             expected.data_type().clone(),
             DecimalOverflowPolicy::OutputNull,
             false,
         );
+        let implicit = PreparedCastRecipe::try_new_trino(
+            &ty(input.data_type().clone()),
+            &ty(expected.data_type().clone()),
+            TrinoCastMode::Implicit,
+            crate::binding_test_control(),
+        )
+        .unwrap();
         let rows = [1, 2];
         let selection = Selection::try_sparse(input.len(), &rows).unwrap();
-        let actual = recipe
-            .evaluate_selected(
-                EvaluatedArgument::Column(&input),
-                selection,
-                &[],
-                &Control::default(),
-            )
-            .unwrap();
-        same(&actual, &expected);
-        assert!(actual.errors().is_empty());
+        for recipe in [original, implicit] {
+            let actual = recipe
+                .evaluate_selected(
+                    EvaluatedArgument::Column(&input),
+                    selection,
+                    &[],
+                    &Control::default(),
+                )
+                .unwrap();
+            same(&actual, &expected);
+            assert!(actual.errors().is_empty());
+        }
     }
 }
 

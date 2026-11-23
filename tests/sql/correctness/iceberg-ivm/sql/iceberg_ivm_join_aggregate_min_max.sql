@@ -40,7 +40,7 @@ CREATE TABLE ice_ivm_jmm_${uuid0}.ns_${uuid0}.orders (
 ) WITH (format_version = 3);
 CREATE TABLE ice_ivm_jmm_${uuid0}.ns_${uuid0}.users (
   id BIGINT NOT NULL,
-  user_region STRING
+  user_region VARCHAR
 ) WITH (format_version = 3);
 USE ice_ivm_jmm_${uuid0}.ns_${uuid0};
 

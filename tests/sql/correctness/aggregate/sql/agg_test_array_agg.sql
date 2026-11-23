@@ -27,10 +27,10 @@ USE ${case_db};
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "ss" (
-  "id" int(11),
+  "id" INTEGER,
   "name" varchar(255),
   "subject" varchar(255),
-  "score" int(11),
+  "score" INTEGER,
    arr array<int>,
    mmap map<int,varchar(20)>
 ) WITH (format_version = 3);
@@ -1242,15 +1242,15 @@ create table test_array_agg (
     col_int INT,
     col_bigint BIGINT,
     col_largeint LARGEINT,
-    col_float FLOAT,
+    col_float REAL,
     col_double DOUBLE,
     col_varchar VARCHAR(100),
     col_char CHAR(10),
-    col_datetime DATETIME,
+    col_datetime TIMESTAMP(6),
     col_date DATE,
     col_array ARRAY<INT>,
-    col_map MAP<STRING, INT>,
-    col_struct ROW(f1 INT, f2 STRING)
+    col_map MAP<VARCHAR, INT>,
+    col_struct ROW(f1 INT, f2 VARCHAR)
 ) WITH (format_version = 3);
 
 -- query 293

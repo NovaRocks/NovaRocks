@@ -52,11 +52,13 @@ const TRINO_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("ADMINISTRATIVELY_KILLED", 38, "USER_ERROR"),
     ("INVALID_ANALYZE_PROPERTY", 42, "USER_ERROR"),
     ("INVALID_CATALOG_PROPERTY", 124, "USER_ERROR"),
+    ("INVALID_DEFAULT_COLUMN_VALUE", 137, "USER_ERROR"),
     ("INVALID_SCHEMA_PROPERTY", 33, "USER_ERROR"),
     ("INVALID_TABLE_PROPERTY", 18, "USER_ERROR"),
     ("NOT_IN_TRANSACTION", 21, "USER_ERROR"),
     ("INVALID_MATERIALIZED_VIEW_PROPERTY", 95, "USER_ERROR"),
     ("INVALID_BRANCH_PROPERTY", 136, "USER_ERROR"),
+    ("TYPE_NOT_FOUND", 43, "USER_ERROR"),
     ("CATALOG_NOT_FOUND", 44, "USER_ERROR"),
     ("SCHEMA_NOT_FOUND", 45, "USER_ERROR"),
     ("TABLE_NOT_FOUND", 46, "USER_ERROR"),
@@ -69,6 +71,8 @@ const TRINO_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("TYPE_MISMATCH", 58, "USER_ERROR"),
     ("INVALID_LITERAL", 59, "USER_ERROR"),
     ("MISMATCHED_COLUMN_ALIASES", 61, "USER_ERROR"),
+    ("FUNCTION_NOT_AGGREGATE", 72, "USER_ERROR"),
+    ("EXPRESSION_NOT_SCALAR", 74, "USER_ERROR"),
     ("EXPRESSION_NOT_CONSTANT", 75, "USER_ERROR"),
     ("INVALID_ARGUMENTS", 76, "USER_ERROR"),
     ("TOO_MANY_ARGUMENTS", 77, "USER_ERROR"),
@@ -185,13 +189,18 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.view_is_stale" => "VIEW_IS_STALE",
         "sql.analyze.view_is_recursive" => "VIEW_IS_RECURSIVE",
         "sql.analyze.type_mismatch" => "TYPE_MISMATCH",
+        "sql.analyze.function_not_aggregate" => "FUNCTION_NOT_AGGREGATE",
+        "sql.analyze.expression_not_scalar" => "EXPRESSION_NOT_SCALAR",
+        "sql.admit.unknown_type" => "TYPE_NOT_FOUND",
         "sql.analyze.invalid_literal" => "INVALID_LITERAL",
         "sql.analyze.invalid_argument" => "INVALID_ARGUMENTS",
+        "sql.analyze.invalid_type_argument" => "INVALID_FUNCTION_ARGUMENT",
         "sql.analyze.invalid_function_argument" => "INVALID_FUNCTION_ARGUMENT",
         "sql.analyze.missing_argument" => "MISSING_ARGUMENT",
         "sql.analyze.expression_not_constant" => "EXPRESSION_NOT_CONSTANT",
         "sql.analyze.invalid_analyze_property" => "INVALID_ANALYZE_PROPERTY",
         "sql.admit.invalid_catalog_property" => "INVALID_CATALOG_PROPERTY",
+        "sql.admit.invalid_default_column_value" => "INVALID_DEFAULT_COLUMN_VALUE",
         "sql.admit.invalid_schema_property" => "INVALID_SCHEMA_PROPERTY",
         "sql.admit.invalid_table_property" => "INVALID_TABLE_PROPERTY",
         "sql.admit.invalid_materialized_view_property" => "INVALID_MATERIALIZED_VIEW_PROPERTY",
@@ -302,6 +311,22 @@ fn column_and_view_analysis_errors_preserve_their_trino_wire_identity() {
             wire.message,
             format!("[{}] {detail} at line 1 column 1", analysis.code())
         );
+    }
+}
+
+#[test]
+fn aggregate_filter_errors_keep_trino_codes() {
+    for (source, expected) in [
+        (
+            "sql.analyze.function_not_aggregate",
+            (72, "FUNCTION_NOT_AGGREGATE", "USER_ERROR"),
+        ),
+        (
+            "sql.analyze.expression_not_scalar",
+            (74, "EXPRESSION_NOT_SCALAR", "USER_ERROR"),
+        ),
+    ] {
+        assert_eq!(user_code(source).unwrap().fields(), expected);
     }
 }
 

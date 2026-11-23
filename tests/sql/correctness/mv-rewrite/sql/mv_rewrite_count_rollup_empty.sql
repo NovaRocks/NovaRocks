@@ -46,9 +46,9 @@ CREATE SCHEMA mvrw_${uuid0}.ns_${uuid0};
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.user_tags (
-  dt STRING,
+  dt VARCHAR,
   user_id INT,
-  user_name STRING,
+  user_name VARCHAR,
   tag_id INT
 ) WITH (format_version = 3);
 

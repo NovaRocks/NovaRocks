@@ -432,6 +432,8 @@ fn forced_collisions_preserve_scalar_aggregate_and_window_call_policies() {
                     volatility: super::super::FunctionVolatility::Immutable,
                 },
                 1 => ScalarNode::AggregateCall {
+                    occurrence: None,
+                    filter: None,
                     name: "sum".into(),
                     args: vec![argument],
                     distinct: false,
@@ -625,7 +627,7 @@ fn typed_map64_interning_and_cast_target_collisions_keep_logical_depth() {
             .unwrap()
     );
     let cast = || ScalarNode::Cast {
-        array_failure_mode: None,
+        cast_mode: None,
         child: first,
         target: value.data_type().clone(),
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

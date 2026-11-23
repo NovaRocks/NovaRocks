@@ -1,5 +1,5 @@
 -- query 7
--- types	varchar	bigint
+-- types	varchar(22)	bigint
 metric	value
 asia_america_customers	4
 asia_customers	2

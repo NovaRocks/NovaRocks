@@ -200,6 +200,43 @@ fn struct_names_use_complete_by_name_mapping_or_complete_ordinal_mapping() {
         }
     }
 }
+
+#[test]
+fn trino_row_label_projection_preserves_ordinal_values_and_parent_nulls() {
+    let fields = [
+        Arc::new(Field::new("a", DataType::Int32, false)),
+        Arc::new(Field::new("b", DataType::Int32, false)),
+    ];
+    let input = Arc::new(StructArray::new(
+        fields.to_vec().into(),
+        vec![
+            Arc::new(Int32Array::from(vec![11, 12, 13])),
+            Arc::new(Int32Array::from(vec![29, 30, 31])),
+        ],
+        Some(arrow_buffer::NullBuffer::from(vec![true, false, true])),
+    )) as ArrayRef;
+    let source = FunctionValueType::new(input.data_type().clone(), true);
+    let target = FunctionValueType::new(
+        DataType::Struct(vec![fields[1].clone(), fields[0].clone()].into()),
+        false,
+    );
+    let mode = TrinoCastMode::Try;
+    assert!(PreparedCastRecipe::trino_result_nullable(&source, &target, mode, &Control).unwrap());
+    let target = target.with_nullable(true).unwrap();
+    let prepared = PreparedCastRecipe::try_new_trino(&source, &target, mode, &Control).unwrap();
+    let rows = [1, 2];
+    let out = output(&prepared, &input, Selection::try_sparse(3, &rows).unwrap());
+    assert_eq!(out.values().data_type(), target.data_type());
+    assert!(out.errors().is_empty());
+    let row = out.values().as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(row.is_null(0));
+    assert!(!row.is_null(1));
+    for (column, expected) in row.columns().iter().zip([13, 31]) {
+        let integers = column.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(integers.value(1), expected);
+    }
+}
+
 #[test]
 fn renamed_struct_keeps_nested_fixed_bytes_without_generic_value_casting() {
     let fixed =

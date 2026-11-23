@@ -96,13 +96,20 @@ impl<'a> TextTyping<'a> {
         let span = expr.span();
         let next = depth + 1;
         if let Some(call) = canonical_call(expr).map_err(TextError::UnsupportedSyntax)? {
-            if call.name == "row" {
+            let shape = if call.name == "row" {
+                Some(NodeShape::Row)
+            } else if matches!(expr, ast::Expr::Coalesce(_)) {
+                Some(NodeShape::Coalesce)
+            } else {
+                None
+            };
+            if let Some(shape) = shape {
                 let children = call
                     .arguments
                     .into_iter()
                     .map(|arg| self.lower(arg, work, next))
                     .collect::<Result<Vec<_>, _>>()?;
-                return self.type_call(NodeShape::Row, children, span, work);
+                return self.type_call(shape, children, span, work);
             }
             return self.lower_call(call.name, call.arguments, span, work, next);
         }
@@ -158,6 +165,46 @@ impl<'a> TextTyping<'a> {
                 )?;
                 node.typing.form = form;
                 Ok(node)
+            }
+            ast::Expr::Cast(cast) => {
+                use crate::typing::declaration::resolve_trino_type;
+                use novarocks_type_contract::TrinoCastMode;
+
+                let input = self.lower(&cast.expression, work, next)?;
+                let target =
+                    resolve_trino_type(&cast.data_type, true, work.control()).map_err(|cause| {
+                        let span = cause.span;
+                        let error = if let Some(control) = cause.control.clone() {
+                            TypingError::Control(control)
+                        } else {
+                            TypingError::TypeMismatch(cause.to_string())
+                        };
+                        typing_error(error, span)
+                    })?;
+                let mode = if cast.safe {
+                    TrinoCastMode::Try
+                } else {
+                    TrinoCastMode::Explicit
+                };
+                let conversion = crate::typing::type_cast(
+                    &self.context,
+                    &input.typing.value_type,
+                    target,
+                    mode,
+                    work,
+                )
+                .map_err(|cause| typing_error(cause, span))?;
+                Ok(TextNode::cast(input, conversion))
+            }
+            ast::Expr::Subscript(subscript) => {
+                let base = self.lower(&subscript.base, work, next)?;
+                let index = self.lower(&subscript.index, work, next)?;
+                self.type_call(
+                    NodeShape::Operator(OperatorFunction::ArraySubscript),
+                    vec![base, index],
+                    span,
+                    work,
+                )
             }
             ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Plus => {
                 let child = self.lower(&unary.expression, work, next)?;
@@ -564,9 +611,9 @@ impl TextNode {
                 ExprKind::Cast {
                     expr,
                     target: ty.data_type().clone(),
-                    decimal_overflow_policy: conversion.decimal_overflow_policy,
-                    allow_throw_exception: context.allow_throw_exception,
-                    array_failure_mode: None,
+                    cast_mode: conversion
+                        .mode
+                        .unwrap_or(novarocks_type_contract::TrinoCastMode::Implicit),
                 }
             }
             TextKind::IsNull(input, negated) => ExprKind::IsNull {
@@ -587,17 +634,17 @@ impl TextNode {
                 }
             }
             TextKind::Case(children) => {
-                let (pairs, remainder) = children.as_chunks::<2>();
+                let (pairs, otherwise) = children.as_chunks::<2>();
                 let when_then = pairs
                     .iter()
-                    .map(|[condition, value]| {
+                    .map(|[condition, branch]| {
                         Ok((
                             condition.emit(draft, constants, context, work)?,
-                            value.emit(draft, constants, context, work)?,
+                            branch.emit(draft, constants, context, work)?,
                         ))
                     })
                     .collect::<Result<Box<_>, TextError>>()?;
-                let else_expr = remainder
+                let else_expr = otherwise
                     .first()
                     .map(|child| child.emit(draft, constants, context, work))
                     .transpose()?;
@@ -824,14 +871,18 @@ mod tests {
             let ExprKind::Cast {
                 expr,
                 target,
-                allow_throw_exception: reference,
+                cast_mode,
                 ..
             } = &draft.definition(root).unwrap().kind
             else {
                 panic!("the temporal literal emits its original cast");
             };
             assert_eq!(target, &expected);
-            assert_eq!(*reference, allow_throw_exception);
+            assert!(matches!(
+                cast_mode,
+                novarocks_type_contract::TrinoCastMode::Implicit
+                    | novarocks_type_contract::TrinoCastMode::Explicit
+            ));
             assert!(matches!(
                 draft.definition(*expr).unwrap().kind,
                 ExprKind::Constant(_)

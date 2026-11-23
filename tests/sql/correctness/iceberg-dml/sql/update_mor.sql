@@ -30,7 +30,7 @@
 DROP TABLE IF EXISTS ${case_db}.t_v3_update_mor ;
 CREATE TABLE ${case_db}.t_v3_update_mor (
   id BIGINT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 INSERT INTO ${case_db}.t_v3_update_mor VALUES
   ROW(1, 'a'),

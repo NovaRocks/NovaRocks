@@ -28,7 +28,7 @@ DROP TABLE IF EXISTS ${case_db}.t_join_not_exists_l;
 DROP TABLE IF EXISTS ${case_db}.t_join_not_exists_r;
 CREATE TABLE ${case_db}.t_join_not_exists_l (
   id INT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_not_exists_r (
   id INT

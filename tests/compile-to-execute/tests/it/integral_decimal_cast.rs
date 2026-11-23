@@ -30,7 +30,7 @@ use novarocks_sql_testkit::sql_source;
 use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, DecimalOverflowPolicy, PureCompileControl,
+    CompileControlError, CompilePhase, PureCompileControl, TrinoCastMode,
 };
 use std::{sync::Arc, time::Duration};
 struct Control;
@@ -68,14 +68,14 @@ fn integral_decimal128_actual_sql_required_i64_to_four_zero_bound_source_and_fra
             if let ExprKind::Cast {
                 expr,
                 target: bound,
-                decimal_overflow_policy,
+                cast_mode,
                 ..
             } = &node.kind
                 && *bound == target
                 && *unit.definition(*expr).unwrap().ty.data_type() == DataType::Int64
             {
                 count += 1;
-                assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
+                assert_eq!(*cast_mode, TrinoCastMode::Explicit);
             }
         }
     }

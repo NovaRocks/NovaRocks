@@ -26,7 +26,7 @@
 -- Keep Map values nullable; keys obey the frozen non-null contract.
 -- fixture_order preserves source row identity under distributed sorting.
 CREATE TABLE ${case_db}.sc2 (
-  "v1" bigint(20),
+  "v1" BIGINT,
   "array1" ARRAY<INT> ,
   "array2" ARRAY<MAP<INT, INT>> ,
   "array3" ARRAY<ROW(a INT, b INT)> ,

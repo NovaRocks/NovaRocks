@@ -23,7 +23,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.dictionary_seed (id INT NOT NULL, label STRING) WITH (format_version = 3);
+CREATE TABLE ${case_db}.dictionary_seed (id INT NOT NULL, label VARCHAR) WITH (format_version = 3);
 INSERT INTO ${case_db}.dictionary_seed VALUES ROW(7,'a'),ROW(19,'a'),ROW(27,'b'),ROW(35,NULL);
 
 SET SESSION cbo_broadcast_node_mem_budget_bytes = 0;

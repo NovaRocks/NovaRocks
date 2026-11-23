@@ -278,7 +278,7 @@ impl ScalarKernelInstance for MapElementAtInstance {
     ) -> Result<SelectedValues<'a>, KernelFailure> {
         match self.0 {
             LookupMode::TrinoArray => {
-                super::array_access_selected::evaluate_with_index_policy(input, true, control)
+                super::array_access_selected::evaluate_element_at(input, control)
             }
             LookupMode::Map(operation) => {
                 super::collection_selected::evaluate(operation, input, control)
@@ -370,7 +370,7 @@ impl MapElementAtOwner {
                 .next()
                 .ok_or_else(|| invalid("element_at has no prepared collection"))?;
             let mode = if matches!(collection.data_type(), arrow_schema::DataType::List(_)) {
-                super::array_access_selected::validate_profile(&contract, || {
+                super::array_access_selected::validate_profile(&contract, false, || {
                     work.step().map_err(compile_failure)
                 })?;
                 LookupMode::TrinoArray

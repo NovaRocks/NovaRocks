@@ -452,9 +452,7 @@ impl Fixture {
                 K::Cast(wire::CastExpression {
                     expr_id: Some(16),
                     target_carrier_type_id: Some(self.carrier_i64),
-                    decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
-                    allow_throw_exception: Some(allow()),
-                    array_failure_mode: None,
+                    cast_mode: Some(wire::TrinoCastMode::Implicit as i32),
                 }),
             ),
             definition(
@@ -658,9 +656,7 @@ fn owned_expressions_materialize_all_sixteen_scalar_kinds_with_independent_paylo
             novarocks_expression_contract::ExprKind::Cast {
                 expr: id(16),
                 target: DataType::Int64,
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: allow,
-                array_failure_mode: None,
+                cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
             },
         ),
         (
@@ -1154,8 +1150,8 @@ fn owned_expression_unit_enters_actual_sparse_fragment_construction() {
 mod caller_owned_tests;
 
 #[test]
-fn explicit_array_cast_modes_materialize_without_erasing_absence_or_target_fields() {
-    use novarocks_type_contract::ArrayCastFailureMode as Mode;
+fn cast_modes_materialize_with_exact_target_fields() {
+    use novarocks_type_contract::TrinoCastMode as Mode;
     use wire::expression_definition::Kind as K;
     let control = Control::default();
     let fixture = Fixture::with_array_types(&control, true);
@@ -1167,9 +1163,13 @@ fn explicit_array_cast_modes_materialize_without_erasing_absence_or_target_field
         .map(|(id, _)| *id)
         .unwrap();
     for (wire_mode, expected) in [
-        (None, None),
-        (Some(1), Some(Mode::ReportError)),
-        (Some(2), Some(Mode::OutputNull)),
+        (Some(wire::TrinoCastMode::Implicit as i32), Mode::Implicit),
+        (Some(wire::TrinoCastMode::Explicit as i32), Mode::Explicit),
+        (Some(wire::TrinoCastMode::Try as i32), Mode::Try),
+        (
+            Some(wire::TrinoCastMode::StoreAssignment as i32),
+            Mode::StoreAssignment,
+        ),
     ] {
         let defs = vec![
             definition(0, 11, K::ValueId(3)),
@@ -1179,9 +1179,7 @@ fn explicit_array_cast_modes_materialize_without_erasing_absence_or_target_field
                 K::Cast(wire::CastExpression {
                     expr_id: Some(0),
                     target_carrier_type_id: Some(carrier),
-                    decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
-                    allow_throw_exception: Some(allow()),
-                    array_failure_mode: wire_mode,
+                    cast_mode: wire_mode,
                 }),
             ),
         ];
@@ -1201,7 +1199,7 @@ fn explicit_array_cast_modes_materialize_without_erasing_absence_or_target_field
             let node = &actual.definitions()[1];
             assert_eq!(node.id, p::ExprId::new(1));
             let novarocks_expression_contract::ExprKind::Cast {
-                array_failure_mode,
+                cast_mode,
                 expr,
                 target,
                 ..
@@ -1209,7 +1207,7 @@ fn explicit_array_cast_modes_materialize_without_erasing_absence_or_target_field
             else {
                 panic!("actual CAST")
             };
-            assert_eq!(*array_failure_mode, expected);
+            assert_eq!(*cast_mode, expected);
             assert_eq!(*expr, p::ExprId::new(0));
             assert_eq!(target, fixture.types.value_type(12).unwrap().data_type());
             assert_eq!(&node.ty, fixture.types.value_type(12).unwrap());

@@ -73,7 +73,7 @@ INSERT INTO ${case_db}.phj_row_util SELECT row_number() OVER() AS idx FROM ${cas
 CREATE TABLE ${case_db}.phj_t1 (
     k1 BIGINT ,
     c_bigint_null BIGINT ,
-    c_string STRING
+    c_string VARCHAR
 ) WITH (format_version = 3);
 
 -- query 11

@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+mod aggregate_filter;
 mod between;
 mod fixtures;
 mod integral_decimal_cast;

@@ -99,7 +99,7 @@ DROP TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 ;
 -- query 20
 -- Add schema field
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 ADD COLUMN added STRING;
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 ADD COLUMN added VARCHAR;
 
 -- query 21
 -- Rename schema field

@@ -22,7 +22,7 @@
 CREATE TABLE ${case_db}.t_agg_sketch_bitmap_source (
     grp INT,
     id_int INT,
-    name STRING,
+    name VARCHAR,
     vb VARBINARY
 ) WITH (format_version = 3);
 

@@ -61,12 +61,12 @@ CREATE TABLE ${case_db}.t1 (
   c_date_2_notnull DATE ,
   c_decimal64_1_null DECIMAL(18) ,
   c_decimal64_2_notnull DECIMAL(18) NOT NULL,
-  c_str_1_null STRING ,
-  c_str_2_notnull STRING NOT NULL,
-  c_str_3_low_null STRING ,
-  c_str_4_low_notnull STRING NOT NULL,
-  c_datetime_1_seq DATETIME ,
-  c_datetime_2_seq DATETIME NOT NULL
+  c_str_1_null VARCHAR ,
+  c_str_2_notnull VARCHAR NOT NULL,
+  c_str_3_low_null VARCHAR ,
+  c_str_4_low_notnull VARCHAR NOT NULL,
+  c_datetime_1_seq TIMESTAMP(6) ,
+  c_datetime_2_seq TIMESTAMP(6) NOT NULL
 ) WITH (format_version = 3);
 
 -- t2: small value interval, triggers bitset filter
@@ -86,12 +86,12 @@ CREATE TABLE ${case_db}.t2 (
   c_date_2_notnull DATE ,
   c_decimal64_1_null DECIMAL(18) ,
   c_decimal64_2_notnull DECIMAL(18) NOT NULL,
-  c_str_1_null STRING ,
-  c_str_2_notnull STRING NOT NULL,
-  c_str_3_low_null STRING ,
-  c_str_4_low_notnull STRING NOT NULL,
-  c_datetime_1_seq DATETIME ,
-  c_datetime_2_seq DATETIME NOT NULL
+  c_str_1_null VARCHAR ,
+  c_str_2_notnull VARCHAR NOT NULL,
+  c_str_3_low_null VARCHAR ,
+  c_str_4_low_notnull VARCHAR NOT NULL,
+  c_datetime_1_seq TIMESTAMP(6) ,
+  c_datetime_2_seq TIMESTAMP(6) NOT NULL
 ) WITH (format_version = 3);
 
 -- t3: large value interval, should NOT trigger bitset filter
@@ -111,12 +111,12 @@ CREATE TABLE ${case_db}.t3 (
   c_date_2_notnull DATE ,
   c_decimal64_1_null DECIMAL(18) ,
   c_decimal64_2_notnull DECIMAL(18) NOT NULL,
-  c_str_1_null STRING ,
-  c_str_2_notnull STRING NOT NULL,
-  c_str_3_low_null STRING ,
-  c_str_4_low_notnull STRING NOT NULL,
-  c_datetime_1_seq DATETIME ,
-  c_datetime_2_seq DATETIME NOT NULL
+  c_str_1_null VARCHAR ,
+  c_str_2_notnull VARCHAR NOT NULL,
+  c_str_3_low_null VARCHAR ,
+  c_str_4_low_notnull VARCHAR NOT NULL,
+  c_datetime_1_seq TIMESTAMP(6) ,
+  c_datetime_2_seq TIMESTAMP(6) NOT NULL
 ) WITH (format_version = 3);
 
 -- Insert t2: small value interval (idx % N for bounded values)

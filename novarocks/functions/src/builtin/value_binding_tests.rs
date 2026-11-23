@@ -130,33 +130,19 @@ fn json_item(nullable: bool) -> Arc<Field> {
 #[test]
 fn repeated_variables_select_owner_authorized_common_domains() {
     let catalog = builtin_engine_function_catalog();
-    for arguments in [
-        vec![value(json()), value(physical(DataType::Utf8))],
-        vec![
-            value(physical(DataType::List(json_item(true)))),
-            value(physical(DataType::List(Arc::new(Field::new(
-                "item",
-                DataType::Utf8,
-                true,
-            ))))),
-        ],
-        vec![
-            value(logical(
-                DataType::FixedSizeBinary(16),
-                ValueLogicalType::LargeInt,
-            )),
-            value(physical(DataType::Int32)),
-        ],
-    ] {
-        for name in ["coalesce", "ifnull"] {
-            let binding = resolve_with_materialized_assignments(name, &arguments);
-            assert!(
-                catalog
-                    .validate_bound(&binding, request(&arguments), crate::binding_test_control())
-                    .is_err(),
-                "the frozen consumer must see the converted full argument domains"
-            );
-        }
+    let arguments = [
+        value(physical(DataType::Int32)),
+        value(physical(DataType::Int64)),
+    ];
+    for name in ["coalesce", "ifnull"] {
+        let binding = resolve_with_materialized_assignments(name, &arguments);
+        assert_eq!(output(&binding).data_type(), &DataType::Int64);
+        assert!(
+            catalog
+                .validate_bound(&binding, request(&arguments), crate::binding_test_control())
+                .is_err(),
+            "the frozen consumer must see the converted full argument domains"
+        );
     }
     let arguments = [value(json()), value(json())];
     let binding = resolve("coalesce", FunctionKind::Scalar, &arguments);
@@ -174,7 +160,9 @@ fn resolve_with_materialized_assignments(
     name: &str,
     arguments: &[FunctionArgument],
 ) -> ResolvedFunctionBinding {
-    use crate::builtin::value_conversion::{VALUE_CONVERSION_NAME, conversion_intermediate_type};
+    use crate::PreparedCastRecipe;
+    use novarocks_type_contract::TrinoCastMode;
+
     let catalog = builtin_engine_function_catalog();
     let binding = catalog
         .resolve_bound_user(
@@ -189,46 +177,27 @@ fn resolve_with_materialized_assignments(
     for (source, target) in arguments.iter().zip(&binding.selected.argument_types) {
         let (
             FunctionArgument::Value {
-                value_type: source_type,
-                ..
+                value_type: source, ..
             },
-            FunctionArgumentType::Value(target_type),
+            FunctionArgumentType::Value(target),
         ) = (source, target)
         else {
             panic!("value arguments");
         };
-        if let Some(intermediate) = conversion_intermediate_type(source_type, target_type).unwrap()
-        {
-            let source = [source.clone()];
-            let conversion_request = FunctionBindingRequest {
-                arguments: &source,
-                logical_argument_count: 1,
-                expected_result_type: Some(&intermediate),
-            };
-            let conversion = catalog
-                .resolve_bound_trusted(
-                    VALUE_CONVERSION_NAME,
-                    FunctionKind::Scalar,
-                    conversion_request,
-                    crate::binding_test_control(),
-                )
-                .unwrap();
-            catalog
-                .validate_bound(
-                    &conversion,
-                    conversion_request,
-                    crate::binding_test_control(),
-                )
-                .unwrap();
-            assert_eq!(output(&conversion), &intermediate);
+        if source != target {
+            let recipe = PreparedCastRecipe::try_new_trino(
+                source,
+                target,
+                TrinoCastMode::Implicit,
+                crate::binding_test_control(),
+            )
+            .unwrap();
+            assert_eq!(recipe.cast_mode(), Some(TrinoCastMode::Implicit));
             conversions += 1;
         }
-        materialized.push(value(target_type.clone()));
+        materialized.push(value(target.clone()));
     }
-    assert!(
-        conversions > 0,
-        "the domain change must have a real owner binding"
-    );
+    assert!(conversions > 0);
     catalog
         .validate_bound(
             &binding,
@@ -240,25 +209,48 @@ fn resolve_with_materialized_assignments(
 }
 
 #[test]
-fn string_anchor_and_largeint_anchor_have_actual_conversion_bindings() {
-    let binding = resolve_with_materialized_assignments("upper", &[value(json())]);
-    assert_eq!(
-        binding.selected.argument_types[0],
-        FunctionArgumentType::Value(physical(DataType::Utf8))
-    );
-    assert_eq!(output(&binding).logical_type(), ValueLogicalType::Physical);
-    let binding = resolve_with_materialized_assignments(
-        "bitand",
-        &[
-            value(logical(
-                DataType::FixedSizeBinary(16),
-                ValueLogicalType::LargeInt,
-            )),
-            value(physical(DataType::Int64)),
-        ],
-    );
-    assert_eq!(output(&binding).logical_type(), ValueLogicalType::LargeInt);
-    assert!(binding.selected.argument_types.iter().all(|argument| matches!(argument, FunctionArgumentType::Value(ty) if ty.logical_type() == ValueLogicalType::LargeInt)));
+fn user_binding_refuses_retired_nominal_family_conversions() {
+    let catalog = builtin_engine_function_catalog();
+    let largeint = || logical(DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt);
+    let cases = [
+        ("upper", vec![value(json())]),
+        (
+            "coalesce",
+            vec![value(json()), value(physical(DataType::Utf8))],
+        ),
+        (
+            "ifnull",
+            vec![value(largeint()), value(physical(DataType::Int32))],
+        ),
+        (
+            "bitand",
+            vec![value(largeint()), value(physical(DataType::Int64))],
+        ),
+        (
+            "coalesce",
+            vec![
+                value(physical(DataType::List(json_item(true)))),
+                value(physical(DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Utf8,
+                    true,
+                ))))),
+            ],
+        ),
+    ];
+    for (name, arguments) in cases {
+        assert!(
+            catalog
+                .resolve_bound_user(
+                    name,
+                    FunctionKind::Scalar,
+                    request(&arguments),
+                    crate::binding_test_control()
+                )
+                .is_err(),
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -306,43 +298,25 @@ fn undeclared_domains_do_not_gain_conversion_authority_from_carriers() {
 
 #[test]
 fn nested_common_domain_and_null_variable_targets_keep_exact_conversion_recipes() {
-    let mut metadata = std::collections::HashMap::from([
-        (
-            novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
-            "json".to_string(),
-        ),
-        ("provider-field".to_string(), "source-key".to_string()),
-    ]);
-    let source = FunctionValueType::from_legacy_declared_projection(
-        DataType::List(Arc::new(
-            Field::new("source_item", DataType::Utf8, false).with_metadata(metadata.clone()),
-        )),
-        false,
-    );
-    metadata.remove(novarocks_type_contract::NR_LOGICAL_TYPE_KEY);
-    let other = physical(DataType::List(Arc::new(Field::new(
-        "item",
-        DataType::Utf8,
-        true,
-    ))));
-    let binding =
-        resolve_with_materialized_assignments("coalesce", &[value(source.clone()), value(other)]);
-    let FunctionArgumentType::Value(target) = &binding.selected.argument_types[0] else {
-        panic!("value");
+    let inputs = [
+        value(physical(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Int16,
+            false,
+        ))))),
+        value(physical(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        ))))),
+    ];
+    let binding = resolve_with_materialized_assignments("coalesce", &inputs);
+    let DataType::List(child) = output(&binding).data_type() else {
+        panic!("list result");
     };
-    let intermediate =
-        crate::builtin::value_conversion::conversion_intermediate_type(&source, target)
-            .unwrap()
-            .unwrap();
-    let DataType::List(child) = intermediate.data_type() else {
-        panic!("list");
-    };
-    let DataType::List(source_child) = source.data_type() else {
-        panic!("source list")
-    };
-    assert_eq!(child.name(), source_child.name());
-    assert!(!child.is_nullable());
-    assert!(child.metadata().is_empty());
+    assert_eq!(child.data_type(), &DataType::Int64);
+    assert!(child.is_nullable());
+    assert_eq!(child.name(), "item");
     let nullable_json = json();
     let null = physical(DataType::Null);
     let binding =

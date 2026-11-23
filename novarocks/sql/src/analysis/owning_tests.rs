@@ -100,7 +100,7 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
         4 => ExprKind::Cast {
             expr: boxed(child),
             target: DataType::Int64,
-            array_failure_mode: None,
+            cast_mode: None,
             decimal_overflow_policy: policy,
         },
         5 => ExprKind::IsNull {
@@ -170,6 +170,8 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             volatility: crate::functions::FunctionVolatility::Immutable,
         },
         18 => ExprKind::AggregateCall {
+            occurrence: crate::analysis::AggregateOccurrence::new(),
+            filter: None,
             name: "owning".into(),
             args: vec![marker(), child].into(),
             distinct: true,
@@ -177,6 +179,8 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             resolved: binding(),
         },
         19 => ExprKind::AggregateCall {
+            occurrence: crate::analysis::AggregateOccurrence::new(),
+            filter: None,
             name: "owning".into(),
             args: vec![marker()].into(),
             distinct: true,
@@ -294,7 +298,7 @@ fn child(slot: usize, node: &TypedExpr) -> &TypedExpr {
             ExprKind::Cast {
                 expr,
                 target: DataType::Int64,
-                array_failure_mode: None,
+                cast_mode: None,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             },
             4,

@@ -57,22 +57,24 @@ impl RequiredConstantTarget {
     /// UNKNOWN values. An UNKNOWN key has no resident values, so the property
     /// projection must verify that such a map is empty after evaluation.
     pub fn admits_map_source(self, source: &FunctionValueType) -> bool {
-        use novarocks_type_contract::{ValueKind, ValueLogicalType};
+        use novarocks_type_contract::{CharacterKind, ValueKind, ValueLogicalType};
+
+        let varchar = |kind: &ValueKind| match kind {
+            ValueKind::String => true,
+            ValueKind::BoundedCharacter(character) => character.kind() == CharacterKind::Varchar,
+            _ => false,
+        };
         self == Self::MapVarcharVarchar
             && source.logical_type() == ValueLogicalType::Physical
             && match source.value_type().kind() {
                 ValueKind::Scalar(DataType::Null) => source.nullable(),
                 ValueKind::Map { key, value } => {
                     !key.nullable()
-                        && matches!(
-                            key.kind(),
-                            ValueKind::String | ValueKind::Scalar(DataType::Null)
-                        )
-                        && match value.kind() {
-                            ValueKind::String => true,
-                            ValueKind::Scalar(DataType::Null) => value.nullable(),
-                            _ => false,
-                        }
+                        && (varchar(key.kind())
+                            || matches!(key.kind(), ValueKind::Scalar(DataType::Null)))
+                        && (varchar(value.kind())
+                            || matches!(value.kind(), ValueKind::Scalar(DataType::Null))
+                                && value.nullable())
                 }
                 _ => false,
             }

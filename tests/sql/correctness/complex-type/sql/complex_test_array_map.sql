@@ -70,11 +70,11 @@ values
 USE ${case_db};
 INSERT INTO t1 (k1, c1)
 VALUES 
-ROW(1, transform(sequence(1, 1000), x -> CAST(x AS STRING))),
-ROW(2, transform(sequence(1, 1000), x -> CAST(x AS STRING))),
-ROW(3, transform(sequence(1, 1000), x -> CAST(x AS STRING))),
-ROW(4, transform(sequence(1, 1000), x -> CAST(x AS STRING))),
-ROW(5, transform(sequence(1, 1000), x -> CAST(x AS STRING)));
+ROW(1, transform(sequence(1, 1000), x -> CAST(x AS VARCHAR))),
+ROW(2, transform(sequence(1, 1000), x -> CAST(x AS VARCHAR))),
+ROW(3, transform(sequence(1, 1000), x -> CAST(x AS VARCHAR))),
+ROW(4, transform(sequence(1, 1000), x -> CAST(x AS VARCHAR))),
+ROW(5, transform(sequence(1, 1000), x -> CAST(x AS VARCHAR)));
 
 -- query 7
 -- @skip_result_check=true

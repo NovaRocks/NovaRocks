@@ -30,7 +30,7 @@ CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0};
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0}.t_io_${uuid0} (
   id BIGINT,
-  region STRING,
+  region VARCHAR,
   amount DOUBLE
 ) WITH (partitioning = ARRAY['region']);
 

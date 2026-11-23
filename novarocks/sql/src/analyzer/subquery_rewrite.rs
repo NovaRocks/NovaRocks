@@ -130,6 +130,8 @@ fn value_form_marker_query(
                 field_name: Some(marker_col_name.clone()),
                 expr: TypedExpr {
                     kind: ExprKind::AggregateCall {
+                        occurrence: crate::analysis::AggregateOccurrence::new(),
+                        filter: None,
                         name: "max".to_string(),
                         args: (vec![TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(1)),
@@ -1638,7 +1640,7 @@ impl<'a> AnalyzerContext<'a> {
                                 .expect("valid value root nullability transform"),
 
                             kind: ExprKind::Cast {
-                                array_failure_mode: None,
+                                cast_mode: None,
                                 expr: novarocks_parser::ast::AstBox::new(outer_expr),
                                 target: pred.inner_col.value_type.data_type().clone(),
                                 decimal_overflow_policy:
@@ -2444,7 +2446,7 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Every actual candidate row participates in the same ordinary equality
     /// as an explicit pairwise comparison.
-    // Design: ADR-0252 (docs/adr/ADR-0252-collection-calls-and-relational-sequence.md)
+    // Design: ADR-0254 (docs/adr/ADR-0254-collection-calls-and-relational-sequence.md)
     fn rewrite_composite_in_value_form(
         &self,
         select: &mut ResolvedSelect,
@@ -2994,16 +2996,17 @@ impl<'a> AnalyzerContext<'a> {
             ast::SetExpr::Select(s) => {
                 let (sel, cols, inner_scope) =
                     ctx.analyze_select_with_outer_scope(s, outer_scope)?;
-                let body = QueryBody::Select(sel);
+                let mut body = QueryBody::Select(sel);
 
-                let order_by = ctx.analyze_order_by(
+                let mut order_by = ctx.analyze_order_by(
                     modifiers.order_by.as_ref(),
                     select,
                     query.span,
                     &cols,
                     &body,
                 )?;
-                if let QueryBody::Select(select) = &body {
+                if let QueryBody::Select(select) = &mut body {
+                    ctx.rewrite_order_aggregate_subqueries(select, &mut order_by)?;
                     ctx.validate_grouping_calls(&select.group_by)?;
                 }
                 let limit = super::helpers::extract_limit(modifiers)?;
@@ -3084,7 +3087,11 @@ impl<'a> AnalyzerContext<'a> {
         // --- WHERE clause ---
         let filter = match &select.selection {
             Some(expr) => Some(qualify_inner_shadowing_column_refs(
-                coerce_where_to_bool(self.analyze_expr(expr, &merged_scope)?),
+                self.require_boolean_predicate(
+                    self.analyze_expr(expr, &merged_scope)?,
+                    "WHERE clause",
+                    expr.span(),
+                )?,
                 &inner_scope,
                 outer_scope,
             )),
@@ -3158,7 +3165,12 @@ impl<'a> AnalyzerContext<'a> {
 
         // --- Detect aggregation ---
         let has_agg_in_select = self.select_has_aggregate_functions(&select.projection);
-        let has_aggregation = !group_by.is_empty() || has_agg_in_select;
+        let has_aggregation = !group_by.is_empty()
+            || has_agg_in_select
+            || select
+                .having
+                .as_ref()
+                .is_some_and(|expr| self.expr_contains_aggregate(expr));
 
         if let Some(state) = self.grouping_scope.borrow().as_ref() {
             state.enabled.set(true);
@@ -3166,15 +3178,19 @@ impl<'a> AnalyzerContext<'a> {
         // --- HAVING ---
         let having = match &select.having {
             Some(expr) => {
+                let prior_subqueries = self.collected_subqueries.borrow().len();
                 let analyzed = self.analyze_expr(expr, &merged_scope);
                 match analyzed {
                     Ok(h) => Some(qualify_inner_shadowing_column_refs(
-                        h,
+                        self.require_boolean_predicate(h, "HAVING clause", expr.span())?,
                         &inner_scope,
                         outer_scope,
                     )),
                     Err(error) if error.control_error().is_some() => return Err(error),
                     Err(_) => {
+                        self.collected_subqueries
+                            .borrow_mut()
+                            .truncate(prior_subqueries);
                         let mut alias_scope = merged_scope.clone();
                         for item in &projection {
                             self.check_control()?;
@@ -3187,7 +3203,11 @@ impl<'a> AnalyzerContext<'a> {
                         }
                         let h = self.analyze_expr(expr, &alias_scope)?;
                         Some(qualify_inner_shadowing_column_refs(
-                            self.substitute_select_aliases(h, &projection),
+                            self.require_boolean_predicate(
+                                self.substitute_select_aliases(h, &projection),
+                                "HAVING clause",
+                                expr.span(),
+                            )?,
                             &inner_scope,
                             outer_scope,
                         ))
@@ -3221,6 +3241,17 @@ impl<'a> AnalyzerContext<'a> {
             let mut mutable_inner = inner_scope.clone();
             for sq_info in nested_sqs {
                 self.check_control()?;
+                if matches!(sq_info.kind, SubqueryKind::Scalar)
+                    && locate_scalar_placeholder_clause(&resolved_select, sq_info.id)
+                        == Some(crate::analysis::ApplyClause::AggregateInput)
+                    && self.collect_scalar_apply_spec(
+                        &mut resolved_select,
+                        &mut merged_scope.clone(),
+                        &sq_info,
+                    )?
+                {
+                    continue;
+                }
                 self.rewrite_single_subquery(&mut resolved_select, &mut mutable_inner, sq_info)?;
             }
         }
@@ -3419,50 +3450,6 @@ pub(super) struct CorrelationPred {
 /// A correlation predicate is an equality (or comparison) where one side
 /// references an outer-scope column (resolves in outer_scope but NOT in inner_scope)
 /// and the other side references an inner-scope column.
-/// Coerce a WHERE / ON / HAVING expression to BOOLEAN when its analysed
-/// type is not already boolean. MySQL/StarRocks accept `WHERE int_col`
-/// (truthy when non-zero, FALSE when zero, NULL when NULL); our analyzer
-/// hands such an expression off to downstream AND-conjuncts that
-/// require boolean operands ("AND right operand must be boolean"). Wrap
-/// numeric truthy filters as `expr != 0`; Utf8 truthy filters need an explicit
-/// boolean cast so values like `"true"` keep their predicate meaning.
-pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
-    use arrow::datatypes::DataType;
-    if matches!(expr.value_type.data_type(), DataType::Boolean) {
-        return expr;
-    }
-    let nullable = expr.value_type.nullable();
-    if matches!(expr.value_type.data_type(), DataType::Utf8) {
-        return TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                DataType::Boolean,
-                nullable,
-            ),
-
-            kind: ExprKind::Cast {
-                array_failure_mode: None,
-                expr: novarocks_parser::ast::AstBox::new(expr),
-                target: DataType::Boolean,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        };
-    }
-    let zero = TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::Int(0)),
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-    };
-    TypedExpr {
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
-
-        kind: ExprKind::BinaryOp {
-            left: novarocks_parser::ast::AstBox::new(expr),
-            op: BinOp::Ne,
-            right: novarocks_parser::ast::AstBox::new(zero),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        },
-    }
-}
-
 fn qualify_inner_shadowing_column_refs(
     expr: TypedExpr,
     inner_scope: &AnalyzerScope,
@@ -3558,6 +3545,8 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
@@ -3567,6 +3556,14 @@ fn qualify_inner_shadowing_column_refs(
             value_type: expr.value_type,
 
             kind: ExprKind::AggregateCall {
+                occurrence,
+                filter: filter.map(|value| {
+                    ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                        value.into_inner(),
+                        inner_scope,
+                        outer_scope,
+                    ))
+                }),
                 name,
                 args: args
                     .into_iter()
@@ -3583,7 +3580,7 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::Cast {
-            array_failure_mode,
+            cast_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
@@ -3591,7 +3588,7 @@ fn qualify_inner_shadowing_column_refs(
             value_type: expr.value_type,
 
             kind: ExprKind::Cast {
-                array_failure_mode,
+                cast_mode,
                 expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
                     inner.into_inner(),
                     inner_scope,
@@ -3877,7 +3874,15 @@ fn collect_outer_ref_column_ids(
                 collect_outer_ref_column_ids(arg, inner_scope, outer_scope, out);
             }
         }
-        ExprKind::AggregateCall { args, order_by, .. } => {
+        ExprKind::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let Some(predicate) = filter {
+                collect_outer_ref_column_ids(predicate, inner_scope, outer_scope, out);
+            }
             for arg in args {
                 collect_outer_ref_column_ids(arg, inner_scope, outer_scope, out);
             }
@@ -4172,7 +4177,15 @@ fn walk_for_outer_ref(
                 walk_for_outer_ref(a, inner_scope, outer_scope, saw_outer);
             }
         }
-        ExprKind::AggregateCall { args, order_by, .. } => {
+        ExprKind::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let Some(predicate) = filter {
+                walk_for_outer_ref(predicate, inner_scope, outer_scope, saw_outer);
+            }
             for a in args {
                 walk_for_outer_ref(a, inner_scope, outer_scope, saw_outer);
             }
@@ -4635,6 +4648,17 @@ fn locate_scalar_placeholder_clause(
     if select
         .having
         .as_ref()
+        .is_some_and(|f| placeholder_is_aggregate_input(f, placeholder_id))
+        || select
+            .projection
+            .iter()
+            .any(|p| placeholder_is_aggregate_input(&p.expr, placeholder_id))
+    {
+        return Some(crate::analysis::ApplyClause::AggregateInput);
+    }
+    if select
+        .having
+        .as_ref()
         .map(|f| expr_contains_placeholder(f, placeholder_id))
         .unwrap_or(false)
     {
@@ -4645,13 +4669,6 @@ fn locate_scalar_placeholder_clause(
         .iter()
         .any(|p| expr_contains_placeholder(&p.expr, placeholder_id))
     {
-        if select
-            .projection
-            .iter()
-            .any(|p| placeholder_is_aggregate_input(&p.expr, placeholder_id))
-        {
-            return Some(crate::analysis::ApplyClause::AggregateInput);
-        }
         return Some(crate::analysis::ApplyClause::Projection);
     }
     None
@@ -4663,11 +4680,20 @@ fn locate_scalar_placeholder_clause(
 /// subquery used as an aggregate argument instead has to be evaluated on the
 /// aggregate input, otherwise the Aggregate references a column its child does
 /// not produce.
-fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: usize) -> bool {
+pub(super) fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: usize) -> bool {
     match &expr.kind {
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            args.iter()
-                .any(|arg| expr_contains_placeholder(arg, placeholder_id))
+        ExprKind::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            filter
+                .as_ref()
+                .is_some_and(|value| expr_contains_placeholder(value, placeholder_id))
+                || args
+                    .iter()
+                    .any(|arg| expr_contains_placeholder(arg, placeholder_id))
                 || order_by
                     .iter()
                     .any(|item| expr_contains_placeholder(&item.expr, placeholder_id))
@@ -5180,7 +5206,7 @@ fn collect_column_ids_in_expr(expr: &TypedExpr, out: &mut Vec<crate::column_id::
 
 /// Recursively walk a TypedExpr looking for any `SubqueryPlaceholder` whose
 /// id matches `placeholder_id`.
-fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
+pub(super) fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
     if is_placeholder(expr, placeholder_id) {
         return true;
     }
@@ -5193,9 +5219,19 @@ fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
         ExprKind::IsNull { expr: inner, .. } => expr_contains_placeholder(inner, placeholder_id),
         ExprKind::Cast { expr: inner, .. } => expr_contains_placeholder(inner, placeholder_id),
         ExprKind::Nested(inner) => expr_contains_placeholder(inner, placeholder_id),
-        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => args
+        ExprKind::FunctionCall { args, .. } => args
             .iter()
-            .any(|a| expr_contains_placeholder(a, placeholder_id)),
+            .any(|arg| expr_contains_placeholder(arg, placeholder_id)),
+        ExprKind::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => args
+            .iter()
+            .chain(order_by.iter().map(|item| &item.expr))
+            .chain(filter.as_deref())
+            .any(|value| expr_contains_placeholder(value, placeholder_id)),
         ExprKind::InList {
             expr: inner, list, ..
         } => {
@@ -5557,7 +5593,7 @@ fn cast_case_branch_if_needed(expr: TypedExpr, target: &DataType) -> TypedExpr {
     if expr.value_type.data_type() != target && *expr.value_type.data_type() != DataType::Null {
         TypedExpr {
             kind: ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(expr),
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -5642,6 +5678,8 @@ fn replace_placeholder_in_expr(
             },
         },
         ExprKind::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
@@ -5651,18 +5689,33 @@ fn replace_placeholder_in_expr(
             value_type: expr.value_type.clone(),
 
             kind: ExprKind::AggregateCall {
+                occurrence: occurrence.clone(),
+                filter: filter.as_ref().map(|value| {
+                    ast::AstBox::new(replace_placeholder_in_expr(
+                        value,
+                        placeholder_id,
+                        replacement,
+                    ))
+                }),
                 name: name.clone(),
                 args: args
                     .iter()
                     .map(|a| replace_placeholder_in_expr(a, placeholder_id, replacement))
                     .collect(),
                 distinct: *distinct,
-                order_by: order_by.clone(),
+                order_by: order_by
+                    .iter()
+                    .map(|item| SortItem {
+                        expr: replace_placeholder_in_expr(&item.expr, placeholder_id, replacement),
+                        asc: item.asc,
+                        nulls_first: item.nulls_first,
+                    })
+                    .collect(),
                 resolved: resolved.clone(),
             },
         },
         ExprKind::Cast {
-            array_failure_mode,
+            cast_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
@@ -5670,7 +5723,7 @@ fn replace_placeholder_in_expr(
             value_type: expr.value_type.clone(),
 
             kind: ExprKind::Cast {
-                array_failure_mode: *array_failure_mode,
+                cast_mode: *cast_mode,
                 expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     inner,
                     placeholder_id,
@@ -6101,15 +6154,15 @@ fn correlation_factor_is_total(expression: &TypedExpr) -> bool {
         } => correlation_factor_is_total(left) && correlation_factor_is_total(right),
         ExprKind::Cast {
             expr,
-            target,
             decimal_overflow_policy,
-            array_failure_mode,
+            cast_mode,
+            ..
         } => {
             !crate::optimizer::scalar_expr::scalar_cast_can_fail(
-                expr.value_type.data_type(),
-                target,
+                &expr.value_type,
+                &expression.value_type,
                 *decimal_overflow_policy,
-                *array_failure_mode,
+                *cast_mode,
             ) && correlation_factor_is_total(expr)
         }
         ExprKind::UnaryOp {
@@ -6210,9 +6263,7 @@ mod tests {
     #[test]
     fn shadowing_qualification_preserves_explicit_array_cast_modes_and_complete_sources() {
         use crate::column_id::ColumnId;
-        use novarocks_type_contract::{
-            ArrayCastFailureMode, DecimalOverflowPolicy, FunctionValueType,
-        };
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType, TrinoCastMode};
         use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
         let factory = Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new()));
         let mut inner = AnalyzerScope::new(Rc::clone(&factory));
@@ -6237,10 +6288,7 @@ mod tests {
         outer.add_column_with_id(Some("outer_source"), "values", outer_id, source.clone());
         assert_eq!(inner.resolve(None, "values").unwrap().0, inner_id);
         assert_eq!(outer.resolve(None, "values").unwrap().0, outer_id);
-        for mode in [
-            ArrayCastFailureMode::ReportError,
-            ArrayCastFailureMode::OutputNull,
-        ] {
+        for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
             let original = TypedExpr {
                 kind: ExprKind::Cast {
                     expr: novarocks_parser::ast::AstBox::new(TypedExpr {
@@ -6253,7 +6301,7 @@ mod tests {
                     }),
                     target: target.data_type().clone(),
                     decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                    array_failure_mode: Some(mode),
+                    cast_mode: Some(mode),
                 },
                 value_type: target.clone(),
             };
@@ -6267,12 +6315,12 @@ mod tests {
                 expr,
                 target: actual_target,
                 decimal_overflow_policy,
-                array_failure_mode,
+                cast_mode,
             } = actual.kind
             else {
                 panic!("original CAST boundary")
             };
-            assert_eq!(array_failure_mode, Some(mode));
+            assert_eq!(cast_mode, Some(mode));
             assert_eq!(decimal_overflow_policy, DecimalOverflowPolicy::ReportError);
             assert_eq!(&actual_target, target.data_type());
             assert_eq!(expr.value_type, source);
@@ -6375,51 +6423,6 @@ mod tests {
             );
             assert!(select.has_aggregation);
         }
-    }
-
-    #[test]
-    fn coerce_where_to_bool_keeps_numeric_truthiness_as_ne_zero() {
-        let expr = TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: crate::column_id::ColumnId(1),
-                qualifier: None,
-                column: "flag".to_string(),
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
-        };
-
-        let coerced = coerce_where_to_bool(expr);
-
-        assert!(matches!(
-            coerced.kind,
-            ExprKind::BinaryOp { op: BinOp::Ne, .. }
-        ));
-        assert_eq!(coerced.value_type.data_type().clone(), DataType::Boolean);
-        assert!(coerced.value_type.nullable());
-    }
-
-    #[test]
-    fn coerce_where_to_bool_casts_string_truthiness_to_boolean() {
-        let expr = TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: crate::column_id::ColumnId(1),
-                qualifier: None,
-                column: "flag".to_string(),
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
-        };
-
-        let coerced = coerce_where_to_bool(expr);
-
-        assert!(matches!(
-            coerced.kind,
-            ExprKind::Cast {
-                target: DataType::Boolean,
-                ..
-            }
-        ));
-        assert_eq!(coerced.value_type.data_type().clone(), DataType::Boolean);
-        assert!(coerced.value_type.nullable());
     }
 
     #[test]

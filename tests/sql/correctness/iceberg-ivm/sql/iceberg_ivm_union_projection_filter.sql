@@ -31,12 +31,12 @@ CREATE CATALOG ice_ivm_union_pf_${uuid0} USING iceberg WITH ("iceberg.catalog.ty
 CREATE SCHEMA ice_ivm_union_pf_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_live (
   id INT NOT NULL,
-  name STRING,
+  name VARCHAR,
   amount INT
 ) WITH (format_version = 3);
 CREATE TABLE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_archive (
   id INT NOT NULL,
-  name STRING,
+  name VARCHAR,
   amount INT
 ) WITH (format_version = 3);
 USE ice_ivm_union_pf_${uuid0}.ns_${uuid0};

@@ -89,7 +89,9 @@ impl FloatArithmetic {
                 CastPrepareError::Control(cause) => ArithmeticPrepareError::Control(cause),
                 CastPrepareError::Kernel(cause) => ArithmeticPrepareError::Kernel(cause),
                 CastPrepareError::Unsupported => ArithmeticPrepareError::Unsupported,
-                CastPrepareError::TypeMismatch => ArithmeticPrepareError::TypeMismatch,
+                CastPrepareError::Illegal | CastPrepareError::TypeMismatch => {
+                    ArithmeticPrepareError::TypeMismatch
+                }
             })
         };
         let left = prepare(left)?;

@@ -283,16 +283,9 @@ fn checked_scalar_unit() -> (
             None,
             ValueType::new(DataType::Int32, false),
             ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                 expr: call,
                 target: DataType::Int32,
-                decimal_overflow_policy:
-                    novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: novarocks_type_contract::SemanticParameterRef {
-                    id: novarocks_type_contract::SemanticParameterId::new(0),
-                    expected_key:
-                        novarocks_type_contract::SemanticParameterKey::AllowThrowException,
-                },
             },
         )
         .unwrap();
@@ -443,6 +436,7 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, ConstantPools, usiz
                 NodeKind::Aggregate {
                     group_by: Box::default(),
                     calls: Box::from([AggregateCall {
+                        filter_root: None,
                         id: AggregateCallId::new(0),
                         binding: aggregate,
                         arguments: Box::default(),

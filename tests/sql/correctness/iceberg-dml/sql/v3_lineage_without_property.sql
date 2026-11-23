@@ -22,11 +22,11 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.lineage_absent_${uuid0} (id BIGINT, v STRING) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
-CREATE TABLE ${case_db}.lineage_false_${uuid0} (id BIGINT, v STRING) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.row-lineage', 'novarocks.update.mode'], ARRAY['false', 'merge-on-read']));
+CREATE TABLE ${case_db}.lineage_absent_${uuid0} (id BIGINT, v VARCHAR) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
+CREATE TABLE ${case_db}.lineage_false_${uuid0} (id BIGINT, v VARCHAR) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.row-lineage', 'novarocks.update.mode'], ARRAY['false', 'merge-on-read']));
 INSERT INTO ${case_db}.lineage_absent_${uuid0} VALUES ROW(1,'a'),ROW(2,'b');
 INSERT INTO ${case_db}.lineage_false_${uuid0} VALUES ROW(1,'a'),ROW(2,'b');
-CREATE TABLE ${case_db}.lineage_source_${uuid0} (id BIGINT, v STRING) WITH (format_version = 3);
+CREATE TABLE ${case_db}.lineage_source_${uuid0} (id BIGINT, v VARCHAR) WITH (format_version = 3);
 INSERT INTO ${case_db}.lineage_source_${uuid0} VALUES ROW(2,'bb'),ROW(3,'c');
 
 -- query 2
@@ -68,7 +68,7 @@ ORDER BY property_value;
 
 -- query 6
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.lineage_v2_${uuid0} (id BIGINT, v STRING) WITH (format_version = 2);
+CREATE TABLE ${case_db}.lineage_v2_${uuid0} (id BIGINT, v VARCHAR) WITH (format_version = 2);
 INSERT INTO ${case_db}.lineage_v2_${uuid0} VALUES ROW(1,'a');
 
 -- query 7

@@ -24,13 +24,13 @@
 --    defaults distinct from the small literals in v3_default_primitive_types.
 
 DROP TABLE IF EXISTS ${case_db}.t;
-CREATE TABLE ${case_db}.t (id INT, name STRING) WITH (format_version = 3);
+CREATE TABLE ${case_db}.t (id INT, name VARCHAR) WITH (format_version = 3);
 INSERT INTO ${case_db}.t VALUES ROW(1, 'alice'), ROW(2, 'bob');
 
 ALTER TABLE ${case_db}.t ADD COLUMN score SMALLINT DEFAULT 100;
 ALTER TABLE ${case_db}.t ADD COLUMN salary INT DEFAULT 50000;
 ALTER TABLE ${case_db}.t ADD COLUMN revenue BIGINT DEFAULT 1000000;
-ALTER TABLE ${case_db}.t ADD COLUMN rating FLOAT DEFAULT 4.5;
+ALTER TABLE ${case_db}.t ADD COLUMN rating REAL DEFAULT 4.5;
 ALTER TABLE ${case_db}.t ADD COLUMN percentage DOUBLE DEFAULT 95.5;
 ALTER TABLE ${case_db}.t ADD COLUMN zero_v INT DEFAULT 0;
 ALTER TABLE ${case_db}.t ADD COLUMN neg_v INT DEFAULT -100;

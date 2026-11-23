@@ -25,7 +25,7 @@ use novarocks_type_contract::PureCompileControl;
 
 use super::aggregate::{
     collect_non_agg_column_refs, dedup_group_by_exprs, expr_column_id, prepare_repeat_input,
-    split_projection_for_aggregate,
+    project_aggregate_inputs, split_projection_for_aggregate,
 };
 use super::relation::plan_relation_scoped;
 use super::subquery::{wrap_predicate_applies, wrap_scalar_applies};
@@ -157,7 +157,7 @@ pub(super) fn plan_select_scoped_with_source(
         control,
     )?;
 
-    if let Some(mut repeat_info) = select.repeat.take() {
+    let repeat = if let Some(mut repeat_info) = select.repeat.take() {
         let grouping_key_aliases = prepare_repeat_input(
             &mut current,
             &mut select,
@@ -166,25 +166,23 @@ pub(super) fn plan_select_scoped_with_source(
             factory,
             control,
         )?;
-        current = LogicalPlanNode::new(
-            LogicalPlanKind::Repeat(PlanRepeatNode {
-                repeat_column_ref_list: repeat_info.repeat_column_ref_list,
-                repeat_column_ref_ids: repeat_info.repeat_column_ref_ids,
-                grouping_ids: repeat_info.grouping_ids,
-                all_rollup_columns: repeat_info.all_rollup_columns,
-                all_rollup_column_ids: repeat_info.all_rollup_column_ids,
-                grouping_key_aliases,
-                grouping_fn_args: repeat_info.grouping_fn_args,
-                grouping_fn_arg_ids: repeat_info.grouping_fn_arg_ids,
-                grouping_fn_ids: repeat_info.grouping_fn_ids,
-                virtual_tuple_id: None,
-            }),
-            vec![current],
-            None,
-        );
-    }
+        Some(PlanRepeatNode {
+            repeat_column_ref_list: repeat_info.repeat_column_ref_list,
+            repeat_column_ref_ids: repeat_info.repeat_column_ref_ids,
+            grouping_ids: repeat_info.grouping_ids,
+            all_rollup_columns: repeat_info.all_rollup_columns,
+            all_rollup_column_ids: repeat_info.all_rollup_column_ids,
+            grouping_key_aliases,
+            grouping_fn_args: repeat_info.grouping_fn_args,
+            grouping_fn_arg_ids: repeat_info.grouping_fn_arg_ids,
+            grouping_fn_ids: repeat_info.grouping_fn_ids,
+            virtual_tuple_id: None,
+        })
+    } else {
+        None
+    };
 
-    if select.has_aggregation || !select.group_by.is_empty() {
+    if select.has_aggregation || !select.group_by.is_empty() || repeat.is_some() {
         if let Some(ref having_expr) = select.having {
             // Collect the output column ids of HAVING apply specs so they are
             // not mistakenly promoted into the GROUP BY list. Those columns are
@@ -263,7 +261,7 @@ pub(super) fn plan_select_scoped_with_source(
             }
         }
         let aggregate_group_by = dedup_group_by_exprs(&select.group_by, control)?;
-        let (mut project_items, agg_calls, output_columns, rewritten_having) =
+        let (mut project_items, mut agg_calls, output_columns, rewritten_having) =
             split_projection_for_aggregate(
                 &aggregate_projection,
                 &aggregate_group_by,
@@ -290,6 +288,10 @@ pub(super) fn plan_select_scoped_with_source(
             } else {
                 spec.mark_probe = Some(item.expr);
             }
+        }
+        current = project_aggregate_inputs(current, &mut agg_calls, repeat.as_ref(), factory)?;
+        if let Some(repeat) = repeat {
+            current = LogicalPlanNode::new(LogicalPlanKind::Repeat(repeat), vec![current], None);
         }
         current = LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {

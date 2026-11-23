@@ -243,16 +243,37 @@ pub(super) fn resolve_scalar_value_signature_view_with_overload(
 ) -> Result<(usize, ResolvedScalarValueSignature), ResolveError> {
     value_resolution_scope(control, |work| {
         let candidates = registry::scalar_signatures(name).ok_or(ResolveError::UnknownFunction)?;
-        let carriers = value_carriers(arguments, work)?;
-        for pass in 0..5 {
-            work.step()?;
+        validate_value_arguments(arguments, work)?;
+        for pass in [MatchPass::Exact, MatchPass::Generic, MatchPass::Coercion] {
+            let mut matches = Vec::new();
             for (index, signature) in candidates.iter().enumerate() {
                 work.step()?;
-                if let Some(resolved) =
-                    value_signature_in_pass(signature, arguments, carriers, pass, work)?
+                // The storage profile matches an uninhabited key map exactly;
+                // its value variables do not make it compete with Map<K, V>, K.
+                let exact_map_profile = matches!(
+                    signature.args.first(),
+                    Some(TypeSpec::MapWithUninhabitedKey { .. })
+                );
+                let generic = !exact_map_profile && signature.args.iter().any(TypeSpec::is_generic);
+                if matches!(pass, MatchPass::Exact) && generic
+                    || matches!(pass, MatchPass::Generic) && !generic
                 {
-                    return Ok((index, resolved));
+                    continue;
                 }
+                if let Some(decision) =
+                    value_signature_decision_in_pass(signature, arguments, pass, work)?
+                {
+                    matches.push((index, decision));
+                }
+            }
+            if let Some((index, decision)) = select_match(
+                matches,
+                arguments,
+                pass,
+                |signature| super::catalogue::strict_on_unknown(name, signature),
+                work,
+            )? {
+                return Ok((index, decision.materialize(work)?));
             }
         }
         let mut relevant = false;
@@ -368,13 +389,12 @@ fn decide_scalar_value_signature_with_creation<T, H>(
         let signature = candidates.get(overload_index).ok_or_else(|| {
             ResolveError::BadSignature("selected overload index is unknown".into())
         })?;
-        let carriers = value_carriers(arguments, work)?;
-        for pass in 0..5 {
+        validate_value_arguments(arguments, work)?;
+        for pass in [MatchPass::Exact, MatchPass::Coercion] {
             work.step()?;
             if let Some(resolved) = value_signature_decision_with_creation(
                 signature,
                 arguments,
-                carriers,
                 pass,
                 work,
                 borrow_creator(&mut creation),
@@ -415,133 +435,170 @@ fn value_resolution_scope_with_creation<T, H>(
     work.finish_result(result, ResolutionFailure::from)
 }
 
-fn value_carriers<'a>(
-    arguments: ScalarTypes<'a>,
+fn validate_value_arguments(
+    arguments: ScalarTypes<'_>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<ScalarCarriers<'a>, ResolveError> {
+) -> Result<(), ResolveError> {
     for argument in arguments.iter() {
         work.step()?;
         binding_control::value_type(argument, work).map_err(binding_to_resolution)?;
     }
-    Ok(ScalarCarriers::from_values(arguments))
+    Ok(())
 }
 
-fn carrier_matches_with_creation<H>(
-    sig: &Signature,
-    args: ScalarCarriers<'_>,
-    pass: u8,
+#[derive(Clone, Copy)]
+enum MatchPass {
+    Exact,
+    Generic,
+    Coercion,
+}
+
+fn select_match<'a>(
+    matches: Vec<(usize, ScalarValueSignatureDecision<'a>)>,
+    actuals: ScalarTypes<'_>,
+    pass: MatchPass,
+    strict_on_unknown: impl Fn(&str) -> bool,
     work: &mut CompileCheckpoints<'_>,
-    mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
-) -> Result<bool, ResolutionFailure<H>> {
-    if !check_arity(sig, args.len())
-        || (pass == 3 && !sig.argument_binding.is_enforced())
-        || (pass == 4 && !sig.widening)
-    {
-        return Ok(false);
+) -> Result<Option<(usize, ScalarValueSignatureDecision<'a>)>, ResolveError> {
+    if !matches!(pass, MatchPass::Coercion) || matches.len() <= 1 {
+        return unique_match(matches);
     }
-    let mut bindings = Bindings::default();
-    let mut widened = false;
-    for (index, actual) in args.iter().enumerate() {
-        work.step()?;
-        let spec = signature_spec_at(sig, index);
-        // The declaration's recursive matcher is still a legacy opaque helper;
-        // the actual argument/pass traversal belongs to this controlled owner.
-        work.flush()?;
-        let matched = match pass {
-            0 => anchor_matches(spec, actual),
-            1 => with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
-                super::signature::unify_with_construction(
-                    spec,
-                    actual,
-                    &mut bindings,
-                    BindMode::Strict,
-                    creation,
-                )
-            })?,
-            2 => {
-                if integer_widens_losslessly(spec, actual)
-                    || integer_widens_to_map_key(sig, index, actual, &bindings, args)
-                {
-                    widened = true;
-                    true
-                } else {
-                    with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
-                        super::signature::unify_with_construction(
-                            spec,
-                            actual,
-                            &mut bindings,
-                            BindMode::Strict,
-                            creation,
-                        )
-                    })?
-                }
+
+    // Compare each bound argument list against the other candidate's declared
+    // signature. The declaration still contains its type variables.
+    let mut specific: Vec<usize> = Vec::new();
+    for (position, (_, decision)) in matches.iter().enumerate() {
+        let arguments = ScalarTypes::from_values(&decision.argument_types);
+        let old_len = specific.len();
+        for index in (0..old_len).rev() {
+            let other = &matches[specific[index]].1;
+            if value_signature_decision_in_pass(other.signature, arguments, pass, work)?.is_some() {
+                specific.remove(index);
             }
-            3 => {
-                anchor_matches(spec, actual) || implicit_anchor_cast_target(spec, actual).is_some()
+        }
+        if specific.len() < old_len {
+            specific.push(position);
+            continue;
+        }
+        let mut less_specific = false;
+        for &index in &specific {
+            let arguments = ScalarTypes::from_values(&matches[index].1.argument_types);
+            if value_signature_decision_in_pass(decision.signature, arguments, pass, work)?
+                .is_some()
+            {
+                less_specific = true;
+                break;
             }
-            4 => with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
-                super::signature::unify_with_construction(
-                    spec,
-                    actual,
-                    &mut bindings,
-                    BindMode::Widening,
-                    creation,
-                )
-            })?,
-            _ => unreachable!("closed resolver pass"),
-        };
-        work.step()?;
-        if !matched {
-            return Ok(false);
+        }
+        if !less_specific {
+            specific.push(position);
         }
     }
-    Ok(pass != 2 || widened)
+    if let [winner] = specific.as_slice() {
+        return Ok(matches.into_iter().nth(*winner));
+    }
+
+    if actuals
+        .iter()
+        .any(|actual| actual.data_type() == &DataType::Null)
+    {
+        let mut unknown_only = Vec::new();
+        for (index, (_, decision)) in matches.iter().enumerate() {
+            let mut only_unknown = true;
+            for (actual, target) in actuals.iter().zip(&decision.argument_types) {
+                work.step()?;
+                if actual.data_type() != &DataType::Null
+                    && !novarocks_type_contract::trino_same_type(
+                        actual.value_type(),
+                        target.value_type(),
+                        work,
+                    )?
+                {
+                    only_unknown = false;
+                    break;
+                }
+            }
+            if only_unknown {
+                unknown_only.push(index);
+            }
+        }
+        if let [winner] = unknown_only.as_slice() {
+            return Ok(matches.into_iter().nth(*winner));
+        }
+        if !unknown_only.is_empty() {
+            specific = unknown_only;
+        }
+
+        // The original strict overload does not invoke its kernel with
+        // UNKNOWN. If every remaining result type is identical, their typed
+        // NULL is the same and the stable signature can break the tie.
+        let result = matches[specific[0]].1.checked_return_type.value_type();
+        let mut winner = None;
+        for &index in &specific {
+            work.step()?;
+            let decision = &matches[index].1;
+            let signature = decision.signature.canonical();
+            if !strict_on_unknown(&signature)
+                || !novarocks_type_contract::trino_same_type(
+                    result,
+                    decision.checked_return_type.value_type(),
+                    work,
+                )?
+            {
+                winner = None;
+                break;
+            }
+            if winner
+                .as_ref()
+                .is_none_or(|(_, previous)| previous < &signature)
+            {
+                winner = Some((index, signature));
+            }
+        }
+        if let Some((index, _)) = winner {
+            return Ok(matches.into_iter().nth(index));
+        }
+    }
+
+    Err(ResolveError::AmbiguousSignature {
+        candidates: specific.len(),
+    })
 }
 
-fn value_signature_in_pass(
-    signature: &Signature,
-    arguments: ScalarTypes<'_>,
-    carriers: ScalarCarriers<'_>,
-    pass: u8,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Option<ResolvedScalarValueSignature>, ResolveError> {
-    value_signature_decision_in_pass(signature, arguments, carriers, pass, work)?
-        .map(|decision| decision.materialize(work))
-        .transpose()
+fn unique_match(
+    mut matches: Vec<(usize, ScalarValueSignatureDecision<'_>)>,
+) -> Result<Option<(usize, ScalarValueSignatureDecision<'_>)>, ResolveError> {
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        candidates => Err(ResolveError::AmbiguousSignature { candidates }),
+    }
 }
 
 fn value_signature_decision_in_pass<'a>(
     signature: &'a Signature,
     arguments: ScalarTypes<'_>,
-    carriers: ScalarCarriers<'_>,
-    pass: u8,
+    pass: MatchPass,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<ScalarValueSignatureDecision<'a>>, ResolveError> {
     value_signature_decision_with_creation::<std::convert::Infallible>(
-        signature, arguments, carriers, pass, work, None,
+        signature, arguments, pass, work, None,
     )
     .map_err(ResolutionFailure::into_pure)
 }
 fn value_signature_decision_with_creation<'a, H>(
     signature: &'a Signature,
     arguments: ScalarTypes<'_>,
-    carriers: ScalarCarriers<'_>,
-    pass: u8,
+    pass: MatchPass,
     work: &mut CompileCheckpoints<'_>,
     mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
 ) -> Result<Option<ScalarValueSignatureDecision<'a>>, ResolutionFailure<H>> {
-    let carrier_match = carrier_matches_with_creation(
-        signature,
-        carriers,
-        pass,
-        work,
-        borrow_creator(&mut creation),
-    )?;
-    if !carrier_match {
+    if !check_arity(signature, arguments.len()) {
         return Ok(None);
     }
-    let mode = if pass == 4 {
-        BindMode::Widening
+    let allow_coercion = matches!(pass, MatchPass::Coercion);
+    let mode = if allow_coercion {
+        BindMode::TrinoCoercion
     } else {
         BindMode::Strict
     };
@@ -549,22 +606,34 @@ fn value_signature_decision_with_creation<'a, H>(
     for (index, actual) in arguments.iter().enumerate() {
         work.step()?;
         work.flush()?;
-        let matched = if pass == 2
-            && value_widens_to_map_key(signature, index, actual, &bindings, carriers)
+        let spec = signature_spec_at(signature, index);
+        if allow_coercion
+            && index == 1
+            && let (TypeSpec::Any(probe), TypeSpec::Map(key, _)) =
+                (spec, signature_spec_at(signature, 0))
+            && matches!(key.as_ref(), TypeSpec::Any(map_key) if map_key == probe)
+            && let Some(key) = bindings.lookup_value_borrowed(probe)
         {
-            true
-        } else {
-            with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
-                super::signature::unify_value_with_construction(
-                    signature_spec_at(signature, index),
-                    actual,
-                    &mut bindings,
-                    mode,
-                    creation,
-                )
-            })?
-        };
-        work.step()?;
+            // A lookup coerces its probe to the existing key type. Widening
+            // the binding would demand a different MAP and change key identity.
+            if !novarocks_type_contract::trino_can_coerce(
+                actual.value_type(),
+                key.value_type(),
+                work,
+            )? {
+                return Ok(None);
+            }
+            continue;
+        }
+        let matched = with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
+            super::signature::unify_value_with_construction(
+                spec,
+                actual,
+                &mut bindings,
+                mode,
+                creation,
+            )
+        })?;
         if !matched {
             return Ok(None);
         }
@@ -579,7 +648,11 @@ fn value_signature_decision_with_creation<'a, H>(
         // their opaque internal allocation work is not certified by this step.
         work.flush()?;
         let target = match signature_spec_at(signature, index) {
-            TypeSpec::AnyType | TypeSpec::AnyDecimal128 => actual.clone(),
+            TypeSpec::AnyType => actual.clone(),
+            TypeSpec::AnyDecimal128 if matches!(actual.data_type(), DataType::Decimal128(..)) => {
+                actual.clone()
+            }
+            TypeSpec::AnyDecimal128 => return Ok(None),
             spec => with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
                 super::signature::realize_value_with_construction(
                     spec,
@@ -591,14 +664,20 @@ fn value_signature_decision_with_creation<'a, H>(
         };
         binding_control::value_type(&target, work).map_err(binding_to_resolution)?;
         work.flush()?;
-        let authorized =
-            with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
-                super::value_conversion::assignment_domains_authorized_with_construction(
-                    actual, &target, creation,
-                )
-            })?;
-        work.step()?;
-        if !authorized {
+        let applies = if allow_coercion {
+            novarocks_type_contract::trino_can_coerce(
+                actual.value_type(),
+                target.value_type(),
+                work,
+            )?
+        } else {
+            novarocks_type_contract::trino_same_type(
+                actual.value_type(),
+                target.value_type(),
+                work,
+            )?
+        };
+        if !applies {
             return Ok(None);
         }
         argument_types.push(target);
@@ -791,24 +870,6 @@ fn integer_widens_to_map_key(
     fields[0].data_type() == &bound && integer_widens_losslessly(&anchor, actual)
 }
 
-fn value_widens_to_map_key(
-    signature: &Signature,
-    index: usize,
-    actual: &FunctionValueType,
-    bindings: &Bindings,
-    arguments: ScalarCarriers<'_>,
-) -> bool {
-    let TypeSpec::Any(name) = signature_spec_at(signature, index) else {
-        return false;
-    };
-    let Some(bound) = bindings.lookup_value_borrowed(name) else {
-        return false;
-    };
-    actual.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
-        && bound.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
-        && integer_widens_to_map_key(signature, index, actual.data_type(), bindings, arguments)
-}
-
 fn integer_widens_losslessly(spec: &TypeSpec, actual: &DataType) -> bool {
     let width = |data_type: &DataType| match data_type {
         DataType::Int8 => Some(1u8),
@@ -907,7 +968,52 @@ mod tests {
     }
 
     #[test]
-    fn lossless_anchor_widening_keeps_strict_generic_siblings_and_selected_replay() {
+    fn unknown_ties_require_the_same_result_and_original_strict_receipts() {
+        let unknown = [FunctionValueType::new(DataType::Null, true)];
+        let arguments = ScalarTypes::from_values(&unknown);
+        let control = crate::binding_test_control();
+        let binary =
+            Signature::new(vec![TypeSpec::Binary], TypeSpec::Int64).with_argument_coercion();
+        let varchar =
+            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int64).with_argument_coercion();
+        let other_result =
+            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int32).with_argument_coercion();
+
+        let resolve = |signatures: [&Signature; 2], strict: &dyn Fn(&str) -> bool| {
+            value_resolution_scope(control, |work| {
+                let mut candidates = Vec::new();
+                for (index, signature) in signatures.into_iter().enumerate() {
+                    let decision = value_signature_decision_in_pass(
+                        signature,
+                        arguments,
+                        MatchPass::Coercion,
+                        work,
+                    )?
+                    .expect("unknown input is coercible to the declared argument");
+                    candidates.push((index, decision));
+                }
+                select_match(candidates, arguments, MatchPass::Coercion, strict, work)?
+                    .map(|(_, winner)| winner.materialize(work))
+                    .transpose()
+            })
+        };
+        let winner = resolve([&binary, &varchar], &|_| true).unwrap().unwrap();
+        let reversed = resolve([&varchar, &binary], &|_| true).unwrap().unwrap();
+        assert_eq!(winner.return_type.data_type(), &DataType::Int64);
+        assert_eq!(winner.argument_types, reversed.argument_types);
+        assert!(matches!(
+            resolve([&binary, &varchar], &|signature| signature
+                == binary.canonical()),
+            Err(ResolveError::AmbiguousSignature { candidates: 2 })
+        ));
+        assert!(matches!(
+            resolve([&binary, &other_result], &|_| true),
+            Err(ResolveError::AmbiguousSignature { candidates: 2 })
+        ));
+    }
+
+    #[test]
+    fn scalar_candidates_preserve_selected_targets_and_replay_exact_overloads() {
         struct Control;
         impl PureCompileControl for Control {
             fn checkpoint(
@@ -1029,10 +1135,10 @@ mod tests {
             resolve_scalar_value_signature_with_overload(
                 "__map_element_at",
                 &[narrow_map, FunctionValueType::new(DataType::Int64, false)],
-                &Control
+                &Control,
             )
             .is_err(),
-            "probe cannot narrow or change the existing map-key binding"
+            "a MAP lookup may coerce only its probe to the original key type",
         );
         let repeated = Signature::new(
             vec![TypeSpec::Any("T"), TypeSpec::Any("T"), TypeSpec::Int64],

@@ -400,7 +400,6 @@ pub enum Source {
 fn result_literal(
     builder: &mut BoundExprSetBuilder,
     result: &FunctionValueType,
-    policy: DecimalOverflowPolicy,
     source_pools: &mut ConstantPools,
 ) -> ExprId {
     if matches!(result.data_type(), DataType::Timestamp(_, None)) {
@@ -431,11 +430,9 @@ fn result_literal(
             None,
             result.clone(),
             ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
                 expr: value,
                 target: result.data_type().clone(),
-                decimal_overflow_policy: policy,
-                allow_throw_exception: allow_ref(),
             },
         )
         .unwrap()
@@ -446,7 +443,25 @@ pub fn cast_fixture(
     result_type: FunctionValueType,
     source: Source,
     wrap: Wrap,
-    policy: DecimalOverflowPolicy,
+    _legacy_policy: DecimalOverflowPolicy,
+    allow: bool,
+) -> Result<PreparedFixture, crate::CallAuthorError> {
+    cast_fixture_in_mode(
+        source_type,
+        result_type,
+        source,
+        wrap,
+        novarocks_type_contract::TrinoCastMode::Explicit,
+        allow,
+    )
+}
+
+pub fn cast_fixture_in_mode(
+    source_type: FunctionValueType,
+    result_type: FunctionValueType,
+    source: Source,
+    wrap: Wrap,
+    cast_mode: novarocks_type_contract::TrinoCastMode,
     allow: bool,
 ) -> Result<PreparedFixture, crate::CallAuthorError> {
     let mut source_pools = ConstantPools::empty();
@@ -481,11 +496,9 @@ pub fn cast_fixture(
                     None,
                     ty.clone(),
                     ExprKind::Cast {
-                        array_failure_mode: None,
+                        cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
                         expr: exact,
                         target: DataType::Float32,
-                        decimal_overflow_policy: policy,
-                        allow_throw_exception: allow_ref(),
                     },
                 )
                 .unwrap()
@@ -562,11 +575,9 @@ pub fn cast_fixture(
                     None,
                     source_type.clone(),
                     ExprKind::Cast {
-                        array_failure_mode: None,
+                        cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
                         expr: exact,
                         target: DataType::Float32,
-                        decimal_overflow_policy: policy,
-                        allow_throw_exception: allow_ref(),
                     },
                 )
                 .unwrap()
@@ -648,18 +659,16 @@ pub fn cast_fixture(
             None,
             result_type.clone(),
             ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode,
                 expr: child,
                 target: result_type.data_type().clone(),
-                decimal_overflow_policy: policy,
-                allow_throw_exception: allow_ref(),
             },
         )
         .unwrap();
     let expression = match wrap {
         Wrap::Bare | Wrap::ConstantRight => cast,
         Wrap::Coalesce | Wrap::If => {
-            let fallback = result_literal(&mut builder, &result_type, policy, &mut source_pools);
+            let fallback = result_literal(&mut builder, &result_type, &mut source_pools);
             if matches!(wrap, Wrap::Coalesce) {
                 add_call(
                     &mut builder,
@@ -794,11 +803,30 @@ pub fn compiled(
     result: FunctionValueType,
     mode: Source,
     wrap: Wrap,
-    policy: DecimalOverflowPolicy,
+    _legacy_policy: DecimalOverflowPolicy,
     allow: bool,
 ) -> CompiledFixture {
-    let fixture = cast_fixture(source.clone(), result.clone(), mode, wrap, policy, allow)
-        .expect("cast fixture admitted by the call author");
+    compiled_cast(
+        source,
+        result,
+        mode,
+        wrap,
+        novarocks_type_contract::TrinoCastMode::Explicit,
+        allow,
+    )
+}
+
+pub fn compiled_cast(
+    source: FunctionValueType,
+    result: FunctionValueType,
+    mode: Source,
+    wrap: Wrap,
+    cast_mode: novarocks_type_contract::TrinoCastMode,
+    allow: bool,
+) -> CompiledFixture {
+    let fixture =
+        cast_fixture_in_mode(source.clone(), result.clone(), mode, wrap, cast_mode, allow)
+            .expect("cast fixture admitted by the call author");
     let source_unit = fixture
         .compile_unit(
             fixture.source_prefix.as_ref().unwrap(),
@@ -817,8 +845,9 @@ pub fn compiled(
                 // A narrowed ELSE is itself an authored I64 -> target Cast.
                 // Identify the primary occurrence by both complete source facts.
                 let primary = recipe.source_type() == &source && recipe.result_type() == &result;
-                assert_eq!(recipe.decimal_overflow_policy(), policy);
-                assert_eq!(recipe.allow_throw_exception(), allow);
+                if primary {
+                    assert_eq!(recipe.cast_mode(), Some(cast_mode));
+                }
                 count += usize::from(primary);
             }
         }
@@ -1244,11 +1273,9 @@ pub fn inherited_round_fixture_with_target(allow: bool, target: DataType) -> Com
             None,
             result_type.clone(),
             ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
                 expr: child,
                 target,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: allow_ref(),
             },
         )
         .unwrap();
@@ -1266,63 +1293,6 @@ pub fn inherited_round_fixture_with_target(allow: bool, target: DataType) -> Com
         authors,
         constants: source_pools,
         allow,
-    }
-    .prepare()
-    .unwrap()
-    .compile(&HarnessControl)
-    .unwrap()
-}
-
-pub fn narrow_unsigned_constant(narrow: DataType) -> CompiledFixture {
-    let mut constants = ConstantPools::empty();
-    let mut unit = unit_draft();
-    let wide = FunctionValueType::new(DataType::UInt64, false);
-    let literal = literal(
-        &mut unit,
-        &wide,
-        checked_constants::u64(&wide, 42, fixture_constant_policy()),
-        &mut constants,
-    );
-    let inner = unit
-        .add(
-            None,
-            FunctionValueType::new(narrow.clone(), true),
-            ExprKind::Cast {
-                array_failure_mode: None,
-                expr: literal,
-                target: narrow,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: allow_ref(),
-            },
-        )
-        .unwrap();
-    let output = unit
-        .add(
-            None,
-            FunctionValueType::new(DataType::UInt64, true),
-            ExprKind::Cast {
-                array_failure_mode: None,
-                expr: inner,
-                target: DataType::UInt64,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: allow_ref(),
-            },
-        )
-        .unwrap();
-    let root = unit
-        .root(output, EvaluationDemand::Value, RootScope::Port(0))
-        .unwrap();
-    SinglePortFixture {
-        input: ExprPort {
-            values: Box::default(),
-        },
-        source_prefix: None,
-        unit,
-        root,
-        functions: catalogue(),
-        authors: BTreeMap::new(),
-        constants,
-        allow: false,
     }
     .prepare()
     .unwrap()

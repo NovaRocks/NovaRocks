@@ -29,7 +29,7 @@ CREATE TABLE ${case_db}.t_agg_topk_extrema_misc (
     id INT,
     grp INT,
     v INT,
-    txt STRING,
+    txt VARCHAR,
     flag BOOLEAN,
     big_v BIGINT,
     w BIGINT

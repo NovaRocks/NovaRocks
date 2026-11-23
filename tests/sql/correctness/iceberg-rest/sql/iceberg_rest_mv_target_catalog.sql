@@ -30,7 +30,7 @@ CREATE SCHEMA iceberg_rest_${suite_uuid0}.analytics_${uuid0};
 CREATE SCHEMA iceberg_rest_${suite_uuid0}.sales_${uuid0};
 CREATE TABLE iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0} (
   id INT,
-  name STRING
+  name VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0}
 VALUES ROW(1, 'a'), ROW(2, 'b');

@@ -29,7 +29,7 @@ CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_iw7_db_${uuid0};
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_iw7_db_${uuid0}.t_iw7_${uuid0} (
   id INT,
-  region STRING
+  region VARCHAR
 ) WITH (partitioning = ARRAY['region'], format_version = 3);
 
 -- query 3

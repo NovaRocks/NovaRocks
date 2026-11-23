@@ -33,10 +33,9 @@ use crate::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY;
 use crate::iceberg::spec::{MappedField, NameMapping};
 use crate::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 
-/// Convert one frozen Iceberg schema into the SQL read carrier exposed by the
-/// Provider. iceberg-rust's generic Arrow mapping intentionally chooses wider
-/// physical representations for several primitives; NovaRocks binds these
-/// exact logical carriers at admission and must reproduce them at begin-scan.
+/// Convert one frozen Iceberg schema into its bound source carriers.
+/// The decoder checks widths and field identities in this schema before
+/// the provider projects ordinary Fixed bytes into SQL VARBINARY.
 pub fn sql_read_schema_from_iceberg(
     iceberg_schema: &crate::iceberg::spec::Schema,
 ) -> Result<SchemaRef, String> {

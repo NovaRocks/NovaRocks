@@ -1,0 +1,5 @@
+-- query 7
+-- types	integer	varchar	varchar	varchar	varchar	varchar	varchar
+id	v	c	empty_v	null_v	added_v	added_c
+1	𐐷é	<𐐷é >	""	NULL	é中	<𐐷é >
+2	𐐷é	<𐐷é >	""	NULL	é中	<𐐷é >

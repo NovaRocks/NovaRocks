@@ -31,9 +31,9 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.lineitem (
-  "l_orderkey" int(11) NOT NULL,
-  "l_partkey" int(11) NOT NULL,
-  "l_suppkey" int(11)
+  "l_orderkey" INTEGER NOT NULL,
+  "l_partkey" INTEGER NOT NULL,
+  "l_suppkey" INTEGER
 ) WITH (format_version = 3);
 
 -- query 2
@@ -53,9 +53,9 @@ select * from ${case_db}.lineitem l1 where l1.l_orderkey not in ( select l3.l_or
 -- query 5
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.lineitem_nullable (
-  "l_orderkey" int(11),
-  "l_partkey" int(11),
-  "l_suppkey" int(11)
+  "l_orderkey" INTEGER,
+  "l_partkey" INTEGER,
+  "l_suppkey" INTEGER
 ) WITH (format_version = 3);
 
 -- query 6
@@ -102,9 +102,9 @@ select count(*) from (SELECT * from (SELECT if (generate_series <= 1000, null, g
 -- query 15
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.aware3 (
-  "k1" int(11),
-  "k2" int(11),
-  "k3" int(11)
+  "k1" INTEGER,
+  "k2" INTEGER,
+  "k3" INTEGER
 ) WITH (format_version = 3);
 
 -- query 16
@@ -114,9 +114,9 @@ insert into ${case_db}.aware3 SELECT generate_series, if(generate_series<4095, 1
 -- query 17
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.build1 (
-  "k1" int(11),
-  "k2" int(11),
-  "k3" int(11)
+  "k1" INTEGER,
+  "k2" INTEGER,
+  "k3" INTEGER
 ) WITH (format_version = 3);
 
 -- query 18
@@ -150,9 +150,9 @@ select count(*) from ${case_db}.aware3 l where 1000 not in (select k2 from ${cas
 -- query 25
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.build2 (
-  "k1" int(11),
-  "k2" int(11),
-  "k3" int(11)
+  "k1" INTEGER,
+  "k2" INTEGER,
+  "k3" INTEGER
 ) WITH (format_version = 3);
 
 -- query 26

@@ -23,16 +23,16 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.sc2 (
-  "v1" bigint(20),
+  "v1" BIGINT,
   "map1" MAP<int,MAP<int,MAP<int,int>>>,
   "st1" ROW(s1 int, sm2 MAP<int,int>, sm3 MAP<int,MAP<int,int>>),
   "st2" ROW(s1 int, sa2 ARRAY<int>, ss3 ROW(sss1 int, sss2 ROW(ssss1 int, ssss2 int)))
 ) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t1 (
-  "v1" bigint(20),
-  "v2" bigint(20),
-  "v3" bigint(20)
+  "v1" BIGINT,
+  "v2" BIGINT,
+  "v3" BIGINT
 ) WITH (format_version = 3);
 
 insert into ${case_db}.t1 values ROW(1, 2, 3);
@@ -110,7 +110,7 @@ select CAST(ROW(st1, st2) AS ROW(a ROW(s1 INTEGER, sm2 MAP(INTEGER, INTEGER), sm
 
 -- query 21
 -- Cast struct to different field types
-select cast(row(1,2,3) as ROW(a double, b string, c BIGINT));
+select cast(row(1,2,3) as ROW(a double, b VARCHAR, c BIGINT));
 
 -- query 22
 select CAST(ROW(1, 2, 3) AS ROW(a DOUBLE, b VARCHAR, c BIGINT));

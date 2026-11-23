@@ -328,8 +328,12 @@ pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'so
     };
     work.step()?;
     let phase = phase?;
-    let update =
-        entry.runtime() == AggregateRuntimeDemand::Update && source.binding.phase == entry.phase();
+    let update = entry.runtime().updates_rows()
+        && source.binding.phase == entry.phase()
+        && matches!(
+            entry.runtime(),
+            AggregateRuntimeDemand::FilteredUpdate { .. }
+        ) == entry.captured().filter_input().is_some();
     work.step()?;
     if !update {
         return Err(PhysicalAggregateRequestError::InvalidSource(
@@ -651,7 +655,17 @@ pub(in crate::planner::distributed::build) fn checked_aggregate_state_semantics_
         (Some(a), Some(b)) => a.matches_observed(b, || work.step())?,
         _ => false,
     };
-    if !same_semantics || !same_source_receipt || !same_state {
+    let same_filter_source = match (consumer.filter_input(), producer.filter_input()) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => {
+            expected == actual
+                && consumer
+                    .logical_identity()
+                    .same_lineage(producer.logical_identity())
+        }
+        _ => false,
+    };
+    if !same_semantics || !same_source_receipt || !same_state || !same_filter_source {
         return Err(super::lowered_draft::SqlSourceJournalError::InvalidSource(
             "aggregate state producer changes its original interpretation or semantic source",
         ));

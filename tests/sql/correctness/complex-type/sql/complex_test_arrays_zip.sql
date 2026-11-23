@@ -61,13 +61,13 @@ USE ${case_db};
 CREATE TABLE arrays_zip_test (
   pk bigint not null,
   int_array Array<BigInt>,
-  str_array Array<String>,
+  str_array Array<VARCHAR>,
   double_array Array<Double>,
-  null_array Array<String>,
+  null_array Array<VARCHAR>,
   mixed_null_array Array<BigInt>,
-  empty_array Array<String>,
+  empty_array Array<VARCHAR>,
   single_element_array Array<BigInt>,
-  large_array Array<String>,
+  large_array Array<VARCHAR>,
   decimal_array Array<DECIMAL(10, 2)>
 ) WITH (format_version = 3);
 
@@ -172,7 +172,7 @@ ORDER BY pk;
 
 -- query 31
 USE ${case_db};
-SELECT pk, zip(CAST(int_array AS Array<String>), str_array)
+SELECT pk, zip(CAST(int_array AS ARRAY(VARCHAR)), str_array)
 FROM arrays_zip_test 
 ORDER BY pk;
 

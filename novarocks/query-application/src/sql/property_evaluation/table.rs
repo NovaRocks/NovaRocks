@@ -34,6 +34,7 @@ use crate::{
     session_error::QueryServiceError,
     sql::{
         dml_admission::DmlAdmissionError, lower_command_literal, lower_object_name, lower_sql_type,
+        validate_bounded_varchar_default,
     },
 };
 
@@ -167,8 +168,7 @@ fn lower_table_column(
             "Admitted CREATE TABLE column has a qualified name",
         ));
     };
-    let data_type = lower_sql_type(&column.data_type)
-        .map_err(|message| unsupported(source, column.data_type.span, message))?;
+    let data_type = lower_sql_type(&column.data_type, source, control)?;
     observe_bytes(&name.value, control)?;
     if !names.insert(name.value.to_lowercase()) {
         let written_name = if name.quoted {
@@ -186,10 +186,13 @@ fn lower_table_column(
     }
     let default = match &column.default_value {
         None => None,
-        Some(Expr::Literal(literal)) => Some(
-            lower_command_literal(literal)
-                .map_err(|message| unsupported(source, literal.span, message))?,
-        ),
+        Some(Expr::Literal(literal)) => {
+            validate_bounded_varchar_default(source, literal, &data_type, control)?;
+            Some(
+                lower_command_literal(literal)
+                    .map_err(|message| unsupported(source, literal.span, message))?,
+            )
+        }
         Some(_) => {
             return Err(invariant(
                 "Prepared CREATE TABLE column default is not a literal",
@@ -444,6 +447,37 @@ mod tests {
         value: DdlPropertyValue,
     ) -> DdlPropertyDeclaration {
         DdlPropertyDeclaration::new(name, ty, value, false).unwrap()
+    }
+
+    #[test]
+    fn bounded_character_default_rejections_point_to_the_literal() {
+        let control = SqlCompileControl::unbounded();
+        let create = "CREATE TABLE t (v VARCHAR(1) DEFAULT '𐐷é')";
+        let alter = "ALTER TABLE t ADD COLUMN v VARCHAR(4) DEFAULT 3";
+        let TrinoStatement::CreateTable(create_node) = parse_statement(create).unwrap() else {
+            panic!("expected CREATE TABLE");
+        };
+        let TrinoStatement::AddColumn(alter_node) = parse_statement(alter).unwrap() else {
+            panic!("expected ALTER TABLE ADD COLUMN");
+        };
+        let create_error = lower_create_table(create, &create_node, None, vec![], &control)
+            .expect_err("two code points exceed VARCHAR(1)");
+        let alter_error =
+            crate::sql::trino_table_command::lower_trino_add_column(alter, &alter_node, &control)
+                .expect_err("a numeric literal is invalid for bounded VARCHAR");
+
+        for (error, source, literal) in [(create_error, create, "'𐐷é'"), (alter_error, alter, "3")]
+        {
+            let error = error.user_error().unwrap();
+            assert_eq!(
+                error.code().as_str(),
+                "sql.admit.invalid_default_column_value"
+            );
+            assert_eq!(
+                error.location().unwrap().column() as usize,
+                source.rfind(literal).unwrap() + 1,
+            );
+        }
     }
 
     #[test]

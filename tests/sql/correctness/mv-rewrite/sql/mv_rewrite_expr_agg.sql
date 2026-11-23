@@ -48,7 +48,7 @@ CREATE SCHEMA mvrw_${uuid0}.ns_${uuid0};
 -- k1: 4 distinct dates; k6: small int driving the conditions; k9: payload
 -- @skip_result_check=true
 CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.t1 (
-  k1 STRING,
+  k1 VARCHAR,
   k6 INT,
   k9 BIGINT
 ) WITH (format_version = 3);
@@ -57,7 +57,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.t1 (
 -- @skip_result_check=true
 INSERT INTO mvrw_${uuid0}.ns_${uuid0}.t1
 SELECT
-  concat('2023-08-', CAST(10 + (n % 4) AS STRING)) AS k1,
+  concat('2023-08-', CAST(10 + (n % 4) AS VARCHAR)) AS k1,
   CAST(n % 5 AS INT) AS k6,
   CAST(n % 100 AS BIGINT) AS k9
 FROM TABLE(sequence(1, 2400)) t(n);

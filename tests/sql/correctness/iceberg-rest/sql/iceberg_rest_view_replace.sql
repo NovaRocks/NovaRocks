@@ -28,7 +28,7 @@ CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_vr_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
-CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_vr_db_${uuid0}.t_vr_${uuid0} (id INT, name STRING);
+CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_vr_db_${uuid0}.t_vr_${uuid0} (id INT, name VARCHAR);
 
 -- query 3
 -- @skip_result_check=true

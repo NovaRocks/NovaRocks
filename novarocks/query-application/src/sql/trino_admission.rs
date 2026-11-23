@@ -32,10 +32,17 @@ const PROCEDURE_NOT_REGISTERED: ErrorCodeDescriptor = ErrorCodeDescriptor {
     status: ErrorCodeStatus::Active,
 };
 
+const UNKNOWN_TYPE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.unknown_type"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+
 pub const TRINO_STATEMENT_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     UNSUPPORTED_STATEMENT,
     NOT_IN_TRANSACTION,
     PROCEDURE_NOT_REGISTERED,
+    UNKNOWN_TYPE,
 ];
 
 pub fn procedure_not_registered(name: &ast::ObjectName) -> QueryServiceError {
@@ -50,6 +57,15 @@ pub fn procedure_not_registered(name: &ast::ObjectName) -> QueryServiceError {
             procedure.value.to_ascii_lowercase()
         ),
         None,
+        RetryClass::Never,
+    ))
+}
+
+pub(super) fn type_not_found(source: &str, span: Span, message: String) -> QueryServiceError {
+    QueryServiceError::from_user_error(UserError::from_descriptor(
+        UNKNOWN_TYPE,
+        message,
+        Some(span.to_user_error_location(source)),
         RetryClass::Never,
     ))
 }

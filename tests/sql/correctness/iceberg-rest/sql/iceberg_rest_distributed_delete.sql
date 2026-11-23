@@ -29,7 +29,7 @@ CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0};
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0}.t_del_${uuid0} (
   id INT,
-  region STRING,
+  region VARCHAR,
   amount INT
 ) WITH (partitioning = ARRAY['region']);
 
@@ -52,7 +52,7 @@ SELECT id, region, amount
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0}.t_del_v3_${uuid0} (
   id INT,
-  region STRING
+  region VARCHAR
 ) WITH (format_version = 3);
 
 -- query 7

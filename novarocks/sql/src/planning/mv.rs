@@ -350,6 +350,29 @@ mod refresh_property_facade_tests {
     }
 
     #[test]
+    fn refresh_contract_rejects_a_typed_aggregate_filter() {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let plain = analyzed_refresh_input(
+            "SELECT region, sum(amount) AS total FROM fact_east GROUP BY region",
+        );
+        plain.refresh_contract(&control).unwrap();
+
+        let filtered = analyzed_refresh_input(
+            "SELECT region, sum(amount) FILTER (WHERE amount > 0) AS total
+             FROM fact_east GROUP BY region",
+        );
+        let error = filtered.refresh_contract(&control).unwrap_err();
+        let SqlCompileError::Analyze(error) = error else {
+            panic!("{error:?}")
+        };
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert!(error.to_string().contains("aggregate FILTER"));
+    }
+
+    #[test]
     fn union_aggregate_uses_root_names_with_anonymous_later_branch() {
         let input = analyzed_refresh_input(
             "SELECT id + 1 AS K, count(*) AS C FROM fact_east GROUP BY id + 1 UNION ALL SELECT id + 1, count(*) FROM fact_west GROUP BY id + 1",
@@ -5932,8 +5955,17 @@ fn count_aggregate_projection_outputs(
                 args,
                 distinct,
                 order_by,
+                filter,
                 ..
             } => {
+                if filter.is_some() {
+                    return Err(
+                        crate::analyze_error::AnalyzeError::unsupported_expression_without_span(
+                            "Iceberg IMV refresh contract does not support aggregate FILTER",
+                        )
+                        .into(),
+                    );
+                }
                 work.flush()?;
                 validate_supported_aggregate_call(name, args.len(), *distinct, order_by)?;
                 validate_aggregate_argument_exprs(args)?;

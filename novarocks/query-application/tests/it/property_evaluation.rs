@@ -1452,9 +1452,12 @@ fn trino_column_and_comment_commands_keep_parser_name_segments() {
     let TrinoStatement::AddColumn(statement) = parse_statement(source).unwrap() else {
         panic!("expected an ADD COLUMN statement");
     };
-    let CatalogSqlCommand::AlterIcebergTable(command) =
-        lower_trino_add_column(source, &statement).unwrap()
-    else {
+    let CatalogSqlCommand::AlterIcebergTable(command) = lower_trino_add_column(
+        source,
+        &statement,
+        &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+    )
+    .unwrap() else {
         panic!("expected the original Iceberg table command");
     };
     assert_eq!(command.table.parts, ["lake", "ns", "t"]);

@@ -36,7 +36,6 @@ novarocks-function-contract.workspace = true
 novarocks-failure-contract.workspace = true
 novarocks-parser.workspace = true
 arrow.workspace = true
-chrono.workspace = true
 
 [package.metadata.novarocks.test]
 runtime-inputs = []

@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS t0
 (
   c0 INT ,
   c1 INT ,
-  c2 DECIMAL128(7, 2) ,
+  c2 DECIMAL(7, 2) ,
   c3 VARCHAR(10)
 ) WITH (format_version = 3);
 INSERT INTO t0

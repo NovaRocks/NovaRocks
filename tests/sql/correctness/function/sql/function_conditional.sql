@@ -26,11 +26,11 @@
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE tc (
-    "i" int(11),
-    "ai" array<int(11)>,
+    "i" INTEGER,
+    "ai" array<INTEGER>,
     "ass" array<varchar(100)>,
-    "mi" map<int(11),int>,
-    "ms" map<int(11),varchar(100)>
+    "mi" map<INTEGER,int>,
+    "ms" map<INTEGER,varchar(100)>
 ) WITH (format_version = 3);
 
 -- query 2

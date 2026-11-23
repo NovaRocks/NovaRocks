@@ -1,19 +1,19 @@
--- query 1
--- types	boolean
-caught_range
-true
+-- query 2
+-- types	integer	integer
+try_cast_range	try_range
+NULL	NULL
 
 -- query 3
 -- types	tinyint
 narrowed
 127
 
--- query 4
--- types	boolean
-caught_utf8
-true
-
 -- query 5
 -- types	varchar
 rendered
 2020-01-01
+
+-- query 7
+-- types	integer
+kept
+17

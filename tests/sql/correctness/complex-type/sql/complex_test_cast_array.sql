@@ -26,7 +26,7 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE "tbl" (k1 string,k2 string,k3 int) WITH (format_version = 3);
+CREATE TABLE "tbl" (k1 VARCHAR,k2 VARCHAR,k3 int) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true

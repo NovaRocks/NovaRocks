@@ -24,7 +24,7 @@ DROP TABLE IF EXISTS ${case_db}.t_scan_pruning;
 CREATE TABLE ${case_db}.t_scan_pruning (
   id INT,
   part_id INT,
-  payload STRING
+  payload VARCHAR
 ) WITH (partitioning = ARRAY['part_id']);
 INSERT INTO ${case_db}.t_scan_pruning VALUES
   ROW(1, 1, 'cold-a'),

@@ -21,11 +21,11 @@
 CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0};
 CREATE TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0} (
   name ARRAY<ROW(
-    user STRING,
-    family STRING,
-    given ARRAY<STRING>,
-    prefix ARRAY<STRING>,
-    suffix ARRAY<STRING>
+    user VARCHAR,
+    family VARCHAR,
+    given ARRAY<VARCHAR>,
+    prefix ARRAY<VARCHAR>,
+    suffix ARRAY<VARCHAR>
   )>
 );
 INSERT INTO iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0} VALUES

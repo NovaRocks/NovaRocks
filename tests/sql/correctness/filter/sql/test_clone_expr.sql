@@ -29,14 +29,14 @@ CREATE TABLE t1 (
     age SMALLINT,
     dt VARCHAR(10) NOT NULL
 ) WITH (format_version = 3);
-INSERT INTO t1 SELECT generate_series, generate_series, generate_series % 100, '2024-07-24'
+INSERT INTO t1 SELECT generate_series, CAST(generate_series AS VARCHAR), generate_series % 100, '2024-07-24'
 FROM TABLE(sequence(1, 10)) AS generate_series(generate_series);
 SELECT t2.dt, "unnest", sum(d1), sum(d2)
 FROM (
     SELECT * FROM (
         SELECT dt,
-            count(DISTINCT if(province>5 and id>5, age, null)) as d1,
-            count(DISTINCT if(id>5 and province>5, age, null)) as d2
+            count(DISTINCT if(CAST(province AS BIGINT)>5 and id>5, age, null)) as d1,
+            count(DISTINCT if(id>5 and CAST(province AS BIGINT)>5, age, null)) as d2
         FROM t1 GROUP BY dt
     ) t0, unnest([1, 2, 3]) as "unnest"("unnest")
 ) t2
@@ -44,14 +44,14 @@ GROUP BY 1, 2 ORDER BY 1, 2 LIMIT 10;
 
 -- query 2
 USE ${case_db};
-INSERT INTO t1 SELECT generate_series, generate_series, generate_series % 100, '2024-07-24'
+INSERT INTO t1 SELECT generate_series, CAST(generate_series AS VARCHAR), generate_series % 100, '2024-07-24'
 FROM TABLE(sequence(1, 10)) AS generate_series(generate_series);
 SELECT t2.dt, "unnest", sum(d1), sum(d2)
 FROM (
     SELECT * FROM (
         SELECT dt,
-            count(DISTINCT if(province>5 and id>5, age, null)) as d1,
-            count(DISTINCT if(id>5 and province>5, age, null)) as d2
+            count(DISTINCT if(CAST(province AS BIGINT)>5 and id>5, age, null)) as d1,
+            count(DISTINCT if(id>5 and CAST(province AS BIGINT)>5, age, null)) as d2
         FROM t1 GROUP BY dt
     ) t0, unnest([1, 2, 3]) as "unnest"("unnest")
 ) t2

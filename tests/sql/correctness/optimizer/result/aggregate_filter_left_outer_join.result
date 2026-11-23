@@ -1,0 +1,5 @@
+-- query 9
+-- types	integer	bigint	bigint
+k	matched_sum	all_rows
+1	1990200	200
+99	NULL	200

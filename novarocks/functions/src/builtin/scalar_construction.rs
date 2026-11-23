@@ -218,6 +218,19 @@ impl<'a, E> ScalarConstruction<'a, E> {
     ) -> Result<DataType, Failure<E>> {
         novarocks_type_contract::wider_type_with_construction(left, right, self.observer())
     }
+    pub(super) fn trino_common(
+        &mut self,
+        left: &FunctionValueType,
+        right: &FunctionValueType,
+    ) -> Result<Option<FunctionValueType>, Failure<E>> {
+        let storage = self.storage();
+        novarocks_type_contract::trino_common_type_with_construction(
+            left,
+            right,
+            storage,
+            self.observer(),
+        )
+    }
     pub(super) fn common(
         &mut self,
         carrier: DataType,

@@ -398,7 +398,7 @@ mod fold_frontiers {
             "builtin.aggregate/string_agg/",
         ),
         (
-            "SELECT FROM_UNIXTIME(CAST(ABS(CAST(1 AS BIGINT)) AS BIGINT))",
+            "SELECT FROM_UNIXTIME(-(BIGINT '-1'))",
             "builtin.scalar/from_unixtime/",
         ),
     ];

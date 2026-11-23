@@ -31,7 +31,7 @@ CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_tbl_db_${uuid0};
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tbl_db_${uuid0}.t_basic_${uuid0} (
   id BIGINT,
-  name STRING,
+  name VARCHAR,
   amount DOUBLE,
   d DATE,
   ts TIMESTAMP
@@ -41,7 +41,7 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tbl_db_${uuid0}.t_basic_${
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tbl_db_${uuid0}.t_part_${uuid0} (
   id BIGINT,
-  region STRING,
+  region VARCHAR,
   amount DOUBLE
 ) WITH (partitioning = ARRAY['region']);
 
@@ -50,7 +50,7 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tbl_db_${uuid0}.t_part_${u
 -- IF NOT EXISTS on an existing table must be a no-op.
 CREATE TABLE IF NOT EXISTS iceberg_rest_${suite_uuid0}.iceberg_rest_tbl_db_${uuid0}.t_basic_${uuid0} (
   id BIGINT,
-  name STRING,
+  name VARCHAR,
   amount DOUBLE,
   d DATE,
   ts TIMESTAMP

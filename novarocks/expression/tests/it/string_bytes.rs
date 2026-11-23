@@ -43,9 +43,8 @@ use novarocks_functions::{
     Selection,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
-    FunctionValueType, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
-    SemanticParameterValue, SemanticParameters, ToBase64ByteSource as Source,
+    CompileCheckpoints, CompilePhase, ControlShape, EvaluationDemand, FunctionValueType,
+    SemanticParameterId, SemanticParameterValue, SemanticParameters, ToBase64ByteSource as Source,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -620,14 +619,9 @@ fn base64_program(shape: Shape) -> Program {
                         None,
                         ty.clone(),
                         ExprKind::Cast {
-                            array_failure_mode: None,
+                            cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                             expr: child,
                             target: DataType::Utf8,
-                            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                            allow_throw_exception: SemanticParameterRef {
-                                id: SemanticParameterId::new(0),
-                                expected_key: SemanticParameterKey::AllowThrowException,
-                            },
                         },
                     )
                     .unwrap();

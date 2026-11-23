@@ -29,27 +29,27 @@ USE ${case_db};
 
 -- query 3
 USE ${case_db};
-with input as (SELECT transform(sequence(1, 2000000, 1), x -> CAST(x AS STRING)) AS a UNION ALL SELECT ['A', 'B', 'C'] AS a)
+with input as (SELECT transform(sequence(1, 2000000, 1), x -> CAST(x AS VARCHAR)) AS a UNION ALL SELECT ['A', 'B', 'C'] AS a)
 SELECT count(*) from (select a from input group by 1) AS t;
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t1" (
-  "id" int(11),
+  "id" INTEGER,
   "array_varchar" array<varchar(100)>
 ) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 select generate_series, transform(sequence(1, generate_series % 100, 1), x -> cast(x as string)) from table(sequence(1, 10000)) AS generate_series(generate_series);
+insert into t1 select generate_series, transform(sequence(1, generate_series % 100, 1), x -> cast(x AS VARCHAR)) from table(sequence(1, 10000)) AS generate_series(generate_series);
 
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 values ROW(0, transform(sequence(1, 100000, 1), x -> CAST(x AS STRING))),
-ROW(10001, transform(sequence(1, 100000, 1), x -> CAST(x AS STRING)));
+insert into t1 values ROW(0, transform(sequence(1, 100000, 1), x -> CAST(x AS VARCHAR))),
+ROW(10001, transform(sequence(1, 100000, 1), x -> CAST(x AS VARCHAR)));
 
 -- query 7
 USE ${case_db};

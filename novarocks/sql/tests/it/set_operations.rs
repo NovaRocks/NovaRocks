@@ -58,6 +58,17 @@ fn all_is_refused_only_for_comparison_set_operations() {
 }
 
 #[test]
+fn union_all_under_count_preserves_compiled_branch_declarations() {
+    let compiled = sql_source_with_declared_fields(
+        "SELECT count(*) AS union_rows FROM (SELECT 1 UNION ALL SELECT 1) s",
+        &[],
+    );
+    let result = compiled.plan().result_port().unwrap();
+    assert_eq!(result.fields.len(), 1);
+    assert_eq!(result.fields[0].ty.data_type(), &DataType::Int64);
+}
+
+#[test]
 fn distributed_except_hashes_the_widened_comparison_value_at_the_sender() {
     let compiled = sql_source_with_declared_fields(
         "SELECT narrow_key FROM t EXCEPT SELECT wide_key FROM t",

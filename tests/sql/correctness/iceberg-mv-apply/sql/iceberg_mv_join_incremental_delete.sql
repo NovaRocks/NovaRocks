@@ -33,7 +33,7 @@ CREATE TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0} (
 ) WITH (format_version = 3);
 CREATE TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0} (
   id BIGINT NOT NULL,
-  label STRING
+  label VARCHAR
 ) WITH (format_version = 3);
 USE ice_mv_apply_${uuid0}.ns_${uuid0};
 

@@ -345,12 +345,17 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             control,
         ),
         ScalarNode::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
             order_by,
             resolved,
         } => {
+            if filter.is_some() {
+                return Ok(None);
+            }
             let (args, args_changed) =
                 rewrite_scalar_vec(arena, &args, bindings, factory, control)?;
             let (order_by, order_changed) =
@@ -360,6 +365,8 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                 .then(|| {
                     arena.intern_observed(
                         ScalarNode::AggregateCall {
+                            occurrence,
+                            filter,
                             name,
                             args,
                             distinct,
@@ -373,7 +380,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                 .transpose()
         }
         ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child,
             target,
             decimal_overflow_policy,
@@ -384,7 +391,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             factory,
             value_type,
             |child| ScalarNode::Cast {
-                array_failure_mode,
+                cast_mode,
                 child,
                 target,
                 decimal_overflow_policy,

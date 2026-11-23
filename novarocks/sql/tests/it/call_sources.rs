@@ -134,3 +134,31 @@ mod canonical_calls {
         }
     }
 }
+
+#[test]
+fn deterministic_aggregate_filter_occurrences_share_the_original_update() {
+    use arrow::datatypes::DataType;
+    use novarocks_physical_plan::NodeKind;
+    use novarocks_sql_testkit::sql_source;
+
+    let authored = sql_source(
+        "SELECT count(*) FILTER (WHERE k > 0) AS a,
+                count(*) FILTER (WHERE k > 0) AS b FROM fixture.source",
+        DataType::Int64,
+    );
+    let updates = authored
+        .plan()
+        .fragments()
+        .values()
+        .flat_map(|fragment| fragment.nodes().values())
+        .filter_map(|node| match &node.kind {
+            NodeKind::Aggregate { calls, .. } => Some(calls.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter(|call| call.binding.phase.consumes_logical_arguments())
+        .collect::<Vec<_>>();
+    assert_eq!(updates.len(), 1);
+    assert!(updates[0].filter_root.is_some());
+    assert!(updates[0].arguments.is_empty());
+}

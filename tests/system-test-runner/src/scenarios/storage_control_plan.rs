@@ -72,7 +72,7 @@ pub(super) struct QueryIntent {
 pub(super) fn held_sql(catalog: &str, database: &str, table: &str) -> String {
     // Preserve the existing connector cancellation corpus and scan-side sleep.
     format!(
-        "SELECT t.v FROM (SELECT v FROM {catalog}.{database}.{table} WHERE v % 4096 = 0 AND sleep(1) = 0) AS t CROSS JOIN TABLE(sequence(1, 64)) AS gs(x)"
+        "SELECT t.v FROM (SELECT v FROM {catalog}.{database}.{table} WHERE v % 4096 = 0 AND sleep(1) = FALSE) AS t CROSS JOIN TABLE(sequence(1, 64)) AS gs(x)"
     )
 }
 

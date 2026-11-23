@@ -18,10 +18,10 @@
 -- @order_sensitive=true
 -- @tags=iceberg_dml,decimal,insert
 -- Test Objective:
--- 1. Preserve exact numeric tokens until conversion to the write target type.
--- 2. Apply target typing before VALUES, constant UNION ALL, and container type merging.
+-- 1. Preserve exact decimal literals when the source stays in a decimal domain.
+-- 2. Resolve VALUES, UNION ALL, and container common types before store assignment.
 -- 3. Preserve explicit CAST, source controls, and Binary/VARIANT literal representations.
--- Expected decimals come from their original base-10 coefficients, not server output.
+-- Mixed DECIMAL and DOUBLE sources round before assignment to the target DECIMAL.
 
 -- query 1
 -- @skip_result_check=true

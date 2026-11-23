@@ -1378,7 +1378,7 @@ mod tests {
             );
             let right_key = memo.scalars.intern(
                 ScalarNode::Cast {
-                    array_failure_mode: None,
+                    cast_mode: None,
                     child: right_input,
                     target: DataType::Int64,
                     decimal_overflow_policy:

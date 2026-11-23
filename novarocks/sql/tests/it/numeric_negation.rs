@@ -157,11 +157,15 @@ fn numeric_unary_owned_transaction_actual_aggregate_window_and_table_sources_pub
 
 #[test]
 fn decimal_negation_follows_the_actual_physical_nullability_and_width() {
+    use novarocks_sql::{
+        analyze_error::AnalyzeErrorKind,
+        compiler::{SqlCompileError, SqlCompileProgressError},
+    };
     for (ty, value) in [
         (DataType::Decimal128(23, 4), "1000000000000000000.0001"),
         (
-            DataType::Decimal256(43, 9),
-            "1000000000000000000000000000000000.000000001",
+            DataType::Decimal128(38, 9),
+            "10000000000000000000000000000.000000001",
         ),
     ] {
         for (sql, nullable) in [
@@ -180,6 +184,17 @@ fn decimal_negation_follows_the_actual_physical_nullability_and_width() {
             assert_negation_type(&owner, &ty, nullable);
         }
     }
+    let Err(wide) = compile_table_free(
+        "SELECT -(1000000000000000000000000000000000.000000001) AS negated",
+        session(Default::default(), false),
+        &SqlCompileControl::unbounded(),
+    ) else {
+        panic!("negation must not reintroduce retired DECIMAL precision");
+    };
+    let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = wide else {
+        panic!("expected a typed decimal literal error: {wide:?}");
+    };
+    assert_eq!(error.kind(), AnalyzeErrorKind::InvalidLiteral);
 }
 
 #[test]

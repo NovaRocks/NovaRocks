@@ -30,7 +30,7 @@ CREATE TABLE ${case_db}.t_agg_percentile_semantics (
     v INT,
     w INT,
     d DATE,
-    dt DATETIME,
+    dt TIMESTAMP(6),
     dbl DOUBLE
 ) WITH (format_version = 3);
 

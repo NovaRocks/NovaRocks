@@ -1746,6 +1746,7 @@ impl CountStar {
             semantic_parameters: Box::default(),
         });
         AggregateCall {
+            filter_root: None,
             id: AggregateCallId::new(id),
             binding: AggregateBinding {
                 state_interpretation: None,

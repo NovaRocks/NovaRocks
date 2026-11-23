@@ -385,10 +385,9 @@ fn element_at_type_probe_routes_actual_array_and_map_sources_without_overload_gu
         panic!("select");
     };
     let expected = [
-        // The public ARRAY call selects BIGINT. The ARRAY subscript and
-        // both probes against MAP(INTEGER, INTEGER) select INTEGER.
+        // Both ARRAY forms select BIGINT. MAP probes keep the original key width.
         ("element_at", DataType::Int64),
-        ("__array_element_at", DataType::Int32),
+        ("__array_subscript", DataType::Int64),
         ("element_at", DataType::Int32),
         ("__map_subscript", DataType::Int32),
     ];
@@ -416,16 +415,37 @@ fn element_at_type_probe_routes_actual_array_and_map_sources_without_overload_gu
                 &FunctionArgumentType::Value(argument.value_type.clone())
             );
         }
-        let result = FunctionValueType::new(DataType::Int32, true);
+        let nullable = name != "__array_subscript"
+            || args[0].value_type.nullable()
+            || args[0].value_type.child_at(0).unwrap().nullable();
+        let result = FunctionValueType::new(DataType::Int32, nullable);
         assert_eq!(project.expr.value_type, result);
         assert_eq!(
             binding.selected.result_type,
             FunctionResultType::Scalar(result)
         );
-        assert_eq!(args[1].value_type, FunctionValueType::new(index, false));
+        assert_eq!(
+            args[1].value_type,
+            FunctionValueType::new(index.clone(), false)
+        );
+        let original_index = if index == DataType::Int64 {
+            let ExprKind::Cast {
+                expr, cast_mode, ..
+            } = &args[1].kind
+            else {
+                panic!("ARRAY index requires an implicit BIGINT conversion");
+            };
+            assert_eq!(
+                *cast_mode,
+                Some(novarocks_type_contract::TrinoCastMode::Implicit)
+            );
+            expr.as_ref()
+        } else {
+            &args[1]
+        };
         assert!(
             matches!(
-                args[1].kind,
+                original_index.kind,
                 ExprKind::Literal(crate::analysis::LiteralValue::Int(1))
             ),
             "the selected width preserves the original literal value"

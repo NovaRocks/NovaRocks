@@ -29,7 +29,7 @@ CREATE CATALOG ice_mv_apply_agg_${uuid0} USING iceberg WITH ("iceberg.catalog.ty
 CREATE SCHEMA ice_mv_apply_agg_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.orders_${uuid0} (
   id BIGINT NOT NULL,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 CREATE TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.fact_${uuid0} (
@@ -39,16 +39,16 @@ CREATE TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.fact_${uuid0} (
 ) WITH (format_version = 3);
 CREATE TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.dim_${uuid0} (
   id BIGINT NOT NULL,
-  region STRING
+  region VARCHAR
 ) WITH (format_version = 3);
 CREATE TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t1_${uuid0} (
   id BIGINT NOT NULL,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 CREATE TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t2_${uuid0} (
   id BIGINT NOT NULL,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 USE ice_mv_apply_agg_${uuid0}.ns_${uuid0};

@@ -21,7 +21,7 @@
 use arrow_array::{types::*, *};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, ExpressionEffectContext,
+    CharacterKind, CompileCheckpoints, CompileControlError, CompilePhase, ExpressionEffectContext,
     FunctionValueType, PureCompileControl, ValueKind, ValueLogicalType,
     arrow_data_types_exact_observed,
 };
@@ -200,6 +200,7 @@ enum FlatLeaf {
     IntervalDayTime,
     IntervalMonthDayNano,
     Utf8,
+    Char,
     LargeUtf8,
     Binary,
     LargeBinary,
@@ -306,7 +307,16 @@ impl PreparedComparisonRecipe {
                     },
                 });
             }
-            let leaf = if left.logical_type() == ValueLogicalType::LargeInt {
+            let character = char_declaration(left);
+            if character != char_declaration(right) {
+                return Err(ComparisonPrepareError::TypeMismatch);
+            }
+            let leaf = if character.is_some() {
+                if left.data_type() != &DataType::Utf8 {
+                    return Err(ComparisonPrepareError::Unsupported);
+                }
+                FlatLeaf::Char
+            } else if left.logical_type() == ValueLogicalType::LargeInt {
                 FlatLeaf::LargeInt
             } else {
                 FlatLeaf::from_type(left.data_type()).ok_or(ComparisonPrepareError::Unsupported)?
@@ -439,18 +449,6 @@ impl PreparedComparisonRecipe {
                 primitive::<$ty>(left, l, right, r, self.operator, work)
             };
         }
-        macro_rules! b {
-            ($ty:ty, $bytes:expr) => {{
-                let left = cast::<$ty>(left)?;
-                let right = cast::<$ty>(right)?;
-                if left.is_null(l) || right.is_null(r) {
-                    Ok(None)
-                } else {
-                    let bytes: fn(&$ty, usize) -> &[u8] = $bytes;
-                    compare_bytes(self.operator, bytes(left, l), bytes(right, r), work).map(Some)
-                }
-            }};
-        }
         let leaf = match self.algorithm {
             Algorithm::Flat(leaf) => leaf,
             Algorithm::IntegerArray {
@@ -485,6 +483,25 @@ impl PreparedComparisonRecipe {
                 return Ok((!unknown).then_some(equal));
             }
         };
+        macro_rules! b {
+            ($ty:ty, $bytes:expr) => {{
+                let left = cast::<$ty>(left)?;
+                let right = cast::<$ty>(right)?;
+                if left.is_null(l) || right.is_null(r) {
+                    Ok(None)
+                } else {
+                    let bytes: fn(&$ty, usize) -> &[u8] = $bytes;
+                    compare_bytes(
+                        self.operator,
+                        bytes(left, l),
+                        bytes(right, r),
+                        leaf == FlatLeaf::Char,
+                        work,
+                    )
+                    .map(Some)
+                }
+            }};
+        }
         match leaf {
             FlatLeaf::Null => {
                 cast::<NullArray>(left)?;
@@ -540,7 +557,7 @@ impl PreparedComparisonRecipe {
             FlatLeaf::IntervalYearMonth => p!(IntervalYearMonthType),
             FlatLeaf::IntervalDayTime => p!(IntervalDayTimeType),
             FlatLeaf::IntervalMonthDayNano => p!(IntervalMonthDayNanoType),
-            FlatLeaf::Utf8 => b!(StringArray, |a, i| a.value(i).as_bytes()),
+            FlatLeaf::Utf8 | FlatLeaf::Char => b!(StringArray, |a, i| a.value(i).as_bytes()),
             FlatLeaf::LargeUtf8 => b!(LargeStringArray, |a, i| a.value(i).as_bytes()),
             FlatLeaf::Binary => b!(BinaryArray, |a, i| a.value(i)),
             FlatLeaf::LargeBinary => b!(LargeBinaryArray, |a, i| a.value(i)),
@@ -627,12 +644,13 @@ fn equal_bytes(
     right: &[u8],
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<bool, KernelFailure> {
-    compare_bytes(ComparisonOperator::Eq, left, right, work)
+    compare_bytes(ComparisonOperator::Eq, left, right, false, work)
 }
 fn compare_bytes(
     operator: ComparisonOperator,
     left: &[u8],
     right: &[u8],
+    pad_char: bool,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<bool, KernelFailure> {
     if !operator.is_ordering() && left.len() != right.len() {
@@ -646,10 +664,37 @@ fn compare_bytes(
             return Ok(operator.apply(ordering));
         }
     }
-    let ordering = left.len().cmp(&right.len());
+    let length_order = left.len().cmp(&right.len());
+    if pad_char && length_order != Ordering::Equal {
+        let (shorter, longer) = if length_order == Ordering::Less {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        for &byte in &longer[shorter.len()..] {
+            let ordering = b' '.cmp(&byte);
+            work.step()?;
+            if ordering != Ordering::Equal {
+                return Ok(operator.apply(if length_order == Ordering::Less {
+                    ordering
+                } else {
+                    ordering.reverse()
+                }));
+            }
+        }
+        return Ok(operator.apply(Ordering::Equal));
+    }
     work.step()?;
-    Ok(operator.apply(ordering))
+    Ok(operator.apply(length_order))
 }
+
+fn char_declaration(ty: &FunctionValueType) -> Option<novarocks_type_contract::CharacterType> {
+    match ty.value_type().kind() {
+        ValueKind::BoundedCharacter(ty) if ty.kind() == CharacterKind::Char => Some(*ty),
+        _ => None,
+    }
+}
+
 fn flat_type_matches(
     expected: &DataType,
     actual: &DataType,

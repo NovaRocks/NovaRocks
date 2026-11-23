@@ -151,13 +151,18 @@ impl<'a> super::AnalyzerContext<'a> {
             self.analyze_from_with_outer(&join.right, Some(&current_scope))?;
         let (join_kind, constraint) = parse_join_operator(join.kind, join.criteria.as_ref());
 
+        let mut using_output = Vec::new();
         let condition = match constraint {
             Some(ast::JoinCriteria::On(on)) => {
                 // Build a merged scope for analyzing the ON condition
                 let mut merged = self.new_scope();
                 merged.merge(&current_scope);
                 merged.merge(&right_scope);
-                Some(self.analyze_expr(&on.expression, &merged)?)
+                Some(self.require_boolean_predicate(
+                    self.analyze_expr(&on.expression, &merged)?,
+                    "JOIN ON clause",
+                    on.expression.span(),
+                )?)
             }
             Some(ast::JoinCriteria::Using(ast::JoinUsing { columns, .. })) => {
                 // Convert USING(col1, col2) to ON left.col1 = right.col1 AND ...
@@ -206,19 +211,56 @@ impl<'a> super::AnalyzerContext<'a> {
                             value_type: left_type,
                         }
                     };
-                    let right_ref = TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: right_id,
-                            qualifier: None,
-                            column: col_name,
-                        },
-                        value_type: right_type,
+                    let right_ref = right_scope
+                        .computed_column_for(&col_name)
+                        .cloned()
+                        .unwrap_or(TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: right_id,
+                                qualifier: None,
+                                column: col_name.clone(),
+                            },
+                            value_type: right_type,
+                        });
+                    let common = self.require_common_trino_type(
+                        &left_ref.value_type,
+                        &right_ref.value_type,
+                        col_obj.span,
+                    )?;
+                    let coerce = |value| self.coerce_common_value(value, &common, col_obj.span);
+                    let (left_key, right_key) =
+                        (coerce(left_ref.clone())?, coerce(right_ref.clone())?);
+                    let output = match join_kind {
+                        JoinKind::FullOuter => {
+                            let padded = |mut expr: TypedExpr| {
+                                expr.value_type =
+                                    super::helpers::with_nullability(expr.value_type, true);
+                                coerce(expr)
+                            };
+                            super::resolve_expr::resolved_scalar_call_at(
+                                self.function_catalog,
+                                "coalesce",
+                                vec![padded(left_ref)?, padded(right_ref)?],
+                                col_obj.span,
+                                self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                                self.constant_policy,
+                                self.control,
+                            )?
+                        }
+                        JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti => {
+                            right_key.clone()
+                        }
+                        _ => left_key.clone(),
                     };
-                    if crate::common::binary_operator::requires_legacy_wide(
-                        left_ref.value_type.value_type(),
-                    ) || crate::common::binary_operator::requires_legacy_wide(
-                        right_ref.value_type.value_type(),
-                    ) {
+                    using_output.push((col_name, left_id, right_id, output));
+                    let legacy_key = |key: &TypedExpr| {
+                        use crate::common::binary_operator::{
+                            requires_legacy_wide, uses_structural_comparison,
+                        };
+                        requires_legacy_wide(key.value_type.value_type())
+                            || uses_structural_comparison(key.value_type.value_type())
+                    };
+                    if legacy_key(&left_key) || legacy_key(&right_key) {
                         conds.push(TypedExpr {
                             value_type: novarocks_type_contract::FunctionValueType::new(
                                 DataType::Boolean,
@@ -226,9 +268,9 @@ impl<'a> super::AnalyzerContext<'a> {
                             ),
 
                             kind: ExprKind::BinaryOp {
-                                left: novarocks_parser::ast::AstBox::new(left_ref),
+                                left: novarocks_parser::ast::AstBox::new(left_key),
                                 op: BinOp::Eq,
-                                right: novarocks_parser::ast::AstBox::new(right_ref),
+                                right: novarocks_parser::ast::AstBox::new(right_key),
                                 decimal_overflow_policy:
                                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
@@ -236,8 +278,8 @@ impl<'a> super::AnalyzerContext<'a> {
                     } else {
                         conds.push(self.analyze_binary_operator(
                             novarocks_type_contract::OperatorFunction::Equal,
-                            left_ref,
-                            right_ref,
+                            left_key,
+                            right_key,
                             col_obj.span,
                         )?);
                     }
@@ -275,92 +317,11 @@ impl<'a> super::AnalyzerContext<'a> {
             None => None,
         };
 
-        // SEMI / ANTI joins only expose the surviving side's columns to
-        // the outer scope — the other side is consumed by the join itself
-        // and is not visible to WHERE/SELECT or downstream joins. The ON
-        // condition above was already analyzed against the merged scope.
-        // This must match the physical join output scope so that
-        // analyzer-emitted projections agree with fragment materialization.
+        let prefer_right = matches!(join_kind, JoinKind::RightOuter);
         match join_kind {
-            JoinKind::LeftSemi | JoinKind::LeftAnti => {
-                // outer scope = left scope unchanged. USING-clause
-                // reordering still applies: even though right columns
-                // are not exposed, the surviving USING columns should
-                // sit at the front of the SELECT * column list.
-                if let Some(ast::JoinCriteria::Using(ast::JoinUsing {
-                    columns: using_cols_ast,
-                    ..
-                })) = constraint
-                {
-                    let using_names: Vec<String> =
-                        using_cols_ast.iter().map(|c| c.value.clone()).collect();
-                    current_scope.apply_using_layout(&using_names, false);
-                }
-            }
-            JoinKind::RightSemi | JoinKind::RightAnti => {
-                current_scope = right_scope;
-                if let Some(ast::JoinCriteria::Using(ast::JoinUsing {
-                    columns: using_cols_ast,
-                    ..
-                })) = constraint
-                {
-                    let using_names: Vec<String> =
-                        using_cols_ast.iter().map(|c| c.value.clone()).collect();
-                    current_scope.apply_using_layout(&using_names, false);
-                }
-            }
+            JoinKind::LeftSemi | JoinKind::LeftAnti => {}
+            JoinKind::RightSemi | JoinKind::RightAnti => current_scope = right_scope,
             _ => {
-                // For FULL OUTER USING, the joined column is the merge
-                // of both sides (`COALESCE(left.col, right.col)`).
-                // Capture the per-side qualifiers before
-                // `apply_using_layout` deduplicates `ordered`.
-                let coalesce_quals: Option<Vec<(String, String, String)>> =
-                    if matches!(join_kind, JoinKind::FullOuter)
-                        && let Some(ast::JoinCriteria::Using(ast::JoinUsing {
-                            columns: using_cols_ast,
-                            ..
-                        })) = constraint
-                    {
-                        let mut out = Vec::new();
-                        for c in using_cols_ast {
-                            self.check_control()?;
-                            let name = c.value.clone();
-                            let name_lower = name.to_lowercase();
-                            let left_q = current_scope
-                                .iter_columns()
-                                .find(|(_, _, _, _, n)| {
-                                    n.as_ref()
-                                        .is_some_and(|name| name.to_lowercase() == name_lower)
-                                })
-                                .and_then(|(q, _, _, _, _)| q.clone());
-                            let right_q = right_scope
-                                .iter_columns()
-                                .find(|(_, _, _, _, n)| {
-                                    n.as_ref()
-                                        .is_some_and(|name| name.to_lowercase() == name_lower)
-                                })
-                                .and_then(|(q, _, _, _, _)| q.clone());
-                            match (left_q, right_q) {
-                                (Some(l), Some(r)) => out.push((name, l, r)),
-                                _ => {
-                                    return Err(AnalyzeError::invalid_query_shape(
-                                        format!("USING column `{name}` must exist on both sides"),
-                                        join.span,
-                                    ));
-                                }
-                            }
-                        }
-                        Some(out)
-                    } else {
-                        None
-                    };
-
-                // An outer join pads the side that found no partner, so
-                // every column that side exposes can arrive as NULL even
-                // when the table declares it NOT NULL. Widen the padded
-                // side's output scope before merging; the ON condition was
-                // analyzed above against the unwidened scopes, which is
-                // where the source's own nullability is still the truth.
                 match join_kind {
                     JoinKind::LeftOuter => right_scope.mark_all_nullable(),
                     JoinKind::RightOuter => current_scope.mark_all_nullable(),
@@ -371,56 +332,15 @@ impl<'a> super::AnalyzerContext<'a> {
                     _ => {}
                 }
                 current_scope.merge(&right_scope);
-                // USING-clause column hiding: each USING column appears
-                // once in SELECT * and at the head of the column list.
-                // For RIGHT joins the preserved side is right, so the
-                // surviving column resolves to the right binding. For
-                // FULL OUTER, both sides can be NULL-padded so we
-                // additionally register a `COALESCE(left.col,
-                // right.col)` computed column so that unqualified
-                // references and `SELECT *` see the merged value.
-                if let Some(ast::JoinCriteria::Using(ast::JoinUsing {
-                    columns: using_cols_ast,
-                    ..
-                })) = constraint
-                {
-                    let using_names: Vec<String> =
-                        using_cols_ast.iter().map(|c| c.value.clone()).collect();
-                    let prefer_right = matches!(join_kind, JoinKind::RightOuter);
-                    current_scope.apply_using_layout(&using_names, prefer_right);
-                    if let Some(quals) = coalesce_quals {
-                        for (col, l_q, r_q) in &quals {
-                            self.check_control()?;
-                            current_scope
-                                .register_full_outer_using_coalesce(
-                                    self.function_catalog,
-                                    std::slice::from_ref(col),
-                                    l_q,
-                                    r_q,
-                                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                                    self.constant_policy,
-                                    self.control,
-                                )
-                                .map_err(|error| error.at_type_mismatch(join.span))?;
-                        }
-                    } else if matches!(join_kind, JoinKind::RightOuter) {
-                        // RIGHT JOIN USING after a previous FULL OUTER
-                        // USING: the right side now owns the merged
-                        // column, so the prior left-side COALESCE
-                        // chain no longer reflects reality. Drop the
-                        // computed_column so unqualified resolution
-                        // falls back to the right-side binding.
-                        // LEFT / INNER joins keep the COALESCE
-                        // unchanged — they preserve the left side or
-                        // require equality, so the chained value is
-                        // still correct.
-                        for c in using_cols_ast {
-                            self.check_control()?;
-                            current_scope.clear_computed_column(&c.value);
-                        }
-                    }
-                }
             }
+        }
+        if !using_output.is_empty() {
+            let names = using_output
+                .iter()
+                .map(|(name, ..)| name.clone())
+                .collect::<Vec<_>>();
+            current_scope.apply_using_layout(&names, prefer_right);
+            current_scope.publish_using_columns(using_output);
         }
         let current_rel = Relation::Join(novarocks_parser::ast::AstBox::new(JoinRelation {
             naa_author: None,
@@ -867,6 +787,23 @@ impl<'a> super::AnalyzerContext<'a> {
             &resolved_table.catalog.columns,
             self.control,
         )?;
+        let crate::planner::table::ScanSource::Sql(source) = &table_def.source;
+        for field in &source.retired_read_fields {
+            self.check_control()?;
+            if let Some((ordinal, _)) = resolved_table
+                .catalog
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, column)| column.name == field.field_path[0])
+            {
+                self.factory.borrow_mut().register_retired_read_field(
+                    column_ids[ordinal],
+                    resolved_table.catalog.identity.fqn(),
+                    field.clone(),
+                );
+            }
+        }
         // Register Iceberg V3 row-lineage pseudo-columns (_row_id,
         // _last_updated_sequence_number) when the table carries them.
         // These are hidden from SELECT * but resolvable by explicit name.

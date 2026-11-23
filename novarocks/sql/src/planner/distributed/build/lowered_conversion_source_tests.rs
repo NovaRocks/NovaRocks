@@ -28,7 +28,10 @@ use crate::planner::payload::PlanProjectNode;
 use arrow::array::{Array, StringArray};
 use novarocks_constant_contract::ConstantPool;
 use novarocks_functions::{FunctionArgument, FunctionResultType};
-use novarocks_type_contract::{DecimalOverflowPolicy, ValueLogicalType};
+use novarocks_type_contract::{
+    CharacterKind, CharacterType, DecimalOverflowPolicy, TrinoCastMode, ValueKind, ValueLayout,
+    ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
+};
 use std::sync::Mutex;
 
 const CONVERSION: &str = "builtin.scalar/value_domain_conversion/v1";
@@ -83,10 +86,37 @@ fn selected_json() -> TypedExpr {
 fn cast(input: TypedExpr, target: ValueType, decimal: DecimalOverflowPolicy) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Cast {
-            array_failure_mode: None,
+            cast_mode: None,
             expr: novarocks_parser::ast::AstBox::new(input),
             target: target.data_type().clone(),
             decimal_overflow_policy: decimal,
+        },
+        value_type: target,
+    }
+}
+
+fn bounded_varchar() -> ValueType {
+    let storage = ValueTypeStorageLifetime::pure();
+    let character = CharacterType::new(CharacterKind::Varchar, 16).unwrap();
+    let value = ValueTypeRef::try_new(
+        ValueKind::BoundedCharacter(character),
+        false,
+        storage.clone(),
+    )
+    .unwrap();
+    let layout = ValueLayout::try_from_normalized_arrow(DataType::Utf8, storage).unwrap();
+    ValueType::try_from_value(value, layout).unwrap()
+}
+
+fn cast_to_bounded_varchar(input: TypedExpr, decimal: DecimalOverflowPolicy) -> TypedExpr {
+    let converted = cast(input, ValueType::new(DataType::Utf8, false), decimal);
+    let target = bounded_varchar();
+    TypedExpr {
+        kind: ExprKind::Cast {
+            cast_mode: Some(TrinoCastMode::Explicit),
+            expr: novarocks_parser::ast::AstBox::new(converted),
+            target: DataType::Utf8,
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
         },
         value_type: target,
     }
@@ -278,9 +308,8 @@ fn conversion_journal_constant_input_preserves_original_none_and_full_binding_lo
 
 #[test]
 fn conversion_journal_intermediate_call_is_separate_from_following_cast() {
-    let owner = finish(cast(
+    let owner = finish(cast_to_bounded_varchar(
         selected_json(),
-        ValueType::new(DataType::LargeUtf8, false),
         DecimalOverflowPolicy::OutputNull,
     ));
     let (fragment, unit_node, source) = conversion(&owner);
@@ -296,18 +325,18 @@ fn conversion_journal_intermediate_call_is_separate_from_following_cast() {
             ContractExprKind::Cast {
                 expr,
                 target,
-                decimal_overflow_policy,
+                cast_mode,
                 ..
             } if *expr == source.id => {
-                assert_eq!(target, &DataType::LargeUtf8);
-                assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
+                assert_eq!(target, &DataType::Utf8);
+                assert_eq!(*cast_mode, TrinoCastMode::Explicit);
                 true
             }
             _ => false,
         })
         .expect("actual second-stage same-domain CAST");
     assert_ne!(wrapper.id, source.id);
-    assert_eq!(wrapper.ty, ValueType::new(DataType::LargeUtf8, false));
+    assert_eq!(wrapper.ty, bounded_varchar());
     assert!(std::ptr::eq(receipt.source(), source));
     assert!(matches!(
         loan(&owner, fragment, unit_node, wrapper, &Control::default()),

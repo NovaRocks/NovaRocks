@@ -29,7 +29,7 @@ DROP SCHEMA IF EXISTS iceberg_rest_${suite_uuid0}.ivm_${uuid0} CASCADE;
 CREATE SCHEMA iceberg_rest_${suite_uuid0}.ivm_${uuid0};
 CREATE TABLE iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0} (
   id INT NOT NULL,
-  customer STRING,
+  customer VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 INSERT INTO iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0} VALUES

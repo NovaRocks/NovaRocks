@@ -85,6 +85,7 @@ fn equal<E: From<ValueTypeError>>(
             crate::schema::arrow_validated_data_types_exact_weighted_observed(left, right, observe)?
         }
         (ValueKind::String, ValueKind::String) | (ValueKind::Binary, ValueKind::Binary) => true,
+        (ValueKind::BoundedCharacter(left), ValueKind::BoundedCharacter(right)) => left == right,
         (ValueKind::Nominal(left), ValueKind::Nominal(right)) => {
             observe(TypeComparisonStep::Header)?;
             left == right
@@ -209,7 +210,11 @@ fn visit<'a, E>(
                 visit(field.field.value_type(), observe)?;
             }
         }
-        ValueKind::Scalar(_) | ValueKind::String | ValueKind::Binary | ValueKind::Nominal(_) => {}
+        ValueKind::Scalar(_)
+        | ValueKind::String
+        | ValueKind::BoundedCharacter(_)
+        | ValueKind::Binary
+        | ValueKind::Nominal(_) => {}
     }
     Ok(())
 }

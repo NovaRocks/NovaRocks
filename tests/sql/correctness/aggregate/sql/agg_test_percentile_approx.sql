@@ -98,7 +98,7 @@ select percentile_approx(c2, [0.1, 0.5, 0.9], 10000) from t1;
 USE ${case_db};
 CREATE TABLE "test_sorted_streaming_agg_percentile"
 (
-    "id_int" int(11) NOT NULL,
+    "id_int" INTEGER NOT NULL,
     "value" double NOT NULL
 ) WITH (format_version = 3);
 
@@ -115,18 +115,18 @@ select  percentile_approx(value, CAST([0.5, 0.9] AS array<double>), 5000) from t
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t0_convert_to_serialize_format" (
-  "v1" bigint(20),
-  "v2" bigint(20),
-  "v3" bigint(20)
+  "v1" BIGINT,
+  "v2" BIGINT,
+  "v3" BIGINT
 ) WITH (format_version = 3);
 
 -- query 22
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t1_convert_to_serialize_format" (
-  "v4" bigint(20),
-  "v5" bigint(20),
-  "v6" bigint(20)
+  "v4" BIGINT,
+  "v5" BIGINT,
+  "v6" BIGINT
 ) WITH (format_version = 3);
 
 -- query 23

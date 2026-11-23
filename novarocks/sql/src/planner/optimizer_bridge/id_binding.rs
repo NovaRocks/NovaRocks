@@ -226,14 +226,25 @@ fn verify_hash_aggregate(
     let aggregates = materialize_aggregate_calls(scalars, &op.aggregates, &op.output_layout);
     for (idx, aggregate) in aggregates.iter().enumerate() {
         if !op.is_merge.get(idx).copied().unwrap_or(false) {
-            for arg in aggregate.source.arguments() {
-                verify_expr(arg, input, "PhysicalHashAggregate aggregate arg")?;
+            if let Some(column) = aggregate.source.filter_input() {
+                verify_input_id(column, input, "PhysicalHashAggregate aggregate filter")?;
             }
-            verify_sort_items(
-                aggregate.source.order_by(),
-                input,
-                "PhysicalHashAggregate aggregate order-by",
-            )?;
+            for (ordinal, arg) in aggregate.source.arguments().iter().enumerate() {
+                let context = "PhysicalHashAggregate aggregate arg";
+                if let Some(column) = aggregate.source.projected_argument(ordinal) {
+                    verify_input_id(column, input, context)?;
+                } else {
+                    verify_expr(arg, input, context)?;
+                }
+            }
+            for (ordinal, sort) in aggregate.source.order_by().iter().enumerate() {
+                let context = "PhysicalHashAggregate aggregate order-by";
+                if let Some(column) = aggregate.source.projected_order_key(ordinal) {
+                    verify_input_id(column, input, context)?;
+                } else {
+                    verify_expr(&sort.expr, input, context)?;
+                }
+            }
         }
         verify_output_id(
             aggregate.output_column_id,
@@ -468,8 +479,14 @@ fn verify_expr(expr: &TypedExpr, input: &HashSet<ColumnId>, context: &str) -> Re
             for arg in args {
                 verify_expr(arg, input, context)?;
             }
-            if let ExprKind::AggregateCall { order_by, .. } = &expr.kind {
+            if let ExprKind::AggregateCall {
+                order_by, filter, ..
+            } = &expr.kind
+            {
                 verify_sort_items(order_by, input, context)?;
+                if let Some(predicate) = filter {
+                    verify_expr(predicate, input, context)?;
+                }
             }
             Ok(())
         }

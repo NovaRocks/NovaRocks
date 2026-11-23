@@ -99,7 +99,7 @@ fn physical_binary_policy_rejects_reporting_comparisons_before_publication() {
     }
 }
 #[test]
-fn physical_nested_decimal_cast_requires_a_supported_frozen_policy() {
+fn physical_nested_decimal_cast_preserves_its_frozen_mode() {
     let source = DataType::List(Arc::new(Field::new(
         "element",
         DataType::Decimal128(10, 2),
@@ -110,10 +110,10 @@ fn physical_nested_decimal_cast_requires_a_supported_frozen_policy() {
         DataType::Decimal128(12, 3),
         true,
     )));
-    for (result_type, policy, accepted) in [
-        (target.clone(), Policy::ReportError, false),
-        (target, Policy::OutputNull, true),
-        (source.clone(), Policy::ReportError, true),
+    for mode in [
+        novarocks_type_contract::TrinoCastMode::Explicit,
+        novarocks_type_contract::TrinoCastMode::Try,
+        novarocks_type_contract::TrinoCastMode::Implicit,
     ] {
         let mut builder = BoundExprSetBuilder::new(limits());
         let input_type = ValueType::new(source.clone(), true);
@@ -124,33 +124,18 @@ fn physical_nested_decimal_cast_requires_a_supported_frozen_policy() {
         let expression = builder
             .add(
                 None,
-                ValueType::new(result_type.clone(), true),
+                ValueType::new(target.clone(), true),
                 ExprKind::Cast {
-                    array_failure_mode: None,
-                    allow_throw_exception: SemanticParameterRef {
-                        id: SemanticParameterId::new(0),
-                        expected_key: SemanticParameterKey::AllowThrowException,
-                    },
+                    cast_mode: mode,
                     expr: operand,
-                    target: ValueType::new(result_type, true).data_type().clone(),
-                    decimal_overflow_policy: policy,
+                    target: ValueType::new(target.clone(), true).data_type().clone(),
                 },
             )
             .unwrap();
         builder
             .root(expression, EvaluationDemand::Value, RootScope::AllPorts)
             .unwrap();
-        let result = no_calls(builder, vec![], &Control::good());
-        if accepted {
-            result.unwrap();
-        } else {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("ReportError decimal CAST does not support nested type conversion")
-            );
-        }
+        no_calls(builder, vec![], &Control::good()).unwrap();
         drop(pools);
     }
 }
@@ -285,12 +270,7 @@ fn original_257_cast_semantic_depth_is_a_resource_refusal_before_control_expansi
                 None,
                 integer(false),
                 ExprKind::Cast {
-                    array_failure_mode: None,
-                    allow_throw_exception: SemanticParameterRef {
-                        id: SemanticParameterId::new(0),
-                        expected_key: SemanticParameterKey::AllowThrowException,
-                    },
-                    decimal_overflow_policy: Policy::OutputNull,
+                    cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                     expr: definition,
                     target: DataType::Int64,
                 },

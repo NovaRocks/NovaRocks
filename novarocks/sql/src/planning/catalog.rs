@@ -491,22 +491,27 @@ pub fn materialize_connector_read_table(
         &facts.schema,
         &facts.planning_facts,
     );
+    let mut source = SqlScanSource::new(
+        facts.binding,
+        SqlTableIdentity {
+            catalog: facts.catalog.clone(),
+            namespace: facts.namespace.clone(),
+            table: facts.table.clone(),
+        },
+        scan_kind,
+    )
+    .with_ukfk_facts(ukfk_facts);
+    source.retired_read_fields = facts
+        .planning_facts
+        .column_facts()
+        .iter()
+        .flat_map(|fact| fact.retired_read_fields().iter().cloned())
+        .collect();
     let planner = TableDef {
         name: facts.table.clone(),
         columns: facts.columns,
         iceberg_row_lineage_metadata_columns: facts.iceberg_row_lineage_metadata_columns,
-        source: ScanSource::Sql(
-            SqlScanSource::new(
-                facts.binding,
-                SqlTableIdentity {
-                    catalog: facts.catalog.clone(),
-                    namespace: facts.namespace.clone(),
-                    table: facts.table,
-                },
-                scan_kind,
-            )
-            .with_ukfk_facts(ukfk_facts),
-        ),
+        source: ScanSource::Sql(source),
     };
     Ok(ConnectorReadTableMaterialization {
         resolved: crate::catalog::ResolvedAnalyzerTable::from_planner(

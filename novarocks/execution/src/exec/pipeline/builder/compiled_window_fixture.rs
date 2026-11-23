@@ -259,7 +259,7 @@ fn typed_literal_values(
     builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     types: &[FunctionValueType],
     rows: &[Vec<novarocks_functions::ConstantValue>],
-) -> (Vec<novarocks_physical_plan::ValueId>, bool) {
+) -> Vec<novarocks_physical_plan::ValueId> {
     let needs_cast = |literal: &novarocks_functions::ConstantValue, ty: &FunctionValueType| {
         literal.value_type().data_type() == &DataType::Int64
             && !super::family_fixture::constant_sources::is_null(literal)
@@ -275,10 +275,7 @@ fn typed_literal_values(
             .any(|(literal, ty)| needs_cast(literal, ty))
     });
     if !has_cast {
-        return (
-            super::family_fixture::values(builder, VALUES, types, rows),
-            false,
-        );
+        return super::family_fixture::values(builder, VALUES, types, rows);
     }
     let columns = types
         .iter()
@@ -311,11 +308,9 @@ fn typed_literal_values(
                                 None,
                                 ty.clone(),
                                 ExprKind::Cast {
-                                    array_failure_mode: None,
+                                    cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
                                     expr: source,
                                     target: ty.data_type().clone(),
-                                    decimal_overflow_policy: POLICY,
-                                    allow_throw_exception: allow_throw(),
                                 },
                             )
                             .unwrap()
@@ -339,7 +334,7 @@ fn typed_literal_values(
             columns.clone().into_boxed_slice(),
         )
         .unwrap();
-    (columns, true)
+    columns
 }
 
 /// The package of `Values(rows) -> Sort -> Window(shape) -> Result` over
@@ -388,7 +383,7 @@ pub(super) fn package_typed(
             FragmentId::new(43),
             &fixture_sources,
         );
-    let (columns, integral_literal_cast) = typed_literal_values(&mut builder, types, literal_rows);
+    let columns = typed_literal_values(&mut builder, types, literal_rows);
     // Constants: one non-null BIGINT pool, one ordinal per constant argument.
     let constants = shape
         .calls
@@ -795,10 +790,10 @@ pub(super) fn package_typed(
         .iter()
         .flat_map(|call| call.args.iter())
         .any(|arg| matches!(arg, Arg::Overflowing(_)));
-    let parameters = if overflowing || integral_literal_cast {
+    let parameters = if overflowing {
         SemanticParameters::try_new([(
             allow_throw().id,
-            novarocks_type_contract::SemanticParameterValue::AllowThrowException(overflowing),
+            novarocks_type_contract::SemanticParameterValue::AllowThrowException(true),
         )])
         .unwrap()
     } else {

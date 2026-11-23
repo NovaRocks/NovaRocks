@@ -26,9 +26,9 @@ CREATE TABLE ${case_db}."t1_nulls" (
   "v1" int ,
   "v2" bigint ,
   "v3" largeint ,
-  "v4" string ,
+  "v4" VARCHAR ,
   "v5" json ,
-  "v6" map<int, string> ,
+  "v6" map<int, VARCHAR> ,
   "v7" array<int>
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}."t1_nulls" SELECT generate_series, generate_series, generate_series, generate_series, generate_series, MAP(ARRAY[generate_series], ARRAY[generate_series]), [generate_series] FROM TABLE(sequence(1, 40960)) AS generate_series(generate_series);
@@ -54,9 +54,9 @@ CREATE TABLE ${case_db}."t1_not_nulls" (
   "v1" int,
   "v2" bigint,
   "v3" largeint,
-  "v4" string,
+  "v4" VARCHAR,
   "v5" json,
-  "v6" map<int, string>,
+  "v6" map<int, VARCHAR>,
   "v7" array<int>
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}."t1_not_nulls" SELECT generate_series, generate_series, generate_series, generate_series, generate_series, MAP(ARRAY[generate_series], ARRAY[generate_series]), [generate_series] FROM TABLE(sequence(1, 40960)) AS generate_series(generate_series);

@@ -21,12 +21,13 @@ use crate::{
         filter_conjunction_fixture::{Control, FilterShape, batch, fixture, group},
     },
 };
-use novarocks_functions::Selection;
+use novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT;
+use novarocks_functions::{DataFailureReason, Selection};
 
 #[test]
 fn filter_conjunction_actual_pending_error_commits_before_rand_boundary() {
     let f = fixture(FilterShape::DateAndRandom);
-    let input = batch(&f, &[0], &[Some(f64::NAN)]);
+    let input = batch(&f, &[0], &[Some("not a date")]);
     let mut instance = group(&f);
     let error = instance
         .evaluate(
@@ -44,6 +45,10 @@ fn filter_conjunction_actual_pending_error_commits_before_rand_boundary() {
     };
     assert_eq!(error.root(), f.roots[0]);
     assert_eq!(error.batch_row(), 0);
+    assert_eq!(
+        error.error().reason(),
+        DataFailureReason::Domain(INVALID_CAST_ARGUMENT)
+    );
     assert_eq!(
         instance.constructed_root_call_instances(1),
         0,

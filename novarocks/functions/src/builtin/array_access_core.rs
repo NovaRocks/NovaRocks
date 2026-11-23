@@ -21,9 +21,11 @@ use super::{
     collection_arrow::{ArrowSite, arrow_failure, cast_output, contract},
     map_lookup_core::row_index,
 };
-use crate::KernelFailure;
+use crate::{KernelFailure, RowDataError};
 use arrow_array::builder::StringBuilder;
-use arrow_array::{Array, ArrayRef, BooleanArray, Int32Array, ListArray, StringArray, UInt32Array};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, ListArray, StringArray, UInt32Array,
+};
 use arrow_schema::DataType;
 use arrow_select::take::take;
 #[derive(Debug)]
@@ -41,6 +43,7 @@ pub struct ArrayAccessInputs {
     array: ArrayRef,
     subscript: ArrayRef,
     check: Option<ArrayRef>,
+    strict: bool,
 }
 impl ArrayAccessInputs {
     pub fn new<E>(
@@ -86,8 +89,35 @@ impl ArrayAccessInputs {
             array,
             subscript,
             check,
+            strict: false,
         })
     }
+    pub(super) fn strict(array: ArrayRef, subscript: ArrayRef) -> Result<Self, KernelFailure> {
+        if !array.as_any().is::<ListArray>() || !subscript.as_any().is::<Int64Array>() {
+            return Err(contract(
+                "array subscript requires its exact ARRAY and BIGINT carriers",
+            ));
+        }
+        Ok(Self {
+            array,
+            subscript,
+            check: None,
+            strict: true,
+        })
+    }
+
+    fn index_value(&self, row: usize) -> i64 {
+        if self.strict {
+            self.subscript
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("strict BIGINT admission")
+                .value(row)
+        } else {
+            i64::from(self.subscript().value(row))
+        }
+    }
+
     pub fn list(&self) -> &ListArray {
         self.array
             .as_any()
@@ -151,9 +181,9 @@ pub fn lookup_observed<E>(
     output_type: Option<&DataType>,
     mut before_take: impl FnMut(&dyn Array, &UInt32Array) -> Result<(), E>,
     observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
-) -> Result<ArrayRef, AccessFailure<E>> {
+) -> Result<(ArrayRef, Box<[RowDataError]>), AccessFailure<E>> {
     let list = inputs.list();
-    let subscript_arr = inputs.subscript();
+    let subscript_arr = &inputs.subscript;
     let check_arr = inputs.flags();
     let offsets = list.value_offsets();
     let values = list.values();
@@ -161,6 +191,7 @@ pub fn lookup_observed<E>(
     super::string_failure::array_layout::<Option<u32>>(selection.len())
         .map_err(AccessFailure::Operation)?;
     let mut indices = Vec::new();
+    let mut row_errors = Vec::new();
     indices
         .try_reserve_exact(selection.len())
         .map_err(|source| {
@@ -203,35 +234,35 @@ pub fn lookup_observed<E>(
         let start = offsets[row] as usize;
         let end = offsets[row + 1] as usize;
         let row_len = end - start;
-        let subscript = subscript_arr.value(subscript_idx);
-        if subscript <= 0 {
-            if check_out_of_bounds {
-                return Err(AccessFailure::Operation(KernelFailure::from_domain(
-                    AccessCause::BelowOne { ordinal, subscript },
-                )));
+        let subscript = inputs.index_value(subscript_idx);
+        let undefined = if subscript <= 0 {
+            Some(AccessCause::BelowOne { ordinal, subscript })
+        } else if subscript as u64 > row_len as u64 {
+            Some(AccessCause::AboveLength {
+                ordinal,
+                subscript,
+                len: row_len,
+            })
+        } else {
+            None
+        };
+        if let Some(cause) = undefined {
+            if inputs.strict {
+                row_errors
+                    .try_reserve(1)
+                    .map_err(|_| AccessFailure::Operation(KernelFailure::ResourceExhausted))?;
+                row_errors.push(
+                    RowDataError::from_domain(ordinal, StrictSubscriptCause(cause))
+                        .map_err(AccessFailure::Operation)?,
+                );
+            } else if check_out_of_bounds {
+                return Err(AccessFailure::Operation(KernelFailure::from_domain(cause)));
             }
             indices.push(None);
             continue;
         }
-        let subscript = usize::try_from(subscript).map_err(|source| {
-            AccessFailure::Operation(KernelFailure::from_domain(AccessCause::Conversion {
-                operation: "element_at subscript conversion failed",
-                source,
-            }))
-        })?;
-        if subscript > row_len {
-            if check_out_of_bounds {
-                return Err(AccessFailure::Operation(KernelFailure::from_domain(
-                    AccessCause::AboveLength {
-                        ordinal,
-                        subscript,
-                        len: row_len,
-                    },
-                )));
-            }
-            indices.push(None);
-            continue;
-        }
+        // The checked List offsets and row length bound the positive BIGINT.
+        let subscript = subscript as usize;
         let target = start + subscript - 1;
         let target = u32::try_from(target).map_err(|source| {
             AccessFailure::Operation(KernelFailure::from_domain(AccessCause::Conversion {
@@ -255,11 +286,15 @@ pub fn lookup_observed<E>(
         })?
     };
     observe(observer, CollectionObservation::OpaqueBoundary)?;
-    let out = maybe_unquote_wrapped_utf8_observed(out, observer)?;
+    let out = if inputs.strict {
+        out
+    } else {
+        let projected = maybe_unquote_wrapped_utf8_observed(out, observer)?;
+        observe(observer, CollectionObservation::OpaqueBoundary)?;
+        cast_output(projected, output_type, "element_at").map_err(AccessFailure::Operation)?
+    };
     observe(observer, CollectionObservation::OpaqueBoundary)?;
-    let out = cast_output(out, output_type, "element_at").map_err(AccessFailure::Operation)?;
-    observe(observer, CollectionObservation::OpaqueBoundary)?;
-    Ok(out)
+    Ok((out, row_errors.into_boxed_slice()))
 }
 pub fn maybe_unquote_wrapped_utf8_observed<E>(
     array: ArrayRef,
@@ -305,11 +340,11 @@ pub fn maybe_unquote_wrapped_utf8_observed<E>(
 enum AccessCause {
     BelowOne {
         ordinal: usize,
-        subscript: i32,
+        subscript: i64,
     },
     AboveLength {
         ordinal: usize,
-        subscript: usize,
+        subscript: i64,
         len: usize,
     },
     Conversion {
@@ -361,6 +396,37 @@ impl novarocks_failure_contract::FailureProjection for AccessCause {
     }
 }
 impl novarocks_failure_contract::OuterFailureProjection for AccessCause {}
+
+/// Keep the Trino data reason distinct from the original element_at contract.
+#[derive(Debug)]
+struct StrictSubscriptCause(AccessCause);
+
+impl std::fmt::Display for StrictSubscriptCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            AccessCause::BelowOne { subscript: 0, .. } => {
+                f.write_str("SQL array indices start at 1")
+            }
+            AccessCause::BelowOne { subscript, .. } => {
+                write!(f, "Array subscript is negative: {subscript}")
+            }
+            cause => cause.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for StrictSubscriptCause {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl novarocks_failure_contract::FailureProjection for StrictSubscriptCause {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, kernel_reason};
+        FailureFact::new(FailureClass::Data, kernel_reason::INVALID_FUNCTION_ARGUMENT)
+    }
+}
 
 #[cfg(test)]
 mod source_properties {
@@ -430,7 +496,7 @@ mod source_properties {
         let index: ArrayRef = Arc::new(Int32Array::from(vec![1]));
         let mut observer = |_| Ok::<_, KernelFailure>(());
         let inputs = ArrayAccessInputs::new(list, index, None, &mut observer).unwrap();
-        let output = lookup_observed(
+        let (output, row_errors) = lookup_observed(
             &inputs,
             crate::Selection::all(1),
             |_, row| Ok(inputs.direct_rows(row)),
@@ -439,6 +505,7 @@ mod source_properties {
             &mut observer,
         )
         .unwrap();
+        assert!(row_errors.is_empty());
         assert_eq!(output.data_type(), &expected);
         assert_eq!(output.len(), 1);
         assert_eq!(output.null_count(), 1);

@@ -1072,7 +1072,7 @@ impl ExprText<'_> {
                 if novarocks_type_contract::OperatorFunction::from_function_id(
                     &function.function_id,
                 )
-                .is_some() =>
+                .is_some_and(|operator| operator.is_infix()) =>
             {
                 let [left, right] = args.as_ref() else {
                     return Err(fmt::Error);
@@ -1377,7 +1377,15 @@ impl TreeContext<'_> {
                             function_text(&call.binding.function.function_id),
                             if call.distinct { "DISTINCT " } else { "" },
                             self.expressions(fragment, node.id, &call.arguments, ", ")
-                        )
+                        )?;
+                        if let Some(predicate) = call.filter_root {
+                            write!(
+                                f,
+                                " FILTER (WHERE {})",
+                                self.expr(fragment, node.id, predicate)
+                            )?;
+                        }
+                        Ok(())
                     });
                     out.push(format_args!("{pad}  aggregations: {aggregates}"))?;
                 }

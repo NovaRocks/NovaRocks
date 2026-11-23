@@ -18,10 +18,12 @@
 use super::*;
 use arrow::array::ArrayRef;
 use arrow::datatypes::Field;
-use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::testkit::{PassThroughCallHost, numeric_fixtures::compiled_cast};
 use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
-use novarocks_functions::{CastOperation, ScalarInvocationActivation, ScalarInvocationScope};
-use novarocks_type_contract::{ExpressionEffects, ValueLogicalType};
+use novarocks_functions::{
+    CastPrepareError, PreparedCastRecipe, ScalarInvocationActivation, ScalarInvocationScope,
+};
+use novarocks_type_contract::{ExpressionEffects, TrinoCastMode, ValueLogicalType};
 
 fn profiles() -> Vec<(DataType, DataType)> {
     let numeric = [
@@ -174,81 +176,75 @@ fn root_context(program: &CompiledFixture) -> (ExpressionUseId, ExpressionEffect
 }
 
 #[test]
-fn actual_compiled_bool_cast_thirteen_profiles_keep_sparse_sliced_nulls_and_exact_policies() {
+fn boolean_cast_modes_preserve_typed_values_and_sparse_source_nulls() {
     for (source, target) in profiles() {
-        for allow in [false, true] {
-            for policy in [
-                DecimalOverflowPolicy::OutputNull,
-                DecimalOverflowPolicy::ReportError,
-            ] {
-                let source_type = FunctionValueType::new(source.clone(), true);
-                let target_type = FunctionValueType::new(target.clone(), true);
-                let program = compiled(
-                    source_type.clone(),
-                    target_type.clone(),
-                    Source::Column,
-                    Wrap::Bare,
-                    policy,
-                    allow,
-                );
-                let (occurrence, context) = root_context(&program);
-                let recipe = root_unit(&program).recipes().cast(occurrence).unwrap();
-                assert_eq!(recipe.source_type(), &source_type);
-                assert_eq!(recipe.result_type(), &target_type);
-                assert_eq!(recipe.allow_throw_exception(), allow);
-                assert_eq!(recipe.decimal_overflow_policy(), policy);
-                assert_eq!(
-                    recipe.own_effects(context).for_use(context).unwrap(),
-                    ExpressionEffects::PURE_VALUE
-                );
-                let batch = batch_with_source(&program, source_values(&source), None);
-                let rows = [0, 1, 2, 4];
-                let selection = Selection::try_sparse(5, &rows).unwrap();
-                let expected = match source {
-                    DataType::Boolean => vec![Some(false), Some(true), None, Some(false)],
-                    DataType::Float32 | DataType::Float64 => {
-                        vec![Some(false), Some(true), None, Some(true)]
-                    }
-                    _ => vec![Some(true), Some(false), None, Some(true)],
-                };
-                let mut evaluator = instance(&program);
-                for _ in 0..2 {
-                    let output = evaluator
-                        .evaluate(
-                            EvaluationInput::Batch {
-                                batch: &batch,
-                                source: None,
-                            },
-                            ScalarInvocationScope::new(selection, selection),
-                            ScalarInvocationActivation::Activated,
-                            &Control,
-                            &mut PassThroughCallHost,
-                        )
-                        .unwrap();
-                    assert_eq!(output.selection().iter().collect::<Vec<_>>(), rows);
-                    assert_eq!(output.values().data_type(), &target);
-                    assert!(output.errors().is_empty());
-                    assert_zero_one(&output, &target, &expected);
+        for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
+            let source_type = FunctionValueType::new(source.clone(), true);
+            let target_type = FunctionValueType::new(target.clone(), true);
+            let program = compiled_cast(
+                source_type.clone(),
+                target_type.clone(),
+                Source::Column,
+                Wrap::Bare,
+                mode,
+                false,
+            );
+            let (occurrence, context) = root_context(&program);
+            let recipe = root_unit(&program).recipes().cast(occurrence).unwrap();
+            assert_eq!(recipe.source_type(), &source_type);
+            assert_eq!(recipe.result_type(), &target_type);
+            assert_eq!(recipe.cast_mode(), Some(mode));
+            assert_eq!(
+                recipe.own_effects(context).for_use(context).unwrap(),
+                ExpressionEffects::PURE_VALUE
+            );
+            let batch = batch_with_source(&program, source_values(&source), None);
+            let rows = [0, 1, 2, 4];
+            let selection = Selection::try_sparse(5, &rows).unwrap();
+            let expected = match source {
+                DataType::Boolean => vec![Some(false), Some(true), None, Some(false)],
+                DataType::Float32 | DataType::Float64 => {
+                    vec![Some(false), Some(true), None, Some(true)]
                 }
+                _ => vec![Some(true), Some(false), None, Some(true)],
+            };
+            let mut evaluator = instance(&program);
+            for _ in 0..2 {
                 let output = evaluator
                     .evaluate(
                         EvaluationInput::Batch {
                             batch: &batch,
                             source: None,
                         },
-                        {
-                            let selection = Selection::try_sparse(5, &[]).unwrap();
-                            ScalarInvocationScope::new(selection, selection)
-                        },
+                        ScalarInvocationScope::new(selection, selection),
                         ScalarInvocationActivation::Activated,
                         &Control,
                         &mut PassThroughCallHost,
                     )
                     .unwrap();
-                assert!(output.values().is_empty());
+                assert_eq!(output.selection().iter().collect::<Vec<_>>(), rows);
                 assert_eq!(output.values().data_type(), &target);
                 assert!(output.errors().is_empty());
+                assert_zero_one(&output, &target, &expected);
             }
+            let output = evaluator
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    {
+                        let selection = Selection::try_sparse(5, &[]).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
+            assert!(output.values().is_empty());
+            assert_eq!(output.values().data_type(), &target);
+            assert!(output.errors().is_empty());
         }
     }
 }
@@ -388,54 +384,27 @@ fn actual_compiled_bool_cast_nonfinite_values_are_not_null_under_coalesce_isnull
 }
 
 #[test]
-fn actual_compiled_bool_cast_full_type_nullable_and_uninstalled_nominal_profiles_refuse_without_fallback()
- {
-    // The Physical definition author already rejects dropping source NULLs;
-    // do not manufacture an invalid checked package to reach the compiler.
-    // Its independent prepared owner must refuse the same false declaration.
-    assert!(matches!(
-        novarocks_functions::PreparedCastRecipe::try_new(
-            CastOperation::Carrier,
-            &FunctionValueType::new(DataType::Boolean, true),
-            &FunctionValueType::new(DataType::Int64, false),
-            DecimalOverflowPolicy::OutputNull,
-            false,
-            None,
-            &Control,
-        ),
-        Err(novarocks_functions::CastPrepareError::TypeMismatch)
-    ));
-    // Nominal identities remain valid authored types, but their carrier identity
-    // CAST is not one of the new Physical scalar profiles. No invalid FVT is forged.
-    let uuid = FunctionValueType::try_with_logical_type(
-        DataType::FixedSizeBinary(16),
-        true,
-        ValueLogicalType::Uuid,
-    )
-    .unwrap();
-    let authored = cast_fixture(
-        uuid.clone(),
-        uuid,
-        Source::Column,
-        Wrap::Bare,
-        DecimalOverflowPolicy::OutputNull,
-        false,
-    );
-    match authored {
-        Err(error) => assert!(
-            error
-                .to_string()
-                .contains("implemented exact Physical scalar domain")
-        ),
-        Ok(fixture) => assert!(fixture.compile(&Control).is_err()),
+fn boolean_cast_checks_frozen_nullability_and_input_layout() {
+    let nullable_source = FunctionValueType::new(DataType::Boolean, true);
+    let nonnullable_result = FunctionValueType::new(DataType::Int64, false);
+    for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
+        assert!(matches!(
+            PreparedCastRecipe::try_new_trino(
+                &nullable_source,
+                &nonnullable_result,
+                mode,
+                &Control
+            ),
+            Err(CastPrepareError::TypeMismatch)
+        ));
     }
-    let program = compiled(
+    let program = compiled_cast(
         FunctionValueType::new(DataType::Boolean, false),
-        FunctionValueType::new(DataType::Int64, false),
+        nonnullable_result,
         Source::Column,
         Wrap::Bare,
-        DecimalOverflowPolicy::ReportError,
-        true,
+        TrinoCastMode::Explicit,
+        false,
     );
     let wrong: ArrayRef = Arc::new(Int64Array::from(vec![1]));
     // Construct a real but different incoming schema, rather than bypassing
@@ -464,6 +433,55 @@ fn actual_compiled_bool_cast_full_type_nullable_and_uninstalled_nominal_profiles
             KernelFailure::InvalidProgram(_)
         ))
     ));
+}
+
+#[test]
+fn uuid_identity_cast_retains_nominal_layout_and_bytes() {
+    let uuid = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::Uuid,
+    )
+    .unwrap();
+    let bytes = [0x84_u8; 16];
+    let input = Arc::new(
+        arrow::array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [Some(bytes), None].into_iter(),
+            16,
+        )
+        .unwrap(),
+    );
+    for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
+        let program = compiled_cast(
+            uuid.clone(),
+            uuid.clone(),
+            Source::Column,
+            Wrap::Bare,
+            mode,
+            false,
+        );
+        let recipe = root_unit(&program)
+            .recipes()
+            .cast(cast_root_use(&program))
+            .unwrap();
+        assert!(recipe.is_identity());
+        assert_eq!(recipe.result_type(), &uuid);
+        let batch = batch_with_source(&program, input.clone(), None);
+        let output = instance(&program)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
+        assert_eq!(output.values().to_data(), input.to_data());
+        assert!(output.errors().is_empty());
+    }
 }
 
 #[test]

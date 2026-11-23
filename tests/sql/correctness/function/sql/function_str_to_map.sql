@@ -23,7 +23,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t1(c1 INT, c2 STRING) WITH (format_version = 3);
+CREATE TABLE ${case_db}.t1(c1 INT, c2 VARCHAR) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true

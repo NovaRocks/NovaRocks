@@ -1,0 +1,11 @@
+-- query 5
+-- types	integer	varchar
+user_id	dt
+1	d
+2	d
+3	d
+
+-- query 6
+-- types	bigint	bigint
+c	n
+1	3

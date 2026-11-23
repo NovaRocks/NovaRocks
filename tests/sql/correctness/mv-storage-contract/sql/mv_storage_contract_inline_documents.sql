@@ -30,7 +30,7 @@ CREATE SCHEMA mvside_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
-CREATE TABLE mvside_${uuid0}.ns_${uuid0}.fact (k STRING) WITH (format_version = 3);
+CREATE TABLE mvside_${uuid0}.ns_${uuid0}.fact (k VARCHAR) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true

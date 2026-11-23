@@ -47,9 +47,9 @@ INSERT INTO ${case_db}.decimal_array_test VALUES ROW(1, ARRAY[DECIMAL '123456789
 -- Create table with MAP<string, decimal256> columns
 CREATE TABLE ${case_db}.decimal_map_test (
     id INT,
-    decimal_map_50 MAP<STRING, DECIMAL(38,15)>,
-    decimal_map_76 MAP<STRING, DECIMAL(38,0)>,
-    key_decimal_map MAP<DECIMAL(38,10), STRING>
+    decimal_map_50 MAP<VARCHAR, DECIMAL(38,15)>,
+    decimal_map_76 MAP<VARCHAR, DECIMAL(38,0)>,
+    key_decimal_map MAP<DECIMAL(38,10), VARCHAR>
 ) WITH (format_version = 3);
 
 -- Insert test data for maps - using Iceberg-compatible decimal values
@@ -88,7 +88,7 @@ CREATE TABLE ${case_db}.decimal_struct_test (
         account_id BIGINT,
         balance DECIMAL(38,15),
         metadata ROW(
-            created_date STRING,
+            created_date VARCHAR,
             last_transaction DECIMAL(38,10)
         )
     )
@@ -105,12 +105,12 @@ INSERT INTO ${case_db}.decimal_struct_test VALUES ROW(1, ROW(DECIMAL '1234567890
 CREATE TABLE ${case_db}.complex_nested_test (
     id INT,
     portfolio ARRAY<ROW(
-        asset_name STRING,
+        asset_name VARCHAR,
         quantity DECIMAL(38,15),
         price DECIMAL(38,15),
-        metadata MAP<STRING, DECIMAL(38,10)>
+        metadata MAP<VARCHAR, DECIMAL(38,10)>
     )>,
-    risk_metrics MAP<STRING, ARRAY<DECIMAL(38,20)>>
+    risk_metrics MAP<VARCHAR, ARRAY<DECIMAL(38,20)>>
 ) WITH (format_version = 3);
 
 -- Insert test data for complex nested structures - using Iceberg-compatible decimal values

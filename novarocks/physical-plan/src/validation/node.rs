@@ -3573,6 +3573,26 @@ fn validate_aggregate_contract(
             path,
             errors,
         );
+        if let Some(root) = call.filter_root {
+            if !call.binding.phase.consumes_logical_arguments() {
+                errors.push(ValidationError::new(
+                    path,
+                    "state-consuming aggregate phase cannot apply FILTER",
+                ));
+            }
+            if !fragment
+                .root_expression(node.id, root)
+                .is_some_and(|expression| {
+                    matches!(expression.kind, ExprKind::Value(_))
+                        && expression.ty.data_type() == &arrow_schema::DataType::Boolean
+                })
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "aggregate FILTER must directly reference a BOOLEAN input value",
+                ));
+            }
+        }
         if !call.binding.phase.consumes_logical_arguments() && call.distinct {
             errors.push(ValidationError::new(
                 path,
@@ -3664,6 +3684,7 @@ fn validate_grouped_topn(
     for call in calls {
         if !matches!(call.binding.phase, AggregatePhase::Intermediate { .. })
             || call.distinct
+            || call.filter_root.is_some()
             || !call.order_by.is_empty()
             || call.arguments.len() != 1
         {

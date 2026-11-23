@@ -302,6 +302,9 @@ impl<'a, 'context, 'control> ConstantFolder<'a, 'context, 'control> {
                         novarocks_functions::PureCallLifecycle::Aggregate,
                         self.work.control(),
                     )?;
+                    if aggregate.source.has_projected_inputs() {
+                        continue;
+                    }
                     changed |= aggregate.source.rewrite_channels(|arguments, order_by| {
                         let args_changed = self.fold_slots(arguments)?;
                         Ok::<_, SqlCompileError>(args_changed | self.fold_sort_keys(order_by)?)
@@ -318,6 +321,9 @@ impl<'a, 'context, 'control> ConstantFolder<'a, 'context, 'control> {
                         novarocks_functions::PureCallLifecycle::Aggregate,
                         self.work.control(),
                     )?;
+                    if aggregate.source.has_projected_inputs() {
+                        continue;
+                    }
                     changed |= aggregate.source.rewrite_channels(|arguments, order_by| {
                         let args_changed = self.fold_slots(arguments)?;
                         Ok::<_, SqlCompileError>(args_changed | self.fold_sort_keys(order_by)?)
@@ -596,7 +602,15 @@ fn fold_scalar_uncached(
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
             *body = fold_scalar_id(arena, *body, ctx, memo, work)?;
         }
-        ScalarNode::AggregateCall { args, order_by, .. } => {
+        ScalarNode::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let Some(predicate) = filter {
+                *predicate = fold_scalar_id(arena, *predicate, ctx, memo, work)?;
+            }
             for arg in args.iter_mut() {
                 *arg = fold_scalar_id(arena, *arg, ctx, memo, work)?;
             }

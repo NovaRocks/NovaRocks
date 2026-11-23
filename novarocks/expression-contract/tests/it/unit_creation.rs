@@ -276,14 +276,9 @@ fn temporal_input() -> (BoundExprSetBuilder, Vec<ExprPort>) {
                 None,
                 integer(false),
                 ExprKind::Cast {
-                    array_failure_mode: None,
+                    cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                     expr: normal,
                     target: DataType::Int64,
-                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    allow_throw_exception: SemanticParameterRef {
-                        id: SemanticParameterId::new(0),
-                        expected_key: SemanticParameterKey::AllowThrowException,
-                    },
                 },
             )
             .unwrap();

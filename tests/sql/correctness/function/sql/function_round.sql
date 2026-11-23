@@ -30,13 +30,13 @@ CREATE TABLE ${case_db}.test_all_null (
     id_smallint smallint ,
     id_bigint bigint ,
     id_largeint largeint ,
-    id_float float ,
+    id_float REAL ,
     id_double double ,
-    id_decimal32 decimal32(8, 5) ,
-    id_decimal64 decimal64(8, 5) ,
-    id_decimal128 decimal128(8, 5) ,
+    id_decimal32 DECIMAL(8, 5) ,
+    id_decimal64 DECIMAL(8, 5) ,
+    id_decimal128 DECIMAL(8, 5) ,
     id_date date ,
-    id_datetime datetime ,
+    id_datetime TIMESTAMP(6) ,
     id_varchar varchar(2000) ,
     id_json json,
     id_any_element int ,
@@ -47,11 +47,11 @@ CREATE TABLE ${case_db}.test_all_null (
     id_array_int array<int> ,
     id_array_bigint array<bigint> ,
     id_array_largeint array<largeint> ,
-    id_array_float array<float> ,
+    id_array_float array<REAL> ,
     id_array_double array<double> ,
     id_array_varchar array<varchar(2000)> ,
     id_array_date array<date> ,
-    id_array_datetime array<datetime>
+    id_array_datetime array<TIMESTAMP(6)>
 ) WITH (format_version = 3);
 
 -- query 2

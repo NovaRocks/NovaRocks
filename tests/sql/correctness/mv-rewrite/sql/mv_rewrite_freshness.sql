@@ -40,8 +40,8 @@ CREATE SCHEMA mvrw_${uuid0}.ns_${uuid0};
 -- @skip_result_check=true
 CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.orders (
   id BIGINT NOT NULL,
-  region STRING,
-  day STRING,
+  region VARCHAR,
+  day VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 
