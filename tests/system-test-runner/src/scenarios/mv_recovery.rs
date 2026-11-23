@@ -1582,6 +1582,8 @@ impl Scenario for MvCurrentDependencyRecheck {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        use super::mv_uea7_documents::{commit_updates, load_metadata, wire::Graph};
+
         require_three_backends(context)?;
         let catalog = "system_mv_dependency_recheck";
         let (create_catalog_sql, rest_uri) = {
@@ -1635,12 +1637,25 @@ impl Scenario for MvCurrentDependencyRecheck {
             ),
             "wait for BE computation before Current recheck",
         )?;
-        let before_injection =
-            super::mv_uea7_documents::load_metadata(context, &rest_uri, "ns", "orders_mv")?;
-        let graph = super::mv_uea7_documents::wire::Graph::from_metadata(&before_injection)?;
+        let before_injection = load_metadata(context, &rest_uri, "ns", "orders_mv")?;
+        let graph = Graph::from_metadata(&before_injection)?;
         let missing_key = format!("novarocks.doc.v2.rev.{}", graph.definition);
-        let snapshot_id =
-            externally_remove_current_definition_document(context, &rest_uri, "ns", "orders_mv")?;
+        context.action(format!(
+            "remove current definition version {missing_key} without changing main"
+        ));
+        // This external metadata-only write leaves snapshot OCC satisfied so
+        // the held refresh must reobserve its Current documents before commit.
+        let after_injection = commit_updates(
+            context,
+            &rest_uri,
+            "ns",
+            "orders_mv",
+            &before_injection,
+            vec![serde_json::json!({"action":"remove-properties","removals":[&missing_key]})],
+            "remove-current-definition",
+        )?;
+        assert_rest_snapshot_state_unchanged(&before_injection, &after_injection)
+            .context("external D removal changed the MV snapshot state")?;
         prepared.remove()?;
         context.action("verify an externally changed D stops the old refresh before commit");
         match held_refresh.recv_timeout(context.remaining("receive stale MV refresh")?) {
@@ -1655,8 +1670,10 @@ impl Scenario for MvCurrentDependencyRecheck {
             Ok(Ok(())) => bail!("stale MV refresh published after D changed"),
             Err(error) => bail!("stale MV refresh did not finish: {error}"),
         }
-        assert_rest_snapshot_unchanged(context, &rest_uri, "ns", "orders_mv", snapshot_id)?;
-        context.action("Current D drift rejected without a second MV snapshot");
+        let after_rejection = load_metadata(context, &rest_uri, "ns", "orders_mv")?;
+        assert_rest_snapshot_state_unchanged(&before_injection, &after_rejection)
+            .context("rejected stale refresh changed the MV snapshot state")?;
+        context.action("Current D drift rejected with the MV snapshot state unchanged");
         Ok(())
     }
 
@@ -1775,9 +1792,6 @@ impl Scenario for MvLegacyInterpretationRebuild {
             "orders_mv",
             "before-rejected-refresh",
         )?;
-        let management_snapshot = management_metadata["current-snapshot-id"]
-            .as_i64()
-            .context("empty management snapshot has no Current ID")?;
         context.action("old L must reject a refresh without a data publication");
         let failure = conn
             .execute("REFRESH MATERIALIZED VIEW orders_mv")
@@ -1788,7 +1802,6 @@ impl Scenario for MvLegacyInterpretationRebuild {
         {
             bail!("old L refresh failed for another reason: {error}");
         }
-        assert_rest_snapshot_unchanged(context, &rest_uri, "ns", "orders_mv", management_snapshot)?;
         let after_rejection = capture_empty_management_snapshot(
             context,
             &rest_uri,
@@ -1796,10 +1809,8 @@ impl Scenario for MvLegacyInterpretationRebuild {
             "orders_mv",
             "after-rejected-refresh",
         )?;
-        ensure!(
-            after_rejection["snapshots"] == management_metadata["snapshots"],
-            "old-L rejection changed the management snapshot facts"
-        );
+        assert_rest_snapshot_state_unchanged(&management_metadata, &after_rejection)
+            .context("old-L rejection changed the management snapshot facts")?;
 
         execute(
             context,
@@ -2645,50 +2656,6 @@ fn externally_drop_rest_table(
     Ok(())
 }
 
-/// An unsupported external metadata writer removes only D from the target's
-/// table-level manifest. It leaves `main` untouched, so physical snapshot OCC
-/// cannot stand in for the frontend's post-compute D/L/P reobservation.
-fn externally_remove_current_definition_document(
-    context: &mut ScenarioContext,
-    rest_uri: &str,
-    namespace: &str,
-    table: &str,
-) -> Result<i64> {
-    let url = format!(
-        "{}/v1/namespaces/{namespace}/tables/{table}",
-        rest_uri.trim_end_matches('/')
-    );
-    let client = Client::builder()
-        .no_proxy()
-        .timeout(context.remaining("mutate Current D through external REST")?)
-        .build()?;
-    let loaded: serde_json::Value = client.get(&url).send()?.error_for_status()?.json()?;
-    let metadata = loaded
-        .get("metadata")
-        .context("REST table load has no metadata")?;
-    let snapshot_id = metadata
-        .get("current-snapshot-id")
-        .and_then(serde_json::Value::as_i64)
-        .context("REST table load has no current MV snapshot")?;
-    use super::mv_uea7_documents::{commit_updates, wire::Graph};
-    let graph = Graph::from_metadata(metadata)?;
-    let key = format!("novarocks.doc.v2.rev.{}", graph.definition);
-    context.action(format!(
-        "remove current definition version {key} without changing main"
-    ));
-    commit_updates(
-        context,
-        rest_uri,
-        namespace,
-        table,
-        metadata,
-        vec![serde_json::json!({"action":"remove-properties","removals":[key]})],
-        "remove-current-definition",
-    )?;
-    assert_rest_snapshot_unchanged(context, rest_uri, namespace, table, snapshot_id)?;
-    Ok(snapshot_id)
-}
-
 /// Reproduce the pre-fix CREATE encoding on an unpublished target. The test
 /// writer first advances the physical Iceberg schema ID, then writes that
 /// exact nonzero ID into L in the former big-endian order. No P exists yet,
@@ -2950,42 +2917,45 @@ fn assert_rest_snapshot_count(
     Ok(())
 }
 
-fn assert_rest_snapshot_unchanged(
-    context: &mut ScenarioContext,
-    rest_uri: &str,
-    namespace: &str,
-    table: &str,
-    expected_snapshot_id: i64,
+fn assert_rest_snapshot_state_unchanged(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
 ) -> Result<()> {
-    let url = format!(
-        "{}/v1/namespaces/{namespace}/tables/{table}",
-        rest_uri.trim_end_matches('/')
-    );
-    let loaded: serde_json::Value = Client::builder()
-        .no_proxy()
-        .timeout(context.remaining("read exact Current MV snapshots")?)
-        .build()?
-        .get(&url)
-        .send()?
-        .error_for_status()?
-        .json()?;
-    let metadata = loaded
-        .get("metadata")
-        .context("REST table load has no metadata")?;
-    let current = metadata
-        .get("current-snapshot-id")
-        .and_then(serde_json::Value::as_i64)
-        .context("REST table load has no current snapshot")?;
-    let count = metadata
-        .get("snapshots")
-        .and_then(serde_json::Value::as_array)
-        .context("REST table load has no snapshot list")?
-        .len();
-    if current != expected_snapshot_id || count != 1 {
-        bail!(
-            "stale MV refresh changed main or added a snapshot: current={current}, expected={expected_snapshot_id}, snapshots={count}"
+    for (name, original, observed) in [
+        (
+            "Current",
+            &before["current-snapshot-id"],
+            &after["current-snapshot-id"],
+        ),
+        (
+            "main",
+            &before["refs"]["main"]["snapshot-id"],
+            &after["refs"]["main"]["snapshot-id"],
+        ),
+    ] {
+        let expected = original
+            .as_i64()
+            .with_context(|| format!("original REST MV metadata has no {name} snapshot ID"))?;
+        let actual = observed
+            .as_i64()
+            .with_context(|| format!("observed REST MV metadata has no {name} snapshot ID"))?;
+        ensure!(
+            actual == expected,
+            "REST MV {name} snapshot changed from {expected} to {actual}"
         );
     }
+    let expected = before["snapshots"]
+        .as_array()
+        .context("original REST MV metadata has no snapshot list")?;
+    let actual = after["snapshots"]
+        .as_array()
+        .context("observed REST MV metadata has no snapshot list")?;
+    ensure!(
+        actual == expected,
+        "REST MV snapshot list changed: observed {} snapshots, expected {}",
+        actual.len(),
+        expected.len()
+    );
     Ok(())
 }
 
