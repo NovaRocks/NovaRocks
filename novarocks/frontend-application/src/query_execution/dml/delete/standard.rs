@@ -895,8 +895,12 @@ mod tests {
         let TrinoStatement::Execute(execute) = parse_statement(using).unwrap() else {
             panic!("expected EXECUTE");
         };
-        let binding =
-            super::SqlPreparedParameters::bind(&target, execute.parameters, using.into()).unwrap();
+        let binding = super::SqlPreparedParameters::bind(
+            &target,
+            execute.parameters.into_inner(),
+            using.into(),
+        )
+        .unwrap();
         let TrinoStatement::Delete(delete) = target else {
             panic!("expected DELETE");
         };

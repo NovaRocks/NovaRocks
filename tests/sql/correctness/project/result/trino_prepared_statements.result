@@ -16,7 +16,7 @@ Position	Type
 -- query 5
 -- types	varchar(1)	varchar(0)	varchar(0)	varchar(0)	varchar(6)	integer	boolean
 Column Name	Catalog	Schema	Table	Type	Type Size	Aliased
-n				bigint	8	true
+n	""	""	""	bigint	8	true
 
 -- query 7
 -- types	integer	integer
@@ -42,9 +42,9 @@ value
 -- query 11
 -- types	varchar(5)	varchar(0)	varchar(0)	varchar(0)	varchar(27)	integer	boolean
 Column Name	Catalog	Schema	Table	Type	Type Size	Aliased
-é😀				char(4)	0	true
-_col1				timestamp(3) with time zone	8	false
-_col2				varchar(4)	0	false
+é😀	""	""	""	char(4)	0	true
+_col1	""	""	""	timestamp(3) with time zone	8	false
+_col2	""	""	""	varchar(4)	0	false
 
 -- query 12
 -- types	integer	integer

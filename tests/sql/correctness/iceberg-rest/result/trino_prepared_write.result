@@ -6,7 +6,7 @@ Position	Type
 -- query 5
 -- types	varchar(4)	varchar(0)	varchar(0)	varchar(0)	varchar(6)	integer	boolean
 Column Name	Catalog	Schema	Table	Type	Type Size	Aliased
-rows				bigint	8	false
+rows	""	""	""	bigint	8	false
 
 -- query 6
 -- types	bigint

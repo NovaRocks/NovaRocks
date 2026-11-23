@@ -45,7 +45,8 @@ EXECUTE put_value USING CAST(31 AS BIGINT);
 
 -- query 8
 -- @skip_result_check=true
-EXECUTE IMMEDIATE 'INSERT INTO iceberg_rest_${suite_uuid0}.prepared_write_${uuid0}.items SELECT CAST(? AS BIGINT)' USING 32;
+USE iceberg_rest_${suite_uuid0}.prepared_write_${uuid0};
+EXECUTE IMMEDIATE 'INSERT INTO items SELECT CAST(? AS BIGINT)' USING 32;
 
 -- query 9
 SELECT id FROM iceberg_rest_${suite_uuid0}.prepared_write_${uuid0}.items ORDER BY id;
