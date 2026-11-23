@@ -25,6 +25,21 @@ pub enum StringTrimOp {
     Both,
 }
 
+/// The whitespace set used by Airlift Slice through JDK 25 Character.isWhitespace.
+pub(super) fn trino_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}'..='\u{000d}'
+            | '\u{001c}'..='\u{0020}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{2006}'
+            | '\u{2008}'..='\u{200a}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{205f}'
+            | '\u{3000}'
+    )
+}
+
 /// Return the maximal span retained by the selected whitespace operation.
 /// Observe each original character after its predicate and before its cursor update.
 pub fn trimmed_observed<E>(
@@ -34,12 +49,11 @@ pub fn trimmed_observed<E>(
 ) -> Result<&str, E> {
     let mut start = 0usize;
     let mut end = text.len();
-    // str::trim{,_start,_end} uses this same char::is_whitespace predicate.
     // Each visited UTF-8 scalar consumes at most four bytes; source boundaries
     // come from the original iterator, with no temporary text or side index.
     if matches!(op, StringTrimOp::Left | StringTrimOp::Both) {
         for ch in text.chars() {
-            let whitespace = ch.is_whitespace();
+            let whitespace = trino_whitespace(ch);
             visit()?;
             if !whitespace {
                 break;
@@ -49,7 +63,7 @@ pub fn trimmed_observed<E>(
     }
     if matches!(op, StringTrimOp::Right | StringTrimOp::Both) {
         for ch in text[start..].chars().rev() {
-            let whitespace = ch.is_whitespace();
+            let whitespace = trino_whitespace(ch);
             visit()?;
             if !whitespace {
                 break;
@@ -66,8 +80,8 @@ mod tests {
     use std::convert::Infallible;
 
     #[test]
-    fn string_trim_core_std_fixed_bytes_and_valid_borrowed_boundaries() {
-        let white = "\t\n\u{b}\u{c}\r \u{85}\u{a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+    fn string_trim_core_jdk_fixed_bytes_and_valid_borrowed_boundaries() {
+        let white = "\t\n\u{b}\u{c}\r\u{1c}\u{1d}\u{1e}\u{1f} \u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{205f}\u{3000}";
         let text = [
             String::new(),
             white.into(),
@@ -81,9 +95,9 @@ mod tests {
         for s in &text {
             for op in [StringTrimOp::Both, StringTrimOp::Left, StringTrimOp::Right] {
                 let expected = match op {
-                    StringTrimOp::Both => s.trim(),
-                    StringTrimOp::Left => s.trim_start(),
-                    StringTrimOp::Right => s.trim_end(),
+                    StringTrimOp::Both => s.trim_matches(|ch| white.contains(ch)),
+                    StringTrimOp::Left => s.trim_start_matches(|ch| white.contains(ch)),
+                    StringTrimOp::Right => s.trim_end_matches(|ch| white.contains(ch)),
                 };
                 let actual = trimmed_observed(op, s, || Ok::<(), Infallible>(())).unwrap();
                 assert_eq!(actual.as_bytes(), expected.as_bytes());
@@ -96,9 +110,9 @@ mod tests {
             }
         }
         for (op, expected) in [
-            (StringTrimOp::Both, "x"),
+            (StringTrimOp::Both, "x\u{a0}"),
             (StringTrimOp::Left, "x\u{a0}"),
-            (StringTrimOp::Right, "\u{2003}x"),
+            (StringTrimOp::Right, "\u{2003}x\u{a0}"),
         ] {
             assert_eq!(
                 trimmed_observed(op, "\u{2003}x\u{a0}", || Ok::<(), Infallible>(())).unwrap(),

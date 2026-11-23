@@ -333,7 +333,7 @@ fn actual_ordinary_integer_widening_keeps_physical_targets() {
     ];
     let binding = builtin_engine_function_catalog()
         .resolve_bound_user(
-            "left",
+            "substring",
             FunctionKind::Scalar,
             request(&arguments),
             crate::binding_test_control(),

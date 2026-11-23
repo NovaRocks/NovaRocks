@@ -28,6 +28,8 @@ pub(crate) struct AnalyzedOutputField {
     /// Internal value label; never grants SQL name visibility.
     pub name: String,
     pub field_name: Option<String>,
+    /// Explicit alias on this output occurrence.
+    pub aliased: bool,
     pub value_type: FunctionValueType,
     pub is_internal: bool,
 }
@@ -152,6 +154,7 @@ mod tests {
             column_id: ColumnId(1),
             name: "label".into(),
             field_name: name.map(str::to_owned),
+            aliased: false,
             value_type: FunctionValueType::new(arrow::datatypes::DataType::Int32, false),
             is_internal: internal,
         }

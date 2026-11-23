@@ -23,6 +23,8 @@ mod fold_observation;
 mod implementation_availability;
 mod numeric_negation;
 mod numeric_operators;
+mod prepared_binding;
+mod prepared_description;
 mod set_operations;
 mod table_sequence;
 mod truth_test_analysis;

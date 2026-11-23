@@ -573,8 +573,6 @@ fn unit(owner: &Owner, control: ArgumentControl, hidden_call: bool) -> BoundExpr
                     effects: owner.frozen(u.context, &selected),
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             )
         })
@@ -922,8 +920,6 @@ fn intrinsic_controller_keeps_hand_checked_branch_guards_without_scalar_instance
                     effects: owner.frozen(u.context, &selected),
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             )
         })
@@ -1111,8 +1107,6 @@ fn seal_type_only_fixture(
                     effects: owner.frozen(u.context, &selected),
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             )
         })

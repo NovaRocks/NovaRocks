@@ -111,6 +111,10 @@ impl ValueLogicalType {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValueTypeError {
     InvalidType(&'static str),
+    InvalidCharacterWidth {
+        kind: crate::CharacterKind,
+        length: u64,
+    },
     UnknownLogicalMetadata,
     InvalidLogicalCarrier(ValueLogicalType),
     TooDeep,
@@ -120,6 +124,13 @@ impl fmt::Display for ValueTypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidType(message) => f.write_str(message),
+            Self::InvalidCharacterWidth { kind, length } => {
+                let name = match kind {
+                    crate::CharacterKind::Char => "char",
+                    crate::CharacterKind::Varchar => "varchar",
+                };
+                write!(f, "Unknown type: {name}({length})")
+            }
             Self::UnknownLogicalMetadata => f.write_str("unknown logical type metadata"),
             Self::InvalidLogicalCarrier(logical) => {
                 write!(f, "invalid Arrow carrier for {logical:?}")

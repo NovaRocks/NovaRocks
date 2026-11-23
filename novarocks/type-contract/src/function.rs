@@ -194,6 +194,23 @@ macro_rules! stable_identity {
 stable_identity!(FunctionId, "function", false);
 stable_identity!(FunctionOverloadId, "function overload", false);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NonCanonicalNativeV1FunctionName;
+
+/// Borrow the native-v1 name component of an already declared identity.
+pub fn native_v1_function_name(
+    identity: &FunctionId,
+) -> Result<&str, NonCanonicalNativeV1FunctionName> {
+    identity
+        .as_str()
+        .strip_prefix("builtin.")
+        .or_else(|| identity.as_str().strip_prefix("parametric."))
+        .and_then(|v| v.split_once('/').map(|(_, name)| name))
+        .and_then(|name| name.strip_suffix("/v1"))
+        .filter(|name| !name.is_empty())
+        .ok_or(NonCanonicalNativeV1FunctionName)
+}
+
 // Stable identity of an aggregate's serialized intermediate state. Its
 // delimiter exclusions preserve the original unambiguous digest grammar.
 stable_identity!(AggregateStateFormatId, "aggregate state format", true);

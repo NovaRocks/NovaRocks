@@ -1,4 +1,4 @@
 -- query 1
--- types	integer	boolean	integer	boolean	integer	boolean	integer	boolean
-lpad_limit_len	lpad_over_limit_is_null	rpad_limit_len	rpad_over_limit_is_null	concat_limit_len	concat_over_limit_is_null	concat_ws_limit_len	concat_ws_over_limit_is_null
-1048576	true	1048576	true	1048576	true	1048576	true
+-- types	bigint	bigint	bigint	bigint	bigint	bigint
+lpad_boundary	lpad_past_boundary	rpad_boundary	rpad_past_boundary	concat_boundary	concat_ws_boundary
+1048576	1048577	1048576	1048577	1048576	1048576

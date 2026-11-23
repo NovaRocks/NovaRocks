@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Selected original Rust Unicode case conversion, without runtime name lookup.
-//! Numerical allocation checks prove requested-layout representability only.
-//! Whole-string Unicode conversion remains an observed opaque library call;
-//! it is not internally cooperative or a formal host memory grant.
+//! Selected Unicode case conversion and normalization, using Trino 484's Unicode profile.
 
+pub(super) mod unicode;
+
+use super::string_measure::fixed_char_width;
 use crate::{
     EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure,
     ScalarCallInput, SelectedValues, Selection,
@@ -29,6 +29,7 @@ use crate::{
 use arrow_array::{Array, ArrayRef, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
+use icu_normalizer::{ComposingNormalizer, DecomposingNormalizer};
 use novarocks_type_contract::ValueLogicalType;
 use std::sync::Arc;
 
@@ -38,59 +39,36 @@ pub enum StringCaseOp {
     Upper,
 }
 
+fn visit_case(
+    op: StringCaseOp,
+    text: &str,
+    work: &mut EvaluationCheckpoints<'_>,
+    mut visit: impl FnMut(char, &mut EvaluationCheckpoints<'_>) -> Result<(), KernelFailure>,
+) -> Result<(), KernelFailure> {
+    for character in text.chars() {
+        let mapped = match op {
+            StringCaseOp::Lower => unicode::lowercase(character),
+            StringCaseOp::Upper => unicode::uppercase(character),
+        };
+        work.step()?;
+        visit(mapped, work)?;
+    }
+    Ok(())
+}
+
 fn mapped_length(
     op: StringCaseOp,
     text: &str,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<u128, KernelFailure> {
     let mut length = 0u128;
-    for ch in text.chars() {
-        // UTF-8 decoding consumes at most four bytes per scalar. The Unicode
-        // mapping iterators hold at most three chars and allocate no backing.
-        work.step()?;
-        match op {
-            StringCaseOp::Lower => {
-                for mapped in ch.to_lowercase() {
-                    length += mapped.len_utf8() as u128;
-                    work.step()?;
-                }
-            }
-            StringCaseOp::Upper => {
-                for mapped in ch.to_uppercase() {
-                    length += mapped.len_utf8() as u128;
-                    work.step()?;
-                }
-            }
-        }
-    }
-    // Whole-string lowercase's contextual sigma chooses σ or ς. Both have
-    // two UTF-8 bytes; measuring per-char mappings therefore preserves length
-    // without replacing the original context-sensitive value algorithm.
+    visit_case(op, text, work, |character, work| {
+        length += character.len_utf8() as u128;
+        work.step()
+    })?;
     Ok(length)
 }
-fn temporary_layout(input_bytes: usize, output_bytes: usize) -> Result<(), KernelFailure> {
-    if input_bytes == 0 && output_bytes == 0 {
-        return Ok(());
-    }
-    // Locked Rust str::{to_lowercase,to_uppercase} starts one Vec<u8> at N;
-    // String::push uses RawVec max(2*old, required, 8). For final length L,
-    // requested capacity is <=max(N,2L,8), and cumulative requests are
-    // <=N+2*max(2L,8). These are requests, not allocator-retained/RSS bytes.
-    let doubled = output_bytes
-        .checked_mul(2)
-        .ok_or(KernelFailure::ResourceExhausted)?;
-    let next = doubled.max(8);
-    let cumulative = input_bytes
-        .checked_add(
-            next.checked_mul(2)
-                .ok_or(KernelFailure::ResourceExhausted)?,
-        )
-        .ok_or(KernelFailure::ResourceExhausted)?;
-    super::string_failure::array_layout::<u8>(input_bytes.max(next))?;
-    // Historical request totals are arithmetic, not one allocation layout.
-    let _ = cumulative;
-    Ok(())
-}
+
 fn output_layout(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     let offsets = rows
         .checked_add(1)
@@ -107,6 +85,212 @@ fn output_layout(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
         .and_then(|value| value.checked_add(bitmap))
         .ok_or(KernelFailure::ResourceExhausted)?;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum NormalizationForm {
+    Nfc,
+    Nfd,
+    Nfkc,
+    Nfkd,
+}
+
+impl NormalizationForm {
+    fn from_argument(form: &str) -> Option<Self> {
+        match form {
+            "NFC" => Some(Self::Nfc),
+            "NFD" => Some(Self::Nfd),
+            "NFKC" => Some(Self::Nfkc),
+            "NFKD" => Some(Self::Nfkd),
+            _ => None,
+        }
+    }
+
+    fn visit(
+        self,
+        text: &str,
+        work: &mut EvaluationCheckpoints<'_>,
+        mut visit: impl FnMut(char, &mut EvaluationCheckpoints<'_>) -> Result<(), KernelFailure>,
+    ) -> Result<(), KernelFailure> {
+        let mut start = 0;
+        for (byte, character) in text.char_indices() {
+            work.step()?;
+            if !unicode::assigned_in_unicode_16(character) {
+                // The reference did not assign this scalar. Normalization
+                // treats it as an unchanged starter and breaks the segment.
+                self.visit_segment(&text[start..byte], |character| visit(character, work))?;
+                visit(character, work)?;
+                start = byte + character.len_utf8();
+            }
+        }
+        self.visit_segment(&text[start..], |character| visit(character, work))
+    }
+
+    fn visit_segment(
+        self,
+        text: &str,
+        visit: impl FnMut(char) -> Result<(), KernelFailure>,
+    ) -> Result<(), KernelFailure> {
+        match self {
+            Self::Nfc => ComposingNormalizer::new_nfc()
+                .normalize_iter(text.chars())
+                .try_for_each(visit),
+            Self::Nfd => DecomposingNormalizer::new_nfd()
+                .normalize_iter(text.chars())
+                .try_for_each(visit),
+            Self::Nfkc => ComposingNormalizer::new_nfkc()
+                .normalize_iter(text.chars())
+                .try_for_each(visit),
+            Self::Nfkd => DecomposingNormalizer::new_nfkd()
+                .normalize_iter(text.chars())
+                .try_for_each(visit),
+        }
+    }
+}
+
+pub(super) fn evaluate_normalize<'a>(
+    input: ScalarCallInput<'_, 'a>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<SelectedValues<'a>, KernelFailure> {
+    control.checkpoint(0)?;
+    let mut work = EvaluationCheckpoints::new(control);
+    let result = (|| {
+        let (
+            [
+                FunctionArgumentType::Value(source_type),
+                FunctionArgumentType::Value(form_type),
+            ],
+            [source, form],
+        ) = (
+            input.contract().selected().argument_types.as_ref(),
+            input.arguments(),
+        )
+        else {
+            return Err(invalid("normalize requires two checked arguments"));
+        };
+        let target = input.contract().result_type();
+        if [source_type, form_type, target].iter().any(|ty| {
+            ty.logical_type() != ValueLogicalType::Physical || ty.data_type() != &DataType::Utf8
+        }) {
+            return Err(invalid("normalize differs from its checked string profile"));
+        }
+        let strings = source
+            .array()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| internal("normalize selected source is not Utf8"))?;
+        let forms = form
+            .array()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| internal("normalize selected form is not Utf8"))?;
+        let selection = input.selection();
+        let row_values = |ordinal, batch_row, work: &mut EvaluationCheckpoints<'_>| {
+            let source_row = source.value_row(ordinal, batch_row);
+            let form_row = form.value_row(ordinal, batch_row);
+            work.step()?;
+            if source_row >= strings.len() || form_row >= forms.len() {
+                return Err(internal("normalize selected row is outside its carrier"));
+            }
+            if strings.is_null(source_row) || forms.is_null(form_row) {
+                return Ok(None);
+            }
+            Ok(Some((
+                strings.value(source_row),
+                NormalizationForm::from_argument(forms.value(form_row)),
+            )))
+        };
+
+        let mut extent = 0i32;
+        let mut error_count = 0;
+        for (ordinal, batch_row) in selection.iter().enumerate() {
+            if let Some((text, form)) = row_values(ordinal, batch_row, &mut work)? {
+                match form {
+                    Some(form) => {
+                        work.flush()?;
+                        form.visit(text, &mut work, |character, work| {
+                            extent = crate::aggregate_scalar::checked_utf8_output_offset(
+                                extent,
+                                character.len_utf8(),
+                            )?;
+                            work.step()
+                        })?;
+                        work.flush()?;
+                    }
+                    None => error_count += 1,
+                }
+            }
+        }
+        let bytes_capacity = extent as usize;
+        output_layout(selection.len(), bytes_capacity)?;
+        work.flush()?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(bytes_capacity)
+            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        let mut offsets = Vec::new();
+        offsets
+            .try_reserve_exact(selection.len() + 1)
+            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        let mut errors = Vec::new();
+        errors
+            .try_reserve_exact(error_count)
+            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        let mut validity = BooleanBufferBuilder::new(selection.len());
+        offsets.push(0i32);
+        let mut has_null = false;
+        for (ordinal, batch_row) in selection.iter().enumerate() {
+            let valid = match row_values(ordinal, batch_row, &mut work)? {
+                Some((text, Some(form))) => {
+                    work.flush()?;
+                    form.visit(text, &mut work, |character, work| {
+                        if character.len_utf8() > bytes_capacity - bytes.len() {
+                            return Err(internal("normalize exceeded its measured output extent"));
+                        }
+                        let mut encoded = [0u8; 4];
+                        bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                        work.step()
+                    })?;
+                    work.flush()?;
+                    true
+                }
+                Some((_, None)) => {
+                    errors.push(crate::RowDataError::with_reason(
+                        ordinal,
+                        crate::DataFailureReason::Domain(
+                            novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+                        ),
+                        "Normalization form must be one of [NFD, NFC, NFKD, NFKC]",
+                    ));
+                    false
+                }
+                None => false,
+            };
+            validity.append(valid);
+            has_null |= !valid;
+            offsets.push(i32::try_from(bytes.len()).map_err(|_| KernelFailure::ResourceExhausted)?);
+            work.step()?;
+        }
+        if bytes.len() != bytes_capacity || errors.len() != error_count {
+            return Err(internal(
+                "normalize differs from its measured output extent",
+            ));
+        }
+        work.flush()?;
+        let array = Arc::new(StringArray::new(
+            OffsetBuffer::new(offsets.into()),
+            Buffer::from(bytes),
+            has_null.then(|| NullBuffer::new(validity.finish())),
+        )) as ArrayRef;
+        SelectedValues::try_new_observed(
+            selection,
+            target.data_type(),
+            array,
+            errors.into_boxed_slice(),
+            || work.step(),
+        )
+    })();
+    work.finish_result(result)
 }
 
 pub(super) fn evaluate_string_case<'a>(
@@ -131,6 +315,7 @@ pub(super) fn evaluate_string_case<'a>(
             || target.logical_type() != ValueLogicalType::Physical
             || target.data_type() != &DataType::Utf8
             || target.nullable() != source.nullable()
+            || fixed_char_width(source) != fixed_char_width(target)
         {
             return Err(invalid(
                 "string case conversion differs from its exact installed profile",
@@ -149,9 +334,7 @@ pub(super) fn evaluate_string_case<'a>(
     work.finish_result(result)
 }
 
-/// One original whole-string calculation walk for both value boundaries.
-/// The per-char pass above only measures output; final sigma still depends on
-/// its complete input string in Rust's original Unicode implementation.
+/// Both output passes use the same simple scalar map without a temporary string.
 fn build_case_array(
     op: StringCaseOp,
     argument: EvaluatedArgument<'_>,
@@ -184,7 +367,6 @@ fn build_case_array(
         }
         let text = values.value(row);
         let length = value_extent(mapped_length(op, text, work)?)?;
-        temporary_layout(text.len(), length)?;
         output_extent = crate::aggregate_scalar::checked_utf8_output_offset(output_extent, length)?;
     }
     let output_bytes = output_extent as usize;
@@ -205,22 +387,25 @@ fn build_case_array(
     offsets.push(0i32);
     let mut has_null = false;
     walk_case_values(
-        op,
         argument,
         selection,
         source_nullable,
         work,
         |converted, work| {
             if let Some(converted) = converted {
-                if converted.len() > output_bytes - bytes.len() {
-                    return Err(internal(
-                        "string case conversion exceeded its measured output extent",
-                    ));
-                }
-                for byte in converted.bytes() {
-                    bytes.push(byte);
-                    work.step()?;
-                }
+                visit_case(op, converted, work, |character, work| {
+                    if character.len_utf8() > output_bytes - bytes.len() {
+                        return Err(internal(
+                            "string case conversion exceeded its measured output extent",
+                        ));
+                    }
+                    let mut utf8 = [0u8; 4];
+                    for byte in character.encode_utf8(&mut utf8).bytes() {
+                        bytes.push(byte);
+                        work.step()?;
+                    }
+                    Ok(())
+                })?;
                 validity.append(true);
             } else {
                 has_null = true;
@@ -250,12 +435,11 @@ fn build_case_array(
 }
 
 fn walk_case_values(
-    op: StringCaseOp,
     argument: EvaluatedArgument<'_>,
     selection: Selection<'_>,
     source_nullable: bool,
     work: &mut EvaluationCheckpoints<'_>,
-    mut append: impl FnMut(Option<String>, &mut EvaluationCheckpoints<'_>) -> Result<(), KernelFailure>,
+    mut append: impl FnMut(Option<&str>, &mut EvaluationCheckpoints<'_>) -> Result<(), KernelFailure>,
 ) -> Result<(), KernelFailure> {
     let values = argument
         .array()
@@ -278,13 +462,7 @@ fn walk_case_values(
             }
             None
         } else {
-            work.flush()?;
-            let converted = match op {
-                StringCaseOp::Lower => values.value(row).to_lowercase(),
-                StringCaseOp::Upper => values.value(row).to_uppercase(),
-            };
-            work.flush()?;
-            Some(converted)
+            Some(values.value(row))
         };
         append(converted, work)?;
     }

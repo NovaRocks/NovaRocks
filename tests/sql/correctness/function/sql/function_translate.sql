@@ -21,41 +21,42 @@
 -- 2. Verify correct behavior when to_str is longer/shorter than from_str.
 -- 3. Verify NULL and empty string handling.
 -- 4. Verify error for wrong number of arguments.
--- 5. Validate large string handling near OLAP_STRING_MAX_LENGTH boundary.
+-- 5. Validate wide UTF-8 input and output byte and code-point lengths.
 -- 6. Validate multi-chunk processing with table-based inputs.
 -- 7. Validate random data with various constant/non-constant argument combinations.
 -- 8. Validate UTF-8 constant from_str and to_str permutations.
 
 -- ------------------------------------------------------------------------
--- Section 1: test_translate_exceed_OLAP_STRING_MAX_LENGTH
+-- Section 1: wide UTF-8 translation
 -- ------------------------------------------------------------------------
 
 -- query 1
--- Exceed OLAP_STRING_MAX_LENGTH: constant args, same-byte replacement
+-- Wide UTF-8: constant args, same-byte replacement
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(rpad('', 1024*1024, 'a'), 'a', 'b')
-)), 0);
+SELECT length(translated) AS codepoints, length(to_utf8(translated)) AS utf8_bytes,
+       crc32(to_utf8(translated)) AS fingerprint
+FROM (SELECT TRANSLATE(rpad('', 1024*1024, 'a'), 'a', 'b') AS translated) AS t;
 
 -- query 2
--- Exceed OLAP_STRING_MAX_LENGTH: constant args, multi-byte to single-byte
+-- Wide UTF-8: constant args, multi-byte to single-byte
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(CONCAT(rpad('', 1024*1024-1024*3, 'a'), rpad('', 1024, '膨')), '膨', 'p')
-)), 0);
+SELECT length(translated) AS codepoints, length(to_utf8(translated)) AS utf8_bytes,
+       crc32(to_utf8(translated)) AS fingerprint
+FROM (SELECT TRANSLATE(CONCAT(rpad('', 1024*1024-1024*3, 'a'), rpad('', 1024, '膨')), '膨', 'p') AS translated) AS t;
 
 -- query 3
--- Exceed OLAP_STRING_MAX_LENGTH: constant args, single-byte to multi-byte
+-- Wide UTF-8: constant args, single-byte to multi-byte
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(CONCAT('a', rpad('', 1024*1024 - 1 - 2, 'b')), 'a', '膨')
-)), 0);
+SELECT length(translated) AS codepoints, length(to_utf8(translated)) AS utf8_bytes,
+       crc32(to_utf8(translated)) AS fingerprint
+FROM (SELECT TRANSLATE(CONCAT('a', rpad('', 1024*1024 - 1 - 2, 'b')), 'a', '膨') AS translated) AS t;
 
 -- query 4
--- Expansion beyond max length: may return NULL
--- @skip_result_check=true
+-- Expansion beyond one mebibyte preserves the complete result.
 USE ${case_db};
-SELECT TRANSLATE(rpad('', 1024*1024, 'a'), 'a', '膨');
+SELECT length(translated) AS codepoints, length(to_utf8(translated)) AS utf8_bytes,
+       crc32(to_utf8(translated)) AS fingerprint
+FROM (SELECT translate(rpad('', 1024 * 1024, 'a'), 'a', '膨') AS translated) AS t;
 
 -- query 5
 -- @skip_result_check=true
@@ -72,11 +73,11 @@ USE ${case_db};
 insert into t1 values ROW('placeholder', 'a', 'b');
 
 -- query 7
--- Exceed OLAP_STRING_MAX_LENGTH: table-based, same-byte replacement
+-- Wide UTF-8: table-based, same-byte replacement
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(rpad('', 1024*1024, 'a'), from_str, to_str)
-)), 0) from t1;
+SELECT length(translated) AS codepoints, length(to_utf8(translated)) AS utf8_bytes,
+       crc32(to_utf8(translated)) AS fingerprint
+FROM (SELECT TRANSLATE(rpad('', 1024*1024, 'a'), from_str, to_str) AS translated from t1) AS t;
 
 -- query 8
 -- @skip_result_check=true
@@ -89,11 +90,11 @@ USE ${case_db};
 insert into t1 values ROW('placeholder', '膨', 'p');
 
 -- query 10
--- Exceed OLAP_STRING_MAX_LENGTH: table-based, multi-byte to single-byte
+-- Wide UTF-8: table-based, multi-byte to single-byte
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(CONCAT(rpad('', 1024*1024-1024*3, 'a'), rpad('', 1024, '膨')), from_str, to_str)
-)), 0) from t1;
+SELECT length(translated) AS codepoints, length(to_utf8(translated)) AS utf8_bytes,
+       crc32(to_utf8(translated)) AS fingerprint
+FROM (SELECT TRANSLATE(CONCAT(rpad('', 1024*1024-1024*3, 'a'), rpad('', 1024, '膨')), from_str, to_str) AS translated from t1) AS t;
 
 -- query 11
 -- @skip_result_check=true
@@ -106,11 +107,11 @@ USE ${case_db};
 insert into t1 values ROW('placeholder', 'a', '膨');
 
 -- query 13
--- Exceed OLAP_STRING_MAX_LENGTH: table-based, single-byte to multi-byte
+-- Wide UTF-8: table-based, single-byte to multi-byte
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(CONCAT('a', rpad('', 1024*1024 - 1 - 2, 'b')), from_str, to_str)
-)), 0) from t1;
+SELECT length(translated) AS codepoints, length(to_utf8(translated)) AS utf8_bytes,
+       crc32(to_utf8(translated)) AS fingerprint
+FROM (SELECT TRANSLATE(CONCAT('a', rpad('', 1024*1024 - 1 - 2, 'b')), from_str, to_str) AS translated from t1) AS t;
 
 -- query 14
 -- @skip_result_check=true
@@ -123,15 +124,11 @@ USE ${case_db};
 insert into t1 values ROW('placeholder', 'a', '膨');
 
 -- query 16
--- Exceed OLAP_STRING_MAX_LENGTH: table-based, expansion
+-- Wide UTF-8: table-based, expansion
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(rpad('', 1024*1024, 'a'), from_str, to_str)
-)), 0) from t1;
-
--- ------------------------------------------------------------------------
--- Section 2: test_translate_to_str_greater_than_from_str
--- ------------------------------------------------------------------------
+SELECT length(translated) AS codepoints, length(to_utf8(translated)) AS utf8_bytes,
+       crc32(to_utf8(translated)) AS fingerprint
+FROM (SELECT TRANSLATE(rpad('', 1024*1024, 'a'), from_str, to_str) AS translated from t1) AS t;
 
 -- query 17
 -- @skip_result_check=true
@@ -208,52 +205,52 @@ CREATE TABLE "t1" (
 -- query 28
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 SELECT CONCAT('a|b|c', generate_series), 'ab', '123' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
+INSERT INTO t1 SELECT CONCAT('a|b|c', CAST(generate_series AS varchar)), 'ab', '123' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
 
 -- query 29
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 SELECT CONCAT('a|b|c', generate_series), 'abc', '12' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
+INSERT INTO t1 SELECT CONCAT('a|b|c', CAST(generate_series AS varchar)), 'abc', '12' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
 
 -- query 30
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 SELECT CONCAT('C|S', generate_series), 'CS', '测试' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
+INSERT INTO t1 SELECT CONCAT('C|S', CAST(generate_series AS varchar)), 'CS', '测试' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
 
 -- query 31
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 SELECT CONCAT('测|试', generate_series), '测试', 'CS' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
+INSERT INTO t1 SELECT CONCAT('测|试', CAST(generate_series AS varchar)), '测试', 'CS' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
 
 -- query 32
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 SELECT CONCAT('测|试', generate_series), '测试', 'C' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
+INSERT INTO t1 SELECT CONCAT('测|试', CAST(generate_series AS varchar)), '测试', 'C' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
 
 -- query 33
 -- Multi-chunk: all non-constant args
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 34
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'ab', '123'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'ab', '123')))), BIGINT '0') from t1;
 
 -- query 35
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'abc', '12'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'abc', '12')))), BIGINT '0') from t1;
 
 -- query 36
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'CS', '测试'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'CS', '测试')))), BIGINT '0') from t1;
 
 -- query 37
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, '测试', 'CS'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, '测试', 'CS')))), BIGINT '0') from t1;
 
 -- query 38
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, '测试', 'C'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, '测试', 'C')))), BIGINT '0') from t1;
 
 -- ------------------------------------------------------------------------
 -- Section 4: test_translate_empty
@@ -370,7 +367,7 @@ DROP TABLE IF EXISTS t1;
 
 -- query 56
 -- Invalid: TRANSLATE with 2 args (constant)
--- @expect_error=No matching function
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 SELECT TRANSLATE('abc', 'ab');
 
@@ -393,7 +390,7 @@ INSERT INTO t1 VALUES
 
 -- query 59
 -- Invalid: TRANSLATE with 2 args (table-based)
--- @expect_error=No matching function
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 SELECT TRANSLATE(src, from_str) from t1;
 
@@ -523,158 +520,158 @@ INSERT INTO t1 VALUES
 -- query 63
 -- Random data: all non-constant args aggregate
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, from_str, to_str))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, from_str, to_str)))), BIGINT '0') FROM t1;
 
 -- query 64
 -- Random data: constant from_str with non-constant to_str
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'ù七[I%10', to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'ù七[I%10', to_str)))), BIGINT '0') from t1;
 
 -- query 65
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'ù七[I%10', NULL))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'ù七[I%10', NULL)))), BIGINT '0') FROM t1;
 
 -- query 66
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'ù七[I%10', '1d44cdQjCX'))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'ù七[I%10', '1d44cdQjCX')))), BIGINT '0') FROM t1;
 
 -- query 67
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'ù七[I%10', 'hdA4ZE'))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'ù七[I%10', 'hdA4ZE')))), BIGINT '0') FROM t1;
 
 -- query 68
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'ù七[I%10', '4AlJzF'))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'ù七[I%10', '4AlJzF')))), BIGINT '0') FROM t1;
 
 -- query 69
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'AaPWie', to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'AaPWie', to_str)))), BIGINT '0') from t1;
 
 -- query 70
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'AaPWie', NULL))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'AaPWie', NULL)))), BIGINT '0') FROM t1;
 
 -- query 71
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'AaPWie', '1d44cdQjCX'))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'AaPWie', '1d44cdQjCX')))), BIGINT '0') FROM t1;
 
 -- query 72
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'D不b06&😄0IF😂˜', to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'D不b06&😄0IF😂˜', to_str)))), BIGINT '0') from t1;
 
 -- query 73
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'D不b06&😄0IF😂˜', '1d44cdQjCX'))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'D不b06&😄0IF😂˜', '1d44cdQjCX')))), BIGINT '0') FROM t1;
 
 -- query 74
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'D不b06&😄0IF😂˜', 'hdA4ZE'))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'D不b06&😄0IF😂˜', 'hdA4ZE')))), BIGINT '0') FROM t1;
 
 -- query 75
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'Jf😄dJeCc😂f六˜', to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'Jf😄dJeCc😂f六˜', to_str)))), BIGINT '0') from t1;
 
 -- query 76
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'Jf😄dJeCc😂f六˜', NULL))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'Jf😄dJeCc😂f六˜', NULL)))), BIGINT '0') FROM t1;
 
 -- query 77
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, 'Jf😄dJeCc😂f六˜', '4AlJzF'))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, 'Jf😄dJeCc😂f六˜', '4AlJzF')))), BIGINT '0') FROM t1;
 
 -- query 78
 -- Random data: non-constant from_str with constant to_str
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, from_str, '1d44cdQjCX'))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, from_str, '1d44cdQjCX')))), BIGINT '0') FROM t1;
 
 -- query 79
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, NULL, '1d44cdQjCX'))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, NULL, '1d44cdQjCX')))), BIGINT '0') FROM t1;
 
 -- query 80
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, from_str, 'hdA4ZE'))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, from_str, 'hdA4ZE')))), BIGINT '0') FROM t1;
 
 -- query 81
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, NULL, 'hdA4ZE'))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, NULL, 'hdA4ZE')))), BIGINT '0') FROM t1;
 
 -- query 82
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, from_str, NULL))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, from_str, NULL)))), BIGINT '0') FROM t1;
 
 -- query 83
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, NULL, NULL))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, NULL, NULL)))), BIGINT '0') FROM t1;
 
 -- query 84
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, from_str, '4AlJzF'))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, from_str, '4AlJzF')))), BIGINT '0') FROM t1;
 
 -- query 85
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, NULL, '4AlJzF'))), 0) FROM t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, NULL, '4AlJzF')))), BIGINT '0') FROM t1;
 
 -- query 86
 -- Random data: constant src, non-constant from_str and to_str (representative subset)
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE('4*一测1-F六g五八G八😇I测iJ😂id3-b二j(试&九e^二h&H二cæB%AæB]g0六[', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE('4*一测1-F六g五八G八😇I测iJ😂id3-b二j(试&九e^二h&H二cæB%AæB]g0六[', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 87
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE('æ˜三3h(DIä1j七F试a四G1I›43e›🙂GA二˜##ac五HjD😄jä', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE('æ˜三3h(DIä1j七F试a四G1I›43e›🙂GA二˜##ac五HjD😄jä', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 88
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE('[˜一Gi', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE('[˜一Gi', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 89
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE('e四i)1😄eJD^*C2ù-Fj]测七', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE('e四i)1😄eJD^*C2ù-Fj]测七', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 90
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE('^😂2æ六d]iBdcc五4?a(😂B1七八1[DC三四])(E0æIæ八一', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE('^😂2æ六d]iBdcc五4?a(😂B1七八1[DC三四])(E0æIæ八一', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 91
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE('', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE('', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 92
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(NULL, from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(NULL, from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 93
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE('›gH六🙂九›-一B#二EC(', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE('›gH六🙂九›-一B#二EC(', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 94
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE('f^ä?]GhB三˜&Hb]A😂七七æ六?', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE('f^ä?]GhB三˜&Hb]A😂七七æ六?', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 95
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE('J😇D]&4', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE('J😇D]&4', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 96
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE('试ù^d二八0', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE('试ù^d二八0', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 97
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE('四1h', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE('四1h', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 98
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE('0', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE('0', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 99
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE('七', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE('七', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 100
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(']一', from_str, to_str))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(']一', from_str, to_str)))), BIGINT '0') from t1;
 
 -- query 101
 -- Random data: constant src, from_str, to_str (representative subset)
@@ -760,43 +757,43 @@ SELECT TRANSLATE('h', 'hhzhhhhhChFh', 'hhhh8hhh');
 -- query 121
 -- Permutation: from_str and to_str with various lengths (deduplicated)
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, '˜›âä测试😄😂ab', '˜â测😄a试'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, '˜›âä测试😄😂ab', '˜â测😄a试')))), BIGINT '0') from t1;
 
 -- query 122
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, '˜›âä测试😄😂ab', '˜试'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, '˜›âä测试😄😂ab', '˜试')))), BIGINT '0') from t1;
 
 -- query 123
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, '˜›âä测试😄😂ab', '˜âa试'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, '˜›âä测试😄😂ab', '˜âa试')))), BIGINT '0') from t1;
 
 -- query 124
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, '˜›âä测试😄😂ab', '˜a'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, '˜›âä测试😄😂ab', '˜a')))), BIGINT '0') from t1;
 
 -- query 125
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, '˜›âä测试😄😂ab', 'â测😄a'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, '˜›âä测试😄😂ab', 'â测😄a')))), BIGINT '0') from t1;
 
 -- query 126
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, '˜›âä测试😄😂ab', 'â测试'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, '˜›âä测试😄😂ab', 'â测试')))), BIGINT '0') from t1;
 
 -- query 127
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, '˜›âä测试😄😂ab', '测😄a试'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, '˜›âä测试😄😂ab', '测😄a试')))), BIGINT '0') from t1;
 
 -- query 128
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, '˜›âä测试😄😂ab', '测😄'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, '˜›âä测试😄😂ab', '测😄')))), BIGINT '0') from t1;
 
 -- query 129
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, '˜›âä测试😄😂ab', '˜😄试'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, '˜›âä测试😄😂ab', '˜😄试')))), BIGINT '0') from t1;
 
 -- query 130
 USE ${case_db};
-SELECT ifnull(sum(murmur_hash3_32(TRANSLATE(src, '˜›âä测试😄😂ab', '˜测😄'))), 0) from t1;
+SELECT coalesce(sum(crc32(to_utf8(TRANSLATE(src, '˜›âä测试😄😂ab', '˜测😄')))), BIGINT '0') from t1;
 
 -- ------------------------------------------------------------------------
 -- Section 8: test_translate_utf8_constant_from_and_to

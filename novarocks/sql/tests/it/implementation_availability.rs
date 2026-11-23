@@ -401,9 +401,12 @@ mod fold_frontiers {
             );
         }
 
-        for sql in ["SELECT sleep(0)", "SELECT murmur_hash3_32('x')"] {
-            analyze(sql, &probe).unwrap_or_else(|error| panic!("{sql}: {error}"));
-        }
+        analyze("SELECT sleep(0)", &probe).unwrap();
+        let error = analyze("SELECT murmur_hash3_32('x')", &probe).unwrap_err();
+        let SqlCompileError::Analyze(error) = error else {
+            panic!("retired Murmur call must fail analysis: {error:?}");
+        };
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnknownFunction);
     }
 
     #[test]

@@ -27,10 +27,12 @@ pub use settings::TrinoListenerSettings;
 
 mod body;
 mod columns;
+pub use columns::described_type_name;
 mod driver;
 mod entry;
 mod envelope;
 mod paging;
+mod prepared;
 mod registry;
 mod request;
 mod routes;

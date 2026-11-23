@@ -29,5 +29,5 @@ code-anchors:
 ## 取舍与定位
 
 - 以函数名、结果类型与状态列布局推断旧发布语义，会把旧浮点 `max(1.0, NaN)` 的 NaN 当成新语义的 1.0。聚合解释记录实际绑定，因而允许共用物理布局并拒绝不匹配的发布。
-- 物理计划包从修订 39 升至 40。部署采用现有 FE/BE exact-island 准入。诊断跨版本问题时，先查两端构建兼容身份，再检查实际发布引用的解释及收到的拒绝。按原管理接续流程执行 FULL，并在新快照上核对显式读取、EXPLAIN 与下一次刷新。见[物化视图管理](../guides/iceberg-v3/materialized-views.md)。
+- 物理计划包从修订 40 升至 41。部署采用现有 FE/BE exact-island 准入。诊断跨版本问题时，先查两端构建兼容身份，再检查实际发布引用的解释及收到的拒绝。按原管理接续流程执行 FULL，并在新快照上核对显式读取、EXPLAIN 与下一次刷新。见[物化视图管理](../guides/iceberg-v3/materialized-views.md)。
 - 当前双参 `approx_distinct` 误差控制、弃用 `approx_percentile` accuracy，以及未安装的窗口重载由 B9 承接。持久状态的支持范围受实际安装的作者约束。

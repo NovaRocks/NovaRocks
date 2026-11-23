@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Selected-state and byte-source fixture inputs authored as checked units.
+//! Byte fixture inputs authored as checked units.
 
 use arrow::{
-    array::{ArrayRef, BinaryArray, StringArray},
+    array::{ArrayRef, BinaryArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
@@ -39,8 +39,7 @@ use novarocks_functions::{
     builtin::catalogue::build_builtin_engine_function_catalog,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, ControlShape, EvaluationDemand, FunctionValueType,
-    SemanticParameters,
+    CompileCheckpoints, CompilePhase, EvaluationDemand, FunctionValueType, SemanticParameters,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -132,9 +131,8 @@ fn call_author(
     catalogue: &PureEngineFunctionCatalog,
     name: &str,
     args: &[FunctionValueType],
-    shape: ControlShape,
 ) -> ClaimAuthor {
-    ClaimAuthor::with_legacy_binding(
+    ClaimAuthor::with_exact_eager_binding(
         catalogue,
         name,
         args.iter()
@@ -143,8 +141,6 @@ fn call_author(
                 constant: None,
             })
             .collect(),
-        shape,
-        None,
         POLICY,
         &HarnessControl,
     )
@@ -225,7 +221,7 @@ fn direct_call(
     result_type: DataType,
 ) -> StatefulFixture {
     let (mut draft, port, children) = input_unit(inputs);
-    let owner = call_author(catalogue, name, inputs, ControlShape::Eager);
+    let owner = call_author(catalogue, name, inputs);
     assert_eq!(owner.result().data_type(), &result_type);
     let mut authors = BTreeMap::new();
     let result = add_call(&mut draft, &mut authors, owner, children);
@@ -239,36 +235,16 @@ fn direct_call(
     )
 }
 
-pub(super) fn binary_program(count: usize) -> StatefulFixture {
+pub(super) fn binary_program(name: &str) -> StatefulFixture {
     let actual = build_builtin_engine_function_catalog().unwrap();
     direct_call(
-        &functions(&actual, &[("to_binary", Some(3))]),
-        "to_binary",
-        &vec![FunctionValueType::new(DataType::Utf8, true); count],
+        &functions(&actual, &[(name, Some(2))]),
+        name,
+        &[FunctionValueType::new(DataType::Utf8, true)],
         DataType::Binary,
     )
 }
-pub(super) fn binary_batch(program: &StatefulFixture, count: usize) -> RecordBatch {
-    let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![
-        Some("ff"),
-        Some(""),
-        Some("YWJj"),
-        None,
-        Some("00"),
-        Some("!"),
-    ]))];
-    if count == 2 {
-        arrays.push(Arc::new(StringArray::from(vec![
-            None,
-            Some("utf8"),
-            Some("encode64"),
-            Some("utf8"),
-            Some("unknown"),
-            Some("encode64"),
-        ])));
-    }
-    program.batch(arrays)
-}
+
 pub(super) fn binary_values(array: &ArrayRef) -> Vec<Option<Vec<u8>>> {
     array
         .as_any()

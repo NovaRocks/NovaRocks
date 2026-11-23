@@ -831,11 +831,11 @@ fn cast_utf8_to_boolean_array(arr: &StringArray) -> ArrayRef {
 }
 
 fn format_float64_for_varchar(value: f64) -> String {
-    novarocks_functions::builtin::string_extended::format_float64_for_varchar(value)
+    novarocks_functions::carrier_text::format_float64_for_varchar(value)
 }
 
 fn format_float32_for_varchar(value: f32) -> String {
-    novarocks_functions::builtin::string_extended::format_float32_for_varchar(value)
+    novarocks_functions::carrier_text::format_float32_for_varchar(value)
 }
 
 fn cast_float64_to_utf8_array(arr: &Float64Array) -> ArrayRef {
@@ -904,7 +904,7 @@ fn cast_float_to_decimal_with_rounding(
 }
 
 pub fn format_timestamp_for_varchar(unit: &TimeUnit, value: i64, tz: Option<&str>) -> String {
-    novarocks_functions::builtin::string_extended::format_timestamp_for_varchar(unit, value, tz)
+    novarocks_functions::carrier_text::format_timestamp_for_varchar(unit, value, tz)
 }
 
 fn cast_timestamp_to_utf8_array(

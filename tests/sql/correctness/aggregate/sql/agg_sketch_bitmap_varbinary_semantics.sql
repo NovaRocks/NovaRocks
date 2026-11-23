@@ -27,16 +27,16 @@ CREATE TABLE ${case_db}.t_agg_sketch_bitmap_source (
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_sketch_bitmap_source VALUES
-    ROW(1, 1, 'alpha', to_binary('alpha', 'utf8')),
-    ROW(1, 2, 'beta', to_binary('beta', 'utf8')),
-    ROW(1, 2, 'beta-dup', to_binary('beta', 'utf8')),
-    ROW(1, 3, 'gamma', to_binary('gamma', 'utf8')),
-    ROW(2, 3, 'gamma-dup', to_binary('gamma', 'utf8')),
-    ROW(2, 4, 'delta', to_binary('delta', 'utf8')),
-    ROW(2, 5, 'epsilon', to_binary('epsilon', 'utf8')),
+    ROW(1, 1, 'alpha', to_utf8('alpha')),
+    ROW(1, 2, 'beta', to_utf8('beta')),
+    ROW(1, 2, 'beta-dup', to_utf8('beta')),
+    ROW(1, 3, 'gamma', to_utf8('gamma')),
+    ROW(2, 3, 'gamma-dup', to_utf8('gamma')),
+    ROW(2, 4, 'delta', to_utf8('delta')),
+    ROW(2, 5, 'epsilon', to_utf8('epsilon')),
     ROW(2, NULL, 'null-vb', NULL),
-    ROW(3, 6, 'zeta', to_binary('zeta', 'utf8')),
-    ROW(3, 6, 'zeta-dup', to_binary('zeta', 'utf8'));
+    ROW(3, 6, 'zeta', to_utf8('zeta')),
+    ROW(3, 6, 'zeta-dup', to_utf8('zeta'));
 
 SELECT
     COUNT(DISTINCT id_int) AS exact_id,

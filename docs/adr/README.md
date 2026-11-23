@@ -345,6 +345,7 @@ code-anchors:
 - [ADR-0250](ADR-0250-standard-numeric-operator-semantics.md) — 标准数值怎样经共享定型和普通调用冻结，并保留遗留宽数消费者（active）
 
 - [ADR-0249](ADR-0249-trino-public-functions-and-internal-aggregate-identities.md) — Trino 公开候选如何尊重可见性，标准 DISTINCT 如何保留内部准确重载和状态（active）
+- [ADR-0257](ADR-0257-ordered-regexp-evaluation-and-resource-ownership.md) — 正则模式如何在原实参位置受控编译、搜索和归还资源（active）
 - [ADR-0245](ADR-0245-scalar-typing-finalizes-the-original-overload.md) — 表达式层为何在转换后以原重载定稿，语句准入、实际端口和两套入口如何交接（active）
 - [ADR-0244](ADR-0244-operators-are-identified-catalogue-functions.md) — 隐藏目录函数为何按身份表示运算符，如何沿普通调用迁移、渲染和折叠（active；部分替代 ADR-0242 的取负范围）
 
@@ -388,6 +389,7 @@ code-anchors:
 normalizer、AST mutation或printer生成的内部表示。运行期可以按请求派生typed/canonical facts，但派生物不能反向成为
 语言或durable authority。
 
+- [ADR-0258](ADR-0258-prepared-sql-request-snapshots-and-semantic-authors.md) — 预编译语句为何依赖请求定义快照、原参数位置以及 SchemaOnly 描述（active；实现与验证状态独立核对）
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 公开集合签名和关系 `TABLE(sequence(...))` 如何独立绑定（active）
 - [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) — Iceberg 元数据维护为何由原语句和准确表对象授权，如何保留 Trino 结果形状、完整有效文件集合、Hadoop 发现根与已确认删除事实（active；部分替代 ADR-0110/0198 的显式扫描和自有 ref 条款，以及 ADR-0111/0114/0232 的首次观察状态）
 - [ADR-0241](ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md) — Trino SQL 为何是唯一文法，语法扩展、AST 差异、能力准入与 printer 的边界（active；补充 ADR-0090／0101／0231）

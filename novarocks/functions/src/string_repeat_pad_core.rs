@@ -157,13 +157,23 @@ pub fn pad_into<'a, P: PadProjection<'a>>(
     target_len: i64,
     pad: impl FnOnce() -> &'a str,
     left: bool,
+    projection: P,
+) -> Result<P::Emission, P::Error> {
+    pad_into_with_limit(s, target_len, pad, left, Some(MAX_STRING_BYTES), projection)
+}
+
+pub(crate) fn pad_into_with_limit<'a, P: PadProjection<'a>>(
+    s: &'a str,
+    target_len: i64,
+    pad: impl FnOnce() -> &'a str,
+    left: bool,
+    byte_limit: Option<usize>,
     mut projection: P,
 ) -> Result<P::Emission, P::Error> {
-    if target_len < 0 {
+    let Ok(target_len) = usize::try_from(target_len) else {
         return projection.emit(None);
-    }
-    let target_len = target_len as usize;
-    if target_len > MAX_STRING_BYTES {
+    };
+    if byte_limit.is_some_and(|limit| target_len > limit) {
         return projection.emit(None);
     }
     let pad = pad();
@@ -186,7 +196,7 @@ pub fn pad_into<'a, P: PadProjection<'a>>(
             projection.compose_right(s, fill)?
         }
     };
-    if projection.result_len(&result) > MAX_STRING_BYTES {
+    if byte_limit.is_some_and(|limit| projection.result_len(&result) > limit) {
         projection.emit(None)
     } else {
         projection.emit(Some(result))

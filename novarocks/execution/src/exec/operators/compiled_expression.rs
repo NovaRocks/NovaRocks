@@ -72,6 +72,10 @@ pub(crate) struct RuntimeKernelControl {
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     allocator: Option<Arc<crate::runtime::tracked_state_allocator::TrackedStateAllocator>>,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    #[cfg(novarocks_dev_controls)]
+    task_protocol_observation: Option<crate::runtime::runtime_state::TaskProtocolTestObservation>,
+    #[cfg(novarocks_dev_controls)]
+    regexp_search_observed: std::sync::OnceLock<()>,
     #[cfg(test)]
     input_adapter_observer: Option<Arc<InputAdapterObserver>>,
 }
@@ -84,6 +88,10 @@ impl RuntimeKernelControl {
             query_memory: None,
             allocator: None,
             construction: None,
+            #[cfg(novarocks_dev_controls)]
+            task_protocol_observation: None,
+            #[cfg(novarocks_dev_controls)]
+            regexp_search_observed: std::sync::OnceLock::new(),
             #[cfg(test)]
             input_adapter_observer: None,
         }
@@ -104,6 +112,10 @@ impl RuntimeKernelControl {
             query_memory: self.query_memory.clone(),
             allocator: None,
             construction: self.construction.clone(),
+            #[cfg(novarocks_dev_controls)]
+            task_protocol_observation: self.task_protocol_observation.clone(),
+            #[cfg(novarocks_dev_controls)]
+            regexp_search_observed: std::sync::OnceLock::new(),
             #[cfg(test)]
             input_adapter_observer: self.input_adapter_observer.clone(),
         }
@@ -112,6 +124,10 @@ impl RuntimeKernelControl {
     /// Arc/account clones establish no funding domain or allocation authorization.
     pub(crate) fn bind_runtime_memory(&mut self, state: &RuntimeState) {
         self.query_memory = state.query_memory().cloned();
+        #[cfg(novarocks_dev_controls)]
+        {
+            self.task_protocol_observation = state.task_protocol_observation.clone();
+        }
     }
 
     pub(crate) fn bind_construction_factory(
@@ -190,6 +206,24 @@ impl RuntimeKernelControl {
             let _ = self.observed_stop.set(error);
         }
     }
+    #[cfg(novarocks_dev_controls)]
+    fn observe_regexp(&self, marker: &str, offset: usize) {
+        if let Some(facts) = &self.task_protocol_observation
+            && facts.observer.is_active()
+        {
+            let execution = facts.execution;
+            let task = facts.task_key;
+            facts.observer.observe(&format!(
+                "{marker} execution_id={}:{}:{} task_key={:x}:{:x} offset={offset}",
+                execution.query_id().high(),
+                execution.query_id().low(),
+                execution.attempt_id().get(),
+                task.high(),
+                task.low(),
+            ));
+        }
+    }
+
     pub(crate) fn project_required_failure(&self, failure: ExecutionFailure) -> ExecutionFailure {
         if matches!(
             failure.cause(),
@@ -219,6 +253,31 @@ impl KernelEvaluationControl for RuntimeKernelControl {
         }
         Ok(())
     }
+    #[cfg(novarocks_dev_controls)]
+    fn regexp_search_progress(&self, offset: usize) -> Result<(), KernelFailure> {
+        if self.regexp_search_observed.get().is_none()
+            && self
+                .task_protocol_observation
+                .as_ref()
+                .is_some_and(|facts| facts.observer.is_active())
+            && self.regexp_search_observed.set(()).is_ok()
+        {
+            self.observe_regexp(
+                novarocks_failpoint::observation_marker::REGEXP_SEARCH_PROGRESS,
+                offset,
+            );
+        }
+        self.checkpoint(0)
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    fn regexp_search_stopped(&self, offset: usize) {
+        self.observe_regexp(
+            novarocks_failpoint::observation_marker::REGEXP_SEARCH_STOPPED,
+            offset,
+        );
+    }
+
     fn wait(&self, duration: Duration) -> Result<(), KernelFailure> {
         if self.error.wait_until_stopped(duration) {
             self.observe_stop_cause();

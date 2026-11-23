@@ -125,7 +125,7 @@ INSERT INTO ${case_db}.t_insert_exact_bytes SELECT 7,X'FF00';
 
 -- query 15
 -- LATIN1 U+00FF is FF rather than UTF8 C3BF.
-SELECT id,hex(b) AS bytes_hex FROM ${case_db}.t_insert_exact_bytes ORDER BY id;
+SELECT id,to_hex(b) AS bytes_hex FROM ${case_db}.t_insert_exact_bytes ORDER BY id;
 
 -- query 16
 -- @skip_result_check=true

@@ -320,8 +320,6 @@ fn source_for_arguments(
             context,
             effects: token.call_contract().effects().clone(),
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
             temporal_source: None,
         },
     )]);

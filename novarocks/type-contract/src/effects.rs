@@ -57,6 +57,9 @@ pub enum ArgumentControl {
     If,
     Coalesce,
     Try,
+    /// Demand each regexp argument only after the previous one succeeded and
+    /// produced a non-NULL value. Compile the pattern at argument ordinal 1.
+    OrderedRegexp,
     /// The exact installed owner demands original emitted source occurrences.
     TemporalSource(crate::TemporalSourceKind),
     SimpleCase,
@@ -88,6 +91,7 @@ impl ArgumentControl {
             | (Self::If, ControlShape::If)
             | (Self::Coalesce, ControlShape::Coalesce)
             | (Self::Try, ControlShape::Try)
+            | (Self::OrderedRegexp, ControlShape::OrderedRegexp)
             | (Self::SimpleCase, ControlShape::Case { simple: true, .. })
             | (Self::SearchedCase, ControlShape::Case { simple: false, .. }) => true,
             (
@@ -208,6 +212,7 @@ impl FunctionEffectDeclaration {
                         | ArgumentControl::If
                         | ArgumentControl::Coalesce
                         | ArgumentControl::Try
+                        | ArgumentControl::OrderedRegexp
                         | ArgumentControl::TemporalSource(_)
                         | ArgumentControl::SimpleCase
                         | ArgumentControl::SearchedCase
@@ -238,6 +243,7 @@ impl FunctionEffectDeclaration {
             ArgumentControl::If
                 | ArgumentControl::Coalesce
                 | ArgumentControl::Try
+                | ArgumentControl::OrderedRegexp
                 | ArgumentControl::TemporalSource(_)
                 | ArgumentControl::SimpleCase
                 | ArgumentControl::SearchedCase
@@ -588,6 +594,7 @@ mod tests {
             ArgumentControl::If,
             ArgumentControl::Coalesce,
             ArgumentControl::Try,
+            ArgumentControl::OrderedRegexp,
             ArgumentControl::SimpleCase,
             ArgumentControl::SearchedCase,
             ArgumentControl::HigherOrder {
@@ -608,6 +615,7 @@ mod tests {
             ControlShape::If,
             ControlShape::Coalesce,
             ControlShape::Try,
+            ControlShape::OrderedRegexp,
             ControlShape::Case {
                 simple: true,
                 arms: 1,

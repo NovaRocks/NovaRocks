@@ -1,0 +1,58 @@
+-- query 2
+-- types	bigint
+n
+41
+
+-- query 3
+-- types	bigint
+n
+NULL
+
+-- query 4
+-- types	integer	varchar(7)
+Position	Type
+0	unknown
+
+-- query 5
+-- types	varchar(1)	varchar(0)	varchar(0)	varchar(0)	varchar(6)	integer	boolean
+Column Name	Catalog	Schema	Table	Type	Type Size	Aliased
+n	""	""	""	bigint	8	true
+
+-- query 7
+-- types	integer	integer
+x	_col1
+11	22
+
+-- query 8
+-- types	integer
+_col0
+42
+
+-- query 9
+-- types	integer
+x
+1
+2
+
+-- query 10
+-- types	integer
+value
+42
+
+-- query 11
+-- types	varchar(5)	varchar(0)	varchar(0)	varchar(0)	varchar(27)	integer	boolean
+Column Name	Catalog	Schema	Table	Type	Type Size	Aliased
+é😀	""	""	""	char(4)	0	true
+_col1	""	""	""	timestamp(3) with time zone	8	false
+_col2	""	""	""	varchar(4)	0	false
+
+-- query 12
+-- types	integer	integer
+x	y
+1	9
+2	8
+3	7
+
+-- query 14
+-- types	bigint	varchar
+Position	Type

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 use crate::session_error::QueryServiceError;
 use novarocks_parser::Span;
 use novarocks_parser::ast;
@@ -13,6 +15,12 @@ use novarocks_sql::sql_mode::{self, SqlSemanticSettings};
 use super::{
     ProductSqlCommand, lower_object_name, property_evaluation::validate_create_authorization,
     session_admit::SessionAdmitError,
+};
+
+mod prepared;
+pub use prepared::{
+    AdmittedTrinoStatement, TrinoDescriptionAction, TrinoDescriptionKind, TrinoStatementSource,
+    admit_trino_statement_request,
 };
 
 pub(super) const UNSUPPORTED_STATEMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
@@ -43,6 +51,9 @@ pub const TRINO_STATEMENT_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     NOT_IN_TRANSACTION,
     PROCEDURE_NOT_REGISTERED,
     UNKNOWN_TYPE,
+    prepared::PREPARED_STATEMENT_NOT_FOUND,
+    prepared::EXPRESSION_NOT_CONSTANT,
+    prepared::INVALID_PARAMETER_USAGE,
 ];
 
 pub fn procedure_not_registered(name: &ast::ObjectName) -> QueryServiceError {
@@ -108,6 +119,7 @@ pub enum TrinoStatementAction {
     Session(TrinoSessionAction),
     Product(ProductSqlCommand),
     Prepare(TrinoStatementPreparation),
+    Describe(TrinoDescriptionAction),
 }
 
 #[derive(Debug)]
@@ -133,6 +145,13 @@ pub enum TrinoSessionAction {
         span: Span,
     },
     SetTimeZone(ast::TrinoSetTimeZone),
+    Prepare {
+        name: String,
+        sql: Arc<str>,
+    },
+    DeallocatePrepare {
+        name: String,
+    },
 }
 
 /// Source-bearing requests to the owning preparation path. These values
@@ -228,8 +247,16 @@ pub fn admit_persisted_definition_semantics(
     ))
 }
 
-/// Select the exact statement owner before any provider or session effects.
+/// Select an ordinary statement owner before any provider or session effects.
+/// Request dispatch uses `admit_trino_statement_request` to retain source and bindings.
 pub fn admit_trino_statement(
+    source: &str,
+    statement: ast::TrinoStatement,
+) -> Result<TrinoStatementAction, QueryServiceError> {
+    prepared::admit_ordinary_statement(source, statement)
+}
+
+fn select_trino_statement_owner(
     source: &str,
     statement: ast::TrinoStatement,
 ) -> Result<TrinoStatementAction, QueryServiceError> {

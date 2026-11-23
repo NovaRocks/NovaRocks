@@ -56,6 +56,7 @@ fn scalar_context<'a>(
         control,
         constant_policy,
         materialized_values: None,
+        prepared_parameters: None,
         table_sequence: None,
         catalog: catalog.planner_table_provider(),
         current_database,
@@ -153,7 +154,7 @@ pub(crate) fn prepare(
         control,
     } = request;
     control.check()?;
-    let context = scalar_context(
+    let mut context = scalar_context(
         catalog,
         current_database,
         functions.as_ref(),
@@ -162,7 +163,11 @@ pub(crate) fn prepare(
         control,
     );
     let (expression, span) = match input {
-        RequiredConstantInput::Expression(expression) => {
+        RequiredConstantInput::Expression(expression)
+        | RequiredConstantInput::PreparedExpression { expression, .. } => {
+            if let RequiredConstantInput::PreparedExpression { parameters, .. } = input {
+                context.prepared_parameters = Some(parameters);
+            }
             reject_subqueries(
                 expression,
                 control,
@@ -500,6 +505,9 @@ fn validate_implicit_target(
     span: Span,
     control: &dyn PureCompileControl,
 ) -> Result<(), AnalyzeError> {
+    if target == RequiredConstantTarget::PreparedTableSelection {
+        return Ok(());
+    }
     if target == RequiredConstantTarget::TimeZone {
         let ty = source.value_type();
         if matches!(
@@ -541,6 +549,11 @@ fn validate_implicit_target(
     };
     if allowed {
         Ok(())
+    } else if target == RequiredConstantTarget::PreparedRowCount {
+        Err(AnalyzeError::type_mismatch(
+            "Prepared row count must be implicitly coercible to BIGINT",
+            span,
+        ))
     } else {
         let message = if target == RequiredConstantTarget::Timestamp {
             "required constant for an absolute time must have a Physical TIMESTAMP type"
@@ -564,6 +577,7 @@ fn required_target_value_type(
         RequiredConstantTarget::Boolean
         | RequiredConstantTarget::Integer
         | RequiredConstantTarget::Bigint
+        | RequiredConstantTarget::PreparedRowCount
         | RequiredConstantTarget::Double
         | RequiredConstantTarget::Varchar => {
             let data_type = target.scalar_data_type().ok_or_else(|| {
@@ -582,7 +596,8 @@ fn required_target_value_type(
         // performs the checked projection of any admitted UNKNOWN children.
         RequiredConstantTarget::MapVarcharVarchar
         | RequiredConstantTarget::Timestamp
-        | RequiredConstantTarget::TimeZone => source
+        | RequiredConstantTarget::TimeZone
+        | RequiredConstantTarget::PreparedTableSelection => source
             .clone_observed(|| control.checkpoint(CompilePhase::Validate, 1))
             .map_err(AnalyzeError::control),
         RequiredConstantTarget::ArrayVarchar => {

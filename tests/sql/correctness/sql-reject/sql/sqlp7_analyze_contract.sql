@@ -225,3 +225,39 @@ SELECT substring(a => 'x', b => 1);
 -- query 56
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 SELECT FINAL count(*);
+
+-- query 57
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT format('%s', 7);
+
+-- query 58
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT format(7, 'x');
+
+-- query 59
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT overlay('abc' PLACING 'x' FROM '1');
+
+-- query 60
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT ltrim('abc', 1);
+
+-- query 61
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT char_length('abc');
+
+-- query 62
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT initcap('abc');
+
+-- query 63
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT lower(1);
+
+-- query 64
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT translate('abc', 'a');
+
+-- query 65
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT concat('abc', 1);

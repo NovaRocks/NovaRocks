@@ -108,6 +108,7 @@ fn value_form_marker_query(
 ) -> ResolvedQuery {
     let marker_dtype = DataType::Int32;
     let marker_output = OutputColumn {
+        aliased: false,
         field_name: Some(marker_col_name.clone()),
         column_id: marker_col_id,
         name: marker_col_name.clone(),
@@ -367,6 +368,7 @@ impl<'a> AnalyzerContext<'a> {
             super::helpers::with_nullability(inner_out.value_type.clone(), true),
         );
         let output_column = OutputColumn {
+            aliased: false,
             field_name: Some(output_name.clone()),
             column_id: output_id,
             name: output_name.clone(),
@@ -543,6 +545,7 @@ impl<'a> AnalyzerContext<'a> {
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         let output_column = OutputColumn {
+            aliased: false,
             field_name: Some(output_name.clone()),
             column_id: output_id,
             name: output_name,
@@ -651,6 +654,7 @@ impl<'a> AnalyzerContext<'a> {
             query: novarocks_parser::ast::AstBox::new(marker_query),
             alias: relation_alias,
             output_columns: vec![OutputColumn {
+                aliased: false,
                 field_name: Some(marker_col_name.clone()),
                 column_id: marker_col_id,
                 name: marker_col_name,
@@ -1148,6 +1152,7 @@ impl<'a> AnalyzerContext<'a> {
             });
         }
         modified_sub.output_columns.push(OutputColumn {
+            aliased: false,
             field_name: Some(match_col.clone()),
             column_id: match_col_id,
             name: match_col.clone(),
@@ -1336,6 +1341,7 @@ impl<'a> AnalyzerContext<'a> {
             sel.has_aggregation = false;
         }
         modified_sub.output_columns = vec![OutputColumn {
+            aliased: false,
             field_name: Some(match_col.clone()),
             column_id: exists_col_id,
             name: match_col.clone(),
@@ -1762,6 +1768,7 @@ impl<'a> AnalyzerContext<'a> {
             sel.has_aggregation = false;
         }
         resolved_sub.output_columns = vec![OutputColumn {
+            aliased: false,
             field_name: Some(match_col.clone()),
             column_id: exists_col_id,
             name: match_col.clone(),
@@ -1775,6 +1782,7 @@ impl<'a> AnalyzerContext<'a> {
             query: novarocks_parser::ast::AstBox::new(resolved_sub),
             alias: sq_alias.clone(),
             output_columns: vec![OutputColumn {
+                aliased: false,
                 field_name: Some(match_col.clone()),
                 column_id: exists_col_id,
                 name: match_col.clone(),
@@ -2014,6 +2022,7 @@ impl<'a> AnalyzerContext<'a> {
                 subquery_id: sq_info.id,
                 clause,
                 output_column: crate::analysis::AnalyzedOutputField {
+                    aliased: false,
                     column_id: output.column_id,
                     field_name: Some(output.name.clone()),
                     name: output.name,
@@ -2268,6 +2277,7 @@ impl<'a> AnalyzerContext<'a> {
                 sel.distinct = true;
             }
             modified_sub.output_columns.push(OutputColumn {
+                aliased: false,
                 field_name: Some(match_col_name.clone()),
                 column_id: in_match_col_id,
                 name: match_col_name.clone(),
@@ -2483,6 +2493,7 @@ impl<'a> AnalyzerContext<'a> {
             field_name: Some(probe_name.clone()),
             name: probe_name.clone(),
             value_type: probe_type.clone(),
+            aliased: false,
             is_internal: true,
         };
         let equality = self.analyze_binary_operator(
@@ -2546,6 +2557,7 @@ impl<'a> AnalyzerContext<'a> {
                 field_name: Some(output.name.clone()),
                 name: output.name,
                 value_type: output.value_type,
+                aliased: false,
                 is_internal: true,
             },
             inner: source,
@@ -2926,6 +2938,7 @@ impl<'a> AnalyzerContext<'a> {
             purpose: self.purpose,
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: self.materialized_values,
+            prepared_parameters: self.prepared_parameters,
             table_sequence: self.table_sequence,
             control: self.control,
             constant_policy: self.constant_policy,
@@ -3009,8 +3022,8 @@ impl<'a> AnalyzerContext<'a> {
                     ctx.rewrite_order_aggregate_subqueries(select, &mut order_by)?;
                     ctx.validate_grouping_calls(&select.group_by)?;
                 }
-                let limit = super::helpers::extract_limit(modifiers)?;
-                let offset = super::helpers::extract_offset(modifiers)?;
+                let limit = super::helpers::extract_limit(modifiers, ctx.prepared_parameters)?;
+                let offset = super::helpers::extract_offset(modifiers, ctx.prepared_parameters)?;
 
                 Ok((
                     ResolvedQuery {
@@ -3033,8 +3046,8 @@ impl<'a> AnalyzerContext<'a> {
                     &cols,
                     &body,
                 )?;
-                let limit = super::helpers::extract_limit(modifiers)?;
-                let offset = super::helpers::extract_offset(modifiers)?;
+                let limit = super::helpers::extract_limit(modifiers, ctx.prepared_parameters)?;
+                let offset = super::helpers::extract_offset(modifiers, ctx.prepared_parameters)?;
 
                 Ok((
                     ResolvedQuery {
@@ -3290,6 +3303,7 @@ impl<'a> AnalyzerContext<'a> {
                 _ => self.alloc_column_id(None, col_name.clone(), inner_col.value_type.clone()),
             };
             extra_output.push(OutputColumn {
+                aliased: false,
                 field_name: Some(col_name.clone()),
                 column_id: corr_col_id,
                 name: col_name.clone(),
@@ -4549,6 +4563,7 @@ fn relation_first_output_column(rel: &Relation, scope: &AnalyzerScope) -> Option
             let col_def = s.table.columns.first()?;
             let col_id = s.column_ids.first().copied()?;
             Some(OutputColumn {
+                aliased: false,
                 field_name: Some(col_def.name.clone()),
                 column_id: col_id,
                 name: col_def.name.clone(),
@@ -4561,6 +4576,7 @@ fn relation_first_output_column(rel: &Relation, scope: &AnalyzerScope) -> Option
             let col_def = s.table.columns.first()?;
             let col_id = s.column_ids.first().copied()?;
             Some(OutputColumn {
+                aliased: false,
                 field_name: Some(col_def.name.clone()),
                 column_id: col_id,
                 name: col_def.name.clone(),
@@ -4573,6 +4589,7 @@ fn relation_first_output_column(rel: &Relation, scope: &AnalyzerScope) -> Option
             let col_def = s.table.columns.first()?;
             let col_id = s.column_ids.first().copied()?;
             Some(OutputColumn {
+                aliased: false,
                 field_name: Some(col_def.name.clone()),
                 column_id: col_id,
                 name: col_def.name.clone(),
@@ -4587,6 +4604,7 @@ fn relation_first_output_column(rel: &Relation, scope: &AnalyzerScope) -> Option
                 None
             } else {
                 Some(OutputColumn {
+                    aliased: false,
                     field_name: Some(g.column_name.clone()),
                     column_id: g.output_column_id,
                     name: g.column_name.clone(),
@@ -6455,6 +6473,7 @@ mod tests {
             limit: None,
             offset: None,
             output_columns: vec![OutputColumn {
+                aliased: false,
                 field_name: Some("x".to_string()),
                 column_id: crate::column_id::ColumnId(1),
                 name: "x".to_string(),

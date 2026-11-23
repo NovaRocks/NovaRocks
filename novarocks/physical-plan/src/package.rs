@@ -1153,8 +1153,6 @@ mod parameter_preallocation_review_tests {
                 },
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                 temporal_source: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
             },
         )]);
         let unit = sealed.finish(claims, &mut work).unwrap();

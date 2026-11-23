@@ -16,6 +16,8 @@
 // under the License.
 
 //! Typed changes prepared by the statement that actually changed its session.
+use std::sync::Arc;
+
 use crate::sql::session::registry::{ResolvedSqlSessionProperty, ValidatedSessionProperty};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,11 +25,18 @@ pub struct SetCatalogSchema {
     pub catalog: Option<String>,
     pub schema: String,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreparedStatementEffect {
+    Added { name: String, sql: Arc<str> },
+    Removed { name: String },
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SessionEffects {
     pub(crate) catalog_schema: Option<SetCatalogSchema>,
     pub(crate) properties: Vec<ValidatedSessionProperty>,
     pub(crate) reset_properties: Vec<ResolvedSqlSessionProperty>,
+    prepared_statements: Vec<PreparedStatementEffect>,
 }
 impl SessionEffects {
     pub fn catalog_schema(&self) -> Option<&SetCatalogSchema> {
@@ -47,6 +56,7 @@ impl SessionEffects {
         self.catalog_schema.is_none()
             && self.properties.is_empty()
             && self.reset_properties.is_empty()
+            && self.prepared_statements.is_empty()
     }
     pub fn set_catalog_schema(catalog: Option<String>, schema: String) -> Self {
         Self {
@@ -66,7 +76,27 @@ impl SessionEffects {
             ..Self::default()
         }
     }
+    pub fn prepare(name: String, sql: Arc<str>) -> Self {
+        Self {
+            prepared_statements: vec![PreparedStatementEffect::Added { name, sql }],
+            ..Self::default()
+        }
+    }
+
+    pub fn deallocate_prepare(name: String) -> Self {
+        Self {
+            prepared_statements: vec![PreparedStatementEffect::Removed { name }],
+            ..Self::default()
+        }
+    }
+
+    pub fn prepared_statements(&self) -> impl Iterator<Item = &PreparedStatementEffect> {
+        self.prepared_statements.iter()
+    }
+
     pub fn append(&mut self, mut effects: Self) {
+        self.prepared_statements
+            .append(&mut effects.prepared_statements);
         if effects.catalog_schema.is_some() {
             self.catalog_schema = effects.catalog_schema.take();
         }

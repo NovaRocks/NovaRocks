@@ -572,17 +572,16 @@ fn prepare_compiled_task_in(
                 .install_query_tracker_witness(context.query_tracker_witness.clone());
             if let Some((task, observer)) = context
                 .result_identity
-                .zip(context.position_shard_test_observer.clone())
+                .zip(context.task_protocol_test_observer.clone())
             {
                 Arc::get_mut(&mut state)
                     .expect("newly constructed runtime state has no aliases")
-                    .position_shard_observation = Some(
-                    crate::runtime::runtime_state::PositionShardTestObservation {
+                    .task_protocol_observation =
+                    Some(crate::runtime::runtime_state::TaskProtocolTestObservation {
                         execution: task.query_execution_id(),
                         task_key: instance_task_key,
                         observer,
-                    },
-                );
+                    });
             }
             state
         };

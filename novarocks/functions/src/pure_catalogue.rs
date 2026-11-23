@@ -175,10 +175,19 @@ impl PureKernelAbi {
                             | ArgumentControl::SimpleCase
                             | ArgumentControl::SearchedCase
                             | ArgumentControl::TemporalSource(_)
+                            | ArgumentControl::OrderedRegexp
                     )
-                    && (base.own_row_error == FunctionIntrinsicRowError::NoRowError
-                        || (matches!(base.argument_control, ArgumentControl::TemporalSource(_))
-                            && base.own_row_error == FunctionIntrinsicRowError::MayRaise))
+                    && match base.argument_control {
+                        ArgumentControl::OrderedRegexp => {
+                            base.own_row_error == FunctionIntrinsicRowError::MayRaise
+                        }
+                        ArgumentControl::TemporalSource(_) => matches!(
+                            base.own_row_error,
+                            FunctionIntrinsicRowError::NoRowError
+                                | FunctionIntrinsicRowError::MayRaise
+                        ),
+                        _ => base.own_row_error == FunctionIntrinsicRowError::NoRowError,
+                    }
                     && base.instance_state == FunctionInstanceState::None
                     && base.observable_effects == ObservableEffects::NONE
                     && base.environment_dependencies.is_empty()
@@ -519,6 +528,7 @@ pub enum PreparedPureKernel {
     /// Exact typed control facts for LocalProgram's intrinsic controller;
     /// this variant never pretends to be an ordinary evaluated-argument CPU.
     ControlIntrinsic(Arc<FunctionCallContract>),
+    OrderedRegexp(crate::PreparedRegexp),
 }
 impl PreparedPureKernel {
     /// Borrow the exact call owned by this resolved lifecycle implementation.
@@ -533,6 +543,7 @@ impl PreparedPureKernel {
             Self::Window(kernel) => kernel.contract().call(),
             Self::Table(kernel) => kernel.contract().call(),
             Self::ControlIntrinsic(call) => call,
+            Self::OrderedRegexp(prepared) => prepared.call(),
         }
     }
 }
@@ -1626,7 +1637,7 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
             .map_err(FunctionSpecializationFailure::Control)?;
         Ok(PreparedPureCallDraft {
             effects: effects.into(),
-            prepared: PreparedPureKernel::ControlIntrinsic(call),
+            prepared: prepared_control_call(call)?,
         })
     }
 
@@ -1660,9 +1671,18 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
             .map_err(FunctionSpecializationFailure::Control)?;
         Ok(PreparedPureCallDraft {
             effects: effects.into(),
-            prepared: PreparedPureKernel::ControlIntrinsic(call),
+            prepared: prepared_control_call(call)?,
         })
     }
+}
+
+fn prepared_control_call(
+    call: Arc<FunctionCallContract>,
+) -> Result<PreparedPureKernel, FunctionSpecializationFailure> {
+    if call.effects().argument_control == ArgumentControl::OrderedRegexp {
+        return crate::PreparedRegexp::from_call(call).map(PreparedPureKernel::OrderedRegexp);
+    }
+    Ok(PreparedPureKernel::ControlIntrinsic(call))
 }
 
 type RegisteredParts<O> = (

@@ -440,7 +440,10 @@ fn reject_reserved_update_columns() {
         &[col("id"), col("v")],
     )
     .expect_err("must reject");
-    assert!(err.contains("reserved Iceberg metadata column"), "{err}");
+    assert!(
+        err.message().contains("reserved Iceberg metadata column"),
+        "{err}"
+    );
 }
 
 #[test]

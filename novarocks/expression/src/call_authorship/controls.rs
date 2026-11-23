@@ -56,24 +56,6 @@ pub fn author_call_controls(
                 work.control(),
             )
             .map_err(|error| CallAuthorError::specialization(error, false))?;
-        if function.function_id.as_str() == "builtin.scalar/regexp_count/v1" {
-            work.flush()?;
-            match novarocks_expression_contract::regexp_count_pattern_source_from_lookup_observed(
-                |id| draft.definition(id),
-                args,
-                work,
-            ) {
-                Ok(_) => {}
-                Err(TemporalSourceProjectionError::Control(cause)) => {
-                    return Err(CallAuthorError::Control(cause));
-                }
-                Err(TemporalSourceProjectionError::Invalid(message)) => {
-                    return Err(CallAuthorError::occurrence(format!(
-                        "TemporalSource({message:?})"
-                    )));
-                }
-            }
-        }
         let selected_control =
             if declaration.implementation().abi == PureKernelAbi::ScalarInvocationV1 {
                 let request = draft.requests().get(&id).ok_or(CallAuthorError::Invariant(
@@ -160,6 +142,7 @@ pub fn installed_scalar_control_shape(
         ArgumentControl::If => ControlShape::If,
         ArgumentControl::Coalesce => ControlShape::Coalesce,
         ArgumentControl::Try => ControlShape::Try,
+        ArgumentControl::OrderedRegexp => ControlShape::OrderedRegexp,
         ArgumentControl::SimpleCase | ArgumentControl::SearchedCase => {
             let simple = control == ArgumentControl::SimpleCase;
             let tail = count.checked_sub(usize::from(simple))?;

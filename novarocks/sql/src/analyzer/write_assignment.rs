@@ -237,6 +237,41 @@ pub(crate) fn write_assignment_site_for_column(
 }
 
 impl super::AnalyzerContext<'_> {
+    /// The described command supplies all its target assignments. Validate
+    /// arity before conversion or the caller can project a command result for
+    /// a source whose original writer would reject it.
+    pub(super) fn check_described_write_width(
+        &self,
+        query: &crate::analysis::ResolvedQuery,
+        assignments: &crate::compiler::SqlWriteAssignments,
+        span: Span,
+    ) -> Result<(), AnalyzeError> {
+        if assignments.is_mutation_description() {
+            return Ok(());
+        }
+        for (ordinal, assignment) in assignments.sites().iter().enumerate() {
+            self.check_control()?;
+            if assignment.output_ordinal() != ordinal {
+                return Err(AnalyzeError::internal(
+                    "Write description requires a complete target assignment declaration",
+                ));
+            }
+        }
+        let expected = assignments.sites().len();
+        let mut actual = 0;
+        for column in &query.output_columns {
+            self.check_control()?;
+            actual += usize::from(!column.is_internal);
+        }
+        if actual != expected {
+            return Err(AnalyzeError::type_mismatch(
+                format!("Write source has {actual} columns but the target requires {expected}"),
+                span,
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn bind_write_source_query(
         &self,
         query: crate::analysis::ResolvedQuery,
@@ -266,6 +301,16 @@ impl super::AnalyzerContext<'_> {
         output_columns
             .try_reserve_exact(original.len())
             .map_err(assignment_allocation)?;
+        let mutation_projection = if assignments.is_mutation_description() {
+            let QueryBody::Select(select) = &query.body else {
+                return Err(AnalyzeError::internal(
+                    "Mutation description assignment has no original SELECT",
+                ));
+            };
+            Some(&select.projection)
+        } else {
+            None
+        };
         let alias = "__nr_write_source";
         for (ordinal, field) in original.iter().enumerate() {
             self.check_control()?;
@@ -283,11 +328,25 @@ impl super::AnalyzerContext<'_> {
                 })
                 .map_err(AnalyzeError::control)?;
             let value = match site {
-                Some(site) => self.bind_write_assignment_value(
-                    source,
-                    site,
-                    site.source_span().unwrap_or(span),
-                )?,
+                Some(site) => {
+                    let value = self.bind_write_assignment_value(
+                        source,
+                        site,
+                        site.source_span().unwrap_or(span),
+                    )?;
+                    if let Some(projection) = mutation_projection {
+                        let Some(item) = projection
+                            .get(ordinal)
+                            .filter(|item| item.output_column_id == field.column_id)
+                        else {
+                            return Err(AnalyzeError::internal(
+                                "Mutation description assignment lost its original expression",
+                            ));
+                        };
+                        self.observe_implicit_type(&item.expr, site.input())?;
+                    }
+                    value
+                }
                 None => source,
             };
             let column_id = if let ExprKind::ColumnRef { column_id, .. } = &value.kind {
@@ -299,6 +358,7 @@ impl super::AnalyzerContext<'_> {
                 id
             };
             output_columns.push(AnalyzedOutputField {
+                aliased: field.aliased,
                 column_id,
                 name: field.name.clone(),
                 field_name: field.field_name.clone(),

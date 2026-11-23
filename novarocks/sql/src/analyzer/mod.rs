@@ -253,6 +253,7 @@ pub(crate) fn analyze_mv_definition_with_factory(
         None,
         None,
         false,
+        None,
         QueryAnalysisPurpose::MaterializedViewDefinition,
         None,
     )
@@ -334,6 +335,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
     root_session_admitted: bool,
+    prepared_parameters: Option<&crate::compiler::SqlPreparedParameters>,
     table_sequence: Option<&crate::compiler::table_sequence::TableSequencePass>,
 ) -> Result<
     (
@@ -355,9 +357,78 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
         materialized,
         assignments,
         root_session_admitted,
+        prepared_parameters,
         QueryAnalysisPurpose::Ordinary,
         table_sequence,
     )
+}
+
+/// Describe one effective query directly from semantic analysis and the captured schema.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Original statement facts and analysis authority"
+)]
+pub(crate) fn describe_prepared_query(
+    query: &ast::Query,
+    catalog: &dyn PlannerTableProvider,
+    current_database: &str,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+    assignments: Option<&crate::compiler::SqlWriteAssignments>,
+    materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
+    parameters: &crate::compiler::SqlPreparedParameters,
+    ctas_source: bool,
+) -> Result<crate::compiler::SqlPreparedDescription, crate::compiler::SqlCompileError> {
+    let mut description = crate::compiler::DescriptionAnalysis::new(
+        parameters.positions().len(),
+        constant_policy,
+        control,
+    )?;
+    for need in parameters.contextual_needs(query) {
+        if need.is_row_count() {
+            let ordinal = parameters.ordinal(need.span()).ok_or_else(|| {
+                AnalyzeError::internal("Row count parameter has no description occurrence")
+            })?;
+            description.coerce_parameter(
+                ordinal,
+                &novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            )?;
+        }
+    }
+    let mut factory = crate::column_id::ColumnRefFactory::new();
+    factory.prepared_description = Some(Box::new(description));
+    let (resolved, _, mut factory) =
+        analyze_with_factory_and_function_catalog_and_assignments_inner(
+            query,
+            catalog,
+            current_database,
+            factory,
+            function_catalog,
+            sql_semantics,
+            constant_policy,
+            control,
+            materialized,
+            assignments,
+            true,
+            Some(parameters),
+            QueryAnalysisPurpose::Ordinary,
+            None,
+        )?;
+    if ctas_source {
+        crate::analysis::schema::validate_definition_column_names(
+            &resolved.output_columns,
+            query.span,
+        )?;
+        crate::planning::mv::validate_persistable_output(&resolved, &factory)
+            .map_err(crate::compiler::SqlCompileError::Compilation)?;
+    }
+    let description = factory
+        .prepared_description
+        .take()
+        .expect("description state belongs to the original analysis");
+    Ok(description.into_description(resolved.output_columns))
 }
 
 /// Test-only analysis helper that threads an existing [`ColumnRefFactory`] so that
@@ -456,6 +527,7 @@ fn analyze_with_factory_and_function_catalog_inner(
         materialized,
         None,
         false,
+        None,
         QueryAnalysisPurpose::Ordinary,
         None,
     )
@@ -477,6 +549,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
     root_session_admitted: bool,
+    prepared_parameters: Option<&crate::compiler::SqlPreparedParameters>,
     purpose: QueryAnalysisPurpose,
     table_sequence: Option<&crate::compiler::table_sequence::TableSequencePass>,
 ) -> Result<
@@ -526,6 +599,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
         function_catalog,
         constant_policy,
         materialized_values,
+        prepared_parameters,
         table_sequence,
         control,
         sql_semantics: sql_semantics.clone(),
@@ -539,7 +613,14 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     };
     let resolved = ctx.analyze_query(&query)?;
     let resolved = match assignments {
-        Some(assignments) => ctx.bind_write_source_query(resolved, assignments, query.span)?,
+        Some(assignments) => {
+            if prepared_parameters
+                .is_some_and(crate::compiler::SqlPreparedParameters::is_description)
+            {
+                ctx.check_described_write_width(&resolved, assignments, query.span)?;
+            }
+            ctx.bind_write_source_query(resolved, assignments, query.span)?
+        }
         None => resolved,
     };
     ctx.check_control()?;
@@ -654,6 +735,7 @@ pub(super) struct AnalyzerContext<'a> {
     pub(super) control: &'a crate::compiler::SqlCompileControl,
     pub(super) constant_policy: novarocks_functions::ConstantPolicy,
     materialized_values: Option<crate::compiler::materialized_values::MaterializedValuesLoan<'a>>,
+    prepared_parameters: Option<&'a crate::compiler::SqlPreparedParameters>,
     table_sequence: Option<&'a crate::compiler::table_sequence::TableSequencePass>,
     pub(super) catalog: &'a dyn PlannerTableProvider,
     pub(super) current_database: &'a str,
@@ -1019,6 +1101,7 @@ impl<'a> AnalyzerContext<'a> {
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: self.materialized_values,
+            prepared_parameters: self.prepared_parameters,
             table_sequence: self.table_sequence,
             catalog: self.catalog,
             current_database: self.current_database,
@@ -1122,8 +1205,8 @@ impl<'a> AnalyzerContext<'a> {
             }
 
             // Extract LIMIT / OFFSET
-            let limit = extract_limit(modifiers)?;
-            let offset = extract_offset(modifiers)?;
+            let limit = extract_limit(modifiers, ctx.prepared_parameters)?;
+            let offset = extract_offset(modifiers, ctx.prepared_parameters)?;
 
             // Build output columns from the body
             let output_columns = body_output;
@@ -1322,7 +1405,11 @@ impl<'a> AnalyzerContext<'a> {
                     self.control,
                 )?;
                 let column_id = self.alloc_column_id(None, lc.name.clone(), value_type.clone());
+                if let Some(description) = &mut self.factory.borrow_mut().prepared_description {
+                    description.copy_origin(lc.column_id, column_id);
+                }
                 output_cols.push(OutputColumn {
+                    aliased: lc.aliased,
                     field_name: lc.field_name.clone(),
                     column_id,
                     name: lc.name.clone(),
@@ -1425,6 +1512,7 @@ impl<'a> AnalyzerContext<'a> {
                 let value_type = helpers::with_nullability(ty.clone(), true);
                 let column_id = self.alloc_column_id(None, name.clone(), value_type.clone());
                 Ok(OutputColumn {
+                    aliased: false,
                     field_name: None,
                     column_id,
                     name,
@@ -1434,15 +1522,20 @@ impl<'a> AnalyzerContext<'a> {
             })
             .collect::<Result<Vec<_>, AnalyzeError>>()?;
         for (ordinal, column) in output_cols.iter().enumerate() {
-            if column.value_type.value_type().temporal().is_none() {
+            let temporal = column.value_type.value_type().temporal().is_some();
+            if !temporal && self.factory.borrow().prepared_description.is_none() {
                 continue;
             }
-            for cell in resolved_rows
-                .iter_mut()
-                .filter_map(|row| row.get_mut(ordinal))
-            {
+            for (row, source) in resolved_rows.iter_mut().zip(values.rows.iter()) {
                 self.check_control()?;
-                if !cell.value_type.same_value_domain(&column.value_type) {
+                let Some(cell) = row.get_mut(ordinal) else {
+                    continue;
+                };
+                // The VALUES coercion is attached to the original row expression.
+                if !matches!(source, ast::Expr::Row(_)) {
+                    self.observe_implicit_type(cell, &column.value_type)?;
+                }
+                if temporal && !cell.value_type.same_value_domain(&column.value_type) {
                     *cell = self.cast_to_value_type(
                         cell.clone(),
                         column.value_type.clone(),
@@ -2449,6 +2542,23 @@ impl<'a> AnalyzerContext<'a> {
         Ok((QueryBody::Select(sel), cols))
     }
 
+    fn keeps_described_projection_origin(
+        &self,
+        expression: &ast::Expr,
+        scope: &AnalyzerScope,
+    ) -> bool {
+        if self.factory.borrow().prepared_description.is_none() {
+            return true;
+        }
+        match expression {
+            ast::Expr::Identifier(identifier) => {
+                scope.computed_column_for(&identifier.value).is_none()
+            }
+            ast::Expr::Dereference(_) => true,
+            _ => false,
+        }
+    }
+
     /// Analyze the SELECT projection list.
     fn analyze_projection(
         &self,
@@ -2475,9 +2585,12 @@ impl<'a> AnalyzerContext<'a> {
                         let typed =
                             self.substitute_select_aliases_for_select(typed, &projection, scope);
                         let name = alias.value.clone();
+                        let projection_origin =
+                            self.keeps_described_projection_origin(expr, &effective_scope);
                         let column_id = match &typed.kind {
                             ExprKind::ColumnRef { column_id, .. }
-                                if !matches!(expr, ast::Expr::Cast(_))
+                                if projection_origin
+                                    && !matches!(expr, ast::Expr::Cast(_))
                                     && !is_grouping_call(expr) =>
                             {
                                 *column_id
@@ -2489,7 +2602,8 @@ impl<'a> AnalyzerContext<'a> {
                         // before planner symbol rewrites hand it to the root owner.
                         // A same-carrier explicit CAST may simplify to a reference,
                         // but still owns a separate output domain occurrence.
-                        if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
+                        if !projection_origin
+                            || !matches!(&typed.kind, ExprKind::ColumnRef { .. })
                             || matches!(expr, ast::Expr::Cast(_))
                             || is_grouping_call(expr)
                         {
@@ -2500,6 +2614,7 @@ impl<'a> AnalyzerContext<'a> {
                                 .set_logical_type(column_id, logical);
                         }
                         output_columns.push(OutputColumn {
+                            aliased: true,
                             field_name: Some(name.clone()),
                             column_id,
                             name: name.clone(),
@@ -2531,10 +2646,15 @@ impl<'a> AnalyzerContext<'a> {
                         let typed = self.analyze_expr(expr, &effective_scope)?;
                         let typed =
                             self.substitute_select_aliases_for_select(typed, &projection, scope);
+                        let projection_origin =
+                            self.keeps_described_projection_origin(expr, &effective_scope);
                         let (name, column_id) = match &typed.kind {
                             ExprKind::ColumnRef {
                                 column_id, column, ..
-                            } if !matches!(expr, ast::Expr::Cast(_)) && !is_grouping_call(expr) => {
+                            } if projection_origin
+                                && !matches!(expr, ast::Expr::Cast(_))
+                                && !is_grouping_call(expr) =>
+                            {
                                 (column.clone(), *column_id)
                             }
                             _ => {
@@ -2549,7 +2669,8 @@ impl<'a> AnalyzerContext<'a> {
                         // before planner symbol rewrites hand it to the root owner.
                         // A same-carrier explicit CAST may simplify to a reference,
                         // but still owns a separate output domain occurrence.
-                        if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
+                        if !projection_origin
+                            || !matches!(&typed.kind, ExprKind::ColumnRef { .. })
                             || matches!(expr, ast::Expr::Cast(_))
                             || is_grouping_call(expr)
                         {
@@ -2560,6 +2681,7 @@ impl<'a> AnalyzerContext<'a> {
                                 .set_logical_type(column_id, logical);
                         }
                         output_columns.push(OutputColumn {
+                            aliased: false,
                             field_name: natural_field_name(expr),
                             column_id,
                             name: name.clone(),
@@ -2640,6 +2762,7 @@ impl<'a> AnalyzerContext<'a> {
                             value_type: value_type.clone(),
                         };
                         output_columns.push(OutputColumn {
+                            aliased: false,
                             field_name: field_name.clone(),
                             column_id: *col_id,
                             name: col_name.clone(),
@@ -2699,6 +2822,7 @@ impl<'a> AnalyzerContext<'a> {
                 )
             };
             output_columns.push(OutputColumn {
+                aliased: false,
                 field_name: field_name.clone(),
                 column_id: id,
                 name: col_name.clone(),
@@ -2752,6 +2876,7 @@ impl<'a> AnalyzerContext<'a> {
                             value_type: value_type.clone(),
                         };
                         output_columns.push(OutputColumn {
+                            aliased: false,
                             field_name: field_name.clone(),
                             column_id: *col_id,
                             name: col_name.clone(),
@@ -7341,6 +7466,7 @@ mod tests {
             control: &control,
             constant_policy: crate::constant::test_constant_policy(),
             materialized_values: None,
+            prepared_parameters: None,
             table_sequence: None,
             catalog: &TestCatalog,
             current_database: "default",
@@ -7684,6 +7810,7 @@ mod tests {
             control: &control,
             constant_policy: crate::constant::test_constant_policy(),
             materialized_values: None,
+            prepared_parameters: None,
             table_sequence: None,
             catalog: &TestCatalog,
             current_database: "default",
@@ -7980,8 +8107,7 @@ mod tests {
     #[test]
     fn length_requires_an_explicit_varchar_cast_for_numeric_input() {
         let error = parse_and_analyze("select length(o_orderkey) from orders")
-            .err()
-            .expect("length requires a character argument");
+            .expect_err("length requires a character argument");
         assert!(error.contains("no matching declared overload"), "{error}");
         let resolved = parse_and_analyze("select length(CAST(o_orderkey AS VARCHAR)) from orders")
             .expect("length accepts the explicit text value");
@@ -8035,6 +8161,7 @@ mod tests {
             );
         };
         assert_eq!(name, "substring");
+        assert_eq!(args.len(), 3);
         let ExprKind::Cast {
             target,
             expr,
@@ -8053,10 +8180,34 @@ mod tests {
             expr.value_type.data_type().clone(),
             arrow::datatypes::DataType::Float64
         );
-        for position in &args[1..] {
+        for (position, expected) in args[1..].iter().zip(["1", "6"]) {
             assert_eq!(
                 position.value_type.data_type(),
+                &arrow::datatypes::DataType::Int64
+            );
+            let ExprKind::Cast {
+                expr,
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
+                ..
+            } = &position.kind
+            else {
+                panic!("expected the original INTEGER position widened to BIGINT");
+            };
+            assert_eq!(
+                expr.value_type.data_type(),
                 &arrow::datatypes::DataType::Int32
+            );
+            let ExprKind::Cast {
+                expr: literal,
+                target: arrow::datatypes::DataType::Int32,
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+                ..
+            } = &expr.kind
+            else {
+                panic!("expected the original INTEGER typed string cast");
+            };
+            assert!(
+                matches!(&literal.kind, ExprKind::Literal(LiteralValue::String(value)) if value == expected)
             );
         }
     }
@@ -8096,8 +8247,7 @@ mod tests {
     #[test]
     fn split_returns_varchar_array_after_explicit_argument_casts() {
         let error = parse_and_analyze("select split(o_orderkey, 1) from orders")
-            .err()
-            .expect("split requires character arguments");
+            .expect_err("split requires character arguments");
         assert!(error.contains("no matching declared overload"), "{error}");
         let resolved = parse_and_analyze(
             "select split(CAST(o_orderkey AS VARCHAR), CAST(1 AS VARCHAR)) from orders",

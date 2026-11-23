@@ -48,6 +48,7 @@ pub(super) struct ReadPreparationInput {
     pub(super) optimizer_limit: u64,
     pub(super) sql: Arc<str>,
     pub(super) query: Box<ast::Query>,
+    pub(super) parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
     pub(super) state: SessionSqlState,
     pub(super) statement_time: novarocks_type_contract::StatementTimeEnvironment,
     pub(super) deadline: Option<Instant>,
@@ -97,6 +98,7 @@ pub(super) async fn prepare_read(
             )
             .with_session_property_inputs(property_inputs),
         )
+        .with_prepared_parameters(input.parameters)
         .with_result_capacity(capacity)
         .map_err(statement_work_error)?;
         #[cfg(novarocks_dev_controls)]
@@ -808,6 +810,7 @@ pub(super) fn build_read_action(
         deadline,
         cancellation,
         window,
+        parameters,
         planning_cpu,
         statement_time,
         #[cfg(novarocks_dev_controls)]
@@ -870,6 +873,7 @@ pub(super) fn build_read_action(
         optimizer_limit: environment.optimizer_limit,
         sql,
         query,
+        parameters,
         state,
         statement_time,
         deadline,

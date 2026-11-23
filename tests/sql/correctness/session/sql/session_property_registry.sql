@@ -235,3 +235,20 @@ RESET SESSION decimal_overflow_to_double;
 -- query 55
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
 WITH SESSION decimal_overflow_to_double = true SELECT 1;
+
+-- query 56
+SET SESSION disable_optimizer_rules = 'FoldConstant';
+
+-- query 57
+SET SESSION recursive_cte_max_depth = CAST(regexp_count('aba', 'a') AS INTEGER);
+
+-- query 58
+WITH RECURSIVE numbers(n) AS (
+    SELECT 1
+    UNION ALL
+    SELECT n + 1 FROM numbers WHERE n < 10
+)
+SELECT n FROM numbers ORDER BY n;
+
+-- query 59
+SET SESSION disable_optimizer_rules = '';

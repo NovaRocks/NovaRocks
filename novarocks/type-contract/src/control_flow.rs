@@ -45,6 +45,9 @@ pub const MAX_CONTROL_DEFINITIONS: usize = 262_144;
 pub const MAX_CONTROL_DEPTH: usize = 96;
 pub const MAX_CONTROL_USE_REFERENCES: usize = 65_536;
 
+/// Original zero-based pattern position in every ordered regexp overload.
+pub const ORDERED_REGEXP_PATTERN_ORDINAL: usize = 1;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlShape {
     Eager,
@@ -63,6 +66,9 @@ pub enum ControlShape {
     Coalesce,
     /// Evaluate one value expression in its own row-error catch scope.
     Try,
+    /// Demand source and pattern in order, compile the non-NULL pattern at
+    /// its original position, then demand the remaining arguments in order.
+    OrderedRegexp,
     /// Four ordered source occurrences and two intervening comparisons.
     Between {
         negated: bool,
@@ -109,6 +115,11 @@ pub enum GuardKind {
     },
     /// Source/comparison completed and current invocation is nonempty.
     MembershipAfterSource {
+        ordinal: u32,
+    },
+    /// The preceding regexp argument supplied a non-NULL value and completed
+    /// its required conversion for this row.
+    OrderedRegexpAfterArgument {
         ordinal: u32,
     },
     /// Whole current invocation predicate, never a per-row NULL branch.
@@ -778,6 +789,7 @@ fn validate_arity(shape: ControlShape, count: usize) -> Result<(), ExpressionCon
         ControlShape::If => count == 3,
         ControlShape::Coalesce => count > 0,
         ControlShape::Try => count == 1,
+        ControlShape::OrderedRegexp => (2..=4).contains(&count),
         ControlShape::Between { .. } => count == 4,
         ControlShape::Membership { .. } => count > 0,
         ControlShape::TemporalSource(shape) => count == shape.source_count(),
@@ -816,6 +828,11 @@ fn control_argument_guard(shape: ControlShape, ordinal: usize) -> Option<GuardKi
             ordinal: ordinal as u32,
         }),
         ControlShape::Try => Some(GuardKind::TryBody),
+        ControlShape::OrderedRegexp => {
+            (ordinal > 0).then(|| GuardKind::OrderedRegexpAfterArgument {
+                ordinal: (ordinal - 1) as u32,
+            })
+        }
         ControlShape::Between { .. } => (ordinal > 0).then(|| GuardKind::BetweenAfterSource {
             ordinal: (ordinal - 1) as u32,
         }),
@@ -871,6 +888,7 @@ fn control_argument_demand(
         | ControlShape::NoArguments
         | ControlShape::Coalesce
         | ControlShape::Try
+        | ControlShape::OrderedRegexp
         | ControlShape::TemporalSource(_)
         | ControlShape::Between { .. }
         | ControlShape::Membership { .. } => Value,
@@ -1175,6 +1193,40 @@ mod tests {
             control_argument_semantics(ControlShape::TypeOnly, 1, 0, EvaluationDemand::Value),
             Err(ExpressionControlFlowError::InvalidControlShape)
         );
+    }
+
+    #[test]
+    fn ordered_regexp_requires_value_and_success_of_each_predecessor() {
+        for count in 2usize..=4 {
+            for ordinal in 0..count {
+                let guard =
+                    ordinal
+                        .checked_sub(1)
+                        .map(|previous| GuardKind::OrderedRegexpAfterArgument {
+                            ordinal: previous as u32,
+                        });
+                assert_eq!(
+                    control_argument_semantics(
+                        ControlShape::OrderedRegexp,
+                        count,
+                        ordinal,
+                        EvaluationDemand::TruthOnly,
+                    ),
+                    Ok((EvaluationDemand::Value, guard))
+                );
+            }
+        }
+        for count in [0, 1, 5] {
+            assert_eq!(
+                control_argument_semantics(
+                    ControlShape::OrderedRegexp,
+                    count,
+                    ORDERED_REGEXP_PATTERN_ORDINAL,
+                    EvaluationDemand::Value,
+                ),
+                Err(ExpressionControlFlowError::InvalidControlShape)
+            );
+        }
     }
 
     #[path = "failure_tail_tests.rs"]

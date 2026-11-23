@@ -44,6 +44,7 @@ fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
         control,
         constant_policy: crate::constant::test_constant_policy(),
         materialized_values: None,
+        prepared_parameters: None,
         table_sequence: None,
         catalog: &NoTables,
         current_database: "default",
@@ -560,7 +561,7 @@ fn dedicated_controls_keep_original_bindings_display_and_direct_refusals() {
         ("SELECT try(missing_value)", AnalyzeErrorKind::UnknownColumn),
         (
             "SELECT format(missing_format, missing_value)",
-            AnalyzeErrorKind::UnsupportedExpression,
+            AnalyzeErrorKind::UnknownColumn,
         ),
     ] {
         let parsed = query(sql);

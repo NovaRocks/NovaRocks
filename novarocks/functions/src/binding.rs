@@ -217,6 +217,7 @@ impl FunctionSemantics {
             ArgumentControl::If
             | ArgumentControl::Coalesce
             | ArgumentControl::Try
+            | ArgumentControl::OrderedRegexp
             | ArgumentControl::SimpleCase
             | ArgumentControl::SearchedCase => FunctionArgumentEvaluation::ShortCircuit,
             ArgumentControl::Eager
@@ -1804,6 +1805,7 @@ impl From<crate::FunctionResolutionError> for FunctionBindingError {
     fn from(error: crate::FunctionResolutionError) -> Self {
         match error {
             crate::FunctionResolutionError::Control(error) => error.into(),
+            crate::FunctionResolutionError::ResultType(error) => error.into(),
             other => invalid_binding(&other.to_string()),
         }
     }

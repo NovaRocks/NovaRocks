@@ -269,8 +269,6 @@ pub(in crate::physical_package_v2) fn checked_fixture_unit(
                     effects,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             ))
         })

@@ -85,10 +85,10 @@ select
     idx,
     idx,
     idx,
-    substr(lpad(idx, 4, '-'), 1, 4),
-    substr(lpad(idx, 8, '-'), 1, 8),
-    substr(lpad(idx, 16, '-'), 1, 16),
-    substr(lpad(idx, 32, '-'), 1, 32)
+    substr(lpad(CAST(idx AS VARCHAR), 4, '-'), 1, 4),
+    substr(lpad(CAST(idx AS VARCHAR), 8, '-'), 1, 8),
+    substr(lpad(CAST(idx AS VARCHAR), 16, '-'), 1, 16),
+    substr(lpad(CAST(idx AS VARCHAR), 32, '-'), 1, 32)
 from ${case_db}.__row_util where idx <= 1000;
 
 -- query 12
@@ -121,52 +121,52 @@ insert into ${case_db}.t2 select idx, idx, idx, uuid(), uuid(), uuid(), uuid() f
 
 -- join on c_str4 with =
 -- query 17
-select count(1), sum(murmur_hash3_32(t1.c_str4)), sum(murmur_hash3_32(t2.c_str4))
+select count(1), sum(crc32(to_utf8(CAST(t1.c_str4 AS VARCHAR)))), sum(crc32(to_utf8(CAST(t2.c_str4 AS VARCHAR))))
 from ${case_db}.t1 join ${case_db}.t2 on t1.c_str4 = t2.c_str4;
 
 -- join on c_str4 with <=>
 -- query 18
-select count(1), sum(murmur_hash3_32(t1.c_str4)), sum(murmur_hash3_32(t2.c_str4))
+select count(1), sum(crc32(to_utf8(CAST(t1.c_str4 AS VARCHAR)))), sum(crc32(to_utf8(CAST(t2.c_str4 AS VARCHAR))))
 from ${case_db}.t1 join ${case_db}.t2 on t1.c_str4  IS NOT DISTINCT FROM  t2.c_str4;
 
 -- join on c_str4 with = and c_int =
 -- query 19
-select count(1), sum(murmur_hash3_32(t1.c_str4)), sum(murmur_hash3_32(t2.c_str4))
+select count(1), sum(crc32(to_utf8(CAST(t1.c_str4 AS VARCHAR)))), sum(crc32(to_utf8(CAST(t2.c_str4 AS VARCHAR))))
 from ${case_db}.t1 join ${case_db}.t2 on t1.c_str4 = t2.c_str4 and t1.c_int = t2.c_int;
 
 -- join on c_str8 with =
 -- query 20
-select count(1), sum(murmur_hash3_32(t1.c_str8)), sum(murmur_hash3_32(t2.c_str8))
+select count(1), sum(crc32(to_utf8(CAST(t1.c_str8 AS VARCHAR)))), sum(crc32(to_utf8(CAST(t2.c_str8 AS VARCHAR))))
 from ${case_db}.t1 join ${case_db}.t2 on t1.c_str8 = t2.c_str8;
 
 -- join on c_str8 with <=>
 -- query 21
-select count(1), sum(murmur_hash3_32(t1.c_str8)), sum(murmur_hash3_32(t2.c_str8))
+select count(1), sum(crc32(to_utf8(CAST(t1.c_str8 AS VARCHAR)))), sum(crc32(to_utf8(CAST(t2.c_str8 AS VARCHAR))))
 from ${case_db}.t1 join ${case_db}.t2 on t1.c_str8  IS NOT DISTINCT FROM  t2.c_str8;
 
 -- join on c_str8 with = and c_int =
 -- query 22
-select count(1), sum(murmur_hash3_32(t1.c_str8)), sum(murmur_hash3_32(t2.c_str8))
+select count(1), sum(crc32(to_utf8(CAST(t1.c_str8 AS VARCHAR)))), sum(crc32(to_utf8(CAST(t2.c_str8 AS VARCHAR))))
 from ${case_db}.t1 join ${case_db}.t2 on t1.c_str8 = t2.c_str8 and t1.c_int = t2.c_int;
 
 -- join on c_str16 with =
 -- query 23
-select count(1), sum(murmur_hash3_32(t1.c_str16)), sum(murmur_hash3_32(t2.c_str16))
+select count(1), sum(crc32(to_utf8(CAST(t1.c_str16 AS VARCHAR)))), sum(crc32(to_utf8(CAST(t2.c_str16 AS VARCHAR))))
 from ${case_db}.t1 join ${case_db}.t2 on t1.c_str16 = t2.c_str16;
 
 -- join on c_str16 with <=>
 -- query 24
-select count(1), sum(murmur_hash3_32(t1.c_str16)), sum(murmur_hash3_32(t2.c_str16))
+select count(1), sum(crc32(to_utf8(CAST(t1.c_str16 AS VARCHAR)))), sum(crc32(to_utf8(CAST(t2.c_str16 AS VARCHAR))))
 from ${case_db}.t1 join ${case_db}.t2 on t1.c_str16  IS NOT DISTINCT FROM  t2.c_str16;
 
 -- join on c_str16 with = and c_int =
 -- query 25
-select count(1), sum(murmur_hash3_32(t1.c_str16)), sum(murmur_hash3_32(t2.c_str16))
+select count(1), sum(crc32(to_utf8(CAST(t1.c_str16 AS VARCHAR)))), sum(crc32(to_utf8(CAST(t2.c_str16 AS VARCHAR))))
 from ${case_db}.t1 join ${case_db}.t2 on t1.c_str16 = t2.c_str16 and t1.c_int = t2.c_int;
 
 -- join on c_str32 with =
 -- query 26
-select count(1), sum(murmur_hash3_32(t1.c_str32)), sum(murmur_hash3_32(t2.c_str32))
+select count(1), sum(crc32(to_utf8(CAST(t1.c_str32 AS VARCHAR)))), sum(crc32(to_utf8(CAST(t2.c_str32 AS VARCHAR))))
 from ${case_db}.t1 join ${case_db}.t2 on t1.c_str32 = t2.c_str32;
 
 -- insert null-byte string rows into t2
@@ -184,7 +184,7 @@ select
 
 -- join on c_str8 with <=> after null-byte insert into t2
 -- query 28
-select count(1), sum(murmur_hash3_32(t1.c_str8)), sum(murmur_hash3_32(t2.c_str8))
+select count(1), sum(crc32(to_utf8(CAST(t1.c_str8 AS VARCHAR)))), sum(crc32(to_utf8(CAST(t2.c_str8 AS VARCHAR))))
 from ${case_db}.t1 join ${case_db}.t2 on t1.c_str8  IS NOT DISTINCT FROM  t2.c_str8;
 
 -- insert null-byte string rows into t1
@@ -202,5 +202,5 @@ select
 
 -- join on c_str8 with <=> after null-byte insert into both
 -- query 30
-select count(1), sum(murmur_hash3_32(t1.c_str8)), sum(murmur_hash3_32(t2.c_str8))
+select count(1), sum(crc32(to_utf8(CAST(t1.c_str8 AS VARCHAR)))), sum(crc32(to_utf8(CAST(t2.c_str8 AS VARCHAR))))
 from ${case_db}.t1 join ${case_db}.t2 on t1.c_str8  IS NOT DISTINCT FROM  t2.c_str8;

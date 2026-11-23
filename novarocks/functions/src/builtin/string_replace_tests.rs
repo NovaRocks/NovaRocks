@@ -237,7 +237,7 @@ fn string_replace_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
             owner.binding_declaration().function_id().as_str(),
             format!("builtin.scalar/{name}/v1")
         );
-        assert_eq!(owner.implementation_declarations().len(), 1);
+        assert_eq!(owner.implementation_declarations().len(), 2);
         assert_eq!(
             owner.implementation_declarations()[0]
                 .implementation
@@ -248,8 +248,8 @@ fn string_replace_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
             owner.binding_declaration().overloads()[0].effects.as_ref(),
             Some(&effects())
         );
-        assert_eq!(owner.binding_declaration().overloads().len(), 1);
-        for count in [0, 1, 2, 4] {
+        assert_eq!(owner.binding_declaration().overloads().len(), 2);
+        for count in [0, 1, 4] {
             let bad_args: Vec<_> = (0..count)
                 .map(|i| arguments[i.min(arity - 1)].clone())
                 .collect();

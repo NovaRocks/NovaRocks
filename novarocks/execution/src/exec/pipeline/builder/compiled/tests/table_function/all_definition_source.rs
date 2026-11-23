@@ -423,8 +423,6 @@ fn source_fixture() -> SourceFixture {
                 effects: token.call_contract().effects().clone(),
                 decimal_overflow_policy: POLICY,
                 temporal_source: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
             },
         );
     }

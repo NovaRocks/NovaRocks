@@ -159,6 +159,7 @@ impl Fixture {
             source,
             SessionPropertyMutation {
                 mutation: Box::new(mutation),
+                parameters: None,
                 catalogs: Arc::new(SystemOnly),
             },
             control,
@@ -476,6 +477,7 @@ async fn scoped_set_and_reset_use_the_same_catalog_key_and_original_cpu() {
             Arc::from(source),
             SessionPropertyMutation {
                 mutation: Box::new(mutation),
+                parameters: None,
                 catalogs: Arc::new(ObservedCatalog(Arc::clone(&metadata))),
             },
             SqlCompileControl::unbounded(),
@@ -585,6 +587,7 @@ async fn trino_set_time_zone_uses_original_scoped_constants_and_effects() {
             Arc::from(source),
             SessionPropertyMutation {
                 mutation: Box::new(mutation),
+                parameters: None,
                 catalogs: Arc::new(SystemOnly),
             },
             SqlCompileControl::unbounded(),
@@ -652,6 +655,7 @@ async fn trino_system_set_and_reset_do_not_consult_the_catalog() {
             Arc::from(source),
             SessionPropertyMutation {
                 mutation: Box::new(mutation),
+                parameters: None,
                 catalogs: Arc::new(SystemOnly),
             },
             SqlCompileControl::unbounded(),

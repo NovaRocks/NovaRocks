@@ -39,6 +39,7 @@ use super::scalar_construction::{borrow_creator, with_binding_creation};
 use super::signature::declared_list;
 #[cfg(test)]
 use super::signature::declared_map;
+use super::string_binary::TrinoByteOp;
 use super::{registry, resolver};
 use crate::{FunctionBindingCreationFailure, FunctionVolatility};
 use novarocks_type_contract::{CompileCheckpoints, PureCompileControl, ValueLogicalType};
@@ -1073,7 +1074,18 @@ fn scalar_result_nullable_from_types(
         // A function that is total -- one that answers for every value of
         // its declared argument types -- passes its arguments' nullability
         // through. Everything else is nullable.
-        name if TOTAL_SCALAR_FUNCTIONS.contains(&name) => {
+        name if TOTAL_SCALAR_FUNCTIONS.contains(&name)
+            || TrinoByteOp::from_name(name).is_some()
+            || matches!(
+                name,
+                "url_encode"
+                    | "url_decode"
+                    | "regexp_count"
+                    | "regexp_position"
+                    | "regexp_extract_all"
+                    | "regexp_replace"
+            ) =>
+        {
             nullable_arguments(0..logical_argument_count, false, &value_nullable, work)?
         }
         _ => true,
@@ -1102,9 +1114,10 @@ const TOTAL_SCALAR_FUNCTIONS: &[&str] = &[
     "abs",
     "sign",
     // Measuring a string cannot fail.
-    "char_length",
-    "character_length",
     "length",
+    "bar",
+    "width_bucket",
+    "strpos",
     // The join key hashes every non-null pair and propagates null inputs.
     "join_row_key",
     // Case folding is defined for every string.
@@ -1124,6 +1137,7 @@ pub(super) fn binding_resolution_error(error: ResolveError) -> FunctionBindingEr
         ResolveError::AmbiguousSignature { .. } => FunctionBindingError::AmbiguousOverload,
         ResolveError::Control(error) => FunctionBindingError::Control(error),
         ResolveError::BadSignature(message) => FunctionBindingError::InvalidBinding(message.into()),
+        ResolveError::ResultType(error) => FunctionBindingError::ValueType(error),
     }
 }
 
@@ -1295,12 +1309,6 @@ impl BuiltinScalarResolver {
                         return Err(FunctionBindingError::NoMatchingOverload);
                     }
                 }
-            }
-            "bar" => {
-                super::synopse_owner::Recipe::bind(true, request, work)?;
-            }
-            "equiwidth_bucket" => {
-                super::synopse_owner::Recipe::bind(false, request, work)?;
             }
             super::negation_owner::NAME => {
                 // Negation accepts only the original numeric domain and carrier.
@@ -2945,14 +2953,18 @@ fn scalar_overload_effects(
                 super::control_owner::operation(name).expect("matched control operation"),
             ))
         }
-        "crc32" => Some(super::crc32_owner::effects()),
+        name if let Some(operation) = TrinoByteOp::from_name(name) => {
+            Some(super::string_binary::trino_effects(operation, signature))
+        }
         "parse_json" => Some(super::parse_json_owner::effects()),
         "__json_canonical_key" => Some(super::json_canonical_owner::effects()),
         crate::native_like::ESCAPE_FUNCTION_NAME => Some(super::like_escape_owner::effects()),
         "json_object" => Some(super::json_object_owner::effects()),
+        "chr" | "codepoint" => Some(super::string_measure_owner::codepoint_effects()),
         name if super::string_measure_owner::operation(name).is_some() => {
             Some(super::string_measure_owner::effects())
         }
+        "normalize" => Some(super::string_case_owner::normalize_effects()),
         name if super::string_case_owner::operation(name).is_some() => {
             Some(super::string_case_owner::effects())
         }
@@ -2967,43 +2979,31 @@ fn scalar_overload_effects(
         name if super::string_url_encode_owner::operation(name).is_some() => {
             Some(super::string_url_encode_owner::effects())
         }
-        name if super::string_url_decode_owner::operation(name).is_some() => {
-            Some(super::string_url_decode_owner::effects())
+        name if let Some(operation) = super::string_parse_url_owner::operation(name) => {
+            Some(super::string_parse_url_owner::effects(operation))
         }
         name if super::string_substring_owner::operation(name).is_some() => {
             Some(super::string_substring_owner::effects())
         }
-        name if super::string_left_right_owner::operation(name).is_some() => {
-            Some(super::string_left_right_owner::effects())
-        }
-        name if super::string_locate_owner::operation(name).is_some() => {
-            Some(super::string_locate_owner::effects())
-        }
+        "strpos" => Some(super::string_locate_owner::strpos_effects(
+            if signature.contains(",i64)") { 3 } else { 2 },
+        )),
         name if super::string_initcap_owner::operation(name).is_some() => {
             Some(super::string_initcap_owner::effects())
         }
         name if super::string_pad_owner::operation(name).is_some() => {
-            Some(super::string_pad_owner::effects())
+            Some(super::string_pad_owner::trino_effects())
         }
         name if super::string_replace_owner::operation(name).is_some() => {
             Some(super::string_replace_owner::effects())
         }
         name if super::string_split_part_owner::operation(name).is_some() => {
-            Some(super::string_split_part_owner::effects())
-        }
-        name if super::string_sha2_owner::operation(name).is_some() => {
-            Some(super::string_sha2_owner::effects())
+            Some(super::string_split_part_owner::trino_effects())
         }
         name if super::string_concat_ws_owner::operation(name).is_some() => {
-            Some(super::string_concat_ws_owner::effects())
+            Some(super::string_concat_ws_owner::trino_effects())
         }
-        name if super::string_from_base64_owner::operation(name).is_some() => {
-            Some(super::string_from_base64_owner::effects())
-        }
-        name if super::string_hex_owner::operation(name).is_some() => {
-            Some(super::string_hex_owner::effects())
-        }
-        "split" => Some(super::string_split_owner::effects()),
+        "split" => Some(super::string_split_owner::trino_effects()),
         "__map_element_at" | "__map_subscript" | "element_at" => {
             Some(super::map_element_at_owner::effects())
         }
@@ -3011,27 +3011,13 @@ fn scalar_overload_effects(
         super::array_element_at_owner::SUBSCRIPT_NAME => {
             Some(super::array_element_at_owner::subscript_effects())
         }
-        name if super::string_md5_owner::operation(name).is_some() => {
-            Some(super::string_md5_owner::effects())
-        }
         name if super::map_projection_owner::operation(name).is_some() => {
             Some(super::map_projection_owner::effects())
         }
         name if super::collection_cardinality_owner::operation(name).is_some() => {
             Some(super::collection_cardinality_owner::effects())
         }
-        name if super::string_extended_owner::operation(name).is_some() => {
-            Some(super::string_extended_owner::effects(
-                super::string_extended_owner::operation(name).expect("matched operation"),
-            ))
-        }
-        "regexp_count" => Some(super::regexp_count_owner::effects()),
-        "parse_url" => Some(super::string_parse_url_owner::effects()),
-        "to_base64" => Some(super::string_to_base64_owner::effects()),
-        "regexp_position" => Some(super::regexp_position_owner::effects()),
-        "reverse" if signature.starts_with("(utf8)") => {
-            Some(super::string_reverse_owner::effects())
-        }
+        "reverse" => Some(super::string_reverse_owner::effects()),
         "dround" => Some(super::dround_owner::effects()),
         name if super::bit_shift_owner::operation(name).is_some() => {
             Some(super::bit_shift_owner::effects())
@@ -3303,7 +3289,9 @@ pub fn contribute_builtin_functions(
             name if super::control_owner::operation(name).is_some() => {
                 super::control_owner::definition(name, declaration, resolver)?
             }
-            "crc32" => super::crc32_owner::definition(declaration, resolver)?,
+            name if let Some(operation) = TrinoByteOp::from_name(name) => {
+                super::string_binary::trino_definition(operation, name, declaration, resolver)?
+            }
             "parse_json" => super::parse_json_owner::definition(declaration, resolver)?,
             "__json_canonical_key" => {
                 super::json_canonical_owner::definition(declaration, resolver)?
@@ -3330,14 +3318,8 @@ pub fn contribute_builtin_functions(
             name if super::string_url_encode_owner::operation(name).is_some() => {
                 super::string_url_encode_owner::definition(name, declaration, resolver)?
             }
-            name if super::string_url_decode_owner::operation(name).is_some() => {
-                super::string_url_decode_owner::definition(name, declaration, resolver)?
-            }
             name if super::string_substring_owner::operation(name).is_some() => {
                 super::string_substring_owner::definition(name, declaration, resolver)?
-            }
-            name if super::string_left_right_owner::operation(name).is_some() => {
-                super::string_left_right_owner::definition(name, declaration, resolver)?
             }
             name if super::string_locate_owner::operation(name).is_some() => {
                 super::string_locate_owner::definition(name, declaration, resolver)?
@@ -3354,17 +3336,8 @@ pub fn contribute_builtin_functions(
             name if super::string_split_part_owner::operation(name).is_some() => {
                 super::string_split_part_owner::definition(name, declaration, resolver)?
             }
-            name if super::string_sha2_owner::operation(name).is_some() => {
-                super::string_sha2_owner::definition(name, declaration, resolver)?
-            }
             name if super::string_concat_ws_owner::operation(name).is_some() => {
                 super::string_concat_ws_owner::definition(name, declaration, resolver)?
-            }
-            name if super::string_from_base64_owner::operation(name).is_some() => {
-                super::string_from_base64_owner::definition(name, declaration, resolver)?
-            }
-            name if super::string_hex_owner::operation(name).is_some() => {
-                super::string_hex_owner::definition(name, declaration, resolver)?
             }
             "split" => super::string_split_owner::definition(&name, declaration, resolver)?,
             "__map_element_at" | "__map_subscript" | "element_at" => {
@@ -3373,26 +3346,15 @@ pub fn contribute_builtin_functions(
             "__array_element_at" | super::array_element_at_owner::SUBSCRIPT_NAME => {
                 super::array_element_at_owner::definition(&name, declaration, resolver)?
             }
-            name if super::string_md5_owner::operation(name).is_some() => {
-                super::string_md5_owner::definition(name, declaration, resolver)?
-            }
             name if super::map_projection_owner::operation(name).is_some() => {
                 super::map_projection_owner::definition(name, declaration, resolver)?
             }
             name if super::collection_cardinality_owner::operation(name).is_some() => {
                 super::collection_cardinality_owner::definition(name, declaration, resolver)?
             }
-            name if super::string_extended_owner::operation(name).is_some() => {
-                super::string_extended_owner::definition(name, declaration, resolver)?
-            }
-            "regexp_count" => super::regexp_count_owner::definition(&name, declaration, resolver)?,
             name if super::string_parse_url_owner::operation(name).is_some() => {
                 super::string_parse_url_owner::definition(name, declaration, resolver)?
             }
-            name if super::string_to_base64_owner::operation(name).is_some() => {
-                super::string_to_base64_owner::definition(name, declaration, resolver)?
-            }
-            "regexp_position" => super::regexp_position_owner::definition(declaration, resolver)?,
             name if super::string_reverse_owner::operation(name).is_some() => {
                 super::string_reverse_owner::definition(name, declaration, resolver)?
             }

@@ -72,6 +72,25 @@ impl PureCompileControl for Control {
 pub(in crate::planner::distributed::build) fn policy() -> novarocks_functions::ConstantPolicy {
     crate::constant::test_constant_policy()
 }
+pub(in crate::planner::distributed::build) fn nullable_bounded_character(
+    kind: novarocks_type_contract::CharacterKind,
+    length: u32,
+) -> ValueType {
+    use novarocks_type_contract::{
+        CharacterType, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+
+    let character = CharacterType::new(kind, length).unwrap();
+    let storage = ValueTypeStorageLifetime::pure();
+    let value = ValueTypeRef::try_new(
+        ValueKind::BoundedCharacter(character),
+        true,
+        storage.clone(),
+    )
+    .unwrap();
+    let layout = ValueLayout::try_new(&DataType::Utf8, storage).unwrap();
+    ValueType::try_from_value(value, layout).unwrap()
+}
 pub(in crate::planner::distributed::build) fn text(text: &str) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::String(text.into())),
@@ -748,10 +767,16 @@ fn scalar_journal_bare_null_and_cast_null_keep_distinct_original_request_sources
         .argument_types[0];
     assert_eq!(
         selected_argument,
-        &FunctionArgumentType::Value(ValueType::new(DataType::Utf8, true))
+        &FunctionArgumentType::Value(nullable_bounded_character(
+            novarocks_type_contract::CharacterKind::Char,
+            0,
+        ))
     );
     let emitted = physical_constant(&owner, &receipt, receipt.arguments()[0]);
-    assert_eq!(emitted.value_type(), &ValueType::new(DataType::Utf8, true));
+    assert_eq!(
+        emitted.value_type(),
+        &nullable_bounded_character(novarocks_type_contract::CharacterKind::Char, 0)
+    );
     assert_eq!(emitted.try_utf8().unwrap(), None);
     let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
     let projected = constant(&operational[0]).unwrap();

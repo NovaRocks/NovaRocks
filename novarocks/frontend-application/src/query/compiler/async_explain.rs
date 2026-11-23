@@ -99,7 +99,7 @@ impl FrontendQueryCompiler {
             );
             let mut logical = match planning_cpu
                 .logical_catalog_for_input(
-                    SqlStatementInput::query_with_admitted_session(Box::new(query)),
+                    execution.sql_statement_input(Box::new(query), true),
                     SqlSessionContext {
                         sql_semantics: execution.sql_semantics().clone(),
                         current_catalog: current_catalog.map(str::to_owned),
@@ -249,7 +249,7 @@ impl FrontendQueryCompiler {
             .map_err(FrontendQueryCompilerError::Engine)?;
             Ok(novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
                 crate::query_execution::physical_encoding::mint_plan_version(),
-                SqlStatementInput::query_with_admitted_session(Box::new(query.clone())),
+                execution.sql_statement_input(Box::new(query.clone()), true),
                 SqlCompileIntent::Explain {
                     level,
                     analyze: false,
@@ -364,7 +364,7 @@ impl FrontendQueryCompiler {
             Ok((
                 novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
                     version,
-                    SqlStatementInput::query_with_admitted_session(Box::new(query.clone())),
+                    execution.sql_statement_input(Box::new(query.clone()), true),
                     SqlCompileIntent::Explain {
                         level: ExplainLevel::Analyze,
                         analyze: true,

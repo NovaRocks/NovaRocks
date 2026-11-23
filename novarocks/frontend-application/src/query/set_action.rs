@@ -274,6 +274,7 @@ impl FrontendQuerySession {
         &self,
         source: Arc<str>,
         mutation: ScopedSessionMutation,
+        parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
         deadline: Option<Instant>,
         statement: GovernedQueryStatementOwner,
         statement_time: novarocks_type_contract::StatementTimeEnvironment,
@@ -285,6 +286,7 @@ impl FrontendQuerySession {
             source,
             SessionPropertyMutation {
                 mutation: Box::new(mutation),
+                parameters,
                 catalogs,
             },
             deadline,

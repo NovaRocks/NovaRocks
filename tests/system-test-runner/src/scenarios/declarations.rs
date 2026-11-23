@@ -171,6 +171,8 @@ pub(super) fn for_module(
             "novarocks-server/**",
         ],
         "memory_attribution" => &[
+            "novarocks/functions/src/builtin/regexp_count/**",
+            "novarocks/expression/src/evaluator/guarded/regexp.rs",
             "novarocks/trino-adapter/**",
             "tests/system-test-runner/src/actors/sql.rs",
             "novarocks/memory/**",

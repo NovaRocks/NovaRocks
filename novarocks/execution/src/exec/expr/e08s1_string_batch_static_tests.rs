@@ -23,22 +23,41 @@ use novarocks_functions::{
 };
 use novarocks_sql::compiler::{SqlCompileControl, builtin_sql_function_catalog};
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
+    CharacterKind, CharacterType, CompileControlError, CompilePhase, PureCompileControl, ValueKind,
+    ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
 };
 use std::sync::Mutex;
 fn full_binding(name: &str, mask: usize) -> ResolvedFunctionBinding {
     // Exact test inputs use original declared argument types; the original
     // resolver remains the nullability/result/overload author.
+    let physical = |ty| FunctionValueType::new(ty, false);
     let types = match name {
-        "ascii" | "length" | "char_length" => vec![DataType::Utf8],
-        "lpad" | "rpad" => vec![DataType::Utf8, DataType::Int64, DataType::Utf8],
+        "chr" => vec![physical(DataType::Int64)],
+        "codepoint" => {
+            let storage = ValueTypeStorageLifetime::pure();
+            let character = CharacterType::new(CharacterKind::Varchar, 1).unwrap();
+            let value = ValueTypeRef::try_new(
+                ValueKind::BoundedCharacter(character),
+                false,
+                storage.clone(),
+            )
+            .unwrap();
+            let layout = ValueLayout::try_new(&DataType::Utf8, storage).unwrap();
+            vec![FunctionValueType::try_from_value(value, layout).unwrap()]
+        }
+        "length" => vec![physical(DataType::Utf8)],
+        "lpad" | "rpad" => vec![
+            physical(DataType::Utf8),
+            physical(DataType::Int64),
+            physical(DataType::Utf8),
+        ],
         _ => unreachable!(),
     };
     let arguments = types
         .into_iter()
         .enumerate()
         .map(|(index, ty)| FunctionArgument::Value {
-            value_type: FunctionValueType::new(ty, mask & (1 << index) != 0),
+            value_type: ty.with_nullable(mask & (1 << index) != 0).unwrap(),
             constant: None,
         })
         .collect::<Vec<_>>();
@@ -95,12 +114,17 @@ fn e08s1_string_batch_static_exact_arity_nominal_result_and_nullability_refusal(
     for name in NAMES {
         let binding = full_binding(name, 0);
         let mut wrong = Vec::new();
+        let wrong_carrier = if name == "length" {
+            DataType::Boolean
+        } else {
+            DataType::Binary
+        };
         for index in 0..binding.selected.argument_types.len() {
             let mut bad = binding.clone();
             replace_argument_type(
                 &mut bad.selected.argument_types,
                 index,
-                FunctionArgumentType::Value(FunctionValueType::new(DataType::Binary, true)),
+                FunctionArgumentType::Value(FunctionValueType::new(wrong_carrier.clone(), true)),
             );
             wrong.push(bad);
             if matches!(&binding.selected.argument_types[index],FunctionArgumentType::Value(v) if *v.data_type()==DataType::Utf8)

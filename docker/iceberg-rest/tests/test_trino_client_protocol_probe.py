@@ -188,26 +188,41 @@ class ReferenceInputTests(unittest.TestCase):
             value.jdbc()
         value.command.assert_not_called()
 
-    def test_jdbc_requires_the_full_validated_version_marker(self):
-        for output, passes in [
-            (b"JDBC_PROBE_OK validated=true server_version=server-build\n", True),
-            (b"JDBC_PROBE_OK version=server-build\n", False),
-            (b"JDBC_PROBE_OK validated=false server_version=server-build\n", False),
-            (b"JDBC_PROBE_OK validated=true server_version=\n", False),
+    def test_jdbc_requires_validated_version_and_both_prepared_modes(self):
+        validated = b"JDBC_PROBE_OK validated=true server_version=server-build\n"
+        named = b"JDBC_PREPARED_OK explicitPrepare=true\n"
+        immediate = b"JDBC_PREPARED_OK explicitPrepare=false\n"
+        for output, error in [
+            (validated + named + immediate, None),
+            (validated + named, "prepared mode"),
+            (validated + immediate, "prepared mode"),
+            (b"JDBC_PROBE_OK version=server-build\n", "validated HEAD"),
+            (b"JDBC_PROBE_OK validated=false server_version=server-build\n", "validated HEAD"),
+            (b"JDBC_PROBE_OK validated=true server_version=\n", "validated HEAD"),
         ]:
             value = self.probe()
+            value.namespace = "probe_scope"
+            value.scope = "s3://root/probe_scope"
+            value.ledger = Mock()
+            value.spark = Mock()
+            value.setup_catalog = Mock()
             value.command = Mock(return_value=subprocess.CompletedProcess([], 0, output, b""))
             with self.subTest(output=output), patch.object(probe, "write_json") as write:
-                if passes:
+                if error is None:
                     value.jdbc()
                     self.assertEqual(write.call_args.args[1]["status"], "PASS")
                 else:
-                    with self.assertRaisesRegex(probe.ProbeFailure, "validated HEAD"):
+                    with self.assertRaisesRegex(probe.ProbeFailure, error):
                         value.jdbc()
                     write.assert_not_called()
+            self.assertTrue(value.namespace_intent)
+            value.ledger.assert_called_once()
+            self.assertIn("ice_rest.probe_scope.jdbc_prepared", value.spark.call_args.args[0])
+            value.setup_catalog.assert_called_once()
             command = value.command.call_args.args[0]
             self.assertEqual(command[command.index("--image") + 1], "exact-entry-image")
             self.assertEqual(command[command.index("--jdbc-jar") + 1], "/declared/driver.jar")
+            self.assertEqual(command[-1], "ice_rest.probe_scope.jdbc_prepared")
 
     def test_entry_image_argument_is_forwarded_unchanged(self):
         value = self.probe()

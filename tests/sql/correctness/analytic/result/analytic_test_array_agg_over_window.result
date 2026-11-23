@@ -1,314 +1,314 @@
 -- query 4
--- legacy
+-- types	bigint
 fingerprint
-1082312479600
+51010606783200
 
 -- query 5
--- legacy
+-- types	bigint
 fingerprint
-254113522645
+9257913188324
 
 -- query 6
--- legacy
+-- types	bigint
 fingerprint
-91628652953
+6914557175498
 
 -- query 7
--- legacy
+-- types	bigint
 fingerprint
--1825582172939
+28125829029706
 
 -- query 8
--- legacy
+-- types	bigint
 fingerprint
-1241908580600
+25058477429900
 
 -- query 9
--- legacy
+-- types	bigint
 fingerprint
--1049684500
+2377802690000
 
 -- query 10
--- legacy
+-- types	bigint
 fingerprint
--158546416500
+23574326663300
 
 -- query 11
--- legacy
+-- types	bigint
 fingerprint
-362862152094
+5082204323708
 
 -- query 12
--- legacy
+-- types	bigint
 fingerprint
-109562789390
+6523596630860
 
 -- query 13
--- legacy
+-- types	bigint
 fingerprint
--191899060298
+3574638992474
 
 -- query 14
--- legacy
+-- types	bigint
 fingerprint
-91628652953
+6914557175498
 
 -- query 15
--- legacy
+-- types	bigint
 fingerprint
--1825582172939
+28125829029706
 
 -- query 16
--- legacy
+-- types	bigint
 fingerprint
-283527713251
+3339918183024
 
 -- query 17
--- legacy
+-- types	bigint
 fingerprint
--75372882575
+2872710499694
 
 -- query 18
--- legacy
+-- types	bigint
 fingerprint
-12419085806
+250584774299
 
 -- query 19
--- legacy
+-- types	bigint
 fingerprint
--75372882575
+2872710499694
 
 -- query 20
--- legacy
+-- types	bigint
 fingerprint
-283527713251
+3339918183024
 
 -- query 21
--- legacy
+-- types	bigint
 fingerprint
--75372882575
+2872710499694
 
 -- query 22
--- legacy
+-- types	bigint
 fingerprint
-271933640598
+3481829720728
 
 -- query 23
--- legacy
+-- types	bigint
 fingerprint
--99563701502
+3504937652257
 
 -- query 24
--- legacy
+-- types	bigint
 fingerprint
-385384766157
+2927878308615
 
 -- query 25
--- legacy
+-- types	bigint
 fingerprint
--1538148009290
+2173799020006
 
 -- query 26
--- legacy
+-- types	bigint
 fingerprint
--14298832528
+2951538552644
 
 -- query 27
--- legacy
+-- types	bigint
 fingerprint
--75372882575
+2872710499694
 
 -- query 28
--- legacy
+-- types	bigint
 fingerprint
--75913267945
+2649998490176
 
 -- query 29
--- legacy
+-- types	bigint
 fingerprint
--143410186525
+2517381571737
 
 -- query 30
--- legacy
+-- types	bigint
 fingerprint
-1883573623296
+5097853800896
 
 -- query 31
--- legacy
+-- types	bigint
 fingerprint
--2455033040224
+2937927206224
 
 -- query 32
--- legacy
+-- types	bigint
 fingerprint
-408107586817
+3829023134532
 
 -- query 33
--- legacy
+-- types	bigint
 fingerprint
-297784138304
+5353968375399
 
 -- query 34
--- legacy
+-- types	bigint
 fingerprint
--64402134471
+9707275078696
 
 -- query 35
--- legacy
+-- types	bigint
 fingerprint
-283527713251
+3339918183024
 
 -- query 36
--- legacy
+-- types	bigint
 fingerprint
-271933640598
+3481829720728
 
 -- query 37
--- legacy
+-- types	bigint
 fingerprint
--1813784698768
+5455490677552
 
 -- query 38
--- legacy
+-- types	bigint
 fingerprint
-257137190310
+3339918183024
 
 -- query 41
--- legacy
+-- types	bigint
 fingerprint
-316516447996
+3339918183024
 
 -- query 42
--- legacy
+-- types	bigint
 fingerprint
-2236185520592
+956766973024
 
 -- query 43
--- legacy
+-- types	bigint
 fingerprint
--2823745306736
+732256890608
 
 -- query 44
--- legacy
+-- types	bigint
 fingerprint
-131529312206
+1559726949950
 
 -- query 45
--- legacy
+-- types	bigint
 fingerprint
-12419085806
+250584774299
 
 -- query 46
--- legacy
+-- types	bigint
 fingerprint
-283527713251
+3339918183024
 
 -- query 49
--- legacy
+-- types	bigint
 fingerprint
--12880919090
+198886617000
 
 -- query 50
--- legacy
+-- types	bigint
 fingerprint
--5610049520
+86130758400
 
 -- query 51
--- legacy
+-- types	bigint
 fingerprint
--33055826870
+191721507290
 
 -- query 52
--- legacy
+-- types	bigint
 fingerprint
-30886453330
+170467176080
 
 -- query 53
--- legacy
+-- types	bigint
 fingerprint
--11117803241
+66518978370
 
 -- query 54
--- legacy
+-- types	bigint
 fingerprint
--11117803241
+66518978370
 
 -- query 55
--- legacy
+-- types	bigint
 fingerprint
--9084927487
+48991261648
 
 -- query 56
--- legacy
+-- types	bigint
 fingerprint
--5103979314
+27760197333
 
 -- query 57
--- legacy
+-- types	bigint
 fingerprint
--5103979314
+27760197333
 
 -- query 58
--- legacy
+-- types	bigint
 fingerprint
--5103979314
+27760197333
 
 -- query 59
--- legacy
+-- types	bigint
 fingerprint
--9084927487
+48991261648
 
 -- query 60
--- legacy
+-- types	bigint
 fingerprint
--2466082725
+27760197333
 
 -- query 61
--- legacy
+-- types	bigint
 fingerprint
--8480150293
+56276565945
 
 -- query 62
--- legacy
+-- types	bigint
 fingerprint
--3305582687
+19172150729
 
 -- query 63
--- legacy
+-- types	bigint
 fingerprint
--1365801731
+4108050209
 
 -- query 64
--- legacy
+-- types	bigint
 fingerprint
--8022645636
+14561092345
 
 -- query 65
--- legacy
+-- types	bigint
 fingerprint
--26029627301
+128606164095
 
 -- query 66
--- legacy
+-- types	bigint
 fingerprint
--9084927487
+48991261648
 
 -- query 67
--- legacy
+-- types	bigint
 fingerprint
--9084927487
+48991261648
 
 -- query 68
--- legacy
+-- types	bigint
 fingerprint
--1150863345
+5374280483
 
 -- query 69
--- legacy
+-- types	bigint
 fingerprint
-2623805304
+15471376119
 
 -- query 70
--- legacy
+-- types	bigint
 fingerprint
--26254139207
+98756175506
