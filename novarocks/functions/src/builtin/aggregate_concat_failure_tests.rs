@@ -20,22 +20,20 @@ use arrow_array::StringArray;
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
 
 #[derive(Default)]
-struct Control {
+struct CancelOnFullCheckpoint {
     trace: Mutex<Vec<u32>>,
-    refusal: Option<(usize, KernelFailure)>,
 }
-impl KernelEvaluationControl for Control {
+impl KernelEvaluationControl for CancelOnFullCheckpoint {
     fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
-        assert!(units <= 256);
+        let max_work = crate::kernel_control::MAX_UNOBSERVED_KERNEL_WORK;
+        assert!(units <= max_work);
         let mut trace = self.trace.lock().unwrap();
-        let at = trace.len();
-        if let Some((stop, _)) = &self.refusal {
-            assert!(at <= *stop, "callback after primary refusal");
-        }
+        assert!(!trace.contains(&max_work), "callback after primary refusal");
         trace.push(units);
-        match &self.refusal {
-            Some((stop, cause)) if *stop == at => Err(cause.clone()),
-            _ => Ok(()),
+        if units == max_work {
+            Err(KernelFailure::Cancelled)
+        } else {
+            Ok(())
         }
     }
     fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
@@ -297,15 +295,15 @@ fn listagg_wide_value_copy_observes_cancellation_and_releases_scratch() {
         Arc::new(StringArray::from(vec!["..."])),
         Arc::new(arrow_array::BooleanArray::from(vec![false])),
     ];
-    let control = Control {
-        refusal: Some((8, KernelFailure::Cancelled)),
-        ..Control::default()
-    };
+    let control = CancelOnFullCheckpoint::default();
     let mut checkpoints = EvaluationCheckpoints::new(&control);
     let mut work = ScalarWork::new(Some(&mut checkpoints));
     let outcome = state.update_row(&columns.each_ref().map(|array| (array, 0)), &mut work);
     assert!(matches!(outcome, Err(KernelFailure::Cancelled)));
-    assert!(control.trace.lock().unwrap().contains(&256));
+    assert_eq!(
+        control.trace.lock().unwrap().last(),
+        Some(&crate::kernel_control::MAX_UNOBSERVED_KERNEL_WORK),
+    );
     assert_metadata_only(&host);
     drop(state);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
