@@ -192,6 +192,12 @@ fn pair<E>(
         )?
         .ok_or_else(|| rule(ArrayCommonRuleFailure::IncompatibleScalarTypes));
     }
+    if !matches!(
+        (left.value_type().kind(), right.value_type().kind()),
+        (ValueKind::Scalar(_), ValueKind::Scalar(_))
+    ) {
+        return Err(rule(ArrayCommonRuleFailure::UnreviewedHeterogeneousFamily));
+    }
     let carrier = numeric_common(left.data_type(), right.data_type()).map_err(rule::<E>)?;
     FunctionValueType::try_with_logical_type_with_construction(
         carrier,
