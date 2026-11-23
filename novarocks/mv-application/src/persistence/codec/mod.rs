@@ -153,11 +153,28 @@ pub fn build_definition(
     relation_occurrences: Vec<RelationOccurrence>,
     outputs: Vec<OutputDefinition>,
 ) -> Result<DefinitionDocument, PersistenceCodecError> {
+    build_definition_with_scalar_contracts(
+        created_at_ms,
+        query,
+        relation_occurrences,
+        outputs,
+        Vec::new(),
+    )
+}
+
+pub(crate) fn build_definition_with_scalar_contracts(
+    created_at_ms: u64,
+    query: QuerySource,
+    relation_occurrences: Vec<RelationOccurrence>,
+    outputs: Vec<OutputDefinition>,
+    scalar_contracts: Vec<novarocks_functions::PersistentScalarContract>,
+) -> Result<DefinitionDocument, PersistenceCodecError> {
     let mut document = DefinitionDocument {
         created_at_ms,
         query,
         relation_occurrences,
         outputs,
+        scalar_contracts,
         computation_identity: ComputationIdentity::from_canonical_bytes(&[]),
     };
     canonicalize_definition(&mut document);
@@ -284,6 +301,7 @@ fn enum_value<T>(
 }
 
 fn canonicalize_definition(document: &mut DefinitionDocument) {
+    document.scalar_contracts.sort();
     for relation in &mut document.relation_occurrences {
         relation
             .fields
@@ -389,6 +407,15 @@ fn definition_to_proto(document: &DefinitionDocument) -> proto::DefinitionDocume
                 }),
             })
             .collect(),
+        scalar_contracts: document
+            .scalar_contracts
+            .iter()
+            .map(|contract| proto::ScalarPublicationContract {
+                function: Some(contract.function().as_str().to_owned()),
+                overload: Some(contract.overload().as_str().to_owned()),
+                generation: Some(contract.generation().get()),
+            })
+            .collect(),
         computation_identity: Some(document.computation_identity.as_bytes().to_vec()),
     }
 }
@@ -426,11 +453,45 @@ fn definition_from_proto(
             .into_iter()
             .map(output_from_proto)
             .collect::<Result<_, _>>()?,
+        scalar_contracts: dto
+            .scalar_contracts
+            .into_iter()
+            .map(scalar_contract_from_proto)
+            .collect::<Result<_, _>>()?,
         computation_identity: ComputationIdentity::try_from_bytes(&required(
             dto.computation_identity,
             "definition.computation_identity",
         )?)?,
     })
+}
+
+fn scalar_contract_from_proto(
+    stored: proto::ScalarPublicationContract,
+) -> Result<novarocks_functions::PersistentScalarContract, PersistenceCodecError> {
+    let function = novarocks_functions::FunctionId::try_new(required(
+        stored.function,
+        "definition.scalar_contracts.function",
+    )?)
+    .map_err(|error| {
+        ValidationError::new("definition.scalar_contracts.function", error.to_string())
+    })?;
+    let overload = novarocks_functions::FunctionOverloadId::try_new(required(
+        stored.overload,
+        "definition.scalar_contracts.overload",
+    )?)
+    .map_err(|error| {
+        ValidationError::new("definition.scalar_contracts.overload", error.to_string())
+    })?;
+    let generation = std::num::NonZeroU32::new(required(
+        stored.generation,
+        "definition.scalar_contracts.generation",
+    )?)
+    .ok_or_else(|| {
+        ValidationError::new("definition.scalar_contracts.generation", "must be nonzero")
+    })?;
+    Ok(novarocks_functions::PersistentScalarContract::new(
+        function, overload, generation,
+    ))
 }
 
 fn relation_from_proto(

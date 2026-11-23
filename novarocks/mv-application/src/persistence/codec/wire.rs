@@ -29,6 +29,7 @@ use crate::persistence::codec::PersistenceCodecError;
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Schema {
     DefinitionDocument,
+    ScalarPublicationContract,
     QuerySource,
     ResolutionContext,
     RelationOccurrence,
@@ -184,7 +185,9 @@ const DEFINITION: &[Field] = &[
     repeated_message(4, Schema::OutputDefinition),
     bytes(5),
     scalar(6),
+    repeated_message(7, Schema::ScalarPublicationContract),
 ];
+const SCALAR_PUBLICATION_CONTRACT: &[Field] = &[bytes(1), bytes(2), scalar(3)];
 const QUERY: &[Field] = &[bytes(1), scalar(2), message(3, Schema::ResolutionContext)];
 const RESOLUTION: &[Field] = &[bytes(1), bytes(2)];
 const RELATION: &[Field] = &[
@@ -274,6 +277,7 @@ impl Schema {
     fn fields(self) -> &'static [Field] {
         match self {
             Self::DefinitionDocument => DEFINITION,
+            Self::ScalarPublicationContract => SCALAR_PUBLICATION_CONTRACT,
             Self::QuerySource => QUERY,
             Self::ResolutionContext => RESOLUTION,
             Self::RelationOccurrence => RELATION,

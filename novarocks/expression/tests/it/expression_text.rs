@@ -606,6 +606,47 @@ fn nullif_preserves_left_type_and_demands_only_present_rows() {
 }
 
 #[test]
+fn nullif_evaluates_its_left_once_per_demanded_row() {
+    use novarocks_functions::{KernelEvaluationControl, KernelFailure};
+    use std::{sync::Mutex, time::Duration};
+
+    #[derive(Default)]
+    struct Waits(Mutex<Vec<Duration>>);
+
+    impl KernelEvaluationControl for Waits {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+
+        fn wait(&self, duration: Duration) -> Result<(), KernelFailure> {
+            self.0.lock().unwrap().push(duration);
+            Ok(())
+        }
+    }
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let columns = [column("d", 1, DataType::Int64, true)];
+    let input = batch(
+        &columns,
+        vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(2)]))],
+    );
+    let typed = compile("NULLIF(sleep(d), FALSE)", &columns, &context);
+    let control = Waits::default();
+    let checked = typed.check_rows(&input, &HarnessControl, &control).unwrap();
+    assert!(checked.batch.errors.is_empty());
+    assert_eq!(
+        checked.batch.values.to_data(),
+        BooleanArray::from(vec![Some(true), None, Some(true)]).to_data()
+    );
+    assert_eq!(
+        control.0.into_inner().unwrap(),
+        [Duration::from_secs(1), Duration::from_secs(2)]
+    );
+}
+
+#[test]
 fn nullif_nested_unknown_keeps_the_original_array() {
     use arrow::array::{ListArray, types};
 

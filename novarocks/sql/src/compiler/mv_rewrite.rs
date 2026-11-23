@@ -2536,6 +2536,7 @@ pub struct SqlMvRewriteDefinitionFacts {
     sources: Vec<SqlMvRewriteSourceOccurrenceFacts>,
     selection: Option<SqlMvRewriteSelectionFacts>,
     selection_unavailable: Option<String>,
+    scalar_contracts: Box<[novarocks_functions::PersistentScalarContract]>,
 }
 
 impl SqlMvRewriteDefinitionFacts {
@@ -2579,7 +2580,16 @@ impl SqlMvRewriteDefinitionFacts {
             sources,
             selection: None,
             selection_unavailable: None,
+            scalar_contracts: Box::new([]),
         })
+    }
+
+    pub fn with_scalar_contracts(
+        mut self,
+        contracts: Box<[novarocks_functions::PersistentScalarContract]>,
+    ) -> Self {
+        self.scalar_contracts = contracts;
+        self
     }
 
     pub fn with_selection_facts(
@@ -3654,6 +3664,13 @@ fn build_candidate(
         control,
     )
     .map_err(SqlCompileError::from)?;
+    let scalar_contracts =
+        crate::planning::mv_persistence::collect_scalar_contracts(&resolved, control)?;
+    novarocks_functions::validate_published_scalar_contracts(
+        &definition.scalar_contracts,
+        &scalar_contracts,
+    )
+    .map_err(SqlCompileError::Compilation)?;
     let mut returned = returned;
     let output_names = crate::analysis::schema::validate_definition_column_names(
         &resolved.output_columns,

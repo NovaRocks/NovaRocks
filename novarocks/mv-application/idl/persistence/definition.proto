@@ -30,6 +30,14 @@ message DefinitionDocument {
   optional bytes computation_identity = 5;
   // Frozen CREATE fact; not part of computation identity.
   optional uint64 created_at_ms = 6;
+  // Canonical set of affected scalar bindings selected in the expanded query.
+  repeated ScalarPublicationContract scalar_contracts = 7;
+}
+
+message ScalarPublicationContract {
+  optional string function = 1;
+  optional string overload = 2;
+  optional uint32 generation = 3;
 }
 
 message QuerySource {
