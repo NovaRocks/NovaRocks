@@ -1785,6 +1785,7 @@ impl From<crate::FunctionResolutionError> for FunctionBindingError {
     fn from(error: crate::FunctionResolutionError) -> Self {
         match error {
             crate::FunctionResolutionError::Control(error) => error.into(),
+            crate::FunctionResolutionError::ResultType(error) => error.into(),
             other => invalid_binding(&other.to_string()),
         }
     }

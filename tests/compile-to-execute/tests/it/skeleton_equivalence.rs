@@ -570,3 +570,18 @@ fn row_syntax_reaches_catalogue_admission_without_an_installed_owner() {
         })
     ));
 }
+
+#[test]
+fn derived_char_concat_width_keeps_the_catalogue_type_error() {
+    let fixture = Fixture::new();
+    let result = fixture.sql(
+        "typeof(concat(CAST('a' AS CHAR(32768)), CAST('b' AS CHAR(32769))))",
+        &[],
+    );
+    assert!(matches!(
+        result,
+        Err(SqlCompileError::Analyze(error))
+            if error.kind() == AnalyzeErrorKind::UnknownType
+                && error.message() == "Unknown type: char(65537)"
+    ));
+}
