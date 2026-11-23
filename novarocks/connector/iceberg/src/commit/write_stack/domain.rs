@@ -45,7 +45,7 @@ use novarocks_spi::connector::{
     ConnectorDocumentPublicationDeclaration, ConnectorError, ConnectorErrorKind,
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteIntent, ExternalMutationFinalization,
+    ExternalMutationFinalization,
 };
 use parquet::basic::Compression;
 
@@ -312,14 +312,6 @@ impl IcebergDocumentPublicationFacts {
         self.declaration.empty_input()
     }
 
-    pub const fn connector_intent(&self) -> ConnectorWriteIntent {
-        match self.technique() {
-            ConnectorManagedPublicationTechnique::Full => ConnectorWriteIntent::Overwrite,
-            ConnectorManagedPublicationTechnique::Incremental
-            | ConnectorManagedPublicationTechnique::MetadataOnly => ConnectorWriteIntent::Append,
-        }
-    }
-
     pub const fn commit_op_kind(&self, delete_branch: Option<IcebergWriteBranch>) -> CommitOpKind {
         publication_commit_op_kind(self.technique(), delete_branch)
     }
@@ -334,7 +326,7 @@ const fn publication_commit_op_kind(
         // `plan_document_publication_branches` refuses a full refresh with a
         // change-stream shape, because a commit that replaces every live
         // row has no prior row for a change event to supersede.
-        (ConnectorManagedPublicationTechnique::Full, _) => CommitOpKind::Overwrite,
+        (ConnectorManagedPublicationTechnique::Full, _) => CommitOpKind::FullRefresh,
         // A metadata-only publication writes no files and seals no delete
         // branch: it exists to move the watermark, and the rows it publishes
         // are the ones already there.
@@ -478,19 +470,6 @@ impl IcebergWriteFlavor {
             Self::DistributedRewrite => "distributed-rewrite",
             Self::TableMaintenance => "table-maintenance",
             Self::EqualityDelete => "equality-delete",
-        }
-    }
-
-    /// The neutral write intent this flavor presents to admission.
-    pub const fn connector_intent(self) -> ConnectorWriteIntent {
-        match self {
-            Self::Append | Self::StagedCreate | Self::ManagedPublication => {
-                ConnectorWriteIntent::Append
-            }
-            Self::DistributedRewrite | Self::TableMaintenance => ConnectorWriteIntent::Overwrite,
-            Self::RowMutationPositionDelete
-            | Self::RowMutationDeletionVector
-            | Self::EqualityDelete => ConnectorWriteIntent::RowDelta,
         }
     }
 }
@@ -2593,14 +2572,7 @@ impl IcebergWriteCommitSession {
             flavor,
             IcebergWriteFlavor::Append | IcebergWriteFlavor::StagedCreate
         ) || flavor.is_distributed_rewrite()
-            || (repartition.is_none()
-                && document_publication.as_ref().is_some_and(|publication| {
-                    matches!(
-                        publication.technique(),
-                        ConnectorManagedPublicationTechnique::MetadataOnly
-                            | ConnectorManagedPublicationTechnique::Incremental
-                    )
-                }));
+            || document_publication.is_some();
         let rewrite_groups = flavor.is_distributed_rewrite().then_some(targets.len());
         Ok(Self {
             session_id,
@@ -3403,7 +3375,6 @@ mod tests {
             // A commit op is a total function of the flavor; calling it must
             // never panic and must never be inferred from a fragment.
             let _ = flavor.commit_op_kind();
-            let _ = flavor.connector_intent();
             assert!(flavor.accepts_empty_prepared_set());
         }
         assert_eq!(
@@ -3415,7 +3386,6 @@ mod tests {
         let flavor = IcebergWriteFlavor::EqualityDelete;
         assert_eq!(flavor.branches(), &[IcebergWriteBranch::EqualityDelete]);
         let _ = flavor.commit_op_kind();
-        let _ = flavor.connector_intent();
         assert!(flavor.accepts_empty_prepared_set());
     }
 

@@ -184,7 +184,7 @@ fn keyed_begin(prepared: &PreparedKeyed) -> ConnectorWriteBeginRequest {
         catalog_session: Default::default(),
         table: Arc::from("db.t"),
         target_ref: ConnectorWriteTargetRef::main(),
-        intent: ConnectorWriteIntent::Overwrite,
+        intent: ConnectorWriteIntent::Append,
         purpose: ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
         input: data_input(),
         base: Some(prepared.declaration.expected_base().clone()),
@@ -265,8 +265,7 @@ fn actual_snapshot_updates(fixture: &Fixture) -> Vec<crate::iceberg::spec::Snaps
 #[tokio::test]
 async fn real_keyed_empty_full_begin_finish_reasserts_closure_with_v4_evidence() {
     let fixture = keyed_fixture().await;
-    // Both no-parent and existing-empty-parent Full publications have no file
-    // delta and must append. Logical rows are not used to choose the operation.
+    // The full replacement has both stages even with no parent and no rows.
     for expected_parent in [None, Some(())] {
         let prepared = prepare_keyed(
             &fixture,
@@ -301,16 +300,44 @@ async fn real_keyed_empty_full_begin_finish_reasserts_closure_with_v4_evidence()
             .and_then(|v| v.snapshot_id())
             .unwrap();
         let snapshots = actual_snapshot_updates(&fixture);
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].snapshot_id(), id);
-        assert_eq!(snapshots[0].parent_snapshot_id(), prepared.base_snapshot_id);
+        let [deleted, appended] = snapshots.as_slice() else {
+            panic!("Full refresh must publish both snapshots");
+        };
+        assert_eq!(deleted.parent_snapshot_id(), prepared.base_snapshot_id);
         assert_eq!(
-            snapshots[0].summary().operation,
+            deleted.summary().operation,
+            crate::iceberg::spec::Operation::Delete
+        );
+        assert_eq!(
+            deleted.summary().additional_properties["total-records"],
+            "0"
+        );
+        assert!(
+            !deleted
+                .summary()
+                .additional_properties
+                .contains_key(ICEBERG_WRITE_SESSION_MARKER_PROPERTY)
+        );
+        assert_eq!(appended.snapshot_id(), id);
+        assert_eq!(appended.parent_snapshot_id(), Some(deleted.snapshot_id()));
+        assert_eq!(
+            appended.summary().operation,
             crate::iceberg::spec::Operation::Append
         );
+        assert_eq!(
+            appended.summary().additional_properties["total-records"],
+            "0"
+        );
+        assert!(
+            appended
+                .summary()
+                .additional_properties
+                .contains_key(ICEBERG_WRITE_SESSION_MARKER_PROPERTY)
+        );
         for (key, value) in &prepared.records {
+            assert!(!deleted.summary().additional_properties.contains_key(key));
             assert_eq!(
-                snapshots[0].summary().additional_properties.get(key),
+                appended.summary().additional_properties.get(key),
                 Some(value)
             );
         }
@@ -324,7 +351,10 @@ async fn real_keyed_empty_full_begin_finish_reasserts_closure_with_v4_evidence()
             commits[0].ref_requirements,
             vec![("main".into(), prepared.base_snapshot_id)]
         );
-        assert_eq!(commits[0].ref_updates, vec![("main".into(), id)]);
+        assert_eq!(
+            commits[0].ref_updates,
+            vec![("main".into(), deleted.snapshot_id()), ("main".into(), id)]
+        );
         let updates = fixture.catalog.raw_updates();
         let properties: HashMap<_, _> = updates
             .iter()
@@ -338,7 +368,7 @@ async fn real_keyed_empty_full_begin_finish_reasserts_closure_with_v4_evidence()
             .collect();
         assert_eq!(properties, prepared.expected_properties);
         assert!(
-            snapshots[0]
+            appended
                 .summary()
                 .additional_properties
                 .keys()
@@ -358,7 +388,7 @@ async fn real_keyed_empty_full_begin_finish_reasserts_closure_with_v4_evidence()
 }
 
 #[tokio::test]
-async fn keyed_full_zero_output_that_removes_live_files_is_delete() {
+async fn keyed_full_zero_output_deletes_then_appends_an_empty_snapshot() {
     let fixture = keyed_fixture().await;
     append_snapshot_for_test(
         fixture.provider.clone(),
@@ -379,9 +409,22 @@ async fn keyed_full_zero_output_that_removes_live_files_is_delete() {
             .unwrap(),
         ExternalMutationOutcome::KnownCommitted { .. }
     ));
+    let snapshots = actual_snapshot_updates(&fixture);
+    let [deleted, appended] = snapshots.as_slice() else {
+        panic!("Full refresh must publish a deletion and an empty append");
+    };
     assert_eq!(
-        actual_snapshot_updates(&fixture)[0].summary().operation,
+        deleted.summary().operation,
         crate::iceberg::spec::Operation::Delete
+    );
+    assert_eq!(
+        appended.summary().operation,
+        crate::iceberg::spec::Operation::Append
+    );
+    assert_eq!(appended.parent_snapshot_id(), Some(deleted.snapshot_id()));
+    assert_eq!(
+        appended.summary().additional_properties["total-records"],
+        "0"
     );
     let committed = fixture
         .catalog
@@ -390,6 +433,56 @@ async fn keyed_full_zero_output_that_removes_live_files_is_delete() {
         .unwrap();
     assert!(live_data_paths(&fixture, &committed).await.is_empty());
     assert_eq!(fixture.catalog.commits().len(), 1);
+}
+
+#[tokio::test]
+async fn full_refresh_lost_reply_recovers_only_the_marked_append() {
+    let fixture = publication_fixture(FormatVersion::V2, false, true).await;
+    let prepared = prepare_keyed(&fixture, b"result").await;
+    let control = write_control(&fixture);
+    let plan = control.begin_write(keyed_begin(&prepared)).unwrap();
+    let (request, path) = keyed_data_finish(&fixture, &plan, &prepared).await;
+    let ExternalMutationOutcome::CommitUnknown { evidence, .. } =
+        control.finish_write(request).unwrap()
+    else {
+        panic!("the applied dispatch reply was lost");
+    };
+    let snapshots = actual_snapshot_updates(&fixture);
+    let [deleted, append] = snapshots.as_slice() else {
+        panic!("the original dispatch must publish two snapshots");
+    };
+    let mut marked = snapshots.iter().filter(|snapshot| {
+        snapshot
+            .summary()
+            .additional_properties
+            .contains_key(ICEBERG_WRITE_SESSION_MARKER_PROPERTY)
+    });
+    assert_eq!(marked.next().unwrap().snapshot_id(), append.snapshot_id());
+    assert!(marked.next().is_none());
+    assert_eq!(append.parent_snapshot_id(), Some(deleted.snapshot_id()));
+    assert_eq!(deleted.parent_snapshot_id(), prepared.base_snapshot_id);
+    let ExternalMutationOutcome::KnownCommitted { receipt, .. } = control
+        .reconcile_write(ConnectorWriteSessionReconcileRequest {
+            commit: plan.commit_session(),
+            evidence,
+            context: context(),
+        })
+        .unwrap()
+    else {
+        panic!("the original append marker must reconcile the applied request");
+    };
+    assert_eq!(
+        receipt.committed_version().and_then(|v| v.snapshot_id()),
+        Some(append.snapshot_id())
+    );
+    assert_eq!(receipt.resulting_row_count(), Some(1));
+    assert_eq!(fixture.catalog.commits().len(), 1);
+    let table = fixture
+        .catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .unwrap();
+    assert_eq!(live_data_paths(&fixture, &table).await, [path]);
 }
 
 // Stage a real local Parquet object through the writer sealed by this session,
@@ -407,7 +500,11 @@ async fn keyed_data_finish_observed<'a>(
     fixture: &Fixture,
     plan: &'a novarocks_spi::connector::write_stack::session::ConnectorWriteSessionPlan,
     prepared: &PreparedKeyed,
-) -> (ConnectorWriteFinishRequest<'a>, String, Arc<std::sync::atomic::AtomicUsize>) {
+) -> (
+    ConnectorWriteFinishRequest<'a>,
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
     use crate::commit::write_stack::execution::IcebergWriteStackExecution;
     use crate::commit::write_stack::test_support::{received_write_proof, write_query_identity};
     use novarocks_spi::connector::write_stack::{
@@ -474,7 +571,8 @@ async fn keyed_data_finish_observed<'a>(
         .unwrap();
     writer.append(batch).await.unwrap();
     let fragments = writer.finish().await.unwrap();
-    let (fragments, author, live) = crate::commit::write_stack::test_support::paid_fragments_counted(&adapter, fragments);
+    let (fragments, author, live) =
+        crate::commit::write_stack::test_support::paid_fragments_counted(&adapter, fragments);
     let [fragment] = fragments.as_slice() else {
         panic!("one keyed data row must produce one commit fragment");
     };
@@ -515,32 +613,38 @@ async fn keyed_data_finish_observed<'a>(
 async fn keyed_unknown_retains_session_data_and_manifest_without_redispatch() {
     let fixture = keyed_fixture().await;
     let prepared = prepare_keyed(&fixture, b"result").await;
-    assert_keyed_unknown_retains_artifacts(fixture, prepared, false).await;
+    assert_keyed_unknown_retains_artifacts(fixture, prepared).await;
 }
 
 pub(in crate::commit) async fn assert_compact_keyed_unknown_retains_artifacts() {
     let fixture = keyed_fixture().await;
-    let prepared = prepare_keyed_variant(&fixture, ConnectorManagedPublicationTechnique::Incremental, false).await;
-    assert_keyed_unknown_retains_artifacts(fixture, prepared, true).await;
+    let prepared = prepare_keyed_variant(
+        &fixture,
+        ConnectorManagedPublicationTechnique::Incremental,
+        false,
+    )
+    .await;
+    assert_keyed_unknown_retains_artifacts(fixture, prepared).await;
 }
 
-async fn assert_keyed_unknown_retains_artifacts(
-    fixture: Fixture,
-    prepared: PreparedKeyed,
-    compact: bool,
-) {
+async fn assert_keyed_unknown_retains_artifacts(fixture: Fixture, prepared: PreparedKeyed) {
     use std::sync::atomic::Ordering;
     let control = write_control(&fixture);
-    let shape = if compact {
-        ConnectorManagedPublicationShape::InsertOnlyChangeStream
-    } else {
+    let full = prepared.declaration.technique() == ConnectorManagedPublicationTechnique::Full;
+    let shape = if full {
         ConnectorManagedPublicationShape::Data
+    } else {
+        ConnectorManagedPublicationShape::InsertOnlyChangeStream
     };
-    let plan = control.begin_write(keyed_begin_shape(&prepared, shape)).unwrap();
-    iceberg_handle(&fixture, &plan).with_active_receiving(|receiving| {
-        assert_eq!(receiving.compact_files().is_some(), compact);
-        Ok(())
-    }).unwrap();
+    let plan = control
+        .begin_write(keyed_begin_shape(&prepared, shape))
+        .unwrap();
+    iceberg_handle(&fixture, &plan)
+        .with_active_receiving(|receiving| {
+            assert!(receiving.compact_files().is_some());
+            Ok(())
+        })
+        .unwrap();
     let (request, data, live) = keyed_data_finish_observed(&fixture, &plan, &prepared).await;
     assert!(live.load(Ordering::SeqCst) > 0);
     fixture.catalog.clear();
@@ -584,8 +688,34 @@ async fn assert_keyed_unknown_retains_artifacts(
         assert!(std::path::Path::new(path.strip_prefix("file://").unwrap()).exists());
     }
     let lists = actual_snapshot_updates(&fixture);
-    assert_eq!(lists.len(), 1);
-    assert!(paths.contains(&lists[0].manifest_list().to_string()));
+    assert_eq!(lists.len(), if full { 2 } else { 1 });
+    assert!(
+        lists
+            .iter()
+            .all(|snapshot| paths.contains(&snapshot.manifest_list().to_string()))
+    );
+    let append = lists.last().unwrap();
+    assert_eq!(append.summary().additional_properties["added-records"], "1");
+    if full {
+        let deleted = &lists[0];
+        assert_eq!(deleted.parent_snapshot_id(), prepared.base_snapshot_id);
+        assert_eq!(append.parent_snapshot_id(), Some(deleted.snapshot_id()));
+        assert_eq!(
+            deleted.summary().additional_properties["total-records"],
+            "0"
+        );
+        assert_eq!(append.summary().additional_properties["total-records"], "1");
+    }
+    assert_eq!(
+        lists
+            .iter()
+            .filter(|snapshot| snapshot
+                .summary()
+                .additional_properties
+                .contains_key(ICEBERG_WRITE_SESSION_MARKER_PROPERTY))
+            .count(),
+        1
+    );
     assert_eq!(fixture.catalog.commits().len(), 1);
     assert!(matches!(
         control
@@ -721,7 +851,7 @@ fn keyed_begin_shape(
 ) -> ConnectorWriteBeginRequest {
     let mut request = keyed_begin(prepared);
     request.intent = match (prepared.declaration.technique(), shape) {
-        (ConnectorManagedPublicationTechnique::Full, _) => ConnectorWriteIntent::Overwrite,
+        (ConnectorManagedPublicationTechnique::Full, _) => ConnectorWriteIntent::Append,
         (
             ConnectorManagedPublicationTechnique::Incremental,
             ConnectorManagedPublicationShape::RowMutation,
@@ -747,20 +877,67 @@ async fn assert_keyed_branch_publication(
     snapshot_id: i64,
     expected_updates: &[&'static str],
 ) -> Table {
-    assert_exact_target_mutation(
-        fixture,
-        prepared.base_snapshot_id,
-        expected_updates,
-        snapshot_id,
-    );
     let commits = fixture.catalog.commits();
+    let snapshots = actual_snapshot_updates(fixture);
+    let published = snapshots.last().expect("publication snapshot");
+    assert_eq!(published.snapshot_id(), snapshot_id);
+    if prepared.declaration.technique() == ConnectorManagedPublicationTechnique::Full {
+        let [deleted, append] = snapshots.as_slice() else {
+            panic!("Full publication requires a delete followed by append");
+        };
+        assert_eq!(commits.len(), 1);
+        assert_eq!(
+            commits[0].uuid_requirements,
+            vec![fixture.table.metadata().uuid()]
+        );
+        assert_eq!(
+            commits[0].ref_requirements,
+            vec![("main".into(), prepared.base_snapshot_id)]
+        );
+        assert_eq!(commits[0].update_kinds, expected_updates);
+        assert_eq!(
+            commits[0].ref_updates,
+            vec![
+                ("main".into(), deleted.snapshot_id()),
+                ("main".into(), snapshot_id)
+            ]
+        );
+        assert_eq!(deleted.parent_snapshot_id(), prepared.base_snapshot_id);
+        assert_eq!(append.parent_snapshot_id(), Some(deleted.snapshot_id()));
+        assert_eq!(
+            deleted.summary().operation,
+            crate::iceberg::spec::Operation::Delete
+        );
+        assert_eq!(
+            append.summary().operation,
+            crate::iceberg::spec::Operation::Append
+        );
+        assert!(
+            !deleted
+                .summary()
+                .additional_properties
+                .contains_key(ICEBERG_WRITE_SESSION_MARKER_PROPERTY)
+        );
+        assert!(
+            prepared
+                .records
+                .keys()
+                .all(|key| !deleted.summary().additional_properties.contains_key(key))
+        );
+    } else {
+        assert_exact_target_mutation(
+            fixture,
+            prepared.base_snapshot_id,
+            expected_updates,
+            snapshot_id,
+        );
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(published.parent_snapshot_id(), prepared.base_snapshot_id);
+    }
     for requirement in ["assert-current-schema-id", "assert-default-spec-id"] {
         assert!(commits[0].requirement_kinds.contains(&requirement));
     }
-    let snapshots = actual_snapshot_updates(fixture);
-    assert_eq!(snapshots.len(), 1);
-    assert_eq!(snapshots[0].parent_snapshot_id(), prepared.base_snapshot_id);
-    let actual_records: BTreeMap<_, _> = snapshots[0]
+    let actual_records: BTreeMap<_, _> = published
         .summary()
         .additional_properties
         .iter()
@@ -1003,9 +1180,11 @@ async fn real_keyed_eager_repartition_prepares_begins_and_finishes_one_exact_pub
         &[
             "add-spec",
             "set-default-spec",
-            "set-properties",
             "add-snapshot",
             "set-snapshot-ref",
+            "add-snapshot",
+            "set-snapshot-ref",
+            "set-properties",
         ],
     )
     .await;
@@ -1051,4 +1230,43 @@ async fn real_keyed_eager_repartition_prepares_begins_and_finishes_one_exact_pub
         Some(snapshot_id)
     );
     assert_eq!(fixture.catalog.commits().len(), 1);
+
+    // A later Full refresh reads an evolved storage table and writes only its
+    // current default spec. The older spec still has to remain available.
+    assert!(after.metadata().partition_specs_iter().count() > 1);
+    let next = prepare_keyed(&fixture, b"next").await;
+    assert_eq!(next.base_snapshot_id, Some(snapshot_id));
+    fixture.catalog.clear();
+    let plan = control.begin_write(keyed_begin(&next)).unwrap();
+    let (request, path) = keyed_data_finish(&fixture, &plan, &next).await;
+    let ExternalMutationOutcome::KnownCommitted { receipt, .. } =
+        control.finish_write(request).unwrap()
+    else {
+        panic!("Full refresh must accept storage with more than one spec");
+    };
+    assert_eq!(receipt.resulting_row_count(), Some(1));
+    let snapshots = actual_snapshot_updates(&fixture);
+    let [deleted, appended] = snapshots.as_slice() else {
+        panic!("Full refresh must publish both snapshots");
+    };
+    assert_eq!(deleted.parent_snapshot_id(), Some(snapshot_id));
+    assert_eq!(appended.parent_snapshot_id(), Some(deleted.snapshot_id()));
+    assert_eq!(
+        deleted.summary().additional_properties["total-records"],
+        "0"
+    );
+    assert_eq!(
+        appended.summary().additional_properties["total-records"],
+        "1"
+    );
+    let after = fixture
+        .catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .unwrap();
+    assert_eq!(
+        after.metadata().default_partition_spec_id(),
+        expected.spec_id()
+    );
+    assert_eq!(live_data_paths(&fixture, &after).await, [path]);
 }

@@ -30,11 +30,22 @@ impl super::staging::Preparer for FastAppendPreparer {
         view: &super::staging::StagedView<'_>,
         intent: &super::model::OperationIntent,
     ) -> crate::iceberg::Result<super::staging::PreparedChange> {
-        prepare_append(view, intent, None).await
+        prepare_append(view, intent, None, false, None).await
     }
 }
 
 pub(crate) struct CompactFastAppendPreparer(pub(crate) super::operation::IcebergCommitOperation);
+
+impl CompactFastAppendPreparer {
+    pub(crate) async fn prepare_full_refresh(
+        &self,
+        view: &super::staging::StagedView<'_>,
+        intent: &super::model::OperationIntent,
+        witness: Option<(String, String)>,
+    ) -> crate::iceberg::Result<super::staging::PreparedChange> {
+        prepare_append(view, intent, Some(&self.0), true, witness).await
+    }
+}
 
 #[async_trait]
 impl super::staging::Preparer for CompactFastAppendPreparer {
@@ -43,7 +54,22 @@ impl super::staging::Preparer for CompactFastAppendPreparer {
         view: &super::staging::StagedView<'_>,
         intent: &super::model::OperationIntent,
     ) -> crate::iceberg::Result<super::staging::PreparedChange> {
-        prepare_append(view, intent, Some(&self.0)).await
+        prepare_append(view, intent, Some(&self.0), false, None).await
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct FullRefreshAppendFixture(pub(crate) Option<(String, String)>);
+
+#[cfg(test)]
+#[async_trait]
+impl super::staging::Preparer for FullRefreshAppendFixture {
+    async fn prepare(
+        &self,
+        view: &super::staging::StagedView<'_>,
+        intent: &super::model::OperationIntent,
+    ) -> crate::iceberg::Result<super::staging::PreparedChange> {
+        prepare_append(view, intent, None, true, self.0.clone()).await
     }
 }
 
@@ -51,13 +77,15 @@ async fn prepare_append(
     view: &super::staging::StagedView<'_>,
     intent: &super::model::OperationIntent,
     operation: Option<&super::operation::IcebergCommitOperation>,
+    full_refresh: bool,
+    witness: Option<(String, String)>,
 ) -> crate::iceberg::Result<super::staging::PreparedChange> {
     if operation.is_none() {
         super::overwrite::validate_added_data(intent)?;
     }
     let sources = view.target_sources().await?;
     let snapshot_id = view.stage_snapshot_id()?;
-    let (added, summary) = if let Some(operation) = operation {
+    let (added, mut summary) = if let Some(operation) = operation {
         let stage = intent.compact_stage().ok_or_else(|| {
             crate::iceberg::Error::new(
                 crate::iceberg::ErrorKind::Unexpected,
@@ -91,6 +119,27 @@ async fn prepare_append(
         added,
     )
     .await?;
+    if full_refresh {
+        if let Some((key, value)) = witness
+            && (intent.summary().contains_key(&key) || summary.insert(key, value).is_some())
+        {
+            return Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::DataInvalid,
+                "Full refresh witness conflicts with an existing snapshot fact",
+            ));
+        }
+        let manifests = manifests.into_snapshot_manifests(&mut summary);
+        return super::overwrite::prepare_snapshot_change_with_summary(
+            view,
+            intent,
+            snapshot_id,
+            Operation::Append,
+            manifests,
+            summary,
+            super::overwrite::SnapshotSummaryMode::FullRefreshAppend,
+        )
+        .await;
+    }
     super::overwrite::prepare_ordinary_snapshot_change(
         view,
         intent,

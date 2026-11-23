@@ -320,10 +320,25 @@ struct WriteRecipe<'a> {
     prefix: PreparedChange,
     output_facts: crate::write_codec::IcebergWrittenOutputFacts,
     keyed_documents: Option<novarocks_spi::connector::KeyedPublication>,
-    managed_overwrite: Option<managed_repartition::ManagedOverwrite<'a>>,
+    repartition: Option<managed_repartition::RepartitionPublication<'a>>,
+}
+
+enum LeadingStage {
+    KeyedDocuments,
+    FullRefreshDelete,
 }
 
 impl<'a> WriteRecipe<'a> {
+    fn leading_stage(&self) -> Option<LeadingStage> {
+        if self.op_kind == CommitOpKind::FullRefresh {
+            Some(LeadingStage::FullRefreshDelete)
+        } else if self.keyed_documents.is_some() {
+            Some(LeadingStage::KeyedDocuments)
+        } else {
+            None
+        }
+    }
+
     fn freeze(
         handle: &'a IcebergWriteCommitSession,
         validated: &[ValidatedFragment<'_>],
@@ -435,10 +450,8 @@ impl<'a> WriteRecipe<'a> {
                 }
             }
         }
-        let dependencies = vec![if matches!(
-            handle.commit_op_kind(),
-            CommitOpKind::FastAppend | CommitOpKind::Overwrite
-        ) && handle.repartition().is_none()
+        let dependencies = vec![if handle.commit_op_kind() == CommitOpKind::FastAppend
+            && handle.repartition().is_none()
             && handle.document_publication().is_none()
         {
             Dependency::NoRead
@@ -463,7 +476,7 @@ impl<'a> WriteRecipe<'a> {
                 .map_err(|e| invalid(e.to_string()))?,
             uuid: Some(source.uuid()),
         };
-        let managed_overwrite = managed_repartition::Effect::freeze(handle, &source)?;
+        let repartition = managed_repartition::Effect::freeze(handle, &source)?;
         Ok(Self {
             source,
             files,
@@ -485,7 +498,7 @@ impl<'a> WriteRecipe<'a> {
             prefix,
             output_facts,
             keyed_documents,
-            managed_overwrite,
+            repartition,
         })
     }
 
@@ -628,7 +641,9 @@ impl<'a> WriteRecipe<'a> {
         }
         Ok(match self.op_kind {
             CommitOpKind::FastAppend => Box::new(crate::commit::fast_append::FastAppendPreparer),
-            CommitOpKind::Overwrite => Box::new(crate::commit::overwrite::OverwritePreparer),
+            CommitOpKind::FullRefresh => {
+                return Err(internal("Iceberg full refresh requires compact additions"));
+            }
             CommitOpKind::RowDelta => Box::new(crate::commit::row_delta::RowDeltaPreparer),
             CommitOpKind::MaterializedRowDelta => {
                 if !self.fixed_mutation {
@@ -643,6 +658,33 @@ impl<'a> WriteRecipe<'a> {
                 return Err(internal("Iceberg rewrite lost its RewriteFiles protocol"));
             }
         })
+    }
+}
+
+struct FullRefreshAppend<'a> {
+    compact: crate::commit::fast_append::CompactFastAppendPreparer,
+    repartition: Option<&'a managed_repartition::RepartitionPublication<'a>>,
+}
+
+#[async_trait]
+impl Preparer for FullRefreshAppend<'_> {
+    async fn prepare(
+        &self,
+        view: &StagedView<'_>,
+        intent: &OperationIntent,
+    ) -> crate::iceberg::Result<PreparedChange> {
+        let (witness, slot) = if let Some(repartition) = self.repartition {
+            let (witness, slot) = repartition.prepare_append(view, intent)?;
+            (Some(witness), slot)
+        } else {
+            (None, None)
+        };
+        let mut append = self
+            .compact
+            .prepare_full_refresh(view, intent, witness)
+            .await?;
+        append.updates.extend(slot);
+        Ok(append)
     }
 }
 
@@ -861,7 +903,7 @@ impl IcebergWriteSessionControl {
             let files = received
                 .take_compact_files()
                 .expect("adopted compact files");
-            let stage = usize::from(recipe.keyed_documents.is_some());
+            let stage = recipe.leading_stage().as_slice().len();
             recipe.compact_stage = Some(stage);
             recipe.output_facts.data_files = files.counts.data.files;
             recipe.output_facts.data_rows = files.counts.data.rows;
@@ -905,7 +947,10 @@ impl IcebergWriteSessionControl {
                     stage,
                     crate::commit::new_manifests::PendingNewFiles {
                         received: files,
-                        source: Arc::clone(&recipe.source),
+                        source: handle.repartition().map_or_else(
+                            || Arc::clone(&recipe.source),
+                            |repartition| Arc::new(repartition.prospective_metadata().clone()),
+                        ),
                         codec: super::super::codec::CompactFragmentCodec::for_adapter(
                             &self.adapter,
                         ),
@@ -954,12 +999,17 @@ impl IcebergWriteSessionControl {
                 );
             }
         };
-        let data = match recipe.preparer(&operation) {
-            Ok(data) => data,
-            Err(error) => {
-                return WritePublicationDispatch::settled(
-                    self.reject_operation(handle, &operation, error).await,
-                );
+        let full_refresh = recipe.op_kind == CommitOpKind::FullRefresh;
+        let data = if full_refresh {
+            None
+        } else {
+            match recipe.preparer(&operation) {
+                Ok(data) => Some(data),
+                Err(error) => {
+                    return WritePublicationDispatch::settled(
+                        self.reject_operation(handle, &operation, error).await,
+                    );
+                }
             }
         };
         let policy = match RetryPolicy::from_properties(recipe.source.properties()) {
@@ -984,10 +1034,7 @@ impl IcebergWriteSessionControl {
         let receipt_partitioning = handle.repartition().map(|r| r.committed().clone());
         let receipt_output_facts = recipe.output_facts;
         let retained_evidence = handle.recovery_evidence_slot();
-        let managed_effect = recipe
-            .managed_overwrite
-            .as_ref()
-            .map(|data| data.effect.clone());
+        let managed_effect = recipe.repartition.as_ref().map(|data| data.effect.clone());
         let preflight = Arc::new(
             move |request: &FrozenRequest, operation: &IcebergCommitOperation| {
                 if let Some(effect) = &managed_effect {
@@ -1042,14 +1089,32 @@ impl IcebergWriteSessionControl {
                     .await;
                 }
             };
+            let leading = recipe.leading_stage();
             let keyed = recipe.keyed_documents.map(KeyedPublicationPreparer);
+            let delete;
             let mut preparers: Vec<&dyn Preparer> = Vec::new();
-            if let Some(keyed) = &keyed {
-                preparers.push(keyed);
+            match leading {
+                Some(LeadingStage::KeyedDocuments) => {
+                    preparers.push(keyed.as_ref().expect("frozen keyed publication"));
+                }
+                Some(LeadingStage::FullRefreshDelete) => {
+                    delete = crate::commit::filter_delete::FilterDeletePreparer::for_full_refresh();
+                    preparers.push(&delete);
+                }
+                None => {}
             }
-            let data: &dyn Preparer = match &recipe.managed_overwrite {
-                Some(managed) => managed,
-                None => data.as_ref(),
+            let full_append;
+            let data = match data.as_deref() {
+                Some(data) => data,
+                None => {
+                    full_append = FullRefreshAppend {
+                        compact: crate::commit::fast_append::CompactFastAppendPreparer(
+                            run_operation.clone(),
+                        ),
+                        repartition: recipe.repartition.as_ref(),
+                    };
+                    &full_append
+                }
             };
             let carried_statistics = if matches!(
                 recipe.session_protocol,
@@ -1079,6 +1144,9 @@ impl IcebergWriteSessionControl {
                 None
             };
             preparers.push(data);
+            if full_refresh && let Some(keyed) = &keyed {
+                preparers.push(keyed);
+            }
             if let Some(carry) = &carried_statistics {
                 preparers.push(carry);
             }

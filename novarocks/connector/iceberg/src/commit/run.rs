@@ -413,6 +413,14 @@ mod keyed_publication_trace_tests {
     }
 
     async fn fixture_with_format(format_version: FormatVersion, row_lineage: bool) -> Fixture {
+        publication_fixture(format_version, row_lineage, false).await
+    }
+
+    async fn publication_fixture(
+        format_version: FormatVersion,
+        row_lineage: bool,
+        lose_reply: bool,
+    ) -> Fixture {
         let warehouse = tempfile::tempdir().expect("warehouse tempdir");
         let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
         let binding = {
@@ -476,12 +484,25 @@ mod keyed_publication_trace_tests {
         // admitted owner, independent of Hadoop's product document policy.
         let load_modes = Arc::new(Mutex::new(Vec::new()));
         let recording = catalog.clone();
-        let owner = crate::catalog::admission_test_support::all_admitted_recording_with_snapshot_trace_and_dispatch_fault(
-            owner,
-            Arc::new(move |requirements, updates| recording.record_frozen(requirements, updates)),
-            Arc::clone(&load_modes),
-            Arc::clone(&catalog.next_error),
+        let record = Arc::new(
+            move |requirements: &[TableRequirement], updates: &[TableUpdate]| {
+                recording.record_frozen(requirements, updates);
+            },
         );
+        use crate::catalog::admission_test_support::{
+            all_admitted_recording_with_lost_reply,
+            all_admitted_recording_with_snapshot_trace_and_dispatch_fault,
+        };
+        let owner = if lose_reply {
+            all_admitted_recording_with_lost_reply(owner, record)
+        } else {
+            all_admitted_recording_with_snapshot_trace_and_dispatch_fault(
+                owner,
+                record,
+                Arc::clone(&load_modes),
+                Arc::clone(&catalog.next_error),
+            )
+        };
         let runtime = Arc::new(
             crate::metadata_context::IcebergMetadataContext::with_catalog_for_test(
                 crate::catalog_control::IcebergCatalogControlState::new(configuration),

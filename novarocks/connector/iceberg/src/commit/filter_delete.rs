@@ -78,15 +78,27 @@ impl RowFilterJudge for AlwaysTrue {
 pub(crate) struct FilterDeletePreparer {
     filter: Predicate,
     judge: Arc<dyn RowFilterJudge>,
+    full_refresh: bool,
 }
 
 impl FilterDeletePreparer {
     pub(crate) fn new(filter: Predicate, judge: Arc<dyn RowFilterJudge>) -> Self {
-        Self { filter, judge }
+        Self {
+            filter,
+            judge,
+            full_refresh: false,
+        }
     }
 
     pub(crate) fn always_true() -> Self {
         Self::new(Predicate::AlwaysTrue, Arc::new(AlwaysTrue))
+    }
+
+    pub(crate) fn for_full_refresh() -> Self {
+        Self {
+            full_refresh: true,
+            ..Self::always_true()
+        }
     }
 }
 
@@ -98,7 +110,9 @@ impl Preparer for FilterDeletePreparer {
         intent: &OperationIntent,
     ) -> Result<PreparedChange> {
         let metadata = view.metadata();
-        if !intent.changes().added.is_empty() || !intent.changes().removed.is_empty() {
+        if (!self.full_refresh && !intent.changes().added.is_empty())
+            || !intent.changes().removed.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 "Filtered delete cannot include explicit file changes",
@@ -190,6 +204,7 @@ impl Preparer for FilterDeletePreparer {
             snapshot_id,
             manifests,
             &removed,
+            self.full_refresh,
         )
         .await
     }

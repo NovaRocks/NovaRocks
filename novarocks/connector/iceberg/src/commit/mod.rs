@@ -102,8 +102,7 @@ pub use types::{CommitOpKind, WrittenFile};
 pub use validation::{
     ensure_column_id_not_regressed, ensure_default_sort_order_resolvable,
     ensure_equality_delete_single_partition_spec, ensure_iceberg_write_supported,
-    ensure_iceberg_write_supported_from_metadata, ensure_no_equality_deletes,
-    ensure_overwrite_single_partition_spec, ensure_partition_id_not_regressed,
+    ensure_iceberg_write_supported_from_metadata, ensure_partition_id_not_regressed,
     ensure_single_partition_spec, match_select_schema_to_table,
     row_mutation_strategy_from_metadata,
 };

@@ -35,8 +35,7 @@ use sha2::{Digest, Sha256};
 
 use crate::commit::validation::{
     ensure_equality_delete_single_partition_spec_from_metadata,
-    ensure_iceberg_write_supported_from_metadata, ensure_no_equality_deletes_from_metadata,
-    ensure_overwrite_single_partition_spec_from_metadata,
+    ensure_iceberg_write_supported_from_metadata,
 };
 use crate::commit::write_shared::{
     exact_metadata_write_fields, exact_requested_write_fields, invalid_write_activation,
@@ -57,6 +56,14 @@ pub(crate) fn prepare_write(
     owner: &ConnectorProviderBindingKey,
 ) -> Result<ConnectorWritePreparationOutcome, ConnectorError> {
     request.validate(owner)?;
+    if request.intent == ConnectorWriteIntent::RewriteDataFiles {
+        return Ok(ConnectorWritePreparationOutcome::Denied(
+            ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg rewrite preparation requires the original distributed rewrite plan",
+            ),
+        ));
+    }
     let payload: IcebergTablePayload =
         decode_payload(request.table.payload(), "admitted Iceberg write table")?;
     if payload.metadata_table_type.is_some() {
@@ -208,11 +215,7 @@ fn write_support_denial(
         return Some(denied);
     }
 
-    let insert_shaped = matches!(
-        request.intent,
-        ConnectorWriteIntent::Append | ConnectorWriteIntent::Overwrite
-    );
-    if !insert_shaped {
+    if request.intent != ConnectorWriteIntent::Append {
         return None;
     }
 
@@ -258,10 +261,7 @@ pub(crate) fn insert_intent_support_denial(
     target_ref: &str,
     target_fqn: &str,
 ) -> Option<ConnectorError> {
-    if !matches!(
-        intent,
-        ConnectorWriteIntent::Append | ConnectorWriteIntent::Overwrite
-    ) {
+    if intent != ConnectorWriteIntent::Append {
         return None;
     }
     if let Err(error) =
@@ -271,15 +271,6 @@ pub(crate) fn insert_intent_support_denial(
     }
     let invalid =
         |message: String| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message);
-
-    if matches!(intent, ConnectorWriteIntent::Overwrite) {
-        if let Err(error) = ensure_overwrite_single_partition_spec_from_metadata(metadata) {
-            return Some(invalid(error));
-        }
-        if let Err(error) = ensure_no_equality_deletes_from_metadata(metadata) {
-            return Some(invalid(error));
-        }
-    }
 
     // Branch writes carry row-lineage semantics, which are Iceberg v3 only.
     if target_ref != "main" {
@@ -1148,15 +1139,15 @@ mod tests {
             .build()
             .unwrap()
             .metadata;
-            for intent in [
+            let denied = insert_intent_support_denial(
+                &metadata,
                 ConnectorWriteIntent::Append,
-                ConnectorWriteIntent::Overwrite,
-            ] {
-                let denied = insert_intent_support_denial(&metadata, intent, "main", "ice.db.t")
-                    .expect("data-file writes are denied");
-                assert_eq!(denied.kind(), ConnectorErrorKind::Unsupported);
-                assert!(denied.message().contains("column payload"), "{denied}");
-            }
+                "main",
+                "ice.db.t",
+            )
+            .expect("data-file writes are denied");
+            assert_eq!(denied.kind(), ConnectorErrorKind::Unsupported);
+            assert!(denied.message().contains("column payload"), "{denied}");
             let owner = owner();
             let payload = table_payload(Some(table_info(&metadata)));
             // This request asks for absent id/name columns: the type denial

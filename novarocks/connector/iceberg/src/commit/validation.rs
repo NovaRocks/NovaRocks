@@ -324,19 +324,6 @@ pub fn ensure_single_partition_spec_from_metadata(metadata: &TableMetadata) -> R
     Ok(())
 }
 
-pub fn ensure_overwrite_single_partition_spec(table: &Table) -> Result<(), String> {
-    ensure_overwrite_single_partition_spec_from_metadata(table.metadata())
-}
-
-/// [`ensure_overwrite_single_partition_spec`] for callers that hold frozen metadata.
-pub fn ensure_overwrite_single_partition_spec_from_metadata(
-    metadata: &TableMetadata,
-) -> Result<(), String> {
-    ensure_single_partition_spec_from_metadata(metadata).map_err(|err| {
-        format!("INSERT OVERWRITE on an evolved Iceberg table is not supported yet: {err}")
-    })
-}
-
 pub fn ensure_equality_delete_single_partition_spec(table: &Table) -> Result<(), String> {
     ensure_equality_delete_single_partition_spec_from_metadata(table.metadata())
 }
@@ -348,41 +335,6 @@ pub fn ensure_equality_delete_single_partition_spec_from_metadata(
     ensure_single_partition_spec_from_metadata(metadata).map_err(|err| {
         format!("ADD EQUALITY DELETE on an evolved Iceberg table is not supported yet: {err}")
     })
-}
-
-/// INSERT OVERWRITE rewrites data manifests without fully reconciling existing
-/// equality-delete manifests yet. Row-level DELETE has its own visibility
-/// planner; keep this guard scoped to overwrite-style write planning.
-///
-/// Best-effort check via the snapshot summary's `total-equality-deletes`
-/// property. When absent, we accept (no manifest walk yet — that belongs to
-/// Tasks 9/10). Empty table (no current snapshot) → accept.
-pub fn ensure_no_equality_deletes(table: &Table) -> Result<(), String> {
-    ensure_no_equality_deletes_from_metadata(table.metadata())
-}
-
-/// [`ensure_no_equality_deletes`] for callers that hold frozen metadata.
-pub fn ensure_no_equality_deletes_from_metadata(metadata: &TableMetadata) -> Result<(), String> {
-    let snap = match metadata.current_snapshot() {
-        Some(s) => s,
-        None => return Ok(()), // empty table — no manifests to inspect
-    };
-    let n = snap
-        .summary()
-        .additional_properties
-        .get("total-equality-deletes")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    if n > 0 {
-        return Err(
-            "iceberg table has equality-delete files in its current snapshot; \
-             INSERT OVERWRITE planning does not yet reconcile existing \
-             equality-delete manifests. Compact away the equality deletes \
-             before issuing INSERT OVERWRITE."
-                .to_string(),
-        );
-    }
-    Ok(())
 }
 
 /// Strict column-by-column type match between the SELECT's arrow schema and

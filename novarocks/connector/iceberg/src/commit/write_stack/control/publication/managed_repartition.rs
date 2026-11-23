@@ -17,15 +17,12 @@
 
 //! Bind ordinary storage and a slot replacement to the selected data snapshot.
 
-use super::{
-    FrozenRequest, IcebergWriteCommitSession, OperationIntent, Preparer, StagedView, format_error,
-};
+use super::{FrozenRequest, IcebergWriteCommitSession, OperationIntent, StagedView, format_error};
 use crate::commit::model::{BaseIdentity, Dependency, RequestShape, canonical_json};
-use crate::commit::overwrite::{OverwritePreparer, OverwriteSnapshotExtension};
 use crate::document_storage::keyed::{envelope, keys};
+use crate::iceberg::spec::Operation;
 use crate::iceberg::spec::TableMetadata;
 use crate::iceberg::{Error, ErrorKind, TableUpdate};
-use async_trait::async_trait;
 use novarocks_spi::connector::{
     ConnectorDocumentPublicationSlotUpdate, ConnectorError, DocumentIdentity,
 };
@@ -86,7 +83,7 @@ impl Effect {
     pub(super) fn freeze<'a>(
         handle: &'a IcebergWriteCommitSession,
         source: &TableMetadata,
-    ) -> Result<Option<ManagedOverwrite<'a>>, ConnectorError> {
+    ) -> Result<Option<RepartitionPublication<'a>>, ConnectorError> {
         let Some(repartition) = handle.repartition() else {
             return Ok(None);
         };
@@ -108,7 +105,7 @@ impl Effect {
             spec_id: spec.spec_id(),
         });
         let storage = repartition.storage_updates().unwrap_or_default();
-        Ok(Some(ManagedOverwrite {
+        Ok(Some(RepartitionPublication {
             effect: Self {
                 session: handle.session_id().to_string(),
                 publication: declaration.publication_id().to_bytes(),
@@ -123,7 +120,7 @@ impl Effect {
         }))
     }
 
-    fn summary_value(&self, snapshot: i64) -> Result<String, ConnectorError> {
+    fn summary_value(&self, delete_snapshot: i64, snapshot: i64) -> Result<String, ConnectorError> {
         let slot = self.slot.as_ref().map(|update| {
             (
                 &update.name().owner,
@@ -142,11 +139,12 @@ impl Effect {
                 self.uuid,
                 "main",
                 self.parent,
+                delete_snapshot,
                 snapshot,
                 self.prefix_digest,
                 slot,
             ),
-            b"novarocks.iceberg.managed-repartition-effect.v1\0",
+            b"novarocks.iceberg.managed-repartition-effect.v2\0",
         )?;
         Ok(DocumentIdentity::from_bytes(digest).to_hex())
     }
@@ -161,21 +159,6 @@ impl Effect {
                 ))
             })
             .transpose()
-    }
-
-    fn extension(&self, snapshot: i64) -> Result<OverwriteSnapshotExtension, ConnectorError> {
-        let update = self
-            .slot_property(snapshot)?
-            .map(|entry| TableUpdate::SetProperties {
-                updates: HashMap::from([entry]),
-            });
-        Ok(OverwriteSnapshotExtension {
-            summary: (
-                MANAGED_REPARTITION_EFFECT_SUMMARY_KEY.into(),
-                self.summary_value(snapshot)?,
-            ),
-            update,
-        })
     }
 
     pub(super) fn verify_request(&self, request: &FrozenRequest) -> Result<(), ConnectorError> {
@@ -207,20 +190,34 @@ impl Effect {
             TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
             _ => None,
         });
+        let deleted = snapshots
+            .next()
+            .filter(|snapshot| {
+                snapshot.summary().operation == Operation::Delete
+                    && snapshot.parent_snapshot_id() == self.parent
+                    && !snapshot
+                        .summary()
+                        .additional_properties
+                        .contains_key(ICEBERG_WRITE_SESSION_MARKER_PROPERTY)
+            })
+            .ok_or_else(|| {
+                corrupt("managed repartition lost the deletion from its original base")
+            })?;
         let snapshot = snapshots
             .next()
             .filter(|snapshot| {
                 snapshot.snapshot_id() == snapshot_id
-                    && snapshot.parent_snapshot_id() == self.parent
+                    && snapshot.summary().operation == Operation::Append
+                    && snapshot.parent_snapshot_id() == Some(deleted.snapshot_id())
             })
             .ok_or_else(|| {
-                corrupt("managed repartition changed its selected snapshot or parent")
+                corrupt("managed repartition changed its selected append or deletion parent")
             })?;
         let summary = &snapshot.summary().additional_properties;
         if snapshots.next().is_some()
             || summary.get(ICEBERG_WRITE_SESSION_MARKER_PROPERTY) != Some(&self.session)
             || summary.get(MANAGED_REPARTITION_EFFECT_SUMMARY_KEY)
-                != Some(&self.summary_value(snapshot_id)?)
+                != Some(&self.summary_value(deleted.snapshot_id(), snapshot_id)?)
         {
             return Err(corrupt(
                 "managed repartition lost its immutable effect witness",
@@ -247,31 +244,31 @@ impl Effect {
     }
 }
 
-pub(super) struct ManagedOverwrite<'a> {
+pub(super) struct RepartitionPublication<'a> {
     pub(super) effect: Effect,
     prospective: &'a TableMetadata,
 }
 
-#[async_trait]
-impl Preparer for ManagedOverwrite<'_> {
-    async fn prepare(
+impl RepartitionPublication<'_> {
+    pub(super) fn prepare_append(
         &self,
         view: &StagedView<'_>,
         intent: &OperationIntent,
-    ) -> crate::iceberg::Result<crate::commit::staging::PreparedChange> {
+    ) -> crate::iceberg::Result<((String, String), Option<TableUpdate>)> {
         let metadata = view.metadata();
-        let parent = metadata
-            .snapshot_for_ref("main")
-            .map(|snapshot| snapshot.snapshot_id());
+        let deleted = metadata.snapshot_for_ref("main").filter(|snapshot| {
+            snapshot.summary().operation == Operation::Delete
+                && snapshot.parent_snapshot_id() == self.effect.parent
+        });
         if intent.target_ref() != "main"
             || !intent.dependencies().contains(&Dependency::RefUnchanged)
-            || parent != self.effect.parent
+            || deleted.is_none()
             || intent.summary().get(ICEBERG_WRITE_SESSION_MARKER_PROPERTY)
                 != Some(&self.effect.session)
         {
             return Err(Error::new(
                 ErrorKind::CatalogCommitConflicts,
-                "managed overwrite lost its original main publication",
+                "managed repartition lost its original main publication",
             ));
         }
         // Keyed publication preparation may update its private document records
@@ -286,7 +283,7 @@ impl Preparer for ManagedOverwrite<'_> {
                 if ordinary(key) && other.get(key) != Some(value) {
                     return Err(Error::new(
                         ErrorKind::CatalogCommitConflicts,
-                        "staged managed overwrite differs from the sealed writer settings",
+                        "staged managed repartition differs from the sealed writer settings",
                     ));
                 }
             }
@@ -298,7 +295,7 @@ impl Preparer for ManagedOverwrite<'_> {
         {
             return Err(Error::new(
                 ErrorKind::CatalogCommitConflicts,
-                "staged managed overwrite differs from the sealed writer type or partition spec",
+                "staged managed repartition differs from the sealed writer type or partition spec",
             ));
         }
         if let Some(update) = &self.effect.slot
@@ -306,17 +303,28 @@ impl Preparer for ManagedOverwrite<'_> {
         {
             return Err(Error::new(
                 ErrorKind::CatalogCommitConflicts,
-                "managed overwrite slot differs from the admitted value and writer",
+                "managed repartition slot differs from the admitted value and writer",
             ));
         }
-        OverwritePreparer
-            .prepare_with_snapshot_extension(view, intent, |snapshot| {
-                self.effect
-                    .extension(snapshot)
-                    .map(Some)
-                    .map_err(format_error)
-            })
-            .await
+        let snapshot = view.stage_snapshot_id()?;
+        let delete_snapshot = deleted
+            .expect("validated full refresh delete")
+            .snapshot_id();
+        let witness = self
+            .effect
+            .summary_value(delete_snapshot, snapshot)
+            .map_err(format_error)?;
+        let slot = self
+            .effect
+            .slot_property(snapshot)
+            .map_err(format_error)?
+            .map(|entry| TableUpdate::SetProperties {
+                updates: HashMap::from([entry]),
+            });
+        Ok((
+            (MANAGED_REPARTITION_EFFECT_SUMMARY_KEY.into(), witness),
+            slot,
+        ))
     }
 }
 
@@ -326,7 +334,7 @@ mod tests {
     use crate::commit::model::{FileChanges, OperationIntentParts, TableTarget};
     use crate::commit::overwrite::preparer_tests::Fixture;
     use crate::commit::publication_descriptor::{AttributionPlan, PublicationDescriptor};
-    use crate::commit::staging::{StagingBase, StagingEngine};
+    use crate::commit::staging::{PreparedChange, Preparer, StagingBase, StagingEngine};
     use crate::iceberg::spec::{
         FormatVersion, Transform, UnboundPartitionField, UnboundPartitionSpecBuilder,
     };
@@ -335,6 +343,24 @@ mod tests {
         ConnectorDocumentFormat, ConnectorSlotName, ConnectorSlotValue,
     };
     use std::collections::BTreeMap;
+
+    struct AppendWithRepartition<'a>(&'a RepartitionPublication<'a>);
+
+    #[async_trait::async_trait]
+    impl Preparer for AppendWithRepartition<'_> {
+        async fn prepare(
+            &self,
+            view: &StagedView<'_>,
+            intent: &OperationIntent,
+        ) -> crate::iceberg::Result<PreparedChange> {
+            let (witness, slot) = self.0.prepare_append(view, intent)?;
+            let mut append = crate::commit::fast_append::FullRefreshAppendFixture(Some(witness))
+                .prepare(view, intent)
+                .await?;
+            append.updates.extend(slot);
+            Ok(append)
+        }
+    }
 
     #[tokio::test]
     async fn one_overwrite_writes_the_slot_and_immutable_repartition_witness() {
@@ -413,7 +439,7 @@ mod tests {
             prefix_digest: prefix_digest(std::slice::from_ref(&storage), &normalized).unwrap(),
             slot: Some(slot),
         };
-        let overwrite = ManagedOverwrite {
+        let repartition = RepartitionPublication {
             effect,
             prospective: &intended,
         };
@@ -452,10 +478,26 @@ mod tests {
                 ],
             })
             .unwrap();
-        engine.stage(&overwrite).await.unwrap();
+        engine
+            .stage(&crate::commit::filter_delete::FilterDeletePreparer::for_full_refresh())
+            .await
+            .unwrap();
+        engine
+            .stage(&AppendWithRepartition(&repartition))
+            .await
+            .unwrap();
         let metadata = engine.metadata().clone();
-        let snapshot = metadata.current_snapshot().unwrap().snapshot_id();
-        assert_eq!(metadata.snapshots().len(), 1);
+        let append = metadata.current_snapshot().unwrap();
+        let snapshot = append.snapshot_id();
+        let delete = append.parent_snapshot_id().unwrap();
+        assert_eq!(metadata.snapshots().len(), 2);
+        assert_eq!(
+            metadata
+                .snapshot_by_id(delete)
+                .unwrap()
+                .parent_snapshot_id(),
+            None
+        );
         assert_eq!(metadata.default_partition_spec_id(), selected.spec_id());
         assert_eq!(metadata.properties()["read.split.target-size"], "1024");
         let (_, stored) = envelope::decode_slot(&key, &metadata.properties()[&key]).unwrap();
@@ -463,14 +505,14 @@ mod tests {
         assert_eq!(stored.writer, Some(snapshot));
 
         let request = engine.freeze().unwrap();
-        overwrite.effect.verify_request(&request).unwrap();
-        let mut wrong_prefix = overwrite.effect.clone();
+        repartition.effect.verify_request(&request).unwrap();
+        let mut wrong_prefix = repartition.effect.clone();
         wrong_prefix.prefix_digest[0] ^= 1;
         assert!(wrong_prefix.verify_request(&request).is_err());
         let descriptor = PublicationDescriptor::frozen(&request).unwrap();
         let plan = &descriptor.attribution;
         assert!(
-            matches!(plan, AttributionPlan::ManagedRepartition { snapshot_id, parent: None, .. } if *snapshot_id == snapshot)
+            matches!(plan, AttributionPlan::ManagedRepartition { snapshot_id, parent: Some(parent), .. } if *snapshot_id == snapshot && *parent == delete)
         );
         let observed = plan.observe_table_metadata(&metadata).unwrap();
         assert!(plan.matches_observation(&observed));

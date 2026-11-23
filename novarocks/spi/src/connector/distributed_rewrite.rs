@@ -915,7 +915,7 @@ fn request_digest(
 
 fn rewrite_operation_intent(kind: &str) -> ConnectorWriteIntent {
     match kind {
-        REWRITE_DATA_FILES_KIND => ConnectorWriteIntent::Overwrite,
+        REWRITE_DATA_FILES_KIND => ConnectorWriteIntent::RewriteDataFiles,
         _ => unreachable!("validated distributed rewrite operation kind"),
     }
 }
@@ -1109,7 +1109,7 @@ mod tests {
                 preparation(
                     &request,
                     request.operation().table().clone(),
-                    ConnectorWriteIntent::Overwrite,
+                    ConnectorWriteIntent::RewriteDataFiles,
                     &schema,
                 ),
                 [7; 32],
@@ -1280,7 +1280,7 @@ mod tests {
             preparation(
                 &request,
                 wrong_target,
-                ConnectorWriteIntent::Overwrite,
+                ConnectorWriteIntent::RewriteDataFiles,
                 &schema,
             ),
             preparation(

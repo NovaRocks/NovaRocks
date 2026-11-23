@@ -540,7 +540,7 @@ async fn artifacts_for_staged_metadata(
     op_kind: CommitOpKind,
     current: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
 ) -> Result<Vec<novarocks_spi::connector::StatisticsArtifactDraft>, ConnectorError> {
-    if current.is_empty() || op_kind == CommitOpKind::Overwrite {
+    if current.is_empty() || op_kind == CommitOpKind::FullRefresh {
         return Ok(current);
     }
     let Some(parent_id) = parent_id else {
@@ -1574,14 +1574,13 @@ impl IcebergWriteSessionControl {
         let (snapshot_id, observation) = if managed_repartition {
             let AttributionPlan::ManagedRepartition {
                 snapshot_id,
-                parent,
                 session,
                 ..
             } = &descriptor.attribution
             else {
                 return Ok(journal.catalog_entry_outcome(entry));
             };
-            if !decoded.names_publication(*snapshot_id, *parent)
+            if !decoded.names_publication(*snapshot_id, handle.table().base_snapshot_id())
                 || session != &handle.session_id().to_string()
             {
                 return Ok(journal.catalog_entry_outcome(entry));
@@ -1855,7 +1854,7 @@ pub(crate) fn session_plan_from_targets(
     });
     let statistics_eligible = matches!(
         handle.commit_op_kind(),
-        CommitOpKind::FastAppend | CommitOpKind::Overwrite
+        CommitOpKind::FastAppend | CommitOpKind::FullRefresh
     ) && writes_rows;
     let mut expectations = BTreeMap::new();
     let plans = targets
@@ -2244,10 +2243,10 @@ impl IcebergWriteSessionControl {
         let operation = match &request.flavor {
             ConnectorWriteSessionFlavor::Ordinary => match request.intent {
                 novarocks_spi::connector::ConnectorWriteIntent::Append => CatalogOperation::Append,
-                novarocks_spi::connector::ConnectorWriteIntent::Overwrite => {
+                novarocks_spi::connector::ConnectorWriteIntent::RewriteDataFiles => {
                     return Err(ConnectorError::new(
                         ConnectorErrorKind::Unsupported,
-                        "Iceberg ordinary write does not support the overwrite intent",
+                        "Iceberg rewrite intent requires the original distributed rewrite session",
                     ));
                 }
                 novarocks_spi::connector::ConnectorWriteIntent::RowDelta => {
@@ -2300,6 +2299,13 @@ impl IcebergWriteSessionControl {
         let target_ref = request.target_ref.as_str();
         let frozen_rewrite = match &request.flavor {
             ConnectorWriteSessionFlavor::DistributedRewrite { frozen, .. } => {
+                if request.intent
+                    != novarocks_spi::connector::ConnectorWriteIntent::RewriteDataFiles
+                {
+                    return Err(invalid(
+                        "Iceberg distributed rewrite session lost its exact rewrite intent",
+                    ));
+                }
                 frozen.validate_owner(&self.key)?;
                 let content = frozen
                     .value::<crate::distributed_rewrite::FrozenRewritePlanContent>(
@@ -2429,7 +2435,7 @@ impl IcebergWriteSessionControl {
                 (
                     novarocks_spi::connector::ConnectorManagedPublicationTechnique::Full,
                     ConnectorManagedPublicationShape::Data,
-                ) => ConnectorWriteIntent::Overwrite,
+                ) => ConnectorWriteIntent::Append,
                 (
                     novarocks_spi::connector::ConnectorManagedPublicationTechnique::Incremental,
                     ConnectorManagedPublicationShape::InsertOnlyChangeStream,

@@ -783,9 +783,8 @@ mod tests {
     async fn full_replacement_can_publish_an_unpartitioned_spec_with_its_new_snapshot() {
         use crate::commit::fast_append::FastAppendPreparer;
         use crate::commit::model::AddedContent;
-        use crate::commit::overwrite::{
-            OverwritePreparer,
-            preparer_tests::{Fixture, data, raw_entries},
+        use crate::commit::overwrite::preparer_tests::{
+            Fixture, data, raw_entries, raw_snapshot_entries,
         };
         use crate::commit::staging::{StagingBase, StagingEngine};
         use crate::iceberg::{
@@ -854,7 +853,14 @@ mod tests {
         )
         .unwrap();
         engine.stage_change(prepared.prepared_change()).unwrap();
-        engine.stage(&OverwritePreparer).await.unwrap();
+        engine
+            .stage(&crate::commit::filter_delete::FilterDeletePreparer::for_full_refresh())
+            .await
+            .unwrap();
+        engine
+            .stage(&crate::commit::fast_append::FullRefreshAppendFixture(None))
+            .await
+            .unwrap();
         let after = engine.metadata().clone();
         let frozen = engine.freeze().unwrap();
         assert_eq!(after.default_partition_spec_id(), unpartitioned_spec_id);
@@ -862,9 +868,18 @@ mod tests {
             after.partition_spec_by_id(original_spec_id),
             partitioned.partition_spec_by_id(original_spec_id),
         );
+        let appended = after.current_snapshot().unwrap();
+        let deleted = after
+            .snapshot_by_id(appended.parent_snapshot_id().unwrap())
+            .unwrap();
+        assert_eq!(deleted.parent_snapshot_id(), Some(parent));
         assert_eq!(
-            after.current_snapshot().unwrap().parent_snapshot_id(),
-            Some(parent)
+            deleted.summary().operation,
+            crate::iceberg::spec::Operation::Delete
+        );
+        assert_eq!(
+            appended.summary().operation,
+            crate::iceberg::spec::Operation::Append
         );
         assert!(
             frozen
@@ -882,13 +897,14 @@ mod tests {
                 .iter()
                 .any(|update| matches!(update, TableUpdate::AddSnapshot { .. }))
         );
-        let entries = raw_entries(&after, "main", &attempt).await;
+        let deleted_entries = raw_snapshot_entries(&after, deleted, &attempt).await;
         assert!(
-            entries
+            deleted_entries
                 .iter()
                 .any(|entry| entry.data_file().file_path() == old
                     && entry.status == ManifestStatus::Deleted)
         );
+        let entries = raw_entries(&after, "main", &attempt).await;
         assert!(
             entries
                 .iter()

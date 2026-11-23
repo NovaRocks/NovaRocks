@@ -29,6 +29,11 @@ pub(super) fn project_compact(
         return Ok(None);
     }
     match handle.commit_op_kind() {
+        CommitOpKind::FullRefresh
+            if counts.position_deletes.files == 0 && counts.newly_deleted_rows == 0 =>
+        {
+            Ok(Some(ConnectorWriteRowChange::Replace(counts.data.rows)))
+        }
         CommitOpKind::FastAppend
             if counts.position_deletes.files == 0 && counts.newly_deleted_rows == 0 =>
         {
@@ -41,7 +46,7 @@ pub(super) fn project_compact(
             inserted: counts.data.rows,
             deleted: counts.newly_deleted_rows,
         })),
-        CommitOpKind::FastAppend => Err(invalid(
+        CommitOpKind::FastAppend | CommitOpKind::FullRefresh => Err(invalid(
             "Iceberg prepared artifact contradicts its logical publication operation",
         )),
         _ => Ok(None),
@@ -58,7 +63,7 @@ pub(super) fn project(
     let op = handle.commit_op_kind();
     if !matches!(
         op,
-        CommitOpKind::FastAppend | CommitOpKind::Overwrite | CommitOpKind::MaterializedRowDelta
+        CommitOpKind::FastAppend | CommitOpKind::FullRefresh | CommitOpKind::MaterializedRowDelta
     ) {
         return Ok(None);
     }
@@ -87,7 +92,7 @@ pub(super) fn project(
             }
         }
     }
-    Ok(Some(if op == CommitOpKind::Overwrite {
+    Ok(Some(if op == CommitOpKind::FullRefresh {
         ConnectorWriteRowChange::Replace(inserted)
     } else {
         ConnectorWriteRowChange::Delta { inserted, deleted }

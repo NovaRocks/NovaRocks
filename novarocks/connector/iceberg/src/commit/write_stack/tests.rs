@@ -1182,7 +1182,7 @@ fn a_managed_publication_carries_its_technique_and_disposition_into_finish() {
     for (technique, op_kind) in [
         (
             ConnectorManagedPublicationTechnique::Full,
-            CommitOpKind::Overwrite,
+            CommitOpKind::FullRefresh,
         ),
         (
             ConnectorManagedPublicationTechnique::Incremental,
@@ -1425,7 +1425,7 @@ fn a_change_stream_publication_commits_as_a_delta_not_an_append() {
         (
             ConnectorManagedPublicationTechnique::Full,
             ConnectorManagedPublicationShape::Data,
-            CommitOpKind::Overwrite,
+            CommitOpKind::FullRefresh,
         ),
     ] {
         let (handle, _) = flavor_session(
@@ -2793,7 +2793,16 @@ fn all_write_admission_requests(
             },
         ),
     ] {
-        let mut request = ordinary(ConnectorWriteIntent::Append);
+        let mut request = ordinary(
+            if matches!(
+                &flavor,
+                ConnectorWriteSessionFlavor::DistributedRewrite { .. }
+            ) {
+                ConnectorWriteIntent::RewriteDataFiles
+            } else {
+                ConnectorWriteIntent::Append
+            },
+        );
         request.flavor = flavor;
         requests.push((name.to_string(), request));
     }
@@ -2801,7 +2810,7 @@ fn all_write_admission_requests(
         (
             "full document publication",
             ConnectorManagedPublicationTechnique::Full,
-            ConnectorWriteIntent::Overwrite,
+            ConnectorWriteIntent::Append,
         ),
         (
             "incremental document publication",

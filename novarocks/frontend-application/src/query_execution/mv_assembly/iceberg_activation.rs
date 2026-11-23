@@ -160,13 +160,10 @@ fn prepare_first_refresh_document_write_request(
         namespace: prepared.target_namespace().to_string(),
         table: prepared.target_name().to_string(),
     };
-    // A document publication commits the target itself, so its write intent is
-    // the one its technique implies rather than the staging mode's.
+    // Both data writers produce additions. The original publication technique
+    // separately declares whether the commit replaces the preceding contents.
     let intent = match prepared.publication_intent().technique() {
-        MvRefreshPublicationTechnique::Full => {
-            novarocks_spi::connector::ConnectorWriteIntent::Overwrite
-        }
-        MvRefreshPublicationTechnique::Incremental => {
+        MvRefreshPublicationTechnique::Full | MvRefreshPublicationTechnique::Incremental => {
             novarocks_spi::connector::ConnectorWriteIntent::Append
         }
         MvRefreshPublicationTechnique::MetadataOnly => {

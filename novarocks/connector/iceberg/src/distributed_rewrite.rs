@@ -690,7 +690,7 @@ fn cohort_plans_from_artifact(
     Vec<ConnectorDistributedRewriteCohortPlan>,
     novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
 > {
-    let intent = ConnectorWriteIntent::Overwrite;
+    let intent = ConnectorWriteIntent::RewriteDataFiles;
     let execution = rewrite_execution_schema(metadata, row_lineage, creation)?;
     artifact
         .groups
