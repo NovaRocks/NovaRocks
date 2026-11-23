@@ -565,7 +565,7 @@ fn extract_binding_uses_the_exact_scalar_identity_even_when_a_custom_name_exists
             crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
-        .map(|(query, _)| query)
+        .map(|resolved| resolved.0)
     };
     let ordinary = analyze_sql("SELECT year(x) FROM temporal_source").unwrap();
     let expression = project(&ordinary, 0);
