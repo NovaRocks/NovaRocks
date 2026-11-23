@@ -26,12 +26,14 @@ sql.admit.create_table_unsupported_form	Admit	Active
 sql.admit.delete_requires_where	Admit	Active
 sql.admit.delete_unsupported_form	Admit	Active
 sql.admit.duplicate_table_procedure_argument	Admit	Active
+sql.admit.expression_not_constant	Admit	Active
 sql.admit.insert_unsupported_form	Admit	Active
 sql.admit.invalid_analyze_property	Admit	Active
 sql.admit.invalid_branch_property	Admit	Active
 sql.admit.invalid_catalog_property	Admit	Active
 sql.admit.invalid_default_column_value	Admit	Active
 sql.admit.invalid_materialized_view_property	Admit	Active
+sql.admit.invalid_parameter_usage	Admit	Active
 sql.admit.invalid_schema_property	Admit	Active
 sql.admit.invalid_session_property	Admit	Active
 sql.admit.invalid_table_procedure_argument	Admit	Active
@@ -42,6 +44,7 @@ sql.admit.kill_denied	Admit	Deprecated
 sql.admit.merge_unsupported_form	Admit	Active
 sql.admit.not_in_transaction	Admit	Active
 sql.admit.persisted_definition_semantics_unsupported	Admit	Active
+sql.admit.prepared_statement_not_found	Admit	Active
 sql.admit.procedure_not_found	Admit	Active
 sql.admit.schema_already_exists	Admit	Active
 sql.admit.session_catalog_not_found	Admit	Active

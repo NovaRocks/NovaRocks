@@ -77,6 +77,7 @@ const TRINO_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("INVALID_ARGUMENTS", 76, "USER_ERROR"),
     ("TOO_MANY_ARGUMENTS", 77, "USER_ERROR"),
     ("DUPLICATE_PROPERTY", 79, "USER_ERROR"),
+    ("INVALID_PARAMETER_USAGE", 80, "USER_ERROR"),
     ("VIEW_IS_STALE", 81, "USER_ERROR"),
     ("VIEW_IS_RECURSIVE", 82, "USER_ERROR"),
     ("DUPLICATE_WINDOW_NAME", 92, "USER_ERROR"),
@@ -189,6 +190,9 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.view_is_stale" => "VIEW_IS_STALE",
         "sql.analyze.view_is_recursive" => "VIEW_IS_RECURSIVE",
         "sql.analyze.type_mismatch" => "TYPE_MISMATCH",
+        "sql.admit.prepared_statement_not_found" => "NOT_FOUND",
+        "sql.admit.expression_not_constant" => "EXPRESSION_NOT_CONSTANT",
+        "sql.admit.invalid_parameter_usage" => "INVALID_PARAMETER_USAGE",
         "sql.analyze.function_not_aggregate" => "FUNCTION_NOT_AGGREGATE",
         "sql.analyze.expression_not_scalar" => "EXPRESSION_NOT_SCALAR",
         "sql.admit.unknown_type" | "sql.analyze.unknown_type" => "TYPE_NOT_FOUND",
@@ -1055,6 +1059,113 @@ fn location_requires_a_positive_real_utf8_boundary_in_the_original_sql() {
     assert_eq!(
         query_error(TrinoErrorSource::Service { error: &error, sql }).error_location,
         None
+    );
+}
+
+#[test]
+fn prepared_diagnostics_project_their_original_named_immediate_and_using_sources() {
+    use novarocks_query_application::{
+        session_value::{PreparedStatementDefinition, PreparedStatementSnapshot},
+        sql::{parse_single_statement, trino_admission::admit_trino_statement_request},
+    };
+    use std::sync::Arc;
+
+    // The protocol retains NovaRocks' UTF-16 indexing. The captured Trino
+    // reference's ANTLR offsets differ by one for each supplementary scalar.
+    let template = "SELECT '😀',\n  '😀', missing";
+    let snapshot = PreparedStatementSnapshot::new(vec![(
+        "p".into(),
+        PreparedStatementDefinition::new(Arc::from(template)),
+    )])
+    .unwrap();
+    let named = "EXECUTE p";
+    let immediate = "-- 中文😀\nEXECUTE IMMEDIATE 'SELECT ''😀'', missing'";
+    for (request, expected) in [
+        (
+            named,
+            TrinoErrorLocation {
+                line_number: 2,
+                column_number: 9,
+            },
+        ),
+        (
+            immediate,
+            TrinoErrorLocation {
+                line_number: 2,
+                column_number: 33,
+            },
+        ),
+    ] {
+        let admitted = admit_trino_statement_request(
+            Arc::from(request),
+            parse_single_statement(request).unwrap(),
+            &snapshot,
+        )
+        .unwrap();
+        let sql = admitted.source.sql();
+        let start = sql.find("missing").unwrap();
+        let span = novarocks_parser::Span::new(start, start + "missing".len());
+        let user =
+            novarocks_sql::analyze_error::AnalyzeError::unknown_column("Unknown column", span)
+                .to_user_error(Some(sql));
+        let service =
+            QueryServiceError::from_user_error(user).with_trino_statement_source(admitted.source);
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: request,
+        });
+        assert_wire(&wire, "COLUMN_NOT_FOUND");
+        assert_eq!(wire.error_location, Some(expected), "{request}");
+    }
+
+    for (request, expected) in [
+        (
+            "EXECUTE IMMEDIATE 'SELECT ''😀'',\n)'",
+            TrinoErrorLocation {
+                line_number: 2,
+                column_number: 20,
+            },
+        ),
+        (
+            "-- line 1\nEXECUTE IMMEDIATE 'SELECT ''😀'',\n)'",
+            TrinoErrorLocation {
+                line_number: 3,
+                column_number: 1,
+            },
+        ),
+    ] {
+        let service = admit_trino_statement_request(
+            Arc::from(request),
+            parse_single_statement(request).unwrap(),
+            &snapshot,
+        )
+        .unwrap_err();
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: request,
+        });
+        assert_wire(&wire, "SYNTAX_ERROR");
+        assert_eq!(wire.error_location, Some(expected), "{request}");
+    }
+
+    let request = "-- 🧭\nEXECUTE IMMEDIATE 'SELECT ?, ?'\nUSING '😀', missing";
+    let service = admit_trino_statement_request(
+        Arc::from(request),
+        parse_single_statement(request).unwrap(),
+        &snapshot,
+    )
+    .unwrap_err();
+    let wire = query_error(TrinoErrorSource::Service {
+        error: &service,
+        sql: request,
+    });
+    assert_wire(&wire, "EXPRESSION_NOT_CONSTANT");
+    assert_eq!(
+        wire.error_location,
+        Some(TrinoErrorLocation {
+            line_number: 3,
+            column_number: 13,
+        })
     );
 }
 

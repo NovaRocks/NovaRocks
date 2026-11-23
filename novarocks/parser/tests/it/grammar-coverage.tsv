@@ -207,17 +207,17 @@ optional	statement	81		1	COMMIT WORK	supported	accept	reviewed-grammar-path	none
 alternative	statement	81	commit	0	COMMIT	supported	accept	reviewed-grammar-path	none
 optional	statement	82		1	ROLLBACK WORK	supported	accept	reviewed-grammar-path	none
 alternative	statement	82	rollback	0	ROLLBACK	supported	accept	reviewed-grammar-path	none
-alternative	statement	83	prepare	0	PREPARE query_name FROM SELECT ?	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	statement	84	deallocate	0	DEALLOCATE PREPARE query_name	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	statement	85		1	EXECUTE query_name USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	statement	85		2	EXECUTE query_name USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	statement	85	execute	0	EXECUTE query_name USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	statement	86		1	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	statement	86		2	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	statement	86	executeImmediate	0	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	statement	87	describeInput	0	DESCRIBE INPUT query_name	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	statement	88	describeOutput	0	DESCRIBE OUTPUT query_name	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	statement	89	describeQueryOutput	0	DESCRIBE OUTPUT (WITH q AS (VALUES ?) SELECT ? FROM q)	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	83	prepare	0	PREPARE query_name FROM SELECT ?	supported	accept	reviewed-grammar-path	none
+alternative	statement	84	deallocate	0	DEALLOCATE PREPARE query_name	supported	accept	reviewed-grammar-path	none
+optional	statement	85		1	EXECUTE query_name USING 1, ?	supported	accept	reviewed-grammar-path	none
+optional	statement	85		2	EXECUTE query_name USING 1, ?	supported	accept	reviewed-grammar-path	none
+alternative	statement	85	execute	0	EXECUTE query_name USING 1, ?	supported	accept	reviewed-grammar-path	none
+optional	statement	86		1	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	supported	accept	reviewed-grammar-path	none
+optional	statement	86		2	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	supported	accept	reviewed-grammar-path	none
+alternative	statement	86	executeImmediate	0	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	supported	accept	reviewed-grammar-path	none
+alternative	statement	87	describeInput	0	DESCRIBE INPUT query_name	supported	accept	reviewed-grammar-path	none
+alternative	statement	88	describeOutput	0	DESCRIBE OUTPUT query_name	supported	accept	reviewed-grammar-path	none
+alternative	statement	89	describeQueryOutput	0	DESCRIBE OUTPUT (WITH q AS (VALUES ?) SELECT ? FROM q)	supported	accept	reviewed-grammar-path	none
 alternative	statement	90	setPath	0	SET PATH lake.s, t	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	statement	91	setTimeZone	0	SET TIME ZONE LOCAL	supported	accept	reviewed-grammar-path	none
 optional	statement	92		1	UPDATE cat.sch.t@dev SET id = ?	supported	accept	reviewed-grammar-path	none
@@ -1986,10 +1986,10 @@ alternative	statement	75		g1.b1.g1.b1	SHOW SESSION LIKE '%x' ESCAPE '!'	parsed-n
 alternative	statement	75		g1.b1	SHOW SESSION LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	statement	80		g1.b1.g1.b1	START TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	statement	80		g1.b1	START TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	statement	85		g1.b1.g1.b1	EXECUTE query_name USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	statement	85		g1.b1	EXECUTE query_name USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	statement	86		g1.b1.g1.b1	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	statement	86		g1.b1	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	85		g1.b1.g1.b1	EXECUTE query_name USING 1, ?	supported	accept	reviewed-grammar-path	none
+alternative	statement	85		g1.b1	EXECUTE query_name USING 1, ?	supported	accept	reviewed-grammar-path	none
+alternative	statement	86		g1.b1.g1.b1	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	supported	accept	reviewed-grammar-path	none
+alternative	statement	86		g1.b1	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	supported	accept	reviewed-grammar-path	none
 alternative	statement	91		g1.b1	SET TIME ZONE LOCAL	supported	accept	reviewed-grammar-path	none
 alternative	statement	91		g1.b2	SET TIME ZONE 'UTC'	supported	accept	reviewed-grammar-path	none
 alternative	statement	92		g1.b1	UPDATE lake.ns.t @dev SET id = 1	supported	accept	reviewed-grammar-path	none

@@ -631,6 +631,7 @@ impl<'a> super::AnalyzerContext<'a> {
                             .map_err(AnalyzeError::internal)?;
                         Ok(OutputColumn {
                             field_name: col.field_name.clone(),
+                            aliased: col.aliased,
                             column_id: new_id,
                             name: col.name,
                             value_type: col.value_type.clone(),
@@ -720,6 +721,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 .map(|column| {
                     self.check_control()?;
                     Ok(OutputColumn {
+                        aliased: false,
                         column_id: self.alloc_column_id(
                             Some(alias_name.clone()),
                             column.name.clone(),
@@ -738,6 +740,18 @@ impl<'a> super::AnalyzerContext<'a> {
                     alias.columns,
                     alias.span,
                 )?;
+            }
+            if self.factory.borrow().prepared_description.is_some() {
+                let origin = novarocks_types::naming::TableIdentity::new(
+                    declaration.binding.catalog_name(),
+                    &declaration.schema,
+                    &declaration.table,
+                );
+                let ids: Vec<_> = output_columns
+                    .iter()
+                    .map(|column| column.column_id)
+                    .collect();
+                self.describe_table_origin(&ids, &origin);
             }
             let mut scope = self.new_scope();
             for column in &output_columns {
@@ -787,7 +801,9 @@ impl<'a> super::AnalyzerContext<'a> {
             &resolved_table.catalog.columns,
             self.control,
         )?;
+
         let crate::planner::table::ScanSource::Sql(source) = &table_def.source;
+        self.describe_table_origin(&column_ids, &resolved_table.catalog.identity);
         for field in &source.retired_read_fields {
             self.check_control()?;
             if let Some((ordinal, _)) = resolved_table
@@ -813,6 +829,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 &resolved_table.catalog.hidden_columns,
                 self.control,
             )?;
+            self.describe_table_origin(&meta_ids, &resolved_table.catalog.identity);
             column_ids.extend(meta_ids);
         }
 
@@ -834,6 +851,19 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok((relation, scope))
     }
 
+    pub(super) fn describe_table_origin(
+        &self,
+        columns: &[ColumnId],
+        origin: &novarocks_types::naming::TableIdentity,
+    ) {
+        if let Some(description) = &mut self.factory.borrow_mut().prepared_description {
+            let origin = std::sync::Arc::new(origin.clone());
+            for &column in columns {
+                description.set_origin(column, std::sync::Arc::clone(&origin));
+            }
+        }
+    }
+
     fn analyze_iceberg_metadata_scan(
         &self,
         database: String,
@@ -849,6 +879,15 @@ impl<'a> super::AnalyzerContext<'a> {
             .iter()
             .map(|column| scope.add_table_column(Some(qualifier), column, self.control))
             .collect::<Result<Vec<_>, AnalyzeError>>()?;
+        if self.factory.borrow().prepared_description.is_some() {
+            let crate::planner::table::ScanSource::Sql(source) = &table.source;
+            let origin = novarocks_types::naming::TableIdentity::new(
+                &source.table.catalog,
+                &database,
+                &table.name,
+            );
+            self.describe_table_origin(&column_ids, &origin);
+        }
         let relation = Relation::IcebergMetadataScan(IcebergMetadataScanRelation {
             database,
             table,
@@ -1016,6 +1055,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 value_type.clone(),
             );
             output_columns.push(OutputColumn {
+                aliased: false,
                 field_name: alias_columns.get(idx).cloned(),
                 column_id,
                 name,

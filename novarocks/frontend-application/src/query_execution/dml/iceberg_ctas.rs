@@ -44,17 +44,22 @@ pub(crate) fn source_columns_to_table_column_defs(
     validate_source_domains(columns)?;
     columns
         .iter()
-        .map(|column| {
-            let data_type = novarocks_types::sql_type_from_value_type(&column.value_type)
-                .map_err(|error| format!("CTAS: source type not supported: {error}"))?;
-            Ok(TableColumnDef {
-                name: column.name.clone(),
-                data_type,
-                nullable: column.value_type.nullable(),
-                default: None,
-            })
-        })
+        .map(|column| source_column_to_table_column_def(&column.name, &column.value_type))
         .collect()
+}
+
+pub(crate) fn source_column_to_table_column_def(
+    name: &str,
+    value: &novarocks_type_contract::FunctionValueType,
+) -> Result<TableColumnDef, String> {
+    let data_type = novarocks_types::sql_type_from_value_type(value)
+        .map_err(|error| format!("CTAS: source type not supported: {error}"))?;
+    Ok(TableColumnDef {
+        name: name.to_owned(),
+        data_type,
+        nullable: value.nullable(),
+        default: None,
+    })
 }
 
 pub(crate) fn source_columns_to_write_fields(

@@ -211,6 +211,10 @@ impl TableSequenceArgumentsInput {
 }
 
 enum PlanningCpuInput {
+    QueryContexts(Box<crate::query::session_property_computation::QueryContextsCpuInput>),
+    PreparedDescription(
+        Box<crate::query::trino_statement::prepared_description::DescriptionCpuInput>,
+    ),
     TableSequenceArguments(Box<TableSequenceArgumentsInput>),
     SessionProperties(Box<crate::query::session_property_computation::SessionPropertyCpuInput>),
     QuerySessionProperties(
@@ -248,6 +252,14 @@ enum PlanningCpuInput {
     LogicalFinish(Box<LogicalFinishInput>),
 }
 enum PlanningCpuOutput {
+    PreparedDescription(
+        Box<
+            Result<
+                novarocks_query_application::api::OwnedLocalResult,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
     TableSequenceArguments(
         Result<Vec<novarocks_sql::compiler::TableSequenceArgumentFact>, SqlCompileError>,
     ),
@@ -401,11 +413,17 @@ impl PlanningCpuOriginal {
         body.started = true;
         let input = body.input.take().expect("original planning input");
         let output = match input {
+            PlanningCpuInput::PreparedDescription(input) => {
+                PlanningCpuOutput::PreparedDescription(Box::new(input.run()))
+            }
             PlanningCpuInput::TableSequenceArguments(input) => {
                 PlanningCpuOutput::TableSequenceArguments(input.evaluate())
             }
             PlanningCpuInput::AnalyzeProperties(input) => {
                 PlanningCpuOutput::AnalyzeColumns(input.run())
+            }
+            PlanningCpuInput::QueryContexts(input) => {
+                PlanningCpuOutput::QuerySessionProperties(Box::new(input.run()))
             }
             PlanningCpuInput::QuerySessionProperties(input) => {
                 PlanningCpuOutput::QuerySessionProperties(Box::new(input.run()))
@@ -1328,6 +1346,40 @@ impl FrontendPlanningCpuSource {
         };
         Ok(*result)
     }
+    pub(crate) async fn describe_prepared(
+        &self,
+        input: crate::query::trino_statement::prepared_description::DescriptionCpuInput,
+    ) -> Result<
+        Result<
+            novarocks_query_application::api::OwnedLocalResult,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::PreparedDescription(Box::new(input)));
+        let PlanningCpuOutput::PreparedDescription(result) = self.receive().await? else {
+            panic!("Prepared description returned another CPU phase");
+        };
+        Ok(*result)
+    }
+
+    pub(crate) async fn query_contexts(
+        &self,
+        input: crate::query::session_property_computation::QueryContextsCpuInput,
+    ) -> Result<
+        Result<
+            crate::query::session_property_computation::PreparedQuerySession,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::QueryContexts(Box::new(input)));
+        let PlanningCpuOutput::QuerySessionProperties(result) = self.receive().await? else {
+            panic!("Prepared query contexts returned another CPU phase");
+        };
+        Ok(*result)
+    }
+
     pub(crate) async fn query_session_properties(
         &self,
         input: crate::query::session_property_computation::QuerySessionPropertyCpuInput,

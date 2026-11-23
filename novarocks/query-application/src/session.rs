@@ -70,6 +70,16 @@ impl QuerySessionStatement {
     pub fn output_owned(output: QuerySessionOutput, kind: StatementKind) -> Self {
         Self::new(output, Box::new(OutputOwnsProtocolTerminal), kind)
     }
+    pub fn with_trino_statement_source(
+        mut self,
+        source: crate::sql::trino_admission::TrinoStatementSource,
+    ) -> Self {
+        if let QuerySessionOutput::GovernedError(error) = &mut self.output {
+            error.attach_trino_statement_source(source);
+        }
+        self
+    }
+
     pub fn session_effects(&self) -> &SessionEffects {
         &self.effects
     }
@@ -100,6 +110,21 @@ pub enum StatementOutputShape {
     Rows,
     UndeterminedCall,
 }
+
+impl StatementOutputShape {
+    pub fn command_row_field(self) -> Option<crate::api::ResultField> {
+        (self == Self::Rows).then(|| {
+            crate::api::ResultField::new(
+                "rows",
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
+            )
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatementAdmission {
     pub kind: StatementKind,

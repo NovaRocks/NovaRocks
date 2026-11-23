@@ -388,6 +388,7 @@ code-anchors:
 normalizer、AST mutation或printer生成的内部表示。运行期可以按请求派生typed/canonical facts，但派生物不能反向成为
 语言或durable authority。
 
+- [ADR-0258](ADR-0258-prepared-sql-request-snapshots-and-semantic-authors.md) — 预编译语句为何依赖请求定义快照、原参数位置以及 SchemaOnly 描述（active；实现与验证状态独立核对）
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 公开集合签名和关系 `TABLE(sequence(...))` 如何独立绑定（active）
 - [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) — Iceberg 元数据维护为何由原语句和准确表对象授权，如何保留 Trino 结果形状、完整有效文件集合、Hadoop 发现根与已确认删除事实（active；部分替代 ADR-0110/0198 的显式扫描和自有 ref 条款，以及 ADR-0111/0114/0232 的首次观察状态）
 - [ADR-0241](ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md) — Trino SQL 为何是唯一文法，语法扩展、AST 差异、能力准入与 printer 的边界（active；补充 ADR-0090／0101／0231）

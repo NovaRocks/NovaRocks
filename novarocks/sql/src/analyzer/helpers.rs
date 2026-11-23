@@ -1025,10 +1025,14 @@ pub(super) fn query_modifiers(query: &ast::Query) -> Result<&ast::QueryModifiers
     }
 }
 
-pub(super) fn extract_limit(modifiers: &ast::QueryModifiers) -> Result<Option<i64>, AnalyzeError> {
+pub(super) fn extract_limit(
+    modifiers: &ast::QueryModifiers,
+    parameters: Option<&crate::compiler::SqlPreparedParameters>,
+) -> Result<Option<i64>, AnalyzeError> {
     match &modifiers.limit {
         Some(ast::QueryLimit::Limit(limit)) => match &limit.row_count {
             ast::Expr::AllRows(_) => Ok(None),
+            row_count if description_row_count(row_count, parameters) => Ok(None),
             row_count => eval_limit_or_offset(row_count, "LIMIT").map(Some),
         },
         Some(ast::QueryLimit::FetchFirst(fetch)) => Err(AnalyzeError::unsupported_expression(
@@ -1039,11 +1043,24 @@ pub(super) fn extract_limit(modifiers: &ast::QueryModifiers) -> Result<Option<i6
     }
 }
 
-pub(super) fn extract_offset(modifiers: &ast::QueryModifiers) -> Result<Option<i64>, AnalyzeError> {
+pub(super) fn extract_offset(
+    modifiers: &ast::QueryModifiers,
+    parameters: Option<&crate::compiler::SqlPreparedParameters>,
+) -> Result<Option<i64>, AnalyzeError> {
     match &modifiers.offset {
+        Some(offset) if description_row_count(&offset.row_count, parameters) => Ok(None),
         Some(offset) => eval_limit_or_offset(&offset.row_count, "OFFSET").map(Some),
         None => Ok(None),
     }
+}
+
+fn description_row_count(
+    expression: &ast::Expr,
+    parameters: Option<&crate::compiler::SqlPreparedParameters>,
+) -> bool {
+    matches!(expression, ast::Expr::Parameter(parameter) if parameters.is_some_and(
+        |parameters| parameters.is_description() && parameters.ordinal(parameter.span).is_some()
+    ))
 }
 
 fn eval_limit_or_offset(expr: &ast::Expr, keyword: &str) -> Result<i64, AnalyzeError> {

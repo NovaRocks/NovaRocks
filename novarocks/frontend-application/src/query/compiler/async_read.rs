@@ -148,7 +148,7 @@ impl FrontendQueryCompiler {
             Ok((
                 novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
                     version,
-                    SqlStatementInput::query_with_admitted_session(Box::new(query.clone())),
+                    execution.sql_statement_input(Box::new(query.clone()), true),
                     SqlCompileIntent::Query,
                     SqlSessionContext {
                         sql_semantics: execution.sql_semantics().clone(),

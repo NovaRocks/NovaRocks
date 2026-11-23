@@ -142,6 +142,10 @@ impl SqlDmlCatalogPreparation {
                 ));
             }
         };
+        let query = match &statement.prepared_parameters {
+            Some(parameters) => parameters.complete_query(query)?,
+            None => query,
+        };
         let query = crate::sql_mode::normalize_concat_query(query, &session.sql_semantics)
             .map_err(SqlCompileError::from)?;
         let catalog = CatalogCompletionState::try_new_with_qualifications(
@@ -263,7 +267,7 @@ impl SqlDmlCatalogPreparation {
         let catalog = self.catalog.fact_catalog(facts)?;
         let snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let query = Box::new(self.catalog.query().clone());
-        let statement = match &self.statement.kind {
+        let mut statement = match &self.statement.kind {
             SqlStatementInputKind::MaterializedValuesQuery { source, .. } => {
                 // Keep the original pool and ordinal. The analysis borrow is
                 // rebuilt from structural sites on this actual owned AST.
@@ -273,6 +277,7 @@ impl SqlDmlCatalogPreparation {
                         query,
                         source: source.clone(),
                     },
+                    prepared_parameters: None,
                 }
             }
             SqlStatementInputKind::ParsedQuery(_) => SqlStatementInput::parsed_query(query),
@@ -282,6 +287,7 @@ impl SqlDmlCatalogPreparation {
                 ));
             }
         };
+        statement.prepared_parameters = self.statement.prepared_parameters.clone();
         let mut request = SqlAnalyzeRequest::new(
             statement,
             self.intent.clone(),

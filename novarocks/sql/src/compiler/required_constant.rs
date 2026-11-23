@@ -33,6 +33,8 @@ pub enum RequiredConstantTarget {
     Boolean,
     Integer,
     Bigint,
+    PreparedRowCount,
+    PreparedTableSelection,
     Double,
     Varchar,
     ArrayVarchar,
@@ -48,10 +50,14 @@ impl RequiredConstantTarget {
         match self {
             Self::Boolean => Some(DataType::Boolean),
             Self::Integer => Some(DataType::Int32),
-            Self::Bigint => Some(DataType::Int64),
+            Self::Bigint | Self::PreparedRowCount => Some(DataType::Int64),
             Self::Double => Some(DataType::Float64),
             Self::Varchar => Some(DataType::Utf8),
-            Self::ArrayVarchar | Self::MapVarcharVarchar | Self::Timestamp | Self::TimeZone => None,
+            Self::ArrayVarchar
+            | Self::MapVarcharVarchar
+            | Self::Timestamp
+            | Self::TimeZone
+            | Self::PreparedTableSelection => None,
         }
     }
 
@@ -86,6 +92,10 @@ impl RequiredConstantTarget {
 /// Materialized inputs keep their original checked pool and selected ordinal.
 pub enum RequiredConstantInput<'a> {
     Expression(&'a ast::Expr),
+    PreparedExpression {
+        expression: &'a ast::Expr,
+        parameters: &'a super::SqlPreparedParameters,
+    },
     Materialized(ConstantValue),
 }
 

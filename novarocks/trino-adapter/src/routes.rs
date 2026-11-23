@@ -292,22 +292,155 @@ mod tests {
         fn cancel_all(&self, _: QueryCancellationReason) {}
     }
     fn registry(opened: Arc<AtomicUsize>) -> Arc<TrinoQueryRegistry> {
+        prepared_registry(Arc::new(RefuseWorkFactory(opened)), Duration::from_secs(60))
+    }
+
+    fn prepared_registry(
+        factory: Arc<dyn QuerySessionFactory>,
+        timeout: Duration,
+    ) -> Arc<TrinoQueryRegistry> {
         let control = QueryControlService::new(Arc::new(
             novarocks_query_application::query_control::QueryApplicationControl::new(
                 novarocks_types::FrontendProcessId::new_v7(),
             ),
         ));
-        TrinoQueryRegistry::new(
-            Arc::new(RefuseWorkFactory(opened)),
-            control,
-            "root".into(),
-            Duration::from_secs(60),
-        )
+        TrinoQueryRegistry::new(factory, control, "root".into(), timeout)
     }
     async fn json(response: Response) -> serde_json::Value {
         assert_eq!(response.status(), StatusCode::OK);
         serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap()
     }
+    fn queued_sql(entry: &crate::entry::QueryEntry, name: &str) -> std::sync::Weak<str> {
+        let request = entry.request.lock().unwrap();
+        Arc::downgrade(request.as_ref().unwrap().prepared_sql(name).unwrap())
+    }
+
+    async fn submit_prepared(state: &StatementState, prepared: &'static str) -> Response {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-trino-user", HeaderValue::from_static("root"));
+        headers.insert(HOST, HeaderValue::from_static("localhost:8080"));
+        headers.insert(crate::prepared::HEADER, HeaderValue::from_static(prepared));
+        submit(State(state.clone()), headers, Body::from("EXECUTE p")).await
+    }
+
+    fn endpoint(page: &serde_json::Value) -> (String, String, String) {
+        let mut parts = page["nextUri"].as_str().unwrap().rsplit('/');
+        let token = parts.next().unwrap().to_owned();
+        let slug = parts.next().unwrap().to_owned();
+        let id = parts.next().unwrap().to_owned();
+        (id, slug, token)
+    }
+
+    #[tokio::test]
+    async fn prepared_post_rejects_bad_syntax_and_cancellation_releases_queued_sql() {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let registry = registry(Arc::clone(&opened));
+        let state = StatementState {
+            registry: Arc::clone(&registry),
+            limit: QueryTextLimit::default(),
+        };
+        let malformed = submit_prepared(&state, "p=SELECT+)").await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+        let queued = json(submit_prepared(&state, "p=SELECT+1").await).await;
+        let (id, slug, token) = endpoint(&queued);
+        let entry = registry.lookup(&id, &slug).unwrap();
+        let sql = queued_sql(&entry, "p");
+        assert_eq!(sql.upgrade().unwrap().as_ref(), "SELECT 1");
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+
+        let status = cancel(State(Arc::clone(&registry)), Path((id, slug, token))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(entry.request.lock().unwrap().is_none());
+        assert!(sql.upgrade().is_none());
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+        registry.finalize().await;
+    }
+
+    #[derive(Default)]
+    struct ObservePreparedFactory(
+        std::sync::Mutex<
+            Option<novarocks_query_application::session_value::PreparedStatementDefinition>,
+        >,
+    );
+
+    impl QuerySessionFactory for ObservePreparedFactory {
+        fn open_statement_session(
+            &self,
+            request: StatementSessionRequest,
+        ) -> Result<Arc<dyn QuerySession>, StatementSessionError> {
+            let (_, _, session) = request.into_parts();
+            *self.0.lock().unwrap() = session.prepared_statements().get("p").cloned();
+            Err(StatementSessionError::Service(QueryServiceError::new(
+                QueryServiceErrorKind::InvalidValue,
+                "Test session construction stops after borrowing its exact definition",
+            )))
+        }
+
+        fn cancel_all(&self, _: QueryCancellationReason) {}
+    }
+
+    #[tokio::test]
+    async fn prepared_first_get_preserves_the_original_sql_until_its_last_alias_drops() {
+        let observer = Arc::new(ObservePreparedFactory::default());
+        let registry = prepared_registry(observer.clone(), Duration::from_secs(60));
+        let state = StatementState {
+            registry: Arc::clone(&registry),
+            limit: QueryTextLimit::default(),
+        };
+        let queued = json(submit_prepared(&state, "p=SELECT+1,other=SELECT+2").await).await;
+        let (id, slug, token) = endpoint(&queued);
+        let entry = registry.lookup(&id, &slug).unwrap();
+        let sql = queued_sql(&entry, "p");
+        let other_sql = queued_sql(&entry, "other");
+        assert!(observer.0.lock().unwrap().is_none());
+        let failed = json(next(State(Arc::clone(&registry)), Path((id, slug, token))).await).await;
+        assert!(failed.get("error").is_some());
+        registry.finalize().await;
+        assert!(entry.request.lock().unwrap().is_none());
+        assert!(other_sql.upgrade().is_none());
+        let selected = observer.0.lock().unwrap().take().unwrap();
+        assert!(Arc::ptr_eq(&sql.upgrade().unwrap(), selected.sql()));
+        assert_eq!(selected.sql().as_ref(), "SELECT 1");
+        drop(selected);
+        assert!(sql.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn prepared_post_expiry_releases_queued_sql_with_an_old_lookup() {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let timeout = Duration::from_secs(60);
+        let registry = prepared_registry(Arc::new(RefuseWorkFactory(Arc::clone(&opened))), timeout);
+        let state = StatementState {
+            registry: Arc::clone(&registry),
+            limit: QueryTextLimit::default(),
+        };
+        let queued = json(submit_prepared(&state, "p=SELECT+1").await).await;
+        let (id, slug, _) = endpoint(&queued);
+        let entry = registry.lookup(&id, &slug).unwrap();
+        let sql = queued_sql(&entry, "p");
+        *entry.touched.lock().unwrap() = std::time::Instant::now() - 2 * timeout;
+        entry.requests.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while entry.request.lock().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the original registry timer has not expired its queued request");
+        assert!(sql.upgrade().is_none());
+        assert_eq!(
+            registry.get(&entry, 0).await.err(),
+            Some(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+        let timer = entry.timer.lock().unwrap().take();
+        if let Some(timer) = timer {
+            timer.await.unwrap();
+        }
+        registry.finalize().await;
+    }
+
     #[tokio::test]
     async fn logical_and_byte_oversize_share_registered_error_35_without_opening_a_session() {
         for (text, limit) in [("xx", 1), ("xxxx", 1), ("😀x", 2), ("x", 0)] {

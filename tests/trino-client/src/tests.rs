@@ -419,15 +419,25 @@ fn every_page_contributes_session_effects_and_only_success_applies_them() {
         let server = FakeServer::new(vec![
             queued()
                 .header("X-Trino-Set-Catalog", "cat")
-                .header("X-Trino-Set-Session", "a=A%2CB"),
+                .header("X-Trino-Set-Session", "a=A%2CB")
+                .header("X-Trino-Added-Prepare", "%E4%B8%AD%2B%2C%3D=SELECT+1"),
             Reply::json(r#"{"id":"q","nextUri":"$BASE/next/1"}"#)
                 .header("X-Trino-Set-Schema", "db")
                 .header("X-Trino-Clear-Session", "old")
-                .header("X-Trino-Set-Session", "a=C+value"),
-            terminal().header("X-Trino-Set-Session", "last=hello%2Bworld"),
+                .header("X-Trino-Set-Session", "a=C+value")
+                .header("X-Trino-Deallocated-Prepare", "before"),
+            terminal()
+                .header("X-Trino-Set-Session", "last=hello%2Bworld")
+                .header(
+                    "X-Trino-Added-Prepare",
+                    "%E4%B8%AD%2B%2C%3D=%24zstd%3AA-_A%3D",
+                ),
         ]);
         let mut state = session();
         state.properties.insert("old".into(), "gone".into());
+        state
+            .prepared_statements
+            .insert("before".into(), "SELECT 2".into());
         let client = match cap {
             Some(cap) => server.client_with_request_timeout_cap(cap),
             None => server.client(),
@@ -435,6 +445,15 @@ fn every_page_contributes_session_effects_and_only_success_applies_them() {
         client.execute(&mut state, "SET a=1", deadline()).unwrap();
         assert_eq!(state.catalog.as_deref(), Some("cat"));
         assert_eq!(state.schema.as_deref(), Some("db"));
+        assert_eq!(
+            state.prepared_statements,
+            BTreeMap::from([("中+,=".into(), "$zstd:A-_A=".into())]),
+        );
+        let headers = state.request_headers().unwrap();
+        assert_eq!(
+            headers["x-trino-prepared-statement"],
+            "%E4%B8%AD%2B%2C%3D=%24zstd%3AA-_A%3D"
+        );
         assert_eq!(
             state.properties,
             BTreeMap::from([
@@ -449,7 +468,9 @@ fn every_page_contributes_session_effects_and_only_success_applies_them() {
 #[test]
 fn failed_statement_discards_accumulated_effects_and_preserves_error_fields() {
     let server = FakeServer::new(vec![
-        queued().header("X-Trino-Set-Catalog", "changed"),
+        queued()
+            .header("X-Trino-Set-Catalog", "changed")
+            .header("X-Trino-Added-Prepare", "lost=SELECT+1"),
         Reply::json(
             r#"{"id":"q","error":{"message":"[sql.analyze.no_table] at line 2 column 3","errorCode":7,"errorName":"NO_TABLE","errorType":"USER_ERROR"}}"#,
         ),
@@ -472,8 +493,6 @@ fn unsupported_session_change_headers_are_rejected_on_any_page() {
     for header in [
         "X-Trino-Set-Path",
         "X-Trino-Set-Role",
-        "X-Trino-Added-Prepare",
-        "X-Trino-Deallocated-Prepare",
         "X-Trino-Started-Transaction-Id",
         "X-Trino-Clear-Transaction-Id",
         "X-Trino-Set-Authorization-User",

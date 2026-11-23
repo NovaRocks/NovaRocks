@@ -355,6 +355,13 @@ impl GovernedErrorStatementResult {
         }
     }
 
+    pub(crate) fn attach_trino_statement_source(
+        &mut self,
+        source: crate::sql::trino_admission::TrinoStatementSource,
+    ) {
+        self.error.attach_trino_statement_source(source);
+    }
+
     pub fn into_parts(self) -> (QueryServiceError, GovernedProtocolOwner) {
         (self.error, self.protocol)
     }

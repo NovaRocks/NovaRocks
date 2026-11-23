@@ -216,6 +216,9 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
         self.check_control()?;
+        if let ast::Expr::Parameter(parameter) = expr {
+            return self.analyze_prepared_parameter(parameter);
+        }
         // Direct expression admission precedes its own CV lookup. This is not
         // a whole-tree prepass over opaque declaration shortcuts.
         if unsupported_remaining_root(expr) {
@@ -255,6 +258,43 @@ impl<'a> super::AnalyzerContext<'a> {
                 })?;
         }
         Ok(resolved)
+    }
+
+    fn analyze_prepared_parameter(
+        &self,
+        parameter: &ast::Parameter,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let parameters = self
+            .prepared_parameters
+            .filter(|parameters| parameters.ordinal(parameter.span).is_some())
+            .ok_or_else(|| {
+                AnalyzeError::unsupported_expression(
+                    "Parameter has no binding in this statement",
+                    parameter.span,
+                )
+            })?;
+        if parameters.is_description() {
+            let ordinal = parameters
+                .ordinal(parameter.span)
+                .expect("validated occurrence");
+            return self
+                .factory
+                .borrow()
+                .prepared_description
+                .as_ref()
+                .ok_or_else(|| {
+                    AnalyzeError::internal("Unknown parameter outside description analysis")
+                })?
+                .parameter(ordinal);
+        }
+        let argument = parameters
+            .argument_at(parameter.span)
+            .expect("validated parameter ordinal");
+        let source_sql = parameters
+            .argument_sql()
+            .expect("validated argument source");
+        self.analyze_expr(argument, &self.new_scope())
+            .map_err(|error| error.in_expression_source(source_sql.clone()))
     }
 
     #[recursive::recursive]
@@ -2544,6 +2584,7 @@ impl<'a> super::AnalyzerContext<'a> {
             let (execution_name, order_by, window_frame) =
                 crate::analysis::normalize_window_for_execution(&name, order_by, window_frame);
             name = execution_name;
+            let ordinals = self.described_arguments(&args_typed);
             let binding = if let Some(aggregate) = &aggregate_binding {
                 aggregate.clone()
             } else {
@@ -2559,6 +2600,17 @@ impl<'a> super::AnalyzerContext<'a> {
                 args_typed = coerced;
                 binding
             };
+            self.observe_argument_types(
+                ordinals,
+                binding
+                    .selected
+                    .argument_types
+                    .iter()
+                    .map(|target| match target {
+                        novarocks_functions::FunctionArgumentType::Value(value) => Some(value),
+                        novarocks_functions::FunctionArgumentType::Lambda { .. } => None,
+                    }),
+            )?;
             // OVER is authored here; aggregate presence alone is not an OVER ABI.
             let lifecycle = if aggregate_binding.is_some() {
                 novarocks_functions::PureCallLifecycle::AggregateWindow
@@ -2724,6 +2776,10 @@ impl<'a> super::AnalyzerContext<'a> {
                     ));
                 }
             }
+            let ordinals = match route {
+                ScalarTypingRoute::Shared => None,
+                ScalarTypingRoute::Legacy => self.described_arguments(&args_typed),
+            };
             let bound = match route {
                 ScalarTypingRoute::Shared => {
                     let shape = if func.original.is_none() && name == "coalesce" {
@@ -2746,6 +2802,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 )
                 .map_err(|error| error.at_type_mismatch(func.span))?,
             };
+            self.observe_argument_types(
+                ordinals,
+                bound.args.iter().map(|argument| Some(&argument.value_type)),
+            )?;
             // This overload is also exposed by Trino's named array concat call.
             if bound.binding.function_id.as_str() == "builtin.scalar/concat/v1"
                 && bound.binding.logical_argument_count > 127
@@ -2805,6 +2865,17 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
                 work.finish().map_err(AnalyzeError::control)?;
             }
+            self.observe_argument_types(
+                self.described_arguments(&args_typed),
+                signature
+                    .selected
+                    .argument_types
+                    .iter()
+                    .map(|target| match target {
+                        novarocks_functions::FunctionArgumentType::Value(value) => Some(value),
+                        novarocks_functions::FunctionArgumentType::Lambda { .. } => None,
+                    }),
+            )?;
             let value_type = crate::functions::aggregate_result_type(&signature).clone();
             Ok(TypedExpr {
                 kind: ExprKind::AggregateCall {
@@ -5252,6 +5323,7 @@ mod tests {
             control,
             constant_policy: crate::constant::test_constant_policy(),
             materialized_values: None,
+            prepared_parameters: None,
             table_sequence: None,
             catalog: &EmptyCatalog,
             current_database: "default",
@@ -7690,6 +7762,7 @@ mod tests {
             purpose: super::super::QueryAnalysisPurpose::Ordinary,
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: None,
+            prepared_parameters: None,
             table_sequence: None,
             catalog: &EmptyCatalog,
             current_database: "default",

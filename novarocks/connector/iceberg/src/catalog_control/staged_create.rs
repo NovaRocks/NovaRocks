@@ -37,11 +37,11 @@ use novarocks_spi::connector::{
     ConnectorStagedCreatePublicationAdjudicationOutcome,
     ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublicationPayload,
     ConnectorStagedCreatePublishOutcome, ConnectorStagedCreatePublishRequest,
-    ConnectorStagedCreateReceipt, ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
-    ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
-    ConnectorStagedWriteProof, ConnectorVendedS3CredentialLeaseRefresher, CreatePolicy,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ProviderBindingEpoch,
+    ConnectorStagedCreateReceipt, ConnectorStagedCreateReceiptPhase, ConnectorStagedCtasProperties,
+    ConnectorStagedTableHandle, ConnectorStagedWritePlanningBinding,
+    ConnectorStagedWritePlanningRequest, ConnectorStagedWriteProof, ConnectorTableIdentity,
+    ConnectorVendedS3CredentialLeaseRefresher, CreatePolicy, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ProviderBindingEpoch,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -190,24 +190,33 @@ fn prepare_typed_staged_table(
     let Some(storage) = request.ordinary_typed_properties()? else {
         return prepare_mv_staged_table(request, warehouse);
     };
-    let control = &request.context;
+    prepare_ctas_definition(&request.table, &request.columns, storage, &request.context)
+}
+
+fn prepare_ctas_definition(
+    table: &ConnectorTableIdentity,
+    columns: &[ConnectorColumnDefinition],
+    storage: &ConnectorStagedCtasProperties,
+    control: &dyn ConnectorOperationControl,
+) -> Result<PreparedStagedTable, ConnectorError> {
     let storage = crate::table_properties::prepare_ctas_storage(
         storage.properties(),
         storage.comment(),
         control,
     )?;
-    validate_typed_staged_columns(request)?;
-    bind_typed_staged_table(request, storage, None, None)
+    validate_staged_columns(table, columns)?;
+    bind_typed_staged_table(columns, control, storage, None, None)
 }
 
-fn validate_typed_staged_columns(
-    request: &ConnectorStagedCreatePrepareRequest,
+fn validate_staged_columns(
+    table: &ConnectorTableIdentity,
+    columns: &[ConnectorColumnDefinition],
 ) -> Result<(), ConnectorError> {
     crate::commit::validation::deny_variant_column_definitions(
-        &request.columns,
-        &format!("{}.{}", request.table.namespace, request.table.table),
+        columns,
+        &format!("{}.{}", table.namespace, table.table),
     )?;
-    super::catalog_mutation::validate_create_column_names(&request.columns)
+    super::catalog_mutation::validate_create_column_names(columns)
 }
 
 fn prepare_mv_staged_table(
@@ -227,7 +236,7 @@ fn prepare_mv_staged_table(
         .map(|path| StagedMetadataPath::under_warehouse(&path, warehouse, CTAS_STAGING_NAMESPACE))
         .transpose()
         .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)?;
-    validate_typed_staged_columns(request)?;
+    validate_staged_columns(&request.table, &request.columns)?;
     for (key, value) in storage.application_properties() {
         control.check_active()?;
         super::catalog_mutation::validate_staged_application_property_key(key)?;
@@ -280,7 +289,8 @@ fn prepare_mv_staged_table(
         visible_sources.insert(normalize_identifier(name).map_err(invalid)?);
     }
     bind_typed_staged_table(
-        request,
+        &request.columns,
+        &request.context,
         storage_facts,
         Some(&visible_sources),
         final_metadata_path,
@@ -288,16 +298,13 @@ fn prepare_mv_staged_table(
 }
 
 fn bind_typed_staged_table(
-    request: &ConnectorStagedCreatePrepareRequest,
+    columns: &[ConnectorColumnDefinition],
+    control: &dyn ConnectorOperationControl,
     storage_facts: crate::table_properties::PreparedCreateTableProperties,
     visible_sources: Option<&HashSet<String>>,
     final_metadata_path: Option<StagedMetadataPath>,
 ) -> Result<PreparedStagedTable, ConnectorError> {
-    let control = &request.context;
-    let schema = Arc::new(build_staged_schema(
-        &request.columns,
-        storage_facts.format_version,
-    )?);
+    let schema = Arc::new(build_staged_schema(columns, storage_facts.format_version)?);
     crate::schema_capability::admit_schema(&schema)?;
     let spec = if let Some(visible_sources) = visible_sources {
         crate::table_properties::bind_mv_create_table_partitioning(
@@ -2291,6 +2298,16 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         control: &dyn ConnectorOperationControl,
     ) -> Result<(), ConnectorError> {
         crate::table_properties::prepare_ctas_storage(properties, comment, control).map(|_| ())
+    }
+
+    fn validate_ctas_definition(
+        &self,
+        table: &ConnectorTableIdentity,
+        columns: &[ConnectorColumnDefinition],
+        storage: &ConnectorStagedCtasProperties,
+        control: &dyn ConnectorOperationControl,
+    ) -> Result<(), ConnectorError> {
+        prepare_ctas_definition(table, columns, storage, control).map(|_| ())
     }
 
     fn mv_storage_property_declarations(
@@ -4503,6 +4520,16 @@ mod tests {
                 &original.context,
             )
             .unwrap();
+        lease
+            .validate_ctas_definition(
+                &original.table,
+                &original.columns,
+                &storage,
+                &original.context,
+            )
+            .unwrap();
+        assert!(adapter.operations.lock().unwrap().is_empty());
+        assert!(server.requests().is_empty());
         let request = lease
             .prepare_typed_request(
                 original.publication_id,
@@ -4598,6 +4625,15 @@ mod tests {
             let storage = lease
                 .prepare_ctas_properties(values.into(), None, &original.context)
                 .unwrap();
+            let description_error = lease
+                .validate_ctas_definition(
+                    &original.table,
+                    &original.columns,
+                    &storage,
+                    &original.context,
+                )
+                .unwrap_err();
+            assert!(!adapter.operations.lock().unwrap().contains_key(&operation));
             let request = lease
                 .prepare_typed_request(
                     original.publication_id,
@@ -4622,6 +4658,11 @@ mod tests {
             let marker =
                 InvalidTableProperty::from_connector_error(failure.connector_source().unwrap())
                     .unwrap();
+            let described = InvalidTableProperty::from_connector_error(&description_error).unwrap();
+            assert_eq!(
+                described.source_error().message(),
+                marker.source_error().message()
+            );
             assert!(
                 marker
                     .source_error()

@@ -624,7 +624,8 @@ fn finish_update_mutation_preparation(
         }
     };
     let target_columns = target_binding.dml_target_columns()?;
-    validate_update_assignments(&stmt.assignments, &target_columns)?;
+    validate_update_assignments(&stmt.assignments, &target_columns)
+        .map_err(|error| error.message().to_owned())?;
     let signed_preparations = DmlChangeStreamPreparations::from_signed(
         strategy_lease,
         strategy_preparation,
@@ -682,6 +683,20 @@ pub(super) fn resolve_merge_target(
     Ok((target, target_ref.to_owned()))
 }
 
+fn merge_effect_set(stmt: &PreparedMergeStatement) -> DmlRowMutationEffectSet {
+    DmlRowMutationEffectSet::Merge {
+        matched_update: matches!(
+            stmt.matched.as_ref().map(|clause| &clause.action),
+            Some(PreparedMergeMatchedAction::Update { .. })
+        ),
+        matched_delete: matches!(
+            stmt.matched.as_ref().map(|clause| &clause.action),
+            Some(PreparedMergeMatchedAction::Delete)
+        ),
+        not_matched_insert: stmt.not_matched.is_some(),
+    }
+}
+
 fn finish_merge_mutation_preparation(
     stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
@@ -695,17 +710,7 @@ fn finish_merge_mutation_preparation(
     let planning_pin = target_binding.planning_pin().clone();
     // The clause composition is a statement fact. The Provider consumes this
     // exact effect set when admitting the merge-on-read mutation.
-    let effect_set = DmlRowMutationEffectSet::Merge {
-        matched_update: matches!(
-            stmt.matched.as_ref().map(|clause| &clause.action),
-            Some(PreparedMergeMatchedAction::Update { .. })
-        ),
-        matched_delete: matches!(
-            stmt.matched.as_ref().map(|clause| &clause.action),
-            Some(PreparedMergeMatchedAction::Delete)
-        ),
-        not_matched_insert: stmt.not_matched.is_some(),
-    };
+    let effect_set = merge_effect_set(stmt);
     let preparations = DmlChangeStreamPreparations::prepare(
         &target_binding,
         &target_ref,
@@ -726,7 +731,8 @@ fn finish_merge_mutation_preparation(
     if let Some(clause) = stmt.matched.as_ref()
         && let PreparedMergeMatchedAction::Update { assignments } = &clause.action
     {
-        validate_update_assignments(assignments, &target_columns)?;
+        validate_update_assignments(assignments, &target_columns)
+            .map_err(|error| error.message().to_owned())?;
     }
     let insert_columns_resolved = stmt
         .not_matched
@@ -1165,7 +1171,8 @@ fn build_merge_mor_producer(
 fn validate_update_assignments(
     assignments: &[PreparedMutationAssignment],
     target_columns: &[novarocks_types::schema::ColumnDef],
-) -> Result<(), String> {
+) -> Result<(), novarocks_sql::analyze_error::AnalyzeError> {
+    use novarocks_sql::analyze_error::AnalyzeError;
     let target_names = target_columns
         .iter()
         .map(|c| c.name.to_ascii_lowercase())
@@ -1177,21 +1184,30 @@ fn validate_update_assignments(
             name.as_str(),
             "_row_id" | "_last_updated_sequence_number" | "_file" | "_pos"
         ) {
-            return Err(format!(
-                "UPDATE cannot assign reserved Iceberg metadata column `{}`",
-                assignment.column
+            return Err(AnalyzeError::unsupported_expression(
+                format!(
+                    "UPDATE cannot assign reserved Iceberg metadata column `{}`",
+                    assignment.column
+                ),
+                assignment.column_span,
             ));
         }
         if !target_names.contains(&name) {
-            return Err(format!(
-                "UPDATE assignment references unknown target column `{}`",
-                assignment.column
+            return Err(AnalyzeError::unknown_column(
+                format!(
+                    "UPDATE assignment references unknown target column `{}`",
+                    assignment.column
+                ),
+                assignment.column_span,
             ));
         }
         if !seen.insert(name) {
-            return Err(format!(
-                "UPDATE assignment lists target column `{}` more than once",
-                assignment.column
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "UPDATE assignment lists target column `{}` more than once",
+                    assignment.column
+                ),
+                assignment.column_span,
             ));
         }
     }
@@ -1314,6 +1330,12 @@ fn mor_merge_pre_expand_assertion() -> DmlPreExpandKeyedAssert {
         message_prefix: "MOR MERGE matched target row".to_string(),
     }
 }
+
+mod prepared_merge_description;
+pub(crate) use prepared_merge_description::describe_merge;
+
+mod mutation_description;
+pub(crate) use mutation_description::describe_update;
 
 #[cfg(test)]
 mod tests;

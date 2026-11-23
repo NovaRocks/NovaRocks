@@ -237,6 +237,7 @@ mod scalar_domain_tests {
             purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: None,
+            prepared_parameters: None,
             table_sequence: None,
             constant_policy: crate::constant::test_constant_policy(),
             control,
