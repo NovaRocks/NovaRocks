@@ -1504,6 +1504,9 @@ mod tests {
         assert_eq!(authority.root().committed_bytes(), before);
 
         writer.set_capacity(bytes).unwrap();
+        // Finish the capacity-reduction sweep before the POST creates new
+        // funding records outside that sweep's membership cutoff.
+        while !authority.maintain(64).complete {}
         let queued = post(address, "p=SELECT+1").await;
         assert!(queued.starts_with("HTTP/1.1 200"));
         assert!(queued.contains("nextUri"));
