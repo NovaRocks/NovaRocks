@@ -1025,7 +1025,7 @@ mod tests {
         wrong_metadata.insert(id_key.into(), "3".into());
         let mut wrong_fields = schema.fields().to_vec();
         wrong_fields[1] = Arc::new(source.clone().with_metadata(wrong_metadata));
-        let error = ConnectorRowMutationPreparation::try_new(
+        let Err(error) = ConnectorRowMutationPreparation::try_new(
             preparation.owner().clone(),
             preparation.operation_id(),
             preparation.table().clone(),
@@ -1038,8 +1038,9 @@ mod tests {
             preparation.strategy(),
             preparation.base_version_ordinal(),
             preparation.payload().clone(),
-        )
-        .unwrap_err();
+        ) else {
+            panic!("a substituted field ID cannot satisfy the signed match source");
+        };
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(
             error.message(),
