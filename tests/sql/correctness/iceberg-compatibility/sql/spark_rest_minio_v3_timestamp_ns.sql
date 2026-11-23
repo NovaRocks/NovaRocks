@@ -17,9 +17,9 @@
 
 -- @order_sensitive=true
 -- @sequential=true
--- Cross-engine nanosecond timestamp (TIMESTAMP_NS) compatibility test.
+-- Cross-engine nanosecond timestamp compatibility test.
 --
--- DIRECTION A: NovaRocks writes a format-v3 TIMESTAMP_NS table into the shared
+-- DIRECTION A: NovaRocks writes a format-v3 TIMESTAMP(9) table into the shared
 -- REST Catalog + MinIO, then the Iceberg REST API (the same catalog Spark uses)
 -- is queried via curl to confirm:
 --   - The Iceberg schema carries type "timestamp_ns" (not timestamp_micro).
@@ -53,11 +53,11 @@ fi
 printf 'NAMESPACE_OK ns=nr_compat_%s\n' "${suite_uuid0}"
 
 -- query 2
--- NovaRocks creates the TIMESTAMP_NS table in the shared REST catalog.
+-- NovaRocks creates the TIMESTAMP(9) table in the shared REST catalog.
 -- @skip_result_check=true
 CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0} (
     id     BIGINT,
-    ts     TIMESTAMP_NS
+    ts     TIMESTAMP(9)
 ) WITH (format_version = 3);
 
 -- query 3
@@ -68,9 +68,9 @@ CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0} (
 -- @skip_result_check=true
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0}
 VALUES
-    ROW(1, '2024-01-02 03:04:05.123456789'),
-    ROW(2, '2024-01-02 03:04:05.000000001'),
-    ROW(3, '1970-01-01 00:00:00.000000000');
+    ROW(1, TIMESTAMP '2024-01-02 03:04:05.123456789'),
+    ROW(2, TIMESTAMP '2024-01-02 03:04:05.000000001'),
+    ROW(3, TIMESTAMP '1970-01-01 00:00:00.000000000');
 
 -- query 4
 -- Cross-engine catalog verification via the Iceberg REST API.
