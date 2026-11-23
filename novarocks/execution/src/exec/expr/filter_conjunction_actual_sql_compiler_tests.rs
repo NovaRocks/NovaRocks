@@ -24,7 +24,7 @@ pub(super) use novarocks_test_compile_to_execute::compiler_results::{
     compile_options, compiler_results, compiler_results_with_declared_read_fields, source_packages,
     validate_package,
 };
-const HAVING: &str = "SELECT k FROM fixture.ndv_null_contract GROUP BY k\nHAVING ndv(v) = 0 AND approx_count_distinct(v) = 0 ORDER BY k;";
+const HAVING: &str = "SELECT k FROM fixture.ndv_null_contract GROUP BY k\nHAVING approx_distinct(v) = 0 AND approx_distinct(CAST(v AS BIGINT)) = 0 ORDER BY k;";
 fn permanent() {
     let source = ndv_sql_source(HAVING);
     let mut filter_fragment = None;
