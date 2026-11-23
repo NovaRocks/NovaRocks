@@ -23,8 +23,8 @@ use crate::scenarios::{query_lifecycle, task_evidence};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::{QueryExecutionResourceSnapshot, TestClusterOwner};
 use novarocks_failpoint::observation_marker::{
-    ObservationAction, PARTICIPATION_TERMINATION_COMPLETED, REGEXP_SEARCH_PROGRESS,
-    REGEXP_SEARCH_STOPPED, TASK_PREPARED_DOP,
+    ObservationAction, REGEXP_SEARCH_PROGRESS, REGEXP_SEARCH_STOPPED, TASK_PREPARED_DOP,
+    TASK_TERMINAL_RETAINED,
 };
 use novarocks_test_trino_client::{CancelHandle, PendingStatement};
 use std::{
@@ -380,18 +380,23 @@ fn await_regexp_exit(
             .lines()
             .filter(same_task)
             .find(|line| line.contains(REGEXP_SEARCH_STOPPED));
-        let terminated = task_evidence::backends_with_marker(
-            context,
-            PARTICIPATION_TERMINATION_COMPLETED,
-            execution,
-        )?
-        .contains(&backend);
-        if let (Some(prepared), Some(stopped), true) = (prepared, stopped, terminated) {
-            return Ok((
-                marker_field(prepared, "stage=")?.parse()?,
-                marker_field(prepared, "task=")?.parse()?,
-                marker_field(stopped, "offset=")?.parse()?,
-            ));
+        if let (Some(prepared), Some(stopped)) = (prepared, stopped) {
+            let stage = marker_field(prepared, "stage=")?.parse::<u32>()?;
+            let task = marker_field(prepared, "task=")?.parse::<u32>()?;
+            let stage_field = format!("stage={stage} ");
+            let task_id_field = format!("task={task} ");
+            // Worker emits the retained terminal only after the original
+            // accepted Task's physical payload is destroyed.
+            let retired = log.lines().any(|line| {
+                line.contains(TASK_TERMINAL_RETAINED)
+                    && line.contains(&execution_field)
+                    && line.contains(&stage_field)
+                    && line.contains(&task_id_field)
+                    && marker_field(line, "state=").is_ok_and(|state| state == "ABORTED")
+            });
+            if retired {
+                return Ok((stage, task, marker_field(stopped, "offset=")?.parse()?));
+            }
         }
         thread::sleep(
             context
