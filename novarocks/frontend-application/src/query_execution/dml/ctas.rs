@@ -1373,10 +1373,19 @@ impl CoreStandardCtasTargetSession {
             intent: ConnectorWriteIntent::Append,
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             input: ConnectorWriteInputRequest::Data {
-                fields: crate::query_execution::dml::iceberg_ctas::source_columns_to_write_fields(
-                    source_columns,
-                )
-                .map_err(connector_failure)?,
+                fields: if source_columns
+                    .iter()
+                    .any(novarocks_sql::planning::dml::DmlSourceColumn::has_temporal_type)
+                {
+                    // A temporal source can carry finer precision than the
+                    // staged table. Bind SQL assignment to the signed target.
+                    Vec::new()
+                } else {
+                    crate::query_execution::dml::iceberg_ctas::source_columns_to_write_fields(
+                        source_columns,
+                    )
+                    .map_err(connector_failure)?
+                },
             },
             base: None,
             flavor:

@@ -47,21 +47,26 @@ impl PreparedNullSafeComparisonRecipe {
             }
             // This is the legacy null-safe scalar capability, not the ordinary
             // Arrow comparison matrix. No data-dependent NULL-only permission.
-            let supported = matches!(
-                left.data_type(),
-                DataType::Null
-                    | DataType::Boolean
-                    | DataType::Int8
-                    | DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::Float32
-                    | DataType::Float64
-                    | DataType::Utf8
-                    | DataType::Date32
-                    | DataType::Timestamp(_, None)
-                    | DataType::Decimal128(..)
-            );
+            let temporal = left.value_type().temporal();
+            if temporal != right.value_type().temporal() {
+                return Err(ComparisonPrepareError::TypeMismatch);
+            }
+            let supported = temporal.is_some()
+                || matches!(
+                    left.data_type(),
+                    DataType::Null
+                        | DataType::Boolean
+                        | DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float32
+                        | DataType::Float64
+                        | DataType::Utf8
+                        | DataType::Date32
+                        | DataType::Timestamp(_, None)
+                        | DataType::Decimal128(..)
+                );
             work.step()?;
             if !supported {
                 return Err(ComparisonPrepareError::Unsupported);
@@ -73,8 +78,11 @@ impl PreparedNullSafeComparisonRecipe {
             )? {
                 return Err(ComparisonPrepareError::TypeMismatch);
             }
-            let leaf =
-                FlatLeaf::from_type(left.data_type()).ok_or(ComparisonPrepareError::Unsupported)?;
+            let leaf = if let Some(declaration) = temporal {
+                FlatLeaf::Temporal(declaration)
+            } else {
+                FlatLeaf::from_type(left.data_type()).ok_or(ComparisonPrepareError::Unsupported)?
+            };
             work.step()?;
             // These admitted carriers have no retained field graph or timezone.
             let recipe = Self {
@@ -181,6 +189,15 @@ impl PreparedNullSafeComparisonRecipe {
             FlatLeaf::TimestampMillisecond => p!(TimestampMillisecondType),
             FlatLeaf::TimestampMicrosecond => p!(TimestampMicrosecondType),
             FlatLeaf::TimestampNanosecond => p!(TimestampNanosecondType),
+            FlatLeaf::Temporal(declaration) => {
+                novarocks_value_arrays::decode::PreparedTemporalArray::bind(
+                    declaration,
+                    array,
+                    true,
+                )
+                .map(|_| ())
+                .map_err(|_| invalid("null-safe temporal carrier differs from its binding"))
+            }
             _ => Err(internal(
                 "null-safe recipe contains an unsupported frozen leaf",
             )),
@@ -217,6 +234,25 @@ impl PreparedNullSafeComparisonRecipe {
             }};
         }
         match self.leaf {
+            FlatLeaf::Temporal(declaration) => {
+                use novarocks_value_arrays::decode::PreparedTemporalArray;
+                let left = PreparedTemporalArray::bind(declaration, left, self.left.nullable())
+                    .map_err(|_| {
+                        invalid("null-safe temporal left carrier differs from its binding")
+                    })?;
+                let right = PreparedTemporalArray::bind(declaration, right, self.right.nullable())
+                    .map_err(|_| {
+                        invalid("null-safe temporal right carrier differs from its binding")
+                    })?;
+                let left = left
+                    .relation_key(l)
+                    .map_err(|_| invalid("invalid temporal left value"))?;
+                let right = right
+                    .relation_key(r)
+                    .map_err(|_| invalid("invalid temporal right value"))?;
+                work.step()?;
+                Ok(left == right)
+            }
             FlatLeaf::Boolean => {
                 let left = cast::<BooleanArray>(left)?;
                 let right = cast::<BooleanArray>(right)?;

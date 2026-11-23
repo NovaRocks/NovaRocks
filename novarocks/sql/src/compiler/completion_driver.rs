@@ -851,6 +851,7 @@ fn optimize_to_physical(
         factory,
         intent,
         settings,
+        semantic_settings: _,
         decimal_overflow_policy,
         root_allow_throw_exception,
         change_stream: _,
@@ -1146,7 +1147,8 @@ fn collect_provider_needs_with_next(
                         &scan,
                         &predicate_columns,
                         row_mutation_match == Some(source.binding),
-                    )
+                        work,
+                    )?
                 } else {
                     Box::default()
                 };

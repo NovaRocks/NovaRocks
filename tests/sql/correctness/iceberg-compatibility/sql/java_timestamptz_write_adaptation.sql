@@ -30,20 +30,24 @@ receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 -- query 2
 -- @skip_result_check=true
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} VALUES
- ROW(1,'2024-01-02 03:04:05.123456',12.34,'東京',X'FF00'),
+ ROW(1,TIMESTAMP '2024-01-02 03:04:05.123456 UTC',12.34,'東京',X'FF00'),
  ROW(2,NULL,NULL,NULL,NULL);
 
 -- query 3
-SELECT id,CAST(ts AS VARCHAR) AS instant,d,s,hex(raw) AS raw_hex
+SELECT id,ts AS instant,d,s,hex(raw) AS raw_hex
 FROM iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} ORDER BY id;
 
 -- ADD EQUALITY DELETE currently accepts scalar literals only; hexadecimal
 -- binary literals are rejected by the existing statement lowering. Keep the
 -- non-NULL FF00 binary data writer/read assertion above, and exercise equality
 -- adaptation with expressible timestamptz, decimal and string keys.
+-- The equality procedure's zone-less timestamp text is cast in the session
+-- zone. Use the same zone as the instant inserted above.
 -- query 4
 -- @skip_result_check=true
+SET TIME ZONE 'UTC';
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} EXECUTE add_equality_delete(columns => ARRAY['ts', 'd', 's'], rows => ARRAY[ROW('2024-01-02 03:04:05.123456',12.34,'東京')]);
+SET TIME ZONE LOCAL;
 
 -- query 5
 SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} ORDER BY id;

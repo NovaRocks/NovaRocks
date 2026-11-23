@@ -74,13 +74,19 @@ fn legacy_and_observed_constructor_preserve_exact_error_precedence() {
         .map(|id| entry(id, AllowThrowException(false)))
         .collect();
     let mut duplicate_full = full.clone();
-    duplicate_full.push(entry(0, TimeZone("".into())));
-    full.push(entry(u32::MAX, TimeZone("".into())));
+    duplicate_full.push(entry(
+        0,
+        TimeZone(crate::TimeZoneKey::parse("UTC").unwrap()),
+    ));
+    full.push(entry(
+        u32::MAX,
+        TimeZone(crate::TimeZoneKey::parse("UTC").unwrap()),
+    ));
     let cases = [
         (
             vec![
                 entry(0, AllowThrowException(true)),
-                entry(0, TimeZone("".into())),
+                entry(0, TimeZone(crate::TimeZoneKey::parse("UTC").unwrap())),
             ],
             SemanticParameterError::DuplicateId(id),
         ),
@@ -88,29 +94,29 @@ fn legacy_and_observed_constructor_preserve_exact_error_precedence() {
         (full, SemanticParameterError::TooManyParameters),
         (
             vec![
-                entry(0, StatementStartUtc(-1)),
-                entry(u32::MAX, StatementStartUtc(2)),
+                entry(
+                    0,
+                    StatementStartUtc(crate::StatementStartUtc::try_new(-1, 0).unwrap()),
+                ),
+                entry(
+                    u32::MAX,
+                    StatementStartUtc(crate::StatementStartUtc::try_new(2, 0).unwrap()),
+                ),
             ],
             SemanticParameterError::DuplicateStatementStart,
         ),
         (
             vec![
-                entry(0, StatementStartUtc(-1)),
-                entry(0, StatementStartUtc(2)),
+                entry(
+                    0,
+                    StatementStartUtc(crate::StatementStartUtc::try_new(-1, 0).unwrap()),
+                ),
+                entry(
+                    0,
+                    StatementStartUtc(crate::StatementStartUtc::try_new(2, 0).unwrap()),
+                ),
             ],
             SemanticParameterError::DuplicateId(id),
-        ),
-        (
-            vec![entry(0, TimeZone("".into()))],
-            SemanticParameterError::InvalidTimeZone,
-        ),
-        (
-            vec![entry(0, TimeZone("x".repeat(256).into_boxed_str()))],
-            SemanticParameterError::InvalidTimeZone,
-        ),
-        (
-            vec![entry(0, TimeZone("UTC\n".into()))],
-            SemanticParameterError::InvalidTimeZone,
         ),
     ];
     for (entries, expected) in cases {
@@ -128,18 +134,20 @@ fn legacy_and_observed_constructor_preserve_exact_error_precedence() {
 }
 
 #[test]
-fn scoped_raw_values_sparse_ids_and_original_text_allocation_are_retained() {
+fn scoped_raw_values_sparse_ids_and_canonical_zone_identity_are_retained() {
     use SemanticParameterValue::*;
-    let zone: Box<str> = "exact spelling +08:00".into();
-    let original = zone.as_ptr();
+    let original = crate::TimeZoneKey::parse("+08:00").unwrap();
     let entries = vec![
         entry(u32::MAX, GroupConcatMaxLen(i64::MIN)),
-        entry(0, StatementStartUtc(i64::MAX)),
-        entry(15, TimeZone(zone)),
+        entry(
+            0,
+            StatementStartUtc(crate::StatementStartUtc::try_new(i64::MAX, 0).unwrap()),
+        ),
+        entry(15, TimeZone(original)),
         entry(9, AllowThrowException(false)),
         entry(8, GroupConcatLegacy(true)),
         entry(7, GroupConcatLegacy(false)),
-        entry(16, TimeZone("UTC".into())),
+        entry(16, TimeZone(crate::TimeZoneKey::parse("UTC").unwrap())),
         entry(19, AllowThrowException(true)),
     ];
     let expected = SemanticParameters::try_new(entries.clone()).unwrap();
@@ -149,8 +157,8 @@ fn scoped_raw_values_sparse_ids_and_original_text_allocation_are_retained() {
     let Some(TimeZone(zone)) = output.get(SemanticParameterId::new(15)) else {
         panic!("missing zone")
     };
-    assert_eq!(zone.as_ptr(), original);
-    assert_eq!(zone.as_ref(), "exact spelling +08:00");
+    assert_eq!(*zone, original);
+    assert_eq!(zone.name(), "+08:00");
     assert_eq!(
         output.get(SemanticParameterId::new(19)),
         Some(&AllowThrowException(true))
@@ -163,20 +171,26 @@ fn scoped_raw_values_sparse_ids_and_original_text_allocation_are_retained() {
 }
 
 #[test]
-fn every_actual_success_ordinary_empty_and_character_quantum_prefix_preserves_control() {
+fn every_actual_success_error_and_empty_prefix_preserves_control() {
     for entries in [
         vec![],
         vec![entry(
             0,
-            SemanticParameterValue::TimeZone("x".repeat(255).into_boxed_str()),
-        )],
-        vec![entry(
-            0,
-            SemanticParameterValue::TimeZone("valid\u{0007}later".into()),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("UTC").unwrap()),
         )],
         vec![
-            entry(0, SemanticParameterValue::StatementStartUtc(1)),
-            entry(1, SemanticParameterValue::StatementStartUtc(2)),
+            entry(
+                0,
+                SemanticParameterValue::StatementStartUtc(
+                    crate::StatementStartUtc::try_new(1, 0).unwrap(),
+                ),
+            ),
+            entry(
+                1,
+                SemanticParameterValue::StatementStartUtc(
+                    crate::StatementStartUtc::try_new(2, 0).unwrap(),
+                ),
+            ),
         ],
     ] {
         let baseline = Control::default();
@@ -187,10 +201,6 @@ fn every_actual_success_ordinary_empty_and_character_quantum_prefix_preserves_co
                 .map_err(SemanticParameterProjectionError::Parameter)
         );
         let trace = baseline.trace();
-        if matches!(entries.first(), Some((_, SemanticParameterValue::TimeZone(zone))) if zone.len() == 255)
-        {
-            assert!(trace.iter().any(|(_, units)| *units == 256));
-        }
         for at in 0..trace.len() {
             for cause in CAUSES {
                 let c = Control {
@@ -228,7 +238,10 @@ fn lazy_case(
             // Actual lazy owned projection, bounded by the receiver's prior
             // resource gate; this constructor must not clone it again.
             boxes.set(boxes.get() + 1);
-            Some(entry(0, SemanticParameterValue::TimeZone("UTC".into())))
+            Some(entry(
+                0,
+                SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("UTC").unwrap()),
+            ))
         } else {
             projection_failed.set(true);
             failed_next_post.set(c.trace().len());

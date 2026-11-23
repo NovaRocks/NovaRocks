@@ -53,7 +53,7 @@ use novarocks_spi::connector::ConnectorError;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::default_value::{
-    ICEBERG_INITIAL_DEFAULT_META_KEY, build_iceberg_default_array, literal_to_constant_array,
+    ICEBERG_INITIAL_DEFAULT_META_KEY, literal_to_constant_array, materialize_initial_default,
 };
 use crate::file_reader::field_identity::{
     FieldIdentityError, original_field_id_coverage, resolve_arrow_fields,
@@ -261,7 +261,7 @@ pub enum IcebergColumnSource {
     MutationSpecId(i32),
     MutationPartition(Vec<Option<Literal>>),
     /// The frozen table schema's initial default for this field.
-    InitialDefault,
+    InitialDefault(Arc<NestedField>),
     /// A typed null, legal only for a nullable field.
     TypedNull,
     /// A column that is not a field of the table schema.
@@ -473,7 +473,7 @@ impl IcebergSchemaBinding {
                     IcebergColumnSource::IdentityPartitionConstant(_)
                         | IcebergColumnSource::MutationSpecId(_)
                         | IcebergColumnSource::MutationPartition(_)
-                        | IcebergColumnSource::InitialDefault
+                        | IcebergColumnSource::InitialDefault(_)
                         | IcebergColumnSource::TypedNull
                         | IcebergColumnSource::Metadata(IcebergMetadataColumn::Path)
                 );
@@ -511,8 +511,8 @@ impl IcebergSchemaBinding {
                     };
                     mutation_partition::materialize(values, fields, row_count)?
                 }
-                IcebergColumnSource::InitialDefault => {
-                    build_iceberg_default_array(bound.target.as_ref(), row_count)
+                IcebergColumnSource::InitialDefault(field) => {
+                    materialize_initial_default(field, bound.target.data_type(), row_count)
                         .map_err(|error| corrupt(format!("iceberg initial default: {error}")))?
                 }
                 IcebergColumnSource::TypedNull => {
@@ -583,7 +583,7 @@ pub(super) fn bind_decoder_columns(
 
 fn bind_columns(
     request: IcebergSchemaBindingRequest<'_>,
-    bind_field: fn(Option<&Field>, &FieldRef) -> Result<FieldAdaptation, AdaptationError>,
+    bind_field: fn(Option<&Field>, &FieldRef, &Schema) -> Result<FieldAdaptation, AdaptationError>,
 ) -> Result<IcebergSchemaBinding, ConnectorError> {
     let coverage = file_field_id_coverage(request.file_schema)?;
     // Name mapping repairs a legacy file, so it is consulted only when the
@@ -633,6 +633,7 @@ fn bind_columns(
             bind_one_column(
                 handle,
                 &read_schema,
+                request.table_schema,
                 &physical,
                 mapped_physical.as_ref(),
                 &identity_partitions,
@@ -645,7 +646,7 @@ fn bind_columns(
             IcebergColumnSource::IdentityPartitionConstant(_)
             | IcebergColumnSource::MutationSpecId(_)
             | IcebergColumnSource::MutationPartition(_)
-            | IcebergColumnSource::InitialDefault
+            | IcebergColumnSource::InitialDefault(_)
             | IcebergColumnSource::TypedNull
             | IcebergColumnSource::Metadata(_) => None,
         };
@@ -691,6 +692,7 @@ fn bind_columns(
             let adaptation = bind_field(
                 Some(resolved_schema.field(original_slot)),
                 &bound.base_target,
+                request.table_schema,
             )
             .map_err(AdaptationError::into_read_error)?;
             entry.insert(BoundPhysicalRoot { slot, adaptation });
@@ -919,9 +921,17 @@ impl PhysicalIndex {
     }
 }
 
+fn initial_default_field(table_schema: &Schema, field_id: i32) -> Option<Arc<NestedField>> {
+    table_schema
+        .field_by_id(field_id)
+        .filter(|field| field.initial_default.is_some())
+        .cloned()
+}
+
 fn bind_one_column(
     handle: &IcebergColumnHandle,
     read_schema: &SchemaRef,
+    table_schema: &Schema,
     physical: &PhysicalIndex,
     mapped_physical: Option<&PhysicalIndex>,
     identity_partitions: &HashMap<i32, Option<Literal>>,
@@ -993,15 +1003,17 @@ fn bind_one_column(
     }
 
     // 4. the frozen table schema's initial default.
-    if target
-        .metadata()
-        .contains_key(ICEBERG_INITIAL_DEFAULT_META_KEY)
-    {
+    let target_id = handle
+        .field_id_path()
+        .last()
+        .copied()
+        .unwrap_or(base_field_id);
+    if let Some(field) = initial_default_field(table_schema, target_id) {
         return Ok(IcebergBoundColumn {
             handle: handle.clone(),
             target,
             base_target,
-            source: IcebergColumnSource::InitialDefault,
+            source: IcebergColumnSource::InitialDefault(field),
         });
     }
 

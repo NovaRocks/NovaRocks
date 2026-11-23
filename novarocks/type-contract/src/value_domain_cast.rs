@@ -36,7 +36,7 @@ fn has_domain<E>(
     observe: &mut impl FnMut(usize) -> Result<(), E>,
 ) -> Result<bool, E> {
     observe(1)?;
-    if value.domain().is_some() {
+    if value.domain().is_some() || value.temporal().is_some() {
         return Ok(true);
     }
     for index in 0..value.child_count() {
@@ -55,6 +55,9 @@ fn preserves<E>(
     observe: &mut impl FnMut(usize) -> Result<(), E>,
 ) -> Result<bool, E> {
     observe(1)?;
+    if actual.temporal().is_some() || expected.temporal().is_some() {
+        return Ok(actual.temporal() == expected.temporal());
+    }
     if actual.domain().is_some() || expected.domain().is_some() {
         return Ok(actual.domain() == expected.domain());
     }
@@ -175,6 +178,24 @@ mod tests {
         assert!(!check(&nested, &string));
         assert!(!check(&nested, &value(ValueKind::List(string.clone()))));
         assert!(check(&value(ValueKind::Scalar(DataType::Int32)), &string));
+    }
+
+    #[test]
+    fn equal_width_nested_temporal_carriers_require_the_same_semantic_type() {
+        use crate::{TemporalPrecision, TemporalType};
+        let nested = |precision| {
+            value(ValueKind::List(value(ValueKind::Temporal(
+                TemporalType::Timestamp(precision),
+            ))))
+        };
+        let nanos = nested(TemporalPrecision::NANOSECONDS);
+        let picos = nested(TemporalPrecision::PICOSECONDS);
+        assert!(check(&nanos, &nanos));
+        assert!(!check(&nanos, &picos));
+        assert!(!check(
+            &nanos,
+            &value(ValueKind::Scalar(DataType::FixedSizeBinary(12)))
+        ));
     }
     #[test]
     fn original_callback_refusal_stops_before_later_nodes() {

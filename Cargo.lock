@@ -3270,6 +3270,7 @@ dependencies = [
  "novarocks-failpoint",
  "novarocks-failure-contract",
  "novarocks-fs",
+ "novarocks-functions",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-resource-contract",
@@ -3951,7 +3952,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
- "chrono-tz",
  "futures",
  "novarocks-connector-contract",
  "novarocks-constant-contract",
@@ -4007,6 +4007,7 @@ dependencies = [
  "novarocks-functions",
  "novarocks-result-contract",
  "novarocks-type-contract",
+ "novarocks-value-arrays",
 ]
 
 [[package]]

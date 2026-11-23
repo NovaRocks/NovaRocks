@@ -15,11 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::DataType;
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field};
 use novarocks_constant_contract::{ConstantPolicy, ConstantValue};
+use novarocks_functions::temporal_value::{
+    ParsedTemporal, parse_time_literal, parse_timestamp_literal,
+};
 use novarocks_functions::{KernelFailure, validate_trino_json_literal};
+use novarocks_parser::ast;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, FunctionValueType, ValueLogicalType,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, ValueLogicalType,
 };
 
 use super::{CarrierConversion, LiteralValue, TypingError, admit_syntax_constant};
@@ -35,7 +41,7 @@ pub enum LiteralSyntax<'a> {
     String(&'a str),
     Binary(&'a [u8]),
     TypedString { name: &'a str, value: &'a str },
-    Interval,
+    Interval(&'a ast::IntervalLiteral),
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +71,10 @@ impl TypedLiteral {
 #[derive(Debug)]
 pub enum LiteralEmission {
     Direct(TypedLiteral),
+    Constant {
+        value_type: FunctionValueType,
+        value: ConstantValue,
+    },
     Cast {
         input: TypedLiteral,
         declared_result: FunctionValueType,
@@ -113,6 +123,23 @@ pub(super) fn type_literal(
             false,
         ),
         LiteralSyntax::TypedString { name, value } => {
+            let is_time = name.eq_ignore_ascii_case("time");
+            if is_time || name.eq_ignore_ascii_case("timestamp") {
+                for _ in value.bytes() {
+                    work.step()?;
+                }
+                let parsed = if is_time {
+                    parse_time_literal(value)
+                } else {
+                    parse_timestamp_literal(value)
+                }
+                .map_err(|error| {
+                    TypingError::InvalidLiteral(format!(
+                        "invalid {name} literal '{value}': {error}"
+                    ))
+                })?;
+                return temporal_constant(context, parsed, work);
+            }
             use super::declaration::{TypeDeclarationProblem, resolve_trino_type};
             use novarocks_type_contract::TrinoCastMode;
 
@@ -155,6 +182,22 @@ pub(super) fn type_literal(
                 )
                 .map(LiteralEmission::Direct);
             }
+            if target.data_type() == &DataType::Date32 {
+                let days = novarocks_functions::temporal_value::parse_date_literal_observed(
+                    value,
+                    || work.step(),
+                )?
+                .ok_or_else(|| {
+                    TypingError::InvalidLiteral(format!("invalid DATE literal '{value}'"))
+                })?;
+                return TypedLiteral::checked(
+                    LiteralValue::Int(i64::from(days)),
+                    target,
+                    context.constant_policy,
+                    work,
+                )
+                .map(LiteralEmission::Direct);
+            }
             let input = string_literal(context, value, work)?;
             let conversion = super::type_cast(
                 context,
@@ -169,10 +212,15 @@ pub(super) fn type_literal(
                 conversion,
             });
         }
-        LiteralSyntax::Interval => {
-            return Err(TypingError::Unsupported(
-                "INTERVAL literals are not supported".into(),
-            ));
+        LiteralSyntax::Interval(interval) => {
+            for _ in interval.value.bytes() {
+                work.step()?;
+            }
+            return temporal_constant(
+                context,
+                super::temporal::parse_interval_literal(interval)?,
+                work,
+            );
         }
     };
     TypedLiteral::checked(
@@ -182,6 +230,24 @@ pub(super) fn type_literal(
         work,
     )
     .map(LiteralEmission::Direct)
+}
+
+fn temporal_constant(
+    context: &super::TypingContext<'_>,
+    parsed: ParsedTemporal,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<LiteralEmission, TypingError> {
+    work.flush()?;
+    let value_type = super::temporal_function_value_type(parsed.ty, false)?;
+    let value = ConstantValue::from_temporal(
+        Arc::new(Field::new("value", parsed.ty.carrier(), false)),
+        value_type.clone(),
+        parsed.value,
+        context.constant_policy,
+        CompilePhase::FunctionSpecialization,
+        work.control(),
+    )?;
+    Ok(LiteralEmission::Constant { value_type, value })
 }
 
 fn string_literal(

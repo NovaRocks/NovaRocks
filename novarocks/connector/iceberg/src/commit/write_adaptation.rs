@@ -19,6 +19,7 @@
 
 use std::{fmt, sync::Arc};
 
+use crate::temporal::TemporalReadProjection;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, DictionaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
     Int8Array, Int16Array, Int32Array, LargeBinaryArray, LargeStringArray, ListArray, MapArray,
@@ -42,6 +43,7 @@ pub(crate) enum WriteAdaptationError {
         path: String,
     },
     Contract(String),
+    Temporal(ConnectorError),
 }
 impl fmt::Display for WriteAdaptationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -59,6 +61,7 @@ impl fmt::Display for WriteAdaptationError {
                 "Iceberg write adaptation required column `{path}` contains NULL; the upstream writer obligation must reject it before Provider I/O"
             ),
             Self::Contract(message) => message.fmt(f),
+            Self::Temporal(error) => error.fmt(f),
         }
     }
 }
@@ -70,9 +73,13 @@ impl From<String> for WriteAdaptationError {
 }
 impl WriteAdaptationError {
     pub(crate) fn into_connector_error(self) -> ConnectorError {
+        if let Self::Temporal(error) = self {
+            return error;
+        }
         let kind = match self {
             Self::ValueWidth { .. } => ConnectorErrorKind::InvalidRequest,
             Self::RequiredNull { .. } | Self::Contract(_) => ConnectorErrorKind::Internal,
+            Self::Temporal(_) => unreachable!("temporal failure is already typed"),
         };
         ConnectorError::new(kind, self.to_string())
     }
@@ -101,6 +108,67 @@ pub(super) fn adapt_batch(
     .map_err(|error| {
         WriteAdaptationError::Contract(format!("Iceberg write adaptation batch failed: {error}"))
     })
+}
+
+pub(super) fn validate_temporal_batch_schema(
+    input: &arrow::datatypes::Schema,
+    target: &arrow::datatypes::Schema,
+    temporals: &[TemporalReadProjection],
+) -> Result<(), String> {
+    if temporals.len() != input.fields().len() {
+        return Err("Iceberg write storage projection has a different width from its input".into());
+    }
+    if temporals.iter().all(TemporalReadProjection::is_identity) {
+        return validate_batch_schema(input, target);
+    }
+    let fields = input
+        .fields()
+        .iter()
+        .zip(temporals)
+        .map(|(field, projection)| {
+            let data_type = projection.write_layout(field.data_type())?;
+            Ok(field.as_ref().clone().with_data_type(data_type))
+        })
+        .collect::<Result<Vec<_>, &'static str>>()?;
+    validate_batch_schema(&arrow::datatypes::Schema::new(fields), target)
+}
+
+pub(super) fn adapt_temporal_batch(
+    input: &RecordBatch,
+    target: &SchemaRef,
+    temporals: &[TemporalReadProjection],
+) -> Result<RecordBatch, WriteAdaptationError> {
+    validate_temporal_batch_schema(input.schema().as_ref(), target, temporals)?;
+    if temporals.iter().all(TemporalReadProjection::is_identity) {
+        return adapt_batch(input, target);
+    }
+    let input_schema = input.schema();
+    let mut fields = Vec::with_capacity(input.num_columns());
+    let mut columns = Vec::with_capacity(input.num_columns());
+    for ((array, field), projection) in input
+        .columns()
+        .iter()
+        .zip(input_schema.fields())
+        .zip(temporals)
+    {
+        let array = projection
+            .write(array, field.name())
+            .map_err(WriteAdaptationError::Temporal)?;
+        fields.push(
+            field
+                .as_ref()
+                .clone()
+                .with_data_type(array.data_type().clone()),
+        );
+        columns.push(array);
+    }
+    let batch = RecordBatch::try_new_with_options(
+        Arc::new(arrow::datatypes::Schema::new(fields)),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(input.num_rows())),
+    )
+    .map_err(|error| WriteAdaptationError::Contract(error.to_string()))?;
+    adapt_batch(&batch, target)
 }
 
 fn nested_nullability(from: &Field, to: &Field, path: &str) -> Result<(), String> {

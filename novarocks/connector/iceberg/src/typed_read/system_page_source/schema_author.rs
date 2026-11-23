@@ -581,6 +581,7 @@ fn publish_read_schema_inner(
     };
     let mut selected = creation.reserve(requested.len())?;
     let mut fields = creation.reserve(requested.len())?;
+    let mut execution_fields = None;
     for column in requested {
         let mut found = None;
         for (name, value) in &authored {
@@ -621,7 +622,36 @@ fn publish_read_schema_inner(
             value.data_type(),
             creation,
         )?;
-        selected.push(clone_value(value, creation)?);
+        let execution = if crate::temporal::contains_temporal(&declaration) {
+            crate::schema_mapping::typed_value::from_declaration(
+                &declaration,
+                value.nullable(),
+                None,
+                None,
+                creation,
+            )?
+            .binding
+        } else {
+            clone_value(value, creation)?
+        };
+        let changed_layout = field.data_type() != execution.data_type();
+        if changed_layout && execution_fields.is_none() {
+            let mut target = creation.reserve(requested.len())?;
+            for prior in &fields {
+                creation.work(1)?;
+                target.push(Arc::clone(prior));
+            }
+            execution_fields = Some(target);
+        }
+        if let Some(target) = &mut execution_fields {
+            let execution_field = if changed_layout {
+                self::field(name, &execution, creation)?
+            } else {
+                field.clone()
+            };
+            target.push(execution_field);
+        }
+        selected.push(execution);
         fields.push(field);
     }
     let fields = creation.arrow_fields(fields)?;
@@ -643,9 +673,15 @@ fn publish_read_schema_inner(
         |layout| request(layout).map_err(Failure::Control),
         |units| work(units).map_err(Failure::Control),
     )?;
+    let execution_schema = if let Some(execution_fields) = execution_fields {
+        let execution_fields = creation.arrow_fields(execution_fields)?;
+        creation.arc(ArrowSchema::new(execution_fields))?
+    } else {
+        schema
+    };
     let (request, work) = creation.observers();
     let execution = ConnectorReadExecutionSchema::try_new_observed(
-        schema,
+        execution_schema,
         selected.into_boxed_slice(),
         storage.clone(),
         |layout| request(layout).map_err(Failure::Control),
@@ -923,14 +959,23 @@ mod tests {
                 let field = &public.schema().fields()[ordinal];
                 let binding = execution.binding(ordinal).unwrap();
                 assert_eq!(field.name(), original.name());
-                assert_eq!(field.data_type(), original.data_type());
+                match row.fields()[ordinal].field_type.as_ref() {
+                    Type::Primitive(primitive)
+                        if crate::temporal::declaration(primitive).is_some() =>
+                    {
+                        let declaration = crate::temporal::declaration(primitive).unwrap();
+                        assert_eq!(field.data_type(), &declaration.carrier());
+                        assert_eq!(binding.value_type().temporal(), Some(declaration));
+                    }
+                    _ => assert_eq!(field.data_type(), original.data_type()),
+                }
                 assert_eq!(field.is_nullable(), original.is_nullable());
                 assert!(field.metadata().is_empty());
                 assert_eq!(
                     binding.logical_type(),
                     system_column_domain(kind, original.name())
                 );
-                assert_eq!(source.shape().schema().fields()[ordinal], *field);
+                assert_eq!(source.shape().schema().fields()[ordinal], *original);
             }
             drop(creation);
             assert!(!requests.is_empty());
@@ -1065,9 +1110,9 @@ mod tests {
         drop(public);
         drop(creation);
         assert_eq!(exits.load(Ordering::SeqCst), 0);
-        assert!(
-            matches!(value.data_type(),DataType::Timestamp(TimeUnit::Microsecond,Some(tz)) if tz.as_ref()==UTC_TIME_ZONE)
-        );
+        let timestamp = crate::temporal::declaration(&PrimitiveType::Timestamptz).unwrap();
+        assert_eq!(value.value_type().temporal(), Some(timestamp));
+        assert_eq!(value.data_type(), &timestamp.carrier());
         drop(value);
         assert_eq!(exits.load(Ordering::SeqCst), 0);
         assert!(

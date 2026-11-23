@@ -1363,18 +1363,34 @@ impl ConnectorTableMetadata {
         execution_schema: novarocks_connector_contract::ConnectorReadExecutionSchema,
         creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
     ) -> Result<Self, novarocks_connector_contract::PureProviderCompileError<ConnectorError>> {
-        Self::try_new_with_read_projection(header, format_schema, execution_schema, None, creation)
+        Self::try_new_with_read_projection(
+            header,
+            format_schema,
+            execution_schema,
+            None,
+            creation,
+            |_, _, _, _| Ok(false),
+        )
     }
 
-    /// A provider can supply the original complete source binding for a read
-    /// projection of plain Fixed leaves. Format and writer storage continue
-    /// to match the original binding. A historical read may have no writer.
+    /// Check format and writer storage against the original binding. The
+    /// provider proves any format conversion against its declaration. An
+    /// original schema also supplies proof of a plain Fixed read projection.
     pub fn try_new_with_read_projection(
         header: ConnectorTableMetadataHeader,
         format_schema: SchemaRef,
         execution_schema: novarocks_connector_contract::ConnectorReadExecutionSchema,
         original_schema: Option<&novarocks_connector_contract::ConnectorReadExecutionSchema>,
         creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
+        mut matches_projection: impl FnMut(
+            usize,
+            &arrow::datatypes::DataType,
+            &novarocks_type_contract::FunctionValueType,
+            &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            bool,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        >,
     ) -> Result<Self, novarocks_connector_contract::PureProviderCompileError<ConnectorError>> {
         creation.work(1)?;
         let count = format_schema.fields().len();
@@ -1463,7 +1479,9 @@ impl ConnectorTableMetadata {
                 |units| creation.work(units).map_err(CatalogLayoutError::Caller),
             )
             .map_err(CatalogLayoutError::into_failure)?;
-            if !same {
+            if !same
+                && !matches_projection(ordinal, source.data_type(), original_binding, creation)?
+            {
                 return Err(ConnectorError::new(
                     super::ConnectorErrorKind::InvalidRequest,
                     "catalog source/execution normalized layouts differ",
@@ -2422,6 +2440,7 @@ mod tests {
                 typed_catalog_execution(storage.clone()),
                 Some(&original),
                 &mut creation,
+                |_, _, _, _| Ok(false),
             );
             if accepted {
                 let metadata = result.unwrap();

@@ -23,6 +23,9 @@ use crate::{ArithmeticOperator, FunctionValueType, ValueLogicalType};
 
 /// Classify an admitted integer value. This is not a complete schema validator.
 pub fn is_integer_value_type(value: &FunctionValueType) -> bool {
+    if value.value_type().temporal().is_some() {
+        return false;
+    }
     match value.logical_type() {
         ValueLogicalType::LargeInt => crate::is_largeint_data_type(value.data_type()),
         ValueLogicalType::Physical => matches!(

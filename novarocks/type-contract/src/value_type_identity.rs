@@ -218,6 +218,10 @@ fn node<E>(value: &ValueTypeRef, write: &mut impl FnMut(&[u8]) -> Result<(), E>)
                 ValueLogicalType::Physical => unreachable!("checked nominal excludes Physical"),
             },
         ])?,
+        ValueKind::Temporal(declaration) => {
+            write(&[10])?;
+            write(&declaration.identity_bytes())?;
+        }
         ValueKind::List(item) => {
             write(&[4])?;
             node(item, write)?;
@@ -292,6 +296,27 @@ mod tests {
         assert!(!a.shares_storage(&b));
         assert_eq!(a, b);
         assert_eq!(identity(&a), identity(&b));
+    }
+    #[test]
+    fn bounded_character_and_temporal_use_distinct_node_tags() {
+        let character = ty(
+            ValueKind::BoundedCharacter(
+                crate::CharacterType::new(crate::CharacterKind::Varchar, 3).unwrap(),
+            ),
+            false,
+        );
+        let temporal = ty(
+            ValueKind::Temporal(crate::TemporalType::TimeWithTimeZone(
+                crate::TemporalPrecision::DEFAULT,
+            )),
+            false,
+        );
+        let node_tag = |value| {
+            let identity = identity(value);
+            let node = identity.strip_prefix(b"novarocks-value-type-v1").unwrap();
+            node[1]
+        };
+        assert_ne!(node_tag(&character), node_tag(&temporal));
     }
     #[test]
     fn null_names_domains_parameters_and_edges_are_distinct() {

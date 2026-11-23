@@ -324,7 +324,9 @@ impl Fixture {
             ),
             (
                 SemanticParameterId::new(5),
-                SemanticParameterValue::TimeZone("UTC".into()),
+                SemanticParameterValue::TimeZone(
+                    novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+                ),
             ),
         ])
         .unwrap();

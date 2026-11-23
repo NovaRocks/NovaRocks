@@ -108,6 +108,28 @@ pub(super) fn system_declarations() -> Result<Vec<PropertyDeclaration>, SessionP
             });
         }};
     }
+    values.push(PropertyDeclaration {
+        name: TIME_ZONE_ID.into(),
+        value_type: SessionPropertyType::Varchar,
+        default: None,
+        description: "Time Zone Id for the current session".into(),
+        hidden: true,
+        validate: Arc::new(|value| match value {
+            V::Varchar(zone) if novarocks_type_contract::TimeZoneKey::parse(zone).is_some() => {
+                Ok(())
+            }
+            _ => Err("Expected a supported time zone".into()),
+        }),
+        project: Some(|state, value| {
+            let V::Varchar(zone) = value else {
+                return Err(SessionPropertyError::ProjectionInvariant);
+            };
+            let key = novarocks_type_contract::TimeZoneKey::parse(zone)
+                .ok_or(SessionPropertyError::ProjectionInvariant)?;
+            state.time_zone_override = Some(key);
+            Ok(())
+        }),
+    });
     declaration!(
         "sql_mode",
         Varchar,

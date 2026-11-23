@@ -29,7 +29,10 @@ pub(crate) fn typed_call(binding: SqlFunctionBinding, operand: TypedExpr) -> Typ
     let value_type = result.clone();
     TypedExpr {
         kind: ExprKind::FunctionCall {
-            name: OperatorFunction::Negation.catalog_name().to_owned(),
+            name: OperatorFunction::from_function_id(&binding.function_id)
+                .expect("selected negation identity")
+                .catalog_name()
+                .to_owned(),
             volatility: binding.semantics.volatility,
             args: vec![operand].into(),
             distinct: false,
@@ -62,7 +65,10 @@ pub(crate) fn scalar_operand(arena: &ScalarArena, expression: ScalarId) -> Optio
 pub(crate) fn is_negation(function: &novarocks_type_contract::FunctionId) -> bool {
     use novarocks_type_contract::OperatorFunction;
 
-    OperatorFunction::from_function_id(function) == Some(OperatorFunction::Negation)
+    matches!(
+        OperatorFunction::from_function_id(function),
+        Some(OperatorFunction::Negation | OperatorFunction::TemporalNegation)
+    )
 }
 
 pub(crate) fn typed_operand_has_lower_precedence(operand: &crate::analysis::TypedExpr) -> bool {

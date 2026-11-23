@@ -23,7 +23,7 @@
 use std::{error::Error, fmt};
 
 use novarocks_parser::{SYNTHETIC, ast, build};
-use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+use novarocks_type_contract::{FunctionValueType, IntervalField, TemporalType, ValueLogicalType};
 use novarocks_types::{ColumnValueTypeError, schema::SqlType, sql_type_from_value_type};
 
 /// A declaration rejection or construction defect, without a parser re-entry.
@@ -106,6 +106,7 @@ fn declaration_syntax(declaration: &SqlType) -> Result<ast::TypeName, TypeSyntax
         SqlType::DateTime => "DATETIME",
         SqlType::DateTimeNs => "DATETIME_NS",
         SqlType::Time => "TIME",
+        SqlType::Temporal(ty) => return Ok(temporal_syntax(*ty)),
         SqlType::Variant => "VARIANT",
         SqlType::Uuid => return Err(TypeSyntaxError::Uuid),
         SqlType::Object => return Err(TypeSyntaxError::OpaqueDomain(ValueLogicalType::Object)),
@@ -160,6 +161,62 @@ fn declaration_syntax(declaration: &SqlType) -> Result<ast::TypeName, TypeSyntax
         }
     };
     Ok(build::simple_type(scalar))
+}
+
+fn temporal_syntax(declaration: TemporalType) -> ast::TypeName {
+    let kind = if let TemporalType::Interval(qualifier) = declaration {
+        let field = |field: IntervalField| match field {
+            IntervalField::Year => ast::IntervalQualifierField::Year,
+            IntervalField::Month => ast::IntervalQualifierField::Month,
+            IntervalField::Day => ast::IntervalQualifierField::Day,
+            IntervalField::Hour => ast::IntervalQualifierField::Hour,
+            IntervalField::Minute => ast::IntervalQualifierField::Minute,
+            IntervalField::Second => ast::IntervalQualifierField::Second {
+                fractional_precision: Some(
+                    number_argument(u32::from(qualifier.fractional_precision().digits())).into(),
+                ),
+            },
+        };
+        let precision = Some(number_argument(u32::from(qualifier.leading_precision())).into());
+        let qualifier = if qualifier.start() == qualifier.end() {
+            ast::IntervalQualifier::Simple(ast::SimpleIntervalQualifier {
+                precision,
+                field: field(qualifier.start()),
+                span: SYNTHETIC,
+            })
+        } else {
+            ast::IntervalQualifier::Composite(ast::CompositeIntervalQualifier {
+                precision,
+                from: field(qualifier.start()),
+                to: field(qualifier.end()),
+                span: SYNTHETIC,
+            })
+        };
+        ast::TypeKind::Interval(ast::IntervalDataType {
+            qualifier,
+            span: SYNTHETIC,
+        })
+    } else {
+        ast::TypeKind::DateTime(ast::DateTimeDataType {
+            kind: if matches!(
+                declaration,
+                TemporalType::Time(_) | TemporalType::TimeWithTimeZone(_)
+            ) {
+                ast::DateTimeType::Time
+            } else {
+                ast::DateTimeType::Timestamp
+            },
+            with_time_zone: matches!(
+                declaration,
+                TemporalType::TimeWithTimeZone(_) | TemporalType::TimestampWithTimeZone(_)
+            ),
+            precision: Some(number_argument(u32::from(declaration.precision().digits())).into()),
+        })
+    };
+    ast::TypeName {
+        kind,
+        span: SYNTHETIC,
+    }
 }
 
 fn number_argument(value: u32) -> ast::DataTypeParameter {

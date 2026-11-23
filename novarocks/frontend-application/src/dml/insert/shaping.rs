@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_parser::{Span, ast, build, printer};
 use novarocks_types::naming::normalize_identifier;
-use novarocks_types::schema::{ColumnDef, ColumnDefault, validate_column_default};
+use novarocks_types::schema::{ColumnDef, ColumnDefault, SqlType, validate_column_default};
 
 use super::command::{literal_query, plain_function};
 use novarocks_type_contract::FunctionValueType;
@@ -489,7 +489,7 @@ pub(crate) fn omitted_insert_expr(column: &ColumnDef) -> Result<ast::Expr, Strin
     if let Some(default) = &column.write_default {
         validate_column_default(default)
             .map_err(|error| format!("INSERT write-default for `{}`: {error}", column.name))?;
-        return default_to_expr(default, &column.data_type)
+        return default_to_expr(default, &column.data_type, column.logical_type.as_ref())
             .map_err(|error| format!("INSERT write-default for `{}`: {error}", column.name));
     }
     if column.nullable {
@@ -718,7 +718,31 @@ fn array(elements: Vec<ast::Expr>) -> ast::Expr {
 fn tuple(expressions: Vec<ast::Expr>) -> Result<ast::Expr, String> {
     build::tuple_value(expressions).map_err(|error| error.to_string())
 }
-fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast::Expr, String> {
+fn map_default_field_type(
+    field: &arrow::datatypes::Field,
+    declaration: Option<&SqlType>,
+) -> Result<FunctionValueType, String> {
+    let Some(declaration) = declaration else {
+        return FunctionValueType::try_from_field(field).map_err(|cause| cause.to_string());
+    };
+    let binding = novarocks_types::execution_value_type_from_declaration(
+        declaration,
+        field.data_type(),
+        field.is_nullable(),
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+    )
+    .map_err(|cause| cause.to_string())?;
+    FunctionValueType::try_from_typed_binding(binding).map_err(|cause| cause.to_string())
+}
+
+fn default_to_expr(
+    default: &ColumnDefault,
+    data_type: &DataType,
+    logical: Option<&SqlType>,
+) -> Result<ast::Expr, String> {
+    if let Some(SqlType::Temporal(ty)) = logical {
+        return temporal_default_to_expr(default, *ty);
+    }
     Ok(match (default, data_type) {
         (ColumnDefault::Boolean(value), DataType::Boolean) => {
             literal(ast::LiteralKind::Boolean(*value))
@@ -774,7 +798,11 @@ fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast:
                     if matches!(value, ColumnDefault::Null) {
                         Ok(null_expr())
                     } else {
-                        default_to_expr(value, field.data_type())
+                        let logical = match logical {
+                            Some(SqlType::Array(element)) => Some(element.as_ref()),
+                            _ => None,
+                        };
+                        default_to_expr(value, field.data_type(), logical)
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -789,19 +817,21 @@ fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast:
             if fields.len() != 2 {
                 return Err("MAP entries struct must contain key and value".to_string());
             }
-            let key_type =
-                FunctionValueType::try_from_field(&fields[0]).map_err(|cause| cause.to_string())?;
-            let value_type =
-                FunctionValueType::try_from_field(&fields[1]).map_err(|cause| cause.to_string())?;
+            let (key_declaration, value_declaration) = match logical {
+                Some(SqlType::Map(key, value)) => (Some(key.as_ref()), Some(value.as_ref())),
+                _ => (None, None),
+            };
+            let key_type = map_default_field_type(&fields[0], key_declaration)?;
+            let value_type = map_default_field_type(&fields[1], value_declaration)?;
             let (keys, values) = entries
                 .iter()
                 .map(|(key, value)| {
                     Ok((
-                        default_to_expr(key, fields[0].data_type())?,
+                        default_to_expr(key, fields[0].data_type(), key_declaration)?,
                         if matches!(value, ColumnDefault::Null) {
                             null_expr()
                         } else {
-                            default_to_expr(value, fields[1].data_type())?
+                            default_to_expr(value, fields[1].data_type(), value_declaration)?
                         },
                     ))
                 })
@@ -820,11 +850,18 @@ fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast:
                 values
                     .iter()
                     .zip(fields)
-                    .map(|((_, value), field)| {
+                    .enumerate()
+                    .map(|(ordinal, ((_, value), field))| {
                         if matches!(value, ColumnDefault::Null) {
                             Ok(null_expr())
                         } else {
-                            default_to_expr(value, field.data_type())
+                            let logical = match logical {
+                                Some(SqlType::Struct(children)) => {
+                                    children.get(ordinal).map(|(_, ty)| ty)
+                                }
+                                _ => None,
+                            };
+                            default_to_expr(value, field.data_type(), logical)
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -836,6 +873,79 @@ fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast:
             ));
         }
     })
+}
+
+fn temporal_default_to_expr(
+    default: &ColumnDefault,
+    ty: novarocks_type_contract::TemporalType,
+) -> Result<ast::Expr, String> {
+    use novarocks_functions::temporal_value::{TemporalTextFormat, format};
+    use novarocks_type_contract::{
+        PICOS_PER_MICROSECOND, TemporalMicros, TemporalType, TemporalValue, TimeZoneKey,
+    };
+    let picos_per_nano = i128::from(PICOS_PER_MICROSECOND / 1_000);
+    let timestamp = |picos| {
+        TemporalMicros::from_picos(picos)
+            .ok_or_else(|| "Iceberg timestamp default is outside its SQL value range".to_owned())
+    };
+    let picos_per_micro = i128::from(PICOS_PER_MICROSECOND);
+    let (type_name, value) = match (ty, default) {
+        (_, ColumnDefault::Null) => return Ok(null_expr()),
+        (
+            TemporalType::Time(_),
+            ColumnDefault::TimeMicros {
+                micros_since_midnight,
+            },
+        ) => {
+            let picos = micros_since_midnight
+                .checked_mul(PICOS_PER_MICROSECOND)
+                .ok_or_else(|| "Iceberg TIME default is outside its SQL value range".to_owned())?;
+            ("TIME", TemporalValue::Time(picos))
+        }
+        (
+            TemporalType::Timestamp(precision),
+            ColumnDefault::TimestampMicros { micros_since_epoch },
+        ) if precision.fits_microseconds() => (
+            "TIMESTAMP",
+            TemporalValue::Timestamp(timestamp(
+                i128::from(*micros_since_epoch) * picos_per_micro,
+            )?),
+        ),
+        (
+            TemporalType::Timestamp(precision),
+            ColumnDefault::TimestampNanos { nanos_since_epoch },
+        ) if !precision.fits_microseconds() => (
+            "TIMESTAMP",
+            TemporalValue::Timestamp(timestamp(i128::from(*nanos_since_epoch) * picos_per_nano)?),
+        ),
+        (
+            TemporalType::TimestampWithTimeZone(precision),
+            ColumnDefault::TimestamptzMicros { micros_since_epoch },
+        ) if precision.fits_microseconds() => (
+            "TIMESTAMP",
+            TemporalValue::TimestampWithTimeZone {
+                instant: timestamp(i128::from(*micros_since_epoch) * picos_per_micro)?,
+                zone: TimeZoneKey::UTC,
+            },
+        ),
+        (
+            TemporalType::TimestampWithTimeZone(precision),
+            ColumnDefault::TimestamptzNanos { nanos_since_epoch },
+        ) if !precision.fits_microseconds() => (
+            "TIMESTAMP",
+            TemporalValue::TimestampWithTimeZone {
+                instant: timestamp(i128::from(*nanos_since_epoch) * picos_per_nano)?,
+                zone: TimeZoneKey::UTC,
+            },
+        ),
+        _ => return Err("Iceberg default differs from the complete temporal declaration".into()),
+    };
+    let mut text = String::new();
+    format(&mut text, ty, value, TemporalTextFormat::Cast).map_err(|error| error.to_string())?;
+    Ok(literal(ast::LiteralKind::Generic(ast::GenericLiteral {
+        type_name: type_name.to_owned(),
+        value: text,
+    })))
 }
 
 fn format_decimal(unscaled: i128, scale: i8) -> Result<String, String> {

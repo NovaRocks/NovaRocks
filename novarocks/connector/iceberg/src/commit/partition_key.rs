@@ -36,13 +36,14 @@ use novarocks_spi::connector::{
 };
 
 use super::frozen_write::parse_partition_transform;
-use super::write_adaptation::{adapt_batch, validate_batch_schema};
+use super::write_adaptation::{adapt_temporal_batch, validate_temporal_batch_schema};
 use super::write_stack::codec::{decode_write_layout, encode_write_layout};
 use super::write_stack::domain::IcebergDataBranchRecipe;
 use crate::iceberg::arrow::{
     PartitionValueCalculator, arrow_struct_to_literal, schema_to_arrow_schema,
 };
 use crate::iceberg::spec::{Literal, PartitionSpec, Schema, Transform};
+use crate::temporal::TemporalReadProjection;
 
 pub(crate) fn partition_layout(
     binding: &ConnectorWriteBinding,
@@ -230,6 +231,7 @@ struct IcebergPartitionKeyEvaluator {
     input: ArrowSchemaRef,
     target: ArrowSchemaRef,
     transformed_inputs: Box<[bool]>,
+    temporal_storage: Box<[TemporalReadProjection]>,
 }
 
 impl IcebergPartitionKeyEvaluator {
@@ -284,7 +286,20 @@ impl IcebergPartitionKeyEvaluator {
                 })
                 .collect::<Vec<_>>(),
         ));
-        validate_batch_schema(&input, &target).map_err(invalid)?;
+        let temporal_storage: Box<[_]> = schema
+            .as_struct()
+            .fields()
+            .iter()
+            .zip(&transformed_inputs)
+            .map(|(field, transformed)| {
+                if *transformed {
+                    TemporalReadProjection::from_type(&field.field_type)
+                } else {
+                    TemporalReadProjection::Identity
+                }
+            })
+            .collect();
+        validate_temporal_batch_schema(&input, &target, &temporal_storage).map_err(invalid)?;
         let calculator = PartitionValueCalculator::try_new(spec, schema)
             .map_err(|error| invalid(error.to_string()))?;
         Ok(Self {
@@ -292,6 +307,7 @@ impl IcebergPartitionKeyEvaluator {
             input,
             target,
             transformed_inputs,
+            temporal_storage,
         })
     }
 }
@@ -323,7 +339,7 @@ impl ConnectorPartitionKeyEvaluator for IcebergPartitionKeyEvaluator {
         let input = RecordBatch::try_new(self.input.clone(), sources).map_err(|error| {
             ConnectorError::new(ConnectorErrorKind::Internal, error.to_string())
         })?;
-        let adapted = adapt_batch(&input, &self.target)
+        let adapted = adapt_temporal_batch(&input, &self.target, &self.temporal_storage)
             .map_err(super::write_adaptation::WriteAdaptationError::into_connector_error)?;
         let partition_values = self
             .calculator

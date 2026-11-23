@@ -99,6 +99,20 @@ impl PartitionHashAlgorithm {
     /// bucket stays at the two list shapes Iceberg's transform names. Unsigned
     /// and dictionary-encoded types remain outside v1 until their canonical
     /// encoding is frozen under a new algorithm identity.
+    pub fn supports_partition_value_type(self, value_type: &crate::FunctionValueType) -> bool {
+        self.supports_partition_binding(value_type.value_type(), value_type.data_type())
+    }
+
+    pub fn supports_partition_binding(
+        self,
+        semantic: &crate::ValueTypeRef,
+        data_type: &DataType,
+    ) -> bool {
+        self.supports_partition_key(data_type)
+            || matches!(self, Self::NativeExchangeV1 | Self::NativeHierarchicalV1)
+                && canonical_temporal_key(semantic, data_type)
+    }
+
     pub fn supports_partition_key(self, data_type: &DataType) -> bool {
         match self {
             Self::NativeExchangeV1 | Self::NativeHierarchicalV1 => {
@@ -119,6 +133,35 @@ impl PartitionHashAlgorithm {
                     )
             }
         }
+    }
+}
+
+fn canonical_temporal_key(semantic: &crate::ValueTypeRef, data_type: &DataType) -> bool {
+    if let Some(temporal) = semantic.temporal() {
+        return temporal.carrier() == *data_type;
+    }
+    let child = |index, data_type| {
+        semantic.child_type_at(index).is_some_and(|semantic| {
+            canonical_key_member(data_type) || canonical_temporal_key(semantic, data_type)
+        })
+    };
+    match data_type {
+        DataType::List(field) => child(0, field.data_type()),
+        DataType::Struct(fields) => {
+            fields.len() == semantic.child_count()
+                && fields
+                    .iter()
+                    .enumerate()
+                    .all(|(index, field)| child(index, field.data_type()))
+        }
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(fields) if fields.len() == 2 => fields
+                .iter()
+                .enumerate()
+                .all(|(index, field)| child(index, field.data_type())),
+            _ => false,
+        },
+        _ => false,
     }
 }
 

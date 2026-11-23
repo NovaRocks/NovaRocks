@@ -172,7 +172,7 @@ impl OperatorFactory for CompiledGenerateSeriesProcessorFactory {
 }
 
 #[derive(Clone, Copy)]
-// Design: ADR-0254 (docs/adr/ADR-0254-collection-calls-and-relational-sequence.md)
+// Design: ADR-0255 (docs/adr/ADR-0255-collection-calls-and-relational-sequence.md)
 struct SeriesCursor {
     current: i128,
     stop: i128,

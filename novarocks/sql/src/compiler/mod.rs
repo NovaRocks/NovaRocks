@@ -261,6 +261,15 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// Exact time dependencies of the selected scalar, if its declaration
+    /// belongs to this SQL catalogue.
+    fn scalar_time_dependencies(
+        &self,
+        _binding: &novarocks_functions::ResolvedFunctionBinding,
+    ) -> &[novarocks_type_contract::SemanticParameterKey] {
+        &[]
+    }
+
     /// Actual same-source frozen environment admission. Original catalogues
     /// retain their original path without lookup, preparation or added work.
     fn admit_bound_environment_observed(
@@ -1137,6 +1146,7 @@ pub struct SqlAnalyzedQuery {
     factory: crate::column_id::ColumnRefFactory,
     intent: SqlCompileIntent,
     settings: SessionOptimizerSettings,
+    semantic_settings: crate::sql_mode::SqlSemanticSettings,
     /// Policy of the admitted root scope for calls synthesized after analysis.
     /// Existing calls retain their own scope policy in `SqlFunctionBinding`.
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
@@ -1206,6 +1216,10 @@ pub struct SqlOptimizeRequest<'a> {
 }
 
 impl<'a> SqlOptimizeRequest<'a> {
+    pub(crate) fn semantic_settings(&self) -> &crate::sql_mode::SqlSemanticSettings {
+        &self.analyzed.semantic_settings
+    }
+
     pub fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
         self.analyzed.constant_policy
     }
@@ -1957,6 +1971,7 @@ impl SqlCompiler {
             factory,
             intent: request.intent,
             settings,
+            semantic_settings: request.session.sql_semantics.clone(),
             decimal_overflow_policy,
             root_allow_throw_exception: legacy_allow_throw_exception,
             change_stream,
@@ -1974,6 +1989,7 @@ impl SqlCompiler {
             factory,
             intent,
             settings,
+            semantic_settings: _,
             decimal_overflow_policy,
             root_allow_throw_exception,
             change_stream,

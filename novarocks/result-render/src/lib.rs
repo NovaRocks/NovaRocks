@@ -43,6 +43,7 @@ pub enum RenderErrorKind {
     InvalidVariant,
     CursorInvariant,
     WorkStackLimit,
+    LegacyIntervalMapKeyCollision,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderError {
@@ -94,6 +95,12 @@ pub trait BoundedClientRowEncoder: Send {
     fn scratch_capacity_bytes(&self) -> usize;
 }
 
+pub const LEGACY_INTERVAL_MAP_KEY_COLLISION: novarocks_failure_contract::FailureReason =
+    novarocks_failure_contract::FailureReason::new(
+        novarocks_failure_contract::domain::RESULT,
+        std::num::NonZeroU16::new(114).unwrap(),
+    );
+
 impl novarocks_failure_contract::FailureProjection for RenderError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use novarocks_failure_contract::*;
@@ -112,6 +119,12 @@ impl novarocks_failure_contract::FailureProjection for RenderError {
             RenderErrorKind::InvalidVariant => (FailureClass::Data, 111),
             RenderErrorKind::CursorInvariant => (FailureClass::Invariant, 112),
             RenderErrorKind::WorkStackLimit => (FailureClass::Resource, 113),
+            RenderErrorKind::LegacyIntervalMapKeyCollision => {
+                return FailureFact::new(
+                    FailureClass::Unsupported,
+                    LEGACY_INTERVAL_MAP_KEY_COLLISION,
+                );
+            }
         };
         let fact = FailureFact::new(
             class,

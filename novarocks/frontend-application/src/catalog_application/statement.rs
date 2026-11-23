@@ -192,6 +192,7 @@ pub(crate) fn connector_data_type(data_type: &SqlType) -> Result<ConnectorDataTy
         SqlType::DateTime => ConnectorDataType::DateTime,
         SqlType::DateTimeNs => ConnectorDataType::DateTimeNs,
         SqlType::Time => ConnectorDataType::Time,
+        SqlType::Temporal(declaration) => ConnectorDataType::Temporal(*declaration),
         SqlType::Array(element) => {
             ConnectorDataType::Array(Box::new(connector_data_type(element)?))
         }
@@ -230,6 +231,10 @@ fn connector_default(value: &DefaultLiteral) -> Result<ConnectorDefaultValue, St
         DefaultLiteral::String(value) => ConnectorDefaultValue::String(Arc::from(value.as_str())),
         DefaultLiteral::Date(value) => ConnectorDefaultValue::Date(*value),
         DefaultLiteral::DateTime(value) => ConnectorDefaultValue::DateTime(*value),
+        DefaultLiteral::Temporal { data_type, value } => ConnectorDefaultValue::Temporal {
+            data_type: *data_type,
+            value: *value,
+        },
         DefaultLiteral::Binary(value) => {
             ConnectorDefaultValue::Binary(Bytes::copy_from_slice(value))
         }
@@ -1068,6 +1073,28 @@ fn lower_typed_string_default(value: &str, data_type: &SqlType) -> Result<Defaul
         SqlType::DateTimeNs => Ok(DefaultLiteral::DateTime(typed_datetime_string_to_nanos(
             value,
         )?)),
+        SqlType::Temporal(ty) => {
+            use novarocks_functions::temporal_value::{
+                parse_time_literal, parse_timestamp_literal,
+            };
+            use novarocks_type_contract::TemporalType;
+            let parsed = match ty {
+                TemporalType::Time(_) | TemporalType::TimeWithTimeZone(_) => {
+                    parse_time_literal(value)
+                }
+                TemporalType::Timestamp(_) | TemporalType::TimestampWithTimeZone(_) => {
+                    parse_timestamp_literal(value)
+                }
+                TemporalType::Interval(_) => {
+                    return Err("Iceberg cannot store an interval DEFAULT".into());
+                }
+            }
+            .map_err(|error| error.to_string())?;
+            Ok(DefaultLiteral::Temporal {
+                data_type: parsed.ty,
+                value: parsed.value,
+            })
+        }
         SqlType::Binary | SqlType::Bitmap | SqlType::Hll => {
             Ok(DefaultLiteral::Binary(value.as_bytes().to_vec()))
         }
@@ -1150,6 +1177,13 @@ fn validate_typed_default_literal(
         | (DefaultLiteral::Binary(_), SqlType::Binary | SqlType::Bitmap | SqlType::Hll)
         | (DefaultLiteral::Date(_), SqlType::Date)
         | (DefaultLiteral::DateTime(_), SqlType::DateTime | SqlType::DateTimeNs) => {}
+        (DefaultLiteral::Temporal { data_type, value }, SqlType::Temporal(target))
+            if std::mem::discriminant(data_type) == std::mem::discriminant(target) =>
+        {
+            value
+                .validate(*data_type)
+                .map_err(|error| error.to_string())?;
+        }
         (DefaultLiteral::Int(value), SqlType::TinyInt) => {
             i8::try_from(*value).map_err(|_| default_out_of_range("TINYINT", *value))?;
         }

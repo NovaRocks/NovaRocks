@@ -113,6 +113,20 @@ impl<'a> TextTyping<'a> {
             }
             return self.lower_call(call.name, call.arguments, span, work, next);
         }
+        if let Some((syntax, target)) =
+            crate::typing::clock_syntax(expr).map_err(|cause| typing_error(cause, span))?
+        {
+            work.flush()?;
+            let binding = crate::typing::bind_temporal_syntax(
+                self.context.catalog,
+                syntax,
+                &[],
+                &target,
+                work.control(),
+            )
+            .map_err(|cause| typing_error(cause, span))?;
+            return Ok(TextNode::call(binding, Some(target), Vec::new()));
+        }
         match expr {
             ast::Expr::Identifier(identifier) => {
                 let Some(&ordinal) = self.by_name.get(&identifier.value.to_ascii_lowercase())
@@ -157,14 +171,65 @@ impl<'a> TextTyping<'a> {
             ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
                 let child = self.lower(&unary.expression, work, next)?;
                 let form = negated_integer_form(&child.typing);
-                let mut node = self.type_call(
-                    NodeShape::Operator(OperatorFunction::Negation),
-                    vec![child],
+                let operator = crate::typing::negation_operator(&child.typing.value_type);
+                let mut node =
+                    self.type_call(NodeShape::Operator(operator), vec![child], span, work)?;
+                node.typing.form = form;
+                Ok(node)
+            }
+            ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Plus => {
+                let child = self.lower(&unary.expression, work, next)?;
+                let (_, mut children) =
+                    self.type_value(NodeShape::UnaryPlus, vec![child], span, work)?;
+                Ok(children.pop().expect("one unary plus operand"))
+            }
+            ast::Expr::Binary(binary) => {
+                let left = self.lower(&binary.left, work, next)?;
+                let right = self.lower(&binary.right, work, next)?;
+                use novarocks_type_contract::ArithmeticOperator as A;
+                let operation = match binary.operator {
+                    ast::BinaryOperator::Add => A::Add,
+                    ast::BinaryOperator::Subtract => A::Subtract,
+                    ast::BinaryOperator::Multiply => A::Multiply,
+                    ast::BinaryOperator::Divide => A::Divide,
+                    ast::BinaryOperator::Modulo => A::Modulo,
+                };
+                let operator = crate::typing::temporal_binary_operator(
+                    operation,
+                    &left.typing.value_type,
+                    &right.typing.value_type,
+                )
+                .map_err(|cause| typing_error(cause, span))?
+                .unwrap_or_else(|| syntax_arithmetic(binary.operator));
+                self.type_call(NodeShape::Operator(operator), vec![left, right], span, work)
+            }
+            ast::Expr::AtLocal(node) => {
+                let source = self.lower(&node.value, work, next)?;
+                self.type_at_zone(source, None, span, work)
+            }
+            ast::Expr::AtTimeZone(node) => {
+                let source = self.lower(&node.value, work, next)?;
+                let zone = self.lower(&node.time_zone, work, next)?;
+                self.type_at_zone(source, Some(zone), span, work)
+            }
+            ast::Expr::IntervalValueExpression(node) => {
+                let left = self.lower(&node.left, work, next)?;
+                let right = self.lower(&node.right, work, next)?;
+                let [left_type, right_type, target] = crate::typing::qualified_datetime_difference(
+                    &left.typing.value_type,
+                    &right.typing.value_type,
+                    &node.data_type,
+                )
+                .map_err(|cause| typing_error(cause, span))?;
+                let left = self.qualified_cast(left, left_type, node.left.span(), work)?;
+                let right = self.qualified_cast(right, right_type, node.right.span(), work)?;
+                let difference = self.type_call(
+                    NodeShape::Operator(OperatorFunction::TemporalSubtract),
+                    vec![left, right],
                     span,
                     work,
                 )?;
-                node.typing.form = form;
-                Ok(node)
+                self.qualified_cast(difference, target, span, work)
             }
             ast::Expr::Cast(cast) => {
                 use crate::typing::declaration::resolve_trino_type;
@@ -186,6 +251,21 @@ impl<'a> TextTyping<'a> {
                 } else {
                     TrinoCastMode::Explicit
                 };
+                let temporal_target = target
+                    .with_nullable(cast.safe || input.typing.value_type.nullable())
+                    .map_err(|cause| typing_error(cause.into(), span))?;
+                work.flush()?;
+                if let Some(binding) = crate::typing::select_temporal_cast(
+                    self.context.catalog,
+                    &input.typing.argument(),
+                    &temporal_target,
+                    cast.safe,
+                    work.control(),
+                )
+                .map_err(|cause| typing_error(cause, span))?
+                {
+                    return Ok(TextNode::call(binding, Some(temporal_target), vec![input]));
+                }
                 let conversion = crate::typing::type_cast(
                     &self.context,
                     &input.typing.value_type,
@@ -202,22 +282,6 @@ impl<'a> TextTyping<'a> {
                 self.type_call(
                     NodeShape::Operator(OperatorFunction::ArraySubscript),
                     vec![base, index],
-                    span,
-                    work,
-                )
-            }
-            ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Plus => {
-                let child = self.lower(&unary.expression, work, next)?;
-                let (_, mut children) =
-                    self.type_value(NodeShape::UnaryPlus, vec![child], span, work)?;
-                Ok(children.pop().expect("one unary plus operand"))
-            }
-            ast::Expr::Binary(binary) => {
-                let left = self.lower(&binary.left, work, next)?;
-                let right = self.lower(&binary.right, work, next)?;
-                self.type_call(
-                    NodeShape::Operator(syntax_arithmetic(binary.operator)),
-                    vec![left, right],
                     span,
                     work,
                 )
@@ -303,6 +367,29 @@ impl<'a> TextTyping<'a> {
         }
     }
 
+    fn qualified_cast(
+        &self,
+        node: TextNode,
+        target: FunctionValueType,
+        span: Span,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<TextNode, TextError> {
+        if node.typing.value_type == target {
+            return Ok(node);
+        }
+        work.flush()?;
+        let binding = crate::typing::select_temporal_cast(
+            self.context.catalog,
+            &node.typing.argument(),
+            &target,
+            false,
+            work.control(),
+        )
+        .map_err(|cause| typing_error(cause, span))?
+        .ok_or_else(|| legacy("qualified temporal CAST", span))?;
+        Ok(TextNode::call(binding, Some(target), vec![node]))
+    }
+
     fn lower_call<'expr>(
         &mut self,
         name: &str,
@@ -361,7 +448,7 @@ impl<'a> TextTyping<'a> {
                 name: &value.type_name,
                 value: &value.value,
             },
-            ast::LiteralKind::Interval(_) => LiteralSyntax::Interval,
+            ast::LiteralKind::Interval(value) => LiteralSyntax::Interval(value),
         };
         let NodeTyping::Literal(emission) =
             type_node(&self.context, NodeShape::Literal(syntax), &[], work)
@@ -371,6 +458,14 @@ impl<'a> TextTyping<'a> {
         };
         Ok(match emission {
             LiteralEmission::Direct(value) => TextNode::literal(value),
+            LiteralEmission::Constant { value_type, value } => TextNode {
+                typing: ChildTyping {
+                    value_type,
+                    constant: Some(value),
+                    form: ChildForm::Other,
+                },
+                kind: TextKind::Literal,
+            },
             LiteralEmission::Cast {
                 input,
                 declared_result,
@@ -381,6 +476,48 @@ impl<'a> TextTyping<'a> {
                 node
             }
         })
+    }
+
+    fn type_at_zone(
+        &self,
+        mut source: TextNode,
+        zone: Option<TextNode>,
+        span: Span,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<TextNode, TextError> {
+        let (syntax, zoned, target) = crate::typing::at_zone_syntax(
+            &source.typing.value_type,
+            zone.as_ref().map(|node| &node.typing.value_type),
+        )
+        .map_err(|cause| typing_error(cause, span))?;
+        work.flush()?;
+        if source.typing.value_type != zoned {
+            let binding = crate::typing::select_temporal_cast(
+                self.context.catalog,
+                &source.typing.argument(),
+                &zoned,
+                false,
+                work.control(),
+            )
+            .map_err(|cause| typing_error(cause, span))?
+            .ok_or_else(|| legacy("AT TIME ZONE source conversion", span))?;
+            source = TextNode::call(binding, Some(zoned), vec![source]);
+        }
+        let mut children = vec![source];
+        children.extend(zone);
+        let arguments = children
+            .iter()
+            .map(|node| node.typing.argument())
+            .collect::<Vec<_>>();
+        let binding = crate::typing::bind_temporal_syntax(
+            self.context.catalog,
+            syntax,
+            &arguments,
+            &target,
+            work.control(),
+        )
+        .map_err(|cause| typing_error(cause, span))?;
+        Ok(TextNode::call(binding, Some(target), children))
     }
 
     fn type_call(
@@ -722,7 +859,48 @@ impl TextNode {
                 } else {
                     binding.as_ref()
                 };
-                let function = legacy_scalar_function(binding, &ty);
+                let mut function = legacy_scalar_function(binding, &ty);
+                let declaration = context
+                    .functions
+                    .metadata()
+                    .pure_overload_declaration_observed(
+                        &binding.function_id,
+                        binding.kind,
+                        &binding.selected.overload,
+                        work.control(),
+                    )
+                    .map_err(|error| match error {
+                        novarocks_functions::FunctionSpecializationFailure::Control(cause) => {
+                            TextError::Control(cause)
+                        }
+                        novarocks_functions::FunctionSpecializationFailure::Binding(cause) => {
+                            typing_error(cause.into(), novarocks_parser::SYNTHETIC)
+                        }
+                        other => typing_error(
+                            TypingError::Unsupported(other.to_string()),
+                            novarocks_parser::SYNTHETIC,
+                        ),
+                    })?;
+                let mut references = Vec::new();
+                for &key in &declaration.effects().environment_dependencies {
+                    let mut matching = None;
+                    for (&id, value) in context.parameters.entries() {
+                        work.step()?;
+                        if value.key() == key && matching.replace(id).is_some() {
+                            return Err(TextError::Layout("ambiguous temporal parameter"));
+                        }
+                    }
+                    let id = matching.ok_or(TextError::Layout("missing temporal parameter"))?;
+                    references.push(novarocks_type_contract::SemanticParameterRef {
+                        id,
+                        expected_key: key,
+                    });
+                }
+                function
+                    .legacy_metadata
+                    .as_mut()
+                    .expect("original author metadata")
+                    .semantic_parameters = references.into_boxed_slice();
                 let id = draft.add(None, ty, ExprKind::FunctionCall { function, args })?;
                 let request = physical_call_request(
                     &request_args,
@@ -824,14 +1002,14 @@ fn construct_name(expr: &ast::Expr) -> &'static str {
 mod tests {
     use super::*;
     use crate::testkit::{HarnessControl, constant_policy};
-    use arrow::datatypes::TimeUnit;
     use novarocks_type_contract::{
         CompilePhase, DecimalOverflowPolicy, SemanticParameterId, SemanticParameterKey,
-        SemanticParameterRef, SemanticParameterValue, SemanticParameters,
+        SemanticParameterRef, SemanticParameterValue, SemanticParameters, TemporalPrecision,
+        TemporalType,
     };
 
     #[test]
-    fn temporal_text_literals_emit_the_original_cast_before_call_authorship() {
+    fn temporal_text_literals_emit_a_typed_constant_before_call_authorship() {
         let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
         let allow_throw_exception = SemanticParameterRef {
             id: SemanticParameterId::new(0),
@@ -849,13 +1027,12 @@ mod tests {
             parameters: &parameters,
             allow_throw_exception,
         };
-        // This inspection precedes recipe admission: the recipe may refuse
-        // the analyzed cast's successful-NULL contract independently.
+        let precision = TemporalPrecision::WHOLE_SECONDS;
         for (source, expected) in [
-            ("TIME '01:02:03'", DataType::Time64(TimeUnit::Microsecond)),
+            ("TIME '01:02:03'", TemporalType::Time(precision)),
             (
                 "TIMESTAMP '1970-01-01 00:00:01'",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+                TemporalType::Timestamp(precision),
             ),
         ] {
             let ast = novarocks_parser::parser::parse_expression(source).unwrap();
@@ -868,25 +1045,16 @@ mod tests {
             let root = node
                 .emit(&mut draft, &mut constants, &context, &mut work)
                 .unwrap();
-            let ExprKind::Cast {
-                expr,
-                target,
-                cast_mode,
-                ..
-            } = &draft.definition(root).unwrap().kind
-            else {
-                panic!("the temporal literal emits its original cast");
+            let node = draft.definition(root).unwrap();
+            let ExprKind::Constant(reference) = node.kind else {
+                panic!("the temporal literal emits a typed constant");
             };
-            assert_eq!(target, &expected);
-            assert!(matches!(
-                cast_mode,
-                novarocks_type_contract::TrinoCastMode::Implicit
-                    | novarocks_type_contract::TrinoCastMode::Explicit
-            ));
-            assert!(matches!(
-                draft.definition(*expr).unwrap().kind,
-                ExprKind::Constant(_)
-            ));
+            let value = constants
+                .resolve_observed(reference, &node.ty, &mut work)
+                .unwrap();
+            assert_eq!(value.value_type().value_type().temporal(), Some(expected));
+            assert_eq!(value.value_type().data_type(), &expected.carrier());
+            assert!(!value.value_type().nullable());
             work.finish().unwrap();
         }
     }

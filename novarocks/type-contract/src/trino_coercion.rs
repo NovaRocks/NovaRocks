@@ -19,9 +19,9 @@ use novarocks_result_contract::{CharacterKind, CharacterType};
 use std::{alloc::Layout, sync::Arc};
 
 use crate::{
-    CompileCheckpoints, CompileControlError, FunctionValueType, ValueConstructionFailure,
-    ValueConstructionRequest, ValueField, ValueKind, ValueLayout, ValueTypeRef,
-    ValueTypeStorageLifetime, owned_resources::layout::arc_layout,
+    CompileCheckpoints, CompileControlError, FunctionValueType, TemporalType,
+    ValueConstructionFailure, ValueConstructionRequest, ValueField, ValueKind, ValueLayout,
+    ValueTypeRef, ValueTypeStorageLifetime, owned_resources::layout::arc_layout,
     value_construction::ValueConstruction,
 };
 
@@ -39,7 +39,7 @@ pub enum TrinoCastMode {
 /// for the leaves, irrespective of their physical Arrow representation.
 pub fn trino_common_scalar_kind(left: &ValueKind, right: &ValueKind) -> Option<ValueKind> {
     use DataType::Null;
-    use ValueKind::{BoundedCharacter, Scalar, String};
+    use ValueKind::{BoundedCharacter, Scalar, String, Temporal};
 
     match (left, right) {
         (Scalar(Null), leaf) | (leaf, Scalar(Null))
@@ -74,6 +74,15 @@ pub fn trino_common_scalar_kind(left: &ValueKind, right: &ValueKind) -> Option<V
         (Scalar(DataType::Timestamp(left, None)), Scalar(DataType::Timestamp(right, None))) => {
             Some(Scalar(DataType::Timestamp((*left).max(*right), None)))
         }
+        (Temporal(left), Temporal(right)) => left.common_type(*right).map(Temporal),
+        (
+            Temporal(kind @ (TemporalType::Timestamp(_) | TemporalType::TimestampWithTimeZone(_))),
+            Scalar(DataType::Date32),
+        )
+        | (
+            Scalar(DataType::Date32),
+            Temporal(kind @ (TemporalType::Timestamp(_) | TemporalType::TimestampWithTimeZone(_))),
+        ) => Some(Temporal(*kind)),
         (Scalar(left), Scalar(right)) => common_numeric(left, right).map(Scalar),
         (String, String) => Some(String),
         (ValueKind::Binary, ValueKind::Binary) => Some(ValueKind::Binary),
@@ -368,6 +377,7 @@ fn common_value<E>(
             };
             let carrier = match &kind {
                 Scalar(ty) => ty.clone(),
+                ValueKind::Temporal(ty) => ty.carrier(),
                 String | BoundedCharacter(_) => DataType::Utf8,
                 ValueKind::Binary => DataType::Binary,
                 ValueKind::Nominal(domain) => {
@@ -468,7 +478,7 @@ fn decimal_shape(kind: &DataType) -> Option<(u8, u8)> {
 mod tests {
     use super::*;
     use DataType::{Boolean, Decimal128, Float32, Int8, Int16, Int64};
-    use ValueKind::{BoundedCharacter, Scalar, String};
+    use ValueKind::{BoundedCharacter, Scalar, String, Temporal};
 
     #[test]
     fn common_numeric_type_uses_the_reference_width_and_scale() {
@@ -506,5 +516,22 @@ mod tests {
         assert!(trino_can_coerce_scalar(&char_four, &String));
         assert!(!trino_can_coerce_scalar(&varchar_four, &char_four));
         assert!(!trino_can_coerce_scalar(&char_four, &varchar_two));
+    }
+
+    #[test]
+    fn temporal_coercion_uses_declarations_instead_of_integer_carriers() {
+        use crate::TemporalPrecision;
+        let time = Temporal(TemporalType::Time(TemporalPrecision::DEFAULT));
+        let zoned_time = Temporal(TemporalType::TimeWithTimeZone(
+            TemporalPrecision::PICOSECONDS,
+        ));
+        assert!(trino_can_coerce_scalar(&time, &zoned_time));
+        assert!(!trino_can_coerce_scalar(&zoned_time, &time));
+        assert_eq!(trino_common_scalar_kind(&time, &Scalar(Int64)), None);
+
+        let date = Scalar(DataType::Date32);
+        let timestamp = Temporal(TemporalType::Timestamp(TemporalPrecision::PICOSECONDS));
+        assert!(trino_can_coerce_scalar(&date, &timestamp));
+        assert!(!trino_can_coerce_scalar(&timestamp, &date));
     }
 }

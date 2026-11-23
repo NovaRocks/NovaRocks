@@ -79,6 +79,62 @@ fn policy() -> ConstantPolicy {
         max_library_validation_bytes: 67_108_864,
     }
 }
+
+#[test]
+fn temporal_constant_content_distinguishes_zone_and_checks_reachable_value() {
+    use arrow_array::FixedSizeBinaryArray;
+    use novarocks_type_contract::{
+        TemporalCarrier, TemporalMicros, TemporalPrecision, TemporalType, TemporalValue,
+        TimeZoneKey, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    let declaration = TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS);
+    let storage = ValueTypeStorageLifetime::pure();
+    let ty = FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(ValueKind::Temporal(declaration), false, storage.clone()).unwrap(),
+        ValueLayout::try_new(&declaration.carrier(), storage).unwrap(),
+    )
+    .unwrap();
+    let field = Arc::new(ty.try_to_field("ts").unwrap());
+    let constant = |bytes: [u8; 14]| {
+        let array = FixedSizeBinaryArray::try_from_iter([bytes.as_slice()].into_iter()).unwrap();
+        ConstantPool::try_new(
+            field.clone(),
+            ty.clone(),
+            array.into_data(),
+            policy(),
+            CompilePhase::Validate,
+            &Control::good(),
+        )
+        .and_then(|pool| pool.value(0))
+    };
+    let payload = |zone| {
+        let observed = TemporalValue::TimestampWithTimeZone {
+            instant: TemporalMicros::from_picos(-1).unwrap(),
+            zone,
+        };
+        let TemporalCarrier::ZonedTimestamp(bytes) = observed.to_carrier(declaration).unwrap()
+        else {
+            panic!("unexpected carrier");
+        };
+        bytes
+    };
+    let a = constant(payload(TimeZoneKey::UTC)).unwrap();
+    let shanghai = payload(TimeZoneKey::parse("Asia/Shanghai").unwrap());
+    let b = constant(shanghai).unwrap();
+    assert!(
+        !a.equals_observed(&b, CompilePhase::Validate, &Control::good())
+            .unwrap()
+    );
+    assert_ne!(
+        a.semantic_key_observed(CompilePhase::Validate, &Control::good())
+            .unwrap(),
+        b.semantic_key_observed(CompilePhase::Validate, &Control::good())
+            .unwrap()
+    );
+    let mut bad = shanghai;
+    bad[12..].copy_from_slice(&u16::MAX.to_le_bytes());
+    assert!(matches!(constant(bad), Err(ConstantError::Invalid(_))));
+}
 fn pool(array: ArrayRef, ty: FunctionValueType, field: Arc<Field>) -> ConstantPool {
     ConstantPool::try_new(
         field,

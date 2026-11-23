@@ -500,6 +500,22 @@ fn validate_implicit_target(
     span: Span,
     control: &dyn PureCompileControl,
 ) -> Result<(), AnalyzeError> {
+    if target == RequiredConstantTarget::TimeZone {
+        let ty = source.value_type();
+        if matches!(
+            ty.kind(),
+            ValueKind::String | ValueKind::BoundedCharacter(_)
+        ) || matches!(ty.temporal(), Some(novarocks_type_contract::TemporalType::Interval(qualifier)) if !qualifier.is_year_month())
+        {
+            return Ok(());
+        }
+        return Err(AnalyzeError::type_mismatch(
+            "Expected an expression of varchar or interval day-time type",
+            span,
+        ));
+    }
+    // The semantic value kind owns this decision. A dictionary layout, a
+    // nominal Utf8 value, and a physical SQL string are not interchangeable.
     let allowed = if target == RequiredConstantTarget::Timestamp {
         source.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
             && match source.value_type().kind() {
@@ -564,7 +580,9 @@ fn required_target_value_type(
         }
         // Keep the original complete MAP result. The property consumer
         // performs the checked projection of any admitted UNKNOWN children.
-        RequiredConstantTarget::MapVarcharVarchar | RequiredConstantTarget::Timestamp => source
+        RequiredConstantTarget::MapVarcharVarchar
+        | RequiredConstantTarget::Timestamp
+        | RequiredConstantTarget::TimeZone => source
             .clone_observed(|| control.checkpoint(CompilePhase::Validate, 1))
             .map_err(AnalyzeError::control),
         RequiredConstantTarget::ArrayVarchar => {

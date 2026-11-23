@@ -325,7 +325,9 @@ fn shared_if_authors_exact_guarded_claims_for_value_and_truth_demands() {
     let sealed = fixture.seal();
     let parameters = SemanticParameters::try_new([(
         novarocks_type_contract::SemanticParameterId::new(91),
-        novarocks_type_contract::SemanticParameterValue::TimeZone("UTC".into()),
+        novarocks_type_contract::SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+        ),
     )])
     .unwrap();
     let authored = fixture

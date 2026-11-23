@@ -3978,11 +3978,18 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
     );
     let required = SemanticParameters::try_new([(
         reference.id,
-        SemanticParameterValue::TimeZone("UTC".into()),
+        SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+        ),
     )])
     .unwrap();
     let parameters = SemanticParameters::try_new([
-        (reference.id, SemanticParameterValue::TimeZone("UTC".into())),
+        (
+            reference.id,
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+            ),
+        ),
         (
             SemanticParameterId::new(0),
             SemanticParameterValue::AllowThrowException(true),

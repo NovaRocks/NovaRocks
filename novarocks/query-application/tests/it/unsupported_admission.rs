@@ -165,7 +165,6 @@ fn expected_subject(rule: &str, alternative: &str) -> &'static str {
         "87" => "DESCRIBE INPUT",
         "88" | "89" => "DESCRIBE OUTPUT",
         "90" => "SET PATH",
-        "91" => "SET TIME ZONE",
         _ => panic!("missing statement oracle for alternative {alternative}"),
     }
 }
@@ -271,7 +270,7 @@ fn each_pure_parsed_only_statement_witness_has_its_typed_gate() {
         exercised += 1;
     }
     assert_eq!(
-        exercised, 291,
+        exercised, 288,
         "reconcile the statement gate with the grammar ledger"
     );
 }

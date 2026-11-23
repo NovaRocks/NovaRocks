@@ -25,6 +25,16 @@ use std::cmp::Ordering;
 #[path = "aggregate_scalar_fingerprint_failure.rs"]
 mod extent_failure;
 use extent_failure::{LengthKind, checked_encoded_len_add, checked_u32_len};
+
+pub(crate) fn temporal_key(
+    declaration: novarocks_type_contract::TemporalType,
+    value: novarocks_type_contract::TemporalValue,
+) -> Result<novarocks_type_contract::TemporalRelationKey, crate::KernelFailure> {
+    value
+        .relation_key(declaration)
+        .map_err(|_| crate::aggregate_scalar::temporal_scalar_contract())
+}
+
 pub fn tracked_key_fingerprint<A: ScalarStateAllocator>(
     key: &TrackedAggScalarValue<A>,
     allocator: &A,
@@ -79,6 +89,7 @@ fn tracked_scalar_encoded_len<A: ScalarStateAllocator>(
         | TrackedAggScalarValue::Float64(_)
         | TrackedAggScalarValue::Timestamp(_) => checked_encoded_len_add(&mut len, 8)?,
         TrackedAggScalarValue::Date32(_) => checked_encoded_len_add(&mut len, 4)?,
+        TrackedAggScalarValue::Temporal(..) => checked_encoded_len_add(&mut len, 12)?,
         TrackedAggScalarValue::Decimal128(_) => checked_encoded_len_add(&mut len, 16)?,
         TrackedAggScalarValue::Decimal256(_) => checked_encoded_len_add(&mut len, 32)?,
         TrackedAggScalarValue::Utf8(bytes) | TrackedAggScalarValue::Binary(bytes) => {
@@ -160,6 +171,10 @@ fn encode_tracked_scalar<A: ScalarStateAllocator>(
         TrackedAggScalarValue::Timestamp(value) => {
             output.push(6);
             output.extend_from_slice(&value.to_le_bytes());
+        }
+        TrackedAggScalarValue::Temporal(ty, value) => {
+            output.push(13);
+            output.extend_from_slice(&temporal_key(*ty, *value)?.order_bytes());
         }
         TrackedAggScalarValue::Decimal128(value) => {
             output.push(7);
@@ -274,6 +289,9 @@ pub fn compare_scalar_values_partial(
         }
         (AggScalarValue::Date32(l), AggScalarValue::Date32(r)) => Ok(Ordered(l.cmp(r))),
         (AggScalarValue::Timestamp(l), AggScalarValue::Timestamp(r)) => Ok(Ordered(l.cmp(r))),
+        (AggScalarValue::Temporal(lt, l), AggScalarValue::Temporal(rt, r)) if lt == rt => {
+            Ok(Ordered(temporal_key(*lt, *l)?.cmp(&temporal_key(*rt, *r)?)))
+        }
         (AggScalarValue::Decimal128(l), AggScalarValue::Decimal128(r)) => Ok(Ordered(l.cmp(r))),
         (AggScalarValue::Decimal256(l), AggScalarValue::Decimal256(r)) => Ok(Ordered(l.cmp(r))),
         (AggScalarValue::Struct(l), AggScalarValue::Struct(r))
@@ -384,6 +402,10 @@ fn encode_scalar(
         AggScalarValue::Timestamp(v) => {
             out.push(6);
             out.extend_from_slice(&v.to_le_bytes());
+        }
+        AggScalarValue::Temporal(ty, value) => {
+            out.push(13);
+            out.extend_from_slice(&temporal_key(*ty, *value)?.order_bytes());
         }
         AggScalarValue::Decimal128(v) => {
             out.push(7);

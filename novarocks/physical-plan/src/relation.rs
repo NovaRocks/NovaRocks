@@ -52,8 +52,21 @@ pub struct RelationField {
 /// of its own column against a checked non-NULL constant.
 pub fn supports_provider_scan_comparison(ty: &ValueType) -> bool {
     use arrow_schema::{DataType, TimeUnit};
+    use novarocks_type_contract::{TemporalType, ValueKind, ValueLogicalType};
 
-    ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+    match ty.value_type().kind() {
+        ValueKind::Temporal(temporal) => {
+            return matches!(
+                temporal,
+                TemporalType::Time(_)
+                    | TemporalType::Timestamp(_)
+                    | TemporalType::TimestampWithTimeZone(_)
+            );
+        }
+        ValueKind::BoundedCharacter(_) => return false,
+        _ => {}
+    }
+    ty.logical_type() == ValueLogicalType::Physical
         && match ty.data_type() {
             DataType::Boolean
             | DataType::Int8

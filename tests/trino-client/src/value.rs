@@ -252,6 +252,25 @@ impl TypeSignature {
                 "time" | "time with time zone" | "timestamp" | "timestamp with time zone" => {
                     matches!(signature.arguments.as_slice(), [] | [A::Long(0..=12)])
                 }
+                "interval year to month" => match signature.arguments.as_slice() {
+                    [] => true,
+                    [
+                        A::Long(start @ 0..=1),
+                        A::Long(end @ 0..=1),
+                        A::Long(1..=10),
+                    ] => start <= end,
+                    _ => false,
+                },
+                "interval day to second" => match signature.arguments.as_slice() {
+                    [] => true,
+                    [
+                        A::Long(start @ 2..=5),
+                        A::Long(end @ 2..=5),
+                        A::Long(1..=13),
+                        A::Long(fractional @ 0..=12),
+                    ] => start <= end && (*end == 5 || *fractional == 0),
+                    _ => false,
+                },
                 "array" => matches!(signature.arguments.as_slice(), [A::Type(_)]),
                 "map" => matches!(signature.arguments.as_slice(), [A::Type(_), A::Type(_)]),
                 "row" => signature

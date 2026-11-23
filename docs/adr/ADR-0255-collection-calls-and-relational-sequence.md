@@ -1,5 +1,5 @@
 ---
-id: ADR-0254
+id: ADR-0255
 title: "Collection calls and relational sequence"
 domain: [sql-compiler, sql-language, join-execution, map-semantics]
 status: active

@@ -16,16 +16,27 @@
 -- under the License.
 
 -- @order_sensitive=true
--- @tags=d04,project,date,date_add,months_add,null_semantics
--- Test Objective:
--- 1. Validate invalid datetime and non-numeric interval inputs return NULL for date add variants.
--- 2. Prevent regressions where date_add family throws type errors instead of producing NULL.
--- Test Flow:
--- 1. Execute days_add/date_add/months_add with invalid datetime and interval literals.
--- 2. Assert all outputs are NULL via IS NULL checks.
+-- @tags=d04,project,date,interval,null_semantics
+-- Conversion failures caught by TRY_CAST supply a typed NULL to calendar
+-- arithmetic. Numeric and character operands have no DATE shift overload.
+
+-- query 1
 SELECT
-  DAYS_ADD('abcd', 1) IS NULL AS days_add_invalid_date_is_null_v,
-  DAYS_ADD('2024-01-01', 'x') IS NULL AS days_add_invalid_delta_is_null_v,
-  DATE_ADD('abcd', 1) IS NULL AS date_add_invalid_date_is_null_v,
-  MONTHS_ADD('abcd', 1) IS NULL AS months_add_invalid_date_is_null_v,
-  MONTHS_ADD('2024-01-01', 'x') IS NULL AS months_add_invalid_delta_is_null_v;
+    TRY_CAST('abcd' AS DATE) + INTERVAL '1' DAY AS invalid_day_source,
+    TRY_CAST('abcd' AS DATE) + INTERVAL '1' MONTH AS invalid_month_source,
+    DATE '2024-01-01' + CAST(NULL AS INTERVAL DAY) AS null_delta,
+    DATE '2024-01-31' + INTERVAL '1' MONTH AS next_month,
+    DATE '2024-01-01' + INTERVAL '1' DAY AS next_day,
+    DATE '2024-01-01' - INTERVAL '1' DAY AS previous_day;
+
+-- query 2
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT DATE '2024-01-01' + 'x';
+
+-- query 3
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT DATE '2024-01-01' + 1;
+
+-- query 4
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT DATE '2024-01-01' - 1;

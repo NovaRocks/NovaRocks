@@ -66,6 +66,7 @@ under the License.
 ### 查询与时间旅行
 
 - [时间旅行（`FOR VERSION / TIMESTAMP AS OF`）](time-travel.md)
+- [持久视图的时间精度升级](temporal-view-upgrade.md)
 - [Branch / Tag DDL 与分支写入](branches-and-tags.md)
 - [Metadata Tables（`$snapshots` / `$history` / `$refs` / `$partitions` / ...）](metadata-tables.md)
 

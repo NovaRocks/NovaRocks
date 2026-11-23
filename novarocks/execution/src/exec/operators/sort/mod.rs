@@ -39,7 +39,13 @@ use arrow::datatypes::SchemaRef;
 use arrow::datatypes::{DataType, Field, Fields};
 #[cfg(test)]
 use arrow::record_batch::RecordBatch;
+use arrow_buffer::Buffer;
+#[cfg(test)]
 use arrow_buffer::OffsetBuffer;
+use novarocks_value_arrays::{
+    ValueError, ValueFailure, ValueViolation, decode::PreparedTemporalArray,
+    reachability::ReachableRows,
+};
 use std::sync::Arc;
 
 use novarocks_types::largeint;
@@ -178,6 +184,7 @@ pub(crate) fn normalize_sort_key_array(values: &ArrayRef) -> Result<ArrayRef, So
     normalize_sort_key_array_body::<SortKeyFailure>(
         values,
         SortKeyDeclaration::LegacyExpansion,
+        &ReachableRows::all(values.len()),
         &mut |_| Ok(()),
     )
 }
@@ -188,6 +195,7 @@ pub(crate) enum SortKeyConstruction<'a> {
     FieldTable(usize),
     SharedFields(usize),
     BufferAdoption,
+    ValueBuffer(usize),
     Field {
         source: &'a Field,
         target: &'a DataType,
@@ -276,14 +284,25 @@ pub(crate) fn normalize_sort_key_array_observed<E: From<SortKeyFailure>>(
         SortKeyTypeCheckFailure::Declaration(error) => E::from(SortKeyFailure::Type(error)),
         SortKeyTypeCheckFailure::Observer(error) => error,
     })?;
-    normalize_sort_key_array_body(values, SortKeyDeclaration::Value(declared), observe)
+    normalize_sort_key_array_body(
+        values,
+        SortKeyDeclaration::Value(declared),
+        &ReachableRows::all(values.len()),
+        observe,
+    )
 }
 
 fn normalize_sort_key_array_body<E: From<SortKeyFailure>>(
     values: &ArrayRef,
     declaration: SortKeyDeclaration<'_>,
+    reachable: &ReachableRows<'_>,
     observe: &mut impl FnMut(SortKeyConstruction<'_>) -> Result<(), E>,
 ) -> Result<ArrayRef, E> {
+    if let SortKeyDeclaration::Value(declared) = declaration
+        && let Some(ty) = declared.temporal()
+    {
+        return normalize_temporal_sort_key(values, ty, declared.nullable(), reachable, observe);
+    }
     match values.data_type() {
         DataType::Null => {
             observe(SortKeyConstruction::BufferAdoption)?;
@@ -295,9 +314,19 @@ fn normalize_sort_key_array_body<E: From<SortKeyFailure>>(
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| E::from(SortKeyFailure::PhysicalWrapper("ListArray")))?;
-            let normalized_values =
-                normalize_sort_key_array_body(list.values(), declaration.child(0)?, observe)?;
-            if normalized_values.data_type() == list.values().data_type() {
+            let child_rows = ReachableRows::List32 {
+                parent: reachable,
+                offsets: list.value_offsets(),
+                validity: list.nulls(),
+                child_len: list.values().len(),
+            };
+            let normalized_values = normalize_sort_key_array_body(
+                list.values(),
+                declaration.child(0)?,
+                &child_rows,
+                observe,
+            )?;
+            if Arc::ptr_eq(&normalized_values, list.values()) {
                 return Ok(values.clone());
             }
             observe(SortKeyConstruction::Field {
@@ -313,7 +342,7 @@ fn normalize_sort_key_array_body<E: From<SortKeyFailure>>(
             observe(SortKeyConstruction::BufferAdoption)?;
             let normalized = ListArray::new(
                 normalized_field,
-                OffsetBuffer::new(list.value_offsets().to_vec().into()),
+                list.offsets().clone(),
                 normalized_values,
                 list.nulls().cloned(),
             );
@@ -324,9 +353,19 @@ fn normalize_sort_key_array_body<E: From<SortKeyFailure>>(
                 .as_any()
                 .downcast_ref::<LargeListArray>()
                 .ok_or_else(|| E::from(SortKeyFailure::PhysicalWrapper("LargeListArray")))?;
-            let normalized_values =
-                normalize_sort_key_array_body(list.values(), declaration.child(0)?, observe)?;
-            if normalized_values.data_type() == list.values().data_type() {
+            let child_rows = ReachableRows::List64 {
+                parent: reachable,
+                offsets: list.value_offsets(),
+                validity: list.nulls(),
+                child_len: list.values().len(),
+            };
+            let normalized_values = normalize_sort_key_array_body(
+                list.values(),
+                declaration.child(0)?,
+                &child_rows,
+                observe,
+            )?;
+            if Arc::ptr_eq(&normalized_values, list.values()) {
                 return Ok(values.clone());
             }
             observe(SortKeyConstruction::Field {
@@ -342,7 +381,7 @@ fn normalize_sort_key_array_body<E: From<SortKeyFailure>>(
             observe(SortKeyConstruction::BufferAdoption)?;
             return Ok(Arc::new(LargeListArray::new(
                 normalized_field,
-                OffsetBuffer::new(list.value_offsets().to_vec().into()),
+                list.offsets().clone(),
                 normalized_values,
                 list.nulls().cloned(),
             )) as ArrayRef);
@@ -352,9 +391,20 @@ fn normalize_sort_key_array_body<E: From<SortKeyFailure>>(
                 .as_any()
                 .downcast_ref::<FixedSizeListArray>()
                 .ok_or_else(|| E::from(SortKeyFailure::PhysicalWrapper("FixedSizeListArray")))?;
-            let normalized_values =
-                normalize_sort_key_array_body(list.values(), declaration.child(0)?, observe)?;
-            if normalized_values.data_type() == list.values().data_type() {
+            let child_rows = ReachableRows::FixedSizeList {
+                parent: reachable,
+                width: *width as usize,
+                child_start: 0,
+                validity: list.nulls(),
+                child_len: list.values().len(),
+            };
+            let normalized_values = normalize_sort_key_array_body(
+                list.values(),
+                declaration.child(0)?,
+                &child_rows,
+                observe,
+            )?;
+            if Arc::ptr_eq(&normalized_values, list.values()) {
                 return Ok(values.clone());
             }
             observe(SortKeyConstruction::Field {
@@ -382,10 +432,17 @@ fn normalize_sort_key_array_body<E: From<SortKeyFailure>>(
             let mut changed = false;
             observe(SortKeyConstruction::ArrayTable(struct_arr.num_columns()))?;
             let mut normalized_columns = Vec::with_capacity(struct_arr.num_columns());
+            let child_rows = struct_arr
+                .nulls()
+                .map_or(*reachable, |validity| reachable.masked(validity));
             for (index, column) in struct_arr.columns().iter().enumerate() {
-                let normalized =
-                    normalize_sort_key_array_body(column, declaration.child(index)?, observe)?;
-                changed |= normalized.data_type() != column.data_type();
+                let normalized = normalize_sort_key_array_body(
+                    column,
+                    declaration.child(index)?,
+                    &child_rows,
+                    observe,
+                )?;
+                changed |= !Arc::ptr_eq(&normalized, column);
                 normalized_columns.push(normalized);
             }
             if !changed {
@@ -424,9 +481,19 @@ fn normalize_sort_key_array_body<E: From<SortKeyFailure>>(
             observe(SortKeyConstruction::ArrayTable(map.entries().num_columns()))?;
             observe(SortKeyConstruction::ArrayHeader(map.entries().data_type()))?;
             let entries = Arc::new(map.entries().clone()) as ArrayRef;
-            let normalized_entries =
-                normalize_sort_key_array_body(&entries, declaration.map_entries()?, observe)?;
-            if normalized_entries.data_type() == entries.data_type() {
+            let child_rows = ReachableRows::List32 {
+                parent: reachable,
+                offsets: map.value_offsets(),
+                validity: map.nulls(),
+                child_len: entries.len(),
+            };
+            let normalized_entries = normalize_sort_key_array_body(
+                &entries,
+                declaration.map_entries()?,
+                &child_rows,
+                observe,
+            )?;
+            if Arc::ptr_eq(&normalized_entries, &entries) {
                 return Ok(values.clone());
             }
             observe(SortKeyConstruction::ArrayTable(map.entries().num_columns()))?;
@@ -448,7 +515,7 @@ fn normalize_sort_key_array_body<E: From<SortKeyFailure>>(
             observe(SortKeyConstruction::BufferAdoption)?;
             let normalized = MapArray::new(
                 normalized_field,
-                OffsetBuffer::new(map.value_offsets().to_vec().into()),
+                map.offsets().clone(),
                 normalized_entries,
                 map.nulls().cloned(),
                 *ordered,
@@ -494,6 +561,78 @@ fn normalize_sort_key_array_body<E: From<SortKeyFailure>>(
         .with_precision_and_scale(38, 0)
         .map_err(|source| E::from(SortKeyFailure::Arrow(source)))?;
     Ok(Arc::new(decimal) as ArrayRef)
+}
+
+fn normalize_temporal_sort_key<E: From<SortKeyFailure>>(
+    values: &ArrayRef,
+    declaration: novarocks_type_contract::TemporalType,
+    nullable: bool,
+    reachable: &ReachableRows<'_>,
+    observe: &mut impl FnMut(SortKeyConstruction<'_>) -> Result<(), E>,
+) -> Result<ArrayRef, E> {
+    const WIDTH: usize = 12;
+    let source = PreparedTemporalArray::bind(declaration, values.as_ref(), nullable)
+        .map_err(SortKeyFailure::Value)?;
+    if matches!(
+        values.data_type(),
+        DataType::Int32 | DataType::Int64 | DataType::Timestamp(_, None)
+    ) {
+        // Every compact temporal carrier already has the signed ordering of
+        // the exact relation key. Validate the reached values and borrow the
+        // original buffer rather than materializing a wider sort-only column.
+        reachable
+            .for_each(&mut |row| {
+                observe(SortKeyConstruction::Work(1))?;
+                source.value(row).map_err(SortKeyFailure::Value)?;
+                Ok(())
+            })
+            .map_err(|error| match error {
+                ValueFailure::Caller(error) => error,
+                ValueFailure::Value(error) => E::from(SortKeyFailure::Value(error)),
+            })?;
+        return Ok(Arc::clone(values));
+    }
+    let count = values
+        .len()
+        .checked_mul(WIDTH)
+        .ok_or_else(|| SortKeyFailure::Value(ValueError::invariant(ValueViolation::Bounds)))?;
+    observe(SortKeyConstruction::ValueBuffer(count))?;
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(count).map_err(|source| {
+        SortKeyFailure::Value(ValueError::Allocation {
+            requested: count,
+            source,
+        })
+    })?;
+    for remaining in (0..count).step_by(4096) {
+        let end = remaining.saturating_add(4096).min(count);
+        observe(SortKeyConstruction::Work(end - remaining))?;
+        buffer.resize(end, 0);
+    }
+    reachable
+        .for_each(&mut |row| {
+            observe(SortKeyConstruction::Work(1))?;
+            if let Some(key) = source.relation_key(row).map_err(SortKeyFailure::Value)? {
+                let start = row * WIDTH;
+                buffer[start..start + WIDTH].copy_from_slice(&key.order_bytes());
+            }
+            Ok(())
+        })
+        .map_err(|error| match error {
+            ValueFailure::Caller(error) => error,
+            ValueFailure::Value(error) => E::from(SortKeyFailure::Value(error)),
+        })?;
+    observe(SortKeyConstruction::BufferAdoption)?;
+    observe(SortKeyConstruction::ArrayHeader(
+        &DataType::FixedSizeBinary(WIDTH as i32),
+    ))?;
+    let sorted = FixedSizeBinaryArray::try_new(
+        WIDTH as i32,
+        Buffer::from_vec(buffer),
+        values.nulls().cloned(),
+    )
+    .map_err(SortKeyFailure::Arrow)?;
+    Ok(Arc::new(sorted))
 }
 
 #[cfg(test)]
@@ -547,6 +686,35 @@ mod tests {
     use arrow::array::{Int32Builder, ListBuilder, StringArray};
     use arrow::compute::lexsort_to_indices;
     use novarocks_types::SlotId;
+
+    #[test]
+    fn compact_temporal_sort_reuses_the_validated_original_buffer() {
+        use arrow::array::TimestampMicrosecondArray;
+        use novarocks_type_contract::{TemporalPrecision, TemporalType};
+        let values: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(-1000),
+            None,
+            Some(1),
+        ]));
+        let declaration = TemporalType::Timestamp(TemporalPrecision::DEFAULT);
+        let selected = ReachableRows::Range {
+            len: 3,
+            start: 0,
+            end: 2,
+        };
+        let mut observe = |step: SortKeyConstruction<'_>| -> Result<(), SortKeyFailure> {
+            assert!(matches!(step, SortKeyConstruction::Work(_)));
+            Ok(())
+        };
+        let sorted =
+            normalize_temporal_sort_key(&values, declaration, true, &selected, &mut observe)
+                .unwrap();
+        assert!(Arc::ptr_eq(&values, &sorted));
+        let all = ReachableRows::All { len: 3 };
+        assert!(
+            normalize_temporal_sort_key(&values, declaration, true, &all, &mut observe).is_err()
+        );
+    }
 
     fn decimal_chunk(precision: u8, scale: i8, value: i128) -> Chunk {
         let data_type = DataType::Decimal128(precision, scale);

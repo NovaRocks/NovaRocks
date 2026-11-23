@@ -545,7 +545,7 @@ fn complete_system_read_uses_actual_metadata_schema_kind_evidence_and_execution_
         IcebergSystemTableType::Refs,
         IcebergSystemTableType::Manifests,
     ] {
-        let fixture = system_fixture(kind);
+        let fixture = published(&system_fixture(kind));
         assert_eq!(fixture.fields.len(), fixture.columns.len());
         assert!(fixture.fields.len() > 1);
         assert!(!fixture.source.coverage_evidence().is_empty());

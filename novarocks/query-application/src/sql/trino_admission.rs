@@ -132,6 +132,7 @@ pub enum TrinoSessionAction {
         name: ast::ObjectName,
         span: Span,
     },
+    SetTimeZone(ast::TrinoSetTimeZone),
 }
 
 /// Source-bearing requests to the owning preparation path. These values
@@ -474,7 +475,7 @@ pub fn admit_trino_statement(
         Statement::ShowFunctions(_) => return unsupported("SHOW FUNCTIONS"),
         Statement::ShowSession(_) => return unsupported("SHOW SESSION"),
         Statement::SetPath(_) => return unsupported("SET PATH"),
-        Statement::SetTimeZone(_) => return unsupported("SET TIME ZONE"),
+        Statement::SetTimeZone(node) => Session(TrinoSessionAction::SetTimeZone(node)),
         Statement::Prepare(_) => return unsupported("PREPARE"),
         Statement::Deallocate(_) => return unsupported("DEALLOCATE PREPARE"),
         Statement::Execute(_) => return unsupported("EXECUTE"),
@@ -799,6 +800,31 @@ mod tests {
     }
 
     #[test]
+    fn set_time_zone_admits_the_original_expression_or_local() {
+        let sql = "  SET TIME ZONE INTERVAL '-05:30' HOUR TO MINUTE";
+        let TrinoStatementAction::Session(TrinoSessionAction::SetTimeZone(node)) =
+            admit(sql).unwrap()
+        else {
+            panic!("original SET TIME ZONE")
+        };
+        assert!(matches!(
+            node.time_zone,
+            Some(ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::Interval(_),
+                ..
+            }))
+        ));
+        assert_eq!((node.span.start(), node.span.end()), (2, sql.len()));
+        assert!(matches!(
+            admit("SET TIME ZONE LOCAL").unwrap(),
+            TrinoStatementAction::Session(TrinoSessionAction::SetTimeZone(ast::TrinoSetTimeZone {
+                time_zone: None,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
     fn show_create_materialized_view_is_a_read_preparation() {
         assert!(matches!(
             admit("SHOW CREATE MATERIALIZED VIEW db.v").unwrap(),
@@ -819,7 +845,6 @@ mod tests {
             ("CREATE ROLE reader", "CREATE ROLE"),
             ("PREPARE q FROM SELECT 1", "PREPARE"),
             ("EXECUTE q", "EXECUTE"),
-            ("SET TIME ZONE LOCAL", "SET TIME ZONE"),
             ("SET PATH a.b", "SET PATH"),
             ("START TRANSACTION READ ONLY", "START TRANSACTION"),
             ("SHOW STATS FOR (SELECT 1)", "SHOW STATS FOR a query"),

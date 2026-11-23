@@ -618,10 +618,10 @@ fn execute_admitted_alter_schema(
     operation: novarocks_spi::connector::ConnectorCatalogMutationOperation,
     context: novarocks_spi::connector::ConnectorRequestContext,
     guard: impl FnOnce(&novarocks_spi::connector::ConnectorControlPlanningPin) -> Result<(), String>,
-) -> Result<crate::connector::mutation::CompletedCatalogMutation, String> {
+) -> Result<crate::connector::mutation::CompletedCatalogMutation, CommandError> {
     let planning = controls
         .acquire_current(instance_id)
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::connector::mutation::command_error_from_connector)?;
     execute_admitted_table_mutation_on_pin(&planning, operation, context, guard)
 }
 
@@ -630,14 +630,14 @@ fn execute_admitted_table_mutation_on_pin(
     operation: ConnectorCatalogMutationOperation,
     context: ConnectorRequestContext,
     guard: impl FnOnce(&ConnectorControlPlanningPin) -> Result<(), String>,
-) -> Result<crate::connector::mutation::CompletedCatalogMutation, String> {
+) -> Result<crate::connector::mutation::CompletedCatalogMutation, CommandError> {
     let mutation = planning
         .derive_mutation_lease()
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::connector::mutation::command_error_from_connector)?;
     let operation_id = novarocks_spi::connector::ConnectorMutationOperationId::new();
     mutation
         .admit_operation(operation_id, operation.clone(), context.clone())
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::connector::mutation::command_error_from_connector)?;
     guard(planning)?;
     crate::connector::mutation::execute_catalog_mutation_with_lease(
         &mutation,
@@ -1167,6 +1167,7 @@ mod tests {
 
     #[test]
     fn schema_alter_admission_refusal_precedes_metadata_guards_and_dispatch() {
+        use novarocks_failure_contract::FailureProjection;
         for kind in [
             spi::ConnectorErrorKind::Unsupported,
             spi::ConnectorErrorKind::Cancelled,
@@ -1184,10 +1185,9 @@ mod tests {
                 |planning| schema_alter_metadata_guard(planning, &operation, &context),
             )
             .unwrap_err();
-            assert_eq!(
-                error,
-                spi::ConnectorError::new(kind, "original provider admission").to_string()
-            );
+            let original = error.failure_cause().unwrap();
+            assert_eq!(original.failure_fact(), kind.failure_fact());
+            assert!(original.detail().contains("original provider admission"));
             assert_eq!(controls.acquired.load(Ordering::Acquire), 1);
             assert_eq!(*capability.calls.lock().unwrap(), [(1, "admit")]);
             assert_eq!(capability.operation_ids.lock().unwrap().len(), 1);
@@ -1232,7 +1232,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            error,
+            error.to_string(),
             spi::ConnectorError::new(
                 spi::ConnectorErrorKind::PermissionDenied,
                 "metadata guard refused"

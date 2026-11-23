@@ -3543,7 +3543,7 @@ fn validate_provider_properties(
                     .expect("validated provider ordinal always fits usize");
                 !scheme
                     .algorithm
-                    .supports_partition_key(need.columns[ordinal].engine_type.data_type())
+                    .supports_partition_value_type(&need.columns[ordinal].engine_type)
             }) {
                 return Err(CompletionProtocolError::ProviderPartitionSchemeInvalid {
                     id: need.id,
@@ -3574,7 +3574,7 @@ fn validate_provider_properties(
                     .expect("validated provider ordinal always fits usize");
                 !scheme
                     .hash
-                    .supports_partition_key(need.columns[ordinal].engine_type.data_type())
+                    .supports_partition_value_type(&need.columns[ordinal].engine_type)
             }) {
                 return Err(CompletionProtocolError::ProviderPartitionSchemeInvalid {
                     id: need.id,

@@ -19,8 +19,8 @@ use super::aggregate_map_source_failure as failure;
 use crate::KernelFailure;
 use crate::aggregate_scalar::checked_map_output_offset;
 use crate::aggregate_scalar::{
-    AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue, build_scalar_array,
-    tracked_scalar_from_array, tracked_scalar_to_output,
+    AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue,
+    build_typed_scalar_array, tracked_scalar_from_typed_array, tracked_scalar_to_output,
 };
 use crate::aggregate_scalar_fingerprint::tracked_key_fingerprint;
 use allocator_api2::vec::Vec as ScalarVec;
@@ -29,6 +29,7 @@ use arrow_buffer::OffsetBuffer;
 use arrow_cast::cast;
 use arrow_schema::{DataType, Field, Fields};
 use hashbrown::{HashSet, hash_map::DefaultHashBuilder};
+use novarocks_type_contract::ValueTypeRef;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -127,10 +128,8 @@ pub fn update_row<A: ScalarStateAllocator>(
 ) -> Result<(), KernelFailure> {
     update_from_arrays_observed(
         state,
-        &input.keys,
-        row,
-        &input.values,
-        row,
+        (&input.keys, row, None),
+        (&input.values, row, None),
         work,
         &mut |_| Ok(()),
     )
@@ -138,18 +137,24 @@ pub fn update_row<A: ScalarStateAllocator>(
 /// Distinct actual carrier addresses preserve Column, Selected and Constant inputs.
 pub fn update_from_arrays_observed<A: ScalarStateAllocator>(
     state: &mut MapAggState<A>,
-    keys: &ArrayRef,
-    key_row: usize,
-    values: &ArrayRef,
-    value_row: usize,
+    (keys, key_row, key_declaration): (&ArrayRef, usize, Option<&ValueTypeRef>),
+    (values, value_row, value_declaration): (&ArrayRef, usize, Option<&ValueTypeRef>),
     work: &mut ScalarWork<'_, '_>,
     inserted_key: &mut dyn FnMut(usize) -> Result<(), KernelFailure>,
 ) -> Result<(), KernelFailure> {
     work.step()?;
-    let Some(key) = tracked_scalar_from_array(keys, key_row, &state.allocator, work)? else {
+    let Some(key) =
+        tracked_scalar_from_typed_array(keys, key_row, key_declaration, &state.allocator, work)?
+    else {
         return Ok(());
     };
-    let value = tracked_scalar_from_array(values, value_row, &state.allocator, work)?;
+    let value = tracked_scalar_from_typed_array(
+        values,
+        value_row,
+        value_declaration,
+        &state.allocator,
+        work,
+    )?;
     append_entry_observed(state, key, value, work, inserted_key)
 }
 pub struct MapMergeInput<'a> {
@@ -174,12 +179,13 @@ pub fn merge_row<A: ScalarStateAllocator>(
     row: usize,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<(), KernelFailure> {
-    merge_row_observed(state, input, row, work, &mut |_| Ok(()))
+    merge_row_observed(state, input, row, None, work, &mut |_| Ok(()))
 }
 pub fn merge_row_observed<A: ScalarStateAllocator>(
     state: &mut MapAggState<A>,
     input: &MapMergeInput<'_>,
     row: usize,
+    declaration: Option<&ValueTypeRef>,
     work: &mut ScalarWork<'_, '_>,
     inserted_key: &mut dyn FnMut(usize) -> Result<(), KernelFailure>,
 ) -> Result<(), KernelFailure> {
@@ -190,12 +196,27 @@ pub fn merge_row_observed<A: ScalarStateAllocator>(
     let offsets = input.map.value_offsets();
     let start = offsets[row] as usize;
     let end = offsets[row + 1] as usize;
+    let key_declaration = declaration.and_then(|value| value.child_type_at(0));
+    let value_declaration = declaration.and_then(|value| value.child_type_at(1));
     for idx in start..end {
         work.step()?;
-        let Some(key) = tracked_scalar_from_array(&input.keys, idx, &state.allocator, work)? else {
+        let Some(key) = tracked_scalar_from_typed_array(
+            &input.keys,
+            idx,
+            key_declaration,
+            &state.allocator,
+            work,
+        )?
+        else {
             continue;
         };
-        let value = tracked_scalar_from_array(&input.values, idx, &state.allocator, work)?;
+        let value = tracked_scalar_from_typed_array(
+            &input.values,
+            idx,
+            value_declaration,
+            &state.allocator,
+            work,
+        )?;
         append_entry_observed(state, key, value, work, inserted_key)?;
     }
     Ok(())
@@ -208,10 +229,11 @@ pub fn build_array<'state, A: ScalarStateAllocator + 'state, I>(
 where
     I: ExactSizeIterator<Item = &'state MapAggState<A>>,
 {
-    build_array_checked_states(target_type, group_states.map(Ok), work)
+    build_array_checked_states(target_type, None, group_states.map(Ok), work)
 }
 pub fn build_array_checked_states<'state, A: ScalarStateAllocator + 'state, I>(
     target_type: &DataType,
+    declaration: Option<&ValueTypeRef>,
     group_states: I,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<ArrayRef, KernelFailure>
@@ -245,8 +267,18 @@ where
         current = next;
         offsets.push(current);
     }
-    let mut out_keys = build_scalar_array(key_type, key_values, work)?;
-    let mut out_values = build_scalar_array(value_type, value_values, work)?;
+    let mut out_keys = build_typed_scalar_array(
+        key_type,
+        declaration.and_then(|value| value.child_type_at(0)),
+        key_values,
+        work,
+    )?;
+    let mut out_values = build_typed_scalar_array(
+        value_type,
+        declaration.and_then(|value| value.child_type_at(1)),
+        value_values,
+        work,
+    )?;
     if out_keys.data_type() != field_defs[0].data_type() {
         work.flush()?;
         out_keys = cast(&out_keys, field_defs[0].data_type()).map_err(failure::constructor)?;

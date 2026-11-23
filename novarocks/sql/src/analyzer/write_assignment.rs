@@ -21,7 +21,7 @@
 
 use crate::analysis::TypedExpr;
 use crate::analyze_error::AnalyzeError;
-use crate::compiler::{SqlCompileError, SqlWriteAssignmentSite};
+use crate::compiler::{SqlCompileControl, SqlCompileError, SqlWriteAssignmentSite};
 use novarocks_parser::Span;
 use novarocks_type_contract::{CheckedWriteInputProjection, CompilePhase, PureCompileControl};
 
@@ -32,82 +32,112 @@ impl super::AnalyzerContext<'_> {
         site: &SqlWriteAssignmentSite,
         span: Span,
     ) -> Result<TypedExpr, AnalyzeError> {
-        let related = |source: &TypedExpr| {
-            CheckedWriteInputProjection::try_new_observed(
-                source.value_type.typed_binding().borrowed(),
-                site.input().typed_binding().borrowed(),
-                site.storage().map(|ty| ty.typed_binding().borrowed()),
-                || {
-                    self.control
-                        .checkpoint(CompilePhase::Validate, 1)
-                        .map_err(AnalyzeError::control)
-                },
-            )
-            .map(|proof| proof.is_some())
-        };
-        // Preserve Fixed(m), actual NULL declarations and original constant
-        // ownership whenever only the licensed write projection remains.
-        if related(&source)? {
-            return Ok(source);
+        bind_write_assignment_value(
+            source,
+            site,
+            span,
+            self.function_catalog,
+            &self.sql_semantics,
+            self.constant_policy,
+            self.control,
+        )
+    }
+}
+
+pub(crate) fn bind_write_assignment_value(
+    source: TypedExpr,
+    site: &SqlWriteAssignmentSite,
+    span: Span,
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    settings: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &SqlCompileControl,
+) -> Result<TypedExpr, AnalyzeError> {
+    let related = |source: &TypedExpr| {
+        CheckedWriteInputProjection::try_new_observed(
+            source.value_type.typed_binding().borrowed(),
+            site.input().typed_binding().borrowed(),
+            site.storage().map(|ty| ty.typed_binding().borrowed()),
+            || {
+                control
+                    .checkpoint(CompilePhase::Validate, 1)
+                    .map_err(AnalyzeError::control)
+            },
+        )
+        .map(|proof| proof.is_some())
+    };
+    // Preserve Fixed(m), actual NULL declarations and original constant
+    // ownership whenever only the licensed write projection remains.
+    if related(&source)? {
+        return Ok(source);
+    }
+    // Exact writer declarations cannot smuggle a byte-width conversion
+    // through ordinary safe CAST, which would turn bad widths into NULL.
+    let mut fixed_target = false;
+    novarocks_type_contract::visit_value_type_observed(site.input().value_type(), |event| {
+        control
+            .checkpoint(CompilePhase::Validate, 1)
+            .map_err(AnalyzeError::control)?;
+        if let novarocks_type_contract::ValueSemanticVisit::Node(value) = event {
+            fixed_target |= matches!(
+                value.kind(),
+                novarocks_type_contract::ValueKind::Scalar(
+                    arrow::datatypes::DataType::FixedSizeBinary(_)
+                )
+            );
         }
-        // Exact writer declarations cannot smuggle a byte-width conversion
-        // through ordinary safe CAST, which would turn bad widths into NULL.
-        let mut fixed_target = false;
-        novarocks_type_contract::visit_value_type_observed(site.input().value_type(), |event| {
-            self.control
-                .checkpoint(CompilePhase::Validate, 1)
-                .map_err(AnalyzeError::control)?;
-            if let novarocks_type_contract::ValueSemanticVisit::Node(value) = event {
-                fixed_target |= matches!(
-                    value.kind(),
-                    novarocks_type_contract::ValueKind::Scalar(
-                        arrow::datatypes::DataType::FixedSizeBinary(_)
-                    )
-                );
-            }
-            Ok::<_, AnalyzeError>(())
-        })?;
-        if fixed_target {
+        Ok::<_, AnalyzeError>(())
+    })?;
+    if fixed_target {
+        return Err(AnalyzeError::type_mismatch(
+            "fixed write assignment requires its explicit signed byte projection",
+            span,
+        ));
+    }
+    if let Some(storage) = site.storage() {
+        let projection = CheckedWriteInputProjection::try_new_observed(
+            storage.typed_binding().borrowed(),
+            site.input().typed_binding().borrowed(),
+            Some(storage.typed_binding().borrowed()),
+            || {
+                control
+                    .checkpoint(CompilePhase::Validate, 1)
+                    .map_err(AnalyzeError::control)
+            },
+        )?
+        .ok_or_else(|| AnalyzeError::internal("validated write declaration lost its projection"))?;
+        if pending_fixed_projection(
+            source.value_type.typed_binding().borrowed(),
+            projection,
+            control,
+        )? {
             return Err(AnalyzeError::type_mismatch(
-                "fixed write assignment requires its explicit signed byte projection",
+                "ordinary nested conversion cannot precede its licensed fixed byte projection",
                 span,
             ));
         }
-        if let Some(storage) = site.storage() {
-            let projection = CheckedWriteInputProjection::try_new_observed(
-                storage.typed_binding().borrowed(),
-                site.input().typed_binding().borrowed(),
-                Some(storage.typed_binding().borrowed()),
-                || {
-                    self.control
-                        .checkpoint(CompilePhase::Validate, 1)
-                        .map_err(AnalyzeError::control)
-                },
-            )?
-            .ok_or_else(|| {
-                AnalyzeError::internal("validated write declaration lost its projection")
-            })?;
-            if pending_fixed_projection(
-                source.value_type.typed_binding().borrowed(),
-                projection,
-                self.control,
-            )? {
-                return Err(AnalyzeError::type_mismatch(
-                    "ordinary nested conversion cannot precede its licensed fixed byte projection",
-                    span,
-                ));
-            }
-        }
-        // Reuse the neutral declaration-widening author for a truthful SOURCE
-        // conversion target. W itself retains its signed requiredness.
-        // Normal literal constructors may choose tighter non-NULL promises.
-        let target = super::declaration_widening::widen_declaration(site.input(), self.control)
-            .map_err(original_analysis_error)?;
-        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
-            self.control,
-            CompilePhase::Validate,
-        )
-        .map_err(AnalyzeError::control)?;
+    }
+    // Reuse the neutral declaration-widening author for a truthful SOURCE
+    // conversion target. W itself retains its signed requiredness.
+    // Normal literal constructors may choose tighter non-NULL promises.
+    let target = super::declaration_widening::widen_declaration(site.input(), control)
+        .map_err(original_analysis_error)?;
+    use novarocks_functions::builtin::value_conversion::temporal_write_assignment_matches;
+    let converted = if temporal_write_assignment_matches(&source.value_type, &target, control)
+        .map_err(AnalyzeError::function_binding)?
+    {
+        bind_nested_temporal_assignment(
+            source,
+            target,
+            catalog,
+            settings,
+            constant_policy,
+            control,
+        )?
+    } else {
+        let mut work =
+            novarocks_type_contract::CompileCheckpoints::try_new(control, CompilePhase::Validate)
+                .map_err(AnalyzeError::control)?;
         let compatible = novarocks_type_contract::trino_can_store_assign(
             source.value_type.value_type(),
             target.value_type(),
@@ -125,20 +155,85 @@ impl super::AnalyzerContext<'_> {
                 span,
             ));
         }
-        let converted = self.cast_with_trino_mode(
+        super::value_conversion::cast_with_trino_mode(
             source,
             target,
             novarocks_type_contract::TrinoCastMode::StoreAssignment,
             span,
-        )?;
-        if !related(&converted)? {
-            return Err(AnalyzeError::type_mismatch(
-                "ordinary assignment conversion cannot satisfy the signed write projection",
-                span,
-            ));
-        }
-        Ok(converted)
+            catalog,
+            settings,
+            constant_policy,
+            control,
+            false,
+        )?
+    };
+    if !related(&converted)? {
+        return Err(AnalyzeError::type_mismatch(
+            "ordinary assignment conversion cannot satisfy the signed write projection",
+            span,
+        ));
     }
+    Ok(converted)
+}
+
+fn bind_nested_temporal_assignment(
+    source: TypedExpr,
+    target: novarocks_type_contract::FunctionValueType,
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    settings: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &SqlCompileControl,
+) -> Result<TypedExpr, AnalyzeError> {
+    use crate::analysis::{ExprKind, function_argument};
+    use novarocks_functions::FunctionBindingRequest;
+    use novarocks_functions::builtin::value_conversion as owner;
+    use novarocks_type_contract::{FunctionId, FunctionOverloadId};
+
+    let argument = function_argument(&source, constant_policy, control)
+        .map_err(AnalyzeError::function_binding)?;
+    let function = FunctionId::try_new(owner::VALUE_CONVERSION_FUNCTION_ID)
+        .map_err(|error| AnalyzeError::internal(error.to_string()))?;
+    let overload = FunctionOverloadId::try_new(owner::TEMPORAL_WRITE_ASSIGNMENT)
+        .map_err(|error| AnalyzeError::internal(error.to_string()))?;
+    let resolved = catalog
+        .finish_scalar_binding(
+            &function,
+            &overload,
+            FunctionBindingRequest {
+                arguments: std::slice::from_ref(&argument),
+                logical_argument_count: 1,
+                expected_result_type: Some(&target),
+            },
+            control,
+        )
+        .map_err(AnalyzeError::function_binding)?;
+    let volatility = resolved.semantics.volatility;
+    let binding = crate::binding::SqlFunctionBinding::new_with_temporal_constraint(
+        resolved,
+        settings.sql_mode().decimal_overflow_policy(),
+        target.clone(),
+        target.nullable(),
+    );
+    Ok(TypedExpr {
+        value_type: target,
+        kind: ExprKind::FunctionCall {
+            name: owner::VALUE_CONVERSION_NAME.into(),
+            args: vec![source].into(),
+            distinct: false,
+            binding,
+            volatility,
+        },
+    })
+}
+
+pub(crate) fn write_assignment_site_for_column(
+    ordinal: usize,
+    column: &novarocks_types::schema::ColumnDef,
+    storage: Option<novarocks_type_contract::FunctionValueType>,
+    control: &SqlCompileControl,
+) -> Result<SqlWriteAssignmentSite, SqlCompileError> {
+    let input = super::helpers::column_value_type(column, control)?;
+    SqlWriteAssignmentSite::try_new(ordinal, input, storage, control)
 }
 
 impl super::AnalyzerContext<'_> {

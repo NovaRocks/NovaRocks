@@ -17,15 +17,23 @@
 
 -- @order_sensitive=true
 -- @tags=project,cast,time
--- Test Objective:
--- 1. Validate CAST(... AS TIME) literal parsing semantics.
--- 2. Distinguish direct string-to-time cast from datetime-to-time cast path.
--- Test Flow:
--- 1. Cast canonical and extended-hour time strings.
--- 2. Cast datetime/date values to TIME.
--- 3. Assert deterministic scalar output.
+-- TIME defaults to millisecond precision. A parsed timestamp can project its
+-- clock at an explicit precision. TRY_CAST captures invalid time text.
+
+-- query 1
 SELECT
-  CAST('00:00:00' AS TIME) AS t0,
-  CAST('1970-01-01 01:01:01' AS TIME) AS t_dt_literal,
-  CAST(CAST('1970-01-01 01:01:01' AS TIMESTAMP(6)) AS TIME) AS t_from_datetime,
-  CAST(CAST('2020-01-02' AS DATE) AS TIME) AS t_from_date;
+    CAST('00:00:00' AS TIME) AS t0,
+    TRY_CAST('1970-01-01 01:01:01' AS TIME) AS t_dt_literal,
+    CAST(TIMESTAMP '1970-01-01 01:01:01.000000' AS TIME(6)) AS t_from_datetime;
+
+-- query 2
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT CAST(DATE '2020-01-02' AS TIME);
+
+-- query 3
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('1970-01-01 01:01:01' AS TIME);
+
+-- query 4
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('24:00:00' AS TIME);

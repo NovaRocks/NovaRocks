@@ -43,7 +43,9 @@ impl NumericArgument {
     fn from_type(value: &FunctionValueType) -> Result<Self, FunctionBindingError> {
         use ArithmeticSignature::*;
 
-        if value.logical_type() != ValueLogicalType::Physical {
+        if value.logical_type() != ValueLogicalType::Physical
+            || value.value_type().temporal().is_some()
+        {
             return Err(FunctionBindingError::NoMatchingOverload);
         }
         Ok(match value.data_type() {

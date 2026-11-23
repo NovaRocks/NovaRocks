@@ -235,8 +235,14 @@ fn unixtime_utf8_constant_format_proof_preserves_normal_null_128_129_and_expansi
 #[test]
 fn unixtime_prepare_names_missing_local_author_declared_raw_errors_and_original_format_panic_shapes()
  {
-    for zone in [None, Some("local"), Some("bad-zone")] {
-        assert!(one_kernel(zone, &CompileControl::default()).is_err());
+    assert!(one_kernel(None, &CompileControl::default()).is_err());
+    for zone in ["local", "bad-zone"] {
+        assert!(matches!(
+            one_kernel(Some(zone), &CompileControl::default()),
+            Err(crate::FunctionSpecializationFailure::InvalidInput(
+                "invalid statement time zone"
+            ))
+        ));
     }
     let constant = format(Some("%Y"));
     for source in [

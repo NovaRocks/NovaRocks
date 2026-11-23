@@ -668,6 +668,7 @@ pub fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, String> {
         SqlType::DateTime => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         SqlType::DateTimeNs => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
         SqlType::Time => Ok(DataType::Time64(TimeUnit::Microsecond)),
+        SqlType::Temporal(ty) => Ok(ty.carrier()),
         SqlType::Decimal { precision, scale } => Ok(DataType::Decimal128(*precision, *scale)),
         SqlType::Array(inner) => Ok(DataType::List(Arc::new(sql_type_to_arrow_field(
             "item", inner, true,

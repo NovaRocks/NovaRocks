@@ -1,0 +1,14 @@
+-- query 2
+-- types	bigint
+snapshots
+1
+
+-- query 4
+-- types	bigint
+snapshots
+1
+
+-- query 5
+-- types	bigint
+persisted_rows
+1

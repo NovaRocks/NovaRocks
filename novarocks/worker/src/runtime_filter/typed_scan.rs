@@ -252,6 +252,7 @@ fn artifact_scalar(value: &ConnectorValue) -> Option<ConnectorScalarValue> {
         | ConnectorValue::TimeMicros(_)
         | ConnectorValue::TimestampTzMicros(_)
         | ConnectorValue::TimestampTzNanos(_)
+        | ConnectorValue::Temporal { .. }
         | ConnectorValue::Varbinary(_)
         | ConnectorValue::Uuid(_)
         | ConnectorValue::Fixed(_) => None,

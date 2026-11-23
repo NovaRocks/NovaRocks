@@ -178,6 +178,7 @@ impl Fixture {
             source,
             mutation,
             staged: self.live.clone(),
+            statement_time: crate::application::test_statement_time(),
             registry: Arc::clone(&self.registry),
             interpreter: Arc::new(
                 crate::query_execution::required_constant_eval::test_required_constant_interpreter(
@@ -524,6 +525,107 @@ fn parse_session_action(source: &str) -> (StatementKind, TrinoSessionWork) {
         panic!("expected an admitted session action");
     };
     lower_trino_session_action(action)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trino_set_time_zone_uses_original_scoped_constants_and_effects() {
+    use novarocks_query_application::session_effects::SessionEffects;
+    use novarocks_type_contract::TimeZoneKey;
+
+    for (source, expected_zone, expected_error) in [
+        ("SET TIME ZONE 'GMT+0'", Some("UTC"), None),
+        ("SET TIME ZONE '+' || '14:00'", Some("+14:00"), None),
+        (
+            "SET TIME ZONE INTERVAL '-05:30' HOUR TO MINUTE",
+            Some("-05:30"),
+            None,
+        ),
+        ("SET TIME ZONE LOCAL", None, None),
+        ("SET TIME ZONE 42", None, Some("sql.analyze.type_mismatch")),
+        (
+            "SET TIME ZONE INTERVAL '1' MONTH",
+            None,
+            Some("sql.analyze.type_mismatch"),
+        ),
+        (
+            "SET TIME ZONE INTERVAL '00:00:01' HOUR TO SECOND",
+            None,
+            Some("sql.analyze.invalid_literal"),
+        ),
+        (
+            "SET TIME ZONE INTERVAL '00:00:00.0000001' HOUR TO SECOND",
+            Some("UTC"),
+            None,
+        ),
+        (
+            "SET TIME ZONE INTERVAL '00:00:00.0000001' HOUR TO SECOND(7)",
+            None,
+            Some("sql.analyze.invalid_literal"),
+        ),
+        (
+            "SET TIME ZONE INTERVAL '14:01' HOUR TO MINUTE",
+            None,
+            Some("query.execution.invalid_function_argument"),
+        ),
+    ] {
+        let mut fixture = Fixture::new(ResultCapacityConfig::V1);
+        let original = TimeZoneKey::parse("Asia/Shanghai").unwrap();
+        let original_effects: SessionEffects = fixture
+            .registry
+            .prepare_trino_time_zone(Some(original))
+            .unwrap();
+        fixture.live.apply_effects(&original_effects).unwrap();
+
+        let (kind, TrinoSessionWork::Mutation(mutation)) = parse_session_action(source) else {
+            panic!("SET TIME ZONE must use the original mutation action");
+        };
+        assert_eq!(kind, StatementKind::SetTimeZone);
+        let mut tail = fixture.tail();
+        tail.start(fixture.mutation_input(
+            Arc::from(source),
+            SessionPropertyMutation {
+                mutation: Box::new(mutation),
+                catalogs: Arc::new(SystemOnly),
+            },
+            SqlCompileControl::unbounded(),
+        ));
+        closed(&mut tail).await;
+        match (tail.prepared.take().unwrap(), expected_zone, expected_error) {
+            (Ok(prepared), Some(expected), None) => {
+                assert_eq!(
+                    prepared.effects.set_properties().collect::<Vec<_>>(),
+                    [("time_zone_id".to_owned(), expected.to_owned())]
+                );
+                assert_eq!(prepared.effects.reset_properties().count(), 0);
+                assert_eq!(
+                    prepared.staged.effective_time_zone(TimeZoneKey::UTC).name(),
+                    expected
+                );
+            }
+            (Ok(prepared), None, None) => {
+                assert_eq!(
+                    prepared.effects.reset_properties().collect::<Vec<_>>(),
+                    ["time_zone_id"]
+                );
+                assert_eq!(prepared.effects.set_properties().count(), 0);
+                assert_eq!(
+                    prepared.staged.effective_time_zone(TimeZoneKey::UTC),
+                    TimeZoneKey::UTC
+                );
+            }
+            (Err(error), _, Some(expected)) => {
+                assert_eq!(
+                    error.user_error().unwrap().code().as_str(),
+                    expected,
+                    "{source}"
+                );
+            }
+            (Err(error), _, None) => panic!("{source}: {error}"),
+            (Ok(_), _, Some(expected)) => panic!("{source} should fail with {expected}"),
+        }
+        assert_eq!(fixture.live.effective_time_zone(TimeZoneKey::UTC), original);
+        fixture.close(tail).await;
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

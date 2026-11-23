@@ -495,15 +495,16 @@ impl<'a> SortCreation<'a> {
     ) -> ExecutionResult<arrow::array::ArrayRef> {
         use super::SortKeyConstruction;
         use arrow::array::{
-            Decimal128Array, FixedSizeListArray, Int8Array, LargeListArray, ListArray, MapArray,
-            StructArray,
+            Decimal128Array, FixedSizeBinaryArray, FixedSizeListArray, Int8Array, LargeListArray,
+            ListArray, MapArray, StructArray,
         };
         use arrow::datatypes::DataType;
         use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
         let result = super::normalize_sort_key_array_observed::<ConstructionFailure>(
             values,
             Some(declared),
-            &mut |event| match event {
+            &mut |event| {
+                match event {
                 SortKeyConstruction::Field { source, target } => types.observe(
                     0,
                     &[],
@@ -529,11 +530,15 @@ impl<'a> SortCreation<'a> {
                     )?,
                 )?),
                 SortKeyConstruction::BufferAdoption => self.buffer_adoption(owner),
+                SortKeyConstruction::ValueBuffer(bytes) => owner.request(std::alloc::Layout::array::<u8>(bytes).map_err(|_| {
+                    novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic
+                })?),
                 SortKeyConstruction::Work(units) => self.factory.observe_input_work(units),
                 SortKeyConstruction::ArrayHeader(ty) => {
                     let layout = match ty {
                         DataType::Int8 => std::alloc::Layout::new::<Int8Array>(),
                         DataType::Decimal128(_, _) => std::alloc::Layout::new::<Decimal128Array>(),
+                        DataType::FixedSizeBinary(_) => std::alloc::Layout::new::<FixedSizeBinaryArray>(),
                         DataType::List(_) => std::alloc::Layout::new::<ListArray>(),
                         DataType::LargeList(_) => std::alloc::Layout::new::<LargeListArray>(),
                         DataType::FixedSizeList(_, _) => {
@@ -549,6 +554,7 @@ impl<'a> SortCreation<'a> {
                     };
                     owner.request(arc_layout(layout)?)
                 }
+            }
             },
         )?;
         Ok(result)

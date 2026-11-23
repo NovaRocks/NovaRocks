@@ -73,7 +73,7 @@ impl AnalyzerContext<'_> {
             catalog: &view.default_catalog,
         };
         let child = AnalyzerContext {
-            purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
+            purpose: self.purpose,
             grouping_scope: std::cell::RefCell::new(None),
             control: self.control,
             constant_policy: self.constant_policy,
@@ -622,6 +622,44 @@ mod tests {
     fn analyze(sql: &str, catalog: &Catalog) -> Result<ResolvedQuery, AnalyzeError> {
         let query = novarocks_parser::parser::parse_query(sql).unwrap();
         analyze_and_plan(&query, catalog)
+    }
+
+    #[test]
+    fn mv_definition_checks_temporal_dependencies_after_view_expansion() {
+        use novarocks_type_contract::{TemporalPrecision, TemporalType};
+        let declared = novarocks_expression::typing::temporal_function_value_type(
+            TemporalType::TimestampWithTimeZone(TemporalPrecision::MICROSECONDS),
+            false,
+        )
+        .unwrap();
+        let dependent_source =
+            "SELECT CAST(TIMESTAMP '2024-01-01 00:00:00' AS TIMESTAMP(6) WITH TIME ZONE) AS ts";
+        let deterministic_source =
+            "SELECT CAST(TIMESTAMP '2024-01-01 00:00:00 UTC' AS TIMESTAMP(6) WITH TIME ZONE) AS ts";
+        let analyze = |sql, catalog: &Catalog| {
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
+            crate::analyzer::analyze_mv_definition(
+                &query,
+                catalog,
+                "db",
+                crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+        };
+        let dependent = catalog(declaration(dependent_source, "ts", declared.clone()));
+        let deterministic = catalog(declaration(deterministic_source, "ts", declared));
+        for query in [dependent_source, "SELECT ts FROM v"] {
+            let failure = analyze(query, &dependent).expect_err("time environment is required");
+            assert!(
+                failure
+                    .to_string()
+                    .contains("statement instant or session time zone"),
+                "{failure}"
+            );
+        }
+        assert!(analyze(deterministic_source, &deterministic).is_ok());
+        assert!(analyze("SELECT ts FROM v", &deterministic).is_ok());
     }
 
     fn analyze_and_plan(

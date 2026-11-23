@@ -70,9 +70,11 @@ mod invocation_input;
 use invocation_input::InvocationInputBuffer;
 
 use super::analytic_shared::{
-    AnalyticOutputValidationFailure, validate_analytic_output_columns_typed,
+    AnalyticKeyType, AnalyticOutputValidationFailure, validate_analytic_output_columns_typed,
 };
-use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
+use super::compiled_expression::{
+    RuntimeKernelControl, evaluate_all, instances, root_value_type_ref,
+};
 use super::compiled_window_geometry::{admit_frame, frame_table, frame_table_tracked, peer_groups};
 use super::sort::creation::{CreatedSortConverter, CreatedSortRows, SortCreation};
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
@@ -160,6 +162,7 @@ pub struct CompiledWindowProcessorFactory {
     output_node: ProgramNodeId,
     error: Arc<RuntimeErrorState>,
     original_function_major: bool,
+    original_key_types: Arc<[AnalyticKeyType]>,
 }
 
 impl CompiledWindowProcessorFactory {
@@ -299,6 +302,24 @@ impl CompiledWindowProcessorFactory {
             .iter()
             .any(|call| call.kernel.has_original_invocation_handoff());
 
+        let original_key_types =
+            if original_function_major {
+                sites[..partition_keys + order_keys]
+                    .iter()
+                    .map(|site| {
+                        root_value_type_ref(&program, *site)
+                    .map(AnalyticKeyType::from_binding)
+                    .ok_or_else(|| program_binding_failure(
+                        PlanBindingKind::InvalidAssignment,
+                        format!("compiled Analytic at local node {at} lacks a declared key type"),
+                    ))
+                    })
+                    .collect::<ExecutionResult<Vec<_>>>()?
+                    .into()
+            } else {
+                Arc::from([])
+            };
+
         Ok(Self {
             name: format!("COMPILED_ANALYTIC (node={at})"),
             program,
@@ -310,6 +331,7 @@ impl CompiledWindowProcessorFactory {
             output_node: node,
             error,
             original_function_major,
+            original_key_types,
         })
     }
 }
@@ -348,6 +370,7 @@ impl CompiledWindowProcessorFactory {
             emission: None,
             failed: None,
             original_function_major: self.original_function_major,
+            original_key_types: Arc::clone(&self.original_key_types),
             invocation_input: None,
             partition_ordinal: 0,
         }
@@ -397,6 +420,7 @@ struct CompiledWindowProcessor {
     emission: Option<WindowOutputCursor>,
     failed: Option<ExecutionFailure>,
     original_function_major: bool,
+    original_key_types: Arc<[AnalyticKeyType]>,
     invocation_input: Option<InvocationInputBuffer>,
     partition_ordinal: usize,
 }
@@ -480,11 +504,18 @@ fn slice_body(
 /// guessed dictionary expansion, or second comparison algorithm is introduced.
 fn original_peer_groups(
     keys: &[ArrayRef],
+    declarations: &[AnalyticKeyType],
     start: usize,
     end: usize,
     host: Arc<dyn AggregateStateAllocator>,
     control: &dyn KernelEvaluationControl,
 ) -> ExecutionResult<WindowInvocationScratch<WindowRowRange>> {
+    if keys.len() != declarations.len() {
+        return Err(program_binding_failure(
+            PlanBindingKind::InvalidAssignment,
+            "analytic peer declarations differ from its keys",
+        ));
+    }
     let mut groups = WindowInvocationScratch::try_with_capacity(
         if keys.is_empty() {
             usize::from(start != end)
@@ -500,10 +531,9 @@ fn original_peer_groups(
     let mut first = start;
     for row in start + 1..end {
         let mut equal = true;
-        for key in keys {
+        for (key, declaration) in keys.iter().zip(declarations) {
             control.checkpoint(1)?;
-            if !super::analytic_shared::row_equal_on_keys(std::slice::from_ref(key), row - 1, row)?
-            {
+            if !declaration.equal(key.as_ref(), row - 1, row)? {
                 equal = false;
                 break;
             }
@@ -634,6 +664,7 @@ impl CompiledWindowProcessor {
                 &self.control,
             )?;
         }
+        let key_types = self.original_key_types.as_ref();
         let regroup = novarocks_functions::window_input_order::should_regroup_partition_only(
             self.order_keys != 0,
             self.calls
@@ -644,9 +675,10 @@ impl CompiledWindowProcessor {
                 .map(|call| call.kernel.original_partition_regroup_eligible()),
         );
         if rows > 1 && self.partition_keys != 0 && regroup {
-            ordered = super::analytic_shared::reorder_chunk_by_partition_keys(
+            ordered = super::analytic_shared::reorder_chunk_by_typed_partition_keys(
                 &ordered,
                 &keys[..self.partition_keys],
+                &key_types[..self.partition_keys],
             )?;
             // Original source really re-invokes these roots even when the
             // permutation happened to be identity. No source CSE is invented.
@@ -669,6 +701,7 @@ impl CompiledWindowProcessor {
         // key errors, without a new normalized-key or RowConverter allocation.
         let partitions = original_peer_groups(
             &keys[..self.partition_keys],
+            &key_types[..self.partition_keys],
             0,
             rows,
             host.clone(),
@@ -678,9 +711,15 @@ impl CompiledWindowProcessor {
         let mut peers =
             WindowInvocationScratch::try_with_capacity(rows, host.clone(), &self.control)?;
         for part in &partitions {
-            for peer in
-                original_peer_groups(order, part.start, part.end, host.clone(), &self.control)?
-                    .iter()
+            for peer in original_peer_groups(
+                order,
+                &key_types[self.partition_keys..],
+                part.start,
+                part.end,
+                host.clone(),
+                &self.control,
+            )?
+            .iter()
             {
                 peers.try_push(*peer, &self.control)?;
             }

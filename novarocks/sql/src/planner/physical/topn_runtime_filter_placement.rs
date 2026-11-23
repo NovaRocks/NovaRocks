@@ -395,8 +395,7 @@ fn bind_exact_column_ref(expr: &TypedExpr, columns: &[OutputColumn]) -> Option<T
 
 fn is_exact_column_ref(expr: &TypedExpr, column: &OutputColumn) -> bool {
     matches!(&expr.kind, ExprKind::ColumnRef { column_id, .. } if *column_id == column.column_id)
-        && expr.value_type.data_type() == column.value_type.data_type()
-        && expr.value_type.nullable() == column.value_type.nullable()
+        && expr.value_type == column.value_type
 }
 
 fn same_column_ref(left: &TypedExpr, right: &TypedExpr) -> bool {
@@ -409,19 +408,13 @@ fn same_column_ref(left: &TypedExpr, right: &TypedExpr) -> bool {
                 column_id: right_id,
                 ..
             },
-        ) => {
-            left_id == right_id
-                && left.value_type.data_type() == right.value_type.data_type()
-                && left.value_type.nullable() == right.value_type.nullable()
-        }
+        ) => left_id == right_id && left.value_type == right.value_type,
         _ => false,
     }
 }
 
 fn is_same_column(left: &OutputColumn, right: &OutputColumn) -> bool {
-    left.column_id == right.column_id
-        && left.value_type.data_type() == right.value_type.data_type()
-        && left.value_type.nullable() == right.value_type.nullable()
+    left.column_id == right.column_id && left.value_type == right.value_type
 }
 
 fn ordered_filter_scan_payload_supported(node: &PhysicalPlanNode) -> bool {

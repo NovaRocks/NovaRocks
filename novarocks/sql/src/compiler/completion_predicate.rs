@@ -31,6 +31,7 @@ use novarocks_spi::connector::read_stack::{
     Bound, ConnectorValue, ConnectorValueType, Constraint, Domain, MAX_CONNECTOR_VALUE_BYTES,
     Range, TupleDomain, ValueSet,
 };
+use novarocks_type_contract::{CompileCheckpoints, TemporalPrecision, TemporalType};
 
 use super::completion::{ProviderPredicateOccurrenceId, ProviderReadPredicateNeed};
 use crate::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
@@ -47,37 +48,143 @@ pub(super) fn lower_provider_predicates(
     scan: &PlanScanNode,
     columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
     row_mutation_match: bool,
-) -> Box<[ProviderReadPredicateNeed]> {
-    let literal = if row_mutation_match {
-        lower_row_mutation_literal
-    } else {
-        lower_literal
-    };
-    scan.predicates
-        .iter()
-        .enumerate()
-        .filter_map(|(ordinal, predicate)| {
-            if !provider_guarantee_supports_atom(predicate) {
-                return None;
-            }
-            let occurrence = u32::try_from(ordinal).ok()?;
-            let (column, domain) = lower_atom_with_literal(
-                predicate,
-                |expression| lower_column(scan, columns, expression),
-                literal,
-            )?;
-            let summary =
-                TupleDomain::with_column_domains(BTreeMap::from([(column, domain)])).ok()?;
-            Some(ProviderReadPredicateNeed::new(
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Box<[ProviderReadPredicateNeed]>, super::SqlCompileError> {
+    let mut predicates = Vec::new();
+    for (ordinal, predicate) in scan.predicates.iter().enumerate() {
+        work.step()?;
+        if !provider_guarantee_supports_atom(predicate, scan, columns) {
+            continue;
+        }
+        let Ok(occurrence) = u32::try_from(ordinal) else {
+            continue;
+        };
+        let mut failure = None;
+        let atom = lower_atom_with_literal(
+            predicate,
+            |expression| lower_column(scan, columns, expression),
+            |expression, expected| {
+                if let ConnectorValueType::Temporal(declaration) = expected {
+                    let expression = unnest(expression);
+                    let ExprKind::Constant(value) = &expression.kind else {
+                        return None;
+                    };
+                    if expression.value_type.value_type().temporal() != Some(declaration)
+                        || value.value_type() != &expression.value_type
+                    {
+                        return None;
+                    }
+                    let decoded = work
+                        .flush()
+                        .map_err(novarocks_functions::ConstantError::from)
+                        .and_then(|()| {
+                            value.temporal_observed(
+                                novarocks_type_contract::CompilePhase::Validate,
+                                work.control(),
+                            )
+                        });
+                    match decoded {
+                        Ok(value) => value.map(|value| ConnectorValue::Temporal {
+                            data_type: declaration,
+                            value,
+                        }),
+                        Err(cause) => {
+                            failure = Some(match cause {
+                                novarocks_functions::ConstantError::Control(cause) => {
+                                    super::SqlCompileError::from(cause)
+                                }
+                                other => super::SqlCompileError::Compilation(other.to_string()),
+                            });
+                            None
+                        }
+                    }
+                } else if row_mutation_match {
+                    lower_row_mutation_literal(expression, expected)
+                } else {
+                    lower_literal(expression, expected)
+                }
+            },
+        );
+        if let Some(cause) = failure {
+            return Err(cause);
+        }
+        let Some((column, domain)) = atom else {
+            continue;
+        };
+        let domain = complete_datetime_offer(domain, work)?;
+        if let Ok(summary) = TupleDomain::with_column_domains(BTreeMap::from([(column, domain)])) {
+            predicates.push(ProviderReadPredicateNeed::new(
                 ProviderPredicateOccurrenceId::new(occurrence),
                 Constraint::of_summary(summary),
-            ))
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
+            ));
+        }
+    }
+    Ok(predicates.into_boxed_slice())
 }
 
-fn provider_guarantee_supports_atom(predicate: &TypedExpr) -> bool {
+/// Every accepted comparison was already checked in its actual SQL type.
+/// Carry its unchanged bounds at full precision so occurrences with different
+/// lossless coercions of the same column can share the exact conjunction.
+fn complete_datetime_offer(
+    domain: Domain,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Domain, super::SqlCompileError> {
+    let ConnectorValueType::Temporal(source) = domain.value_type() else {
+        return Ok(domain);
+    };
+    let picos = TemporalPrecision::PICOSECONDS;
+    let target = match source {
+        TemporalType::Time(_) => TemporalType::Time(picos),
+        TemporalType::TimeWithTimeZone(_) => TemporalType::TimeWithTimeZone(picos),
+        TemporalType::Timestamp(_) => TemporalType::Timestamp(picos),
+        TemporalType::TimestampWithTimeZone(_) => TemporalType::TimestampWithTimeZone(picos),
+        TemporalType::Interval(_) => return Ok(domain),
+    };
+    if source == target {
+        return Ok(domain);
+    }
+
+    let promote = |value: &ConnectorValue| match value {
+        ConnectorValue::Temporal { data_type, value } if *data_type == source => {
+            Ok(ConnectorValue::Temporal {
+                data_type: target,
+                value: *value,
+            })
+        }
+        _ => Err(super::SqlCompileError::Compilation(
+            "provider temporal offer bound differs from its exact SQL declaration".into(),
+        )),
+    };
+    let bound = |bound: &Bound| -> Result<Bound, super::SqlCompileError> {
+        Ok(match bound {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Inclusive(value) => Bound::Inclusive(promote(value)?),
+            Bound::Exclusive(value) => Bound::Exclusive(promote(value)?),
+        })
+    };
+    let value_type = ConnectorValueType::Temporal(target);
+    let invalid = |error: novarocks_spi::connector::ConnectorError| {
+        super::SqlCompileError::Compilation(error.to_string())
+    };
+    let mut ranges = Vec::with_capacity(domain.values().ranges().len());
+    for range in domain.values().ranges() {
+        work.step()?;
+        ranges.push(
+            Range::try_new(value_type, bound(range.low())?, bound(range.high())?)
+                .map_err(invalid)?,
+        );
+    }
+    Ok(Domain::new(
+        ValueSet::of_ranges(value_type, ranges).map_err(invalid)?,
+        domain.null_allowed(),
+    ))
+}
+
+fn provider_guarantee_supports_atom(
+    predicate: &TypedExpr,
+    scan: &PlanScanNode,
+    columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
+) -> bool {
     let predicate = unnest(predicate);
     let ExprKind::FunctionCall { binding, .. } = &predicate.kind else {
         return true;
@@ -97,15 +204,15 @@ fn provider_guarantee_supports_atom(predicate: &TypedExpr) -> bool {
     {
         return false;
     }
-    match (&left.kind, &right.kind) {
-        (ExprKind::ColumnRef { .. }, ExprKind::Literal(_) | ExprKind::Constant(_)) => {
-            !right.value_type.nullable()
-        }
-        (ExprKind::Literal(_) | ExprKind::Constant(_), ExprKind::ColumnRef { .. }) => {
-            !left.value_type.nullable()
-        }
-        _ => false,
-    }
+    let is_literal = |expression: &TypedExpr| {
+        !expression.value_type.nullable()
+            && matches!(
+                expression.kind,
+                ExprKind::Literal(_) | ExprKind::Constant(_)
+            )
+    };
+    (lower_column(scan, columns, left).is_some() && is_literal(right))
+        || (is_literal(left) && lower_column(scan, columns, right).is_some())
 }
 
 /// Shared exact atom author. Each caller supplies its original column identity
@@ -113,7 +220,7 @@ fn provider_guarantee_supports_atom(predicate: &TypedExpr) -> bool {
 pub(super) fn lower_atom_with_literal(
     predicate: &TypedExpr,
     resolve_column: impl Fn(&TypedExpr) -> Option<ProviderPredicateColumn>,
-    lower_literal: impl Fn(&TypedExpr, ConnectorValueType) -> Option<ConnectorValue>,
+    mut lower_literal: impl FnMut(&TypedExpr, ConnectorValueType) -> Option<ConnectorValue>,
 ) -> Option<(u32, Domain)> {
     let predicate = unnest(predicate);
     if let Some((op, [left, right])) = crate::common::binary_operator::typed_comparison(predicate) {
@@ -173,7 +280,24 @@ fn lower_column(
     columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
     expression: &TypedExpr,
 ) -> Option<ProviderPredicateColumn> {
-    let ExprKind::ColumnRef { column_id, .. } = &unnest(expression).kind else {
+    let expression = unnest(expression);
+    let (source, widened) = if let ExprKind::FunctionCall { binding, args, .. } = &expression.kind {
+        let [source] = &args[..] else { return None };
+        let original = source.value_type.value_type().temporal()?;
+        let widened = expression.value_type.value_type().temporal()?;
+        use novarocks_functions::builtin::value_conversion as owner;
+        if !original.is_lossless_widening_to(widened)
+            || binding.function_id.as_str() != owner::VALUE_CONVERSION_FUNCTION_ID
+            || owner::temporal_cast_overload(&source.value_type, &expression.value_type, false)
+                != Some(binding.selected.overload.as_str())
+        {
+            return None;
+        }
+        (unnest(source), Some((original, widened)))
+    } else {
+        (expression, None)
+    };
+    let ExprKind::ColumnRef { column_id, .. } = &source.kind else {
         return None;
     };
     if scan
@@ -187,19 +311,21 @@ fn lower_column(
         .columns
         .iter()
         .find(|output| output.column_id == *column_id)?;
-    if output.value_type.data_type() != expression.value_type.data_type()
-        || output.value_type.nullable() != expression.value_type.nullable()
-    {
+    if output.value_type != source.value_type {
         return None;
     }
     // Composite assignments can name a scan column, but the provider domain
     // vocabulary cannot represent even an IS NULL domain over that type.
     // Keep the exact SQL predicate as an engine residual instead of emitting
     // a constraint that the native decoder must reject.
-    columns
-        .get(column_id)
-        .copied()
-        .filter(|column| column.value_type.is_comparable())
+    let mut column = *columns.get(column_id)?;
+    if let Some((original, widened)) = widened {
+        if column.value_type != ConnectorValueType::Temporal(original) {
+            return None;
+        }
+        column.value_type = ConnectorValueType::Temporal(widened);
+    }
+    column.value_type.is_comparable().then_some(column)
 }
 
 fn comparison_domain(
@@ -446,6 +572,21 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
+    fn offered(
+        scan: &PlanScanNode,
+        columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
+    ) -> Box<[ProviderReadPredicateNeed]> {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            &control,
+            novarocks_type_contract::CompilePhase::Validate,
+        )
+        .unwrap();
+        let result = lower_provider_predicates(scan, columns, false, &mut work).unwrap();
+        work.finish().unwrap();
+        result
+    }
+
     use crate::analysis::OutputColumn;
     use crate::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::planner::table::{
@@ -578,13 +719,64 @@ mod tests {
             comparison(BinOp::Lt, integer(10), column_ref()),
         ]);
 
-        let offered = lower_provider_predicates(&scan, &columns(), false);
+        let offered = offered(&scan, &columns());
 
         assert_eq!(offered.len(), 2);
         assert_eq!(offered[0].occurrence().get(), 0);
         assert_eq!(offered[1].occurrence().get(), 2);
         assert_eq!(offered[0].constraint().summary().columns().count(), 1);
         assert!(offered[0].constraint().expression().is_constant_true());
+    }
+
+    #[test]
+    fn datetime_comparison_offers_of_mixed_precisions_intersect_exactly() {
+        use novarocks_type_contract::{CompilePhase, TemporalMicros, TemporalValue};
+
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let timestamp =
+            |precision| TemporalType::Timestamp(TemporalPrecision::new(precision).unwrap());
+        let point = |data_type, picos| ConnectorValue::Temporal {
+            data_type,
+            value: TemporalValue::Timestamp(TemporalMicros::from_picos(picos).unwrap()),
+        };
+        let greater = comparison_domain(
+            ConnectorValueType::Temporal(timestamp(9)),
+            BinOp::Gt,
+            point(timestamp(9), -1_001_000),
+        )
+        .unwrap();
+        let less = comparison_domain(
+            ConnectorValueType::Temporal(timestamp(7)),
+            BinOp::Lt,
+            point(timestamp(7), 400_000),
+        )
+        .unwrap();
+        let non_null = Domain::not_null(ConnectorValueType::Temporal(timestamp(6)));
+        let combined = complete_datetime_offer(greater, &mut work)
+            .unwrap()
+            .intersect(&complete_datetime_offer(less, &mut work).unwrap())
+            .unwrap()
+            .intersect(&complete_datetime_offer(non_null, &mut work).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            combined.value_type(),
+            ConnectorValueType::Temporal(timestamp(12))
+        );
+        assert!(!combined.null_allowed());
+        let [range] = combined.values().ranges() else {
+            panic!("the combined temporal filter must be one exact bounded range");
+        };
+        assert_eq!(
+            range.low(),
+            &Bound::Exclusive(point(timestamp(12), -1_001_000))
+        );
+        assert_eq!(
+            range.high(),
+            &Bound::Exclusive(point(timestamp(12), 400_000))
+        );
+        work.finish().unwrap();
     }
 
     #[test]
@@ -599,7 +791,7 @@ mod tests {
         };
         let scan = scan(vec![comparison(BinOp::Eq, expression, integer(1))]);
 
-        assert!(lower_provider_predicates(&scan, &columns(), false).is_empty());
+        assert!(offered(&scan, &columns()).is_empty());
     }
 
     #[test]
@@ -662,7 +854,7 @@ mod tests {
                         value_type: ConnectorValueType::NonComparable,
                     },
                 )]);
-                assert!(lower_provider_predicates(&scan, &columns, false).is_empty());
+                assert!(offered(&scan, &columns).is_empty());
                 assert_eq!(scan.predicates.len(), 1, "SQL residual is retained");
             }
         }
@@ -679,6 +871,6 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         };
 
-        assert!(lower_provider_predicates(&scan(vec![predicate]), &columns(), false).is_empty());
+        assert!(offered(&scan(vec![predicate]), &columns()).is_empty());
     }
 }

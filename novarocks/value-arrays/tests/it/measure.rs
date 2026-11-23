@@ -33,6 +33,35 @@ fn cap(rows: u32) -> NonZeroU32 {
 }
 
 #[test]
+fn additional_column_storage_preserves_the_original_prefix_and_first_row_rule() {
+    let source: ArrayRef = Arc::new(Int32Array::from(vec![0, 1, 2, 3]));
+    let mut planner = PrefixPlanner::new(
+        &[OutputColumn::new(&source, &DataType::Int32)],
+        OutputRows::Contiguous(1..4),
+        &mut global_growth,
+        &mut uncontrolled,
+    )
+    .unwrap();
+    let mut measured = Vec::new();
+    let mut storage = |source_row| {
+        measured.push(source_row);
+        Ok::<_, std::convert::Infallible>(if source_row == 3 { 40 } else { 14 })
+    };
+    let first = planner
+        .plan_prefix_with_additional_storage(cap(8), 28, Some(&mut storage), &mut uncontrolled)
+        .unwrap();
+    assert_eq!((first.rows(), first.new_column_bytes()), (2, 28));
+    assert!(first.shares_source());
+    let rows = first.rows();
+    planner.advance(rows).unwrap();
+    let last = planner
+        .plan_prefix_with_additional_storage(cap(8), 28, Some(&mut storage), &mut uncontrolled)
+        .unwrap();
+    assert_eq!((last.rows(), last.new_column_bytes()), (1, 40));
+    assert_eq!(measured, [1, 2, 3, 3]);
+}
+
+#[test]
 fn logical_bytes_ignore_carrier_and_keep_dictionary_occurrences() {
     let long = "a long string value";
     let offsets: ArrayRef = Arc::new(StringArray::from(vec![Some(long), None, Some(long)]));

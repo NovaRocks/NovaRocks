@@ -1501,6 +1501,7 @@ mod client_render_error_tests {
             if message == "ClientRows requires an explicit client presentation"));
         let family = ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
             parametric_datetime: false,
+            parametric_interval: false,
             variant: true,
             variant_binary: false,
         });

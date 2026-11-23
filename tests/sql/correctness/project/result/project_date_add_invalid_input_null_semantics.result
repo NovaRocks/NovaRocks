@@ -1,4 +1,4 @@
 -- query 1
--- types	boolean	boolean	boolean	boolean	boolean
-days_add_invalid_date_is_null_v	days_add_invalid_delta_is_null_v	date_add_invalid_date_is_null_v	months_add_invalid_date_is_null_v	months_add_invalid_delta_is_null_v
-true	true	true	true	true
+-- types	date	date	date	date	date	date
+invalid_day_source	invalid_month_source	null_delta	next_month	next_day	previous_day
+NULL	NULL	NULL	2024-02-29	2024-01-02	2023-12-31

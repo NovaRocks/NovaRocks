@@ -362,6 +362,7 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
                 novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                     novarocks_result_contract::TrinoJsonFacts {
                         parametric_datetime: true,
+                        parametric_interval: false,
                         variant: false,
                         variant_binary: false,
                     },

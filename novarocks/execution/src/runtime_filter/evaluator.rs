@@ -56,6 +56,7 @@ pub enum RuntimeFilterScalarRef<'a> {
     TimestampMillisecond(i64),
     TimestampMicrosecond(i64),
     TimestampNanosecond(i64),
+    Temporal([u8; 12]),
     Decimal128(i128),
 }
 
@@ -114,6 +115,16 @@ pub trait RuntimeFilterControlledScalarQuery: Send + Sync {
 pub trait RuntimeFilterArtifactQuery: Send + Sync {
     /// The exact, frozen Arrow data type accepted by this artifact.
     fn data_type(&self) -> &DataType;
+
+    fn temporal_type(&self) -> Option<novarocks_type_contract::TemporalType> {
+        None
+    }
+
+    /// The declared temporal family when the artifact consumes normalized
+    /// relational keys. Compact membership can keep its raw equality owner.
+    fn temporal_relation_key_type(&self) -> Option<novarocks_type_contract::TemporalType> {
+        self.temporal_type()
+    }
 
     /// None explicitly identifies an uninstalled controlled capability. New
     /// compiled consumers must refuse it, including on an all-NULL batch.
@@ -312,189 +323,206 @@ fn evaluate_rows_with<P: RowQueryPolicy>(
     }
 
     let data = input.to_data();
-    let evaluation = match input.data_type() {
-        DataType::Boolean => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| Ok(RuntimeFilterScalarRef::Boolean(boolean_value(data, row)?)),
-        ),
-        DataType::Int8 => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| {
-                Ok(RuntimeFilterScalarRef::Int8(i8::from_ne_bytes(
-                    fixed_value::<1>(data, row)?,
-                )))
-            },
-        ),
-        DataType::Int16 => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| {
-                Ok(RuntimeFilterScalarRef::Int16(i16::from_ne_bytes(
-                    fixed_value::<2>(data, row)?,
-                )))
-            },
-        ),
-        DataType::Int32 => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| {
-                Ok(RuntimeFilterScalarRef::Int32(i32::from_ne_bytes(
-                    fixed_value::<4>(data, row)?,
-                )))
-            },
-        ),
-        DataType::Int64 => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| {
-                Ok(RuntimeFilterScalarRef::Int64(i64::from_ne_bytes(
-                    fixed_value::<8>(data, row)?,
-                )))
-            },
-        ),
-        DataType::FixedSizeBinary(width)
-            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            evaluate_data(
+    let evaluation = if let Some(declaration) = artifact.temporal_relation_key_type() {
+        let view = novarocks_value_arrays::decode::PreparedTemporalArray::bind(
+            declaration,
+            input.as_ref(),
+            true,
+        )
+        .map_err(|_| violation("runtime filter temporal carrier does not match the key type"))?;
+        evaluate_data(policy, artifact, input, &data, logical_version, |_, row| {
+            let key = view
+                .relation_key(row)
+                .map_err(|_| violation("invalid temporal runtime filter key"))?
+                .ok_or_else(|| violation("null reached temporal runtime filter probe"))?;
+            Ok(RuntimeFilterScalarRef::Temporal(key.order_bytes()))
+        })
+    } else {
+        match input.data_type() {
+            DataType::Boolean => evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| Ok(RuntimeFilterScalarRef::Boolean(boolean_value(data, row)?)),
+            ),
+            DataType::Int8 => evaluate_data(
                 policy,
                 artifact,
                 input,
                 &data,
                 logical_version,
                 |data, row| {
-                    let value = novarocks_types::largeint::i128_from_be_bytes(&fixed_value::<16>(
-                        data, row,
-                    )?)
-                    .map_err(|_| violation("invalid FixedSizeBinary(16) LargeInt value"))?;
-                    Ok(RuntimeFilterScalarRef::LargeInt(value))
+                    Ok(RuntimeFilterScalarRef::Int8(i8::from_ne_bytes(
+                        fixed_value::<1>(data, row)?,
+                    )))
                 },
-            )
+            ),
+            DataType::Int16 => evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| {
+                    Ok(RuntimeFilterScalarRef::Int16(i16::from_ne_bytes(
+                        fixed_value::<2>(data, row)?,
+                    )))
+                },
+            ),
+            DataType::Int32 => evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| {
+                    Ok(RuntimeFilterScalarRef::Int32(i32::from_ne_bytes(
+                        fixed_value::<4>(data, row)?,
+                    )))
+                },
+            ),
+            DataType::Int64 => evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| {
+                    Ok(RuntimeFilterScalarRef::Int64(i64::from_ne_bytes(
+                        fixed_value::<8>(data, row)?,
+                    )))
+                },
+            ),
+            DataType::FixedSizeBinary(width)
+                if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
+            {
+                evaluate_data(
+                    policy,
+                    artifact,
+                    input,
+                    &data,
+                    logical_version,
+                    |data, row| {
+                        let value =
+                            novarocks_types::largeint::i128_from_be_bytes(&fixed_value::<16>(
+                                data, row,
+                            )?)
+                            .map_err(|_| violation("invalid FixedSizeBinary(16) LargeInt value"))?;
+                        Ok(RuntimeFilterScalarRef::LargeInt(value))
+                    },
+                )
+            }
+            DataType::Float32 => evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| {
+                    Ok(RuntimeFilterScalarRef::Float32(f32::from_ne_bytes(
+                        fixed_value::<4>(data, row)?,
+                    )))
+                },
+            ),
+            DataType::Float64 => evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| {
+                    Ok(RuntimeFilterScalarRef::Float64(f64::from_ne_bytes(
+                        fixed_value::<8>(data, row)?,
+                    )))
+                },
+            ),
+            DataType::Utf8 => evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| Ok(RuntimeFilterScalarRef::Utf8(utf8_value(data, row)?)),
+            ),
+            DataType::Date32 => evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| {
+                    Ok(RuntimeFilterScalarRef::Date32(i32::from_ne_bytes(
+                        fixed_value::<4>(data, row)?,
+                    )))
+                },
+            ),
+            DataType::Timestamp(TimeUnit::Second, _) => evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| {
+                    Ok(RuntimeFilterScalarRef::TimestampSecond(i64::from_ne_bytes(
+                        fixed_value::<8>(data, row)?,
+                    )))
+                },
+            ),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| {
+                    Ok(RuntimeFilterScalarRef::TimestampMillisecond(
+                        i64::from_ne_bytes(fixed_value::<8>(data, row)?),
+                    ))
+                },
+            ),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| {
+                    Ok(RuntimeFilterScalarRef::TimestampMicrosecond(
+                        i64::from_ne_bytes(fixed_value::<8>(data, row)?),
+                    ))
+                },
+            ),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| {
+                    Ok(RuntimeFilterScalarRef::TimestampNanosecond(
+                        i64::from_ne_bytes(fixed_value::<8>(data, row)?),
+                    ))
+                },
+            ),
+            DataType::Decimal128(_, _) => evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| {
+                    Ok(RuntimeFilterScalarRef::Decimal128(i128::from_ne_bytes(
+                        fixed_value::<16>(data, row)?,
+                    )))
+                },
+            ),
+            _ => Ok(RuntimeFilterRowEvaluation::NotEvaluated {
+                reason: RuntimeFilterRowNotEvaluatedReason::DataTypeUnsupported,
+                observed_version: logical_version,
+            }),
         }
-        DataType::Float32 => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| {
-                Ok(RuntimeFilterScalarRef::Float32(f32::from_ne_bytes(
-                    fixed_value::<4>(data, row)?,
-                )))
-            },
-        ),
-        DataType::Float64 => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| {
-                Ok(RuntimeFilterScalarRef::Float64(f64::from_ne_bytes(
-                    fixed_value::<8>(data, row)?,
-                )))
-            },
-        ),
-        DataType::Utf8 => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| Ok(RuntimeFilterScalarRef::Utf8(utf8_value(data, row)?)),
-        ),
-        DataType::Date32 => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| {
-                Ok(RuntimeFilterScalarRef::Date32(i32::from_ne_bytes(
-                    fixed_value::<4>(data, row)?,
-                )))
-            },
-        ),
-        DataType::Timestamp(TimeUnit::Second, _) => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| {
-                Ok(RuntimeFilterScalarRef::TimestampSecond(i64::from_ne_bytes(
-                    fixed_value::<8>(data, row)?,
-                )))
-            },
-        ),
-        DataType::Timestamp(TimeUnit::Millisecond, _) => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| {
-                Ok(RuntimeFilterScalarRef::TimestampMillisecond(
-                    i64::from_ne_bytes(fixed_value::<8>(data, row)?),
-                ))
-            },
-        ),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| {
-                Ok(RuntimeFilterScalarRef::TimestampMicrosecond(
-                    i64::from_ne_bytes(fixed_value::<8>(data, row)?),
-                ))
-            },
-        ),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| {
-                Ok(RuntimeFilterScalarRef::TimestampNanosecond(
-                    i64::from_ne_bytes(fixed_value::<8>(data, row)?),
-                ))
-            },
-        ),
-        DataType::Decimal128(_, _) => evaluate_data(
-            policy,
-            artifact,
-            input,
-            &data,
-            logical_version,
-            |data, row| {
-                Ok(RuntimeFilterScalarRef::Decimal128(i128::from_ne_bytes(
-                    fixed_value::<16>(data, row)?,
-                )))
-            },
-        ),
-        _ => Ok(RuntimeFilterRowEvaluation::NotEvaluated {
-            reason: RuntimeFilterRowNotEvaluatedReason::DataTypeUnsupported,
-            observed_version: logical_version,
-        }),
     }?;
 
     Ok(RuntimeFilterRowOutcome {

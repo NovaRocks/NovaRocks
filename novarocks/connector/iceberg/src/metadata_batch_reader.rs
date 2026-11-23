@@ -45,6 +45,7 @@ pub enum MetadataTableType {
 pub struct MetadataOutputColumn {
     name: String,
     binding: novarocks_type_contract::FunctionValueType,
+    temporal_declaration: Option<crate::iceberg::spec::Type>,
 }
 
 impl MetadataOutputColumn {
@@ -59,6 +60,9 @@ impl MetadataOutputColumn {
     }
     pub fn value_type(&self) -> &novarocks_type_contract::FunctionValueType {
         &self.binding
+    }
+    pub(crate) fn temporal_declaration(&self) -> Option<&crate::iceberg::spec::Type> {
+        self.temporal_declaration.as_ref()
     }
 }
 
@@ -79,7 +83,13 @@ pub fn metadata_table_output_columns(
     let mut column = |name: &str, data_type: DataType, nullable: bool| {
         let name = creation.text(name)?;
         let binding = typed::value(&data_type, nullable, creation)?;
-        Ok::<_, MetadataOutputError>(MetadataOutputColumn { name, binding })
+        let temporal_declaration =
+            crate::typed_read::metadata_temporal_declaration(&data_type, creation)?;
+        Ok::<_, MetadataOutputError>(MetadataOutputColumn {
+            name,
+            binding,
+            temporal_declaration,
+        })
     };
     let map_int_to = |value: DataType| {
         let entries = DataType::Struct(

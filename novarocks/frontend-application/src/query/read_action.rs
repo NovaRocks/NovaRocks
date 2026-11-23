@@ -49,6 +49,7 @@ pub(super) struct ReadPreparationInput {
     pub(super) sql: Arc<str>,
     pub(super) query: Box<ast::Query>,
     pub(super) state: SessionSqlState,
+    pub(super) statement_time: novarocks_type_contract::StatementTimeEnvironment,
     pub(super) deadline: Option<Instant>,
     pub(super) cancellation: QueryCancellationView,
     pub(super) scope: WorkScope,
@@ -72,6 +73,7 @@ pub(super) async fn prepare_read(
             wait_for_initial_query_topology(&input.topology, &input.cancellation, input.deadline)
                 .await?;
         let presentation = input.state.presentation().copied();
+        let statement_time = input.state.statement_time(input.statement_time);
         let (catalog, database, execution, mut optimizer, semantics, property_inputs) =
             input.state.into_query_attempt_inputs();
         if optimizer.optimizer_query_mem_limit_bytes.is_none() {
@@ -90,7 +92,7 @@ pub(super) async fn prepare_read(
                 input.deadline,
                 input.cancellation,
                 optimizer,
-                semantics,
+                semantics.with_statement_time(statement_time),
                 presentation,
             )
             .with_session_property_inputs(property_inputs),
@@ -807,6 +809,7 @@ pub(super) fn build_read_action(
         cancellation,
         window,
         planning_cpu,
+        statement_time,
         #[cfg(novarocks_dev_controls)]
         observation,
         #[cfg(novarocks_dev_controls)]
@@ -868,6 +871,7 @@ pub(super) fn build_read_action(
         sql,
         query,
         state,
+        statement_time,
         deadline,
         cancellation,
         scope: scope.clone(),

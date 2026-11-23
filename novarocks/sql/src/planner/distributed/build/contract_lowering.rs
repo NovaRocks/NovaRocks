@@ -501,7 +501,7 @@ struct ContractLoweringVisitor<'a> {
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     root_allow_throw_exception_used: bool,
-    group_concat_parameters: BTreeMap<SemanticParameterId, SemanticParameterValue>,
+    semantic_parameters: BTreeMap<SemanticParameterId, SemanticParameterValue>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     control: &'a dyn PureCompileControl,
@@ -1581,6 +1581,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             root_allow_throw_exception: self.root_allow_throw_exception,
             constant_policy: self.constant_policy,
             root_allow_throw_exception_used: &mut self.root_allow_throw_exception_used,
+            parameters: &mut self.semantic_parameters,
             functions: &self.functions,
             control: self.control,
             work: &mut self.work,
@@ -1616,7 +1617,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             root_allow_throw_exception,
             constant_policy,
             root_allow_throw_exception_used: false,
-            group_concat_parameters: BTreeMap::new(),
+            semantic_parameters: BTreeMap::new(),
             functions,
             sealed_functions,
             control,
@@ -2127,7 +2128,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             let parameters = scalar_emission::freeze_semantic_parameters(
                 self.root_allow_throw_exception_used,
                 self.root_allow_throw_exception,
-                std::mem::take(&mut self.group_concat_parameters),
+                std::mem::take(&mut self.semantic_parameters),
             )?;
             #[cfg(test)]
             if let Some(observer) = self.original_emission_observer.take() {
@@ -3375,6 +3376,26 @@ impl<'a> ContractLoweringVisitor<'a> {
             )?);
         }
         let mut guarantee_by_occurrence = BTreeMap::new();
+        let temporal_offers = contract
+            .request
+            .predicates()
+            .iter()
+            .filter(|predicate| {
+                predicate
+                    .constraint()
+                    .summary()
+                    .domains()
+                    .is_some_and(|domains| {
+                        domains.values().any(|domain| {
+                            matches!(
+                                domain.value_type(),
+                                novarocks_connector_contract::ConnectorValueType::Temporal(_)
+                            )
+                        })
+                    })
+            })
+            .map(|predicate| predicate.occurrence().get())
+            .collect::<BTreeSet<_>>();
         for predicate in &contract.predicates {
             let occurrence = predicate.occurrence().get();
             if guarantee_by_occurrence
@@ -3397,6 +3418,14 @@ impl<'a> ContractLoweringVisitor<'a> {
                     ordinal,
                 })?;
             match guarantee_by_occurrence.remove(&occurrence) {
+                Some(PredicateGuaranteeKind::PruningOnly)
+                    if temporal_offers.contains(&occurrence) =>
+                {
+                    // The frozen connector scan carries the pruning constraint.
+                    // Its temporal widening can reference a selected function,
+                    // which remains in the complete executable SQL residual.
+                    residuals.push(expression);
+                }
                 Some(kind) => {
                     guarantees.push(PredicateGuarantee {
                         predicate: expression,
@@ -7196,9 +7225,9 @@ impl<'a> ContractLoweringVisitor<'a> {
                             detail: "group_concat has no admitted max length source",
                         })?;
                 self.work.flush()?;
-                self.group_concat_parameters.insert(mode_id, mode);
+                self.semantic_parameters.insert(mode_id, mode);
                 if self
-                    .group_concat_parameters
+                    .semantic_parameters
                     .get(&max_id)
                     .is_some_and(|prior| prior != &value)
                 {
@@ -7206,7 +7235,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                         detail: "group_concat changes its admitted max length source",
                     });
                 }
-                self.group_concat_parameters.insert(max_id, value);
+                self.semantic_parameters.insert(max_id, value);
                 self.work.step()?;
             }
             let logical_source = self.capture_aggregate_source(&call.source)?;

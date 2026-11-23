@@ -1572,13 +1572,8 @@ fn metadata_query_binding_from_materialization(
     metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
     binding_id: SqlTableBindingId,
 ) -> CatalogResolutionResult<QueryTableBinding> {
-    // The columns SQL analyzes must be the ones the typed reader produces.
-    // The connector's own alias materialization still reports the retired
-    // schema — `committed_at` as a bare `Int64`, `summary` as `Utf8` —
-    // while both the frozen contract and the typed reader say
-    // `TIMESTAMP WITH TIME ZONE` and `MAP`. Analyzing the retired shape
-    // renders a raw epoch integer, and ordering by it fails at the
-    // exchange with a schema mismatch.
+    // Static relations use the frozen SQL declaration that the typed reader
+    // answers. Schema-derived relations use this exact catalog observation.
     let columns = frozen_metadata_columns(metadata_table_type)?.unwrap_or(materialization.columns);
     Ok(QueryTableBinding {
         resolved: novarocks_sql::planning::catalog::resolved_metadata_table(

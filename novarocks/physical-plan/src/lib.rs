@@ -103,7 +103,7 @@ pub fn grouped_state_topn_key_supported(
     ty: &FunctionValueType,
 ) -> bool {
     comparator.supports_value_type(ty)
-        && PartitionHashAlgorithm::NativeExchangeV1.supports_partition_key(ty.data_type())
+        && PartitionHashAlgorithm::NativeExchangeV1.supports_partition_value_type(ty)
 }
 
 /// Exact revision of the semantic plan contract implemented by this crate.
@@ -114,8 +114,10 @@ pub fn grouped_state_topn_key_supported(
 /// Revision 35 retires the TableExecute connector relation.
 /// Revision 36 freezes Trino cast modes, guarded TRY, and bounded character types.
 /// Revision 37 adds an optional per-call aggregate FILTER root.
-/// Revision 38 admits composite predicate LeftMark over the full right relation.
-pub const PLAN_CONTRACT_REVISION: u32 = 38;
+/// Revision 38 adds exact temporal declarations, statement-time facts, and
+/// capability-dependent temporal result schemas.
+/// Revision 39 admits composite predicate LeftMark over the full right relation.
+pub const PLAN_CONTRACT_REVISION: u32 = 39;
 
 #[cfg(test)]
 mod tests;

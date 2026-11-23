@@ -26,7 +26,7 @@ TRC-6a 的标准算术和比较经共享定型选择隐藏重载，EXPLAIN 按�
 
 [共享迁移判定](../../../novarocks/expression/src/typing/route.rs) 列出具名函数和可达别名。迁移整个函数时同步 SQL 与文本入口的归属。
 
-- **结构与语法特设，由 TRC-6d 迁移。** `resolve_expr.rs` 保有 `strpos`、`normalize`、`typeof`、`if`、`variant_get` 及别名，以及 FIELD 的参数规范化和公开名称 `negative` 的原拒绝。集合调用的已迁入重载通过目录定型，`TABLE(sequence(...))` 沿独立关系入口准备必需常量。 [ADR-0254](../../adr/ADR-0254-collection-calls-and-relational-sequence.md)
+- **结构与语法特设，由 TRC-6d 迁移。** `resolve_expr.rs` 保有 `strpos`、`normalize`、`typeof`、`if`、`variant_get` 及别名，以及 FIELD 的参数规范化和公开名称 `negative` 的原拒绝。集合调用的已迁入重载通过目录定型，`TABLE(sequence(...))` 沿独立关系入口准备必需常量。 [ADR-0255](../../adr/ADR-0255-collection-calls-and-relational-sequence.md)
 - **字符串预转换，由 TRC-6d 迁移。** SQL 的 `apply_implicit_string_function_casts` 保有拼接、TRIM、长度与大小写、正则、替换、拆分、子串等具名规则，实际实现由 Functions 对应 owner 执行。
 - **按名校验，由 TRC-6d 迁移。** `analyzer/functions.rs::validate_scalar_function_call_impl` 仍承担部分数组约束、固定参数个数及 MV 状态辅助函数规则。MAP 构造的键校验由已安装的原 kernel 承担。
 - **高阶函数与 lambda。** 公开数组和 MAP 的高阶重载按目录声明，缺少可执行 ABI 时报告具名能力拒绝。UEA-5E B7c 负责两段式定型和执行。

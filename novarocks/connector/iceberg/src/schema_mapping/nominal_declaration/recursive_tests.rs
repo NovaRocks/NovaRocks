@@ -49,7 +49,13 @@ pub(crate) fn columns() -> Vec<ConnectorColumnDefinition> {
 pub(crate) fn metadata() -> TableMetadata {
     let columns = columns();
     let schema = Schema::builder()
-        .with_fields(crate::catalog_control::type_mapping::schema_fields(&columns).unwrap())
+        .with_fields(
+            crate::catalog_control::type_mapping::schema_fields(
+                &columns,
+                crate::iceberg::spec::FormatVersion::V2,
+            )
+            .unwrap(),
+        )
         .build()
         .unwrap();
     let declarations = from_columns(&schema, &columns).unwrap();

@@ -1498,38 +1498,38 @@ pub(crate) fn build_table_metadata(
     } else {
         None
     };
-    let (schema, execution_schema) = if let Some(metadata_table_type) = payload.metadata_table_type
-    {
-        let columns = metadata_table_output_columns(metadata_table_type, metadata, creation)?;
-        let schema = metadata_output_schema(&columns).map_err(corrupt)?;
-        let execution =
-            crate::metadata_batch_reader::metadata_output_execution_schema(&columns, creation)?;
-        (schema, execution)
-    } else {
-        // The table schema exposed to SQL carries the Iceberg metadata
-        // pseudo-columns after the storage fields, in exactly the order
-        // `projected_schema` uses for scans. Their planning facts are what
-        // marks them hidden and row-lineage-owned, so omitting them here
-        // would make `_file`, `_pos`, `_row_id` and
-        // `_last_updated_sequence_number` unresolvable.
-        let mut fields = base_schema.fields().to_vec();
-        fields.extend(metadata_arrow_fields(&payload.metadata_columns)?);
-        if let Some(mutation) = &mutation_metadata {
-            fields.extend(mutation.arrow_fields()?);
-        }
-        let schema = Arc::new(Schema::new_with_metadata(
-            fields,
-            base_schema.metadata().clone(),
-        ));
-        let execution = crate::schema_mapping::catalog_value::table_with_document(
-            &nominal_document,
-            definition_schema.as_ref(),
-            &payload.metadata_columns,
-            mutation_metadata.as_ref(),
-            creation,
-        )?;
-        (schema, execution)
-    };
+    let (schema, execution_schema, metadata_columns) =
+        if let Some(metadata_table_type) = payload.metadata_table_type {
+            let columns = metadata_table_output_columns(metadata_table_type, metadata, creation)?;
+            let schema = metadata_output_schema(&columns).map_err(corrupt)?;
+            let execution =
+                crate::metadata_batch_reader::metadata_output_execution_schema(&columns, creation)?;
+            (schema, execution, Some(columns))
+        } else {
+            // The table schema exposed to SQL carries the Iceberg metadata
+            // pseudo-columns after the storage fields, in exactly the order
+            // `projected_schema` uses for scans. Their planning facts are what
+            // marks them hidden and row-lineage-owned, so omitting them here
+            // would make `_file`, `_pos`, `_row_id` and
+            // `_last_updated_sequence_number` unresolvable.
+            let mut fields = base_schema.fields().to_vec();
+            fields.extend(metadata_arrow_fields(&payload.metadata_columns)?);
+            if let Some(mutation) = &mutation_metadata {
+                fields.extend(mutation.arrow_fields()?);
+            }
+            let schema = Arc::new(Schema::new_with_metadata(
+                fields,
+                base_schema.metadata().clone(),
+            ));
+            let execution = crate::schema_mapping::catalog_value::table_with_document(
+                &nominal_document,
+                definition_schema.as_ref(),
+                &payload.metadata_columns,
+                mutation_metadata.as_ref(),
+                creation,
+            )?;
+            (schema, execution, None)
+        };
     let planning_facts = if payload.metadata_table_type.is_some() {
         ConnectorTablePlanningFacts::empty()
     } else {
@@ -1641,8 +1641,66 @@ pub(crate) fn build_table_metadata(
         execution_schema,
         original_schema.as_ref(),
         creation,
+        |ordinal, source, binding, creation| {
+            let declaration = if let Some(columns) = &metadata_columns {
+                columns
+                    .get(ordinal)
+                    .and_then(|column| column.temporal_declaration())
+            } else if let Some(field) = definition_schema.as_struct().fields().get(ordinal) {
+                Some(field.field_type.as_ref())
+            } else {
+                mutation_metadata
+                    .as_ref()
+                    .filter(|_| {
+                        ordinal + 1
+                            == definition_schema.as_struct().fields().len()
+                                + payload.metadata_columns.len()
+                                + 2
+                    })
+                    .map(|mutation| mutation.partition_field().field_type.as_ref())
+            };
+            match declaration {
+                Some(declaration) => crate::temporal::matches_projection(
+                    declaration,
+                    source,
+                    binding.data_type(),
+                    binding.value_type(),
+                    &mut |units| {
+                        creation
+                            .work(units)
+                            .map_err(CatalogTemporalLayoutError::Creation)
+                    },
+                )
+                .map_err(CatalogTemporalLayoutError::into_failure),
+                None => Ok(false),
+            }
+        },
     )
     .map(|metadata| metadata.with_source_read_facts(source_facts))
+}
+
+enum CatalogTemporalLayoutError {
+    Creation(novarocks_connector_contract::PureProviderCompileError<ConnectorError>),
+    Layout(novarocks_type_contract::ValueTypeError),
+}
+
+impl From<novarocks_type_contract::ValueTypeError> for CatalogTemporalLayoutError {
+    fn from(cause: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Layout(cause)
+    }
+}
+
+impl CatalogTemporalLayoutError {
+    fn into_failure(
+        self,
+    ) -> novarocks_connector_contract::PureProviderCompileError<ConnectorError> {
+        match self {
+            Self::Creation(cause) => cause,
+            Self::Layout(cause) => {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, cause.to_string()).into()
+            }
+        }
+    }
 }
 
 impl ConnectorScanPlanning for IcebergMetadata {
@@ -3088,6 +3146,105 @@ mod plan_splits_pruning_tests {
         fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
             None
         }
+    }
+
+    #[test]
+    fn catalog_metadata_composes_fixed_and_temporal_projections_in_one_row() {
+        use crate::iceberg::spec::StructType;
+        use arrow::datatypes::DataType;
+        use novarocks_type_contract::{TemporalPrecision, TemporalType, ValueKind};
+
+        let (_executor, _warehouse, provider) = provider();
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "payload",
+                Type::Struct(StructType::new(vec![
+                    Arc::new(NestedField::required(
+                        2,
+                        "raw",
+                        Type::Primitive(PrimitiveType::Fixed(4)),
+                    )),
+                    Arc::new(NestedField::optional(
+                        3,
+                        "instant",
+                        Type::Primitive(PrimitiveType::Timestamptz),
+                    )),
+                ])),
+            ))])
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///catalog-projection".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let resources = provider.runtime.resources();
+        let io = crate::fs_io::build_file_io_for_location(
+            metadata.location(),
+            resources.planning_binding().clone(),
+        );
+        let table = crate::iceberg::table::Table::builder()
+            .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+            .metadata(Arc::new(metadata))
+            .file_io(io)
+            .runtime(resources.catalog_runtime().iceberg_runtime().clone())
+            .build()
+            .unwrap();
+        let context = context();
+        let published = with_pure_schema_creation(&context, |creation| {
+            build_table_metadata(
+                TableMetadataBuildInput {
+                    descriptor: &provider.descriptor,
+                    incarnation: provider.incarnation,
+                    request: ConnectorTableRequest {
+                        table: ConnectorTableIdentity {
+                            instance_id: provider.descriptor.instance_id.clone(),
+                            namespace: Arc::from("db"),
+                            table: Arc::from("t"),
+                        },
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        context: context.clone(),
+                    },
+                    loaded: crate::loaded_table::IcebergPhysicalTable::new(table),
+                    table_name: "t".to_string(),
+                    metadata_table_type: None,
+                    snapshots: crate::catalog::SnapshotLoading::All,
+                    projection: TableMetadataProjection::Current,
+                },
+                creation,
+            )
+            .map_err(metadata_creation_error)
+        })
+        .unwrap();
+
+        let input = published.planning_facts.column_facts()[0]
+            .write_input()
+            .unwrap();
+        let DataType::Struct(storage) = input.storage_type().unwrap().data_type() else {
+            panic!("expected complete writer storage row");
+        };
+        assert_eq!(storage[0].data_type(), &DataType::FixedSizeBinary(4));
+
+        let binding = published.execution_schema().binding(0).unwrap();
+        let ValueKind::Struct(fields) = binding.value_type().kind() else {
+            panic!("expected projected read row");
+        };
+        assert_eq!(fields[0].value_type().kind(), &ValueKind::Binary);
+        assert!(!fields[0].value_type().nullable());
+        assert_eq!(
+            fields[1].value_type().temporal(),
+            Some(TemporalType::TimestampWithTimeZone(
+                TemporalPrecision::MICROSECONDS,
+            ))
+        );
     }
 
     #[test]

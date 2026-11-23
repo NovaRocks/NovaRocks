@@ -24,3 +24,10 @@ bounds when comparing the target manifest.
 wrote it with `spark.sql.parquet.writeLegacyFormat=true`. The physical leaf
 path is `items.bag.array.value`. The decoded file's SHA-256 is
 `9f6bfa14ff3516636854c83e4793f86df8d2892278fbf3a9fd0b12d1c96ce2c2`.
+
+`trc6c-wide-zoned-micros.parquet.b64` contains one raw INT64 value,
+`2251799813685248000`. PyArrow 23.0.1 wrote it as an optional UTC-adjusted
+microsecond timestamp with field ID 1 using Parquet 2.6, without compression,
+dictionary encoding, optional statistics or an embedded Arrow schema.
+Reading the file as INT64 reproduces the original value. Its decoded
+SHA-256 is `7b2862f55a4fed09a4cd6b809d242009ba051fce99474258936b7be8d5604e1f`.

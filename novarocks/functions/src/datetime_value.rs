@@ -498,6 +498,15 @@ mod tests {
     }
 }
 
+// SliceUtf8.trim delegates Character.isWhitespace. This is its Unicode
+// whitespace set, including Java's four information separators and
+// excluding NBSP/FIGURE SPACE/NARROW NBSP and NEL (Rust trim differs).
+pub(crate) fn trino_whitespace(ch: char) -> bool {
+    matches!(ch, '\u{0009}'..='\u{000d}' | '\u{001c}'..='\u{0020}' | '\u{1680}'
+        | '\u{2000}'..='\u{2006}' | '\u{2008}'..='\u{200a}' | '\u{2028}' | '\u{2029}'
+        | '\u{205f}' | '\u{3000}')
+}
+
 /// Explicit Trino ARRAY date-cast text profile of this original date author.
 /// Unlike the legacy NaiveDate entry it preserves the complete Date32 range.
 /// No SQL input limit, new parser module, fallback or global policy is installed.
@@ -514,18 +523,10 @@ pub(crate) fn parse_trino_date32_observed<E>(
         }
         Ok(())
     }
-    // SliceUtf8.trim delegates Character.isWhitespace. This is its Unicode
-    // whitespace set, including Java's four information separators and
-    // excluding NBSP/FIGURE SPACE/NARROW NBSP and NEL (Rust trim differs).
-    fn whitespace(ch: char) -> bool {
-        matches!(ch, '\u{0009}'..='\u{000d}' | '\u{001c}'..='\u{0020}' | '\u{1680}'
-            | '\u{2000}'..='\u{2006}' | '\u{2008}'..='\u{200a}' | '\u{2028}' | '\u{2029}'
-            | '\u{205f}' | '\u{3000}')
-    }
     let mut start = 0;
     for ch in text.chars() {
         step_char(ch, &mut observe)?;
-        if !whitespace(ch) {
+        if !trino_whitespace(ch) {
             break;
         }
         start += ch.len_utf8();
@@ -533,7 +534,7 @@ pub(crate) fn parse_trino_date32_observed<E>(
     let mut end = text.len();
     for ch in text[start..].chars().rev() {
         step_char(ch, &mut observe)?;
-        if !whitespace(ch) {
+        if !trino_whitespace(ch) {
             break;
         }
         end -= ch.len_utf8();
@@ -618,9 +619,9 @@ mod trino_date_profile_tests;
 const GREGORIAN_EPOCH_DAY_OFFSET: i64 = 719468;
 const DAYS_PER_GREGORIAN_ERA: i64 = 146097;
 
-/// The forward half of the same calendar geometry. Its sole parser caller
-/// has already validated month/day and bounds year to nine decimal digits.
-fn gregorian_epoch_day_from_valid_parts(year: i64, month: i64, day: i64) -> i64 {
+/// The forward half of the same calendar geometry. Callers validate month/day
+/// and bound the year to nine decimal digits.
+pub(crate) fn gregorian_epoch_day_from_valid_parts(year: i64, month: i64, day: i64) -> i64 {
     let year = year - i64::from(month <= 2);
     let era = year.div_euclid(400);
     let year_of_era = year - era * 400;

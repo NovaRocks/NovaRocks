@@ -18,27 +18,30 @@
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorColumnDefinition, ConnectorDataType, ConnectorDefaultValue,
+    ConnectorColumnDefinition, ConnectorDataType, ConnectorDefaultValue, ConnectorError,
+    ConnectorErrorKind,
 };
+use novarocks_type_contract::TemporalType;
 
 use crate::iceberg::spec::{
-    ListType, Literal, MapType, NestedField, PrimitiveLiteral, PrimitiveType, StructType, Type,
+    FormatVersion, ListType, Literal, MapType, NestedField, PrimitiveLiteral, PrimitiveType,
+    StructType, Type,
 };
 
 pub(crate) fn schema_fields(
     columns: &[ConnectorColumnDefinition],
-) -> Result<Vec<Arc<NestedField>>, String> {
+    format_version: FormatVersion,
+) -> Result<Vec<Arc<NestedField>>, ConnectorError> {
     let mut next_id = i32::try_from(columns.len())
-        .map_err(|_| "too many Iceberg columns".to_string())?
+        .map_err(|_| invalid("too many Iceberg columns"))?
         .checked_add(1)
-        .ok_or_else(|| "too many Iceberg columns".to_string())?;
+        .ok_or_else(|| invalid("too many Iceberg columns"))?;
     columns
         .iter()
         .enumerate()
         .map(|(index, column)| {
-            let id =
-                i32::try_from(index + 1).map_err(|_| "too many Iceberg columns".to_string())?;
-            column_field(id, column, &mut next_id).map(Arc::new)
+            let id = i32::try_from(index + 1).map_err(|_| invalid("too many Iceberg columns"))?;
+            column_field(id, column, format_version, &mut next_id).map(Arc::new)
         })
         .collect()
 }
@@ -46,29 +49,44 @@ pub(crate) fn schema_fields(
 pub(crate) fn column_field(
     id: i32,
     column: &ConnectorColumnDefinition,
+    format_version: FormatVersion,
     next_id: &mut i32,
-) -> Result<NestedField, String> {
-    let field_type = iceberg_type(&column.data_type, next_id)?;
+) -> Result<NestedField, ConnectorError> {
+    let field_type = iceberg_type(&column.data_type, format_version, next_id)?;
     let mut field = NestedField::new(
         id,
         column.name.as_ref(),
         field_type.clone(),
         !column.nullable,
     );
-    if let Some(default) = &column.default
-        && let Some(literal) = default_literal(default, &field_type)?
-    {
-        field = field
-            .with_initial_default(literal.clone())
-            .with_write_default(literal);
+    if let Some(default) = &column.default {
+        let literal = if let ConnectorDefaultValue::Temporal { data_type, value } = default {
+            let ConnectorDataType::Temporal(requested) = column.data_type else {
+                return Err(invalid("temporal default requires a temporal column"));
+            };
+            Some(crate::default_value::temporal_default_literal(
+                *data_type,
+                *value,
+                requested,
+                &field_type,
+            )?)
+        } else {
+            default_literal(default, &field_type).map_err(invalid)?
+        };
+        if let Some(literal) = literal {
+            field = field
+                .with_initial_default(literal.clone())
+                .with_write_default(literal);
+        }
     }
     Ok(field)
 }
 
 pub(crate) fn iceberg_type(
     data_type: &ConnectorDataType,
+    format_version: FormatVersion,
     next_id: &mut i32,
-) -> Result<Type, String> {
+) -> Result<Type, ConnectorError> {
     let primitive = |value| Ok(Type::Primitive(value));
     match data_type {
         ConnectorDataType::Boolean => primitive(PrimitiveType::Boolean),
@@ -88,13 +106,17 @@ pub(crate) fn iceberg_type(
                     .ok()
                     .is_some_and(|scale| scale > *precision)
             {
-                return Err(format!("invalid DECIMAL({precision},{scale})"));
+                return Err(invalid(format!("invalid DECIMAL({precision},{scale})")));
             }
             Type::decimal(
                 u32::from(*precision),
                 u32::try_from(*scale).unwrap_or_default(),
             )
-            .map_err(|error| format!("invalid Iceberg DECIMAL({precision},{scale}): {error}"))
+            .map_err(|error| {
+                invalid(format!(
+                    "invalid Iceberg DECIMAL({precision},{scale}): {error}"
+                ))
+            })
         }
         ConnectorDataType::String
         | ConnectorDataType::BoundedCharacter(_)
@@ -106,19 +128,36 @@ pub(crate) fn iceberg_type(
         ConnectorDataType::DateTime => primitive(PrimitiveType::Timestamp),
         ConnectorDataType::DateTimeNs => primitive(PrimitiveType::TimestampNs),
         ConnectorDataType::Time => primitive(PrimitiveType::Time),
+        ConnectorDataType::Temporal(declaration) => {
+            let nanos =
+                format_version == FormatVersion::V3 && !declaration.precision().fits_microseconds();
+            primitive(match declaration {
+                TemporalType::Time(_) => PrimitiveType::Time,
+                TemporalType::Timestamp(_) if nanos => PrimitiveType::TimestampNs,
+                TemporalType::Timestamp(_) => PrimitiveType::Timestamp,
+                TemporalType::TimestampWithTimeZone(_) if nanos => PrimitiveType::TimestamptzNs,
+                TemporalType::TimestampWithTimeZone(_) => PrimitiveType::Timestamptz,
+                TemporalType::TimeWithTimeZone(_) | TemporalType::Interval(_) => {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "Iceberg tables do not support TIME WITH TIME ZONE or INTERVAL columns",
+                    ));
+                }
+            })
+        }
         ConnectorDataType::Variant => Ok(Type::Variant(crate::iceberg::spec::VariantType)),
         ConnectorDataType::Array(element) => {
             let element_id = allocate_id(next_id)?;
-            let element_type = iceberg_type(element, next_id)?;
+            let element_type = iceberg_type(element, format_version, next_id)?;
             Ok(Type::List(ListType::new(Arc::new(
                 NestedField::list_element(element_id, element_type, false),
             ))))
         }
         ConnectorDataType::Map(key, value) => {
             let key_id = allocate_id(next_id)?;
-            let key_type = iceberg_type(key, next_id)?;
+            let key_type = iceberg_type(key, format_version, next_id)?;
             let value_id = allocate_id(next_id)?;
-            let value_type = iceberg_type(value, next_id)?;
+            let value_type = iceberg_type(value, format_version, next_id)?;
             Ok(Type::Map(MapType::new(
                 Arc::new(NestedField::map_key_element(key_id, key_type)),
                 Arc::new(NestedField::map_value_element(value_id, value_type, false)),
@@ -135,7 +174,7 @@ pub(crate) fn iceberg_type(
                 .iter()
                 .zip(ids)
                 .map(|(field, id)| {
-                    let field_type = iceberg_type(&field.data_type, next_id)?;
+                    let field_type = iceberg_type(&field.data_type, format_version, next_id)?;
                     Ok(Arc::new(NestedField::new(
                         id,
                         field.name.as_ref(),
@@ -143,17 +182,21 @@ pub(crate) fn iceberg_type(
                         !field.nullable,
                     )))
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, ConnectorError>>()?;
             Ok(Type::Struct(StructType::new(fields)))
         }
     }
 }
 
-fn allocate_id(next_id: &mut i32) -> Result<i32, String> {
+fn invalid(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
+}
+
+fn allocate_id(next_id: &mut i32) -> Result<i32, ConnectorError> {
     let id = *next_id;
     *next_id = next_id
         .checked_add(1)
-        .ok_or_else(|| "Iceberg field ID space exhausted".to_string())?;
+        .ok_or_else(|| invalid("Iceberg field ID space exhausted"))?;
     Ok(id)
 }
 
@@ -242,6 +285,81 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use novarocks_spi::connector::ConnectorStructField;
+    use novarocks_type_contract::TemporalPrecision;
+
+    #[test]
+    fn temporal_defaults_use_the_version_precision_once() {
+        use novarocks_functions::temporal_value::parse_timestamp_literal;
+        let parsed = parse_timestamp_literal("1970-01-01 00:00:00.0000004995 UTC").unwrap();
+        let column = ConnectorColumnDefinition {
+            name: "written_at".into(),
+            data_type: ConnectorDataType::Temporal(TemporalType::TimestampWithTimeZone(
+                TemporalPrecision::PICOSECONDS,
+            )),
+            nullable: true,
+            default: Some(ConnectorDefaultValue::Temporal {
+                data_type: parsed.ty,
+                value: parsed.value,
+            }),
+        };
+        let v2 = schema_fields(std::slice::from_ref(&column), FormatVersion::V2).unwrap();
+        let v3 = schema_fields(std::slice::from_ref(&column), FormatVersion::V3).unwrap();
+        assert_eq!(v2[0].initial_default, Some(Literal::long(0)));
+        assert_eq!(v3[0].initial_default, Some(Literal::long(500)));
+        assert_eq!(v3[0].write_default, v3[0].initial_default);
+    }
+
+    #[test]
+    fn temporal_projection_uses_one_recursive_storage_version() {
+        let columns = [ConnectorColumnDefinition {
+            name: "payload".into(),
+            data_type: ConnectorDataType::Struct(vec![
+                ConnectorStructField {
+                    name: "clock".into(),
+                    data_type: ConnectorDataType::Temporal(TemporalType::Time(
+                        TemporalPrecision::PICOSECONDS,
+                    )),
+                    nullable: false,
+                },
+                ConnectorStructField {
+                    name: "instant".into(),
+                    data_type: ConnectorDataType::Temporal(TemporalType::TimestampWithTimeZone(
+                        TemporalPrecision::PICOSECONDS,
+                    )),
+                    nullable: true,
+                },
+            ]),
+            nullable: true,
+            default: None,
+        }];
+        for (version, expected) in [
+            (FormatVersion::V1, PrimitiveType::Timestamptz),
+            (FormatVersion::V2, PrimitiveType::Timestamptz),
+            (FormatVersion::V3, PrimitiveType::TimestamptzNs),
+        ] {
+            let fields = schema_fields(&columns, version).unwrap();
+            let Type::Struct(payload) = fields[0].field_type.as_ref() else {
+                panic!("struct");
+            };
+            assert_eq!(
+                *payload.fields()[0].field_type,
+                Type::Primitive(PrimitiveType::Time)
+            );
+            assert_eq!(*payload.fields()[1].field_type, Type::Primitive(expected));
+            assert_eq!(payload.fields()[0].id, 2);
+            assert!(payload.fields()[0].required);
+            assert!(!payload.fields()[1].required);
+        }
+        let forbidden = ConnectorDataType::Temporal(TemporalType::TimeWithTimeZone(
+            TemporalPrecision::MICROSECONDS,
+        ));
+        assert_eq!(
+            iceberg_type(&forbidden, FormatVersion::V3, &mut 1)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Unsupported,
+        );
+    }
 
     #[test]
     fn connector_schema_mapping_preserves_nested_nullability_and_unique_ids() {
@@ -255,7 +373,7 @@ mod tests {
             nullable: true,
             default: None,
         }];
-        let fields = schema_fields(&columns).expect("schema fields");
+        let fields = schema_fields(&columns, FormatVersion::V2).expect("schema fields");
         assert_eq!(fields[0].id, 1);
         assert!(!fields[0].required);
         let Type::Struct(struct_type) = fields[0].field_type.as_ref() else {
@@ -285,6 +403,6 @@ mod tests {
             precision: 10,
             scale: -1,
         };
-        assert!(iceberg_type(&decimal, &mut 1).is_err());
+        assert!(iceberg_type(&decimal, FormatVersion::V2, &mut 1).is_err());
     }
 }

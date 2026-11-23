@@ -1117,7 +1117,9 @@ fn aggregate_occurrences_missing_foreign_source_scope_environment_and_proof_keep
     let refs = [reference];
     let ep = SemanticParameters::try_new([(
         reference.id,
-        SemanticParameterValue::TimeZone("UTC".into()),
+        SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+        ),
     )])
     .unwrap();
     prefixes(

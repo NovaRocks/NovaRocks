@@ -37,10 +37,15 @@ mod literal;
 mod route;
 #[doc(hidden)]
 pub mod syntax_constant;
+mod temporal;
 pub use conversion::operator_decimal_float;
 pub use literal::{LiteralEmission, LiteralSyntax, TypedLiteral, supports_typed_string};
 pub use route::{ScalarTypingRoute, scalar_typing_route};
 pub use syntax_constant::{LiteralValue, admit_syntax_constant};
+pub use temporal::{
+    TemporalSyntax, at_zone_syntax, bind_temporal_syntax, clock_syntax, declared_temporal_type,
+    qualified_datetime_difference, select_temporal_cast, temporal_function_value_type,
+};
 
 /// Project numeric and comparison syntax into the installed operator vocabulary.
 pub fn syntax_arithmetic(operator: novarocks_parser::ast::BinaryOperator) -> OperatorFunction {
@@ -206,7 +211,7 @@ pub struct ChildTyping {
 }
 
 impl ChildTyping {
-    fn argument(&self) -> FunctionArgument {
+    pub(crate) fn argument(&self) -> FunctionArgument {
         FunctionArgument::Value {
             value_type: self.value_type.clone(),
             constant: self.constant.clone(),
@@ -349,6 +354,54 @@ impl std::error::Error for TypingError {
     }
 }
 
+/// Select the temporal operator for typed binary operands shared by SQL and EXL.
+pub fn temporal_binary_operator(
+    operator: novarocks_type_contract::ArithmeticOperator,
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+) -> Result<Option<OperatorFunction>, TypingError> {
+    use novarocks_type_contract::ArithmeticOperator as A;
+    if !temporal_arithmetic_type(left) && !temporal_arithmetic_type(right) {
+        return Ok(None);
+    }
+    Ok(Some(match operator {
+        A::Add => OperatorFunction::TemporalAdd,
+        A::Subtract => OperatorFunction::TemporalSubtract,
+        A::Multiply => OperatorFunction::TemporalMultiply,
+        A::Divide => OperatorFunction::TemporalDivide,
+        A::Modulo => {
+            return Err(TypingError::TypeMismatch(
+                "No matching temporal arithmetic overload for modulo".into(),
+            ));
+        }
+    }))
+}
+
+fn temporal_arithmetic_type(value: &FunctionValueType) -> bool {
+    value.value_type().temporal().is_some() || value.data_type() == &DataType::Date32
+}
+
+pub fn validate_temporal_unary_plus(operand: &FunctionValueType) -> Result<(), TypingError> {
+    if temporal_arithmetic_type(operand) {
+        Err(TypingError::TypeMismatch(
+            "Unary plus requires a numeric operand".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn negation_operator(operand: &FunctionValueType) -> OperatorFunction {
+    if matches!(
+        operand.value_type().temporal(),
+        Some(novarocks_type_contract::TemporalType::Interval(_))
+    ) {
+        OperatorFunction::TemporalNegation
+    } else {
+        OperatorFunction::Negation
+    }
+}
+
 /// Select a node's result and its ordered child conversions. The caller
 /// applies the decisions and hands the actual converted facts to finish_call.
 pub fn type_node(
@@ -423,13 +476,18 @@ pub fn type_node(
             type_selected_call(context, binding, None, children, work)?
         }
         NodeShape::Operator(operator) => {
-            let unary = operator == OperatorFunction::Negation;
+            let unary = matches!(
+                operator,
+                OperatorFunction::Negation | OperatorFunction::TemporalNegation
+            );
             if children.len() != if unary { 1 } else { 2 } {
                 return Err(TypingError::InvalidShape(
                     "operator has the wrong number of operands",
                 ));
             }
-            if unary && children[0].value_type.data_type() == &DataType::Null {
+            if operator == OperatorFunction::Negation
+                && children[0].value_type.data_type() == &DataType::Null
+            {
                 return Err(FunctionBindingError::AmbiguousOverload.into());
             }
             let arguments = arguments(children, work)?;
@@ -440,6 +498,19 @@ pub fn type_node(
                 work.control(),
             ) {
                 Err(FunctionBindingError::NoMatchingOverload) => {
+                    if matches!(
+                        operator,
+                        OperatorFunction::TemporalAdd
+                            | OperatorFunction::TemporalSubtract
+                            | OperatorFunction::TemporalMultiply
+                            | OperatorFunction::TemporalDivide
+                            | OperatorFunction::TemporalNegation
+                    ) {
+                        return Err(TypingError::TypeMismatch(format!(
+                            "No matching temporal arithmetic overload for {:?}",
+                            operator
+                        )));
+                    }
                     if operator == OperatorFunction::ArraySubscript {
                         return Err(TypingError::TypeMismatch(format!(
                             "cannot subscript {:?} with {:?}",
@@ -468,6 +539,7 @@ pub fn type_node(
             let [child] = children else {
                 return Err(TypingError::InvalidShape("unary plus requires one operand"));
             };
+            validate_temporal_unary_plus(&child.value_type)?;
             if child.value_type.logical_type()
                 != novarocks_type_contract::ValueLogicalType::Physical
                 || !matches!(

@@ -17,6 +17,9 @@
 
 syntax = "proto3";
 
+import "connector_read.proto";
+import "value_type.proto";
+
 package novarocks.connector.iceberg;
 
 // Iceberg owns this complete private read format. The public connector
@@ -46,6 +49,7 @@ enum ValueTypeKind {
   VALUE_TYPE_KIND_TINY_INT = 18;
   VALUE_TYPE_KIND_SMALL_INT = 19;
   VALUE_TYPE_KIND_TIMESTAMP_MILLIS = 20;
+  VALUE_TYPE_KIND_TEMPORAL = 21;
 }
 
 message ValueType {
@@ -53,6 +57,7 @@ message ValueType {
   optional uint32 decimal_precision = 2;
   optional int32 decimal_scale = 3;
   optional uint32 fixed_length = 4;
+  novarocks.value_type.TemporalType temporal = 5;
 }
 
 message DecimalValue {
@@ -82,6 +87,7 @@ message Value {
     int32 tiny_int = 17;
     int32 small_int = 18;
     int64 timestamp_millis = 19;
+    novarocks.connector_read.TemporalPredicateValue temporal = 20;
   }
 }
 

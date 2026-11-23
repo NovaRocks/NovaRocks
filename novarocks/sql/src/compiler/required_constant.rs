@@ -40,6 +40,8 @@ pub enum RequiredConstantTarget {
     /// Accept an already typed Physical timestamp or an UNKNOWN NULL.
     /// Preserve its exact timestamp carrier, precision and zone annotation.
     Timestamp,
+    /// Accept an already typed VARCHAR or day-time interval, retaining its declaration.
+    TimeZone,
 }
 impl RequiredConstantTarget {
     pub const fn scalar_data_type(self) -> Option<DataType> {
@@ -49,7 +51,7 @@ impl RequiredConstantTarget {
             Self::Bigint => Some(DataType::Int64),
             Self::Double => Some(DataType::Float64),
             Self::Varchar => Some(DataType::Utf8),
-            Self::ArrayVarchar | Self::MapVarcharVarchar | Self::Timestamp => None,
+            Self::ArrayVarchar | Self::MapVarcharVarchar | Self::Timestamp | Self::TimeZone => None,
         }
     }
 

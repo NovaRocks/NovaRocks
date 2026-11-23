@@ -19,6 +19,7 @@ syntax = "proto3";
 
 import "catalog.proto";
 import "connector_common.proto";
+import "value_type.proto";
 
 // NovaRocks-native typed connector read contract.
 //
@@ -58,6 +59,7 @@ enum ValueTypeKind {
   VALUE_TYPE_KIND_TIMESTAMP_NANOS = 11;
   VALUE_TYPE_KIND_TIMESTAMP_TZ_NANOS = 12;
   VALUE_TYPE_KIND_TIMESTAMP_MILLIS = 20;
+  VALUE_TYPE_KIND_TEMPORAL = 21;
   VALUE_TYPE_KIND_VARCHAR = 13;
   VALUE_TYPE_KIND_VARBINARY = 14;
   VALUE_TYPE_KIND_UUID = 15;
@@ -77,6 +79,7 @@ message ValueType {
   optional uint32 decimal_precision = 2;  // 1..=38, DECIMAL only.
   optional int32 decimal_scale = 3;       // 0..=precision, DECIMAL only.
   optional uint32 fixed_length = 4;       // FIXED only.
+  novarocks.value_type.TemporalType temporal = 5;  // TEMPORAL only.
 }
 
 // A 16-byte two's-complement unscaled magnitude plus its exact type parameters.
@@ -84,6 +87,16 @@ message DecimalValue {
   bytes unscaled = 1;      // exactly 16 bytes, big-endian two's complement.
   uint32 precision = 2;    // 1..=38.
   int32 scale = 3;         // 0..=precision.
+}
+
+// Complete SQL precision and original value. The declaration fixes the unit
+// of whole and the presence of each trailing component.
+message TemporalPredicateValue {
+  novarocks.value_type.TemporalType data_type = 1;
+  optional sint64 whole = 2;
+  optional uint32 picoseconds_of_microsecond = 3;
+  optional sint32 offset_minutes = 4;
+  optional uint32 zone_key = 5;
 }
 
 // One exactly typed, non-null value. NULL is carried by Domain.null_allowed.
@@ -104,6 +117,7 @@ message Value {
     int64 timestamp_nanos = 11;
     int64 timestamp_tz_nanos = 12;
     int64 timestamp_millis = 19;
+    TemporalPredicateValue temporal = 20;
     string varchar = 13;               // <= 64 KiB.
     bytes varbinary = 14;              // <= 64 KiB.
     bytes uuid = 15;                   // exactly 16 bytes.

@@ -187,6 +187,7 @@ pub trait CountScalarValue: Sized {
     fn children(&self) -> usize;
     fn child(&self, index: usize, second: bool) -> Option<&Self>;
 }
+const TEMPORAL_TAG: u8 = 13;
 macro_rules! value_access {
     ($enum:ident, $utf8:ident) => {
         fn tag(&self) -> u8 {
@@ -203,6 +204,7 @@ macro_rules! value_access {
                 $enum::List(_) => 10,
                 $enum::Decimal256(_) => 11,
                 $enum::Binary(_) => 12,
+                $enum::Temporal(..) => TEMPORAL_TAG,
             }
         }
         fn fixed_bytes(&self) -> Option<([u8; 16], usize)> {
@@ -270,6 +272,9 @@ fn append_scalar_body<'buffer, V: CountScalarValue, B: CountBuffer<'buffer>>(
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<(), crate::KernelFailure> {
     let tag = value.tag();
+    if tag == TEMPORAL_TAG {
+        return Err(scalar::temporal_scalar_contract());
+    }
     out.append(&[tag], work)?;
     if let Some((bytes, len)) = value.fixed_bytes() {
         return out.append(&bytes[..len], work);

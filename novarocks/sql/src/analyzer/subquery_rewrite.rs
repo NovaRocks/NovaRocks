@@ -2446,7 +2446,7 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Every actual candidate row participates in the same ordinary equality
     /// as an explicit pairwise comparison.
-    // Design: ADR-0254 (docs/adr/ADR-0254-collection-calls-and-relational-sequence.md)
+    // Design: ADR-0255 (docs/adr/ADR-0255-collection-calls-and-relational-sequence.md)
     fn rewrite_composite_in_value_form(
         &self,
         select: &mut ResolvedSelect,

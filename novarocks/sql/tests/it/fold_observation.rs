@@ -40,6 +40,7 @@ pub(super) struct FoldReceipt {
     root: RootOrdinal,
     constants: ConstantPools,
     pub(super) result: Option<ConstantValue>,
+    pub(super) parameters: novarocks_type_contract::SemanticParameters,
     policy: ConstantPolicy,
 }
 
@@ -102,6 +103,7 @@ impl SqlFoldDependencyObserver for FoldProbe {
             root: source.root(),
             constants: source.constants().clone(),
             result: result.cloned(),
+            parameters: source.parameters().clone(),
             policy: source.constant_policy(),
         });
         Ok(())

@@ -29,6 +29,8 @@ use analytic_failure::contract as analytic_contract;
 use arrow::array::{Array, ArrayRef, UInt32Builder};
 use arrow::compute::take;
 use arrow::datatypes::DataType;
+use novarocks_type_contract::{FunctionValueType, TemporalType};
+use novarocks_value_arrays::decode::PreparedTemporalArray;
 use std::cmp::Ordering;
 #[cfg(test)]
 use std::collections::VecDeque;
@@ -174,6 +176,66 @@ pub(crate) fn split_analytic_output_chunks(
     ))
 }
 
+/// Original analytic operations choose temporal semantics from the exact
+/// expression-root declaration. Legacy key domains retain their own rules.
+#[derive(Clone, Copy)]
+pub(crate) enum AnalyticKeyType {
+    Carrier,
+    Temporal {
+        declaration: TemporalType,
+        nullable: bool,
+    },
+}
+
+impl AnalyticKeyType {
+    pub(crate) fn from_binding(binding: &FunctionValueType) -> Self {
+        match binding.value_type().temporal() {
+            Some(declaration) => Self::Temporal {
+                declaration,
+                nullable: binding.nullable(),
+            },
+            None => Self::Carrier,
+        }
+    }
+
+    fn temporal_order(
+        self,
+        array: &dyn Array,
+        left: usize,
+        right: usize,
+    ) -> ExecutionResult<Option<Ordering>> {
+        let Self::Temporal {
+            declaration,
+            nullable,
+        } = self
+        else {
+            return Ok(None);
+        };
+        let values = PreparedTemporalArray::bind(declaration, array, nullable)
+            .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
+        let left = values
+            .relation_key(left)
+            .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
+        let right = values
+            .relation_key(right)
+            .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
+        Ok(Some(left.cmp(&right)))
+    }
+
+    pub(crate) fn equal(
+        self,
+        array: &dyn Array,
+        left: usize,
+        right: usize,
+    ) -> ExecutionResult<bool> {
+        if let Some(order) = self.temporal_order(array, left, right)? {
+            return Ok(order.is_eq());
+        }
+        value_equal_or_both_null(array, left, right)
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn reorder_chunk_by_partition_keys(
     chunk: &Chunk,
     keys: &[ArrayRef],
@@ -181,6 +243,25 @@ pub(crate) fn reorder_chunk_by_partition_keys(
     analytic_input_stages::unscoped(analytic_input_stages::regroup(
         chunk,
         keys,
+        None,
+        &mut analytic_input_stages::UnscopedWork,
+    ))
+}
+
+pub(crate) fn reorder_chunk_by_typed_partition_keys(
+    chunk: &Chunk,
+    keys: &[ArrayRef],
+    key_types: &[AnalyticKeyType],
+) -> ExecutionResult<Chunk> {
+    if keys.len() != key_types.len() {
+        return Err(analytic_contract(
+            "analytic regroup key declarations do not match its keys",
+        ));
+    }
+    analytic_input_stages::unscoped(analytic_input_stages::regroup(
+        chunk,
+        keys,
+        Some(key_types),
         &mut analytic_input_stages::UnscopedWork,
     ))
 }
@@ -194,6 +275,7 @@ fn compare_rows_on_partition_keys(
     analytic_input_stages::unscoped_compare(keys, left, right)
 }
 
+#[cfg(test)]
 pub(crate) fn row_equal_on_keys(
     keys: &[ArrayRef],
     left: usize,
@@ -481,6 +563,55 @@ mod tests {
     use arrow::datatypes::Field;
     use novarocks_types::SlotId;
     use std::sync::Arc;
+
+    #[test]
+    fn temporal_window_peers_use_instant_order_and_keep_input_zone_values() {
+        use arrow::array::FixedSizeBinaryBuilder;
+        use novarocks_type_contract::{
+            TemporalCarrier, TemporalMicros, TemporalPrecision, TemporalValue, TimeZoneKey,
+        };
+
+        let declaration = TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS);
+        let DataType::FixedSizeBinary(width) = declaration.carrier() else {
+            panic!("expected zoned timestamp carrier");
+        };
+        let mut builder = FixedSizeBinaryBuilder::with_capacity(4, width);
+        let eastern = TimeZoneKey::parse("America/New_York").unwrap();
+        let utc = TimeZoneKey::UTC;
+        for (fraction, zone) in [(1, eastern), (1, utc), (2, utc)] {
+            let value = TemporalValue::TimestampWithTimeZone {
+                instant: TemporalMicros::new(-1, fraction).unwrap(),
+                zone,
+            };
+            let TemporalCarrier::ZonedTimestamp(bytes) = value.to_carrier(declaration).unwrap()
+            else {
+                panic!("expected timestamp carrier")
+            };
+            builder.append_value(bytes).unwrap();
+        }
+        builder.append_null();
+        let timestamp: ArrayRef = Arc::new(builder.finish());
+        let key = AnalyticKeyType::Temporal {
+            declaration,
+            nullable: true,
+        };
+        assert!(key.equal(timestamp.as_ref(), 0, 1).unwrap());
+        assert!(!key.equal(timestamp.as_ref(), 1, 2).unwrap());
+        assert!(!key.equal(timestamp.as_ref(), 1, 3).unwrap());
+        assert!(key.equal(timestamp.as_ref(), 3, 3).unwrap());
+        let prepared = PreparedTemporalArray::bind(declaration, timestamp.as_ref(), true).unwrap();
+        assert!(matches!(
+            prepared.value(0).unwrap(),
+            Some(TemporalValue::TimestampWithTimeZone { zone, .. }) if zone == eastern
+        ));
+        let source = int32_chunk(vec![Some(0), Some(1), Some(2), Some(3)]);
+        let ordered = reorder_chunk_by_typed_partition_keys(&source, &[timestamp], &[key]).unwrap();
+        let values = ordered.columns()[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.values().as_ref(), [3, 0, 1, 2]);
+    }
 
     fn int32_chunk_schema() -> ChunkSchemaRef {
         Arc::new(

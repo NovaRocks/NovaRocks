@@ -17,8 +17,8 @@
 
 //! Trino column metadata projected only from the frozen client render contract.
 use novarocks_result_contract::{
-    CharacterKind, ClientPresentationFamily, ClientRenderSchema, NativeRenderType, RenderTimeUnit,
-    TrinoJsonFacts,
+    CharacterKind, ClientPresentationFamily, ClientRenderSchema, NativeRenderType,
+    RenderIntervalField, RenderTemporalType, RenderTimeUnit, TrinoJsonFacts,
 };
 use serde::Serialize;
 use std::fmt::{self, Write};
@@ -241,11 +241,17 @@ enum ScalarName {
         precision: u64,
         suffix: &'static str,
     },
+    Interval {
+        start: RenderIntervalField,
+        end: RenderIntervalField,
+        leading: u8,
+        fractional: u8,
+    },
 }
 struct ScalarInfo {
     raw_type: &'static str,
     name: ScalarName,
-    arguments: [u64; 2],
+    arguments: [u64; 4],
     argument_count: usize,
 }
 enum TypeInfo<'a> {
@@ -263,7 +269,7 @@ fn type_info(ty: &NativeRenderType, facts: TrinoJsonFacts) -> Result<TypeInfo<'_
         TypeInfo::Scalar(ScalarInfo {
             raw_type: name,
             name: ScalarName::Plain(name),
-            arguments: [0; 2],
+            arguments: [0; 4],
             argument_count: 0,
         })
     };
@@ -284,13 +290,13 @@ fn type_info(ty: &NativeRenderType, facts: TrinoJsonFacts) -> Result<TypeInfo<'_
         } if *precision <= 38 && *scale >= 0 => TypeInfo::Scalar(ScalarInfo {
             raw_type: "decimal",
             name: ScalarName::Decimal(*precision, *scale),
-            arguments: [u64::from(*precision), *scale as u64],
+            arguments: [u64::from(*precision), *scale as u64, 0, 0],
             argument_count: 2,
         }),
         N::String => TypeInfo::Scalar(ScalarInfo {
             raw_type: "varchar",
             name: ScalarName::Plain("varchar"),
-            arguments: [2_147_483_647, 0],
+            arguments: [2_147_483_647, 0, 0, 0],
             argument_count: 1,
         }),
         N::BoundedCharacter(character) => {
@@ -306,7 +312,7 @@ fn type_info(ty: &NativeRenderType, facts: TrinoJsonFacts) -> Result<TypeInfo<'_
                     precision: length,
                     suffix: "",
                 },
-                arguments: [length, 0],
+                arguments: [length, 0, 0, 0],
                 argument_count: 1,
             })
         }
@@ -330,13 +336,14 @@ fn type_info(ty: &NativeRenderType, facts: TrinoJsonFacts) -> Result<TypeInfo<'_
                         precision,
                         suffix,
                     },
-                    arguments: [precision, 0],
+                    arguments: [precision, 0, 0, 0],
                     argument_count: 1,
                 })
             } else {
                 plain(raw_type)
             }
         }
+        N::Temporal(ty) => TypeInfo::Scalar(temporal_type_info(*ty, facts)),
         N::Json => plain("json"),
         N::Variant => plain(if facts.variant || facts.variant_binary {
             "variant"
@@ -350,6 +357,83 @@ fn type_info(ty: &NativeRenderType, facts: TrinoJsonFacts) -> Result<TypeInfo<'_
             return Err(ColumnsError::UnsupportedFrozenType);
         }
     })
+}
+
+fn temporal_type_info(ty: RenderTemporalType, facts: TrinoJsonFacts) -> ScalarInfo {
+    use RenderTemporalType as T;
+    let (raw_type, keyword, precision, suffix) = match ty {
+        T::Time(p) => ("time", "time", p, ""),
+        T::TimeWithTimeZone(p) => ("time with time zone", "time", p, " with time zone"),
+        T::Timestamp(p) => ("timestamp", "timestamp", p, ""),
+        T::TimestampWithTimeZone(p) => (
+            "timestamp with time zone",
+            "timestamp",
+            p,
+            " with time zone",
+        ),
+        T::Interval {
+            start,
+            end,
+            leading_precision,
+            fractional_precision,
+        } => {
+            let year_month = start <= RenderIntervalField::Month;
+            let raw_type = if year_month {
+                "interval year to month"
+            } else {
+                "interval day to second"
+            };
+            return ScalarInfo {
+                raw_type,
+                name: if facts.parametric_interval {
+                    ScalarName::Interval {
+                        start,
+                        end,
+                        leading: leading_precision,
+                        fractional: fractional_precision,
+                    }
+                } else {
+                    ScalarName::Plain(raw_type)
+                },
+                arguments: [
+                    u64::from(start as u8),
+                    u64::from(end as u8),
+                    u64::from(leading_precision),
+                    u64::from(fractional_precision),
+                ],
+                argument_count: if facts.parametric_interval {
+                    if year_month { 3 } else { 4 }
+                } else {
+                    0
+                },
+            };
+        }
+    };
+    ScalarInfo {
+        raw_type,
+        name: if facts.parametric_datetime {
+            ScalarName::Parameterized {
+                keyword,
+                precision: u64::from(precision),
+                suffix,
+            }
+        } else {
+            ScalarName::Plain(raw_type)
+        },
+        arguments: [u64::from(precision), 0, 0, 0],
+        argument_count: usize::from(facts.parametric_datetime),
+    }
+}
+
+fn interval_field_name(field: RenderIntervalField) -> &'static str {
+    match field {
+        RenderIntervalField::Year => "YEAR",
+        RenderIntervalField::Month => "MONTH",
+        RenderIntervalField::Day => "DAY",
+        RenderIntervalField::Hour => "HOUR",
+        RenderIntervalField::Minute => "MINUTE",
+        RenderIntervalField::Second => "SECOND",
+    }
 }
 fn argument_backing(length: usize) -> Result<usize, ColumnsError> {
     length
@@ -507,6 +591,32 @@ fn write_type_name(
                 precision,
                 suffix,
             } => write!(out, "{keyword}({precision}){suffix}"),
+            ScalarName::Interval {
+                start,
+                end,
+                leading,
+                fractional,
+            } => {
+                use RenderIntervalField::Second;
+                match (start, end) {
+                    (Second, Second) => write!(out, "INTERVAL SECOND({leading}, {fractional})"),
+                    (start, end) if start == end => {
+                        write!(out, "INTERVAL {}({leading})", interval_field_name(start))
+                    }
+                    (start, end) => {
+                        write!(
+                            out,
+                            "INTERVAL {}({leading}) TO {}",
+                            interval_field_name(start),
+                            interval_field_name(end)
+                        )?;
+                        if end == Second {
+                            write!(out, "({fractional})")?;
+                        }
+                        Ok(())
+                    }
+                }
+            }
         },
         TypeInfo::Array(child) => {
             out.write_str("array(")?;
@@ -758,6 +868,7 @@ mod tests {
             (
                 TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: false,
                 },
@@ -767,6 +878,7 @@ mod tests {
             (
                 TrinoJsonFacts {
                     parametric_datetime: false,
+                    parametric_interval: false,
                     variant: false,
                     variant_binary: true,
                 },
@@ -972,12 +1084,96 @@ mod tests {
     }
 
     #[test]
+    fn temporal_signatures_preserve_exact_parameters_through_nested_shapes() {
+        use NativeRenderType as N;
+        use novarocks_result_contract::{RenderIntervalField as F, RenderTemporalType as T};
+        let types = vec![
+            N::Temporal(T::Time(0)),
+            N::Temporal(T::TimeWithTimeZone(12)),
+            N::Temporal(T::Timestamp(6)),
+            N::Temporal(T::TimestampWithTimeZone(12)),
+            N::List(Box::new(field(N::Temporal(T::Interval {
+                start: F::Day,
+                end: F::Second,
+                leading_precision: 1,
+                fractional_precision: 6,
+            })))),
+            N::Temporal(T::Interval {
+                start: F::Month,
+                end: F::Month,
+                leading_precision: 2,
+                fractional_precision: 0,
+            }),
+        ];
+        let exact = assert_exact_construction(&schema(
+            types.clone(),
+            TrinoJsonFacts {
+                parametric_datetime: true,
+                parametric_interval: true,
+                ..Default::default()
+            },
+        ));
+        let legacy = assert_exact_construction(&schema(types, TrinoJsonFacts::default()));
+        let names = |columns: &[TrinoColumn]| {
+            columns
+                .iter()
+                .map(|c| c.type_name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&exact),
+            [
+                "time(0)",
+                "time(12) with time zone",
+                "timestamp(6)",
+                "timestamp(12) with time zone",
+                "array(INTERVAL DAY(1) TO SECOND(6))",
+                "INTERVAL MONTH(2)"
+            ]
+        );
+        assert_eq!(
+            names(&legacy),
+            [
+                "time",
+                "time with time zone",
+                "timestamp",
+                "timestamp with time zone",
+                "array(interval day to second)",
+                "interval year to month"
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&exact[4].type_signature).unwrap(),
+            json!({
+                "rawType": "array",
+                "arguments": [{"kind": "TYPE", "value": {
+                    "rawType": "interval day to second",
+                    "arguments": [
+                        {"kind": "LONG", "value": 2}, {"kind": "LONG", "value": 5},
+                        {"kind": "LONG", "value": 1}, {"kind": "LONG", "value": 6}
+                    ]
+                }}]
+            })
+        );
+        assert_eq!(
+            exact[5].type_signature.arguments,
+            [
+                ClientTypeArgument::Long(1),
+                ClientTypeArgument::Long(1),
+                ClientTypeArgument::Long(2)
+            ]
+        );
+        assert_eq!(legacy[5].type_signature.arguments, []);
+    }
+
+    #[test]
     fn construction_bound_matches_exact_builder_for_every_supported_scalar_and_capability() {
         for parametric_datetime in [false, true] {
             for variant in [false, true] {
                 for variant_binary in [false, true] {
                     let facts = TrinoJsonFacts {
                         parametric_datetime,
+                        parametric_interval: false,
                         variant,
                         variant_binary,
                     };

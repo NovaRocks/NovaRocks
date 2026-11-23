@@ -95,7 +95,7 @@ pub(crate) struct TableSequenceOccurrence {
     arguments: Vec<TableSequenceArgumentNeed>,
 }
 
-// Design: ADR-0254 (docs/adr/ADR-0254-collection-calls-and-relational-sequence.md)
+// Design: ADR-0255 (docs/adr/ADR-0255-collection-calls-and-relational-sequence.md)
 pub(crate) enum TableSequencePass {
     SchemaOnly(Arc<PureEngineFunctionCatalog>),
     Request(RefCell<TableSequenceRequestPass>),

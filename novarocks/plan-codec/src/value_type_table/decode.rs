@@ -111,6 +111,9 @@ pub(crate) fn decode_with_factory<H, F: novarocks_type_contract::ValueSchemaCrea
                             kind
                         }
                         Kind::Nominal(value) => ValueKind::Nominal(scalars::nominal(*value)?),
+                        Kind::Temporal(value) => {
+                            ValueKind::Temporal(super::temporal::decode(value)?)
+                        }
                         Kind::ListItemTypeId(id) => {
                             ValueKind::List(child(*id, &graph, &values, context)?)
                         }

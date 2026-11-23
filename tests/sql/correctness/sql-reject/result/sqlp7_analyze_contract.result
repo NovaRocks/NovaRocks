@@ -1,0 +1,24 @@
+-- query 18
+-- types	INTERVAL DAY(1)
+_col0
+1 00:00:00
+
+-- query 19
+-- types	INTERVAL DAY(2) TO SECOND(6)
+_col0
+NULL
+
+-- query 47
+-- types	timestamp(0) with time zone
+_col0
+2019-12-31 16:00:00 UTC
+
+-- query 48
+-- types	timestamp(0) with time zone
+_col0
+2020-01-01 00:00:00 Asia/Shanghai
+
+-- query 49
+-- types	timestamp(3) with time zone
+_col0
+NULL

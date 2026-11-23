@@ -95,14 +95,25 @@ pub(super) fn admit_original_binding_observed(
     control: &dyn PureCompileControl,
 ) -> Result<(), FunctionBindingError> {
     functions.admit_bound_lifecycle_observed(binding.resolved(), lifecycle, control)?;
-    let environment = original
-        .group_concat_source()
-        .map(|facts| facts.environment());
-    let references = environment
-        .as_ref()
-        .map(|refs| refs.as_slice())
-        .unwrap_or(&[]);
-    functions.admit_bound_environment_observed(binding.resolved(), references, parameters, control)
+    let admit = |references: &[novarocks_type_contract::SemanticParameterRef]| {
+        functions.admit_bound_environment_observed(
+            binding.resolved(),
+            references,
+            parameters,
+            control,
+        )
+    };
+    if let Some(facts) = original.group_concat_source() {
+        return admit(&facts.environment());
+    }
+    let mut time = original
+        .statement_time_parameters()
+        .map(|(reference, _)| reference);
+    match (time.next(), time.next()) {
+        (Some(start), Some(zone)) => admit(&[start, zone]),
+        (Some(only), None) => admit(std::slice::from_ref(&only)),
+        (None, _) => admit(&[]),
+    }
 }
 
 /// Explicit read-only inspection of a completed original SQL source using its

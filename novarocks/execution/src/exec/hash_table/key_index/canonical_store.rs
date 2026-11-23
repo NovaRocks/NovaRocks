@@ -26,7 +26,8 @@ use super::{
 use crate::{
     exec::{
         hash_table::key_builder::{
-            canonical_component_payload, canonical_nullable_equals_with_policy_observed,
+            canonical_component_forms, canonical_component_payload,
+            canonical_nullable_equals_with_policy_observed,
         },
         pipeline::operator::InputConstructionOwner,
     },
@@ -433,7 +434,8 @@ impl OwnedCanonicalColumn {
                 u8::from(canonical_nullable_equals_with_policy_observed::<CONTENT>(
                     source,
                     physical,
-                    encoded.value(stored.row),
+                    Some(self.binding.value_type()),
+                    canonical_component_forms(encoded.value(stored.row))?.0,
                     checkpoint,
                 )?)
             };

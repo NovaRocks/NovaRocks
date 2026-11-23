@@ -35,10 +35,15 @@ pub enum OperatorFunction {
     GreaterThanOrEqual,
     Identical,
     Distinct,
+    TemporalAdd,
+    TemporalSubtract,
+    TemporalMultiply,
+    TemporalDivide,
+    TemporalNegation,
 }
 
 impl OperatorFunction {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 20] = [
         Self::Negation,
         Self::Add,
         Self::Subtract,
@@ -54,6 +59,11 @@ impl OperatorFunction {
         Self::Identical,
         Self::Distinct,
         Self::ArraySubscript,
+        Self::TemporalAdd,
+        Self::TemporalSubtract,
+        Self::TemporalMultiply,
+        Self::TemporalDivide,
+        Self::TemporalNegation,
     ];
 
     pub const fn catalog_name(self) -> &'static str {
@@ -73,6 +83,11 @@ impl OperatorFunction {
             Self::GreaterThanOrEqual => "__operator_greater_than_or_equal",
             Self::Identical => "__operator_identical",
             Self::Distinct => "__operator_distinct",
+            Self::TemporalAdd => "__temporal_add",
+            Self::TemporalSubtract => "__temporal_subtract",
+            Self::TemporalMultiply => "__temporal_multiply",
+            Self::TemporalDivide => "__temporal_divide",
+            Self::TemporalNegation => "__temporal_negate",
         }
     }
 
@@ -93,6 +108,11 @@ impl OperatorFunction {
             Self::GreaterThanOrEqual => "builtin.scalar/__operator_greater_than_or_equal/v1",
             Self::Identical => "builtin.scalar/__operator_identical/v1",
             Self::Distinct => "builtin.scalar/__operator_distinct/v1",
+            Self::TemporalAdd => "builtin.scalar/__temporal_add/v1",
+            Self::TemporalSubtract => "builtin.scalar/__temporal_subtract/v1",
+            Self::TemporalMultiply => "builtin.scalar/__temporal_multiply/v1",
+            Self::TemporalDivide => "builtin.scalar/__temporal_divide/v1",
+            Self::TemporalNegation => "builtin.scalar/__temporal_negate/v1",
         }
     }
 
@@ -141,16 +161,19 @@ impl OperatorFunction {
     }
 
     pub const fn is_infix(self) -> bool {
-        !matches!(self, Self::Negation | Self::ArraySubscript)
+        !matches!(
+            self,
+            Self::Negation | Self::ArraySubscript | Self::TemporalNegation
+        )
     }
 
     pub const fn sql(self) -> &'static str {
         match self {
-            Self::Negation => "-",
-            Self::Add => "+",
-            Self::Subtract => "-",
-            Self::Multiply => "*",
-            Self::Divide => "/",
+            Self::Negation | Self::TemporalNegation => "-",
+            Self::Add | Self::TemporalAdd => "+",
+            Self::Subtract | Self::TemporalSubtract => "-",
+            Self::Multiply | Self::TemporalMultiply => "*",
+            Self::Divide | Self::TemporalDivide => "/",
             Self::Modulo => "%",
             Self::Equal => "=",
             Self::NotEqual => "<>",

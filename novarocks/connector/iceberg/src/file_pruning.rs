@@ -38,6 +38,7 @@ use novarocks_fs::{MinMaxPredicateValue, ScanPredicate, ScanPredicateDomain};
 
 use crate::scan_model::{
     IcebergColumnStats, IcebergDataFileInfo, IcebergPartitionValue, IcebergPhysicalPredicate,
+    IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateValue,
 };
 
 /// Judge one data file against the frozen physical predicates.
@@ -47,24 +48,29 @@ pub fn file_may_satisfy_physical_predicates(
     file: &IcebergDataFileInfo,
     predicates: &[IcebergPhysicalPredicate],
 ) -> bool {
-    if predicates.is_empty() {
-        return true;
-    }
-    let predicates = crate::file_reader::physical_predicates_to_file_predicates(predicates);
-    file_may_satisfy_predicates(file, &predicates)
-}
-
-fn file_may_satisfy_predicates(file: &IcebergDataFileInfo, predicates: &[ScanPredicate]) -> bool {
     for predicate in predicates {
+        let temporal = matches!(
+            match &predicate.domain {
+                IcebergPhysicalPredicateDomain::Range { value, .. } => Some(value),
+                IcebergPhysicalPredicateDomain::DiscreteSet { values } => values.first(),
+            },
+            Some(IcebergPhysicalPredicateValue::Temporal(_))
+        );
+        let physical = crate::file_reader::physical_predicates_to_file_predicates(
+            std::slice::from_ref(predicate),
+        );
+        let Some(predicate) = physical.first() else {
+            continue;
+        };
         // An identity partition value is exact, so it outranks the column
         // bounds when it can decide.
-        if let Some(may_satisfy) = partition_decision(file, predicate) {
+        if let Some(may_satisfy) = partition_decision(file, predicate, temporal) {
             if !may_satisfy {
                 return false;
             }
             continue;
         }
-        if let Some(may_satisfy) = stats_decision(file, predicate)
+        if let Some(may_satisfy) = stats_decision(file, predicate, temporal)
             && !may_satisfy
         {
             return false;
@@ -84,11 +90,25 @@ fn file_may_satisfy_predicates(file: &IcebergDataFileInfo, predicates: &[ScanPre
 /// `source_column` is resolved from the same schema snapshot that resolved the
 /// predicate, and partition pruning has no row-group-level counterpart that
 /// could disagree with it.
-fn partition_decision(file: &IcebergDataFileInfo, predicate: &ScanPredicate) -> Option<bool> {
+fn partition_decision(
+    file: &IcebergDataFileInfo,
+    predicate: &ScanPredicate,
+    temporal: bool,
+) -> Option<bool> {
     let partition = file.partition_values.iter().find(|value| {
         value.transform.eq_ignore_ascii_case("identity")
-            && value.source_column.eq_ignore_ascii_case(predicate.column())
+            && if temporal {
+                value.source_field_id.is_some()
+                    && value.source_field_id == predicate.physical_field_id()
+            } else {
+                value.source_column.eq_ignore_ascii_case(predicate.column())
+            }
     })?;
+    if temporal && !matches!(partition.value, Some(IcebergPartitionValue::Int64(_))) {
+        // A historic DATE partition may still carry an i32 count of days.
+        // A missing value also cannot prove the original temporal unit.
+        return None;
+    }
     let Some(value) = partition.value.as_ref() else {
         // The partition value is NULL. None of the comparison or IN predicates
         // the provider can emit is satisfied by NULL, so the file is provably
@@ -103,10 +123,31 @@ fn partition_decision(file: &IcebergDataFileInfo, predicate: &ScanPredicate) -> 
 
 /// Decide from the manifest column bounds, or `None` when they cannot be
 /// judged (no statistics, no bound pair, or an undecodable literal).
-fn stats_decision(file: &IcebergDataFileInfo, predicate: &ScanPredicate) -> Option<bool> {
-    let stats = find_column_stats(file.column_stats.as_ref()?, predicate)?;
-    let lower = decode_i64_bound(stats.lower_bound.as_deref()?)?;
-    let upper = decode_i64_bound(stats.upper_bound.as_deref()?)?;
+fn stats_decision(
+    file: &IcebergDataFileInfo,
+    predicate: &ScanPredicate,
+    temporal: bool,
+) -> Option<bool> {
+    let columns = file.column_stats.as_ref()?;
+    let stats = if temporal {
+        let field_id = predicate.physical_field_id()?;
+        columns
+            .values()
+            .find(|stats| stats.field_id == Some(field_id))?
+    } else {
+        find_column_stats(columns, predicate)?
+    };
+    let decode = |bytes: &[u8]| {
+        if temporal {
+            // The only legal temporal promotion that changes the physical
+            // unit is DATE -> TIMESTAMP; DATE bounds are four bytes.
+            Some(i64::from_le_bytes(bytes.try_into().ok()?))
+        } else {
+            decode_i64_bound(bytes)
+        }
+    };
+    let lower = decode(stats.lower_bound.as_deref()?)?;
+    let upper = decode(stats.upper_bound.as_deref()?)?;
     let domain = domain_as_i64(predicate.domain())?;
     Some(domain.may_match_bounds(
         &MinMaxPredicateValue::Int64(lower),
@@ -358,6 +399,7 @@ mod tests {
     fn non_identity_transforms_are_not_judged() {
         let mut file = IcebergDataFileInfo::for_test("s3://bucket/b.parquet", 128, 10);
         file.partition_values = vec![IcebergPartitionFieldValue {
+            source_field_id: None,
             source_column: "id".to_string(),
             field_name: "id_bucket".to_string(),
             transform: "bucket[16]".to_string(),
@@ -466,6 +508,7 @@ mod tests {
 
         let mut string_partition = IcebergDataFileInfo::for_test("s3://bucket/s.parquet", 128, 10);
         string_partition.partition_values = vec![IcebergPartitionFieldValue {
+            source_field_id: None,
             source_column: "id".to_string(),
             field_name: "id".to_string(),
             transform: "identity".to_string(),
@@ -481,6 +524,7 @@ mod tests {
     fn null_identity_partition_prunes() {
         let mut file = IcebergDataFileInfo::for_test("s3://bucket/z.parquet", 128, 10);
         file.partition_values = vec![IcebergPartitionFieldValue {
+            source_field_id: None,
             source_column: "id".to_string(),
             field_name: "id".to_string(),
             transform: "identity".to_string(),

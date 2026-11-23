@@ -346,7 +346,9 @@ fn owned_finalization_runs_final_package_constants_parameters_pruning_contract_a
             1 => {
                 source.parameters = SemanticParameters::try_new([(
                     SemanticParameterId::new(u32::MAX),
-                    SemanticParameterValue::TimeZone("UTC".into()),
+                    SemanticParameterValue::TimeZone(
+                        novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+                    ),
                 )])
                 .unwrap()
             }

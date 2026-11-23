@@ -1382,3 +1382,35 @@ fn a_zero_request_timeout_cap_is_refused_before_client_construction() {
     );
     assert!(matches!(result, Err(StatementFailure::Protocol(_))));
 }
+
+#[test]
+fn exact_interval_metadata_and_legacy_nested_cells_share_the_wire_type() {
+    let exact = sig(
+        r#"{"rawType":"array","arguments":[{"kind":"TYPE","value":{"rawType":"interval day to second","arguments":[{"kind":"LONG","value":2},{"kind":"LONG","value":5},{"kind":"LONG","value":1},{"kind":"LONG","value":12}]}}]}"#,
+    );
+    let raw =
+        serde_json::value::RawValue::from_string(r#"["0 00:00:00.000000000001"]"#.into()).unwrap();
+    assert_eq!(
+        decode_value(&exact, &raw).unwrap(),
+        TrinoValue::Array(vec![TrinoValue::Text("0 00:00:00.000000000001".into())])
+    );
+    let legacy = sig(
+        r#"{"rawType":"map","arguments":[{"kind":"TYPE","value":{"rawType":"interval day to second","arguments":[]}},{"kind":"TYPE","value":{"rawType":"interval year to month","arguments":[]}}]}"#,
+    );
+    let raw =
+        serde_json::value::RawValue::from_string(r#"{"0 00:00:00.123":"0-2"}"#.into()).unwrap();
+    assert_eq!(
+        decode_value(&legacy, &raw).unwrap(),
+        TrinoValue::Map(vec![(
+            TrinoValue::Text("0 00:00:00.123".into()),
+            TrinoValue::Text("0-2".into()),
+        )])
+    );
+    for arguments in [[2, 1, 1, 0], [2, 5, 14, 0], [3, 4, 2, 1], [2, 5, 3, 13]] {
+        let malformed = TypeSignature {
+            raw_type: "interval day to second".into(),
+            arguments: arguments.into_iter().map(TypeArgument::Long).collect(),
+        };
+        assert!(malformed.validate().is_err(), "{arguments:?}");
+    }
+}

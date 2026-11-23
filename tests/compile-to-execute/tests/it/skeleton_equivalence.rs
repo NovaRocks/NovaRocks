@@ -446,7 +446,7 @@ fn migrated_literals_control_and_conversions_share_the_full_unit() {
         );
     }
     let text = fixture.equivalent("TIME '01:02:03'", &[]);
-    assert!(text.environment().parameters.require(ALLOW_THROW).is_err());
+    assert!(text.environment().parameters.entries().is_empty());
 }
 
 #[test]

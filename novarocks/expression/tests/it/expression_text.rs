@@ -21,7 +21,7 @@ use arrow::{
     array::{
         Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
         Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
-        Time64MicrosecondArray, TimestampMicrosecondArray,
+        TimestampMicrosecondArray,
     },
     datatypes::{DataType, Schema, i256},
     record_batch::RecordBatch,
@@ -34,14 +34,14 @@ use novarocks_expression::{
             TextColumn, TextContext, TextError, TypedText, type_expression_text,
         },
     },
-    typing::TypingError,
+    typing::{TypingError, temporal_function_value_type},
 };
 use novarocks_expression_contract::{ExprKind, ValueId};
 use novarocks_functions::{DataFailureReason, largeint};
 use novarocks_type_contract::{
     AssignmentCommonTypeError, DecimalOverflowPolicy, FunctionValueType, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
-    ValueLogicalType,
+    TemporalPrecision, TemporalType, ValueLogicalType,
 };
 use std::sync::Arc;
 
@@ -305,42 +305,30 @@ fn literal_types_and_cast_parameters_follow_the_checked_unit() {
             "{source}"
         );
     }
-    let temporal: &[(&str, u32, ArrayRef)] = &[
+    let precision = TemporalPrecision::WHOLE_SECONDS;
+    let temporal: &[(&str, TemporalType, ArrayRef)] = &[
         (
             "TIME '01:02:03'",
-            8,
-            Arc::new(Time64MicrosecondArray::from(vec![3_723_000_000])),
+            TemporalType::Time(precision),
+            Arc::new(Int64Array::from(vec![3_723_000_000_000_000])),
         ),
         (
             "TIMESTAMP '1970-01-02 00:00:00'",
-            19,
+            TemporalType::Timestamp(precision),
             Arc::new(TimestampMicrosecondArray::from(vec![86_400_000_000])),
         ),
     ];
-    for (source, expected_width, expected) in temporal {
+    for (source, declaration, expected) in temporal {
         let typed = compile(source, &[], &context);
         let unit = typed.unit();
         let root = unit.definition(unit.roots()[0].definition).unwrap();
-        let expected_type = FunctionValueType::new(expected.data_type().clone(), false);
+        let expected_type = temporal_function_value_type(*declaration, false).unwrap();
         assert_eq!(root.ty, expected_type, "{source}");
-        let ExprKind::Cast {
-            expr,
-            target,
-            cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
-        } = &root.kind
-        else {
-            panic!("{source}: expected the original text CAST");
-        };
-        assert_eq!(target, expected.data_type(), "{source}");
-        let child = unit.definition(*expr).unwrap();
-        assert!(matches!(child.kind, ExprKind::Constant(_)));
-        assert!(!child.ty.nullable());
-        assert!(matches!(
-            child.ty.value_type().kind(),
-            novarocks_type_contract::ValueKind::BoundedCharacter(character)
-                if character.kind() == novarocks_type_contract::CharacterKind::Varchar
-                    && character.length() == *expected_width
-        ));
+        assert!(matches!(root.kind, ExprKind::Constant(_)), "{source}");
+        assert!(
+            typed.environment().parameters.entries().is_empty(),
+            "{source}"
+        );
 
         let result = evaluate(&typed, &batch(&[], vec![]));
         assert_eq!(result.batch.shape, CONSTANT_SHAPE, "{source}");
@@ -821,6 +809,11 @@ fn input_constant_policy_reports_the_original_row_and_column() {
     ));
 }
 
+#[path = "expression_text/temporal_arithmetic.rs"]
+mod temporal_arithmetic;
+
+#[path = "expression_text/temporal_context.rs"]
+mod temporal_context;
 #[test]
 fn standard_arithmetic_selects_the_exact_decimal_declarations() {
     use arrow::array::Decimal128Array;

@@ -169,6 +169,7 @@ impl<C: Context> Debug for ScalarView<'_, C> {
             Utf8(v) => tuple("Utf8", v, self.1, f),
             Date32(v) => tuple("Date32", v, self.1, f),
             Timestamp(v) => tuple("Timestamp", v, self.1, f),
+            Temporal(ty, value) => tuple("Temporal", &(ty, value), self.1, f),
             Decimal128(v) => tuple("Decimal128", v, self.1, f),
             Decimal256(v) => tuple("Decimal256", &DecimalView(v, self.1), self.1, f),
             Binary(v) => tuple("Binary", &SequenceView(Items::Bytes(v), self.1), self.1, f),

@@ -36,6 +36,7 @@ mod encode;
 mod graph;
 pub(crate) mod resources;
 pub(crate) mod scalars;
+mod temporal;
 
 /// Explicit caller profile, independent of numeric ID magnitude.
 /// Expanded nodes count every definition's unfolded semantic subtree.

@@ -78,6 +78,26 @@ impl SessionPropertyRegistry {
         })
     }
 
+    /// Project a canonical zone selected by the scoped SET TIME ZONE constant
+    /// or clear the same system override for LOCAL.
+    pub fn prepare_trino_time_zone(
+        &self,
+        zone: Option<novarocks_type_contract::TimeZoneKey>,
+    ) -> Result<SessionEffects, SessionPropertyError> {
+        match zone {
+            Some(zone) => self
+                .prepare_sql(
+                    TIME_ZONE_ID,
+                    SessionPropertyValue::Varchar(zone.name().into()),
+                )
+                .map(SessionEffects::property),
+            None => Ok(SessionEffects::reset_property(ResolvedSqlSessionProperty {
+                declaration: self.lookup_system(TIME_ZONE_ID, SessionPropertyOrigin::Sql)?,
+                scope: SessionPropertyScope::System,
+            })),
+        }
+    }
+
     fn resolve_sql_parts(
         &self,
         parts: &[String],

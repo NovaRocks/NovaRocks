@@ -221,7 +221,7 @@ fn c02_p2_constructor_fast_paths_have_no_birth() {
     let single = stages::gather(std::slice::from_ref(&input), &mut work).unwrap();
     assert!(Arc::ptr_eq(&single.value.columns()[0], &input.columns()[0]));
     for source in [ints(vec![]), ints(vec![Some(1)]), input.clone()] {
-        let result = stages::regroup(&source, &[], &mut work).unwrap();
+        let result = stages::regroup(&source, &[], None, &mut work).unwrap();
         assert!(Arc::ptr_eq(
             &result.value.columns()[0],
             &source.columns()[0]
@@ -230,7 +230,7 @@ fn c02_p2_constructor_fast_paths_have_no_birth() {
     for source in [ints(vec![]), ints(vec![Some(1)])] {
         let trace_start = control.trace().len();
         let key = Arc::clone(&source.columns()[0]);
-        let result = stages::regroup(&source, &[key], &mut work).unwrap();
+        let result = stages::regroup(&source, &[key], None, &mut work).unwrap();
         assert_eq!(&control.trace()[trace_start..], &[0, 0]);
         assert!(Arc::ptr_eq(
             &result.value.columns()[0],
@@ -240,7 +240,7 @@ fn c02_p2_constructor_fast_paths_have_no_birth() {
         assert_eq!(work.bodies, 0);
     }
     let key = Arc::clone(&input.columns()[0]);
-    let identity = stages::regroup(&input, &[key], &mut work).unwrap();
+    let identity = stages::regroup(&input, &[key], None, &mut work).unwrap();
     assert!(Arc::ptr_eq(
         &identity.value.columns()[0],
         &input.columns()[0]
@@ -264,7 +264,7 @@ fn c02_p2_constructor_regroup_consumes_actual_taken_columns_and_stable_ties() {
     let keys: ArrayRef = Arc::new(Int32Array::from(vec![Some(2), Some(1), Some(1), None]));
     let control = Control::new(None);
     let mut work = Constructors::new(&control);
-    let result = stages::regroup(&source, &[keys], &mut work).unwrap();
+    let result = stages::regroup(&source, &[keys], None, &mut work).unwrap();
     assert_eq!(work.births.len(), 1);
     assert_eq!(work.bodies, 1);
     let birth = &work.births[0];
@@ -364,7 +364,7 @@ fn evaluate<W: AnalyticInputWork>(
         AnalyticInputStage::Regroup => {
             let source = ints(vec![Some(2), None, Some(1), Some(0)]);
             let key: ArrayRef = Arc::new(Int32Array::from(vec![2, 1, 1, 0]));
-            drop(stages::regroup(&source, &[key], work)?);
+            drop(stages::regroup(&source, &[key], None, work)?);
         }
         AnalyticInputStage::OutputSplit => {
             let column: ArrayRef =

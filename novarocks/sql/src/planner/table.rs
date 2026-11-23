@@ -794,6 +794,7 @@ impl TableCompletionRetainedBytes {
             | SqlType::DateTime
             | SqlType::DateTimeNs
             | SqlType::Time
+            | SqlType::Temporal(_)
             | SqlType::Variant
             | SqlType::Uuid => {}
         }

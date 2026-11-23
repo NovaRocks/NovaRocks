@@ -27,6 +27,10 @@ pub mod signature;
 mod array_invocation_diagnostic_probe_owner;
 pub mod catalogue;
 
+pub(crate) mod temporal_arithmetic_owner;
+#[doc(hidden)]
+pub mod temporal_context;
+pub(crate) mod temporal_output;
 pub mod value_conversion;
 mod value_conversion_kernel;
 mod value_conversion_owner;

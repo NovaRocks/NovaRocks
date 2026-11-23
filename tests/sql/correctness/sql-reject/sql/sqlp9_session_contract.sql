@@ -115,37 +115,33 @@ DESCRIBE OUTPUT (SELECT 1 AS id);
 SET PATH reject_ice.reject_ns;
 
 -- query 25
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SET TIME ZONE 'UTC';
-
--- query 26
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
 SET SESSION no_such_property = 1;
 
--- query 27
+-- query 26
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
 WITH SESSION no_such_property = 1 SELECT CAST(1 AS integer);
 
--- query 28
+-- query 27
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SET LOCAL pipeline_dop = 1;
 
--- query 29
+-- query 28
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SET pipeline_dop = 1;
 
--- query 30
+-- query 29
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 START TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY;
 
--- query 31
+-- query 30
 -- @expect_trino_error=NOT_IN_TRANSACTION,USER_ERROR
 COMMIT WORK;
 
--- query 32
+-- query 31
 -- @expect_trino_error=NOT_IN_TRANSACTION,USER_ERROR
 ROLLBACK WORK;
 
--- query 33
+-- query 32
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
 RESET SESSION no_such_property;

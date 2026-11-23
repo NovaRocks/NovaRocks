@@ -167,7 +167,32 @@ async fn sdk_file_nested_binary_and_timestamptz_bind_to_sql_carriers() {
     let dir = tempfile::tempdir().unwrap();
     let location = format!("file://{}", dir.path().display());
     let table_schema = schema();
-    let input = input(&table_schema);
+    let raw = input(&table_schema);
+    let columns = raw
+        .columns()
+        .iter()
+        .zip(table_schema.as_struct().fields())
+        .map(|(array, field)| {
+            crate::temporal::TemporalReadProjection::from_type(&field.field_type)
+                .materialize(array.clone(), &field.name, &mut || Ok(()))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let fields = raw
+        .schema()
+        .fields()
+        .iter()
+        .zip(&columns)
+        .map(|(old, column)| {
+            Arc::new(
+                old.as_ref()
+                    .clone()
+                    .with_data_type(column.data_type().clone()),
+            )
+        })
+        .collect::<arrow::datatypes::Fields>();
+    let input =
+        RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns).unwrap();
     let runtime = tokio::runtime::Handle::current();
     let binding = IcebergReadBinding::new(
         None,
@@ -261,7 +286,13 @@ async fn recursive_nominal_largeint_sdk_file_preserves_nested_values_and_storage
         column("mapping", D::Map(Box::new(D::Int), Box::new(D::LargeInt))),
     ];
     let schema = Schema::builder()
-        .with_fields(crate::catalog_control::type_mapping::schema_fields(&columns).unwrap())
+        .with_fields(
+            crate::catalog_control::type_mapping::schema_fields(
+                &columns,
+                crate::iceberg::spec::FormatVersion::V2,
+            )
+            .unwrap(),
+        )
         .build()
         .unwrap();
     let declarations = nominal_declaration::from_columns(&schema, &columns).unwrap();

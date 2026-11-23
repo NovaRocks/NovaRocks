@@ -146,11 +146,15 @@ impl Owner {
             parameters: SemanticParameters::try_new([
                 (
                     SemanticParameterId::new(7),
-                    SemanticParameterValue::TimeZone("UTC".into()),
+                    SemanticParameterValue::TimeZone(
+                        novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+                    ),
                 ),
                 (
                     SemanticParameterId::new(8),
-                    SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+                    SemanticParameterValue::TimeZone(
+                        novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
+                    ),
                 ),
             ])
             .unwrap(),
@@ -457,7 +461,9 @@ fn fresh_and_frozen_entries_preserve_equivalent_complete_child_and_call_effects_
             .parameters()
             .require(owner.environment[0])
             .unwrap(),
-        &SemanticParameterValue::TimeZone("UTC".into())
+        &SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap()
+        )
     );
 }
 #[test]

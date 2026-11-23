@@ -123,8 +123,8 @@ pub(crate) fn execute_catalog_mutation_with_lease(
     operation_id: ConnectorMutationOperationId,
     operation: ConnectorCatalogMutationOperation,
     context: ConnectorRequestContext,
-) -> Result<CompletedCatalogMutation, String> {
-    present_catalog_mutation_result(resolve_catalog_mutation_with_lease(
+) -> Result<CompletedCatalogMutation, CommandError> {
+    present_catalog_mutation_command_result(resolve_catalog_mutation_with_lease(
         lease,
         operation_id,
         operation,

@@ -251,6 +251,9 @@ fn encode_tracked_scalar_value<A: ScalarStateAllocator, B: ByEncodeBuffer>(
             output.append(&len.to_le_bytes(), work)?;
             output.append(value, work)?;
         }
+        TrackedAggScalarValue::Temporal(..) => {
+            return Err(crate::aggregate_scalar::temporal_scalar_contract());
+        }
     }
     Ok(())
 }

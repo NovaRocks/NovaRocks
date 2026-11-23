@@ -16,7 +16,7 @@
 
 use std::{fmt, sync::Arc};
 
-use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow::datatypes::{DataType, Field};
 use novarocks_parser::{Span, ast};
 use novarocks_type_contract::{
     CharacterKind, CharacterType, CompileCheckpoints, CompileControlError, CompilePhase,
@@ -188,22 +188,11 @@ fn resolve_parts(
                 DataType::Struct(fields.into()),
             )
         }
-        ast::TypeKind::DateTime(datetime) => {
-            if datetime.with_time_zone || datetime.precision.as_deref().is_some_and(|parameter| {
-                !matches!(parameter, ast::DataTypeParameter::Numeric(number) if number.parsed_value == 6)
-            }) {
-                return Err(unsupported(syntax.span, "TIME/TIMESTAMP require microsecond precision without time zone"));
-            }
-            scalar(match datetime.kind {
-                ast::DateTimeType::Time => DataType::Time64(TimeUnit::Microsecond),
-                ast::DateTimeType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
-            })
-        }
-        ast::TypeKind::Interval(_) => {
-            return Err(unsupported(
-                syntax.span,
-                "INTERVAL data types are not supported",
-            ));
+        ast::TypeKind::DateTime(_) | ast::TypeKind::Interval(_) => {
+            let temporal = super::declared_temporal_type(syntax)
+                .map_err(|error| invalid(syntax.span, error.to_string()))?
+                .expect("temporal syntax provides its exact declaration");
+            (ValueKind::Temporal(temporal), temporal.carrier())
         }
         ast::TypeKind::ExplicitArray(_) => {
             return Err(unsupported(
@@ -305,8 +294,15 @@ fn resolve_leaf(
         "double" | "double precision" => scalar(Float64),
         "boolean" => scalar(Boolean),
         "date" => scalar(Date32),
-        "time" => scalar(Time64(TimeUnit::Microsecond)),
-        "timestamp" => scalar(Timestamp(TimeUnit::Microsecond, None)),
+        "time" | "timestamp" if arguments.is_empty() => {
+            use novarocks_type_contract::{TemporalPrecision, TemporalType};
+            let temporal = if name == "time" {
+                TemporalType::Time(TemporalPrecision::DEFAULT)
+            } else {
+                TemporalType::Timestamp(TemporalPrecision::DEFAULT)
+            };
+            (ValueKind::Temporal(temporal), temporal.carrier())
+        }
         "varbinary" => (ValueKind::Binary, Binary),
         "json" => (ValueKind::Nominal(ValueLogicalType::Json), Utf8),
         "uuid" => (

@@ -152,12 +152,6 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                         expression.span(),
                     ))
                 }
-                Expr::IntervalValueExpression(_) => {
-                    self.0 = Some(AnalyzeError::unsupported_expression(
-                        "INTERVAL value expressions are not supported",
-                        expression.span(),
-                    ));
-                }
                 Expr::JsonObject(node) if !super::is_supported_json_object_profile(node) => {
                     self.0 = Some(AnalyzeError::unsupported_expression(
                         "JSON_OBJECT clauses are not supported by the existing function",
@@ -183,11 +177,13 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
             if self.0.is_some() {
                 return;
             }
-            use novarocks_parser::ast::{DataTypeParameter, TypeKind};
             match &data_type.kind {
-                TypeKind::ExplicitArray(_) => self.0 = Some(AnalyzeError::unsupported_expression("explicit ARRAY lengths are not supported", data_type.span)),
-                TypeKind::Interval(_) => self.0 = Some(AnalyzeError::unsupported_expression("INTERVAL data types are not supported", data_type.span)),
-                TypeKind::DateTime(value) if value.with_time_zone || value.precision.as_deref().is_some_and(|parameter| !matches!(parameter, DataTypeParameter::Numeric(number) if number.parsed_value == 6)) => self.0 = Some(AnalyzeError::unsupported_expression("TIME/TIMESTAMP only support microsecond precision without time zone", data_type.span)),
+                ast::TypeKind::ExplicitArray(_) => {
+                    self.0 = Some(AnalyzeError::unsupported_expression(
+                        "explicit ARRAY lengths are not supported",
+                        data_type.span,
+                    ));
+                }
                 _ => novarocks_parser::ast::walk_type_name(self, data_type),
             }
         }
@@ -196,12 +192,6 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                 return;
             }
             match &literal.kind {
-                LiteralKind::Interval(_) => {
-                    self.0 = Some(AnalyzeError::unsupported_expression(
-                        "INTERVAL literals are not supported",
-                        literal.span,
-                    ))
-                }
                 LiteralKind::Generic(value) => {
                     let rejected =
                         novarocks_expression::typing::declaration::validate_typed_string_type_name(

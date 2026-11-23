@@ -33,6 +33,18 @@ pub(super) fn value(
 ) -> Result<(), Failure> {
     work.step()?;
     match source {
+        Type::Primitive(primitive) if crate::temporal::declaration(primitive).is_some() => {
+            let declaration = crate::temporal::declaration(primitive).unwrap();
+            if nominal.is_some()
+                || integer.is_some()
+                || actual.temporal() != Some(declaration)
+                || layout != &declaration.carrier()
+            {
+                return Err(invalid(
+                    "public Iceberg temporal value differs from its source declaration or carrier",
+                ));
+            }
+        }
         Type::Primitive(_) | Type::Variant(_) => {
             let (source_layout, domain) = match source {
                 Type::Primitive(primitive) => (

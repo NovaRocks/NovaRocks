@@ -207,13 +207,6 @@ fn mapped_domain(
     Ok((allocator, owned))
 }
 impl MapKernel {
-    fn output_type(&self) -> &DataType {
-        let FunctionResultType::Scalar(output) = &self.contract.call().selected().result_type
-        else {
-            unreachable!("validated scalar result")
-        };
-        output.data_type()
-    }
     fn check_emit(
         &self,
         context: &AggregateEmissionContext<'_>,
@@ -459,12 +452,19 @@ impl PreparedAggregateKernel for MapKernel {
             let from = state.core.entries.len();
             let mut scalar_work = ScalarWork::new(Some(work));
             let key_bytes = &mut state.key_bytes;
+            let mut declarations = self.contract.logical_argument_types();
+            let key_type = declarations
+                .next()
+                .expect("checked MAP_AGG key")
+                .value_type();
+            let value_type = declarations
+                .next()
+                .expect("checked MAP_AGG value")
+                .value_type();
             core::update_from_arrays_observed(
                 &mut state.core,
-                keys.array(),
-                kr,
-                values.array(),
-                vr,
+                (keys.array(), kr, Some(key_type)),
+                (values.array(), vr, Some(value_type)),
                 &mut scalar_work,
                 &mut |capacity| {
                     *key_bytes = key_bytes
@@ -524,6 +524,7 @@ impl PreparedAggregateKernel for MapKernel {
                 &mut state.core,
                 &merge,
                 address,
+                Some(self.contract.intermediate_type().value_type()),
                 &mut scalar_work,
                 &mut |capacity| {
                     *key_bytes = key_bytes
@@ -595,13 +596,14 @@ impl MapKernel {
                 control,
             };
             let target = if final_output {
-                self.output_type()
+                self.contract.final_type()
             } else {
-                self.contract.intermediate_type().data_type()
+                self.contract.intermediate_type()
             };
             let mut scalar_work = ScalarWork::new(Some(work));
             let output = core::build_array_checked_states(
-                target,
+                target.data_type(),
+                Some(target.value_type()),
                 states.map(|state| {
                     if state.failed {
                         Err(KernelFailure::InstanceFailed)

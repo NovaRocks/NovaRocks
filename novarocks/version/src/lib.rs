@@ -376,6 +376,26 @@ pub fn derive_native_compatibility_material(
     static_plan_interpreter: StaticPlanInterpreter,
     epoch: u64,
 ) -> Result<NativeCompatibilityMaterial, NativeCompatibilityError> {
+    derive_native_compatibility_with_plan_rules(
+        descriptor_set,
+        carriers,
+        function_catalog_digest,
+        plan_contract_revision,
+        static_plan_interpreter,
+        epoch,
+        None,
+    )
+}
+
+fn derive_native_compatibility_with_plan_rules(
+    descriptor_set: &[u8],
+    carriers: impl IntoIterator<Item = NativeCarrierDeclaration>,
+    function_catalog_digest: [u8; 32],
+    plan_contract_revision: u32,
+    static_plan_interpreter: StaticPlanInterpreter,
+    epoch: u64,
+    temporal_rules_digest: Option<[u8; 32]>,
+) -> Result<NativeCompatibilityMaterial, NativeCompatibilityError> {
     if descriptor_set.is_empty() {
         return Err(NativeCompatibilityError::EmptyDescriptorSet);
     }
@@ -403,8 +423,15 @@ pub fn derive_native_compatibility_material(
     let descriptor_digest: [u8; 32] = Sha256::digest(descriptor_set).into();
     let plan_contract_digest: [u8; 32] = {
         let mut hasher = Sha256::new();
-        hasher.update(PLAN_CONTRACT_DOMAIN);
+        hasher.update(if temporal_rules_digest.is_some() {
+            b"novarocks.physical-plan-contract/v2\0".as_slice()
+        } else {
+            PLAN_CONTRACT_DOMAIN
+        });
         hasher.update(plan_contract_revision.to_be_bytes());
+        if let Some(digest) = temporal_rules_digest {
+            hasher.update(digest);
+        }
         hasher.finalize().into()
     };
     let static_plan_interpreter_digest = static_plan_interpreter.component_digest();
@@ -445,20 +472,42 @@ pub fn derive_native_compatibility_material(
     })
 }
 
+/// The inputs come from the actual key and rule owners linked into Server.
+pub fn digest_temporal_plan_rules(
+    zone_index: &[&str],
+    rule_material: &[u8],
+    interpretation: &[u8],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.temporal-plan-rules/v1\0");
+    hasher.update((zone_index.len() as u64).to_be_bytes());
+    for name in zone_index {
+        hasher.update((name.len() as u64).to_be_bytes());
+        hasher.update(name.as_bytes());
+    }
+    hasher.update((rule_material.len() as u64).to_be_bytes());
+    hasher.update(rule_material);
+    hasher.update((interpretation.len() as u64).to_be_bytes());
+    hasher.update(interpretation);
+    hasher.finalize().into()
+}
+
 /// Derives the material for the repository's current Protocol descriptor.
 pub fn derive_repository_native_compatibility_material(
     carriers: impl IntoIterator<Item = NativeCarrierDeclaration>,
     function_catalog_digest: [u8; 32],
     plan_contract_revision: u32,
     static_plan_interpreter: StaticPlanInterpreter,
+    temporal_rules_digest: [u8; 32],
 ) -> Result<NativeCompatibilityMaterial, NativeCompatibilityError> {
-    derive_native_compatibility_material(
+    derive_native_compatibility_with_plan_rules(
         FILE_DESCRIPTOR_SET,
         carriers,
         function_catalog_digest,
         plan_contract_revision,
         static_plan_interpreter,
         NATIVE_COMPAT_EPOCH,
+        Some(temporal_rules_digest),
     )
 }
 
@@ -468,6 +517,32 @@ mod tests {
         NATIVE_COMPAT_EPOCH, NativeCarrierDeclaration, NativeCompatibilityError,
         StaticPlanInterpreter, derive_native_compatibility_material,
     };
+
+    #[test]
+    fn temporal_rule_material_changes_only_the_plan_component_and_native_identity() {
+        let derive = |rule| {
+            let rules = super::digest_temporal_plan_rules(&["UTC", "+00:01"], rule, b"jdk/joda/v1");
+            super::derive_repository_native_compatibility_material(
+                [NativeCarrierDeclaration::try_new("iceberg", 1).unwrap()],
+                [0x31; 32],
+                34,
+                COMPILED,
+                rules,
+            )
+            .unwrap()
+        };
+        let a = derive(b"first rule");
+        let b = derive(b"other rule");
+        assert_ne!(a.id(), b.id());
+        assert_ne!(a.plan_contract_digest(), b.plan_contract_digest());
+        assert_eq!(a.plan_contract_revision(), b.plan_contract_revision());
+        assert_eq!(a.descriptor_digest(), b.descriptor_digest());
+        assert_eq!(a.function_catalog_digest(), b.function_catalog_digest());
+        assert_eq!(
+            a.static_plan_interpreter_digest(),
+            b.static_plan_interpreter_digest()
+        );
+    }
 
     const COMPILED: StaticPlanInterpreter = StaticPlanInterpreter::CompiledPackage {
         pure_function_catalog_digest: [0x51; 32],

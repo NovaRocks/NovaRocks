@@ -112,6 +112,40 @@ fn analyze(sql: &str) -> crate::analysis::ResolvedQuery {
 }
 
 #[test]
+fn values_retain_temporal_assignment_domains() {
+    use novarocks_type_contract::{TemporalPrecision, TemporalType};
+
+    let nested = analyze(
+        "VALUES ARRAY[TIMESTAMP '2024-01-01 00:00:00.123456789012 UTC'], \
+         ARRAY[TIMESTAMP '2024-01-01 08:00:00.123456789012 Asia/Shanghai']",
+    );
+    let item = nested.output_columns[0].value_type.child_at(0).unwrap();
+    assert_eq!(
+        item.value_type().temporal(),
+        Some(TemporalType::TimestampWithTimeZone(
+            TemporalPrecision::PICOSECONDS
+        ))
+    );
+
+    let scalar = analyze(
+        "VALUES TIMESTAMP '2024-01-01 00:00:00.123456', \
+         TIMESTAMP '2024-01-01 00:00:00.123456789012'",
+    );
+    assert_eq!(
+        scalar.output_columns[0].value_type.value_type().temporal(),
+        Some(TemporalType::Timestamp(TemporalPrecision::PICOSECONDS))
+    );
+    let crate::analysis::QueryBody::Values(values) = scalar.body else {
+        panic!("expected VALUES");
+    };
+    assert!(values.rows.iter().all(|row| {
+        row[0]
+            .value_type
+            .same_value_domain(&scalar.output_columns[0].value_type)
+    }));
+}
+
+#[test]
 fn catalog_root_identity_survives_projection_alias_derived_cte_and_outer_padding() {
     let expected = [
         ValueLogicalType::Json,

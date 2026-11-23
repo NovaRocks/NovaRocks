@@ -57,6 +57,9 @@ pub(super) fn coerce_argument(
         if is_null(child, work)? {
             return typed_null(context, target.clone(), work);
         }
+        if source.value_type().temporal().is_some() || target.value_type().temporal().is_some() {
+            return value_domain(context, child, target.clone(), work);
+        }
         return super::type_cast(
             context,
             source,

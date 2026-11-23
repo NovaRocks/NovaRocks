@@ -288,8 +288,11 @@ fn kind(value: &ValueTypeRef, layout: &D) -> Result<Kind, String> {
         ValueKind::List(_) if matches!(layout, D::List(_) | D::LargeList(_)) => Kind::List,
         ValueKind::Map { .. } if matches!(layout, D::Map(_, false)) => Kind::Map,
         ValueKind::Struct(_) if matches!(layout, D::Struct(_)) => Kind::Struct,
+        ValueKind::Temporal(ty) if ty.carrier() == *layout => Kind::Leaf(N::Temporal((*ty).into())),
         // Complete value identity does not install a renderer capability.
-        ValueKind::FixedSizeList { .. } | ValueKind::Union(_) => return Err(invalid()),
+        ValueKind::FixedSizeList { .. } | ValueKind::Union(_) => {
+            return Err(invalid());
+        }
         _ => return Err(invalid()),
     })
 }
@@ -472,6 +475,7 @@ mod tests {
     fn schema(fields: &[ResultField]) -> Result<ClientRenderSchema, ClientRenderSchemaError> {
         let facts = novarocks_result_contract::TrinoJsonFacts {
             parametric_datetime: true,
+            parametric_interval: false,
             variant: true,
             variant_binary: true,
         };
@@ -930,6 +934,7 @@ mod tests {
         ]);
         let facts = novarocks_result_contract::TrinoJsonFacts {
             parametric_datetime: true,
+            parametric_interval: false,
             variant: true,
             variant_binary: true,
         };

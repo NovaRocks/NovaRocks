@@ -57,10 +57,17 @@ impl Fixture {
         // Every key is a real admitted setting, with separate sparse identities.
         // The fixture has no CPU kernel or runtime capability.
         let values = [
-            (0, SemanticParameterValue::StatementStartUtc(-17)),
+            (
+                0,
+                SemanticParameterValue::StatementStartUtc(
+                    novarocks_type_contract::StatementStartUtc::try_new(-17, 0).unwrap(),
+                ),
+            ),
             (
                 u32::MAX,
-                SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+                SemanticParameterValue::TimeZone(
+                    novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
+                ),
             ),
             (7, SemanticParameterValue::AllowThrowException(true)),
             (300, SemanticParameterValue::GroupConcatLegacy(true)),
@@ -79,7 +86,9 @@ impl Fixture {
                 .map(|(id, value)| (SemanticParameterId::new(id), value))
                 .chain([(
                     SemanticParameterId::new(88),
-                    SemanticParameterValue::TimeZone("UTC".into()),
+                    SemanticParameterValue::TimeZone(
+                        novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+                    ),
                 )]),
         )
         .unwrap();
@@ -299,13 +308,17 @@ fn exact_nonempty_frozen_parameter_closure_preserves_values_and_drops_unused_sco
     );
     assert_eq!(
         contract.parameters().get(SemanticParameterId::new(0)),
-        Some(&SemanticParameterValue::StatementStartUtc(-17))
+        Some(&SemanticParameterValue::StatementStartUtc(
+            novarocks_type_contract::StatementStartUtc::try_new(-17, 0).unwrap()
+        ))
     );
     assert_eq!(
         contract
             .parameters()
             .get(SemanticParameterId::new(u32::MAX)),
-        Some(&SemanticParameterValue::TimeZone("Asia/Shanghai".into()))
+        Some(&SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap()
+        ))
     );
     assert_eq!(
         contract.parameters().get(SemanticParameterId::new(19)),

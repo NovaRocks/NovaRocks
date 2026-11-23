@@ -228,23 +228,17 @@ fn preflight(
         None => decode_header(n, admission)?,
     };
     cap(header.work, limits.max_work, w)?;
-    let mut strings = 0;
-    let mut string_bytes = 0;
     for entry in &input.entries {
         if let Some(wire::semantic_parameter::Value::TimeZone(zone)) = &entry.value {
             known = add(known, zone.capacity())?;
-            // The sole decoder rejects >255 before cloning. Do not prevalidate
-            // empty/control chars or change an earlier constructor error.
-            if !zone.is_empty() && zone.len() <= 255 {
-                strings = add(strings, 1)?;
-                string_bytes = add(string_bytes, bytes::<u8>(zone.len())?)?;
-            }
         }
-        admission.gate(header.facts(n, source, strings, string_bytes))?;
+        // Decoding holds only a checked inline key. The wire name stays with
+        // the original source owner until the decode call has completed.
+        admission.gate(header.facts(n, source, 0, 0))?;
         w.step()?;
     }
     floor(source, known, w)?;
-    let facts = admission.numeric(header.facts(n, source, strings, string_bytes))?;
+    let facts = admission.numeric(header.facts(n, source, 0, 0))?;
     admission.gate(Ok(facts))?;
     cap(
         facts.timezone_request_bytes_upper_bound,
@@ -377,7 +371,7 @@ fn preflight_encode(
     cap(n, limits.max_parameters, w)?;
     // The actual BTree may have spare slots and headers; these are necessary
     // occupied-entry lower floors, never a claim of exact retained backing.
-    let mut known = add(
+    let known = add(
         size_of::<SemanticParameters>(),
         mul(
             n,
@@ -408,13 +402,10 @@ fn preflight_encode(
             break;
         };
         if let SemanticParameterValue::TimeZone(zone) = value {
-            known = add(known, zone.len())?;
-            // Only calculate copy requests; semantic spelling remains with
-            // the original owner and sole encoder grammar.
-            if !zone.is_empty() && zone.len() <= 255 {
-                strings = add(strings, 1)?;
-                string_bytes = add(string_bytes, bytes::<u8>(zone.len())?)?;
-            }
+            // The source key is inline. Only the actual outbound wire name
+            // requires new backing.
+            strings = add(strings, 1)?;
+            string_bytes = add(string_bytes, bytes::<u8>(zone.name().len())?)?;
         }
         admission.gate(header.facts(n, source, strings, string_bytes))?;
         w.step()?;

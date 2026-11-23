@@ -609,7 +609,6 @@ fn parameter_projection_resources(
                 .map_err(package_resource_error)?;
         }
         SemanticParameterProjectionVisit::CapturedValue {
-            value,
             is_new,
             output_definition_count,
             ..
@@ -623,11 +622,6 @@ fn parameter_projection_resources(
                     .tree::<SemanticParameterId, SemanticParameterValue>(count)
                     .map_err(package_resource_error)?;
                 *tree = next_tree.facts();
-                if let SemanticParameterValue::TimeZone(zone) = value {
-                    resources
-                        .buffer::<u8>(zone.len(), 1)
-                        .map_err(package_resource_error)?;
-                }
             }
         }
     }
@@ -1180,7 +1174,9 @@ mod parameter_preallocation_review_tests {
             .unwrap();
         let parameters = SemanticParameters::try_new([(
             reference.id,
-            SemanticParameterValue::TimeZone("UTC".into()),
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+            ),
         )])
         .unwrap();
         let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control).unwrap();

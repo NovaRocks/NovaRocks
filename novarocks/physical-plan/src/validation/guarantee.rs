@@ -303,6 +303,7 @@ fn prove_provider_comparison(
         || !supports_provider_scan_comparison(&left.ty)
         || !supports_provider_scan_comparison(&right.ty)
         || left.ty.data_type() != right.ty.data_type()
+        || left.ty.value_type().temporal() != right.ty.value_type().temporal()
     {
         return Ok(false);
     }
