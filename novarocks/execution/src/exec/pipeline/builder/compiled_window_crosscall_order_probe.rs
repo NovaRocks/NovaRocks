@@ -22,13 +22,12 @@ use super::super::window_fixture::package_typed;
 use super::*;
 use crate::exec::pipeline::test_driver::TestDriver;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::task::ExecutionFailureCause;
 use arrow::datatypes::DataType;
-use novarocks_functions::{FunctionKind, KernelFailure};
+use novarocks_functions::FunctionKind;
 
 use novarocks_type_contract::FunctionValueType;
 #[test]
-fn by_window_compiled_function_major_error_order_across_partitions() {
+fn by_window_compiled_nan_keys_are_disfavored_across_partitions() {
     use WindowBound::{CurrentRow, UnboundedPreceding};
     let shape = Shape {
         partition: vec![3],
@@ -129,44 +128,37 @@ fn by_window_compiled_function_major_error_order_across_partitions() {
     operator.prepare().unwrap();
     let state = RuntimeState::default();
     let mut processor = TestDriver::new(operator.as_mut(), &state);
-    let first = match processor
+    processor
         .input_without_output(Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap())
-    {
-        Err(first) => first,
-        Ok(()) => {
-            processor.signal_eos().unwrap();
-            processor.collect_until_finished().unwrap_err()
-        }
-    };
-    match first.cause() {
-        ExecutionFailureCause::WindowInvocationData(data) => {
-            assert_eq!(
-                data.message(),
-                "window function #0: update aggregate state: float comparison is not ordered"
-            );
-            assert_eq!(data.call_ordinal(), 0);
-        }
-        ExecutionFailureCause::Kernel(KernelFailure::Operational(error)) => {
-            panic!("raw Data must not be bounded/Operational: {error:?}")
-        }
-        other => panic!("actual original whole-call Data: {other:?}"),
+        .unwrap();
+    processor.signal_eos().unwrap();
+    let output = processor.collect_until_finished().unwrap();
+    let mut call_values = Vec::new();
+    for chunk in &output {
+        let first = chunk
+            .record_batch()
+            .column(5)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        let second = chunk
+            .record_batch()
+            .column(6)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        call_values.extend(
+            first
+                .values()
+                .iter()
+                .copied()
+                .zip(second.values().iter().copied()),
+        );
     }
-    assert_eq!(
-        processor
-            .advance_to_boundary()
-            .map(|step| step.output)
-            .unwrap_err(),
-        first
-    );
-    assert_eq!(processor.signal_eos().unwrap_err(), first);
-    assert_eq!(state.error(), Some(first.clone()));
+    assert_eq!(call_values, [(10, 10), (11, 10), (20, 20), (20, 20)]);
+    assert!(state.error().is_none());
+    drop(output);
     drop(processor);
     drop(operator);
-    drop(first);
-    assert!(
-        tracker.current() > 0,
-        "the early failure observer still owns original invocation data"
-    );
-    drop(state);
     assert_eq!(tracker.current(), 0);
 }

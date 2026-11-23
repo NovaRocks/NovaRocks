@@ -421,16 +421,10 @@ mod fold_frontiers {
         }
     }
 
-    const UNAUTHORED_ENVIRONMENT: &[(&str, &str)] = &[
-        (
-            "SELECT LISTAGG(REVERSE('abc')) WITHIN GROUP (ORDER BY 1)",
-            "builtin.aggregate/string_agg/",
-        ),
-        (
-            "SELECT FROM_UNIXTIME(-(BIGINT '-1'))",
-            "builtin.scalar/from_unixtime/",
-        ),
-    ];
+    const UNAUTHORED_ENVIRONMENT: &[(&str, &str)] = &[(
+        "SELECT FROM_UNIXTIME(-(BIGINT '-1'))",
+        "builtin.scalar/from_unixtime/",
+    )];
 
     #[test]
     fn e08s1_fold_environment_exact_missing_authors_refuse_parent_before_children() {

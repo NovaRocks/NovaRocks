@@ -127,7 +127,7 @@ fn source_with(
         expected_result_type: None,
     };
     let bound = catalog
-        .resolve_bound_user(name, FunctionKind::Aggregate, request, &Compile)
+        .resolve_bound_trusted(name, FunctionKind::Aggregate, request, &Compile)
         .unwrap();
     let declaration = catalog
         .pure_overload_declaration_observed(

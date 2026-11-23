@@ -57,7 +57,7 @@ fn prepare(
         expected_result_type: None,
     };
     let bound = catalog
-        .resolve_bound_user(name, FunctionKind::Aggregate, request, &Control)
+        .resolve_bound_trusted(name, FunctionKind::Aggregate, request, &Control)
         .unwrap();
     let selected = Arc::new(bound.selected);
     let context = novarocks_type_contract::RelationEffectContext::call(

@@ -788,24 +788,27 @@ fn dynamic_offsets_and_typed_parameter_refusals_follow_partition_addresses() {
             assert_eq!(error.failure_fact().reason(), INVALID_FUNCTION_ARGUMENT);
         }
 
-        for fixture in [
-            Fixture::offset(
+        for offset in [None, Some(-1)] {
+            let fixture = Fixture::offset(
                 name,
                 source.clone(),
-                cv(None, true),
+                cv(offset, offset.is_none()),
                 DecimalOverflowPolicy::OutputNull,
-            ),
-            Fixture::offset(
-                name,
-                source.clone(),
-                cv(Some(-1), false),
-                DecimalOverflowPolicy::OutputNull,
-            ),
-        ] {
-            let Err(FunctionSpecializationFailure::Kernel(error)) =
-                fixture.prepare(options(false), &CompileControl::default())
-            else {
-                panic!("invalid checked offset must fail");
+            );
+            let prepared = fixture
+                .prepare(options(false), &CompileControl::default())
+                .unwrap();
+            let offset = cv(offset, offset.is_none());
+            let arguments = [
+                EvaluatedArgument::Column(&values),
+                EvaluatedArgument::Constant(&offset),
+            ];
+            let Err(error) = WindowEvaluationPartition::begin(
+                prepared.clone(),
+                geometry(&prepared, &arguments, &peers, &frames),
+                &Control::default(),
+            ) else {
+                panic!("invalid constant offset must fail at its runtime row");
             };
             assert_eq!(error.failure_fact().reason(), INVALID_FUNCTION_ARGUMENT);
         }

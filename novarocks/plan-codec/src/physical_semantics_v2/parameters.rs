@@ -442,13 +442,7 @@ mod tests {
                 entry(9, Value::TimeZone("-07:30".into())),
                 entry(11, Value::AllowThrowException(false)),
                 entry(15, Value::AllowThrowException(false)),
-                entry(
-                    u32::MAX,
-                    wire::semantic_parameter::Value::StatementStartUtc(wire::StatementStartUtc {
-                        seconds: Some(-77),
-                        nanos: Some(0),
-                    }),
-                ),
+                entry(u32::MAX, Value::AllowThrowException(true)),
             ],
         };
         let before = dto.clone();
@@ -475,9 +469,7 @@ mod tests {
             ),
             (
                 SemanticParameterId::new(u32::MAX),
-                SemanticParameterValue::StatementStartUtc(
-                    novarocks_type_contract::StatementStartUtc::try_new(-77, 0).unwrap(),
-                ),
+                SemanticParameterValue::AllowThrowException(true),
             ),
         ])
         .unwrap();
@@ -540,7 +532,7 @@ mod tests {
                 &SemanticParameterValue::AllowThrowException(value)
             );
             let wrong = SemanticParameterRef {
-                expected_key: SemanticParameterKey::AllowThrowException,
+                expected_key: SemanticParameterKey::TimeZone,
                 ..decoded
             };
             assert!(table.require(wrong).is_err());

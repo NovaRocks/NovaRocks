@@ -1017,6 +1017,8 @@ mod tests {
                 "sql.analyze.invalid_argument",
                 "sql.analyze.missing_argument",
                 "sql.analyze.invalid_function_argument",
+                "sql.analyze.missing_argument",
+                "sql.analyze.invalid_function_argument",
                 "sql.analyze.expression_not_constant",
                 "sql.analyze.invalid_type_argument",
                 "sql.analyze.invalid_analyze_property",

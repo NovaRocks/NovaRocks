@@ -615,9 +615,7 @@ mod tests {
             ),
             (
                 SemanticParameterId::new(2),
-                SemanticParameterValue::StatementStartUtc(
-                    crate::StatementStartUtc::try_new(-121, 0).unwrap(),
-                ),
+                SemanticParameterValue::AllowThrowException(true),
             ),
         ])
         .unwrap();
@@ -633,9 +631,7 @@ mod tests {
         );
         assert_eq!(
             table.get(SemanticParameterId::new(2)),
-            Some(&SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(-121, 0).unwrap()
-            ))
+            Some(&SemanticParameterValue::AllowThrowException(true))
         );
         assert!(matches!(
             table.project([

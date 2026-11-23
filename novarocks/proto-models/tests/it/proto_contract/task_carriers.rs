@@ -210,9 +210,9 @@ fn query_options_runtime_consumed_fields_use_native_tags() {
     assert_eq!(
         fields,
         (1..=29)
-            .filter(|tag| ![1, 6, 11, 12].contains(tag))
+            .filter(|tag| ![1, 6, 10, 11, 12].contains(tag))
             .collect::<Vec<_>>(),
-        "QueryOptions must keep native runtime consumed fields on tags 1..=29 except reserved 1, 6, 11, 12"
+        "QueryOptions must keep native runtime consumed fields on tags 1..=29 except reserved 1, 6, 10, 11, 12"
     );
 }
 

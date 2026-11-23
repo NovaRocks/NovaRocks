@@ -140,9 +140,7 @@ fn scoped_raw_values_sparse_ids_and_canonical_zone_identity_are_retained() {
     let entries = vec![
         entry(
             u32::MAX,
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(i64::MIN, 0).unwrap(),
-            ),
+            TimeZone(crate::TimeZoneKey::parse("-07:30").unwrap()),
         ),
         entry(
             0,

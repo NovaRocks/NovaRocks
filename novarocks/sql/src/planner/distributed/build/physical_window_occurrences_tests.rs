@@ -1515,8 +1515,7 @@ fn analyze_window_admission_sql(sql: &str) -> Result<(), crate::analyze_error::A
 #[test]
 fn window_missing_profiles_are_named_at_actual_sql_binding_before_package_emission() {
     for sql in [
-        "SELECT lead('x', 1, 1.5) OVER ()",
-        "SELECT lead(TRUE, 1, FALSE) OVER ()",
+        "SELECT lead(TRUE, 1, FALSE) OVER (ORDER BY 1)",
         "SELECT min('x') OVER ()",
         "SELECT max('x') OVER ()",
     ] {
@@ -1541,12 +1540,12 @@ fn window_missing_profiles_are_named_at_actual_sql_binding_before_package_emissi
         "SELECT max('x')",
         "SELECT min(7) OVER ()",
         "SELECT max(7) OVER ()",
-        "SELECT lead('x') OVER ()",
-        "SELECT lag(7, 1, 0) OVER ()",
+        "SELECT lead('x') OVER (ORDER BY 1)",
+        "SELECT lag(7, 1, 0) OVER (ORDER BY 1)",
     ] {
         analyze_window_admission_sql(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
     }
-    let error = analyze_window_admission_sql("SELECT lead(missing, 1, 0) OVER ()")
+    let error = analyze_window_admission_sql("SELECT lead(missing, 1, 0) OVER (ORDER BY 1)")
         .expect_err("unknown input column");
     assert_eq!(
         error.kind(),

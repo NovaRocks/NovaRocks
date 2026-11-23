@@ -2552,7 +2552,9 @@ fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values()
         ),
         (
             SemanticParameterId::new(u32::MAX),
-            SemanticParameterValue::AllowThrowException(true),
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+            ),
         ),
     ])
     .unwrap();

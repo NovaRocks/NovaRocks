@@ -3531,7 +3531,7 @@ mod tests {
                 "SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100",
             ),
             (
-                "original-137",
+                "ordered-listagg",
                 "WITH result AS (SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100) SELECT 'Test Case 39' AS test_name, MD5(LISTAGG(CAST(c1 AS VARCHAR), ':') WITHIN GROUP (ORDER BY c1, c2, c3)) AS result_hash FROM result",
             ),
         ];
@@ -3540,8 +3540,10 @@ mod tests {
             match grouped_state_topn_sequence_fixture(sql) {
                 Ok(SqlCompileProgress::Complete(completed)) => {
                     let owner = completed.into_plan();
-                    {
+                    if label == "inner" {
                         assert_grouped_state_topn_sources(&owner);
+                    } else {
+                        assert_complete_group_topn_sources(&owner);
                     }
                 }
                 Ok(SqlCompileProgress::Incomplete(_)) => {

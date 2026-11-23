@@ -113,7 +113,7 @@ impl Fixture {
             })
             .collect::<Vec<_>>();
         let resolved = catalog
-            .resolve_bound_user(
+            .resolve_bound_trusted(
                 name,
                 FunctionKind::Aggregate,
                 FunctionBindingRequest {
