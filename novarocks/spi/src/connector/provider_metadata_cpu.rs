@@ -46,6 +46,15 @@ impl ProviderMetadataCpuInput {
 /// Provider owns the closed input variants; this cannot run a Statistics product
 /// operation, arbitrary Future or caller-supplied closure.
 pub trait ProviderMetadataCpuPort: Send + Sync {
+    /// Supplies the real result-window allocation observer for one metadata
+    /// discovery payload, separately from the closed worker admission.
+    fn discovery_allocation(&self) -> Result<Arc<dyn super::DiscoveryAllocation>, ConnectorError> {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "metadata CPU port has no admitted discovery allocation author",
+        ))
+    }
+
     fn submit_metadata_in(
         &self,
         input: &mut Option<ProviderMetadataCpuInput>,

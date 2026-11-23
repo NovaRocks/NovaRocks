@@ -77,6 +77,7 @@ impl AnalyzerContext<'_> {
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: None,
+            statement_relation: None,
             prepared_parameters: None,
             table_sequence: self.table_sequence,
             catalog: &catalog,

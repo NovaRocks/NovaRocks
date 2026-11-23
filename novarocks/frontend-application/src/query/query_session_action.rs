@@ -23,7 +23,7 @@ use super::session_property_computation::{
 use super::*;
 use crate::query_execution::completion_facts::FrontendPlanningCpuSource;
 use novarocks_query_application::session_control::{
-    GovernedActionContext, GovernedStatementAction, GovernedStatementResidual,
+    ClientQueryTiming, GovernedActionContext, GovernedStatementAction, GovernedStatementResidual,
     QuerySessionDeadline, StatementActionValue,
 };
 use novarocks_query_application::{
@@ -34,6 +34,7 @@ use std::task::{Context, Poll};
 
 pub(super) enum QueryFamily {
     Read(Box<ast::Query>),
+    Show(novarocks_query_application::sql::trino_admission::TrinoShowAction),
     Explain(compiler::ExplainInput),
 }
 
@@ -41,6 +42,7 @@ impl QueryFamily {
     pub(super) fn query(&self) -> &ast::Query {
         match self {
             Self::Read(query) => query,
+            Self::Show(_) => unreachable!("SHOW has no original Query AST"),
             Self::Explain(input) => &input.query,
         }
     }
@@ -51,6 +53,7 @@ impl QueryFamily {
         use novarocks_query_application::sql::trino_admission::TrinoQueryAction;
         match action {
             TrinoQueryAction::Read(query) => Self::Read(Box::new(query)),
+            TrinoQueryAction::Show(show) => Self::Show(show),
             TrinoQueryAction::Explain(query) => {
                 Self::Explain(compiler::ExplainInput::plan(Box::new(query)))
             }
@@ -62,7 +65,7 @@ impl QueryFamily {
 
     fn window_class(&self) -> ResultWindowClass {
         match self {
-            Self::Read(_) => ResultWindowClass::Client,
+            Self::Read(_) | Self::Show(_) => ResultWindowClass::Client,
             Self::Explain(input) if input.is_analyze() => ResultWindowClass::Internal,
             Self::Explain(_) => ResultWindowClass::Local,
         }
@@ -76,6 +79,9 @@ pub(crate) struct QueryActionEnvironment {
     pub(super) role: ClusterRole,
     pub(super) optimizer_limit: u64,
     pub(super) state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
+    pub(super) session_properties:
+        Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
+    pub(super) session_catalogs: SessionCatalogService,
     pub(super) launcher: Arc<dyn LogicalExecutionLauncher>,
 }
 impl QueryActionEnvironment {
@@ -86,6 +92,8 @@ impl QueryActionEnvironment {
             role: service.role,
             optimizer_limit: service.optimizer_query_mem_limit_bytes,
             state_store: service.state_store.clone(),
+            session_properties: Arc::clone(&service.session_properties),
+            session_catalogs: Arc::clone(&service.session_catalog_resolver),
             launcher: Arc::clone(&service.logical_execution_launcher),
         }
     }
@@ -98,6 +106,8 @@ pub(super) struct QueryActionInputs {
     pub(super) window: ResultWindowAlias,
     pub(super) parameters: Option<Arc<SqlPreparedParameters>>,
     pub(super) planning_cpu: Option<Arc<FrontendPlanningCpuSource>>,
+    pub(super) principal: Option<Arc<str>>,
+    pub(super) timing: Option<ClientQueryTiming>,
     pub(super) statement_time: novarocks_type_contract::StatementTimeEnvironment,
     #[cfg(novarocks_dev_controls)]
     pub(super) observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
@@ -121,6 +131,7 @@ struct ScopedQueryAction {
     source: TrinoStatementSource,
     planning_cpu: Arc<FrontendPlanningCpuSource>,
     action: Option<Box<dyn GovernedStatementAction>>,
+    principal: Arc<str>,
     statement_time: novarocks_type_contract::StatementTimeEnvironment,
     #[cfg(novarocks_dev_controls)]
     observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
@@ -194,6 +205,8 @@ impl GovernedStatementAction for ScopedQueryAction {
                 window,
                 parameters: prepared.parameters,
                 planning_cpu: Some(Arc::clone(&self.planning_cpu)),
+                principal: Some(Arc::clone(&self.principal)),
+                timing: owner.client_query_timing(),
                 statement_time: self.statement_time,
                 #[cfg(novarocks_dev_controls)]
                 observation: self.observation.clone(),
@@ -209,7 +222,15 @@ impl GovernedStatementAction for ScopedQueryAction {
                     &self.environment,
                     inputs,
                     Arc::clone(self.source.sql()),
-                    query,
+                    read_action::ReadQueryInput::Query(query),
+                    prepared.state,
+                    FrontendQueryPurpose::ClientRows,
+                )?,
+                QueryFamily::Show(show) => read_action::build_read_action(
+                    &self.environment,
+                    inputs,
+                    Arc::clone(self.source.sql()),
+                    read_action::ReadQueryInput::Show(show),
                     prepared.state,
                     FrontendQueryPurpose::ClientRows,
                 )?,
@@ -244,7 +265,7 @@ impl FrontendQuerySession {
             statement_kind::StatementKind,
         };
         let kind = match &family {
-            QueryFamily::Read(_) => StatementKind::Query,
+            QueryFamily::Read(_) | QueryFamily::Show(_) => StatementKind::Query,
             QueryFamily::Explain(_) => StatementKind::Explain,
         };
         let admitted = StatementAdmission {
@@ -274,10 +295,11 @@ impl FrontendQuerySession {
         *self.output_shape.lock().map_err(poisoned_state)? = Some(admitted.shape);
         let class = family.window_class();
         let plain_explain = class == ResultWindowClass::Local;
-        let needs_properties = !family.query().session_properties.is_empty()
-            || parameters
-                .as_ref()
-                .is_some_and(|parameters| !parameters.contextual_needs(family.query()).is_empty());
+        let needs_properties = !matches!(family, QueryFamily::Show(_))
+            && (!family.query().session_properties.is_empty()
+                || parameters.as_ref().is_some_and(|parameters| {
+                    !parameters.contextual_needs(family.query()).is_empty()
+                }));
         #[cfg(novarocks_dev_controls)]
         let is_read = class == ResultWindowClass::Client;
         let token = self.token()?;
@@ -377,6 +399,7 @@ impl FrontendQuerySession {
             source: statement_source,
             planning_cpu,
             action: None,
+            principal: Arc::clone(&self.principal),
             statement_time,
             #[cfg(novarocks_dev_controls)]
             observation,

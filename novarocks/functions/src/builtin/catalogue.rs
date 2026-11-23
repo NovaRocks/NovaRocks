@@ -26,8 +26,8 @@ use crate::{
     FunctionBindingError, FunctionBindingRequest, FunctionBindingResolver,
     FunctionBindingSelection, FunctionCatalogError, FunctionDefinition, FunctionFailureBehavior,
     FunctionId, FunctionKind, FunctionOverloadDeclaration, FunctionOverloadId,
-    FunctionResolutionError, FunctionResultType, FunctionSemantics, FunctionValueType,
-    FunctionVisibility, ResolvedAggregateSignature, ResolvedFunctionBinding,
+    FunctionPublicSignature, FunctionResolutionError, FunctionResultType, FunctionSemantics,
+    FunctionValueType, FunctionVisibility, ResolvedAggregateSignature, ResolvedFunctionBinding,
 };
 use arrow_schema::DataType;
 
@@ -140,12 +140,15 @@ pub fn resolve_bound_aggregate(
     result
 }
 
+type AggregatePublicSignatures = &'static [(&'static str, &'static str)];
+
 #[derive(Clone, Copy)]
 struct AggregateDeclaration {
     name: &'static str,
     signature: &'static str,
     min_args: usize,
     max_args: usize,
+    public_signatures: AggregatePublicSignatures,
 }
 
 impl AggregateDeclaration {
@@ -155,12 +158,13 @@ impl AggregateDeclaration {
             signature,
             min_args: args,
             max_args: args,
+            public_signatures: &[],
         }
     }
 
     fn for_logical_arity(self, arity: usize) -> Self {
         if arity == 2 && matches!(self.name, "min" | "max") {
-            Self::exact(self.name, 2, "(any,i64)->list<any>")
+            Self::exact(self.name, 2, "(any,i64)->list<any>").public(&[("T, bigint", "array(T)")])
         } else {
             self
         }
@@ -215,7 +219,13 @@ impl AggregateDeclaration {
             signature,
             min_args,
             max_args,
+            public_signatures: &[],
         }
+    }
+
+    const fn public(mut self, signatures: AggregatePublicSignatures) -> Self {
+        self.public_signatures = signatures;
+        self
     }
 }
 
@@ -692,34 +702,9 @@ fn builtin_overload_identity(
         .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))
 }
 
-const ONE_ARG_AGGREGATES: &[&str] = &[
-    "any_value",
-    "approx_count_distinct",
-    "array_agg",
-    "array_agg_distinct",
-    "avg",
-    "bool_and",
-    "bool_or",
-    "booland_agg",
-    "boolor_agg",
+const INTERNAL_ONE_ARG_AGGREGATES: &[&str] = &[
     "count_distinct_state",
     "count_distinct_state_merge",
-    "count_if",
-    "max",
-    "min",
-    "multi_distinct_sum",
-    "multi_distinct_avg",
-    "ndv",
-    "sum",
-    "variance",
-    "variance_pop",
-    "variance_samp",
-    "var_pop",
-    "var_samp",
-    "stddev",
-    "stddev_pop",
-    "stddev_samp",
-    "std",
     "approx_count_distinct_state_merge",
     "avg_state_merge",
     "bool_and_state_merge",
@@ -728,6 +713,8 @@ const ONE_ARG_AGGREGATES: &[&str] = &[
     "max_state_merge",
     "min_state_merge",
     "sum_state_merge",
+    "multi_distinct_avg",
+    "multi_distinct_sum",
 ];
 
 const STATE_ONE_ARG_AGGREGATES: &[&str] = &[
@@ -756,7 +743,7 @@ const SIGNED_STATE_ONE_ARG_AGGREGATES: &[&str] = &[
 fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
     let mut declarations = Vec::new();
     declarations.extend(
-        ONE_ARG_AGGREGATES
+        INTERNAL_ONE_ARG_AGGREGATES
             .iter()
             .copied()
             .map(|name| AggregateDeclaration::exact(name, 1, "(any)->derived")),
@@ -773,26 +760,100 @@ fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
             .copied()
             .map(|name| AggregateDeclaration::exact(name, 1, "(row(value,change_op))->binary")),
     );
+    // These derived binding families retain one stable execution identity
+    // even when the SQL owner offers several concrete call shapes.
+    let simple_families: &[(&[&str], AggregatePublicSignatures)] = &[
+        (&["any_value", "min", "max"], &[("T", "T")]),
+        (&["approx_count_distinct", "ndv"], &[("T", "bigint")]),
+        (&["array_agg", "array_agg_distinct"], &[("T", "array(T)")]),
+        (
+            &["bool_and", "bool_or", "booland_agg", "boolor_agg"],
+            &[("boolean", "boolean")],
+        ),
+        (&["count_if"], &[("boolean", "bigint")]),
+        (
+            &["avg"],
+            &[
+                ("bigint", "double"),
+                ("real", "double"),
+                ("double", "double"),
+                ("decimal(p,s)", "decimal(38,output_scale)"),
+            ],
+        ),
+        (
+            &["sum"],
+            &[
+                ("bigint", "bigint"),
+                ("real", "double"),
+                ("double", "double"),
+                ("decimal(p,s)", "decimal(38,s)"),
+            ],
+        ),
+        (
+            &[
+                "variance",
+                "variance_pop",
+                "variance_samp",
+                "var_pop",
+                "var_samp",
+                "stddev",
+                "stddev_pop",
+                "stddev_samp",
+                "std",
+            ],
+            &[("double", "double")],
+        ),
+    ];
+    for &(names, signatures) in simple_families {
+        declarations.extend(
+            names.iter().map(|name| {
+                AggregateDeclaration::exact(name, 1, "(any)->derived").public(signatures)
+            }),
+        );
+    }
     declarations.extend([
-        AggregateDeclaration::ranged("count", 0, 1, "()->i64 | (any)->i64"),
+        AggregateDeclaration::ranged("count", 0, 1, "()->i64 | (any)->i64")
+            .public(&[("", "bigint"), ("T", "bigint")]),
         AggregateDeclaration::ranged("multi_distinct_count", 1, usize::MAX, "(any...)->i64"),
-        AggregateDeclaration::exact("listagg", 5, "(utf8,utf8,bool,utf8,bool)->utf8"),
-        AggregateDeclaration::exact("map_agg", 2, "(any,any)->map"),
-        AggregateDeclaration::exact("max_by", 2, "(any,any)->any"),
-        AggregateDeclaration::exact("min_by", 2, "(any,any)->any"),
-        AggregateDeclaration::exact("min_n", 2, "(any,i64)->list<any>"),
-        AggregateDeclaration::exact("max_n", 2, "(any,i64)->list<any>"),
-        AggregateDeclaration::exact("corr", 2, "(any,any)->f64"),
-        AggregateDeclaration::exact("covar_pop", 2, "(any,any)->f64"),
-        AggregateDeclaration::exact("covar_samp", 2, "(any,any)->f64"),
-        AggregateDeclaration::ranged("percentile_approx", 2, 3, "(any,f64[,i64])->f64"),
+        AggregateDeclaration::exact("listagg", 5, "(utf8,utf8,bool,utf8,bool)->utf8")
+            .public(&[("varchar, varchar, boolean, varchar, boolean", "varchar")]),
+        AggregateDeclaration::exact("map_agg", 2, "(any,any)->map").public(&[("K, V", "map(K,V)")]),
+        AggregateDeclaration::exact("max_by", 2, "(any,any)->any").public(&[("V, K", "V")]),
+        AggregateDeclaration::exact("min_by", 2, "(any,any)->any").public(&[("V, K", "V")]),
+        AggregateDeclaration::exact("min_n", 2, "(any,i64)->list<any>")
+            .public(&[("T, bigint", "array(T)")]),
+        AggregateDeclaration::exact("max_n", 2, "(any,i64)->list<any>")
+            .public(&[("T, bigint", "array(T)")]),
+        AggregateDeclaration::exact("corr", 2, "(any,any)->f64")
+            .public(&[("double, double", "double")]),
+        AggregateDeclaration::exact("covar_pop", 2, "(any,any)->f64")
+            .public(&[("double, double", "double")]),
+        AggregateDeclaration::exact("covar_samp", 2, "(any,any)->f64")
+            .public(&[("double, double", "double")]),
+        AggregateDeclaration::ranged("percentile_approx", 2, 3, "(any,f64[,i64])->f64").public(&[
+            ("double, double", "double"),
+            ("double, double, bigint", "double"),
+            ("double, array(double)", "array(double)"),
+            ("double, array(double), bigint", "array(double)"),
+        ]),
         AggregateDeclaration::ranged(
             "percentile_approx_weighted",
             3,
             4,
             "(any,i64,f64[,i64])->f64",
-        ),
-        AggregateDeclaration::ranged("approx_top_k", 1, 3, "(any[,i64[,i64]])->list<struct>"),
+        )
+        .public(&[
+            ("double, bigint, double", "double"),
+            ("double, bigint, double, bigint", "double"),
+            ("double, bigint, array(double)", "array(double)"),
+            ("double, bigint, array(double), bigint", "array(double)"),
+        ]),
+        AggregateDeclaration::ranged("approx_top_k", 1, 3, "(any[,i64[,i64]])->list<struct>")
+            .public(&[
+                ("T", "array(row(item T,count bigint))"),
+                ("T, bigint", "array(row(item T,count bigint))"),
+                ("T, bigint, bigint", "array(row(item T,count bigint))"),
+            ]),
     ]);
     declarations.sort_unstable_by_key(|declaration| declaration.name);
     declarations
@@ -3149,6 +3210,15 @@ pub(super) fn dynamic_definition_parts(
         }
         _ => None,
     };
+    let public_signatures: &[(&str, &str)] = match name {
+        "__array_literal" => &[("T...", "array(T)")],
+        // T is the selected field of the input row, named by the constant VARCHAR.
+        "__array_struct_subfield" => &[("array(row(...)), varchar", "array(T)")],
+        "map_entries" => &[("map(K,V)", "array(row(K,V))")],
+        "greatest" | "least" => &[("T...", "T")],
+        "round" | "truncate" => super::rounding_binding::public_signatures(name),
+        _ => &[],
+    };
     let overload_declaration = if let Some(effects) = pure_effects {
         FunctionOverloadDeclaration::from_effects(
             overload.clone(),
@@ -3193,6 +3263,26 @@ pub(super) fn dynamic_definition_parts(
         subject: "dynamic scalar binding declaration",
         value: error.to_string().into(),
     })?;
+    let declaration = if let Some(empty) = &empty_map_overload {
+        declaration
+            .with_public_signatures([
+                (
+                    overload.clone(),
+                    vec![FunctionPublicSignature::new(
+                        "array(K), array(V)",
+                        "map(K,V)",
+                        "",
+                    )],
+                ),
+                (
+                    empty.clone(),
+                    vec![FunctionPublicSignature::new("", "map(unknown,unknown)", "")],
+                ),
+            ])
+            .map_err(public_signature_error)?
+    } else {
+        attach_public_signatures(declaration, public_signatures)?
+    };
     let resolver = BuiltinDynamicScalarResolver {
         function_id,
         canonical_name: name.into(),
@@ -3200,6 +3290,42 @@ pub(super) fn dynamic_definition_parts(
         empty_map_overload,
     };
     Ok((declaration, resolver))
+}
+
+// A single native binding family can supply several SQL call shapes, like
+// COUNT's zero-argument and one-argument forms. Freeze the display strings
+// under that family's original stable identity.
+fn attach_public_signatures(
+    declaration: FunctionBindingDeclaration,
+    forms: &[(&str, &str)],
+) -> Result<FunctionBindingDeclaration, FunctionCatalogError> {
+    if forms.is_empty() {
+        return Ok(declaration);
+    }
+    let [overload] = declaration.overloads() else {
+        return Err(FunctionCatalogError::InvalidStableIdentity {
+            subject: "builtin family public signatures",
+            value: declaration.function_id().as_str().into(),
+        });
+    };
+    let id = overload.identity.clone();
+    declaration
+        .with_public_signatures([(id, owned_public_signatures(forms))])
+        .map_err(public_signature_error)
+}
+
+fn owned_public_signatures(forms: &[(&str, &str)]) -> Vec<FunctionPublicSignature> {
+    forms
+        .iter()
+        .map(|&(args, result)| FunctionPublicSignature::new(args, result, ""))
+        .collect()
+}
+
+pub(super) fn public_signature_error(error: FunctionBindingError) -> FunctionCatalogError {
+    FunctionCatalogError::InvalidStableIdentity {
+        subject: "builtin public signature",
+        value: error.to_string().into(),
+    }
 }
 
 pub fn contribute_builtin_functions(
@@ -3265,6 +3391,33 @@ pub fn contribute_builtin_functions(
             }
         };
         let (declaration, resolver) = scalar_definition_parts(&name, &signatures, kind)?;
+        let typed_signatures = registry::scalar_signatures(&name).ok_or_else(|| {
+            FunctionCatalogError::InvalidStableIdentity {
+                subject: "builtin scalar registry signature presentation",
+                value: name.clone().into_boxed_str(),
+            }
+        })?;
+        let mut public_signatures = Vec::new();
+        for (canonical, typed) in signatures.iter().zip(typed_signatures) {
+            let id = builtin_scalar_overload_id(&name, canonical, kind)?;
+            if declaration
+                .overloads()
+                .iter()
+                .any(|overload| overload.identity == id)
+            {
+                let shape =
+                    typed.public_signature(builtin_fixed_result_domain(declaration.function_id()));
+                public_signatures.push((id, vec![shape]));
+            }
+        }
+        if name == "array_sort" {
+            let comparator =
+                super::collection_lambda::signature(&name).expect("declared array_sort comparator");
+            public_signatures.push((comparator.overload(), vec![comparator.public_signature()]));
+        }
+        let declaration = declaration
+            .with_public_signatures(public_signatures)
+            .map_err(public_signature_error)?;
         let definition = match name.as_str() {
             name if super::window_ranking_owner::operation(name).is_some() => {
                 super::window_ranking_owner::definition(name, declaration, resolver)?
@@ -3430,6 +3583,13 @@ pub fn contribute_builtin_functions(
                     subject: "builtin aggregate state format",
                     value: error.to_string().into(),
                 })?;
+        let mut public = Vec::new();
+        if !declaration.public_signatures.is_empty() {
+            public.push((
+                overload_id.clone(),
+                owned_public_signatures(declaration.public_signatures),
+            ));
+        }
         let overload = FunctionOverloadDeclaration {
             effects: match declaration.name {
                 "listagg" => Some(super::aggregate_concat_owner::effects()),
@@ -3498,6 +3658,10 @@ pub fn contribute_builtin_functions(
                         value: error.to_string().into(),
                     })?,
             });
+            public.push((
+                top_n.identity.clone(),
+                owned_public_signatures(alternate.public_signatures),
+            ));
             overloads.push(top_n);
         }
         let binding_declaration =
@@ -3506,6 +3670,13 @@ pub fn contribute_builtin_functions(
                     subject: "builtin aggregate binding declaration",
                     value: error.to_string().into(),
                 })?;
+        let binding_declaration = if public.is_empty() {
+            binding_declaration
+        } else {
+            binding_declaration
+                .with_public_signatures(public)
+                .map_err(public_signature_error)?
+        };
         // One resolver in both roles: it answers binding questions and it is
         // the typed signature contract an aggregate is resolved through.
         let resolver = Arc::new(BuiltinAggregateResolver { declaration });
@@ -3671,6 +3842,11 @@ pub fn contribute_builtin_functions(
         subject: "builtin table function binding declaration",
         value: error.to_string().into(),
     })?;
+    let unnest_signature = FunctionPublicSignature::new("array(T)...", "relation(T...)", "");
+    let unnest_id = unnest_declaration.overloads()[0].identity.clone();
+    let unnest_declaration = unnest_declaration
+        .with_public_signatures([(unnest_id, vec![unnest_signature])])
+        .map_err(public_signature_error)?;
     builder.register(super::table_unnest_owner::definition(
         unnest_declaration,
         BuiltinUnnestResolver,

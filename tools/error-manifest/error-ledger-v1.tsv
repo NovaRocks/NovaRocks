@@ -42,6 +42,12 @@ sql.admit.invalid_table_procedure_arguments	Admit	Active
 sql.admit.invalid_table_property	Admit	Active
 sql.admit.kill_connection_unsupported	Admit	Deprecated
 sql.admit.kill_denied	Admit	Deprecated
+sql.admit.kill_query_argument_type	Admit	Active
+sql.admit.kill_query_arguments	Admit	Active
+sql.admit.kill_query_invalid_argument	Admit	Active
+sql.admit.kill_query_permission_denied	Execution	Active
+sql.admit.kill_query_target_not_found	Execution	Active
+sql.admit.kill_query_target_not_running	Execution	Active
 sql.admit.merge_unsupported_form	Admit	Active
 sql.admit.not_in_transaction	Admit	Active
 sql.admit.persisted_definition_semantics_unsupported	Admit	Active
@@ -51,6 +57,12 @@ sql.admit.schema_already_exists	Admit	Active
 sql.admit.session_catalog_not_found	Admit	Active
 sql.admit.session_global_scope_unsupported	Admit	Deprecated
 sql.admit.session_transaction_unsupported	Admit	Deprecated
+sql.admit.show_catalog_not_found	Admit	Active
+sql.admit.show_missing_catalog	Admit	Active
+sql.admit.show_missing_schema	Admit	Active
+sql.admit.show_name_too_long	Admit	Active
+sql.admit.show_schema_not_found	Admit	Active
+sql.admit.show_table_not_found	Admit	Active
 sql.admit.table_already_exists	Admit	Active
 sql.admit.table_procedure_not_found	Admit	Active
 sql.admit.unknown_type	Admit	Active

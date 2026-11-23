@@ -30,6 +30,7 @@ pub(crate) struct ExplainPreparationPorts<'a> {
     pub(crate) cpu: &'a Arc<FrontendPlanningCpuSource>,
     pub(crate) io: Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>,
     pub(crate) state_store: Option<Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>>,
+    pub(crate) timing: Option<novarocks_query_application::session_control::ClientQueryTiming>,
     pub(crate) query_local_overlays:
         Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
     pub(crate) original_context: Option<novarocks_spi::connector::ConnectorPlanningContext>,
@@ -95,7 +96,8 @@ impl FrontendQueryCompiler {
         }
         if logical_only {
             use novarocks_query_application::preparation::CatalogFactPort;
-            let control = sql_compile_control_from_execution(execution);
+            let control =
+                observe_plan_timing(sql_compile_control_from_execution(execution), ports.timing);
             let bindings = match QueryTableBindingStore::try_new() {
                 Ok(bindings) => Arc::new(bindings),
                 Err(error) => return Ok(Err(FrontendQueryCompilerError::Engine(error))),
@@ -223,6 +225,7 @@ impl FrontendQueryCompiler {
             provider: provider_source,
             cpu: planning_cpu,
             state_store,
+            timing,
             query_local_overlays,
             ..
         } = ports;
@@ -279,7 +282,7 @@ impl FrontendQueryCompiler {
                 novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
                 self.sealed_functions(),
                 self.constant_policy(),
-                sql_compile_control_from_execution(execution),
+                observe_plan_timing(sql_compile_control_from_execution(execution), timing),
                 Self::pipeline_dop_domain(query_options.as_ref())?,
                 novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
             ))
@@ -336,6 +339,7 @@ impl FrontendQueryCompiler {
             provider: provider_source,
             cpu: planning_cpu,
             state_store,
+            timing,
             ..
         } = ports;
         let bindings = match QueryTableBindingStore::try_new() {
@@ -394,7 +398,7 @@ impl FrontendQueryCompiler {
                     novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
                     self.sealed_functions(),
                     self.constant_policy(),
-                    sql_compile_control_from_execution(execution),
+                    observe_plan_timing(sql_compile_control_from_execution(execution), timing),
                     Self::pipeline_dop_domain(query_options.as_ref())?,
                     novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
                 ),

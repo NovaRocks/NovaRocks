@@ -32,6 +32,17 @@ pub struct SessionPropertyMetadata {
     pub value_type: SessionPropertyType,
     pub description: String,
 }
+/// Borrowed metadata from the declarations and overrides frozen for this read.
+#[derive(Clone, Copy, Debug)]
+pub struct VisibleSessionProperty<'a> {
+    pub catalog: Option<&'a str>,
+    pub name: &'a str,
+    pub override_value: Option<&'a str>,
+    pub default_value: Option<&'a SessionPropertyValue>,
+    pub value_type: SessionPropertyType,
+    pub description: &'a str,
+}
+
 impl SessionPropertyInputs {
     /// This mutates only the owner's prepared inputs. The application commits
     /// the whole staged state once, after CPU exit and cancellation checks.
@@ -204,49 +215,67 @@ impl SessionPropertyInputs {
     }
 }
 impl SessionPropertyRegistry {
+    pub fn visible_properties<'a>(
+        &'a self,
+        inputs: &'a SessionPropertyInputs,
+        catalogs: &'a [Arc<CatalogPropertyMetadata>],
+    ) -> impl Iterator<Item = VisibleSessionProperty<'a>> + 'a {
+        self.system_declarations()
+            .filter(|declaration| !declaration.hidden())
+            .map(move |declaration| VisibleSessionProperty {
+                catalog: None,
+                name: declaration.name(),
+                override_value: inputs.raw_system_value(declaration.name()),
+                default_value: declaration.default_value(),
+                value_type: declaration.value_type(),
+                description: declaration.description(),
+            })
+            .chain(catalogs.iter().flat_map(move |metadata| {
+                metadata
+                    .declarations()
+                    .filter(|declaration| !declaration.hidden())
+                    .map(move |declaration| VisibleSessionProperty {
+                        catalog: Some(metadata.catalog()),
+                        name: declaration.name(),
+                        override_value: inputs
+                            .read_catalog_override(metadata, declaration.name())
+                            .and_then(|_| {
+                                inputs.raw_catalog_value(metadata.catalog(), declaration.name())
+                            }),
+                        default_value: declaration.default_value(),
+                        value_type: declaration.value_type(),
+                        description: declaration.description(),
+                    })
+            }))
+    }
+
     pub fn visible_metadata(
         &self,
         inputs: &SessionPropertyInputs,
         catalogs: &[Arc<CatalogPropertyMetadata>],
     ) -> Result<Vec<SessionPropertyMetadata>, SessionPropertyError> {
-        let mut values = Vec::new();
-        for declaration in self.system_declarations().filter(|d| !d.hidden()) {
-            let default = declaration
-                .default_value()
-                .map(SessionPropertyValue::render)
-                .transpose()?;
-            values.push(SessionPropertyMetadata {
-                name: declaration.name().to_owned(),
-                value: inputs
-                    .raw_system_value(declaration.name())
-                    .map(str::to_owned)
-                    .or_else(|| default.clone()),
-                default,
-                value_type: declaration.value_type(),
-                description: declaration.description().to_owned(),
-            });
-        }
-        for metadata in catalogs {
-            for declaration in metadata.declarations().filter(|d| !d.hidden()) {
-                let default = declaration
-                    .default_value()
+        let mut values = self
+            .visible_properties(inputs, catalogs)
+            .map(|property| {
+                let default = property
+                    .default_value
                     .map(SessionPropertyValue::render)
                     .transpose()?;
-                // An old instance's raw input remains owned, but is not
-                // presented as an admitted value for a new generation.
-                let admitted = inputs
-                    .read_catalog_override(metadata, declaration.name())
-                    .and_then(|_| inputs.raw_catalog_value(metadata.catalog(), declaration.name()))
-                    .map(str::to_owned);
-                values.push(SessionPropertyMetadata {
-                    name: format!("{}.{}", metadata.catalog(), declaration.name()),
-                    value: admitted.or_else(|| default.clone()),
+                Ok(SessionPropertyMetadata {
+                    name: match property.catalog {
+                        Some(catalog) => format!("{catalog}.{}", property.name),
+                        None => property.name.to_owned(),
+                    },
+                    value: property
+                        .override_value
+                        .map(str::to_owned)
+                        .or_else(|| default.clone()),
                     default,
-                    value_type: declaration.value_type(),
-                    description: declaration.description().to_owned(),
-                });
-            }
-        }
+                    value_type: property.value_type,
+                    description: property.description.to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         values.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(values)
     }

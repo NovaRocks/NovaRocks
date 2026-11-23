@@ -278,13 +278,48 @@ impl FunctionOverloadDeclaration {
     }
 }
 
+/// Display of an owner's concrete or symbolic SQL signature.
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionPublicSignature {
+    pub argument_types: Box<str>,
+    pub return_type: Box<str>,
+    pub description: Box<str>,
+}
+
+impl FunctionPublicSignature {
+    pub fn new(
+        argument_types: impl Into<Box<str>>,
+        return_type: impl Into<Box<str>>,
+        description: impl Into<Box<str>>,
+    ) -> Self {
+        Self {
+            argument_types: argument_types.into(),
+            return_type: return_type.into(),
+            description: description.into(),
+        }
+    }
+}
+
+/// The original execution binding. Public signatures are a display projection.
+#[derive(Clone, Debug)]
 pub struct FunctionBindingDeclaration {
     function_id: FunctionId,
     kind: FunctionKind,
     overloads: Box<[FunctionOverloadDeclaration]>,
     scalar_invocation_data: Box<[FunctionOverloadId]>,
+    public_signatures: Box<[Vec<FunctionPublicSignature>]>,
 }
+
+impl PartialEq for FunctionBindingDeclaration {
+    fn eq(&self, other: &Self) -> bool {
+        self.function_id == other.function_id
+            && self.kind == other.kind
+            && self.overloads == other.overloads
+            && self.scalar_invocation_data == other.scalar_invocation_data
+    }
+}
+
+impl Eq for FunctionBindingDeclaration {}
 
 impl FunctionBindingDeclaration {
     /// A complete metadata declaration, not proof of installed CPU coverage.
@@ -382,7 +417,51 @@ impl FunctionBindingDeclaration {
             kind,
             overloads: overloads.into_boxed_slice(),
             scalar_invocation_data: Box::new([]),
+            public_signatures: Box::new([]),
         })
+    }
+
+    /// Attach presentation to the exact original overloads. This carries no
+    /// binding or execution authority.
+    pub fn with_public_signatures(
+        mut self,
+        signatures: impl IntoIterator<Item = (FunctionOverloadId, Vec<FunctionPublicSignature>)>,
+    ) -> Result<Self, FunctionBindingError> {
+        let mut signatures = signatures.into_iter().collect::<Vec<_>>();
+        signatures.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        if !self.public_signatures.is_empty()
+            || self.overloads.len() != signatures.len()
+            || self
+                .overloads
+                .iter()
+                .zip(&signatures)
+                .any(|(overload, (id, forms))| &overload.identity != id || forms.is_empty())
+        {
+            return Err(invalid_binding(
+                "public signatures must cover the original overload families exactly once",
+            ));
+        }
+        for (_, forms) in &signatures {
+            let mut inputs = BTreeSet::new();
+            for form in forms {
+                if form.return_type.is_empty() || !inputs.insert(&form.argument_types) {
+                    return Err(invalid_binding(
+                        "a public overload family repeats a signature or has no result type",
+                    ));
+                }
+            }
+        }
+        self.public_signatures = signatures.into_iter().map(|(_, forms)| forms).collect();
+        Ok(self)
+    }
+
+    pub(crate) fn public_signatures(
+        &self,
+    ) -> impl Iterator<Item = (&FunctionOverloadDeclaration, &FunctionPublicSignature)> {
+        self.overloads
+            .iter()
+            .zip(self.public_signatures.iter())
+            .flat_map(|(overload, forms)| forms.iter().map(move |form| (overload, form)))
     }
 
     /// A positive original whole-call Data fact, independent of whether this

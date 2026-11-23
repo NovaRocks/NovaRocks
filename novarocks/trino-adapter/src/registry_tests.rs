@@ -37,7 +37,11 @@ use novarocks_query_application::{
         GovernedCompletionStatementResult, GovernedErrorStatementResult,
         GovernedImmediateStatementResult, QuerySessionOutput,
     },
-    query_control::QueryApplicationControl,
+    query_control::{
+        ABANDONED_QUERY, ADMINISTRATIVELY_KILLED, ClientQueryColumns, ClientQueryHistoryConfig,
+        ClientQueryObservation, ClientQueryState, ClientQueryTime, KillClientQueryError,
+        QueryApplicationControl, USER_CANCELED,
+    },
     session::{
         QuerySession, QuerySessionFactory, QuerySessionStatement, SessionProtocolTerminal,
         StatementSessionRequest,
@@ -201,6 +205,24 @@ impl Fixture {
         timeout: Duration,
         deadline_ms: Option<u64>,
     ) -> Self {
+        Self::configured_with_history(
+            held,
+            hold_after_cancel,
+            mode,
+            timeout,
+            deadline_ms,
+            Duration::from_secs(60),
+        )
+    }
+
+    fn configured_with_history(
+        held: bool,
+        hold_after_cancel: bool,
+        mode: OutputMode,
+        timeout: Duration,
+        deadline_ms: Option<u64>,
+        history_age: Duration,
+    ) -> Self {
         let host = WorkloadControl::try_new_counted(WorkloadConfig::default())
             .unwrap()
             .owner;
@@ -208,9 +230,15 @@ impl Fixture {
             .configure_result_capacity(ResultCapacityConfig::V1)
             .unwrap();
         host.mark_ready().unwrap();
-        let control = QueryControlService::new(Arc::new(QueryApplicationControl::new(
-            novarocks_types::FrontendProcessId::new_v7(),
-        )));
+        let control = QueryControlService::new(Arc::new(
+            QueryApplicationControl::with_client_query_history(
+                novarocks_types::FrontendProcessId::new_v7(),
+                ClientQueryHistoryConfig {
+                    max_bytes: 256 * 1024,
+                    max_age: history_age,
+                },
+            ),
+        ));
         let property_registry = SessionPropertyRegistry::with_catalog_factories(vec![Arc::new(
             EmptyCatalogPropertyDeclarationFactory::new(
                 novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
@@ -250,6 +278,10 @@ impl Fixture {
         self.register_with_properties(None)
     }
     fn register_with_properties(&self, properties: Option<&str>) -> (Arc<QueryEntry>, Value) {
+        self.register_sql("SELECT fixture".into(), properties)
+    }
+
+    fn register_sql(&self, sql: String, properties: Option<&str>) -> (Arc<QueryEntry>, Value) {
         let mut headers = HeaderMap::new();
         headers.insert("x-trino-user", HeaderValue::from_static("root"));
         headers.insert("x-trino-catalog", HeaderValue::from_static("input_lake"));
@@ -260,8 +292,7 @@ impl Fixture {
                 HeaderValue::from_str(properties).unwrap(),
             );
         }
-        let request =
-            ParsedStatementRequest::parse(&headers, "SELECT fixture".into(), "root").unwrap();
+        let request = ParsedStatementRequest::parse(&headers, sql, "root").unwrap();
         let first = self
             .registry
             .register(request, "http://localhost:8080".into());
@@ -269,6 +300,45 @@ impl Fixture {
         let (id, slug, _) = locator(json["nextUri"].as_str().unwrap());
         let entry = self.registry.lookup(&id, &slug).unwrap();
         (entry, json)
+    }
+    fn observe(&self, query: &str, query_text: bool) -> Option<ClientQueryObservation> {
+        self.state.control.observe_client_query(
+            "root",
+            query,
+            ClientQueryColumns {
+                query: query_text,
+                ..Default::default()
+            },
+            ClientQueryTime::now(),
+        )
+    }
+    fn management_requester(
+        &self,
+    ) -> (
+        QuerySessionLease,
+        novarocks_query_application::session_control::GovernedQueryStatementOwner,
+    ) {
+        let lease = self
+            .state
+            .control
+            .register_session(SessionIdentity::client_statement(
+                self.state.control.mint_client_query_id(),
+                "root",
+            ))
+            .unwrap();
+        let owner = self
+            .state
+            .control
+            .begin_governed_statement(
+                lease.token(),
+                &self.state.host.root_admission(),
+                WorkClass::Management,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        (lease, owner)
     }
     fn captured(&self) -> Captured {
         self.state.captured.lock().unwrap().last().unwrap().clone()
@@ -395,17 +465,23 @@ impl QuerySessionFactory for Factory {
         request: StatementSessionRequest,
     ) -> Result<Arc<dyn QuerySession>, StatementSessionError> {
         let admission = request.admission();
-        let (id, principal, value) = request.into_parts();
+        let (id, principal, value, claim) = request.into_parts_with_client_query_claim();
         let input = SessionSqlState::from_session_value(
             value,
             &self.0.property_registry,
             &self.0.catalogs,
         )?;
-        let lease = self
-            .0
-            .control
-            .register_session(SessionIdentity::client_statement(id, principal))
-            .expect("original statement session registration");
+        let identity = SessionIdentity::client_statement(id, principal);
+        let lease = match claim {
+            Some(claim) => self.0.control.register_claimed_session(identity, claim),
+            None => self.0.control.register_session(identity),
+        }
+        .map_err(|error| {
+            QueryServiceError::new(
+                QueryServiceErrorKind::Internal,
+                format!("register original statement session: {error:?}"),
+            )
+        })?;
         let token = lease.token();
         self.0.opened.fetch_add(1, Ordering::AcqRel);
         Ok(Arc::new(Session {
@@ -849,6 +925,22 @@ async fn delete_after_success_seal_fails_delivery_without_reclassifying_sealed_s
     let cancellation = fixture.captured().cancellation;
     let token = next(&data);
     assert_eq!(cancellation.reason(), None);
+    assert_eq!(
+        fixture.observe(entry.id.as_str(), false).unwrap().state,
+        ClientQueryState::Finishing
+    );
+    let (requester, requester_owner) = fixture.management_requester();
+    assert_eq!(
+        fixture.state.control.kill_client_query(
+            requester.token(),
+            entry.id.as_str(),
+            None,
+            ClientQueryTime::now(),
+        ),
+        Err(KillClientQueryError::NotRunning)
+    );
+    drop(requester_owner);
+    drop(requester);
     drop(data);
     fixture.registry.cancel(&entry).await;
     assert_eq!(
@@ -860,6 +952,9 @@ async fn delete_after_success_seal_fails_delivery_without_reclassifying_sealed_s
         json(get(&fixture.registry, &entry, token).await.as_ref())["error"]["errorName"],
         "USER_CANCELED"
     );
+    let history = fixture.observe(entry.id.as_str(), false).unwrap();
+    assert_eq!(history.state, ClientQueryState::Failed);
+    assert_eq!(history.error, Some(USER_CANCELED));
     fixture.assert_released().await;
     assert_eq!(fixture.protocol_metrics(), (0, 1));
     fixture.registry.finalize().await;
@@ -1243,7 +1338,7 @@ async fn registered_touch_preserves_entry_and_expiry_never_instantiates_a_statem
     // Use the same real monotonic clock as the production owner. Explicit
     // aging exercises expiry, while request notification reschedules its timer.
     *entry.touched.lock().unwrap() = std::time::Instant::now() - 2 * timeout;
-    assert!(fixture.registry.lookup(&id, &slug).is_some());
+    assert!(fixture.registry.heartbeat(&entry).await);
     tokio::task::yield_now().await;
     tokio::time::sleep(Duration::from_millis(25)).await;
     assert!(
@@ -1262,6 +1357,9 @@ async fn registered_touch_preserves_entry_and_expiry_never_instantiates_a_statem
     .await
     .expect("registered expiry releases its sole registry entry");
     assert!(fixture.registry.lookup(&id, &slug).is_none());
+    let history = fixture.observe(&id, false).unwrap();
+    assert_eq!(history.state, ClientQueryState::Failed);
+    assert_eq!(history.error, Some(ABANDONED_QUERY));
     assert_eq!(fixture.state.opened.load(Ordering::Acquire), 0);
     assert_eq!(
         fixture
@@ -1354,7 +1452,7 @@ async fn original_deadline_or_shutdown_wins_before_late_delete_or_idle_abandon()
             drop(empty);
             fixture.assert_retained_original();
             let captured = fixture.captured();
-            let (expected_reason, expected_name, expected_code) = if shutdown {
+            let (expected_reason, expected_name, expected_code, expected_message) = if shutdown {
                 assert_eq!(
                     fixture.state.host.cancel_active_roots(
                         novarocks_workload_control::CancellationReason::ServerShutdown
@@ -1365,6 +1463,7 @@ async fn original_deadline_or_shutdown_wins_before_late_delete_or_idle_abandon()
                     QueryCancellationReason::ServerShutdown,
                     "SERVER_SHUTTING_DOWN",
                     65545,
+                    "[query.execution.cancelled] Query execution was interrupted because the server is shutting down",
                 )
             } else {
                 // Exercise the original owner's admitted deadline and real
@@ -1375,6 +1474,7 @@ async fn original_deadline_or_shutdown_wins_before_late_delete_or_idle_abandon()
                     QueryCancellationReason::DeadlineExceeded { timeout_ms: 60 },
                     "EXCEEDED_TIME_LIMIT",
                     131075,
+                    "[query.execution.deadline_exceeded] query timed out after 60 ms",
                 )
             };
             assert_eq!(
@@ -1411,6 +1511,7 @@ async fn original_deadline_or_shutdown_wins_before_late_delete_or_idle_abandon()
             let error = &json(&terminal)["error"];
             assert_eq!(error["errorName"], expected_name, "{command:?}");
             assert_eq!(error["errorCode"], expected_code, "{command:?}");
+            assert_eq!(error["message"], expected_message, "{command:?}");
             assert_eq!(captured.cancellation.reason(), Some(expected_reason));
             assert!(
                 !matches!(
@@ -2191,4 +2292,233 @@ async fn optimize_result_set_keeps_rows_and_table_execute_update_type() {
     let terminal = get(&fixture.registry, &entry, next(&page)).await;
     assert_eq!(json(&terminal)["stats"]["state"], "FINISHED");
     assert!(json(&terminal).get("nextUri").is_none());
+}
+
+#[tokio::test]
+async fn registered_management_kill_keeps_one_query_backing_and_replays_original_receipt() {
+    let fixture = Fixture::standard();
+    let (entry, first) = fixture.register();
+    let (other, _) = fixture.register_sql("SELECT a_longer_original_fixture".into(), None);
+    let queued = fixture.observe(entry.id.as_str(), true).unwrap();
+    let original = queued.query.unwrap();
+    assert_eq!(queued.state, ClientQueryState::Queued);
+    assert!(queued.claimed.is_none());
+    assert_eq!(first["stats"]["state"], "QUEUED");
+    assert_eq!(
+        original.as_str().as_ptr(),
+        entry
+            .request
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .request
+            .sql()
+            .as_ptr(),
+    );
+    assert_ne!(
+        original.as_str().as_ptr(),
+        other
+            .request
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .request
+            .sql()
+            .as_ptr(),
+    );
+    let (requester, owner) = fixture.management_requester();
+    fixture
+        .state
+        .control
+        .kill_client_query(
+            requester.token(),
+            entry.id.as_str(),
+            Some("stop from management"),
+            ClientQueryTime::now(),
+        )
+        .unwrap();
+    drop(owner);
+    drop(requester);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fixture.observe(entry.id.as_str(), false).unwrap().state == ClientQueryState::Failed
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued management failure settles before the first GET");
+    assert!(entry.request.lock().unwrap().is_none());
+    assert!(entry.original_text.lock().unwrap().is_none());
+    assert_eq!(fixture.state.opened.load(Ordering::Acquire), 0);
+    let page = get(&fixture.registry, &entry, 0).await;
+    assert_eq!(
+        json(&page)["error"]["message"],
+        "Query killed by user 'root'. Message: stop from management"
+    );
+    assert_eq!(
+        json(&page)["error"]["errorName"],
+        ADMINISTRATIVELY_KILLED.name
+    );
+    let history = fixture.observe(entry.id.as_str(), true).unwrap();
+    assert_eq!(history.error, Some(ADMINISTRATIVELY_KILLED));
+    assert_eq!(
+        history.query.unwrap().as_str().as_ptr(),
+        original.as_str().as_ptr()
+    );
+    fixture.registry.cancel(&entry).await;
+    assert_eq!(
+        bytes(get(&fixture.registry, &entry, 0).await.as_ref()),
+        bytes(&page)
+    );
+    assert_eq!(
+        fixture.observe(other.id.as_str(), false).unwrap().state,
+        ClientQueryState::Queued
+    );
+    fixture.registry.finalize().await;
+}
+
+#[tokio::test]
+async fn simultaneous_first_get_keeps_one_session_and_one_terminal_history() {
+    let fixture = Fixture::standard();
+    let (entry, _) = fixture.register();
+    let (first, retry) = tokio::join!(
+        get(&fixture.registry, &entry, 0),
+        get(&fixture.registry, &entry, 0),
+    );
+    assert_eq!(bytes(&first), bytes(&retry));
+    assert_eq!(fixture.state.opened.load(Ordering::Acquire), 1);
+    let following = next(&first);
+    drop(first);
+    drop(retry);
+    let terminal = get(&fixture.registry, &entry, following).await;
+    assert!(json(&terminal).get("nextUri").is_none());
+    let history = fixture.observe(entry.id.as_str(), false).unwrap();
+    assert!(history.claimed.is_some());
+    assert_eq!(history.state, ClientQueryState::Finished);
+    assert!(history.error.is_none());
+    fixture.assert_released().await;
+    fixture.registry.finalize().await;
+}
+
+#[tokio::test]
+async fn management_kill_accepted_during_work_wins_late_delete() {
+    let fixture = Fixture::new(true, false, Duration::from_secs(60));
+    let (entry, _) = fixture.register();
+    let page = get(&fixture.registry, &entry, 0).await;
+    let next = next(&page);
+    let (requester, owner) = fixture.management_requester();
+    fixture
+        .state
+        .control
+        .kill_client_query(
+            requester.token(),
+            entry.id.as_str(),
+            None,
+            ClientQueryTime::now(),
+        )
+        .unwrap();
+    drop(owner);
+    drop(requester);
+    fixture.registry.cancel(&entry).await;
+    let terminal = get(&fixture.registry, &entry, next).await;
+    let wire = json(&terminal);
+    assert_eq!(wire["error"]["errorName"], ADMINISTRATIVELY_KILLED.name);
+    assert!(
+        wire["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Query killed by user 'root'. No message provided.")
+    );
+    let history = fixture.observe(entry.id.as_str(), false).unwrap();
+    assert_eq!(history.state, ClientQueryState::Failed);
+    assert_eq!(history.error, Some(ADMINISTRATIVELY_KILLED));
+    drop(page);
+    fixture.assert_released().await;
+    fixture.registry.finalize().await;
+}
+
+#[tokio::test]
+async fn idle_history_expiry_does_not_consume_a_live_terminal_replay() {
+    let fixture = Fixture::configured_with_history(
+        false,
+        false,
+        OutputMode::Rows,
+        Duration::from_secs(60),
+        None,
+        Duration::from_millis(40),
+    );
+    let (entry, _) = fixture.register();
+    let page = get(&fixture.registry, &entry, 0).await;
+    let token = next(&page);
+    let terminal = get(&fixture.registry, &entry, token).await;
+    drop(page);
+    let observer = fixture
+        .observe(entry.id.as_str(), true)
+        .unwrap()
+        .query
+        .unwrap();
+    let expiry = fixture.registry.expire_query_history();
+    tokio::pin!(expiry);
+    tokio::select! {
+        _ = &mut expiry => panic!("listener-scoped history wake exited"),
+        result = tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.observe(entry.id.as_str(), false).is_some() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }) => result.expect("idle listener woke for history expiry"),
+    }
+    let retained = fixture
+        .state
+        .control
+        .evict_client_query_history(std::time::Instant::now());
+    assert_eq!(retained.rows, 0);
+    assert!(retained.retained_bytes > 0);
+    assert_eq!(observer.as_str(), "SELECT fixture");
+    drop(observer);
+    assert_eq!(
+        fixture
+            .state
+            .control
+            .evict_client_query_history(std::time::Instant::now())
+            .retained_bytes,
+        0
+    );
+    assert_eq!(
+        bytes(get(&fixture.registry, &entry, token).await.as_ref()),
+        bytes(&terminal)
+    );
+    fixture.assert_released().await;
+    fixture.registry.finalize().await;
+}
+
+#[tokio::test]
+async fn invalid_get_does_not_refresh_original_client_heartbeat_or_claim() {
+    let fixture = Fixture::standard();
+    let (entry, _) = fixture.register();
+    let heartbeat = fixture
+        .observe(entry.id.as_str(), false)
+        .unwrap()
+        .last_heartbeat;
+    assert!(matches!(
+        fixture.registry.get(&entry, 1).await,
+        Err(StatusCode::NOT_FOUND)
+    ));
+    let unchanged = fixture.observe(entry.id.as_str(), false).unwrap();
+    assert_eq!(unchanged.last_heartbeat, heartbeat);
+    assert!(unchanged.claimed.is_none());
+    assert_eq!(fixture.state.opened.load(Ordering::Acquire), 0);
+    assert!(fixture.registry.heartbeat(&entry).await);
+    assert!(
+        fixture
+            .observe(entry.id.as_str(), false)
+            .unwrap()
+            .last_heartbeat
+            >= heartbeat
+    );
+    fixture.registry.finalize().await;
 }

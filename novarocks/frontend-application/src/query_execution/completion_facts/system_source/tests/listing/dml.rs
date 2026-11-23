@@ -242,7 +242,11 @@ async fn original_insert_and_ctas_completion_install_system_snapshots_before_wri
                 .iter()
                 .map(|batch| batch.num_rows())
                 .sum::<usize>(),
-            1
+            source
+                .owners
+                .system_relations()
+                .declarations(&novarocks_sql::system_table::SystemTableBinding::System)
+                .count()
         );
         assert!(
             candidate

@@ -46,45 +46,33 @@ SHOW CREATE SCHEMA reject_ice.reject_ns;
 SHOW CREATE FUNCTION reject_ice.reject_ns.f;
 
 -- query 7
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SHOW TABLES FROM reject_ice.reject_ns;
+-- @expect_trino_error=CATALOG_NOT_FOUND,USER_ERROR
+SHOW TABLES FROM trc7_missing_catalog.reject_ns;
 
 -- query 8
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SHOW SCHEMAS FROM reject_ice;
+-- @expect_trino_error=CATALOG_NOT_FOUND,USER_ERROR
+SHOW SCHEMAS FROM trc7_missing_catalog;
 
 -- query 9
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SHOW CATALOGS;
+-- @expect_trino_error=CATALOG_NOT_FOUND,USER_ERROR
+SHOW COLUMNS FROM trc7_missing_catalog.reject_ns.t;
 
 -- query 10
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SHOW COLUMNS FROM reject_ice.reject_ns.t;
+-- @expect_trino_error=CATALOG_NOT_FOUND,USER_ERROR
+DESCRIBE trc7_missing_catalog.reject_ns.t;
 
 -- query 11
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-DESCRIBE reject_ice.reject_ns.t;
+SHOW STATS FOR (SELECT 1 AS id);
 
 -- query 12
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SHOW STATS FOR (SELECT 1 AS id);
+SHOW CURRENT ROLES FROM reject_ice;
 
 -- query 13
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SHOW CURRENT ROLES FROM reject_ice;
-
--- query 14
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 SHOW ROLE GRANTS FROM reject_ice;
 
--- query 15
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SHOW FUNCTIONS;
-
--- query 16
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SHOW SESSION;
-
--- query 17
+-- query 14
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SHOW PROCESSLIST;

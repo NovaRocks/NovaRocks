@@ -23,7 +23,10 @@ use crate::{
 };
 use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
-use novarocks_query_application::session_effects::SessionEffects;
+use novarocks_query_application::{
+    query_control::{ClientQueryRegistration, ClientQueryText},
+    session_effects::SessionEffects,
+};
 use novarocks_workload_control::ResultWindowAlias;
 use std::{
     sync::{Arc, Mutex},
@@ -55,6 +58,7 @@ pub(crate) struct Outcome {
     pub(crate) effects: SessionEffects,
 }
 pub(crate) enum Phase {
+    Expired,
     Registered,
     Executing,
     Settled {
@@ -68,11 +72,20 @@ pub(crate) struct EntryState {
     pub(crate) next_token: u64,
     pub(crate) retained: Option<(u64, Arc<Page>)>,
 }
+pub(crate) struct RegisteredQueryRequest {
+    pub(crate) request: ParsedStatementRequest,
+    pub(crate) unclaimed: crate::observation::UnclaimedQueryObservation,
+}
+
 pub(crate) struct QueryEntry {
     pub(crate) id: novarocks_query_application::session_control::ClientQueryId,
     pub(crate) slug: String,
     pub(crate) base: String,
-    pub(crate) request: Mutex<Option<ParsedStatementRequest>>,
+    pub(crate) request: Mutex<Option<RegisteredQueryRequest>>,
+    pub(crate) registration: Option<ClientQueryRegistration>,
+    // The full request moves to the driver. This alias alone survives until
+    // the terminal protocol decision has attempted the history handoff.
+    pub(crate) original_text: Mutex<Option<ClientQueryText>>,
     pub(crate) state: tokio::sync::Mutex<EntryState>,
     pub(crate) production: Mutex<Production>,
     // Bounded diagnostic knowledge from this original output; not an owner,
@@ -93,6 +106,12 @@ pub(crate) struct QueryEntry {
     pub(crate) timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 impl QueryEntry {
+    pub(crate) fn registration(&self) -> &ClientQueryRegistration {
+        self.registration
+            .as_ref()
+            .expect("a published URI has an original query registration")
+    }
+
     pub(crate) fn retain_external_effect(
         &self,
         effect: Option<novarocks_query_application::api::StatementExternalEffectDisposition>,

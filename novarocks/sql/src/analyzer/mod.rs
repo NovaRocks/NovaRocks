@@ -254,6 +254,7 @@ pub(crate) fn analyze_mv_definition_with_factory(
         None,
         false,
         None,
+        None,
         QueryAnalysisPurpose::MaterializedViewDefinition,
         None,
     )
@@ -322,7 +323,7 @@ pub(crate) fn analyze_with_materialized_values_and_sql_semantics(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Analysis receives the original statement inputs, assignments, and table arguments."
+    reason = "Analysis receives the original statement, write, SHOW, and table argument inputs."
 )]
 pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     query: &ast::Query,
@@ -335,6 +336,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
     root_session_admitted: bool,
+    statement_relation: Option<&crate::compiler::StatementSystemRelationSource>,
     prepared_parameters: Option<&crate::compiler::SqlPreparedParameters>,
     table_sequence: Option<&crate::compiler::table_sequence::TableSequencePass>,
 ) -> Result<
@@ -357,6 +359,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
         materialized,
         assignments,
         root_session_admitted,
+        statement_relation,
         prepared_parameters,
         QueryAnalysisPurpose::Ordinary,
         table_sequence,
@@ -412,6 +415,7 @@ pub(crate) fn describe_prepared_query(
             materialized,
             assignments,
             true,
+            None,
             Some(parameters),
             QueryAnalysisPurpose::Ordinary,
             None,
@@ -528,6 +532,7 @@ fn analyze_with_factory_and_function_catalog_inner(
         None,
         false,
         None,
+        None,
         QueryAnalysisPurpose::Ordinary,
         None,
     )
@@ -549,6 +554,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
     root_session_admitted: bool,
+    statement_relation: Option<&crate::compiler::StatementSystemRelationSource>,
     prepared_parameters: Option<&crate::compiler::SqlPreparedParameters>,
     purpose: QueryAnalysisPurpose,
     table_sequence: Option<&crate::compiler::table_sequence::TableSequencePass>,
@@ -590,6 +596,13 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
             other => AnalyzeError::internal(other.to_string()),
         })?;
     let materialized_values = materialized_source.as_ref().map(|source| source.view());
+    let statement_relation = statement_relation
+        .map(|source| {
+            crate::compiler::statement_system_relation_site(&query)
+                .map(|site| (site, source))
+                .map_err(|error| AnalyzeError::internal(error.to_string()))
+        })
+        .transpose()?;
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
         grouping_scope: std::cell::RefCell::new(None),
@@ -599,6 +612,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
         function_catalog,
         constant_policy,
         materialized_values,
+        statement_relation,
         prepared_parameters,
         table_sequence,
         control,
@@ -735,6 +749,10 @@ pub(super) struct AnalyzerContext<'a> {
     pub(super) control: &'a crate::compiler::SqlCompileControl,
     pub(super) constant_policy: novarocks_functions::ConstantPolicy,
     materialized_values: Option<crate::compiler::materialized_values::MaterializedValuesLoan<'a>>,
+    statement_relation: Option<(
+        &'a ast::Table,
+        &'a crate::compiler::StatementSystemRelationSource,
+    )>,
     prepared_parameters: Option<&'a crate::compiler::SqlPreparedParameters>,
     table_sequence: Option<&'a crate::compiler::table_sequence::TableSequencePass>,
     pub(super) catalog: &'a dyn PlannerTableProvider,
@@ -1101,6 +1119,7 @@ impl<'a> AnalyzerContext<'a> {
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: self.materialized_values,
+            statement_relation: self.statement_relation,
             prepared_parameters: self.prepared_parameters,
             table_sequence: self.table_sequence,
             catalog: self.catalog,
@@ -2922,15 +2941,17 @@ impl<'a> AnalyzerContext<'a> {
         match relation {
             Relation::SystemTable {
                 alias,
+                declaration,
                 output_columns,
+                required_columns,
                 ..
-            } => {
-                for column in output_columns {
-                    self.check_control()?;
-                    scope.add_field(Some(alias), column);
-                }
-                Ok(())
-            }
+            } => self.add_system_table_scope_fields(
+                scope,
+                alias,
+                declaration,
+                output_columns,
+                required_columns,
+            ),
             Relation::Scan(scan) => {
                 let mut local_scope = self.new_scope();
                 let qualifier = scan.alias.as_deref().unwrap_or(&scan.table.name);
@@ -5447,6 +5468,29 @@ mod tests {
     }
 
     #[test]
+    fn using_rejects_repeated_column_names_at_the_second_identifier() {
+        let sql =
+            "SELECT * FROM (VALUES (1, 10)) a(id, x) JOIN (VALUES (1, 20)) b(id, y) USING (id, ID)";
+        let query = parse_native_query(sql).unwrap();
+        let Err(error) = analyze(&query, &TestCatalog, "default") else {
+            panic!("duplicate USING columns must fail analysis");
+        };
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::DuplicateColumnName
+        );
+        assert_eq!(
+            error.message(),
+            "Column 'ID' appears multiple times in USING clause"
+        );
+        let start = sql.rfind("ID").unwrap();
+        assert_eq!(
+            error.span(),
+            Some(novarocks_parser::Span::new(start, start + 2))
+        );
+    }
+
+    #[test]
     fn using_requires_a_real_column_binding_on_both_sides() {
         for sql in [
             "SELECT 1 FROM (VALUES (1)) l(other) JOIN (VALUES (2)) r(key) USING (key)",
@@ -7466,6 +7510,7 @@ mod tests {
             control: &control,
             constant_policy: crate::constant::test_constant_policy(),
             materialized_values: None,
+            statement_relation: None,
             prepared_parameters: None,
             table_sequence: None,
             catalog: &TestCatalog,
@@ -7810,6 +7855,7 @@ mod tests {
             control: &control,
             constant_policy: crate::constant::test_constant_policy(),
             materialized_values: None,
+            statement_relation: None,
             prepared_parameters: None,
             table_sequence: None,
             catalog: &TestCatalog,

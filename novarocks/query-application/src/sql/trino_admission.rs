@@ -13,14 +13,17 @@ use novarocks_sql::semantic::{CatalogSqlCommand, ObjectName, StatisticsSqlComman
 use novarocks_sql::sql_mode::{self, SqlSemanticSettings};
 
 use super::{
-    ProductSqlCommand, lower_object_name, property_evaluation::validate_create_authorization,
+    ProductSqlCommand,
+    kill_query::{KillQueryCall, KillQuerySqlError, resolves_kill_query},
+    lower_object_name,
+    property_evaluation::validate_create_authorization,
     session_admit::SessionAdmitError,
 };
 
 mod prepared;
 pub use prepared::{
     AdmittedTrinoStatement, TrinoDescriptionAction, TrinoDescriptionKind, TrinoStatementSource,
-    admit_trino_statement_request,
+    admit_trino_statement_request, admit_trino_statement_request_in_namespace,
 };
 
 pub(super) const UNSUPPORTED_STATEMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
@@ -46,11 +49,65 @@ const UNKNOWN_TYPE: ErrorCodeDescriptor = ErrorCodeDescriptor {
     status: ErrorCodeStatus::Active,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShowAdmitError {
+    MissingCatalog,
+    MissingSchema,
+    CatalogNotFound,
+    SchemaNotFound,
+    TableNotFound,
+    NameTooLong,
+}
+
+impl ShowAdmitError {
+    const fn descriptor(self) -> ErrorCodeDescriptor {
+        let code = match self {
+            Self::MissingCatalog => "sql.admit.show_missing_catalog",
+            Self::MissingSchema => "sql.admit.show_missing_schema",
+            Self::CatalogNotFound => "sql.admit.show_catalog_not_found",
+            Self::SchemaNotFound => "sql.admit.show_schema_not_found",
+            Self::TableNotFound => "sql.admit.show_table_not_found",
+            Self::NameTooLong => "sql.admit.show_name_too_long",
+        };
+        ErrorCodeDescriptor {
+            code: ErrorCodeId::new(code),
+            phase: ErrorPhase::Admit,
+            status: ErrorCodeStatus::Active,
+        }
+    }
+
+    pub fn into_service(
+        self,
+        source: &str,
+        span: Span,
+        message: impl Into<String>,
+    ) -> QueryServiceError {
+        QueryServiceError::from_user_error(UserError::from_descriptor(
+            self.descriptor(),
+            message,
+            Some(span.to_user_error_location(source)),
+            RetryClass::Never,
+        ))
+    }
+}
+
 pub const TRINO_STATEMENT_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     UNSUPPORTED_STATEMENT,
     NOT_IN_TRANSACTION,
     PROCEDURE_NOT_REGISTERED,
     UNKNOWN_TYPE,
+    ShowAdmitError::MissingCatalog.descriptor(),
+    ShowAdmitError::MissingSchema.descriptor(),
+    ShowAdmitError::CatalogNotFound.descriptor(),
+    ShowAdmitError::SchemaNotFound.descriptor(),
+    ShowAdmitError::TableNotFound.descriptor(),
+    ShowAdmitError::NameTooLong.descriptor(),
+    KillQuerySqlError::Arguments.descriptor(),
+    KillQuerySqlError::ArgumentType.descriptor(),
+    KillQuerySqlError::InvalidArgument.descriptor(),
+    KillQuerySqlError::Missing.descriptor(),
+    KillQuerySqlError::NotRunning.descriptor(),
+    KillQuerySqlError::PermissionDenied.descriptor(),
     prepared::PREPARED_STATEMENT_NOT_FOUND,
     prepared::EXPRESSION_NOT_CONSTANT,
     prepared::INVALID_PARAMETER_USAGE,
@@ -125,8 +182,19 @@ pub enum TrinoStatementAction {
 #[derive(Debug)]
 pub enum TrinoQueryAction {
     Read(ast::Query),
+    Show(TrinoShowAction),
     Explain(ast::Query),
     ExplainAnalyze(ast::Query),
+}
+
+#[derive(Debug)]
+pub enum TrinoShowAction {
+    Tables(ast::TrinoShowTables),
+    Schemas(ast::TrinoShowSchemas),
+    Catalogs(ast::TrinoShowCatalogs),
+    Columns(ast::TrinoShowColumns),
+    Functions(ast::TrinoShowFunctions),
+    Session(ast::TrinoShowSession),
 }
 
 #[derive(Debug)]
@@ -193,6 +261,7 @@ pub enum TrinoStatementPreparation {
     Update(ast::TrinoUpdate),
     Merge(ast::TrinoMerge),
     Call(ast::TrinoCall),
+    KillQuery(Box<KillQueryCall>),
     CreateView(ast::TrinoCreateView),
     DropView(ast::TrinoDropView),
     ShowCreateView(ast::TrinoShowCreate),
@@ -254,12 +323,23 @@ pub fn admit_trino_statement(
     source: &str,
     statement: ast::TrinoStatement,
 ) -> Result<TrinoStatementAction, QueryServiceError> {
-    prepared::admit_ordinary_statement(source, statement)
+    admit_trino_statement_in_namespace(source, statement, None, None)
+}
+
+pub fn admit_trino_statement_in_namespace(
+    source: &str,
+    statement: ast::TrinoStatement,
+    current_catalog: Option<&str>,
+    current_schema: Option<&str>,
+) -> Result<TrinoStatementAction, QueryServiceError> {
+    prepared::admit_ordinary_statement(source, statement, current_catalog, current_schema)
 }
 
 fn select_trino_statement_owner(
     source: &str,
     statement: ast::TrinoStatement,
+    current_catalog: Option<&str>,
+    current_schema: Option<&str>,
 ) -> Result<TrinoStatementAction, QueryServiceError> {
     use TrinoStatementAction::{Prepare, Product, Query, Session};
     use TrinoStatementPreparation as Preparation;
@@ -413,6 +493,13 @@ fn select_trino_statement_owner(
         }
         Statement::Update(node) => Prepare(Preparation::Update(node)),
         Statement::Merge(node) => Prepare(Preparation::Merge(node)),
+        Statement::Call(node)
+            if resolves_kill_query(&node.name, current_catalog, current_schema) =>
+        {
+            Prepare(Preparation::KillQuery(Box::new(KillQueryCall::bind(
+                source, node,
+            )?)))
+        }
         Statement::Call(node) => Prepare(Preparation::Call(node)),
         Statement::CreateView(node) => Prepare(Preparation::CreateView(node)),
         Statement::DropView(node) => Prepare(Preparation::DropView(node)),
@@ -485,12 +572,22 @@ fn select_trino_statement_owner(
                 &format!("ALTER {} SET AUTHORIZATION", node.owned_entity_kind),
             ));
         }
-        Statement::ShowTables(_) => return unsupported("SHOW TABLES"),
-        Statement::ShowSchemas(_) => return unsupported("SHOW SCHEMAS"),
-        Statement::ShowCatalogs(_) => return unsupported("SHOW CATALOGS"),
-        Statement::ShowColumns(_) => return unsupported("SHOW COLUMNS or DESCRIBE table"),
-        Statement::ShowFunctions(_) => return unsupported("SHOW FUNCTIONS"),
-        Statement::ShowSession(_) => return unsupported("SHOW SESSION"),
+        Statement::ShowTables(node) => Query(TrinoQueryAction::Show(TrinoShowAction::Tables(node))),
+        Statement::ShowSchemas(node) => {
+            Query(TrinoQueryAction::Show(TrinoShowAction::Schemas(node)))
+        }
+        Statement::ShowCatalogs(node) => {
+            Query(TrinoQueryAction::Show(TrinoShowAction::Catalogs(node)))
+        }
+        Statement::ShowColumns(node) => {
+            Query(TrinoQueryAction::Show(TrinoShowAction::Columns(node)))
+        }
+        Statement::ShowFunctions(node) => {
+            Query(TrinoQueryAction::Show(TrinoShowAction::Functions(node)))
+        }
+        Statement::ShowSession(node) => {
+            Query(TrinoQueryAction::Show(TrinoShowAction::Session(node)))
+        }
         Statement::SetPath(_) => return unsupported("SET PATH"),
         Statement::SetTimeZone(node) => Session(TrinoSessionAction::SetTimeZone(node)),
         Statement::Prepare(_) => return unsupported("PREPARE"),
@@ -631,6 +728,41 @@ mod tests {
     fn admit(source: &str) -> Result<TrinoStatementAction, QueryServiceError> {
         let statement = parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
         admit_trino_statement(source, statement)
+    }
+
+    #[test]
+    fn execute_immediate_resolves_the_kill_procedure_in_the_request_namespace() {
+        use crate::session_value::PreparedStatementSnapshot;
+
+        let source = "EXECUTE IMMEDIATE 'CALL kill_query(?)' USING 'target'";
+        let snapshot = PreparedStatementSnapshot::default();
+        let admitted = admit_trino_statement_request_in_namespace(
+            source.into(),
+            parse_statement(source).unwrap(),
+            &snapshot,
+            Some("system"),
+            Some("runtime"),
+        )
+        .unwrap();
+        assert_eq!(admitted.source.sql().as_ref(), "CALL kill_query(?)");
+        assert!(admitted.parameters.is_some());
+        assert!(matches!(
+            admitted.action,
+            TrinoStatementAction::Prepare(TrinoStatementPreparation::KillQuery(_))
+        ));
+
+        let admitted = admit_trino_statement_request_in_namespace(
+            source.into(),
+            parse_statement(source).unwrap(),
+            &snapshot,
+            Some("other"),
+            Some("runtime"),
+        )
+        .unwrap();
+        assert!(matches!(
+            admitted.action,
+            TrinoStatementAction::Prepare(TrinoStatementPreparation::Call(_))
+        ));
     }
 
     #[test]
@@ -885,10 +1017,20 @@ mod tests {
     }
 
     #[test]
+    fn show_tables_and_describe_admit_typed_metadata_queries() {
+        assert!(matches!(
+            admit("SHOW TABLES").unwrap(),
+            TrinoStatementAction::Query(TrinoQueryAction::Show(TrinoShowAction::Tables(_)))
+        ));
+        assert!(matches!(
+            admit("DESCRIBE db.t").unwrap(),
+            TrinoStatementAction::Query(TrinoQueryAction::Show(TrinoShowAction::Columns(_)))
+        ));
+    }
+
+    #[test]
     fn parsed_only_statements_and_transactions_return_distinct_typed_errors() {
         for (sql, subject) in [
-            ("SHOW TABLES", "SHOW TABLES"),
-            ("DESCRIBE db.t", "SHOW COLUMNS or DESCRIBE table"),
             (
                 "SET SESSION AUTHORIZATION 'reader'",
                 "SET SESSION AUTHORIZATION",

@@ -147,8 +147,11 @@ async fn cancel(
     let Some(entry) = registry.lookup(&id, &slug) else {
         return StatusCode::NOT_FOUND;
     };
-    registry.cancel(&entry).await;
-    StatusCode::NO_CONTENT
+    if registry.cancel(&entry).await {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 async fn heartbeat(
     State(registry): State<Arc<TrinoQueryRegistry>>,
@@ -157,7 +160,9 @@ async fn heartbeat(
     if token.parse::<u64>().is_err() {
         return StatusCode::NOT_FOUND;
     }
-    if registry.lookup(&id, &slug).is_some() {
+    if let Some(entry) = registry.lookup(&id, &slug)
+        && registry.heartbeat(&entry).await
+    {
         StatusCode::OK
     } else {
         StatusCode::NOT_FOUND
@@ -311,8 +316,9 @@ mod tests {
         serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap()
     }
     fn queued_sql(entry: &crate::entry::QueryEntry, name: &str) -> std::sync::Weak<str> {
-        let request = entry.request.lock().unwrap();
-        Arc::downgrade(request.as_ref().unwrap().prepared_sql(name).unwrap())
+        let registered = entry.request.lock().unwrap();
+        let request = &registered.as_ref().unwrap().request;
+        Arc::downgrade(request.prepared_sql(name).unwrap())
     }
 
     async fn submit_prepared(state: &StatementState, prepared: &'static str) -> Response {

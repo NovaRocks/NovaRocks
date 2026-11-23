@@ -70,6 +70,198 @@ pub(crate) fn temporal_default_literal(
     )))
 }
 
+/// Produce the SQL expression displayed by Iceberg discovery. Mutation
+/// admission continues to consume the typed literal, without this formatting.
+pub(crate) fn discover_column_default(
+    field: &crate::iceberg::spec::NestedField,
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<Option<Arc<str>>, novarocks_connector_contract::PureProviderCompileError<ConnectorError>>
+{
+    use arrow::temporal_conversions::{
+        date32_to_datetime, time64us_to_time, timestamp_us_to_datetime,
+    };
+    use novarocks_spi::connector::DiscoveredColumn;
+    use std::fmt::Write;
+
+    let Some(literal) = field.write_default.as_ref() else {
+        return Ok(None);
+    };
+    creation.work(1)?;
+    if !matches!(
+        field.field_type.as_ref(),
+        Type::Primitive(
+            PrimitiveType::Boolean
+                | PrimitiveType::Int
+                | PrimitiveType::Long
+                | PrimitiveType::Float
+                | PrimitiveType::Double
+                | PrimitiveType::Date
+                | PrimitiveType::Time
+                | PrimitiveType::Timestamp
+                | PrimitiveType::Timestamptz
+                | PrimitiveType::String
+                | PrimitiveType::Uuid
+                | PrimitiveType::Binary
+                | PrimitiveType::Fixed(_)
+                | PrimitiveType::Decimal { .. }
+        )
+    ) {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            format!(
+                "Iceberg discovery cannot display the default for column {}",
+                field.name
+            ),
+        )
+        .into());
+    }
+    let invalid = || {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "Iceberg discovery read an invalid column default",
+        )
+    };
+    // Borrow variable-size values from the same observed field. The write
+    // decoder would allocate a second copy before discovery could admit it.
+    let storage = field.field_type.as_ref();
+    let text = match (literal, storage) {
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::String(value)),
+            Type::Primitive(PrimitiveType::String),
+        ) => {
+            let extra = value.bytes().filter(|byte| *byte == b'\'').count();
+            let len = value
+                .len()
+                .checked_add(extra)
+                .and_then(|len| len.checked_add(2))
+                .ok_or_else(invalid)?;
+            let mut text = creation.reserve::<u8>(len)?;
+            text.push(b'\'');
+            for byte in value.bytes() {
+                text.push(byte);
+                if byte == b'\'' {
+                    text.push(byte);
+                }
+            }
+            text.push(b'\'');
+            Some(String::from_utf8(text).map_err(|_| invalid())?)
+        }
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Binary(bytes)),
+            Type::Primitive(primitive @ (PrimitiveType::Binary | PrimitiveType::Fixed(_))),
+        ) => {
+            if let PrimitiveType::Fixed(width) = primitive
+                && u64::try_from(bytes.len()) != Ok(*width)
+            {
+                return Err(invalid().into());
+            }
+            let len = bytes
+                .len()
+                .checked_mul(2)
+                .and_then(|len| len.checked_add(3))
+                .ok_or_else(invalid)?;
+            let mut output =
+                String::from_utf8(creation.reserve::<u8>(len)?).map_err(|_| invalid())?;
+            output.push_str("X'");
+            for byte in bytes {
+                write!(&mut output, "{byte:02X}").map_err(|_| invalid())?;
+            }
+            output.push('\'');
+            Some(output)
+        }
+        _ => None,
+    };
+    if let Some(text) = text {
+        return DiscoveredColumn::copy_text(&text, creation).map(Some);
+    }
+    let value = iceberg_literal_to_column_default(literal, storage).map_err(|_| invalid())?;
+    let expression = match value {
+        ColumnDefault::Boolean(value) => value.to_string(),
+        ColumnDefault::Int32(value) => value.to_string(),
+        ColumnDefault::Int64(value) => value.to_string(),
+        ColumnDefault::Float32 { bits } => {
+            let value = f32::from_bits(bits);
+            format!(
+                "REAL '{}'",
+                display_floating_default(value, f64::from(value))
+            )
+        }
+        ColumnDefault::Float64 { bits } => {
+            let value = f64::from_bits(bits);
+            format!("DOUBLE '{}'", display_floating_default(value, value))
+        }
+        ColumnDefault::Date { days_since_epoch } => {
+            let value = date32_to_datetime(days_since_epoch).ok_or_else(invalid)?;
+            format!("DATE '{}'", value.date())
+        }
+        ColumnDefault::TimeMicros {
+            micros_since_midnight,
+        } => {
+            let value = time64us_to_time(micros_since_midnight).ok_or_else(invalid)?;
+            let format = match micros_since_midnight % 60_000_000 {
+                0 => "%H:%M",
+                _ if micros_since_midnight % 1_000_000 == 0 => "%H:%M:%S",
+                _ if micros_since_midnight % 1_000 == 0 => "%H:%M:%S%.3f",
+                _ => "%H:%M:%S%.6f",
+            };
+            format!("TIME '{}'", value.format(format))
+        }
+        ColumnDefault::TimestampMicros { micros_since_epoch }
+        | ColumnDefault::TimestamptzMicros { micros_since_epoch } => {
+            let suffix = if matches!(value, ColumnDefault::TimestamptzMicros { .. }) {
+                " UTC"
+            } else {
+                ""
+            };
+            let value = timestamp_us_to_datetime(micros_since_epoch).ok_or_else(invalid)?;
+            format!(
+                "TIMESTAMP '{}{suffix}'",
+                value.format("%Y-%m-%d %H:%M:%S%.6f")
+            )
+        }
+        ColumnDefault::Uuid(bytes) => format!("UUID '{}'", uuid::Uuid::from_bytes(bytes)),
+        ColumnDefault::Decimal {
+            unscaled, scale, ..
+        } => {
+            format!(
+                "DECIMAL '{}'",
+                novarocks_functions::decimal_text::format_decimal_with_scale(unscaled, scale)
+            )
+        }
+        _ => return Err(invalid().into()),
+    };
+    DiscoveredColumn::copy_text(&expression, creation).map(Some)
+}
+
+fn display_floating_default(
+    value: impl std::fmt::Display + std::fmt::UpperExp,
+    check: f64,
+) -> String {
+    if !check.is_finite() {
+        if check.is_nan() {
+            return "NaN".into();
+        }
+        return if check.is_sign_negative() {
+            "-Infinity"
+        } else {
+            "Infinity"
+        }
+        .into();
+    }
+    let formatted = if check != 0.0 && !(1.0e-3..1.0e7).contains(&check.abs()) {
+        format!("{value:E}")
+    } else {
+        value.to_string()
+    };
+    let (coefficient, exponent) =
+        formatted.split_at(formatted.find('E').unwrap_or(formatted.len()));
+    if coefficient.contains('.') {
+        formatted
+    } else {
+        format!("{coefficient}.0{exponent}")
+    }
+}
+
 pub fn iceberg_literal_to_column_default(
     literal: &IcebergLiteral,
     iceberg_type: &Type,

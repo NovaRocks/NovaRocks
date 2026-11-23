@@ -23,6 +23,8 @@
 //! Every case requires a fresh 1FE+3BE harness. Inputs are finite constants in
 //! this module; no Trino image or external shared endpoint is used. The Trino
 //! entrypoint owner maintains these cases with the default functional suite.
+mod query_observation;
+
 use super::result_delivery_support::{await_idle, metric};
 use crate::{
     actors::trino_protocol::{RawResponse, TrinoClient},
@@ -62,6 +64,7 @@ pub(super) fn scenarios() -> Vec<Box<dyn Scenario>> {
         Case::Completion,
         Case::StatementSize,
         Case::Info,
+        Case::QueryObservation,
     ]
     .into_iter()
     .map(|case| {
@@ -86,6 +89,7 @@ enum Case {
     Completion,
     StatementSize,
     Info,
+    QueryObservation,
 }
 struct TrinoProtocol {
     case: Case,
@@ -110,16 +114,29 @@ impl Scenario for TrinoProtocol {
             Case::Completion => "trino-protocol/command-completion-shape",
             Case::StatementSize => "trino-protocol/statement-too-large",
             Case::Info => "trino-protocol/info-and-head",
+            Case::QueryObservation => "trino-protocol/query-observation-and-kill",
         }
     }
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
-        crate::scenarios::declarations::for_module("trino_protocol", self.name(), false, false)
+        let mut declaration =
+            crate::scenarios::declarations::for_module("trino_protocol", self.name(), false, false);
+        if matches!(self.case, Case::QueryObservation) {
+            declaration.impact.paths.extend([
+                "tests/system-test-runner/src/scenarios/trino_protocol/query_observation.rs".into(),
+                "novarocks/query-application/src/query_control/**".into(),
+                "novarocks/query-application/src/system_tables/**".into(),
+                "novarocks/query-application/src/sql/trino_admission.rs".into(),
+                "novarocks/sql/src/compiler/completion_driver.rs".into(),
+            ]);
+        }
+        declaration
     }
     fn launch_config(&self, _: &Path) -> Result<ScenarioLaunchConfig> {
         let fe = match self.case {
             Case::Abandon => Some(format!(
                 "[standalone_server]\ntrino_client_timeout_ms = {ABANDON_MS}\n"
             )),
+            Case::QueryObservation => Some(query_observation::frontend_overlay()),
             _ => None,
         };
         Ok(ScenarioLaunchConfig {
@@ -166,10 +183,14 @@ impl Scenario for TrinoProtocol {
             }
             Case::StatementSize => statement_size(context, &actor),
             Case::Info => info(context, &actor),
+            Case::QueryObservation => {
+                self.prepare_catalog(context, &actor)?;
+                query_observation::run(context, &actor, epoch)
+            }
         };
         if matches!(
             self.case,
-            Case::Session | Case::UpdateType | Case::Completion
+            Case::Session | Case::UpdateType | Case::Completion | Case::QueryObservation
         ) {
             let cleanup = success(&actor, "DROP CATALOG IF EXISTS trc1_catalog");
             match (outcome, cleanup) {

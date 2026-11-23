@@ -41,3 +41,14 @@ a
 -- types	varchar	varchar
 table_name	table_type
 materialized_views	BASE TABLE
+
+-- query 13
+-- types	varchar	varchar	bigint	varchar
+table_name	column_name	ordinal_position	data_type
+metadata_base	a	1	bigint
+metadata_view	a	1	bigint
+
+-- query 14
+-- types	varchar	boolean
+table_name	has_definition
+metadata_view	true

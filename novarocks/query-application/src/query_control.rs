@@ -20,6 +20,17 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+mod client_lifecycle;
+use client_lifecycle::ClientQueries;
+pub use client_lifecycle::{
+    ABANDONED_QUERY, ADMINISTRATIVELY_KILLED, ClientQueryCancellation, ClientQueryClaim,
+    ClientQueryColumns, ClientQueryConclusion, ClientQueryEvent, ClientQueryFailure,
+    ClientQueryHistoryConfig, ClientQueryHistoryStatus, ClientQueryLifecyclePort,
+    ClientQueryObservation, ClientQueryRegistration, ClientQueryStart, ClientQueryState,
+    ClientQueryText, ClientQueryTextBackingStatus, ClientQueryTextTracker, ClientQueryTime,
+    KillClientQueryError, ManagementCancellationCut, ManagementCancellationReceipt, USER_CANCELED,
+};
+
 use crate::cancellation::{QueryCancellationReason, QueryCancellationSource};
 use crate::session_control::{
     ClientQueryId, ClientSessionKey, GovernedStatementCancellation, GovernedStatementFinishOutcome,
@@ -52,6 +63,7 @@ struct QueryControlState {
     statement_sources: Box<[Option<Arc<crate::session_control::StatementActionSource>>]>,
     sessions: BTreeMap<ClientSessionKey, SessionEntry>,
     by_client_query: BTreeMap<ClientQueryId, ClientSessionKey>,
+    client_queries: ClientQueries,
 }
 
 impl QueryControlState {
@@ -65,6 +77,8 @@ impl QueryControlState {
 
 struct SessionEntry {
     origin: SessionOrigin,
+    principal: Arc<str>,
+    claimed_client_query: bool,
     next_statement_generation: u64,
     active: Option<ActiveStatement>,
     unregister_pending: bool,
@@ -201,8 +215,25 @@ impl Default for QueryApplicationControl {
 }
 impl QueryApplicationControl {
     pub fn new(process: novarocks_types::FrontendProcessId) -> Self {
+        Self::create(process, None)
+    }
+
+    pub fn with_client_query_history(
+        process: novarocks_types::FrontendProcessId,
+        config: ClientQueryHistoryConfig,
+    ) -> Self {
+        Self::create(process, Some(config))
+    }
+
+    fn create(
+        process: novarocks_types::FrontendProcessId,
+        config: Option<ClientQueryHistoryConfig>,
+    ) -> Self {
         Self {
-            state: Mutex::new(QueryControlState::default()),
+            state: Mutex::new(QueryControlState {
+                client_queries: ClientQueries::new(config),
+                ..QueryControlState::default()
+            }),
             query_ids: crate::client_query_id::ClientQueryIdGenerator::new(process),
             #[cfg(novarocks_dev_controls)]
             client_statement_observer: std::sync::OnceLock::new(),
@@ -240,12 +271,63 @@ impl QueryApplicationControl {
         QueryControlService::new(Arc::new(Self::default()))
     }
 
+    fn register_client_session(
+        &self,
+        identity: SessionIdentity,
+        claim: Option<ClientQueryClaim>,
+    ) -> Result<SessionToken, QueryControlError> {
+        let mut state = self.lock();
+        let SessionOrigin::ClientStatement(query) = identity.origin();
+        if state.by_client_query.contains_key(query) {
+            return Err(QueryControlError::ClientQueryIdInUse);
+        }
+        match &claim {
+            Some(claim) => state.client_queries.bind_claim(&identity, claim)?,
+            None if state.client_queries.reserve_unclaimed_identity(query) => {
+                return Err(QueryControlError::ClientQueryIdInUse);
+            }
+            None => {}
+        }
+        let client_query = query.clone();
+        state.next_session_key = state
+            .next_session_key
+            .checked_add(1)
+            .ok_or(QueryControlError::SessionIdentityExhausted)?;
+        let key =
+            ClientSessionKey::new(state.next_session_key).expect("incremented nonzero session key");
+        let token = SessionToken::new(key);
+        state.by_client_query.insert(client_query.clone(), key);
+        state.sessions.insert(
+            key,
+            SessionEntry {
+                origin: identity.origin().clone(),
+                principal: identity.principal_handle(),
+                claimed_client_query: claim.is_some(),
+                next_statement_generation: 0,
+                active: None,
+                unregister_pending: false,
+            },
+        );
+        if let Some(claim) = claim {
+            state.client_queries.install_session(claim, token);
+        }
+        // Never call the consumer while holding the registry lock: the observer
+        // has its own journal and input freezing must precede statement admission.
+        drop(state);
+        #[cfg(novarocks_dev_controls)]
+        if let Some(observer) = self.client_statement_observer.get() {
+            observer(&client_query, token);
+        }
+        Ok(token)
+    }
+
     fn seal_statement_visibility(
         &self,
         statement: StatementToken,
         source: Option<&Arc<crate::session_control::StatementActionSource>>,
     ) -> GovernedStatementVisibilitySealOutcome {
         let mut state = self.lock();
+        let state = &mut *state;
         let Some(entry) = state.sessions.get_mut(&statement.session().key()) else {
             return GovernedStatementVisibilitySealOutcome::Stale;
         };
@@ -269,6 +351,8 @@ impl QueryApplicationControl {
         match cancellation.success_sealer().seal() {
             Ok(WorkSuccessSealOutcome::Sealed | WorkSuccessSealOutcome::AlreadySealed) => {
                 active.success_visibility_sealed = true;
+                let SessionOrigin::ClientStatement(query) = &entry.origin;
+                state.client_queries.seal(query, statement);
                 GovernedStatementVisibilitySealOutcome::Sealed
             }
             Ok(WorkSuccessSealOutcome::Cancelled(reason)) => {
@@ -286,6 +370,10 @@ impl QueryApplicationControl {
 }
 
 impl QueryControlPort for QueryApplicationControl {
+    fn client_query_lifecycle(&self) -> Option<&dyn ClientQueryLifecyclePort> {
+        Some(self)
+    }
+
     fn mint_client_query_id(&self) -> ClientQueryId {
         self.query_ids.mint()
     }
@@ -500,37 +588,7 @@ impl QueryControlPort for QueryApplicationControl {
         &self,
         identity: SessionIdentity,
     ) -> Result<SessionToken, QueryControlError> {
-        let mut state = self.lock();
-        let SessionOrigin::ClientStatement(query) = identity.origin();
-        if state.by_client_query.contains_key(query) {
-            return Err(QueryControlError::ClientQueryIdInUse);
-        }
-        let client_query = query.clone();
-        state.next_session_key = state
-            .next_session_key
-            .checked_add(1)
-            .ok_or(QueryControlError::SessionIdentityExhausted)?;
-        let key =
-            ClientSessionKey::new(state.next_session_key).expect("incremented nonzero session key");
-        let token = SessionToken::new(key);
-        state.by_client_query.insert(client_query.clone(), key);
-        state.sessions.insert(
-            key,
-            SessionEntry {
-                origin: identity.origin().clone(),
-                next_statement_generation: 0,
-                active: None,
-                unregister_pending: false,
-            },
-        );
-        // Never call the consumer while holding the registry lock: the observer
-        // has its own journal and input freezing must precede statement admission.
-        drop(state);
-        #[cfg(novarocks_dev_controls)]
-        if let Some(observer) = self.client_statement_observer.get() {
-            observer(&client_query, token);
-        }
-        Ok(token)
+        self.register_client_session(identity, None)
     }
 
     fn unregister_session(&self, token: SessionToken) {
@@ -569,6 +627,7 @@ impl QueryControlPort for QueryApplicationControl {
         cancellation: QueryCancellationSource,
     ) -> Result<StatementRegistration, QueryControlError> {
         let mut state = self.lock();
+        let state = &mut *state;
         let entry = state
             .sessions
             .get_mut(&session.key())
@@ -579,14 +638,14 @@ impl QueryControlPort for QueryApplicationControl {
         if entry.active.is_some() {
             return Err(QueryControlError::StatementBusy);
         }
-        entry.next_statement_generation = entry.next_statement_generation.wrapping_add(1);
-        if entry.next_statement_generation == 0 {
-            entry.next_statement_generation = 1;
+        let generation = entry.next_statement_generation.wrapping_add(1).max(1);
+        let token = StatementToken::new(session, generation);
+        if entry.claimed_client_query {
+            let SessionOrigin::ClientStatement(query) = &entry.origin;
+            state.client_queries.install_statement(query, token)?;
         }
-        let registration = StatementRegistration::new(
-            StatementToken::new(session, entry.next_statement_generation),
-            cancellation.view(),
-        );
+        entry.next_statement_generation = generation;
+        let registration = StatementRegistration::new(token, cancellation.view());
         entry.active = Some(ActiveStatement {
             action: None,
             generation: entry.next_statement_generation,
@@ -603,6 +662,7 @@ impl QueryControlPort for QueryApplicationControl {
         _statement_text: Option<Arc<str>>,
     ) -> Result<GovernedStatementRegistration, QueryControlError> {
         let mut state = self.lock();
+        let state = &mut *state;
         let entry = state
             .sessions
             .get_mut(&session.key())
@@ -613,14 +673,14 @@ impl QueryControlPort for QueryApplicationControl {
         if entry.active.is_some() {
             return Err(QueryControlError::StatementBusy);
         }
-        entry.next_statement_generation = entry.next_statement_generation.wrapping_add(1);
-        if entry.next_statement_generation == 0 {
-            entry.next_statement_generation = 1;
+        let generation = entry.next_statement_generation.wrapping_add(1).max(1);
+        let token = StatementToken::new(session, generation);
+        if entry.claimed_client_query {
+            let SessionOrigin::ClientStatement(query) = &entry.origin;
+            state.client_queries.install_statement(query, token)?;
         }
-        let registration = GovernedStatementRegistration::new(
-            StatementToken::new(session, entry.next_statement_generation),
-            cancellation.view().clone(),
-        );
+        entry.next_statement_generation = generation;
+        let registration = GovernedStatementRegistration::new(token, cancellation.view().clone());
         entry.active = Some(ActiveStatement {
             action: None,
             generation: entry.next_statement_generation,

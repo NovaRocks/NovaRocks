@@ -34,6 +34,7 @@ mod http;
 mod management;
 pub(crate) mod native_transport;
 mod process_memory;
+mod query_history;
 pub(crate) mod task_creation;
 pub(crate) use http::{LateBoundQueryLifecycleConvergenceReader, MetricsHttpServer};
 pub use process_memory::FrontendProcessMemoryObservation;
@@ -301,6 +302,7 @@ pub(crate) struct FrontendMetricsRegistry {
     scrape: Mutex<()>,
     process_memory: Option<process_memory::ProcessMemoryGauges>,
     control_runtime: Option<FrontendRuntimeMetrics>,
+    query_history: std::sync::OnceLock<query_history::QueryHistoryGauges>,
 }
 
 impl FrontendMetricsRegistry {
@@ -366,6 +368,7 @@ impl FrontendMetricsRegistry {
             scrape: Mutex::new(()),
             process_memory,
             control_runtime,
+            query_history: std::sync::OnceLock::new(),
         }))
     }
 
@@ -378,6 +381,19 @@ impl FrontendMetricsRegistry {
             .map_err(|error| error.to_string())
     }
 
+    pub(crate) fn install_query_history(
+        &self,
+        owner: novarocks_query_application::session_control::QueryControlService,
+    ) -> Result<(), String> {
+        if owner.client_query_history_status().is_none() {
+            return Ok(());
+        }
+        let metrics = query_history::QueryHistoryGauges::register(&self.registry, owner)?;
+        self.query_history
+            .set(metrics)
+            .map_err(|_| "query history observation already installed".into())
+    }
+
     fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
         // Sampling and collection happen in one scrape order.
         let _scrape = self.scrape.lock().expect("frontend metrics scrape lock");
@@ -386,6 +402,9 @@ impl FrontendMetricsRegistry {
         }
         if let Some(runtime) = &self.control_runtime {
             runtime.sample();
+        }
+        if let Some(metrics) = self.query_history.get() {
+            metrics.sample();
         }
         self.registry.gather()
     }

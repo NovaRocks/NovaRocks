@@ -280,6 +280,7 @@ struct ExplainPreparationInput {
     explain: ExplainInput,
     parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
     state: SessionSqlState,
+    timing: Option<novarocks_query_application::session_control::ClientQueryTiming>,
     statement_time: novarocks_type_contract::StatementTimeEnvironment,
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
@@ -389,6 +390,7 @@ async fn make_explain_preparation(
                 cpu: &input.planning_cpu,
                 io: input.io,
                 state_store: input.state_store,
+                timing: input.timing,
                 query_local_overlays: Vec::new(),
                 original_context: None,
             },
@@ -800,11 +802,13 @@ pub(super) fn build_explain_action(
         window,
         parameters,
         planning_cpu,
+        timing,
         statement_time,
         #[cfg(novarocks_dev_controls)]
         observation,
         #[cfg(novarocks_dev_controls)]
             statement_token: _,
+        principal: _,
     } = inputs;
     let prepared_scope = scope.clone();
     let prepared_cancellation = cancellation.clone();
@@ -835,6 +839,7 @@ pub(super) fn build_explain_action(
                 explain,
                 parameters,
                 state,
+                timing,
                 statement_time,
                 deadline,
                 cancellation,
@@ -1052,6 +1057,7 @@ async fn make_delete_explain_preparation(
                         cpu: &sources.cpu,
                         io: sources.io,
                         state_store: sources.state_store,
+                        timing: input.timing,
                         query_local_overlays: vec![overlay],
                         original_context: Some(planning_context),
                     },

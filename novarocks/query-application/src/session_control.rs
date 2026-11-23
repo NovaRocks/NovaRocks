@@ -45,6 +45,12 @@ use tokio::time::Instant;
 use crate::cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView, governed_timeout_ms,
 };
+use crate::query_control::{
+    ClientQueryCancellation, ClientQueryClaim, ClientQueryColumns, ClientQueryConclusion,
+    ClientQueryEvent, ClientQueryHistoryStatus, ClientQueryLifecyclePort, ClientQueryObservation,
+    ClientQueryRegistration, ClientQueryStart, ClientQueryText, ClientQueryTime,
+    KillClientQueryError, ManagementCancellationReceipt,
+};
 use novarocks_workload_control::{
     BusinessPermit, CancellationReason, CancellationView, PendingQueryRoot, QueryConcurrencyPermit,
     ResultClosingCut, ResultWindowAlias, ResultWindowClass, ResultWindowGrant, RootAdmissionHandle,
@@ -122,6 +128,10 @@ impl SessionIdentity {
     }
     pub fn principal(&self) -> &str {
         &self.principal
+    }
+
+    pub(crate) fn principal_handle(&self) -> Arc<str> {
+        Arc::clone(&self.principal)
     }
 }
 
@@ -259,6 +269,8 @@ impl GovernedStatementRegistration {
 pub enum QueryControlError {
     SessionIdentityExhausted,
     ClientQueryIdInUse,
+    ClientQueryCancelled,
+    ClientQueryLifecycleUnavailable,
     UnknownSession,
     StaleSession,
     StatementBusy,
@@ -318,6 +330,11 @@ impl std::fmt::Display for GovernedQueryStatementBeginError {
 impl std::error::Error for GovernedQueryStatementBeginError {}
 
 pub trait QueryControlPort: Send + Sync + 'static {
+    #[doc(hidden)]
+    fn client_query_lifecycle(&self) -> Option<&dyn ClientQueryLifecyclePort> {
+        None
+    }
+
     fn mint_client_query_id(&self) -> ClientQueryId;
     fn register_session(
         &self,
@@ -420,6 +437,27 @@ pub trait QueryControlPort: Send + Sync + 'static {
     }
 }
 
+/// Read-only reporting to the original statement generation. A compiler
+/// continuation can hold this without retaining its controlling Action.
+pub struct ClientQueryTiming {
+    port: Weak<dyn QueryControlPort>,
+    statement: StatementToken,
+}
+
+impl ClientQueryTiming {
+    pub fn record(&self, event: ClientQueryEvent, time: ClientQueryTime) {
+        if let Some(port) = self.port.upgrade()
+            && let Some(lifecycle) = port.client_query_lifecycle()
+        {
+            lifecycle.record_client_query_event(self.statement, event, time);
+        }
+    }
+
+    pub fn start_control(self) {
+        self.record(ClientQueryEvent::ControlStarted, ClientQueryTime::now());
+    }
+}
+
 #[derive(Clone)]
 pub struct QueryControlService {
     port: Arc<dyn QueryControlPort>,
@@ -439,11 +477,170 @@ impl QueryControlService {
         identity: SessionIdentity,
     ) -> Result<QuerySessionLease, QueryControlError> {
         let token = self.port.register_session(identity)?;
-        Ok(QuerySessionLease {
+        Ok(self.lease_session(token))
+    }
+
+    pub fn register_claimed_session(
+        &self,
+        identity: SessionIdentity,
+        claim: ClientQueryClaim,
+    ) -> Result<QuerySessionLease, QueryControlError> {
+        let token = self
+            .client_query_lifecycle()?
+            .register_claimed_session(identity, claim)?;
+        Ok(self.lease_session(token))
+    }
+
+    fn lease_session(&self, token: SessionToken) -> QuerySessionLease {
+        QuerySessionLease {
             service: self.clone(),
             token,
             released: false,
-        })
+        }
+    }
+
+    fn client_query_lifecycle(&self) -> Result<&dyn ClientQueryLifecyclePort, QueryControlError> {
+        self.port
+            .client_query_lifecycle()
+            .ok_or(QueryControlError::ClientQueryLifecycleUnavailable)
+    }
+
+    pub fn register_client_query(
+        &self,
+        id: ClientQueryId,
+        principal: Arc<str>,
+        source: Option<Arc<str>>,
+        text: Option<&ClientQueryText>,
+        time: ClientQueryTime,
+    ) -> Result<ClientQueryRegistration, QueryControlError> {
+        self.client_query_lifecycle()?
+            .register_client_query(id, principal, source, text, time)
+    }
+
+    pub fn withdraw_client_query(&self, registration: &ClientQueryRegistration) -> bool {
+        self.client_query_lifecycle()
+            .is_ok_and(|lifecycle| lifecycle.withdraw_client_query(registration))
+    }
+
+    pub fn claim_client_query(
+        &self,
+        registration: &ClientQueryRegistration,
+        time: ClientQueryTime,
+    ) -> ClientQueryStart {
+        self.client_query_lifecycle()
+            .map_or(ClientQueryStart::Unavailable, |lifecycle| {
+                lifecycle.claim_client_query(registration, time)
+            })
+    }
+
+    pub fn touch_client_query(
+        &self,
+        registration: &ClientQueryRegistration,
+        time: ClientQueryTime,
+    ) {
+        if let Ok(lifecycle) = self.client_query_lifecycle() {
+            lifecycle.touch_client_query(registration, time);
+        }
+    }
+
+    pub fn request_unstarted_client_cancel(
+        &self,
+        registration: &ClientQueryRegistration,
+        reason: QueryCancellationReason,
+    ) -> bool {
+        self.client_query_lifecycle()
+            .is_ok_and(|lifecycle| lifecycle.request_unstarted_client_cancel(registration, reason))
+    }
+
+    pub fn client_query_cancellation(
+        &self,
+        registration: &ClientQueryRegistration,
+    ) -> Option<ClientQueryCancellation> {
+        self.client_query_lifecycle()
+            .ok()?
+            .client_query_cancellation(registration)
+    }
+
+    pub fn settle_client_query(
+        &self,
+        registration: &ClientQueryRegistration,
+        proposed: ClientQueryConclusion,
+        time: ClientQueryTime,
+    ) -> Option<ClientQueryConclusion> {
+        self.client_query_lifecycle()
+            .ok()?
+            .settle_client_query(registration, proposed, time)
+    }
+
+    pub fn record_client_query_event(
+        &self,
+        statement: StatementToken,
+        event: ClientQueryEvent,
+        time: ClientQueryTime,
+    ) -> bool {
+        self.client_query_lifecycle()
+            .is_ok_and(|lifecycle| lifecycle.record_client_query_event(statement, event, time))
+    }
+
+    pub fn kill_client_query(
+        &self,
+        requester: SessionToken,
+        target: &str,
+        message: Option<&str>,
+        now: ClientQueryTime,
+    ) -> Result<Arc<ManagementCancellationReceipt>, KillClientQueryError> {
+        self.client_query_lifecycle()
+            .map_err(|_| KillClientQueryError::UnknownRequester)?
+            .kill_client_query(requester, target, message, now)
+    }
+
+    pub fn observe_client_query(
+        &self,
+        principal: &str,
+        id: &str,
+        columns: ClientQueryColumns,
+        now: ClientQueryTime,
+    ) -> Option<ClientQueryObservation> {
+        self.client_query_lifecycle()
+            .ok()?
+            .observe_client_query(principal, id, columns, now)
+    }
+
+    pub fn next_client_query(
+        &self,
+        principal: &str,
+        after: Option<&str>,
+        columns: ClientQueryColumns,
+        now: ClientQueryTime,
+    ) -> Option<ClientQueryObservation> {
+        self.client_query_lifecycle()
+            .ok()?
+            .next_client_query(principal, after, columns, now)
+    }
+
+    pub fn subscribe_client_query_history(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<Option<std::time::Instant>>> {
+        Some(
+            self.client_query_lifecycle()
+                .ok()?
+                .subscribe_client_query_history(),
+        )
+    }
+
+    pub fn client_query_history_status(&self) -> Option<ClientQueryHistoryStatus> {
+        Some(
+            self.client_query_lifecycle()
+                .ok()?
+                .client_query_history_status(),
+        )
+    }
+
+    pub fn evict_client_query_history(&self, now: std::time::Instant) -> ClientQueryHistoryStatus {
+        self.client_query_lifecycle().map_or_else(
+            |_| ClientQueryHistoryStatus::default(),
+            |lifecycle| lifecycle.evict_client_query_history(now),
+        )
     }
 
     pub fn begin_statement(
@@ -587,6 +784,11 @@ impl QueryControlService {
             .map(StatementResultCapacity::Window)
             .or(retention);
         owner.query_concurrency = Some(grant.permit);
+        self.record_client_query_event(
+            owner.token(),
+            ClientQueryEvent::Admitted,
+            ClientQueryTime::now(),
+        );
         Ok(owner)
     }
 
@@ -684,6 +886,7 @@ impl QueryControlService {
             session_query_admission: None,
             accepted_delivery_cut: None,
             timeout_ms,
+            control_start_pending: false,
             success_visibility_sealed: false,
             finished: false,
         }
@@ -789,6 +992,11 @@ impl QueryControlService {
                 return Err(GovernedQueryStatementBeginError::QueryControl(error));
             }
         };
+        self.record_client_query_event(
+            registration.token(),
+            ClientQueryEvent::Admitted,
+            ClientQueryTime::now(),
+        );
         Ok(GovernedQueryStatementOwner {
             service: GovernedControlLink::Strong(self.clone()),
             registration,
@@ -800,6 +1008,7 @@ impl QueryControlService {
             session_query_admission: None,
             accepted_delivery_cut: None,
             timeout_ms,
+            control_start_pending: class == WorkClass::Management,
             success_visibility_sealed: false,
             finished: false,
         })
@@ -1082,6 +1291,31 @@ impl<'a> GovernedActionContext<'a> {
         }
     }
 
+    pub fn record_client_query_event(
+        &self,
+        event: ClientQueryEvent,
+        time: ClientQueryTime,
+    ) -> bool {
+        self.visibility.as_ref().is_some_and(|visibility| {
+            visibility
+                .service
+                .port()
+                .client_query_lifecycle()
+                .is_some_and(|lifecycle| {
+                    lifecycle.record_client_query_event(visibility.token, event, time)
+                })
+        })
+    }
+
+    pub fn client_query_timing(&self) -> Option<ClientQueryTiming> {
+        self.visibility
+            .as_ref()
+            .map(|visibility| ClientQueryTiming {
+                port: Arc::downgrade(&visibility.service.port()),
+                statement: visibility.token,
+            })
+    }
+
     fn with_query_permit(mut self, permit: &'a mut Option<QueryConcurrencyPermit>) -> Self {
         self.query_permit = Some(permit);
         self
@@ -1160,6 +1394,7 @@ impl<'a> GovernedActionContext<'a> {
             .and_then(|window| result.replace(StatementResultCapacity::Window(window)));
         *slots = None;
         drop(retired);
+        self.record_client_query_event(ClientQueryEvent::Admitted, ClientQueryTime::now());
         Ok(())
     }
 
@@ -1232,6 +1467,7 @@ pub struct GovernedQueryStatementOwner {
     session_query_admission: Option<SessionQueryAdmissionSlots>,
     accepted_delivery_cut: Option<ResultClosingCut>,
     timeout_ms: Option<u64>,
+    control_start_pending: bool,
     success_visibility_sealed: bool,
     finished: bool,
 }
@@ -1295,6 +1531,27 @@ impl GovernedQueryStatementOwner {
 
     pub const fn token(&self) -> StatementToken {
         self.registration.token()
+    }
+
+    /// Observe query planning without transferring the command control-start observation.
+    pub fn client_query_timing(&self) -> ClientQueryTiming {
+        ClientQueryTiming {
+            port: Arc::downgrade(&self.service.port()),
+            statement: self.token(),
+        }
+    }
+
+    /// Transfer the one timing observation to the original command execution edge.
+    pub fn take_control_timing(&mut self) -> Option<ClientQueryTiming> {
+        std::mem::take(&mut self.control_start_pending).then(|| self.client_query_timing())
+    }
+
+    pub fn observe_control_start(&mut self) {
+        if let Some(timing) = self.take_control_timing()
+            && self.scope.check().is_ok()
+        {
+            timing.start_control();
+        }
     }
 
     pub fn scope(&self) -> &WorkScope {

@@ -17,13 +17,72 @@
 
 //! Listener-local protocol facts. Observing these counters grants no query authority.
 use crate::settlement::Disposition;
-use prometheus::{IntCounterVec, IntGauge, Opts, Registry};
+use novarocks_query_application::query_control::{ClientQueryText, ClientQueryTextTracker};
+use prometheus::{
+    IntCounterVec, IntGauge, Opts, Registry,
+    core::{Collector, Desc},
+    proto::MetricFamily,
+};
 #[derive(Clone)]
 pub struct TrinoProtocolObservation {
     active: IntGauge,
+    unclaimed: IntGauge,
+    original_text: OriginalTextMetrics,
     settled: IntCounterVec,
     write_failures: IntCounterVec,
 }
+#[derive(Clone)]
+struct OriginalTextMetrics {
+    tracker: ClientQueryTextTracker,
+    backing_bytes: IntGauge,
+    backings: IntGauge,
+}
+
+impl OriginalTextMetrics {
+    fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            tracker: ClientQueryTextTracker::default(),
+            backing_bytes: IntGauge::new(
+                "novarocks_trino_original_query_text_backing_bytes",
+                "Requested backing bytes of original accepted SQL text, through its last alias.",
+            )?,
+            backings: IntGauge::new(
+                "novarocks_trino_original_query_text_backings",
+                "Original accepted SQL text allocations still retained by a request, history, or reader.",
+            )?,
+        })
+    }
+}
+
+impl Collector for OriginalTextMetrics {
+    fn desc(&self) -> Vec<&Desc> {
+        let mut values = self.backing_bytes.desc();
+        values.extend(self.backings.desc());
+        values
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let status = self.tracker.status();
+        let mut values = self.backing_bytes.collect();
+        values.extend(self.backings.collect());
+        for (family, value) in values
+            .iter_mut()
+            .zip([status.requested_bytes, status.backings])
+        {
+            family.mut_metric()[0].mut_gauge().set_value(value as f64);
+        }
+        values
+    }
+}
+
+pub(crate) struct UnclaimedQueryObservation(IntGauge);
+
+impl Drop for UnclaimedQueryObservation {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum ResponseWriteFailure {
     Timeout,
@@ -36,6 +95,11 @@ impl TrinoProtocolObservation {
                 "novarocks_trino_queries_active",
                 "Executing Trino entries, including sealed output awaiting acknowledgement.",
             )?,
+            unclaimed: IntGauge::new(
+                "novarocks_trino_queries_unclaimed",
+                "Accepted Trino requests whose original statement request is still in the POST queue.",
+            )?,
+            original_text: OriginalTextMetrics::new()?,
             settled: IntCounterVec::new(
                 Opts::new(
                     "novarocks_trino_query_settlements_total",
@@ -67,10 +131,21 @@ impl TrinoProtocolObservation {
     }
     pub fn register(&self, registry: &Registry) -> Result<(), prometheus::Error> {
         registry.register(Box::new(self.active.clone()))?;
+        registry.register(Box::new(self.unclaimed.clone()))?;
+        registry.register(Box::new(self.original_text.clone()))?;
         registry.register(Box::new(self.settled.clone()))?;
         registry.register(Box::new(self.write_failures.clone()))?;
         Ok(())
     }
+    pub(crate) fn observe_original_text(&self, text: &ClientQueryText) {
+        text.observe_original_backing(&self.original_text.tracker);
+    }
+
+    pub(crate) fn unclaimed(&self) -> UnclaimedQueryObservation {
+        self.unclaimed.inc();
+        UnclaimedQueryObservation(self.unclaimed.clone())
+    }
+
     pub(crate) fn write_failed(&self, reason: ResponseWriteFailure) {
         self.write_failures
             .with_label_values(&[match reason {
@@ -129,7 +204,7 @@ mod tests {
         let observation = TrinoProtocolObservation::new().unwrap();
         let registry = Registry::new();
         observation.register(&registry).unwrap();
-        assert_eq!(registry.gather().len(), 3);
+        assert_eq!(registry.gather().len(), 6);
         assert_eq!(observation.active.get(), 0);
         assert_eq!(
             counters(
@@ -152,6 +227,45 @@ mod tests {
             ),
             vec![("interrupted".into(), 0), ("timeout".into(), 0)]
         );
+    }
+
+    #[test]
+    fn original_sql_metrics_refund_on_the_last_alias_and_unclaimed_queue_exits_separately() {
+        let observation = TrinoProtocolObservation::new().unwrap();
+        let registry = Registry::new();
+        observation.register(&registry).unwrap();
+        let sample = |name| {
+            registry
+                .gather()
+                .iter()
+                .find(|family| family.get_name() == name)
+                .unwrap()
+                .get_metric()[0]
+                .get_gauge()
+                .get_value()
+        };
+        let first = ClientQueryText::new("SELECT fixture".into());
+        let alias = first.clone();
+        let queued = observation.unclaimed();
+        observation.observe_original_text(&first);
+        observation.observe_original_text(&alias);
+        let size = sample("novarocks_trino_original_query_text_backing_bytes");
+        assert!(size > first.as_str().len() as f64);
+        assert_eq!(sample("novarocks_trino_original_query_text_backings"), 1.0);
+        assert_eq!(sample("novarocks_trino_queries_unclaimed"), 1.0);
+        drop(queued);
+        drop(first);
+        assert_eq!(sample("novarocks_trino_queries_unclaimed"), 0.0);
+        assert_eq!(
+            sample("novarocks_trino_original_query_text_backing_bytes"),
+            size
+        );
+        drop(alias);
+        assert_eq!(
+            sample("novarocks_trino_original_query_text_backing_bytes"),
+            0.0
+        );
+        assert_eq!(sample("novarocks_trino_original_query_text_backings"), 0.0);
     }
 
     #[test]

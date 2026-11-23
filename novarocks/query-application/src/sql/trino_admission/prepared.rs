@@ -144,6 +144,17 @@ pub fn admit_trino_statement_request(
     statement: ast::TrinoStatement,
     snapshot: &PreparedStatementSnapshot,
 ) -> Result<AdmittedTrinoStatement, QueryServiceError> {
+    admit_trino_statement_request_in_namespace(request, statement, snapshot, None, None)
+}
+
+/// Resolve the effective action in the original request's current namespace.
+pub fn admit_trino_statement_request_in_namespace(
+    request: Arc<str>,
+    statement: ast::TrinoStatement,
+    snapshot: &PreparedStatementSnapshot,
+    current_catalog: Option<&str>,
+    current_schema: Option<&str>,
+) -> Result<AdmittedTrinoStatement, QueryServiceError> {
     use ast::{TrinoDescribeOutputInput as DescribeTarget, TrinoStatement as Statement};
 
     match statement {
@@ -161,7 +172,7 @@ pub fn admit_trino_statement_request(
                 request,
                 find_prepared(snapshot, &node.name.value)?.clone(),
             );
-            admit_execute(source, node.parameters)
+            admit_execute(source, node.parameters, current_catalog, current_schema)
         }
         Statement::ExecuteImmediate(node) => {
             let source = TrinoStatementSource::immediate(
@@ -169,7 +180,7 @@ pub fn admit_trino_statement_request(
                 node.statement_text.into(),
                 node.statement_text_span,
             );
-            admit_execute(source, node.parameters)
+            admit_execute(source, node.parameters, current_catalog, current_schema)
         }
         Statement::DescribeInput(node) => {
             let source = TrinoStatementSource::named(
@@ -177,7 +188,13 @@ pub fn admit_trino_statement_request(
                 find_prepared(snapshot, &node.name.value)?.clone(),
             );
             let target = source.parse_effective()?;
-            admit_description(source, TrinoDescriptionKind::Input, target)
+            admit_description(
+                source,
+                TrinoDescriptionKind::Input,
+                target,
+                current_catalog,
+                current_schema,
+            )
         }
         Statement::DescribeOutput(node) => {
             let (source, target) = match node.input {
@@ -194,10 +211,17 @@ pub fn admit_trino_statement_request(
                     Statement::Query(query.into_inner()),
                 ),
             };
-            admit_description(source, TrinoDescriptionKind::Output, target)
+            admit_description(
+                source,
+                TrinoDescriptionKind::Output,
+                target,
+                current_catalog,
+                current_schema,
+            )
         }
         statement => {
-            let action = admit_ordinary_statement(&request, statement)?;
+            let action =
+                admit_ordinary_statement(&request, statement, current_catalog, current_schema)?;
             Ok(AdmittedTrinoStatement {
                 source: TrinoStatementSource::request(request),
                 parameters: None,
@@ -270,6 +294,8 @@ fn admit_prepare(
 fn admit_execute(
     source: TrinoStatementSource,
     values: ast::AstVec<ast::Expr>,
+    current_catalog: Option<&str>,
+    current_schema: Option<&str>,
 ) -> Result<AdmittedTrinoStatement, QueryServiceError> {
     let target = source.parse_effective()?;
     refuse_persistent_parameters(source.sql(), &target)
@@ -280,8 +306,9 @@ fn admit_execute(
         source.request_sql().clone(),
     )
     .map_err(|error| binding_error(&source, target.span(), error))?;
-    let action = select_trino_statement_owner(source.sql(), target)
-        .map_err(|error| error.with_trino_statement_source(source.clone()))?;
+    let action =
+        select_trino_statement_owner(source.sql(), target, current_catalog, current_schema)
+            .map_err(|error| error.with_trino_statement_source(source.clone()))?;
     Ok(AdmittedTrinoStatement {
         source,
         parameters: Some(Arc::new(parameters)),
@@ -293,12 +320,15 @@ fn admit_description(
     source: TrinoStatementSource,
     kind: TrinoDescriptionKind,
     target: ast::TrinoStatement,
+    current_catalog: Option<&str>,
+    current_schema: Option<&str>,
 ) -> Result<AdmittedTrinoStatement, QueryServiceError> {
     refuse_persistent_parameters(source.sql(), &target)
         .map_err(|error| error.with_trino_statement_source(source.clone()))?;
     let parameters = Arc::new(SqlPreparedParameters::describe(&target));
-    let action = select_trino_statement_owner(source.sql(), target)
-        .map_err(|error| error.with_trino_statement_source(source.clone()))?;
+    let action =
+        select_trino_statement_owner(source.sql(), target, current_catalog, current_schema)
+            .map_err(|error| error.with_trino_statement_source(source.clone()))?;
     Ok(AdmittedTrinoStatement {
         source,
         parameters: Some(parameters),
@@ -312,11 +342,13 @@ fn admit_description(
 pub(super) fn admit_ordinary_statement(
     source: &str,
     statement: ast::TrinoStatement,
+    current_catalog: Option<&str>,
+    current_schema: Option<&str>,
 ) -> Result<TrinoStatementAction, QueryServiceError> {
     refuse_persistent_parameters(source, &statement)?;
     let positions = SqlPreparedParameters::positions_in(&statement);
     let span = statement.span();
-    let action = select_trino_statement_owner(source, statement)?;
+    let action = select_trino_statement_owner(source, statement, current_catalog, current_schema)?;
     if !positions.is_empty() {
         return Err(prepared_error(
             INVALID_PARAMETER_USAGE,

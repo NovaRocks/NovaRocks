@@ -575,15 +575,38 @@ pub(super) fn definition(
         .collect::<Vec<_>>();
     let function = FunctionId::try_new(format!("builtin.scalar/{name}/v1"))
         .map_err(|error| owner_error("calendar function", &error))?;
+    let public = !name.starts_with("__extract_");
+    let display = public.then(|| {
+        declarations
+            .iter()
+            .map(|overload| {
+                (
+                    overload.identity.clone(),
+                    vec![crate::FunctionPublicSignature::new(
+                        overload.argument_pattern.replace(',', ", "),
+                        overload.result_pattern.clone(),
+                        "",
+                    )],
+                )
+            })
+            .collect::<Vec<_>>()
+    });
     let declaration =
         FunctionBindingDeclaration::try_new_complete(function, FunctionKind::Scalar, declarations)
             .map_err(|error| owner_error("calendar declaration", &error))?;
+    let declaration = if let Some(display) = display {
+        declaration
+            .with_public_signatures(display)
+            .map_err(super::catalogue::public_signature_error)?
+    } else {
+        declaration
+    };
     FunctionDefinition::try_new_pure_scalar_with_declared_only(
         name,
-        if name.starts_with("__extract_") {
-            FunctionVisibility::Hidden
-        } else {
+        if public {
             FunctionVisibility::Public
+        } else {
+            FunctionVisibility::Hidden
         },
         Arc::new(Owner {
             resolver: Arc::new(DateShiftResolver {

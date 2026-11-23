@@ -20,8 +20,8 @@
 use super::construction::{array_layout, control_error, layout_error, validate_value};
 use super::source::{SystemTableRow, SystemValue};
 use arrow::array::{
-    ArrayRef, BooleanArray, Int64Array, ListArray, StringArray, TimestampMillisecondArray,
-    TimestampNanosecondArray,
+    ArrayRef, BooleanArray, FixedSizeBinaryArray, Int64Array, ListArray, StringArray,
+    TimestampMillisecondArray, TimestampNanosecondArray,
 };
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, TimeUnit};
@@ -236,6 +236,32 @@ pub(crate) fn build_system_table_batch(
                     ),
                     _ => unreachable!(),
                 }
+            }
+            DataType::FixedSizeBinary(14)
+                if declared.value_type.value_type().temporal()
+                    == Some(novarocks_query_application::system_tables::QUERY_OBSERVATION_TIME) =>
+            {
+                let payload_len = rows.len().checked_mul(14).ok_or_else(exhausted)?;
+                request(creation, array_layout::<u8>(payload_len)?)?;
+                let mut payload = exact_vec::<u8>(payload_len)?;
+                for row in rows {
+                    work.step().map_err(control_error)?;
+                    let bytes = match row[column] {
+                        SystemValue::ZonedTimestamp(value) => value,
+                        SystemValue::Null => [0; 14],
+                        _ => unreachable!("validated zoned timestamp"),
+                    };
+                    payload.extend_from_slice(&bytes);
+                }
+                Arc::new(
+                    FixedSizeBinaryArray::try_new(14, Buffer::from_vec(payload), nulls).map_err(
+                        |error| {
+                            SystemTableError::Internal(format!(
+                                "build system-table zoned timestamp: {error}"
+                            ))
+                        },
+                    )?,
+                )
             }
             DataType::Boolean => {
                 let count = rows.len().checked_add(7).ok_or_else(exhausted)? / 8;

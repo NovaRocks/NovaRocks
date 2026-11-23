@@ -78,10 +78,41 @@ pub(super) fn table_free_request_with_constant_policy(
     control: &SqlCompileControl,
     policy: novarocks_functions::ConstantPolicy,
 ) -> SqlFinalPlanCompileRequest {
-    SqlFinalPlanCompileRequest::new(
-        PlanVersionId::try_new([84; 16]).unwrap(),
+    plan_request_with_constant_policy(
         SqlStatementInput::parsed_query(novarocks_sql_testkit::parse_query(sql)),
         SqlCompileIntent::Query,
+        session,
+        control,
+        policy,
+    )
+}
+
+pub(super) fn plan_request(
+    statement: SqlStatementInput,
+    intent: SqlCompileIntent,
+    session: SqlSessionContext,
+    control: &SqlCompileControl,
+) -> SqlFinalPlanCompileRequest {
+    plan_request_with_constant_policy(
+        statement,
+        intent,
+        session,
+        control,
+        novarocks_sql_testkit::sql_fixture_constant_policy(),
+    )
+}
+
+fn plan_request_with_constant_policy(
+    statement: SqlStatementInput,
+    intent: SqlCompileIntent,
+    session: SqlSessionContext,
+    control: &SqlCompileControl,
+    policy: novarocks_functions::ConstantPolicy,
+) -> SqlFinalPlanCompileRequest {
+    SqlFinalPlanCompileRequest::new(
+        PlanVersionId::try_new([84; 16]).unwrap(),
+        statement,
+        intent,
         session,
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),

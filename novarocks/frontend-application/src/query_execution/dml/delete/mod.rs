@@ -318,6 +318,7 @@ pub struct DeleteExplainStatementInput {
     pub(crate) command: novarocks_query_application::api::CommandContext,
     pub(crate) query_options: QueryOptions,
     pub(crate) detail: novarocks_query_application::sql::session::ExplainDetail,
+    pub(crate) timing: Option<novarocks_query_application::session_control::ClientQueryTiming>,
     pub(crate) environment: crate::query::QueryActionEnvironment,
     pub(crate) family: novarocks_result_contract::ClientPresentationFamily,
     #[cfg(novarocks_dev_controls)]

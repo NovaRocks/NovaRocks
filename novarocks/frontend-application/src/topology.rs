@@ -129,6 +129,31 @@ pub struct BackendTopologyRow {
     pub status_detail: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackendNodeState {
+    Active,
+    Draining,
+    Inactive,
+}
+
+impl BackendNodeState {
+    pub(crate) const fn sql_name(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Draining => "draining",
+            Self::Inactive => "inactive",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BackendNodeFacts<'a> {
+    pub(crate) process_id: BackendProcessId,
+    pub(crate) build_identity: &'a str,
+    pub(crate) http_uri: Option<&'a str>,
+    pub(crate) state: BackendNodeState,
+}
+
 /// Read-only topology capability used only by the Frontend management surface.
 pub trait BackendIslandSnapshotReader: Send + Sync {
     fn backend_island_snapshot(&self) -> BackendIslandSnapshot;
@@ -282,6 +307,20 @@ struct BackendFacts {
 }
 
 impl BackendFacts {
+    fn node_state(&self) -> BackendNodeState {
+        if self.eligible() {
+            BackendNodeState::Active
+        } else if self.announce_lease_valid
+            && self.exact_identity_verified
+            && self.endpoint_owned
+            && self.reported_state == BackendReportedState::Draining
+        {
+            BackendNodeState::Draining
+        } else {
+            BackendNodeState::Inactive
+        }
+    }
+
     fn eligible(&self) -> bool {
         self.announce_lease_valid
             && self.exact_identity_verified
@@ -816,45 +855,75 @@ impl ClusterBackendService {
         BackendTopologySnapshot::try_new(state.revision, live_targets(&state))
     }
 
-    /// Refreshes leases and captures all row fields from one topology observation.
+    /// Captures all projected fields under the same topology observation.
     pub fn backend_rows(&self) -> Result<Vec<BackendTopologyRow>, String> {
+        self.observe_backend_processes(|state| {
+            state
+                .processes
+                .iter()
+                .map(|(process_id, facts)| {
+                    let endpoint = facts.descriptor.endpoint();
+                    BackendTopologyRow {
+                        process_id: process_id.to_string(),
+                        endpoint: format!("{}:{}", endpoint.host(), endpoint.port()),
+                        lease_valid: facts.announce_lease_valid,
+                        identity_verified: facts.exact_identity_verified,
+                        reported_state: format!("{:?}", facts.reported_state),
+                        compatible: facts.compatibility.is_compatible(),
+                        endpoint_owned: facts.endpoint_owned,
+                        eligible: facts.eligible(),
+                        scheduled_fragments: facts.scheduled_fragments,
+                        last_announce_ms: facts.last_announce_ms,
+                        last_heartbeat_ms: facts.last_heartbeat_ms,
+                        build_identity: facts.descriptor.build_identity().to_string(),
+                        native_compatibility_id: facts
+                            .descriptor
+                            .native_compatibility_id()
+                            .to_string(),
+                        diagnostic_status: diagnostic_status(facts),
+                        status_detail: facts
+                            .last_err
+                            .clone()
+                            .unwrap_or_else(|| facts.compatibility.detail().to_string()),
+                    }
+                })
+                .collect()
+        })
+    }
+
+    /// Provides borrowed node facts for bounded statement-local projection.
+    /// The visitor runs synchronously while the topology observation is held.
+    pub(crate) fn visit_backend_nodes<E>(
+        &self,
+        mut visit: impl FnMut(BackendNodeFacts<'_>) -> Result<(), E>,
+    ) -> Result<Result<(), E>, String> {
+        self.observe_backend_processes(|state| {
+            state.processes.iter().try_for_each(|(&process_id, facts)| {
+                visit(BackendNodeFacts {
+                    process_id,
+                    build_identity: facts.descriptor.build_identity(),
+                    http_uri: None,
+                    state: facts.node_state(),
+                })
+            })
+        })
+    }
+
+    fn observe_backend_processes<T>(
+        &self,
+        observe: impl FnOnce(&TopologyState) -> T,
+    ) -> Result<T, String> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| "lock frontend topology failed".to_string())?;
         let changed = expire_announce_leases(&mut state, std::time::Instant::now());
-        let rows = state
-            .processes
-            .iter()
-            .map(|(process_id, facts)| {
-                let endpoint = facts.descriptor.endpoint();
-                BackendTopologyRow {
-                    process_id: process_id.to_string(),
-                    endpoint: format!("{}:{}", endpoint.host(), endpoint.port()),
-                    lease_valid: facts.announce_lease_valid,
-                    identity_verified: facts.exact_identity_verified,
-                    reported_state: format!("{:?}", facts.reported_state),
-                    compatible: facts.compatibility.is_compatible(),
-                    endpoint_owned: facts.endpoint_owned,
-                    eligible: facts.eligible(),
-                    scheduled_fragments: facts.scheduled_fragments,
-                    last_announce_ms: facts.last_announce_ms,
-                    last_heartbeat_ms: facts.last_heartbeat_ms,
-                    build_identity: facts.descriptor.build_identity().to_string(),
-                    native_compatibility_id: facts.descriptor.native_compatibility_id().to_string(),
-                    diagnostic_status: diagnostic_status(facts),
-                    status_detail: facts
-                        .last_err
-                        .clone()
-                        .unwrap_or_else(|| facts.compatibility.detail().to_string()),
-                }
-            })
-            .collect();
+        let observation = observe(&state);
         drop(state);
         if changed {
             self.publish_snapshot();
         }
-        Ok(rows)
+        Ok(observation)
     }
 
     fn island_snapshot_inner(&self) -> BackendIslandSnapshot {
@@ -1892,6 +1961,45 @@ mod tests {
         assert_eq!(json["eligible"], true);
         assert_eq!(json["scheduled_fragments"], 0);
         assert_eq!(json["last_heartbeat_ms"], 1);
+    }
+
+    #[test]
+    fn backend_rows_projects_node_state_and_missing_http_address() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let announced = descriptor("127.0.0.1:9070".parse().unwrap());
+        service
+            .record_announce(announced.clone(), BackendReportedState::Running)
+            .unwrap();
+        let assert_node = |expected| {
+            let mut seen = 0;
+            service
+                .visit_backend_nodes(|node| {
+                    seen += 1;
+                    assert_eq!(node.process_id, announced.process_id());
+                    assert_eq!(node.http_uri, None);
+                    assert_eq!(node.build_identity, announced.build_identity());
+                    assert_eq!(node.state.sql_name(), expected);
+                    Ok::<_, std::convert::Infallible>(())
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(seen, 1);
+        };
+        assert_node("inactive");
+        verify(&service, &announced);
+        assert_node("active");
+        {
+            let mut state = service.state.lock().unwrap();
+            let facts = state.processes.get_mut(&announced.process_id()).unwrap();
+            facts.reported_state = BackendReportedState::Draining;
+        }
+        assert_node("draining");
+        {
+            let mut state = service.state.lock().unwrap();
+            let facts = state.processes.get_mut(&announced.process_id()).unwrap();
+            facts.endpoint_owned = false;
+        }
+        assert_node("inactive");
     }
 
     #[test]

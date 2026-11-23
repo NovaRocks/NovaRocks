@@ -16,9 +16,10 @@
 // under the License.
 //! Unicode LIKE matching shared by native predicates and the explicit ESCAPE function.
 use arrow_array::{Array, ArrayRef, BooleanArray, StringArray};
-use std::{convert::Infallible, fmt, sync::Arc};
+use std::{borrow::Cow, convert::Infallible, fmt, str::Chars, sync::Arc};
 
 pub const ESCAPE_FUNCTION_NAME: &str = "__like_with_escape";
+pub const ESCAPE_FUNCTION_ID: &str = "builtin.scalar/__like_with_escape/v1";
 
 #[derive(Clone, Copy, Debug)]
 pub enum LikeObservation {
@@ -95,14 +96,20 @@ pub(crate) fn like_with_escape_observed<E>(
     escape: &str,
     observe: &mut dyn FnMut(LikeObservation) -> Result<(), E>,
 ) -> Result<bool, LikeError<E>> {
+    match_observed(
+        text,
+        pattern,
+        Some(escape_character(escape).map_err(LikeError::Pattern)?),
+        observe,
+    )
+}
+
+fn escape_character(escape: &str) -> Result<char, LikePatternError> {
     let mut chars = escape.chars();
-    let Some(escape) = chars
+    chars
         .next()
         .filter(|c| c.len_utf16() == 1 && chars.next().is_none())
-    else {
-        return Err(LikeError::Pattern(LikePatternError::EscapeLength));
-    };
-    match_observed(text, pattern, Some(escape), observe)
+        .ok_or(LikePatternError::EscapeLength)
 }
 
 #[derive(Clone, Copy)]
@@ -112,6 +119,68 @@ enum PatternToken {
     AnySequence,
 }
 
+fn next_pattern_token<E>(
+    chars: &mut Chars<'_>,
+    escape: Option<char>,
+    observe: &mut dyn FnMut(LikeObservation) -> Result<(), E>,
+) -> Result<Option<PatternToken>, LikeError<E>> {
+    let Some(character) = chars.next() else {
+        return Ok(None);
+    };
+    event(observe, LikeObservation::Step)?;
+    let token = if Some(character) == escape {
+        let escaped = chars
+            .next()
+            .filter(|escaped| matches!(*escaped, '%' | '_') || *escaped == character)
+            .ok_or(LikeError::Pattern(LikePatternError::InvalidEscape))?;
+        event(observe, LikeObservation::Step)?;
+        PatternToken::Literal(escaped)
+    } else {
+        match character {
+            '%' => PatternToken::AnySequence,
+            '_' => PatternToken::AnyOne,
+            _ => PatternToken::Literal(character),
+        }
+    };
+    Ok(Some(token))
+}
+
+/// Prove that a LIKE pattern matches exactly one string. A wildcard removes
+/// the proof. The executor remains responsible for evaluating the predicate
+/// and reporting malformed patterns.
+pub fn exact_literal_observed<'a, E>(
+    pattern: &'a str,
+    escape: Option<&str>,
+    observe: &mut dyn FnMut(LikeObservation) -> Result<(), E>,
+) -> Result<Option<Cow<'a, str>>, LikeError<E>> {
+    let escape = escape
+        .map(escape_character)
+        .transpose()
+        .map_err(LikeError::Pattern)?;
+    let mut chars = pattern.chars();
+    let mut literal = String::new();
+    while let Some(token) = next_pattern_token(&mut chars, escape, observe)? {
+        let PatternToken::Literal(value) = token else {
+            return Ok(None);
+        };
+        if escape.is_some() {
+            if literal.capacity() - literal.len() < value.len_utf8() {
+                event(observe, LikeObservation::OpaqueBoundary)?;
+                literal
+                    .try_reserve(value.len_utf8())
+                    .map_err(|_| LikeError::Operation(crate::KernelFailure::ResourceExhausted))?;
+                event(observe, LikeObservation::OpaqueBoundary)?;
+            }
+            literal.push(value);
+        }
+    }
+    Ok(Some(if escape.is_some() {
+        Cow::Owned(literal)
+    } else {
+        Cow::Borrowed(pattern)
+    }))
+}
+
 fn parse_pattern<E>(
     pattern: &str,
     escape: Option<char>,
@@ -119,22 +188,7 @@ fn parse_pattern<E>(
 ) -> Result<Vec<PatternToken>, LikeError<E>> {
     let mut tokens = Vec::new();
     let mut chars = pattern.chars();
-    while let Some(character) = chars.next() {
-        event(observe, LikeObservation::Step)?;
-        let token = if Some(character) == escape {
-            let escaped = chars
-                .next()
-                .filter(|escaped| matches!(*escaped, '%' | '_') || *escaped == character)
-                .ok_or(LikeError::Pattern(LikePatternError::InvalidEscape))?;
-            event(observe, LikeObservation::Step)?;
-            PatternToken::Literal(escaped)
-        } else {
-            match character {
-                '%' => PatternToken::AnySequence,
-                '_' => PatternToken::AnyOne,
-                _ => PatternToken::Literal(character),
-            }
-        };
+    while let Some(token) = next_pattern_token(&mut chars, escape, observe)? {
         if tokens.len() == tokens.capacity() {
             event(observe, LikeObservation::OpaqueBoundary)?;
             tokens

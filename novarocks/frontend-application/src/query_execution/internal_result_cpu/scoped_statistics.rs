@@ -677,6 +677,25 @@ impl StatisticsCpuFixture {
 mod scoped_rewrite;
 
 impl novarocks_spi::connector::ProviderMetadataCpuPort for ScopedProviderCreatorCpu {
+    fn discovery_allocation(
+        &self,
+    ) -> Result<Arc<dyn novarocks_spi::connector::DiscoveryAllocation>, ConnectorError> {
+        if !matches!(
+            self.mode,
+            CreatorCpuMode::ProviderMetadata | CreatorCpuMode::ProviderMetadataSettlement(_)
+        ) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "provider CPU port lacks original metadata discovery admission",
+            ));
+        }
+        let storage =
+            crate::system_tables::DiscoveryStorage::try_new(&self.window).map_err(|error| {
+                ConnectorError::from_domain(statistics_failure_kind(error.failure_fact()), error)
+            })?;
+        Ok(storage)
+    }
+
     fn submit_metadata_in(
         &self,
         input: &mut Option<novarocks_spi::connector::ProviderMetadataCpuInput>,

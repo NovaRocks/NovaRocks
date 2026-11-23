@@ -2938,6 +2938,7 @@ impl<'a> AnalyzerContext<'a> {
             purpose: self.purpose,
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: self.materialized_values,
+            statement_relation: self.statement_relation,
             prepared_parameters: self.prepared_parameters,
             table_sequence: self.table_sequence,
             control: self.control,

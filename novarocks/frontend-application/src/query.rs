@@ -70,10 +70,10 @@ use novarocks_query_application::session::{
     StatementOutputShape, StatementSessionRequest,
 };
 use novarocks_query_application::session_control::{
-    GovernedQueryStatementBeginError, GovernedQueryStatementOwner, GovernedStatementAction,
-    QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementActionReady,
-    StatementActionValue, StatementCommandCompletion, StatementCompletionProjection,
-    StatementToken,
+    ClientQueryTiming, GovernedQueryStatementBeginError, GovernedQueryStatementOwner,
+    GovernedStatementAction, QueryControlService, QuerySessionLease, SessionIdentity, SessionToken,
+    StatementActionReady, StatementActionValue, StatementCommandCompletion,
+    StatementCompletionProjection, StatementToken,
 };
 use novarocks_query_application::session_effects::SessionEffects;
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
@@ -752,6 +752,7 @@ async fn execute_synchronous_stage<T, F>(
     cancellation: QueryCancellationView,
     execution_owner: WorkOwner,
     result_window: Option<ResultWindowAlias>,
+    control_timing: Option<ClientQueryTiming>,
     call: F,
 ) -> Result<
     (
@@ -773,6 +774,9 @@ where
                         .to_owned(),
                 ))
             } else {
+                if let Some(timing) = control_timing {
+                    timing.start_control();
+                }
                 call()
             };
             (result, execution_owner, result_window)
@@ -797,6 +801,7 @@ async fn execute_prepared_dml_statement<P, Prepare, Execute>(
     cancellation: QueryCancellationView,
     execution_owner: WorkOwner,
     result_window: Option<ResultWindowAlias>,
+    control_timing: Option<ClientQueryTiming>,
     prepare: Prepare,
     execute: Execute,
 ) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
@@ -810,6 +815,7 @@ where
         cancellation.clone(),
         execution_owner,
         result_window,
+        control_timing,
         prepare,
     )
     .await?;
@@ -819,6 +825,7 @@ where
             cancellation,
             execution_owner,
             result_window,
+            None,
             move || execute(prepared),
         )
         .await
@@ -833,7 +840,13 @@ async fn execute_product_statement(
     request_context: RequestContext,
     command_context: CommandContext,
     execution_owner: WorkOwner,
+    control_timing: Option<ClientQueryTiming>,
 ) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String> {
+    if let Some(timing) = control_timing
+        && command_context.scope().check().is_ok()
+    {
+        timing.start_control();
+    }
     let result = router
         .execute(command, request_context, command_context)
         .await
@@ -1053,7 +1066,7 @@ impl FrontendQueryService {
         request: StatementSessionRequest,
     ) -> Result<Arc<FrontendQuerySession>, StatementSessionError> {
         let admission = request.admission();
-        let (query_id, principal, value) = request.into_parts();
+        let (query_id, principal, value, claim) = request.into_parts_with_client_query_claim();
         let prepared_statements = value.prepared_statements().clone();
         let state = SessionSqlState::from_session_value(
             value,
@@ -1063,7 +1076,10 @@ impl FrontendQueryService {
         let identity = SessionIdentity::client_statement(query_id.clone(), Arc::clone(&principal));
         let lease = self
             .serving_admission
-            .register_session(|| self.query_control.register_session(identity))
+            .register_session(|| match claim {
+                Some(claim) => self.query_control.register_claimed_session(identity, claim),
+                None => self.query_control.register_session(identity),
+            })
             .map_err(query_service_admission_error)?
             .map_err(|error| {
                 internal_error(format!(
@@ -1248,8 +1264,9 @@ impl FrontendQuerySession {
     async fn execute_session_use(
         &self,
         namespace: SessionNamespace<'_>,
-        governed: GovernedQueryStatementOwner,
+        mut governed: GovernedQueryStatementOwner,
     ) -> StatementResult {
+        governed.observe_control_start();
         let cancellation =
             QueryCancellationView::governed(governed.cancellation().clone(), governed.timeout_ms());
         match self
@@ -2476,7 +2493,7 @@ mod tests {
                 assert!(*open, "test worker gate timed out");
                 Ok(StatementResult::Ok)
             };
-            execute_synchronous_stage(executor, cancellation, owner, Some(alias), produce)
+            execute_synchronous_stage(executor, cancellation, owner, Some(alias), None, produce)
                 .await
                 .map(|(result, owner, _window)| (result, owner))
         });

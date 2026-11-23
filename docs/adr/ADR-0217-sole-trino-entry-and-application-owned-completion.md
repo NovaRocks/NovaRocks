@@ -20,6 +20,7 @@ partially-supersedes:
     link: "ADR-0203-client-result-presentation-and-trino-paged-delivery.md"
 date: 2026-11-05
 provenance:
+  - "discussion: 2026-11-23 TRC-7 accepted query registration, terminal observations, and targeted cancellation"
   - "discussion: sole statement-scoped client entry, static completion shape and application-owned logical counts"
   - "reference: Trino 483, commit 50b0b50b75abd47f830b7805ee1b51716eb4065e"
 code-anchors:
@@ -71,7 +72,7 @@ code-anchors:
 
 1. **唯一客户端入口。** FE仅组合Trino HTTP statement入口；旧MySQL listener、connection registry/token控制port、专属encoder/呈现、容量advertisement、feature与同步client依赖在无真实消费者后退出。旧mysql_port等配置明确拒绝，不静默忽略或转换。语法层的MySQL兼容、SQL类型/算术/CAST/时间语义不由本条删除；外部MySQL StateStore、mysql_async及其fixture/测试保留，外部StarRocks比较端按原owner保留。
 
-2. **身份、授权与生命周期不迁给socket。** 客户端查询ID与内部attempt身份仍由原应用作者分配，语句会话以不复用的中立session key保管；HTTP连接不是查询身份，也不是容量票据。依赖已退役连接身份的KILL、KILL QUERY、KILL CONNECTION、SHOW PROCESSLIST在原准入阶段typed拒绝，不伪造ID、不返回空成功。此拒绝不提前实现新的按query-id管理SQL。现有准确continuation DELETE、服务drain/取消、当前principal/Host校验和有限测试授权继续通过原owner；不引入管理员豁免、隐藏控制listener或通用观测授权。
+2. **身份、授权与生命周期不迁给socket。** 客户端查询ID与内部attempt身份仍由原应用作者分配，语句会话以不复用的中立session key保管；HTTP连接不是查询身份，也不是容量票据。依赖已退役连接身份的KILL、KILL QUERY、KILL CONNECTION、SHOW PROCESSLIST在原准入阶段typed拒绝，不伪造ID、不返回空成功。`CALL system.runtime.kill_query` 以 Query Application 的准确 Trino 客户端查询 ID 和调用者权限进行定向管理取消。现有准确continuation DELETE、服务drain/取消、当前principal/Host校验和有限测试授权继续通过原owner；不引入管理员豁免、隐藏控制listener或通用观测授权。
 
 3. **错误沿原类型投影。** SQL作者保留稳定code与有来源的span；已知执行/Connector/资源/控制/Representation事实保留原typed cause和外部效果。Trino边界按登记映射输出errorCode/errorName/errorType/location，不以message匹配分类。未知来源不能借客户端迁移变成已知失败，success seal后的取消或送达失败也不能抹去已发生的提交。ADR-0095的Analyze规则及ADR-0187已有部分替代关系继续有效；只退出旧MySQL ErrorKind/errno/SQLSTATE映射。
 
@@ -87,6 +88,10 @@ code-anchors:
 7. **大小限制沿固定上游语义。** `[standalone_server].trino_query_max_length`采用Trino483的query.max-length默认1,000,000，按 Java 字符串长度等价的 UTF-16 code units 计数：BMP为一单位，补充平面字符为两单位。超限在执行准入前返回QUERY_TEXT_TOO_LARGE（既有映射code35/USER_ERROR），不启动语句工作。读取HTTP body使用同一限制推导的有界UTF8字节上界：合法UTF8每UTF16单位最多三字节，所以3L仅是读取保管上界，最终仍以UTF16单位精确裁决，不把字节数当语句语义长度。本条不创设新的硬阈值，也不恢复MySQL command_bytes。
 
 8. **冻结与兼容不靠旧名字缺省。** sole Trino family与呈现词汇由原FE/BE codec/descriptor作者同步；退役tag/name保留reserved，缺族、退役枚举和未知值明确拒绝。客户端呈现变化不改变Internal结果域，也不以旧fixture/旧binary receipt证明新compatibility岛。规范构建、实际程序来源、原生行为、运行/清理和准入资格分别核验。
+
+9. **登记、领取与取消回执。** Adapter 和 Query Application 完成同一 POST ID 的登记后发布可续取 URI。首个有效 GET 领取一次，原请求与 SQL backing 随领取移交到准确 Session generation。管理取消沿排队、领取及原 Work 的控制裁决，唯一胜者发布完整回执。终页按原消息呈现该回执，近期查询观察消费同一错误身份。管理命令的确认沿自己的治理协议交付，目标实际退出仍由其原 owner 核对。
+
+10. **客户端结论和近期保留。** 客户端终态由原协议结算向 Query Application 定稿。业务成功封定至最后页确认这一段呈现 FINISHING。该阶段的管理取消被拒绝，后来胜出的 DELETE 仍可终结交付，保留原业务成功和外部效果。近期终态占用按真实 backing 归入同进程字节及年龄策略，保留到最后反馈读取别名实际退出。原 URI、合法重放与历史驱逐沿各自原所有者推进。Server 通过 `[runtime.frontend_workload.query_history]` 确定 FE 历史预算与年龄，默认每个 FE 16 MiB、最长 60 秒，压力可提早淘汰。排队及处理时长取单调时间，公开时刻取真实采样对应的带时区声明。
 
 ## 接受的妥协（诚实记录）
 

@@ -73,16 +73,12 @@ fn check_operation_control(
     stop: &ConnectorStopView,
 ) -> Result<(), ConnectorError> {
     if stop.is_stopped() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Cancelled,
+        return Err(ConnectorError::observed_cancellation(
             OPERATION_CANCELLED_DETAIL,
         ));
     }
     if Instant::now() >= deadline {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::DeadlineExceeded,
-            OPERATION_DEADLINE_DETAIL,
-        ));
+        return Err(ConnectorError::observed_deadline(OPERATION_DEADLINE_DETAIL));
     }
     Ok(())
 }
@@ -1286,6 +1282,7 @@ mod tests {
 #[cfg(test)]
 mod control_failure_geometry_tests {
     use super::*;
+    use novarocks_failure_contract::{FailureEvidence, FailureProjection};
     #[test]
     fn original_control_failure_strings_fit_their_actual_author_quote() {
         let stopped = super::super::ConnectorStopOwner::new();
@@ -1302,6 +1299,10 @@ mod control_failure_geometry_tests {
         assert_eq!(cancelled.message(), OPERATION_CANCELLED_DETAIL);
         assert_eq!(deadline.message(), OPERATION_DEADLINE_DETAIL);
         for error in [cancelled, deadline] {
+            assert_eq!(
+                error.failure_fact().evidence(),
+                FailureEvidence::StopObservation
+            );
             assert!(
                 error.message().len() <= ConnectorOperationControlView::failure_backing_bytes()
             );

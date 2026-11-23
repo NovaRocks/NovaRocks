@@ -29,9 +29,13 @@ use crate::planner::system_relation::PhysicalSystemTableState;
 use crate::system_table::{
     SystemTableKeyConstraint, SystemTableKeyValues, SystemTableOccurrenceId,
 };
-use novarocks_spi::connector::read_stack::{ConnectorValue, ConnectorValueType};
+use novarocks_functions::native_like::{self, LikeError, LikeObservation};
+use novarocks_spi::connector::read_stack::{
+    ConnectorValue, ConnectorValueType, MAX_CONNECTOR_VALUE_BYTES,
+};
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl,
+    CharacterKind, CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl,
+    ValueKind, trino_can_coerce_scalar,
 };
 use std::collections::BTreeMap;
 
@@ -57,6 +61,106 @@ fn unnest(mut expression: &TypedExpr) -> &TypedExpr {
     }
     expression
 }
+fn is_varchar(value_type: &FunctionValueType) -> bool {
+    match value_type.value_type().kind() {
+        ValueKind::String => true,
+        ValueKind::BoundedCharacter(character) => character.kind() == CharacterKind::Varchar,
+        _ => false,
+    }
+}
+
+fn varchar_widening_source(expression: &TypedExpr) -> Option<&TypedExpr> {
+    let mut input = unnest(expression);
+    if !is_varchar(&input.value_type) {
+        return None;
+    }
+    while let ExprKind::Cast { expr, target, .. } = &input.kind {
+        if target != input.value_type.data_type()
+            || input.value_type.nullable() != expr.value_type.nullable()
+            || !is_varchar(&expr.value_type)
+            || !trino_can_coerce_scalar(
+                expr.value_type.value_type().kind(),
+                input.value_type.value_type().kind(),
+            )
+        {
+            return None;
+        }
+        input = unnest(expr);
+    }
+    Some(input)
+}
+
+fn lower_varchar_literal(expression: &TypedExpr) -> Option<ConnectorValue> {
+    let source = varchar_widening_source(expression)?;
+    if let ExprKind::Constant(constant) = &source.kind
+        && !source.value_type.nullable()
+        && constant.value_type() == &source.value_type
+    {
+        let text = constant.try_utf8().ok().flatten()?;
+        return (text.len() <= MAX_CONNECTOR_VALUE_BYTES)
+            .then(|| ConnectorValue::Varchar(std::sync::Arc::from(text)));
+    }
+    lower_literal(expression, ConnectorValueType::Varchar)
+}
+
+fn like_operands(expression: &TypedExpr) -> Option<(&TypedExpr, &TypedExpr, Option<&TypedExpr>)> {
+    match &expression.kind {
+        ExprKind::Like {
+            expr,
+            pattern,
+            negated: false,
+        } => Some((expr, pattern, None)),
+        ExprKind::FunctionCall { binding, args, .. }
+            if binding.function_id.as_str() == native_like::ESCAPE_FUNCTION_ID =>
+        {
+            let [input, pattern, escape] = &args[..] else {
+                return None;
+            };
+            Some((input, pattern, Some(escape)))
+        }
+        _ => None,
+    }
+}
+
+fn exact_like_key(
+    input: &TypedExpr,
+    pattern: &TypedExpr,
+    escape: Option<&TypedExpr>,
+    resolve_column: impl Fn(&TypedExpr) -> Option<ProviderPredicateColumn>,
+    resolve_literal: impl Fn(&TypedExpr, ConnectorValueType) -> Option<ConnectorValue>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<(usize, String)>, SqlCompileError> {
+    let Some(column) = resolve_column(input) else {
+        return Ok(None);
+    };
+    let Some(ConnectorValue::Varchar(pattern)) =
+        resolve_literal(pattern, ConnectorValueType::Varchar)
+    else {
+        return Ok(None);
+    };
+    let escape = match escape {
+        Some(escape) => match resolve_literal(escape, ConnectorValueType::Varchar) {
+            Some(ConnectorValue::Varchar(value)) => Some(value),
+            _ => return Ok(None),
+        },
+        None => None,
+    };
+    let literal =
+        native_like::exact_literal_observed(
+            &pattern,
+            escape.as_deref(),
+            &mut |event| match event {
+                LikeObservation::Step => work.step(),
+                LikeObservation::OpaqueBoundary => work.flush(),
+            },
+        );
+    match literal {
+        Ok(literal) => Ok(literal.map(|literal| (column.ordinal as usize, literal.into_owned()))),
+        Err(LikeError::Host(error)) => Err(error.into()),
+        Err(LikeError::Pattern(_) | LikeError::Operation(_)) => Ok(None),
+    }
+}
+
 fn add_conjuncts(expression: &TypedExpr, predicates: &mut Vec<Predicate>) {
     let expression = unnest(expression);
     if let ExprKind::BinaryOp {
@@ -105,7 +209,7 @@ pub(super) fn collect(
                                 ProjectInput::Column(*column_id)
                             }
                             _ => ProjectInput::Varchar {
-                                value: lower_literal(expression, ConnectorValueType::Varchar)?,
+                                value: lower_varchar_literal(expression)?,
                                 value_type: expression.value_type.clone(),
                             },
                         };
@@ -142,13 +246,9 @@ pub(super) fn collect(
                 for predicate in predicates {
                     work.step()?;
                     let expression = unnest(&predicate.expression);
-                    if !matches!(typed_comparison(expression), Some((BinOp::Eq, _)))
-                        && !matches!(&expression.kind, ExprKind::InList { negated: false, .. })
-                    {
-                        continue;
-                    }
                     let resolve_column = |expression: &TypedExpr| {
-                        let ExprKind::ColumnRef { column_id, .. } = &unnest(expression).kind else {
+                        let expression = varchar_widening_source(expression)?;
+                        let ExprKind::ColumnRef { column_id, .. } = &expression.kind else {
                             return None;
                         };
                         let id = match &predicate.mapping {
@@ -166,7 +266,7 @@ pub(super) fn collect(
                             .find(|(column, _)| column.column_id == id)?;
                         if !table.relation.declaration.key_columns.contains(ordinal)
                             || column.value_type != expression.value_type
-                            || column.value_type.data_type() != &arrow::datatypes::DataType::Utf8
+                            || !is_varchar(&column.value_type)
                         {
                             return None;
                         }
@@ -176,16 +276,40 @@ pub(super) fn collect(
                         })
                     };
                     let resolve_literal = |expression: &TypedExpr, expected| {
-                        if let ExprKind::ColumnRef { column_id, .. } = &unnest(expression).kind
+                        if expected != ConnectorValueType::Varchar {
+                            return None;
+                        }
+                        let source = varchar_widening_source(expression)?;
+                        if let ExprKind::ColumnRef { column_id, .. } = &source.kind
                             && let Some(ProjectInput::Varchar { value, value_type }) =
                                 predicate.mapping.as_ref()?.get(column_id)
-                            && expected == ConnectorValueType::Varchar
-                            && value_type == &expression.value_type
+                            && value_type == &source.value_type
                         {
                             return Some(value.clone());
                         }
-                        lower_literal(expression, expected)
+                        lower_varchar_literal(expression)
                     };
+                    if let Some((input, pattern, escape)) = like_operands(expression) {
+                        if let Some((ordinal, literal)) = exact_like_key(
+                            input,
+                            pattern,
+                            escape,
+                            resolve_column,
+                            resolve_literal,
+                            work,
+                        )? {
+                            constraint.set_values(
+                                ordinal,
+                                SystemTableKeyValues::Values([literal].into()),
+                            );
+                        }
+                        continue;
+                    }
+                    if !matches!(typed_comparison(expression), Some((BinOp::Eq, _)))
+                        && !matches!(&expression.kind, ExprKind::InList { negated: false, .. })
+                    {
+                        continue;
+                    }
                     let Some((ordinal, domain)) = lower_atom_with_literal(
                         &predicate.expression,
                         resolve_column,
@@ -232,6 +356,7 @@ pub(super) fn collect(
                     needs.push(SystemTableSnapshotNeed::new(
                         id,
                         occurrence,
+                        table.relation.statement_relation,
                         table.relation.declaration.clone(),
                         table.relation.required_columns.clone().into(),
                         table.key_constraint.clone(),
@@ -321,6 +446,7 @@ pub(crate) fn install(
                 )
             })?;
             if !matches!(table.state, PhysicalSystemTableState::Planning)
+                || request.statement_relation() != table.relation.statement_relation
                 || request.declaration() != &table.relation.declaration
                 || request.required_columns() != table.relation.required_columns
                 || request.key_constraint() != &table.key_constraint

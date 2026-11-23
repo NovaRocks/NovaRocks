@@ -69,6 +69,19 @@ enum Input {
 }
 
 impl Input {
+    fn public_sql(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Boolean => "boolean",
+            Self::AnyHash => "T",
+            Self::Bigint => "bigint",
+            Self::Real => "real",
+            Self::Double => "double",
+            Self::Varchar => "varchar",
+            Self::DoubleArray => "array(double)",
+        }
+    }
+
     fn accepts(self, value: &DataType) -> bool {
         match self {
             Self::Unknown => value == &DataType::Null,
@@ -127,6 +140,21 @@ struct Overload {
 }
 
 impl Overload {
+    fn public_signature(&self) -> FunctionPublicSignature {
+        let inputs = self
+            .inputs
+            .iter()
+            .map(|input| input.public_sql())
+            .collect::<Vec<_>>();
+        let result = match self.output {
+            Output::Count => "bigint".to_owned(),
+            Output::Value => inputs[0].to_owned(),
+            Output::Array => format!("array({})", inputs[0]),
+            Output::Map => format!("map({},bigint)", inputs[1]),
+        };
+        FunctionPublicSignature::new(inputs.join(", "), result, "")
+    }
+
     fn identity(&self, family: Family) -> Result<FunctionOverloadId, FunctionBindingError> {
         FunctionOverloadId::try_new(format!("builtin.aggregate/{}/{}", family.name(), self.name))
             .map_err(binding_error)
@@ -437,9 +465,21 @@ fn definition<K: PreparedAggregateKernel>(
         .map(|overload| overload.declaration(family))
         .collect::<Result<Vec<_>, _>>()
         .map_err(catalogue_error)?;
+    let public = declarations
+        .iter()
+        .zip(overloads)
+        .map(|(declaration, overload)| {
+            (
+                declaration.identity.clone(),
+                vec![overload.public_signature()],
+            )
+        })
+        .collect::<Vec<_>>();
     let declaration =
         FunctionBindingDeclaration::try_new(function_id, FunctionKind::Aggregate, declarations)
-            .map_err(catalogue_error)?;
+            .map_err(catalogue_error)?
+            .with_public_signatures(public)
+            .map_err(super::catalogue::public_signature_error)?;
     let mut declared_only = Vec::new();
     let mut implementations = Vec::new();
     for overload in overloads {

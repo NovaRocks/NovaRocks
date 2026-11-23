@@ -26,7 +26,10 @@ use crate::commit::model::FrozenRequest;
 use crate::commit::operation::IcebergCommitOperation;
 use crate::iceberg::puffin::Blob;
 use crate::iceberg::spec::BlobMetadata;
-use novarocks_spi::connector::{StatisticsCpuInput, StatisticsCpuPort};
+use novarocks_spi::connector::{
+    ConnectorTablePreparation, ConnectorViewPreparation, DiscoveredRelation, DiscoveryAllocation,
+    DiscoveryProjection, StatisticsCpuInput, StatisticsCpuPort,
+};
 use std::sync::{Mutex, Weak};
 
 type PublicationResult = Result<async_publication::PreparedStatisticsPublication, ConnectorError>;
@@ -41,10 +44,55 @@ pub(crate) mod scoped_prepared_split;
 mod scoped_read;
 #[path = "scoped_snapshot.rs"]
 pub(crate) mod scoped_snapshot;
+pub(crate) enum DiscoveryPreparation {
+    Table(ConnectorTablePreparation),
+    View(ConnectorViewPreparation),
+}
+
+struct DiscoveryWork {
+    provider: IcebergMetadata,
+    preparation: Option<DiscoveryPreparation>,
+    projection: DiscoveryProjection,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    allocation: Arc<dyn DiscoveryAllocation>,
+    result: Option<Result<DiscoveredRelation, ConnectorError>>,
+}
+
+impl DiscoveryWork {
+    fn run(&mut self) {
+        let preparation = self.preparation.take().expect("same discovery preparation");
+        let control = || crate::metadata::pure_catalog_control(&self.context);
+        let mut request = |layout| {
+            control()?;
+            self.allocation.request(layout)
+        };
+        let mut work = |_| control();
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            Arc::clone(&self.allocation).retention(),
+            &mut request,
+            &mut work,
+        );
+        self.result = Some(
+            match preparation {
+                DiscoveryPreparation::Table(preparation) => self.provider.discover_prepared_table(
+                    preparation,
+                    self.projection,
+                    &mut creation,
+                ),
+                DiscoveryPreparation::View(preparation) => self
+                    .provider
+                    .discover_prepared_view_metadata(preparation, self.projection, &mut creation),
+            }
+            .map_err(crate::metadata::metadata_creation_error),
+        );
+    }
+}
+
 enum CpuBody {
     OrphanDecode(Box<DecodeWork>),
     CatalogCreate(Box<crate::catalog_control::catalog_mutation::create_cpu::Work>),
     ViewListing(Box<crate::catalog_control::views::async_listing::Work>),
+    Discovery(Box<DiscoveryWork>),
     Compaction(crate::catalog_control::metadata_maintenance::observation::CompactionWork),
     RetainedPartitionSpecs(
         Box<crate::catalog_control::metadata_maintenance::expiry_metadata::Work>,
@@ -292,6 +340,35 @@ impl IcebergMetadataCpuOriginal {
             })),
         })
     }
+    pub(crate) fn discovery(
+        provider: IcebergMetadata,
+        preparation: DiscoveryPreparation,
+        projection: DiscoveryProjection,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+        allocation: Arc<dyn DiscoveryAllocation>,
+    ) -> Arc<Self> {
+        Self::new(
+            provider.descriptor().clone(),
+            provider.incarnation(),
+            CpuBody::Discovery(Box::new(DiscoveryWork {
+                provider,
+                preparation: Some(preparation),
+                projection,
+                context,
+                allocation,
+                result: None,
+            })),
+        )
+    }
+
+    pub(crate) fn take_discovery_result(&self) -> Result<DiscoveredRelation, ConnectorError> {
+        let mut loan = BodyLoan::take(self);
+        let CpuBody::Discovery(work) = &mut loan.body.as_mut().expect("same CPU body").body else {
+            return Err(internal("Discovery CPU source differs"));
+        };
+        work.result.take().expect("actual discovery result")
+    }
+
     pub(crate) fn metadata_binding(
         provider: IcebergMetadata,
         facts: crate::metadata::IcebergPreparedTableFacts,
@@ -412,6 +489,7 @@ impl IcebergMetadataCpuOriginal {
             CpuBody::OrphanDecode(work) => work.run(),
             CpuBody::CatalogCreate(work) => work.run(),
             CpuBody::ViewListing(work) => work.run(),
+            CpuBody::Discovery(work) => work.run(),
             CpuBody::Compaction(work) => work.run(),
             CpuBody::RetainedPartitionSpecs(work) => work.run(),
             CpuBody::PreparedSource(body) => body.run(),
@@ -755,6 +833,7 @@ impl novarocks_spi::connector::ProviderMetadataCpuSource for IcebergMetadataCpuO
                     CpuBody::MetadataBinding { .. }
                         | CpuBody::CatalogCreate(_)
                         | CpuBody::ViewListing(_)
+                        | CpuBody::Discovery(_)
                         | CpuBody::PreparedSource(_)
                         | CpuBody::PreparedSplit(_)
                         | CpuBody::ReadSnapshot(_)
@@ -788,6 +867,7 @@ pub(crate) fn metadata_cpu_source_bytes() -> Result<usize, ConnectorError> {
         .max(std::mem::size_of::<
             crate::catalog_control::catalog_mutation::create_cpu::Work,
         >())
+        .max(std::mem::size_of::<DiscoveryWork>())
         .max(std::mem::size_of::<scoped_prepared_source::Work>())
         .max(std::mem::size_of::<scoped_prepared_split::Work>())
         .max(std::mem::size_of::<

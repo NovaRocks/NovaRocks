@@ -56,6 +56,7 @@ fn scalar_context<'a>(
         control,
         constant_policy,
         materialized_values: None,
+        statement_relation: None,
         prepared_parameters: None,
         table_sequence: None,
         catalog: catalog.planner_table_provider(),

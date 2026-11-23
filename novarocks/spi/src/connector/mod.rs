@@ -38,6 +38,7 @@ mod listing;
 mod maintenance_data_size;
 mod maintenance_duration;
 mod metadata;
+mod metadata_discovery;
 mod metadata_maintenance;
 mod mutation;
 mod mv_storage_observation;
@@ -210,6 +211,10 @@ pub use metadata::{
     MAX_CONNECTOR_TABLE_PLANNING_FACT_CONSTRAINT_COLUMNS,
     MAX_CONNECTOR_TABLE_PLANNING_FACT_FOREIGN_KEY_CONSTRAINTS,
     MAX_CONNECTOR_TABLE_PLANNING_FACT_UNIQUE_CONSTRAINTS,
+};
+pub use metadata_discovery::{
+    DiscoveredColumn, DiscoveredRelation, DiscoveryAllocation, DiscoveryColumnProjection,
+    DiscoveryProjection, DiscoveryRelationKind, DiscoveryViewDomainUnavailable,
 };
 pub use metadata_maintenance::{
     CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorExpireSnapshotsExecute,

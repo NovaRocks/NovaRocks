@@ -77,6 +77,19 @@ impl CollectionLambdaSignature {
             aggregate: None,
         }
     }
+
+    pub(super) fn public_signature(self) -> crate::FunctionPublicSignature {
+        let arguments = self
+            .arguments
+            .strip_prefix('(')
+            .and_then(|arguments| arguments.strip_suffix(')'))
+            .expect("collection lambda declaration encloses its argument list");
+        crate::FunctionPublicSignature::new(
+            arguments.replacen(",function(", ", function(", 1),
+            self.result,
+            "",
+        )
+    }
 }
 
 pub fn signature(name: &str) -> Option<CollectionLambdaSignature> {
@@ -171,7 +184,9 @@ pub(super) fn register(
         .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
             subject: "collection lambda binding declaration",
             value: error.to_string().into(),
-        })?;
+        })?
+        .with_public_signatures([(signature.overload(), vec![signature.public_signature()])])
+        .map_err(super::catalogue::public_signature_error)?;
         builder.register(FunctionDefinition::try_new_bound(
             name,
             FunctionVisibility::Public,

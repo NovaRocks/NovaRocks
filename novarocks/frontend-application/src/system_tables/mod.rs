@@ -18,17 +18,22 @@
 //! Statement-scoped standard system-table providers.
 mod batch;
 mod construction;
+mod discovery_storage;
+pub(crate) use discovery_storage::DiscoveryStorage;
+mod metadata_type;
 mod pinned_catalog;
 mod provider;
+mod runtime;
 mod source;
 #[cfg(test)]
 use batch::build_system_table_batch;
 pub(crate) use construction::{RowStage, SystemTableCpuStaging, control_error};
 pub(crate) use pinned_catalog::PinnedCatalogListing;
 pub(crate) use provider::{FrontendSystemTableProvider, materialized_view_states_registration};
+pub(crate) use runtime::FrontendRuntimeMetadata;
 pub(crate) use source::{
-    ListableMaterializedViews, MaterializedViewFacts, MaterializedViewInventory,
-    StatementSystemTableSource, SystemValueRef, repository_error,
+    ListableMaterializedViews, MaterializedViewFacts, MaterializedViewInventory, MetadataNames,
+    RuntimeMetadataObservation, StatementSystemTableSource, SystemValueRef, repository_error,
 };
 #[cfg(test)]
 mod tests;

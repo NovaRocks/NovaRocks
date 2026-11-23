@@ -26,6 +26,7 @@ mod numeric_operators;
 mod prepared_binding;
 mod prepared_description;
 mod set_operations;
+mod system_relation_visibility;
 mod table_sequence;
 mod truth_test_analysis;
 

@@ -294,6 +294,7 @@ impl SqlCapturedCatalogPreparation {
                 None,
                 false,
                 None,
+                None,
                 Some(&table_sequence),
             )
             .map_err(SqlCompileError::from)?;

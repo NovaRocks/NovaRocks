@@ -32,7 +32,10 @@ use novarocks_query_application::{
     preparation::{FinalPlanCompletionDriver, ReadAccessSink},
     system_tables::{SystemTableRegistration, SystemTableRegistry, SystemTableScope},
 };
-use novarocks_sql::{compiler::*, system_table::SystemTableColumn};
+use novarocks_sql::{
+    compiler::*,
+    system_table::{SystemTableBinding, SystemTableColumn},
+};
 use novarocks_type_contract::FunctionValueType;
 use prost::Message;
 use std::collections::BTreeMap;
@@ -40,6 +43,7 @@ use std::collections::BTreeMap;
 fn registry(entries: usize, padding: &str) -> Arc<SystemTableRegistry> {
     let columns: Arc<[SystemTableColumn]> = Arc::from([SystemTableColumn {
         name: "value".into(),
+        hidden: false,
         value_type: FunctionValueType::new(DataType::Utf8, false),
     }]);
     Arc::new(
@@ -202,10 +206,14 @@ async fn round_trip(rows: usize, padding_bytes: usize) {
     } else {
         192 << 20
     };
+    let standard_rows = SystemTableRegistry::try_new([])
+        .unwrap()
+        .declarations(&SystemTableBinding::System)
+        .count();
     let mut fixture = Fixture::new_in(
         &provider,
         ResultWindowClass::Client,
-        registry(rows - 1, &padding),
+        registry(rows - standard_rows, &padding),
         config,
         Duration::from_secs(30),
     )
@@ -341,26 +349,24 @@ async fn round_trip(rows: usize, padding_bytes: usize) {
             sizes,
             "the actual compiled Source keeps every original batch"
         );
-        let mut ordinal = 0;
-        for chunk in &chunks {
+        for (chunk, original) in chunks.iter().zip(source_batches.iter()) {
             let column = chunk
                 .record_batch()
                 .column(0)
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
-            for row in 0..column.len() {
-                assert!(!column.is_null(row));
-                let expected = if ordinal == 0 {
-                    "materialized_views".into()
-                } else {
-                    format!("entry_{:05}_{padding}", ordinal - 1)
-                };
-                assert_eq!(column.value(row), expected);
-                ordinal += 1;
-            }
+            let original = original
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(column.null_count(), 0);
+            assert!(
+                column.iter().eq(original.iter()),
+                "the compiled cursor preserves every projected table name"
+            );
         }
-        assert_eq!(ordinal, rows);
         drop(chunks);
         drop(envelope);
         drop(artifact);

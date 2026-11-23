@@ -197,6 +197,33 @@ impl Signature {
         self
     }
 
+    pub(super) fn public_signature(
+        &self,
+        result_domain: Option<novarocks_type_contract::ValueLogicalType>,
+    ) -> crate::FunctionPublicSignature {
+        let mut arguments = String::new();
+        for (index, argument) in self.args.iter().enumerate() {
+            if index > 0 {
+                arguments.push_str(", ");
+            }
+            argument.write_public_sql(&mut arguments);
+        }
+        if self.variadic {
+            arguments.push_str("...");
+        }
+        let mut result = String::new();
+        match result_domain {
+            Some(novarocks_type_contract::ValueLogicalType::Json) => result.push_str("json"),
+            Some(novarocks_type_contract::ValueLogicalType::Hll) => result.push_str("hyperloglog"),
+            Some(novarocks_type_contract::ValueLogicalType::Bitmap) => result.push_str("bitmap"),
+            Some(novarocks_type_contract::ValueLogicalType::Percentile) => {
+                result.push_str("percentile")
+            }
+            _ => self.ret.write_public_sql(&mut result),
+        }
+        crate::FunctionPublicSignature::new(arguments, result, "")
+    }
+
     pub fn canonical(&self) -> String {
         let mut value = String::from("(");
         for (index, argument) in self.args.iter().enumerate() {
@@ -232,6 +259,48 @@ impl TypeSpec {
             Self::List(item) => item.is_generic(),
             Self::Map(key, value) => key.is_generic() || value.is_generic(),
             _ => false,
+        }
+    }
+
+    fn write_public_sql(&self, output: &mut String) {
+        match self {
+            Self::Boolean => output.push_str("boolean"),
+            Self::Int8 => output.push_str("tinyint"),
+            Self::Int16 => output.push_str("smallint"),
+            Self::Int32 => output.push_str("integer"),
+            Self::Int64 => output.push_str("bigint"),
+            Self::Float32 => output.push_str("real"),
+            Self::Float64 => output.push_str("double"),
+            Self::Utf8 => output.push_str("varchar"),
+            Self::Character(_, _) => self.write_canonical(output),
+            Self::Json => output.push_str("json"),
+            Self::Binary => output.push_str("varbinary"),
+            Self::Bitmap => output.push_str("bitmap"),
+            Self::Date => output.push_str("date"),
+            Self::Datetime => output.push_str("timestamp(p)"),
+            Self::AnyDecimal128 | Self::Decimal128Of(_) | Self::Decimal256Of(_) => {
+                output.push_str("decimal(p,s)");
+            }
+            Self::LargeInt => output.push_str("largeint"),
+            Self::List(item) => {
+                output.push_str("array(");
+                item.write_public_sql(output);
+                output.push(')');
+            }
+            Self::Map(key, value) => {
+                output.push_str("map(");
+                key.write_public_sql(output);
+                output.push(',');
+                value.write_public_sql(output);
+                output.push(')');
+            }
+            Self::MapWithUninhabitedKey { value, .. } => {
+                output.push_str("map(unknown,");
+                output.push_str(value);
+                output.push(')');
+            }
+            Self::Any(variable) => output.push_str(variable),
+            Self::AnyType => output.push_str("any"),
         }
     }
 

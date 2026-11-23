@@ -81,6 +81,80 @@ pub fn table_definition_facts(
     )
 }
 
+pub(crate) fn discover_columns(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    projection: novarocks_spi::connector::DiscoveryColumnProjection,
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<
+    Vec<novarocks_spi::connector::DiscoveredColumn>,
+    novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+> {
+    use novarocks_spi::connector::DiscoveredColumn;
+
+    let schema = metadata.current_schema();
+    let fields = schema.as_struct().fields();
+    let is_visible = |name: &str| {
+        !crate::metadata::hidden_internal_column_names(metadata.properties())
+            .any(|hidden| hidden.eq_ignore_ascii_case(name))
+    };
+    let mut visible = 0;
+    for field in fields {
+        creation.work(1)?;
+        visible += usize::from(is_visible(&field.name));
+    }
+    let mut columns = creation.reserve(visible)?;
+    let typed = if projection.data_type {
+        let document =
+            crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata(
+                metadata,
+            )?;
+        let integers = crate::scalar_integer_domain::of_schema(schema, &document.integers)?;
+        Some((document, integers))
+    } else {
+        None
+    };
+    for field in fields {
+        creation.work(1)?;
+        if !is_visible(&field.name) {
+            continue;
+        }
+        let data_type = typed
+            .as_ref()
+            .map(|(document, integers)| {
+                crate::schema_mapping::typed_value::from_storage_field(
+                    field,
+                    &document.nominals,
+                    integers.get(&field.id).copied(),
+                    creation,
+                )
+                .map(|value| value.binding)
+            })
+            .transpose()?;
+        let comment = if projection.comment {
+            field
+                .doc
+                .as_deref()
+                .map(|comment| DiscoveredColumn::copy_text(comment, creation))
+                .transpose()?
+        } else {
+            None
+        };
+        let default_expression = if projection.default_expression {
+            crate::default_value::discover_column_default(field, creation)?
+        } else {
+            None
+        };
+        columns.push(DiscoveredColumn {
+            name: DiscoveredColumn::copy_text(&field.name, creation)?,
+            data_type,
+            nullable: !field.required,
+            comment,
+            default_expression,
+        });
+    }
+    Ok(columns)
+}
+
 fn definition_type(data_type: &Type) -> ConnectorTableDefinitionType {
     match data_type {
         Type::Primitive(PrimitiveType::Boolean) => ConnectorTableDefinitionType::Boolean,

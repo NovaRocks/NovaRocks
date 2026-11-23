@@ -193,6 +193,7 @@ mod tests {
             control,
             constant_policy: crate::constant::test_constant_policy(),
             materialized_values: None,
+            statement_relation: None,
             prepared_parameters: None,
             table_sequence: None,
             catalog: &NO_TABLES,

@@ -59,8 +59,16 @@ impl DdlPropertyConstantEvaluator<'_> {
         expression: &Expr,
         target: RequiredConstantTarget,
     ) -> Result<PreparedRequiredConstant, DdlPropertyConstantError> {
+        self.prepare_input(RequiredConstantInput::Expression(expression), target)
+    }
+
+    pub(crate) fn prepare_input(
+        &self,
+        input: RequiredConstantInput<'_>,
+        target: RequiredConstantTarget,
+    ) -> Result<PreparedRequiredConstant, DdlPropertyConstantError> {
         prepare_required_constant(RequiredConstantRequest {
-            input: RequiredConstantInput::Expression(expression),
+            input,
             target,
             catalog: self.catalog,
             current_database: self.current_database,

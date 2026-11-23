@@ -24,7 +24,8 @@ use novarocks_query_application::sql::property_evaluation::{
 };
 use novarocks_sql::{
     compiler::{
-        RequiredConstantTarget, SqlCompileControl, SqlFunctionCatalog, SqlPlannerTableSnapshot,
+        RequiredConstantInput, RequiredConstantTarget, SqlCompileControl, SqlFunctionCatalog,
+        SqlPlannerTableSnapshot, SqlPreparedParameters,
     },
     sql_mode::SqlSemanticSettings,
 };
@@ -44,11 +45,22 @@ pub(crate) struct PropertyCpuContext {
 }
 impl PropertyCpuContext {
     pub(super) fn constant_port(&self) -> PropertyConstantPort<'_> {
-        PropertyConstantPort { context: self }
+        self.constant_port_with_parameters(None)
+    }
+
+    pub(super) fn constant_port_with_parameters<'a>(
+        &'a self,
+        parameters: Option<&'a SqlPreparedParameters>,
+    ) -> PropertyConstantPort<'a> {
+        PropertyConstantPort {
+            context: self,
+            parameters,
+        }
     }
 }
 pub(super) struct PropertyConstantPort<'a> {
     context: &'a PropertyCpuContext,
+    parameters: Option<&'a SqlPreparedParameters>,
 }
 impl DdlPropertyConstantPort for PropertyConstantPort<'_> {
     fn evaluate(
@@ -70,7 +82,16 @@ impl DdlPropertyConstantPort for PropertyConstantPort<'_> {
                 scope: &input.scope,
                 window: &input.window,
             };
-            evaluator.prepare(expression, target)
+            match self.parameters {
+                Some(parameters) => evaluator.prepare_input(
+                    RequiredConstantInput::PreparedExpression {
+                        expression,
+                        parameters,
+                    },
+                    target,
+                ),
+                None => evaluator.prepare(expression, target),
+            }
         }?;
         // Release the catalog read guard before the original interpreter runs.
         input

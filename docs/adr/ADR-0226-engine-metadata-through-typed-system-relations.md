@@ -10,6 +10,7 @@ partially-superseded-by:
     scope: "Decision 11 retained SHOW MATERIALIZED VIEWS/BACKENDS/TABLE STATS and job SHOW surfaces; typed system relations and MV management procedures remain"
 date: 2026-11-10
 provenance:
+  - "discussion: 2026-11-23 TRC-7 accepted Trino 484 catalog discovery, typed JDBC and runtime observations"
   - "discussion: 2026-11-09 accepted Trino-standard system catalog, retained product commands and null last-fresh time"
   - "discussion: 2026-11-10 accepted typed batch snapshots, original statement custody and source-missing freshness semantics"
   - "reference: Trino 484, commit e2d50bb733e193607c44be84ad80ce2430ba1d01"
@@ -57,9 +58,9 @@ code-anchors:
 
 1. **Static-declaration rule。** 启动期注册表仅保存描述。Provider 在原语句 Source 下绑定当次能力；不得将 FE 聚合服务、某次 planning pin 或资源 owner 放入长期注册表。
 2. **Typed-batch rule。** 系统快照使用类型化批序列和显式行数。完整 FunctionValueType、NULL 和宽度语义不从 Arrow 展示值猜测；空所需列集仍保留行数。系统关系退出常量池与 VALUES，不整份合并为一个 RecordBatch；BE 每次推进原游标消费批次。
-3. **Two-round rule。** 名称/描述补全与快照应答分开。普通 EXPLAIN 只展示关系、所需列和键约束，不取快照；EXPLAIN ANALYZE、普通读取及 INSERT/CTAS 的源在执行前取得快照。只下推键列上顶层合取中的字面量等值/IN；SQL 谓词仍保留。
+3. **Two-round rule。** 名称/描述补全与快照应答分开。普通 EXPLAIN 只展示关系、所需列和键约束，不取快照；EXPLAIN ANALYZE、普通读取及 INSERT/CTAS 的源在执行前取得快照。下推条件来自键列顶层合取中的字面量等值、IN 以及原 LIKE 与 ESCAPE 作者证明等价的精确字面模式。原 SQL 谓词负责最终匹配。
 4. **Reserved-name rule。** `system` 是保留的内置 catalog，优先于外部 catalog 注册。创建同名 catalog 报 `ALREADY_EXISTS`，删除报 `NOT_SUPPORTED`；静态声明或持久配置的同名冲突明确失败。`USE system[.schema]` 依据真实注册 schema 检查，未知 catalog/schema/table 保持各自类型化错误。
-5. **Catalog-binding rule。** `<catalog>.information_schema.<table>` 绑定到该 catalog，两段名绑定会话 catalog；没有会话 catalog 时沿现有默认 catalog 规则处理。System 自身同样可解析 information_schema。默认系统普通 schema 仅 `metadata`；`runtime` 在有表注册后出现。当前 `schemata` 仍不列 information_schema 自身，完整 Trino 列集合与自身行对齐另行演进。
+5. **Catalog-binding rule。** `<catalog>.information_schema.<table>` 绑定到该 catalog，两段名绑定会话 catalog；没有会话 catalog 时沿现有默认 catalog 规则处理。System 自身同样可解析 information_schema。系统普通 schema 由真实注册的 `metadata`、`runtime` 和 `jdbc` 关系产生。各目录的 `schemata` 包含自身的 `information_schema`，目录自身的表与列由同一公开注册表供数。
 6. **Naming rule。** 表和列使用小写下划线。元数据扩展放 `system.metadata`，运行状态放 `system.runtime`；扩展不占用 Trino 484 标准表或过程名称，不放入 `jdbc` 或 catalog-local information_schema。重名和标准名单冲突在组合时拒绝。
 7. **Read-only rule。** system 与各 catalog 的 information_schema 不允许建 schema、建表或写入，目标拒绝为 `NOT_SUPPORTED`。允许的 INSERT/CTAS 源与其写目标分开判断。DELETE/UPDATE/MERGE 子查询源与统计任务中的系统表暂不接入快照，明确报 `NOT_SUPPORTED`；将来接入由这些流程的原所有者负责。
 8. **View-enumeration rule。** `information_schema.tables` 列出基表、物化视图和可列举的视图；表/物化视图为 `BASE TABLE`，视图为 `VIEW`。仅当 Provider 明确不支持视图列举时省略 VIEW 行；其他类型化错误不得变为空结果。HMS 仍按 [HMS 版 ADR-0216](ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md) 接受全名称、BASE TABLE 类型回退，不借本规则改变其只读、缺表错误和 metadata 访问妥协。
@@ -67,10 +68,14 @@ code-anchors:
 10. **Original-custody rule。** 取消借用 future 不销毁原 Source、capture、CPU job 或 pin。原错误、原接收格、外部工作与存储持有分别保留，真实关闭后才能退休和退款；超时、终态和停止等待不代替实际退出。
 11. **Surface-migration rule。** SHOW VIEWS、SHOW BASIC STATS META、SHOW HISTOGRAM STATS META 退出语句集合；非标准 information_schema.materialized_views 不再声明。SHOW MATERIALIZED VIEWS、SHOW BACKENDS、SHOW TABLE STATS 保留原服务；SHOW ANALYZE JOBS、SHOW ALTER TABLE OPTIMIZE 与 MV 管理过程也不因标准系统表而变更。
 
+12. **目录观察和投影。** 原目录 pin 及原对象版本供四张发现表和 JDBC 的同一列事实。名称列举沿 Provider 名录，按准确范围和所需事实观察列与定义。隐藏列保留原 ordinal，准确名字可以显式绑定。星号和位置列别名只展开公开列。可见列的 JDBC 和目录 ordinal 在过滤前确定。
+13. **SHOW 查询准备。** SCHEMAS、TABLES、COLUMNS 与表级 DESCRIBE 通过标准发现表执行。准确对象观察同时服务存在性校验和供数。CATALOGS、FUNCTIONS、SESSION 从原 Read 的同一次候选确定动态列宽，宽度以 Unicode 码点计。该次语句通过编译侧的准确 relation occurrence 持有私有声明，SQL 继续执行原过滤与排序。
+14. **运行时观察。** `system.runtime.nodes` 从 FE serving 和准确 BE 进程拓扑的原观察投影。HTTP 地址按实际发布事实填写。 `system.runtime.queries` 从 Query Application 的原语句身份、实际客户端结算和原阶段时刻投影。两个系统关系与普通 Read 使用同一原生拓扑和资源条件。零可用 BE 的拓扑诊断使用原 FE 管理入口。
+
 ## 接受的妥协（诚实记录）
 
 - FE 仍需在执行前保留整份快照及其真实资源责任。批序列避免额外整份拼接，不代表任意规模快照都能在当前资源配置下运行。
-- information_schema 的现有列与自身行尚未完整对齐 Trino；无 catalog 时的两段名仍沿原默认规则。HMS 的条目类型回退继续存在。
+- 无 catalog 时，普通关系的两段信息模式名沿原默认规则。HMS 的条目类型回退继续存在。
 - last_fresh_time 暂不从当前时间或成功刷新时间猜值。填值需要 MV 原持久事实与 Connector 对基表变化时间的实际支持。
 - 本记录固化长期合同；组件、Native、SQL/System 与全工作区验证按各自范围取证，不把局部测试等同于全部调用面的最终准入。
 

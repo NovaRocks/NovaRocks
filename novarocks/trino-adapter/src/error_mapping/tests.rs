@@ -69,6 +69,8 @@ const TRINO_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("DUPLICATE_NAMED_QUERY", 53, "USER_ERROR"),
     ("DUPLICATE_COLUMN_NAME", 54, "USER_ERROR"),
     ("MISSING_COLUMN_NAME", 55, "USER_ERROR"),
+    ("MISSING_CATALOG_NAME", 56, "USER_ERROR"),
+    ("MISSING_SCHEMA_NAME", 57, "USER_ERROR"),
     ("TYPE_MISMATCH", 58, "USER_ERROR"),
     ("INVALID_LITERAL", 59, "USER_ERROR"),
     ("MISMATCHED_COLUMN_ALIASES", 61, "USER_ERROR"),
@@ -178,9 +180,18 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.validate.duplicate_cte_name" => "DUPLICATE_NAMED_QUERY",
         "sql.validate.duplicate_window_name" => "DUPLICATE_WINDOW_NAME",
         "sql.validate.invalid_window_frame_bounds" => "INVALID_WINDOW_FRAME",
-        "sql.analyze.unknown_catalog" => "CATALOG_NOT_FOUND",
-        "sql.analyze.unknown_schema" => "SCHEMA_NOT_FOUND",
-        "sql.analyze.unknown_table" => "TABLE_NOT_FOUND",
+        "sql.analyze.unknown_catalog" | "sql.admit.show_catalog_not_found" => "CATALOG_NOT_FOUND",
+        "sql.analyze.unknown_schema" | "sql.admit.show_schema_not_found" => "SCHEMA_NOT_FOUND",
+        "sql.analyze.unknown_table" | "sql.admit.show_table_not_found" => "TABLE_NOT_FOUND",
+        "sql.admit.show_missing_catalog" => "MISSING_CATALOG_NAME",
+        "sql.admit.show_missing_schema" => "MISSING_SCHEMA_NAME",
+        "sql.admit.show_name_too_long" => "SYNTAX_ERROR",
+        "sql.admit.kill_query_arguments" => "INVALID_ARGUMENTS",
+        "sql.admit.kill_query_argument_type" => "TYPE_MISMATCH",
+        "sql.admit.kill_query_invalid_argument" => "INVALID_PROCEDURE_ARGUMENT",
+        "sql.admit.kill_query_target_not_found" => "NOT_FOUND",
+        "sql.admit.kill_query_target_not_running" => "NOT_SUPPORTED",
+        "sql.admit.kill_query_permission_denied" => "PERMISSION_DENIED",
         "sql.admit.table_already_exists" => "TABLE_ALREADY_EXISTS",
         "sql.admit.schema_already_exists" => "SCHEMA_ALREADY_EXISTS",
         "sql.analyze.unknown_column" => "COLUMN_NOT_FOUND",
@@ -484,7 +495,7 @@ fn cancellations_preserve_the_original_requester_category() {
         (DeadlineExceeded { timeout_ms: 10 }, "EXCEEDED_TIME_LIMIT"),
         (
             FrontendDrainDeadlineExceeded { timeout_ms: 10 },
-            "SERVER_SHUTTING_DOWN",
+            "EXCEEDED_TIME_LIMIT",
         ),
         (ServerShutdown, "SERVER_SHUTTING_DOWN"),
     ] {
@@ -494,6 +505,35 @@ fn cancellations_preserve_the_original_requester_category() {
                 message: "original cancellation detail",
             }),
             expected,
+        );
+        assert_wire(
+            &query_error(TrinoErrorSource::OriginalCancellation(reason)),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn original_deadline_projects_its_typed_detail_and_effect() {
+    use QueryCancellationReason::{DeadlineExceeded, FrontendDrainDeadlineExceeded};
+    let deadline = query_error_for_query_with_effect(
+        "original-query",
+        TrinoErrorSource::OriginalCancellation(DeadlineExceeded { timeout_ms: 1_000 }),
+        Some(StatementExternalEffectDisposition::KnownCommitted),
+    );
+    assert_wire(&deadline, "EXCEEDED_TIME_LIMIT");
+    assert_eq!(
+        deadline.message,
+        "[query.execution.deadline_exceeded] query timed out after 1000 ms (external effect disposition=KnownCommitted do_not_retry=true; do not retry statement)"
+    );
+    for timeout_ms in [0, 500] {
+        let drain = query_error(TrinoErrorSource::OriginalCancellation(
+            FrontendDrainDeadlineExceeded { timeout_ms },
+        ));
+        assert_wire(&drain, "EXCEEDED_TIME_LIMIT");
+        assert_eq!(
+            drain.message,
+            "[query.execution.deadline_exceeded] FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded"
         );
     }
 }

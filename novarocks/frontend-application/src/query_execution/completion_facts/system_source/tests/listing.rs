@@ -262,7 +262,7 @@ impl Fixture {
     }
 }
 fn assert_original_error(response: Response, kind: ConnectorErrorKind, provider: &ListingFixture) {
-    let Response::Names(Err(SystemTableError::Provider(error))) = response else {
+    let Response::MetadataNames(Err(SystemTableError::Provider(error))) = response else {
         panic!("same original listing error")
     };
     assert_eq!(error.kind(), kind);
@@ -274,6 +274,44 @@ fn assert_original_error(response: Response, kind: ConnectorErrorKind, provider:
         cause.failure_fact(),
         novarocks_failure_contract::FailureProjection::failure_fact(&kind)
     );
+}
+
+#[tokio::test]
+async fn broad_listing_charges_fe_names_until_the_original_observation_retires() {
+    let provider = ListingFixture::new(FailurePoint::Views, ConnectorErrorKind::Unavailable);
+    let fixture = Fixture::new(&provider, ResultWindowClass::Client).await;
+    let source = fixture.source();
+    let context = &source.scope.connector_context;
+    let window = fixture.window.as_ref().unwrap().retain_alias();
+    let schema_bytes = (2 * size_of::<String>() + "a".len() + "b".len()) as u64;
+    let table_bytes = (size_of::<String>() + "existing_table".len()) as u64;
+    let occupied = window.payload_capacity_bytes() - schema_bytes + 1;
+    let competing = window.reserve_payload_bytes(occupied).unwrap();
+
+    let error = source.schema_names("catalog", context).await.unwrap_err();
+    assert!(
+        matches!(error, SystemTableError::Provider(error) if error.kind() == ConnectorErrorKind::ResourceExhausted)
+    );
+    assert_eq!(window.retained_payload_bytes(), occupied);
+    drop(competing);
+
+    let schemas = source.schema_names("catalog", context).await.unwrap();
+    assert_eq!(&*schemas, ["a", "b"]);
+    assert_eq!(window.retained_payload_bytes(), schema_bytes);
+    let tables = source
+        .table_names("catalog", &schemas[0], context)
+        .await
+        .unwrap();
+    assert_eq!(&*tables, ["existing_table"]);
+    assert_eq!(window.retained_payload_bytes(), schema_bytes + table_bytes);
+    assert_eq!(provider.calls(), ["namespaces", "namespaces", "tables:a"]);
+    drop(tables);
+    assert_eq!(window.retained_payload_bytes(), schema_bytes);
+    drop(schemas);
+    assert_eq!(window.retained_payload_bytes(), 0);
+    drop(window);
+    drop(source);
+    fixture.finish(false).await;
 }
 
 #[tokio::test]
@@ -359,6 +397,12 @@ async fn original_metadata_cpu_footer_precedes_source_close_and_window_retiremen
     let mut fixture = Fixture::new(&provider, ResultWindowClass::Client).await;
     let _release_on_panic = Release(gate.clone());
     let source = fixture.source();
+    {
+        let pin = source.pin("catalog").unwrap();
+        let original = source.metadata_cpu("catalog", &pin).unwrap();
+        let alias = source.metadata_cpu("catalog", &pin).unwrap();
+        assert!(Arc::ptr_eq(&original, &alias));
+    }
     let error = tokio::time::timeout(
         Duration::from_secs(5),
         driven(

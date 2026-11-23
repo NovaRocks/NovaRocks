@@ -34,6 +34,7 @@ use registry::{SessionCatalogPropertyPort, SessionPropertyInputs, SessionPropert
 pub struct SessionSqlState {
     current_catalog: Option<String>,
     current_database: String,
+    explicit_database: bool,
     execution_settings: SessionExecutionSettings,
     optimizer_settings: SessionOptimizerSettings,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
@@ -47,6 +48,7 @@ impl Default for SessionSqlState {
         Self {
             current_catalog: None,
             current_database: DEFAULT_DATABASE.into(),
+            explicit_database: false,
             execution_settings: SessionExecutionSettings::default(),
             optimizer_settings: SessionOptimizerSettings::default(),
             sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -63,6 +65,9 @@ impl SessionSqlState {
     }
     pub fn current_database(&self) -> &str {
         &self.current_database
+    }
+    pub fn explicit_database(&self) -> Option<&str> {
+        self.explicit_database.then_some(&self.current_database)
     }
     pub fn sql_semantics(&self) -> &novarocks_sql::sql_mode::SqlSemanticSettings {
         &self.sql_semantics
@@ -109,10 +114,11 @@ impl SessionSqlState {
             time_zone: value.time_zone,
             ..Self::default()
         };
-        state.assign_session_names(
-            value.catalog,
-            value.schema.unwrap_or_else(|| DEFAULT_DATABASE.into()),
-        );
+        state.current_catalog = value.catalog;
+        if let Some(schema) = value.schema {
+            state.current_database = schema;
+            state.explicit_database = true;
+        }
         inputs
             .project_into(&mut state)
             .map_err(session_property_error)?;
@@ -123,6 +129,7 @@ impl SessionSqlState {
     pub fn assign_session_names(&mut self, catalog: Option<String>, schema: String) {
         self.current_catalog = catalog;
         self.current_database = schema;
+        self.explicit_database = true;
     }
     pub fn set_resolved_database_context(&mut self, catalog: Option<String>, database: String) {
         self.assign_session_names(catalog, database);

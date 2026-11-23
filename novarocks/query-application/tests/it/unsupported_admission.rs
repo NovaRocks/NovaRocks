@@ -7,7 +7,10 @@ use novarocks_query_application::{
     session_error::QueryServiceError,
     sql::{
         property_evaluation::table,
-        trino_admission::{TrinoStatementAction, TrinoStatementPreparation, admit_trino_statement},
+        trino_admission::{
+            TrinoQueryAction, TrinoStatementAction, TrinoStatementPreparation,
+            admit_trino_statement,
+        },
         trino_table_command,
     },
     view::ViewCommand,
@@ -146,15 +149,9 @@ fn expected_subject(rule: &str, alternative: &str) -> &'static str {
         "60" => "SHOW CREATE SCHEMA",
         "62" => "SHOW CREATE MATERIALIZED VIEW",
         "63" => "SHOW CREATE FUNCTION",
-        "64" => "SHOW TABLES",
-        "65" => "SHOW SCHEMAS",
-        "66" => "SHOW CATALOGS",
-        "67" | "72" | "73" => "SHOW COLUMNS",
         "69" => "SHOW STATS FOR",
         "70" => "SHOW ROLES",
         "71" => "SHOW ROLE GRANTS",
-        "74" => "SHOW FUNCTIONS",
-        "75" => "SHOW SESSION",
         "76" => "SET SESSION AUTHORIZATION",
         "77" => "RESET SESSION AUTHORIZATION",
         "80" => "START TRANSACTION",
@@ -251,6 +248,32 @@ fn assert_refusal(line: usize, source: &str, owner: Owner, subject: &str) {
 }
 
 #[test]
+fn show_admission_preserves_the_supported_grammar_witnesses() {
+    for line in COVERAGE.lines() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 10
+            || fields[1] != "statement"
+            || fields[6] != "supported"
+            || !matches!(
+                fields[2],
+                "64" | "65" | "66" | "67" | "72" | "73" | "74" | "75"
+            )
+        {
+            continue;
+        }
+        let sql = fields[5];
+        let statement = parse_statement(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        assert!(
+            matches!(
+                admit_trino_statement(sql, statement),
+                Ok(TrinoStatementAction::Query(TrinoQueryAction::Show(_)))
+            ),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn each_pure_parsed_only_statement_witness_has_its_typed_gate() {
     let mut exercised = 0;
     for (line, rule, alternative, clause, source) in statement_witnesses() {
@@ -264,7 +287,7 @@ fn each_pure_parsed_only_statement_witness_has_its_typed_gate() {
         exercised += 1;
     }
     assert_eq!(
-        exercised, 273,
+        exercised, 227,
         "reconcile the statement gate with the grammar ledger"
     );
 }

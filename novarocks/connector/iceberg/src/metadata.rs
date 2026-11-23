@@ -987,6 +987,64 @@ impl ConnectorMetadata for IcebergMetadata {
         Box::pin(self.prepare_table_original(request))
     }
 
+    fn supports_table_discovery(&self) -> bool {
+        true
+    }
+
+    fn can_probe_discovery_name(&self, name: &str) -> bool {
+        novarocks_types::naming::normalize_identifier(name).is_ok_and(|name_key| name_key == name)
+    }
+
+    fn discover_table_async(
+        &self,
+        request: ConnectorTableRequest,
+        projection: novarocks_spi::connector::DiscoveryProjection,
+        cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<novarocks_spi::connector::DiscoveredRelation, ConnectorError>,
+    > {
+        use crate::catalog_control::statistics::scoped_cpu::{
+            DiscoveryPreparation, IcebergMetadataCpuOriginal, run_provider_metadata,
+        };
+        Box::pin(async move {
+            let context = request.context.clone();
+            self.validate_context(&context)?;
+            self.ensure_owner(&request.table.instance_id)?;
+            if request.resolution != ConnectorTableResolution::StrictBaseTable {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg discovery requires an exact current base table",
+                ));
+            }
+            let loaded = self
+                .runtime
+                .observe_discovery_table(&request.table.namespace, &request.table.table, &context)
+                .await?;
+            let preparation = novarocks_spi::connector::ConnectorTablePreparation::new(
+                self.descriptor.instance_id.clone(),
+                IcebergPreparedTableFacts {
+                    table_name: request.table.table.to_string(),
+                    request,
+                    loaded,
+                    metadata_table_type: None,
+                    snapshots: crate::catalog::SnapshotLoading::Refs,
+                    incarnation: self.incarnation,
+                    generation_owner: Arc::clone(&self.generation_owner),
+                },
+            );
+            let source = IcebergMetadataCpuOriginal::discovery(
+                self.clone(),
+                DiscoveryPreparation::Table(preparation),
+                projection,
+                context,
+                cpu.discovery_allocation()?,
+            );
+            run_provider_metadata(&cpu, &source).await?;
+            source.take_discovery_result()
+        })
+    }
+
     fn prepare_source_table(
         &self,
         request: ConnectorTableRequest,
@@ -1105,12 +1163,11 @@ impl IcebergMetadata {
             },
         )
     }
-    pub(crate) fn create_prepared_view_metadata(
+    fn validated_view_preparation(
         &self,
         preparation: novarocks_spi::connector::ConnectorViewPreparation,
-        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
     ) -> Result<
-        novarocks_spi::connector::ConnectorViewMetadataValue,
+        IcebergPreparedViewFacts,
         novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
     > {
         let facts = preparation
@@ -1124,6 +1181,39 @@ impl IcebergMetadata {
             )
             .into());
         }
+        Ok(facts)
+    }
+
+    pub(crate) fn discover_prepared_view_metadata(
+        &self,
+        preparation: novarocks_spi::connector::ConnectorViewPreparation,
+        projection: novarocks_spi::connector::DiscoveryProjection,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        novarocks_spi::connector::DiscoveredRelation,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        let facts = self.validated_view_preparation(preparation)?;
+        self.validate_context(&facts.request.context)?;
+        let result = crate::catalog_control::views::discover_view_metadata(
+            facts.request.view,
+            &facts.metadata,
+            projection,
+            creation,
+        )?;
+        self.validate_context(&facts.request.context)?;
+        Ok(result)
+    }
+
+    pub(crate) fn create_prepared_view_metadata(
+        &self,
+        preparation: novarocks_spi::connector::ConnectorViewPreparation,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorViewMetadataValue,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        let facts = self.validated_view_preparation(preparation)?;
         pure_catalog_control(&facts.request.context)
             .map_err(novarocks_connector_contract::PureProviderCompileError::Control)?;
         crate::catalog_control::views::materialize_view_metadata(
@@ -1217,6 +1307,56 @@ impl IcebergMetadata {
         // phase. No handle-token interpretation or second Catalog observation.
         Ok((binding, facts.loaded.table.metadata().current_snapshot_id()))
     }
+    pub(crate) fn discover_prepared_table(
+        &self,
+        preparation: novarocks_spi::connector::ConnectorTablePreparation,
+        projection: novarocks_spi::connector::DiscoveryProjection,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        novarocks_spi::connector::DiscoveredRelation,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        use novarocks_spi::connector::{
+            DiscoveredColumn, DiscoveredRelation, DiscoveryRelationKind,
+        };
+        let facts =
+            preparation.into_facts::<IcebergPreparedTableFacts>(&self.descriptor.instance_id)?;
+        if facts.incarnation != self.incarnation
+            || !Arc::ptr_eq(&facts.generation_owner, &self.generation_owner)
+            || facts.request.resolution != ConnectorTableResolution::StrictBaseTable
+            || facts.metadata_table_type.is_some()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg discovery requires an exact current base-table preparation",
+            )
+            .into());
+        }
+        self.validate_context(&facts.request.context)?;
+        creation.work(1)?;
+        let table = &facts.loaded.table;
+        let columns = projection
+            .columns
+            .map(|projection| {
+                crate::table_definition::discover_columns(table.metadata(), projection, creation)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let version = table
+            .metadata_location()
+            .map(|location| DiscoveredColumn::copy_text(location, creation))
+            .transpose()?;
+        self.validate_context(&facts.request.context)?;
+        Ok(DiscoveredRelation {
+            identity: facts.request.table,
+            kind: DiscoveryRelationKind::Table,
+            columns,
+            view_definition: None,
+            version,
+            retention: creation.storage(),
+        })
+    }
+
     async fn prepare_table_original(
         &self,
         request: ConnectorTableRequest,
@@ -2647,24 +2787,29 @@ fn read_reference_facts(
     )
 }
 
-fn hidden_internal_columns(properties: &HashMap<String, String>) -> Vec<String> {
-    let mut hidden = Vec::new();
-    for value in properties
+pub(crate) fn hidden_internal_column_names(
+    properties: &HashMap<String, String>,
+) -> impl Iterator<Item = &str> {
+    properties
         .get(APPLY_KEY_COLUMN_PROPERTY)
         .into_iter()
         .chain(properties.get(HIDDEN_COLUMNS_PROPERTY))
-    {
-        for name in value
-            .split(',')
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+        })
+}
+
+fn hidden_internal_columns(properties: &HashMap<String, String>) -> Vec<String> {
+    let mut hidden = Vec::new();
+    for name in hidden_internal_column_names(properties) {
+        if !hidden
+            .iter()
+            .any(|current: &String| current.eq_ignore_ascii_case(name))
         {
-            if !hidden
-                .iter()
-                .any(|current: &String| current.eq_ignore_ascii_case(name))
-            {
-                hidden.push(name.to_string());
-            }
+            hidden.push(name.to_string());
         }
     }
     hidden
@@ -4954,9 +5099,30 @@ mod plan_splits_pruning_tests {
         closed: std::sync::atomic::AtomicBool,
         started: tokio::sync::Notify,
     }
+    struct DiscoveryFixtureStorage;
+    impl novarocks_spi::connector::DiscoveryAllocation for DiscoveryFixtureStorage {
+        fn request(
+            &self,
+            _: std::alloc::Layout,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+
+        fn retention(self: Arc<Self>) -> novarocks_type_contract::ValueTypeStorageLifetime {
+            novarocks_type_contract::ValueTypeStorageLifetime::pure()
+        }
+    }
+
     // Explicit component-only inline CPU author: the real private input runs,
     // while a separate footer gate tests handoff ordering, not physical QB exit.
     impl novarocks_spi::connector::ProviderMetadataCpuPort for CaptureFooterPort {
+        fn discovery_allocation(
+            &self,
+        ) -> Result<Arc<dyn novarocks_spi::connector::DiscoveryAllocation>, ConnectorError>
+        {
+            Ok(Arc::new(DiscoveryFixtureStorage))
+        }
+
         fn submit_metadata_in(
             &self,
             input: &mut Option<novarocks_spi::connector::ProviderMetadataCpuInput>,
@@ -5036,6 +5202,145 @@ mod plan_splits_pruning_tests {
     }
 
     #[test]
+    fn table_definition_metadata_discovery_reads_requested_facts_from_one_observation() {
+        use crate::catalog::{
+            CatalogNamespaceName, catalog_request::CatalogPublicationRequest, error::CatalogOutcome,
+        };
+        use crate::iceberg::spec::Literal;
+        use novarocks_spi::connector::{
+            DiscoveryColumnProjection, DiscoveryProjection, DiscoveryRelationKind,
+            ProviderMetadataCpuPort,
+        };
+        use std::sync::atomic::Ordering;
+
+        let (executor, _warehouse, metadata) = provider();
+        executor.block_on(async {
+            let namespace = CatalogNamespaceName::new("discovery");
+            let schema = Schema::builder()
+                .with_fields(vec![
+                    Arc::new(
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long))
+                            .with_doc("key"),
+                    ),
+                    Arc::new(
+                        NestedField::optional(2, "label", Type::Primitive(PrimitiveType::String))
+                            .with_write_default(Literal::string("é'té")),
+                    ),
+                    Arc::new(NestedField::optional(
+                        3,
+                        "__hidden",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                ])
+                .build()
+                .unwrap();
+            for request in [
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: namespace.clone(),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+                CatalogPublicationRequest::CreateTable {
+                    namespace,
+                    creation: crate::iceberg::TableCreation::builder()
+                        .name("t".into())
+                        .schema(schema)
+                        .format_version(FormatVersion::V3)
+                        .properties(HashMap::from([(
+                            HIDDEN_COLUMNS_PROPERTY.into(),
+                            "__hidden".into(),
+                        )]))
+                        .build(),
+                    no_op_if_exists: false,
+                },
+            ] {
+                let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                    &metadata.runtime,
+                    metadata.incarnation,
+                    request,
+                )
+                .await;
+                assert!(
+                    matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                    "{outcome:?}"
+                );
+            }
+
+            let request = ConnectorTableRequest {
+                table: original_capture_request(&metadata, "discovery").table,
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context(),
+            };
+            let (_release, port) = footer_port(&metadata);
+            let cpu: Arc<dyn ProviderMetadataCpuPort> = port.clone();
+            let observation = metadata
+                .discover_table_async(
+                    request.clone(),
+                    DiscoveryProjection {
+                        columns: Some(DiscoveryColumnProjection {
+                            data_type: true,
+                            comment: true,
+                            default_expression: true,
+                        }),
+                        view_definition: false,
+                    },
+                    cpu,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(observation.kind, DiscoveryRelationKind::Table);
+            assert_eq!(observation.identity, request.table);
+            assert!(observation.version.is_some());
+            assert_eq!(observation.columns.len(), 2);
+            let key = &observation.columns[0];
+            assert_eq!(key.name.as_ref(), "id");
+            assert_eq!(key.comment.as_deref(), Some("key"));
+            assert!(!key.nullable);
+            assert_eq!(
+                key.data_type.as_ref().unwrap().data_type(),
+                &arrow::datatypes::DataType::Int64
+            );
+            let label = &observation.columns[1];
+            assert_eq!(label.name.as_ref(), "label");
+            assert_eq!(label.default_expression.as_deref(), Some("'é''té'"));
+            assert_eq!(port.calls.load(Ordering::SeqCst), 1);
+
+            let (_release, port) = footer_port(&metadata);
+            let cpu: Arc<dyn ProviderMetadataCpuPort> = port;
+            let names_only = metadata
+                .discover_table_async(
+                    request.clone(),
+                    DiscoveryProjection {
+                        columns: Some(DiscoveryColumnProjection::default()),
+                        view_definition: false,
+                    },
+                    cpu,
+                )
+                .await
+                .unwrap();
+            assert_eq!(names_only.version, observation.version);
+            assert_eq!(names_only.columns.len(), 2);
+            assert!(names_only.columns.iter().all(|column| {
+                column.data_type.is_none()
+                    && column.comment.is_none()
+                    && column.default_expression.is_none()
+            }));
+
+            let (_release, port) = footer_port(&metadata);
+            let cpu: Arc<dyn ProviderMetadataCpuPort> = port.clone();
+            let mut missing = request;
+            missing.table.table = "absent".into();
+            let error = metadata
+                .discover_table_async(missing, DiscoveryProjection::default(), cpu)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+            assert_eq!(port.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
     fn actual_catalog_original_failure_survives_prepare_current_and_stable_cpu_capture() {
         use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
         use std::error::Error;
@@ -5097,7 +5402,21 @@ mod plan_splits_pruning_tests {
                 owner.is_some(),
                 "the original Source stays in caller custody on refusal"
             );
-            for error in [&preparation, &current, &capture] {
+            let (_release, port) = footer_port(&metadata);
+            let discovery = metadata
+                .discover_table_async(
+                    ConnectorTableRequest {
+                        table: original_capture_request(&metadata, "catalog_failure").table,
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        context: context(),
+                    },
+                    novarocks_spi::connector::DiscoveryProjection::default(),
+                    port.clone(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(port.calls.load(Ordering::SeqCst), 0);
+            for error in [&preparation, &current, &capture, &discovery] {
                 assert_eq!(error.failure_fact(), fact);
                 assert_eq!(
                     error.source().unwrap().downcast_ref::<SharedFailureCause>(),
@@ -5110,7 +5429,7 @@ mod plan_splits_pruning_tests {
             }
             assert_eq!(
                 catalog.reads.load(Ordering::SeqCst),
-                3,
+                4,
                 "each request reached the real catalog loader; no negative-cache shortcut"
             );
         });

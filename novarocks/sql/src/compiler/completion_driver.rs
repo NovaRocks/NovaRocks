@@ -171,6 +171,7 @@ impl SqlFinalPlanCompileRequest {
         validate_dop_domain(dop_domain)?;
         let display_intent = display_intent(&intent);
         let root_session_admitted = statement.root_session_admitted();
+        control.observe_final_plan(super::SqlFinalPlanEvent::AnalysisStarted);
         let query = super::parse_query(&statement)?;
         let query_semantics;
         let effective = if root_session_admitted {
@@ -185,6 +186,12 @@ impl SqlFinalPlanCompileRequest {
         // Retain the producer's actual checked constants across discovery and
         // catalog rounds. The loan is rebuilt against the admitted query;
         // syntax transformations must validate the original structural sites.
+        let statement_relation = match &statement.kind {
+            super::SqlStatementInputKind::StatementSystemRelationQuery { source, .. } => {
+                Some(source.clone())
+            }
+            _ => None,
+        };
         let prepared_parameters = statement.prepared_parameters;
         let materialized_source = match statement.kind {
             super::SqlStatementInputKind::MaterializedValuesQuery { source, .. } => {
@@ -207,6 +214,7 @@ impl SqlFinalPlanCompileRequest {
             materialized_source,
             prepared_parameters,
             root_session_admitted,
+            statement_relation,
             catalog_qualifications,
         };
 
@@ -215,17 +223,19 @@ impl SqlFinalPlanCompileRequest {
         // catalog needs so an unrelated candidate cannot fail the base query.
         let mv_enabled = common.session.optimizer_settings.mv_rewrite_enabled()
             && !consumer_requires_semantic_snapshot;
-        let initial_catalog = CatalogCompletionState::try_new_with_qualifications(
-            query.clone(),
-            &[],
-            &[],
-            common.session.current_catalog.as_deref(),
-            &common.session.current_database,
-            TableLookupMode::SchemaOnly,
-            if mv_enabled { 1 } else { 0 },
-            &common.session.sql_semantics,
-            common.catalog_qualifications.clone(),
-        )?;
+        let initial_catalog =
+            CatalogCompletionState::try_new_with_qualifications_and_statement_relation(
+                query.clone(),
+                &[],
+                &[],
+                common.session.current_catalog.as_deref(),
+                &common.session.current_database,
+                TableLookupMode::SchemaOnly,
+                if mv_enabled { 1 } else { 0 },
+                &common.session.sql_semantics,
+                common.catalog_qualifications.clone(),
+                common.statement_relation.is_some(),
+            )?;
         let mut seen_relations = HashSet::new();
         let referenced_relations = initial_catalog
             .needs()
@@ -308,6 +318,7 @@ struct FinalPlanCommon {
     // Both variants hold Arc-backed constant collections. Cloning this source
     // for analysis preserves original pool/ordinal facts, not AST pointers.
     materialized_source: Option<super::materialized_values::MaterializedValues>,
+    statement_relation: Option<super::StatementSystemRelationSource>,
     prepared_parameters: Option<Arc<super::SqlPreparedParameters>>,
     root_session_admitted: bool,
     catalog_qualifications: super::CatalogQualifications,
@@ -487,7 +498,7 @@ pub(super) fn resume_materialized_view(
         .collect::<Vec<_>>();
     let mv_definitions = MvRewriteDefinitionIndex::try_new(definitions)
         .map_err(|error| SqlCompileError::Compilation(format!("MV completion facts: {error}")))?;
-    let catalog = CatalogCompletionState::try_new_with_qualifications(
+    let catalog = CatalogCompletionState::try_new_with_qualifications_and_statement_relation(
         *state.query,
         &[],
         &additional_relations,
@@ -497,6 +508,7 @@ pub(super) fn resume_materialized_view(
         1,
         &state.common.session.sql_semantics,
         state.common.catalog_qualifications.clone(),
+        state.common.statement_relation.is_some(),
     )?;
     catalog_or_analyze_step(state.common, catalog, Some(mv_definitions), control)
 }
@@ -619,8 +631,15 @@ fn analyze_with_catalog(
 ) -> Result<Option<SqlAnalyzedQuery>, SqlCompileError> {
     let catalog = SqlPlannerTableSnapshot::new(catalog);
     let query = Box::new(query);
-    let mut statement = match &common.materialized_source {
-        Some(source) => {
+    let mut statement = match (&common.statement_relation, &common.materialized_source) {
+        (Some(source), _) => SqlStatementInput {
+            kind: super::SqlStatementInputKind::StatementSystemRelationQuery {
+                query,
+                source: source.clone(),
+            },
+            prepared_parameters: None,
+        },
+        (None, Some(source)) => {
             // Resolve a fresh loan only over the actual query entering this
             // analysis round, under the original request control. No pointer
             // map or inferred literal is carried through AST cloning.
@@ -633,10 +652,10 @@ fn analyze_with_catalog(
                 prepared_parameters: None,
             }
         }
-        None if common.root_session_admitted => {
+        (None, None) if common.root_session_admitted => {
             SqlStatementInput::query_with_admitted_session(query)
         }
-        None => SqlStatementInput::parsed_query(query),
+        (None, None) => SqlStatementInput::parsed_query(query),
     };
     statement.prepared_parameters = common.prepared_parameters.clone();
     let mut request = SqlAnalyzeRequest::new(
@@ -652,7 +671,11 @@ fn analyze_with_catalog(
         control.clone(),
     );
     request.table_sequence = table_sequence;
-    match SqlCompiler::analyze_with_table_sequence(request)? {
+    let analyzed = SqlCompiler::analyze_with_table_sequence(request);
+    if !matches!(analyzed, Ok(None)) {
+        control.observe_final_plan(super::SqlFinalPlanEvent::AnalysisFinished);
+    }
+    match analyzed? {
         None => Ok(None),
         Some(SqlAnalyzeOutput::Pending(analyzed)) => Ok(Some(analyzed)),
         Some(SqlAnalyzeOutput::Complete(_)) => Err(SqlCompileError::InvalidRequest(
@@ -667,6 +690,7 @@ fn statistics_or_optimize_step(
     first_need_ordinal: u32,
     control: &SqlCompileControl,
 ) -> Result<CompilerStep, SqlCompileError> {
+    control.observe_final_plan(super::SqlFinalPlanEvent::PlanningStarted);
     let (needs, next_need_ordinal) = collect_statistics_needs(&analyzed, first_need_ordinal)?;
     if needs.is_empty() {
         return optimize_and_prepare_provider(
@@ -1010,6 +1034,7 @@ fn provider_or_ready_step(
         )
         .map_err(SqlCompileError::from)?;
     query_statistics.annotate_final_plan(&mut draft);
+    control.observe_final_plan(super::SqlFinalPlanEvent::PlanningFinished);
     Ok(CompilerStep::ready(
         common.version,
         draft,
@@ -1432,6 +1457,7 @@ pub(super) fn resume_provider_read(
         )
         .map_err(SqlCompileError::from)?;
     state.query_statistics.annotate_final_plan(&mut draft);
+    control.observe_final_plan(super::SqlFinalPlanEvent::PlanningFinished);
     Ok(CompilerStep::ready(
         state.common.version,
         draft,
@@ -1517,6 +1543,39 @@ mod tests {
             },
             DEFAULT_COMPLETION_LIMITS,
         )
+    }
+
+    #[test]
+    fn query_observation_timing_reports_only_stages_the_original_compiler_enters() {
+        use super::super::SqlFinalPlanEvent::*;
+        use std::sync::Mutex;
+
+        for (sql, expected) in [
+            (
+                "SELECT 1",
+                &[
+                    AnalysisStarted,
+                    AnalysisFinished,
+                    PlanningStarted,
+                    PlanningFinished,
+                ][..],
+            ),
+            (
+                "SELECT unbound_column",
+                &[AnalysisStarted, AnalysisFinished][..],
+            ),
+        ] {
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let events = Arc::clone(&observed);
+            let control =
+                SqlCompileControl::unbounded().with_final_plan_observer(Arc::new(move |event| {
+                    events.lock().unwrap().push(event);
+                }));
+            let result = request_with_control(sql, SqlCompileIntent::Query, false, control)
+                .try_into_completion();
+            assert_eq!(result.is_ok(), expected.len() == 4, "{sql}");
+            assert_eq!(observed.lock().unwrap().as_slice(), expected, "{sql}");
+        }
     }
 
     #[test]

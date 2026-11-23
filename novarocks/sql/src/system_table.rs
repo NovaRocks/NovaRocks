@@ -37,6 +37,14 @@ impl SystemTableOccurrenceId {
     }
 }
 
+/// A private relation authored from one admitted SHOW statement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatementSystemRelation {
+    ShowCatalogs,
+    ShowFunctions,
+    ShowSession,
+}
+
 /// Closed declaration-lookup failures, separate from provider execution errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SystemTableLookupError {
@@ -69,6 +77,7 @@ impl SystemTableBinding {
 pub struct SystemTableColumn {
     pub name: String,
     pub value_type: FunctionValueType,
+    pub hidden: bool,
 }
 
 /// The complete immutable column contract for one catalog-bound relation.
@@ -82,6 +91,14 @@ pub struct SystemTableDeclaration {
 }
 
 impl SystemTableDeclaration {
+    /// Visible fields retain their original declaration ordinals.
+    pub fn visible_columns(&self) -> impl Iterator<Item = (usize, &SystemTableColumn)> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| !column.hidden)
+    }
+
     pub fn qualified_name(&self) -> String {
         format!(
             "{}.{}.{}",
