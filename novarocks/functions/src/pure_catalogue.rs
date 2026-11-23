@@ -1915,6 +1915,33 @@ impl FunctionDefinition {
         )
     }
 
+    /// Declared signatures remain bindable even when this edition installs
+    /// only a subset of the family.
+    pub(crate) fn try_new_pure_aggregate_with_declared_only<O>(
+        name: impl AsRef<str>,
+        visibility: FunctionVisibility,
+        owner: Arc<O>,
+        declared_only: &[FunctionOverloadId],
+    ) -> Result<Self, PureCatalogError>
+    where
+        O: PureFunctionMetadataOwner
+            + PureAggregateImplementation
+            + AggregateSignatureResolver
+            + 'static,
+    {
+        let legacy = owner.clone();
+        let (registered, implementations) =
+            register_owner_with_declared_only(owner, &[PureKernelAbi::AggregateV1], declared_only)?;
+        attach_definition(
+            name,
+            visibility,
+            registered.clone(),
+            implementations,
+            Arc::new(AggregateOwner(registered)),
+            Some(legacy),
+        )
+    }
+
     /// One registered binding author can install distinct aggregate kernels
     /// with different lifecycle support. Both kernels use the same checked
     /// binding declaration and dispatch by the selected overload identity.

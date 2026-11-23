@@ -2446,6 +2446,30 @@ impl<'a> super::AnalyzerContext<'a> {
                 .collect();
         }
 
+        if name == "approx_distinct"
+            && args_typed.len() == 2
+            && args_typed[1].value_type.logical_type()
+                == novarocks_type_contract::ValueLogicalType::Physical
+            && matches!(
+                args_typed[1].value_type.data_type(),
+                DataType::Null
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Decimal128(..)
+            )
+        {
+            let target = novarocks_type_contract::FunctionValueType::new(
+                DataType::Float64,
+                args_typed[1].value_type.nullable(),
+            );
+            let error = self.coerce_common_value(args_typed.remove(1), &target, func.span)?;
+            args_typed.push(error);
+            arg_types[1] = DataType::Float64;
+        }
+
         if name == "listagg" && args_typed.len() == 5 {
             if args_typed[0].value_type.data_type() != &DataType::Utf8
                 || args_typed[0].value_type.logical_type()

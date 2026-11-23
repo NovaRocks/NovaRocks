@@ -541,6 +541,7 @@ enum BindingResolverOwnerKind {
     DynamicScalar(Arc<crate::builtin::catalogue::BuiltinDynamicScalarResolver>),
     Unnest(Arc<crate::builtin::UnnestOwner>),
     BorrowedAggregate(Arc<crate::builtin::catalogue::BuiltinAggregateResolver>),
+    BorrowedApproxDistinct(Arc<crate::builtin::approx_distinct_owner::ApproxDistinctOwner>),
     BorrowedConversion(Arc<crate::builtin::value_conversion::ValueConversionResolver>),
     BorrowedTemporalArithmetic(
         Arc<crate::builtin::temporal_arithmetic_owner::TemporalArithmeticResolver>,
@@ -573,6 +574,11 @@ impl FunctionBindingResolverOwner {
         owner: Arc<crate::builtin::catalogue::BuiltinAggregateResolver>,
     ) -> Self {
         Self(BindingResolverOwnerKind::BorrowedAggregate(owner))
+    }
+    pub(crate) fn borrowed_approx_distinct(
+        owner: Arc<crate::builtin::approx_distinct_owner::ApproxDistinctOwner>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::BorrowedApproxDistinct(owner))
     }
     pub(crate) fn borrowed_conversion(
         owner: Arc<crate::builtin::value_conversion::ValueConversionResolver>,
@@ -627,6 +633,9 @@ impl FunctionBindingResolverOwner {
                     BindingResolverOwnerKind::BorrowedAggregate(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
+                    BindingResolverOwnerKind::BorrowedApproxDistinct(owner) => owner
+                        .validate_selected(selected, request, control)
+                        .map_err(Into::into),
                     BindingResolverOwnerKind::BorrowedConversion(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
@@ -657,6 +666,7 @@ impl FunctionBindingResolverOwner {
             BindingResolverOwnerKind::DynamicScalar(owner) => owner.as_ref(),
             BindingResolverOwnerKind::Unnest(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedAggregate(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::BorrowedApproxDistinct(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedConversion(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedTemporalArithmetic(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedDateShift(owner) => owner.as_ref(),

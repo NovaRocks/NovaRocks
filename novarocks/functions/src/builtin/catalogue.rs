@@ -3429,6 +3429,7 @@ pub fn contribute_builtin_functions(
         };
         builder.register(definition)?;
     }
+    builder.register(super::approx_distinct_owner::definition()?)?;
     for declaration in builtin_aggregate_declarations() {
         let function_id = FunctionId::try_new(format!("builtin.aggregate/{}/v1", declaration.name))
             .map_err(|error| FunctionCatalogError::InvalidStableIdentity {

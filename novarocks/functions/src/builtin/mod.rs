@@ -93,6 +93,8 @@ mod aggregate_n_owner;
 mod aggregate_sum;
 mod aggregate_sum_owner;
 mod aggregate_window_adapter;
+pub(crate) mod approx_distinct_kernel;
+pub(crate) mod approx_distinct_owner;
 pub(crate) mod binary_operator_owner;
 mod bit_shift;
 mod bit_shift_owner;

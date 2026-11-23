@@ -16,6 +16,7 @@
 // under the License.
 
 mod aggregate_values;
+mod approximate_aggregates;
 mod assert_true;
 mod cast;
 mod collection_functions;

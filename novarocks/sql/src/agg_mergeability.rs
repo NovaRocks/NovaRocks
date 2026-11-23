@@ -58,6 +58,11 @@ fn has_two_phase_merge(binding: &crate::binding::SqlFunctionBinding) -> bool {
         ) | (
             "builtin.aggregate/avg/v1",
             "builtin.aggregate/avg/derived-v1"
+        ) | (
+            "builtin.aggregate/approx_distinct/v1",
+            "builtin.aggregate/approx_distinct/default-hll-v1"
+                | "builtin.aggregate/approx_distinct/boolean-v1"
+                | "builtin.aggregate/approx_distinct/unknown-v1"
         )
     )
 }
@@ -154,6 +159,29 @@ mod tests {
                 aggregate_mergeability(&call),
                 AggMergeability::SinglePhaseOnly
             );
+        }
+    }
+
+    #[test]
+    fn approx_distinct_default_overloads_split_only_without_distinct_or_order() {
+        for data_type in [DataType::Int64, DataType::Boolean, DataType::Null] {
+            for (distinct, expected) in [
+                (false, AggMergeability::TwoPhase),
+                (true, AggMergeability::SinglePhaseOnly),
+            ] {
+                let mut call = call("count", distinct, false);
+                call.name = "approx_distinct".into();
+                call.source = crate::binding::AggregateArgumentSource::uncertified(
+                    vec![arg(data_type.clone())],
+                    vec![],
+                    crate::functions::test_resolved_aggregate(
+                        "approx_distinct",
+                        &[data_type.clone()],
+                        distinct,
+                    ),
+                );
+                assert_eq!(aggregate_mergeability(&call), expected);
+            }
         }
     }
 
