@@ -32,7 +32,10 @@
 use std::sync::Arc;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
+use crate::catalog_application::query_materializer::QueryLocalTableOverlay;
 use crate::catalog_application::resolver::{TargetBackend, resolve_existing_table_target};
+use crate::connector::write_target::ConnectorWriteTargetBinding;
+use crate::dml::error::DmlExecutionError;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
@@ -44,8 +47,10 @@ use novarocks_parser::ast::{Expr, FunctionCall, LiteralKind, Predicate, Query, U
 use super::PreparedPredicateDelete;
 use novarocks_parser::{SYNTHETIC, ast, build};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
-use novarocks_spi::connector::ConnectorRowMutationStrategy;
-use novarocks_spi::connector::ConnectorWriteOperationId;
+use novarocks_spi::connector::{
+    ConnectorControlPlanningPin, ConnectorRequestContext, ConnectorRowMutationIntent,
+    ConnectorRowMutationStrategy, ConnectorWriteOperationId,
+};
 use novarocks_sql::compiler::SqlPreparedParameters;
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
@@ -78,7 +83,7 @@ pub(super) fn resolve_target(
 
 fn delete_where_expr<'a>(
     stmt: &'a PreparedPredicateDelete,
-    target_binding: &crate::connector::write_target::ConnectorWriteTargetBinding,
+    target_binding: &ConnectorWriteTargetBinding,
     parameters: Option<&SqlPreparedParameters>,
 ) -> Result<&'a Expr, crate::dml::error::DmlExecutionError> {
     let where_clause = stmt.selection.as_ref().ok_or_else(|| {
@@ -94,17 +99,12 @@ fn delete_where_expr<'a>(
     Ok(where_clause)
 }
 
-pub(super) async fn prepare_delete_statement_async(
+async fn load_delete_target(
     state: &DmlExecutionKernel,
-    stmt: &PreparedPredicateDelete,
     target: &TargetBackend,
-    target_ref: &str,
-    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
-    execution: QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    operation_id: ConnectorWriteOperationId,
-    begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
-) -> Result<super::PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
+    planning_pin: ConnectorControlPlanningPin,
+    connector_context: &ConnectorRequestContext,
+) -> Result<ConnectorWriteTargetBinding, DmlExecutionError> {
     let target_binding = super::super::mutation_match_read::load_row_mutation_target(
         target,
         planning_pin,
@@ -119,6 +119,60 @@ pub(super) async fn prepare_delete_statement_async(
         target_binding.metadata(),
         connector_context.clone(),
     )?;
+    Ok(target_binding)
+}
+
+pub(super) async fn describe_predicate_delete(
+    state: &DmlExecutionKernel,
+    statement: &PreparedPredicateDelete,
+    target: &TargetBackend,
+    target_ref: &str,
+    planning_pin: ConnectorControlPlanningPin,
+    connector_context: &ConnectorRequestContext,
+    parameters: &SqlPreparedParameters,
+) -> Result<(Query, QueryLocalTableOverlay), DmlExecutionError> {
+    let target_binding = load_delete_target(state, target, planning_pin, connector_context).await?;
+    let predicate = delete_where_expr(statement, &target_binding, Some(parameters))?;
+    let (_, mutation) = target_binding.prepare_row_mutation(
+        target_ref,
+        ConnectorWriteOperationId::new(),
+        ConnectorRowMutationIntent::Delete,
+        connector_context.clone(),
+    )?;
+    delete_write_mode(mutation.strategy())?;
+    let mut query = delete_match_query(
+        target,
+        predicate,
+        vec![build::item(
+            build::number("1").map_err(|error| error.to_string())?,
+            None,
+        )],
+        target_ref,
+    )?;
+    let from = super::super::mutation_match_read::mutation_match_select(&mut query)?;
+    let overlay = super::super::mutation_match_read::describe_mutation_match_read(
+        target,
+        from,
+        false,
+        &mutation,
+        target_binding.metadata(),
+        target_binding.planning_pin(),
+    )?;
+    Ok((query, overlay))
+}
+
+pub(super) async fn prepare_delete_statement_async(
+    state: &DmlExecutionKernel,
+    stmt: &PreparedPredicateDelete,
+    target: &TargetBackend,
+    target_ref: &str,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
+    execution: QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    operation_id: ConnectorWriteOperationId,
+    begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
+) -> Result<super::PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
+    let target_binding = load_delete_target(state, target, planning_pin, connector_context).await?;
     let where_expr = delete_where_expr(
         stmt,
         &target_binding,
@@ -129,7 +183,7 @@ pub(super) async fn prepare_delete_statement_async(
     let (write_lease, mutation) = target_binding.prepare_row_mutation(
         target_ref,
         operation_id,
-        novarocks_spi::connector::ConnectorRowMutationIntent::Delete,
+        ConnectorRowMutationIntent::Delete,
         connector_context.clone(),
     )?;
     let (deletion_vectors, sink_mode) = delete_write_mode(mutation.strategy())?;
@@ -298,6 +352,15 @@ fn delete_position_sink_query_ast(
         .iter()
         .map(|column| build::item(build::identifier(build::ident(&column.name, true)), None))
         .collect();
+    delete_match_query(target, where_clause, projection, target_ref)
+}
+
+fn delete_match_query(
+    target: &TargetBackend,
+    where_clause: &Expr,
+    projection: Vec<ast::SelectItem>,
+    target_ref: &str,
+) -> Result<Query, String> {
     let name = build::object_name(
         [&target.catalog, &target.namespace, &target.table]
             .into_iter()
@@ -464,9 +527,14 @@ fn validate_where_predicate(
                 {
                     return Ok(());
                 }
-                let (col_name, value_expr, _flipped) =
+                let (col_name, value_expr, flipped) =
                     extract_comparison(&expression.value, &comparison.right)?;
-                validate_value_for_column(value_expr, columns, &col_name, parameters)
+                let column = if flipped {
+                    &comparison.right
+                } else {
+                    &expression.value
+                };
+                validate_value_for_column(value_expr, columns, &col_name, column.span(), parameters)
             }
             Predicate::In(predicate) => {
                 let Expr::InList(list) = &predicate.value_list else {
@@ -477,7 +545,13 @@ fn validate_where_predicate(
                 }
                 let col_name = expr_to_column_name(&expression.value)?;
                 for literal in &list.values {
-                    validate_value_for_column(literal, columns, &col_name, parameters)?;
+                    validate_value_for_column(
+                        literal,
+                        columns,
+                        &col_name,
+                        expression.value.span(),
+                        parameters,
+                    )?;
                 }
                 Ok(())
             }
@@ -650,14 +724,23 @@ fn is_supported_scalar_fn(name: &str) -> bool {
 
 /// The positional binding has already proved that a supplied value is independent
 /// of DELETE's input rows. The original SQL planner checks its expression type.
-fn is_bound_parameter(expr: &Expr, parameters: Option<&SqlPreparedParameters>) -> bool {
-    matches!(expr, Expr::Parameter(place) if parameters.is_some_and(|bindings| bindings.argument_at(place.span).is_some()))
+fn is_admitted_parameter(expr: &Expr, parameters: Option<&SqlPreparedParameters>) -> bool {
+    let Expr::Parameter(place) = expr else {
+        return false;
+    };
+    parameters.is_some_and(|parameters| {
+        if parameters.is_description() {
+            parameters.ordinal(place.span).is_some()
+        } else {
+            parameters.argument_at(place.span).is_some()
+        }
+    })
 }
 
 fn is_supported_value(expr: &Expr, parameters: Option<&SqlPreparedParameters>) -> bool {
     match expr {
         Expr::Literal(_) => true,
-        Expr::Parameter(_) => is_bound_parameter(expr, parameters),
+        Expr::Parameter(_) => is_admitted_parameter(expr, parameters),
         Expr::Unary(unary) if unary.operator == UnaryOperator::Minus => {
             matches!(unary.expression.as_ref(), Expr::Literal(_))
         }
@@ -684,12 +767,25 @@ fn validate_value_for_column(
     expr: &Expr,
     columns: &[ColumnDef],
     column_name: &str,
+    column_span: novarocks_parser::Span,
     parameters: Option<&SqlPreparedParameters>,
 ) -> Result<(), crate::dml::error::DmlExecutionError> {
     let column = columns
         .iter()
         .find(|column| column.name.eq_ignore_ascii_case(column_name))
-        .ok_or_else(|| format!("column `{column_name}` not found in iceberg table schema"))?;
+        .ok_or_else(|| {
+            let message = format!("column `{column_name}` not found in iceberg table schema");
+            if parameters.is_some_and(SqlPreparedParameters::is_description) {
+                DmlExecutionError::Analyze(
+                    novarocks_sql::analyze_error::AnalyzeError::unknown_column(
+                        message,
+                        column_span,
+                    ),
+                )
+            } else {
+                message.into()
+            }
+        })?;
     let column_type = match &column.data_type {
         nested @ (DataType::Struct(_)
         | DataType::List(_)
@@ -701,7 +797,7 @@ fn validate_value_for_column(
         }
         other => other,
     };
-    if is_bound_parameter(expr, parameters) {
+    if is_admitted_parameter(expr, parameters) {
         return match column_type {
             DataType::Int8
             | DataType::Int16
@@ -910,6 +1006,37 @@ mod tests {
         assert!(super::validate_bound_where(&predicate, &columns, None).is_err());
         assert!(
             super::validate_bound_where(&where_expr("n = ?"), &columns, Some(&binding)).is_err()
+        );
+    }
+
+    #[test]
+    fn delete_description_admits_original_markers_and_keeps_predicate_refusals() {
+        use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
+
+        let target = parse_statement("DELETE FROM orders WHERE n IN (?, 2)").unwrap();
+        let declaration = super::SqlPreparedParameters::describe(&target);
+        let TrinoStatement::Delete(delete) = target else {
+            panic!("expected DELETE");
+        };
+        let predicate = delete.predicate.unwrap();
+        let columns = [column("n", DataType::Int32)];
+        super::validate_bound_where(&predicate, &columns, Some(&declaration)).unwrap();
+        assert!(
+            super::validate_bound_where(&where_expr("n = ?"), &columns, Some(&declaration),)
+                .is_err()
+        );
+        let error = super::validate_bound_where(&predicate, &[], Some(&declaration)).unwrap_err();
+        assert!(matches!(error, super::DmlExecutionError::Analyze(_)));
+        let nested_literal = [column(
+            "n",
+            DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                "item",
+                DataType::Int32,
+                true,
+            ))),
+        )];
+        assert!(
+            super::validate_bound_where(&predicate, &nested_literal, Some(&declaration),).is_err()
         );
     }
 
@@ -1333,8 +1460,14 @@ mod tests {
             kind: LiteralKind::String("2020-01-01T00:00:00".to_string()),
             span: Span::new(0, 21),
         });
-        let error = super::validate_value_for_column(&expr, &columns_with_timestamp(), "ts", None)
-            .expect_err("ISO-8601 `T` separator is not the accepted DATETIME form");
+        let error = super::validate_value_for_column(
+            &expr,
+            &columns_with_timestamp(),
+            "ts",
+            expr.span(),
+            None,
+        )
+        .expect_err("ISO-8601 `T` separator is not the accepted DATETIME form");
         let crate::dml::error::DmlExecutionError::Engine(error) = error else {
             panic!("expected the original DATETIME validation error");
         };

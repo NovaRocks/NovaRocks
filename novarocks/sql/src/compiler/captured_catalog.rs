@@ -195,6 +195,40 @@ impl SqlCapturedCatalogPreparation {
         write_assignments: Option<&super::SqlWriteAssignments>,
         materialized_constants: Option<super::SqlExpressionConstants>,
     ) -> Result<super::SqlPreparedDescription, SqlCompileError> {
+        self.describe_inner(
+            parameters,
+            session,
+            functions,
+            policy,
+            write_assignments,
+            materialized_constants,
+            false,
+        )
+    }
+
+    /// Analyze a CTAS source and validate its persistent output declaration.
+    /// Source analysis needs no optimization, Provider read, or writer request.
+    pub fn describe_ctas_source(
+        self,
+        parameters: &super::SqlPreparedParameters,
+        session: &super::SqlSessionContext,
+        functions: &dyn super::SqlFunctionCatalog,
+        policy: super::ConstantPolicy,
+    ) -> Result<super::SqlPreparedDescription, SqlCompileError> {
+        self.describe_inner(parameters, session, functions, policy, None, None, true)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "Original description facts")]
+    fn describe_inner(
+        self,
+        parameters: &super::SqlPreparedParameters,
+        session: &super::SqlSessionContext,
+        functions: &dyn super::SqlFunctionCatalog,
+        policy: super::ConstantPolicy,
+        write_assignments: Option<&super::SqlWriteAssignments>,
+        materialized_constants: Option<super::SqlExpressionConstants>,
+        ctas_source: bool,
+    ) -> Result<super::SqlPreparedDescription, SqlCompileError> {
         self.control.check()?;
         let capture = self.description.as_deref().ok_or_else(|| {
             SqlCompileError::InvalidRequest("Description requires its own schema capture".into())
@@ -229,6 +263,7 @@ impl SqlCapturedCatalogPreparation {
             write_assignments,
             materialized.as_ref(),
             parameters,
+            ctas_source,
         )
     }
 

@@ -46,6 +46,27 @@ fn describe_with_materialized_constants(
     assignments: Option<&SqlWriteAssignments>,
     materialized_constants: Option<SqlExpressionConstants>,
 ) -> Result<SqlPreparedDescription, SqlCompileError> {
+    let (preparation, parameters, session) = capture(sql)?;
+    preparation.describe(
+        &parameters,
+        &session,
+        builtin_sql_function_catalog(),
+        novarocks_sql_testkit::sql_fixture_constant_policy(),
+        assignments,
+        materialized_constants,
+    )
+}
+
+fn capture(
+    sql: &str,
+) -> Result<
+    (
+        SqlCapturedCatalogPreparation,
+        SqlPreparedParameters,
+        novarocks_sql::compiler::SqlSessionContext,
+    ),
+    SqlCompileError,
+> {
     let query = novarocks_sql_testkit::parse_query(sql);
     let parameters = SqlPreparedParameters::describe_query(&query);
     let mut session = super::fixtures::session(SqlSemanticSettings::default(), false);
@@ -92,14 +113,35 @@ fn describe_with_materialized_constants(
             .collect();
         preparation = preparation.continue_catalog(facts)?;
     }
-    preparation.describe(
-        &parameters,
-        &session,
-        builtin_sql_function_catalog(),
-        novarocks_sql_testkit::sql_fixture_constant_policy(),
-        assignments,
-        materialized_constants,
-    )
+    Ok((preparation, parameters, session))
+}
+
+#[test]
+fn ctas_description_checks_original_definition_names_before_presentation() {
+    let describe_ctas = |sql| {
+        let (preparation, parameters, session) = capture(sql)?;
+        preparation.describe_ctas_source(
+            &parameters,
+            &session,
+            builtin_sql_function_catalog(),
+            novarocks_sql_testkit::sql_fixture_constant_policy(),
+        )
+    };
+    let described = describe_ctas("SELECT CAST(? AS BIGINT) AS id, x FROM t").unwrap();
+    assert_eq!(described.parameters[0].data_type(), &DataType::Null);
+    assert_eq!(described.columns[0].name, "id");
+    assert_eq!(
+        described.columns[0].value_type.data_type(),
+        &DataType::Int64
+    );
+    assert!(matches!(
+        describe_ctas("SELECT CAST(? AS BIGINT), x FROM t"),
+        Err(SqlCompileError::Analyze(error)) if error.kind() == AnalyzeErrorKind::MissingColumnName
+    ));
+    assert!(matches!(
+        describe_ctas("SELECT CAST(? AS BIGINT) AS x, x FROM t"),
+        Err(SqlCompileError::Analyze(error)) if error.kind() == AnalyzeErrorKind::DuplicateColumnName
+    ));
 }
 
 #[test]
@@ -270,4 +312,55 @@ fn unknown_table_version_is_refused_before_catalog_requests_are_published() {
     };
     assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedQueryShape);
     assert_eq!(error.span(), Some(parameters.positions()[0]));
+}
+
+#[test]
+fn mutation_description_observes_original_assignment_root_after_valid_conversion() {
+    let control = SqlCompileControl::unbounded();
+    let assignments = |columns: &[(usize, DataType)]| {
+        let sites = columns
+            .iter()
+            .map(|(ordinal, ty)| {
+                SqlWriteAssignmentSite::try_new(
+                    *ordinal,
+                    FunctionValueType::new(ty.clone(), true),
+                    None,
+                    &control,
+                )
+                .unwrap()
+            })
+            .collect();
+        SqlWriteAssignments::try_new(sites, &control)
+            .unwrap()
+            .for_mutation_description()
+    };
+    let write = assignments(&[
+        (2, DataType::Int64),
+        (3, DataType::Utf8),
+        (4, DataType::Int64),
+    ]);
+    let described = describe(
+        "SELECT 3 AS identity, t.*, ? + BIGINT '1', (?), CAST(? AS BIGINT) FROM t WHERE x = ?",
+        Some(&write),
+    )
+    .unwrap();
+    assert_eq!(
+        described
+            .parameters
+            .iter()
+            .map(FunctionValueType::data_type)
+            .collect::<Vec<_>>(),
+        [
+            &DataType::Int64,
+            &DataType::Utf8,
+            &DataType::Null,
+            &DataType::Int64
+        ],
+    );
+
+    let write = assignments(&[(1, DataType::Int64)]);
+    assert!(matches!(
+        describe("SELECT t.*, 'x' FROM t", Some(&write)),
+        Err(SqlCompileError::Analyze(error)) if error.kind() == AnalyzeErrorKind::TypeMismatch
+    ));
 }

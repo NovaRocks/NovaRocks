@@ -82,6 +82,59 @@ pub(super) fn bind_mutation_match_read(
     original: &ConnectorTableMetadata,
     planning_pin: &ConnectorControlPlanningPin,
 ) -> Result<QueryLocalTableOverlay, String> {
+    let lookup = if isolate_lookup {
+        MutationMatchLookup::Isolated
+    } else {
+        MutationMatchLookup::Original
+    };
+    mutation_match_overlay(
+        target,
+        target_factor,
+        lookup,
+        preparation,
+        original,
+        planning_pin,
+    )
+}
+
+pub(super) fn describe_mutation_match_read(
+    target: &TargetBackend,
+    target_factor: &mut ast::Relation,
+    isolate_lookup: bool,
+    preparation: &ConnectorRowMutationPreparation,
+    original: &ConnectorTableMetadata,
+    planning_pin: &ConnectorControlPlanningPin,
+) -> Result<QueryLocalTableOverlay, String> {
+    mutation_match_overlay(
+        target,
+        target_factor,
+        MutationMatchLookup::Description { isolate_lookup },
+        preparation,
+        original,
+        planning_pin,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum MutationMatchLookup {
+    Original,
+    Isolated,
+    Description { isolate_lookup: bool },
+}
+
+fn mutation_match_overlay(
+    target: &TargetBackend,
+    target_factor: &mut ast::Relation,
+    lookup: MutationMatchLookup,
+    preparation: &ConnectorRowMutationPreparation,
+    original: &ConnectorTableMetadata,
+    planning_pin: &ConnectorControlPlanningPin,
+) -> Result<QueryLocalTableOverlay, String> {
+    let isolate_lookup = match lookup {
+        MutationMatchLookup::Original => false,
+        MutationMatchLookup::Isolated => true,
+        MutationMatchLookup::Description { isolate_lookup } => isolate_lookup,
+    };
     let instance = &planning_pin.binding().descriptor().instance_id;
     let source = original.source_read_facts().ok_or_else(|| {
         "mutation match target lost its original provider access provenance".to_string()
@@ -146,7 +199,12 @@ pub(super) fn bind_mutation_match_read(
     let (catalog, namespace) = (target.catalog.clone(), target.namespace.clone());
     let original = original.clone();
     let planning_pin = planning_pin.clone();
-    let match_source = preparation.match_source().clone();
+    let match_source = match lookup {
+        MutationMatchLookup::Original | MutationMatchLookup::Isolated => {
+            Some(preparation.match_source().clone())
+        }
+        MutationMatchLookup::Description { .. } => None,
+    };
     Ok(QueryLocalTableOverlay::for_catalog(
         catalog.clone(),
         namespace.clone(),
@@ -174,8 +232,8 @@ pub(super) fn bind_mutation_match_read(
                     preparation_digest,
                 ),
                 source_metadata: Some(original.clone()),
-                scan_materialization: Some(QueryScanMaterialization {
-                    table: match_source.clone(),
+                scan_materialization: match_source.as_ref().map(|table| QueryScanMaterialization {
+                    table: table.clone(),
                     selector: ConnectorReadSelector::Current,
                     mv_partition_selection: None,
                     planning_pin: planning_pin.clone(),

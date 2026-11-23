@@ -372,6 +372,7 @@ pub(crate) fn describe_prepared_query(
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     parameters: &crate::compiler::SqlPreparedParameters,
+    ctas_source: bool,
 ) -> Result<crate::compiler::SqlPreparedDescription, crate::compiler::SqlCompileError> {
     let mut description = crate::compiler::DescriptionAnalysis::new(
         parameters.positions().len(),
@@ -407,6 +408,14 @@ pub(crate) fn describe_prepared_query(
             Some(parameters),
             QueryAnalysisPurpose::Ordinary,
         )?;
+    if ctas_source {
+        crate::analysis::schema::validate_definition_column_names(
+            &resolved.output_columns,
+            query.span,
+        )?;
+        crate::planning::mv::validate_persistable_output(&resolved, &factory)
+            .map_err(crate::compiler::SqlCompileError::Compilation)?;
+    }
     let description = factory
         .prepared_description
         .take()

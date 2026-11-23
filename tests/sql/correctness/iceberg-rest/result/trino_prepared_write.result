@@ -23,3 +23,62 @@ id
 -- types	integer
 id
 41
+
+-- query 24
+-- types	integer	varchar(6)
+Position	Type
+0	bigint
+
+-- query 25
+-- types	varchar(4)	varchar(0)	varchar(0)	varchar(0)	varchar(6)	integer	boolean
+Column Name	Catalog	Schema	Table	Type	Type Size	Aliased
+rows	""	""	""	bigint	8	false
+
+-- query 30
+-- types	bigint
+id
+31
+32
+
+-- query 32
+-- types	bigint
+id
+32
+
+-- query 34
+-- types	integer	varchar(6)
+Position	Type
+0	bigint
+1	bigint
+
+-- query 35
+-- types	varchar(4)	varchar(0)	varchar(0)	varchar(0)	varchar(6)	integer	boolean
+Column Name	Catalog	Schema	Table	Type	Type Size	Aliased
+rows	""	""	""	bigint	8	false
+
+-- query 39
+-- types	integer	varchar(7)
+Position	Type
+0	unknown
+1	bigint
+2	bigint
+
+-- query 40
+-- types	varchar(4)	varchar(0)	varchar(0)	varchar(0)	varchar(6)	integer	boolean
+Column Name	Catalog	Schema	Table	Type	Type Size	Aliased
+rows	""	""	""	bigint	8	false
+
+-- query 42
+-- types	integer	varchar(7)
+Position	Type
+0	unknown
+
+-- query 43
+-- types	varchar(4)	varchar(0)	varchar(0)	varchar(0)	varchar(6)	integer	boolean
+Column Name	Catalog	Schema	Table	Type	Type Size	Aliased
+rows	""	""	""	bigint	8	false
+
+-- query 45
+-- types	bigint
+id
+32

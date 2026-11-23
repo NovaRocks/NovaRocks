@@ -409,7 +409,33 @@ pub struct TrinoCtasInput {
     pub(crate) interpreter: Arc<crate::RequiredConstantInterpreter>,
 }
 
+pub struct CtasDescriptionInput<'a> {
+    pub(crate) statement: novarocks_parser::ast::TrinoCreateTableAsSelect,
+    pub(crate) request: novarocks_query_application::admitted_query_context::RequestContext,
+    pub(crate) command: novarocks_query_application::api::CommandContext,
+    pub(crate) connector: novarocks_spi::connector::ConnectorRequestContext,
+    pub(crate) source: Arc<str>,
+    pub(crate) control: novarocks_sql::compiler::SqlCompileControl,
+    pub(crate) parameters: Arc<novarocks_sql::compiler::SqlPreparedParameters>,
+    pub(crate) compiler: crate::query::compiler::FrontendQueryCompiler,
+    pub(crate) interpreter: Arc<crate::RequiredConstantInterpreter>,
+    pub(crate) cpu: &'a crate::query_execution::completion_facts::FrontendPlanningCpuSource,
+}
+
+pub struct PreparedCtasDescription {
+    pub(crate) query: Query,
+    pub(crate) target: Option<crate::query::ctas_action::trino::CtasDescriptionTarget>,
+}
+
+pub type CtasDescriptionResult = Result<
+    Result<PreparedCtasDescription, novarocks_query_application::session_error::QueryServiceError>,
+    novarocks_query_application::api::StatementNativeHealthFailure,
+>;
+
+#[async_trait::async_trait]
 pub trait CtasEngine: Send + Sync {
+    async fn describe_ctas(&self, input: CtasDescriptionInput<'_>) -> CtasDescriptionResult;
+
     fn prepare_trino_statement_action(
         &self,
         _input: TrinoCtasInput,
@@ -915,7 +941,12 @@ fn standard_ctas_unsupported() -> CtasFailure {
     }
 }
 
+#[async_trait::async_trait]
 impl CtasEngine for DmlExecutionKernel {
+    async fn describe_ctas(&self, input: CtasDescriptionInput<'_>) -> CtasDescriptionResult {
+        crate::query::ctas_action::trino::describe(self, input).await
+    }
+
     fn prepare_trino_statement_action(
         &self,
         input: TrinoCtasInput,

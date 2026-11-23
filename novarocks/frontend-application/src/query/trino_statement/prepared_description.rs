@@ -109,6 +109,9 @@ impl FrontendQuerySession {
             input,
             compiler,
             insert_engine: self.service.insert_engine.clone(),
+            delete_engine: self.service.delete_engine.clone(),
+            mutation_engine: self.service.mutation_engine.clone(),
+            ctas_engine: self.service.ctas_engine.clone(),
             registry: self.service.session_properties.clone(),
             session_catalogs: self.service.session_catalog_resolver.clone(),
             interpreter: self.service.required_constant_interpreter.clone(),
@@ -140,6 +143,9 @@ struct DescriptionPreparation {
     input: CommandContextInput,
     compiler: compiler::FrontendQueryCompiler,
     insert_engine: Arc<dyn crate::query_execution::dml::insert::InsertEngine>,
+    delete_engine: Arc<dyn crate::query_execution::dml::delete::DeleteEngine>,
+    mutation_engine: Arc<dyn crate::query_execution::dml::mutation::MutationEngine>,
+    ctas_engine: Arc<dyn crate::query_execution::dml::ctas::CtasEngine>,
     registry: Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
     session_catalogs: novarocks_query_application::sql::catalog::SessionCatalogService,
     interpreter: Arc<crate::RequiredConstantInterpreter>,
@@ -274,8 +280,8 @@ async fn run_description(
         .connector_context()
         .clone()
         .with_io_admission(io);
-    let (mut query, write) = match *job.description.target {
-        TrinoStatementAction::Query(TrinoQueryAction::Read(query)) => (query, None),
+    let (mut query, write, overlays) = match *job.description.target {
+        TrinoStatementAction::Query(TrinoQueryAction::Read(query)) => (query, None, Vec::new()),
         TrinoStatementAction::Prepare(preparation @ TrinoStatementPreparation::Insert(_)) => {
             let result_field = preparation_plan(&preparation)?
                 .admission
@@ -306,10 +312,148 @@ async fn run_description(
             (
                 prepared.query,
                 Some(DescriptionWrite {
-                    assignments: prepared.assignments,
+                    assignments: Some(Arc::new(prepared.assignments)),
                     constants: prepared.constants,
+                    ctas_target: None,
                     result_field,
                 }),
+                Vec::new(),
+            )
+        }
+        TrinoStatementAction::Prepare(preparation @ TrinoStatementPreparation::Delete(_)) => {
+            let result_field = preparation_plan(&preparation)?
+                .admission
+                .shape
+                .command_row_field()
+                .ok_or_else(|| internal_error("DELETE has no command row declaration"))?;
+            let TrinoStatementPreparation::Delete(node) = preparation else {
+                unreachable!("already matched DELETE preparation");
+            };
+            let target_span = node.table.span;
+            let statement = dml_result(crate::dml::prepare_trino_delete_shape(node, source))
+                .map_err(routed_execution_service_error)?;
+            let preparation = job
+                .delete_engine
+                .describe_delete(
+                    crate::query_execution::dml::delete::DeleteDescriptionInput {
+                        statement,
+                        request: job.input.request.clone(),
+                        connector: connector.clone(),
+                        parameters: job.parameters.clone(),
+                        target_span,
+                        source: source.clone(),
+                    },
+                )
+                .await
+                .map_err(|error| error.into_dml_error(Some(source)));
+            let preparation = dml_result(preparation).map_err(routed_execution_service_error)?;
+            (
+                preparation.query,
+                Some(DescriptionWrite {
+                    assignments: None,
+                    constants: None,
+                    ctas_target: None,
+                    result_field,
+                }),
+                vec![preparation.overlay],
+            )
+        }
+        TrinoStatementAction::Prepare(
+            preparation @ (TrinoStatementPreparation::Update(_)
+            | TrinoStatementPreparation::Merge(_)),
+        ) => {
+            let result_field = preparation_plan(&preparation)?
+                .admission
+                .shape
+                .command_row_field()
+                .ok_or_else(|| internal_error("Mutation has no command row declaration"))?;
+            let (statement, target_span) = match preparation {
+                TrinoStatementPreparation::Update(node) => {
+                    let span = node.table.span;
+                    (
+                        crate::dml::mutation::prepare_trino_update_shape(node, source),
+                        span,
+                    )
+                }
+                TrinoStatementPreparation::Merge(node) => {
+                    let span = node.target.span();
+                    (
+                        crate::dml::mutation::prepare_trino_merge_shape(node, source),
+                        span,
+                    )
+                }
+                _ => unreachable!("already matched UPDATE or MERGE preparation"),
+            };
+            let statement = dml_result(statement).map_err(routed_execution_service_error)?;
+            use crate::query_execution::dml::mutation::{
+                MutationDescriptionInput, OwnedMutationStatement,
+            };
+            let merge = matches!(statement, OwnedMutationStatement::Merge(_));
+            let input = MutationDescriptionInput {
+                statement,
+                request: job.input.request.clone(),
+                connector: connector.clone(),
+                control: control.clone(),
+                source: source.clone(),
+                target_span,
+            };
+            let prepared = if merge {
+                job.mutation_engine.describe_merge(input).await
+            } else {
+                job.mutation_engine.describe_update(input).await
+            }
+            .map_err(|error| error.into_dml_error(Some(source)));
+            let prepared = dml_result(prepared).map_err(routed_execution_service_error)?;
+            (
+                prepared.query,
+                Some(DescriptionWrite {
+                    assignments: prepared.assignments,
+                    constants: None,
+                    ctas_target: None,
+                    result_field,
+                }),
+                vec![prepared.overlay],
+            )
+        }
+        TrinoStatementAction::Prepare(
+            preparation @ TrinoStatementPreparation::CreateTableAsSelect(_),
+        ) => {
+            let result_field = preparation_plan(&preparation)?
+                .admission
+                .shape
+                .command_row_field()
+                .ok_or_else(|| internal_error("CTAS has no command row declaration"))?;
+            let TrinoStatementPreparation::CreateTableAsSelect(node) = preparation else {
+                unreachable!("already matched CTAS preparation");
+            };
+            let prepared = job
+                .ctas_engine
+                .describe_ctas(crate::query_execution::dml::ctas::CtasDescriptionInput {
+                    statement: node,
+                    request: job.input.request.clone(),
+                    command: job.input.command.clone(),
+                    connector: connector.clone(),
+                    source: source.clone(),
+                    control: control.clone(),
+                    parameters: job.parameters.clone(),
+                    compiler: job.compiler.clone(),
+                    interpreter: job.interpreter.clone(),
+                    cpu,
+                })
+                .await
+                .map_err(|failure| {
+                    *health = Some(failure);
+                    internal_error("CTAS description preparation has no proven exit")
+                })??;
+            (
+                prepared.query,
+                Some(DescriptionWrite {
+                    assignments: None,
+                    constants: None,
+                    ctas_target: prepared.target,
+                    result_field,
+                }),
+                Vec::new(),
             )
         }
         _ => {
@@ -415,7 +559,8 @@ async fn run_description(
             None,
         )
         .map_err(statement_work_error)?
-        .with_snapshot_planning_owned(control.clone(), execution.cancellation().clone()),
+        .with_snapshot_planning_owned(control.clone(), execution.cancellation().clone())
+        .with_query_local_overlays(overlays),
         crate::query_execution::compiler::typed_connector_session().map_err(internal_error)?,
         property_inputs,
     )
@@ -475,8 +620,9 @@ pub(crate) struct DescriptionCpuInput {
 }
 
 struct DescriptionWrite {
-    assignments: SqlWriteAssignments,
+    assignments: Option<Arc<SqlWriteAssignments>>,
     constants: Option<SqlExpressionConstants>,
+    ctas_target: Option<crate::query::ctas_action::trino::CtasDescriptionTarget>,
     result_field: ResultField,
 }
 
@@ -484,22 +630,34 @@ impl DescriptionCpuInput {
     pub(crate) fn run(self) -> Result<OwnedLocalResult, QueryServiceError> {
         let mut write = self.write;
         let constants = write.as_mut().and_then(|write| write.constants.take());
-        let mut described = self
-            .preparation
-            .describe(
+        let ctas = write.as_mut().and_then(|write| write.ctas_target.take());
+        let described = match ctas.as_ref() {
+            Some(_) => self.preparation.describe_ctas_source(
                 &self.parameters,
                 &self.session,
                 self.functions.as_ref(),
                 self.policy,
-                write.as_ref().map(|write| &write.assignments),
+            ),
+            None => self.preparation.describe(
+                &self.parameters,
+                &self.session,
+                self.functions.as_ref(),
+                self.policy,
+                write
+                    .as_ref()
+                    .and_then(|write| write.assignments.as_deref()),
                 constants,
-            )
-            .map_err(|error| {
-                routed_execution_service_error(routed_compiler_failure(
-                    compiler::FrontendQueryCompilerError::from_compile(error),
-                    self.source.sql(),
-                ))
-            })?;
+            ),
+        };
+        let mut described = described.map_err(|error| {
+            routed_execution_service_error(routed_compiler_failure(
+                compiler::FrontendQueryCompilerError::from_compile(error),
+                self.source.sql(),
+            ))
+        })?;
+        if let Some(target) = ctas {
+            target.validate_source(&described.columns)?;
+        }
         if let Some(write) = write {
             described.columns = vec![SqlDescribedColumn {
                 name: write.result_field.name().to_owned(),
