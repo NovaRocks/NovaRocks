@@ -15,78 +15,61 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Migrated from dev/test/sql/test_function/T/test_round
--- Test Objective:
--- 1. Validate round() and dround() with all-NULL column values produce correct null-safe equality results.
--- 2. Test one-arg and two-arg forms of round/dround with NULL propagation.
--- 3. Verify null-safe equality (<=>) behavior when comparing NULL-derived results.
+-- Check strict NULL propagation through persisted inputs and preserve the
+-- null-safe comparisons with untyped NULLs from the original round fixture.
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.test_all_null (
-    id_int int ,
-    id_boolean boolean ,
-    id_tinyint tinyint ,
-    id_smallint smallint ,
-    id_bigint bigint ,
-    id_largeint largeint ,
-    id_float REAL ,
-    id_double double ,
-    id_decimal32 DECIMAL(8, 5) ,
-    id_decimal64 DECIMAL(8, 5) ,
-    id_decimal128 DECIMAL(8, 5) ,
-    id_date date ,
-    id_datetime TIMESTAMP(6) ,
-    id_varchar varchar(2000) ,
-    id_json json,
-    id_any_element int ,
-    id_any_array array<int> ,
-    id_array_boolean array<boolean> ,
-    id_array_tinyint array<tinyint> ,
-    id_array_smallint array<smallint> ,
-    id_array_int array<int> ,
-    id_array_bigint array<bigint> ,
-    id_array_largeint array<largeint> ,
-    id_array_float array<REAL> ,
-    id_array_double array<double> ,
-    id_array_varchar array<varchar(2000)> ,
-    id_array_date array<date> ,
-    id_array_datetime array<TIMESTAMP(6)>
+CREATE TABLE ${case_db}.round_inputs (
+    id INTEGER,
+    digits INTEGER,
+    real_value REAL,
+    double_value DOUBLE,
+    decimal_value DECIMAL(20, 5)
 ) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-USE ${case_db};
-insert into test_all_null select t.* from (select 1 as d) x left join test_all_null t on x.d = t.id_int;
+INSERT INTO ${case_db}.round_inputs VALUES
+    (1, NULL, NULL, NULL, NULL),
+    (2, 2, NULL, NULL, NULL),
+    (3, NULL, CAST(2.5e0 AS REAL), 2.5e0, DECIMAL '2.50000'),
+    (4, 2, CAST(-12.375e0 AS REAL), -12.375e0, DECIMAL '-12.34565');
 
 -- query 3
-USE ${case_db};
-select (round(id_double))  IS NOT DISTINCT FROM  (round(NULL)) from test_all_null;
+SELECT round(double_value) IS NOT DISTINCT FROM round(NULL) AS unary_nulls,
+       round(double_value, digits) IS NOT DISTINCT FROM round(NULL, NULL) AS both_null,
+       round(double_value, digits) IS NOT DISTINCT FROM round(double_value, NULL) AS null_digits,
+       round(double_value, digits) IS NOT DISTINCT FROM round(NULL, digits) AS null_input
+FROM ${case_db}.round_inputs
+WHERE id = 1;
 
 -- query 4
-USE ${case_db};
-select (dround(id_double))  IS NOT DISTINCT FROM  (dround(NULL)) from test_all_null;
+-- @order_sensitive=true
+SELECT id,
+       round(real_value, digits) AS rounded_real,
+       round(double_value) AS rounded_double,
+       round(double_value, digits) AS rounded_double_at_digits,
+       round(decimal_value) AS rounded_decimal,
+       round(decimal_value, digits) AS rounded_decimal_at_digits,
+       truncate(decimal_value) AS truncated_decimal,
+       truncate(decimal_value, digits) AS truncated_decimal_at_digits
+FROM ${case_db}.round_inputs
+ORDER BY id;
 
 -- query 5
-USE ${case_db};
-select (round(id_double, id_int))  IS NOT DISTINCT FROM  (round(NULL, NULL)) from test_all_null;
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT dround(double_value) FROM ${case_db}.round_inputs;
 
 -- query 6
-USE ${case_db};
-select (round(id_double, id_int))  IS NOT DISTINCT FROM  (round(id_double, NULL)) from test_all_null;
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT dround(double_value, digits) FROM ${case_db}.round_inputs;
 
 -- query 7
-USE ${case_db};
-select (round(id_double, id_int))  IS NOT DISTINCT FROM  (round(NULL, id_int)) from test_all_null;
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+-- @expect_error=[sql.analyze.type_mismatch] Unknown type: largeint
+SELECT CAST(1 AS LARGEINT);
 
 -- query 8
-USE ${case_db};
-select (dround(id_double, id_int))  IS NOT DISTINCT FROM  (dround(NULL, NULL)) from test_all_null;
-
--- query 9
-USE ${case_db};
-select (dround(id_double, id_int))  IS NOT DISTINCT FROM  (dround(id_double, NULL)) from test_all_null;
-
--- query 10
-USE ${case_db};
-select (dround(id_double, id_int))  IS NOT DISTINCT FROM  (dround(NULL, id_int)) from test_all_null;
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT truncate(double_value, digits) FROM ${case_db}.round_inputs;

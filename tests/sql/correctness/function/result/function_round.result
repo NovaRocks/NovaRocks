@@ -1,39 +1,12 @@
 -- query 3
--- types	boolean
-_col0
-true
+-- types	boolean	boolean	boolean	boolean
+unary_nulls	both_null	null_digits	null_input
+true	true	true	true
 
 -- query 4
--- types	boolean
-_col0
-true
-
--- query 5
--- types	boolean
-_col0
-true
-
--- query 6
--- types	boolean
-_col0
-true
-
--- query 7
--- types	boolean
-_col0
-true
-
--- query 8
--- types	boolean
-_col0
-true
-
--- query 9
--- types	boolean
-_col0
-true
-
--- query 10
--- types	boolean
-_col0
-true
+-- types	integer	real	double	double	decimal(16, 0)	decimal(21, 5)	decimal(15, 0)	decimal(20, 5)
+id	rounded_real	rounded_double	rounded_double_at_digits	rounded_decimal	rounded_decimal_at_digits	truncated_decimal	truncated_decimal_at_digits
+1	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+2	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+3	NULL	3.0	NULL	3	NULL	2	NULL
+4	-12.38	-12.0	-12.38	-12	-12.35000	-12	-12.34000
