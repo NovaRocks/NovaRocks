@@ -30,9 +30,10 @@ pub(super) fn transform_absorbs(
     if matches!(
         transform,
         Transform::Void | Transform::Unknown | Transform::Bucket(0) | Transform::Truncate(0)
-    ) || transform
-        .result_type(&Type::Primitive(primitive.clone()))
-        .is_err()
+    ) || matches!((transform, primitive), (Transform::Truncate(width), PrimitiveType::Int) if i32::try_from(*width).is_err())
+        || transform
+            .result_type(&Type::Primitive(primitive.clone()))
+            .is_err()
     {
         return false;
     }
@@ -80,7 +81,7 @@ fn boundary_aligns(
                 // but no previous value. The appended codepoint must survive.
                 step > 0 && value.chars().take(*width as usize).count() < *width as usize
             }
-            _ => truncate_boundary(*width, value, step),
+            _ => truncate_boundary(primitive, *width, value, step),
         },
         Transform::Day | Transform::Hour => temporal_bucket_boundary(transform, value, step),
         Transform::Year | Transform::Month => calendar_boundary(transform, value, step),
@@ -88,7 +89,12 @@ fn boundary_aligns(
     }
 }
 
-fn truncate_boundary(width: u32, value: &ConnectorValue, step: i64) -> bool {
+fn truncate_boundary(
+    primitive: &PrimitiveType,
+    width: u32,
+    value: &ConnectorValue,
+    step: i64,
+) -> bool {
     let (value, minimum, maximum) = match value {
         ConnectorValue::TinyInt(value) => {
             (i128::from(*value), i128::from(i8::MIN), i128::from(i8::MAX))
@@ -129,10 +135,22 @@ fn truncate_boundary(width: u32, value: &ConnectorValue, step: i64) -> bool {
     else {
         return false;
     };
-    // Compare mathematical buckets in a wide representation. Subtraction
-    // back to an i32/i64 physical partition value can overflow at the minimum.
+    // The input's SQL lattice can be narrower than the physical Int
+    // partition (for example, a nominal SMALLINT column). Both truncated
+    // outputs must still be writable in the actual partition type.
+    let (partition_min, partition_max) = match primitive {
+        PrimitiveType::Int => (i128::from(i32::MIN), i128::from(i32::MAX)),
+        PrimitiveType::Long => (i128::from(i64::MIN), i128::from(i64::MAX)),
+        PrimitiveType::Decimal { .. } => (minimum, maximum),
+        _ => return false,
+    };
     let width = i128::from(width);
-    value.div_euclid(width) != adjacent.div_euclid(width)
+    let truncate = |point: i128| {
+        point
+            .checked_sub(point.rem_euclid(width))
+            .filter(|value| (partition_min..=partition_max).contains(value))
+    };
+    matches!((truncate(value), truncate(adjacent)), (Some(left), Some(right)) if left != right)
 }
 
 fn temporal_bucket_boundary(transform: &Transform, value: &ConnectorValue, step: i64) -> bool {
@@ -151,9 +169,15 @@ fn temporal_bucket_boundary(transform: &Transform, value: &ConnectorValue, step:
         86_400
     };
     let ticks = seconds * ticks_per_second;
-    timestamp
-        .checked_add(step)
-        .is_some_and(|adjacent| timestamp.div_euclid(ticks) != adjacent.div_euclid(ticks))
+    let Some(adjacent) = timestamp.checked_add(step) else {
+        return false;
+    };
+    // Iceberg stores the epoch bucket as an Int. The SDK's unchecked Hour
+    // cast can otherwise wrap a valid microsecond timestamp to a remote hour.
+    i32::try_from(timestamp.div_euclid(ticks))
+        .ok()
+        .zip(i32::try_from(adjacent.div_euclid(ticks)).ok())
+        .is_some_and(|(left, right)| left != right)
 }
 
 fn calendar_boundary(transform: &Transform, value: &ConnectorValue, step: i64) -> bool {

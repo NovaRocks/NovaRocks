@@ -138,6 +138,49 @@ fn absorption_bucket_void_and_signed_truncate_preserve_unproved_ranges() {
 }
 
 #[test]
+fn absorption_refuses_unrepresentable_partition_buckets() {
+    let wide = u32::try_from(i32::MAX).unwrap() + 1;
+    assert!(!absorb(
+        PrimitiveType::Int,
+        Transform::Truncate(wide),
+        ge(ConnectorValue::Integer(0)),
+    ));
+    assert!(!absorb(
+        PrimitiveType::Int,
+        Transform::Truncate(10),
+        ge(ConnectorValue::Integer(-2_147_483_640)),
+    ));
+    assert!(absorb(
+        PrimitiveType::Int,
+        Transform::Truncate(10),
+        ge(ConnectorValue::Integer(-2_147_483_630)),
+    ));
+    assert!(!absorb(
+        PrimitiveType::Long,
+        Transform::Truncate(10),
+        ge(ConnectorValue::BigInt(-9_223_372_036_854_775_800)),
+    ));
+
+    const MICROS_PER_HOUR: i64 = 3_600_000_000;
+    let at = |hour: i64| ge(ConnectorValue::TimestampMicros(hour * MICROS_PER_HOUR));
+    assert!(absorb(
+        PrimitiveType::Timestamp,
+        Transform::Hour,
+        at(i64::from(i32::MAX))
+    ));
+    assert!(!absorb(
+        PrimitiveType::Timestamp,
+        Transform::Hour,
+        at(i64::from(i32::MAX) + 1)
+    ));
+    assert!(!absorb(
+        PrimitiveType::Timestamp,
+        Transform::Hour,
+        at(i64::from(i32::MIN))
+    ));
+}
+
+#[test]
 fn absorption_handles_calendar_precision_and_unicode_bound_direction() {
     let at = ConnectorValue::Date(18_414); // 2020-06-01
     assert!(absorb(

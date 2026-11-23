@@ -441,7 +441,7 @@ fn absent_nan_count_and_large_in_keep_files_when_metrics_cannot_prove_verdict() 
         let file = candidate(
             Struct::empty(),
             2,
-            (None, Some(Datum::float(10.0))),
+            (None, Some(Datum::float(10.0_f32))),
             vec![(2, 0)],
             nans,
         );
