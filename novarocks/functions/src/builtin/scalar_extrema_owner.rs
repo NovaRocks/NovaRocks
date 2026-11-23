@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The greatest/least binding, eager effects and exact flat preparation share one owner.
+//! Scalar extrema pin the common declared domain and its selected ordering.
 
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ pub(super) fn operation(name: &str) -> bool {
     matches!(name, "greatest" | "least")
 }
 
-/// A NULL or nonfinite argument makes the result NULL after eager demand.
+/// A top-level NULL makes the result NULL after eager demand.
 pub(super) fn effects() -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
@@ -102,7 +102,7 @@ impl ExtremaOwner {
             });
         }
         let implementation =
-            PureImplementationId::try_new(format!("builtin.scalar/{name}/selected-v1"))?;
+            PureImplementationId::try_new(format!("builtin.scalar/{name}/selected-v2"))?;
         let implementations = declaration
             .overloads()
             .iter()
@@ -248,6 +248,7 @@ impl PureScalarImplementation for ExtremaOwner {
 
 #[derive(Debug)]
 struct PreparedExtrema {
+    order: Arc<crate::comparison::ExtremaOrder>,
     operation: super::scalar_extrema::ExtremaOperation,
     contract: Arc<ScalarCallContract>,
 }
@@ -261,18 +262,24 @@ impl PreparedScalarKernel for PreparedExtrema {
     }
 
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
-        Ok(Box::new(ExtremaInstance(self.operation)))
+        Ok(Box::new(ExtremaInstance {
+            operation: self.operation,
+            order: self.order.clone(),
+        }))
     }
 }
 
-struct ExtremaInstance(super::scalar_extrema::ExtremaOperation);
+struct ExtremaInstance {
+    operation: super::scalar_extrema::ExtremaOperation,
+    order: Arc<crate::comparison::ExtremaOrder>,
+}
 impl ScalarKernelInstance for ExtremaInstance {
     fn evaluate<'a>(
         &mut self,
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        super::scalar_extrema::evaluate(self.0, input, control)
+        super::scalar_extrema::evaluate(self.operation, &self.order, input, control)
     }
 
     fn retained_bytes(&self) -> usize {
@@ -354,16 +361,13 @@ impl ExtremaOwner {
                 FunctionBindingError::Control(error) => compile_failure(error),
                 _ => invalid("extrema preparation has a stale selected binding"),
             })?;
-            super::scalar_extrema::validate_profile(&contract, || {
-                work.step().map_err(compile_failure)
-            })?;
+            let order =
+                super::scalar_extrema::prepare(&contract, || work.step().map_err(compile_failure))?;
             work.flush().map_err(compile_failure)?;
-            super::scalar_extrema::validate_target(&contract)?;
-            work.flush().map_err(compile_failure)?;
-            work.step().map_err(compile_failure)?;
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.
             Ok(Arc::new(PreparedExtrema {
+                order: Arc::new(order),
                 contract,
                 operation: self.operation,
             }) as Arc<dyn PreparedScalarKernel>)

@@ -502,6 +502,111 @@ fn two_argument_if_preserves_the_selected_type_and_null_branch() {
 }
 
 #[test]
+fn extrema_keep_selected_values_with_exact_width_and_nested_null_order() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let widest = constant(
+        "greatest(BIGINT '9007199254740993', 9007199254740992)",
+        &context,
+    );
+    assert_eq!(
+        widest.batch.values.to_data(),
+        Int64Array::from(vec![9007199254740993]).to_data()
+    );
+    let labels = [
+        ("greatest(DOUBLE 'NaN', DOUBLE 'Infinity')", f64::INFINITY),
+        ("least(DOUBLE 'NaN', DOUBLE '-Infinity')", f64::NEG_INFINITY),
+        ("greatest(DOUBLE '-0.0', DOUBLE '0.0')", -0.0),
+        ("least(DOUBLE '0.0', DOUBLE '-0.0')", 0.0),
+    ];
+    for (text, expected) in labels {
+        let values = constant(text, &context).batch.values;
+        let floats = values.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(floats.value(0).to_bits(), expected.to_bits(), "{text}");
+    }
+    let values = constant("least(DOUBLE 'NaN', DOUBLE 'NaN')", &context)
+        .batch
+        .values;
+    assert!(
+        values
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0)
+            .is_nan()
+    );
+
+    let null = constant("greatest(NULL, NULL)", &context);
+    assert_eq!(null.batch.values.data_type(), &DataType::Null);
+    let fields = arrow::datatypes::Fields::from(vec![
+        arrow::datatypes::Field::new("a", DataType::Float64, true),
+        arrow::datatypes::Field::new("b", DataType::Int32, true),
+    ]);
+    let left = arrow::array::StructArray::new(
+        fields.clone(),
+        vec![
+            Arc::new(Float64Array::from(vec![None])),
+            Arc::new(Int32Array::from(vec![2])),
+        ],
+        None,
+    );
+    let right = arrow::array::StructArray::new(
+        fields.clone(),
+        vec![
+            Arc::new(Float64Array::from(vec![1.0])),
+            Arc::new(Int32Array::from(vec![3])),
+        ],
+        None,
+    );
+    let columns = [
+        column("left_row", 1, DataType::Struct(fields.clone()), false),
+        column("right_row", 2, DataType::Struct(fields), false),
+    ];
+    let expected = right.to_data();
+    let input = batch(&columns, vec![Arc::new(left), Arc::new(right)]);
+    let row = compile("least(left_row, right_row)", &columns, &context);
+    assert_eq!(evaluate(&row, &input).batch.values.to_data(), expected);
+
+    let arrays =
+        arrow::array::ListArray::from_iter_primitive::<arrow::datatypes::Float64Type, _, _>([
+            Some(vec![Some(f64::NAN)]),
+            Some(vec![None]),
+            None,
+            Some(vec![Some(2.0)]),
+        ]);
+    let other =
+        arrow::array::ListArray::from_iter_primitive::<arrow::datatypes::Float64Type, _, _>([
+            Some(vec![Some(1.0)]),
+            Some(vec![Some(1.0)]),
+            Some(vec![Some(1.0)]),
+            Some(vec![Some(1.0)]),
+        ]);
+    let columns = [
+        column("left_value", 1, arrays.data_type().clone(), true),
+        column("right_value", 2, other.data_type().clone(), true),
+    ];
+    let input = batch(&columns, vec![Arc::new(arrays), Arc::new(other)]);
+    for (name, last) in [("greatest", 2.0), ("least", 1.0)] {
+        let typed = compile(
+            &format!("{name}(left_value, right_value)"),
+            &columns,
+            &context,
+        );
+        let result = evaluate(&typed, &input);
+        assert!(result.batch.errors.is_empty());
+        let expected =
+            arrow::array::ListArray::from_iter_primitive::<arrow::datatypes::Float64Type, _, _>([
+                Some(vec![Some(1.0)]),
+                Some(vec![Some(1.0)]),
+                None,
+                Some(vec![Some(last)]),
+            ]);
+        assert_eq!(result.batch.values.to_data(), expected.to_data(), "{name}");
+    }
+}
+
+#[test]
 fn typeof_describes_exact_types_and_demands_the_selected_argument_rows() {
     let functions = fixture();
     let parameters = parameters();

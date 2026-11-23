@@ -2550,33 +2550,6 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                 borrow_creator(&mut creation),
             )?;
         }
-        "greatest" | "least" => {
-            let values =
-                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
-            if !observed_all(
-                values.iter().copied(),
-                |value| value.value_type().temporal().is_none(),
-                work,
-            )? {
-                full_result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                    cx.value(DataType::Null, true, ValueLogicalType::Physical)
-                })?;
-                for value in values {
-                    work.step()?;
-                    full_result =
-                        with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                            cx.trino_common(&full_result, value)
-                        })?
-                        .ok_or(FunctionBindingError::NoMatchingOverload)?;
-                }
-            } else {
-                full_result = fold_value_types_with_creation(
-                    values.into_iter(),
-                    work,
-                    borrow_creator(&mut creation),
-                )?;
-            }
-        }
         "map_concat" => {
             let arguments =
                 dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
@@ -2814,6 +2787,50 @@ impl BuiltinDynamicScalarResolver {
                 aggregate: None,
             });
         }
+        if super::scalar_extrema_owner::operation(&self.canonical_name) {
+            let sources =
+                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
+            let Some((first, rest)) = sources.split_first() else {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
+            };
+            let mut result = (*first).clone();
+            for source in rest {
+                work.step()?;
+                result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                    cx.trino_common(&result, source)
+                })?
+                .ok_or(FunctionBindingError::NoMatchingOverload)?;
+            }
+            if !crate::comparison::ExtremaOrder::supports(
+                result.value_type(),
+                result.data_type(),
+                || work.step(),
+            )? {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
+            }
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.collected_vec::<FunctionArgumentType>(sources.len())
+            })?;
+            let mut targets = Vec::with_capacity(sources.len());
+            for source in sources {
+                work.step()?;
+                let ty = dynamic_nullable(
+                    &result,
+                    source.nullable() || source.data_type() == &DataType::Null,
+                    work,
+                    borrow_creator(&mut creation),
+                )?;
+                targets.push(FunctionArgumentType::Value(ty));
+            }
+            let argument_types =
+                with_binding_creation(creation, work, |cx| cx.publish_arguments(targets))?;
+            return Ok(FunctionBindingSelection {
+                overload: overload.clone(),
+                argument_types,
+                result_type: FunctionResultType::Scalar(result),
+                aggregate: None,
+            });
+        }
         let result = bind_dynamic_scalar_result_with_creation(
             &self.function_id,
             overload,
@@ -2851,32 +2868,6 @@ impl BuiltinDynamicScalarResolver {
                         .map_err(super::scalar_construction::binding_owner_failure)
                     })?;
                     work.step()?;
-                    Ok(FunctionArgumentType::Value(target))
-                })
-                .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?
-        } else if super::scalar_extrema_owner::operation(&self.canonical_name)
-            && (result.value_type().temporal().is_some() || *result.data_type() == DataType::Date32)
-        {
-            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                cx.collected_vec::<FunctionArgumentType>(request.arguments.len())
-            })?;
-            request
-                .arguments
-                .iter()
-                .map(|argument| {
-                    let FunctionArgument::Value {
-                        value_type: source, ..
-                    } = argument
-                    else {
-                        return Err(FunctionBindingError::NoMatchingOverload.into());
-                    };
-                    work.step()?;
-                    let target = dynamic_nullable(
-                        &result,
-                        source.nullable(),
-                        work,
-                        borrow_creator(&mut creation),
-                    )?;
                     Ok(FunctionArgumentType::Value(target))
                 })
                 .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?
@@ -3195,6 +3186,8 @@ pub(super) fn dynamic_definition_parts(
         })?;
     let overload_identity = if name == "map" {
         "builtin.scalar/map/array-keys-array-values-v1".to_string()
+    } else if super::scalar_extrema_owner::operation(name) {
+        format!("builtin.scalar/{name}/dynamic-v2")
     } else {
         format!("builtin.scalar/{name}/dynamic-v1")
     };

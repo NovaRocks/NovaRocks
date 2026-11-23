@@ -1189,7 +1189,7 @@ pub enum ExtremaDirection {
 }
 
 impl ExtremaDirection {
-    fn compare_unordered(self, left: bool, right: bool) -> std::cmp::Ordering {
+    pub(crate) fn compare_unordered(self, left: bool, right: bool) -> std::cmp::Ordering {
         match self {
             Self::Minimum => left.cmp(&right),
             Self::Maximum => right.cmp(&left),

@@ -86,6 +86,16 @@ pub(super) fn prepared_for_test(
     let owner = owner(name);
     let arguments = (*sources).clone().map(argument);
     let selected = Arc::new(owner.resolve(request(&arguments), crate::binding_test_control())?);
+    let arguments = selected
+        .argument_types
+        .iter()
+        .map(|argument_type| {
+            let crate::FunctionArgumentType::Value(value) = argument_type else {
+                panic!("extrema requires values");
+            };
+            argument(value.clone())
+        })
+        .collect::<Vec<_>>();
     let parameters = SemanticParameters::try_new([]).unwrap();
     let uses = [
         Some(ExpressionUseId::new(42)),
@@ -102,8 +112,9 @@ pub(super) fn prepared_for_test(
 }
 
 #[test]
-fn extrema_owner_all_supported_exact_profiles_are_nullable_eager() {
+fn extrema_owner_exact_profiles_keep_source_nullability_and_eager_demand() {
     let profiles = vec![
+        DataType::Boolean,
         DataType::Int8,
         DataType::Int16,
         DataType::Int32,
@@ -111,9 +122,11 @@ fn extrema_owner_all_supported_exact_profiles_are_nullable_eager() {
         DataType::Float32,
         DataType::Float64,
         DataType::Utf8,
+        DataType::Binary,
         DataType::Date32,
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        DataType::Struct(vec![Field::new("item", DataType::Int64, true)].into()),
         DataType::Decimal128(9, 0),
-        DataType::Decimal128(38, -46),
         DataType::Timestamp(TimeUnit::Second, None),
         DataType::Timestamp(TimeUnit::Millisecond, None),
         DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -129,7 +142,7 @@ fn extrema_owner_all_supported_exact_profiles_are_nullable_eager() {
                 let prepared = prepared_for_test(name, &[source.clone(), source]).unwrap();
                 let result = prepared.contract().result_type();
                 assert_eq!(result.data_type(), ty);
-                assert!(result.nullable());
+                assert_eq!(result.nullable(), nullable);
                 assert_eq!(
                     prepared.contract().effects().argument_control,
                     ArgumentControl::Eager
@@ -150,31 +163,33 @@ fn extrema_owner_all_supported_exact_profiles_are_nullable_eager() {
         .unwrap();
         assert_eq!(
             prepared.contract().result_type().data_type().clone(),
-            DataType::Decimal256(39, 1)
+            DataType::Decimal128(38, 1)
         );
     }
 }
 #[test]
-fn extrema_owner_rejects_actual_unsupported_numeric_and_json_result_domain() {
+fn extrema_owner_rejects_unordered_domains_and_invalid_zones() {
+    let entries = DataType::Struct(
+        vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into(),
+    );
+    let map = FunctionValueType::new(
+        DataType::Map(Arc::new(Field::new("entries", entries, false)), false),
+        true,
+    );
     for name in ["greatest", "least"] {
-        for ty in [
-            DataType::Boolean,
-            DataType::Binary,
-            DataType::UInt64,
-            DataType::Decimal256(38, 2),
-            DataType::FixedSizeBinary(16),
-            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
-            DataType::Struct(vec![Field::new("item", DataType::Int64, true)].into()),
-        ] {
-            let source = FunctionValueType::from_legacy_declared_projection(ty, true);
-            assert!(prepared_for_test(name, &[source.clone(), source]).is_err());
-        }
+        assert!(prepared_for_test(name, &[map.clone(), map.clone()]).is_err());
         let json =
             FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
                 .unwrap();
-        // Existing v1 formats these legal JSON numeric texts as unquoted dates.
-        // Preserving a Json result receipt would therefore assert a false domain.
-        assert!(prepared_for_test(name, &[json.clone(), json]).is_err());
+        assert!(prepared_for_test(name, &[json.clone(), json.clone()]).is_err());
+        let text = FunctionValueType::new(DataType::Utf8, true);
+        for mixed in [[json.clone(), text.clone()], [text, json]] {
+            assert!(prepared_for_test(name, &mixed).is_err());
+        }
         let invalid = FunctionValueType::new(
             DataType::Timestamp(TimeUnit::Microsecond, Some("invalid/zone".into())),
             true,
@@ -184,60 +199,24 @@ fn extrema_owner_rejects_actual_unsupported_numeric_and_json_result_domain() {
 }
 
 #[test]
-fn extrema_owner_json_source_with_declared_physical_utf8_result_is_supported() {
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
-    let physical = FunctionValueType::new(DataType::Utf8, true);
+fn extrema_owner_retains_unknown_result_and_applies_common_precision_without_rounding() {
     for name in ["greatest", "least"] {
-        for sources in [
-            [json.clone(), physical.clone()],
-            [physical.clone(), json.clone()],
-        ] {
-            let prepared = prepared_for_test(name, &sources).unwrap();
-            assert_eq!(
-                prepared.contract().result_type().logical_type(),
-                ValueLogicalType::Physical
-            );
-            assert_eq!(
-                prepared.contract().result_type().data_type().clone(),
-                DataType::Utf8
-            );
-        }
-    }
-}
-
-#[test]
-fn extrema_owner_null_result_refusal_preserves_the_original_full_cast_error() {
-    use arrow_array::{ArrayRef, NullArray};
-    let expected =
-        "math: failed to cast output: Cast error: Casting from Timestamp(µs) to Null not supported";
-    for name in ["greatest", "least"] {
-        let source = FunctionValueType::new(DataType::Null, true);
-        let failure = prepared_for_test(name, &[source.clone(), source]).unwrap_err();
-        assert!(
-            failure
-                .to_string()
-                .contains("greatest/least has no v1 value result for an exact Null target")
+        let unknown = FunctionValueType::new(DataType::Null, true);
+        let prepared = prepared_for_test(name, &[unknown.clone(), unknown.clone()]).unwrap();
+        assert_eq!(prepared.contract().result_type(), &unknown);
+        let wide = FunctionValueType::new(DataType::Int64, false);
+        let narrow = FunctionValueType::new(DataType::Int8, true);
+        let prepared = prepared_for_test(name, &[narrow, wide.clone()]).unwrap();
+        assert_eq!(
+            prepared.contract().result_type(),
+            &wide.with_nullable(true).unwrap()
         );
-        for rows in [0, 5] {
-            let arrays = [Arc::new(NullArray::new(rows)) as ArrayRef];
-            let operation = if name == "greatest" {
-                super::super::scalar_extrema::ExtremaOperation::Greatest
-            } else {
-                super::super::scalar_extrema::ExtremaOperation::Least
-            };
-            assert_eq!(
-                super::super::scalar_extrema::evaluate_legacy(
-                    operation,
-                    &arrays,
-                    rows,
-                    Some(&DataType::Null)
-                )
-                .unwrap_err()
-                .to_string(),
-                expected
-            );
-        }
+        assert_eq!(
+            prepared.contract().selected().argument_types.as_ref(),
+            [
+                crate::FunctionArgumentType::Value(wide.with_nullable(true).unwrap()),
+                crate::FunctionArgumentType::Value(wide),
+            ]
+        );
     }
 }

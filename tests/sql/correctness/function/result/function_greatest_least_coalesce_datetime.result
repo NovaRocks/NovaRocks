@@ -67,3 +67,18 @@ first_instant	first_clock
 -- types	INTERVAL SECOND(1, 12)
 elapsed
 0 00:00:01.000000000002
+
+-- query 15
+-- types	bigint	varchar	boolean	boolean
+exact_integer	exact_decimal	boolean_greatest	boolean_least
+9007199254740993	decimal(38,1)	true	false
+
+-- query 16
+-- types	double	double	double	double	varchar	double
+positive_limit	negative_limit	first_negative_zero	first_positive_zero	unknown_type	strict_null
+Infinity	-Infinity	-0.0	0.0	unknown	NULL
+
+-- query 17
+-- types	array(double)	array(double)	array(double)
+array_greatest	array_least	array_nested_null
+[1.0]	[1.0]	[1.0]
