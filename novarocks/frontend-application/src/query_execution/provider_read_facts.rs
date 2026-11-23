@@ -71,8 +71,8 @@ use novarocks_spi::connector::{
         ConnectorReadMetadataKind, ConnectorReadMetadataRequest, ConnectorReadMetadataVersion,
         ConnectorReadNullOrdering, ConnectorReadProperties, ConnectorReadPublicSchema,
         ConnectorReadRelationVersion, ConnectorReadRequestControl, ConnectorReadSortDirection,
-        ConnectorReadStaticFacts, ConnectorReadTableHandle, ConnectorSession, Constraint,
-        SchemaTableName, TupleDomain,
+        ConnectorReadStaticFacts, ConnectorReadTableHandle, ConnectorSession, ConnectorValueType,
+        Constraint, SchemaTableName, TupleDomain,
         negotiation::{
             ReadFreezeRequest, ReadNegotiation, ReadPushdownDisposition, ReadPushdownOp,
             ReadPushdownOutcome,
@@ -1419,8 +1419,11 @@ fn finish_read_from_opened(
             ProviderReadError::from(error)
                 .context(format!("provider read of {name} has no frozen relation"))
         })?;
-    let (enforced_predicate, unenforced_predicate, remaining_expression) =
-        filter_responsibility(&offer, &negotiated.outcomes);
+    let (enforced_predicate, unenforced_predicate, remaining_expression) = filter_responsibility(
+        &offer,
+        &negotiated.outcomes,
+        entire_filter_exact(need, &offer, &negotiated.outcomes),
+    );
     let (schema, named_columns) = column_facts(
         need.columns(),
         &assignments,
@@ -2076,6 +2079,7 @@ fn offered_constraint(offer: &OfferedOps) -> ConnectorReadConstraint {
 fn filter_responsibility(
     offer: &OfferedOps,
     outcomes: &[ReadPushdownOutcome],
+    sql_filter_exact: bool,
 ) -> (
     TupleDomain<ConnectorReadColumnHandle>,
     TupleDomain<ConnectorReadColumnHandle>,
@@ -2110,6 +2114,20 @@ fn filter_responsibility(
                 // and guessing "nothing remains" would drop rows.
                 return nothing_for_the_reader;
             };
+            // A provider can accept an exactly projected wider temporal
+            // domain even when SQL retains the original coercion and filter.
+            // For that query the original offer remains pruning information.
+            if !sql_filter_exact
+                && residual.summary().is_all()
+                && residual.expression().is_constant_true()
+                && offered.summary().domains().is_some_and(|domains| {
+                    domains.values().any(|domain| {
+                        matches!(domain.value_type(), ConnectorValueType::Temporal(_))
+                    })
+                })
+            {
+                return (TupleDomain::all(), offered.summary().clone(), None);
+            }
             let unenforced = residual.summary().clone();
             // Enforcement is claimed only for a column the provider kept
             // whole. A column handed back partially is covered by its own
@@ -2255,7 +2273,7 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
 #[cfg(test)]
 mod tests {
     use novarocks_physical_plan::{ProviderReadOccurrenceId, ValueType};
-    use novarocks_spi::connector::read_stack::{ConnectorValueType, TupleDomain};
+    use novarocks_spi::connector::read_stack::TupleDomain;
     use novarocks_sql::binding::SqlTableBindingAllocator;
     use novarocks_sql::compiler::fixtures;
     use novarocks_types::naming::TableIdentity;
@@ -2484,7 +2502,7 @@ mod tests {
             ReadPushdownDisposition::Exact,
         ] {
             let outcomes = all_answered(&offer, disposition, ReadPushdownDisposition::Exact);
-            let (enforced, unenforced, remaining) = filter_responsibility(&offer, &outcomes);
+            let (enforced, unenforced, remaining) = filter_responsibility(&offer, &outcomes, false);
             assert!(!entire_filter_exact(&need, &offer, &outcomes));
             assert_eq!(enforced, TupleDomain::all(), "{disposition:?}");
             assert_eq!(unenforced, TupleDomain::all(), "{disposition:?}");

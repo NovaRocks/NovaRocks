@@ -314,6 +314,9 @@ impl PreparedReadManifestList {
         for entry in list.consume_entries() {
             active()?;
             if entry.content == ManifestContentType::Data
+                // A rewrite can keep a manifest containing only deleted
+                // entries. Missing summary counts still admit live files.
+                && (entry.has_added_files() || entry.has_existing_files())
                 && metadata
                     .partition_spec_by_id(entry.partition_spec_id)
                     .is_some()
@@ -1726,6 +1729,132 @@ mod tests {
                 .err()
                 .unwrap();
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn prepared_list_ignores_old_spec_only_when_its_live_counts_are_both_zero() {
+        let io = FileIO::new_with_memory();
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "p",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let builder = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory:///c6".to_owned(),
+            FormatVersion::V1,
+            HashMap::new(),
+        )
+        .unwrap();
+        let metadata = builder.build().unwrap().metadata;
+        let old_spec_id = metadata.default_partition_spec_id();
+        let identity = PartitionSpec::builder(metadata.current_schema().clone())
+            .add_partition_field("p", "p_part", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let list_path = "memory:///c6-list.avro";
+        let metadata = metadata
+            .into_builder(None)
+            .add_partition_spec(identity.into_unbound())
+            .unwrap()
+            .set_default_partition_spec(-1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(77)
+            .with_parent_snapshot_id(None)
+            .with_sequence_number(0)
+            .with_timestamp_ms(metadata.last_updated_ms())
+            .with_manifest_list(list_path.to_owned())
+            .with_summary(Summary {
+                operation: Operation::Replace,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(metadata.current_schema_id())
+            .build();
+        let metadata = metadata
+            .into_builder(None)
+            .add_snapshot(snapshot)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let old_spec = metadata.partition_spec_by_id(old_spec_id).unwrap();
+        let current_spec_id = metadata.default_partition_spec_id();
+        assert_ne!(old_spec_id, current_spec_id);
+        let mut old_manifest = ManifestWriterBuilder::new(
+            io.new_output("memory:///c6-old.avro").unwrap(),
+            Some(77),
+            metadata.current_schema().clone(),
+            old_spec.as_ref().clone(),
+        )
+        .build_v1();
+        old_manifest
+            .add_delete_file(data("removed"), 0, Some(0))
+            .unwrap();
+        let old_descriptor = old_manifest.write_manifest_file().await.unwrap();
+        assert_eq!(old_descriptor.added_files_count, Some(0));
+        assert_eq!(old_descriptor.existing_files_count, Some(0));
+        assert_eq!(old_descriptor.deleted_files_count, Some(1));
+
+        let mut current_manifest = ManifestWriterBuilder::new(
+            io.new_output("memory:///c6-current.avro").unwrap(),
+            Some(77),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().as_ref().clone(),
+        )
+        .build_v1();
+        let live = file(
+            "live",
+            DataContentType::Data,
+            Struct::from_iter([Some(Literal::int(10))]),
+        )
+        .build()
+        .unwrap();
+        current_manifest.add_file(live, 0).unwrap();
+        let current_descriptor = current_manifest.write_manifest_file().await.unwrap();
+        let table = Table::builder()
+            .runtime(crate::iceberg::Runtime::try_current().unwrap())
+            .file_io(io.clone())
+            .metadata(metadata)
+            .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+            .disable_cache()
+            .build()
+            .unwrap();
+        for (added, existing) in [(Some(0), Some(0)), (None, Some(0)), (Some(0), None)] {
+            let old_descriptor = ManifestFile {
+                added_files_count: added,
+                existing_files_count: existing,
+                ..old_descriptor.clone()
+            };
+            let mut writer = ManifestListWriter::v1(
+                io.new_output(list_path).unwrap().writer().await.unwrap(),
+                77,
+                None,
+            );
+            writer
+                .add_manifests([old_descriptor, current_descriptor.clone()].into_iter())
+                .unwrap();
+            writer.close().await.unwrap();
+
+            let prepared = PreparedReadManifestList::prepare(&table, 77, None)
+                .await
+                .unwrap();
+            if added.is_some() && existing.is_some() {
+                assert_eq!(prepared.spec_ids(), &[current_spec_id]);
+            } else {
+                assert_eq!(prepared.spec_ids(), &[old_spec_id, current_spec_id]);
+            }
+            assert_eq!(prepared.entries.len(), 2);
+        }
     }
 
     #[tokio::test]
