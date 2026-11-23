@@ -70,7 +70,7 @@ fn n_fixture(limit: usize) -> Fixture {
     // freezer's request constant stays None, as this owner's contract permits.
     fixture_with_calls(&[int64(true)], &rows, &[(0, true, true)], limit, true)
 }
-type NOutput = (Option<i64>, Vec<i128>, Vec<i128>);
+type NOutput = (Option<i64>, Option<Vec<i128>>, Option<Vec<i128>>);
 fn n_oracle(limit: usize) -> Vec<NOutput> {
     let mut groups = BTreeMap::<Option<i64>, Vec<i128>>::new();
     for &(key, value) in N_ROWS {
@@ -84,8 +84,8 @@ fn n_oracle(limit: usize) -> Vec<NOutput> {
         .take(limit)
         .map(|(key, mut values)| {
             values.sort();
-            let min = values.iter().copied().take(2).collect();
-            let max = values[values.len().saturating_sub(2)..].to_vec();
+            let min = (!values.is_empty()).then(|| values.iter().copied().take(2).collect());
+            let max = (!values.is_empty()).then(|| values.iter().rev().copied().take(2).collect());
             (key, min, max)
         })
         .collect()
@@ -106,10 +106,7 @@ fn n_results(chunks: &[Chunk]) -> Vec<NOutput> {
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .unwrap();
-            assert!(
-                !lists.is_null(row),
-                "NULL-only state produces an empty list"
-            );
+
             let DataType::List(item) = lists.data_type() else {
                 unreachable!()
             };
@@ -125,17 +122,22 @@ fn n_results(chunks: &[Chunk]) -> Vec<NOutput> {
             };
             assert_eq!(child.domain(), Some(ValueLogicalType::LargeInt));
             assert!(item.metadata().as_arc().is_none());
+            if lists.is_null(row) {
+                return None;
+            }
             let values = lists.value(row);
             let binary = values
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .unwrap();
-            (0..binary.len())
-                .map(|index| {
-                    assert!(!binary.is_null(index));
-                    i128::from_be_bytes(binary.value(index).try_into().unwrap())
-                })
-                .collect::<Vec<_>>()
+            Some(
+                (0..binary.len())
+                    .map(|index| {
+                        assert!(!binary.is_null(index));
+                        i128::from_be_bytes(binary.value(index).try_into().unwrap())
+                    })
+                    .collect::<Vec<_>>(),
+            )
         };
         for row in 0..chunk.len() {
             result.push((

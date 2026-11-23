@@ -70,6 +70,21 @@ const EXPRESSION_NOT_SCALAR: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const EXPRESSION_NOT_IN_DISTINCT: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.expression_not_in_distinct"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const MISSING_ORDER_BY: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.missing_order_by"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const INVALID_WINDOW_FRAME: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.invalid_window_frame"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const TYPE_MISMATCH: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.type_mismatch"),
     phase: ErrorPhase::Analyze,
@@ -189,6 +204,9 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     TYPE_MISMATCH,
     FUNCTION_NOT_AGGREGATE,
     EXPRESSION_NOT_SCALAR,
+    EXPRESSION_NOT_IN_DISTINCT,
+    MISSING_ORDER_BY,
+    INVALID_WINDOW_FRAME,
     INVALID_LITERAL,
     NUMERIC_OUT_OF_RANGE,
     INVALID_ARGUMENT,
@@ -224,6 +242,9 @@ pub enum AnalyzeErrorKind {
     TypeMismatch,
     FunctionNotAggregate,
     ExpressionNotScalar,
+    ExpressionNotInDistinct,
+    MissingOrderBy,
+    InvalidWindowFrame,
     InvalidLiteral,
     NumericOutOfRange,
     InvalidArgument,
@@ -261,6 +282,9 @@ impl AnalyzeErrorKind {
             Self::TypeMismatch => TYPE_MISMATCH,
             Self::FunctionNotAggregate => FUNCTION_NOT_AGGREGATE,
             Self::ExpressionNotScalar => EXPRESSION_NOT_SCALAR,
+            Self::ExpressionNotInDistinct => EXPRESSION_NOT_IN_DISTINCT,
+            Self::MissingOrderBy => MISSING_ORDER_BY,
+            Self::InvalidWindowFrame => INVALID_WINDOW_FRAME,
             Self::InvalidLiteral => INVALID_LITERAL,
             Self::NumericOutOfRange => NUMERIC_OUT_OF_RANGE,
             Self::InvalidArgument => INVALID_ARGUMENT,
@@ -677,6 +701,18 @@ impl AnalyzeError {
         Self::at(AnalyzeErrorKind::InvalidFunctionArgument, message, span)
     }
 
+    pub(crate) fn expression_not_in_distinct(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::ExpressionNotInDistinct, message, span)
+    }
+
+    pub(crate) fn missing_order_by(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::MissingOrderBy, message, span)
+    }
+
+    pub(crate) fn invalid_window_frame(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::InvalidWindowFrame, message, span)
+    }
+
     pub(crate) fn expression_not_constant(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::ExpressionNotConstant, message, span)
     }
@@ -1021,6 +1057,9 @@ mod tests {
                 "sql.analyze.type_mismatch",
                 "sql.analyze.function_not_aggregate",
                 "sql.analyze.expression_not_scalar",
+                "sql.analyze.expression_not_in_distinct",
+                "sql.analyze.missing_order_by",
+                "sql.analyze.invalid_window_frame",
                 "sql.analyze.invalid_literal",
                 "sql.analyze.numeric_out_of_range",
                 "sql.analyze.invalid_argument",

@@ -158,6 +158,9 @@ fn replacement(
     Ok(Some(replacement))
 }
 impl PreparedAggregateKernel for Utf8ExtremaKernel {
+    fn supports_local_stages(&self) -> bool {
+        true
+    }
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,

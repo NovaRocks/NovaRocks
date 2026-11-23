@@ -56,6 +56,9 @@ fn observed<T>(
     observation.finish(result)
 }
 impl PreparedAggregateKernel for CountDistinctKernel {
+    fn supports_local_stages(&self) -> bool {
+        true
+    }
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,

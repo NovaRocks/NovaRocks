@@ -231,31 +231,16 @@ pub fn admit_persisted_definition_semantics(
         }
         _ => return Ok(()),
     };
-    let (legacy, strict) = match definition {
-        Some(query) => {
-            let map_error = |error: novarocks_sql::analyze_error::AnalyzeError| {
-                QueryServiceError::from_user_error(error.to_user_error(Some(source)))
-            };
-            (
-                sql_mode::query_uses_group_concat_legacy(caller, query).map_err(map_error)?,
-                sql_mode::query_uses_error_if_overflow(caller, query).map_err(map_error)?,
-            )
-        }
-        None => (
-            caller.sql_mode().group_concat_legacy(),
-            caller.sql_mode().error_if_overflow(),
-        ),
+    let strict = match definition {
+        Some(query) => sql_mode::query_uses_error_if_overflow(caller, query).map_err(|error| {
+            QueryServiceError::from_user_error(error.to_user_error(Some(source)))
+        })?,
+        None => caller.sql_mode().error_if_overflow(),
     };
-    let setting = if legacy {
-        "GROUP_CONCAT_LEGACY"
-    } else if strict {
-        "ERROR_IF_OVERFLOW"
-    } else {
+    if !strict {
         return Ok(());
-    };
-    let message = format!(
-        "unsupported semantic setting: {setting} is not captured for persistent VIEW or MATERIALIZED VIEW definition replay"
-    );
+    }
+    let message = "unsupported semantic setting: ERROR_IF_OVERFLOW is not captured for persistent VIEW or MATERIALIZED VIEW definition replay";
     Err(QueryServiceError::from_user_error(
         SessionAdmitError::PersistedDefinitionSemanticsUnsupported
             .to_user_error(source, span, message),
@@ -639,9 +624,6 @@ mod tests {
         use novarocks_sql::sql_mode::SqlMode;
 
         let default = SqlSemanticSettings::default();
-        let legacy = default
-            .clone()
-            .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY"));
         let strict = default
             .clone()
             .with_sql_mode(SqlMode::from_assignment("ERROR_IF_OVERFLOW"));
@@ -657,10 +639,7 @@ mod tests {
                 panic!("expected definition or replay preparation: {source}");
             };
             assert!(admit_persisted_definition_semantics(source, &preparation, &default).is_ok());
-            for (settings, feature) in [
-                (&legacy, "GROUP_CONCAT_LEGACY"),
-                (&strict, "ERROR_IF_OVERFLOW"),
-            ] {
+            for (settings, feature) in [(&strict, "ERROR_IF_OVERFLOW")] {
                 let error = admit_persisted_definition_semantics(source, &preparation, settings)
                     .unwrap_err();
                 let user = error.user_error().unwrap();

@@ -220,7 +220,7 @@ ORDER BY
 USE ${case_db};
 SELECT
     id,
-    GROUP_CONCAT(varchar_value ORDER BY varchar_value) AS group_concat_varchar_value
+    LISTAGG(CAST(varchar_value AS VARCHAR), ',') WITHIN GROUP (ORDER BY varchar_value) AS group_concat_varchar_value
 FROM
     test_agg_group_single_key_values
 GROUP BY
@@ -232,7 +232,7 @@ ORDER BY
 USE ${case_db};
 SELECT
     id,
-    GROUP_CONCAT(double_value ORDER BY double_value) AS group_concat_double_value
+    LISTAGG(CAST(double_value AS VARCHAR), ',') WITHIN GROUP (ORDER BY double_value) AS group_concat_double_value
 FROM
     test_agg_group_single_key_values
 GROUP BY
@@ -310,7 +310,7 @@ USE ${case_db};
 SELECT
     id,
     big_value,
-    GROUP_CONCAT(varchar_value ORDER BY varchar_value) AS group_concat_varchar_value
+    LISTAGG(CAST(varchar_value AS VARCHAR), ',') WITHIN GROUP (ORDER BY varchar_value) AS group_concat_varchar_value
 FROM
     test_agg_group_multi_key_values
 GROUP BY

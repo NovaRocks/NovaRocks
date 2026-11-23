@@ -132,7 +132,7 @@ fn reconstruct_runtime_query_options(options: &QueryOptions) -> RuntimeQueryOpti
         runtime_filter_scan_wait_time_ms: src.runtime_filter_scan_wait_time_ms,
         runtime_filter_wait_timeout_ms: src.runtime_filter_wait_timeout_ms,
         allow_throw_exception: src.allow_throw_exception,
-        group_concat_max_len: src.group_concat_max_len,
+
         enable_join_runtime_bitset_filter: src.enable_join_runtime_bitset_filter,
         global_runtime_filter_build_max_size: (src.global_runtime_filter_build_max_size > 0)
             .then_some(src.global_runtime_filter_build_max_size),

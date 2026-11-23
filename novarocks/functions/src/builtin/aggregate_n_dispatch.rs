@@ -88,6 +88,13 @@ impl PreparedAggregateKernel for NKernel {
     type State = NProfileState;
     type PreparedUpdateBatch<'a> = NUpdate<'a>;
     type PreparedMergeBatch<'a> = NMerge<'a>;
+    fn supports_local_stages(&self) -> bool {
+        let selected = self.contract().call().selected();
+        !matches!(
+            selected.overload.as_str(),
+            "builtin.aggregate/min/top-n-v1" | "builtin.aggregate/max/top-n-v1"
+        )
+    }
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,

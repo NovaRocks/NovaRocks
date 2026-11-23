@@ -207,7 +207,11 @@ fn sql_effect_rendering_roundtrips_without_normalizing_varchar() {
     assert_eq!(text.raw_value(), "group_concat_legacy");
     let mut state = SessionSqlState::default();
     text.project_into(&mut state).unwrap();
-    assert!(state.sql_semantics.sql_mode().group_concat_legacy());
+    assert_eq!(
+        state.sql_semantics.sql_mode().assignment(),
+        "group_concat_legacy"
+    );
+    assert!(!state.sql_semantics.sql_mode().error_if_overflow());
     assert_eq!(text.raw_value(), "group_concat_legacy");
 }
 

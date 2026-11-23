@@ -19,7 +19,7 @@
 -- Test Objective:
 -- 1. Validate that a column reference can be used as the default value for lead/lag.
 -- 2. Validate IGNORE NULLS combined with column default.
--- 3. Verify FE rejects column expressions (not plain column refs) as default.
+-- 3. Verify row-local default expressions are evaluated for missing targets.
 -- 4. Verify FE rejects type-mismatched column default (INT col, VARCHAR default).
 -- 5. Validate VARCHAR column type with column defaults.
 -- 6. Validate same-type ARRAY column defaults and preserve NULL target values.
@@ -105,10 +105,9 @@ SELECT col_1, col_2, LEAD(col_2, 2, col_3) OVER (ORDER BY col_1) AS lead_result
 FROM ${case_db}.t_col_int ORDER BY col_1;
 
 -- query 4
--- INT: column expression as default is rejected by FE
--- @expect_error=The type of the third parameter of LEAD/LAG not match the type INT.
+-- INT: evaluate the default expression on the current row if no target row exists.
 SELECT col_1, col_2, LAG(col_2, 2, col_3 * 2 + 99) OVER (ORDER BY col_1) AS lag_result
-FROM ${case_db}.t_col_int;
+FROM ${case_db}.t_col_int ORDER BY col_1;
 
 -- query 5
 -- INT: LAG IGNORE NULLS with INT column as default
@@ -122,7 +121,7 @@ FROM ${case_db}.t_col_int ORDER BY col_1;
 
 -- query 7
 -- VARCHAR default for INT column is rejected by FE (type mismatch)
--- @expect_error=The type of the third parameter of LEAD/LAG not match the type INT.
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
 SELECT col_1, col_2, LAG(col_2, 2, col_3) OVER (ORDER BY col_1) AS lag_result
 FROM ${case_db}.t_col_varchar_default;
 

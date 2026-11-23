@@ -34,8 +34,6 @@ pub(super) fn encode_key(key: SemanticParameterKey) -> i32 {
         SemanticParameterKey::AllowThrowException => {
             wire::SemanticParameterKey::AllowThrowException
         }
-        SemanticParameterKey::GroupConcatLegacy => wire::SemanticParameterKey::GroupConcatLegacy,
-        SemanticParameterKey::GroupConcatMaxLen => wire::SemanticParameterKey::GroupConcatMaxLen,
     }) as i32
 }
 
@@ -47,12 +45,6 @@ pub(super) fn decode_key(key: i32) -> Result<SemanticParameterKey, SemanticsCode
         Ok(wire::SemanticParameterKey::TimeZone) => Ok(SemanticParameterKey::TimeZone),
         Ok(wire::SemanticParameterKey::AllowThrowException) => {
             Ok(SemanticParameterKey::AllowThrowException)
-        }
-        Ok(wire::SemanticParameterKey::GroupConcatLegacy) => {
-            Ok(SemanticParameterKey::GroupConcatLegacy)
-        }
-        Ok(wire::SemanticParameterKey::GroupConcatMaxLen) => {
-            Ok(SemanticParameterKey::GroupConcatMaxLen)
         }
         _ => Err(SemanticsCodecError::InvalidShape(
             "unknown or unspecified semantic parameter key",
@@ -158,12 +150,6 @@ fn emit_parameter_entries(
             SemanticParameterValue::AllowThrowException(value) => {
                 wire::semantic_parameter::Value::AllowThrowException(*value)
             }
-            SemanticParameterValue::GroupConcatLegacy(value) => {
-                wire::semantic_parameter::Value::GroupConcatLegacy(*value)
-            }
-            SemanticParameterValue::GroupConcatMaxLen(value) => {
-                wire::semantic_parameter::Value::GroupConcatMaxLen(*value)
-            }
         };
         entries.push(wire::SemanticParameter {
             id: id.get(),
@@ -199,12 +185,6 @@ fn decode_value(
         }
         Some(Value::AllowThrowException(value)) => {
             Ok(SemanticParameterValue::AllowThrowException(*value))
-        }
-        Some(Value::GroupConcatLegacy(value)) => {
-            Ok(SemanticParameterValue::GroupConcatLegacy(*value))
-        }
-        Some(Value::GroupConcatMaxLen(value)) => {
-            Ok(SemanticParameterValue::GroupConcatMaxLen(*value))
         }
         None => Err(SemanticsCodecError::InvalidShape(
             "semantic parameter is missing its value variant",
@@ -448,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn parameter_projection_preserves_all_six_exact_values_without_clamps() {
+    fn parameter_projection_preserves_exact_values_without_clamps() {
         use wire::semantic_parameter::Value;
         let dto = wire::SemanticParameters {
             entries: vec![
@@ -461,8 +441,8 @@ mod tests {
                 ),
                 entry(9, Value::TimeZone("-07:30".into())),
                 entry(11, Value::AllowThrowException(false)),
-                entry(15, Value::GroupConcatLegacy(false)),
-                entry(u32::MAX, Value::GroupConcatMaxLen(-77)),
+                entry(15, Value::AllowThrowException(false)),
+                entry(u32::MAX, Value::AllowThrowException(true)),
             ],
         };
         let before = dto.clone();
@@ -485,11 +465,11 @@ mod tests {
             ),
             (
                 SemanticParameterId::new(15),
-                SemanticParameterValue::GroupConcatLegacy(false),
+                SemanticParameterValue::AllowThrowException(false),
             ),
             (
                 SemanticParameterId::new(u32::MAX),
-                SemanticParameterValue::GroupConcatMaxLen(-77),
+                SemanticParameterValue::AllowThrowException(true),
             ),
         ])
         .unwrap();
@@ -499,12 +479,20 @@ mod tests {
         assert_eq!(encode(&table, &Control::default()).unwrap(), dto);
         for raw in [i64::MIN, 0, i64::MAX] {
             let dto = wire::SemanticParameters {
-                entries: vec![entry(42, Value::GroupConcatMaxLen(raw))],
+                entries: vec![entry(
+                    42,
+                    wire::semantic_parameter::Value::StatementStartUtc(wire::StatementStartUtc {
+                        seconds: Some(raw),
+                        nanos: Some(0),
+                    }),
+                )],
             };
             let table = decode(&dto, &Control::default()).unwrap();
             assert_eq!(
                 table.get(SemanticParameterId::new(42)),
-                Some(&SemanticParameterValue::GroupConcatMaxLen(raw))
+                Some(&SemanticParameterValue::StatementStartUtc(
+                    novarocks_type_contract::StatementStartUtc::try_new(raw, 0).unwrap()
+                ))
             );
         }
     }
@@ -544,7 +532,7 @@ mod tests {
                 &SemanticParameterValue::AllowThrowException(value)
             );
             let wrong = SemanticParameterRef {
-                expected_key: SemanticParameterKey::GroupConcatLegacy,
+                expected_key: SemanticParameterKey::TimeZone,
                 ..decoded
             };
             assert!(table.require(wrong).is_err());
@@ -618,7 +606,7 @@ mod tests {
         assert!(matches!(
             table.require(SemanticParameterRef {
                 id: SemanticParameterId::new(0),
-                expected_key: SemanticParameterKey::GroupConcatLegacy,
+                expected_key: SemanticParameterKey::AllowThrowException,
             }),
             Err(SemanticParameterError::KeyMismatch(_))
         ));
@@ -641,12 +629,12 @@ mod tests {
                 wire::SemanticParameterKey::AllowThrowException,
             ),
             (
-                SemanticParameterKey::GroupConcatLegacy,
-                wire::SemanticParameterKey::GroupConcatLegacy,
+                SemanticParameterKey::AllowThrowException,
+                wire::SemanticParameterKey::AllowThrowException,
             ),
             (
-                SemanticParameterKey::GroupConcatMaxLen,
-                wire::SemanticParameterKey::GroupConcatMaxLen,
+                SemanticParameterKey::StatementStartUtc,
+                wire::SemanticParameterKey::StatementStartUtc,
             ),
         ];
         for (typed, wire_key) in key_pairs {
@@ -683,7 +671,7 @@ mod tests {
         let duplicate = wire::SemanticParameters {
             entries: vec![
                 entry(0, Value::AllowThrowException(false)),
-                entry(0, Value::GroupConcatLegacy(true)),
+                entry(0, Value::AllowThrowException(true)),
             ],
         };
         assert!(
@@ -715,7 +703,7 @@ mod tests {
         ));
         let missing = wire::SemanticParameters {
             entries: vec![
-                entry(0, Value::GroupConcatLegacy(false)),
+                entry(0, Value::AllowThrowException(false)),
                 wire::SemanticParameter { id: 1, value: None },
             ],
         };

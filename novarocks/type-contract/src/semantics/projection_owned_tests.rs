@@ -81,15 +81,15 @@ fn source() -> SemanticParameters {
         ),
         (
             SemanticParameterId::new(4),
-            SemanticParameterValue::GroupConcatLegacy(false),
+            SemanticParameterValue::AllowThrowException(false),
         ),
         (
             SemanticParameterId::new(5),
-            SemanticParameterValue::GroupConcatLegacy(true),
+            SemanticParameterValue::AllowThrowException(true),
         ),
         (
             SemanticParameterId::new(u32::MAX),
-            SemanticParameterValue::GroupConcatMaxLen(-23),
+            SemanticParameterValue::AllowThrowException(true),
         ),
     ])
     .unwrap()
@@ -132,7 +132,10 @@ fn immutable_projection_actual_unique_entry_loans_preserve_full_values_after_sou
             .map(|(id, value)| reference(id.get(), value.key()))
             .collect();
         refs.push(reference(1, SemanticParameterKey::TimeZone));
-        refs.push(reference(u32::MAX, SemanticParameterKey::GroupConcatMaxLen));
+        refs.push(reference(
+            u32::MAX,
+            SemanticParameterKey::AllowThrowException,
+        ));
         let mut captured = Vec::new();
         let mut header_counts = Vec::new();
         let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
@@ -198,7 +201,7 @@ fn immutable_projection_actual_unique_entry_loans_preserve_full_values_after_sou
     );
     assert_eq!(
         output.get(SemanticParameterId::new(u32::MAX)),
-        Some(&SemanticParameterValue::GroupConcatMaxLen(-23))
+        Some(&SemanticParameterValue::AllowThrowException(true))
     );
     let Some(SemanticParameterValue::TimeZone(zone)) = output.get(SemanticParameterId::new(1))
     else {
@@ -334,7 +337,7 @@ fn immutable_projection_captured_clone_and_header_refusals_have_no_after_callbac
 fn immutable_projection_header_admission_precedes_pending255_without_own_scope() {
     let input = source();
     let c = Control::default();
-    let r = reference(u32::MAX, SemanticParameterKey::GroupConcatMaxLen);
+    let r = reference(u32::MAX, SemanticParameterKey::AllowThrowException);
     for cause in CAUSES {
         c.arm(Some((1, cause)));
         let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();

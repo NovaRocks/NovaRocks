@@ -214,6 +214,7 @@ pub struct SqlMvPersistenceAggregateFacts {
     branch_ordinal: Option<u32>,
     output_ordinal: Option<u32>,
     function_identity: String,
+    semantic_contract: novarocks_functions::PersistentAggregateContract,
     source_fields: Vec<SqlMvPersistenceSourceFieldReference>,
 }
 
@@ -232,6 +233,10 @@ impl SqlMvPersistenceAggregateFacts {
 
     pub fn function_identity(&self) -> &str {
         &self.function_identity
+    }
+
+    pub fn semantic_contract(&self) -> &novarocks_functions::PersistentAggregateContract {
+        &self.semantic_contract
     }
 
     pub fn source_fields(&self) -> &[SqlMvPersistenceSourceFieldReference] {
@@ -944,12 +949,15 @@ fn collect_aggregates(
 ) -> Result<(), String> {
     let mut calls = Vec::new();
     walk_expression(expression, &mut |node| {
-        if let ExprKind::AggregateCall { name, .. } = &node.kind {
-            calls.push((name.to_ascii_lowercase(), node));
+        if let ExprKind::AggregateCall { name, resolved, .. } = &node.kind {
+            calls.push((name.to_ascii_lowercase(), resolved, node));
         }
         Ok(())
     })?;
-    for (function_identity, call) in calls {
+    for (function_identity, resolved, call) in calls {
+        let semantic_contract =
+            novarocks_functions::PersistentAggregateContract::from_binding(resolved.resolved())
+                .ok_or("MV aggregate lacks its selected state contract")?;
         let aggregate_ordinal = u32_from_usize("MV aggregate ordinal", builder.aggregates.len())?;
         let source_fields = expression_source_fields(call, builder)?;
         builder.aggregates.push(SqlMvPersistenceAggregateFacts {
@@ -957,6 +965,7 @@ fn collect_aggregates(
             branch_ordinal,
             output_ordinal,
             function_identity,
+            semantic_contract,
             source_fields,
         });
     }

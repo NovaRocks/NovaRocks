@@ -10,6 +10,7 @@ workspace = true
 [features]
 
 [dependencies]
+novarocks-functions.workspace = true
 novarocks-failure-contract.workspace = true
 novarocks-type-contract.workspace = true
 apache-avro.workspace = true
@@ -35,7 +36,6 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
-novarocks-functions.workspace = true
 arrow-schema.workspace = true
 novarocks-catalog-application = { workspace = true }
 novarocks-state-store-testkit.workspace = true

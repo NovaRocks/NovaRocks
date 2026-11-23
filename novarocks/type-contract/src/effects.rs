@@ -264,15 +264,11 @@ impl FunctionEffectDeclaration {
         let mut statement_start_utc = false;
         let mut time_zone = false;
         let mut allow_throw_exception = false;
-        let mut group_concat_legacy = false;
-        let mut group_concat_max_len = false;
         for key in &self.environment_dependencies {
             let seen = match key {
                 SemanticParameterKey::StatementStartUtc => &mut statement_start_utc,
                 SemanticParameterKey::TimeZone => &mut time_zone,
                 SemanticParameterKey::AllowThrowException => &mut allow_throw_exception,
-                SemanticParameterKey::GroupConcatLegacy => &mut group_concat_legacy,
-                SemanticParameterKey::GroupConcatMaxLen => &mut group_concat_max_len,
             };
             if std::mem::replace(seen, true) {
                 return Err(EffectContractError::DuplicateEnvironmentKey);

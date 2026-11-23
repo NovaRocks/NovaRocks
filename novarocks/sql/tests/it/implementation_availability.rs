@@ -17,6 +17,35 @@
 use arrow::datatypes::{DataType, Field};
 
 #[test]
+fn approximate_aggregate_availability_uses_the_exact_selected_profile() {
+    use novarocks_sql::{
+        analyze_error::AnalyzeErrorKind,
+        compiler::{SqlCompileError, SqlCompileProgressError},
+    };
+    use novarocks_sql_testkit::try_sql_source_with_declared_fields;
+
+    let fields = [Field::new("k", DataType::Int64, false)];
+    for (sql, overload) in [
+        (
+            "SELECT approx_distinct(k, 0.01) FROM t",
+            "explicit-error-hll-v1",
+        ),
+        (
+            "SELECT approx_percentile(k, 1, 0.5, 0.01) FROM t",
+            "bigint-accuracy-v1",
+        ),
+        ("SELECT approx_distinct(ARRAY[k]) FROM t", "default-hll-v1"),
+    ] {
+        let failure = try_sql_source_with_declared_fields(sql, &fields).unwrap_err();
+        let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = failure else {
+            panic!("expected typed aggregate profile refusal: {failure:?}");
+        };
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
+        assert!(error.message().contains(overload), "{error}");
+    }
+}
+
+#[test]
 fn actual_map_key_keeps_original_exact_binding_and_names_uninstalled_key_domain() {
     use novarocks_sql::{
         analyze_error::AnalyzeErrorKind,
@@ -395,16 +424,10 @@ mod fold_frontiers {
         }
     }
 
-    const UNAUTHORED_ENVIRONMENT: &[(&str, &str)] = &[
-        (
-            "SELECT GROUP_CONCAT(REVERSE('abc'))",
-            "builtin.aggregate/string_agg/",
-        ),
-        (
-            "SELECT FROM_UNIXTIME(-(BIGINT '-1'))",
-            "builtin.scalar/from_unixtime/",
-        ),
-    ];
+    const UNAUTHORED_ENVIRONMENT: &[(&str, &str)] = &[(
+        "SELECT FROM_UNIXTIME(-(BIGINT '-1'))",
+        "builtin.scalar/from_unixtime/",
+    )];
 
     #[test]
     fn e08s1_fold_environment_exact_missing_authors_refuse_parent_before_children() {
@@ -452,11 +475,11 @@ mod fold_frontiers {
 
     #[test]
     fn e08s1_logical_environment_exact_authored_raw_limit_keeps_original_logical_success() {
-        for raw in [-1, 4096] {
+        {
             let probe = Arc::new(FoldProbe::default());
-            let semantics = SqlSemanticSettings::default().with_group_concat_max_len(raw);
+            let semantics = SqlSemanticSettings::default();
             analyze_table_free(
-                "SELECT GROUP_CONCAT(REVERSE('abc'))",
+                "SELECT LISTAGG(REVERSE('abc')) WITHIN GROUP (ORDER BY 1)",
                 SqlCompileIntent::LogicalOnly,
                 session(semantics, true),
                 builtin_sql_function_catalog(),

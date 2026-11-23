@@ -104,7 +104,7 @@ where
             for state in states {
                 scalar_work.step()?;
                 state.with_core(|core| {
-                    values.push(Some(core.output(&mut scalar_work)?));
+                    values.push(core.output(&mut scalar_work)?);
                     Ok(())
                 })?;
             }

@@ -328,6 +328,29 @@ impl KernelEvaluationControl for KernelControlObservation<'_> {
     }
 }
 
+#[derive(Debug)]
+struct InvalidParameter(&'static str);
+
+impl std::fmt::Display for InvalidParameter {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(self.0)
+    }
+}
+impl std::error::Error for InvalidParameter {}
+impl novarocks_failure_contract::FailureProjection for InvalidParameter {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Data,
+            novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for InvalidParameter {}
+
+pub(crate) fn invalid_function_argument(message: &'static str) -> KernelFailure {
+    KernelFailure::from_domain(InvalidParameter(message))
+}
+
 pub(crate) fn invalid(message: &str) -> KernelFailure {
     KernelFailure::InvalidProgram(KernelDiagnostic::new(message))
 }

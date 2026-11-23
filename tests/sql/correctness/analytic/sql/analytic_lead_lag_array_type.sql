@@ -20,7 +20,7 @@
 -- 1. Validate first_value/last_value/lead/lag produce consistent results across
 --    parallel VARCHAR columns (c2, c3) and an ARRAY<VARCHAR> column (c4).
 -- 2. Cover both default (respect nulls) and IGNORE NULLS variants.
--- The assertion checks that concat(varchar_a, ",", varchar_b) == array_join(array_c, ",")
+-- Compare each scalar result with the corresponding element in the array result.
 -- for every non-null row in the window function output, ensuring array and varchar
 -- window semantics are in sync.
 
@@ -38,9 +38,9 @@ INSERT INTO ${case_db}.t0
 SELECT
     i%10 AS c0,
     i AS c1,
-    IF(i % 3 = 0, NULL, CONCAT('foo_', i)) AS c2,
-    IF(i % 3 = 0, NULL, CONCAT('bar_', i)) AS c3,
-    IF(i % 3 = 0, NULL, [CONCAT('foo_', i), CONCAT('bar_', i)]) AS c4
+    IF(i % 3 = 0, NULL, CONCAT('foo_', CAST(i AS VARCHAR))) AS c2,
+    IF(i % 3 = 0, NULL, CONCAT('bar_', CAST(i AS VARCHAR))) AS c3,
+    IF(i % 3 = 0, NULL, ARRAY[CONCAT('foo_', CAST(i AS VARCHAR)), CONCAT('bar_', CAST(i AS VARCHAR))]) AS c4
 FROM TABLE(sequence(1, 10000)) t(i);
 
 -- query 2
@@ -53,7 +53,7 @@ WITH cte AS (
     FROM ${case_db}.t0
 ),
 cte1 AS (
-    SELECT concat(a, ',', b) = array_join(c, ',') AS pred FROM cte
+    SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
 SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
 
@@ -67,7 +67,7 @@ WITH cte AS (
     FROM ${case_db}.t0
 ),
 cte1 AS (
-    SELECT concat(a, ',', b) = array_join(c, ',') AS pred FROM cte
+    SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
 SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
 
@@ -81,7 +81,7 @@ WITH cte AS (
     FROM ${case_db}.t0
 ),
 cte1 AS (
-    SELECT concat(a, ',', b) = array_join(c, ',') AS pred FROM cte
+    SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
 SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
 
@@ -95,7 +95,7 @@ WITH cte AS (
     FROM ${case_db}.t0
 ),
 cte1 AS (
-    SELECT concat(a, ',', b) = array_join(c, ',') AS pred FROM cte
+    SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
 SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
 
@@ -109,7 +109,7 @@ WITH cte AS (
     FROM ${case_db}.t0
 ),
 cte1 AS (
-    SELECT concat(a, ',', b) = array_join(c, ',') AS pred FROM cte
+    SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
 SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
 
@@ -123,7 +123,7 @@ WITH cte AS (
     FROM ${case_db}.t0
 ),
 cte1 AS (
-    SELECT concat(a, ',', b) = array_join(c, ',') AS pred FROM cte
+    SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
 SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
 
@@ -137,7 +137,7 @@ WITH cte AS (
     FROM ${case_db}.t0
 ),
 cte1 AS (
-    SELECT concat(a, ',', b) = array_join(c, ',') AS pred FROM cte
+    SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
 SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
 
@@ -151,6 +151,6 @@ WITH cte AS (
     FROM ${case_db}.t0
 ),
 cte1 AS (
-    SELECT concat(a, ',', b) = array_join(c, ',') AS pred FROM cte
+    SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
 SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;

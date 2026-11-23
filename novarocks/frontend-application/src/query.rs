@@ -1748,7 +1748,6 @@ async fn wait_for_eligible_query_topology_after(
 /// the native query-options DTO consumed at the execution boundary.
 fn query_options_from_session_settings(settings: &SessionExecutionSettings) -> QueryOptions {
     QueryOptions::from_proto(novarocks::QueryOptions {
-        group_concat_max_len: Some(settings.group_concat_max_len()),
         query_mem_limit: settings.query_mem_limit_bytes().unwrap_or_default(),
         query_timeout: settings
             .query_timeout_secs()
@@ -1927,7 +1926,6 @@ mod tests {
         );
         settings.set_query_mem_limit_bytes(23).unwrap();
         settings.set_query_timeout_secs(17);
-        settings.set_group_concat_max_len(-1);
         settings.set_pipeline_dop(4);
         settings
             .set_runtime_filter_scan_wait_time_ms(0)
@@ -1941,7 +1939,7 @@ mod tests {
 
         let options = query_options_from_session_settings(&settings);
         let proto = options.as_proto();
-        assert_eq!(proto.group_concat_max_len, Some(-1));
+
         assert_eq!(proto.query_timeout, 17);
         assert_eq!(proto.query_mem_limit, 23);
         assert_eq!(proto.pipeline_dop, 4);
@@ -2758,7 +2756,7 @@ mod tests {
     fn execution_throw_policy_uses_the_same_effective_mode_as_sql_analysis() {
         let session = novarocks_sql::sql_mode::SqlSemanticSettings::default().with_sql_mode(
             novarocks_sql::sql_mode::SqlMode::from_assignment(
-                "GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION",
+                "ERROR_IF_OVERFLOW,ALLOW_THROW_EXCEPTION",
             ),
         );
         let query =
@@ -2775,7 +2773,7 @@ mod tests {
             with_query_sql_semantics(query_options_from_session_settings(&execution), &session);
         assert!(restored.as_proto().allow_throw_exception);
         assert_eq!(restored.as_proto().query_mem_limit, 9);
-        assert!(session.sql_mode().group_concat_legacy());
+        assert!(session.sql_mode().error_if_overflow());
     }
 }
 

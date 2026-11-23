@@ -1,75 +1,29 @@
--- query 5
--- types	integer
-_col0
-25000
+-- query 1
+-- types	bigint	array(bigint)
+median	bounds
+4	[2,8,4]
+
+-- query 2
+-- types	real	array(real)
+median	bounds
+4.0	[2.0,8.0]
+
+-- query 3
+-- types	double	array(double)
+median	bounds
+4.0	[2.0,8.0]
+
+-- query 4
+-- types	bigint
+targets
+4097
 
 -- query 6
--- types	integer
-_col0
-45000
+-- types	bigint
+median
+3
 
 -- query 7
--- types	integer
-_col0
-45000
-
--- query 8
--- types	integer
-_col0
-45000
-
--- query 9
--- types	integer
-_col0
-45000
-
--- query 10
--- types	integer
-_col0
-25000
-
--- query 11
--- types	integer
-_col0
-25000
-
--- query 12
--- types	array(double)
-_col0
-[12499.75,25000.0,37500.25]
-
--- query 13
--- types	array(double)
-_col0
-[1.0,25000.0,49999.0]
-
--- query 14
--- types	array(double)
-_col0
-[4999.6005859375,12499.75,25000.0,37500.25,45000.3984375]
-
--- query 15
--- types	array(double)
-_col0
-[12499.75,25000.0,37500.25]
-
--- query 16
--- types	array(double)
-_col0
-[25000.0,45000.39453125]
-
--- query 17
--- types	array(double)
-_col0
-[4999.6005859375,25000.0,45000.3984375]
-
--- query 20
--- types	array(double)
-_col0
-[3.5,6.0]
-[5.5,8.0]
-
--- query 25
--- types	array(double)
-_col0
-[2.0,5.0,8.0]
+-- types	bigint
+median
+NULL

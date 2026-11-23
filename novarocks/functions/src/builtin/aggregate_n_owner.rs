@@ -59,7 +59,7 @@ pub(super) fn definition(
         },
     )
 }
-struct NOwner {
+pub(super) struct NOwner {
     resolver: Arc<BuiltinAggregateResolver>,
     declaration: FunctionBindingDeclaration,
     keep_smallest: bool,
@@ -107,6 +107,44 @@ impl NOwner {
             implementations,
         })
     }
+    pub(super) fn for_extrema_overload(
+        name: &str,
+        declaration: FunctionBindingDeclaration,
+        resolver: Arc<BuiltinAggregateResolver>,
+    ) -> Result<Self, FunctionCatalogError> {
+        let id = format!("builtin.aggregate/{name}/top-n-v1");
+        let state_format = format!("novarocks/{name}/top-n-state-v1");
+        let expected = effects();
+        let overload = declaration
+            .overloads()
+            .iter()
+            .find(|overload| {
+                overload.identity.as_str() == id
+                    && overload.effects.as_ref() == Some(&expected)
+                    && overload
+                        .aggregate
+                        .as_ref()
+                        .is_some_and(|state| state.state_format.as_str() == state_format)
+            })
+            .ok_or_else(|| FunctionCatalogError::InvalidStableIdentity {
+                subject: "builtin MIN/MAX Top N overload",
+                value: id.clone().into(),
+            })?;
+        let implementations = Box::new([PureImplementationDeclaration {
+            overload: overload.identity.clone(),
+            implementation: PureImplementationId::try_new(format!(
+                "builtin.aggregate/{name}/top-n-selected-v1"
+            ))?,
+            abi: PureKernelAbi::AggregateV1,
+        }]);
+        Ok(Self {
+            resolver,
+            declaration,
+            keep_smallest: name == "min",
+            implementations,
+        })
+    }
+
     fn call_effects(&self, proof_scope: CallProofScope) -> CallEffects {
         let base = effects();
         CallEffects {

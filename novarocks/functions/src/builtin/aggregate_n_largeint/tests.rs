@@ -127,7 +127,7 @@ fn source_with(
         expected_result_type: None,
     };
     let bound = catalog
-        .resolve_bound_user(name, FunctionKind::Aggregate, request, &Compile)
+        .resolve_bound_trusted(name, FunctionKind::Aggregate, request, &Compile)
         .unwrap();
     let declaration = catalog
         .pure_overload_declaration_observed(
@@ -369,13 +369,56 @@ fn sparse_selection_and_independent_scalar_limit_preserve_original_result() {
     clean(&host);
 }
 #[test]
-fn null_limit_before_null_value_is_full_data_and_retains_its_domain_until_last_clone() {
+fn top_n_initializes_on_the_first_contributing_row() {
+    let host = Arc::new(Host::default());
+    {
+        let kernel = kernel(AggregateKernelPhase::Single);
+        let mut state = state(&kernel, &host);
+        let input = values(&[Some(77), None, Some(-7), Some(3), Some(12)]);
+        let limits: ArrayRef = Arc::new(Int64Array::from(vec![
+            None,
+            Some(-1),
+            Some(2),
+            Some(-1),
+            Some(1),
+        ]));
+        update(
+            &kernel,
+            &mut state,
+            &input,
+            &limits,
+            Selection::try_sparse(5, &[0, 1]).unwrap(),
+            &host,
+            false,
+        )
+        .unwrap();
+        assert!(emit(&kernel, &state, &host).unwrap().is_null(0));
+        update(
+            &kernel,
+            &mut state,
+            &input,
+            &limits,
+            Selection::try_sparse(5, &[2, 3, 4]).unwrap(),
+            &host,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            read_list(&emit(&kernel, &state, &host).unwrap()),
+            vec![-7, 3]
+        );
+    }
+    clean(&host);
+}
+
+#[test]
+fn reached_out_of_range_limit_retains_its_typed_data_until_last_clone() {
     let host = Arc::new(Host::default());
     let data = {
         let kernel = kernel(AggregateKernelPhase::Single);
         let mut state = state(&kernel, &host);
-        let input = values(&[Some(77), None]);
-        let limits: ArrayRef = Arc::new(Int64Array::from(vec![None]));
+        let input = values(&[None, Some(77)]);
+        let limits: ArrayRef = Arc::new(Int64Array::from(vec![Some(10_001)]));
         let error = update(
             &kernel,
             &mut state,
@@ -391,14 +434,14 @@ fn null_limit_before_null_value_is_full_data_and_retains_its_domain_until_last_c
         };
         assert_eq!(
             data.message(),
-            "update aggregate state: min_n/max_n limit cannot be null"
+            "update aggregate state: min/max number of values must be between 1 and 10000, got 10001"
         );
         {
             use novarocks_failure_contract::FailureProjection;
-            let source = data.original_source().expect("the actual NULL limit cause");
+            let source = data.original_source().expect("the reached invalid limit");
             assert_eq!(
-                source.failure_fact(),
-                crate::DataFailureReason::InvalidValue.failure_fact()
+                source.failure_fact().reason(),
+                novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT
             );
             assert_eq!(data.failure_fact(), source.failure_fact());
         }
@@ -444,7 +487,7 @@ fn partial_intermediate_final_use_one_codec_and_exact_largeint_result() {
         merge(&final_kernel, &mut target, &bytes, &host).unwrap();
         assert_eq!(
             read_list(&emit(&final_kernel, &target, &host).unwrap()),
-            vec![8, i128::MAX]
+            vec![i128::MAX, 8]
         );
         let changed = phase(
             source("min_n", true, DataType::Int64, true),
@@ -481,7 +524,7 @@ fn empty_and_nonempty_child_aliases_hold_original_output_until_cross_thread_last
             }
             let result = emit(&kernel, &state, &host).unwrap();
             let list = result.as_any().downcast_ref::<ListArray>().unwrap();
-            assert!(!list.is_null(0));
+            assert_eq!(list.is_null(0), empty);
             assert_eq!(list.value_length(0), if empty { 0 } else { 2 });
             Arc::clone(list.values())
         };
@@ -957,7 +1000,7 @@ fn original_empty_binary_builder_capacities_are_an_upgrade_sensitive_budget_fact
 }
 
 #[test]
-fn a_real_null_limit_origin_survives_a_refused_diagnostic_and_keeps_both_typed_sources() {
+fn a_real_invalid_limit_origin_survives_a_refused_diagnostic_and_keeps_both_typed_sources() {
     use crate::builtin::aggregate_n_largeint_operation::{NDiagnosticFailure, project_failure};
     use novarocks_failure_contract::FailureProjection;
     use std::error::Error;
@@ -966,7 +1009,7 @@ fn a_real_null_limit_origin_survives_a_refused_diagnostic_and_keeps_both_typed_s
     let failure = {
         let kernel = kernel(AggregateKernelPhase::Single);
         let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
-        let limits: ArrayRef = Arc::new(Int64Array::from(vec![None]));
+        let limits: ArrayRef = Arc::new(Int64Array::from(vec![Some(10_001)]));
         let origin =
             crate::builtin::aggregate_n_core::parse_limit(&limits, 0, &mut ScalarWork::new(None))
                 .unwrap_err();
@@ -1005,7 +1048,7 @@ fn a_real_null_limit_origin_survives_a_refused_diagnostic_and_keeps_both_typed_s
     drop(host);
     assert!(weak_host.upgrade().is_none());
     assert_eq!(
-        failure.failure_fact(),
-        crate::DataFailureReason::InvalidValue.failure_fact()
+        failure.failure_fact().reason(),
+        novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT
     );
 }

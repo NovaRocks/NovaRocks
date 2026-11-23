@@ -18,12 +18,11 @@
 use super::sql_test_source::sql_source_with_semantics;
 use arrow::datatypes::DataType;
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
-use novarocks_type_contract::SemanticParameterValue;
 pub(super) fn concat_source() -> SqlAuthoredPhysicalPlan {
     sql_source_with_semantics(
-        "SELECT GROUP_CONCAT(CAST(k AS VARCHAR)) FROM fixture",
+        "SELECT LISTAGG(CAST(k AS VARCHAR)) WITHIN GROUP (ORDER BY k) FROM fixture",
         DataType::Int64,
-        novarocks_sql::sql_mode::SqlSemanticSettings::default().with_group_concat_max_len(4096),
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
     )
 }
 pub(super) fn unix_source()
@@ -34,21 +33,6 @@ pub(super) fn unix_source()
     )
 }
 #[test]
-fn e08s1_environment_original_concat_has_actual_lexical_sparse_values() {
-    let source = concat_source();
-    let values = source.plan().parameters().entries();
-    assert_eq!(
-        values
-            .values()
-            .filter(|v| matches!(v, SemanticParameterValue::GroupConcatLegacy(_)))
-            .count(),
-        1
-    );
-    assert_eq!(
-        values
-            .values()
-            .filter(|v| matches!(v, SemanticParameterValue::GroupConcatMaxLen(4096)))
-            .count(),
-        1
-    );
+fn listagg_has_no_lexical_semantic_parameters() {
+    assert!(concat_source().plan().parameters().entries().is_empty());
 }

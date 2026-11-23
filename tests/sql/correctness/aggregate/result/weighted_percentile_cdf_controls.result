@@ -1,34 +1,14 @@
+-- query 1
+-- types	bigint	bigint
+fractional	integral
+16	20
+
 -- query 2
--- types	bigint	bigint	bigint
-rows_seen	values_seen	weights_seen
-7	6	6
+-- types	array(double)
+estimates
+[2.0,2.5,3.4,4.0]
 
 -- query 3
--- types	double
-p
-3.4000000953674316
-
--- query 4
--- types	array(double)
-p
-[2.0,2.6666667461395264,3.4000000953674316,4.0]
-
--- query 5
 -- types	boolean
-empty
+empty_state
 true
-
--- query 6
--- types	boolean
-empty
-true
-
--- query 7
--- types	boolean
-empty
-true
-
--- query 9
--- types	double
-p
-1.0

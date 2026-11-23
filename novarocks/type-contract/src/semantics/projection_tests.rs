@@ -66,15 +66,15 @@ fn table() -> SemanticParameters {
         ),
         (
             SemanticParameterId::new(3),
-            SemanticParameterValue::GroupConcatLegacy(true),
+            SemanticParameterValue::AllowThrowException(true),
         ),
         (
             SemanticParameterId::new(4),
-            SemanticParameterValue::GroupConcatLegacy(false),
+            SemanticParameterValue::AllowThrowException(false),
         ),
         (
             SemanticParameterId::new(u32::MAX),
-            SemanticParameterValue::GroupConcatMaxLen(-23),
+            SemanticParameterValue::AllowThrowException(true),
         ),
     ])
     .unwrap()
@@ -102,7 +102,7 @@ fn exact_values_sparse_ids_and_input_are_preserved() {
     );
     assert_eq!(
         output.get(SemanticParameterId::new(u32::MAX)),
-        Some(&SemanticParameterValue::GroupConcatMaxLen(-23))
+        Some(&SemanticParameterValue::AllowThrowException(true))
     );
     assert_eq!(
         control.checkpoints.into_inner().unwrap(),
@@ -155,7 +155,7 @@ fn every_repeated_reference_is_checked_and_one_definition_is_retained() {
         ]
     );
     // A repeated ID never skips the expected-key check.
-    let wrong = reference(0, SemanticParameterKey::GroupConcatMaxLen);
+    let wrong = reference(0, SemanticParameterKey::AllowThrowException);
     assert_eq!(
         input.project_observed(
             [reference(0, SemanticParameterKey::TimeZone), wrong,],
@@ -279,7 +279,7 @@ fn intermediate_failure_accounts_all_completed_references_without_overreading() 
     };
     let consumed = AtomicUsize::new(0);
     let refs = std::iter::repeat_n(
-        reference(u32::MAX, SemanticParameterKey::GroupConcatMaxLen),
+        reference(u32::MAX, SemanticParameterKey::AllowThrowException),
         1025,
     )
     .inspect(|_| {
@@ -307,7 +307,7 @@ fn maximum_valid_definition_table_projects_without_a_second_validation_pass() {
     let input = SemanticParameters::try_new((0..MAX_SEMANTIC_PARAMETERS).map(|id| {
         (
             SemanticParameterId::new(id as u32),
-            SemanticParameterValue::GroupConcatMaxLen(id as i64),
+            SemanticParameterValue::AllowThrowException(id % 2 == 0),
         )
     }))
     .unwrap();
@@ -318,7 +318,7 @@ fn maximum_valid_definition_table_projects_without_a_second_validation_pass() {
             input
                 .entries()
                 .keys()
-                .map(|id| reference(id.get(), SemanticParameterKey::GroupConcatMaxLen)),
+                .map(|id| reference(id.get(), SemanticParameterKey::AllowThrowException)),
             CompilePhase::Decode,
             &control,
         )

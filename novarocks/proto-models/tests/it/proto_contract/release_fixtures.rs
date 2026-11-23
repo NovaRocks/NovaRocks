@@ -71,7 +71,7 @@ fn release_query_options() -> novarocks::QueryOptions {
         runtime_filter_scan_wait_time_ms: Some(1500),
         runtime_filter_wait_timeout_ms: Some(3000),
         allow_throw_exception: true,
-        group_concat_max_len: Some(65_536),
+
         enable_scan_datacache: true,
         enable_populate_datacache: true,
         enable_datacache_async_populate_mode: true,

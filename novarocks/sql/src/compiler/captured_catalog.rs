@@ -87,8 +87,6 @@ impl SqlCapturedCatalogPreparation {
             ));
         }
         let query = parameters.complete_query(query)?;
-        let query =
-            crate::sql_mode::normalize_concat_query_with_semantics(query, &session.sql_semantics);
         let mut preparation = Self::try_new_qualified_catalog(
             query,
             session.current_catalog.as_deref(),
@@ -281,9 +279,7 @@ impl SqlCapturedCatalogPreparation {
         let semantics = crate::sql_mode::SqlSemanticSettings::default();
         crate::sql_mode::validate_persisted_query_semantics_typed(self.catalog.query(), &semantics)
             .map_err(SqlCompileError::from)?;
-        let query =
-            crate::sql_mode::normalize_concat_query(self.catalog.query().clone(), &semantics)
-                .map_err(SqlCompileError::from)?;
+        let query = self.catalog.query().clone();
         let functions = functions.snapshot_for_scalar_presence();
         let table_sequence = super::table_sequence::TableSequencePass::SchemaOnly(sealed_functions);
         let (resolved, _, factory) =

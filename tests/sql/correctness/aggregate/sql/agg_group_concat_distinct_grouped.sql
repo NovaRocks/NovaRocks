@@ -38,11 +38,7 @@ INSERT INTO ${case_db}.t_agg_group_concat_distinct_grouped VALUES
 
 SELECT
     MOD(k, 2) AS g,
-    string_agg(DISTINCT s
-,
- ','
-ORDER BY s
-) AS gc
+    LISTAGG(DISTINCT CAST(s AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(s AS VARCHAR)) AS gc
 FROM ${case_db}.t_agg_group_concat_distinct_grouped
 GROUP BY g
 ORDER BY g;

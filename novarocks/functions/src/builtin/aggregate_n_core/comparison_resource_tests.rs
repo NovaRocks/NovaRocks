@@ -194,12 +194,14 @@ fn reached_comparison_scopes_keep_original_values_and_default_control_trace() {
     let mut raw_checkpoints = EvaluationCheckpoints::new(&raw);
     let mut checkpoints = EvaluationCheckpoints::new(observed.as_ref());
     left.sort_values(
+        ExtremaDirection::Minimum,
         &mut NoopSortResources,
         &mut ScalarWork::new(Some(&mut raw_checkpoints)),
     )
     .unwrap();
     right
         .sort_values(
+            ExtremaDirection::Minimum,
             &mut Resources {
                 trace: observed.clone(),
                 comparison_refusal: None,
@@ -243,23 +245,17 @@ fn reached_comparison_scopes_keep_original_values_and_default_control_trace() {
     );
 }
 #[test]
-fn mixed_tags_and_unordered_float_keep_original_equal_under_nested_scope() {
-    for values in [
-        vec![
-            TrackedAggScalarValue::Bool(true),
-            TrackedAggScalarValue::Int64(7),
-        ],
-        vec![
+fn nan_is_disfavored_in_both_directions_under_the_comparison_scope() {
+    for direction in [ExtremaDirection::Minimum, ExtremaDirection::Maximum] {
+        let trace = Arc::new(Trace::default());
+        let mut state = state(vec![
             TrackedAggScalarValue::Float64(f64::NAN),
             TrackedAggScalarValue::Float64(7.0),
-        ],
-    ] {
-        let expected = format!("{values:?}");
-        let trace = Arc::new(Trace::default());
-        let mut state = state(values);
+        ]);
         let mut checkpoints = EvaluationCheckpoints::new(trace.as_ref());
         state
             .sort_values(
+                direction,
                 &mut Resources {
                     trace: trace.clone(),
                     comparison_refusal: None,
@@ -267,7 +263,11 @@ fn mixed_tags_and_unordered_float_keep_original_equal_under_nested_scope() {
                 &mut ScalarWork::new(Some(&mut checkpoints)),
             )
             .unwrap();
-        assert_eq!(format!("{:?}", state.values.as_slice()), expected);
+        assert!(matches!(
+            state.values.as_slice(),
+            [TrackedAggScalarValue::Float64(7.0), TrackedAggScalarValue::Float64(value)]
+              if value.is_nan()
+        ));
         assert_eq!(
             trace.state.lock().unwrap().events,
             [
@@ -289,6 +289,7 @@ fn comparison_admission_refusal_preserves_every_first_cause_and_skips_later_work
         let mut checkpoints = EvaluationCheckpoints::new(trace.as_ref());
         let error = state
             .sort_values(
+                ExtremaDirection::Minimum,
                 &mut Resources {
                     trace: trace.clone(),
                     comparison_refusal: Some((1, cause.clone())),
@@ -321,6 +322,7 @@ fn original_comparator_control_refusal_releases_inner_then_outer_without_footer(
         let mut checkpoints = EvaluationCheckpoints::new(trace.as_ref());
         let error = state
             .sort_values(
+                ExtremaDirection::Minimum,
                 &mut Resources {
                     trace: trace.clone(),
                     comparison_refusal: None,

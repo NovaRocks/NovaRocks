@@ -89,7 +89,7 @@ fn declarations() -> Value {
                         },
                     ];
                     let bound = catalog
-                        .resolve_bound_user(
+                        .resolve_bound_trusted(
                             name,
                             FunctionKind::Aggregate,
                             FunctionBindingRequest {

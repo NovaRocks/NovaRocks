@@ -542,6 +542,7 @@ enum BindingResolverOwnerKind {
     DynamicScalar(Arc<crate::builtin::catalogue::BuiltinDynamicScalarResolver>),
     Unnest(Arc<crate::builtin::UnnestOwner>),
     BorrowedAggregate(Arc<crate::builtin::catalogue::BuiltinAggregateResolver>),
+    BorrowedApproximate(Arc<crate::builtin::approximate_owner::ApproximateBinding>),
     BorrowedConversion(Arc<crate::builtin::value_conversion::ValueConversionResolver>),
     BorrowedTemporalArithmetic(
         Arc<crate::builtin::temporal_arithmetic_owner::TemporalArithmeticResolver>,
@@ -574,6 +575,11 @@ impl FunctionBindingResolverOwner {
         owner: Arc<crate::builtin::catalogue::BuiltinAggregateResolver>,
     ) -> Self {
         Self(BindingResolverOwnerKind::BorrowedAggregate(owner))
+    }
+    pub(crate) fn borrowed_approximate(
+        owner: Arc<crate::builtin::approximate_owner::ApproximateBinding>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::BorrowedApproximate(owner))
     }
     pub(crate) fn borrowed_conversion(
         owner: Arc<crate::builtin::value_conversion::ValueConversionResolver>,
@@ -628,6 +634,9 @@ impl FunctionBindingResolverOwner {
                     BindingResolverOwnerKind::BorrowedAggregate(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
+                    BindingResolverOwnerKind::BorrowedApproximate(owner) => owner
+                        .validate_selected(selected, request, control)
+                        .map_err(Into::into),
                     BindingResolverOwnerKind::BorrowedConversion(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
@@ -658,6 +667,7 @@ impl FunctionBindingResolverOwner {
             BindingResolverOwnerKind::DynamicScalar(owner) => owner.as_ref(),
             BindingResolverOwnerKind::Unnest(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedAggregate(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::BorrowedApproximate(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedConversion(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedTemporalArithmetic(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedDateShift(owner) => owner.as_ref(),
