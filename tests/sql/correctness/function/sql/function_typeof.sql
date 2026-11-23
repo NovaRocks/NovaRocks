@@ -69,6 +69,8 @@ SELECT typeof(CAST('2023-03-07 11:22:33' AS TIMESTAMP(6)));
 select typeof([1, 2, 3]);
 
 -- query 17
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_error=[sql.analyze.unavailable_implementation] selected overload `builtin.scalar/get_json_object/(any,utf8)->utf8;strict;legacy` has no installed implementation
 select typeof(get_json_object('{"k1":1, "k2":"v2"}', '$.k1'));
 
 -- query 18
@@ -160,3 +162,6 @@ SELECT typeof(CAST(NULL AS ROW(a INTEGER, "B" VARCHAR(2)))) AS row_type,
 -- query 28
 -- @expect_trino_error=COLUMN_NOT_FOUND,USER_ERROR
 SELECT typeof(CAST(missing_input AS INTEGER));
+
+-- query 29
+SELECT typeof(JSON '{"a":1}') AS json_type;

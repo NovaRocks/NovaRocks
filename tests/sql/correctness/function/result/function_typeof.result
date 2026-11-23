@@ -73,11 +73,6 @@ timestamp(6)
 _col0
 array(integer)
 
--- query 17
--- legacy
-_col0
-varchar
-
 -- query 18
 -- legacy
 _col0
@@ -114,3 +109,8 @@ NULL	integer
 -- types	varchar	varchar	varchar
 row_type	map_type	temporal_type
 row("a" integer, "B" varchar(2))	map(varchar(3), array(decimal(5,2)))	timestamp(12)
+
+-- query 29
+-- types	varchar
+json_type
+json
