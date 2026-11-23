@@ -74,12 +74,12 @@ _col0
 array(integer)
 
 -- query 18
--- legacy
+-- types	varchar
 _col0
 map(integer, varchar(6))
 
 -- query 19
--- legacy
+-- types	varchar
 _col0
 row("col1" integer, "col2" integer, "col3" integer, "col4" integer)
 

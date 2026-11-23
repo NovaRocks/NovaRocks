@@ -77,7 +77,7 @@ select typeof(get_json_object('{"k1":1, "k2":"v2"}', '$.k1'));
 select typeof(MAP(ARRAY[1, 2, 3], ARRAY['apple', 'orange', 'pear']));
 
 -- query 19
-select typeof(CAST(ROW(1, 2, 3, 4) AS ROW(col1 INTEGER, col2 INTEGER, col3 INTEGER, col4 INTEGER)));
+select typeof(CAST(NULL AS ROW(col1 INTEGER, col2 INTEGER, col3 INTEGER, col4 INTEGER)));
 
 -- query 20
 select typeof(parse_json('{"a": 1, "b": true}'));

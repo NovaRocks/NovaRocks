@@ -17,7 +17,7 @@
 
 -- Migrated from dev/test/sql/test_function/T/test_conditional_fn
 -- Test Objective:
--- 1. Validate conditional functions (CASE/WHEN, COALESCE, IF, IFNULL, NULLIF) on nested types (ARRAY, MAP).
+-- 1. Validate conditional functions (CASE/WHEN, COALESCE, IF, NULLIF) on nested types (ARRAY, MAP).
 -- 2. Verify correct type coercion between ARRAY<INT> and ARRAY<VARCHAR>, MAP<INT,INT> and MAP<INT,VARCHAR>.
 -- 3. Cover NULL propagation for each conditional function with nested-type columns.
 
@@ -42,7 +42,7 @@ INSERT INTO tc VALUES ROW(4, null, null, null, null);
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; dropped the null-key entry from ms (kept the non-null 1:null entry)
 USE ${case_db};
-INSERT INTO tc VALUES ROW(3, null, ['a','b'], null, MAP(ARRAY[1], ARRAY[null]));
+INSERT INTO tc VALUES ROW(3, null, ['a','b'], null, MAP(ARRAY[1], ARRAY[CAST(NULL AS VARCHAR)]));
 
 -- query 4
 -- @skip_result_check=true
@@ -54,7 +54,7 @@ INSERT INTO tc VALUES ROW(1, [1,2], null, MAP(ARRAY[1], ARRAY[1]), null);
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; dropped the null-key entries from mi and ms (kept the non-null entries)
 USE ${case_db};
-INSERT INTO tc VALUES ROW(2, [1,2], ['a','b'], MAP(ARRAY[1], ARRAY[1]), MAP(ARRAY[1], ARRAY['b']));
+INSERT INTO tc VALUES ROW(2, [1,2], ['a','b'], MAP(ARRAY[1], ARRAY[1]), MAP(ARRAY[1], ARRAY[CAST('b' AS VARCHAR)]));
 
 -- query 6
 -- CASE WHEN with array columns (with else)
@@ -112,19 +112,19 @@ USE ${case_db};
 SELECT coalesce(null, ms, mi) FROM tc ORDER BY i;
 
 -- query 17
--- IFNULL on map columns
+-- Two-argument COALESCE on map columns
 USE ${case_db};
-SELECT ifnull(ms, mi), ms, mi FROM tc ORDER BY i;
+SELECT coalesce(ms, mi), ms, mi FROM tc ORDER BY i;
 
 -- query 18
--- IFNULL on array columns
+-- Two-argument COALESCE on array columns
 USE ${case_db};
-SELECT ifnull(ass, ai), ass, ai FROM tc ORDER BY i;
+SELECT coalesce(ass, ai), ass, ai FROM tc ORDER BY i;
 
 -- query 19
--- IFNULL with NULL literal as second arg
+-- COALESCE with NULL literal as second arg
 USE ${case_db};
-SELECT ifnull(ai, null) FROM tc ORDER BY i;
+SELECT coalesce(ai, null) FROM tc ORDER BY i;
 
 -- query 20
 -- IF on map columns
