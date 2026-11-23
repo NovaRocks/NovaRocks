@@ -399,15 +399,23 @@ fn scalar_rebind_lawful_canonical_source_keeps_policy_and_catalog_owned_changed_
                 FunctionValueType::new(DataType::Int64, false)
             );
             let ExprKind::Cast {
-                cast_mode: None,
+                cast_mode,
                 expr,
                 target,
                 decimal_overflow_policy,
             } = &args[0].kind
             else {
-                panic!("actual widening cast");
+                panic!(
+                    "{path:?} should preserve an actual widening cast, got {:?}",
+                    args[0].kind
+                );
             };
             assert_eq!(*target, DataType::Int64);
+            let expected_mode = match path {
+                Path::Ordinary | Path::Resolved => None,
+                Path::Shared => Some(novarocks_type_contract::TrinoCastMode::Implicit),
+            };
+            assert_eq!(*cast_mode, expected_mode);
             assert_eq!(*decimal_overflow_policy, policy);
             assert_eq!(expr.value_type, original.value_type);
             assert!(

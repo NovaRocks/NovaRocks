@@ -6134,7 +6134,7 @@ mod tests {
                         panic!("resolved SELECT");
                     };
                     let actual = &select.projection[0].expr;
-                    let expected = FunctionValueType::new(expected_type, decimal || nullable);
+                    let expected = FunctionValueType::new(expected_type, nullable);
                     assert_eq!(actual.value_type, expected, "{mode}: {sql}");
                     assert_eq!(resolved.output_columns[0].value_type, expected);
                     assert_eq!(select.projection[0].field_name.as_deref(), Some("result"));
@@ -6161,7 +6161,10 @@ mod tests {
                         let source_child = if decimal {
                             assert_eq!(
                                 computed.value_type,
-                                FunctionValueType::new(DataType::Decimal128(5, 1), true)
+                                FunctionValueType::new(
+                                    DataType::Decimal128(5, 1),
+                                    source.value_type.nullable()
+                                )
                             );
                             let ExprKind::Cast {
                                 expr,
@@ -6173,7 +6176,10 @@ mod tests {
                                 panic!("original explicit Decimal cast");
                             };
                             assert_eq!(*target, DataType::Decimal128(4, 1));
-                            assert_eq!(*cast_mode, None);
+                            assert_eq!(
+                                *cast_mode,
+                                Some(novarocks_type_contract::TrinoCastMode::Explicit)
+                            );
                             assert_eq!(*decimal_overflow_policy, policy);
                             expr.as_ref()
                         } else {
