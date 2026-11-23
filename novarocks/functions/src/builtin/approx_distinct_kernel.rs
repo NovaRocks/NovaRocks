@@ -78,7 +78,7 @@ pub(crate) struct ApproxDistinctKernel {
     pub(super) contract: Arc<AggregateCallContract>,
     pub(super) profile: ApproxProfile,
 }
-fn observed<T>(
+pub(super) fn observed<T>(
     control: &dyn KernelEvaluationControl,
     f: impl FnOnce(&mut ScalarWork<'_, '_>) -> Result<T, KernelFailure>,
 ) -> Result<T, KernelFailure> {

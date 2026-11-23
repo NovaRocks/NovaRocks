@@ -17,6 +17,35 @@
 use arrow::datatypes::{DataType, Field};
 
 #[test]
+fn approximate_aggregate_availability_uses_the_exact_selected_profile() {
+    use novarocks_sql::{
+        analyze_error::AnalyzeErrorKind,
+        compiler::{SqlCompileError, SqlCompileProgressError},
+    };
+    use novarocks_sql_testkit::try_sql_source_with_declared_fields;
+
+    let fields = [Field::new("k", DataType::Int64, false)];
+    for (sql, overload) in [
+        (
+            "SELECT approx_distinct(k, 0.01) FROM t",
+            "explicit-error-hll-v1",
+        ),
+        (
+            "SELECT approx_percentile(k, 1, 0.5, 0.01) FROM t",
+            "bigint-accuracy-v1",
+        ),
+        ("SELECT approx_distinct(ARRAY[k]) FROM t", "default-hll-v1"),
+    ] {
+        let failure = try_sql_source_with_declared_fields(sql, &fields).unwrap_err();
+        let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = failure else {
+            panic!("expected typed aggregate profile refusal: {failure:?}");
+        };
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
+        assert!(error.message().contains(overload), "{error}");
+    }
+}
+
+#[test]
 fn actual_map_key_keeps_original_exact_binding_and_names_uninstalled_key_domain() {
     use novarocks_sql::{
         analyze_error::AnalyzeErrorKind,

@@ -608,7 +608,7 @@ pub(crate) fn resolve_sql_aggregate_call(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
     bind_aggregate_arguments(args, order_by, constant_policy, control, |request| {
-        match public_aggregate_target(name, distinct) {
+        let bound = match public_aggregate_target(name, distinct) {
             PublicAggregateTarget::Named(executable) => catalog.resolve_aggregate_binding(
                 executable,
                 request.logical_argument_count,
@@ -618,7 +618,19 @@ pub(crate) fn resolve_sql_aggregate_call(
             PublicAggregateTarget::Distinct(aggregate) => {
                 catalog.resolve_distinct_aggregate(aggregate, request, control)
             }
+        }?;
+        if distinct
+            && matches!(
+                bound.function_id.as_str(),
+                "builtin.aggregate/approx_percentile/v1"
+                    | "builtin.aggregate/approx_most_frequent/v1"
+            )
+        {
+            return Err(FunctionBindingError::UnavailableImplementation(
+                bound.selected.overload,
+            ));
         }
+        Ok(bound)
     })
 }
 

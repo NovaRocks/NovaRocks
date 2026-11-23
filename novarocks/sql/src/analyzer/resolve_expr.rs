@@ -2446,28 +2446,34 @@ impl<'a> super::AnalyzerContext<'a> {
                 .collect();
         }
 
-        if name == "approx_distinct"
-            && args_typed.len() == 2
-            && args_typed[1].value_type.logical_type()
-                == novarocks_type_contract::ValueLogicalType::Physical
-            && matches!(
-                args_typed[1].value_type.data_type(),
-                DataType::Null
-                    | DataType::Int8
-                    | DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::Float32
-                    | DataType::Decimal128(..)
-            )
-        {
-            let target = novarocks_type_contract::FunctionValueType::new(
-                DataType::Float64,
-                args_typed[1].value_type.nullable(),
-            );
-            let error = self.coerce_common_value(args_typed.remove(1), &target, func.span)?;
-            args_typed.push(error);
-            arg_types[1] = DataType::Float64;
+        if matches!(
+            name.as_str(),
+            "approx_distinct" | "approx_percentile" | "approx_most_frequent"
+        ) {
+            args_typed = args_typed
+                .into_iter()
+                .enumerate()
+                .map(|(index, argument)| {
+                    if let Some(data_type) = approximate_aggregate_target(
+                        &name,
+                        index,
+                        arg_types.len(),
+                        &argument.value_type,
+                    ) {
+                        let target = novarocks_type_contract::FunctionValueType::new(
+                            data_type,
+                            argument.value_type.nullable(),
+                        );
+                        self.coerce_common_value(argument, &target, func.span)
+                    } else {
+                        Ok(argument)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            arg_types = args_typed
+                .iter()
+                .map(|argument| argument.value_type.data_type().clone())
+                .collect();
         }
 
         if name == "listagg" && args_typed.len() == 5 {
@@ -4382,6 +4388,60 @@ pub(super) fn resolve_aggregate_function_call(
 fn ordered_aggregate_syntax(expression: &ast::Expr) -> Result<String, AnalyzeError> {
     novarocks_parser::printer::print_expression(expression)
         .map_err(|error| AnalyzeError::unsupported_expression(error.to_string(), expression.span()))
+}
+
+fn approximate_aggregate_target(
+    name: &str,
+    index: usize,
+    arity: usize,
+    input: &novarocks_type_contract::FunctionValueType,
+) -> Option<DataType> {
+    if input.logical_type() != novarocks_type_contract::ValueLogicalType::Physical {
+        return None;
+    }
+    let data_type = input.data_type();
+    let small_integer = matches!(
+        data_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32
+    );
+    let numeric_or_unknown = |data_type: &DataType| {
+        matches!(
+            data_type,
+            DataType::Null
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Decimal128(..)
+        )
+    };
+    match (name, index, arity) {
+        ("approx_distinct", 1, 2) if numeric_or_unknown(data_type) => Some(DataType::Float64),
+        ("approx_percentile", 0, 2..=4) if small_integer || data_type == &DataType::Null => {
+            Some(DataType::Int64)
+        }
+        ("approx_percentile", 0, 2..=4) if matches!(data_type, DataType::Decimal128(..)) => {
+            Some(DataType::Float64)
+        }
+        ("approx_percentile", 1..=3, 2..=4) if numeric_or_unknown(data_type) => {
+            Some(DataType::Float64)
+        }
+        ("approx_percentile", 1..=2, 2..=3) if index + 1 == arity => {
+            if let DataType::List(item) = data_type
+                && numeric_or_unknown(item.data_type())
+            {
+                return Some(DataType::List(std::sync::Arc::new(
+                    arrow::datatypes::Field::new("item", DataType::Float64, item.is_nullable()),
+                )));
+            }
+            None
+        }
+        ("approx_most_frequent", _, 3) if small_integer || data_type == &DataType::Null => {
+            Some(DataType::Int64)
+        }
+        _ => None,
+    }
 }
 
 fn resolve_aggregate_function_call_with_order(
@@ -6874,6 +6934,49 @@ mod tests {
             }
             _ => panic!("unexpected ARRAY_AGG intermediate type"),
         }
+    }
+
+    #[test]
+    fn approximate_aggregate_sql_selects_exact_supported_and_declared_overloads() {
+        for (sql, expected) in [
+            ("SELECT approx_distinct(TRUE)", DataType::Int64),
+            ("SELECT approx_percentile(2, 0.5)", DataType::Int64),
+            (
+                "SELECT approx_percentile(CAST(2 AS REAL), 1.9, DOUBLE '0.5')",
+                DataType::Float32,
+            ),
+        ] {
+            assert_eq!(
+                analyze_projection_expr(sql).unwrap().value_type.data_type(),
+                &expected
+            );
+        }
+        let output = analyze_projection_expr("SELECT approx_percentile(2, ARRAY[0, 1])")
+            .unwrap()
+            .value_type;
+        assert!(
+            matches!(output.data_type(), DataType::List(item) if item.data_type() == &DataType::Int64)
+        );
+        let output = analyze_projection_expr("SELECT approx_most_frequent(2, 'a', 100001)")
+            .unwrap()
+            .value_type;
+        assert!(matches!(output.data_type(), DataType::Map(..)));
+        for (sql, missing) in [
+            ("SELECT approx_distinct(TRUE, 0.02)", "boolean-error-v1"),
+            (
+                "SELECT approx_percentile(2, 1.0, 0.5, 0.02)",
+                "bigint-accuracy-v1",
+            ),
+        ] {
+            let resolved = analyze_projection_expr(sql).unwrap();
+            let ExprKind::AggregateCall { resolved, .. } = resolved.kind else {
+                panic!("expected typed aggregate");
+            };
+            assert!(resolved.selected.overload.as_str().ends_with(missing));
+        }
+        let error = analyze_projection_expr("SELECT approx_most_frequent(DISTINCT 2, 'a', 100001)")
+            .unwrap_err();
+        assert!(error.contains("varchar-v1"), "{error}");
     }
 
     #[test]
