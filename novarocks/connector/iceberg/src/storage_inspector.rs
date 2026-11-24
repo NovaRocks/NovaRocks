@@ -40,6 +40,7 @@ use crate::scan_model::IcebergTableInfo;
 use crate::source_type::project_source_type;
 
 mod binding;
+pub(crate) mod storage_mapping;
 
 pub(crate) const MV_DESCRIPTOR_PACKAGE_ID_PROP: &str = "novarocks.mv.descriptor.package-id";
 const MAX_TARGET_FIELDS: usize = 4_096;

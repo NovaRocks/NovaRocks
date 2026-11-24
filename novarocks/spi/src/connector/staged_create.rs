@@ -38,7 +38,8 @@ use super::{
     ConnectorWriteReceipt, CreatePolicy, DdlPropertyDeclaration, DdlPropertyValue,
     ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
     LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MvExactPartitionField,
-    MvExactPartitionTransform, ProviderBindingEpoch, ProviderSourceType,
+    MvExactPartitionTransform, MvStorageColumnDeclaration, ProviderBindingEpoch,
+    ProviderSourceType,
 };
 
 pub const CONNECTOR_STAGED_CREATE_CONTRACT_VERSION: u32 = 1;
@@ -62,6 +63,7 @@ pub struct ConnectorPreparedCreateFieldBinding {
     name: String,
     type_signature: String,
     source_type: Option<ProviderSourceType>,
+    storage_declaration: Option<MvStorageColumnDeclaration>,
     nullable: bool,
 }
 
@@ -101,6 +103,7 @@ impl ConnectorPreparedCreateFieldBinding {
             name,
             type_signature,
             source_type: None,
+            storage_declaration: None,
             nullable,
         })
     }
@@ -130,12 +133,28 @@ impl ConnectorPreparedCreateFieldBinding {
         self.source_type.as_ref()
     }
 
+    pub fn with_storage_declaration(mut self, declaration: MvStorageColumnDeclaration) -> Self {
+        self.storage_declaration = Some(declaration);
+        self
+    }
+
+    pub fn storage_declaration(&self) -> Option<&MvStorageColumnDeclaration> {
+        self.storage_declaration.as_ref()
+    }
+
     fn retained_type_bytes(&self) -> usize {
-        self.type_signature.len().saturating_add(
-            self.source_type
-                .as_ref()
-                .map_or(0, ProviderSourceType::retained_bytes),
-        )
+        self.type_signature
+            .len()
+            .saturating_add(
+                self.source_type
+                    .as_ref()
+                    .map_or(0, ProviderSourceType::retained_bytes),
+            )
+            .saturating_add(
+                self.storage_declaration
+                    .as_ref()
+                    .map_or(0, MvStorageColumnDeclaration::retained_identity_bytes),
+            )
     }
 
     pub const fn nullable(&self) -> bool {
@@ -339,6 +358,20 @@ impl ConnectorPreparedCreateDocumentTarget {
                     hasher.update([0]);
                     digest_bytes(hasher, field.type_signature().as_bytes());
                 }
+            }
+            if let Some(mapping) = field.storage_declaration() {
+                hasher.update([1]);
+                hasher.update(mapping.storage_format_version.to_be_bytes());
+                for identity in [
+                    &mapping.provider_declaration,
+                    &mapping.encode_identity,
+                    &mapping.decode_identity,
+                    &mapping.content_contract,
+                ] {
+                    digest_bytes(hasher, identity);
+                }
+            } else {
+                hasher.update([0]);
             }
             hasher.update([u8::from(field.nullable())]);
         }

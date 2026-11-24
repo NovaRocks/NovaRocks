@@ -588,4 +588,88 @@ mod tests {
         assert_eq!(stats.value_counts.get(&3), Some(&3));
         assert_eq!(stats.null_value_counts.get(&3), Some(&1));
     }
+
+    #[test]
+    fn parquet_content_preserves_json_bytes_map_order_nominal_carriers_and_float_bits() {
+        use arrow::array::{
+            Array, FixedSizeBinaryBuilder, Float64Array, Int64Builder, MapArray, MapBuilder,
+            RecordBatch, StringBuilder,
+        };
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::properties::WriterProperties;
+
+        let mut map = MapBuilder::new(None, Int64Builder::new(), StringBuilder::new());
+        for (key, value) in [(9, "{ \"a\": 1 }"), (3, "[3, 2, 1]")] {
+            map.keys().append_value(key);
+            map.values().append_value(value);
+        }
+        map.append(true).unwrap();
+        map.append(false).unwrap();
+        let map = map.finish();
+        let mut carrier = FixedSizeBinaryBuilder::new(16);
+        carrier.append_value(i128::MIN.to_be_bytes()).unwrap();
+        carrier.append_null();
+        let carrier = carrier.finish();
+        let float_bits = [(-0.0f64).to_bits(), 0x7ff8_0000_0000_0007];
+        let batch = RecordBatch::try_from_iter([
+            ("payload", Arc::new(map) as ArrayRef),
+            ("largeint_carrier", Arc::new(carrier)),
+            (
+                "sample",
+                Arc::new(Float64Array::from_iter_values(
+                    float_bits.map(f64::from_bits),
+                )),
+            ),
+        ])
+        .unwrap();
+        let props = WriterProperties::builder().build();
+        let (bytes, _) = super::write_parquet_to_bytes(batch.schema(), &batch, props).unwrap();
+        let decoded = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let decoded_map = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_eq!(
+            decoded_map
+                .keys()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            &[9, 3],
+        );
+        assert_eq!(
+            decoded_map
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            [Some("{ \"a\": 1 }"), Some("[3, 2, 1]")],
+        );
+        assert!(decoded_map.is_null(1));
+        assert_eq!(decoded.column(1).as_ref(), batch.column(1).as_ref());
+        let floats = decoded
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(
+            floats
+                .values()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            float_bits
+        );
+    }
 }

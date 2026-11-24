@@ -28,9 +28,11 @@ pub mod exact_revision;
 pub mod identity;
 pub mod keyed_documents;
 pub mod publication_facts;
+pub mod rebuild_classification;
 pub mod runtime_bindings;
 pub mod schema;
 pub mod semantic;
+pub mod storage_mapping;
 pub mod validation;
 
 #[cfg(any(test, novarocks_dev_controls))]

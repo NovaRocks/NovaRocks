@@ -3021,6 +3021,11 @@ fn prepared_document_field_bindings(
     context: &ConnectorRequestContext,
 ) -> Result<Vec<ConnectorPreparedCreateFieldBinding>, ConnectorError> {
     let mut type_bytes = 0;
+    let nominal =
+        crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata_checked(
+            metadata,
+            &|_| context.original_operation_control().check_active(),
+        )?;
     metadata
         .current_schema()
         .as_struct()
@@ -3034,6 +3039,13 @@ fn prepared_document_field_bindings(
                 crate::source_type::project_source_type(&field.field_type, context, |bytes| {
                     crate::storage_inspector::reserve_bytes(context, &mut type_bytes, bytes)
                 })?;
+            let declaration = crate::storage_inspector::storage_mapping::declare_column(
+                metadata,
+                field,
+                &source_type,
+                &nominal,
+                context,
+            )?;
             ConnectorPreparedCreateFieldBinding::try_new(
                 ordinal,
                 Bytes::copy_from_slice(&field.id.to_be_bytes()),
@@ -3041,7 +3053,11 @@ fn prepared_document_field_bindings(
                 field.field_type.to_string(),
                 !field.required,
             )
-            .map(|binding| binding.with_source_type(source_type))
+            .map(|binding| {
+                binding
+                    .with_source_type(source_type)
+                    .with_storage_declaration(declaration)
+            })
         })
         .collect()
 }

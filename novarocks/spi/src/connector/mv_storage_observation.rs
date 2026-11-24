@@ -970,6 +970,25 @@ impl MvMaintenanceMetadataObservation {
 /// answer from the supplied exact lease and sealed metadata only.
 // Design: ADR-0086 (docs/adr/ADR-0086-frontend-mv-storage-observation-spi-relocation.md)
 pub trait MvStorageObservationPort: Send + Sync {
+    fn map_prepared_storage(
+        &self,
+        _target: &super::ConnectorPreparedCreateDocumentTarget,
+        _columns: &[super::MvStorageColumnRequest],
+        _context: ConnectorRequestContext,
+    ) -> Result<Vec<super::MvObservedStorageMapping>, ConnectorError> {
+        Err(unavailable())
+    }
+
+    fn observe_current_storage_mapping(
+        &self,
+        _exact_lease: &ConnectorControlPlanningPin,
+        _metadata: &ConnectorTableMetadata,
+        _columns: &[super::MvStorageColumnRequest],
+        _context: ConnectorRequestContext,
+    ) -> Result<super::MvCurrentStorageMapping, ConnectorError> {
+        Err(unavailable())
+    }
+
     /// Projects A1–A4 from the original observed table generation, without
     /// resolving another table or acquiring any I/O capability.
     fn observe_source_binding(

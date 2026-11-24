@@ -41,6 +41,7 @@ mod metadata;
 mod metadata_discovery;
 mod metadata_maintenance;
 mod mutation;
+mod mv_storage_mapping;
 mod mv_storage_observation;
 mod original_result_scope;
 mod payload_retention;
@@ -253,6 +254,7 @@ pub use mutation::{
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
     MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
+pub use mv_storage_mapping::*;
 pub use mv_storage_observation::{
     MAX_MV_OBSERVATION_FIELDS, MAX_MV_OBSERVATION_PARTITION_FIELDS, MAX_MV_OBSERVATION_REFS,
     MAX_MV_OBSERVATION_SNAPSHOTS, MvCreatedTargetObservation, MvExactPartitionField,
