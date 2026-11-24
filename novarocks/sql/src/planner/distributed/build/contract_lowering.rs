@@ -8642,20 +8642,42 @@ impl<'a> ContractLoweringVisitor<'a> {
         let node = self.fragment_mut().reserve_node_id()?;
         if partitioned {
             let leading = &sort.items[..sort.analytic_partition_by.len().min(sort.items.len())];
-            if leading.len() != sort.analytic_partition_by.len()
-                || leading
-                    .iter()
-                    .zip(&sort.analytic_partition_by)
-                    .any(|(item, key)| {
-                        !item.asc
-                            || !item.nulls_first
-                            || identity_column_ref(&item.expr).is_none()
-                            || identity_column_ref(&item.expr) != identity_column_ref(key)
-                    })
-            {
-                return Err(ContractLoweringError::UnsupportedSortMode {
-                    detail: "an analytic sort's leading keys are not its partition keys",
-                });
+            let invalid_prefix = || ContractLoweringError::UnsupportedSortMode {
+                detail: "an analytic sort's leading keys are not its partition keys",
+            };
+            if leading.len() != sort.analytic_partition_by.len() {
+                return Err(invalid_prefix());
+            }
+            for (item, key) in leading.iter().zip(&sort.analytic_partition_by) {
+                if !item.asc || !item.nulls_first {
+                    return Err(invalid_prefix());
+                }
+                let same = match (identity_column_ref(&item.expr), identity_column_ref(key)) {
+                    (Some(left), Some(right)) => left == right,
+                    // Computed partition keys are gathered by the optimizer.
+                    // They still appear in both the ordering prefix and the
+                    // partition declaration, just without a column identity.
+                    _ => crate::analysis::expr_identity::typed_expr_semantically_eq(
+                        &item.expr,
+                        key,
+                        self.control,
+                    )
+                    .map_err(|error| match error {
+                        crate::compiler::SqlCompileError::Cancelled => {
+                            ContractLoweringError::Control(CompileControlError::Cancelled)
+                        }
+                        crate::compiler::SqlCompileError::DeadlineExceeded => {
+                            ContractLoweringError::Control(CompileControlError::DeadlineExceeded)
+                        }
+                        crate::compiler::SqlCompileError::ResourceExhausted => {
+                            ContractLoweringError::Control(CompileControlError::ResourceExhausted)
+                        }
+                        _ => invalid_prefix(),
+                    })?,
+                };
+                if !same {
+                    return Err(invalid_prefix());
+                }
             }
         }
         let LoweredOrdering {

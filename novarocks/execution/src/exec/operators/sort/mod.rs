@@ -354,7 +354,9 @@ fn normalize_float_key<T: ArrowPrimitiveType, E: From<SortKeyFailure>>(
             let buffer = match &mut normalized {
                 Some(buffer) => buffer,
                 None => {
-                    observe(SortKeyConstruction::ValueBuffer(std::mem::size_of_val(source)))?;
+                    observe(SortKeyConstruction::ValueBuffer(std::mem::size_of_val(
+                        source,
+                    )))?;
                     normalized.insert(source.to_vec())
                 }
             };
@@ -1054,10 +1056,11 @@ mod tests {
         }
         let values = fixed16_values();
         let mut seen = 0;
-        let missing = normalize_sort_key_array_observed::<Failure>(&values, None, None, &mut |_| {
-            seen += 1;
-            Ok(())
-        });
+        let missing =
+            normalize_sort_key_array_observed::<Failure>(&values, None, None, &mut |_| {
+                seen += 1;
+                Ok(())
+            });
         assert!(matches!(
             missing,
             Err(Failure::Declaration(SortKeyFailure::MissingDeclaration))
@@ -1074,8 +1077,11 @@ mod tests {
         let cause = Arc::new(17);
         for refused in 0..total {
             let mut seen = 0;
-            let result =
-                normalize_sort_key_array_observed::<Failure>(&values, Some(&declared), None, &mut |_| {
+            let result = normalize_sort_key_array_observed::<Failure>(
+                &values,
+                Some(&declared),
+                None,
+                &mut |_| {
                     let boundary = seen;
                     seen += 1;
                     if boundary == refused {
@@ -1083,7 +1089,8 @@ mod tests {
                     } else {
                         Ok(())
                     }
-                });
+                },
+            );
             match result {
                 Err(Failure::Caller(original)) => assert!(Arc::ptr_eq(&original, &cause)),
                 other => panic!("wrong caller cause: {other:?}"),
