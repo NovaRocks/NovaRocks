@@ -32,6 +32,16 @@ pub enum SqlTableVersionSelector {
     Snapshot(i64),
 }
 
+/// Original SQL read choice for an MV source occurrence. A branch or tag
+/// can share the same executable snapshot binding as an explicit snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlMvReadSelection {
+    Current,
+    Snapshot,
+    Branch,
+    Tag,
+}
+
 /// SQL-level metadata table identity.  Provider-specific metadata APIs are
 /// deliberately not represented in the compiler vocabulary.
 ///
@@ -297,6 +307,7 @@ pub struct SqlScanSource {
     pub(crate) table: SqlTableIdentity,
     pub(crate) kind: SqlScanKind,
     pub(crate) mv_occurrence: Option<crate::compiler::SqlMvRelationOccurrenceId>,
+    mv_read_selection: SqlMvReadSelection,
     ukfk_facts: SqlUkFkTableFacts,
     pub(crate) retired_read_fields: Vec<novarocks_spi::connector::ConnectorRetiredReadField>,
 }
@@ -312,9 +323,18 @@ impl SqlScanSource {
             table,
             kind,
             mv_occurrence: None,
+            mv_read_selection: SqlMvReadSelection::Current,
             ukfk_facts: SqlUkFkTableFacts::default(),
             retired_read_fields: Vec::new(),
         }
+    }
+
+    pub(crate) const fn mv_read_selection(&self) -> SqlMvReadSelection {
+        self.mv_read_selection
+    }
+
+    pub(crate) fn set_mv_read_selection(&mut self, selection: SqlMvReadSelection) {
+        self.mv_read_selection = selection;
     }
 
     /// Attach normalized constraint facts captured from the exact admission

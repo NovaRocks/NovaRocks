@@ -537,6 +537,10 @@ pub(crate) fn materialize_view_metadata(
             columns: columns.into(),
         },
         version_identity,
+        Some(novarocks_spi::connector::ConnectorIcebergViewVersion {
+            uuid: *metadata.uuid().as_bytes(),
+            version_id: metadata.current_version_id(),
+        }),
         metadata
             .properties()
             .get("comment")
@@ -1675,6 +1679,16 @@ mod declaration_tests {
             .map_err(crate::metadata::metadata_creation_error)
         })
         .unwrap();
+        assert_eq!(
+            original.iceberg_version,
+            Some(novarocks_spi::connector::ConnectorIcebergViewVersion {
+                uuid: [
+                    0xfa, 0x65, 0x06, 0xc3, 0x76, 0x81, 0x40, 0xc8, 0x86, 0xdc, 0xe3, 0x65, 0x61,
+                    0xf8, 0x33, 0x85,
+                ],
+                version_id: 4,
+            }),
+        );
         assert_eq!(discovery.version.as_ref(), Some(&original.version));
         assert_eq!(
             discovery.view_definition.as_ref(),

@@ -31,6 +31,8 @@ use std::sync::Arc;
 fn definition(need: &crate::compiler::CatalogRelationNeed, sql: &str) -> Arc<SqlViewDefinition> {
     Arc::new(SqlViewDefinition {
         identity: need.relation().clone(),
+        origin: crate::catalog::SqlViewOrigin::Session,
+        dialect: crate::catalog::SqlViewDialect::Trino,
         version: "immutable-version-1".into(),
         raw_sql: sql.into(),
         default_catalog: need.relation().catalog.as_str().into(),
@@ -826,10 +828,28 @@ fn saved_view_selection_uses_saved_context_and_preserves_semantic_refusal_layers
         let captured = source.capture(&[]).unwrap();
         let result = crate::analyzer::analyze(&query(sql), captured.provider(), "outside");
         if body.contains("'backup'") {
+            use crate::analysis::{QueryBody, Relation};
+            use crate::planner::table::{ScanSource, SqlMvReadSelection};
+
+            let (analyzed, _, _) = result.unwrap();
             assert_eq!(
-                result.unwrap().0.output_columns[0].value_type.data_type(),
+                analyzed.output_columns[0].value_type.data_type(),
                 &arrow::datatypes::DataType::Int32
             );
+            let QueryBody::Select(outer) = &analyzed.body else {
+                panic!("outer SELECT");
+            };
+            let Some(Relation::Subquery { query: view, .. }) = &outer.from else {
+                panic!("expanded view");
+            };
+            let QueryBody::Select(inner) = &view.body else {
+                panic!("view SELECT");
+            };
+            let Some(Relation::Scan(scan)) = &inner.from else {
+                panic!("view's historical base relation");
+            };
+            let ScanSource::Sql(source) = &scan.table.source;
+            assert_eq!(source.mv_read_selection(), SqlMvReadSelection::Tag);
         } else {
             let error = result.unwrap_err();
             assert_eq!(

@@ -1363,6 +1363,7 @@ impl CatalogRelationFact {
                 binding.selection(),
                 binding.relation_fqn(),
                 binding.snapshot_id(),
+                binding.read_selection(),
             )),
         )
     }
@@ -1381,13 +1382,27 @@ impl CatalogRelationFact {
                 reason: "captured snapshot cannot resolve a named reference or timestamp",
             });
         };
-        Self::resolved_with_selection(need, table, Some((key, &need.relation.fqn(), *snapshot)))
+        Self::resolved_with_selection(
+            need,
+            table,
+            Some((
+                key,
+                &need.relation.fqn(),
+                *snapshot,
+                crate::planner::table::SqlMvReadSelection::Snapshot,
+            )),
+        )
     }
 
     fn resolved_with_selection(
         need: &CatalogRelationNeed,
-        table: ResolvedAnalyzerTable,
-        binding: Option<(&crate::planning::catalog::SqlTimeTravelSelection, &str, i64)>,
+        mut table: ResolvedAnalyzerTable,
+        binding: Option<(
+            &crate::planning::catalog::SqlTimeTravelSelection,
+            &str,
+            i64,
+            crate::planner::table::SqlMvReadSelection,
+        )>,
     ) -> Result<Self, CompletionProtocolError> {
         if table.catalog.identity != need.relation {
             return Err(CompletionProtocolError::CatalogRelationMismatch {
@@ -1401,10 +1416,10 @@ impl CatalogRelationFact {
         }
         let selected_snapshot = match (need.selection_key(), binding) {
             (None, None) => None,
-            (Some(request), Some((selection, relation, selected_snapshot)))
+            (Some(request), Some((selection, relation, selected_snapshot, read_selection)))
                 if request == selection && need.relation.fqn() == relation =>
             {
-                let crate::planner::table::ScanSource::Sql(source) = &table.planner.source;
+                let crate::planner::table::ScanSource::Sql(source) = &mut table.planner.source;
                 if !matches!(&source.kind,
                     crate::planner::table::SqlScanKind::Data {
                         version: crate::planner::table::SqlTableVersionSelector::Snapshot(snapshot), ..
@@ -1416,6 +1431,7 @@ impl CatalogRelationFact {
                         id: need.id,
                     });
                 }
+                source.set_mv_read_selection(read_selection);
                 Some(selected_snapshot)
             }
             _ => return Err(CompletionProtocolError::CatalogLookupTargetMismatch { id: need.id }),

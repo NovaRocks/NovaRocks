@@ -181,8 +181,8 @@ impl SqlFinalPlanCompileRequest {
                 .map_err(SqlCompileError::from)?;
             &query_semantics
         };
-        let consumer_requires_semantic_snapshot =
-            crate::sql_mode::query_requires_semantic_snapshot(effective, &query);
+        let consumer_has_default_computation_semantics =
+            effective.has_default_computation_semantics();
         // Retain the producer's actual checked constants across discovery and
         // catalog rounds. The loan is rebuilt against the admitted query;
         // syntax transformations must validate the original structural sites.
@@ -218,11 +218,10 @@ impl SqlFinalPlanCompileRequest {
             catalog_qualifications,
         };
 
-        // A persisted semantic snapshot is required before an optional MV
-        // definition can be replayed. Decide before publishing discovery or
-        // catalog needs so an unrelated candidate cannot fail the base query.
+        // MV computation uses the default semantics. Decide before publishing
+        // discovery needs so an optional candidate cannot affect the base query.
         let mv_enabled = common.session.optimizer_settings.mv_rewrite_enabled()
-            && !consumer_requires_semantic_snapshot;
+            && consumer_has_default_computation_semantics;
         let initial_catalog =
             CatalogCompletionState::try_new_with_qualifications_and_statement_relation(
                 query.clone(),

@@ -199,6 +199,8 @@ impl QueryViewService {
         )?;
         let declaration = Arc::new(novarocks_sql::planning::catalog::SqlViewDefinition {
             identity,
+            origin: novarocks_sql::planning::catalog::SqlViewOrigin::Session,
+            dialect: novarocks_sql::planning::catalog::SqlViewDialect::Trino,
             version: uuid::Uuid::now_v7().to_string().into(),
             raw_sql: definition.raw_query_source.as_str().into(),
             default_catalog: definition.resolution.default_catalog.as_str().into(),

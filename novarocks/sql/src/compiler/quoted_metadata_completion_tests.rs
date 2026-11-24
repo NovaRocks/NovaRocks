@@ -399,6 +399,8 @@ fn quoted_partitions_analyze_a_files_view_with_the_exact_catalog_binding() {
 fn saved_view(need: &CatalogRelationNeed) -> Arc<SqlViewDefinition> {
     Arc::new(SqlViewDefinition {
         identity: need.relation().clone(),
+        origin: crate::catalog::SqlViewOrigin::Session,
+        dialect: crate::catalog::SqlViewDialect::Trino,
         version: "saved-view-version".into(),
         raw_sql: r#"SELECT snapshot_id AS x FROM "orders$snapshots""#.into(),
         default_catalog: "ice".into(),

@@ -31,12 +31,14 @@ use novarocks_type_contract::{
 };
 
 pub use super::mv_persistence::{
-    SqlMvCreatePersistenceFacts, SqlMvPersistenceAggregateFacts, SqlMvPersistenceExpressionFacts,
-    SqlMvPersistenceExpressionKind, SqlMvPersistenceOutputFacts,
+    SqlMvCreatePersistenceFacts, SqlMvFieldCoordinate, SqlMvFieldPath,
+    SqlMvPersistenceAggregateFacts, SqlMvPersistenceOutputFacts,
     SqlMvPersistenceRelationOccurrenceFacts, SqlMvPersistenceSourceFieldFacts,
     SqlMvPersistenceSourceFieldReference, SqlMvPersistenceUnionBranchFacts,
 };
 pub use crate::compiler::SqlMvRelationOccurrenceId;
+pub use crate::planner::table::SqlMvReadSelection;
+pub use crate::planning::catalog::SqlMvViewDependency;
 
 /// Refuse private result domains before a persistence facade discards their
 /// query-local identities or converts their physical storage into SQL DDL.
@@ -1139,7 +1141,11 @@ pub trait SqlResolvedMvRefreshInputSource: resolved_mv_refresh_input_private::Se
 /// Opaque analyzed-MV input. It deliberately exposes neither analyzer nodes
 /// nor mutation access; SQL planning facades consume it directly.
 #[derive(Clone, Debug)]
-pub struct SqlResolvedMvRefreshInput(crate::analysis::ResolvedQuery, Box<[String]>);
+pub struct SqlResolvedMvRefreshInput(
+    crate::analysis::ResolvedQuery,
+    Box<[String]>,
+    Box<[SqlMvViewDependency]>,
+);
 
 impl SqlResolvedMvRefreshInput {
     pub fn from_analysis<T: SqlResolvedMvRefreshInputSource>(
@@ -1151,8 +1157,13 @@ impl SqlResolvedMvRefreshInput {
     pub(crate) fn from_validated_analysis(
         resolved: crate::analysis::ResolvedQuery,
         names: Vec<String>,
+        view_dependencies: Vec<SqlMvViewDependency>,
     ) -> Self {
-        Self(resolved, names.into_boxed_slice())
+        Self(
+            resolved,
+            names.into_boxed_slice(),
+            view_dependencies.into_boxed_slice(),
+        )
     }
 
     fn checked(
@@ -1162,7 +1173,7 @@ impl SqlResolvedMvRefreshInput {
             &resolved.output_columns,
             None,
         )?;
-        Ok(Self::from_validated_analysis(resolved, names))
+        Ok(Self::from_validated_analysis(resolved, names, Vec::new()))
     }
 
     pub fn refresh_property(
@@ -1251,8 +1262,12 @@ impl SqlResolvedMvRefreshInput {
     /// query used for refresh planning. It is deliberately not an AST or plan:
     /// provider object, schema, and field identities remain application-owned
     /// observations that are joined to these occurrence-qualified SQL facts.
-    pub fn create_persistence_facts(&self) -> Result<SqlMvCreatePersistenceFacts, String> {
-        super::mv_persistence::project_create_persistence_facts(&self.0, &self.1)
+    pub fn create_persistence_facts(&self) -> Result<SqlMvCreatePersistenceFacts, AnalyzeError> {
+        super::mv_persistence::project_create_persistence_facts(&self.0, &self.1, &self.2)
+    }
+
+    pub fn view_dependencies(&self) -> &[SqlMvViewDependency] {
+        &self.2
     }
 
     /// Derive one immutable aggregate-layout input from the admitted query and

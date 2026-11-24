@@ -40,8 +40,8 @@ use novarocks_types::schema::{CatalogTable, ColumnDef};
 pub use crate::analyzer::iceberg_metadata::{MetadataColumn, metadata_table_schema};
 pub use crate::catalog::memory::PlannerMemoryCatalog;
 pub use crate::catalog::{
-    IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, SqlViewColumn,
-    SqlViewDefinition, TableLookupMode,
+    IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, SqlMvViewDependency,
+    SqlViewColumn, SqlViewDefinition, SqlViewDialect, SqlViewOrigin, TableLookupMode,
 };
 /// SQL metadata-relation vocabulary needed by application catalog admission.
 /// This is a value-only DTO; it carries neither a table definition nor a
@@ -226,12 +226,13 @@ pub use crate::analyzer::iceberg_ref::{
 };
 
 /// Sealed result of resolving one parsed time-travel clause against validated
-/// immutable snapshot facts.  SQL exposes only the frozen snapshot identity
-/// needed for query-local rewrite; ref metadata remains internal.
+/// immutable snapshot facts. Retain the original selection kind separately
+/// from the snapshot used by the executable read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlTimeTravelSnapshotBindingFacts {
     snapshot_id: i64,
     selection: SqlTimeTravelSelection,
+    read_selection: crate::planner::table::SqlMvReadSelection,
     relation_fqn: Box<str>,
 }
 
@@ -245,6 +246,10 @@ impl SqlTimeTravelSnapshotBindingFacts {
 
     pub const fn snapshot_id(&self) -> i64 {
         self.snapshot_id
+    }
+
+    pub(crate) const fn read_selection(&self) -> crate::planner::table::SqlMvReadSelection {
+        self.read_selection
     }
 }
 
@@ -264,6 +269,7 @@ pub fn resolve_time_travel_snapshot_binding(
     )?;
     Ok(SqlTimeTravelSnapshotBindingFacts {
         snapshot_id: binding.snapshot_id,
+        read_selection: binding.read_selection(),
         selection: parse_time_travel_selection(version, fully_qualified_name)?,
         relation_fqn: fully_qualified_name.into(),
     })
@@ -980,6 +986,12 @@ mod tests {
                     20,
                 )
                 .expect("valid named reference"),
+                SqlTimeTravelNamedReferenceFacts::try_new(
+                    "backup".to_string(),
+                    SqlTimeTravelReferenceKind::Tag,
+                    20,
+                )
+                .expect("valid named reference"),
             ],
             Some(20),
         )
@@ -1168,6 +1180,8 @@ mod tests {
 
     #[test]
     fn time_travel_binding_resolves_parsed_snapshot_and_named_ref() {
+        use crate::planner::table::SqlMvReadSelection;
+
         let metadata = time_travel_metadata();
 
         let snapshot = resolve_time_travel_snapshot_binding(
@@ -1177,6 +1191,7 @@ mod tests {
         )
         .expect("known snapshot resolves");
         assert_eq!(snapshot.snapshot_id(), 10);
+        assert_eq!(snapshot.read_selection(), SqlMvReadSelection::Snapshot);
         assert_eq!(
             snapshot.selection(),
             &SqlTimeTravelSelection::SnapshotId(10)
@@ -1189,10 +1204,20 @@ mod tests {
         )
         .expect("known named reference resolves");
         assert_eq!(named_ref.snapshot_id(), 20);
+        assert_eq!(named_ref.read_selection(), SqlMvReadSelection::Branch);
         assert_eq!(
             named_ref.selection(),
             &SqlTimeTravelSelection::NamedReference("dev".into())
         );
+
+        let tag = resolve_time_travel_snapshot_binding(
+            &parsed_time_travel_clause("SELECT id FROM t FOR VERSION AS OF 'backup'"),
+            &metadata,
+            "ice.analytics.t",
+        )
+        .expect("known tag resolves");
+        assert_eq!(tag.snapshot_id(), 20);
+        assert_eq!(tag.read_selection(), SqlMvReadSelection::Tag);
 
         let timestamp = resolve_time_travel_snapshot_binding(
             &parsed_time_travel_clause("SELECT id FROM t FOR TIMESTAMP AS OF 1700000000500"),
@@ -1201,6 +1226,7 @@ mod tests {
         )
         .expect("snapshot log resolves timestamp");
         assert_eq!(timestamp.snapshot_id(), 10);
+        assert_eq!(timestamp.read_selection(), SqlMvReadSelection::Snapshot);
         assert_eq!(
             timestamp.selection(),
             &SqlTimeTravelSelection::TimestampMillis(1700000000500)

@@ -1466,7 +1466,7 @@ pub fn analyze_mv_refresh_input(
     .map_err(SqlCompileError::Compilation)?;
     let scoped_functions = functions.snapshot_for_scalar_presence();
     let functions = scoped_functions.as_ref();
-    let (resolved, _, factory) = crate::analyzer::analyze_mv_definition(
+    let (resolved, _, factory, view_dependencies) = crate::analyzer::analyze_mv_definition(
         &query,
         catalog.planner_table_provider(),
         &current_database,
@@ -1481,7 +1481,13 @@ pub fn analyze_mv_refresh_input(
     )?;
     crate::planning::mv::validate_persistable_output(&resolved, &factory)
         .map_err(SqlCompileError::Compilation)?;
-    Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_validated_analysis(resolved, names))
+    Ok(
+        crate::planning::mv::SqlResolvedMvRefreshInput::from_validated_analysis(
+            resolved,
+            names,
+            view_dependencies,
+        ),
+    )
 }
 
 /// Compile and render an IMV refresh EXPLAIN request without exposing its
@@ -1831,7 +1837,10 @@ impl SqlCompiler {
                 factory.clone(),
                 root_semantics.clone(),
                 true,
-                (request.session.sql_semantics.sql_mode().error_if_overflow()),
+                !request
+                    .session
+                    .sql_semantics
+                    .has_default_computation_semantics(),
                 request
                     .session
                     .sql_semantics
@@ -1914,7 +1923,7 @@ impl SqlCompiler {
                     &query_semantics
                 };
                 let consumer_requires_semantic_snapshot =
-                    crate::sql_mode::query_requires_semantic_snapshot(effective, &query);
+                    !effective.has_default_computation_semantics();
                 (
                     logical_plan,
                     factory,

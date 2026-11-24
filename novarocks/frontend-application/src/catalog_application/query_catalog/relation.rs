@@ -25,7 +25,8 @@ use novarocks_sql::compiler::{
     CatalogRelationFact, CatalogRelationNeed, CatalogTimeTravelResolution,
 };
 use novarocks_sql::planning::catalog::{
-    SqlTimeTravelSnapshotBindingFacts, SqlViewColumn, SqlViewDefinition,
+    SqlTimeTravelSnapshotBindingFacts, SqlViewColumn, SqlViewDefinition, SqlViewDialect,
+    SqlViewOrigin,
 };
 use std::sync::Arc;
 
@@ -442,9 +443,9 @@ pub(crate) fn project_view(
     planning_pin: ConnectorControlPlanningPin,
     expected: &ConnectorTableIdentity,
 ) -> CatalogResolutionResult<ConnectorQueryViewMaterialization> {
-    match value.definition.dialect {
-        ConnectorViewDialect::Trino => {}
-    }
+    let dialect = match value.definition.dialect {
+        ConnectorViewDialect::Trino => SqlViewDialect::Trino,
+    };
     if value.identity.instance_id != expected.instance_id
         || value.identity.namespace != expected.namespace
         || value.identity.view != expected.table
@@ -466,6 +467,13 @@ pub(crate) fn project_view(
             expected.namespace.as_ref(),
             expected.table.as_ref(),
         ),
+        origin: value
+            .iceberg_version
+            .map_or(SqlViewOrigin::External, |original| SqlViewOrigin::Iceberg {
+                uuid: original.uuid,
+                version_id: original.version_id,
+            }),
+        dialect,
         version: value.version,
         raw_sql: value.definition.raw_sql,
         default_catalog,
