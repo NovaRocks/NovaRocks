@@ -319,9 +319,12 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
 /// foreign environment loans without widening any production API.
 #[test]
 fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
+    use crate::compiler::SqlFunctionCatalog;
+    use novarocks_functions::{EngineFunctionCatalogBuilder, FunctionDefinition, FunctionKind};
+
     // A constant-false CASE branch is runtime-dead but remains reachable from
-    // the original root. Do not invent an installed TypeOnly owner or an
-    // unrooted definition, which the unit contract would independently reject.
+    // the original root. The same declaration is admissible only when its
+    // exact installed owner is present.
     let query = novarocks_parser::parser::parse_query(
         "SELECT CASE WHEN FALSE THEN sequence(CAST(1 AS BIGINT), CAST(2 AS BIGINT)) ELSE NULL END AS mapped",
     )
@@ -395,6 +398,42 @@ fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
     assert!(selected.as_str().starts_with("builtin.scalar/sequence/"));
     assert_eq!(original.captured().request().logical_argument_count, 2);
     let presence = source.functions.snapshot_for_scalar_presence();
+    unit_authorship::admit_scalar_unit_sources_observed(
+        &loan,
+        &source.draft,
+        presence.as_ref(),
+        &control,
+        &mut work,
+    )
+    .unwrap();
+    let admitted = emit(&expression, &Control::default()).unwrap();
+    assert!(admitted.unit().definitions().iter().any(|definition| {
+        matches!(&definition.kind, ContractExprKind::FunctionCall { function, .. }
+            if function.function_id.as_str() == "builtin.scalar/sequence/v1"
+                && &function.overload == selected)
+    }));
+
+    // Keep the real declaration and resolver, withhold just its installed
+    // implementation, and leave the rest of the original catalogue intact.
+    let installed = crate::functions::builtin_engine_function_catalog();
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    for original in installed.definitions() {
+        let definition =
+            if original.kind() == FunctionKind::Scalar && original.canonical_name() == "sequence" {
+                FunctionDefinition::try_new_bound(
+                    original.canonical_name(),
+                    original.visibility(),
+                    original.binding_declaration().unwrap().clone(),
+                    Arc::new(original.binding_resolver().unwrap().clone()),
+                )
+                .unwrap()
+            } else {
+                original.clone()
+            };
+        builder.register(definition).unwrap();
+    }
+    let declared = builder.seal_bound().unwrap();
+    let presence = declared.snapshot_for_scalar_presence();
     assert!(matches!(
         unit_authorship::admit_scalar_unit_sources_observed(
             &loan, &source.draft, presence.as_ref(), &control, &mut work
@@ -407,7 +446,14 @@ fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
     // The production standalone entry reaches the same original capability
     // refusal before neutral transfer, seal, effects or a published source.
     assert!(matches!(
-        emit(&expression, &Control::default()),
+        lower_required_constant_unit(
+            &expression,
+            declared.snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+            false,
+            policy(),
+            &Control::default(),
+        ),
         Err(ContractLoweringError::FunctionBinding(
             novarocks_functions::FunctionBindingError::UnavailableImplementation(ref overload)
         )) if overload == selected

@@ -17,13 +17,16 @@
 //! Actual analysis/request-snapshot admission probes; not a complete support seal.
 use arrow::datatypes::DataType;
 use novarocks_functions::{
-    FunctionArgument, FunctionBindingError, FunctionKind, FunctionSpecializationFailure,
-    FunctionValueType, ResolvedFunctionBinding,
+    ConstantValue, FunctionArgument, FunctionBindingError, FunctionKind,
+    FunctionSpecializationFailure, FunctionValueType, ResolvedFunctionBinding,
 };
+use novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY;
 use novarocks_sql::compiler::{
     SqlCompileControl, SqlFunctionCatalog, builtin_sql_function_catalog,
 };
-use novarocks_type_contract::{CompileControlError, PureCompileControl};
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -42,52 +45,83 @@ fn array_argument() -> FunctionArgument {
         true,
     ))))
 }
+fn variant_get_arguments(control: &dyn PureCompileControl) -> [FunctionArgument; 2] {
+    let variant = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Variant,
+    )
+    .unwrap();
+    let path_type = FunctionValueType::new(DataType::Utf8, false);
+    let path = ConstantValue::from_utf8(
+        Arc::new(path_type.try_to_field("path").unwrap()),
+        path_type.clone(),
+        "$.k",
+        FROZEN_CONSTANT_POLICY,
+        CompilePhase::Validate,
+        control,
+    )
+    .unwrap();
+    [
+        FunctionArgument::Value {
+            value_type: variant,
+            constant: None,
+        },
+        FunctionArgument::Value {
+            value_type: path_type,
+            constant: Some(path),
+        },
+    ]
+}
+
 #[test]
 fn sql_presence_candidate_snapshot_keeps_exact_bindings_and_table_owner_separate() {
     let original = builtin_sql_function_catalog().snapshot();
     let scoped = original.snapshot_for_scalar_presence();
     let again = scoped.snapshot().snapshot_for_scalar_presence();
     let control = SqlCompileControl::unbounded();
-    let args = [argument(DataType::Utf8)];
-    let original_binding = original
-        .resolve_scalar_binding("reverse", &args, &control)
-        .unwrap();
-    assert_eq!(
-        original_binding.admitted_execution_abi, None,
-        "original declaration is not admission"
-    );
-    let actual_abi = original
-        .pure_overload_declaration_observed(
-            &original_binding.function_id,
-            original_binding.kind,
-            &original_binding.selected.overload,
-            &control,
-        )
-        .unwrap()
-        .implementation()
-        .abi;
-    // Scoped admission adds the real installed ABI without replacing source facts.
-    let mut expected = original_binding.clone();
-    expected.admitted_execution_abi = Some(actual_abi);
-    for scope in [scoped.as_ref(), again.as_ref()] {
-        let mut admitted = scope
-            .resolve_scalar_binding("reverse", &args, &control)
+    for (name, args) in [
+        ("reverse", [argument(DataType::Utf8)]),
+        ("array_sort", [array_argument()]),
+    ] {
+        let original_binding = original
+            .resolve_scalar_binding(name, &args, &control)
             .unwrap();
-        assert_eq!(admitted.admitted_execution_abi, Some(actual_abi));
-        assert_eq!(admitted, expected);
-        // Only the independently checked admission refinement differs. Every
-        // original function, selected signature, semantics and source fact stays.
-        admitted.admitted_execution_abi = None;
-        assert_eq!(admitted, original_binding);
+        assert_eq!(
+            original_binding.admitted_execution_abi, None,
+            "original declaration is not admission"
+        );
+        let actual_abi = original
+            .pure_overload_declaration_observed(
+                &original_binding.function_id,
+                original_binding.kind,
+                &original_binding.selected.overload,
+                &control,
+            )
+            .unwrap()
+            .implementation()
+            .abi;
+        // Scoped admission adds the real installed ABI without replacing source facts.
+        let mut expected = original_binding.clone();
+        expected.admitted_execution_abi = Some(actual_abi);
+        for scope in [scoped.as_ref(), again.as_ref()] {
+            let mut admitted = scope.resolve_scalar_binding(name, &args, &control).unwrap();
+            assert_eq!(admitted.admitted_execution_abi, Some(actual_abi));
+            assert_eq!(admitted, expected);
+            // Only the independently checked admission refinement differs. Every
+            // original function, selected signature, semantics and source fact stays.
+            admitted.admitted_execution_abi = None;
+            assert_eq!(admitted, original_binding);
+        }
     }
-    // ARRAY sort has an original selected declaration without a pure owner.
-    let array = [array_argument()];
+    // VARIANT_GET has a selectable declaration without a pure owner.
+    let args = variant_get_arguments(&control);
     let bound = original
-        .resolve_scalar_binding("array_sort", &array, &control)
+        .resolve_scalar_binding("variant_get", &args, &control)
         .unwrap();
     for scope in [scoped.as_ref(), again.as_ref()] {
         assert!(
-            matches!(scope.resolve_scalar_binding("array_sort", &array, &control), Err(FunctionBindingError::UnavailableImplementation(ref id)) if id == &bound.selected.overload)
+            matches!(scope.resolve_scalar_binding("variant_get", &args, &control), Err(FunctionBindingError::UnavailableImplementation(ref id)) if id == &bound.selected.overload)
         );
     }
     // This uses the actual registered table owner, separately from scalar admission.
@@ -124,9 +158,9 @@ fn sql_presence_candidate_exact_selected_loan_cannot_bypass_missing_owner() {
     let original = builtin_sql_function_catalog().snapshot();
     let scoped = original.snapshot_for_scalar_presence();
     let control = SqlCompileControl::unbounded();
-    let args = [array_argument()];
+    let args = variant_get_arguments(&control);
     let bound = original
-        .resolve_scalar_binding("array_sort", &args, &control)
+        .resolve_scalar_binding("variant_get", &args, &control)
         .unwrap();
     let request = novarocks_functions::FunctionBindingRequest {
         arguments: &args,
