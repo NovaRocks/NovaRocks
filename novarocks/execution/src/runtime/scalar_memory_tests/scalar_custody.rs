@@ -504,9 +504,8 @@ fn runtime_scalar_memory_array_slice_compacts_actual_selected_lists() {
     .unwrap();
     let binding = bound();
     let mut control = runtime_control(Some(&binding));
-    control.bind_mem_tracker(crate::runtime::mem_tracker::MemTracker::new_root(
-        "array-slice-selected-lists",
-    ));
+    let tracker = crate::runtime::mem_tracker::MemTracker::new_root("array-slice-selected-lists");
+    control.bind_mem_tracker(Arc::clone(&tracker));
     let root = root(&program);
     let mut instance = CompiledExpressionInstance::try_new_with_allocator(
         program.unit(root.unit).unwrap().clone(),
@@ -535,7 +534,12 @@ fn runtime_scalar_memory_array_slice_compacts_actual_selected_lists() {
         Some(vec![Some(11)]),
     ]);
     assert_eq!(result.values().to_data(), expected.to_data());
-    assert_eq!(journal.body.stopped, Some(Ok(())));
+    let alias = result.values().clone();
+    drop(result);
+    drop(instance);
+    assert!(tracker.current() > 0);
+    drop(alias);
+    assert_eq!(tracker.current(), 0);
 }
 #[test]
 fn runtime_scalar_memory_original_frame_nested_and_selected_values_match_old_entry() {

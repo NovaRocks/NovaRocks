@@ -205,10 +205,10 @@
       "unit": "sql-case:complex-type/complex_test_array_contains",
       "failure": {
         "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
+        "code": "sql.analyze.unsupported_expression"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_repeat/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
+      "reason": "Native 1FE+3BE executes the full prefix through step 196, including the stored temporal comparison and both argument orders of mixed-precision contains_sequence. Step 197 first refuses the recursive ROW conversion for INSERT of the anonymous ROW array into ARRAY(ROW(f1 INTEGER, f2 VARCHAR)). B7e owns changing the nested ROW member type. Preserve all later MAP, JSON, and ROW oracles. Evidence: B7b p07-matrix-v6/complex-type. Exit after the complete case and cleanup pass.",
+      "owner": "UEA-5E B7e",
       "expires": "2026-12-15"
     },
     {
