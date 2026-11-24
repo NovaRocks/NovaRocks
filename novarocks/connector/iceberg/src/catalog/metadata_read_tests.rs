@@ -110,7 +110,6 @@ async fn owner_with_identity(
     .unwrap();
     Arc::new(super::rest::NovaRocksRestCatalog::new(
         endpoints,
-        None,
         RestAccessDelegationMode::Vended,
     ))
 }

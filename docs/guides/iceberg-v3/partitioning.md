@@ -29,7 +29,6 @@ under the License.
 | DELETE 跨历史 partition spec | ✅ | |
 | OPTIMIZE 跨历史 spec（compact 到当前 spec） | ✅ | |
 | Partition transform `void`（V3） | ❌ | |
-| Dynamic partition overwrite | ✅ | `INSERT OVERWRITE PARTITIONS` |
 | Partition stats puffin（V3 `partition-stats-blob`） | ❌ | 写入 + 消费均未实现 |
 | Partition spec 修复 / 等价合并 | ❌ | |
 
@@ -78,9 +77,10 @@ Spec：v3 引入 `void(col)` transform，作用是"声明这一列不再用作�
 
 通过 `SET PROPERTIES partitioning` 声明仍参与分区的完整变换列表，即可移除旧规格中的变换。
 
-## ✅ Dynamic partition overwrite
+## 追加期间的分区演进
 
-`INSERT OVERWRITE PARTITIONS` 只替换本次写入命中的分区。`INSERT OVERWRITE` 替换整张表。
+普通 INSERT 冻结写出所用的默认分区规范，并在提交时核对该规范。并发提交改变默认规范时，
+本次 INSERT 结束并返回提交冲突。其他写操作的条件见 [lake publication](lake-publication.md#冲突与重新准备)。
 
 ## ❌ Partition stats puffin（V3 `partition-stats-blob`）
 

@@ -461,20 +461,37 @@ fn gc_disabled_real_lease_refuses_before_dispatch_and_preserves_shared_source_ro
         )
         .unwrap();
         engine
-            .stage(&crate::commit::overwrite::OverwritePreparer)
+            .stage(&crate::commit::filter_delete::FilterDeletePreparer::for_full_refresh())
+            .await
+            .unwrap();
+        engine
+            .stage(&crate::commit::fast_append::FullRefreshAppendFixture(None))
             .await
             .unwrap();
         let frozen = engine.freeze().unwrap();
-        assert!(frozen.updates().iter().any(|update| matches!(update,
-            crate::iceberg::TableUpdate::AddSnapshot { snapshot }
-            if snapshot.summary().operation == crate::iceberg::spec::Operation::Overwrite
-        )));
+        let operations: Vec<_> = frozen
+            .updates()
+            .iter()
+            .filter_map(|update| match update {
+                crate::iceberg::TableUpdate::AddSnapshot { snapshot } => {
+                    Some(snapshot.summary().operation.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            operations,
+            [
+                crate::iceberg::spec::Operation::Delete,
+                crate::iceberg::spec::Operation::Append
+            ]
+        );
         let outcome = crate::catalog::admission_test_support::publish_frozen(
             Arc::clone(base.runtime.novarocks_catalog()),
             base.descriptor.clone(),
             key.incarnation,
             frozen,
-            CatalogOperation::Overwrite,
+            CatalogOperation::Append,
             preparation,
             None,
         )
@@ -502,7 +519,7 @@ fn gc_disabled_real_lease_refuses_before_dispatch_and_preserves_shared_source_ro
         ),
     );
     assert_ne!(target.metadata().uuid(), source.metadata().uuid());
-    assert_eq!(target.metadata().snapshots().len(), 2);
+    assert_eq!(target.metadata().snapshots().len(), 3);
     assert!(target.metadata().snapshot_by_id(copied_snapshot).is_some());
     assert_ne!(
         target.metadata().current_snapshot().unwrap().snapshot_id(),

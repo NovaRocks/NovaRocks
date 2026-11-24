@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
 use crate::iceberg::spec::{Datum, Type};
 use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
 use std::str::FromStr;
 
 use crate::iceberg::spec::{Literal, PartitionSpecRef, PrimitiveLiteral, Struct};
@@ -397,6 +399,7 @@ mod tests {
 }
 
 /// Decode immutable writer output facts without owning a commit or cleanup ledger.
+#[cfg(test)]
 pub(crate) fn written_file_from_report(
     report: IcebergWriterReport,
     schema: &crate::iceberg::spec::Schema,
@@ -468,6 +471,7 @@ pub(crate) fn written_file_from_report(
     Ok(written)
 }
 
+#[cfg(test)]
 fn decode_report_bounds(
     schema: &crate::iceberg::spec::Schema,
     bounds: Option<BTreeMap<i32, Vec<u8>>>,
@@ -503,6 +507,7 @@ fn decode_report_bounds(
     Ok(out)
 }
 
+#[cfg(test)]
 fn validate_puffin_dv_descriptor(
     format: crate::iceberg::spec::DataFileFormat,
     content: crate::iceberg::spec::DataContentType,
@@ -557,10 +562,12 @@ fn validate_puffin_dv_descriptor(
 
 /// Convert signed writer-report counts into the `WrittenFile`
 /// `HashMap<i32, u64>` representation.
+#[cfg(test)]
 fn i64_to_u64(value: i64, field: &str) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| format!("iceberg {field} value {value} is negative"))
 }
 
+#[cfg(test)]
 fn i64_option_non_negative(value: Option<i64>, field: &str) -> Result<Option<i64>, String> {
     if let Some(value) = value
         && value < 0
@@ -570,6 +577,7 @@ fn i64_option_non_negative(value: Option<i64>, field: &str) -> Result<Option<i64
     Ok(value)
 }
 
+#[cfg(test)]
 fn i64_vec_non_negative(values: Option<Vec<i64>>, field: &str) -> Result<Vec<i64>, String> {
     values
         .unwrap_or_default()
@@ -585,6 +593,7 @@ fn i64_vec_non_negative(values: Option<Vec<i64>>, field: &str) -> Result<Vec<i64
         .collect()
 }
 
+#[cfg(test)]
 fn i64_map_to_u64(
     map: Option<BTreeMap<i32, i64>>,
     field: &str,

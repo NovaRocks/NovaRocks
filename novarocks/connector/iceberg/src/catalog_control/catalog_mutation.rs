@@ -741,6 +741,11 @@ trait CreateCatalogReads: Sync {
     type Read<'a>: std::future::Future<Output = Result<bool, ConnectorError>> + Send + 'a
     where
         Self: 'a;
+    type CreateLocation<'a>: std::future::Future<Output = Result<Option<String>, ConnectorError>>
+        + Send
+        + 'a
+    where
+        Self: 'a;
     type Preflight<'a>: std::future::Future<Output = Result<CreatePreflightFacts, CreatePreparationFailure>>
         + Send
         + 'a
@@ -758,11 +763,12 @@ trait CreateCatalogReads: Sync {
         table: CatalogTableName,
         context: ConnectorRequestContext,
     ) -> Self::Read<'a>;
-    fn namespace_exists<'a>(
+    fn create_location<'a>(
         &'a self,
-        namespace: CatalogNamespaceName,
+        table: CatalogTableName,
+        explicit: Option<String>,
         context: ConnectorRequestContext,
-    ) -> Self::Read<'a>;
+    ) -> Self::CreateLocation<'a>;
 }
 
 struct AsyncCreateCatalogReads {
@@ -772,6 +778,12 @@ impl CreateCatalogReads for AsyncCreateCatalogReads {
     type Read<'a>
         = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<bool, ConnectorError>> + Send + 'a>,
+    >
+    where
+        Self: 'a;
+    type CreateLocation<'a>
+        = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<String>, ConnectorError>> + Send + 'a>,
     >
     where
         Self: 'a;
@@ -816,11 +828,12 @@ impl CreateCatalogReads for AsyncCreateCatalogReads {
             .for_request(context);
         Box::pin(async move { catalog.table_exists_for_read(table, binding).await })
     }
-    fn namespace_exists<'a>(
+    fn create_location<'a>(
         &'a self,
-        namespace: CatalogNamespaceName,
+        table: CatalogTableName,
+        explicit: Option<String>,
         context: ConnectorRequestContext,
-    ) -> Self::Read<'a> {
+    ) -> Self::CreateLocation<'a> {
         let catalog = Arc::clone(self.original.provider.runtime().novarocks_catalog());
         let binding = self
             .original
@@ -829,7 +842,11 @@ impl CreateCatalogReads for AsyncCreateCatalogReads {
             .resources()
             .planning_binding()
             .for_request(context);
-        Box::pin(async move { catalog.namespace_exists_for_read(namespace, binding).await })
+        Box::pin(async move {
+            catalog
+                .ordinary_create_table_location(&table, explicit, &binding)
+                .await
+        })
     }
 }
 
@@ -840,6 +857,10 @@ struct SynchronousCreateCatalogReads<'a> {
 impl CreateCatalogReads for SynchronousCreateCatalogReads<'_> {
     type Read<'a>
         = std::future::Ready<Result<bool, ConnectorError>>
+    where
+        Self: 'a;
+    type CreateLocation<'a>
+        = std::future::Ready<Result<Option<String>, ConnectorError>>
     where
         Self: 'a;
     type Preflight<'a>
@@ -910,11 +931,12 @@ impl CreateCatalogReads for SynchronousCreateCatalogReads<'_> {
                 .and_then(|result| result),
         )
     }
-    fn namespace_exists<'a>(
+    fn create_location<'a>(
         &'a self,
-        namespace: CatalogNamespaceName,
+        table: CatalogTableName,
+        explicit: Option<String>,
         context: ConnectorRequestContext,
-    ) -> Self::Read<'a> {
+    ) -> Self::CreateLocation<'a> {
         let catalog = Arc::clone(self.provider.runtime().novarocks_catalog());
         let binding = self
             .provider
@@ -927,9 +949,11 @@ impl CreateCatalogReads for SynchronousCreateCatalogReads<'_> {
                 .runtime()
                 .resources()
                 .catalog_runtime()
-                .block_on(
-                    async move { catalog.namespace_exists_for_read(namespace, binding).await },
-                )
+                .block_on(async move {
+                    catalog
+                        .ordinary_create_table_location(&table, explicit, &binding)
+                        .await
+                })
                 .map_err(unavailable)
                 .and_then(|result| result),
         )
@@ -1070,7 +1094,7 @@ async fn prepare_ordinary_create<R: CreateCatalogReads>(
         .catalog_runtime()
         .observe_preparation_async(
             async {
-                let facts = reads.preflight().await?;
+                let mut facts = reads.preflight().await?;
                 let target = CatalogTableName::new(facts.namespace.clone(), facts.name.clone());
                 let exists = reads.table_exists(target, request.context.clone()).await?;
                 request.context.check_active()?;
@@ -1085,14 +1109,15 @@ async fn prepare_ordinary_create<R: CreateCatalogReads>(
                         .into())
                     };
                 }
-                let target = CatalogNamespaceName::new(facts.namespace.clone());
-                let exists = reads
-                    .namespace_exists(target, request.context.clone())
+                let target = CatalogTableName::new(facts.namespace.clone(), facts.name.clone());
+                facts.properties.location = reads
+                    .create_location(
+                        target,
+                        facts.properties.location.take(),
+                        request.context.clone(),
+                    )
                     .await?;
                 request.context.check_active()?;
-                if !exists {
-                    return Err(not_found("Iceberg table namespace does not exist").into());
-                }
                 reads.freeze(facts).await
             },
             |error| match error {

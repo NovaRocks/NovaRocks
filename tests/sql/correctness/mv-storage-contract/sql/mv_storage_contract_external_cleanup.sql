@@ -49,7 +49,7 @@ import scala.collection.JavaConverters._
 import spark.implicits._
 val table = Spark3Util.loadIcebergTable(spark, "ice_rest.ns_${uuid0}.cleanup_mv")
 spark.sparkContext.hadoopConfiguration.set("fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-require(table.snapshots().asScala.size == 3, "fixture did not create three historical publications")
+require(table.snapshots().asScala.size == 5, "fixture did not create three publications with two FULL pairs")
 for (fileList <- Seq(false, true)) {
   val path = table.location() + "/data/t09-orphan-${uuid0}-" + fileList + ".bin"
   val output = table.io().newOutputFile(path).create()

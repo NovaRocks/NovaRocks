@@ -227,6 +227,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_deadline_uses_the_session_query_timeout() {
+        let mut state = SessionSqlState::default();
+        assert_eq!(governed_query_deadline(&state).unwrap(), (None, None));
+
+        let registry = crate::sql::session::registry::SessionPropertyRegistry::new().unwrap();
+        state
+            .apply_session_property_text(&registry, "query_timeout", "3600")
+            .unwrap();
+        let start = Instant::now();
+        let (deadline, timeout) = governed_query_deadline(&state).unwrap();
+        let limit = Duration::from_secs(3600);
+        assert_eq!(timeout, Some(3_600_000));
+        let deadline = deadline.unwrap();
+        assert!(deadline >= start + limit);
+        assert!(deadline <= Instant::now() + limit);
+    }
+
+    #[test]
     fn canonical_execution_error_keeps_resource_facts_site_and_descriptor() {
         use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
         use novarocks_execution_contract::{

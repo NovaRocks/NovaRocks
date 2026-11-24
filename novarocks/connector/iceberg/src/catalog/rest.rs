@@ -37,14 +37,7 @@ use crate::rest_protocol::boundary::sanitize_upstream_error;
 use crate::rest_protocol::endpoints::RestEndpoints;
 use crate::rest_protocol::evidence::{AttributionExpectation, ExpectedSnapshot};
 
-/// A REST Iceberg catalog.
-///
-/// This is the only implementation that can satisfy a standard staged CTAS,
-/// and even here that is a per-request question: staged creation needs an
-/// explicit warehouse so the unanchored staging namespace is enumerable and
-/// therefore collectable. A REST catalog configured without one can still
-/// serve reads, DDL, and ordinary writes; it just cannot run CTAS safely, and
-/// says so before the source executes.
+/// The REST catalog owns StageCreate and the location policy shared with CREATE TABLE.
 #[derive(Debug)]
 pub(super) struct NovaRocksRestCatalog {
     /// Delegates generic owner methods to the generation's one transitional
@@ -53,7 +46,6 @@ pub(super) struct NovaRocksRestCatalog {
     listing: Arc<super::listing_admission::ListingAdmission>,
     /// NovaRocks requests sharing the upstream client's one session (L27).
     endpoints: Arc<RestEndpoints>,
-    warehouse: Option<Arc<str>>,
     access_delegation: RestAccessDelegationMode,
 }
 
@@ -68,30 +60,13 @@ impl NovaRocksRestCatalog {
 
     pub(super) fn new(
         endpoints: Arc<RestEndpoints>,
-        warehouse: Option<Arc<str>>,
         access_delegation: RestAccessDelegationMode,
     ) -> Self {
         Self {
             evidence_policy: Default::default(),
             listing: Default::default(),
             endpoints,
-            warehouse,
             access_delegation,
-        }
-    }
-
-    /// Admission for the staged-create path.
-    ///
-    /// Returns the proven warehouse root, or the refusal to report before any
-    /// side effect.
-    fn admit_staged_create(&self, intent: CatalogCreateIntent) -> Result<Arc<str>, String> {
-        match &self.warehouse {
-            Some(warehouse) if !warehouse.is_empty() => Ok(Arc::clone(warehouse)),
-            _ => Err(format!(
-                "REST Iceberg catalog has no explicit warehouse, so {} cannot stage its target \
-                 where the unanchored staging namespace stays enumerable and collectable",
-                intent.as_str()
-            )),
         }
     }
 }
@@ -132,6 +107,95 @@ pub(crate) fn accept_rest_page(
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksRestCatalog {
+    async fn resolve_create_table_location(
+        &self,
+        table: &CatalogTableName,
+        explicit: Option<String>,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<Option<String>, ConnectorError> {
+        if explicit.is_some() {
+            return Ok(explicit);
+        }
+        let namespace = super::delegate::namespace_ident(&CatalogNamespaceName::new(Arc::clone(
+            &table.namespace,
+        )))?;
+        let namespace = self
+            .listing
+            .run(context, self.endpoints.load_namespace(&namespace))
+            .await
+            .map_err(|error| {
+                if error.kind() == ConnectorErrorKind::NotFound {
+                    error.map_message(|_| "Iceberg table namespace does not exist".into())
+                } else {
+                    error
+                }
+            })?;
+        Ok(namespace.properties().get("location").map(|location| {
+            let separator = if location.ends_with('/') { "" } else { "/" };
+            let suffix = uuid::Uuid::new_v4().simple();
+            format!("{location}{separator}{}-{suffix}", table.name)
+        }))
+    }
+
+    async fn check_create_table_location(
+        &self,
+        location: &str,
+        binding: &crate::access_binding::IcebergReadBinding,
+    ) -> Result<(), ConnectorError> {
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Create location listing requires the original request context",
+            )
+        })?;
+        self.listing
+            .run_wait_for_exit(
+                context,
+                super::create_location::check_empty(location, binding),
+            )
+            .await
+    }
+
+    async fn ordinary_create_table_location(
+        &self,
+        table: &CatalogTableName,
+        explicit: Option<String>,
+        binding: &crate::access_binding::IcebergReadBinding,
+    ) -> Result<Option<String>, ConnectorError> {
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Create location requires the original request context",
+            )
+        })?;
+        if explicit.is_some()
+            && !self
+                .namespace_exists_for_read(
+                    CatalogNamespaceName::new(Arc::clone(&table.namespace)),
+                    binding.clone(),
+                )
+                .await?
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                "Iceberg table namespace does not exist",
+            ));
+        }
+        let location = self
+            .resolve_create_table_location(table, explicit, context)
+            .await?;
+        if self.access_delegation == RestAccessDelegationMode::Vended {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "REST ordinary create cannot hand off vended storage credentials; use staged create",
+            ));
+        }
+        if let Some(location) = &location {
+            self.check_create_table_location(location, binding).await?;
+        }
+        Ok(location)
+    }
+
     fn materialize_staged_create_response(
         &self,
         table: CatalogTableName,
@@ -464,6 +528,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                     .into());
                 }
                 AttributionExpectation::ctas_final_commit(
+                    CatalogTableName::from_identifier(request.identifier()),
                     expected.staged_table_uuid,
                     snapshot,
                     expected.properties,
@@ -527,15 +592,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         operation: &CatalogOperation,
         target: &CatalogAdmissionTarget,
     ) -> Result<(), super::error::CatalogUnsupported> {
-        operation.validate_target(target)?;
-        match operation {
-            CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect)
-            | CatalogOperation::CreateDocuments => self
-                .admit_staged_create(CatalogCreateIntent::CreateTableAsSelect)
-                .map(|_| ())
-                .map_err(super::error::CatalogUnsupported::new),
-            _ => Ok(()),
-        }
+        operation.validate_target(target)
     }
 
     async fn list_namespaces(
@@ -1195,7 +1252,7 @@ mod tests {
             )
             .await
             .expect("REST client");
-            NovaRocksRestCatalog::new(endpoints, None, RestAccessDelegationMode::Vended)
+            NovaRocksRestCatalog::new(endpoints, RestAccessDelegationMode::Vended)
         }
     }
 
@@ -1653,79 +1710,27 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_insert_session_denies_partition_overwrite_on_unpartitioned_and_pre_v3_tables() {
+    fn ordinary_insert_session_keeps_supported_v2_append_admissible() {
         use crate::iceberg::spec::FormatVersion;
         use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
-        for (version, partitioned, expected) in [
-            (
-                FormatVersion::V3,
-                false,
-                "INSERT OVERWRITE PARTITIONS requires a partitioned table; table ice.db.t is unpartitioned (use OVERWRITE without PARTITIONS)",
-            ),
-            (
-                FormatVersion::V2,
-                true,
-                "INSERT OVERWRITE PARTITIONS requires an Iceberg v3 row-lineage table; table ice.db.t is v2",
-            ),
-        ] {
-            let error = begin_insert_admission(
-                insert_admission_metadata(version, partitioned),
-                ConnectorWriteIntent::PartitionOverwrite,
-                "main",
-                ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            )
-            .expect_err("partition overwrite must be denied before a writer is admitted");
-            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-            assert_eq!(error.message(), expected);
-        }
-    }
 
-    #[test]
-    fn ordinary_insert_session_keeps_supported_v2_append_and_v3_partition_overwrite_admissible() {
-        use crate::iceberg::spec::FormatVersion;
-        use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
-        for (version, partitioned, intent) in [
-            (FormatVersion::V2, false, ConnectorWriteIntent::Append),
-            (
-                FormatVersion::V3,
-                true,
-                ConnectorWriteIntent::PartitionOverwrite,
-            ),
-        ] {
-            let plan = begin_insert_admission(
-                insert_admission_metadata(version, partitioned),
-                intent,
-                "main",
-                ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            )
-            .expect("a supported ordinary INSERT must remain admissible");
-            assert_eq!(plan.expected_targets().len(), 1);
-        }
-    }
-
-    #[test]
-    fn ordinary_session_materialized_view_purpose_does_not_acquire_insert_only_denials() {
-        use crate::iceberg::spec::FormatVersion;
-        use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
-        // Same table, intent and input as the unpartitioned INSERT denial above.
-        // The existing purpose path remains independent of the new INSERT gate.
         let plan = begin_insert_admission(
-            insert_admission_metadata(FormatVersion::V3, false),
-            ConnectorWriteIntent::PartitionOverwrite,
+            insert_admission_metadata(FormatVersion::V2, false),
+            ConnectorWriteIntent::Append,
             "main",
-            ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+            ConnectorWriteAdmissionPurpose::OrdinaryDml,
         )
-        .expect("the existing MV-purpose admission must retain its own policy");
+        .expect("a supported v2 INSERT must remain admissible");
         assert_eq!(plan.expected_targets().len(), 1);
     }
+
     #[test]
     fn ordinary_insert_session_keeps_generic_support_error_kind_and_precedence() {
         use crate::iceberg::spec::FormatVersion;
         use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
-        // This protocol-valid metadata names a sort source absent from its schema.
-        // It also fails the unpartitioned INSERT-only gate. The existing generic
-        // support error must retain its kind and precedence.
-        let mut json = serde_json::to_value(insert_admission_metadata(FormatVersion::V3, false))
+        // The v2 target also requests a branch write. The generic support
+        // error for the unresolved sort source must retain its precedence.
+        let mut json = serde_json::to_value(insert_admission_metadata(FormatVersion::V2, false))
             .expect("metadata JSON");
         json["default-sort-order-id"] = serde_json::json!(1);
         json["sort-orders"] = serde_json::json!([{
@@ -1738,8 +1743,8 @@ mod tests {
         let metadata = serde_json::from_value(json).expect("metadata with unresolved sort source");
         let error = begin_insert_admission(
             metadata,
-            ConnectorWriteIntent::PartitionOverwrite,
-            "main",
+            ConnectorWriteIntent::Append,
+            "nightly",
             ConnectorWriteAdmissionPurpose::OrdinaryDml,
         )
         .expect_err("generic support must fail before the INSERT-only gate");
@@ -1996,11 +2001,7 @@ mod evidence_tests {
         )
         .await
         .expect("REST generation");
-        NovaRocksRestCatalog::new(
-            endpoints,
-            Some(Arc::from("s3://warehouse")),
-            RestAccessDelegationMode::Vended,
-        )
+        NovaRocksRestCatalog::new(endpoints, RestAccessDelegationMode::Vended)
     }
 
     async fn publish_catalog_request(
@@ -2369,7 +2370,7 @@ mod evidence_tests {
             } else {
                 vended_endpoints
             };
-            let owner = NovaRocksRestCatalog::new(endpoints, None, mode);
+            let owner = NovaRocksRestCatalog::new(endpoints, mode);
             for snapshots in [SnapshotLoading::All, SnapshotLoading::Refs] {
                 let loaded = if snapshots == SnapshotLoading::All {
                     owner.load_table(CatalogTableName::new("db", "t")).await

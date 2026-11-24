@@ -21,7 +21,7 @@
 -- Test Objective:
 -- 1. Validate aggregate MV full refresh over a v3 row-lineage Iceberg base table.
 -- 2. Validate append snapshots refresh incrementally.
--- 3. Validate INSERT OVERWRITE refresh falls back to full refresh and advances metadata.
+-- 3. Validate a Spark overwrite triggers a full refresh and advances metadata.
 -- 4. Validate S3-backed Iceberg DELETE mutates visible base rows and MV refresh state.
 -- MV is Iceberg-target (PROPERTIES('storage_engine'='iceberg')).
 
@@ -70,11 +70,17 @@ FROM orders_strategy_mv
 ORDER BY customer;
 
 -- query 7
--- @skip_result_check=true
-INSERT OVERWRITE mv_strategy_ice_${uuid0}.ns_${uuid0}.orders
-SELECT id, customer, amount + 100
-FROM mv_strategy_ice_${uuid0}.ns_${uuid0}.orders
-WHERE id >= 2;
+-- Replace the base with the seeded rows whose id is at least 2, adding 100 to each amount.
+-- @result_contains=SPARK_BASE_OVERWRITE_OK
+shell: set -eu
+tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-ivm-overwrite-XXXXXX.sql")"
+trap 'rm -f "$tmp_sql"' EXIT
+cat > "$tmp_sql" <<'SPARK_SQL'
+INSERT OVERWRITE TABLE ice_rest.ns_${uuid0}.orders
+VALUES (2, 'A', 120), (3, 'B', 130), (4, 'A', 200);
+SPARK_SQL
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
+printf 'SPARK_BASE_OVERWRITE_OK\n'
 
 -- query 8
 -- @skip_result_check=true

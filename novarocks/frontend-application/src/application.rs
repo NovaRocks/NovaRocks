@@ -95,7 +95,6 @@ use novarocks_catalog_application::{
 };
 use novarocks_mv_application::state_store_repository::StateStoreMvRepository;
 use novarocks_native_adapter::FrontendNativeTransport;
-use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -881,7 +880,6 @@ pub struct FrontendApplicationHost {
     topology: Option<Arc<ClusterBackendService>>,
     optimizer_query_mem_limit_bytes: u64,
     statement_clock: StatementClock,
-    lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     mv_scheduler_config: MvSchedulerConfig,
     mv_maintenance_config: MaintenanceCoordinatorConfig,
     mv_remote_effect_policy: novarocks_mv_application::management::RemoteEffectPolicy,
@@ -1132,7 +1130,6 @@ pub struct FrontendExecutionConfig {
     /// Connector split enumeration's bounded, server-owned initial feedback
     /// wait. This is frozen at startup and deliberately has no SQL override.
     connector_split_initial_dynamic_filter_wait_cap: Duration,
-    lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     catalog_projection: CatalogProjectionConfig,
     catalog_materialization: CatalogMaterializationConfig,
     catalog_prune: CatalogPruneConfig,
@@ -1202,14 +1199,6 @@ impl FrontendExecutionConfig {
             result_profile: logical_runtime.result_profile,
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_CONNECTOR_SPLIT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
-            lake_publication_runtime_policy: LakePublicationRuntimePolicy::try_new(
-                Duration::from_secs(30 * 60),
-                Duration::from_secs(45 * 60),
-                Duration::from_secs(60),
-                Duration::from_secs(5 * 60),
-                Duration::from_secs(60),
-            )
-            .expect("default lake publication policy is safe"),
             catalog_projection: CatalogProjectionConfig::default(),
             catalog_materialization: CatalogMaterializationConfig::default(),
             catalog_prune: CatalogPruneConfig::try_new(
@@ -1342,18 +1331,6 @@ impl FrontendExecutionConfig {
     pub fn with_connector_split_initial_dynamic_filter_wait_cap(mut self, cap: Duration) -> Self {
         self.connector_split_initial_dynamic_filter_wait_cap = cap;
         self
-    }
-
-    pub fn with_lake_publication_runtime_policy(
-        mut self,
-        policy: LakePublicationRuntimePolicy,
-    ) -> Self {
-        self.lake_publication_runtime_policy = policy;
-        self
-    }
-
-    pub(crate) const fn lake_publication_runtime_policy(&self) -> LakePublicationRuntimePolicy {
-        self.lake_publication_runtime_policy
     }
 
     pub fn with_default_statement_time_zone(
@@ -1666,7 +1643,6 @@ impl FrontendApplicationHost {
             topology: None,
             optimizer_query_mem_limit_bytes: execution.optimizer_query_mem_limit_bytes(),
             statement_clock: execution.statement_clock.clone(),
-            lake_publication_runtime_policy: execution.lake_publication_runtime_policy(),
             mv_scheduler_config: execution.mv_scheduler.clone(),
             mv_maintenance_config: execution.mv_maintenance.clone(),
             mv_remote_effect_policy: execution.mv_remote_effect_policy.clone(),
@@ -2296,10 +2272,6 @@ impl FrontendApplicationHost {
 
     pub fn optimizer_query_mem_limit_bytes(&self) -> u64 {
         self.optimizer_query_mem_limit_bytes
-    }
-
-    pub fn lake_publication_runtime_policy(&self) -> LakePublicationRuntimePolicy {
-        self.lake_publication_runtime_policy
     }
 
     /// The immutable deployment profile used by every FE constant author.

@@ -26,6 +26,8 @@ use std::sync::Arc;
 pub(crate) enum CommitOperation {
     Legacy,
     Write,
+    Insert,
+    CreateTable,
     Optimize,
     Truncate,
     Delete,
@@ -44,7 +46,9 @@ impl CommitOperation {
     pub(crate) const fn style(self) -> CommitStyle {
         match self {
             Self::Legacy => CommitStyle::Legacy,
-            Self::Write | Self::Optimize => CommitStyle::Transaction,
+            Self::Write | Self::Insert | Self::CreateTable | Self::Optimize => {
+                CommitStyle::Transaction
+            }
             Self::Truncate | Self::Delete | Self::OptimizeManifests | Self::ExpireSnapshots => {
                 CommitStyle::Update
             }
@@ -76,6 +80,7 @@ impl WriterSchemaSpec {
 pub(crate) enum WriteSessionCommitProtocol {
     #[default]
     Legacy,
+    Append,
     RowDelta(IsolationLevel),
     RewriteFiles,
 }
@@ -84,6 +89,7 @@ impl WriteSessionCommitProtocol {
     pub(crate) const fn operation(self) -> CommitOperation {
         match self {
             Self::Legacy => CommitOperation::Legacy,
+            Self::Append => CommitOperation::Insert,
             Self::RowDelta(_) => CommitOperation::Write,
             Self::RewriteFiles => CommitOperation::Optimize,
         }
@@ -91,7 +97,7 @@ impl WriteSessionCommitProtocol {
 
     pub(crate) const fn row_delta_isolation(self) -> Option<IsolationLevel> {
         match self {
-            Self::Legacy | Self::RewriteFiles => None,
+            Self::Legacy | Self::Append | Self::RewriteFiles => None,
             Self::RowDelta(isolation) => Some(isolation),
         }
     }
@@ -102,7 +108,11 @@ impl WriteSessionCommitProtocol {
 #[derive(Debug)]
 pub(crate) enum CommitProtocol {
     Legacy,
+    CreateTable,
     Truncate,
+    Append {
+        output_spec_id: i32,
+    },
     Delete,
     RowDelta {
         window: RowDeltaWindowCheck,
@@ -118,6 +128,8 @@ impl CommitProtocol {
     pub(crate) const fn operation(&self) -> CommitOperation {
         match self {
             Self::Legacy => CommitOperation::Legacy,
+            Self::CreateTable => CommitOperation::CreateTable,
+            Self::Append { .. } => CommitOperation::Insert,
             Self::Truncate => CommitOperation::Truncate,
             Self::Delete => CommitOperation::Delete,
             Self::RowDelta { .. } => CommitOperation::Write,
@@ -127,7 +139,11 @@ impl CommitProtocol {
 
     pub(crate) fn window(&self) -> WindowValidation<'_> {
         match self {
-            Self::Legacy | Self::Truncate | Self::Delete => WindowValidation::None,
+            Self::Legacy
+            | Self::CreateTable
+            | Self::Append { .. }
+            | Self::Truncate
+            | Self::Delete => WindowValidation::None,
             Self::RowDelta { window, .. } => WindowValidation::RowDelta(window),
             Self::RewriteFiles { replaced, .. } => WindowValidation::RewriteFiles(replaced),
         }
@@ -135,18 +151,28 @@ impl CommitProtocol {
 
     pub(crate) const fn writer_schema_spec(&self) -> Option<WriterSchemaSpec> {
         match self {
-            Self::Legacy | Self::Truncate | Self::Delete | Self::RewriteFiles { .. } => None,
+            Self::Legacy
+            | Self::CreateTable
+            | Self::Append { .. }
+            | Self::Truncate
+            | Self::Delete
+            | Self::RewriteFiles { .. } => None,
             Self::RowDelta { writer, .. } => Some(*writer),
         }
     }
-    pub(crate) const fn rewrite_output_requirement(&self) -> Option<TableRequirement> {
+
+    pub(crate) const fn output_spec_requirement(&self) -> Option<TableRequirement> {
         match self {
-            Self::RewriteFiles { output_spec_id, .. } => {
+            Self::Append { output_spec_id } | Self::RewriteFiles { output_spec_id, .. } => {
                 Some(TableRequirement::DefaultSpecIdMatch {
                     default_spec_id: *output_spec_id,
                 })
             }
-            Self::Legacy | Self::Truncate | Self::Delete | Self::RowDelta { .. } => None,
+            Self::Legacy
+            | Self::CreateTable
+            | Self::Truncate
+            | Self::Delete
+            | Self::RowDelta { .. } => None,
         }
     }
 

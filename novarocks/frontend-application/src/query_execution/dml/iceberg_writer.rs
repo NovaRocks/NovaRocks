@@ -39,27 +39,15 @@ use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
 use novarocks_types::schema::{ColumnDef, ColumnDefault};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IcebergWriteMode {
-    Append,
-    FullTableOverwrite,
-    DynamicPartitionOverwrite,
-}
-
 /// Resolve and prepare the original INSERT through direct asynchronous
 /// Provider I/O. The admitted action retains its InitialComputationReservation;
 /// this entry neither reserves the old coordinator nor compiles a native plan.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The write preparation boundary keeps the exact target, statement and provider generation explicit."
-)]
 pub(crate) async fn prepare_iceberg_write_async(
     state: &DmlExecutionKernel,
     target: &TargetBackend,
     resolved: &ResolvedTable,
     insert_columns: &[String],
     source: &Query,
-    overwrite_mode: IcebergWriteMode,
     target_ref: &str,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -90,7 +78,7 @@ pub(crate) async fn prepare_iceberg_write_async(
         crate::query_execution::planning::sql_compile_control_from_connector_request(
             connector_context,
         );
-    let intent = iceberg_write_intent(overwrite_mode);
+    let intent = ConnectorWriteIntent::Append;
     // The same closed SQL author admits the original provider input before
     // shaping any casts. This is pure work, never a joining metadata wrapper.
     let (query, source_constants, input) = build_iceberg_write_plan(
@@ -164,14 +152,6 @@ pub(crate) async fn prepare_iceberg_write_async(
         connector_context,
         write_session,
     ))
-}
-
-const fn iceberg_write_intent(overwrite_mode: IcebergWriteMode) -> ConnectorWriteIntent {
-    match overwrite_mode {
-        IcebergWriteMode::Append => ConnectorWriteIntent::Append,
-        IcebergWriteMode::FullTableOverwrite => ConnectorWriteIntent::Overwrite,
-        IcebergWriteMode::DynamicPartitionOverwrite => ConnectorWriteIntent::PartitionOverwrite,
-    }
 }
 
 fn bind_iceberg_session_write_input(
@@ -1004,22 +984,6 @@ mod tests {
                 .map(|(name, data_type)| Arc::new(Field::new(name, data_type, true)))
                 .collect::<Vec<_>>(),
         ))
-    }
-
-    #[test]
-    fn write_mode_preserves_provider_intent() {
-        assert_eq!(
-            iceberg_write_intent(IcebergWriteMode::Append),
-            ConnectorWriteIntent::Append
-        );
-        assert_eq!(
-            iceberg_write_intent(IcebergWriteMode::FullTableOverwrite),
-            ConnectorWriteIntent::Overwrite
-        );
-        assert_eq!(
-            iceberg_write_intent(IcebergWriteMode::DynamicPartitionOverwrite),
-            ConnectorWriteIntent::PartitionOverwrite
-        );
     }
 
     #[test]

@@ -17,19 +17,20 @@
 
 //! Manifest input retains logical identities, including multiple DV blobs in one Puffin.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 #[cfg(test)]
-use super::super::manifest_sources::duplicate_identity;
-use super::super::manifest_sources::{LocatedEntry, SnapshotSources};
+use super::super::manifest_sources::{LocatedEntry, SnapshotSources, duplicate_identity};
+use super::super::model::ArtifactWriter;
 #[cfg(test)]
-use super::super::model::FrozenEntry;
-use super::super::model::{ArtifactWriter, EntryIdentity};
+use super::super::model::{EntryIdentity, FrozenEntry};
 #[cfg(test)]
 use super::{HistoryGap, HistoryWindow, history_window};
 #[cfg(test)]
 use crate::iceberg::spec::DataFile;
 use crate::iceberg::spec::TableMetadata;
+#[cfg(test)]
 use crate::iceberg::{Error, ErrorKind, Result};
 
 #[cfg(test)]
@@ -46,6 +47,7 @@ pub struct ValidationInputs<'a> {
     pub(super) stage: Option<usize>,
     pub metadata: &'a TableMetadata,
     pub parent: Option<i64>,
+    #[cfg(test)]
     io: &'a dyn ArtifactWriter,
     #[cfg(test)]
     live: Option<LiveSet>,
@@ -55,18 +57,20 @@ impl<'a> ValidationInputs<'a> {
     pub fn new(
         metadata: &'a TableMetadata,
         parent: Option<i64>,
-        io: &'a dyn ArtifactWriter,
+        _io: &'a dyn ArtifactWriter,
     ) -> Self {
         Self {
             stage: None,
             metadata,
             parent,
-            io,
+            #[cfg(test)]
+            io: _io,
             #[cfg(test)]
             live: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn compact_live_entries(
         &self,
     ) -> Result<BTreeMap<EntryIdentity, LocatedEntry>> {
@@ -141,6 +145,7 @@ impl<'a> ValidationInputs<'a> {
     }
 }
 
+#[cfg(test)]
 fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::DataInvalid, message)
 }

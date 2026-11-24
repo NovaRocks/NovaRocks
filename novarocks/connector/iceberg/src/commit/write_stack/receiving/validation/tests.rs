@@ -29,7 +29,6 @@ use crate::commit::write_stack::test_support::{
 use crate::commit::write_stack::tests::{
     data_fragment, dv_session, final_vector, fixed_delete_recipe, fixed_dv_fragment,
 };
-use crate::iceberg::spec::{DataFileBuilder, DataFileFormat};
 use novarocks_spi::connector::ConnectorWriteAdmissionPurpose;
 
 use super::*;
@@ -293,13 +292,6 @@ fn distributed_v2_records_can_repeat_a_target_with_an_exact_matching_partition()
 
     // Whole-set receiving continues to defer exact partition grouping to
     // its original materialized publication step.
-    let mut whole = FragmentAdmission::for_whole_set(&handle);
-    whole
-        .admit_whole_fragment(ordinal, &first, |_| Ok(false))
-        .unwrap();
-    whole
-        .admit_whole_fragment(ordinal, &third, |_| Ok(false))
-        .unwrap();
 }
 
 fn prove_partition_refusal(result: Result<usize, ConnectorError>) {
@@ -334,37 +326,4 @@ fn materialized_data_rejects_assigned_first_row_id_during_compact_admission() {
         error.message(),
         "unsupported materialized row-delta addition"
     );
-}
-
-#[test]
-fn materialized_projection_requires_inheritance_and_the_original_declared_target() {
-    let path = "s3://b/new-delete.parquet";
-    let target = "s3://b/target.parquet";
-    let file = DataFileBuilder::default()
-        .content(DataContentType::PositionDeletes)
-        .file_path(path.into())
-        .file_format(DataFileFormat::Parquet)
-        .record_count(1)
-        .file_size_in_bytes(100)
-        .referenced_data_file(Some(target.into()))
-        .build()
-        .unwrap();
-    let admitted = EntryIdentity::DeleteFile { path: path.into() };
-    let explicit = AddedContent::rewritten_data(file.clone(), 0, 7).unwrap();
-    let error = validate_materialized_addition(&admitted, Some(target), &explicit).unwrap_err();
-    assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-    assert_eq!(
-        error.message(),
-        "materialized write has a repeated or non-inheriting addition"
-    );
-    let inheriting = AddedContent::new_logical_data(file, 0).unwrap();
-    let error =
-        validate_materialized_addition(&admitted, Some("s3://b/other.parquet"), &inheriting)
-            .unwrap_err();
-    assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-    assert_eq!(
-        error.message(),
-        "materialized output references a different target"
-    );
-    validate_materialized_addition(&admitted, Some(target), &inheriting).unwrap();
 }

@@ -17,21 +17,18 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# DML（INSERT / DELETE / UPDATE / MERGE / OVERWRITE / TRUNCATE / ADD FILES）
+# DML（INSERT / DELETE / UPDATE / MERGE / CTAS / TRUNCATE / ADD FILES）
 
-> NovaRocks 支持 INSERT、DELETE、UPDATE、MERGE、OVERWRITE、TRUNCATE 与 ADD FILES；CTAS 使用标准 REST staged create。Catalog 写入准入和 v3 row-lineage 要求见各节，CDC sink 尚未实现。
+> NovaRocks 支持 INSERT、DELETE、UPDATE、MERGE、TRUNCATE 与 ADD FILES。CTAS 使用标准 REST staged create。Catalog 写入准入和 v3 row-lineage 要求见各节。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| INSERT INTO（VALUES / SELECT） | ✅ | |
-| INSERT OVERWRITE（全表） | ✅ | 覆盖目标 ref 的整表数据 |
+| INSERT INTO（VALUES / SELECT） | ✅ | 零行结果跳过提交 |
 | DELETE FROM（元数据删除、V2 位置删除、V3 DV） | ✅ | |
 | UPDATE（MOR + UPDATE FROM source） | ✅ | PR #76 |
 | MERGE INTO（matched UPDATE / matched DELETE / not matched INSERT） | ✅ | PR #78 |
 | OPTIMIZE TABLE（whole-table 重写） | ✅ | 见 [maintenance](maintenance.md) |
-| INSERT OVERWRITE 动态分区（`INSERT OVERWRITE PARTITIONS`） | ✅ | v3、分区表，见下文 |
-| CTAS（`CREATE TABLE AS SELECT`） | ✅ | 标准 REST staged-create，显式 warehouse；Hadoop/HMS 在副作用前拒绝 |
-| CTAS 默认 V3 row-lineage | ✅ | 默认格式 v3，不注入 lineage 属性 |
+| CTAS（`CREATE TABLE AS SELECT`） | ✅ | 标准 REST staged create，格式版本 1–3，缺省 2 |
 | TRUNCATE TABLE | ✅ | 清空目标 ref，保留 schema 和历史 |
 | ADD FILES（登记已有 Parquet） | ✅ | 按 catalog 启用，规划目标为 v1/v2 非分区表，见下文 |
 | CDC sink（Flink-style 持续写入） | ❌ | |
@@ -44,12 +41,11 @@ under the License.
 
 | 操作 | 提交时验证 |
 |---|---|
-| INSERT、INSERT SELECT、纯 MV 追加 | 无读依赖，可在新 head 上重新准备 |
-| 静态全表 INSERT OVERWRITE | 无读依赖，覆盖提交时的状态 |
+| 普通 INSERT（VALUES / SELECT） | 核对同一目标表及写出所用的默认分区规范，可在新 head 上重新准备 |
 | ADD FILES | 候选路径未在准确 `main` 快照存活。快照变化时复核候选，依赖名称映射时同时保护整版 metadata |
 | 行级 DELETE / UPDATE / MERGE | 按原隔离级别与连续快照窗口核对 |
 | 主分支元数据 DELETE | 每轮核对原字段身份，按当前文件证明整文件匹配 |
-| 动态分区覆盖、显式分支 TRUNCATE | 目标 ref 与源读取基线相同 |
+| 显式分支 TRUNCATE | 目标 ref 与源读取基线相同 |
 | 主分支 TRUNCATE | 核对表与分支身份，清空获胜轮基准中的全部文件 |
 | OPTIMIZE | 核对原重写文件、实际输出规范与适用的历史依赖 |
 | 绑定基线的文档或分区演进提交 | 目标 ref 与输出基线相同 |
@@ -97,32 +93,13 @@ INSERT INTO orders SELECT id, user_id, amount * 1.1, ts FROM orders_staging;
 INSERT INTO orders (id, user_id, amount) VALUES (2, 1002, 30.00);
 ```
 
-v3 新逻辑行在提交时分配 `first_row_id`，snapshot 的 row range 取实际 manifest-list 分配量，见 [row-lineage](row-lineage.md)。
+输出为零行时跳过提交。v3 的新逻辑行在提交时分配 `first_row_id`，snapshot 的 row range 取实际 manifest-list 分配量，见 [row-lineage](row-lineage.md)。
 
-## ✅ INSERT OVERWRITE
+## 迁移旧覆盖写
 
-```sql
--- 全表覆盖
-INSERT OVERWRITE orders SELECT * FROM orders_staging;
-
--- 退役写法，解析阶段拒绝
-INSERT OVERWRITE orders PARTITION (country = 'CN') SELECT * FROM orders_cn;
-```
-
-实现：写出新 data file，由 canonical preparer 将目标 ref 的旧条目标为 DELETED 并发布完整请求。
-
-原入口将 `PARTITION (country = 'CN')` 写法作为全表覆盖处理。切换后，指定此子句会返回语法错误。
-
-### ✅ 动态分区 OVERWRITE
-
-仅替换本次输出命中的分区，未命中的分区保留；空输出不删除已有分区。
-当前要求 v3 分区表，并拒绝跨历史 partition spec 的覆盖范围。
-
-```sql
-INSERT OVERWRITE PARTITIONS orders SELECT * FROM orders_changes;
-```
-
-移除 data file 时同步移除它适用的精确 DV；共享 Puffin 中其他 data file 的 DV 继续保留。
+全表清空使用 `TRUNCATE TABLE`，再按需执行 `INSERT INTO`。按条件替换可用
+`DELETE ... WHERE` 加 `INSERT INTO`，或将适用的匹配更新、删除和新增表达为 `MERGE`。
+由两条语句完成的替换会进行两次独立提交。
 
 ## ✅ DELETE FROM
 
@@ -206,14 +183,19 @@ phase 1 仅覆盖 INSERT / UPDATE / DELETE 写指定 branch，MERGE INTO 暂未�
 CREATE TABLE t_new AS SELECT * FROM t_old;
 ```
 
-要求支持标准 staged create 的 REST catalog 和显式 warehouse，以便在执行 source 前确定 staging
-namespace。完整初始化、属性和数据请求使用 assert-create 一次发布；零行结果创建无快照空表。
-目标被并发创建时按 `IF NOT EXISTS` 语义结束，结果未知时按 lake-publication 核对。
+CTAS 要求支持标准 staged create 的 REST Catalog。Hadoop 和 HMS 会在产生副作用前拒绝 CTAS。
 
-## ✅ CTAS 默认 V3 row-lineage
+REST CTAS 与普通 `CREATE TABLE` 共用位置规则。显式 `location` 优先。其次使用 namespace location
+下的 `<表名>-<UUID>`。namespace 没有 location 时由 Catalog 分配。NovaRocks 选择的位置在写入或
+注册前检查是否已有文件。非空位置返回 `ICEBERG_FILESYSTEM_ERROR`。
 
-CTAS 只创建 v3 表，显式请求其他格式会在准入时拒绝；不注入 `write.row-lineage`。
-用户显式给出的这个属性（包括 `false`）作为普通表属性保留，不改变 v3 的 lineage 能力。
+格式版本缺省 2，可通过 `format_version` 选择 1、2 或 3。显式 `write.row-lineage` 作为普通表属性保留，
+v3 的 lineage 能力由格式版本决定。
+
+初始化、追加及启用后的写时统计随同一个 assert-create 请求发布一次。零行结果发布一个空 append
+快照并跳过写时统计。`IF NOT EXISTS` 在分析阶段发现表已存在时返回 0 行。分析后被并发建表抢先时，
+返回 `TABLE_ALREADY_EXISTS`。确定拒绝时清理本语句拥有的对象，结果未知时按
+[lake publication](lake-publication.md#不确定提交) 核对。
 
 ## ✅ TRUNCATE TABLE
 

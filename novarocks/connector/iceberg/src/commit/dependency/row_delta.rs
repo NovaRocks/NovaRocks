@@ -310,7 +310,10 @@ fn may_match(check: &RowDeltaWindowCheck, file: &CandidateFile<'_>) -> Result<bo
 }
 
 fn conflict(message: String) -> Result<Verdict> {
-    Ok(Verdict::ValidationConflict(validation_conflict(message)))
+    Ok(Verdict::ValidationConflict(validation_conflict(
+        CommitOperation::Write,
+        message,
+    )))
 }
 
 pub(super) fn history_conflict(
@@ -322,10 +325,10 @@ pub(super) fn history_conflict(
     let endpoint = |id: Option<i64>| id.map_or_else(|| "null".into(), |id| id.to_string());
     match reason {
         HistoryGap::StartExpired(id) | HistoryGap::StartNotAncestor { start: id, .. } => {
-            validation_conflict(format!(
-                "Snapshot {id} is not an ancestor of {}",
-                endpoint(parent)
-            ))
+            validation_conflict(
+                CommitOperation::Write,
+                format!("Snapshot {id} is not an ancestor of {}", endpoint(parent)),
+            )
         }
         HistoryGap::SnapshotMissing(_) | HistoryGap::Cycle(_) => {
             // This path is only used after the exact window reports a gap.
@@ -342,11 +345,14 @@ pub(super) fn history_conflict(
                 last = Some(id);
                 next = snapshot.parent_snapshot_id();
             }
-            validation_conflict(format!(
-                "Cannot determine history between starting snapshot {} and the last known ancestor {}",
-                endpoint(start),
-                endpoint(last)
-            ))
+            validation_conflict(
+                CommitOperation::Write,
+                format!(
+                    "Cannot determine history between starting snapshot {} and the last known ancestor {}",
+                    endpoint(start),
+                    endpoint(last)
+                ),
+            )
         }
     }
 }

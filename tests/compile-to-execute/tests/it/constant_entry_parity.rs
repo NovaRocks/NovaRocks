@@ -609,8 +609,8 @@ fn constant_entry_heterogeneous_comparisons_replay_actual_sql_conversion_order()
             "CAST('1970-01-02' AS DATE) < CAST('1970-01-03 00:00:00' AS TIMESTAMP(6))",
             DataType::Date32,
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-            // The timestamp value is outside the rule's result-literal domain.
-            FoldOutcome::Kept,
+            // The constant pool retains the declared timestamp precision.
+            FoldOutcome::Folded,
         ),
         (
             "CAST('12.3' AS DECIMAL(4,1)) < CAST('12.34' AS DECIMAL(6,2))",

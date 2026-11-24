@@ -43,7 +43,7 @@ CREATE MATERIALIZED VIEW mv_conflict WITH (refresh_policy = 'MANUAL') AS SELECT 
 
 -- query 5
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_conflict,publications=1,slot-changes=0
+-- @mv_rest_document_graph=ns_${uuid0}.mv_conflict,publications=1,slot-changes=0,full-refreshes=1
 REFRESH MATERIALIZED VIEW mv_conflict;
 
 -- query 6

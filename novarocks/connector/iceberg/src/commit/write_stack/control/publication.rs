@@ -39,16 +39,15 @@ use crate::commit::attempt::Publisher;
 use crate::commit::attempt::observation::PublicationJournal;
 use crate::commit::attempt::prepared::CatalogPublisher;
 use crate::commit::attempt::{self, RetryPolicy};
-use crate::commit::dependency::ValidationInputs;
-use crate::commit::model::EntryIdentity;
-use crate::commit::model::{
-    AddedContent, BaseIdentity, CleanupScope, CommitProtocol, FileChanges, FrozenRequest,
-    ObjectIdentity, OperationIntent, OperationIntentParts, OperationToken, RequestShape,
-    StartSnapshot, TableTarget, WriteSessionCommitProtocol, WriterSchemaSpec,
-};
 #[cfg(test)]
 use crate::commit::model::{
-    ArtifactOrigin, ArtifactWriter, IcebergCleanupReport, PublicationOutcome, ReceivedPublication,
+    AddedContent, ArtifactOrigin, ArtifactWriter, IcebergCleanupReport, PublicationOutcome,
+    ReceivedPublication,
+};
+use crate::commit::model::{
+    BaseIdentity, CleanupScope, CommitProtocol, FileChanges, FrozenRequest, ObjectIdentity,
+    OperationIntent, OperationIntentParts, OperationToken, RequestShape, StartSnapshot,
+    TableTarget, WriteSessionCommitProtocol, WriterSchemaSpec,
 };
 #[cfg(test)]
 use crate::commit::operation::IcebergCommitAttempt;
@@ -305,10 +304,9 @@ pub(in crate::commit) fn rewrite_file_backing(
 
 struct WriteRecipe<'a> {
     source: Arc<TableMetadata>,
-    files: Vec<WrittenFile>,
-    compact_stage: Option<usize>,
     materialized: Option<Arc<materialized::MaterializedDeleteStep>>,
     fixed_mutation: bool,
+    equality_delete: bool,
     session_protocol: WriteSessionCommitProtocol,
     writer: WriterSchemaSpec,
     rewrite_removals: Option<Arc<[crate::commit::model::FrozenEntry]>>,
@@ -321,13 +319,27 @@ struct WriteRecipe<'a> {
     prefix: PreparedChange,
     output_facts: crate::write_codec::IcebergWrittenOutputFacts,
     keyed_documents: Option<novarocks_spi::connector::KeyedPublication>,
-    managed_overwrite: Option<managed_repartition::ManagedOverwrite<'a>>,
+    repartition: Option<managed_repartition::RepartitionPublication<'a>>,
+}
+
+enum LeadingStage {
+    KeyedDocuments,
+    FullRefreshDelete,
 }
 
 impl<'a> WriteRecipe<'a> {
+    fn leading_stage(&self) -> Option<LeadingStage> {
+        if self.op_kind == CommitOpKind::FullRefresh {
+            Some(LeadingStage::FullRefreshDelete)
+        } else if self.keyed_documents.is_some() {
+            Some(LeadingStage::KeyedDocuments)
+        } else {
+            None
+        }
+    }
+
     fn freeze(
         handle: &'a IcebergWriteCommitSession,
-        validated: &[ValidatedFragment<'_>],
         documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
     ) -> Result<Self, ConnectorError> {
         use crate::commit::model::Dependency;
@@ -337,91 +349,10 @@ impl<'a> WriteRecipe<'a> {
                 .source_metadata_ref()
                 .ok_or_else(|| internal("Iceberg write lost its admitted source metadata"))?,
         );
-        let writer_metadata = handle
-            .repartition()
-            .map_or(source.as_ref(), |r| r.prospective_metadata());
         let fixed_mutation = handle.mutation_read().is_some();
-        let historical = handle
-            .mutation_read()
-            .map(|recipe| {
-                recipe.validate_loaded(facts, &source)?;
-                let snapshot = facts
-                    .base_snapshot_id()
-                    .map(|id| {
-                        source
-                            .snapshot_by_id(id)
-                            .ok_or_else(|| corrupt("Iceberg fixed write snapshot is absent"))
-                    })
-                    .transpose()?;
-                let schema = match snapshot {
-                    Some(snapshot) => snapshot
-                        .schema(&source)
-                        .map_err(|error| corrupt(error.to_string()))?,
-                    None => source.current_schema().clone(),
-                };
-                crate::read_snapshot::frozen_partition_types(&source, &schema).map_err(corrupt)
-            })
-            .transpose()?;
-        let mut targets = BTreeMap::new();
-        let mut files = Vec::new();
-        for entry in validated {
-            let fragment = entry.fragment;
-            let target = match fragment.artifact() {
-                IcebergCommitArtifact::FinalDelete(effect) => Some(materialized::Target {
-                    partition: effect.partition().clone(),
-                    final_effect: Some(effect.clone()),
-                }),
-                IcebergCommitArtifact::PositionDeleteFile(file) if fixed_mutation => {
-                    Some(materialized::Target {
-                        partition: file.partition().clone(),
-                        final_effect: None,
-                    })
-                }
-                _ => None,
-            };
-            let historical_type = target
-                .as_ref()
-                .map(|target| {
-                    historical
-                        .as_ref()
-                        .and_then(|types| types.get(&target.partition.partition_spec_id()))
-                        .ok_or_else(|| {
-                            corrupt("Iceberg materialized target has no historical partition type")
-                        })
-                })
-                .transpose()?;
-            if fragment.new_object_path().is_some() {
-                let file = written_file_with_historical_partition(
-                    fragment,
-                    writer_metadata,
-                    historical_type,
-                )?;
-
-                files.push(file);
-            }
-            if let Some(target) = target {
-                let path = fragment
-                    .referenced_data_file()
-                    .ok_or_else(|| corrupt("Iceberg materialized effect has no target"))?;
-                match targets.entry(path.to_owned()) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(target);
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry)
-                        if entry.get().final_effect.is_none()
-                            && target.final_effect.is_none()
-                            && entry.get().partition == target.partition => {}
-                    std::collections::btree_map::Entry::Occupied(_) => {
-                        return Err(corrupt(
-                            "Iceberg materialized step has conflicting effects for one data file",
-                        ));
-                    }
-                }
-            }
+        if let Some(recipe) = handle.mutation_read() {
+            recipe.validate_loaded(facts, &source)?;
         }
-        let materialized = (!targets.is_empty())
-            .then(|| Arc::new(materialized::MaterializedDeleteStep::new(targets)));
-        let output_facts = crate::write_codec::written_output_facts(&files).map_err(invalid)?;
         let mut summary = session_snapshot_properties_for_commit(handle)?;
         let keyed_documents = documents.map(|intent| intent.documents.clone());
         if let Some(keyed) = &keyed_documents {
@@ -436,10 +367,8 @@ impl<'a> WriteRecipe<'a> {
                 }
             }
         }
-        let dependencies = vec![if matches!(
-            handle.commit_op_kind(),
-            CommitOpKind::FastAppend | CommitOpKind::Overwrite
-        ) && handle.repartition().is_none()
+        let dependencies = vec![if handle.commit_op_kind() == CommitOpKind::FastAppend
+            && handle.repartition().is_none()
             && handle.document_publication().is_none()
         {
             Dependency::NoRead
@@ -464,13 +393,13 @@ impl<'a> WriteRecipe<'a> {
                 .map_err(|e| invalid(e.to_string()))?,
             uuid: Some(source.uuid()),
         };
-        let managed_overwrite = managed_repartition::Effect::freeze(handle, &source)?;
+        let repartition = managed_repartition::Effect::freeze(handle, &source)?;
         Ok(Self {
             source,
-            files,
-            compact_stage: None,
-            materialized,
+            materialized: None,
             fixed_mutation,
+            equality_delete: handle.flavor()
+                == crate::commit::write_stack::domain::IcebergWriteFlavor::EqualityDelete,
             session_protocol: handle.commit_protocol(),
             writer,
             rewrite_removals: handle.frozen_rewrite_removals().cloned(),
@@ -484,9 +413,9 @@ impl<'a> WriteRecipe<'a> {
             op_kind: handle.commit_op_kind(),
             summary,
             prefix,
-            output_facts,
+            output_facts: Default::default(),
             keyed_documents,
-            managed_overwrite,
+            repartition,
         })
     }
 
@@ -494,14 +423,6 @@ impl<'a> WriteRecipe<'a> {
         &self,
         operation: &IcebergCommitOperation,
     ) -> crate::iceberg::Result<OperationIntent> {
-        let mut added = Vec::new();
-        for file in &self.files {
-            let data = crate::commit::data_file::from_written_file(file)?;
-            added.push(AddedContent::new_logical_data(
-                data,
-                file.partition_spec_id,
-            )?);
-        }
         let mut removed = Vec::new();
         if let Some(step) = &self.materialized {
             let snapshot_id = self
@@ -517,69 +438,17 @@ impl<'a> WriteRecipe<'a> {
                     operation.request_context(),
                 )
                 .await?;
-        } else if !self.fixed_mutation
-            && !matches!(
-                self.op_kind,
-                CommitOpKind::FastAppend
-                    | CommitOpKind::Overwrite
-                    | CommitOpKind::RowDelta
-                    | CommitOpKind::MaterializedRowDelta
-                    | CommitOpKind::SelectedRewrite
-            )
-        {
-            let source_io = operation.begin_attempt()?;
-            let inputs =
-                ValidationInputs::new(&self.source, self.start.map(|s| s.snapshot_id), &source_io);
-            let live = inputs.compact_live_entries().await?;
-            let mut identities: BTreeSet<_> = match self.op_kind {
-                CommitOpKind::Truncate => live.keys().cloned().collect(),
-                CommitOpKind::OverwritePartitions => live
-                    .iter()
-                    .filter(|(_, entry)| {
-                        added.iter().any(|a| {
-                            a.partition_spec_id() == entry.frozen.facts().partition_spec_id
-                                && a.file().partition() == &entry.frozen.facts().partition
-                        })
-                    })
-                    .map(|(key, _)| key.clone())
-                    .collect(),
-                _ => BTreeSet::new(),
-            };
-            if matches!(self.op_kind, CommitOpKind::OverwritePartitions) {
-                // Deletion vectors follow their exact data file, including when
-                // their stored partition differs. Removing one blob grants no
-                // authority to delete a shared Puffin container.
-                let data_paths: BTreeSet<_> = identities
-                    .iter()
-                    .filter_map(|id| match id {
-                        EntryIdentity::DataFile { path } => Some(path.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                identities.extend(
-                    live.keys()
-                        .filter(|id| {
-                            matches!(id,
-                                EntryIdentity::DeletionVector { referenced_data_file, .. }
-                                    if data_paths.contains(referenced_data_file)
-                            )
-                        })
-                        .cloned(),
-                );
-            }
-            for identity in identities {
-                let entry = live.get(&identity).ok_or_else(|| {
-                    format_error(corrupt(format!(
-                        "Frozen source entry is absent: {identity:?}"
-                    )))
-                })?;
-                removed.push(entry.frozen.clone());
-            }
         }
         let (dependencies, protocol) = match self.session_protocol {
             WriteSessionCommitProtocol::Legacy => {
                 (self.dependencies.clone(), CommitProtocol::Legacy)
             }
+            WriteSessionCommitProtocol::Append => (
+                Vec::new(),
+                CommitProtocol::Append {
+                    output_spec_id: self.writer.default_spec_id,
+                },
+            ),
             WriteSessionCommitProtocol::RewriteFiles => (
                 Vec::new(),
                 CommitProtocol::RewriteFiles {
@@ -608,7 +477,10 @@ impl<'a> WriteRecipe<'a> {
             target: self.target.clone(),
             target_ref: self.target_ref.clone(),
             start: self.start,
-            changes: FileChanges { added, removed },
+            changes: FileChanges {
+                added: Vec::new(),
+                removed,
+            },
             dependencies,
             protocol,
             shape: RequestShape::SnapshotProducing,
@@ -616,10 +488,7 @@ impl<'a> WriteRecipe<'a> {
             token: operation.token(),
         })
         .and_then(|intent| {
-            let intent = match self.compact_stage {
-                Some(stage) => intent.with_compact_stage(stage)?,
-                None => intent,
-            };
+            let intent = intent.with_compact_stage(self.leading_stage().as_slice().len())?;
             Ok(
                 if matches!(self.session_protocol, WriteSessionCommitProtocol::Legacy)
                     && self.summary.keys().any(|key| {
@@ -641,10 +510,8 @@ impl<'a> WriteRecipe<'a> {
         if let Some(step) = &self.materialized {
             return Ok(Box::new(Arc::clone(step)));
         }
+        let stage = self.leading_stage().as_slice().len();
         if self.session_protocol.operation() == crate::commit::model::CommitOperation::Optimize {
-            let stage = self
-                .compact_stage
-                .ok_or_else(|| internal("Iceberg rewrite lost its original compact additions"))?;
             return Ok(Box::new(
                 crate::commit::selected_rewrite::CompactRewritePreparer {
                     operation: operation.clone(),
@@ -652,42 +519,44 @@ impl<'a> WriteRecipe<'a> {
                 },
             ));
         }
-        if self.compact_stage.is_some() {
+        if self.equality_delete {
             return Ok(Box::new(
-                crate::commit::fast_append::CompactFastAppendPreparer(operation.clone()),
+                crate::commit::row_delta::CompactEqualityDeletePreparer {
+                    operation: operation.clone(),
+                    stage,
+                },
             ));
         }
-        // A managed publication admitted as CommitEmptyWrite still needs its
-        // snapshot marker even when no row delta was materialized.
-        if self.files.is_empty()
-            && matches!(
-                self.op_kind,
-                CommitOpKind::RowDelta | CommitOpKind::MaterializedRowDelta
-            )
-            && !self.summary.is_empty()
-        {
-            return Ok(Box::new(crate::commit::fast_append::FastAppendPreparer));
-        }
-        Ok(match self.op_kind {
-            CommitOpKind::FastAppend => Box::new(crate::commit::fast_append::FastAppendPreparer),
-            CommitOpKind::Overwrite => Box::new(crate::commit::overwrite::OverwritePreparer),
-            CommitOpKind::RowDelta => Box::new(crate::commit::row_delta::RowDeltaPreparer),
-            CommitOpKind::MaterializedRowDelta => {
-                if !self.fixed_mutation {
-                    return Err(corrupt(
-                        "Iceberg v3 row delta lacks its complete materialization",
-                    ));
-                }
-                Box::new(crate::commit::fast_append::FastAppendPreparer)
-            }
-            CommitOpKind::OverwritePartitions => {
-                Box::new(crate::commit::overwrite_partitions::OverwritePartitionsPreparer)
-            }
-            CommitOpKind::Truncate => Box::new(crate::commit::truncate::TruncatePreparer),
-            CommitOpKind::SelectedRewrite => {
-                return Err(internal("Iceberg rewrite lost its RewriteFiles protocol"));
-            }
-        })
+        Ok(Box::new(
+            crate::commit::fast_append::CompactFastAppendPreparer(operation.clone()),
+        ))
+    }
+}
+
+struct FullRefreshAppend<'a> {
+    compact: crate::commit::fast_append::CompactFastAppendPreparer,
+    repartition: Option<&'a managed_repartition::RepartitionPublication<'a>>,
+}
+
+#[async_trait]
+impl Preparer for FullRefreshAppend<'_> {
+    async fn prepare(
+        &self,
+        view: &StagedView<'_>,
+        intent: &OperationIntent,
+    ) -> crate::iceberg::Result<PreparedChange> {
+        let (witness, slot) = if let Some(repartition) = self.repartition {
+            let (witness, slot) = repartition.prepare_append(view, intent)?;
+            (Some(witness), slot)
+        } else {
+            (None, None)
+        };
+        let mut append = self
+            .compact
+            .prepare_full_refresh(view, intent, witness)
+            .await?;
+        append.updates.extend(slot);
+        Ok(append)
     }
 }
 
@@ -705,7 +574,10 @@ impl crate::commit::dependency::RemovedDataFiles for materialized::MaterializedD
     }
 }
 
-struct KeyedPublicationPreparer(novarocks_spi::connector::KeyedPublication);
+struct KeyedPublicationPreparer {
+    documents: novarocks_spi::connector::KeyedPublication,
+    full_refresh: bool,
+}
 #[async_trait]
 impl Preparer for KeyedPublicationPreparer {
     async fn prepare(
@@ -716,9 +588,30 @@ impl Preparer for KeyedPublicationPreparer {
         // Recompute closure on this attempt's actual refs base.
         // A concurrent metadata-only marker write may increase its byte size
         // without advancing main; the admitted source is not that base.
-        let prepared =
-            crate::document_storage::keyed::write::publication_updates(view.metadata(), &self.0)
-                .map_err(format_error)?;
+        use crate::document_storage::keyed::write::{
+            publication_updates, publication_updates_from_snapshot,
+        };
+        let metadata = view.metadata();
+        let prepared = if self.full_refresh {
+            // The staged append already names the new records. Validate the
+            // actual attempt's preceding publication before adding their closure.
+            let predecessor = intent
+                .start()
+                .map(|base| {
+                    metadata.snapshot_by_id(base.snapshot_id).ok_or_else(|| {
+                        format_error(corrupt("Full refresh lost its original document snapshot"))
+                    })
+                })
+                .transpose()?;
+            publication_updates_from_snapshot(
+                metadata,
+                predecessor.map(AsRef::as_ref),
+                &self.documents,
+            )
+        } else {
+            publication_updates(metadata, &self.documents)
+        }
+        .map_err(format_error)?;
         for (key, value) in &prepared.summary {
             if intent.summary().get(key) != Some(value) {
                 return Err(format_error(invalid(
@@ -733,9 +626,9 @@ impl Preparer for KeyedPublicationPreparer {
     }
 }
 
-struct WriteStatisticsPreparer {
-    op_kind: CommitOpKind,
-    drafts: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
+pub(crate) struct WriteStatisticsPreparer {
+    pub(crate) op_kind: CommitOpKind,
+    pub(crate) drafts: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
 }
 
 #[async_trait]
@@ -863,22 +756,6 @@ pub(super) struct ReceivedOperation<'a> {
 }
 
 impl IcebergWriteSessionControl {
-    pub(super) fn prepare_received_operation<'a>(
-        &self,
-        handle: &'a IcebergWriteCommitSession,
-        validated: &[ValidatedFragment<'_>],
-        documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
-        context: &ConnectorRequestContext,
-    ) -> Result<ReceivedOperation<'a>, ConnectorError> {
-        let (operation, journal) = self.adopt_received_operation(handle, validated, context)?;
-        let recipe = WriteRecipe::freeze(handle, validated, documents);
-        Ok(ReceivedOperation {
-            operation,
-            journal,
-            recipe,
-        })
-    }
-
     pub(super) fn prepare_compact_operation<'a>(
         &self,
         handle: &'a IcebergWriteCommitSession,
@@ -886,11 +763,9 @@ impl IcebergWriteSessionControl {
         documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
         context: &ConnectorRequestContext,
     ) -> Result<ReceivedOperation<'a>, ConnectorError> {
-        let compact = received
-            .compact_files()
-            .ok_or_else(|| internal("Expected compact write receiving"))?;
-        let (operation, journal) = self.adopt_compact_operation(handle, compact, context)?;
-        let recipe = WriteRecipe::freeze(handle, &[], documents).and_then(|mut recipe| {
+        let (operation, journal) =
+            self.adopt_compact_operation(handle, received.compact_files(), context)?;
+        let recipe = WriteRecipe::freeze(handle, documents).and_then(|mut recipe| {
             let validation = recipe
                 .session_protocol
                 .row_delta_isolation()
@@ -903,14 +778,17 @@ impl IcebergWriteSessionControl {
                     Ok::<_, ConnectorError>((isolation, scope))
                 })
                 .transpose()?;
-            let files = received
-                .take_compact_files()
-                .expect("adopted compact files");
-            let stage = usize::from(recipe.keyed_documents.is_some());
-            recipe.compact_stage = Some(stage);
+            let files = received.take_compact_files();
+            let stage = recipe.leading_stage().as_slice().len();
             recipe.output_facts.data_files = files.counts.data.files;
             recipe.output_facts.data_rows = files.counts.data.rows;
-            if files.has_delete_effects() {
+            recipe.output_facts.equality_delete_files = files.counts.equality_deletes.files;
+            if files.counts.equality_deletes.files != 0 && !recipe.equality_delete {
+                return Err(corrupt(
+                    "Iceberg equality delete output has no equality delete session",
+                ));
+            }
+            if files.has_position_effects() {
                 if !recipe.fixed_mutation {
                     return Err(internal(
                         "Iceberg compact delete lost its fixed write endpoint",
@@ -950,7 +828,10 @@ impl IcebergWriteSessionControl {
                     stage,
                     crate::commit::new_manifests::PendingNewFiles {
                         received: files,
-                        source: Arc::clone(&recipe.source),
+                        source: handle.repartition().map_or_else(
+                            || Arc::clone(&recipe.source),
+                            |repartition| Arc::new(repartition.prospective_metadata().clone()),
+                        ),
                         codec: super::super::codec::CompactFragmentCodec::for_adapter(
                             &self.adapter,
                         ),
@@ -999,12 +880,17 @@ impl IcebergWriteSessionControl {
                 );
             }
         };
-        let data = match recipe.preparer(&operation) {
-            Ok(data) => data,
-            Err(error) => {
-                return WritePublicationDispatch::settled(
-                    self.reject_operation(handle, &operation, error).await,
-                );
+        let full_refresh = recipe.op_kind == CommitOpKind::FullRefresh;
+        let data = if full_refresh {
+            None
+        } else {
+            match recipe.preparer(&operation) {
+                Ok(data) => Some(data),
+                Err(error) => {
+                    return WritePublicationDispatch::settled(
+                        self.reject_operation(handle, &operation, error).await,
+                    );
+                }
             }
         };
         let policy = match RetryPolicy::from_properties(recipe.source.properties()) {
@@ -1029,10 +915,7 @@ impl IcebergWriteSessionControl {
         let receipt_partitioning = handle.repartition().map(|r| r.committed().clone());
         let receipt_output_facts = recipe.output_facts;
         let retained_evidence = handle.recovery_evidence_slot();
-        let managed_effect = recipe
-            .managed_overwrite
-            .as_ref()
-            .map(|data| data.effect.clone());
+        let managed_effect = recipe.repartition.as_ref().map(|data| data.effect.clone());
         let preflight = Arc::new(
             move |request: &FrozenRequest, operation: &IcebergCommitOperation| {
                 if let Some(effect) = &managed_effect {
@@ -1087,23 +970,43 @@ impl IcebergWriteSessionControl {
                     .await;
                 }
             };
-            let keyed = recipe.keyed_documents.map(KeyedPublicationPreparer);
+            let leading = recipe.leading_stage();
+            let keyed = recipe
+                .keyed_documents
+                .map(|documents| KeyedPublicationPreparer {
+                    documents,
+                    full_refresh,
+                });
+            let delete;
             let mut preparers: Vec<&dyn Preparer> = Vec::new();
-            if let Some(keyed) = &keyed {
-                preparers.push(keyed);
+            match leading {
+                Some(LeadingStage::KeyedDocuments) => {
+                    preparers.push(keyed.as_ref().expect("frozen keyed publication"));
+                }
+                Some(LeadingStage::FullRefreshDelete) => {
+                    delete = crate::commit::filter_delete::FilterDeletePreparer::for_full_refresh();
+                    preparers.push(&delete);
+                }
+                None => {}
             }
-            let data: &dyn Preparer = match &recipe.managed_overwrite {
-                Some(managed) => managed,
-                None => data.as_ref(),
+            let full_append;
+            let data = match data.as_deref() {
+                Some(data) => data,
+                None => {
+                    full_append = FullRefreshAppend {
+                        compact: crate::commit::fast_append::CompactFastAppendPreparer(
+                            run_operation.clone(),
+                        ),
+                        repartition: recipe.repartition.as_ref(),
+                    };
+                    &full_append
+                }
             };
             let carried_statistics = if matches!(
                 recipe.session_protocol,
                 WriteSessionCommitProtocol::RewriteFiles
             ) {
-                let Some((stage, author)) = recipe
-                    .compact_stage
-                    .zip(handle.rewrite_payload_byte_author())
-                else {
+                let Some(author) = handle.rewrite_payload_byte_author() else {
                     let failure = format_error(internal(
                         "Iceberg rewrite statistics lost its original Replace stage or byte author",
                     ));
@@ -1116,7 +1019,7 @@ impl IcebergWriteSessionControl {
                 Some(
                     crate::commit::statistics_carry::CarryForwardStatisticsPreparer::new(
                         &run_operation,
-                        stage,
+                        leading.as_slice().len(),
                         author,
                     ),
                 )
@@ -1124,6 +1027,9 @@ impl IcebergWriteSessionControl {
                 None
             };
             preparers.push(data);
+            if full_refresh && let Some(keyed) = &keyed {
+                preparers.push(keyed);
+            }
             if let Some(carry) = &carried_statistics {
                 preparers.push(carry);
             }
@@ -1263,27 +1169,6 @@ impl IcebergWriteSessionControl {
         }
     }
 
-    fn adopt_received_operation(
-        &self,
-        handle: &IcebergWriteCommitSession,
-        validated: &[ValidatedFragment<'_>],
-        context: &ConnectorRequestContext,
-    ) -> Result<
-        (
-            IcebergCommitOperation,
-            PublicationJournal<ConnectorWriteReceipt>,
-        ),
-        ConnectorError,
-    > {
-        let objects = validated
-            .iter()
-            .filter_map(|entry| entry.fragment.new_object_path())
-            .map(ObjectIdentity::new)
-            .collect::<crate::iceberg::Result<BTreeSet<_>>>()
-            .map_err(|error| corrupt(error.to_string()))?;
-        self.adopt_operation_objects(handle, objects, context)
-    }
-
     fn adopt_compact_operation(
         &self,
         handle: &IcebergWriteCommitSession,
@@ -1355,19 +1240,10 @@ impl IcebergWriteSessionControl {
                 "received write cleanup requires a proven uncommitted session",
             ));
         }
-        if handle.flavor() == IcebergWriteFlavor::StagedCreate {
-            return Err(invalid(
-                "staged target publication retains its own sealed object cleanup authority",
-            ));
-        }
         // This is the original confirmed receiver won by the release or
         // refused finish. No ref/live-set scan or old reference grants deletion.
-        let (operation, _) = if let Some(compact) = received.compact_files() {
-            self.adopt_compact_operation(handle, compact, context)?
-        } else {
-            let validated = validate_received_set(handle, &self.adapter, &received)?;
-            self.adopt_received_operation(handle, &validated, context)?
-        };
+        let (operation, _) =
+            self.adopt_compact_operation(handle, received.compact_files(), context)?;
         drop(received);
         let cleanup = {
             let mut original = std::pin::pin!(operation.cleanup(CleanupScope::EntireOperation));
@@ -2138,7 +2014,10 @@ mod keyed_preparation_tests {
         )
         .unwrap();
         engine
-            .stage(&KeyedPublicationPreparer(documents))
+            .stage(&KeyedPublicationPreparer {
+                documents,
+                full_refresh: false,
+            })
             .await
             .expect("large existing private properties do not prevent keyed preparation");
         for (key, value) in properties {
@@ -2173,7 +2052,10 @@ mod keyed_preparation_tests {
         )
         .unwrap();
         engine
-            .stage(&KeyedPublicationPreparer(documents.clone()))
+            .stage(&KeyedPublicationPreparer {
+                documents: documents.clone(),
+                full_refresh: false,
+            })
             .await
             .unwrap();
         engine

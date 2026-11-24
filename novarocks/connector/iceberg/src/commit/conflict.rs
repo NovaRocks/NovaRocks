@@ -49,19 +49,18 @@ pub(crate) trait MayMatch: fmt::Display + Send + Sync {
     fn may_match(&self, file: &CandidateFile<'_>) -> Result<bool, ConnectorError>;
 }
 
-pub(crate) fn validation_conflict(message: impl Into<Arc<str>>) -> ConnectorMutationFailure {
-    validation_conflict_for(CommitOperation::Write, message)
-}
-
-pub(super) fn validation_conflict_for(
+pub(crate) fn validation_conflict(
     operation: CommitOperation,
     message: impl Into<Arc<str>>,
 ) -> ConnectorMutationFailure {
     validation_failure(operation, message)
 }
 
-pub(crate) fn commit_state_unknown(original: ConnectorMutationFailure) -> ConnectorMutationFailure {
-    original_commit_failure(CommitOperation::Write, CommitFailureKind::Unknown, original)
+pub(crate) fn commit_state_unknown(
+    operation: CommitOperation,
+    original: ConnectorMutationFailure,
+) -> ConnectorMutationFailure {
+    original_commit_failure(operation, CommitFailureKind::Unknown, original)
 }
 
 #[cfg(test)]

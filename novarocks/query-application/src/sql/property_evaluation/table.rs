@@ -314,9 +314,7 @@ pub fn validate_trino_ctas(
     Err(unsupported(source, statement.span, refusal))
 }
 
-/// Caller inputs must be actual CTAS declarations and their same-generation
-/// name policy. Existing ordinary CREATE (v2) and MV declarations cannot
-/// supply the original staged CTAS v3 default; the CTAS provider issues it.
+/// Caller inputs are the provider's CREATE declarations and their same-generation name policy.
 /// Apply only after the existing-target/IFNE decision, before query analysis.
 pub fn prepare_trino_ctas<'a>(
     source: &str,
@@ -327,14 +325,6 @@ pub fn prepare_trino_ctas<'a>(
     control: &dyn PureCompileControl,
 ) -> Result<PreparedTrinoCtas<'a>, QueryServiceError> {
     validate_trino_ctas(source, statement, control)?;
-    if !declarations.iter().any(|property| {
-        property.name() == "format_version"
-            && *property.default_value() == DdlPropertyValue::Integer(3)
-    }) {
-        return Err(invariant(
-            "Staged CTAS requires the original v3 format_version declaration",
-        ));
-    }
     let evaluated = evaluate_table_properties(
         source,
         &statement.properties,
@@ -624,7 +614,7 @@ mod tests {
         let declarations = [declaration(
             "format_version",
             DdlPropertyType::Integer,
-            DdlPropertyValue::Integer(3),
+            DdlPropertyValue::Integer(2),
         )];
         let control = SqlCompileControl::unbounded();
         let prepared = prepare_trino_ctas(
@@ -643,7 +633,7 @@ mod tests {
         assert_eq!(prepared.table.comment.as_deref(), Some("ctas"));
         assert_eq!(
             prepared.table.properties,
-            vec![("format_version".into(), DdlPropertyValue::Integer(3))]
+            vec![("format_version".into(), DdlPropertyValue::Integer(2))]
         );
     }
 

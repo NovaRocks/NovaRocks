@@ -45,7 +45,6 @@ pub(crate) struct MvRefreshRuntimeSettings {
     /// The MV worker has no session. Use the optimizer budget from `[runtime]`.
     pub(crate) optimizer_query_mem_limit_bytes: u64,
     pub(crate) statement_clock: crate::application::StatementClock,
-    pub(crate) attempt_timeout: Duration,
 }
 
 /// Frontend composition and statement adapter for materialized-view products.
@@ -150,7 +149,6 @@ impl FrontendMvProductAdapter {
             root_admission: self.root_admission.clone(),
             optimizer_query_mem_limit_bytes: self.refresh_runtime.optimizer_query_mem_limit_bytes,
             statement_clock: self.refresh_runtime.statement_clock.clone(),
-            attempt_timeout: self.refresh_runtime.attempt_timeout,
             runtime: tokio::runtime::Handle::current(),
             startup_isolation: self.startup_isolation.clone(),
         })?;
@@ -172,7 +170,6 @@ struct RefreshWorkerDependencies {
     root_admission: RootAdmissionHandle,
     optimizer_query_mem_limit_bytes: u64,
     statement_clock: crate::application::StatementClock,
-    attempt_timeout: Duration,
     /// The existing FE runtime hosts the two original serial asynchronous
     /// tasks and the shared warehouse queue; no worker or local queue is added.
     runtime: tokio::runtime::Handle,

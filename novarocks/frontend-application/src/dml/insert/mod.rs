@@ -38,9 +38,6 @@ pub(crate) fn prepare_trino_insert_shape(
     statement: novarocks_parser::ast::TrinoInsert,
     source: &str,
 ) -> Result<(command::InsertCommand, InsertTargetRef), DmlError> {
-    use crate::query_execution::dml::insert::InsertOverwriteMode;
-    use novarocks_parser::ast::TrinoInsertMode;
-
     if statement.table.query_period.is_some() {
         return Err(insert_admit_error(
             source,
@@ -63,11 +60,6 @@ pub(crate) fn prepare_trino_insert_shape(
         .map_or(InsertTargetRef::Main, |branch| {
             InsertTargetRef::Branch(branch.value)
         });
-    let overwrite_mode = match statement.mode {
-        TrinoInsertMode::Into => InsertOverwriteMode::Append,
-        TrinoInsertMode::Overwrite => InsertOverwriteMode::FullTable,
-        TrinoInsertMode::OverwritePartitions => InsertOverwriteMode::DynamicPartitions,
-    };
     Ok((
         command::InsertCommand {
             target: InsertTargetName { parts },
@@ -78,7 +70,6 @@ pub(crate) fn prepare_trino_insert_shape(
                 .map(|column| column.value)
                 .collect(),
             source: statement.query.into_box(),
-            overwrite_mode,
         },
         reference,
     ))
@@ -94,25 +85,21 @@ mod variant_constants_tests;
 #[cfg(test)]
 mod trino_tests {
     use super::*;
-    use crate::query_execution::dml::insert::InsertOverwriteMode;
     use novarocks_parser::{ast::TrinoStatement, parser};
 
     #[test]
     fn trino_insert_uses_the_typed_branch_and_original_query_allocation() {
-        for (sql, expected_mode, expected_reference) in [
+        for (sql, expected_reference) in [
             (
-                r#"INSERT OVERWRITE c.s.branch_named@"Audit-Ref" (x) SELECT ?"#,
-                InsertOverwriteMode::FullTable,
+                r#"INSERT INTO c.s.branch_named@"Audit-Ref" (x) SELECT ?"#,
                 InsertTargetRef::Branch("Audit-Ref".into()),
             ),
             (
-                "INSERT OVERWRITE PARTITIONS c.s.branch_named@dev (x) SELECT ?",
-                InsertOverwriteMode::DynamicPartitions,
+                "INSERT INTO c.s.branch_named@dev (x) SELECT ?",
                 InsertTargetRef::Branch("dev".into()),
             ),
             (
                 "INSERT INTO c.s.branch_named (x) SELECT ?",
-                InsertOverwriteMode::Append,
                 InsertTargetRef::Main,
             ),
         ] {
@@ -124,27 +111,11 @@ mod trino_tests {
             let (command, reference) = prepare_trino_insert_shape(insert, sql).unwrap();
             assert_eq!(command.target.parts, ["c", "s", "branch_named"]);
             assert_eq!(command.columns, ["x"]);
-            assert_eq!(command.overwrite_mode, expected_mode);
             assert_eq!(reference, expected_reference);
             assert_eq!(&sql[span.start()..span.end()], "SELECT ?");
             assert_eq!(command.source.span, span);
             assert_eq!(std::ptr::from_ref(command.source.as_ref()), original);
         }
-    }
-
-    #[test]
-    fn trino_insert_preserves_dynamic_overwrite_target() {
-        let sql = "INSERT OVERWRITE PARTITIONS INTO db.t VALUES ROW(1)";
-        let TrinoStatement::Insert(insert) = parser::parse_statement(sql).unwrap() else {
-            panic!("expected dynamic overwrite INSERT");
-        };
-        let (command, reference) = prepare_trino_insert_shape(insert, sql).unwrap();
-        assert_eq!(command.target.parts, ["db", "t"]);
-        assert_eq!(
-            command.overwrite_mode,
-            InsertOverwriteMode::DynamicPartitions
-        );
-        assert_eq!(reference, InsertTargetRef::Main);
     }
 
     #[test]

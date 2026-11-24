@@ -49,7 +49,7 @@ use novarocks_spi::connector::{
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::CommitOpKind;
 use crate::commit::write_stack::control::{
-    empty_write_needed, release_session_state, session_plan_from_targets, validate_received_set,
+    empty_write_needed, release_session_state, session_plan_from_targets,
 };
 use crate::commit::write_stack::domain::{
     IcebergCommitFragment, IcebergDataFileArtifact, IcebergEmptyWriteDecision,
@@ -70,7 +70,8 @@ use crate::commit::write_stack::test_support::{
     binding, data_branch_plan, data_input_shape, delete_branch_plan, delete_input_shape,
     document_publication_facts, document_publication_facts_with_shape, dv_artifact,
     equality_delete_input_shape, equality_delete_recipe, lineage_only_input_shape,
-    merge_on_read_input_shape, sample_metrics, sample_partition, session_material, table_facts,
+    merge_on_read_input_shape, paid_fragments, sample_metrics, sample_partition, session_material,
+    table_facts,
 };
 use crate::commit::write_stack::test_support::{receive_write_query, write_query_identity};
 use crate::delete_file::IcebergFileFormat;
@@ -230,25 +231,57 @@ fn received(
     handle: &IcebergWriteCommitSession,
     adapter: &IcebergWriteAdapter,
     entries: Vec<(WriteTargetOrdinal, IcebergCommitFragment)>,
-) -> IcebergReceiving {
-    let mut received = IcebergReceiving::default();
-    let query = write_query_identity();
-    received
-        .begin_query(
-            query,
-            &handle.expected_targets(),
-            &mut None,
-            handle.targets(),
-            None,
-        )
-        .expect("register query");
-    let mut fragments = entries
-        .into_iter()
-        .map(|(target, fragment)| (target, adapter.wrap_commit_fragment(fragment)))
-        .collect();
-    received.arrive(query, &mut fragments).expect("arrive");
-    received.confirm(query).expect("confirm");
-    received
+) -> Result<IcebergReceiving, ConnectorError> {
+    use super::domain::{IcebergCreationReceipt, IcebergCreationScope};
+    use novarocks_spi::connector::write_stack::ConnectorWriterPhysicalContext;
+
+    let mut received = IcebergReceiving::new(None);
+    let query_id = [1; 16];
+    let query = ConnectorWriteQueryIdentity::try_new(query_id, 1, [2; 16])?;
+    received.begin_query(
+        query,
+        &handle.expected_targets(),
+        &mut None,
+        handle.targets(),
+        None,
+    )?;
+    let scope = IcebergCreationScope::try_new(handle.session_id(), [3; 16], [4; 32])?;
+    let physical = ConnectorWriterPhysicalContext::new(query_id, 1, [5; 16], 0, 1);
+    let mut targets = Vec::with_capacity(entries.len());
+    let mut fragments = Vec::with_capacity(entries.len());
+    for (target, fragment) in entries {
+        let fragment = if fragment.branch() == IcebergWriteBranch::DeletionVector {
+            let path = fragment.new_object_path().expect("fixture Puffin object");
+            let identity = scope.identity(physical, path, IcebergFileFormat::Puffin)?;
+            let size = fragment
+                .metrics()
+                .expect("fixture Puffin metrics")
+                .file_size_in_bytes();
+            // Two logical ranges in the same Puffin describe one creation.
+            fragment.try_with_creation(IcebergCreationReceipt::try_new(
+                physical,
+                identity[..16].try_into().expect("creation ID width"),
+                identity,
+                size,
+                [6; 32],
+            )?)?
+        } else {
+            fragment
+        };
+        targets.push(target);
+        fragments.push(adapter.wrap_commit_fragment(fragment));
+    }
+    let (paid, author) = paid_fragments(adapter, fragments);
+    received.arrive_original(
+        handle,
+        adapter,
+        query,
+        targets.into_iter().zip(paid).collect(),
+        &author,
+    )?;
+    received.confirm(query)?;
+    received.require_complete()?;
+    Ok(received)
 }
 
 pub(super) fn final_vector(
@@ -306,20 +339,18 @@ pub(in crate::commit) fn data_fragment(path: &str) -> IcebergCommitFragment {
 }
 
 #[test]
-fn a_zero_row_write_still_produces_a_valid_complete_prepared_set() {
+fn a_zero_row_write_can_complete_compact_receiving() {
     // A statement that matched nothing still reaches finish_write. Complete
     // empty input is valid; its exact row-delta author selects a NoOp rather
     // than confusing an absent action with an absent result.
     let (handle, adapter) = dv_session();
-    let empty = received(&handle, &adapter, Vec::new());
-    let validated =
-        validate_received_set(&handle, &adapter, &empty).expect("an empty complete set is legal");
-    assert!(validated.is_empty());
-    assert_eq!(empty.fragments().count(), 0);
+    let empty = received(&handle, &adapter, Vec::new()).expect("complete empty receiving");
+    assert!(empty.compact_files().is_empty());
+    assert_eq!(empty.compact_files().entries().count(), 0);
 }
 
 #[test]
-fn a_valid_prepared_set_passes_every_sealed_check() {
+fn a_paid_data_and_delete_record_passes_compact_admission() {
     let (handle, adapter) = dv_session();
     let set = received(
         &handle,
@@ -337,15 +368,17 @@ fn a_valid_prepared_set_passes_every_sealed_check() {
                 ),
             ),
         ],
-    );
-    let validated = validate_received_set(&handle, &adapter, &set).expect("valid set");
-    assert_eq!(validated.len(), 2);
+    )
+    .expect("valid paid record");
+    assert_eq!(set.compact_files().entries().count(), 2);
+    assert_eq!(set.compact_files().counts.data.files, 1);
+    assert!(set.compact_files().has_position_effects());
 }
 
 #[test]
 fn a_fragment_whose_branch_disagrees_with_its_target_is_rejected() {
     let (handle, adapter) = dv_session();
-    let set = received(
+    let error = received(
         &handle,
         &adapter,
         vec![(
@@ -356,8 +389,8 @@ fn a_fragment_whose_branch_disagrees_with_its_target_is_rejected() {
                 Vec::new(),
             ),
         )],
-    );
-    let error = validate_received_set(&handle, &adapter, &set).expect_err("branch disagreement");
+    )
+    .expect_err("paid arrival must reject the branch disagreement");
     assert!(
         error.message().contains("drives the data branch"),
         "{}",
@@ -368,7 +401,7 @@ fn a_fragment_whose_branch_disagrees_with_its_target_is_rejected() {
 #[test]
 fn two_delete_artifacts_for_one_data_file_are_rejected() {
     let (handle, adapter) = dv_session();
-    let set = received(
+    let error = received(
         &handle,
         &adapter,
         vec![
@@ -389,8 +422,8 @@ fn two_delete_artifacts_for_one_data_file_are_rejected() {
                 ),
             ),
         ],
-    );
-    let error = validate_received_set(&handle, &adapter, &set).expect_err("duplicate delete");
+    )
+    .expect_err("paid arrival must reject duplicate delete effects");
     assert!(
         error.message().contains("more than one delete artifact"),
         "{}",
@@ -401,7 +434,7 @@ fn two_delete_artifacts_for_one_data_file_are_rejected() {
 #[test]
 fn a_repeated_staged_path_is_rejected() {
     let (handle, adapter) = dv_session();
-    let set = received(
+    let error = received(
         &handle,
         &adapter,
         vec![
@@ -414,8 +447,8 @@ fn a_repeated_staged_path_is_rejected() {
                 data_fragment("s3://b/wh/db/t/data/same.parquet"),
             ),
         ],
-    );
-    let error = validate_received_set(&handle, &adapter, &set).expect_err("duplicate path");
+    )
+    .expect_err("paid arrival must reject the duplicate path");
     assert!(
         error.message().contains("repeats staged artifact"),
         "{}",
@@ -424,7 +457,7 @@ fn a_repeated_staged_path_is_rejected() {
 }
 
 #[test]
-fn a_prepared_set_accepts_distinct_vectors_in_the_same_puffin_object() {
+fn compact_receiving_keeps_distinct_vectors_in_the_same_puffin_object() {
     let paths = [
         "s3://b/wh/db/t/data/a.parquet",
         "s3://b/wh/db/t/data/b.parquet",
@@ -450,18 +483,29 @@ fn a_prepared_set_accepts_distinct_vectors_in_the_same_puffin_object() {
             )
         })
         .collect();
-    let set = received(&handle, &adapter, fragments);
-    let validated = validate_received_set(&handle, &adapter, &set).unwrap();
-    assert_eq!(validated.len(), 2);
-    let mut fragments = set.fragments();
-    let first = adapter
-        .commit_fragment(fragments.next().unwrap().fragment)
-        .unwrap();
-    let second = adapter
-        .commit_fragment(fragments.next().unwrap().fragment)
-        .unwrap();
-    assert_eq!(first.path(), second.path());
-    assert_ne!(first.entry_identity(), second.entry_identity());
+    let set = received(&handle, &adapter, fragments).expect("distinct compact vectors");
+    let compact = set.compact_files();
+    let codec = super::codec::CompactFragmentCodec::for_adapter(&adapter);
+    let author = compact.author.as_ref().expect("paid compact inventory");
+    let identities: Vec<_> = compact
+        .entries()
+        .map(|entry| {
+            let addition = entry.addition.as_ref().expect("vector addition");
+            let (fragment, _receipt) = codec.decode(&addition.payload, author).unwrap();
+            fragment.entry_identity()
+        })
+        .collect();
+    let expected = paths
+        .into_iter()
+        .zip([4, 132])
+        .map(|(path, offset)| EntryIdentity::DeletionVector {
+            path: "s3://b/wh/db/t/data/shared.puffin".into(),
+            offset,
+            length: 64,
+            referenced_data_file: path.into(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(identities, expected);
 }
 
 #[test]
@@ -589,12 +633,9 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
     let mut seen: BTreeMap<IcebergWriteFlavor, usize> = BTreeMap::new();
     for flavor in [
         IcebergWriteFlavor::Append,
-        IcebergWriteFlavor::Overwrite,
-        IcebergWriteFlavor::PartitionOverwrite,
         IcebergWriteFlavor::StagedCreate,
         IcebergWriteFlavor::ManagedPublication,
         IcebergWriteFlavor::DistributedRewrite,
-        IcebergWriteFlavor::TableMaintenance,
     ] {
         let (handle, plans) = plan_write_session(
             IcebergWriteSessionId::new(),
@@ -643,7 +684,19 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
         assert_eq!(handle.branch_of(ordinal(1)), Some(branch));
         seen.insert(flavor, plans.len());
     }
-    assert_eq!(seen.len(), 9, "every flavor must be covered");
+    let mut material = session_material(equality_delete_input_shape());
+    material.equality = Some(equality_delete_recipe());
+    let (handle, plans) = flavor_session(
+        plan_ordinary_branches(IcebergWriteFlavor::EqualityDelete, &material).unwrap(),
+    );
+    assert_eq!(plans.len(), 1);
+    assert_eq!(handle.expected_targets(), vec![ordinal(0)]);
+    assert_eq!(
+        handle.branch_of(ordinal(0)),
+        Some(IcebergWriteBranch::EqualityDelete)
+    );
+    seen.insert(IcebergWriteFlavor::EqualityDelete, plans.len());
+    assert_eq!(seen.len(), 7, "every flavor must be covered");
 }
 
 // -------------------------------------------------------------------------
@@ -1151,13 +1204,11 @@ fn a_rewrite_is_not_gated_by_the_external_write_fence() {
     // write fence. Every other flavor below keeps the fence.
     for flavor in [
         IcebergWriteFlavor::Append,
-        IcebergWriteFlavor::Overwrite,
-        IcebergWriteFlavor::PartitionOverwrite,
         IcebergWriteFlavor::RowMutationPositionDelete,
         IcebergWriteFlavor::RowMutationDeletionVector,
+        IcebergWriteFlavor::EqualityDelete,
         IcebergWriteFlavor::StagedCreate,
         IcebergWriteFlavor::ManagedPublication,
-        IcebergWriteFlavor::TableMaintenance,
     ] {
         assert!(
             flavor.requires_external_write_fence(),
@@ -1186,7 +1237,7 @@ fn a_managed_publication_carries_its_technique_and_disposition_into_finish() {
     for (technique, op_kind) in [
         (
             ConnectorManagedPublicationTechnique::Full,
-            CommitOpKind::Overwrite,
+            CommitOpKind::FullRefresh,
         ),
         (
             ConnectorManagedPublicationTechnique::Incremental,
@@ -1429,7 +1480,7 @@ fn a_change_stream_publication_commits_as_a_delta_not_an_append() {
         (
             ConnectorManagedPublicationTechnique::Full,
             ConnectorManagedPublicationShape::Data,
-            CommitOpKind::Overwrite,
+            CommitOpKind::FullRefresh,
         ),
     ] {
         let (handle, _) = flavor_session(
@@ -1745,9 +1796,8 @@ fn a_document_publication_prepares_exact_keyed_records_closure_and_session_marke
 
 #[test]
 fn an_empty_prepared_set_commits_or_aborts_by_the_publication_disposition() {
-    // The decision is the caller's declared disposition, not an inference from
-    // "there were no fragments": a zero-row INSERT reaches finish exactly the
-    // same way and still publishes.
+    // A zero-row INSERT skips publication. An empty managed write follows
+    // the independently declared publication disposition.
     let (append, _) = flavor_session(
         plan_ordinary_branches(
             IcebergWriteFlavor::Append,
@@ -1757,7 +1807,7 @@ fn an_empty_prepared_set_commits_or_aborts_by_the_publication_disposition() {
     );
     assert_eq!(
         append.empty_write_decision(),
-        IcebergEmptyWriteDecision::Commit
+        IcebergEmptyWriteDecision::SkipExternalCommit
     );
 
     let publication = |empty_input| {
@@ -1909,7 +1959,10 @@ fn staged_target_handle_at(
         crate::iceberg::spec::SortOrder::unsorted_order(),
         location.to_string(),
         crate::iceberg::spec::FormatVersion::V2,
-        std::collections::HashMap::new(),
+        std::collections::HashMap::from([(
+            crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY.to_string(),
+            "false".to_string(),
+        )]),
     )
     .expect("metadata builder")
     .build()
@@ -2154,14 +2207,25 @@ fn a_staged_finish_seals_a_thousand_files_with_bounded_receipt_facts() {
         .collect();
     let fragments = paths
         .iter()
-        .map(|path| {
-            (
-                ordinal(0),
-                adapter.wrap_commit_fragment(data_fragment(path)),
-            )
-        })
+        .map(|path| adapter.wrap_commit_fragment(data_fragment(path)))
         .collect();
-    receive_write_query(&control, &commit, &expected, fragments).unwrap();
+    let (fragments, author) = super::test_support::paid_fragments(&adapter, fragments);
+    let query = write_query_identity();
+    control
+        .begin_write_query(&commit, &query, &expected, None, None)
+        .unwrap();
+    control
+        .arrive_write_fragments(
+            &commit,
+            &query,
+            fragments
+                .into_iter()
+                .map(|fragment| (ordinal(0), fragment))
+                .collect(),
+            &author,
+        )
+        .unwrap();
+    control.confirm_write_received(&commit, &query).unwrap();
     let result = control
         .finish_write(ConnectorWriteFinishRequest {
             commit: &commit,
@@ -2223,12 +2287,71 @@ fn a_staged_finish_seals_a_thousand_files_with_bounded_receipt_facts() {
     // Equal session identity/count with different file facts must remain a
     // different content receipt, even though the attachment is excluded from Eq.
     let mut changed = files.to_vec();
-    changed[0].record_count += 1;
+    changed[0].file_size_in_bytes += 1;
     let changed =
         crate::write_codec::seal_staged_files(changed, &metadata, session_id.to_bytes(), &owner)
             .unwrap();
     assert_ne!(receipt, changed);
     assert_ne!(receipt.digest(), changed.digest());
+}
+
+#[test]
+fn staged_abort_before_sealing_deletes_only_confirmed_output() {
+    use novarocks_spi::connector::ConnectorWriteAbortOutcome;
+    use novarocks_spi::connector::write_stack::{
+        ConnectorWriteAbortProduction, ConnectorWriteSessionAbortRequest,
+    };
+
+    let incarnation = ProviderBindingEpoch::new();
+    let (executor, runtime) = unreachable_rest_runtime();
+    let descriptor = descriptor("unit");
+    let catalog = CatalogHandle::new(
+        descriptor.instance_id.clone(),
+        CatalogVersion::from_bytes([1; 32]),
+    );
+    let adapter = super::runtime::build_write_adapter(descriptor.clone(), catalog.clone());
+    let control = super::control::IcebergWriteSessionControl::new(
+        descriptor,
+        incarnation,
+        catalog,
+        Arc::clone(&runtime),
+    );
+    let scratch = tempfile::TempDir::new().unwrap();
+    let location = format!("file://{}/table", scratch.path().display());
+    let request = staged_begin_request(staged_target_handle_at(&runtime, incarnation, &location));
+    let session = control.begin_write(request).unwrap();
+    let (output, _writer) =
+        seal_test_data_output(&control, &executor, &runtime, &adapter, &session);
+    let file = std::path::Path::new(output.paths[0].trim_start_matches("file://"));
+    let sibling = file.with_file_name("not-received.parquet");
+    std::fs::write(&sibling, b"external").unwrap();
+    assert!(file.is_file());
+    control
+        .confirm_write_received(session.commit_session(), &output.query)
+        .unwrap();
+    let outcome = executor
+        .block_on(
+            control.abort_write_async(ConnectorWriteSessionAbortRequest {
+                commit: session.commit_session(),
+                context: request_context(),
+                production: ConnectorWriteAbortProduction::CompleteReceived,
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        ConnectorWriteAbortOutcome::KnownUncommitted {
+            cleanup: ExternalMutationFinalization::Complete,
+        },
+    ));
+    assert!(!file.exists());
+    assert!(sibling.is_file());
+    assert_eq!(
+        control
+            .cleanup_responsibility(session.commit_session())
+            .unwrap(),
+        novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Disposed,
+    );
 }
 
 /// A staged write that produced no artifact still reaches the provider.
@@ -2492,9 +2615,10 @@ fn real_prepare_and_begin_preserve_the_same_scalar_integer_fields() {
                 .collect::<Vec<_>>(),
             prepared_fields
         );
-        // Staged create deliberately has no collect-on-write aggregates. The
-        // exact input-domain admission still applies before that eligibility gate.
-        assert!(session.targets()[0].statistics().is_empty());
+        assert_eq!(
+            session.targets()[0].statistics().is_empty(),
+            !collect_statistics
+        );
     }
 }
 
@@ -2683,11 +2807,6 @@ fn all_write_admission_requests(
     };
     let mut requests = [
         ("append", ConnectorWriteIntent::Append),
-        ("overwrite", ConnectorWriteIntent::Overwrite),
-        (
-            "partition overwrite",
-            ConnectorWriteIntent::PartitionOverwrite,
-        ),
         ("row delta", ConnectorWriteIntent::RowDelta),
     ]
     .into_iter()
@@ -2729,7 +2848,16 @@ fn all_write_admission_requests(
             },
         ),
     ] {
-        let mut request = ordinary(ConnectorWriteIntent::Append);
+        let mut request = ordinary(
+            if matches!(
+                &flavor,
+                ConnectorWriteSessionFlavor::DistributedRewrite { .. }
+            ) {
+                ConnectorWriteIntent::RewriteDataFiles
+            } else {
+                ConnectorWriteIntent::Append
+            },
+        );
         request.flavor = flavor;
         requests.push((name.to_string(), request));
     }
@@ -2737,7 +2865,7 @@ fn all_write_admission_requests(
         (
             "full document publication",
             ConnectorManagedPublicationTechnique::Full,
-            ConnectorWriteIntent::Overwrite,
+            ConnectorWriteIntent::Append,
         ),
         (
             "incremental document publication",
@@ -2803,8 +2931,6 @@ fn assert_write_admission_refused_without_io(
             .collect::<Vec<_>>(),
         [
             "append",
-            "overwrite",
-            "partition overwrite",
             "row delta",
             "equality delete",
             "staged create",
@@ -3604,27 +3730,12 @@ fn optimize_pins_the_data_file_with_a_materialized_deletion_vector() {
     assert_eq!(lake.inventory(), before);
 }
 
-fn project_prepared_managed_rows(
+pub(super) fn project_prepared_managed_rows(
     technique: ConnectorManagedPublicationTechnique,
     shape: ConnectorManagedPublicationShape,
     entries: Vec<(WriteTargetOrdinal, IcebergCommitFragment)>,
 ) -> Result<Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>, ConnectorError>
 {
-    project_managed_rows_fixture(technique, shape, entries, false).map(|(_, rows)| rows)
-}
-
-pub(super) fn project_managed_rows_fixture(
-    technique: ConnectorManagedPublicationTechnique,
-    shape: ConnectorManagedPublicationShape,
-    entries: Vec<(WriteTargetOrdinal, IcebergCommitFragment)>,
-    use_legacy_receiver: bool,
-) -> Result<
-    (
-        bool,
-        Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>,
-    ),
-    ConnectorError,
-> {
     let material = session_material(if shape == ConnectorManagedPublicationShape::RowMutation {
         merge_on_read_input_shape()
     } else {
@@ -3656,13 +3767,6 @@ pub(super) fn project_managed_rows_fixture(
     } else {
         handle
     };
-    let chooses_compact = handle.with_active_receiving(|receiving| {
-        let compact = receiving.compact_files().is_some();
-        if use_legacy_receiver {
-            *receiving = IcebergReceiving::default();
-        }
-        Ok(compact)
-    })?;
     let expected = handle.expected_targets();
     let adapter = adapter("unit", 1);
     let commit = adapter.wrap_commit_session(handle);
@@ -3672,7 +3776,7 @@ pub(super) fn project_managed_rows_fixture(
         .into_iter()
         .map(|(ordinal, fragment)| (ordinal, adapter.wrap_commit_fragment(fragment)))
         .unzip();
-    let (fragments, author) = super::test_support::paid_fragments(&adapter, fragments);
+    let (fragments, author) = paid_fragments(&adapter, fragments);
     let (_executor, runtime) = unreachable_rest_runtime();
     let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
         descriptor("unit"),
@@ -3697,7 +3801,7 @@ pub(super) fn project_managed_rows_fixture(
         adapter.commit_session(&commit)?.state()?,
         IcebergWriteSessionState::Active
     ));
-    result.map(|rows| (chooses_compact, rows))
+    result
 }
 
 fn logical_data_fragment(path: &str, rows: u64) -> IcebergCommitFragment {
@@ -3818,9 +3922,8 @@ fn managed_logical_rows_refuse_insertion_count_overflow() {
     )
     .unwrap_err();
     assert!(
-        error
-            .message()
-            .contains("logical insertion count overflowed")
+        error.message().contains("compact entry counter overflow"),
+        "{error}"
     );
 }
 
@@ -4624,69 +4727,93 @@ fn empty_artifact_row_deltas_settle_noop_before_any_catalog_io() {
                 },
             )
             .unwrap();
-            let position_mutation = flavor != IcebergWriteFlavor::EqualityDelete;
-            let plan = if position_mutation {
-                plan_row_mutation_branches(&material)
-            } else {
-                plan_ordinary_branches(flavor, &material)
-            }
-            .unwrap();
-            assert_eq!(plan.flavor, flavor);
-            let (handle, _) = plan_branch_session(
-                IcebergWriteSessionId::new(),
-                IcebergBranchSessionPlanInput {
-                    flavor,
-                    purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-                    table: material.table,
-                    base_version_digest: Some([42; 32]),
-                    document_publication: None,
-                    staged_metadata: None,
-                    rewrite_inputs: plan.rewrite_inputs,
-                    repartition: None,
-                    writer_table: None,
-                    branches: plan.branches,
-                },
-            )
-            .unwrap();
-            let handle = if position_mutation {
-                let recipe = fixed_delete_recipe(handle.table());
-                handle.with_mutation_read(recipe)
-            } else {
-                handle
+            let adapter = adapter("unit", 1);
+            let new_commit = || {
+                let position_mutation = flavor != IcebergWriteFlavor::EqualityDelete;
+                let plan = if position_mutation {
+                    plan_row_mutation_branches(&material)
+                } else {
+                    plan_ordinary_branches(flavor, &material)
+                }
+                .unwrap();
+                assert_eq!(plan.flavor, flavor);
+                let (handle, _) = plan_branch_session(
+                    IcebergWriteSessionId::new(),
+                    IcebergBranchSessionPlanInput {
+                        flavor,
+                        purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                        table: material.table.clone(),
+                        base_version_digest: Some([42; 32]),
+                        document_publication: None,
+                        staged_metadata: None,
+                        rewrite_inputs: plan.rewrite_inputs,
+                        repartition: None,
+                        writer_table: None,
+                        branches: plan.branches,
+                    },
+                )
+                .unwrap();
+                let handle = if position_mutation {
+                    let recipe = fixed_delete_recipe(handle.table());
+                    handle.with_mutation_read(recipe)
+                } else {
+                    handle
+                };
+                adapter.wrap_commit_session(handle)
             };
-            let empty = IcebergReceiving::default();
-            let rejected = control
-                .validate_received_commit(&handle, &empty, 1, &request_context())
-                .expect_err("a positive logical delta without artifacts cannot claim NoOp");
-            assert_eq!(rejected.kind(), ConnectorErrorKind::CorruptData);
-            assert!(matches!(
-                handle.state().unwrap(),
-                IcebergWriteSessionState::Active
-            ));
-            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
-            let cancelled = ConnectorRequestContext::try_new(
-                Instant::now() + Duration::from_secs(30),
-                stop.view(),
-                64 * 1024,
-                1024 * 1024,
-            )
-            .unwrap();
-            stop.request_stop();
-            let cancelled_result = control
-                .validate_received_commit(&handle, &empty, 0, &cancelled)
-                .expect_err("ordinary cancelled Work cannot mint a NoOp success");
-            assert_eq!(cancelled_result.kind(), ConnectorErrorKind::Cancelled);
-            assert!(matches!(
-                handle.state().unwrap(),
-                IcebergWriteSessionState::Active
-            ));
-            let commit = adapter("unit", 1).wrap_commit_session(handle);
+            for (row_count, cancelled, expected, detail) in [
+                (
+                    1,
+                    false,
+                    ConnectorErrorKind::CorruptData,
+                    Some("nonzero logical row delta produced no artifact"),
+                ),
+                (0, true, ConnectorErrorKind::Cancelled, None),
+            ] {
+                let commit = new_commit();
+                let handle = adapter.commit_session(&commit).unwrap();
+                assert!(matches!(
+                    handle.state().unwrap(),
+                    IcebergWriteSessionState::Active
+                ));
+                let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+                let context = ConnectorRequestContext::try_new(
+                    Instant::now() + Duration::from_secs(30),
+                    stop.view(),
+                    64 * 1024,
+                    1024 * 1024,
+                )
+                .unwrap();
+                if cancelled {
+                    stop.request_stop();
+                }
+                let mut request = empty_finish_request(&commit, &context);
+                request.row_count = row_count;
+                let outcome = futures::executor::block_on(
+                    control.finish_write_needed_original(request, None),
+                )
+                .expect("the original finish must report the rejection");
+                let ConnectorWritePublicationCompletion::KnownUncommitted { failure, .. } = outcome
+                else {
+                    panic!("a rejected empty finish must not mint a NoOp");
+                };
+                let cause = failure.connector_source().unwrap();
+                assert_eq!(cause.kind(), expected);
+                if let Some(detail) = detail {
+                    assert_eq!(cause.message(), detail);
+                }
+                assert!(matches!(
+                    handle.state().unwrap(),
+                    IcebergWriteSessionState::KnownUncommitted { .. }
+                ));
+            }
+            let commit = new_commit();
             let outcome = futures::executor::block_on(control.finish_write_needed_original(
                 empty_finish_request(&commit, &request_context()),
                 None,
             ))
             .expect("empty exact row delta must not reach the unreachable REST catalog");
-            let handle = adapter("unit", 1).commit_session(&commit).unwrap();
+            let handle = adapter.commit_session(&commit).unwrap();
             let ConnectorWritePublicationCompletion::KnownCommitted { needed, cleanup } = outcome
             else {
                 panic!("empty complete row delta must prove its NoOp")
@@ -4749,21 +4876,47 @@ fn empty_artifact_row_deltas_settle_noop_before_any_catalog_io() {
 }
 
 #[test]
-fn empty_data_replacements_and_managed_publications_keep_their_own_decision() {
-    for flavor in [
-        IcebergWriteFlavor::Append,
-        IcebergWriteFlavor::Overwrite,
-        IcebergWriteFlavor::PartitionOverwrite,
-        IcebergWriteFlavor::TableMaintenance,
-    ] {
-        let (handle, _) = flavor_session(
-            plan_ordinary_branches(flavor, &session_material(data_input_shape())).unwrap(),
-        );
-        assert_eq!(
-            handle.empty_write_decision(),
-            IcebergEmptyWriteDecision::Commit
-        );
-    }
+fn empty_insert_settles_without_contacting_the_catalog() {
+    use novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion;
+
+    // The catalog binding is unreachable. An empty write must settle using
+    // the already admitted ref and publish its original NoOp completion.
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        ProviderBindingEpoch::new(),
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").unwrap(),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        runtime,
+    );
+    let (handle, _) = flavor_session(
+        plan_ordinary_branches(
+            IcebergWriteFlavor::Append,
+            &session_material(data_input_shape()),
+        )
+        .unwrap(),
+    );
+    let snapshot = handle.table().base_snapshot_id();
+    let commit = adapter("unit", 1).wrap_commit_session(handle);
+    let outcome = futures::executor::block_on(
+        control
+            .finish_write_needed_original(empty_finish_request(&commit, &request_context()), None),
+    )
+    .unwrap();
+    let ConnectorWritePublicationCompletion::KnownCommitted { needed, .. } = outcome else {
+        panic!("empty INSERT must have a known completion");
+    };
+    assert_eq!(needed.effect(), ExternalMutationEffect::NoOp);
+    assert_eq!(
+        needed.receipt().committed_version().unwrap().snapshot_id(),
+        snapshot
+    );
+}
+
+#[test]
+fn empty_managed_publications_keep_their_own_decision() {
     for disposition in [
         ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
         ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit,

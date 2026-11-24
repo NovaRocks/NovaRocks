@@ -147,14 +147,67 @@ fn distributed_rewrite_begin_uses_the_exact_frozen_source_with_catalog_offline()
     assert_eq!(lake.rows(), vec![1, 2, 99]);
 }
 
+fn truncate_table(lake: &FrozenRewriteLake) {
+    use crate::catalog_control::data_mutation::IcebergDataMutationAdapter;
+    use novarocks_spi::connector::{
+        ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationOperation,
+        ConnectorDataMutationPlanningRequest, ConnectorMetadata, ConnectorMutationOperationId,
+        ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+    };
+
+    let context = request_context();
+    let key = lake.control.binding_key();
+    let metadata = Arc::new(crate::metadata::IcebergMetadata::new(
+        descriptor("rewrite-local"),
+        key.incarnation,
+        Arc::clone(&lake.runtime),
+    ));
+    let table = crate::metadata::with_pure_schema_creation(&context, |creation| {
+        metadata
+            .load_table(
+                ConnectorTableRequest {
+                    table: ConnectorTableIdentity {
+                        instance_id: key.instance_id.clone(),
+                        namespace: Arc::from("db"),
+                        table: Arc::from("t"),
+                    },
+                    resolution: ConnectorTableResolution::StrictBaseTable,
+                    context: context.clone(),
+                },
+                creation,
+            )
+            .map_err(crate::metadata::metadata_creation_error)
+    })
+    .unwrap();
+    let mutation = IcebergDataMutationAdapter::try_new(metadata).unwrap();
+    let plan = mutation
+        .plan_mutation(
+            ConnectorDataMutationPlanningRequest::try_new(
+                ConnectorMutationOperationId::new(),
+                key.clone(),
+                ConnectorDataMutationOperation::truncate_main(table.table),
+                context.clone(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let outcome = mutation
+        .execute(ConnectorDataMutationExecuteRequest::try_new(plan, context).unwrap())
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        ExternalMutationOutcome::KnownCommitted { .. }
+    ));
+}
+
 #[test]
 fn distributed_rewrite_replaces_only_frozen_inputs_and_validates_the_current_base() {
     let cases = [
-        (None, vec![1, 2]),
-        (Some(ConnectorWriteIntent::Append), vec![1, 2, 99]),
-        (Some(ConnectorWriteIntent::Overwrite), vec![99]),
+        (false, false, vec![1, 2]),
+        (true, false, vec![1, 2, 99]),
+        (true, true, vec![99]),
     ];
-    for (concurrent, expected_rows) in cases {
+    for (concurrent_append, concurrent_truncate, expected_rows) in cases {
         let lake = FrozenRewriteLake::new();
         seed_two_files(&lake);
         let plan = lake.plan();
@@ -165,8 +218,11 @@ fn distributed_rewrite_replaces_only_frozen_inputs_and_validates_the_current_bas
 
         // Change the live base before write begin. The writer must retain E;
         // only publication may validate the later B.
-        if let Some(intent) = concurrent {
-            lake.write_rows(intent, &[99], "concurrent");
+        if concurrent_truncate {
+            truncate_table(&lake);
+        }
+        if concurrent_append {
+            lake.write_rows(ConnectorWriteIntent::Append, &[99], "concurrent");
         }
         let base = lake.table();
         let current_parent = base.metadata().current_snapshot_id();
@@ -239,7 +295,7 @@ fn distributed_rewrite_replaces_only_frozen_inputs_and_validates_the_current_bas
                 context: context.clone(),
             })
         };
-        if concurrent.is_none() {
+        if !concurrent_append {
             let error = finish(0).unwrap_err();
             assert!(
                 error
@@ -257,9 +313,9 @@ fn distributed_rewrite_replaces_only_frozen_inputs_and_validates_the_current_bas
         let row_count = lake.output(&session, &[1, 2], "rewritten");
         let outcome = finish(row_count).unwrap();
         let current = lake.table();
-        if concurrent == Some(ConnectorWriteIntent::Overwrite) {
+        if concurrent_truncate {
             let ExternalMutationOutcome::KnownUncommitted { failure, .. } = outcome else {
-                panic!("overwrite removed the exact frozen inputs: {outcome:?}");
+                panic!("the competing truncate removed the exact frozen inputs: {outcome:?}");
             };
             assert_eq!(failure.kind(), ConnectorMutationFailureKind::Conflict);
             assert_eq!(
@@ -303,7 +359,7 @@ fn distributed_rewrite_replaces_only_frozen_inputs_and_validates_the_current_bas
             assert!(!selected.data_paths.contains(&EntryIdentity::DataFile {
                 path: rewritten[0].path.clone(),
             }));
-            assert_eq!(files.len(), if concurrent.is_some() { 2 } else { 1 });
+            assert_eq!(files.len(), if concurrent_append { 2 } else { 1 });
         }
         assert_eq!(lake.rows(), expected_rows);
         lake.inventory();

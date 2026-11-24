@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::commit::model::{EntryIdentity, FrozenEntry};
 use crate::iceberg::io::FileIO;
@@ -212,6 +214,7 @@ impl<'a> SnapshotSources<'a> {
 
     /// P lookup scans all data sources because paths have no partition
     /// constraint. Only facts for matching paths escape the source fold.
+    #[cfg(test)]
     pub(crate) async fn live_data_matches(
         &self,
         paths: &BTreeSet<&str>,

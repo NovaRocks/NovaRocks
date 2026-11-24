@@ -100,5 +100,5 @@ fn delete_uses_the_main_update_protocol_without_a_history_window() {
     assert!(protocol.requires_target_branch());
     assert!(matches!(protocol.window(), WindowValidation::None));
     assert!(protocol.writer_schema_spec().is_none());
-    assert!(protocol.rewrite_output_requirement().is_none());
+    assert!(protocol.output_spec_requirement().is_none());
 }

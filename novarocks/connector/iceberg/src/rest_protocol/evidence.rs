@@ -25,8 +25,12 @@
 use std::fmt;
 use std::sync::Arc;
 
+use novarocks_failure_contract::{
+    FailureClass, FailureFact, FailureProjection, connector_reason::ICEBERG_TABLE_ALREADY_EXISTS,
+};
 use novarocks_spi::connector::{
-    ConnectorMutationFailure, ConnectorMutationFailureKind, ExternalMutationEffect,
+    ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ExternalMutationEffect,
 };
 use reqwest::header::HeaderName;
 use uuid::Uuid;
@@ -36,6 +40,7 @@ use super::minimal_view::{
     MutationView, NamespaceView, PropertyValue, RefCheck, TableResponseView, TableViewRequest,
     ViewMutationView, ViewRequestError,
 };
+use crate::catalog::CatalogTableName;
 use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome};
 use crate::catalog::staged_metadata_path::StagedMetadataPath;
 use crate::catalog::transaction::CommitProof;
@@ -268,6 +273,7 @@ impl From<ViewRequestError> for ExpectationError {
 pub(crate) struct AttributionExpectation {
     endpoint: MutationEndpoint,
     identity: ExpectedIdentity,
+    staged_table: Option<CatalogTableName>,
     snapshot: Option<ExpectedSnapshot>,
     /// CTAS supplementary expectations: NovaRocks-named properties.
     properties: Vec<(String, String)>,
@@ -304,6 +310,7 @@ impl AttributionExpectation {
         Ok(Self {
             endpoint,
             identity,
+            staged_table: None,
             snapshot,
             properties,
             view_request,
@@ -319,6 +326,7 @@ impl AttributionExpectation {
         Self {
             endpoint,
             identity,
+            staged_table: None,
             snapshot: None,
             properties: Vec::new(),
             view_request,
@@ -394,6 +402,7 @@ impl AttributionExpectation {
     /// when it carries data, and the publication marker and document
     /// properties CTAS already checks.
     pub(crate) fn ctas_final_commit(
+        table: CatalogTableName,
         staged_uuid: Uuid,
         snapshot: Option<ExpectedSnapshot>,
         properties: Vec<(String, String)>,
@@ -404,6 +413,10 @@ impl AttributionExpectation {
             snapshot,
             properties,
         )
+        .map(|mut expectation| {
+            expectation.staged_table = Some(table);
+            expectation
+        })
     }
 
     pub(crate) fn with_final_table_location(mut self, expected: Option<Arc<str>>) -> Self {
@@ -423,8 +436,11 @@ impl AttributionExpectation {
         Self::infallible(MutationEndpoint::CreateTable, ExpectedIdentity::Unknown)
     }
 
-    pub(crate) fn stage_create() -> Self {
-        Self::infallible(MutationEndpoint::StageCreate, ExpectedIdentity::Unknown)
+    pub(crate) fn stage_create(table: CatalogTableName) -> Self {
+        let mut expectation =
+            Self::infallible(MutationEndpoint::StageCreate, ExpectedIdentity::Unknown);
+        expectation.staged_table = Some(table);
+        expectation
     }
 
     pub(crate) fn create_namespace(namespace: Vec<String>) -> Self {
@@ -638,6 +654,7 @@ pub(crate) enum RestEvidence {
         status: u16,
         kind: ConnectorMutationFailureKind,
     },
+    RejectedStagedTableExists(CatalogTableName),
     Applied {
         receipt: RestReceipt,
     },
@@ -702,8 +719,13 @@ pub(crate) fn classify(
                         RefRelation::NotTracked,
                     )
                 }
-                409 if endpoint.creates() => rejected(ConnectorMutationFailureKind::AlreadyExists),
-                409 => rejected(ConnectorMutationFailureKind::Conflict),
+                409 => match &expect.staged_table {
+                    Some(table) => RestEvidence::RejectedStagedTableExists(table.clone()),
+                    None if endpoint.creates() => {
+                        rejected(ConnectorMutationFailureKind::AlreadyExists)
+                    }
+                    None => rejected(ConnectorMutationFailureKind::Conflict),
+                },
                 401 | 419 => rejected(ConnectorMutationFailureKind::Unauthenticated),
                 403 => rejected(ConnectorMutationFailureKind::PermissionDenied),
                 413 => rejected(ConnectorMutationFailureKind::ResourceExhausted),
@@ -1048,6 +1070,36 @@ fn not_dispatched_message(cause: NotDispatchedCause) -> &'static str {
     }
 }
 
+#[derive(Debug)]
+struct StagedTableAlreadyExists(CatalogTableName);
+
+impl fmt::Display for StagedTableAlreadyExists {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Table {} already exists", self.0)
+    }
+}
+
+impl std::error::Error for StagedTableAlreadyExists {}
+
+impl FailureProjection for StagedTableAlreadyExists {
+    fn failure_fact(&self) -> FailureFact {
+        FailureFact::new(FailureClass::Data, ICEBERG_TABLE_ALREADY_EXISTS)
+    }
+}
+
+fn staged_table_already_exists(table: CatalogTableName) -> ConnectorMutationFailure {
+    let source = ConnectorError::from_domain(
+        ConnectorErrorKind::InvalidRequest,
+        StagedTableAlreadyExists(table),
+    )
+    .with_public_failure_detail();
+    ConnectorMutationFailure::new(
+        ConnectorMutationFailureKind::AlreadyExists,
+        source.message(),
+    )
+    .with_connector_source(source)
+}
+
 impl RestEvidence {
     /// A fixed, server-text-free message for this evidence.
     pub(crate) fn message(&self) -> String {
@@ -1055,6 +1107,9 @@ impl RestEvidence {
             Self::NotDispatched { cause, .. } => not_dispatched_message(*cause).to_owned(),
             Self::Rejected { status, .. } => {
                 format!("REST catalog rejected the request with HTTP {status}")
+            }
+            Self::RejectedStagedTableExists(table) => {
+                StagedTableAlreadyExists(table.clone()).to_string()
             }
             Self::Applied { receipt } => {
                 format!("REST catalog applied the {}", receipt.endpoint.label())
@@ -1106,6 +1161,9 @@ impl RestEvidence {
     pub(crate) fn failure(&self) -> Option<ConnectorMutationFailure> {
         let kind = match self {
             Self::NotDispatched { kind, .. } | Self::Rejected { kind, .. } => *kind,
+            Self::RejectedStagedTableExists(table) => {
+                return Some(staged_table_already_exists(table.clone()));
+            }
             Self::Unknown { .. } => ConnectorMutationFailureKind::Unavailable,
             Self::Applied { .. } => return None,
         };
@@ -1132,6 +1190,9 @@ impl RestEvidence {
             Self::NotDispatched { kind, .. } | Self::Rejected { kind, .. } => {
                 CatalogOutcome::uncommitted(kind, message)
             }
+            Self::RejectedStagedTableExists(table) => CatalogOutcome::KnownUncommitted {
+                failure: staged_table_already_exists(table),
+            },
             Self::Unknown { .. } => CatalogOutcome::unknown(message, evidence),
         }
     }
@@ -1176,6 +1237,9 @@ fn split(evidence: RestEvidence) -> Split {
         RestEvidence::Applied { receipt } => Split::Applied(receipt),
         RestEvidence::Rejected { status: 409, kind } => {
             Split::Conflict(ConnectorMutationFailure::new(kind, message))
+        }
+        RestEvidence::RejectedStagedTableExists(table) => {
+            Split::Conflict(staged_table_already_exists(table))
         }
         RestEvidence::Rejected { kind, .. } | RestEvidence::NotDispatched { kind, .. } => {
             Split::Uncommitted(ConnectorMutationFailure::new(kind, message))
@@ -1247,19 +1311,24 @@ mod tests {
         Some(ExpectedSnapshot::new(S, Some("main".to_owned())))
     }
 
+    fn staged_table() -> CatalogTableName {
+        CatalogTableName::new("db.inner", "target")
+    }
+
     fn expectation(endpoint: MutationEndpoint) -> AttributionExpectation {
         match endpoint {
             E::TableCommit => {
                 AttributionExpectation::table_commit(uuid(TABLE_UUID), snapshot()).unwrap()
             }
             E::CtasFinalCommit => AttributionExpectation::ctas_final_commit(
+                staged_table(),
                 uuid(TABLE_UUID),
                 snapshot(),
                 vec![(MARKER.to_owned(), "op-7".to_owned())],
             )
             .unwrap(),
             E::CreateTable => AttributionExpectation::create_table(),
-            E::StageCreate => AttributionExpectation::stage_create(),
+            E::StageCreate => AttributionExpectation::stage_create(staged_table()),
             E::CreateNamespace => {
                 AttributionExpectation::create_namespace(vec!["db".to_owned(), "inner".to_owned()])
             }
@@ -1458,6 +1527,20 @@ mod tests {
             ] {
                 // A body is never consulted for a non-success status.
                 let evidence = classify_body(&expect, code, Some("<html>"));
+                if code == 409 && matches!(endpoint, E::StageCreate | E::CtasFinalCommit) {
+                    assert_eq!(
+                        evidence,
+                        RestEvidence::RejectedStagedTableExists(staged_table())
+                    );
+                    let failure = evidence.failure().unwrap();
+                    assert_eq!(failure.kind(), Kind::AlreadyExists);
+                    assert_eq!(
+                        failure.failure_fact(),
+                        FailureFact::new(FailureClass::Data, ICEBERG_TABLE_ALREADY_EXISTS)
+                    );
+                    assert_eq!(failure.message(), "Table db.inner.target already exists");
+                    continue;
+                }
                 assert_eq!(
                     evidence,
                     RestEvidence::Rejected { status: code, kind },
@@ -1634,6 +1717,7 @@ mod tests {
     #[test]
     fn final_staged_table_location_is_attributed_independently_of_the_metadata_file() {
         let expected = AttributionExpectation::ctas_final_commit(
+            staged_table(),
             Uuid::parse_str(TABLE_UUID).unwrap(),
             None,
             Vec::new(),
@@ -1701,6 +1785,7 @@ mod tests {
         let path = "s3://storage/warehouse/mv-metadata";
         let file = "s3://storage/warehouse/mv-metadata/00000-own.metadata.json";
         let expected = AttributionExpectation::ctas_final_commit(
+            staged_table(),
             Uuid::parse_str(TABLE_UUID).unwrap(),
             None,
             vec![(WRITE_METADATA_PATH.to_string(), path.to_string())],
@@ -1897,6 +1982,7 @@ mod tests {
         );
         // A CTAS without data adds no snapshot; only the marker is checked.
         let no_data = AttributionExpectation::ctas_final_commit(
+            staged_table(),
             uuid(TABLE_UUID),
             None,
             vec![(MARKER.to_owned(), "op-7".to_owned())],
@@ -2168,6 +2254,7 @@ mod tests {
         let expected = "原文".repeat(16 * 1024);
         assert!(expected.len() > 64 * 1024);
         let expect = AttributionExpectation::ctas_final_commit(
+            staged_table(),
             uuid(TABLE_UUID),
             None,
             vec![(MARKER.to_owned(), expected.clone())],

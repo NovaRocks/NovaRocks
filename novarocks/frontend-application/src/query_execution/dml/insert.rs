@@ -29,14 +29,6 @@ pub struct InsertTargetName {
     pub parts: Vec<String>,
 }
 
-/// Overwrite semantics owned by the frontend INSERT command.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InsertOverwriteMode {
-    Append,
-    FullTable,
-    DynamicPartitions,
-}
-
 /// Complete original INSERT input for its registered statement action.
 /// Fields are not an authority constructor for downstream callers.
 pub struct InsertStatementInput {

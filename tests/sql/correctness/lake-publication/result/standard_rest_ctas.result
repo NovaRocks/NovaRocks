@@ -15,3 +15,13 @@ n	assigned_ids	assigned_sequences
 id	k
 2	20
 3	30
+
+-- query 14
+-- types	bigint
+snapshots
+3
+
+-- query 16
+-- types	bigint
+snapshots
+3

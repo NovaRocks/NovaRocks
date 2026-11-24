@@ -23,17 +23,15 @@ struct CommandPlan {
     admission: StatementAdmission,
     work_class: WorkClass,
     window_class: ResultWindowClass,
-    publication_deadline: bool,
     waits_for_topology: bool,
 }
 
 impl CommandPlan {
-    fn management(kind: StatementKind, shape: StatementOutputShape, publication: bool) -> Self {
+    fn management(kind: StatementKind, shape: StatementOutputShape) -> Self {
         Self {
             admission: StatementAdmission { kind, shape },
             work_class: WorkClass::Management,
             window_class: ResultWindowClass::Local,
-            publication_deadline: publication,
             waits_for_topology: false,
         }
     }
@@ -46,7 +44,6 @@ impl CommandPlan {
             },
             work_class: WorkClass::Query,
             window_class: ResultWindowClass::Internal,
-            publication_deadline: true,
             waits_for_topology,
         }
     }
@@ -204,20 +201,10 @@ impl FrontendQuerySession {
     ) -> Result<CommandStart, QueryServiceError> {
         self.admission.publish(plan.admission);
         *self.output_shape.lock().map_err(poisoned_state)? = Some(plan.admission.shape);
-        let (state, session_deadline) = {
+        let (state, deadline) = {
             let state = self.state.lock().map_err(poisoned_state)?;
             let (session_deadline, _) = governed_query_deadline(&state)?;
             (state.clone(), session_deadline)
-        };
-        let deadline = if plan.publication_deadline {
-            Some(
-                self.service
-                    .lake_publication_runtime_policy
-                    .admit_deadline(Instant::now(), session_deadline)
-                    .map_err(internal_error)?,
-            )
-        } else {
-            session_deadline
         };
         let timeout_duration =
             deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
@@ -392,7 +379,7 @@ fn preparation_plan(
         TableProcedureKind as Procedure, declared_table_procedure_kind,
     };
 
-    let management = |kind| CommandPlan::management(kind, Empty, true);
+    let management = |kind| CommandPlan::management(kind, Empty);
     let result = match preparation {
         Prep::CreateCatalog(_) => management(CreateCatalog),
         Prep::CreateSchema(_) => management(CreateDatabase),
@@ -417,19 +404,16 @@ fn preparation_plan(
                 },
                 work_class: WorkClass::Query,
                 window_class: ResultWindowClass::Internal,
-                publication_deadline: true,
                 waits_for_topology: false,
             },
             Some(Procedure::OptimizeManifests) => {
-                CommandPlan::management(RewriteManifests, ResultSet, true)
+                CommandPlan::management(RewriteManifests, ResultSet)
             }
-            Some(Procedure::ExpireSnapshots) => {
-                CommandPlan::management(ExpireSnapshots, ResultSet, true)
-            }
+            Some(Procedure::ExpireSnapshots) => CommandPlan::management(ExpireSnapshots, ResultSet),
             Some(Procedure::RemoveOrphanFiles) => {
-                CommandPlan::management(RemoveOrphanFiles, ResultSet, true)
+                CommandPlan::management(RemoveOrphanFiles, ResultSet)
             }
-            Some(Procedure::AddFiles) => CommandPlan::management(AddFiles, ResultSet, true),
+            Some(Procedure::AddFiles) => CommandPlan::management(AddFiles, ResultSet),
             Some(Procedure::MoveColumn) => management(ReorderColumn),
             Some(Procedure::SetColumnNotNull) => management(SetColumnNotNull),
             Some(Procedure::UnsetExtraProperties) => management(UnsetTableProperties),
@@ -443,7 +427,7 @@ fn preparation_plan(
                 },
                 ..CommandPlan::write(AddEqualityDelete, true)
             },
-            None => CommandPlan::management(Call, UndeterminedCall, true),
+            None => CommandPlan::management(Call, UndeterminedCall),
         },
         Prep::Analyze(_) => CommandPlan::write(Analyze, false),
         Prep::CreateBranch(_) => management(CreateBranch),
@@ -451,21 +435,21 @@ fn preparation_plan(
         Prep::FastForwardBranch(_) | Prep::ShowBranches(_) => management(Call),
         Prep::Insert(_) => CommandPlan::write(Insert, true),
         Prep::Delete(node) if node.predicate.is_none() => {
-            CommandPlan::management(Delete, StatementOutputShape::Rows, true)
+            CommandPlan::management(Delete, StatementOutputShape::Rows)
         }
         Prep::Delete(_) => CommandPlan::write(Delete, false),
         Prep::DeleteEntireBranch { .. } => {
-            CommandPlan::management(Delete, StatementOutputShape::Rows, true)
+            CommandPlan::management(Delete, StatementOutputShape::Rows)
         }
         Prep::Update(_) => CommandPlan::write(Update, true),
         Prep::Merge(_) => CommandPlan::write(Merge, true),
-        Prep::Call(_) => CommandPlan::management(Call, UndeterminedCall, true),
-        Prep::KillQuery(_) => CommandPlan::management(Call, Empty, false),
+        Prep::Call(_) => CommandPlan::management(Call, UndeterminedCall),
+        Prep::KillQuery(_) => CommandPlan::management(Call, Empty),
         Prep::CreateView(_) => management(CreateView),
         Prep::DropView(_) => management(DropView),
-        Prep::ShowCreateView(_) => CommandPlan::management(ShowCreateView, ResultSet, false),
+        Prep::ShowCreateView(_) => CommandPlan::management(ShowCreateView, ResultSet),
         Prep::ShowCreateMaterializedView(_) => {
-            CommandPlan::management(ShowCreateMaterializedView, ResultSet, false)
+            CommandPlan::management(ShowCreateMaterializedView, ResultSet)
         }
         Prep::CreateMaterializedView(_) => management(CreateMaterializedView),
         Prep::DropMaterializedView(_) => management(DropMaterializedView),
@@ -476,11 +460,10 @@ fn preparation_plan(
             },
             work_class: WorkClass::Management,
             window_class: ResultWindowClass::Internal,
-            publication_deadline: true,
             waits_for_topology: false,
         },
         Prep::ExplainRefreshMaterializedView(..) => {
-            CommandPlan::management(ExplainMaterializedViewRefresh, ResultSet, false)
+            CommandPlan::management(ExplainMaterializedViewRefresh, ResultSet)
         }
         Prep::ExplainDelete(_) => CommandPlan {
             admission: StatementAdmission {
@@ -489,7 +472,6 @@ fn preparation_plan(
             },
             work_class: WorkClass::Query,
             window_class: ResultWindowClass::Local,
-            publication_deadline: false,
             waits_for_topology: false,
         },
         Prep::SetMaterializedViewProperties { properties, .. } => {
@@ -514,19 +496,17 @@ fn product_plan(command: &ProductSqlCommand) -> Result<CommandPlan, QueryService
         ProductSqlCommand::Catalog(command) => {
             let plan = match command.as_ref() {
                 CatalogSqlCommand::DropCatalog { .. } => {
-                    CommandPlan::management(DropCatalog, Empty, true)
+                    CommandPlan::management(DropCatalog, Empty)
                 }
                 CatalogSqlCommand::DropDatabase { .. } => {
-                    CommandPlan::management(DropDatabase, Empty, true)
+                    CommandPlan::management(DropDatabase, Empty)
                 }
-                CatalogSqlCommand::DropTable { .. } => {
-                    CommandPlan::management(DropTable, Empty, true)
-                }
+                CatalogSqlCommand::DropTable { .. } => CommandPlan::management(DropTable, Empty),
                 CatalogSqlCommand::TruncateTable { .. } => {
-                    CommandPlan::management(TruncateTable, Empty, true)
+                    CommandPlan::management(TruncateTable, Empty)
                 }
                 CatalogSqlCommand::ShowCreateTable { .. } => {
-                    CommandPlan::management(ShowCreateTable, ResultSet, false)
+                    CommandPlan::management(ShowCreateTable, ResultSet)
                 }
                 _ => {
                     return Err(internal_error(
@@ -537,7 +517,7 @@ fn product_plan(command: &ProductSqlCommand) -> Result<CommandPlan, QueryService
             Ok(plan)
         }
         ProductSqlCommand::Statistics(StatisticsSqlCommand::ShowStats { .. }) => {
-            Ok(CommandPlan::management(ShowStats, ResultSet, false))
+            Ok(CommandPlan::management(ShowStats, ResultSet))
         }
         _ => Err(internal_error(
             "Product admission returned an unclassified command",
@@ -1737,7 +1717,7 @@ mod explain_delete_tests {
     use novarocks_query_application::sql::trino_admission::admit_trino_statement;
 
     #[test]
-    fn explain_delete_uses_original_local_result_without_publication_or_topology_wait() {
+    fn explain_delete_uses_original_local_result_without_topology_wait() {
         let sql = "EXPLAIN DELETE FROM lake.db.t WHERE part >= 10";
         let parsed = novarocks_parser::parser::parse_statement(sql).unwrap();
         let TrinoStatementAction::Prepare(preparation) =
@@ -1751,7 +1731,6 @@ mod explain_delete_tests {
         assert_eq!(plan.work_class, WorkClass::Query);
         assert_eq!(plan.window_class, ResultWindowClass::Local);
         assert!(!plan.waits_for_topology);
-        assert!(!plan.publication_deadline);
     }
 }
 
@@ -1795,7 +1774,6 @@ mod branch_delete_tests {
         assert_eq!(plan.work_class, WorkClass::Management);
         assert_eq!(plan.window_class, ResultWindowClass::Local);
         assert!(!plan.waits_for_topology);
-        assert!(plan.publication_deadline);
 
         let TrinoStatementPreparation::DeleteEntireBranch { table, branch } = preparation else {
             panic!("expected whole-branch delete preparation");

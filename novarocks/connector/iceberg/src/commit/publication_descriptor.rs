@@ -390,9 +390,11 @@ impl PublicationDescriptor {
         // attribution. Only markers written by this exact request are probes.
         let mut attribution = AttributionPlan::ObserveOnly;
         let mut managed = None;
+        let mut preceding_snapshot = None;
         for update in request.updates() {
             match update {
                 crate::iceberg::TableUpdate::AddSnapshot { snapshot } => {
+                    let previous = preceding_snapshot.replace(snapshot);
                     let summary = &snapshot.summary().additional_properties;
                     if let Some(effect) = summary.get(MANAGED_REPARTITION_EFFECT_SUMMARY_KEY) {
                         let BaseIdentity::Existing { parent, .. } = request.base() else {
@@ -403,7 +405,14 @@ impl PublicationDescriptor {
                         };
                         if request.target_ref() != "main"
                             || request.ref_snapshot_after("main") != Some(snapshot.snapshot_id())
-                            || *parent != snapshot.parent_snapshot_id()
+                            || snapshot.summary().operation
+                                != crate::iceberg::spec::Operation::Append
+                            || !previous.is_some_and(|deleted| {
+                                deleted.summary().operation
+                                    == crate::iceberg::spec::Operation::Delete
+                                    && deleted.parent_snapshot_id() == *parent
+                                    && snapshot.parent_snapshot_id() == Some(deleted.snapshot_id())
+                            })
                             || managed.is_some()
                         {
                             return Err(Error::new(
@@ -422,7 +431,7 @@ impl PublicationDescriptor {
                         managed = Some(AttributionPlan::ManagedRepartition {
                             table_uuid,
                             snapshot_id: snapshot.snapshot_id(),
-                            parent: *parent,
+                            parent: snapshot.parent_snapshot_id(),
                             session: session.clone(),
                             effect: effect.clone(),
                         });

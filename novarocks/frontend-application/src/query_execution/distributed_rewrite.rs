@@ -493,7 +493,7 @@ mod tests {
             owner,
             table,
             novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-            ConnectorWriteIntent::Overwrite,
+            ConnectorWriteIntent::RewriteDataFiles,
             ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).unwrap(),
             ConnectorWriteInputShape::RowLineage {
                 data_fields,
@@ -941,7 +941,7 @@ mod tests {
              {} column table schema",
             table.schema().fields().len()
         );
-        assert_eq!(request.intent, ConnectorWriteIntent::Overwrite);
+        assert_eq!(request.intent, ConnectorWriteIntent::RewriteDataFiles);
         assert_eq!(request.target_ref.as_str(), "main");
     }
 

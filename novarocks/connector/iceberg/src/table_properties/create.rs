@@ -101,30 +101,6 @@ pub(crate) fn prepare_create_table_properties(
         .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)
 }
 
-/// Keep ordinary CTAS on its existing v3, warehouse-rooted staging profile.
-pub(crate) fn prepare_ctas_storage(
-    properties: &[(Arc<str>, DdlPropertyValue)],
-    comment: Option<&str>,
-    control: &dyn ConnectorOperationControl,
-) -> Result<PreparedCreateTableProperties, ConnectorError> {
-    let storage = prepare_create_table_properties(properties, comment, control)?;
-    if storage.format_version != FormatVersion::V3 {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg CTAS requires format_version = 3",
-        ));
-    }
-    if storage.location.is_some() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg CTAS does not support an explicit table location",
-        ));
-    }
-    // A raw metadata path property stays an existing writer property. This
-    // profile does not use the MV-only final table relocation contract.
-    Ok(storage)
-}
-
 /// Validate evaluated user properties for the existing document-managed staged
 /// path. The caller keeps application markers separate and binds partitioning
 /// against the admitted materialized-view output.

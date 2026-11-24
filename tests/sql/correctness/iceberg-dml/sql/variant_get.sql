@@ -37,14 +37,15 @@ grep -E '^IRU9_(EMPTY_INT_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
 
 -- query 3
 -- typed extraction; missing path / SQL NULL / unconvertible-cast
--- rows are NULL; numeric narrowing (1.5) truncates per Spark CAST semantics
+-- rows are NULL; the UNION assigns the SQL NULL the other rows' Variant type.
+-- Numeric narrowing (1.5) truncates per Spark CAST semantics
 -- (IV3-6 cast-semantics decision 2026-06-11).
 WITH source_values AS (
   SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
   UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
   UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
   UNION ALL SELECT 4, parse_json('{"a":1.5}')
-  UNION ALL SELECT 5, CAST(NULL AS VARIANT)
+  UNION ALL SELECT 5, NULL
   UNION ALL SELECT 6, parse_json('{"a":"abc"}')
 )
 SELECT id, try_variant_get(v, '$.a', 'bigint') FROM source_values ORDER BY id;
@@ -56,7 +57,7 @@ WITH source_values AS (
   UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
   UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
   UNION ALL SELECT 4, parse_json('{"a":1.5}')
-  UNION ALL SELECT 5, CAST(NULL AS VARIANT)
+  UNION ALL SELECT 5, NULL
   UNION ALL SELECT 6, parse_json('{"a":"abc"}')
 )
 SELECT id, variant_get(v, '$.a', 'bigint') FROM source_values WHERE id <= 4 ORDER BY id;
@@ -69,7 +70,7 @@ WITH source_values AS (
   UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
   UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
   UNION ALL SELECT 4, parse_json('{"a":1.5}')
-  UNION ALL SELECT 5, CAST(NULL AS VARIANT)
+  UNION ALL SELECT 5, NULL
   UNION ALL SELECT 6, parse_json('{"a":"abc"}')
 )
 SELECT variant_get(v, '$.a', 'bigint') FROM source_values WHERE id = 6;
@@ -81,7 +82,7 @@ WITH source_values AS (
   UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
   UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
   UNION ALL SELECT 4, parse_json('{"a":1.5}')
-  UNION ALL SELECT 5, CAST(NULL AS VARIANT)
+  UNION ALL SELECT 5, NULL
   UNION ALL SELECT 6, parse_json('{"a":"abc"}')
 )
 SELECT id FROM source_values WHERE try_variant_get(v, '$.a', 'bigint') = 99 ORDER BY id;
@@ -96,7 +97,7 @@ WITH source_values AS (
   UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
   UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
   UNION ALL SELECT 4, parse_json('{"a":1.5}')
-  UNION ALL SELECT 5, CAST(NULL AS VARIANT)
+  UNION ALL SELECT 5, NULL
   UNION ALL SELECT 6, parse_json('{"a":"abc"}')
 )
 SELECT id FROM source_values WHERE try_variant_get(v, '$.a', 'bigint') = 99 ORDER BY id;
@@ -111,7 +112,7 @@ WITH source_values AS (
   UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
   UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
   UNION ALL SELECT 4, parse_json('{"a":1.5}')
-  UNION ALL SELECT 5, CAST(NULL AS VARIANT)
+  UNION ALL SELECT 5, NULL
   UNION ALL SELECT 6, parse_json('{"a":"abc"}')
 )
 SELECT id, variant_typeof(variant_get(v, '$.a')) FROM source_values WHERE id <= 2 ORDER BY id;
@@ -123,7 +124,7 @@ WITH source_values AS (
   UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
   UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
   UNION ALL SELECT 4, parse_json('{"a":1.5}')
-  UNION ALL SELECT 5, CAST(NULL AS VARIANT)
+  UNION ALL SELECT 5, NULL
   UNION ALL SELECT 6, parse_json('{"a":"abc"}')
 )
 SELECT id FROM source_values WHERE try_variant_get(v, '$.a', 'bigint') > 5 ORDER BY id;
@@ -135,7 +136,7 @@ WITH source_values AS (
   UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
   UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
   UNION ALL SELECT 4, parse_json('{"a":1.5}')
-  UNION ALL SELECT 5, CAST(NULL AS VARIANT)
+  UNION ALL SELECT 5, NULL
   UNION ALL SELECT 6, parse_json('{"a":"abc"}')
 )
 SELECT id, variant_get(v, '$.b', 'string') FROM source_values WHERE id <= 3 ORDER BY id;

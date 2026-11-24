@@ -134,8 +134,7 @@ impl ConnectorWriteCohortId {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ConnectorWriteIntent {
     Append,
-    Overwrite,
-    PartitionOverwrite,
+    RewriteDataFiles,
     RowDelta,
 }
 
@@ -2329,8 +2328,7 @@ fn digest_bound_fields(hasher: &mut Sha256, fields: &[ConnectorWriteFieldBinding
 const fn write_intent_tag(intent: ConnectorWriteIntent) -> u8 {
     match intent {
         ConnectorWriteIntent::Append => 1,
-        ConnectorWriteIntent::Overwrite => 2,
-        ConnectorWriteIntent::PartitionOverwrite => 3,
+        ConnectorWriteIntent::RewriteDataFiles => 5,
         ConnectorWriteIntent::RowDelta => 4,
     }
 }

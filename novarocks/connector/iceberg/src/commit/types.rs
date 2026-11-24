@@ -24,12 +24,11 @@ use crate::iceberg::spec::{DataContentType, DataFileFormat, Datum, Struct};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommitOpKind {
     FastAppend,
-    Overwrite,
+    FullRefresh,
     RowDelta,
     MaterializedRowDelta,
     SelectedRewrite,
     Truncate,
-    OverwritePartitions,
 }
 
 /// Physical metadata for one staged Iceberg artifact. This stays provider

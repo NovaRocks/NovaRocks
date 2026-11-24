@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use novarocks_parser::ast::{
-    self, Expr, SetExpr, SyntaxEq, TrinoInsertMode, TrinoStatement, Visit,
-};
+use novarocks_parser::ast::{self, Expr, SetExpr, SyntaxEq, TrinoStatement, Visit};
 use novarocks_parser::{Span, parser, printer};
 
 fn source_text(sql: &str, span: Span) -> &str {
@@ -25,7 +23,6 @@ fn insert_target_columns_and_query_use_their_own_source_ranges() {
     let TrinoStatement::Insert(node) = &statement else {
         panic!("expected INSERT");
     };
-    assert_eq!(node.mode, TrinoInsertMode::Into);
     let branch = node.table.branch.as_ref().unwrap();
     assert!(branch.quoted);
     assert_eq!(branch.value, "audit-branch");
@@ -67,85 +64,14 @@ fn insert_target_columns_and_query_use_their_own_source_ranges() {
 }
 
 #[test]
-fn overwrite_is_contextual_and_keeps_its_two_distinct_modes() {
-    for (sql, mode, target) in [
-        (
-            "INSERT OVERWRITE t SELECT 1",
-            TrinoInsertMode::Overwrite,
-            "t",
-        ),
-        (
-            "INSERT OVERWRITE INTO t (id) VALUES 1",
-            TrinoInsertMode::Overwrite,
-            "t",
-        ),
-        (
-            "INSERT OVERWRITE PARTITIONS t SELECT 1",
-            TrinoInsertMode::OverwritePartitions,
-            "t",
-        ),
-        (
-            "INSERT OVERWRITE PARTITIONS INTO t (id) VALUES 1",
-            TrinoInsertMode::OverwritePartitions,
-            "t",
-        ),
-        (
-            "INSERT OVERWRITE partitions SELECT 1",
-            TrinoInsertMode::Overwrite,
-            "partitions",
-        ),
-        (
-            "INSERT OVERWRITE partitions.s SELECT 1",
-            TrinoInsertMode::Overwrite,
-            "partitions.s",
-        ),
-        (
-            "INSERT INTO overwrite SELECT 1",
-            TrinoInsertMode::Into,
-            "overwrite",
-        ),
-    ] {
-        let statement = parser::parse_statement(sql).unwrap();
-        let TrinoStatement::Insert(node) = &statement else {
-            panic!("expected INSERT");
-        };
-        assert_eq!(node.mode, mode, "{sql}");
-        assert_eq!(source_text(sql, node.table.name.span), target);
-        assert_round_trip(sql, &statement);
-    }
-    for (sql, mode, target, branch_name, quoted) in [
-        (
-            r#"INSERT OVERWRITE c.s.t@"retained" (id) SELECT ?"#,
-            TrinoInsertMode::Overwrite,
-            "c.s.t",
-            "retained",
-            true,
-        ),
-        (
-            "INSERT OVERWRITE PARTITIONS s.t_branch@dev VALUES (99, 'us')",
-            TrinoInsertMode::OverwritePartitions,
-            "s.t_branch",
-            "dev",
-            false,
-        ),
-    ] {
-        let statement = parser::parse_statement(sql).unwrap();
-        let TrinoStatement::Insert(node) = &statement else {
-            panic!("expected INSERT");
-        };
-        assert_eq!(node.mode, mode);
-        assert_eq!(source_text(sql, node.table.name.span), target);
-        let branch = node.table.branch.as_ref().unwrap();
-        assert_eq!(
-            (branch.value.as_str(), branch.quoted),
-            (branch_name, quoted)
-        );
-        assert_round_trip(sql, &statement);
-    }
-
-    let whole = parser::parse_statement("INSERT OVERWRITE t SELECT 1").unwrap();
-    let partitions = parser::parse_statement("INSERT OVERWRITE PARTITIONS t SELECT 1").unwrap();
-    assert!(!whole.syntax_eq(&partitions));
+fn overwrite_is_a_valid_insert_target_name() {
+    let sql = "INSERT INTO overwrite SELECT 1";
+    let statement = parser::parse_statement(sql).unwrap();
+    let TrinoStatement::Insert(node) = &statement else {
+        panic!("expected INSERT");
+    };
+    assert_eq!(source_text(sql, node.table.name.span), "overwrite");
+    assert_round_trip(sql, &statement);
 }
 
 #[test]
@@ -195,7 +121,7 @@ fn update_assignments_and_delete_keep_branch_and_parameter_facts() {
 }
 
 #[test]
-fn write_leaf_rejects_forms_outside_the_grammar_and_two_extensions() {
+fn write_leaf_rejects_forms_outside_the_grammar() {
     for sql in [
         "INSERT t SELECT 1",
         "INSERT INTO TABLE t VALUES 1",
@@ -204,6 +130,10 @@ fn write_leaf_rejects_forms_outside_the_grammar_and_two_extensions() {
         "INSERT INTO t@ SELECT 1",
         "INSERT INTO t@a.b SELECT 1",
         "INSERT INTO t WITH SESSION x = 1 SELECT 1",
+        "INSERT OVERWRITE t SELECT 1",
+        "INSERT OVERWRITE INTO t SELECT 1",
+        "INSERT OVERWRITE PARTITIONS t SELECT 1",
+        "INSERT OVERWRITE PARTITIONS INTO t SELECT 1",
         "INSERT OVERWRITE TABLE t SELECT 1",
         "INSERT OVERWRITE t PARTITION (p = 1) VALUES 1",
         "INSERT OVERWRITE t@dev.extra SELECT 1",

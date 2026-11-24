@@ -227,11 +227,13 @@ struct CatalogMutationCommandFailure {
 impl fmt::Display for CatalogMutationCommandFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.outcome {
-            ResolvedCatalogMutation::KnownUncommitted { failure, cleanup } => write!(
-                formatter,
-                "{}",
-                EngineError::commit_known_uncommitted(known_uncommitted_message(failure, cleanup))
-            ),
+            ResolvedCatalogMutation::KnownUncommitted { failure, cleanup } => {
+                let detail = failure
+                    .connector_source()
+                    .and_then(ConnectorError::public_failure_detail)
+                    .map_or_else(|| failure.to_string(), str::to_owned);
+                formatter.write_str(&known_uncommitted_message(detail, cleanup))
+            }
             ResolvedCatalogMutation::CommitUnknown { failure, .. } => formatter.write_str(
                 &EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message(),
             ),
@@ -825,6 +827,52 @@ mod tests {
             Some(StatementExternalEffectDisposition::KnownUncommitted)
         );
         assert!(!service.message().contains("do_not_retry=true"));
+    }
+
+    #[test]
+    fn command_presentation_preserves_public_location_refusal() {
+        use novarocks_failure_contract::{
+            FailureClass, connector_reason::ICEBERG_FILESYSTEM_ERROR,
+        };
+        use novarocks_spi::connector::ConnectorErrorKind;
+
+        const DETAIL: &str = "Cannot create a table on a non-empty location: s3://warehouse/table";
+
+        #[derive(Debug)]
+        struct LocationRefusal;
+
+        impl fmt::Display for LocationRefusal {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(DETAIL)
+            }
+        }
+
+        impl std::error::Error for LocationRefusal {}
+
+        impl FailureProjection for LocationRefusal {
+            fn failure_fact(&self) -> FailureFact {
+                FailureFact::new(FailureClass::Dependency, ICEBERG_FILESYSTEM_ERROR)
+            }
+        }
+
+        let source = ConnectorError::from_domain(ConnectorErrorKind::Unavailable, LocationRefusal)
+            .with_public_failure_detail();
+        let failure = ConnectorMutationFailure::from_connector(source);
+        let command =
+            present_catalog_mutation_command_result(ResolvedCatalogMutation::KnownUncommitted {
+                failure,
+                cleanup: ExternalMutationFinalization::Complete,
+            })
+            .unwrap_err();
+        let service = crate::query::product_command_service_error(command);
+
+        let diagnostic = service.execution_failure().unwrap();
+        assert_eq!(diagnostic.detail().as_str(), DETAIL);
+        assert_eq!(diagnostic.fact(), LocationRefusal.failure_fact());
+        assert_eq!(
+            service.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownUncommitted)
+        );
     }
 
     #[test]

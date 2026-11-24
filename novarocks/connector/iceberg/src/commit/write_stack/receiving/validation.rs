@@ -23,9 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use novarocks_spi::connector::write_stack::{ConnectorWriterPhysicalContext, WriteTargetOrdinal};
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
-use crate::commit::model::{AddedContent, EntryIdentity, SeqField};
 use crate::delete_file::IcebergFileFormat;
-use crate::iceberg::spec::DataContentType;
 
 use super::super::domain::{
     IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment, IcebergCreationReceipt,
@@ -95,7 +93,7 @@ impl StatementIndexes {
 
 pub(crate) struct FragmentAdmission<'session, 'fragment> {
     handle: &'session IcebergWriteCommitSession,
-    previous: Option<&'session StatementIndexes>,
+    previous: &'session StatementIndexes,
     keys: IndexKeys<'fragment>,
     // Record-local witnesses only. Across records the compact deletion effect
     // owner supplies its already-retained partition for this exact path.
@@ -109,20 +107,9 @@ struct FragmentKeys<'a> {
 }
 
 impl<'session, 'fragment> FragmentAdmission<'session, 'fragment> {
-    pub(crate) fn for_whole_set(handle: &'session IcebergWriteCommitSession) -> Self {
-        Self::new(handle, None)
-    }
-
     pub(crate) fn for_record(
         handle: &'session IcebergWriteCommitSession,
         previous: &'session StatementIndexes,
-    ) -> Self {
-        Self::new(handle, Some(previous))
-    }
-
-    fn new(
-        handle: &'session IcebergWriteCommitSession,
-        previous: Option<&'session StatementIndexes>,
     ) -> Self {
         Self {
             handle,
@@ -130,17 +117,6 @@ impl<'session, 'fragment> FragmentAdmission<'session, 'fragment> {
             keys: IndexKeys::default(),
             v2_partitions: BTreeMap::new(),
         }
-    }
-
-    pub(crate) fn admit_whole_fragment(
-        &mut self,
-        target: WriteTargetOrdinal,
-        fragment: &'fragment IcebergCommitFragment,
-        admits_creation: impl FnOnce(&ConnectorWriterPhysicalContext) -> Result<bool, ConnectorError>,
-    ) -> Result<(), ConnectorError> {
-        let keys = self.check_fragment(target, fragment, admits_creation)?;
-        self.keys.insert(keys);
-        Ok(())
     }
 
     /// Stage one compact fragment using borrowed keys and quote the bytes
@@ -231,11 +207,7 @@ impl<'session, 'fragment> FragmentAdmission<'session, 'fragment> {
             )));
         }
         let identity = EntryKey::from_fragment(fragment);
-        if self.keys.entries.contains(&identity)
-            || self
-                .previous
-                .is_some_and(|prior| prior.0.entries.contains(&identity))
-        {
+        if self.keys.entries.contains(&identity) || self.previous.0.entries.contains(&identity) {
             return Err(corrupt(format!(
                 "Iceberg prepared write set repeats staged artifact {}",
                 fragment.path()
@@ -250,9 +222,7 @@ impl<'session, 'fragment> FragmentAdmission<'session, 'fragment> {
                 );
             if !distributed_v2 {
                 if self.keys.delete_targets.contains(referenced)
-                    || self
-                        .previous
-                        .is_some_and(|prior| prior.0.delete_targets.contains(referenced))
+                    || self.previous.0.delete_targets.contains(referenced)
                 {
                     return Err(corrupt(format!(
                         "Iceberg prepared write set stages more than one delete artifact for data file {referenced}"
@@ -311,10 +281,12 @@ impl<'session, 'fragment> FragmentAdmission<'session, 'fragment> {
             return Err(cohort_mismatch());
         }
         let creation = (ordinal, receipt);
-        if let Some(previous) = self.keys.creations_by_path.get(path).or_else(|| {
-            self.previous
-                .and_then(|prior| prior.0.creations_by_path.get(path))
-        }) {
+        if let Some(previous) = self
+            .keys
+            .creations_by_path
+            .get(path)
+            .or_else(|| self.previous.0.creations_by_path.get(path))
+        {
             if previous != &creation {
                 return Err(corrupt(
                     "Iceberg received creation facts disagree about a physical object",
@@ -334,7 +306,9 @@ impl<'session, 'fragment> FragmentAdmission<'session, 'fragment> {
                 .get(&receipt.create_id())
                 .or_else(|| {
                     self.previous
-                        .and_then(|prior| prior.0.paths_by_creation_id.get(&receipt.create_id()))
+                        .0
+                        .paths_by_creation_id
+                        .get(&receipt.create_id())
                 })
                 .is_some_and(|previous| previous.as_ref() != path)
         {
@@ -464,41 +438,6 @@ fn checked_add(total: usize, additional: usize) -> Result<usize, ConnectorError>
 
 fn cohort_mismatch() -> ConnectorError {
     corrupt("Iceberg received object creation differs from its completed writer cohort")
-}
-
-/// Validate the actual projected addition of an already admitted materialized
-/// fragment. The fragment's exact declared target remains the authority; the
-/// source snapshot still has to be observed during publication.
-pub(crate) fn validate_materialized_addition(
-    expected_identity: &EntryIdentity,
-    declared_target: Option<&str>,
-    added: &AddedContent,
-) -> Result<(), ConnectorError> {
-    let file = added.file();
-    if added.data_sequence() != SeqField::Inherit {
-        return Err(invalid(
-            "materialized write has a repeated or non-inheriting addition",
-        ));
-    }
-    match file.content_type() {
-        DataContentType::Data if file.first_row_id().is_none() => {}
-        DataContentType::PositionDeletes => {
-            let referenced = file
-                .referenced_data_file()
-                .ok_or_else(|| invalid("materialized delete file has no exact target"))?;
-            if declared_target != Some(referenced.as_str()) {
-                return Err(invalid("materialized output references a different target"));
-            }
-        }
-        _ => return Err(invalid("unsupported materialized row-delta addition")),
-    }
-    let identity = EntryIdentity::try_from(file).map_err(|error| invalid(error.to_string()))?;
-    if &identity != expected_identity {
-        return Err(corrupt(
-            "Iceberg materialized addition differs from its admitted fragment",
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

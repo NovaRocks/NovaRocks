@@ -81,24 +81,12 @@ impl WriteStatementFamily for InsertFamily {
                 &table,
             )?,
         };
-        let mode = match input.command.overwrite_mode {
-            crate::query_execution::dml::insert::InsertOverwriteMode::Append => {
-                iceberg_writer::IcebergWriteMode::Append
-            }
-            crate::query_execution::dml::insert::InsertOverwriteMode::FullTable => {
-                iceberg_writer::IcebergWriteMode::FullTableOverwrite
-            }
-            crate::query_execution::dml::insert::InsertOverwriteMode::DynamicPartitions => {
-                iceberg_writer::IcebergWriteMode::DynamicPartitionOverwrite
-            }
-        };
         iceberg_writer::prepare_iceberg_write_async(
             &input.kernel,
             &input.target,
             &resolved,
             &input.command.columns,
             &input.command.source,
-            mode,
             &input.reference,
             input.execution.clone(),
             &context,
@@ -131,7 +119,7 @@ pub(crate) async fn describe(
     crate::query_execution::dml::insert::PreparedInsertDescription,
     novarocks_query_application::session_error::QueryServiceError,
 > {
-    use crate::query_execution::dml::insert::{InsertOverwriteMode, PreparedInsertDescription};
+    use crate::query_execution::dml::insert::PreparedInsertDescription;
     use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
     use novarocks_spi::connector::{
         ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
@@ -222,15 +210,10 @@ pub(crate) async fn describe(
         crate::dml::insert::InsertTargetRef::Main => "main",
         crate::dml::insert::InsertTargetRef::Branch(name) => name,
     };
-    let intent = match input.command.overwrite_mode {
-        InsertOverwriteMode::Append => ConnectorWriteIntent::Append,
-        InsertOverwriteMode::FullTable => ConnectorWriteIntent::Overwrite,
-        InsertOverwriteMode::DynamicPartitions => ConnectorWriteIntent::PartitionOverwrite,
-    };
     let (query, constants, fields) = iceberg_writer::build_iceberg_write_plan(
         &write_lease,
         target_ref,
-        intent,
+        ConnectorWriteIntent::Append,
         &context,
         &resolved,
         &input.command.columns,

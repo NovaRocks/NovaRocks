@@ -45,12 +45,12 @@ CREATE MATERIALIZED VIEW mv_config WITH (refresh_policy = 'MANUAL') AS SELECT k,
 
 -- query 6
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=0
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=0,full-refreshes=1
 REFRESH MATERIALIZED VIEW mv_config;
 
 -- query 7
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=1,table-commits=3
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=1,table-commits=3,full-refreshes=1
 ALTER MATERIALIZED VIEW mv_config SET PROPERTIES refresh_paused = true;
 
 -- query 8
@@ -62,7 +62,7 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvcf
 
 -- query 9
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=2,table-commits=4
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=2,table-commits=4,full-refreshes=1
 ALTER MATERIALIZED VIEW mv_config SET PROPERTIES refresh_policy = 'ON_CHANGE';
 
 -- query 10
@@ -75,12 +75,12 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvcf
 
 -- query 11
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=3,table-commits=5
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=3,table-commits=5,full-refreshes=1
 ALTER MATERIALIZED VIEW mv_config SET PROPERTIES refresh_policy = 'MANUAL';
 
 -- query 12
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=4,table-commits=6
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=4,table-commits=6,full-refreshes=1
 ALTER MATERIALIZED VIEW mv_config SET PROPERTIES refresh_paused = false;
 
 -- query 13
@@ -98,7 +98,7 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvcf
 -- A later publication observes the revised C but still uses the same D/L/P
 -- dependencies. Its metadata-only snapshot must preserve the final policy.
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=2,slot-changes=4,table-commits=7
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=2,slot-changes=4,table-commits=7,full-refreshes=1
 REFRESH MATERIALIZED VIEW mv_config;
 
 -- query 16
@@ -110,12 +110,12 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvcf
 -- query 17
 -- A metadata-only user property update must not require a legacy package.
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=2,slot-changes=4,table-commits=8
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=2,slot-changes=4,table-commits=8,full-refreshes=1
 ALTER MATERIALIZED VIEW mv_config SET PROPERTIES extra_properties = MAP(ARRAY['read.split.target-size'], ARRAY['16777216']);
 
 -- query 18
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=3,slot-changes=4,table-commits=9
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=3,slot-changes=4,table-commits=9,full-refreshes=1
 REFRESH MATERIALIZED VIEW mv_config;
 
 -- query 19

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Whole-table overwrite preparation and shared snapshot assembly.
+//! Shared snapshot and manifest assembly.
 //!
 //! Live data and delete entries retain their original identity and source facts
 //! when removed. The current attempt owns new manifests and the exact list's
@@ -30,92 +30,9 @@ use crate::iceberg::spec::{
     SnapshotRetention, Summary,
 };
 use crate::iceberg::{TableRequirement, TableUpdate};
-use async_trait::async_trait;
 
 use super::action::merge_snapshot_summary_properties;
 use super::helpers::{finalize_snapshot_summary, now_ms};
-
-/// Prepare a whole-table overwrite against the current target-ref state.
-/// The intent owns added files; this attempt owns only new metadata artifacts.
-pub(crate) struct OverwritePreparer;
-
-#[async_trait]
-impl super::staging::Preparer for OverwritePreparer {
-    async fn prepare(
-        &self,
-        view: &super::staging::StagedView<'_>,
-        intent: &super::model::OperationIntent,
-    ) -> crate::iceberg::Result<super::staging::PreparedChange> {
-        self.prepare_with_snapshot_extension(view, intent, |_| Ok(None))
-            .await
-    }
-}
-
-pub(crate) struct OverwriteSnapshotExtension {
-    pub summary: (String, String),
-    pub update: Option<TableUpdate>,
-}
-
-impl OverwritePreparer {
-    /// The optional extension uses the snapshot selected by this exact data attempt.
-    pub(crate) async fn prepare_with_snapshot_extension(
-        &self,
-        view: &super::staging::StagedView<'_>,
-        intent: &super::model::OperationIntent,
-        extend: impl FnOnce(i64) -> crate::iceberg::Result<Option<OverwriteSnapshotExtension>> + Send,
-    ) -> crate::iceberg::Result<super::staging::PreparedChange> {
-        validate_added_data(intent)?;
-        let (sources, live) = view.observe_live_sources().await?;
-        let removed = live.values().collect::<Vec<_>>();
-        if removed.is_empty() && intent.changes().added.is_empty() && intent.summary().is_empty() {
-            return Ok(super::staging::PreparedChange::default());
-        }
-        let snapshot_id = view.stage_snapshot_id()?;
-        let extension = extend(snapshot_id)?;
-        let added = write_added_intent_data(view, intent, snapshot_id).await?;
-        let manifests = super::manifest_transform::ordinary_manifests(
-            view,
-            snapshot_id,
-            sources.as_ref(),
-            &removed,
-            added,
-        )
-        .await?;
-        let operation = match (intent.changes().added.is_empty(), removed.is_empty()) {
-            (true, true) | (false, true) => Operation::Append,
-            (true, false) => Operation::Delete,
-            _ => Operation::Overwrite,
-        };
-        let mut summary = snapshot_file_summary(&intent.changes().added, &removed)?;
-        // Every old entry is removed, so the new row total is fully known even
-        // when the parent's total includes already-deleted rows or is absent.
-        summary.insert("total-records".into(), summary["added-records"].clone());
-        let update = if let Some(extension) = extension {
-            let (key, value) = extension.summary;
-            if intent.summary().contains_key(&key) || summary.insert(key, value).is_some() {
-                return Err(crate::iceberg::Error::new(
-                    crate::iceberg::ErrorKind::DataInvalid,
-                    "Overwrite extension conflicts with an existing snapshot fact",
-                ));
-            }
-            extension.update
-        } else {
-            None
-        };
-        let mut change = prepare_ordinary_snapshot_change(
-            view,
-            intent,
-            snapshot_id,
-            operation,
-            manifests,
-            summary,
-            false,
-        )
-        .await?;
-        change.updates.extend(update);
-        Ok(change)
-    }
-}
 
 pub(crate) fn validate_added_data(
     intent: &super::model::OperationIntent,
@@ -246,7 +163,11 @@ pub(crate) async fn prepare_snapshot_change(
         operation,
         manifests,
         properties,
-        |properties, parent| finalize_snapshot_summary(properties, parent, truncate_full_table),
+        if truncate_full_table {
+            SnapshotSummaryMode::Truncate
+        } else {
+            SnapshotSummaryMode::Inherit
+        },
     )
     .await
 }
@@ -257,6 +178,7 @@ pub(super) async fn prepare_filtered_delete_snapshot_change(
     snapshot_id: i64,
     manifests: super::manifest_transform::OrdinaryManifests,
     removed: &[&super::manifest_sources::LocatedEntry],
+    full_refresh: bool,
 ) -> crate::iceberg::Result<super::staging::PreparedChange> {
     let mut properties = snapshot_file_summary_with_mode(&[], removed, true)?;
     let manifests = manifests.into_snapshot_manifests(&mut properties);
@@ -267,19 +189,31 @@ pub(super) async fn prepare_filtered_delete_snapshot_change(
         Operation::Delete,
         manifests,
         properties,
-        super::helpers::finalize_filtered_delete_summary,
+        if full_refresh {
+            SnapshotSummaryMode::FullRefreshDelete
+        } else {
+            SnapshotSummaryMode::FilteredDelete
+        },
     )
     .await
 }
 
-async fn prepare_snapshot_change_with_summary(
+pub(super) enum SnapshotSummaryMode {
+    Inherit,
+    Truncate,
+    FilteredDelete,
+    FullRefreshDelete,
+    FullRefreshAppend,
+}
+
+pub(super) async fn prepare_snapshot_change_with_summary(
     view: &super::staging::StagedView<'_>,
     intent: &super::model::OperationIntent,
     snapshot_id: i64,
     operation: Operation,
     manifests: Vec<ManifestFile>,
     properties: HashMap<String, String>,
-    finalize: impl FnOnce(HashMap<String, String>, Option<&Summary>) -> HashMap<String, String>,
+    summary_mode: SnapshotSummaryMode,
 ) -> crate::iceberg::Result<super::staging::PreparedChange> {
     let metadata = view.metadata();
     let parent = metadata
@@ -288,15 +222,31 @@ async fn prepare_snapshot_change_with_summary(
     let parent_summary = parent
         .and_then(|id| metadata.snapshot_by_id(id))
         .map(|s| s.summary());
-    // A preparer may supply an exact physical data-record total, including for
-    // a full overwrite whose parent total is absent.
+    // Some preparers already know the exact physical data-record total.
     let exact_records = properties.get("total-records").cloned();
-    let mut finalized = finalize(properties, parent_summary);
+    let mut finalized = match summary_mode {
+        SnapshotSummaryMode::Inherit => {
+            finalize_snapshot_summary(properties, parent_summary, false)
+        }
+        SnapshotSummaryMode::Truncate | SnapshotSummaryMode::FullRefreshDelete => {
+            finalize_snapshot_summary(properties, None, true)
+        }
+        SnapshotSummaryMode::FilteredDelete => {
+            super::helpers::finalize_filtered_delete_summary(properties, parent_summary)
+        }
+        SnapshotSummaryMode::FullRefreshAppend => {
+            finalize_snapshot_summary(properties, None, false)
+        }
+    };
     if let Some(total) = exact_records {
         finalized.insert("total-records".into(), total);
     }
-    let properties = merge_snapshot_summary_properties(finalized, intent.summary())
-        .map_err(to_iceberg_unexpected)?;
+    let properties = if matches!(summary_mode, SnapshotSummaryMode::FullRefreshDelete) {
+        finalized
+    } else {
+        merge_snapshot_summary_properties(finalized, intent.summary())
+            .map_err(to_iceberg_unexpected)?
+    };
     let list = super::staging::write_manifest_list(
         view.artifacts(),
         metadata,
@@ -330,10 +280,7 @@ async fn prepare_snapshot_change_with_summary(
             max_ref_age_ms: None,
         });
     let mut requirements = Vec::new();
-    if !matches!(
-        intent.protocol(),
-        super::model::CommitProtocol::RewriteFiles { .. }
-    ) {
+    if intent.protocol().output_spec_requirement().is_none() {
         requirements.extend([
             TableRequirement::CurrentSchemaIdMatch {
                 current_schema_id: metadata.current_schema_id(),
@@ -771,7 +718,7 @@ mod tests {
         let publisher = journal.observe_prepared(Arc::new(
             crate::commit::attempt::prepared::CatalogPublisher {
                 expected_table_uuid: None,
-                catalog_operation: crate::catalog::admission::CatalogOperation::Overwrite,
+                catalog_operation: crate::catalog::admission::CatalogOperation::Append,
                 catalog: Arc::clone(&fixture.owner),
                 ident: fixture.table_ident.clone(),
                 target_ref: target_ref.to_string(),
@@ -1189,6 +1136,31 @@ pub(crate) mod preparer_tests {
             intent: &OperationIntent,
             preparer: &dyn Preparer,
         ) -> (TableMetadata, FrozenRequest) {
+            self.stage_all(metadata, intent, &[preparer]).await
+        }
+
+        async fn stage_full_refresh(
+            &self,
+            metadata: TableMetadata,
+            intent: &OperationIntent,
+        ) -> (TableMetadata, FrozenRequest) {
+            self.stage_all(
+                metadata,
+                intent,
+                &[
+                    &crate::commit::filter_delete::FilterDeletePreparer::for_full_refresh(),
+                    &crate::commit::fast_append::FullRefreshAppendFixture(None),
+                ],
+            )
+            .await
+        }
+
+        async fn stage_all(
+            &self,
+            metadata: TableMetadata,
+            intent: &OperationIntent,
+            preparers: &[&dyn Preparer],
+        ) -> (TableMetadata, FrozenRequest) {
             // Each seed is a separate logical publication, rather than a retry
             // of this fixture's operation. Its fresh token also keeps output paths unique.
             let operation = IcebergCommitOperation::new(
@@ -1226,7 +1198,9 @@ pub(crate) mod preparer_tests {
                 &attempt,
             )
             .unwrap();
-            engine.stage(preparer).await.unwrap();
+            for preparer in preparers {
+                engine.stage(*preparer).await.unwrap();
+            }
             let after = engine.metadata().clone();
             (after, engine.freeze().unwrap())
         }
@@ -1261,8 +1235,16 @@ pub(crate) mod preparer_tests {
         target_ref: &str,
         attempt: &IcebergCommitAttempt,
     ) -> Vec<crate::iceberg::spec::ManifestEntry> {
-        use crate::commit::model::ArtifactWriter;
         let snapshot = metadata.snapshot_for_ref(target_ref).unwrap();
+        raw_snapshot_entries(metadata, snapshot, attempt).await
+    }
+
+    pub(crate) async fn raw_snapshot_entries(
+        metadata: &TableMetadata,
+        snapshot: &Snapshot,
+        attempt: &IcebergCommitAttempt,
+    ) -> Vec<crate::iceberg::spec::ManifestEntry> {
+        use crate::commit::model::ArtifactWriter;
         let list = crate::manifest::load_manifest_list(snapshot, attempt.file_io(), metadata)
             .await
             .unwrap();
@@ -1286,7 +1268,7 @@ pub(crate) mod preparer_tests {
         entries
     }
     struct Seed(Vec<AddedContent>);
-    #[async_trait]
+    #[async_trait::async_trait]
     impl Preparer for Seed {
         async fn prepare(
             &self,
@@ -1399,7 +1381,7 @@ pub(crate) mod preparer_tests {
     }
 
     #[tokio::test]
-    async fn overwrite_preparer_deletes_every_logical_delete_blob_and_uses_actual_sizes() {
+    async fn full_refresh_deletes_every_logical_delete_blob_and_uses_actual_sizes() {
         let fixture = Fixture::new();
         let base = fixture.metadata(FormatVersion::V3);
         let seed = vec![
@@ -1426,20 +1408,29 @@ pub(crate) mod preparer_tests {
                     .unwrap(),
             ],
         );
-        let (after, _) = fixture.stage(base, &intent, &OverwritePreparer).await;
+        let (after, _) = fixture.stage_full_refresh(base, &intent).await;
         let snapshot = after.current_snapshot().unwrap();
-        assert_eq!(snapshot.summary().operation, Operation::Overwrite);
+        assert_eq!(snapshot.summary().operation, Operation::Append);
         assert_eq!(snapshot.row_range(), Some((5, 2)));
+        let deletion = after
+            .snapshot_by_id(snapshot.parent_snapshot_id().unwrap())
+            .unwrap();
+        assert_eq!(deletion.summary().operation, Operation::Delete);
+        assert_eq!(deletion.parent_snapshot_id(), Some(start));
         assert_eq!(
-            snapshot.summary().additional_properties["removed-files-size"],
+            deletion.summary().additional_properties["removed-files-size"],
             "68"
         );
         assert_eq!(
-            snapshot.summary().additional_properties["removed-delete-files"],
+            deletion.summary().additional_properties["removed-delete-files"],
             "2"
         );
-        let entries =
-            raw_entries(&after, "main", &fixture.operation.begin_attempt().unwrap()).await;
+        let entries = raw_snapshot_entries(
+            &after,
+            deletion,
+            &fixture.operation.begin_attempt().unwrap(),
+        )
+        .await;
         let deleted: Vec<_> = entries
             .iter()
             .filter(|e| e.status == ManifestStatus::Deleted)
@@ -1448,7 +1439,7 @@ pub(crate) mod preparer_tests {
         assert!(
             deleted
                 .iter()
-                .all(|e| e.snapshot_id == Some(snapshot.snapshot_id())
+                .all(|e| e.snapshot_id == Some(deletion.snapshot_id())
                     && e.sequence_number == Some(1)
                     && e.file_sequence_number == Some(1))
         );
@@ -1461,7 +1452,7 @@ pub(crate) mod preparer_tests {
     }
 
     #[tokio::test]
-    async fn overwrite_labels_distinguish_append_and_delete() {
+    async fn full_refresh_always_publishes_delete_then_append() {
         let fixture = Fixture::new();
         let base = fixture.metadata(FormatVersion::V3);
         let intent = fixture.intent(
@@ -1472,18 +1463,28 @@ pub(crate) mod preparer_tests {
                     .unwrap(),
             ],
         );
-        let (base, _) = fixture.stage(base, &intent, &OverwritePreparer).await;
+        let (base, _) = fixture.stage_full_refresh(base, &intent).await;
         assert_eq!(
             base.current_snapshot().unwrap().summary().operation,
             Operation::Append
         );
         let intent = fixture.intent(&base, "main", Vec::new());
-        let (after, _) = fixture.stage(base, &intent, &OverwritePreparer).await;
+        let (after, _) = fixture.stage_full_refresh(base, &intent).await;
+        let appended = after.current_snapshot().unwrap();
+        assert_eq!(appended.summary().operation, Operation::Append);
+        let deleted = after
+            .snapshot_by_id(appended.parent_snapshot_id().unwrap())
+            .unwrap();
+        assert_eq!(deleted.summary().operation, Operation::Delete);
         assert_eq!(
-            after.current_snapshot().unwrap().summary().operation,
-            Operation::Delete
+            deleted.summary().additional_properties["total-records"],
+            "0"
         );
-        assert_eq!(after.current_snapshot().unwrap().row_range(), Some((3, 0)));
+        assert_eq!(
+            appended.summary().additional_properties["total-records"],
+            "0"
+        );
+        assert_eq!(appended.row_range(), Some((3, 0)));
     }
 
     #[tokio::test]
@@ -1571,218 +1572,7 @@ pub(crate) mod preparer_tests {
     }
 
     #[tokio::test]
-    async fn dynamic_overwrite_assigns_only_unassigned_survivors_and_new_rows() {
-        let fixture = Fixture::new();
-        let base = fixture.metadata(FormatVersion::V2);
-        let spec = crate::iceberg::spec::UnboundPartitionSpecBuilder::new()
-            .add_partition_field(1, "id", crate::iceberg::spec::Transform::Identity)
-            .unwrap()
-            .build();
-        let base = base
-            .into_builder(None)
-            .add_default_partition_spec(spec)
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata;
-        let spec_id = base.default_partition_spec_id();
-        let partition = |id| {
-            [Some(crate::iceberg::spec::Literal::long(id))]
-                .into_iter()
-                .collect::<Struct>()
-        };
-        let intent = fixture.intent(
-            &base,
-            "main",
-            vec![
-                AddedContent::new_logical_data(data("s3://b/p1.parquet", 3, partition(1)), spec_id)
-                    .unwrap(),
-                AddedContent::new_logical_data(data("s3://b/p2.parquet", 5, partition(2)), spec_id)
-                    .unwrap(),
-            ],
-        );
-        let (base, _) = fixture
-            .stage(
-                base,
-                &intent,
-                &super::super::fast_append::FastAppendPreparer,
-            )
-            .await;
-        let base = base
-            .into_builder(None)
-            .upgrade_format_version(FormatVersion::V3)
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata;
-        let intent = fixture.intent(
-            &base,
-            "main",
-            vec![
-                AddedContent::new_logical_data(
-                    data("s3://b/new-p1.parquet", 2, partition(1)),
-                    spec_id,
-                )
-                .unwrap(),
-            ],
-        );
-        let (base, _) = fixture
-            .stage(
-                base,
-                &intent,
-                &super::super::overwrite_partitions::OverwritePartitionsPreparer,
-            )
-            .await;
-        assert_eq!(
-            base.current_snapshot().unwrap().summary().operation,
-            Operation::Overwrite
-        );
-        assert_eq!(base.current_snapshot().unwrap().row_range(), Some((0, 7)));
-        assert_eq!(base.next_row_id(), 7);
-        let intent = fixture.intent(
-            &base,
-            "main",
-            vec![
-                AddedContent::new_logical_data(
-                    data("s3://b/newer-p1.parquet", 1, partition(1)),
-                    spec_id,
-                )
-                .unwrap(),
-            ],
-        );
-        let (after, _) = fixture
-            .stage(
-                base,
-                &intent,
-                &super::super::overwrite_partitions::OverwritePartitionsPreparer,
-            )
-            .await;
-        assert_eq!(after.current_snapshot().unwrap().row_range(), Some((7, 1)));
-        let entries =
-            raw_entries(&after, "main", &fixture.operation.begin_attempt().unwrap()).await;
-        let survivor = entries
-            .iter()
-            .find(|e| e.data_file().file_path() == "s3://b/p2.parquet")
-            .unwrap();
-        assert_eq!(survivor.status, ManifestStatus::Existing);
-        assert_eq!(survivor.data_file().first_row_id(), None);
-        let read = fixture.operation.begin_attempt().unwrap();
-        let mut inputs = super::super::dependency::ValidationInputs::new(
-            &after,
-            after.current_snapshot_id(),
-            &read,
-        );
-        let live = inputs.live_set().await.unwrap();
-        let survivor_id = super::super::model::EntryIdentity::DataFile {
-            path: "s3://b/p2.parquet".into(),
-        };
-        // The retained V2 object still has null on disk. The first V3 list
-        // allocated the two new rows before the five historical survivors.
-        assert_eq!(live[&survivor_id].frozen.facts().first_row_id, Some(2));
-        assert_eq!(survivor.sequence_number, Some(1));
-        assert_eq!(survivor.file_sequence_number, Some(1));
-    }
-    #[tokio::test]
-    async fn dynamic_overwrite_removes_referenced_dv_even_with_a_different_partition() {
-        let fixture = Fixture::new();
-        let base = fixture.metadata(FormatVersion::V3);
-        let spec = crate::iceberg::spec::UnboundPartitionSpecBuilder::new()
-            .add_partition_field(1, "id", crate::iceberg::spec::Transform::Identity)
-            .unwrap()
-            .build();
-        let base = base
-            .into_builder(None)
-            .add_default_partition_spec(spec)
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata;
-        let spec_id = base.default_partition_spec_id();
-        let partition = |id| {
-            [Some(crate::iceberg::spec::Literal::long(id))]
-                .into_iter()
-                .collect::<Struct>()
-        };
-        let intent = fixture.intent(
-            &base,
-            "main",
-            vec![
-                AddedContent::new_logical_data(data("s3://b/p1.parquet", 3, partition(1)), spec_id)
-                    .unwrap(),
-            ],
-        );
-        let (base, _) = fixture
-            .stage(
-                base,
-                &intent,
-                &super::super::fast_append::FastAppendPreparer,
-            )
-            .await;
-        let vector = crate::iceberg::spec::DataFileBuilder::default()
-            .content(DataContentType::PositionDeletes)
-            .file_path("s3://b/shared.puffin".into())
-            .file_format(crate::iceberg::spec::DataFileFormat::Puffin)
-            .partition(partition(2))
-            .partition_spec_id(spec_id)
-            .record_count(1)
-            .file_size_in_bytes(1000)
-            .content_offset(Some(4))
-            .content_size_in_bytes(Some(11))
-            .referenced_data_file(Some("s3://b/p1.parquet".into()))
-            .build()
-            .unwrap();
-        let vector_id = super::super::model::EntryIdentity::try_from(&vector).unwrap();
-        let intent = fixture.intent(
-            &base,
-            "main",
-            vec![AddedContent::new_logical_data(vector, spec_id).unwrap()],
-        );
-        let (base, _) = fixture
-            .stage(base, &intent, &super::super::row_delta::RowDeltaPreparer)
-            .await;
-        let intent = fixture.intent(
-            &base,
-            "main",
-            vec![
-                AddedContent::new_logical_data(
-                    data("s3://b/new-p1.parquet", 2, partition(1)),
-                    spec_id,
-                )
-                .unwrap(),
-            ],
-        );
-        let (after, _) = fixture
-            .stage(
-                base,
-                &intent,
-                &super::super::overwrite_partitions::OverwritePartitionsPreparer,
-            )
-            .await;
-        let attempt = fixture.operation.begin_attempt().unwrap();
-        let mut inputs = super::super::dependency::ValidationInputs::new(
-            &after,
-            after.current_snapshot_id(),
-            &attempt,
-        );
-        let live = inputs.live_set().await.unwrap();
-        assert!(!live.contains_key(&vector_id));
-        assert!(
-            !live.contains_key(&super::super::model::EntryIdentity::DataFile {
-                path: "s3://b/p1.parquet".into()
-            })
-        );
-        assert_eq!(
-            after
-                .current_snapshot()
-                .unwrap()
-                .summary()
-                .additional_properties["removed-delete-files"],
-            "1"
-        );
-    }
-
-    #[tokio::test]
-    async fn overwrite_preparer_can_replace_historical_unassigned_data() {
+    async fn full_refresh_can_replace_historical_unassigned_data() {
         let fixture = Fixture::new();
         let base = fixture.metadata(FormatVersion::V2);
         let intent = fixture.intent(
@@ -1821,11 +1611,16 @@ pub(crate) mod preparer_tests {
                 .unwrap(),
             ],
         );
-        let (after, _) = fixture.stage(base, &intent, &OverwritePreparer).await;
+        let (after, _) = fixture.stage_full_refresh(base, &intent).await;
         assert_eq!(after.current_snapshot().unwrap().row_range(), Some((0, 2)));
         assert_eq!(after.next_row_id(), 2);
+        let appended = after.current_snapshot().unwrap();
+        let deleted = after
+            .snapshot_by_id(appended.parent_snapshot_id().unwrap())
+            .unwrap();
         let entries =
-            raw_entries(&after, "main", &fixture.operation.begin_attempt().unwrap()).await;
+            raw_snapshot_entries(&after, deleted, &fixture.operation.begin_attempt().unwrap())
+                .await;
         let old = entries
             .iter()
             .find(|e| e.data_file().file_path() == "s3://b/historic.parquet")
@@ -1956,35 +1751,51 @@ pub(crate) mod preparer_tests {
             "main",
             vec![added("s3://b/replacement.parquet", 11, 4)],
         );
-        let (after_overwrite, _) = fixture
-            .stage(after_append, &intent, &OverwritePreparer)
-            .await;
+        let (after_overwrite, _) = fixture.stage_full_refresh(after_append, &intent).await;
         let snapshot = after_overwrite.current_snapshot().unwrap();
-        let outputs =
+        let deleted = after_overwrite
+            .snapshot_by_id(snapshot.parent_snapshot_id().unwrap())
+            .unwrap();
+        let removed =
+            crate::manifest::load_manifest_list(deleted, attempt.file_io(), &after_overwrite)
+                .await
+                .unwrap();
+        let appended =
             crate::manifest::load_manifest_list(snapshot, attempt.file_io(), &after_overwrite)
                 .await
                 .unwrap();
-        assert_eq!(outputs.entries().len(), 2);
-        assert!(
-            outputs
-                .entries()
-                .iter()
-                .all(|descriptor| descriptor.added_snapshot_id == snapshot.snapshot_id())
+        assert_eq!(removed.entries().len(), 2);
+        assert_eq!(appended.entries().len(), 1);
+        assert_eq!(
+            appended.entries()[0].added_snapshot_id,
+            snapshot.snapshot_id()
         );
-        assert!(outputs.entries().iter().all(|descriptor| {
-            after
-                .entries()
-                .iter()
-                .all(|old| old.manifest_path != descriptor.manifest_path)
+        assert!(removed.entries().iter().all(|descriptor| {
+            descriptor.added_snapshot_id == deleted.snapshot_id()
+                && after
+                    .entries()
+                    .iter()
+                    .all(|old| old.manifest_path != descriptor.manifest_path)
         }));
         for (property, expected) in [
             ("manifests-created", "2"),
             ("manifests-kept", "0"),
             ("manifests-replaced", "2"),
-            ("added-data-files", "1"),
-            ("added-records", "11"),
             ("deleted-data-files", "4"),
             ("deleted-records", "17"),
+            ("total-records", "0"),
+        ] {
+            assert_eq!(
+                deleted.summary().additional_properties[property],
+                expected,
+                "{property}"
+            );
+        }
+        for (property, expected) in [
+            ("manifests-created", "1"),
+            ("added-data-files", "1"),
+            ("added-records", "11"),
+            ("deleted-data-files", "0"),
             ("total-records", "11"),
         ] {
             assert_eq!(
@@ -1993,8 +1804,7 @@ pub(crate) mod preparer_tests {
                 "{property}"
             );
         }
-
-        let aged_off = outputs
+        let aged_off = removed
             .entries()
             .iter()
             .find(|manifest| manifest.partition_spec_id == old_spec_id)
@@ -2112,12 +1922,12 @@ pub(crate) mod preparer_tests {
                 token: fixture.operation.token(),
             })
             .unwrap();
-            let (next, request) = fixture.stage(base, &intent, &OverwritePreparer).await;
+            let (next, request) = fixture.stage_full_refresh(base, &intent).await;
             assert_eq!(
                 next.current_snapshot().unwrap().summary().operation,
                 Operation::Append
             );
-            assert_eq!(request.artifacts().references().len(), 1);
+            assert_eq!(request.artifacts().references().len(), 2);
             base = next;
         }
     }

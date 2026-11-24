@@ -284,6 +284,45 @@ fn logical_rows_are_distinct_from_physical_records() {
     );
 }
 #[test]
+fn full_refresh_pairs_require_empty_delete_and_unique_marked_append() {
+    let mut delete = snapshot(1, None, "delete", None);
+    delete["summary"]["total-data-files"] = json!("0");
+    delete["summary"]["total-records"] = json!("0");
+    let mut append = snapshot(2, Some(1), "append", Some(frame(1)));
+    append["summary"]["novarocks.write.session.v1"] = json!("first");
+    let snapshots = BTreeMap::from([(1, &delete), (2, &append)]);
+    assert_eq!(
+        full_refresh_pairs(&snapshots).unwrap(),
+        (BTreeSet::from([1]), BTreeSet::from([2]))
+    );
+
+    let mut corrupt_delete = delete.clone();
+    corrupt_delete["summary"][wire::PUBLICATION_KEY] = json!(frame(2));
+    assert!(
+        full_refresh_pairs(&BTreeMap::from([(1, &corrupt_delete), (2, &append)]))
+            .unwrap()
+            .0
+            .is_empty()
+    );
+    let mut nonempty = delete.clone();
+    nonempty["summary"]["total-records"] = json!("1");
+    assert!(full_refresh_pairs(&BTreeMap::from([(1, &nonempty), (2, &append)])).is_err());
+    let mut wrong_parent = append.clone();
+    wrong_parent["parent-snapshot-id"] = json!(0);
+    assert!(full_refresh_pairs(&BTreeMap::from([(1, &delete), (2, &wrong_parent)])).is_err());
+    let mut repeated_marker = snapshot(3, Some(2), "append", Some(frame(3)));
+    repeated_marker["summary"]["novarocks.write.session.v1"] = json!("first");
+    assert!(
+        full_refresh_pairs(&BTreeMap::from([
+            (1, &delete),
+            (2, &append),
+            (3, &repeated_marker)
+        ]))
+        .is_err()
+    );
+}
+
+#[test]
 fn each_check_has_table_and_warehouse_document_prefixes() {
     let metadata = json!({"location":"s3://bucket/private/rest/_novarocks/ctas-staging/table"});
     let prefixes = document_prefixes(&metadata, "s3://bucket/private/rest").unwrap();

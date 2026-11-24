@@ -1,5 +1,5 @@
 -- query 7
--- types	bigint	timestamp(6)	integer
+-- types	bigint	timestamp(6)	bigint
 id	dt	y
 1	2024-02-29 12:34:56.000000	2024
 2	NULL	NULL
