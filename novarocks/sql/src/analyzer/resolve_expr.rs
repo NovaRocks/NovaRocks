@@ -2409,19 +2409,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 .collect();
         }
 
-        if name == "flatten"
-            && let Some(DataType::List(item)) = arg_types.first()
-            && !matches!(item.data_type(), DataType::List(_))
-        {
-            return Err(AnalyzeError::invalid_argument(
-                format!(
-                    "The only one input of array_flatten should be an array of arrays, rather than {}",
-                    starrocks_error_type_name(&arg_types[0])
-                ),
-                func.span,
-            ));
-        }
-
         if name == "array_agg" && is_distinct {
             if args_typed
                 .first()

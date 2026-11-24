@@ -2196,23 +2196,6 @@ fn dynamic_scalar_data_type_with_construction<E>(
     }))
 }
 
-fn fold_value_types_with_creation<'a, H>(
-    values: impl Iterator<Item = &'a FunctionValueType>,
-    work: &mut CompileCheckpoints<'_>,
-    mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
-) -> Result<FunctionValueType, FunctionBindingCreationFailure<H>> {
-    let mut result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-        cx.value(DataType::Null, true, ValueLogicalType::Physical)
-    })?;
-    for value in values {
-        work.step()?;
-        result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-            super::signature::merge_value_types_with_construction(&result, value, true, cx)
-        })?
-        .ok_or(FunctionBindingError::NoMatchingOverload)?;
-    }
-    Ok(result)
-}
 fn full_list_item_with_creation<H>(
     ty: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
@@ -2478,6 +2461,27 @@ fn bind_dynamic_scalar_result_with_creation<H>(
             })
         });
     }
+    if name == "array_intersect" {
+        let [
+            FunctionArgument::Value {
+                value_type: left, ..
+            },
+            FunctionArgument::Value {
+                value_type: right, ..
+            },
+        ] = request.arguments
+        else {
+            return Err(FunctionBindingError::NoMatchingOverload.into());
+        };
+        let left = full_list_item_with_creation(left, work, borrow_creator(&mut creation))?;
+        let right = full_list_item_with_creation(right, work, borrow_creator(&mut creation))?;
+        let item = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+            cx.trino_common(&left, &right)
+        })?
+        .ok_or(FunctionBindingError::NoMatchingOverload)?;
+        let nullable = scalar_result_nullable(name, request, work)?;
+        return dynamic_list(&item, nullable, work, creation);
+    }
     let argument_types =
         dynamic_argument_data_types_with_creation(request, work, borrow_creator(&mut creation))?;
     validate_builtin_selected_domain(name, ScalarCarriers::from_data_types(&argument_types), work)?;
@@ -2593,28 +2597,6 @@ fn bind_dynamic_scalar_result_with_creation<H>(
         borrow_creator(&mut creation),
     )?;
     match name {
-        "array_intersect" => {
-            let arguments =
-                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
-            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                cx.collected_vec::<FunctionValueType>(arguments.len())
-            })?;
-            let items = arguments
-                .into_iter()
-                .map(|value| {
-                    work.step()?;
-                    full_list_item_with_creation(value, work, borrow_creator(&mut creation))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let item =
-                fold_value_types_with_creation(items.iter(), work, borrow_creator(&mut creation))?;
-            full_result = dynamic_list(
-                &item,
-                full_result.nullable(),
-                work,
-                borrow_creator(&mut creation),
-            )?;
-        }
         "flatten" => {
             let outer =
                 full_list_item_with_creation(value(0)?, work, borrow_creator(&mut creation))?;
