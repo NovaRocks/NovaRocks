@@ -33,8 +33,6 @@ use crate::column_id::ColumnId;
 use crate::common::{BinOp, UnOp};
 use crate::compiler::SqlMvRelationOccurrenceId;
 use crate::planner::table::ScanSource;
-use novarocks_functions::PersistentScalarContract;
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
 /// Complete SQL-owned input for CREATE-time MV persistence mapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,7 +41,6 @@ pub struct SqlMvCreatePersistenceFacts {
     outputs: Vec<SqlMvPersistenceOutputFacts>,
     aggregates: Vec<SqlMvPersistenceAggregateFacts>,
     union_branches: Vec<SqlMvPersistenceUnionBranchFacts>,
-    scalar_contracts: Box<[PersistentScalarContract]>,
 }
 
 impl SqlMvCreatePersistenceFacts {
@@ -57,10 +54,6 @@ impl SqlMvCreatePersistenceFacts {
 
     pub fn aggregates(&self) -> &[SqlMvPersistenceAggregateFacts] {
         &self.aggregates
-    }
-
-    pub fn scalar_contracts(&self) -> &[PersistentScalarContract] {
-        &self.scalar_contracts
     }
 
     /// Ordered UNION ALL leaves. A non-UNION query has no branch records.
@@ -283,7 +276,6 @@ struct ProjectionBuilder {
 pub(super) fn project_create_persistence_facts(
     query: &ResolvedQuery,
     names: &[String],
-    scalar_contracts: Box<[PersistentScalarContract]>,
 ) -> Result<SqlMvCreatePersistenceFacts, String> {
     let mut output_leaves = Vec::new();
     let is_root_union = collect_union_leaves(query, &mut output_leaves)?;
@@ -386,7 +378,6 @@ pub(super) fn project_create_persistence_facts(
         outputs,
         aggregates: builder.aggregates,
         union_branches,
-        scalar_contracts,
     })
 }
 
@@ -981,80 +972,6 @@ fn collect_aggregates(
     Ok(())
 }
 
-pub(crate) fn collect_scalar_contracts(
-    query: &ResolvedQuery,
-    control: &dyn PureCompileControl,
-) -> Result<Box<[PersistentScalarContract]>, crate::compiler::SqlCompileError> {
-    let mut contracts = BTreeSet::new();
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-    collect_scalar_query(query, &mut |node| {
-        work.step()?;
-        if let ExprKind::FunctionCall { binding, .. } = &node.kind
-            && let Some(contract) = PersistentScalarContract::from_binding(binding.resolved())
-        {
-            contracts.insert(contract);
-        }
-        Ok::<_, novarocks_type_contract::CompileControlError>(())
-    })?;
-    work.finish()?;
-    Ok(contracts.into_iter().collect())
-}
-
-#[recursive::recursive]
-fn collect_scalar_query<E>(
-    query: &ResolvedQuery,
-    visitor: &mut impl FnMut(&TypedExpr) -> Result<(), E>,
-) -> Result<(), E> {
-    match &query.body {
-        QueryBody::Select(select) => {
-            for expr in select
-                .projection
-                .iter()
-                .map(|item| &item.expr)
-                .chain(select.filter.iter())
-                .chain(select.group_by.iter())
-                .chain(select.having.iter())
-            {
-                walk_expression(expr, visitor)?;
-            }
-            if let Some(relation) = &select.from {
-                collect_scalar_relation(relation, visitor)?;
-            }
-        }
-        QueryBody::SetOperation(set) => {
-            collect_scalar_query(&set.left, visitor)?;
-            collect_scalar_query(&set.right, visitor)?;
-        }
-        // The MV persistence profile requires a SELECT over observed sources.
-        QueryBody::Values(_) => {}
-    }
-    walk_sort_items(&query.order_by, visitor)
-}
-
-#[recursive::recursive]
-fn collect_scalar_relation<E>(
-    relation: &Relation,
-    visitor: &mut impl FnMut(&TypedExpr) -> Result<(), E>,
-) -> Result<(), E> {
-    match relation {
-        Relation::Subquery { query, .. } => collect_scalar_query(query, visitor),
-        Relation::Join(join) => {
-            if let Some(condition) = &join.condition {
-                walk_expression(condition, visitor)?;
-            }
-            collect_scalar_relation(&join.left, visitor)?;
-            collect_scalar_relation(&join.right, visitor)
-        }
-        Relation::Unnest(unnest) => walk_expressions(&unnest.args, visitor),
-        Relation::Scan(_)
-        | Relation::SystemTable { .. }
-        | Relation::IcebergMetadataScan(_)
-        | Relation::IcebergDeltaScan(_)
-        | Relation::GenerateSeries(_)
-        | Relation::CTEConsume { .. } => Ok(()),
-    }
-}
-
 fn walk_expression<'a, E>(
     expression: &'a TypedExpr,
     visitor: &mut impl FnMut(&'a TypedExpr) -> Result<(), E>,
@@ -1335,31 +1252,6 @@ mod tests {
                 )
             })
             .collect()
-    }
-
-    #[test]
-    fn scalar_publication_contracts_include_actual_filter_and_projection_calls() {
-        let input = facts("SELECT greatest(id, 1) AS top FROM base WHERE least(id, 0) < 1");
-        let selected = input
-            .scalar_contracts()
-            .iter()
-            .map(|contract| (contract.function().as_str(), contract.overload().as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            selected,
-            [
-                (
-                    "builtin.scalar/greatest/v1",
-                    "builtin.scalar/greatest/dynamic-v2"
-                ),
-                ("builtin.scalar/least/v1", "builtin.scalar/least/dynamic-v2"),
-            ]
-        );
-        assert!(
-            facts("SELECT id AS top FROM base WHERE id < 1")
-                .scalar_contracts()
-                .is_empty()
-        );
     }
 
     #[test]

@@ -1021,7 +1021,7 @@ fn valid_definition_with_many_outputs_and_source_fields_roundtrips() {
 }
 
 #[test]
-fn keyed_same_layout_aggregate_publication_requires_current_semantics() {
+fn keyed_aggregate_publication_checks_state_format() {
     use crate::persistence::aggregate_bindings::validate_published_aggregate_contracts;
     use arrow_schema::DataType;
     use novarocks_functions::{
@@ -1065,56 +1065,28 @@ fn keyed_same_layout_aggregate_publication_requires_current_semantics() {
         .unwrap();
     let selected = PersistentAggregateContract::from_binding(&bound).unwrap();
     let mut previous = selected.clone();
-    previous.result_semantics = "legacy-total-order-v1".into();
+    previous.state_format =
+        novarocks_functions::AggregateStateFormatIdentity::try_new("legacy-state-v1").unwrap();
     legacy.aggregates[0].semantic_contract = Some(previous);
     let bytes = keyed::encode_keyed_interpretation(&legacy).unwrap();
     let decoded = keyed::decode_keyed_interpretation(bytes.as_bytes()).unwrap();
     assert_eq!(decoded.state_slots, legacy.state_slots);
     let refusal = validate_published_aggregate_contracts(&decoded).unwrap_err();
-    assert!(refusal.contains("legacy-total-order-v1"));
+    assert!(refusal.contains("legacy-state-v1"));
+
+    let mut previous_overload = selected.clone();
+    previous_overload.overload =
+        novarocks_functions::FunctionOverloadId::try_new("builtin.aggregate/max/unsupported")
+            .unwrap();
+    legacy.aggregates[0].semantic_contract = Some(previous_overload);
+    let bytes = keyed::encode_keyed_interpretation(&legacy).unwrap();
+    let decoded = keyed::decode_keyed_interpretation(bytes.as_bytes()).unwrap();
+    let refusal = validate_published_aggregate_contracts(&decoded).unwrap_err();
+    assert!(refusal.contains("no longer admitted"));
 
     legacy.aggregates[0].semantic_contract = Some(selected);
     let bytes = keyed::encode_keyed_interpretation(&legacy).unwrap();
     let decoded = keyed::decode_keyed_interpretation(bytes.as_bytes()).unwrap();
     assert_eq!(decoded, legacy);
     validate_published_aggregate_contracts(&decoded).unwrap();
-}
-
-#[test]
-fn scalar_publication_contracts_preserve_legacy_decode_and_change_computation_identity() {
-    use novarocks_functions::{
-        FunctionId, FunctionOverloadId, PersistentScalarContract,
-        validate_published_scalar_contracts,
-    };
-
-    let original = sample_definition();
-    let encoded = encode_definition(&original).unwrap();
-    let legacy = decode_definition(encoded.as_bytes()).unwrap();
-    assert!(legacy.scalar_contracts.is_empty());
-    assert_eq!(legacy.computation_identity, original.computation_identity);
-    validate_published_scalar_contracts(&legacy.scalar_contracts, &[]).unwrap();
-
-    let greatest = PersistentScalarContract::new(
-        FunctionId::try_new("builtin.scalar/greatest/v1").unwrap(),
-        FunctionOverloadId::try_new("builtin.scalar/greatest/dynamic-v2").unwrap(),
-        std::num::NonZeroU32::MIN,
-    );
-    let contracts = vec![greatest];
-    let reason =
-        validate_published_scalar_contracts(&legacy.scalar_contracts, &contracts).unwrap_err();
-    assert!(reason.contains("builtin.scalar/greatest/v1 requires a full rebuild"));
-
-    let rebuilt = build_definition_with_scalar_contracts(
-        legacy.created_at_ms,
-        legacy.query,
-        legacy.relation_occurrences,
-        legacy.outputs,
-        contracts.clone(),
-    )
-    .unwrap();
-    assert_ne!(rebuilt.computation_identity, legacy.computation_identity);
-    let encoded = encode_definition(&rebuilt).unwrap();
-    let decoded = decode_definition(encoded.as_bytes()).unwrap();
-    validate_published_scalar_contracts(&decoded.scalar_contracts, &contracts).unwrap();
-    assert_eq!(decoded, rebuilt);
 }

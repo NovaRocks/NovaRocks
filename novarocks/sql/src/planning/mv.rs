@@ -1139,11 +1139,7 @@ pub trait SqlResolvedMvRefreshInputSource: resolved_mv_refresh_input_private::Se
 /// Opaque analyzed-MV input. It deliberately exposes neither analyzer nodes
 /// nor mutation access; SQL planning facades consume it directly.
 #[derive(Clone, Debug)]
-pub struct SqlResolvedMvRefreshInput(
-    crate::analysis::ResolvedQuery,
-    Box<[String]>,
-    Box<[novarocks_functions::PersistentScalarContract]>,
-);
+pub struct SqlResolvedMvRefreshInput(crate::analysis::ResolvedQuery, Box<[String]>);
 
 impl SqlResolvedMvRefreshInput {
     pub fn from_analysis<T: SqlResolvedMvRefreshInputSource>(
@@ -1155,9 +1151,8 @@ impl SqlResolvedMvRefreshInput {
     pub(crate) fn from_validated_analysis(
         resolved: crate::analysis::ResolvedQuery,
         names: Vec<String>,
-        scalar_contracts: Box<[novarocks_functions::PersistentScalarContract]>,
     ) -> Self {
-        Self(resolved, names.into_boxed_slice(), scalar_contracts)
+        Self(resolved, names.into_boxed_slice())
     }
 
     fn checked(
@@ -1167,16 +1162,7 @@ impl SqlResolvedMvRefreshInput {
             &resolved.output_columns,
             None,
         )?;
-        let scalar_contracts = super::mv_persistence::collect_scalar_contracts(
-            &resolved,
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .map_err(|error| crate::analyze_error::AnalyzeError::internal(error.to_string()))?;
-        Ok(Self::from_validated_analysis(
-            resolved,
-            names,
-            scalar_contracts,
-        ))
+        Ok(Self::from_validated_analysis(resolved, names))
     }
 
     pub fn refresh_property(
@@ -1266,11 +1252,7 @@ impl SqlResolvedMvRefreshInput {
     /// provider object, schema, and field identities remain application-owned
     /// observations that are joined to these occurrence-qualified SQL facts.
     pub fn create_persistence_facts(&self) -> Result<SqlMvCreatePersistenceFacts, String> {
-        super::mv_persistence::project_create_persistence_facts(&self.0, &self.1, self.2.clone())
-    }
-
-    pub fn scalar_contracts(&self) -> &[novarocks_functions::PersistentScalarContract] {
-        &self.2
+        super::mv_persistence::project_create_persistence_facts(&self.0, &self.1)
     }
 
     /// Derive one immutable aggregate-layout input from the admitted query and

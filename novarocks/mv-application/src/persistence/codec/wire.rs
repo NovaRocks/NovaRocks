@@ -29,7 +29,6 @@ use crate::persistence::codec::PersistenceCodecError;
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Schema {
     DefinitionDocument,
-    ScalarPublicationContract,
     QuerySource,
     ResolutionContext,
     RelationOccurrence,
@@ -185,9 +184,7 @@ const DEFINITION: &[Field] = &[
     repeated_message(4, Schema::OutputDefinition),
     bytes(5),
     scalar(6),
-    repeated_message(7, Schema::ScalarPublicationContract),
 ];
-const SCALAR_PUBLICATION_CONTRACT: &[Field] = &[bytes(1), bytes(2), scalar(3)];
 const QUERY: &[Field] = &[bytes(1), scalar(2), message(3, Schema::ResolutionContext)];
 const RESOLUTION: &[Field] = &[bytes(1), bytes(2)];
 const RELATION: &[Field] = &[
@@ -253,7 +250,7 @@ const AGGREGATE: &[Field] = &[
     message(6, Schema::PersistentAggregateContract),
 ];
 // Repeated uint32 is encoded packed and therefore length-delimited.
-const PERSISTENT_AGGREGATE: &[Field] = &[bytes(1), bytes(2), bytes(3), bytes(4)];
+const PERSISTENT_AGGREGATE: &[Field] = &[bytes(1), bytes(2), bytes(4)];
 const BRANCH: &[Field] = &[bytes(1), packed_varints(2), repeated_bytes(3)];
 const TARGET: &[Field] = &[
     bytes(1),
@@ -277,7 +274,6 @@ impl Schema {
     fn fields(self) -> &'static [Field] {
         match self {
             Self::DefinitionDocument => DEFINITION,
-            Self::ScalarPublicationContract => SCALAR_PUBLICATION_CONTRACT,
             Self::QuerySource => QUERY,
             Self::ResolutionContext => RESOLUTION,
             Self::RelationOccurrence => RELATION,

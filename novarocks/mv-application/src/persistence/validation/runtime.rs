@@ -29,7 +29,7 @@ use crate::persistence::codec::{
     DefinitionDocument, ExpressionKind, ExpressionShape, InterpretationDocument, OutputBinding,
     OutputDefinition, PhysicalFieldBinding, PhysicalFieldLogicalIdentity, QuerySource,
     RelationOccurrence, SourceFieldBinding, SourceFieldReference, StateEncoding, StateRole,
-    StateSlot, TargetBinding, TargetPartitionFieldBinding, build_definition_with_scalar_contracts,
+    StateSlot, TargetBinding, TargetPartitionFieldBinding, build_definition,
 };
 use crate::persistence::identity::{
     AggregateIdentity, ApplyKeyIdentity, BranchIdentity, ComputationIdentity, DocumentRevision,
@@ -43,7 +43,6 @@ pub struct RuntimeDefinitionFacts {
     pub query_definition: PersistedQueryDefinition,
     pub relation_occurrences: Vec<RuntimeRelationOccurrenceFacts>,
     pub outputs: Vec<RuntimeOutputFacts>,
-    pub scalar_contracts: Vec<novarocks_functions::PersistentScalarContract>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,7 +174,7 @@ impl TryFrom<RuntimeDefinitionFacts> for DefinitionDocument {
 
     fn try_from(value: RuntimeDefinitionFacts) -> Result<Self, Self::Error> {
         let query = QuerySource::try_from(value.query_definition)?;
-        build_definition_with_scalar_contracts(
+        build_definition(
             value.created_at_ms,
             query,
             value
@@ -223,7 +222,6 @@ impl TryFrom<RuntimeDefinitionFacts> for DefinitionDocument {
                     },
                 })
                 .collect(),
-            value.scalar_contracts,
         )
         .map_err(|error| error.to_string())
     }
@@ -235,7 +233,6 @@ impl TryFrom<&DefinitionDocument> for RuntimeDefinitionFacts {
     fn try_from(value: &DefinitionDocument) -> Result<Self, Self::Error> {
         Ok(Self {
             created_at_ms: value.created_at_ms,
-            scalar_contracts: value.scalar_contracts.clone(),
             query_definition: PersistedQueryDefinition::try_from(value.query.clone())?,
             relation_occurrences: value
                 .relation_occurrences

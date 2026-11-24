@@ -84,7 +84,6 @@ pub fn build_mv_create_documents(
     let targets = target_by_name(&target_observations)?;
     let definition = DefinitionDocument::try_from(RuntimeDefinitionFacts {
         created_at_ms: input.created_at_ms,
-        scalar_contracts: input.sql_facts.scalar_contracts().to_vec(),
         query_definition: input.query_definition,
         relation_occurrences: definition_relations(
             input.sql_facts,

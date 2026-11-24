@@ -102,7 +102,7 @@ message AggregateInterpretation {
 message PersistentAggregateContract {
   optional string function_identity = 1;
   optional string overload_identity = 2;
-  optional string result_semantics = 3;
+  reserved 3;
   optional string state_format = 4;
 }
 

@@ -1069,9 +1069,8 @@ pub fn validate_published_aggregate_contracts(
             Some(contract) if catalogue.admits_persistent_aggregate(contract) => {}
             Some(contract) => {
                 return Err(format!(
-                    "MV aggregate {function} requires a full rebuild: publication overload {} carries result contract {} and state format {}, which are no longer admitted",
+                    "MV aggregate {function} requires a full rebuild: publication overload {} carries state format {}, which is no longer admitted",
                     contract.overload.as_str(),
-                    contract.result_semantics,
                     contract.state_format.as_str(),
                 ));
             }

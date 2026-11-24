@@ -58,7 +58,6 @@ pub struct DefinitionDocument {
     pub relation_occurrences: Vec<RelationOccurrence>,
     /// Ordered result contract.
     pub outputs: Vec<OutputDefinition>,
-    pub scalar_contracts: Vec<novarocks_functions::PersistentScalarContract>,
     pub computation_identity: ComputationIdentity,
 }
 

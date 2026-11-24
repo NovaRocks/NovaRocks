@@ -1481,15 +1481,7 @@ pub fn analyze_mv_refresh_input(
     )?;
     crate::planning::mv::validate_persistable_output(&resolved, &factory)
         .map_err(SqlCompileError::Compilation)?;
-    let scalar_contracts =
-        crate::planning::mv_persistence::collect_scalar_contracts(&resolved, &control)?;
-    Ok(
-        crate::planning::mv::SqlResolvedMvRefreshInput::from_validated_analysis(
-            resolved,
-            names,
-            scalar_contracts,
-        ),
-    )
+    Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_validated_analysis(resolved, names))
 }
 
 /// Compile and render an IMV refresh EXPLAIN request without exposing its
