@@ -55,19 +55,42 @@ SELECT map_concat(c1, MAP(ARRAY[1], ARRAY[2]))
 FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
 
 -- query 6
--- MAP key
-SELECT map_concat(c1, MAP(ARRAY[map()], ARRAY[map()]))
-FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
+-- Verify the nested MAP key through the declared type.
+WITH merged AS (
+    SELECT map_concat(c1, MAP(ARRAY[map()], ARRAY[map()])) AS m
+    FROM (VALUES ROW(map())) AS t(c1)
+), entries AS (
+    SELECT cardinality(m) AS merged_entries, element_at(map_entries(m), 1) AS e
+    FROM merged
+)
+SELECT merged_entries, cardinality(e[1]) AS key_entries, cardinality(e[2]) AS value_entries
+FROM entries;
 
 -- query 7
--- ARRAY key
-SELECT map_concat(c1, MAP(ARRAY[[]], ARRAY[map()]))
-FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
+-- Verify the ARRAY key and MAP value through their declared types.
+WITH merged AS (
+    SELECT map_concat(c1, MAP(ARRAY[[]], ARRAY[map()])) AS m
+    FROM (VALUES ROW(map())) AS t(c1)
+), entries AS (
+    SELECT cardinality(m) AS merged_entries, element_at(map_entries(m), 1) AS e
+    FROM merged
+)
+SELECT merged_entries, cardinality(e[1]) AS key_entries, cardinality(e[2]) AS value_entries
+FROM entries;
 
 -- query 8
--- ROW key
-SELECT map_concat(c1, MAP(ARRAY[CAST(ROW(2) AS ROW("1" INTEGER))], ARRAY[CAST(ROW(ARRAY[MAP()]) AS ROW("A" ARRAY(MAP(INTEGER, INTEGER))))]))
-FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
+-- Read the ROW key and the empty MAP nested in its ROW value by position.
+WITH merged AS (
+    SELECT map_concat(c1, MAP(ARRAY[CAST(ROW(2) AS ROW("1" INTEGER))],
+                              ARRAY[CAST(ROW(ARRAY[MAP()]) AS ROW("A" ARRAY(MAP(INTEGER, INTEGER))))])) AS m
+    FROM (VALUES ROW(map())) AS t(c1)
+), entries AS (
+    SELECT cardinality(m) AS merged_entries, element_at(map_entries(m), 1) AS e
+    FROM merged
+)
+SELECT merged_entries, e[1][1] AS key_value, cardinality(e[2][1]) AS value_array_entries,
+       cardinality(element_at(e[2][1], 1)) AS nested_map_entries
+FROM entries;
 
 -- query 9
 -- map_entries on a table column; order by pk for determinism

@@ -19,19 +19,19 @@ _col0
 {1:2}
 
 -- query 6
--- types	map(map(unknown, unknown), map(unknown, unknown))
-_col0
-{"{}":{}}
+-- types	bigint	bigint	bigint
+merged_entries	key_entries	value_entries
+1	0	0
 
 -- query 7
--- types	map(array(unknown), map(unknown, unknown))
-_col0
-{"[]":{}}
+-- types	bigint	bigint	bigint
+merged_entries	key_entries	value_entries
+1	0	0
 
 -- query 8
--- types	map(row("1" integer), row(A array(map(integer, integer))))
-_col0
-{"[2]":[[{}]]}
+-- types	bigint	integer	bigint	bigint
+merged_entries	key_value	value_array_entries	nested_map_entries
+1	2	1	0
 
 -- query 9
 -- legacy
