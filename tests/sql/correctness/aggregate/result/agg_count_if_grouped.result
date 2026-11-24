@@ -1,5 +1,5 @@
 -- query 3
--- types	double	bigint
+-- types	integer	bigint
 g	c_gt_15
-0.0	2
-1.0	0
+0	2
+1	0

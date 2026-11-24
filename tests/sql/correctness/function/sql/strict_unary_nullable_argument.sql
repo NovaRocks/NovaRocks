@@ -19,7 +19,7 @@
 -- @order_sensitive=true
 
 -- query 1
-SELECT seq, -k AS negative_key, bitnot(i) AS inverted_integer
+SELECT seq, -k AS negative_key, bitwise_not(i) AS inverted_integer
 FROM (VALUES
 ROW(1,CAST('1.25' AS DECIMAL(18,9)),CAST(1 AS BIGINT)),
 ROW(2,CAST('-2.5' AS DECIMAL(18,9)),CAST(-2 AS BIGINT)),
@@ -39,4 +39,4 @@ ROW(99,CAST(NULL AS DECIMAL(18,9)))
 SELECT max_by(11,-CAST(NULL AS DECIMAL(18,9))) AS null_key_winner;
 
 -- query 4
-SELECT -(1.25) AS negative_literal, bitnot(1) AS inverted_literal;
+SELECT -(1.25) AS negative_literal, CAST(bitwise_not(1) AS INTEGER) AS inverted_literal;

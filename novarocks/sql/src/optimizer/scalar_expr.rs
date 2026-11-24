@@ -1020,9 +1020,18 @@ pub(crate) fn scalar_cast_can_fail(
     let source_carrier = source.data_type();
     let result_carrier = result.data_type();
     match cast_mode {
-        Some(TrinoCastMode::Explicit | TrinoCastMode::StoreAssignment) => {
-            !signed_widening_domains(source, result)
+        Some(TrinoCastMode::Explicit) => {
+            use novarocks_type_contract::ValueLogicalType;
+            let total_signed_decimal_cast = source.logical_type() == ValueLogicalType::Physical
+                && result.logical_type() == ValueLogicalType::Physical
+                && signed_integer_fits(0, source_carrier)
+                && novarocks_type_contract::trino_decimal_widening_is_total(
+                    source_carrier,
+                    result_carrier,
+                );
+            !(signed_widening_domains(source, result) || total_signed_decimal_cast)
         }
+        Some(TrinoCastMode::StoreAssignment) => !signed_widening_domains(source, result),
         Some(TrinoCastMode::Try) => false,
         Some(TrinoCastMode::Implicit) => {
             implicit_cast_has_intrinsic_row_error(source_carrier, result_carrier)
@@ -1047,7 +1056,12 @@ fn signed_integer_bounds(arena: &ScalarArena, mut expression: ScalarId) -> Optio
         if let ScalarNode::Cast {
             child,
             target,
-            cast_mode: None | Some(novarocks_type_contract::TrinoCastMode::Implicit),
+            cast_mode:
+                None
+                | Some(
+                    novarocks_type_contract::TrinoCastMode::Explicit
+                    | novarocks_type_contract::TrinoCastMode::Implicit,
+                ),
             ..
         } = arena.node(expression)
             && target == value_type.data_type()
@@ -1479,30 +1493,37 @@ mod intrinsic_error_consumer_tests {
     #[test]
     fn signed_add_proves_widened_operand_without_disabling_checked_integer_add() {
         use novarocks_type_contract::{
-            DecimalOverflowPolicy, FunctionArgumentType, OperatorFunction,
+            DecimalOverflowPolicy, FunctionArgumentType, OperatorFunction, TrinoCastMode,
         };
 
         let mut arena = ScalarArena::new();
-        let smallint = arena.intern(
+        let integer = arena.intern(
             ScalarNode::ColumnRef(ColumnId(1)),
-            FunctionValueType::new(DataType::Int16, true),
+            FunctionValueType::new(DataType::Int32, true),
         );
-        let integer_type = FunctionValueType::new(DataType::Int32, true);
-        let widened = arena.intern(
-            ScalarNode::Cast {
-                child: smallint,
-                target: DataType::Int32,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
-            },
-            integer_type.clone(),
-        );
-        let integer = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), integer_type);
+        let bigint_type = FunctionValueType::new(DataType::Int64, true);
+        let [implicit, explicit, assignment] = [
+            TrinoCastMode::Implicit,
+            TrinoCastMode::Explicit,
+            TrinoCastMode::StoreAssignment,
+        ]
+        .map(|cast_mode| {
+            arena.intern(
+                ScalarNode::Cast {
+                    child: integer,
+                    target: DataType::Int64,
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    cast_mode: Some(cast_mode),
+                },
+                bigint_type.clone(),
+            )
+        });
+        let bigint = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), bigint_type.clone());
         let one = arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
-            FunctionValueType::new(DataType::Int32, false),
+            FunctionValueType::new(DataType::Int64, false),
         );
-        let arguments = [widened, one].map(|id| FunctionArgument::Value {
+        let arguments = [implicit, one].map(|id| FunctionArgument::Value {
             value_type: arena.value_type(id).clone(),
             constant: None,
         });
@@ -1528,11 +1549,11 @@ mod intrinsic_error_consumer_tests {
         let FunctionResultType::Scalar(result) = &selected.selected.result_type else {
             panic!("scalar result")
         };
-        assert_eq!(result, &FunctionValueType::new(DataType::Int32, true));
+        assert_eq!(result, &bigint_type);
         assert_eq!(
             selected.selected.argument_types.as_slice(),
             &[
-                FunctionArgumentType::Value(arena.value_type(widened).clone()),
+                FunctionArgumentType::Value(arena.value_type(implicit).clone()),
                 FunctionArgumentType::Value(arena.value_type(one).clone()),
             ]
         );
@@ -1541,7 +1562,12 @@ mod intrinsic_error_consumer_tests {
         let binding =
             crate::binding::SqlFunctionBinding::new(selected, DecimalOverflowPolicy::OutputNull);
         assert!(scalar_call_can_fail(&binding));
-        for (left, expected) in [(widened, false), (integer, true)] {
+        for (left, expected) in [
+            (implicit, false),
+            (explicit, false),
+            (assignment, true),
+            (bigint, true),
+        ] {
             let expression = arena.intern(
                 ScalarNode::FunctionCall {
                     name: operator.catalog_name().into(),
@@ -1917,6 +1943,46 @@ mod intrinsic_cast_effect_tests {
                 FunctionValueType::new(target, false),
             );
             assert_eq!(can_fail(&arena, cast), expected);
+        }
+    }
+
+    #[test]
+    fn explicit_signed_decimal_cast_requires_full_declared_domain() {
+        use novarocks_type_contract::{FunctionValueType, TrinoCastMode};
+
+        for (source, target, expected) in [
+            (DataType::Int8, DataType::Decimal128(3, 0), false),
+            (DataType::Int16, DataType::Decimal128(5, 0), false),
+            (DataType::Int32, DataType::Decimal128(10, 0), false),
+            (DataType::Int64, DataType::Decimal128(19, 0), false),
+            (DataType::Int32, DataType::Decimal128(9, 0), true),
+            (DataType::Int32, DataType::Decimal128(12, 2), false),
+            (DataType::Int32, DataType::Decimal128(11, 2), true),
+            (
+                DataType::Decimal128(10, 2),
+                DataType::Decimal128(10, 0),
+                true,
+            ),
+            (DataType::Float64, DataType::Decimal128(38, 0), true),
+        ] {
+            let source = FunctionValueType::new(source, true);
+            let target = FunctionValueType::new(target, true);
+            assert_eq!(
+                scalar_cast_can_fail(
+                    &source,
+                    &target,
+                    DecimalOverflowPolicy::ReportError,
+                    Some(TrinoCastMode::Explicit),
+                ),
+                expected,
+                "{source:?} to {target:?}"
+            );
+            assert!(scalar_cast_can_fail(
+                &source,
+                &target,
+                DecimalOverflowPolicy::ReportError,
+                Some(TrinoCastMode::StoreAssignment),
+            ));
         }
     }
 

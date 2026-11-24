@@ -260,6 +260,143 @@ fn indexed_struct_list_assembly_keeps_typed_null_sentinel_and_raw_null_parent_fi
         vec![Some(true), None, Some(true), Some(false)]
     );
 }
+fn map_list_sources() -> Vec<ArrayRef> {
+    let item = Arc::new(Field::new("item", DataType::Int64, true));
+    let fields: arrow_schema::Fields = vec![
+        Arc::new(Field::new("key", DataType::Utf8, false)),
+        Arc::new(Field::new("value", DataType::List(item.clone()), true)),
+    ]
+    .into();
+    let entries_field = Arc::new(
+        Field::new("entries", DataType::Struct(fields.clone()), false)
+            .with_metadata([("test.map".to_owned(), "exact".to_owned())]),
+    );
+    let map = |keys: StringArray, values: ListArray, offsets: Vec<i32>, nulls| {
+        MapArray::new(
+            entries_field.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            StructArray::new(fields.clone(), vec![Arc::new(keys), Arc::new(values)], None),
+            nulls,
+            true,
+        )
+    };
+    let left = map(
+        StringArray::from(vec!["outside", "hidden-a", "hidden-b", "tail", "skipped"]),
+        ListArray::new(
+            item.clone(),
+            OffsetBuffer::new(vec![0i32, 1, 2, 4, 4, 5].into()),
+            Arc::new(Int64Array::from(vec![666, 11, 21, 22, 999])),
+            Some(NullBuffer::from(vec![true, false, true, true, true])),
+        ),
+        vec![0, 1, 3, 4, 5],
+        Some(NullBuffer::from(vec![true, false, true, true])),
+    );
+    let right = map(
+        StringArray::from(vec!["right"]),
+        ListArray::new(
+            item,
+            OffsetBuffer::new(vec![0i32, 1].into()),
+            Arc::new(Int64Array::from(vec![77])),
+            None,
+        ),
+        vec![0, 1],
+        None,
+    );
+    vec![Arc::new(left.slice(1, 3)), Arc::new(right)]
+}
+
+#[test]
+fn nested_indexed_map_interleaves_exact_entries_from_selected_physical_ranges() {
+    let sources = map_list_sources();
+    let ty = sources[0].data_type();
+    assert!(supports_guarded_result(ty));
+    let output = assemble_values(
+        AssemblyPlan::Indexed {
+            result_type: ty,
+            sources: &[Some(&sources[0]), Some(&sources[1])],
+            choices: &[Some((0, 1)), None, Some((1, 0)), Some((0, 0)), Some((0, 1))],
+        },
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(output.data_type(), ty);
+    let output = downcast::<MapArray>(output.as_ref()).unwrap();
+    assert_eq!(output.value_offsets(), &[0, 1, 1, 2, 4, 5]);
+    assert_eq!(
+        output.nulls(),
+        Some(&NullBuffer::from(vec![true, false, true, false, true]))
+    );
+    assert_eq!(output.entries().null_count(), 0);
+    let keys = downcast::<StringArray>(output.keys().as_ref()).unwrap();
+    assert_eq!(
+        keys.iter().collect::<Vec<_>>(),
+        vec![
+            Some("tail"),
+            Some("right"),
+            Some("hidden-a"),
+            Some("hidden-b"),
+            Some("tail")
+        ]
+    );
+    let values = downcast::<ListArray>(output.values().as_ref()).unwrap();
+    assert_eq!(values.value_offsets(), &[0, 0, 1, 2, 4, 4]);
+    assert!(values.is_null(2));
+    assert_eq!(
+        downcast::<Int64Array>(values.values().as_ref())
+            .unwrap()
+            .values()
+            .as_ref(),
+        &[77, 11, 21, 22]
+    );
+
+    let empty = assemble_values(
+        AssemblyPlan::Indexed {
+            result_type: ty,
+            sources: &[Some(&sources[0]), Some(&sources[1])],
+            choices: &[],
+        },
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(empty.data_type(), ty);
+    let empty = downcast::<MapArray>(empty.as_ref()).unwrap();
+    assert_eq!(empty.value_offsets(), &[0]);
+    assert!(empty.entries().is_empty());
+}
+
+#[test]
+fn nested_map_preflight_rejects_i32_child_offset_overflow() {
+    let count = i32::MAX / 2 + 1;
+    let keys = StructArray::new_empty_fields(count as usize, None);
+    let fields: arrow_schema::Fields = vec![
+        Arc::new(Field::new("key", keys.data_type().clone(), false)),
+        Arc::new(Field::new("value", DataType::Null, true)),
+    ]
+    .into();
+    let entries = StructArray::new(
+        fields.clone(),
+        vec![Arc::new(keys), Arc::new(NullArray::new(count as usize))],
+        None,
+    );
+    // Zero-buffer entries make the i32 boundary test independent of memory.
+    let source: ArrayRef = Arc::new(MapArray::new(
+        Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+        OffsetBuffer::new(vec![0i32, count].into()),
+        entries,
+        None,
+        false,
+    ));
+    assert!(matches!(
+        super::super::preflight_guarded_interleave(
+            source.data_type(),
+            std::slice::from_ref(&source),
+            &[(0, 0), (0, 0)],
+            |_| Ok(())
+        ),
+        Err(CopyError::Extent(_))
+    ));
+}
+
 #[test]
 fn nested_indexed_empty_output_keeps_complete_type_and_real_empty_child_offsets() {
     let sources = list_struct_sources();
@@ -331,6 +468,22 @@ fn nested_interleave_rejects_exact_type_source_choice_and_static_extent_failures
 }
 #[test]
 fn nested_guarded_carriers_do_not_admit_other_encoding_or_child_protocols() {
+    let map = |entries_nullable, key_nullable, value_type| {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Utf8, key_nullable)),
+                        Arc::new(Field::new("value", value_type, true)),
+                    ]
+                    .into(),
+                ),
+                entries_nullable,
+            )),
+            false,
+        )
+    };
     for ty in [
         DataType::FixedSizeBinary(0),
         DataType::FixedSizeBinary(-1),
@@ -348,20 +501,9 @@ fn nested_guarded_carriers_do_not_admit_other_encoding_or_child_protocols() {
             .into(),
         ),
         DataType::LargeList(Arc::new(Field::new("item", DataType::Int64, true))),
-        DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        Arc::new(Field::new("key", DataType::Utf8, false)),
-                        Arc::new(Field::new("value", DataType::Int64, true)),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        ),
+        map(true, false, DataType::Int64),
+        map(false, true, DataType::Int64),
+        map(false, false, DataType::Utf8View),
     ] {
         assert!(!crate::control_values::supports_indexed_result(&ty));
         assert!(matches!(
@@ -383,10 +525,14 @@ fn nested_guarded_carriers_do_not_admit_other_encoding_or_child_protocols() {
 }
 #[test]
 fn every_nested_interleave_callback_refusal_preserves_primary_cause_without_tail() {
-    let sources = list_struct_sources();
+    assert_callback_refusals(&list_struct_sources());
+    assert_callback_refusals(&map_list_sources());
+}
+
+fn assert_callback_refusals(sources: &[ArrayRef]) {
     let choices = [(0, 1), (1, 0), (0, 0), (0, 1)];
     let mut calls = 0;
-    super::super::preflight_guarded_interleave(sources[0].data_type(), &sources, &choices, |_| {
+    super::super::preflight_guarded_interleave(sources[0].data_type(), sources, &choices, |_| {
         calls += 1;
         Ok(())
     })
@@ -408,7 +554,7 @@ fn every_nested_interleave_callback_refusal_preserves_primary_cause_without_tail
             let mut seen = 0;
             let result = super::super::preflight_guarded_interleave(
                 sources[0].data_type(),
-                &sources,
+                sources,
                 &choices,
                 |_| {
                     seen += 1;
@@ -430,6 +576,7 @@ fn every_nested_interleave_callback_refusal_preserves_primary_cause_without_tail
         }
     }
 }
+
 #[test]
 fn legacy_nested_fill_nulls_keeps_its_original_arrow_zip_path() {
     let field = Arc::new(Field::new("item", DataType::Utf8, true));

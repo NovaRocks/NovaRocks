@@ -305,8 +305,8 @@ USE caller_${uuid0};
 
 -- query 85
 SELECT v, caller_user = CURRENT_USER AS same_user,
-       caller_catalog = 'trc_views_${uuid0}' AS same_catalog,
-       caller_schema = 'caller_${uuid0}' AS uses_caller_schema
+       caller_catalog = CURRENT_CATALOG AS same_catalog,
+       caller_schema = CURRENT_SCHEMA AS uses_caller_schema
 FROM trc_views_${uuid0}.saved_${uuid0}.caller_context_view;
 
 -- query 86

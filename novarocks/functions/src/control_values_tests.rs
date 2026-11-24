@@ -192,7 +192,15 @@ fn control_values_indexed_rejects_dedicated_carriers_without_fallback() {
                 DataType::Struct(
                     vec![
                         Arc::new(Field::new("key", DataType::Utf8, false)),
-                        Arc::new(Field::new("value", DataType::Int64, true)),
+                        Arc::new(Field::new(
+                            "value",
+                            DataType::LargeList(Arc::new(Field::new(
+                                "item",
+                                DataType::Int64,
+                                true,
+                            ))),
+                            true,
+                        )),
                     ]
                     .into(),
                 ),

@@ -17,10 +17,10 @@
 
 -- Migrated from dev/test/sql/test_function/T/test_filter_same_columns
 -- Test Objective:
--- 1. Validate that filtering with least(col), greatest(col), positive(col), CAST(col AS TIMESTAMP(6)) on
+-- 1. Validate that filtering with least(col), greatest(col), unary +, CAST(col AS TIMESTAMP(6)) on
 --    the same column works correctly when the column appears in both IS NOT NULL and comparison predicates.
 -- 2. Validate correct NULL handling when the column has interleaved NULL values.
--- 3. Cover least(), greatest(), positive(), and explicit TIMESTAMP casts as filter expressions.
+-- 3. Cover least(), greatest(), unary +, and explicit TIMESTAMP casts as filter expressions.
 
 -- query 1
 WITH input AS (SELECT if(id%2=0, id, null) AS col FROM TABLE(sequence(1, 10)) AS tmp(id) limit 10) SELECT col FROM input WHERE least(col) IS NOT NULL AND least(col) < 20;
@@ -29,7 +29,7 @@ WITH input AS (SELECT if(id%2=0, id, null) AS col FROM TABLE(sequence(1, 10)) AS
 WITH input AS (SELECT if(id%2=0, id, null) AS col FROM TABLE(sequence(1, 10)) AS tmp(id) limit 10) SELECT col FROM input WHERE greatest(col) IS NOT NULL AND greatest(col) < 20;
 
 -- query 3
-WITH input AS (SELECT if(id%2=0, id, null) AS col FROM TABLE(sequence(1, 10)) AS tmp(id) limit 10) SELECT col FROM input WHERE positive(col) IS NOT NULL AND positive(col) < 20;
+WITH input AS (SELECT if(id%2=0, id, null) AS col FROM TABLE(sequence(1, 10)) AS tmp(id) limit 10) SELECT col FROM input WHERE +col IS NOT NULL AND +col < 20;
 
 -- query 4
 WITH input AS (

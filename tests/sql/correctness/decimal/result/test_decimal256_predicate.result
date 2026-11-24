@@ -30,7 +30,7 @@ id	big_decimal	huge_decimal	max_decimal
 -- query 3
 -- types	integer	varchar	varchar	varchar
 id	big_decimal_type	huge_decimal_type	max_decimal_type
-1	decimal128(38, 15)	decimal128(38, 20)	decimal128(38, 0)
+1	decimal(38,15)	decimal(38,20)	decimal(38,0)
 
 -- query 4
 -- types	integer	decimal(38, 15)	decimal(38, 20)	decimal(38, 0)

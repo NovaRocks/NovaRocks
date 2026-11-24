@@ -123,15 +123,15 @@ select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 join ${case_db}.t1 tt
 
 -- inner join using(c_string)
 -- query 20
-select count(tt1.c_string) from ${case_db}.t1 tt1 join ${case_db}.t1 tt2 using(c_string);
+select count(c_string) from ${case_db}.t1 tt1 join ${case_db}.t1 tt2 using(c_string);
 
 -- inner join using(c_string) with filter % 2
 -- query 21
-select count(tt1.c_string) from ${case_db}.t1 tt1 join ${case_db}.t1 tt2 using(c_string) where tt1.k1 % 2 = 0;
+select count(c_string) from ${case_db}.t1 tt1 join ${case_db}.t1 tt2 using(c_string) where tt1.k1 % 2 = 0;
 
 -- inner join using(c_string) with filter % 100
 -- query 22
-select count(tt1.c_string) from ${case_db}.t1 tt1 join ${case_db}.t1 tt2 using(c_string) where tt1.k1 % 100 = 0;
+select count(c_string) from ${case_db}.t1 tt1 join ${case_db}.t1 tt2 using(c_string) where tt1.k1 % 100 = 0;
 
 -- inner join on all three keys
 -- query 23
@@ -266,15 +266,15 @@ select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 left outer join ${cas
 
 -- left outer join using(c_string)
 -- query 50
-select count(tt1.c_string) from ${case_db}.t1 tt1 left outer join ${case_db}.t1 tt2 using(c_string);
+select count(c_string) from ${case_db}.t1 tt1 left outer join ${case_db}.t1 tt2 using(c_string);
 
 -- left outer join using(c_string) with filter % 2
 -- query 51
-select count(tt1.c_string) from ${case_db}.t1 tt1 left outer join ${case_db}.t1 tt2 using(c_string) where tt1.k1 % 2 = 0;
+select count(c_string) from ${case_db}.t1 tt1 left outer join ${case_db}.t1 tt2 using(c_string) where tt1.k1 % 2 = 0;
 
 -- left outer join using(c_string) with filter % 100
 -- query 52
-select count(tt1.c_string) from ${case_db}.t1 tt1 left outer join ${case_db}.t1 tt2 using(c_string) where tt1.k1 % 100 = 0;
+select count(c_string) from ${case_db}.t1 tt1 left outer join ${case_db}.t1 tt2 using(c_string) where tt1.k1 % 100 = 0;
 
 -- left outer join on all three keys
 -- query 53

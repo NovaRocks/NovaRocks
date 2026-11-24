@@ -17,7 +17,7 @@
 
 -- Test Objective:
 -- 1. Validate checked decimal arithmetic under both SQL modes.
--- 2. Preserve the default NULL and strict overflow behavior of explicit narrowing CASTs.
+-- 2. Verify typed NULL from TRY_CAST and execution errors from checked narrowing CAST.
 -- 3. Validate decimal subtraction and complex aggregate expressions.
 -- Migrated from dev/test/sql/test_decimal/T/test_decimal_overflow
 
@@ -48,44 +48,45 @@ select 274.97790000000000000000 * (round(1103.00000000000000000000 * 1.0000,16) 
 WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ 274.97790000000000000000 * (round(1103.00000000000000000000 * 1.0000,16) /round(1103.00000000000000000000,16));
 
 -- query 4
-select cast(c_d32 * c_d32 as decimal32) from ${case_db}.t_decimal_overflow where c_id = 1;
+-- TRY_CAST handles the narrowing failure after the valid product.
+select try_cast(c_d32 * c_d32 AS DECIMAL(9,0)) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 5
-select cast(c_d32 * c_d32 as decimal32) from ${case_db}.t_decimal_overflow where c_id = 2;
+select try_cast(c_d32 * c_d32 AS DECIMAL(9,0)) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 6
-select cast(c_d64 * c_d64 as decimal64) from ${case_db}.t_decimal_overflow where c_id = 1;
+select try_cast(c_d64 * c_d64 AS DECIMAL(18,0)) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 7
-select cast(c_d64 * c_d64 as decimal64) from ${case_db}.t_decimal_overflow where c_id = 2;
+select try_cast(c_d64 * c_d64 AS DECIMAL(18,0)) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 8
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
-select cast(c_d128 * c_d128 as decimal128) from ${case_db}.t_decimal_overflow where c_id = 1;
+select cast(c_d128 * c_d128 AS DECIMAL(38,0)) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 9
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
-select cast(c_d128 * c_d128 as decimal128) from ${case_db}.t_decimal_overflow where c_id = 2;
+select cast(c_d128 * c_d128 AS DECIMAL(38,0)) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 10
-select cast(c_d32 * 1.000 as decimal32) from ${case_db}.t_decimal_overflow where c_id = 1;
+select cast(c_d32 * 1.000 AS DECIMAL(9,0)) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 11
-select cast(c_d32 * 1.000 as decimal32) from ${case_db}.t_decimal_overflow where c_id = 2;
+select cast(c_d32 * 1.000 AS DECIMAL(9,0)) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 12
-select cast(c_d64 * 1.000000 as decimal64) from ${case_db}.t_decimal_overflow where c_id = 1;
+select cast(c_d64 * 1.000000 AS DECIMAL(18,0)) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 13
-select cast(c_d64 * 1.000000 as decimal64) from ${case_db}.t_decimal_overflow where c_id = 2;
+select cast(c_d64 * 1.000000 AS DECIMAL(18,0)) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 14
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
-select cast(c_d128 * 1.000000000 as decimal128) from ${case_db}.t_decimal_overflow where c_id = 1;
+select cast(c_d128 * 1.000000000 AS DECIMAL(38,0)) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 15
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
-select cast(c_d128 * 1.000000000 as decimal128) from ${case_db}.t_decimal_overflow where c_id = 2;
+select cast(c_d128 * 1.000000000 AS DECIMAL(38,0)) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 16
 -- @skip_result_check=true
@@ -93,7 +94,7 @@ select cast(c_d128 * 1.000000000 as decimal128) from ${case_db}.t_decimal_overfl
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d32 * c_d32 as decimal32) from ${case_db}.t_decimal_overflow where c_id = 1;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d32 * c_d32 AS DECIMAL(9,0)) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 17
 -- @skip_result_check=true
@@ -101,7 +102,7 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_I
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d32 * c_d32 as decimal32) from ${case_db}.t_decimal_overflow where c_id = 2;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d32 * c_d32 AS DECIMAL(9,0)) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 18
 -- @skip_result_check=true
@@ -109,7 +110,7 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_I
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d64 * c_d64 as decimal64) from ${case_db}.t_decimal_overflow where c_id = 1;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d64 * c_d64 AS DECIMAL(18,0)) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 19
 -- @skip_result_check=true
@@ -117,7 +118,7 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_I
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d64 * c_d64 as decimal64) from ${case_db}.t_decimal_overflow where c_id = 2;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d64 * c_d64 AS DECIMAL(18,0)) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 20
 -- @skip_result_check=true
@@ -125,7 +126,7 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_I
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d128 * c_d128 as decimal128) from ${case_db}.t_decimal_overflow where c_id = 1;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d128 * c_d128 AS DECIMAL(38,0)) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 21
 -- @skip_result_check=true
@@ -133,19 +134,19 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_I
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d128 * c_d128 as decimal128) from ${case_db}.t_decimal_overflow where c_id = 2;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d128 * c_d128 AS DECIMAL(38,0)) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 22
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d32 * 1.000 as decimal32) from ${case_db}.t_decimal_overflow where c_id = 1;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d32 * 1.000 AS DECIMAL(9,0)) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 23
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d32 * 1.000 as decimal32) from ${case_db}.t_decimal_overflow where c_id = 2;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d32 * 1.000 AS DECIMAL(9,0)) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 24
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d64 * 1.000000 as decimal64) from ${case_db}.t_decimal_overflow where c_id = 1;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d64 * 1.000000 AS DECIMAL(18,0)) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 25
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d64 * 1.000000 as decimal64) from ${case_db}.t_decimal_overflow where c_id = 2;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d64 * 1.000000 AS DECIMAL(18,0)) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 26
 -- @skip_result_check=true
@@ -153,7 +154,7 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_I
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d128 * 1.000000000 as decimal128) from ${case_db}.t_decimal_overflow where c_id = 1;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d128 * 1.000000000 AS DECIMAL(38,0)) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 27
 -- @skip_result_check=true
@@ -161,7 +162,7 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_I
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d128 * 1.000000000 as decimal128) from ${case_db}.t_decimal_overflow where c_id = 2;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d128 * 1.000000000 AS DECIMAL(38,0)) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 28
 select c_id - 1.12345678901234567890 from ${case_db}.t_decimal_overflow where c_id = 1;
