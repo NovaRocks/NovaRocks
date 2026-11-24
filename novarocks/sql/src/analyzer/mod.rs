@@ -336,6 +336,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     statement_relation: Option<&crate::compiler::StatementSystemRelationSource>,
     prepared_parameters: Option<&crate::compiler::SqlPreparedParameters>,
     table_sequence: Option<&crate::compiler::table_sequence::TableSequencePass>,
+    first_refresh_view_row_lineage: bool,
 ) -> Result<
     (
         ResolvedQuery,
@@ -358,7 +359,11 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
         root_session_admitted,
         statement_relation,
         prepared_parameters,
-        QueryAnalysisPurpose::Ordinary,
+        if first_refresh_view_row_lineage {
+            QueryAnalysisPurpose::FirstRefreshViewRowLineage
+        } else {
+            QueryAnalysisPurpose::Ordinary
+        },
         table_sequence,
         view::ViewAnalysisStack::default(),
     )
@@ -741,6 +746,7 @@ impl GroupingSyntax {
 enum QueryAnalysisPurpose {
     Ordinary,
     MaterializedViewDefinition,
+    FirstRefreshViewRowLineage,
 }
 
 pub(super) struct AnalyzerContext<'a> {

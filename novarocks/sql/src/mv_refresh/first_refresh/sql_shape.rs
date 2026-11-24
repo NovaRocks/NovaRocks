@@ -90,6 +90,7 @@ impl SqlMvSnapshotPinOccurrence {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SqlMvSnapshotPin {
     occurrences: Vec<SqlMvSnapshotPinOccurrence>,
+    captured_sources: bool,
 }
 
 impl SqlMvSnapshotPin {
@@ -106,7 +107,21 @@ impl SqlMvSnapshotPin {
         {
             return Err("MV first-refresh snapshot pin repeats an occurrence".to_string());
         }
-        Ok(Self { occurrences })
+        Ok(Self {
+            occurrences,
+            captured_sources: false,
+        })
+    }
+
+    /// The original expanded relation bindings already address these pins.
+    /// In this mode a syntax-level table can be a view rather than a scan.
+    pub fn with_captured_sources(mut self) -> Self {
+        self.captured_sources = true;
+        self
+    }
+
+    pub(super) const fn uses_captured_sources(&self) -> bool {
+        self.captured_sources
     }
 
     #[cfg(test)]
@@ -415,6 +430,9 @@ fn inject_pin_as_version_as_of(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<usize, String> {
+    if pin.uses_captured_sources() {
+        return Ok(0);
+    }
     let mut state = InjectState {
         pin,
         current_catalog,

@@ -992,6 +992,16 @@ async fn prepare_frontend_first_refresh_write(
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         )?;
+    let sql_pin = if effective_binding.dependencies.iter().any(|dependency| {
+        matches!(
+            dependency,
+            novarocks_mv_application::persistence::codec::BindingDependency::View { .. }
+        )
+    }) {
+        sql_pin.with_captured_sources()
+    } else {
+        sql_pin
+    };
     // L owns the branch and relation shape; the count of UNION branches is the
     // number of branch interpretations, not a separately persisted number.
     let branch_count = effective_interpretation.branches.len();

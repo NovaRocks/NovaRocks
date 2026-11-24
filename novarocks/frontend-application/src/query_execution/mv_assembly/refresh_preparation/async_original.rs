@@ -342,6 +342,12 @@ pub(super) async fn capture_catalog_with_source_history(
     if let Some(views) = io.captured_sources().views() {
         input.bindings.retain_statement_views(views).await;
     }
+    if matches!(&input.query, MvCatalogCaptureQuery::FirstSql(source) if source.uses_captured_sources())
+    {
+        // Generated reads of expanded views may use only their original table
+        // overlays and the view versions retained during definition analysis.
+        input.bindings.seal_catalog_observations().await;
+    }
     let current_catalog = input.current_catalog.as_deref();
     let current_database = &input.current_database;
     let candidates = match &input.query {

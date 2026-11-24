@@ -1097,6 +1097,7 @@ impl novarocks_type_contract::PureCompileControl for SqlCompileControl {
 /// exist until this phase has completed.
 pub struct SqlAnalyzeRequest<'a> {
     pub(crate) write_assignments: Option<Arc<SqlWriteAssignments>>,
+    first_refresh_view_row_lineage: bool,
     pub(crate) statement: SqlStatementInput,
     pub(crate) intent: SqlCompileIntent,
     pub(crate) session: SqlSessionContext,
@@ -1114,6 +1115,11 @@ pub struct SqlAnalyzeRequest<'a> {
 }
 
 impl<'a> SqlAnalyzeRequest<'a> {
+    pub(crate) fn with_first_refresh_view_row_lineage(mut self, enabled: bool) -> Self {
+        self.first_refresh_view_row_lineage = enabled;
+        self
+    }
+
     pub fn with_write_assignments(
         mut self,
         assignments: Arc<SqlWriteAssignments>,
@@ -1150,6 +1156,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
     ) -> Self {
         Self {
             write_assignments: None,
+            first_refresh_view_row_lineage: false,
             statement,
             intent,
             session,
@@ -1188,6 +1195,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
     ) -> Self {
         Self {
             write_assignments: None,
+            first_refresh_view_row_lineage: false,
             statement: SqlStatementInput::logical_plan(plan, factory, root_semantics),
             intent,
             session,
@@ -1892,6 +1900,7 @@ impl SqlCompiler {
                         },
                         request.statement.prepared_parameters.as_deref(),
                         request.table_sequence,
+                        request.first_refresh_view_row_lineage,
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;

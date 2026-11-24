@@ -253,19 +253,31 @@ pub(crate) struct MvFirstRefreshPhysicalQuery {
 ///
 /// Applications can retain and hand this value back to SQL, but cannot read
 /// its syntax tree or obtain a logical/physical planner graph from it.
-pub struct SqlMvFirstRefreshArtifact(MvFirstRefreshPhysicalQuery);
+pub struct SqlMvFirstRefreshArtifact {
+    physical: MvFirstRefreshPhysicalQuery,
+    captured_sources: bool,
+    view_row_lineage: bool,
+}
 
 impl SqlMvFirstRefreshArtifact {
     fn from_physical(physical: MvFirstRefreshPhysicalQuery) -> Self {
-        Self(physical)
+        Self {
+            physical,
+            captured_sources: false,
+            view_row_lineage: false,
+        }
     }
 
     pub fn root_hash_column(&self) -> &str {
-        self.0.root_hash_column()
+        self.physical.root_hash_column()
+    }
+
+    pub fn uses_captured_sources(&self) -> bool {
+        self.captured_sources
     }
 
     fn query(&self) -> &ast::Query {
-        &self.0.query
+        &self.physical.query
     }
 
     /// Declare the catalog observations for the artifact's quoted relations
@@ -340,7 +352,7 @@ pub fn analyze_mv_first_refresh_connector_write(
     );
     let settings = context.optimizer_settings.clone();
     let request = crate::compiler::SqlAnalyzeRequest::new(
-        crate::compiler::SqlStatementInput::parsed_query(artifact.0.query),
+        crate::compiler::SqlStatementInput::parsed_query(artifact.physical.query),
         crate::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
         crate::compiler::SqlSessionContext {
             sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
@@ -355,7 +367,8 @@ pub fn analyze_mv_first_refresh_connector_write(
         None,
         context.constant_policy,
         context.control,
-    );
+    )
+    .with_first_refresh_view_row_lineage(artifact.view_row_lineage);
     let analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
     Ok(SqlMvFirstRefreshAnalyzed {
         analyzed,
@@ -2425,7 +2438,7 @@ impl SqlMvFirstRefreshArtifactBuilder {
     pub fn build(self) -> Result<SqlMvFirstRefreshArtifact, String> {
         let current_catalog = self.current_catalog.as_deref();
         let target_schema = self.target_contract.schema();
-        let physical = match &self.shape {
+        let mut physical = match &self.shape {
             SqlMvFirstRefreshArtifactShape::Projection => {
                 prepare_projection_first_refresh_write_sql(
                     &self.select_query,
@@ -2496,6 +2509,13 @@ impl SqlMvFirstRefreshArtifactBuilder {
             physical.root_hash_column(),
             self.target_contract.hidden_hash_key(),
         )?;
+        physical.captured_sources = self.pin.uses_captured_sources();
+        physical.view_row_lineage = physical.captured_sources
+            && matches!(
+                self.shape,
+                SqlMvFirstRefreshArtifactShape::Projection
+                    | SqlMvFirstRefreshArtifactShape::UnionProjection { .. }
+            );
         Ok(physical)
     }
 }
