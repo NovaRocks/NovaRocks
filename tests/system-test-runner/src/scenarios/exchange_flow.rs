@@ -1297,19 +1297,25 @@ fn await_fault_exit(
 fn await_pressure(
     context: &mut ScenarioContext,
     fault: &RootReplyFaultControl,
+    candidate: &ExchangeFaultCandidate,
+    require_same_stream_successor: bool,
 ) -> Result<Vec<FlowSnapshot>> {
     loop {
-        context.remaining("observe actual ordered positions and pending demand competition")?;
+        context.remaining("observe receiver saturation and pending Exchange demand")?;
         capture_healthy(fault)?;
         let observed = fault.exchange_observation();
         ensure!(
             original_still_held(&observed),
             "held Unit was dispatched before release"
         );
-        if applied_successor(&observed)
+        // A shuffle receiver can spend only its floor on the held stream
+        // while another receiver on that BE owns the shared floating slot.
+        // A same-stream successor then correctly waits until a slot returns.
+        if (!require_same_stream_successor || applied_successor(&observed))
             && let Some(snapshots) = flow_snapshots(context)?
             && snapshots.iter().any(|snapshot| {
-                snapshot.in_use > 0
+                snapshot.backend_index == candidate.backend_index
+                    && snapshot.in_use > 0
                     && snapshot.max_instance_in_use == snapshot.instance_max
                     && snapshot.floating_in_use == snapshot.floating
                     && snapshot.pending_demands > 0
@@ -1406,9 +1412,9 @@ fn current_park(text: &str, identity: &str, source: &str) -> Result<Option<Park>
                     *blocked == park.generation,
                     "actual wake disagrees with its original parked generation"
                 );
-            } else if park.generation > 0 && current == park.generation {
-                // A zero initial frontier or an already changed endpoint is
-                // not evidence for the requested stable nonzero parked epoch.
+            } else if current == park.generation {
+                // The first Unit can be held before the Source receives any
+                // input. Its initial generation is a real park until it wakes.
                 latest = Some(park);
             }
         }
@@ -1576,7 +1582,7 @@ impl ExchangeFlow {
                 settings(partitioned, 120),
             )?);
             let candidate = bind_candidate(context, fault, &jobs[target], &receiver)?;
-            let pressure = await_pressure(context, fault)?;
+            let pressure = await_pressure(context, fault, &candidate, !partitioned)?;
             let concurrent = jobs.len();
             jobs.push(QueryJob::start(
                 context,
@@ -1635,7 +1641,7 @@ impl ExchangeFlow {
             settings(true, 120),
         )?);
         let candidate = bind_candidate(context, fault, &jobs[0], &receiver)?;
-        let pressure = await_pressure(context, fault)?;
+        let pressure = await_pressure(context, fault, &candidate, false)?;
         jobs.push(QueryJob::start(
             context,
             self.intent.take(1)?,
@@ -1822,7 +1828,7 @@ impl ExchangeFlow {
             settings(true, 120),
         )?);
         let candidate = bind_candidate(context, fault, &jobs[0], &receiver)?;
-        let pressure = await_pressure(context, fault)?;
+        let pressure = await_pressure(context, fault, &candidate, false)?;
         let park = hold_parked(context, fault, &candidate)?;
         ensure!(
             HOLD.as_millis() > u128::from(TRANSPORT_MILLIS),
@@ -1894,7 +1900,7 @@ impl ExchangeFlow {
             settings(true, 120),
         )?);
         let candidate = bind_candidate(context, fault, &jobs[0], &receiver)?;
-        let pressure = await_pressure(context, fault)?;
+        let pressure = await_pressure(context, fault, &candidate, false)?;
         short_query(context)?;
         jobs.push(QueryJob::start(
             context,
@@ -2296,14 +2302,19 @@ mod tests {
             )
             .is_err()
         );
+        let initial_park = park.replace("generation=7", "generation=0");
+        assert_eq!(
+            current_park(&initial_park, identity, source)
+                .unwrap()
+                .unwrap()
+                .generation,
+            0
+        );
+        let initial_wake = wake.replace("blocked_generation=7", "blocked_generation=0");
         assert!(
-            current_park(
-                &park.replace("generation=7", "generation=0"),
-                identity,
-                source
-            )
-            .unwrap()
-            .is_none()
+            current_park(&format!("{initial_wake}{initial_park}"), identity, source)
+                .unwrap()
+                .is_none()
         );
         assert!(
             current_park(
