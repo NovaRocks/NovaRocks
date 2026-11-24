@@ -60,10 +60,7 @@ pub struct SqlMvViewDependency {
 }
 
 impl SqlMvViewDependency {
-    pub(crate) fn try_from_definition(
-        view: &SqlViewDefinition,
-        depth: u32,
-    ) -> Result<Self, &'static str> {
+    pub fn try_from_definition(view: &SqlViewDefinition, depth: u32) -> Result<Self, &'static str> {
         let mut writer = CanonicalFactWriter::new("novarocks.mv-view-dependency", 1);
         writer.text(&view.identity.catalog);
         match view.origin {

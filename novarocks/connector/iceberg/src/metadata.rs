@@ -354,6 +354,64 @@ impl IcebergMetadata {
 }
 
 impl ConnectorMetadata for IcebergMetadata {
+    fn project_current_keyed_documents(
+        &self,
+        table: &ConnectorTableMetadata,
+        planning: &novarocks_spi::connector::ConnectorControlPlanningPin,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<Option<novarocks_spi::connector::KeyedDocumentView>, ConnectorError> {
+        use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts;
+        use crate::document_storage::{keyed, observation};
+        use novarocks_spi::connector::{ConnectorSlotName, KeyedDocumentObservationRequest};
+
+        self.ensure_owner(&table.identity.instance_id)?;
+        self.validate_context(context)?;
+        let Some(marker) = table.source_read_facts() else {
+            return Ok(None);
+        };
+        let owner = ConnectorProviderBindingKey {
+            instance_id: self.descriptor.instance_id.clone(),
+            incarnation: self.incarnation,
+        };
+        marker.validate_owner(&owner)?;
+        let observed =
+            marker.value::<IcebergObservedSourceReadFacts>(self.descriptor.instance_id.as_str())?;
+        let identifier = observed.access.identifier();
+        if !matches!(observed.projection, TableMetadataProjection::Current)
+            || identifier.name() != table.identity.table.as_ref()
+            || identifier.namespace().to_url_string() != table.identity.namespace.as_ref()
+        {
+            return Err(corrupt(
+                "Iceberg keyed documents require the original Current table observation",
+            ));
+        }
+        let metadata = observed.access.metadata();
+        let management = ConnectorSlotName {
+            owner: "novarocks.storage".into(),
+            name: "management".into(),
+        };
+        if !metadata
+            .properties()
+            .contains_key(&keyed::keys::slot_key(&management))
+        {
+            return Ok(None);
+        }
+        let version = observation::committed_version_from_metadata(
+            metadata,
+            observed.access.metadata_location(),
+        )?;
+        let request = KeyedDocumentObservationRequest {
+            owner,
+            catalog_handle: planning.binding().catalog_handle()?.clone(),
+            target: table.identity.clone(),
+            object_id: ConnectorTableObjectId::try_new(Bytes::from(metadata.uuid().to_string()))?,
+            context: context.clone(),
+        };
+        keyed::view::project_view(metadata, &request, version)
+            .map(Some)
+            .map_err(observation::keyed_read_error)
+    }
+
     fn table_definition_properties(
         &self,
         table: &ConnectorTableMetadata,

@@ -331,6 +331,17 @@ pub(crate) async fn capture_catalog(
     input: MvCatalogCaptureInput,
     io: &MvRefreshPreparationIo,
 ) -> Result<MvCatalogCaptureOutput, MvApplicationError> {
+    capture_catalog_with_source_history(input, io, false).await
+}
+
+pub(super) async fn capture_catalog_with_source_history(
+    input: MvCatalogCaptureInput,
+    io: &MvRefreshPreparationIo,
+    complete_sources: bool,
+) -> Result<MvCatalogCaptureOutput, MvApplicationError> {
+    if let Some(views) = io.captured_sources().views() {
+        input.bindings.retain_statement_views(views).await;
+    }
     let current_catalog = input.current_catalog.as_deref();
     let current_database = &input.current_database;
     let candidates = match &input.query {
@@ -392,9 +403,11 @@ pub(crate) async fn capture_catalog(
                         input.ports.connector_control(),
                         input.context.clone(),
                         io,
-                        preparation.needs().iter().any(|candidate| {
-                            candidate.version().is_some() && candidate.relation() == need.relation()
-                        }),
+                        complete_sources
+                            || preparation.needs().iter().any(|candidate| {
+                                candidate.version().is_some()
+                                    && candidate.relation() == need.relation()
+                            }),
                     )
                     .await?
             } else {

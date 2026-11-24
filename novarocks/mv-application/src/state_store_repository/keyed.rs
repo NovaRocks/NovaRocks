@@ -5,6 +5,12 @@
 
 //! Keyed projections on the single Accelerator owner and canonical indexes.
 use super::codec::{ProjectionRow, decode_projection_row};
+
+#[derive(Clone)]
+pub(crate) struct LoadedRetiredMvProjection {
+    pub(crate) entry: MvProjectionInventoryEntry,
+    pub(crate) dependencies: Vec<StoredMvDependency>,
+}
 use super::*;
 use crate::persistence::keyed_documents::{MvKeyedDocumentProjection, StoredKeyedMvProjection};
 use crate::repository::MvProjectionVersion;
@@ -81,6 +87,22 @@ impl StateStoreMvRepository {
     ) -> Result<bool, MvRepositoryError> {
         self.write_repository()
             .delete_keyed_projection(operation_id, expected)
+            .await
+    }
+
+    pub(crate) async fn find_retired_projection(
+        &self,
+        target: &MvTarget,
+    ) -> Result<Option<LoadedRetiredMvProjection>, MvRepositoryError> {
+        self.read_repository().find_retired_projection(target).await
+    }
+
+    pub(crate) async fn delete_retired_projection(
+        &self,
+        expected: LoadedRetiredMvProjection,
+    ) -> Result<bool, MvRepositoryError> {
+        self.write_repository()
+            .delete_retired_projection(expected)
             .await
     }
 }

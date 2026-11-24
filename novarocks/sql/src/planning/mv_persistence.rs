@@ -227,6 +227,7 @@ pub struct SqlMvPersistenceOutputFacts {
     name: String,
     value_type: FunctionValueType,
     source_fields: Vec<SqlMvPersistenceSourceFieldReference>,
+    direct_source: Option<SqlMvPersistenceSourceFieldReference>,
     canonical_bytes: Vec<u8>,
 }
 
@@ -253,6 +254,10 @@ impl SqlMvPersistenceOutputFacts {
 
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
+    }
+
+    pub fn direct_source(&self) -> Option<&SqlMvPersistenceSourceFieldReference> {
+        self.direct_source.as_ref()
     }
 
     pub fn source_fields(&self) -> &[SqlMvPersistenceSourceFieldReference] {
@@ -425,11 +430,25 @@ pub(super) fn project_create_persistence_facts(
                 .extend(lineage.fields.iter().cloned());
             let mut writer = CanonicalFactWriter::new("novarocks.sql.mv-output-type", 1);
             writer.value_type(field.value_type.value_type());
+            let source_fields = root_source_fields(&lineage.fields);
+            let direct_source = match source_fields.as_slice() {
+                [field]
+                    if lineage.passthrough
+                        && lineage
+                            .fields
+                            .iter()
+                            .all(|used| used.path.fields.len() == 1) =>
+                {
+                    Some(field.clone())
+                }
+                _ => None,
+            };
             Ok(SqlMvPersistenceOutputFacts {
                 output_ordinal: u32_from_usize("MV output ordinal", output_index)?,
                 name: name.clone(),
                 value_type: field.value_type.clone(),
-                source_fields: root_source_fields(&lineage.fields),
+                source_fields,
+                direct_source,
                 canonical_bytes: writer.finish(),
             })
         })

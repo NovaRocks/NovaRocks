@@ -406,6 +406,34 @@ pub(crate) async fn install_metadata_only_current_projection_async_in(
     .await
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CommittedMvMarker {
+    pub(crate) operation: uuid::Uuid,
+    pub(crate) key: novarocks_spi::connector::ConnectorMarkerKey,
+    pub(crate) value: novarocks_spi::connector::ConnectorMarkerValue,
+}
+
+pub(crate) async fn install_marked_current_projection_async_in(
+    services: CurrentProjectionServices<'_, '_>,
+    catalog: CatalogHandle,
+    expected: Arc<
+        novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
+    >,
+    marker: CommittedMvMarker,
+    context: ConnectorRequestContext,
+) -> Result<(), novarocks_mv_application::readiness::MvProjectionError> {
+    install_current_projection_async_in(
+        services,
+        catalog,
+        expected.target(),
+        marker.operation,
+        None,
+        MvConvergence::CommittedMarker { expected, marker },
+        context.after_external_effect(),
+    )
+    .await
+}
+
 pub(crate) async fn readmit_declared_target_async_in(
     services: CurrentProjectionServices<'_, '_>,
     catalog: CatalogHandle,
@@ -460,6 +488,11 @@ enum MvConvergence {
     /// An effect this process committed must be re-observed before management
     /// reopens.
     CommittedEffect,
+    CommittedMarker {
+        expected:
+            Arc<novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection>,
+        marker: CommittedMvMarker,
+    },
     /// A previous writer's unresolved effects were declared unable to land,
     /// and the target is being readmitted under this process. The permits are
     /// what the declaration bought: the observation cannot begin until every
@@ -468,6 +501,21 @@ enum MvConvergence {
         previous_incarnation: ProcessIncarnation,
         permits: Vec<novarocks_mv_application::management::ReadmissionPermit>,
     },
+}
+
+impl MvConvergence {
+    fn verify_marker(
+        &self,
+        observed: &novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+    ) -> Result<(), String> {
+        if let Self::CommittedMarker { expected, marker } = self
+            && (!metadata_only_current_matches(expected, observed)
+                || observed.view.markers.get(&marker.key) != Some(&marker.value))
+        {
+            return Err("MV marker settlement observed a different binding or marker".into());
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn keyed_request(
@@ -1206,12 +1254,14 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 }
                 return Ok((observed, admission));
             }
-            MvConvergence::CommittedEffect => self.entrance.begin_committed_convergence(
-                &table,
-                novarocks_mv_application::management::ManagementContinuation::SameOwner {
-                    previous_incarnation: self.entrance.incarnation().clone(),
-                },
-            ),
+            MvConvergence::CommittedEffect | MvConvergence::CommittedMarker { .. } => {
+                self.entrance.begin_committed_convergence(
+                    &table,
+                    novarocks_mv_application::management::ManagementContinuation::SameOwner {
+                        previous_incarnation: self.entrance.incarnation().clone(),
+                    },
+                )
+            }
             MvConvergence::Readmission {
                 previous_incarnation,
                 ..
@@ -1250,7 +1300,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             .await
             .map_err(current_projection_connector)?;
         if matches!(&self.convergence, MvConvergence::Readmission { .. }) {
-            for occurrence in &observed.definition.relation_occurrences {
+            for occurrence in &observed.versions.binding_document.occurrences {
                 let source_instance = novarocks_spi::connector::ConnectorInstanceId::parse(
                     &occurrence.catalog_at_binding,
                 )
@@ -1324,6 +1374,9 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 .map_err(MvProjectionError::from)?;
         }
         validate_current_publication_carrier(self.published, &observed).map_err(conflict)?;
+        self.convergence
+            .verify_marker(&observed)
+            .map_err(conflict)?;
         let admission = self
             .entrance
             .install_observed_target(
@@ -1414,12 +1467,14 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 }
                 return Ok((observed, admission));
             }
-            MvConvergence::CommittedEffect => self.entrance.begin_committed_convergence(
-                &table,
-                novarocks_mv_application::management::ManagementContinuation::SameOwner {
-                    previous_incarnation: self.entrance.incarnation().clone(),
-                },
-            ),
+            MvConvergence::CommittedEffect | MvConvergence::CommittedMarker { .. } => {
+                self.entrance.begin_committed_convergence(
+                    &table,
+                    novarocks_mv_application::management::ManagementContinuation::SameOwner {
+                        previous_incarnation: self.entrance.incarnation().clone(),
+                    },
+                )
+            }
             MvConvergence::Readmission {
                 previous_incarnation,
                 ..
@@ -1455,7 +1510,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             .resolve_pending_slot_changes(&documents, observation.clone())
             .map_err(|e| conflict(e.to_string()))?;
         if matches!(&self.convergence, MvConvergence::Readmission { .. }) {
-            for occurrence in &observed.definition.relation_occurrences {
+            for occurrence in &observed.versions.binding_document.occurrences {
                 let source_instance = novarocks_spi::connector::ConnectorInstanceId::parse(
                     &occurrence.catalog_at_binding,
                 )
@@ -1519,6 +1574,9 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 .map_err(|e| conflict(e.to_string()))?;
         }
         validate_current_publication_carrier(self.published, &observed).map_err(conflict)?;
+        self.convergence
+            .verify_marker(&observed)
+            .map_err(conflict)?;
         let admission = self
             .entrance
             .install_observed_target(
@@ -1555,7 +1613,8 @@ pub(crate) struct AdmittedMvPublication {
     versions: novarocks_mv_application::persistence::keyed_documents::MvKeyedVersions,
     entrance: ManagementEntrance,
     repartitioned: bool,
-    rebound_aggregate_contracts: bool,
+    replacement: Option<novarocks_mv_application::persistence::keyed_documents::MvKeyedVersions>,
+    markers_remove: std::collections::BTreeSet<novarocks_spi::connector::ConnectorMarkerKey>,
     configuration_slot_update: Option<ConnectorDocumentPublicationSlotUpdate>,
 }
 
@@ -1658,6 +1717,7 @@ impl AdmittedMvPublication {
         if documents.versions.definition_revision() != self.source_revision.definition_revision
             || documents.versions.interpretation_revision()
                 != self.source_revision.interpretation_revision
+            || documents.versions.binding.identity() != self.versions.binding.identity()
             || documents.publication_revision != self.source_revision.publication_revision
         {
             return Err(
@@ -1696,8 +1756,14 @@ impl AdmittedMvPublication {
             .map_err(|error| format!("dispatch the MV publication effect: {error:?}"))
     }
 
-    pub(crate) const fn definition(&self) -> &DefinitionDocument {
-        &self.definition
+    fn publication_binding(
+        &self,
+    ) -> &novarocks_mv_application::persistence::codec::BindingDocument {
+        &self
+            .replacement
+            .as_ref()
+            .unwrap_or(&self.versions)
+            .binding_document
     }
 
     /// A managed repartition's provider preview supplies the exact opaque
@@ -1725,18 +1791,23 @@ impl AdmittedMvPublication {
         Ok(())
     }
 
-    pub(crate) fn rebind_aggregate_contracts(
+    pub(crate) fn replace_refresh_layout(
         &mut self,
-        current: &novarocks_sql::planning::mv::SqlMvCreatePersistenceFacts,
+        replacement: novarocks_mv_application::persistence::keyed_documents::MvKeyedVersions,
+        interpretation: InterpretationDocument,
+        markers_remove: std::collections::BTreeSet<novarocks_spi::connector::ConnectorMarkerKey>,
     ) -> Result<(), String> {
-        if self.rebound_aggregate_contracts {
-            return Err("MV aggregate contracts were already rebound".into());
+        if self.replacement.is_some()
+            || replacement.definition_revision() != self.source_revision.definition_revision
+            || interpretation.target.object_id != self.interpretation.target.object_id
+        {
+            return Err(
+                "MV rebuild layout does not belong to the admitted target and definition".into(),
+            );
         }
-        self.interpretation =
-            novarocks_mv_application::persistence::aggregate_bindings::rebind_aggregate_semantic_contracts(
-                &self.definition, &self.interpretation, current,
-            )?;
-        self.rebound_aggregate_contracts = true;
+        self.replacement = Some(replacement);
+        self.interpretation = interpretation;
+        self.markers_remove = markers_remove;
         Ok(())
     }
 
@@ -1752,18 +1823,20 @@ impl AdmittedMvPublication {
         inputs: &MvPublicationInputs,
         logical_result_rows: Option<u64>,
     ) -> Result<novarocks_spi::connector::KeyedPublication, String> {
-        let changes_interpretation = self.repartitioned || self.rebound_aggregate_contracts;
-        let versions = if changes_interpretation {
+        let base_versions = self.replacement.as_ref().unwrap_or(&self.versions);
+        let versions = if self.repartitioned {
             novarocks_mv_application::persistence::keyed_documents::build_keyed_versions(
                 &self.definition,
                 &self.interpretation,
-                self.versions.binding_document.clone(),
+                base_versions.binding_document.clone(),
+                base_versions.mapping_document.clone(),
             )
             .map_err(|e| e.to_string())?
         } else {
-            self.versions.clone()
+            base_versions.clone()
         };
-        if !changes_interpretation
+        if self.replacement.is_none()
+            && !self.repartitioned
             && (versions.definition_revision() != self.source_revision.definition_revision
                 || versions.interpretation_revision()
                     != self.source_revision.interpretation_revision)
@@ -1783,12 +1856,16 @@ impl AdmittedMvPublication {
                 inputs: inputs.inputs().to_vec(),
                 logical_result_rows,
             };
-        novarocks_mv_application::persistence::keyed_documents::keyed_publication_document_set(
-            &versions,
-            &self.definition,
-            &publication,
-        )
-        .map_err(|e| format!("encode MV publication record: {e}"))
+        let mut documents =
+            novarocks_mv_application::persistence::keyed_documents::keyed_publication_document_set(
+                &versions,
+                &publication,
+            )
+            .map_err(|e| format!("encode MV publication record: {e}"))?;
+        documents
+            .markers_remove
+            .extend(self.markers_remove.iter().cloned());
+        Ok(documents)
     }
 
     /// Close either the local admission or the dispatched publication with
@@ -1823,7 +1900,8 @@ impl AdmittedMvDataPublication {
         publication: AdmittedMvPublication,
         revision_by_occurrence: &BTreeMap<u32, ConnectorExactSemanticRevision>,
     ) -> Result<Self, String> {
-        let inputs = MvPublicationInputs::freeze(publication.definition(), revision_by_occurrence)?;
+        let inputs =
+            MvPublicationInputs::freeze(publication.publication_binding(), revision_by_occurrence)?;
         Ok(Self {
             publication,
             inputs,
@@ -1943,7 +2021,8 @@ impl MvPublicationAdmissionParts {
             versions: self.versions,
             entrance: self.entrance,
             repartitioned: false,
-            rebound_aggregate_contracts: false,
+            replacement: None,
+            markers_remove: Default::default(),
             configuration_slot_update: self.configuration_slot_update,
         }
     }

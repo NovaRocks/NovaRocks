@@ -245,7 +245,8 @@ impl SqlFinalPlanCompileRequest {
 
         let step = if mv_enabled && !referenced_relations.is_empty() {
             let need = MaterializedViewNeed::try_new(CompileNeedId::new(0), referenced_relations)
-                .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
+                .map_err(|error| SqlCompileError::Compilation(error.to_string()))?
+                .with_relation_needs(initial_catalog.needs());
             CompilerStep::need(
                 SqlNeedBatch::MaterializedViews(vec![need].into_boxed_slice()),
                 CompilerContinuation::materialized_view(SqlMaterializedViewCompletionState {

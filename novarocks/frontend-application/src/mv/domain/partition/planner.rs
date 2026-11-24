@@ -23,6 +23,8 @@ pub(crate) struct AffectedPartitionPlanInput<'a> {
     pub source_occurrence_id: u32,
     pub target_partition: &'a novarocks_mv_application::persistence::schema::MvPartitionContract,
     pub prepared_source: Option<PreparedPartitionSource<'a>>,
+    pub direct_output_sources:
+        Option<&'a crate::mv::domain::persistence::source_bindings::MvDirectOutputSources>,
 }
 
 /// A prepared impact cannot be separated from its exact generation/schema inputs.
@@ -47,6 +49,7 @@ pub(crate) fn plan_affected_partitions(
         prepared.planning,
         prepared.receipt,
         input.target_partition,
+        input.direct_output_sources,
     )
 }
 
@@ -76,6 +79,7 @@ mod tests {
             source_occurrence_id: 7,
             target_partition: &target,
             prepared_source: None,
+            direct_output_sources: None,
         })
         .unwrap();
         assert_eq!(

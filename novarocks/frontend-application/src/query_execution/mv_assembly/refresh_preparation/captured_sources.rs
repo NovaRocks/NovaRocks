@@ -135,10 +135,99 @@ impl CapturedRefreshSource {
 /// No CPU source, pending future, resource grant or cross-attempt cache is stored here.
 #[derive(Default)]
 pub(crate) struct CapturedRefreshSources {
+    views: std::sync::OnceLock<crate::catalog_application::query_bindings::FrozenStatementViews>,
+    analyzed_fields: std::sync::OnceLock<
+        std::collections::BTreeMap<
+            u32,
+            Vec<novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts>,
+        >,
+    >,
     sources: Mutex<Vec<Arc<CapturedRefreshSource>>>,
     aliases: Mutex<Vec<(TableIdentity, Arc<CapturedRefreshSource>)>>,
+    direct_output_sources:
+        std::sync::OnceLock<crate::mv::domain::persistence::source_bindings::MvDirectOutputSources>,
 }
 impl CapturedRefreshSources {
+    pub(crate) fn set_analyzed_fields(
+        &self,
+        binding: &crate::mv::domain::persistence::source_bindings::MvObservedBinding,
+    ) -> Result<(), PreparationError> {
+        let fields = binding
+            .document
+            .occurrences
+            .iter()
+            .map(|occurrence| {
+                let table = format!(
+                    "{}.{}.{}",
+                    occurrence.catalog_at_binding,
+                    occurrence.namespace_at_binding,
+                    occurrence.relation_at_binding
+                );
+                let schema = binding
+                    .schemas
+                    .get(&table)
+                    .ok_or("MV analyzer lost its source schema")?;
+                let root_ids = occurrence
+                    .paths
+                    .iter()
+                    .filter_map(|path| path.nodes.first())
+                    .map(|node| &node.field_id)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let fields = schema
+                    .fields()
+                    .iter()
+                    .filter(|field| root_ids.contains(&field.field_id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if fields.len() != root_ids.len() {
+                    return Err("MV analyzed paths and original source schema differ");
+                }
+                Ok((occurrence.occurrence_id, fields))
+            })
+            .collect::<Result<_, &'static str>>()?;
+        self.analyzed_fields
+            .set(fields)
+            .map_err(|_| "MV analyzed source fields were already frozen".into())
+    }
+
+    pub(crate) fn analyzed_fields(
+        &self,
+    ) -> Option<
+        &std::collections::BTreeMap<
+            u32,
+            Vec<novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts>,
+        >,
+    > {
+        self.analyzed_fields.get()
+    }
+
+    pub(crate) fn capture_views(
+        &self,
+        views: crate::catalog_application::query_bindings::FrozenStatementViews,
+    ) -> Result<(), PreparationError> {
+        self.views
+            .set(views)
+            .map_err(|_| "MV refresh views were already frozen".into())
+    }
+
+    pub(crate) fn views(
+        &self,
+    ) -> Option<&crate::catalog_application::query_bindings::FrozenStatementViews> {
+        self.views.get()
+    }
+    pub(crate) fn set_direct_output_sources(
+        &self,
+        sources: crate::mv::domain::persistence::source_bindings::MvDirectOutputSources,
+    ) -> Result<(), PreparationError> {
+        self.direct_output_sources
+            .set(sources)
+            .map_err(|_| "MV refresh lineage was already frozen".into())
+    }
+    pub(crate) fn direct_output_sources(
+        &self,
+    ) -> Option<&crate::mv::domain::persistence::source_bindings::MvDirectOutputSources> {
+        self.direct_output_sources.get()
+    }
     pub(crate) fn by_table(&self, table: &TableIdentity) -> Option<Arc<CapturedRefreshSource>> {
         self.aliases
             .lock()
@@ -146,20 +235,6 @@ impl CapturedRefreshSources {
             .iter()
             .find(|(name, _)| name == table)
             .map(|(_, value)| value.clone())
-    }
-    pub(crate) fn by_definition_object(
-        &self,
-        object: &novarocks_mv_application::persistence::identity::ObjectIdentity,
-        catalog: &str,
-    ) -> Result<Option<Arc<CapturedRefreshSource>>, PreparationError> {
-        let sources = self.sources.lock().unwrap_or_else(|e| e.into_inner());
-        for value in sources.iter().filter(|v| v.table.catalog == catalog) {
-            let (observed, _) = novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision(&value.revision)?;
-            if &observed == object {
-                return Ok(Some(value.clone()));
-            }
-        }
-        Ok(None)
     }
     pub(crate) fn bind_alias(
         &self,

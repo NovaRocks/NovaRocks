@@ -312,8 +312,35 @@ pub struct MvKeyedObservedCurrentDocuments {
     pub publication_snapshot: Option<i64>,
 }
 impl MvKeyedObservedCurrentDocuments {
+    pub fn decoded_markers(&self) -> Result<Vec<(ConnectorMarkerKey, Marker)>, MvDocumentError> {
+        self.view
+            .markers
+            .iter()
+            .filter(|(key, _)| key.owner == MV_DOCUMENT_OWNER)
+            .map(|(key, value)| Ok((key.clone(), Marker::decode(key, value)?)))
+            .collect()
+    }
+
+    pub fn root_binding_revision(&self) -> DocumentRevision {
+        revision(self.versions.binding.identity())
+    }
+
     pub fn is_never_published(&self) -> bool {
         never_published(&self.view)
+    }
+
+    pub fn publication_evidence<'a>(
+        &'a self,
+        root: &'a DocumentRevision,
+    ) -> super::codec::PublicationEvidence<'a> {
+        use super::codec::PublicationEvidence;
+        match self.publication.as_ref() {
+            Some(publication) => PublicationEvidence::Current(&publication.publication_id),
+            None if self.is_never_published() && *root == self.root_binding_revision() => {
+                PublicationEvidence::Unpublished(root)
+            }
+            None => PublicationEvidence::Unknown,
+        }
     }
     pub fn management_dependencies(
         &self,
@@ -328,12 +355,12 @@ impl MvKeyedObservedCurrentDocuments {
     }
 }
 pub fn never_published(view: &KeyedDocumentView) -> bool {
-    view.current_snapshot.is_none()
-        || (!view
+    view.before_first_data_publication
+        && !view
             .current_records
             .iter()
-            .any(|r| r.owner == MV_DOCUMENT_OWNER && r.name == "publication")
-            && view.current_snapshot_file_totals.is_empty())
+            .any(|r| r.owner == MV_DOCUMENT_OWNER)
+        && (view.current_snapshot.is_none() || view.current_snapshot_file_totals.is_empty())
 }
 fn decode_keyed_binding_documents(
     view: &KeyedDocumentView,
@@ -389,6 +416,28 @@ pub(crate) struct MvKeyedDropDocuments {
     pub definition_revision: DocumentRevision,
     pub interpretation_revision: DocumentRevision,
     pub configuration_revision: DocumentRevision,
+    pub(crate) retired: bool,
+    pub(crate) management_slot_digest: DocumentIdentity,
+    pub(crate) configuration_slot_digest: DocumentIdentity,
+    pub(crate) configuration: ConfigurationDocument,
+    pub(crate) metadata_version: ConnectorCommittedVersion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetiredMvStatus {
+    pub target: ManagedMvTarget,
+    pub configuration: ConfigurationDocument,
+}
+
+pub fn project_retired_mv_status(
+    view: &KeyedDocumentView,
+    catalog: CatalogHandle,
+) -> Result<Option<RetiredMvStatus>, MvDocumentError> {
+    let documents = decode_keyed_drop_documents(view, catalog)?;
+    Ok(documents.retired.then_some(RetiredMvStatus {
+        target: documents.target,
+        configuration: documents.configuration,
+    }))
 }
 
 pub(crate) fn decode_keyed_drop_documents(
@@ -403,19 +452,21 @@ pub(crate) fn decode_keyed_drop_documents(
     }
     let target = ManagedMvTarget::try_new(catalog, view.table.clone(), view.object_id.clone())
         .map_err(|error| MvDocumentError::Contract(error.to_string()))?;
+    let management_name = management_slot_name()?;
     let management = view
         .slots
-        .get(&management_slot_name()?)
+        .get(&management_name)
         .ok_or_else(|| MvDocumentError::Contract("missing MV management slot".into()))?;
     let (owner, incarnation) = decode_management_slot(&management.value)?;
+    let configuration_name = configuration_slot_name()?;
     let configuration = view
         .slots
-        .get(&configuration_slot_name()?)
+        .get(&configuration_name)
         .ok_or_else(|| MvDocumentError::Contract("missing MV configuration slot".into()))?;
     if configuration.value.format != format("configuration", 1)? {
         return contract("unsupported MV configuration slot format");
     }
-    decode_configuration(&configuration.value.content)?;
+    let configuration_document = decode_configuration(&configuration.value.content)?;
     let root = view
         .roots
         .get(MV_DOCUMENT_OWNER)
@@ -432,7 +483,38 @@ pub(crate) fn decode_keyed_drop_documents(
         configuration_revision: DocumentRevision::from_canonical_bytes(
             &configuration.value.content,
         ),
+        retired: envelope.generation == super::binding_envelope::BindingGeneration::Retired,
+        management_slot_digest: management.value.digest(&management_name, management.writer),
+        configuration_slot_digest: configuration
+            .value
+            .digest(&configuration_name, configuration.writer),
+        configuration: configuration_document,
+        metadata_version: view.metadata_version.clone(),
     })
+}
+
+/// Ordinary direct reads only need the known format gate over the original
+/// Current envelopes. They do not decode the definition or publication data.
+pub fn require_readable_keyed_format(view: &KeyedDocumentView) -> Result<(), MvDocumentError> {
+    let mut publications = view
+        .current_records
+        .iter()
+        .filter(|record| record.owner == MV_DOCUMENT_OWNER && record.name == "publication");
+    let binding = match publications.next() {
+        Some(record) => {
+            if publications.next().is_some() {
+                return contract("duplicate MV publication record");
+            }
+            record.binding
+        }
+        None => view
+            .roots
+            .get(MV_DOCUMENT_OWNER)
+            .filter(|root| !root.dangling)
+            .map(|root| root.identity),
+    }
+    .ok_or_else(|| MvDocumentError::Contract("MV has no exact Current binding envelope".into()))?;
+    inspect_binding(view, binding)?.require_current()
 }
 
 pub fn decode_current_keyed_documents(
@@ -851,6 +933,7 @@ pub fn keyed_view_fixture(
         )
         .unwrap(),
         current_snapshot: snapshot,
+        before_first_data_publication: !published,
         current_snapshot_file_totals: SnapshotFileTotals {
             data_files: Some(u64::from(published)),
             delete_files: Some(0),
@@ -892,6 +975,15 @@ pub(crate) mod tests {
         assert!(!never_published(&view));
         assert!(decode_current_keyed_documents(view.clone(), catalog.clone()).is_err());
         view.current_snapshot_file_totals.data_files = Some(1);
+        assert!(decode_current_keyed_documents(view, catalog).is_err());
+    }
+
+    #[test]
+    fn an_empty_external_snapshot_does_not_prove_first_publication() {
+        let (catalog, mut view) = fixture(Some(17), false);
+        view.before_first_data_publication = false;
+        assert!(view.current_snapshot_file_totals.is_empty());
+        assert!(!never_published(&view));
         assert!(decode_current_keyed_documents(view, catalog).is_err());
     }
     #[test]
@@ -1078,6 +1170,18 @@ pub(crate) mod tests {
             ))
         ));
         let drop = decode_keyed_drop_documents(&view, catalog.clone()).unwrap();
+        assert!(drop.retired);
+        assert!(
+            project_retired_mv_status(&view, catalog.clone())
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(
+            require_readable_keyed_format(&view),
+            Err(MvDocumentError::KeyedStorage(
+                KeyedDocumentReadError::LegacyFormat { .. }
+            ))
+        ));
         assert_eq!(drop.root_binding, binding.identity());
         assert_eq!(drop.definition_revision, revision(definition.identity()));
         assert_eq!(

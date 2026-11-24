@@ -179,6 +179,13 @@ fn validate_path(path: &BoundSourcePath) -> Result<(), PersistenceCodecError> {
     let Some((leaf, ancestors)) = path.nodes.split_last() else {
         return Err(malformed("binding path must have at least one node"));
     };
+    if path
+        .nodes
+        .iter()
+        .any(|node| node.name_at_binding.is_empty())
+    {
+        return Err(malformed("binding path node has no diagnostic name"));
+    }
     if ancestors
         .iter()
         .any(|node| node.kind != SourceNodeKind::Struct)
@@ -273,6 +280,7 @@ fn encode_path(value: &BoundSourcePath) -> proto::BoundSourcePath {
             .iter()
             .map(|node| proto::BoundSourceNode {
                 field_id: Some(node.field_id.as_bytes().to_vec()),
+                name_at_binding: Some(node.name_at_binding.clone()),
                 required: Some(node.required),
                 kind: Some(match node.kind {
                     SourceNodeKind::Scalar => 1,
@@ -298,6 +306,10 @@ fn decode_path(value: proto::BoundSourcePath) -> Result<BoundSourcePath, Persist
                         node.field_id,
                         "binding.path.field_id",
                     )?)?,
+                    name_at_binding: required(
+                        node.name_at_binding,
+                        "binding.path.name_at_binding",
+                    )?,
                     required: required(node.required, "binding.path.required")?,
                     kind: enum_value(node.kind, "binding.path.kind", |kind| {
                         Some(match kind {

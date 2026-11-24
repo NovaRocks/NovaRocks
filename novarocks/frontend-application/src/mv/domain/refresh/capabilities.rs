@@ -156,7 +156,9 @@ mod tests {
             .expect("test field identity"),
             name: name.to_string(),
             ordinal: 0,
-            type_signature: "bigint".to_string(),
+            source_type: novarocks_mv_application::persistence::test_support::fixture_type(
+                "bigint",
+            ),
             nullable: false,
         }
     }

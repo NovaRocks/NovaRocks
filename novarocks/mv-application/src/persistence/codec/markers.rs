@@ -383,6 +383,7 @@ fn revision(
 }
 
 /// Eligibility derived from the original fenced observation.
+#[derive(Clone, Copy)]
 pub enum PublicationEvidence<'a> {
     Current(&'a PublicationIdentity),
     Unpublished(&'a DocumentRevision),

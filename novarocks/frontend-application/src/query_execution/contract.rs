@@ -85,8 +85,22 @@ impl ResolvedQueryOptions {
 /// Project admitted statement semantics for synthetic executions that previously
 /// supplied no options. Existing sealed options must not pass through this path.
 pub(crate) fn synthetic_statement_query_options(execution: &QueryExecutionContext) -> QueryOptions {
+    synthetic_query_options(execution.sql_semantics())
+}
+
+pub(crate) fn synthetic_mv_query_options(execution: &QueryExecutionContext) -> QueryOptions {
+    let semantics = execution
+        .sql_semantics()
+        .clone()
+        .with_default_computation_semantics();
+    synthetic_query_options(&semantics)
+}
+
+fn synthetic_query_options(
+    semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
+) -> QueryOptions {
     let mut runtime = RuntimeQueryOptions::default();
-    runtime.set_allow_throw_exception(execution.sql_semantics().sql_mode().allow_throw_exception());
+    runtime.set_allow_throw_exception(semantics.sql_mode().allow_throw_exception());
     QueryOptions::from_proto(
         crate::native::fragment_encoder::instance::encode_query_options(&runtime),
     )

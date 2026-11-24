@@ -100,6 +100,7 @@ impl ConnectorDocumentStorageObservation for Observation {
                 data_files: Some(0),
                 delete_files: Some(0),
             },
+            before_first_data_publication: false,
             slots: Default::default(),
             markers: Default::default(),
             versions: Default::default(),

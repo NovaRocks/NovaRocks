@@ -64,6 +64,8 @@ pub struct BoundSourcePath {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundSourceNode {
     pub field_id: FieldIdentity,
+    /// Diagnostic name from the same resolved path. It does not enter A2 or A3.
+    pub name_at_binding: String,
     pub required: bool,
     pub kind: SourceNodeKind,
 }
@@ -169,6 +171,8 @@ impl BindingDocument {
         let mut outputs = CanonicalFactWriter::new("novarocks.mv.binding-outputs", 1);
         outputs.sequence(self.outputs.len());
         for item in &self.outputs {
+            outputs.u32(item.ordinal);
+            outputs.text(&item.name);
             outputs.bytes(&item.logical_type_identity);
         }
 

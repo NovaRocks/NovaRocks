@@ -117,10 +117,23 @@ fn project_source_binding(
     let mut budget = 0;
     let object_id = iceberg_object_id_from_uuid(table.uuid().to_string())?;
     reserve_bytes(context, &mut budget, object_id.as_bytes().len())?;
+    let managed = crate::document_storage::keyed::view::management_marker(table)
+        .map_err(crate::document_storage::observation::keyed_read_error)?;
+    let object_kind = if managed
+        .as_ref()
+        .is_some_and(|marker| marker.kind() == "materialized-view")
+    {
+        MvSourceObjectKind::MaterializedView
+    } else {
+        MvSourceObjectKind::Table
+    };
     let mut object = writer("novarocks.iceberg.mv-source-object");
     object.text(catalog_instance.as_str());
     object.bytes(object_id.as_bytes());
-    object.u32(1); // Base table.
+    object.u32(match object_kind {
+        MvSourceObjectKind::Table => 1,
+        MvSourceObjectKind::MaterializedView => 2,
+    });
 
     let mut resolved = Vec::new();
     let mut bindings = Vec::new();
@@ -196,7 +209,7 @@ fn project_source_binding(
     Ok(MvSourceBindingObservation {
         catalog_instance,
         object_id,
-        object_kind: MvSourceObjectKind::Table,
+        object_kind,
         paths: bindings,
         object_fact: finish(object)?,
         path_fact: finish(field_paths)?,

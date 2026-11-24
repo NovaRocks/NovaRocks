@@ -217,12 +217,7 @@ fn validate_mv_select_raw_select_clauses(
 
 fn validate_mv_select_raw_clauses_in_factor(factor: &Relation) -> Result<(), String> {
     match factor {
-        Relation::Table(table) => {
-            if table.query_period.is_some() || table.branch.is_some() {
-                return Err(unsupported_mv_from_clause("table version qualifiers"));
-            }
-            Ok(())
-        }
+        Relation::Table(_) => Ok(()),
         Relation::Aliased(alias) => validate_mv_select_raw_clauses_in_factor(&alias.relation),
         Relation::Join(join) => {
             validate_mv_select_raw_clauses_in_factor(&join.left)?;

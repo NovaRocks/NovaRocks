@@ -33,7 +33,7 @@ pub(crate) fn validate_observed_schema_locator(
 }
 
 pub(crate) fn validate_occurrence_locator(
-    occurrence: &novarocks_mv_application::persistence::codec::RelationOccurrence,
+    occurrence: &novarocks_mv_application::persistence::codec::BindingOccurrence,
     table: &TableIdentity,
 ) -> Result<(), String> {
     if occurrence.catalog_at_binding != table.catalog

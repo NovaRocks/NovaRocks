@@ -18,7 +18,8 @@
 use super::*;
 use crate::management::{DeploymentOwner, ProcessIncarnation};
 use crate::persistence::{
-    keyed_documents::keyed_create_document_set, test_support::MvDocumentFixture,
+    keyed_documents::keyed_create_document_set,
+    test_support::{MvDocumentFixture, fixture_type},
 };
 use bytes::Bytes;
 use novarocks_spi::connector::*;
@@ -29,7 +30,7 @@ fn field(ordinal: u32, id: Bytes) -> ConnectorPreparedCreateFieldBinding {
         ordinal,
         id,
         format!("field_{ordinal}"),
-        "binary".into(),
+        fixture_type("binary"),
         false,
     )
     .unwrap()
@@ -55,11 +56,10 @@ fn fixture() -> (MvDocumentFixture, ConnectorPreparedCreateDocumentTarget) {
                 i as u32,
                 Bytes::copy_from_slice(value.target_field_id.as_bytes()),
                 format!("field_{i}"),
-                "fixture".into(),
+                value.source_type.clone(),
                 value.nullable,
             )
             .unwrap()
-            .with_source_type(value.source_type.clone())
         })
         .collect();
     let target = ConnectorPreparedCreateDocumentTarget::try_new(
@@ -157,11 +157,10 @@ fn keyed_create_binds_by_identity_in_the_providers_own_column_order() {
                 i as u32,
                 v.provider_field_id().clone(),
                 v.name().to_string(),
-                v.type_signature().to_string(),
+                v.source_type().clone(),
                 v.nullable(),
             )
             .unwrap()
-            .with_source_type(v.source_type().unwrap().clone())
         })
         .collect();
     create(&f, &with_fields(&target, reversed).unwrap()).unwrap();

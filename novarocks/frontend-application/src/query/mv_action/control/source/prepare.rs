@@ -58,27 +58,17 @@ impl ControlSource {
             .load_ready(self.request.target())
             .await
             .map_err(|error| shared(SharedFailureCause::new(error)))?;
-        if loaded.is_none() {
-            match &self.request {
-                MvControlRequest::Drop { statement, .. } => {
-                    let mut future =
-                        Box::pin(ready.prepare_drop(self.request.target(), statement.if_exists));
-                    let raw = future.as_mut().await;
-                    match raw {
-                        Ok(value) => body.drop_readiness = Some(value),
-                        Err(error) => body.preparation_failure = Some(projection_failure(error)),
-                    }
-                    drop(future);
-                    self.check_business_refusal()?;
-                    return body.preparation_failure.clone().map_or(Ok(()), Err);
-                }
-                _ => {
-                    return Err(invalid(format!(
-                        "materialized view does not exist: {:?}",
-                        self.target
-                    )));
-                }
+        if loaded.is_none() && !matches!(self.request, MvControlRequest::Drop { .. }) {
+            if readiness.is_retired_mv(self.request.target()) {
+                return Err(connector(ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                    "Retired MV persistence format supports DROP only",
+                )));
             }
+            return Err(invalid(format!(
+                "materialized view does not exist: {:?}",
+                self.target
+            )));
         }
         let instance = ConnectorInstanceId::parse(
             self.target
@@ -108,41 +98,49 @@ impl ControlSource {
             namespace: Arc::from(self.target.namespace()),
             table: Arc::from(self.target.name()),
         };
-        body.binding = Some(
-            self.capture
-                .capture(
-                    &planning,
-                    &body.factory,
-                    ConnectorTableObjectCaptureRequest {
-                        table: table.clone(),
-                        resolution: ConnectorTableResolution::StrictBaseTable,
-                        selector: ConnectorTableObjectSelector::Current,
-                        context: body.context.clone(),
-                    },
-                )
-                .await
-                .map_err(|error| {
+        use crate::mv::domain::staged_create::CaptureFailure;
+        let captured = self
+            .capture
+            .capture(
+                &planning,
+                &body.factory,
+                ConnectorTableObjectCaptureRequest {
+                    table: table.clone(),
+                    resolution: ConnectorTableResolution::StrictBaseTable,
+                    selector: ConnectorTableObjectSelector::Current,
+                    context: body.context.clone(),
+                },
+            )
+            .await;
+        body.binding = Some(match captured {
+            Ok(binding) => binding,
+            Err(CaptureFailure::Provider(error))
+                if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound
+                    && matches!(&self.request, MvControlRequest::Drop { statement, .. } if statement.if_exists) =>
+            {
+                self.check_business_refusal()?;
+                body.drop_readiness = Some(MvKeyedDropReadiness::AlreadyAbsent);
+                return Ok(());
+            }
+            Err(error) => {
+                return Err({
                     let error = error.into_application();
                     let mut result = invalid(error.to_string());
                     if let Some(cause) = error.original_failure() {
                         result = result.with_original_failure(cause.clone())
                     }
                     result
-                })?,
-        );
+                });
+            }
+        });
         let binding = body.binding.as_ref().unwrap().clone();
         if binding.metadata.identity != table {
             return Err(invalid("MV provider bound a different control target"));
         }
         if matches!(self.request, MvControlRequest::Drop { .. })
-            && loaded
-                .as_ref()
-                .unwrap()
-                .projection
-                .facts
-                .source_revision()
-                .target_object_id
-                != binding.object_id
+            && loaded.as_ref().is_some_and(|loaded| {
+                loaded.projection.facts.source_revision().target_object_id != binding.object_id
+            })
         {
             return Err(MvProviderFailure::new(
                 MvProviderFailureKind::TargetReplaced,
@@ -168,10 +166,19 @@ impl ControlSource {
             .clone();
         match &self.request {
             MvControlRequest::Drop { statement, .. } => {
-                let (first, _) = entrance
-                    .observe_keyed_drop_async(&documents, request.clone())
-                    .await
-                    .map_err(document)?;
+                let observe = |request| async {
+                    if loaded.is_none() {
+                        entrance
+                            .observe_retired_keyed_drop_async(&documents, request)
+                            .await
+                    } else {
+                        entrance
+                            .observe_keyed_drop_async(&documents, request)
+                            .await
+                            .map(|(observed, _)| observed)
+                    }
+                };
+                let first = observe(request.clone()).await.map_err(document)?;
                 let cancellation = body.cancel.clone();
                 let mut waiting = Box::pin(
                     entrance
@@ -186,10 +193,7 @@ impl ControlSource {
                 if let Some(error) = &body.management_failure {
                     return Err(error.clone());
                 }
-                let (second, _) = entrance
-                    .observe_keyed_drop_async(&documents, request)
-                    .await
-                    .map_err(document)?;
+                let second = observe(request).await.map_err(document)?;
                 if !first.matches(&second) {
                     return Err(MvProviderFailure::new(
                         MvProviderFailureKind::TargetReplaced,
@@ -197,8 +201,17 @@ impl ControlSource {
                     ));
                 }
                 body.exact_management_target = Some(second.target().clone());
-                let mut prepared =
-                    Box::pin(ready.prepare_drop(self.request.target(), statement.if_exists));
+                let mut prepared = Box::pin(async {
+                    if second.is_retired() {
+                        ready
+                            .prepare_retired_drop(self.request.target(), &second)
+                            .await
+                    } else {
+                        ready
+                            .prepare_drop(self.request.target(), statement.if_exists)
+                            .await
+                    }
+                });
                 let raw = prepared.as_mut().await;
                 match raw {
                     Ok(value) => body.drop_readiness = Some(value),
@@ -214,11 +227,29 @@ impl ControlSource {
                         body.drop_readiness.take().unwrap(),
                         Some(&binding.object_id),
                     )?);
+                let admission = documents
+                    .admit_management(
+                        ConnectorDocumentManagementAdmissionRequest::try_new(
+                            documents.owner().clone(),
+                            documents.catalog_handle().clone(),
+                            ConnectorMutationOperationId::from_bytes(*self.operation.as_bytes()),
+                            binding.metadata.identity.clone(),
+                            Some(binding.object_id.clone()),
+                            ConnectorDocumentManagementOperation::Drop,
+                            body.context.clone(),
+                        )
+                        .map_err(connector)?,
+                    )
+                    .map_err(connector)?;
                 body.operation = Some(ConnectorCatalogMutationOperation::DropTable {
                     table,
                     policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
                     data_disposition:
                         novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
+                    managed: Some(novarocks_spi::connector::ConnectorManagedDropFence {
+                        admission,
+                        expected_metadata: second.metadata_version().clone(),
+                    }),
                 });
             }
             MvControlRequest::Alter { statement, .. } => match &statement.action {
@@ -353,27 +384,6 @@ impl ControlSource {
         };
         let entrance = body.input.ports.management_entrance().map_err(invalid)?;
         let operation_id = ConnectorMutationOperationId::from_bytes(*self.operation.as_bytes());
-        if matches!(self.request, MvControlRequest::Drop { .. }) {
-            let documents = body.documents.as_ref().unwrap();
-            let binding = body.binding.as_ref().unwrap();
-            // The pure Provider admission is retained in the original Body before mark/dispatch.
-            body.drop_admission = Some(
-                documents
-                    .admit_management(
-                        ConnectorDocumentManagementAdmissionRequest::try_new(
-                            documents.owner().clone(),
-                            documents.catalog_handle().clone(),
-                            operation_id,
-                            binding.metadata.identity.clone(),
-                            Some(binding.object_id.clone()),
-                            ConnectorDocumentManagementOperation::Drop,
-                            body.context.clone(),
-                        )
-                        .map_err(connector)?,
-                    )
-                    .map_err(connector)?,
-            );
-        }
         management
             .mark_dispatched(EffectResponsibility::new(
                 EffectIdentity::from_bytes(operation_id.to_bytes()),

@@ -276,7 +276,7 @@ const BOUND_SOURCE_PATH: &[Field] = &[
     bytes(2),
     boolean(3),
 ];
-const BOUND_SOURCE_NODE: &[Field] = &[bytes(1), boolean(2), scalar(3)];
+const BOUND_SOURCE_NODE: &[Field] = &[bytes(1), boolean(2), scalar(3), bytes(4)];
 const BOUND_OUTPUT: &[Field] = &[
     scalar(1),
     bytes(2),

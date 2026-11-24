@@ -1905,6 +1905,7 @@ mod tests {
                 table: table("missing"),
                 policy: DropPolicy::NoOpIfMissing,
                 data_disposition: ConnectorDropTableDataDisposition::Retain,
+                managed: None,
             },
         ];
         for operation in operations {

@@ -336,6 +336,7 @@ impl StatisticsNeed {
 pub struct MaterializedViewNeed {
     id: CompileNeedId,
     referenced_relations: Box<[TableIdentity]>,
+    relation_needs: Box<[CatalogRelationNeed]>,
 }
 
 impl MaterializedViewNeed {
@@ -362,7 +363,13 @@ impl MaterializedViewNeed {
         Ok(Self {
             id,
             referenced_relations,
+            relation_needs: Box::default(),
         })
+    }
+
+    pub(super) fn with_relation_needs(mut self, needs: &[CatalogRelationNeed]) -> Self {
+        self.relation_needs = needs.into();
+        self
     }
 
     pub const fn id(&self) -> CompileNeedId {
@@ -371,6 +378,10 @@ impl MaterializedViewNeed {
 
     pub fn referenced_relations(&self) -> &[TableIdentity] {
         &self.referenced_relations
+    }
+
+    pub fn relation_needs(&self) -> &[CatalogRelationNeed] {
+        &self.relation_needs
     }
 }
 
@@ -1189,13 +1200,7 @@ impl SqlNeedBatch {
             ),
             Self::CatalogRelations(needs) => checked_sum([
                 checked_mul(needs.len(), std::mem::size_of::<CatalogRelationNeed>()),
-                checked_sum(needs.iter().map(|need| {
-                    checked_sum([
-                        table_identity_bytes(&need.relation),
-                        catalog_selection_bytes(need.selection.as_deref()),
-                        quoted_metadata_binding_bytes(need.quoted_metadata_binding()),
-                    ])
-                })),
+                checked_sum(needs.iter().map(catalog_relation_need_bytes)),
             ]),
             Self::Statistics(needs) => checked_sum([
                 checked_mul(needs.len(), std::mem::size_of::<StatisticsNeed>()),
@@ -1215,6 +1220,11 @@ impl SqlNeedBatch {
                             std::mem::size_of::<TableIdentity>(),
                         ),
                         checked_sum(need.referenced_relations.iter().map(table_identity_bytes)),
+                        checked_mul(
+                            need.relation_needs.len(),
+                            std::mem::size_of::<CatalogRelationNeed>(),
+                        ),
+                        checked_sum(need.relation_needs.iter().map(catalog_relation_need_bytes)),
                     ])
                 })),
             ]),
@@ -3634,6 +3644,14 @@ fn provider_payload_matches_binding(
     payload.header().provider_id() == &binding.descriptor().provider_id
         && payload.header().catalog() == binding.catalog_handle()
         && payload.header().category() == category
+}
+
+fn catalog_relation_need_bytes(need: &CatalogRelationNeed) -> Result<u64, CompletionProtocolError> {
+    checked_sum([
+        table_identity_bytes(&need.relation),
+        catalog_selection_bytes(need.selection.as_deref()),
+        quoted_metadata_binding_bytes(need.quoted_metadata_binding()),
+    ])
 }
 
 fn table_identity_bytes(identity: &TableIdentity) -> Result<u64, CompletionProtocolError> {

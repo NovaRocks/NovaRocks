@@ -41,7 +41,7 @@ identity_fixture!(aggregate_id, AggregateIdentity);
 identity_fixture!(branch_id, BranchIdentity);
 identity_fixture!(apply_key_id, ApplyKeyIdentity);
 
-pub(crate) fn fixture_type(signature: &str) -> ProviderSourceType {
+pub fn fixture_type(signature: &str) -> ProviderSourceType {
     let primitive = match signature {
         "bigint" | "long" => IcebergSourcePrimitive::Long,
         "integer" | "int" => IcebergSourcePrimitive::Int,
@@ -63,10 +63,11 @@ pub(crate) fn fixture_type(signature: &str) -> ProviderSourceType {
     )
 }
 
-fn field(id: u8, signature: &str, nullable: bool) -> BoundSourcePath {
+fn field(id: u8, name: &str, signature: &str, nullable: bool) -> BoundSourcePath {
     BoundSourcePath {
         nodes: vec![BoundSourceNode {
             field_id: field_id(id),
+            name_at_binding: name.to_owned(),
             required: !nullable,
             kind: SourceNodeKind::Scalar,
         }],
@@ -103,7 +104,7 @@ pub fn source_object_identity_bytes(object: &[u8]) -> ObjectIdentity {
         .0
 }
 
-pub(crate) fn relation(occurrence_id: u32, object_value: u8, qualifier: &str) -> BindingOccurrence {
+pub fn relation(occurrence_id: u32, object_value: u8, qualifier: &str) -> BindingOccurrence {
     let object_id = source_object_identity(object_value);
     let raw = super::exact_revision::restore_persisted_object(&object_id).unwrap();
     let exact = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
@@ -128,7 +129,10 @@ pub(crate) fn relation(occurrence_id: u32, object_value: u8, qualifier: &str) ->
             read_declarations: Bytes::from_static(b"fixture-declarations"),
         },
         object_id,
-        paths: vec![field(1, "bigint", false), field(2, "decimal(18,2)", true)],
+        paths: vec![
+            field(1, "order_id", "bigint", false),
+            field(2, "amount", "decimal(18,2)", true),
+        ],
     }
 }
 
@@ -173,7 +177,7 @@ fn sample_binding() -> BindingDocument {
     }
 }
 
-pub(crate) fn fixture_mapping(
+pub fn fixture_mapping(
     binding: &BindingDocument,
     interpretation: &InterpretationDocument,
 ) -> StorageMappingDocument {
@@ -692,7 +696,7 @@ pub fn union_all_keyed_projection_fixture(
             occurrence.relation_at_binding = "fact".into();
             occurrence.object_id = source_object.clone();
             occurrence.facts.object = Bytes::copy_from_slice(source_object.as_bytes());
-            occurrence.paths = vec![field(1, "varchar", true)];
+            occurrence.paths = vec![field(1, "k", "varchar", true)];
             occurrence
         })
         .collect::<Vec<_>>();

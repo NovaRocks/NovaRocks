@@ -32,7 +32,7 @@ use novarocks_spi::connector::{
     ConnectorControlPlanningPin, ConnectorErrorKind, ConnectorOperationControl,
     ConnectorRequestContext, ConnectorTableResolution,
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 /// Original SQL and the already selected application leaves only. No stage,
 /// writer, publication identity or refresh admission enters this reader.
@@ -117,25 +117,66 @@ async fn prepare_create_inner(
         io,
     )
     .await?;
-    let analysis = crate::mv::domain::analysis_adapter::analyze_mv_select_with_captured_catalog(
-        input.current_catalog.as_deref(),
-        &captured.catalog,
-        &input.current_database,
-        &canonical,
-        input.ports.function_catalog().as_ref(),
-        input.ports.constant_policy(),
-        control.clone(),
+    let mut analysis =
+        crate::mv::domain::analysis_adapter::analyze_mv_select_with_captured_catalog(
+            input.current_catalog.as_deref(),
+            &captured.catalog,
+            &input.current_database,
+            &canonical,
+            input.ports.function_catalog().as_ref(),
+            input.ports.constant_policy(),
+            control.clone(),
+        )?;
+    let persistence = analysis
+        .refresh_input
+        .create_persistence_facts()
+        .map_err(novarocks_sql::compiler::SqlCompileError::from)?;
+    let (projections, dependencies) = io
+        .refresh_graph(input.ports.readiness().clone())
+        .await?
+        .into_parts();
+    let observed = crate::mv::domain::persistence::source_bindings::observe_mv_binding(
+        input.ports.storage_observation(),
+        &persistence,
+        &captured.bindings,
+        &projections,
+        input.context.clone(),
     )?;
-    let shape = prepare_mv_create_shape(target, canonical, analysis, &control)?;
+    analysis.resolved_refs = observed
+        .document
+        .occurrences
+        .iter()
+        .map(
+            |item| crate::mv::domain::analysis::ResolvedTableRef::Iceberg {
+                catalog: item.catalog_at_binding.clone(),
+                namespace: item.namespace_at_binding.clone(),
+                table: item.relation_at_binding.clone(),
+            },
+        )
+        .collect();
+    let mut shape = prepare_mv_create_shape(target, canonical, analysis, &control)?;
+    use novarocks_mv_application::{
+        dependency::{MvDependencyObjectType, MvDependencyStorageEngine},
+        persistence::codec::BindingDependency,
+    };
+    for (dependency, occurrence) in shape
+        .resolved_dependencies
+        .dependencies
+        .iter_mut()
+        .zip(&observed.document.occurrences)
+    {
+        if observed.document.dependencies.iter().any(|fact| {
+            matches!(fact, BindingDependency::NestedMv { object_id, .. } if object_id == &occurrence.object_id)
+        }) {
+            dependency.upstream.object_type = MvDependencyObjectType::MaterializedView;
+            dependency.upstream.storage_engine = MvDependencyStorageEngine::Iceberg;
+        }
+    }
     let dependency_target = novarocks_mv_application::dependency::iceberg_mv_dependency_ref(
         &shape.target.catalog,
         &shape.target.namespace,
         &shape.target.table,
     );
-    let (projections, dependencies) = io
-        .refresh_graph(input.ports.readiness().clone())
-        .await?
-        .into_parts();
     crate::mv::domain::dependency_resolver::validate_no_create_cycle_from_facts(
         &dependency_target,
         &shape.resolved_dependencies.dependencies,
@@ -148,38 +189,15 @@ async fn prepare_create_inner(
             shape.target.catalog, shape.target.namespace, shape.target.table
         ))
     })?;
-    let (property, persistence) = prepare_mv_create_properties(&shape, &control)?;
-    let (observations, binding_document) =
-        crate::mv::domain::persistence::source_bindings::observe_mv_create_source_bindings_original(
-            input.ports.storage_observation(), &persistence, &captured.bindings, input.context.clone())?;
-    let mut base_observations = BTreeMap::new();
-    for base in &shape.resolved_dependencies.base_refs {
-        base_observations.insert(base.fqn(), {
-            let binding = captured
-                .bindings
-                .strict_base_binding(&base.catalog, &base.namespace, &base.table)
-                .ok_or("CREATE base schema has no original catalog binding")?;
-            let metadata = binding
-                .source_metadata
-                .as_ref()
-                .ok_or("CREATE base schema has no original metadata")?;
-            let lease = binding.admission.exact_planning_pin()?;
-            crate::mv::domain::storage_observation::observe_source_schema(
-                input.ports.storage_observation(),
-                &lease,
-                metadata,
-                input.context.clone(),
-            )?
-        });
-    }
+    let property = prepare_mv_create_properties(&shape, &control)?;
     finish_mv_create_preparation(
         shape,
         &input.statement,
         property,
         persistence,
-        observations,
-        binding_document,
-        base_observations,
+        observed.relations,
+        observed.document,
+        observed.schemas,
     )
     .map_err(Into::into)
 }

@@ -518,11 +518,12 @@ async fn replace_dependency_indexes<T: WriteAccess + ?Sized>(
 
 async fn delete_indexes_for_target<T: WriteAccess + ?Sized>(
     transaction: &mut T,
-    projection: &crate::persistence::keyed_documents::StoredKeyedMvProjection,
+    mv_id: i64,
+    target: &MvTarget,
+    declared: &[StoredMvDependency],
 ) -> Result<(), T::Error> {
-    let mv_id = projection.mv_id;
-    let target_key = target_key(&projection.facts.target())
-        .map_err(|error| T::from_store(invalid_state_store(error)))?;
+    let target_key =
+        target_key(target).map_err(|error| T::from_store(invalid_state_store(error)))?;
     let target = transaction
         .read_get(&target_key)
         .await?
@@ -534,8 +535,7 @@ async fn delete_indexes_for_target<T: WriteAccess + ?Sized>(
             "MV target lookup references a different projection",
         )));
     }
-    let declared = keyed::keyed_dependencies(mv_id, &projection.facts);
-    let current = dependency_pairs_for_projection(transaction, mv_id, &declared).await?;
+    let current = dependency_pairs_for_projection(transaction, mv_id, declared).await?;
     transaction
         .write_delete(target_key, Precondition::Version(target.version))
         .await?;
@@ -696,6 +696,12 @@ impl StateStoreMvRepositoryExecution<'_> {
         target: &MvTarget,
     ) -> Result<Option<keyed::LoadedKeyedMvProjection>, MvRepositoryError> {
         self.read_repository().find_keyed_by_target(target).await
+    }
+    pub(crate) async fn find_retired_projection(
+        &self,
+        target: &MvTarget,
+    ) -> Result<Option<keyed::LoadedRetiredMvProjection>, MvRepositoryError> {
+        self.read_repository().find_retired_projection(target).await
     }
     pub async fn list_keyed_projections(
         &self,
@@ -888,14 +894,98 @@ impl ReadRepository<'_> {
             .read_record(&key)
             .await?
             .ok_or_else(|| corruption("keyed MV lookup has no projection"))?;
-        let decoded = codec::decode_keyed_projection(&key, &row.value).map_err(corruption)?;
-        if decoded.value.facts.target() != *target {
+        let row_facts = codec::decode_projection_row(&key, &row.value)
+            .map_err(corruption)?
+            .value;
+        let decoded = match row_facts {
+            codec::ProjectionRow::Current(value) => value,
+            codec::ProjectionRow::Retired { mv_id, source } => {
+                if mv_id != lookup.value.mv_id || source_target(&source) != *target {
+                    return Err(corruption(
+                        "retired MV lookup disagrees with its projection",
+                    ));
+                }
+                return Ok(None);
+            }
+        };
+        if decoded.mv_id != lookup.value.mv_id || decoded.facts.target() != *target {
             return Err(corruption("keyed MV lookup disagrees with its projection"));
         }
         Ok(Some(keyed::LoadedKeyedMvProjection {
-            projection: decoded.value,
+            projection: decoded,
             version: crate::repository::MvProjectionVersion::from_store(row.version),
         }))
+    }
+    async fn find_retired_projection(
+        &self,
+        target: &MvTarget,
+    ) -> Result<Option<keyed::LoadedRetiredMvProjection>, MvRepositoryError> {
+        let mut tx = self.begin_read().await?;
+        let result = async {
+            let key = target_key(target).map_err(corruption)?;
+            let Some(lookup) = tx.read_get(&key).await? else {
+                return Ok(None);
+            };
+            let mv_id = decode_record::<MvTargetLookup>(&key, &lookup.value)
+                .map_err(corruption)?
+                .value
+                .mv_id;
+            let key = projection_by_id_key(mv_id).map_err(corruption)?;
+            let row = tx
+                .read_get(&key)
+                .await?
+                .ok_or_else(|| corruption("keyed MV lookup has no projection"))?;
+            let codec::ProjectionRow::Retired {
+                mv_id: decoded_id,
+                source,
+            } = codec::decode_projection_row(&key, &row.value)
+                .map_err(corruption)?
+                .value
+            else {
+                return Ok(None);
+            };
+            if decoded_id != mv_id || source_target(&source) != *target {
+                return Err(corruption(
+                    "retired MV lookup disagrees with its projection",
+                ));
+            }
+            let mut dependencies = Vec::new();
+            let mut range = BoundedRecordRange::new(
+                dependency_by_downstream_prefix(mv_id).map_err(corruption)?,
+            )?;
+            while let Some(row) = range.next(&mut tx).await? {
+                let dependency = decode_dependency(&row.key, &row.value)
+                    .map_err(corruption)?
+                    .value;
+                if dependency.downstream_mv_id != mv_id
+                    || row.key
+                        != dependency_by_downstream_key(
+                            mv_id,
+                            &dependency.upstream,
+                            dependency.occurrence_id,
+                        )
+                        .map_err(corruption)?
+                {
+                    return Err(corruption(
+                        "retired MV dependency disagrees with its index key",
+                    ));
+                }
+                dependencies.push(dependency);
+            }
+            Ok(Some(keyed::LoadedRetiredMvProjection {
+                entry: MvProjectionInventoryEntry {
+                    mv_id,
+                    target: target.clone(),
+                    object_id: source.target_object_id,
+                    retired_version: Some(crate::repository::MvProjectionVersion::from_store(
+                        row.version,
+                    )),
+                },
+                dependencies,
+            }))
+        }
+        .await;
+        settle_read(result, tx.read_close().await)
     }
     pub async fn list_keyed_projections(
         &self,
@@ -905,9 +995,20 @@ impl ReadRepository<'_> {
             .scan_prefix(projection_prefix().map_err(corruption)?)
             .await?
         {
-            let value = codec::decode_keyed_projection(&row.key, &row.value)
+            let value = match codec::decode_projection_row(&row.key, &row.value)
                 .map_err(corruption)?
-                .value;
+                .value
+            {
+                codec::ProjectionRow::Current(value) => value,
+                codec::ProjectionRow::Retired { mv_id, .. } => {
+                    if row.key != projection_by_id_key(mv_id).map_err(corruption)? {
+                        return Err(corruption(
+                            "retired projection key differs from root identity",
+                        ));
+                    }
+                    continue;
+                }
+            };
             if row.key != projection_by_id_key(value.mv_id).map_err(corruption)? {
                 return Err(corruption(
                     "keyed projection key differs from root identity",
@@ -1146,6 +1247,14 @@ impl StateStoreMvRepositoryExecution<'_> {
             .delete_keyed_projection(operation_id, expected)
             .await
     }
+    pub(crate) async fn delete_retired_projection(
+        &self,
+        expected: keyed::LoadedRetiredMvProjection,
+    ) -> Result<bool, MvRepositoryError> {
+        self.write_repository()
+            .delete_retired_projection(expected)
+            .await
+    }
     #[cfg(any(test, novarocks_dev_controls))]
     pub async fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvRepositoryError> {
         self.write_repository().wipe_accelerator(operation_id).await
@@ -1196,6 +1305,12 @@ impl WriteRepository<'_> {
             expected,
         })
         .await
+    }
+    async fn delete_retired_projection(
+        &self,
+        expected: keyed::LoadedRetiredMvProjection,
+    ) -> Result<bool, MvRepositoryError> {
+        self.run(DeleteRetiredProjection(expected)).await
     }
     #[cfg(any(test, novarocks_dev_controls))]
     async fn wipe_accelerator(&self, _operation_id: Uuid) -> Result<(), MvRepositoryError> {
@@ -1392,11 +1507,79 @@ impl WriteCommand for DeleteProjection {
                 "keyed MV source changed before delete",
             )));
         }
-        delete_indexes_for_target(transaction, &current).await?;
+        let dependencies = keyed::keyed_dependencies(current.mv_id, &current.facts);
+        delete_indexes_for_target(
+            transaction,
+            current.mv_id,
+            &current.facts.target(),
+            &dependencies,
+        )
+        .await?;
         transaction
             .write_delete(key, Precondition::Version(row.version))
             .await?;
         let _ = operation_id;
+        Ok(true)
+    }
+}
+
+fn source_target(source: &crate::persistence::definition::MvAcceleratorSourceRevision) -> MvTarget {
+    MvTarget::from_parts(
+        Some(source.target.instance_id.as_str()),
+        &source.target.namespace,
+        &source.target.table,
+    )
+}
+
+#[derive(Clone)]
+struct DeleteRetiredProjection(keyed::LoadedRetiredMvProjection);
+
+#[async_trait::async_trait]
+impl WriteCommand for DeleteRetiredProjection {
+    type Output = bool;
+    const PURPOSE: &'static str = "delete retired keyed MV projection";
+
+    async fn apply<T: WriteAccess + ?Sized>(self, transaction: &mut T) -> Result<bool, T::Error> {
+        let keyed::LoadedRetiredMvProjection {
+            entry,
+            dependencies,
+        } = self.0;
+        let invalid = |message: String| T::from_store(invalid_state_store(message));
+        let key = projection_by_id_key(entry.mv_id).map_err(invalid)?;
+        let Some(row) = transaction.read_get(&key).await? else {
+            return Ok(false);
+        };
+        if entry
+            .retired_version
+            .as_ref()
+            .map(|version| version.store_version())
+            != Some(&row.version)
+        {
+            return Err(T::from_store(conflict_state_store(
+                "retired MV root changed before delete",
+            )));
+        }
+        let codec::ProjectionRow::Retired { mv_id, source } =
+            codec::decode_projection_row(&key, &row.value)
+                .map_err(invalid)?
+                .value
+        else {
+            return Err(T::from_store(conflict_state_store(
+                "MV root is no longer retired",
+            )));
+        };
+        if mv_id != entry.mv_id
+            || source_target(&source) != entry.target
+            || source.target_object_id != entry.object_id
+        {
+            return Err(T::from_store(conflict_state_store(
+                "retired MV identity changed before delete",
+            )));
+        }
+        delete_indexes_for_target(transaction, mv_id, &entry.target, &dependencies).await?;
+        transaction
+            .write_delete(key, Precondition::Version(row.version))
+            .await?;
         Ok(true)
     }
 }

@@ -326,6 +326,16 @@ impl CatalogServiceMaterializer<'_> {
         let Some(Ok(binding)) = self.bindings.resolved_lookup(&key) else {
             return None;
         };
+        if let Some((_, context)) = self.loader.connector_read_context()
+            && let Ok(held) = self.bindings.binding(binding)
+            && let Some(metadata) = held.source_metadata.as_ref()
+            && let Ok(planning) = held.admission.exact_planning_pin()
+            && let Err(error) = super::super::query_catalog::relation::validate_current_mv_format(
+                metadata, &planning, context,
+            )
+        {
+            return Some(Err(error.into_compile()));
+        }
         Some(self.memoized_relation_fact(
             need,
             MemoizedQueryRelation::Table {

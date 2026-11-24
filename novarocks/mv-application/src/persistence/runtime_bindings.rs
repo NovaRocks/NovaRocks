@@ -79,7 +79,7 @@ pub fn reconstruct_keyed_runtime_bindings(
     projection: &super::keyed_documents::MvKeyedDocumentProjection,
     schema: &MvExactTargetSchemaFacts,
 ) -> Result<MvRuntimeBindings, String> {
-    reconstruct_from_documents(
+    reconstruct_runtime_bindings(
         projection.binding(),
         projection.interpretation(),
         &projection.source_revision().target_object_id,
@@ -88,14 +88,16 @@ pub fn reconstruct_keyed_runtime_bindings(
     )
 }
 
-fn reconstruct_from_documents(
+pub fn reconstruct_runtime_bindings(
     binding: &super::codec::BindingDocument,
     interpretation: &super::codec::InterpretationDocument,
     object_id: &ConnectorTableObjectId,
     metadata_version: &ConnectorCommittedVersion,
     schema: &MvExactTargetSchemaFacts,
 ) -> Result<MvRuntimeBindings, String> {
-    if schema.object_id != *object_id {
+    if schema.object_id != *object_id
+        || interpretation.target.object_id.as_bytes() != object_id.as_bytes().as_ref()
+    {
         return Err("MV runtime target object is not from the exact document generation".into());
     }
     if &schema.metadata_version != metadata_version {

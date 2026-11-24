@@ -67,6 +67,7 @@ pub struct MvSourceFieldPath {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvSourceObjectKind {
     Table,
+    MaterializedView,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,8 +141,7 @@ pub struct MvSourceBindingObservation {
 pub struct MvObservedSourceField {
     provider_field_id: Bytes,
     name: String,
-    type_signature: String,
-    source_type: Option<ProviderSourceType>,
+    source_type: ProviderSourceType,
     nullable: bool,
 }
 
@@ -210,13 +210,12 @@ impl MvObservedSourceField {
     pub fn try_new(
         provider_field_id: Bytes,
         name: String,
-        type_signature: String,
+        source_type: ProviderSourceType,
         nullable: bool,
     ) -> Result<Self, ConnectorError> {
         if provider_field_id.is_empty()
             || provider_field_id.len() > MAX_MV_SOURCE_FIELD_ID_BYTES
             || name.trim().is_empty()
-            || type_signature.trim().is_empty()
         {
             return corrupt(
                 "MV source field observation has an empty or oversized identity or schema fact",
@@ -225,8 +224,7 @@ impl MvObservedSourceField {
         Ok(Self {
             provider_field_id,
             name,
-            type_signature,
-            source_type: None,
+            source_type,
             nullable,
         })
     }
@@ -239,25 +237,12 @@ impl MvObservedSourceField {
         &self.name
     }
 
-    pub fn type_signature(&self) -> &str {
-        &self.type_signature
-    }
-
-    pub fn with_source_type(mut self, source_type: ProviderSourceType) -> Self {
-        self.source_type = Some(source_type);
-        self
-    }
-
-    pub fn source_type(&self) -> Option<&ProviderSourceType> {
-        self.source_type.as_ref()
+    pub fn source_type(&self) -> &ProviderSourceType {
+        &self.source_type
     }
 
     fn retained_type_bytes(&self) -> usize {
-        self.type_signature.len().saturating_add(
-            self.source_type
-                .as_ref()
-                .map_or(0, ProviderSourceType::retained_bytes),
-        )
+        self.source_type.retained_bytes()
     }
 
     pub const fn nullable(&self) -> bool {
@@ -380,18 +365,21 @@ impl MvSourceSchemaObservation {
 pub struct MvObservedField {
     field_id: i32,
     name: String,
-    type_signature: String,
-    source_type: Option<ProviderSourceType>,
+    source_type: ProviderSourceType,
     nullable: bool,
 }
 
 impl MvObservedField {
-    pub fn new(field_id: i32, name: String, type_signature: String, nullable: bool) -> Self {
+    pub fn new(
+        field_id: i32,
+        name: String,
+        source_type: ProviderSourceType,
+        nullable: bool,
+    ) -> Self {
         Self {
             field_id,
             name,
-            type_signature,
-            source_type: None,
+            source_type,
             nullable,
         }
     }
@@ -404,25 +392,12 @@ impl MvObservedField {
         &self.name
     }
 
-    pub fn type_signature(&self) -> &str {
-        &self.type_signature
-    }
-
-    pub fn with_source_type(mut self, source_type: ProviderSourceType) -> Self {
-        self.source_type = Some(source_type);
-        self
-    }
-
-    pub fn source_type(&self) -> Option<&ProviderSourceType> {
-        self.source_type.as_ref()
+    pub fn source_type(&self) -> &ProviderSourceType {
+        &self.source_type
     }
 
     fn retained_type_bytes(&self) -> usize {
-        self.type_signature.len().saturating_add(
-            self.source_type
-                .as_ref()
-                .map_or(0, ProviderSourceType::retained_bytes),
-        )
+        self.source_type.retained_bytes()
     }
 
     pub const fn nullable(&self) -> bool {
@@ -1149,7 +1124,6 @@ fn validate_fields_and_partition(
     let mut names = HashSet::with_capacity(fields.len());
     for field in fields {
         require_non_empty(&field.name, "MV observed field name")?;
-        require_non_empty(&field.type_signature, "MV observed field type signature")?;
         if !ids.insert(field.field_id) || !names.insert(field.name.to_ascii_lowercase()) {
             return corrupt(format!("{subject} observation has duplicate schema fields"));
         }
@@ -1241,6 +1215,16 @@ fn corrupt<T>(message: impl Into<String>) -> Result<T, ConnectorError> {
 
 #[cfg(test)]
 mod tests {
+    fn long_source_type() -> ProviderSourceType {
+        use crate::connector::{IcebergSourcePrimitive, IcebergSourceType, IcebergSourceTypeNode};
+        ProviderSourceType::Iceberg(
+            IcebergSourceType::try_new(vec![IcebergSourceTypeNode::Primitive(
+                IcebergSourcePrimitive::Long,
+            )])
+            .unwrap(),
+        )
+    }
+
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -1270,7 +1254,12 @@ mod tests {
             .expect("bounded target object ID")
     }
     fn fields() -> Vec<MvObservedField> {
-        vec![MvObservedField::new(1, "id".into(), "bigint".into(), false)]
+        vec![MvObservedField::new(
+            1,
+            "id".into(),
+            long_source_type(),
+            false,
+        )]
     }
     fn partition() -> MvObservedPartitionSpec {
         MvObservedPartitionSpec::new(
@@ -1339,7 +1328,7 @@ mod tests {
         let field = MvObservedSourceField::try_new(
             Bytes::from_static(b"provider-field"),
             "id".into(),
-            "bigint".into(),
+            long_source_type(),
             false,
         )
         .expect("source field");
@@ -1362,7 +1351,7 @@ mod tests {
         let field = MvObservedSourceField::try_new(
             Bytes::from_static(b"id"),
             "id".into(),
-            "long".into(),
+            long_source_type(),
             false,
         )
         .unwrap();
@@ -1386,7 +1375,7 @@ mod tests {
             MvObservedSourceField::try_new(
                 Bytes::from(vec![id]),
                 name.to_owned(),
-                "long".into(),
+                long_source_type(),
                 false,
             )
             .unwrap()
@@ -1423,7 +1412,7 @@ mod tests {
         let field = MvObservedSourceField::try_new(
             Bytes::from_static(b"source-field"),
             "id".into(),
-            "long".into(),
+            long_source_type(),
             false,
         )
         .unwrap();

@@ -121,7 +121,7 @@ pub(crate) fn validate_create_target(
     if !prepared_fields.keys().copied().eq(bound_fields)
         || interpretation.target.fields.iter().any(|binding| {
             let prepared = prepared_fields[binding.target_field_id.as_bytes()];
-            prepared.source_type() != Some(&binding.source_type)
+            prepared.source_type() != &binding.source_type
                 || prepared.nullable() != binding.nullable
         })
     {

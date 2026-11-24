@@ -3050,14 +3050,10 @@ fn prepared_document_field_bindings(
                 ordinal,
                 Bytes::copy_from_slice(&field.id.to_be_bytes()),
                 field.name.clone(),
-                field.field_type.to_string(),
+                source_type,
                 !field.required,
             )
-            .map(|binding| {
-                binding
-                    .with_source_type(source_type)
-                    .with_storage_declaration(declaration)
-            })
+            .map(|binding| binding.with_storage_declaration(declaration))
         })
         .collect()
 }

@@ -59,6 +59,7 @@ pub(crate) enum CreatePublicationInput {
     },
     Publication {
         plan: Arc<IcebergMvCreatePlan>,
+        storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
         seed: Arc<MvCreateProjectionSeed>,
         staged: ConnectorStagedCreateSession,
         handle: ConnectorStagedTableHandle,
@@ -112,6 +113,7 @@ impl CreatePublicationInput {
             }),
             Self::Publication {
                 plan,
+                storage_observation,
                 seed,
                 staged,
                 handle,
@@ -125,9 +127,26 @@ impl CreatePublicationInput {
                 })?;
                 let documents = build_create_documents_for_prepared_target(plan, seed, target)
                     .map_err(invalid)?;
+                use novarocks_mv_application::persistence::storage_mapping::{
+                    build_storage_mapping, storage_mapping_requests,
+                };
+                let outputs = storage_mapping_requests(
+                    &plan.create_persistence_facts,
+                    &documents.interpretation,
+                )
+                .map_err(|error| invalid(error.to_string()))?;
+                let observed_mapping = storage_observation
+                    .map_prepared_storage(target, &outputs, context.clone())
+                    .map_err(provider)?;
+                let mapping = build_storage_mapping(
+                    &plan.create_persistence_facts,
+                    &outputs,
+                    observed_mapping,
+                )
+                .map_err(|error| invalid(error.to_string()))?;
                 let keyed = novarocks_mv_application::persistence::keyed_documents::keyed_create_document_set(
                     &documents.definition, &documents.interpretation, &documents.configuration,
-                    plan.binding_document.clone(), target, owner, incarnation,
+                    plan.binding_document.clone(), mapping, target, owner, incarnation,
                 ).map_err(|error| invalid(error.to_string()))?;
                 // This provider method is pure: it binds the already staged
                 // metadata/schema and serializes its original writer handle.

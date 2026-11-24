@@ -18,8 +18,14 @@
 use super::*;
 use crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError as RefreshError;
 use crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo;
+use novarocks_mv_application::persistence::identity::DocumentRevision;
+use novarocks_mv_application::persistence::rebuild_classification::{
+    DefinitionAnalysisFailure, RebuildEvidence, ReplacementEvidence,
+};
 use novarocks_query_application::sql::session::registry::SessionPropertyInputs;
-use novarocks_spi::connector::{ConnectorOperationControl, ConnectorProviderBindingKey};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorProviderBindingKey,
+};
 
 /// Borrowed facts from the same retained refresh generation.
 pub(crate) struct RefreshPlanningFacts<'a> {
@@ -42,6 +48,236 @@ pub(crate) struct PlannedRequestedRefresh {
     pub(crate) plan: RefreshPlan,
     pub(crate) target_binding: ConnectorProviderBindingKey,
     pub(crate) full_overwrite: bool,
+    pub(crate) rebuild: Option<RefreshRebuildBinding>,
+}
+
+pub(crate) struct RefreshRebuildBinding {
+    pub(crate) candidate: RefreshBindingCandidate,
+    pub(crate) markers_remove: BTreeSet<novarocks_spi::connector::ConnectorMarkerKey>,
+}
+
+pub(crate) struct RefreshBindingCandidate {
+    pub(crate) query: ast::Query,
+    pub(crate) observed: crate::mv::domain::persistence::source_bindings::MvObservedBinding,
+    pub(crate) versions: novarocks_mv_application::persistence::keyed_documents::MvKeyedVersions,
+    pub(crate) interpretation: novarocks_mv_application::persistence::codec::InterpretationDocument,
+}
+
+pub(crate) enum RefreshBindingObservation {
+    Complete(Box<RefreshBindingCandidate>),
+    ChangedOutput(novarocks_mv_application::persistence::codec::BindingDigests),
+    IncompatibleStorage {
+        binding: novarocks_mv_application::persistence::codec::BindingDigests,
+        target_revision: DocumentRevision,
+        cause: RefreshError,
+    },
+}
+
+impl RefreshBindingObservation {
+    pub(crate) fn evidence(&self) -> ReplacementEvidence<RefreshError> {
+        match self {
+            Self::Complete(candidate) => {
+                ReplacementEvidence::Complete(RebuildEvidence::from(&candidate.versions))
+            }
+            Self::ChangedOutput(binding) => ReplacementEvidence::ChangedOutput(*binding),
+            Self::IncompatibleStorage {
+                binding,
+                target_revision,
+                cause,
+            } => ReplacementEvidence::IncompatibleStorage {
+                binding: *binding,
+                target_revision: *target_revision,
+                cause: cause.clone(),
+            },
+        }
+    }
+}
+
+pub(crate) fn definition_analysis_failure(
+    cause: &RefreshError,
+) -> DefinitionAnalysisFailure<RefreshError> {
+    use novarocks_sql::analyze_error::{AnalyzeError, AnalyzeErrorKind};
+    fn deterministic(error: &AnalyzeError) -> bool {
+        if error.control_error().is_some() || error.source_failure().is_some() {
+            return false;
+        }
+        if let Some(cause) =
+            std::error::Error::source(error).and_then(|error| error.downcast_ref::<AnalyzeError>())
+        {
+            return deterministic(cause);
+        }
+        matches!(
+            error.kind(),
+            AnalyzeErrorKind::UnknownTable
+                | AnalyzeErrorKind::UnknownCatalog
+                | AnalyzeErrorKind::UnknownSchema
+                | AnalyzeErrorKind::UnknownColumn
+                | AnalyzeErrorKind::UnknownFunction
+                | AnalyzeErrorKind::UnknownType
+                | AnalyzeErrorKind::AmbiguousFunctionCall
+                | AnalyzeErrorKind::TypeMismatch
+                | AnalyzeErrorKind::InvalidFunctionArgument
+                | AnalyzeErrorKind::UnsupportedQueryShape
+                | AnalyzeErrorKind::InvalidView
+                | AnalyzeErrorKind::ViewIsStale
+                | AnalyzeErrorKind::ViewIsRecursive
+        )
+    }
+    if cause.0.compile_control_error().is_none()
+        && cause.0.analyze_error().is_some_and(deterministic)
+    {
+        DefinitionAnalysisFailure::Deterministic(cause.clone())
+    } else {
+        DefinitionAnalysisFailure::Transient(cause.clone())
+    }
+}
+
+pub(crate) async fn prepare_refresh_binding_candidate(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    stored: &StoredKeyedMvProjection,
+    target: &MvTargetBinding,
+    schema: &MvSchemaValidationObservation,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<RefreshBindingObservation, RefreshError> {
+    use crate::mv::domain::persistence::source_bindings::observe_mv_binding;
+    use crate::query_execution::mv_assembly::refresh_preparation::pure_reader::capture_visible_refresh_analysis;
+    use novarocks_mv_application::persistence::{
+        create_documents::{MvInterpretationFacts, build_mv_refresh_interpretation},
+        keyed_documents::build_keyed_versions,
+        storage_mapping::{build_storage_mapping, storage_mapping_requests},
+    };
+
+    let definition = stored.facts.definition();
+    let resolution = &definition.query.resolution;
+    let query = read_stored_mv_query(&definition.query.effective_sql, &stored_mv_identity(stored))
+        .map_err(novarocks_sql::compiler::SqlCompileError::Analyze)?;
+    let query = canonicalize_iceberg_mv_select_query(
+        &query,
+        Some(&resolution.default_catalog),
+        &resolution.default_namespace,
+    );
+    let (analysis, bindings) = capture_visible_refresh_analysis(
+        io,
+        source,
+        Some(&resolution.default_catalog),
+        &resolution.default_namespace,
+        &query,
+        context,
+    )
+    .await?;
+    let sql = analysis
+        .refresh_input
+        .create_persistence_facts()
+        .map_err(novarocks_sql::compiler::SqlCompileError::from)?;
+    let (upstream, _) = io
+        .refresh_graph(source.readiness().clone())
+        .await?
+        .into_parts();
+    let observed = observe_mv_binding(
+        source.storage_observation(),
+        &sql,
+        &bindings,
+        &upstream,
+        context.clone(),
+    )?;
+    let binding = observed.document.digests();
+    if binding.outputs != stored.facts.binding().digests().outputs {
+        return Ok(RefreshBindingObservation::ChangedOutput(binding));
+    }
+    let exact = schema.exact_schema();
+    let incompatible = |cause| {
+        use novarocks_type_contract::CanonicalFactWriter;
+        use sha2::{Digest, Sha256};
+
+        let mut facts = CanonicalFactWriter::new("novarocks.mv.incompatible-storage", 1);
+        facts.bytes(exact.object_id.as_bytes());
+        facts.bytes(exact.schema_version.as_bytes());
+        facts.bytes(exact.partition_spec_version.as_bytes());
+        facts.sequence(exact.fields.len());
+        for field in &exact.fields {
+            facts.bytes(field.field_id.as_bytes());
+            facts.text(&field.name);
+            facts.bytes(&field.source_type.canonical_bytes());
+            facts.boolean(field.nullable);
+        }
+        RefreshBindingObservation::IncompatibleStorage {
+            binding,
+            target_revision: DocumentRevision::try_from_bytes(&Sha256::digest(facts.finish()))
+                .expect("a SHA-256 digest is an exact document revision"),
+            cause,
+        }
+    };
+    let control =
+        crate::query_execution::planning::sql_compile_control_from_connector_request(context);
+    let property = derive_fragment_property(&analysis, &control)?;
+    let refresh_contract = derive_imv_refresh_contract(&analysis, &control)?;
+    let runtime_layout = representative_aggregate_layout(&property, &query, &analysis)?
+        .map(|layout| layout.runtime_layout().clone())
+        .unwrap_or_else(stateless_mv_runtime_layout);
+    let interpretation = match build_mv_refresh_interpretation(
+        MvInterpretationFacts {
+            definition,
+            sql_facts: &sql,
+            source_observations: &observed.relations,
+            runtime_layout: &runtime_layout,
+            target_identity: &property.identity,
+            apply_key_column_name: refresh_contract.apply_key.column_name,
+            branch_column_name: identity_needs_branch_id_column(&property.identity)
+                .then_some(BRANCH_ID_COLUMN_NAME),
+        },
+        exact,
+    ) {
+        Ok(interpretation) => interpretation,
+        Err(message) => {
+            return Ok(incompatible(
+                ConnectorError::new(ConnectorErrorKind::Unsupported, message).into(),
+            ));
+        }
+    };
+    let requests = storage_mapping_requests(&sql, &interpretation)
+        .map_err(|error| RefreshError::user(error.to_string()))?;
+    let mapped = match source
+        .storage_observation()
+        .observe_current_storage_mapping(
+            target.planning_pin(),
+            target.metadata(),
+            &requests,
+            context.clone(),
+        ) {
+        Ok(mapped) => mapped,
+        Err(error) if error.kind() == ConnectorErrorKind::Unsupported => {
+            return Ok(incompatible(error.into()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if mapped.target_object != schema.exact_schema().object_id
+        || mapped.target_version != schema.exact_schema().metadata_version
+    {
+        return Err(RefreshError::user(
+            "MV mapping differs from the current target observation",
+        ));
+    }
+    let mapping = build_storage_mapping(&sql, &requests, mapped.columns)
+        .map_err(|error| RefreshError::user(error.to_string()))?;
+    let versions = build_keyed_versions(
+        definition,
+        &interpretation,
+        observed.document.clone(),
+        mapping,
+    )
+    .map_err(|error| RefreshError::user(error.to_string()))?;
+    io.install_analyzed_refresh_sources(source, &sql, &bindings, &observed, context)?;
+    io.captured_sources()
+        .capture_views(bindings.freeze_statement_views().await?)?;
+    Ok(RefreshBindingObservation::Complete(Box::new(
+        RefreshBindingCandidate {
+            query,
+            observed,
+            versions,
+            interpretation,
+        },
+    )))
 }
 
 pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
@@ -69,11 +305,12 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     // Metadata maintenance may renew an existing admission only while its
     // carrier facts remain identical. This observation cannot recover an old
     // document format or reopen management without explicit readmission.
-    if reobserve_current_management_before_refresh(io, source, &iceberg_target, connector_context)
-        .await?
-    {
+    let (closed, observed_current) =
+        reobserve_current_management_before_refresh(io, source, &iceberg_target, connector_context)
+            .await?;
+    if closed {
         return Err(RefreshError::user(
-            "MV Current marker names another process incarnation; management is closed".to_string(),
+            "MV Current marker names another process incarnation; management is closed",
         ));
     }
     let mv_definition = io
@@ -84,16 +321,27 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         .target_binding(source, &iceberg_target, connector_context)
         .await
         .map_err(RefreshError::from)?;
-    if let Err(snapshot_error) = validate_target_snapshot_original(
-        io,
-        source,
-        &iceberg_target,
-        &mv_definition,
-        &target_binding,
-        connector_context,
-    )
-    .await
-    {
+    let validation = match observed_current.as_ref() {
+        Some(observed) => crate::mv::domain::refresh::target::validate_target_snapshot_observed(
+            &iceberg_target,
+            &mv_definition,
+            &target_binding,
+            observed,
+        )
+        .map_err(RefreshError::from),
+        None => {
+            validate_target_snapshot_original(
+                io,
+                source,
+                &iceberg_target,
+                &mv_definition,
+                &target_binding,
+                connector_context,
+            )
+            .await
+        }
+    };
+    if let Err(snapshot_error) = validation {
         reconcile_published_lake_projection(
             io,
             source,
@@ -140,52 +388,193 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         plan,
         target_binding: target_binding_key.clone(),
         full_overwrite,
+        rebuild: None,
     };
-    // D's own occurrence inventory is the base-locator authority now; the
-    // retired projection copy of the resolved FQN list is gone.
-    let refresh_state_baseline = build_refresh_state_baseline(&mv_definition, &target_binding)
-        .map_err(RefreshError::from)?;
-    io.capture_refresh_sources(
-        source,
-        &mv_definition,
-        &refresh_state_baseline,
-        stmt.full || full_sources,
-        connector_context,
-    )
-    .await?;
-    let base_refs = definition_base_refs(&mv_definition).map_err(RefreshError::from)?;
-    // One exact target generation serves the whole plan: the snapshot fence
-    // above, the state baseline, the L bindings, and the typed partition facts
-    // every sub-planner reads. Re-resolving `latest` per fact could split one
-    // attempt across two generations.
+    let refresh_state_baseline = build_refresh_state_baseline(&mv_definition, &target_binding)?;
     let target_schema_observation =
         crate::mv::domain::storage_observation::observe_schema_validation(
             source.storage_observation(),
             target_binding.planning_pin(),
             target_binding.metadata(),
             connector_context.clone(),
-        )
-        .map_err(RefreshError::from)?;
-
-    let (mv_definition, refresh_query_source) = io
-        .rebind_definition(
+        )?;
+    let Some(observed_current) = observed_current else {
+        return Err(RefreshError::user(
+            "MV refresh requires the original managed Current observation",
+        ));
+    };
+    if observed_current.view.metadata_version
+        != target_schema_observation.exact_schema().metadata_version
+        || observed_current.versions.binding.identity()
+            != mv_definition.facts.versions().binding.identity()
+        || observed_current.publication_revision
+            != mv_definition.facts.source_revision().publication_revision
+    {
+        return Err(RefreshError(MvApplicationError::new(
+            MvApplicationErrorKind::BindingInvalidated,
+            "MV Current changed while capturing its refresh binding",
+        )));
+    }
+    use novarocks_mv_application::persistence::{
+        codec::{Marker, marker_eligibility},
+        rebuild_classification::{RefreshBindingClassification, classify_refresh_observation},
+    };
+    let analyzed = prepare_refresh_binding_candidate(
+        io,
+        source,
+        &mv_definition,
+        &target_binding,
+        &target_schema_observation,
+        connector_context,
+    )
+    .await;
+    let markers = observed_current
+        .decoded_markers()
+        .map_err(|error| RefreshError::user(error.to_string()))?;
+    let root = observed_current.root_binding_revision();
+    let scope = observed_current.publication_evidence(&root);
+    let mut clear = marker_eligibility(scope, &markers).inactive;
+    let classified = classify_refresh_observation(
+        RebuildEvidence::from(&observed_current.versions),
+        analyzed
+            .as_ref()
+            .map(RefreshBindingObservation::evidence)
+            .map_err(definition_analysis_failure),
+        scope,
+        &markers,
+    )?;
+    let rebuild = match classified {
+        RefreshBindingClassification::Blocked => {
+            return Err(RefreshError::user(
+                "The materialized-view binding has no reusable current generation",
+            ));
+        }
+        RefreshBindingClassification::InvalidDefinition { marker, cause } => {
+            let Marker::InvalidDefinition { diagnostic, .. } = &marker else {
+                unreachable!("invalid-definition classification produces its typed marker");
+            };
+            let diagnostic = diagnostic.clone();
+            io.write_binding_marker(
+                source,
+                target_binding.planning_pin(),
+                observed_current,
+                &mv_definition.facts,
+                marker,
+                connector_context.clone(),
+            )
+            .await?;
+            let stale = novarocks_sql::analyze_error::AnalyzeError::view_is_stale(diagnostic, None);
+            let failure = MvApplicationError::from_compile(
+                novarocks_sql::compiler::SqlCompileError::Analyze(stale),
+            );
+            return Err(RefreshError(
+                match cause.and_then(|cause| cause.0.original_failure().cloned()) {
+                    Some(cause) => failure.with_original_failure(cause),
+                    None => failure,
+                },
+            ));
+        }
+        RefreshBindingClassification::NeedsRebuild(marker) => Some(marker),
+        RefreshBindingClassification::IncompatibleStorage { marker, cause } => {
+            io.write_binding_marker(
+                source,
+                target_binding.planning_pin(),
+                observed_current,
+                &mv_definition.facts,
+                marker,
+                connector_context.clone(),
+            )
+            .await?;
+            return Err(cause);
+        }
+        RefreshBindingClassification::Unchanged => None,
+    };
+    let RefreshBindingObservation::Complete(candidate) = analyzed? else {
+        return Err(RefreshError::user(
+            "MV refresh classification has no admitted storage layout",
+        ));
+    };
+    let candidate = *candidate;
+    if let Some(marker) = rebuild {
+        for (key, existing) in markers {
+            if existing.scope() == marker.scope() {
+                clear.insert(key);
+            }
+        }
+        clear.insert(
+            marker
+                .encode()
+                .map_err(|error| RefreshError::user(error.to_string()))?
+                .0,
+        );
+        io.write_binding_marker(
             source,
-            &mv_definition,
-            &base_refs,
-            &iceberg_target,
-            Some(&target_schema_observation),
+            target_binding.planning_pin(),
+            observed_current,
+            &mv_definition.facts,
+            marker,
+            connector_context.clone(),
+        )
+        .await?;
+        io.capture_refresh_sources(
+            source,
+            &candidate.observed.document,
+            &refresh_state_baseline,
+            true,
             connector_context,
         )
         .await?;
-
-    let resolution = &mv_definition.facts.definition().query.resolution;
-    let canonical_select_query = canonicalize_iceberg_mv_select_query(
-        &read_stored_mv_query(&refresh_query_source, &stored_mv_identity(&mv_definition))
-            .map_err(novarocks_sql::compiler::SqlCompileError::Analyze)
-            .map_err(RefreshError::from)?,
-        Some(resolution.default_catalog.as_str()),
-        &resolution.default_namespace,
-    );
+        let sources = io.captured_sources();
+        let mut bases = Vec::new();
+        let mut snapshots = BTreeMap::new();
+        for occurrence in &candidate.observed.document.occurrences {
+            let table = occurrence_table(occurrence);
+            let occurrence_id =
+                novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(occurrence.occurrence_id);
+            snapshots.insert(occurrence_id, sources.require(&table)?.snapshot);
+            bases.push(RefreshBaseRelationOccurrence {
+                occurrence_id,
+                table,
+            });
+        }
+        let mut baseline = refresh_state_baseline;
+        let RefreshStateBaseline::SnapshotBacked {
+            previous_sources, ..
+        } = &mut baseline;
+        previous_sources.clear();
+        return Ok(PlannedRequestedRefresh {
+            plan: build_iceberg_refresh_plan(
+                &mv_definition,
+                target,
+                stmt,
+                current_catalog,
+                current_database,
+                &bases,
+                snapshots,
+                ExecutableRefreshDecision::FirstRefresh,
+                baseline,
+                crate::mv::domain::model::AffectedTargetPartitions::not_derived(
+                    "MV binding rebuild",
+                ),
+            ),
+            target_binding: target_binding_key,
+            full_overwrite: true,
+            rebuild: Some(RefreshRebuildBinding {
+                candidate,
+                markers_remove: clear,
+            }),
+        });
+    }
+    io.capture_refresh_sources(
+        source,
+        &candidate.observed.document,
+        &refresh_state_baseline,
+        stmt.full || full_sources,
+        connector_context,
+    )
+    .await?;
+    let base_refs = definition_base_refs(&mv_definition)?;
+    let canonical_select_query = candidate.query;
     // Driver dispatch: plan-side dispatch is capability-driven, matching the
     // execute path. The capabilities come from L plus the exact target
     // observation L was validated against, never from a persisted contract.
@@ -195,7 +584,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     let caps = RefreshCapabilities::from_canonical_facts(
         mv_definition.facts.interpretation(),
         &runtime_bindings,
-        mv_definition.facts.definition().relation_occurrences.len(),
+        mv_definition.facts.binding().occurrences.len(),
         definition_has_join(&canonical_select_query),
     )
     .map_err(RefreshError::from)?;
@@ -1224,7 +1613,7 @@ pub(crate) async fn captured_refresh_decision_original(
     let caps = RefreshCapabilities::from_canonical_facts(
         projection.facts.interpretation(),
         bindings,
-        projection.facts.definition().relation_occurrences.len(),
+        projection.facts.binding().occurrences.len(),
         definition_has_join(query),
     )?;
     let statuses = base_snapshot_statuses_for_plan(&bases, &previous.snapshots, &current);
@@ -1306,6 +1695,7 @@ pub(crate) async fn plan_aggregate_mv_affected_partitions(
                     source_occurrence_id: base.occurrence_id.get(),
                     target_partition,
                     prepared_source: None,
+                    direct_output_sources: None,
                 },
             )
             .map_err(Into::into)
@@ -1344,11 +1734,13 @@ async fn plan_prepared_base_partitions(
         );
     }
     let observation = io.schema(source, &base.table, context).await?;
+    let captured_sources = io.captured_sources();
     crate::mv::domain::partition::planner::plan_affected_partitions(
         &crate::mv::domain::partition::planner::AffectedPartitionPlanInput {
             projection,
             source_occurrence_id: base.occurrence_id.get(),
             target_partition,
+            direct_output_sources: captured_sources.direct_output_sources(),
             prepared_source: Some(
                 crate::mv::domain::partition::planner::PreparedPartitionSource {
                     receipt: &receipt,
@@ -1429,7 +1821,15 @@ async fn reobserve_current_management_before_refresh(
     source: &IcebergMvCorePorts,
     target: &IcebergMvTarget,
     context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<bool, RefreshError> {
+) -> Result<
+    (
+        bool,
+        Option<
+            novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+        >,
+    ),
+    RefreshError,
+> {
     let instance = ConnectorInstanceId::parse(&target.catalog).map_err(|e| e.to_string())?;
     let table = novarocks_spi::connector::ConnectorTableIdentity {
         instance_id: instance.clone(),
@@ -1441,7 +1841,7 @@ async fn reobserve_current_management_before_refresh(
         .management_phase(&table)
         .is_manageable()
     {
-        return Ok(false);
+        return Ok((false, None));
     }
     let lease =
         crate::connector::metadata_binding_typed(source.connector_control(), &target.catalog)?;
@@ -1504,7 +1904,7 @@ async fn reobserve_current_management_before_refresh(
             .await?;
         }
     }
-    Ok(closed)
+    Ok((closed, Some(observed)))
 }
 async fn reconcile_published_lake_projection(
     io: &MvRefreshPreparationIo,

@@ -41,9 +41,7 @@ impl IcebergStorageInspector {
                     .iter()
                     .find(|field| field.provider_field_id() == &column.field_id)
                     .ok_or_else(|| invalid("MV output has no exact prepared Iceberg field"))?;
-                let storage = field
-                    .source_type()
-                    .ok_or_else(|| corrupt("prepared Iceberg field has no storage type"))?;
+                let storage = field.source_type();
                 let declaration = field
                     .storage_declaration()
                     .ok_or_else(|| corrupt("prepared Iceberg field has no mapping declaration"))?;

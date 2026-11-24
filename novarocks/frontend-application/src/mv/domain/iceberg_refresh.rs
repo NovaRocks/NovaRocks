@@ -23,8 +23,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::datatypes::DataType;
-
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::mv::domain::analysis::refresh_property::{
     RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
@@ -80,7 +78,7 @@ use crate::mv::domain::storage_observation::{
     MvSchemaValidationObservation, MvSourceSchemaObservation,
 };
 use novarocks_catalog_application::CatalogApplicationPort;
-use novarocks_mv_application::persistence::codec::{ApplyKeyKind, RelationOccurrence};
+use novarocks_mv_application::persistence::codec::{ApplyKeyKind, BindingOccurrence};
 use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest;
 use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
 use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
@@ -229,6 +227,10 @@ impl IcebergMvCorePorts {
         self.storage_observation.as_ref()
     }
 
+    pub(crate) fn storage_observation_port(&self) -> Arc<dyn MvStorageObservationPort> {
+        self.storage_observation.clone()
+    }
+
     pub(crate) fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
         self.catalog_application.as_deref()
     }
@@ -355,17 +357,8 @@ pub(crate) fn prepare_mv_create_shape(
 pub(crate) fn prepare_mv_create_properties(
     shape: &MvCreateShape,
     control: &novarocks_sql::compiler::SqlCompileControl,
-) -> Result<
-    (
-        RefreshFragmentProperty,
-        novarocks_sql::planning::mv::SqlMvCreatePersistenceFacts,
-    ),
-    novarocks_sql::compiler::SqlCompileError,
-> {
-    Ok((
-        derive_fragment_property(&shape.analysis, control)?,
-        shape.analysis.refresh_input.create_persistence_facts()?,
-    ))
+) -> Result<RefreshFragmentProperty, novarocks_sql::compiler::SqlCompileError> {
+    derive_fragment_property(&shape.analysis, control)
 }
 
 pub(crate) fn finish_mv_create_preparation(
@@ -467,16 +460,7 @@ pub(crate) fn finish_mv_create_preparation(
     let aggregate_runtime_layout =
         representative_aggregate_layout(&property, &canonical_select_query, &analysis)?
             .map(|layout| layout.runtime_layout().clone())
-            .unwrap_or_else(|| {
-                novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout::try_new(
-                    "__row_id__".to_string(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )
-                .expect("empty aggregate layout is a valid stateless CREATE carrier")
-            });
+            .unwrap_or_else(stateless_mv_runtime_layout);
     let mut application_properties = vec![
         (
             APPLY_KEY_COLUMN_PROPERTY.to_string(),
@@ -522,6 +506,17 @@ pub(crate) fn finish_mv_create_preparation(
         application_properties,
         created_at_ms,
     }))
+}
+
+fn stateless_mv_runtime_layout() -> novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout {
+    novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout::try_new(
+        "__row_id__".to_string(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("empty aggregate layout is a valid stateless MV carrier")
 }
 
 fn create_declaration_error(message: String) -> MvApplicationError {
@@ -660,25 +655,10 @@ fn base_table_descriptor_from_observation(
             .iter()
             .map(|field| BaseColumnDescriptor {
                 name: field.name.clone(),
-                data_type: DataType::Null,
-                sql_type: observed_iceberg_type_sql_head(&field.type_signature),
+                source_type: field.source_type.clone(),
                 nullable: field.nullable,
             })
             .collect(),
-    }
-}
-
-fn observed_iceberg_type_sql_head(type_signature: &str) -> String {
-    let lower = type_signature.trim().to_ascii_lowercase();
-    let head = lower.split(['(', '<']).next().unwrap_or("").trim();
-    match head {
-        "long" => "BIGINT".to_string(),
-        "int" => "INT".to_string(),
-        "string" => "STRING".to_string(),
-        "decimal" => "DECIMAL".to_string(),
-        "date" => "DATE".to_string(),
-        "timestamp" | "timestamptz" => "DATETIME".to_string(),
-        other => other.to_ascii_uppercase(),
     }
 }
 
@@ -732,7 +712,7 @@ fn validate_union_projection_schema_contract_for_base(
     iceberg_target: &IcebergMvTarget,
     projection: &StoredKeyedMvProjection,
     branch_count: usize,
-    occurrence: &RelationOccurrence,
+    occurrence: &BindingOccurrence,
     base_observation: &MvSourceSchemaObservation,
     target_observation: &MvSchemaValidationObservation,
 ) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
@@ -1327,8 +1307,8 @@ mod tests {
             None,
         );
         for (occurrence, (table, qualifier)) in fixture
-            .definition
-            .relation_occurrences
+            .binding
+            .occurrences
             .iter_mut()
             .zip([(left, left_qualifier), (right, right_qualifier)])
         {
@@ -1671,17 +1651,17 @@ pub(crate) fn build_refresh_state_baseline(
     mv_definition: &StoredKeyedMvProjection,
     target: &crate::mv::domain::refresh::target_binding::MvTargetBinding,
 ) -> Result<RefreshStateBaseline, String> {
-    let definition = mv_definition.facts.definition();
+    let definition = mv_definition.facts.binding();
     let previous_sources = match mv_definition.facts.publication() {
         None => Vec::new(),
         Some(publication) => {
-            if publication.inputs.len() != definition.relation_occurrences.len() {
+            if publication.inputs.len() != definition.occurrences.len() {
                 return Err(
                     "MV publication inputs do not cover every D relation occurrence".into(),
                 );
             }
             definition
-                .relation_occurrences
+                .occurrences
                 .iter()
                 .zip(&publication.inputs)
                 .map(|(occurrence, input)| {
@@ -1724,12 +1704,14 @@ pub(crate) fn build_refresh_state_baseline(
         previous_sources,
         target_snapshot_id: target.current_snapshot_id(),
         target_table_uuid: target.table_uuid().to_string(),
-        definition_fingerprint: mv_definition_fingerprint(&definition.query.effective_sql),
+        definition_fingerprint: mv_definition_fingerprint(
+            &mv_definition.facts.definition().query.effective_sql,
+        ),
     })
 }
 
 /// D's binding-time locator for one relation occurrence.
-fn occurrence_table(occurrence: &RelationOccurrence) -> TableIdentity {
+fn occurrence_table(occurrence: &BindingOccurrence) -> TableIdentity {
     TableIdentity {
         catalog: occurrence.catalog_at_binding.clone(),
         namespace: occurrence.namespace_at_binding.clone(),
@@ -1747,8 +1729,8 @@ fn definition_base_refs(
 ) -> Result<Vec<TableIdentity>, String> {
     Ok(projection
         .facts
-        .definition()
-        .relation_occurrences
+        .binding()
+        .occurrences
         .iter()
         .map(occurrence_table)
         .collect())
@@ -1765,8 +1747,8 @@ fn definition_has_join(query: &ast::Query) -> bool {
 fn definition_occurrences_for_base_refs<'a>(
     projection: &'a StoredKeyedMvProjection,
     base_refs: &[TableIdentity],
-) -> Result<Vec<&'a RelationOccurrence>, String> {
-    let occurrences = &projection.facts.definition().relation_occurrences;
+) -> Result<Vec<&'a BindingOccurrence>, String> {
+    let occurrences = &projection.facts.binding().occurrences;
     if occurrences.len() != base_refs.len() {
         return Err("MV refresh base references do not retain every D occurrence".to_string());
     }
@@ -2048,7 +2030,7 @@ pub fn join_base_refs_for_definition<'a>(
     ),
     String,
 > {
-    let occurrences = &projection.facts.definition().relation_occurrences;
+    let occurrences = &projection.facts.binding().occurrences;
     if occurrences.len() != 2 || base_refs.len() != 2 {
         return Err("join MV refresh requires exactly two D relation occurrences".to_string());
     }

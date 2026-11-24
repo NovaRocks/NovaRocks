@@ -22,10 +22,10 @@ use super::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use bytes::Bytes;
 use novarocks_mv_application::persistence::{
-    codec::{ApplyKeyKind, ExpressionKind, PhysicalFieldLogicalIdentity},
+    codec::{ApplyKeyKind, PhysicalFieldLogicalIdentity},
     identity::FieldIdentity,
     keyed_documents::{MvKeyedObservedCurrentDocuments, StoredKeyedMvProjection},
-    test_support::{KeyedProjectionFixture, observed_current_keyed},
+    test_support::{KeyedProjectionFixture, fixture_mapping, fixture_type, observed_current_keyed},
 };
 use novarocks_spi::connector::document_storage::*;
 use novarocks_spi::connector::read_stack::adapter::*;
@@ -79,27 +79,23 @@ fn row_projection(
     } else {
         "SELECT o.amount AS amount FROM ice.sales.orders o UNION ALL SELECT o2.amount AS amount FROM ice.sales.orders o2".into()
     };
-    for occurrence in &mut fixture.definition.relation_occurrences {
+    for occurrence in &mut fixture.binding.occurrences {
         occurrence
-            .fields
+            .paths
             .iter_mut()
-            .find(|v| v.name_at_binding == "amount")
+            .find(|path| path.nodes[0].name_at_binding == "amount")
             .unwrap()
-            .type_signature = "double".into();
+            .leaf_type = fixture_type("double");
     }
-    let output = &mut fixture.definition.outputs[0];
+    let output = &mut fixture.binding.outputs[0];
     output.name = "amount".into();
-    output.type_signature = "double".into();
-    output.expression.kind = ExpressionKind::Field;
-    output.expression.function_identity = None;
     if self_join {
         output
-            .expression
             .source_fields
-            .retain(|v| v.occurrence_id == 7);
+            .retain(|value| value.occurrence_id == 7);
         fixture.interpretation.branches.clear();
     }
-    fixture.interpretation.outputs[0].type_signature = "double".into();
+    fixture.interpretation.outputs[0].source_type = fixture_type("double");
     fixture.interpretation.aggregates.clear();
     fixture.interpretation.state_slots.clear();
     fixture.interpretation.apply_key.kind = if self_join {
@@ -124,17 +120,18 @@ fn row_projection(
         .fields
         .retain_mut(|binding| match &binding.logical_identity {
             PhysicalFieldLogicalIdentity::Output(_) => {
-                binding.type_signature = "double".into();
+                binding.source_type = fixture_type("double");
                 true
             }
             PhysicalFieldLogicalIdentity::ApplyKey(_) => {
-                binding.type_signature = apply_type.into();
+                binding.source_type = fixture_type(apply_type);
                 binding.nullable = apply.nullable;
                 true
             }
             PhysicalFieldLogicalIdentity::Branch(_) => !self_join,
             PhysicalFieldLogicalIdentity::State(_) => false,
         });
+    fixture.mapping = fixture_mapping(&fixture.binding, &fixture.interpretation);
     let mut names = BTreeMap::from([(field(31), "amount".into()), (field(34), apply.name)]);
     if !self_join {
         let branch = mv_internal_target_column(SqlMvInternalTargetColumn::BranchId);
@@ -189,7 +186,7 @@ impl SourceFixture {
     }
     fn object(&self) -> ConnectorTableObjectId {
         novarocks_mv_application::persistence::exact_revision::restore_persisted_object(
-            &self.projection.facts.definition().relation_occurrences[0].object_id,
+            &self.projection.facts.binding().occurrences[0].object_id,
         )
         .unwrap()
     }
@@ -209,15 +206,18 @@ impl SourceFixture {
         }
     }
     fn source_fields(&self) -> Vec<MvObservedSourceField> {
-        self.projection.facts.definition().relation_occurrences[0]
-            .fields
+        self.projection.facts.binding().occurrences[0]
+            .paths
             .iter()
-            .map(|v| {
+            .map(|path| {
+                let [field] = path.nodes.as_slice() else {
+                    panic!("fixture has a nested field");
+                };
                 MvObservedSourceField::try_new(
-                    Bytes::copy_from_slice(v.field_id.as_bytes()),
-                    v.name_at_binding.clone(),
-                    v.type_signature.clone(),
-                    v.nullable,
+                    Bytes::copy_from_slice(field.field_id.as_bytes()),
+                    field.name_at_binding.clone(),
+                    path.leaf_type.clone(),
+                    !field.required,
                 )
                 .unwrap()
             })
@@ -238,7 +238,7 @@ impl SourceFixture {
                     *amount = MvObservedSourceField::try_new(
                         amount.provider_field_id().clone(),
                         amount.name().to_owned(),
-                        "bigint".to_owned(),
+                        fixture_type("bigint"),
                         amount.nullable(),
                     )
                     .unwrap();
@@ -247,7 +247,7 @@ impl SourceFixture {
                     MvObservedSourceField::try_new(
                         Bytes::from_static(b"unrelated-current-field"),
                         "unrelated_current".to_owned(),
-                        "bigint".to_owned(),
+                        fixture_type("bigint"),
                         true,
                     )
                     .unwrap(),
@@ -273,7 +273,7 @@ impl SourceFixture {
                     MvObservedSourceField::try_new(
                         Bytes::copy_from_slice(v.target_field_id.as_bytes()),
                         self.target_names[&v.target_field_id].clone(),
-                        v.type_signature.clone(),
+                        v.source_type.clone(),
                         v.nullable,
                     )
                     .unwrap(),
@@ -311,16 +311,10 @@ impl SourceFixture {
                 .map(|(_, v)| {
                     Field::new(
                         v.name(),
-                        match v.type_signature() {
-                            "decimal(18,2)" => DataType::Decimal128(18, 2),
-                            "decimal(38,2)" => DataType::Decimal128(38, 2),
-                            "double" => DataType::Float64,
-                            "string" => DataType::Utf8,
-                            "bigint" => DataType::Int64,
-                            "binary" => DataType::Binary,
-                            "integer" => DataType::Int32,
-                            other => panic!("undeclared target type {other}"),
-                        },
+                        crate::mv::domain::rewrite::context::arrow_type_from_provider_type(
+                            v.source_type(),
+                        )
+                        .unwrap(),
                         v.nullable(),
                     )
                 })
@@ -1301,7 +1295,7 @@ async fn explain_counted_with_initial_schema(
     }
     let projections_before = source.schema_projections.load(Ordering::SeqCst);
     let mut occurrences = BTreeSet::new();
-    for occurrence in &source.projection.facts.definition().relation_occurrences {
+    for occurrence in &source.projection.facts.binding().occurrences {
         let (admission,observation)=crate::mv::domain::refresh::rewrite_context::project_prepared_change_window_for_table_original(
             explain.reader.original_io_for_test(),source.as_ref(),&table,&from,17,18,&context,
         ).unwrap();

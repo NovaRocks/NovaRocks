@@ -246,6 +246,7 @@ pub(crate) fn project_view(
         metadata_version,
         current_snapshot: metadata.current_snapshot_id(),
         current_snapshot_file_totals: totals,
+        before_first_data_publication: proves_initial_slot_history(metadata),
         slots,
         markers,
         versions,
@@ -253,6 +254,31 @@ pub(crate) fn project_view(
         current_records,
         management,
     })
+}
+
+fn proves_initial_slot_history(metadata: &TableMetadata) -> bool {
+    use crate::commit::slot_change::SLOT_CHANGE_SNAPSHOT_SUMMARY_KEY;
+    let mut sequence = metadata.last_sequence_number();
+    let mut next = metadata.current_snapshot_id();
+    while let Some(id) = next {
+        let Some(snapshot) = metadata.snapshot_by_id(id) else {
+            return false;
+        };
+        if sequence <= 0
+            || snapshot.sequence_number() != sequence
+            || snapshot
+                .summary()
+                .additional_properties
+                .get(SLOT_CHANGE_SNAPSHOT_SUMMARY_KEY)
+                .map(String::as_str)
+                != Some("true")
+        {
+            return false;
+        }
+        sequence -= 1;
+        next = snapshot.parent_snapshot_id();
+    }
+    sequence == 0
 }
 
 pub(crate) fn project_full_view(

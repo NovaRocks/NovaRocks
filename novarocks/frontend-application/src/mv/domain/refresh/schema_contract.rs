@@ -21,7 +21,7 @@ use crate::mv::domain::refresh::target::IcebergMvTarget;
 use crate::mv::domain::storage_observation::{
     MvSchemaValidationObservation, MvSourceSchemaObservation,
 };
-use novarocks_mv_application::persistence::codec::{InterpretationDocument, RelationOccurrence};
+use novarocks_mv_application::persistence::codec::{BindingOccurrence, InterpretationDocument};
 use novarocks_mv_application::persistence::identity::FieldIdentity;
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::persistence::runtime_bindings::{
@@ -59,7 +59,7 @@ pub(crate) fn validate_projection_target(
 /// Schema version may advance after a rename or an unrelated added column.
 /// Every bound field must still have the same exact identity, type and nullability.
 pub(crate) fn validate_relation_occurrence_schema(
-    occurrence: &RelationOccurrence,
+    occurrence: &BindingOccurrence,
     observation: &MvSourceSchemaObservation,
 ) -> Result<Vec<MvOccurrenceFieldRebind>, String> {
     // D records the source object inside the canonical exact-fact envelope;
@@ -85,7 +85,10 @@ pub(crate) fn validate_relation_occurrence_schema(
         ));
     }
     let mut renames = Vec::new();
-    for bound in &occurrence.fields {
+    for path in &occurrence.paths {
+        let Some((bound, nested)) = path.nodes.split_first() else {
+            return Err("MV source path has no bound root field".into());
+        };
         let current = observation
             .fields()
             .iter()
@@ -96,7 +99,9 @@ pub(crate) fn validate_relation_occurrence_schema(
                     occurrence.occurrence_id
                 )
             })?;
-        if current.type_signature != bound.type_signature || current.nullable != bound.nullable {
+        if (nested.is_empty() && current.source_type != path.leaf_type)
+            || current.nullable == bound.required
+        {
             return Err(format!(
                 "MV source field type or nullability changed for relation occurrence {}",
                 occurrence.occurrence_id
@@ -132,7 +137,7 @@ pub fn validate_aggregate_schema_contract_metadata<'a>(
 
 pub(crate) fn validate_aggregate_schema_contract_for_base(
     projection: &StoredKeyedMvProjection,
-    occurrence: &RelationOccurrence,
+    occurrence: &BindingOccurrence,
     base_observation: &MvSourceSchemaObservation,
     target_observation: &MvSchemaValidationObservation,
 ) -> Result<Vec<MvOccurrenceFieldRebind>, String> {
@@ -192,7 +197,7 @@ mod tests {
                     MvObservedSourceField::try_new(
                         Bytes::copy_from_slice(field.target_field_id.as_bytes()),
                         format!("physical_{ordinal}"),
-                        field.type_signature.clone(),
+                        field.source_type.clone(),
                         field.nullable,
                     )
                     .unwrap(),
@@ -218,14 +223,17 @@ mod tests {
     }
 
     fn source_observation(
-        occurrence: &RelationOccurrence,
+        occurrence: &BindingOccurrence,
         object: &[u8],
         rename: bool,
     ) -> MvSourceSchemaObservation {
         let fields = occurrence
-            .fields
+            .paths
             .iter()
-            .map(|field| {
+            .map(|path| {
+                let [field] = path.nodes.as_slice() else {
+                    panic!("fixture has a nested field");
+                };
                 MvObservedSourceField::try_new(
                     Bytes::copy_from_slice(field.field_id.as_bytes()),
                     if rename {
@@ -233,8 +241,8 @@ mod tests {
                     } else {
                         field.name_at_binding.clone()
                     },
-                    field.type_signature.clone(),
-                    field.nullable,
+                    path.leaf_type.clone(),
+                    !field.required,
                 )
                 .unwrap()
             })
@@ -285,7 +293,7 @@ mod tests {
     #[test]
     fn repeated_objects_keep_distinct_occurrence_rename_facts() {
         let projection = projection();
-        let occurrences = &projection.facts.definition().relation_occurrences;
+        let occurrences = &projection.facts.binding().occurrences;
         let object =
             novarocks_mv_application::persistence::exact_revision::restore_persisted_object(
                 &occurrences[0].object_id,
@@ -310,7 +318,7 @@ mod tests {
     #[test]
     fn same_locator_cannot_rebind_a_replaced_source_object() {
         let projection = projection();
-        let occurrence = &projection.facts.definition().relation_occurrences[0];
+        let occurrence = &projection.facts.binding().occurrences[0];
         let observed = source_observation(occurrence, b"replacement-object", false);
         assert!(
             validate_relation_occurrence_schema(occurrence, &observed)

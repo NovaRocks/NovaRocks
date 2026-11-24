@@ -81,6 +81,9 @@ pub(crate) async fn prepare_analysis(
         crate::query_execution::planning::sql_compile_control_from_execution(&input.execution);
     let settings = input.execution.optimizer_settings().clone();
     let (artifact, sources) = input.prepared.into_assembly_artifact();
+    if let Some(views) = sources.views() {
+        bindings.retain_statement_views(views).await;
+    }
     match artifact {
         PreparedMvRefreshWriteArtifact::FirstRefresh(prepared) => {
             let current_catalog = prepared.current_catalog().map(str::to_owned);

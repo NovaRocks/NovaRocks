@@ -36,11 +36,22 @@ pub enum DefinitionAnalysisFailure<E> {
     Transient(E),
 }
 
+pub enum ReplacementEvidence<E> {
+    Complete(RebuildEvidence),
+    ChangedOutput(BindingDigests),
+    IncompatibleStorage {
+        binding: BindingDigests,
+        target_revision: DocumentRevision,
+        cause: E,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RefreshBindingClassification<E> {
     Unchanged,
     NeedsRebuild(Marker),
     InvalidDefinition { marker: Marker, cause: Option<E> },
+    IncompatibleStorage { marker: Marker, cause: E },
     Blocked,
 }
 
@@ -48,6 +59,20 @@ pub enum RefreshBindingClassification<E> {
 pub fn classify_refresh_binding<E: std::fmt::Display>(
     observed: RebuildEvidence,
     replacement: Result<RebuildEvidence, DefinitionAnalysisFailure<E>>,
+    publication: PublicationEvidence<'_>,
+    markers: &[(ConnectorMarkerKey, Marker)],
+) -> Result<RefreshBindingClassification<E>, E> {
+    classify_refresh_observation(
+        observed,
+        replacement.map(ReplacementEvidence::Complete),
+        publication,
+        markers,
+    )
+}
+
+pub fn classify_refresh_observation<E: std::fmt::Display>(
+    observed: RebuildEvidence,
+    replacement: Result<ReplacementEvidence<E>, DefinitionAnalysisFailure<E>>,
     publication: PublicationEvidence<'_>,
     markers: &[(ConnectorMarkerKey, Marker)],
 ) -> Result<RefreshBindingClassification<E>, E> {
@@ -83,14 +108,19 @@ pub fn classify_refresh_binding<E: std::fmt::Display>(
         }
         Err(DefinitionAnalysisFailure::Transient(cause)) => return Err(cause),
     };
-    if observed.binding.outputs != replacement.binding.outputs {
+    let binding = match &replacement {
+        ReplacementEvidence::Complete(value) => value.binding,
+        ReplacementEvidence::ChangedOutput(value)
+        | ReplacementEvidence::IncompatibleStorage { binding: value, .. } => *value,
+    };
+    if observed.binding.outputs != binding.outputs {
         let marker = Marker::InvalidDefinition {
             scope,
             kind: InvalidDefinitionKind::OutputDeclaration,
             diagnostic: format!(
                 "The analyzed output declaration changed from {} to {}",
                 hex::encode(observed.binding.outputs.as_bytes()),
-                hex::encode(replacement.binding.outputs.as_bytes()),
+                hex::encode(binding.outputs.as_bytes()),
             ),
         };
         return Ok(RefreshBindingClassification::InvalidDefinition {
@@ -98,6 +128,25 @@ pub fn classify_refresh_binding<E: std::fmt::Display>(
             cause: None,
         });
     }
+    let replacement = match replacement {
+        ReplacementEvidence::Complete(value) => value,
+        ReplacementEvidence::ChangedOutput(_) => return Ok(RefreshBindingClassification::Blocked),
+        ReplacementEvidence::IncompatibleStorage {
+            target_revision,
+            cause,
+            ..
+        } => {
+            let marker = Marker::NeedsRebuild {
+                scope,
+                changes: vec![BindingChange {
+                    kind: BindingChangeKind::StorageMapping,
+                    observed_revision: observed.mapping,
+                    current_revision: target_revision,
+                }],
+            };
+            return Ok(RefreshBindingClassification::IncompatibleStorage { marker, cause });
+        }
+    };
     let mut changes = [
         (
             BindingChangeKind::Resolution,
@@ -208,6 +257,41 @@ mod tests {
             RefreshBindingClassification::NeedsRebuild(Marker::NeedsRebuild { scope: MarkerScope::Publication(id), changes })
                 if id == publication && changes.iter().map(|change| change.kind).collect::<Vec<_>>()
                     == [BindingChangeKind::Dependency, BindingChangeKind::Interpretation]
+        ));
+    }
+
+    #[test]
+    fn storage_refusal_keeps_the_exact_scope_and_original_cause() {
+        let original = evidence();
+        let publication = PublicationIdentity::try_new(vec![2; 16]).unwrap();
+        let incompatible = |binding| ReplacementEvidence::IncompatibleStorage {
+            binding,
+            target_revision: facts(9),
+            cause: "original physical mapping refusal",
+        };
+        assert!(matches!(
+            classify_refresh_observation(
+                original,
+                Ok(incompatible(original.binding)),
+                PublicationEvidence::Current(&publication),
+                &[],
+            ).unwrap(),
+            RefreshBindingClassification::IncompatibleStorage {
+                marker: Marker::NeedsRebuild { scope: MarkerScope::Publication(id), changes },
+                cause: "original physical mapping refusal",
+            } if id == publication && changes[0].current_revision == facts(9)
+        ));
+        let mut changed_output = original.binding;
+        changed_output.outputs = facts(8);
+        assert!(matches!(
+            classify_refresh_observation(
+                original,
+                Ok(incompatible(changed_output)),
+                PublicationEvidence::Current(&publication),
+                &[],
+            )
+            .unwrap(),
+            RefreshBindingClassification::InvalidDefinition { .. }
         ));
     }
 

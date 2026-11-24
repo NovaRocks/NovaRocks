@@ -30,6 +30,19 @@ use novarocks_spi::connector::{ConnectorErrorKind, ConnectorOperationControl};
 use novarocks_sql::system_table::SystemTableBinding;
 use std::sync::Arc;
 
+const RETIRED_MV_REASON: &str = "Retired MV persistence format supports DROP only";
+
+fn refresh_policy(
+    policy: novarocks_mv_application::persistence::codec::RefreshPolicy,
+) -> &'static str {
+    use novarocks_mv_application::persistence::codec::RefreshPolicy;
+    match policy {
+        RefreshPolicy::Manual => "MANUAL",
+        RefreshPolicy::AsyncOnChange => "ON_CHANGE",
+        RefreshPolicy::AsyncInterval => "INTERVAL",
+    }
+}
+
 pub(crate) fn materialized_view_states_registration()
 -> novarocks_query_application::system_tables::SystemTableRegistration {
     use arrow::datatypes::{DataType, Field, TimeUnit};
@@ -229,8 +242,12 @@ impl SystemTableProvider for FrontendSystemTableProvider {
                             Some(&facts.name),
                             freshness,
                             None,
-                            Some(""),
-                            Some(&facts.definition),
+                            Some(if facts.retired.is_some() {
+                                RETIRED_MV_REASON
+                            } else {
+                                ""
+                            }),
+                            facts.retired.is_none().then_some(facts.definition.as_str()),
                         ])
                         .await?;
                 }
@@ -247,6 +264,30 @@ impl SystemTableProvider for FrontendSystemTableProvider {
                     {
                         continue;
                     }
+                    if let Some(configuration) = &facts.retired {
+                        let interval = configuration
+                            .refresh_interval_ms
+                            .filter(|_| request.requires(4))
+                            .map(|value| signed_fact(value, "refresh interval"))
+                            .transpose()?;
+                        batches
+                            .push_values(&[
+                                SystemValueRef::Utf8(&facts.catalog),
+                                SystemValueRef::Utf8(&facts.schema),
+                                SystemValueRef::Utf8(&facts.name),
+                                SystemValueRef::Utf8(refresh_policy(configuration.refresh_policy)),
+                                interval.map_or(SystemValueRef::Null, SystemValueRef::Int64),
+                                SystemValueRef::Boolean(configuration.paused),
+                                SystemValueRef::Null,
+                                SystemValueRef::Null,
+                                SystemValueRef::Utf8("RETIRED"),
+                                SystemValueRef::Utf8(RETIRED_MV_REASON),
+                                SystemValueRef::Utf8List(&[]),
+                                SystemValueRef::Null,
+                            ])
+                            .await?;
+                        continue;
+                    }
                     let state = facts.state.as_ref().ok_or_else(|| {
                         SystemTableError::Internal(
                             "materialized-view inventory omitted requested state facts".into(),
@@ -255,11 +296,7 @@ impl SystemTableProvider for FrontendSystemTableProvider {
                     let projection = &state.loaded.projection.facts;
                     let configuration = projection.configuration();
                     use novarocks_mv_application::persistence::codec::RefreshPolicy;
-                    let policy = match configuration.refresh_policy {
-                        RefreshPolicy::Manual => "MANUAL",
-                        RefreshPolicy::AsyncOnChange => "ON_CHANGE",
-                        RefreshPolicy::AsyncInterval => "INTERVAL",
-                    };
+                    let policy = refresh_policy(configuration.refresh_policy);
                     let interval = if request.requires(4)
                         && configuration.refresh_policy == RefreshPolicy::AsyncInterval
                     {
@@ -287,7 +324,7 @@ impl SystemTableProvider for FrontendSystemTableProvider {
                     let mut bases = Vec::new();
                     if request.requires(10) {
                         let mut seen = std::collections::BTreeSet::new();
-                        for occurrence in &projection.definition().relation_occurrences {
+                        for occurrence in &projection.binding().occurrences {
                             let name = format!(
                                 "{}.{}.{}",
                                 occurrence.catalog_at_binding,

@@ -72,12 +72,52 @@ pub(in crate::catalog_application) struct StatementRelationObservations {
 }
 
 impl StatementRelationObservations {
+    pub(crate) fn frozen_views(
+        &self,
+    ) -> Vec<(
+        super::super::query_bindings::QueryTableBindingKey,
+        ConnectorQueryViewMaterialization,
+    )> {
+        self.names
+            .iter()
+            .filter_map(|(key, observed)| match observed {
+                Ok(StatementRelationObservation::View(view)) => Some((key.clone(), view.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn retain_frozen_views(
+        &mut self,
+        views: &[(
+            super::super::query_bindings::QueryTableBindingKey,
+            ConnectorQueryViewMaterialization,
+        )],
+    ) {
+        for (key, view) in views {
+            self.names
+                .entry(key.clone())
+                .or_insert_with(|| Ok(StatementRelationObservation::View(view.clone())));
+        }
+    }
+
+    pub(crate) fn view_definitions(&self) -> Vec<Arc<SqlViewDefinition>> {
+        self.names
+            .values()
+            .filter_map(|observation| match observation {
+                Ok(StatementRelationObservation::View(view)) => Some(view.definition.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn remember_table(
         &mut self,
         original: ConnectorTableMetadata,
         planning_pin: ConnectorControlPlanningPin,
         context: ConnectorRequestContext,
     ) -> CatalogResolutionResult<StatementRelationObservation> {
+        validate_current_mv_format(&original, &planning_pin, &context)?;
         let control = planning_pin.binding();
         let identity = match control
             .metadata()
@@ -379,6 +419,37 @@ impl HeldTableObservation {
             identity,
         )
     }
+}
+
+pub(in crate::catalog_application) fn validate_current_mv_format(
+    metadata: &ConnectorTableMetadata,
+    planning_pin: &ConnectorControlPlanningPin,
+    context: &ConnectorRequestContext,
+) -> CatalogResolutionResult<()> {
+    let binding = planning_pin.binding();
+    let documents = binding
+        .metadata()
+        .project_current_keyed_documents(metadata, planning_pin, context)
+        .map_err(CatalogResolutionError::from_connector)?;
+    if let Some(view) = documents {
+        novarocks_mv_application::persistence::keyed_documents::require_readable_keyed_format(
+            &view,
+        )
+        .map_err(|error| {
+            let kind = if matches!(
+                error,
+                novarocks_mv_application::persistence::documents::MvDocumentError::KeyedStorage(
+                    KeyedDocumentReadError::LegacyFormat { .. }
+                )
+            ) {
+                ConnectorErrorKind::Unsupported
+            } else {
+                ConnectorErrorKind::CorruptData
+            };
+            CatalogResolutionError::from_connector(ConnectorError::new(kind, error.to_string()))
+        })?;
+    }
+    Ok(())
 }
 
 fn create_prepared_table(

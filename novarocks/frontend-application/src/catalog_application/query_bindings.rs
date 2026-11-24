@@ -637,6 +637,14 @@ pub struct QueryTableBindingStore {
     sealed_for_topology_replan: AtomicBool,
 }
 
+pub(crate) struct FrozenStatementViews {
+    local: novarocks_query_application::view::LocalViewSnapshot,
+    external: Vec<(
+        QueryTableBindingKey,
+        super::query_catalog::relation::ConnectorQueryViewMaterialization,
+    )>,
+}
+
 impl QueryTableBindingStore {
     /// Allocate one fresh process-local scope.  Scope exhaustion is explicit
     /// rather than silently reusing a token from another query.
@@ -828,6 +836,53 @@ impl QueryTableBindingStore {
             .expect("query table binding lock")
             .get(key)
             .map(|entry| entry.as_ref().map(|stored| stored.id).map_err(Clone::clone))
+    }
+
+    pub(crate) async fn rewrite_view_definitions(
+        &self,
+        requested: &[novarocks_types::naming::TableIdentity],
+    ) -> Vec<Arc<novarocks_sql::planning::catalog::SqlViewDefinition>> {
+        let mut entries = self.observed_relations.lock().await.view_definitions();
+        if let Some(Ok(local)) = self
+            .local_views
+            .lock()
+            .expect("original local view snapshot")
+            .as_ref()
+        {
+            entries.extend(
+                requested
+                    .iter()
+                    .filter_map(|relation| local.get(relation).cloned()),
+            );
+        }
+        entries
+    }
+
+    pub(crate) async fn freeze_statement_views(&self) -> Result<FrozenStatementViews, String> {
+        let local = self
+            .local_views
+            .lock()
+            .expect("original local view snapshot")
+            .as_ref()
+            .ok_or("MV analysis has no original local view snapshot")?
+            .as_ref()
+            .map_err(ToString::to_string)?
+            .clone();
+        Ok(FrozenStatementViews {
+            local,
+            external: self.observed_relations.lock().await.frozen_views(),
+        })
+    }
+
+    pub(crate) async fn retain_statement_views(&self, views: &FrozenStatementViews) {
+        self.local_views
+            .lock()
+            .expect("original local view snapshot")
+            .get_or_insert_with(|| Ok(views.local.clone()));
+        self.observed_relations
+            .lock()
+            .await
+            .retain_frozen_views(&views.external);
     }
 
     /// Reuse a completed binding or a typed object outcome.
@@ -1094,21 +1149,6 @@ impl QueryTableBindingStore {
         bindings
     }
 
-    /// Lookup the exact resolution retained for the old physical scan facts
-    /// while production callers are moved to `SqlScanSource`.  The result is
-    /// still retrieved from this one token store; this helper never acquires a
-    /// current connector generation.
-    pub fn strict_base_binding(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Option<Arc<QueryTableBinding>> {
-        self.binding_for_key(&QueryTableBindingKey::strict_base(
-            catalog, namespace, table,
-        ))
-    }
-
     /// Return the one admission-frozen MV target binding.  The UUID and
     /// snapshot are part of the lookup key so a recreated target or a later
     /// refresh baseline can never reuse an earlier request's authority.
@@ -1133,16 +1173,6 @@ impl QueryTableBindingStore {
             .expect("query table binding lock")
             .get(&key)
             .and_then(|entry| entry.as_ref().ok().map(|stored| stored.id))
-    }
-
-    fn binding_for_key(&self, key: &QueryTableBindingKey) -> Option<Arc<QueryTableBinding>> {
-        let id = self
-            .entries
-            .lock()
-            .expect("query table binding lock")
-            .get(key)
-            .and_then(|entry| entry.as_ref().ok().map(|stored| stored.id))?;
-        self.binding(id).ok()
     }
 
     #[cfg(test)]

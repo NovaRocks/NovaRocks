@@ -46,7 +46,7 @@ use crate::mv::domain::staged_create::{
 };
 use novarocks_mv_application::engine_properties::MvRefreshPropertyChanges;
 use novarocks_mv_application::persistence::keyed_documents::{
-    MvKeyedObservedCurrentDocuments, StoredKeyedMvProjection,
+    MvKeyedDocumentProjection, MvKeyedObservedCurrentDocuments, StoredKeyedMvProjection,
 };
 use novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection;
 use novarocks_spi::connector::document_storage::{
@@ -81,6 +81,14 @@ enum Request {
         source: IcebergMvCorePorts,
         documents: ConnectorDocumentStorage,
         request: KeyedDocumentObservationRequest,
+    },
+    WriteBindingMarker {
+        source: IcebergMvCorePorts,
+        planning: ConnectorControlPlanningPin,
+        observed: MvKeyedObservedCurrentDocuments,
+        expected: Arc<MvKeyedDocumentProjection>,
+        marker: novarocks_mv_application::persistence::codec::Marker,
+        context: ConnectorRequestContext,
     },
     CloseMismatch {
         source: IcebergMvCorePorts,
@@ -135,6 +143,7 @@ enum Response {
     LoadReady(Result<Option<LoadedKeyedMvProjection>, MvApplicationError>),
     ObserveCurrent(Result<MvKeyedObservedCurrentDocuments, MvApplicationError>),
     CloseMismatch(Result<bool, MvApplicationError>),
+    WriteBindingMarker(Result<(), MvApplicationError>),
     Admit(Result<(), MvApplicationError>),
     InstallCurrent(Result<(), MvApplicationError>),
     MetadataReady,
@@ -339,6 +348,31 @@ impl MvRefreshPreparationIo {
         result
     }
 
+    pub(crate) async fn write_binding_marker(
+        &self,
+        source: &IcebergMvCorePorts,
+        planning: &ConnectorControlPlanningPin,
+        observed: MvKeyedObservedCurrentDocuments,
+        expected: &MvKeyedDocumentProjection,
+        marker: novarocks_mv_application::persistence::codec::Marker,
+        context: ConnectorRequestContext,
+    ) -> Result<(), MvApplicationError> {
+        let Response::WriteBindingMarker(result) = self
+            .exchange(Request::WriteBindingMarker {
+                source: source.clone(),
+                planning: planning.clone(),
+                observed,
+                expected: Arc::new(expected.clone()),
+                marker,
+                context,
+            })
+            .await
+        else {
+            panic!("original MV gate returned another response to binding marker write");
+        };
+        result
+    }
+
     fn loan(&self) -> Loan<'_> {
         let state = self
             .state
@@ -446,6 +480,69 @@ impl MvRefreshPreparationIo {
                                 .await
                                 .map_err(query_error),
                         )
+                    }
+                    Request::WriteBindingMarker {
+                        source,
+                        planning,
+                        observed,
+                        expected,
+                        marker,
+                        context,
+                    } => {
+                        let catalog = observed.management_target.catalog().clone();
+                        let result = super::binding_marker::write_binding_marker(
+                            &source,
+                            &planning,
+                            observed,
+                            marker,
+                            context.clone(),
+                            async {
+                                let _ = services.cancellation.cancelled().await;
+                            },
+                        )
+                        .await;
+                        let result = match result {
+                            Ok(Some(marker)) => {
+                                let readiness = source
+                                    .readiness()
+                                    .in_requests(Arc::clone(&services.requests));
+                                match source.management_entrance() {
+                                    Ok(entrance) => {
+                                        crate::mv::domain::staged_create::install_marked_current_projection_async_in(
+                                            crate::mv::domain::staged_create::CurrentProjectionServices {
+                                                entrance,
+                                                readiness: &readiness,
+                                                connector_control: source.connector_control(),
+                                                metadata_cpu: &current_metadata_cpu,
+                                                registration: &registration,
+                                            },
+                                            catalog,
+                                            expected,
+                                            marker,
+                                            context,
+                                        )
+                                        .await
+                                        .map_err(|error| {
+                                            let error = projection_error(error);
+                                            let mut failure = MvApplicationError::new(
+                                                MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+                                                error.to_string(),
+                                            );
+                                            if let Some(cause) = error.original_failure() {
+                                                failure = failure.with_original_failure(cause.clone());
+                                            }
+                                            failure
+                                        })
+                                    }
+                                    Err(error) => Err(MvApplicationError::new(
+                                        MvApplicationErrorKind::KnownCommittedFinalizeFailed, error,
+                                    )),
+                                }
+                            }
+                            Ok(None) => Ok(()),
+                            Err(error) => Err(error),
+                        };
+                        Response::WriteBindingMarker(result)
                     }
                     Request::CloseMismatch {
                         source,
@@ -800,16 +897,18 @@ impl MvRefreshPreparationIo {
         source: &IcebergMvCorePorts,
         target: &crate::mv::domain::refresh::target::IcebergMvTarget,
     ) -> Result<StoredKeyedMvProjection, MvApplicationError> {
-        let ready = self
-            .load_ready(
-                source,
-                novarocks_sql::planning::mv::SqlMvTarget {
-                    catalog: Some(target.catalog.clone()),
-                    database: target.namespace.clone(),
-                    name: target.table.clone(),
-                },
-            )
-            .await?;
+        let resolved = novarocks_sql::planning::mv::SqlMvTarget {
+            catalog: Some(target.catalog.clone()),
+            database: target.namespace.clone(),
+            name: target.table.clone(),
+        };
+        if source.readiness().is_retired_mv(&resolved) {
+            return Err(provider_error(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "Retired MV persistence format supports DROP only",
+            )));
+        }
+        let ready = self.load_ready(source, resolved).await?;
         ready.map(|v| v.projection).ok_or_else(|| {
             contract_error(format!(
                 "iceberg materialized view {}.{}.{} has no MV definition",

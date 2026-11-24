@@ -21,7 +21,7 @@ use super::staged_create::{CaptureFailure, CurrentMetadataCapture, CurrentProjec
 use async_trait::async_trait;
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_mv_application::freshness::{MvSourceObservation, MvSourceState};
-use novarocks_mv_application::persistence::codec::RelationOccurrence;
+use novarocks_mv_application::persistence::codec::BindingOccurrence;
 use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
 use novarocks_spi::connector::{
     ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
@@ -67,7 +67,7 @@ pub(crate) trait CurrentSourceCapture: Send + Sync {
 /// Replaced identities are Present and belong to the consumer's comparison.
 pub(crate) async fn observe_current_sources(
     source: &dyn CurrentSourceCapture,
-    occurrences: &[RelationOccurrence],
+    occurrences: &[BindingOccurrence],
     context: &ConnectorRequestContext,
 ) -> Result<Vec<MvSourceObservation>, CurrentSourceObservationError> {
     let mut revisions: BTreeMap<(String, String, String, Vec<u8>), MvSourceState> = BTreeMap::new();
@@ -189,9 +189,7 @@ pub(crate) async fn observe_current_source_with_pin(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_mv_application::persistence::identity::{
-        NativeDataVersion, ObjectIdentity, SchemaVersion,
-    };
+    use novarocks_mv_application::persistence::identity::{NativeDataVersion, ObjectIdentity};
     use novarocks_spi::connector::{
         ConnectorStopOwner, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
@@ -262,15 +260,13 @@ mod tests {
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .unwrap();
-        let a = RelationOccurrence {
-            occurrence_id: 1,
-            catalog_at_binding: "ice".into(),
-            namespace_at_binding: "db".into(),
-            relation_at_binding: "t".into(),
-            qualifier_at_binding: "a".into(),
-            object_id: ObjectIdentity::try_new(vec![1]).unwrap(),
-            schema_version: SchemaVersion::try_new(vec![1]).unwrap(),
-            fields: vec![],
+        let a = {
+            let mut occurrence =
+                novarocks_mv_application::persistence::test_support::relation(1, 1, "a");
+            occurrence.namespace_at_binding = "db".into();
+            occurrence.relation_at_binding = "t".into();
+            occurrence.object_id = ObjectIdentity::try_new(vec![1]).unwrap();
+            occurrence
         };
         let mut b = a.clone();
         b.occurrence_id = 2;

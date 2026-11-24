@@ -199,7 +199,7 @@ fn validate_refresh_pin_table_object_ids_for_operation(
     base_refs: &[TableIdentity],
     unsafe_message: &str,
 ) -> Result<(), String> {
-    let occurrences = &mv_definition.facts.definition().relation_occurrences;
+    let occurrences = &mv_definition.facts.binding().occurrences;
     if occurrences.len() != base_refs.len() {
         return Err(
             "refresh base references do not retain every D relation occurrence".to_string(),

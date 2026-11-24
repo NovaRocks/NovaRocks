@@ -54,6 +54,7 @@ message BoundSourceNode {
   optional bytes field_id = 1;
   optional bool required = 2;
   optional SourceNodeKind kind = 3;
+  optional string name_at_binding = 4;
 }
 
 enum SourceNodeKind {

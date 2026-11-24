@@ -71,6 +71,22 @@ pub(crate) struct MvReadinessExecution<'a> {
 }
 
 impl MvReadinessPort {
+    pub(crate) fn remember_retired_mv(
+        &self,
+        status: novarocks_mv_application::persistence::keyed_documents::RetiredMvStatus,
+    ) {
+        self.service.remember_retired_mv(status);
+    }
+
+    pub(crate) fn retired_mv_statuses(
+        &self,
+    ) -> Vec<novarocks_mv_application::persistence::keyed_documents::RetiredMvStatus> {
+        self.service.retired_mv_statuses()
+    }
+
+    pub(crate) fn is_retired_mv(&self, target: &MvTarget) -> bool {
+        self.service.is_retired_mv(&canonical_mv_target(target))
+    }
     pub(crate) fn management(
         &self,
     ) -> &std::sync::Arc<novarocks_mv_application::management::ManagementEntrance> {
@@ -366,6 +382,15 @@ impl MvReadinessExecution<'_> {
     ) -> Result<MvKeyedDropReadiness, MvProjectionError> {
         self.service
             .prepare_drop(&canonical_mv_target(target), if_exists)
+            .await
+    }
+    pub(crate) async fn prepare_retired_drop(
+        &self,
+        target: &MvTarget,
+        observation: &novarocks_mv_application::management::MvDropManagementObservation,
+    ) -> Result<MvKeyedDropReadiness, MvProjectionError> {
+        self.service
+            .prepare_retired_drop(&canonical_mv_target(target), observation)
             .await
     }
     pub(crate) async fn delete_after_provider_drop(
@@ -1020,7 +1045,8 @@ mod original_request_tests {
         };
         let connector_control =
             crate::query_execution::compiler::TestConnectorControlRegistry::default();
-        let storage = novarocks_spi::connector::UnavailableMvStorageObservationPort;
+        let bindings =
+            crate::catalog_application::query_bindings::QueryTableBindingStore::try_new().unwrap();
         let stop = novarocks_spi::connector::ConnectorStopOwner::new();
         let connector_request =
             crate::connector::connector_request_context(None, stop.view()).unwrap();
@@ -1028,7 +1054,8 @@ mod original_request_tests {
             &need,
             &original,
             &connector_control,
-            &storage,
+            &bindings,
+            None,
             &connector_request,
         )
         .await;

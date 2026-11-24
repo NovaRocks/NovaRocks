@@ -88,8 +88,7 @@ pub(crate) struct MvAggregateCreateBindingInput<'a> {
     pub sql_facts: &'a SqlMvCreatePersistenceFacts,
     pub runtime_layout: &'a MvAggregateRuntimeLayout,
     pub source_observations: &'a [MvCreateRelationObservation],
-    pub target_observations: &'a [MvCreateTargetFieldObservation],
-    pub prepared_target: &'a ConnectorPreparedCreateDocumentTarget,
+    pub targets: &'a BTreeMap<&'a str, &'a MvCreateTargetFieldObservation>,
 }
 
 /// The aggregate-owned portions of an interpretation's durable facts.
@@ -117,7 +116,7 @@ pub(crate) fn build_mv_aggregate_create_bindings(
     let source_fields = source_field_map(input.sql_facts, input.source_observations)?;
     let output_identities = output_identities(input.sql_facts)?;
     let branches = branch_identities(input.sql_facts, &output_identities)?;
-    let targets = target_field_map(input.target_observations, input.prepared_target)?;
+    let targets = input.targets;
 
     // A durable aggregate is one per (branch, output position). Two branches
     // computing the same output are two aggregates, and they share the one
@@ -217,7 +216,7 @@ pub(crate) fn build_mv_aggregate_create_bindings(
             let state_slot_ids = bind_aggregate_states(
                 aggregate.function_id(),
                 &columns,
-                &targets,
+                targets,
                 &mut state_slots,
                 &mut target_fields,
             )?;
@@ -400,7 +399,7 @@ fn aggregate_source_fields(
         .collect()
 }
 
-fn target_field_map<'a>(
+pub(crate) fn target_field_map<'a>(
     observations: &'a [MvCreateTargetFieldObservation],
     target: &ConnectorPreparedCreateDocumentTarget,
 ) -> Result<BTreeMap<&'a str, &'a MvCreateTargetFieldObservation>, String> {
@@ -426,7 +425,7 @@ fn target_field_map<'a>(
             })?;
         if prepared.request_ordinal() != observation.request_ordinal
             || prepared.provider_field_id().as_ref() != observation.provider_field_id.as_ref()
-            || prepared.source_type() != Some(&observation.source_type)
+            || prepared.source_type() != &observation.source_type
             || prepared.nullable() != observation.nullable
         {
             return Err(
@@ -675,10 +674,9 @@ mod tests {
                         u32::try_from(ordinal).expect("small fixture ordinal"),
                         Bytes::from(vec![*field_id]),
                         format!("field_{ordinal}"),
-                        "varbinary".to_string(),
+                        fixture_type("varbinary"),
                         false,
                     )
-                    .map(|field| field.with_source_type(fixture_type("varbinary")))
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .expect("prepared fields"),

@@ -22,13 +22,15 @@ use crate::mv::domain::refresh::planning::RefreshBaseRelationOccurrence;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use bytes::Bytes;
 use novarocks_mv_application::persistence::{
-    codec::{ApplyKeyKind, DefinitionDocument, ExpressionKind, SourceFieldReference, StateRole},
+    codec::{
+        ApplyKeyKind, BindingDocument, InterpretationDocument, SourceFieldReference, StateRole,
+    },
     exact_revision::{persist_exact_connector_revision, restore_exact_query_revision},
     identity::{DocumentRevision, PartitionSpecVersion},
     keyed_documents::StoredKeyedMvProjection,
     runtime_bindings::{
         MvExactTargetSchemaFacts, MvPhysicalFieldFacts, MvRuntimeBindings,
-        reconstruct_keyed_runtime_bindings,
+        reconstruct_keyed_runtime_bindings, reconstruct_runtime_bindings,
     },
 };
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
@@ -69,6 +71,9 @@ pub struct MvRewriteAnalysisFacts {
     pub join: Option<SqlImvJoinContractFacts>,
     pub partition: Option<SqlImvPartitionFacts>,
     pub aggregate: Option<MvRewriteAggregateAnalysis>,
+    pub(crate) source_fields: BTreeMap<u32, Vec<MvPhysicalFieldFacts>>,
+    pub(crate) direct_output_sources:
+        crate::mv::domain::persistence::source_bindings::MvDirectOutputSources,
 }
 
 #[derive(Clone, Debug)]
@@ -78,12 +83,19 @@ pub struct MvRewriteAggregateAnalysis {
 }
 
 #[derive(Debug)]
+pub(crate) struct MvRewriteRebuildLayout {
+    pub(crate) binding: BindingDocument,
+    pub(crate) interpretation: InterpretationDocument,
+}
+
+#[derive(Debug)]
 pub struct IcebergMvRewriteContext {
     pub target: TableIdentity,
     pub mv_id: i64,
     pub current_catalog: Option<String>,
     pub current_database: String,
     pub mv_definition: Arc<StoredKeyedMvProjection>,
+    pub(crate) rebuild_layout: Option<Arc<MvRewriteRebuildLayout>>,
     pub canonical_select_query: Arc<novarocks_parser::ast::Query>,
     /// Ordered, one entry per base scan, in D's own occurrence order.
     pub base_refs: Arc<[RefreshBaseRelationOccurrence]>,
@@ -114,8 +126,9 @@ impl IcebergMvRewriteContext {
             .collect()
     }
 
-    pub fn from_parts(
+    pub(crate) fn from_parts(
         projection: Arc<StoredKeyedMvProjection>,
+        rebuild_layout: Option<Arc<MvRewriteRebuildLayout>>,
         current: Vec<MvRewriteSourceSnapshot>,
         previous: Vec<MvRewriteSourceSnapshot>,
         target_table_uuid: String,
@@ -125,9 +138,12 @@ impl IcebergMvRewriteContext {
         analysis: MvRewriteAnalysisFacts,
     ) -> Result<Self, String> {
         let facts = &projection.facts;
+        let (binding, interpretation) = rebuild_layout
+            .as_deref()
+            .map(|layout| (&layout.binding, &layout.interpretation))
+            .unwrap_or_else(|| (facts.binding(), facts.interpretation()));
         if analysis.definition_revision != facts.source_revision().definition_revision
-            || analysis.partition_spec_version
-                != facts.interpretation().target.partition_spec_version
+            || analysis.partition_spec_version != interpretation.target.partition_spec_version
         {
             return Err("MV rewrite analysis belongs to a different D/L generation".into());
         }
@@ -148,21 +164,37 @@ impl IcebergMvRewriteContext {
         {
             return Err("MV rewrite target fields lack their exact complete declarations".into());
         }
-        let runtime_bindings = reconstruct_keyed_runtime_bindings(facts, &exact_target)?;
+        let runtime_bindings = if rebuild_layout.is_some() {
+            reconstruct_runtime_bindings(
+                binding,
+                interpretation,
+                &facts.source_revision().target_object_id,
+                &exact_target.metadata_version,
+                &exact_target,
+            )?
+        } else {
+            reconstruct_keyed_runtime_bindings(facts, &exact_target)?
+        };
         validate_target_schema(&target_arrow_schema, &exact_target)?;
-        if facts.publication().is_some() {
-            novarocks_mv_application::persistence::aggregate_bindings::validate_published_aggregate_contracts(facts.interpretation())?;
+        if rebuild_layout.is_none() && facts.publication().is_some() {
+            novarocks_mv_application::persistence::aggregate_bindings::validate_published_aggregate_contracts(interpretation)?;
         }
-        let pin = validate_source_pins(facts.definition(), current)?;
-        let (previous_snapshot_ids, previous_table_object_ids) =
-            validate_history(&projection, previous.clone())?;
+        let pin = validate_source_pins(binding, current)?;
+        let (previous_snapshot_ids, previous_table_object_ids) = if rebuild_layout.is_some() {
+            if !previous.is_empty() {
+                return Err("MV binding rebuild cannot reuse predecessor source pins".into());
+            }
+            (BTreeMap::new(), BTreeMap::new())
+        } else {
+            validate_history(&projection, previous.clone())?
+        };
         for (occurrence, previous_object) in &previous_table_object_ids {
             if pin.get(occurrence).map(|value| &value.table_object_id) != Some(previous_object) {
                 return Err("MV rewrite source object changed since publication".into());
             }
         }
         validate_aggregate_analysis(&runtime_bindings, &analysis)?;
-        let sql_schema = sql_schema_facts(&projection, &runtime_bindings, &analysis)?;
+        let sql_schema = sql_schema_facts(binding, interpretation, &runtime_bindings, &analysis)?;
         let definition = facts.definition();
         let canonical_select_query = Arc::new(
             crate::mv::domain::refresh::definition::read_stored_mv_query(
@@ -171,8 +203,8 @@ impl IcebergMvRewriteContext {
             )
             .map_err(|error| error.to_string())?,
         );
-        let base_refs = definition
-            .relation_occurrences
+        let base_refs = binding
+            .occurrences
             .iter()
             .map(|occurrence| RefreshBaseRelationOccurrence {
                 occurrence_id: SqlMvRelationOccurrenceId::new(occurrence.occurrence_id),
@@ -194,6 +226,7 @@ impl IcebergMvRewriteContext {
             current_catalog: Some(definition.query.resolution.default_catalog.clone()),
             current_database: definition.query.resolution.default_namespace.clone(),
             mv_definition: projection,
+            rebuild_layout,
             canonical_select_query,
             base_refs: base_refs.into(),
             pin: Arc::new(pin),
@@ -211,6 +244,20 @@ impl IcebergMvRewriteContext {
 
     pub fn analysis_facts(&self) -> &MvRewriteAnalysisFacts {
         &self.analysis
+    }
+
+    pub(crate) fn binding(&self) -> &BindingDocument {
+        self.rebuild_layout.as_deref().map_or_else(
+            || self.mv_definition.facts.binding(),
+            |layout| &layout.binding,
+        )
+    }
+
+    pub(crate) fn interpretation(&self) -> &InterpretationDocument {
+        self.rebuild_layout.as_deref().map_or_else(
+            || self.mv_definition.facts.interpretation(),
+            |layout| &layout.interpretation,
+        )
     }
 
     /// The single D occurrence that names `table`.
@@ -304,7 +351,7 @@ impl IcebergMvRewriteContext {
         project: impl Fn(TableIdentity, &MvRewriteSourceSnapshot) -> T,
     ) -> Result<BTreeMap<SqlMvRelationOccurrenceId, T>, String> {
         let mut values = BTreeMap::new();
-        for occurrence in &self.mv_definition.facts.definition().relation_occurrences {
+        for occurrence in &self.binding().occurrences {
             let table = occurrence_table(occurrence);
             let occurrence_id = SqlMvRelationOccurrenceId::new(occurrence.occurrence_id);
             let pin = self
@@ -343,7 +390,7 @@ impl IcebergMvRewriteContext {
     ) -> Result<SqlImvRewriteSnapshotHandle, String> {
         let mut builder =
             SqlImvRewriteSnapshotBuilder::try_new(self.target.clone(), target_binding, self.mv_id)?;
-        for occurrence in &self.mv_definition.facts.definition().relation_occurrences {
+        for occurrence in &self.binding().occurrences {
             let id = SqlMvRelationOccurrenceId::new(occurrence.occurrence_id);
             let pin = self
                 .pin
@@ -388,7 +435,7 @@ impl IcebergMvRewriteContext {
 }
 
 pub(super) fn occurrence_table(
-    value: &novarocks_mv_application::persistence::codec::RelationOccurrence,
+    value: &novarocks_mv_application::persistence::codec::BindingOccurrence,
 ) -> TableIdentity {
     TableIdentity {
         catalog: value.catalog_at_binding.clone(),
@@ -398,7 +445,7 @@ pub(super) fn occurrence_table(
 }
 
 fn validate_source_pins(
-    definition: &DefinitionDocument,
+    definition: &BindingDocument,
     values: Vec<MvRewriteSourceSnapshot>,
 ) -> Result<BTreeMap<SqlMvRelationOccurrenceId, MvRewriteSourceSnapshot>, String> {
     let mut pins = BTreeMap::new();
@@ -407,10 +454,10 @@ fn validate_source_pins(
             return Err("MV rewrite source pins contain an invalid or repeated occurrence".into());
         }
     }
-    if pins.len() != definition.relation_occurrences.len() {
+    if pins.len() != definition.occurrences.len() {
         return Err("MV rewrite source pins do not cover every D occurrence".into());
     }
-    for occurrence in &definition.relation_occurrences {
+    for occurrence in &definition.occurrences {
         let pin = pins
             .get(&SqlMvRelationOccurrenceId::new(occurrence.occurrence_id))
             .ok_or("MV rewrite source pin refers to an unknown occurrence")?;
@@ -446,7 +493,7 @@ fn validate_history(
         }
         Some(published) => published,
     };
-    let previous = validate_source_pins(projection.facts.definition(), previous)?;
+    let previous = validate_source_pins(projection.facts.binding(), previous)?;
     let mut snapshots = BTreeMap::new();
     let mut objects = BTreeMap::new();
     for input in &published.inputs {
@@ -483,7 +530,7 @@ fn validate_target_schema(
             let arrow = schema.field(ordinal);
             if usize::try_from(field.ordinal).ok() != Some(ordinal)
                 || arrow.name() != &field.name
-                || arrow.data_type() != &arrow_type_from_contract_signature(&field.type_signature)?
+                || arrow.data_type() != &arrow_type_from_provider_type(&field.source_type)?
                 || arrow.is_nullable() != field.nullable
             {
                 return Err(
@@ -496,11 +543,11 @@ fn validate_target_schema(
 }
 
 fn sql_lineage(
-    definition: &DefinitionDocument,
+    definition: &BindingDocument,
     field: &SourceFieldReference,
 ) -> Result<SqlImvQualifiedFieldFacts, String> {
     let occurrence = definition
-        .relation_occurrences
+        .occurrences
         .iter()
         .find(|value| value.occurrence_id == field.occurrence_id)
         .ok_or("MV output references an unknown D occurrence")?;
@@ -513,31 +560,32 @@ fn sql_lineage(
 }
 
 fn sql_schema_facts(
-    projection: &StoredKeyedMvProjection,
+    definition: &BindingDocument,
+    interpretation: &InterpretationDocument,
     bindings: &MvRuntimeBindings,
     analysis: &MvRewriteAnalysisFacts,
 ) -> Result<SqlImvSchemaContractFacts, String> {
-    let definition = projection.facts.definition();
-    let interpretation = projection.facts.interpretation();
     let [apply_key] = bindings.apply_key.as_slice() else {
         return Err("SQL IMV rewrite requires one physical apply-key column".into());
     };
     let bases = definition
-        .relation_occurrences
+        .occurrences
         .iter()
         .map(|occurrence| {
             SqlImvBaseContractFacts::try_new(
                 SqlMvRelationOccurrenceId::new(occurrence.occurrence_id),
                 occurrence_table(occurrence).fqn(),
                 Some(occurrence.qualifier_at_binding.clone()),
-                occurrence
-                    .fields
-                    .iter()
+                analysis
+                    .source_fields
+                    .get(&occurrence.occurrence_id)
+                    .into_iter()
+                    .flatten()
                     .map(|field| {
                         SqlImvBaseFieldFacts::try_new(
                             Bytes::copy_from_slice(field.field_id.as_bytes()),
-                            field.name_at_binding.clone(),
-                            arrow_type_from_contract_signature(&field.type_signature)?,
+                            field.name.clone(),
+                            arrow_type_from_provider_type(&field.source_type)?,
                             field.nullable,
                         )
                     })
@@ -551,15 +599,15 @@ fn sql_schema_facts(
         .map(|output| {
             Ok(SqlImvOutputColumnFacts::new(
                 SqlImvExpressionFacts::try_new(
-                    match output.expression.kind {
-                        ExpressionKind::Field => SqlImvExpressionKindFacts::Column,
-                        ExpressionKind::Literal => SqlImvExpressionKindFacts::Literal,
-                        ExpressionKind::Cast => SqlImvExpressionKindFacts::Cast,
-                        ExpressionKind::Function => SqlImvExpressionKindFacts::Func,
-                        ExpressionKind::Mixed => SqlImvExpressionKindFacts::Mixed,
+                    if analysis
+                        .direct_output_sources
+                        .contains_key(&output.identity())
+                    {
+                        SqlImvExpressionKindFacts::Column
+                    } else {
+                        SqlImvExpressionKindFacts::Mixed
                     },
                     output
-                        .expression
                         .source_fields
                         .iter()
                         .map(|field| sql_lineage(definition, field))
@@ -579,7 +627,7 @@ fn sql_schema_facts(
             .map(|(_, state)| {
                 SqlImvAggregateStateColumnFacts::try_new(
                     state.physical.name.clone(),
-                    state.physical.type_signature.clone(),
+                    state.physical.source_type.clone(),
                     state_role(state.role),
                 )
             })
@@ -747,15 +795,15 @@ fn validate_physical_column(
     data_type: &DataType,
     nullable: bool,
 ) -> Result<(), String> {
-    let bound = arrow_type_from_contract_signature(&field.type_signature)?;
+    let bound = arrow_type_from_provider_type(&field.source_type)?;
     if field.name != name
         || !denote_one_provider_type(&bound, data_type)
         || field.nullable != nullable
     {
         return Err(format!(
             "MV rewrite analyzed physical column differs from its L/provider binding: L has \
-             name={} type={} nullable={}; the analysis wants name={} type={:?} nullable={}",
-            field.name, field.type_signature, field.nullable, name, data_type, nullable
+             name={} type={:?} nullable={}; the analysis wants name={} type={:?} nullable={}",
+            field.name, field.source_type, field.nullable, name, data_type, nullable
         ));
     }
     Ok(())
@@ -899,43 +947,93 @@ pub fn first_union_branch_query(
     Ok(branch)
 }
 
-pub(crate) fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, String> {
-    let trimmed = type_signature.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    Ok(match lower.as_str() {
-        "boolean" | "bool" => DataType::Boolean,
-        "tinyint" => DataType::Int8,
-        "smallint" => DataType::Int16,
-        "int" | "integer" => DataType::Int32,
-        "long" | "bigint" => DataType::Int64,
-        "float" => DataType::Float32,
-        "double" => DataType::Float64,
-        "date" => DataType::Date32,
-        "timestamp" => DataType::Timestamp(TimeUnit::Microsecond, None),
-        "string" | "varchar" | "char" => DataType::Utf8,
-        "binary" | "varbinary" => DataType::Binary,
-        _ if lower.starts_with("decimal(") => {
-            let inner = trimmed
-                .strip_prefix("decimal(")
-                .or_else(|| trimmed.strip_prefix("DECIMAL("))
-                .and_then(|value| value.strip_suffix(')'))
-                .ok_or_else(|| format!("invalid decimal type signature `{type_signature}`"))?;
-            let mut parts = inner.split(',').map(str::trim);
-            let precision = parts
-                .next()
-                .and_then(|value| value.parse::<u8>().ok())
-                .ok_or_else(|| format!("invalid decimal precision in `{type_signature}`"))?;
-            let scale = parts
-                .next()
-                .and_then(|value| value.parse::<i8>().ok())
-                .ok_or_else(|| format!("invalid decimal scale in `{type_signature}`"))?;
-            DataType::Decimal128(precision, scale)
+pub(crate) fn arrow_type_from_provider_type(
+    source_type: &novarocks_spi::connector::ProviderSourceType,
+) -> Result<DataType, String> {
+    use novarocks_spi::connector::ProviderSourceType;
+    let ProviderSourceType::Iceberg(source_type) = source_type;
+    let mut nodes = source_type.nodes().iter();
+    provider_type_node(&mut nodes, 1)
+}
+
+fn provider_type_node(
+    nodes: &mut std::slice::Iter<'_, novarocks_spi::connector::IcebergSourceTypeNode>,
+    depth: usize,
+) -> Result<DataType, String> {
+    use arrow::datatypes::Field;
+    use novarocks_spi::connector::{
+        IcebergSourcePrimitive as Primitive, IcebergSourceTypeNode as Node,
+    };
+    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        return Err("MV source type exceeds the SQL value depth".into());
+    }
+    let error = || "MV source type has an invalid provider node".to_string();
+    Ok(match nodes.next().ok_or_else(error)? {
+        Node::Primitive(primitive) => match primitive {
+            Primitive::Boolean => DataType::Boolean,
+            Primitive::Int => DataType::Int32,
+            Primitive::Long => DataType::Int64,
+            Primitive::Float => DataType::Float32,
+            Primitive::Double => DataType::Float64,
+            Primitive::Date => DataType::Date32,
+            Primitive::Time => DataType::Time64(TimeUnit::Microsecond),
+            Primitive::Timestamp | Primitive::Timestamptz => {
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            }
+            Primitive::TimestampNs | Primitive::TimestamptzNs => {
+                DataType::Timestamp(TimeUnit::Nanosecond, None)
+            }
+            Primitive::String => DataType::Utf8,
+            Primitive::Binary => DataType::Binary,
+            Primitive::Uuid => DataType::FixedSizeBinary(16),
+            Primitive::Variant => DataType::LargeBinary,
+            Primitive::Fixed(width) => {
+                DataType::FixedSizeBinary(i32::try_from(*width).map_err(|_| error())?)
+            }
+            Primitive::Decimal { precision, scale } => DataType::Decimal128(
+                u8::try_from(*precision).map_err(|_| error())?,
+                i8::try_from(*scale).map_err(|_| error())?,
+            ),
+        },
+        Node::Struct { field_count } => {
+            let fields = (0..*field_count)
+                .map(|_| {
+                    let Some(Node::Field { name, required, .. }) = nodes.next() else {
+                        return Err(error());
+                    };
+                    Ok(Field::new(
+                        name.as_ref(),
+                        provider_type_node(nodes, depth + 1)?,
+                        !required,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            DataType::Struct(fields.into())
         }
-        _ => {
-            return Err(format!(
-                "aggregate MV contract input type is unsupported: {type_signature}"
-            ));
+        Node::List {
+            element_required, ..
+        } => DataType::List(Arc::new(Field::new(
+            "element",
+            provider_type_node(nodes, depth + 1)?,
+            !element_required,
+        ))),
+        Node::Map { value_required, .. } => {
+            let key = Field::new("key", provider_type_node(nodes, depth + 1)?, false);
+            let value = Field::new(
+                "value",
+                provider_type_node(nodes, depth + 1)?,
+                !value_required,
+            );
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(vec![key, value].into()),
+                    false,
+                )),
+                false,
+            )
         }
+        Node::Field { .. } => return Err(error()),
     })
 }
 
@@ -957,7 +1055,7 @@ mod tests {
             novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "sales", "mv"),
             None,
         );
-        for occurrence in &mut fixture.definition.relation_occurrences {
+        for occurrence in &mut fixture.binding.occurrences {
             occurrence.object_id = persisted_object.clone();
         }
         StoredKeyedMvProjection {
@@ -984,8 +1082,7 @@ mod tests {
     #[test]
     fn sparse_repeated_relation_occurrences_remain_distinct() {
         let projection = projection();
-        let pins =
-            validate_source_pins(projection.facts.definition(), vec![pin(8), pin(7)]).unwrap();
+        let pins = validate_source_pins(projection.facts.binding(), vec![pin(8), pin(7)]).unwrap();
         assert_eq!(pins.len(), 2);
         assert!(pins.contains_key(&SqlMvRelationOccurrenceId::new(7)));
         assert!(pins.contains_key(&SqlMvRelationOccurrenceId::new(8)));
@@ -994,8 +1091,8 @@ mod tests {
     #[test]
     fn duplicate_and_dense_renumbered_pins_are_rejected() {
         let projection = projection();
-        assert!(validate_source_pins(projection.facts.definition(), vec![pin(7), pin(7)]).is_err());
-        assert!(validate_source_pins(projection.facts.definition(), vec![pin(0), pin(1)]).is_err());
+        assert!(validate_source_pins(projection.facts.binding(), vec![pin(7), pin(7)]).is_err());
+        assert!(validate_source_pins(projection.facts.binding(), vec![pin(0), pin(1)]).is_err());
     }
 
     #[test]
@@ -1005,7 +1102,7 @@ mod tests {
         replacement.table_object_id =
             ConnectorTableObjectId::try_new(Bytes::from_static(b"replacement")).unwrap();
         assert!(
-            validate_source_pins(projection.facts.definition(), vec![pin(7), replacement]).is_err()
+            validate_source_pins(projection.facts.binding(), vec![pin(7), replacement]).is_err()
         );
     }
 
@@ -1022,7 +1119,19 @@ mod tests {
     }
 
     #[test]
-    fn timezone_signature_is_not_silently_downgraded() {
-        assert!(arrow_type_from_contract_signature("timestamptz").is_err());
+    fn zoned_timestamp_uses_the_provider_timestamp_carrier() {
+        use novarocks_spi::connector::{
+            IcebergSourcePrimitive, IcebergSourceType, IcebergSourceTypeNode, ProviderSourceType,
+        };
+        let source = ProviderSourceType::Iceberg(
+            IcebergSourceType::try_new(vec![IcebergSourceTypeNode::Primitive(
+                IcebergSourcePrimitive::Timestamptz,
+            )])
+            .unwrap(),
+        );
+        assert_eq!(
+            arrow_type_from_provider_type(&source).unwrap(),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        );
     }
 }

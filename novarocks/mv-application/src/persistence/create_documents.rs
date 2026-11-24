@@ -42,7 +42,7 @@ use sha2::{Digest, Sha256};
 
 use super::aggregate_bindings::{
     MvAggregateCreateBindingInput, MvCreateRelationObservation, MvCreateTargetFieldObservation,
-    build_mv_aggregate_create_bindings, source_field_map,
+    build_mv_aggregate_create_bindings, source_field_map, target_field_map,
 };
 
 const APPLY_KEY_IDENTITY_DOMAIN: &[u8] = b"novarocks.mv.apply-key.v1";
@@ -67,31 +67,113 @@ pub struct MvCreateDocuments {
     pub configuration: ConfigurationDocument,
 }
 
+pub struct MvInterpretationFacts<'a> {
+    pub definition: &'a DefinitionDocument,
+    pub sql_facts: &'a SqlMvCreatePersistenceFacts,
+    pub runtime_layout: &'a MvAggregateRuntimeLayout,
+    pub source_observations: &'a [MvCreateRelationObservation],
+    pub target_identity: &'a TargetIdentity,
+    pub apply_key_column_name: &'a str,
+    pub branch_column_name: Option<&'a str>,
+}
+
 pub fn build_mv_create_documents(
     input: MvCreateDocumentFacts<'_>,
 ) -> Result<MvCreateDocuments, String> {
     let target_observations = target_observations(input.prepared_target)?;
-    let aggregate = build_mv_aggregate_create_bindings(MvAggregateCreateBindingInput {
-        sql_facts: input.sql_facts,
-        runtime_layout: input.runtime_layout,
-        source_observations: input.source_observations,
-        target_observations: &target_observations,
-        prepared_target: input.prepared_target,
-    })?;
-    let targets = target_by_name(&target_observations)?;
+    let targets = target_field_map(&target_observations, input.prepared_target)?;
     let definition = build_definition(
         input.created_at_ms,
         QuerySource::try_from(input.query_definition)?,
     )
     .map_err(|error| format!("build MV definition document: {error}"))?;
+    let interpretation = build_interpretation(
+        MvInterpretationFacts {
+            definition: &definition,
+            sql_facts: input.sql_facts,
+            runtime_layout: input.runtime_layout,
+            source_observations: input.source_observations,
+            target_identity: input.target_identity,
+            apply_key_column_name: input.apply_key_column_name,
+            branch_column_name: input.branch_column_name,
+        },
+        &targets,
+        RuntimeTargetFacts {
+            object_id: ObjectIdentity::try_new(
+                input.prepared_target.object_id().as_bytes().to_vec(),
+            )
+            .map_err(|error| error.to_string())?,
+            schema_version: SchemaVersion::try_new(input.prepared_target.schema_version().to_vec())
+                .map_err(|error| error.to_string())?,
+            partition_spec_version: PartitionSpecVersion::try_new(
+                input.prepared_target.partition_spec_version().to_vec(),
+            )
+            .map_err(|error| error.to_string())?,
+            fields: Vec::new(),
+            partition_fields: input
+                .prepared_target
+                .partition_fields()
+                .iter()
+                .map(crate::persistence::codec::TargetPartitionFieldBinding::try_from)
+                .collect::<Result<_, _>>()?,
+        },
+    )?;
+    Ok(MvCreateDocuments {
+        definition,
+        interpretation,
+        configuration: input.configuration,
+    })
+}
 
-    let output_bindings = output_bindings(input.sql_facts, &aggregate.output_identities, &targets)?;
+/// Reconstruct L for newly analyzed work using the exact currently observed S.
+pub fn build_mv_refresh_interpretation(
+    input: MvInterpretationFacts<'_>,
+    target: &super::runtime_bindings::MvExactTargetSchemaFacts,
+) -> Result<InterpretationDocument, String> {
+    let fields = target
+        .fields
+        .iter()
+        .map(|field| MvCreateTargetFieldObservation {
+            request_ordinal: field.ordinal,
+            physical_name: field.name.clone(),
+            provider_field_id: Bytes::copy_from_slice(field.field_id.as_bytes()),
+            source_type: field.source_type.clone(),
+            nullable: field.nullable,
+        })
+        .collect::<Vec<_>>();
+    let targets = target_by_name(&fields)?;
+    build_interpretation(
+        input,
+        &targets,
+        RuntimeTargetFacts {
+            object_id: ObjectIdentity::try_new(target.object_id.as_bytes().to_vec())
+                .map_err(|error| error.to_string())?,
+            schema_version: target.schema_version.clone(),
+            partition_spec_version: target.partition_spec_version.clone(),
+            fields: Vec::new(),
+            partition_fields: target.partition_fields.clone(),
+        },
+    )
+}
+
+fn build_interpretation(
+    input: MvInterpretationFacts<'_>,
+    targets: &BTreeMap<&str, &MvCreateTargetFieldObservation>,
+    mut target_facts: RuntimeTargetFacts,
+) -> Result<InterpretationDocument, String> {
+    let aggregate = build_mv_aggregate_create_bindings(MvAggregateCreateBindingInput {
+        sql_facts: input.sql_facts,
+        runtime_layout: input.runtime_layout,
+        source_observations: input.source_observations,
+        targets,
+    })?;
+    let output_bindings = output_bindings(input.sql_facts, &aggregate.output_identities, targets)?;
     let (apply_key, apply_fields) = apply_key_bindings(
         input.target_identity,
         input.apply_key_column_name,
         input.sql_facts,
         &aggregate.output_identities,
-        &targets,
+        targets,
     )?;
     let branches = branch_bindings(
         input.sql_facts,
@@ -114,7 +196,7 @@ pub fn build_mv_create_documents(
         let branch_name = input.branch_column_name.ok_or_else(|| {
             "UNION definition has branches but no staged branch target field".to_string()
         })?;
-        let target = target(&targets, branch_name)?;
+        let target = target(targets, branch_name)?;
         let id = field_identity(target.provider_field_id.clone())?;
         target_fields.extend(branches.iter().map(|branch| RuntimePhysicalFieldFacts {
             logical_identity: PhysicalFieldLogicalIdentity::Branch(branch.branch_id.clone()),
@@ -123,40 +205,18 @@ pub fn build_mv_create_documents(
             nullable: target.nullable,
         }));
     }
-    let interpretation = InterpretationDocument::try_from(RuntimeInterpretationFacts {
-        definition_revision: super::keyed_documents::definition_revision(&definition)
+    target_facts.fields = target_fields;
+    InterpretationDocument::try_from(RuntimeInterpretationFacts {
+        definition_revision: super::keyed_documents::definition_revision(input.definition)
             .map_err(|error| format!("build MV definition semantic revision: {error}"))?,
         output_bindings,
         aggregate_layout: aggregate.aggregate_layout,
         apply_key,
         definition_branch_identities: aggregate.branch_identities.values().cloned().collect(),
         branches,
-        target: RuntimeTargetFacts {
-            object_id: ObjectIdentity::try_new(
-                input.prepared_target.object_id().as_bytes().to_vec(),
-            )
-            .map_err(|error| error.to_string())?,
-            schema_version: SchemaVersion::try_new(input.prepared_target.schema_version().to_vec())
-                .map_err(|error| error.to_string())?,
-            partition_spec_version: PartitionSpecVersion::try_new(
-                input.prepared_target.partition_spec_version().to_vec(),
-            )
-            .map_err(|error| error.to_string())?,
-            fields: target_fields,
-            partition_fields: input
-                .prepared_target
-                .partition_fields()
-                .iter()
-                .map(crate::persistence::codec::TargetPartitionFieldBinding::try_from)
-                .collect::<Result<_, _>>()?,
-        },
+        target: target_facts,
     })
-    .map_err(|error| format!("build MV interpretation document: {error}"))?;
-    Ok(MvCreateDocuments {
-        definition,
-        interpretation,
-        configuration: input.configuration,
-    })
+    .map_err(|error| format!("build MV interpretation document: {error}"))
 }
 
 fn target_observations(
@@ -170,9 +230,7 @@ fn target_observations(
                 request_ordinal: field.request_ordinal(),
                 physical_name: field.name().to_string(),
                 provider_field_id: field.provider_field_id().clone(),
-                source_type: field.source_type().cloned().ok_or_else(|| {
-                    "prepared target has no complete provider source type".to_string()
-                })?,
+                source_type: field.source_type().clone(),
                 nullable: field.nullable(),
             })
         })
