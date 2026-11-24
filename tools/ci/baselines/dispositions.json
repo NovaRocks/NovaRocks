@@ -212,56 +212,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:complex-type/complex_group_by",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_map_basic_functions",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_map_concat_override",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_map_empty_concat_entries",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_map_entries_semantics",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:complex-type/complex_map_higher_order",
       "failure": {
         "class": "error_code",
@@ -269,16 +219,6 @@
       },
       "reason": "Statement 1 selects builtin.scalar/transform_keys/lambda-v1 with the public argument order, and the overload has no installed pure implementation. The prior missing MAP constructor and wrong argument order failures remain in the native evidence. Verify the original higher-order value oracles and native cleanup after installing the exact overloads.",
       "owner": "UEA-5E B7c",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_map_keys_values_unnest",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
       "expires": "2026-12-15"
     },
     {
@@ -329,16 +269,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/__struct_subfield/dynamic-v1; owner B8, I1, I5; remove after capability repair and native verification",
       "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_struct_uppercase",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/named_struct/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
       "expires": "2026-12-15"
     },
     {
@@ -459,16 +389,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
       "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:function/function_str_to_map",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/str_to_map/dynamic-v1; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
       "expires": "2026-12-15"
     },
     {
@@ -1639,25 +1559,11 @@
       "review_by": "2026-12-15"
     },
     {
-      "unit": "sql-case:function/function_intrinsic_admission",
-      "reason": "The original negative oracle at statement9 is masked by the named selected-carrier refusal sql.analyze.unavailable_implementation for builtin.scalar/map/dynamic-v1. The expected-error assertion really fails. D0-6 does not authorize a known-failure match or reordering error precedence; retain this raw failure until the named family restores the capability.",
-      "owner": "UEA-5E B7",
-      "exit_condition": "UEA-5E B7 restores builtin.scalar/map/dynamic-v1; rerun this original complete native1FE+3BE case with all original result, expected-error, fault, lifecycle and cleanup assertions passing, then remove this quarantine.",
-      "review_by": "2026-12-15"
-    },
-    {
       "unit": "sql-case:join/join_struct_type",
       "reason": "The original negative oracle at statement3 is masked by the named selected-carrier refusal sql.analyze.unavailable_implementation for builtin.scalar/row/dynamic-v1. The expected-error assertion really fails. D0-6 does not authorize a known-failure match or reordering error precedence; retain this raw failure until the named family restores the capability.",
       "owner": "UEA-5E B7",
       "exit_condition": "UEA-5E B7 restores builtin.scalar/row/dynamic-v1; rerun this original complete native1FE+3BE case with all original result, expected-error, fault, lifecycle and cleanup assertions passing, then remove this quarantine.",
       "review_by": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/schema_free_exchange_depth64_struct",
-      "owner": "UEA-7B3-A",
-      "review_by": "2026-12-15",
-      "reason": "User ruling on 2026-11-03 permits exact blocked depth64 cases to be temporarily ignored without imposing new implementation limits. Original 1FE+3BE observations are retained in UEA-7B3-A attempts 20261103T111804Z-candidate-2381d00-dev-sql-f97868 and 20261103T112438Z-dev-sql-derived-inputs-distribution-7318c3; suite, server and fixture cleanup were OK. This is quarantine, not a known-error exemption, expected-error rewrite or PASS. The actual selected overload builtin.scalar/row/dynamic-v1 has no installed implementation; positive depth64 results and both distribution assertions remain unexecuted.",
-      "exit_condition": "Restore the named constructor capability and review the supported depth path; run the complete original positive logical64 case under native 1FE+3BE in both placements, verify all value/type and plan oracles and actual cleanup, then remove this exact quarantine."
     },
     {
       "unit": "sql-case:complex-type/schema_free_exchange_depth64_map",
