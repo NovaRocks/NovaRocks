@@ -18,30 +18,59 @@
 -- @order_sensitive=true
 
 -- query 1
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-CREATE TABLE ${case_db}.b7a_anon_row AS
-SELECT ROW(1) AS payload;
+-- @skip_result_check=true
+CREATE CATALOG b7a_rows_${uuid0} USING iceberg WITH (
+    "iceberg.catalog.type" = 'rest',
+    "uri" = '${iceberg_rest_uri}',
+    "warehouse" = '${iceberg_rest_warehouse}',
+    "credential.object-store-metadata.consumer-role" = 'frontend',
+    "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}',
+    "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}',
+    "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}',
+    "credential.object-store-data.consumer-role" = 'backend',
+    "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}',
+    "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}',
+    "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}',
+    "aws.s3.endpoint" = '${oss_endpoint}',
+    "aws.s3.region" = '${oss_region}',
+    "aws.s3.enable_path_style_access" = '${oss_path_style}'
+);
+CREATE SCHEMA b7a_rows_${uuid0}.rows_${uuid0};
 
 -- query 2
--- @expect_trino_error=DUPLICATE_COLUMN_NAME,USER_ERROR
-CREATE TABLE ${case_db}.b7a_duplicate_row AS
-SELECT ROW(1 AS id, 2 AS ID) AS payload;
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+CREATE TABLE b7a_rows_${uuid0}.rows_${uuid0}.b7a_anon_row AS
+SELECT ROW(1) AS payload;
 
 -- query 3
-SELECT count(*) AS rejected_tables
-FROM information_schema.tables
-WHERE table_schema = '${case_db}'
-  AND table_name IN ('b7a_anon_row', 'b7a_duplicate_row');
+-- @expect_trino_error=DUPLICATE_COLUMN_NAME,USER_ERROR
+CREATE TABLE b7a_rows_${uuid0}.rows_${uuid0}.b7a_duplicate_row AS
+SELECT ROW(1 AS id, 2 AS ID) AS payload;
 
 -- query 4
--- @skip_result_check=true
-CREATE TABLE ${case_db}.b7a_named_row (
-    payload ROW(id INTEGER)
-) WITH (format_version = 3);
+SELECT count(*) AS rejected_tables
+FROM b7a_rows_${uuid0}.information_schema.tables
+WHERE table_schema = 'rows_${uuid0}'
+  AND table_name IN ('b7a_anon_row', 'b7a_duplicate_row');
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO ${case_db}.b7a_named_row VALUES ROW(ROW(7));
+CREATE TABLE b7a_rows_${uuid0}.rows_${uuid0}.b7a_named_row (
+    payload ROW(id INTEGER)
+) WITH (format_version = 3);
 
 -- query 6
-SELECT payload.id AS id_value FROM ${case_db}.b7a_named_row;
+-- @skip_result_check=true
+INSERT INTO b7a_rows_${uuid0}.rows_${uuid0}.b7a_named_row VALUES ROW(ROW(7));
+
+-- query 7
+SELECT payload.id AS id_value FROM b7a_rows_${uuid0}.rows_${uuid0}.b7a_named_row;
+
+-- query 8
+-- @cleanup=true
+-- @skip_result_check=true
+DROP TABLE IF EXISTS b7a_rows_${uuid0}.rows_${uuid0}.b7a_anon_row;
+DROP TABLE IF EXISTS b7a_rows_${uuid0}.rows_${uuid0}.b7a_duplicate_row;
+DROP TABLE IF EXISTS b7a_rows_${uuid0}.rows_${uuid0}.b7a_named_row;
+DROP SCHEMA IF EXISTS b7a_rows_${uuid0}.rows_${uuid0};
+DROP CATALOG b7a_rows_${uuid0};

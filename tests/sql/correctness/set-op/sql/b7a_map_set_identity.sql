@@ -16,38 +16,50 @@
 -- under the License.
 
 -- @order_sensitive=true
--- Opposite entry orders originate in separate scanned relations.
+-- Construct MAPs from opposite array orders in separate scanned relations.
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.b7a_map_left (m MAP(INTEGER, INTEGER));
+CREATE TABLE ${case_db}.b7a_map_left (entry_keys ARRAY(INTEGER), entry_values ARRAY(INTEGER));
 
 -- query 2
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.b7a_map_right (m MAP(INTEGER, INTEGER));
+CREATE TABLE ${case_db}.b7a_map_right (entry_keys ARRAY(INTEGER), entry_values ARRAY(INTEGER));
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO ${case_db}.b7a_map_left
-VALUES ROW(MAP(ARRAY[1, 2], ARRAY[11, CAST(NULL AS INTEGER)]));
+VALUES ROW(ARRAY[1, 2], ARRAY[11, CAST(NULL AS INTEGER)]);
 
 -- query 4
 -- @skip_result_check=true
 INSERT INTO ${case_db}.b7a_map_right
-VALUES ROW(MAP(ARRAY[2, 1], ARRAY[CAST(NULL AS INTEGER), 11]));
+VALUES ROW(ARRAY[2, 1], ARRAY[CAST(NULL AS INTEGER), 11]);
 
 -- query 5
 -- @explain_contains=HASH EXCHANGE
 SELECT count(*) AS row_count FROM (
-    SELECT m FROM ${case_db}.b7a_map_left
+    SELECT MAP(entry_keys, entry_values) AS m FROM ${case_db}.b7a_map_left
     UNION DISTINCT
-    SELECT m FROM ${case_db}.b7a_map_right
-);
+    SELECT MAP(entry_keys, entry_values) AS m FROM ${case_db}.b7a_map_right
+) AS unique_maps;
 
 -- query 6
 -- @explain_contains=HASH EXCHANGE
 SELECT count(*) AS row_count FROM (
-    SELECT ARRAY[m] FROM ${case_db}.b7a_map_left
+    SELECT ARRAY[MAP(entry_keys, entry_values)] AS m FROM ${case_db}.b7a_map_left
     INTERSECT
-    SELECT ARRAY[m] FROM ${case_db}.b7a_map_right
-);
+    SELECT ARRAY[MAP(entry_keys, entry_values)] AS m FROM ${case_db}.b7a_map_right
+) AS common_maps;
+
+-- query 7
+-- @skip_result_check=true
+-- @normalize_explain_timing=true
+-- @result_contains=Profile: tasks=
+-- @result_contains=HASH EXCHANGE
+-- @result_contains=algorithm=novarocks.native-exchange.v2
+EXPLAIN ANALYZE SELECT count(*) FROM (
+    SELECT ARRAY[MAP(entry_keys, entry_values)] AS m FROM ${case_db}.b7a_map_left
+    INTERSECT
+    SELECT ARRAY[MAP(entry_keys, entry_values)] AS m FROM ${case_db}.b7a_map_right
+) AS common_maps;

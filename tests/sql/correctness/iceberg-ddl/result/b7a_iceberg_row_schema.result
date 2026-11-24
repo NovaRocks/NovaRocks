@@ -1,9 +1,9 @@
--- query 3
+-- query 4
 -- types	bigint
 rejected_tables
 0
 
--- query 6
+-- query 7
 -- types	integer
 id_value
 7

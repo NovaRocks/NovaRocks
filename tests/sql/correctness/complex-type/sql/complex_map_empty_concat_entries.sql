@@ -81,8 +81,8 @@ FROM entries;
 -- query 8
 -- Read the ROW key and the empty MAP nested in its ROW value by position.
 WITH merged AS (
-    SELECT map_concat(c1, MAP(ARRAY[CAST(ROW(2) AS ROW("1" INTEGER))],
-                              ARRAY[CAST(ROW(ARRAY[MAP()]) AS ROW("A" ARRAY(MAP(INTEGER, INTEGER))))])) AS m
+    SELECT map_concat(c1, MAP(ARRAY[ROW(2 AS "1")],
+                              ARRAY[ROW(ARRAY[CAST(MAP() AS MAP(INTEGER, INTEGER))] AS "A")])) AS m
     FROM (VALUES ROW(map())) AS t(c1)
 ), entries AS (
     SELECT cardinality(m) AS merged_entries, element_at(map_entries(m), 1) AS e
@@ -101,3 +101,8 @@ SELECT col_int, map_entries(col_map) FROM ${case_db}.test_map ORDER BY col_int;
 SELECT col_int, map_entries(col_map), "unnest"
 FROM ${case_db}.test_map, unnest(map_entries(col_map)) AS "unnest"("unnest")
 ORDER BY col_int;
+
+-- query 11
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- Changing a child type inside a ROW uses the separate recursive ROW conversion.
+SELECT CAST(ROW(ARRAY[MAP()]) AS ROW("A" ARRAY(MAP(INTEGER, INTEGER))));

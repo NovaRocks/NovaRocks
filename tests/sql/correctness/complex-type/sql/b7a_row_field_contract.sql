@@ -44,9 +44,9 @@ ORDER BY outer_id;
 -- query 4
 -- @expect_trino_error=AMBIGUOUS_NAME,USER_ERROR
 SELECT r.id
-FROM (SELECT ROW(id AS id, id AS ID) AS r FROM ${case_db}.b7a_row_input);
+FROM (SELECT ROW(id AS id, id AS ID) AS r FROM ${case_db}.b7a_row_input) AS named_rows;
 
 -- query 5
 -- @expect_trino_error=EXPRESSION_NOT_CONSTANT,USER_ERROR
 SELECT r[1 + 1]
-FROM (SELECT ROW(id, payload) AS r FROM ${case_db}.b7a_row_input);
+FROM (SELECT ROW(id, payload) AS r FROM ${case_db}.b7a_row_input) AS positional_rows;
