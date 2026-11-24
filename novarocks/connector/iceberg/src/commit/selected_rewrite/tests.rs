@@ -355,78 +355,19 @@ async fn physical_rewrite_uses_frozen_data_age_exact_ref_and_actual_row_allocati
     let writer = Writer::new();
     let metadata = fixture(&writer, false).await;
     let original = live(&writer, &metadata, 10).await;
-    for preserve in [true, false] {
-        let file = DataFileBuilder::default()
-            .content(DataContentType::Data)
-            .file_path(
-                if preserve {
-                    "file:///preserved.parquet"
-                } else {
-                    "file:///historical-output.parquet"
-                }
-                .into(),
-            )
-            .file_format(DataFileFormat::Parquet)
-            .record_count(6)
-            .file_size_in_bytes(200)
-            .partition_spec_id(0)
-            .first_row_id(preserve.then_some(0))
-            .build()
-            .unwrap();
-        let intent = intent(
-            &writer,
-            &metadata,
-            vec![AddedContent::rewritten_data(file, 0, 1).unwrap()],
-            original.values().map(|e| e.frozen.clone()).collect(),
-            RequestShape::SnapshotProducing,
-        );
-        let mut staging = StagingEngine::begin(base(metadata.clone()), &intent, &writer).unwrap();
-        staging
-            .stage(&super::super::rewrite_data_files::RewriteDataFilesPreparer)
-            .await
-            .unwrap();
-        let snapshot = staging.metadata().snapshot_for_ref("dev").unwrap();
-        assert_eq!(snapshot.parent_snapshot_id(), Some(10));
-        assert_eq!(snapshot.sequence_number(), 3);
-        assert_eq!(snapshot.summary().operation, Operation::Replace);
-        assert_eq!(
-            snapshot.added_rows_count(),
-            Some(if preserve { 0 } else { 6 })
-        );
-        assert_eq!(
-            staging
-                .metadata()
-                .snapshot_for_ref("main")
-                .unwrap()
-                .snapshot_id(),
-            20
-        );
-        let output = live(&writer, staging.metadata(), snapshot.snapshot_id()).await;
-        assert_eq!(output.len(), 1);
-        let entry = output.values().next().unwrap();
-        assert_eq!(entry.frozen.facts().data_sequence, Some(1));
-        assert_eq!(entry.frozen.facts().file_sequence, Some(3));
-        assert_eq!(
-            entry.frozen.facts().first_row_id,
-            Some(if preserve { 0 } else { 9 })
-        );
-    }
-}
-
-#[tokio::test]
-async fn physical_rewrite_mixed_assigned_and_historical_outputs_allocates_only_unassigned_rows() {
-    let writer = Writer::new();
-    let metadata = fixture(&writer, false).await;
-    let original = live(&writer, &metadata, 10).await;
-    let added = vec![
-        AddedContent::rewritten_data(data("file:///already-assigned.parquet", Some(0)), 0, 1)
-            .unwrap(),
-        AddedContent::rewritten_data(data("file:///historical-null.parquet", None), 0, 1).unwrap(),
-    ];
+    let file = DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path("file:///rewrite-output.parquet".into())
+        .file_format(DataFileFormat::Parquet)
+        .record_count(6)
+        .file_size_in_bytes(200)
+        .partition_spec_id(0)
+        .build()
+        .unwrap();
     let intent = intent(
         &writer,
         &metadata,
-        added,
+        vec![AddedContent::rewritten_data(file, 0, 1).unwrap()],
         original.values().map(|e| e.frozen.clone()).collect(),
         RequestShape::SnapshotProducing,
     );
@@ -436,32 +377,25 @@ async fn physical_rewrite_mixed_assigned_and_historical_outputs_allocates_only_u
         .await
         .unwrap();
     let snapshot = staging.metadata().snapshot_for_ref("dev").unwrap();
-    assert_eq!(snapshot.row_range(), Some((9, 3)));
-    assert_eq!(staging.metadata().next_row_id(), 12);
+    assert_eq!(snapshot.parent_snapshot_id(), Some(10));
+    assert_eq!(snapshot.sequence_number(), 3);
+    assert_eq!(snapshot.summary().operation, Operation::Replace);
+    assert_eq!(snapshot.row_range(), Some((9, 6)));
+    assert_eq!(staging.metadata().next_row_id(), 15);
+    assert_eq!(
+        staging
+            .metadata()
+            .snapshot_for_ref("main")
+            .unwrap()
+            .snapshot_id(),
+        20
+    );
     let output = live(&writer, staging.metadata(), snapshot.snapshot_id()).await;
-    assert_eq!(output.len(), 2);
-    assert_eq!(
-        output[&EntryIdentity::DataFile {
-            path: "file:///already-assigned.parquet".into()
-        }]
-            .frozen
-            .facts()
-            .first_row_id,
-        Some(0)
-    );
-    assert_eq!(
-        output[&EntryIdentity::DataFile {
-            path: "file:///historical-null.parquet".into()
-        }]
-            .frozen
-            .facts()
-            .first_row_id,
-        Some(9)
-    );
-    for entry in output.values() {
-        assert_eq!(entry.frozen.facts().data_sequence, Some(1));
-        assert_eq!(entry.frozen.facts().file_sequence, Some(3));
-    }
+    assert_eq!(output.len(), 1);
+    let facts = output.values().next().unwrap().frozen.facts();
+    assert_eq!(facts.data_sequence, Some(1));
+    assert_eq!(facts.file_sequence, Some(3));
+    assert_eq!(facts.first_row_id, Some(9));
 }
 
 #[tokio::test]

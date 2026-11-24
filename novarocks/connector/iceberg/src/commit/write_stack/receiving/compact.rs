@@ -33,7 +33,7 @@ use crate::wire::dto::IcebergPartitionValueDescriptor as EncodedPartitionValue;
 
 use super::super::codec::encode_compact_addition;
 use super::super::domain::{
-    IcebergArtifactMetrics, IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment,
+    IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment,
     IcebergDeleteTargetLocator, IcebergFinalDeleteEffect, IcebergFinalDeleteKind,
     IcebergWriteTableFacts, corrupt, invalid,
 };
@@ -75,8 +75,6 @@ pub(crate) struct CompactAddition {
     pub(crate) kind: AdditionKind,
     pub(crate) encoded_lower_bound: usize,
     pub(crate) data_sequence: SeqField,
-    /// A rewrite marker is the smallest explicitly stored source row ID.
-    pub(crate) first_row_id: Option<i64>,
     pub(crate) payload: Box<[u8]>,
 }
 
@@ -204,7 +202,6 @@ pub(crate) struct PreparedCompactEntry {
     original_bytes: usize,
     payload_bytes: usize,
     data_sequence: SeqField,
-    first_row_id: Option<i64>,
     counts: AddedCounters,
     additional_bytes: usize,
     additional: Option<ConnectorPayloadRetentionGuard>,
@@ -222,7 +219,7 @@ impl CompactEntry {
         rewrite: Option<&IcebergWriteTableFacts>,
     ) -> Result<PreparedCompactEntry, ConnectorError> {
         let (fragment, original_bytes) = adapter.measured_commit_fragment(original)?;
-        let (data_sequence, first_row_id) = addition_lineage(fragment, rewrite)?;
+        let data_sequence = addition_data_sequence(fragment, rewrite)?;
         let payload_bytes = fragment.compact_payload_bytes().ok_or_else(|| {
             invalid("Iceberg artifact has no admitted compact addition projection")
         })?;
@@ -286,7 +283,6 @@ impl CompactEntry {
             original_bytes,
             payload_bytes,
             data_sequence,
-            first_row_id,
             counts,
             additional_bytes,
             additional,
@@ -344,7 +340,6 @@ impl PreparedCompactEntry {
                 kind: addition.kind,
                 encoded_lower_bound: addition.encoded_lower_bound,
                 data_sequence: self.data_sequence,
-                first_row_id: self.first_row_id,
                 payload: encode_compact_addition(artifact, self.payload_bytes)?,
             }),
             (None, None) => None,
@@ -451,101 +446,51 @@ fn addition_metadata(
     })
 }
 
-fn addition_lineage(
+fn addition_data_sequence(
     fragment: &IcebergCommitFragment,
     rewrite: Option<&IcebergWriteTableFacts>,
-) -> Result<(SeqField, Option<i64>), ConnectorError> {
-    let IcebergCommitArtifact::DataFile(file) = fragment.artifact() else {
-        if rewrite.is_some() {
-            return Err(corrupt("Iceberg rewrite received a non-data addition"));
-        }
-        return Ok((SeqField::Inherit, None));
-    };
+) -> Result<SeqField, ConnectorError> {
     let Some(table) = rewrite else {
-        return Ok((SeqField::Inherit, file.first_row_id()));
+        return Ok(SeqField::Inherit);
     };
-    let data_sequence = if table.format_version() == 1 {
+    let IcebergCommitArtifact::DataFile(file) = fragment.artifact() else {
+        return Err(corrupt("Iceberg rewrite received a non-data addition"));
+    };
+    if file.first_row_id().is_some() {
+        return Err(corrupt(
+            "Iceberg rewrite output must not supply a first-row-id marker",
+        ));
+    }
+    if table.format_version() == 3
+        && let Some(stats) = file.metrics().column_stats()
+    {
+        for field in [
+            ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+            ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+        ] {
+            if let Some(bytes) = stats.lower_bounds.get(&field) {
+                validate_lineage_lower_bound(bytes)?;
+            }
+        }
+    }
+    Ok(if table.format_version() == 1 {
         SeqField::Inherit
     } else {
         // IcebergWriteTableFacts has already checked the frozen sequence.
         SeqField::Explicit(table.base_sequence_number())
-    };
-    let first_row_id = if table.format_version() == 3 {
-        Some(certify_preserved_row_id(
-            file.metrics(),
-            file.first_row_id(),
-        )?)
-    } else {
-        None
-    };
-    Ok((data_sequence, first_row_id))
+    })
 }
 
-fn long_bound(
-    bounds: &std::collections::BTreeMap<i32, Vec<u8>>,
-    field: i32,
-) -> Result<i64, ConnectorError> {
-    let bytes = bounds
-        .get(&field)
-        .ok_or_else(|| corrupt("Preserved rewrite is missing a stored lineage bound"))?;
-    let bytes: [u8; 8] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| corrupt("Preserved rewrite stored lineage bound is not an Iceberg Long"))?;
-    let value = i64::from_le_bytes(bytes);
-    if value < 0 {
+fn validate_lineage_lower_bound(bytes: &[u8]) -> Result<(), ConnectorError> {
+    let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+        corrupt("Iceberg rewrite stored lineage lower bound is not an Iceberg Long")
+    })?;
+    if i64::from_le_bytes(bytes) < 0 {
         return Err(corrupt(
-            "Preserved rewrite stored lineage bound is negative",
+            "Iceberg rewrite stored lineage lower bound is negative",
         ));
     }
-    Ok(value)
-}
-
-pub(crate) fn certify_preserved_row_id(
-    metrics: &IcebergArtifactMetrics,
-    marker: Option<i64>,
-) -> Result<i64, ConnectorError> {
-    let stats = metrics
-        .column_stats()
-        .ok_or_else(|| corrupt("Preserved rewrite output is missing physical row-id statistics"))?;
-    if stats
-        .null_value_counts
-        .get(&ICEBERG_RESERVED_FIELD_ID_ROW_ID)
-        != Some(&0)
-    {
-        return Err(corrupt(
-            "Preserved rewrite requires a proven non-null stored row-id column",
-        ));
-    }
-    let first_row_id = long_bound(&stats.lower_bounds, ICEBERG_RESERVED_FIELD_ID_ROW_ID)?;
-    if stats
-        .null_value_counts
-        .get(&ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER)
-        != Some(&0)
-    {
-        return Err(corrupt(
-            "Preserved rewrite requires proven non-null stored last-updated sequences",
-        ));
-    }
-    let last_updated_min = long_bound(
-        &stats.lower_bounds,
-        ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-    )?;
-    let last_updated_max = long_bound(
-        &stats.upper_bounds,
-        ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-    )?;
-    if last_updated_min > last_updated_max {
-        return Err(corrupt(
-            "Preserved rewrite stored last-updated sequence bounds are reversed",
-        ));
-    }
-    if marker.is_some_and(|marker| marker != first_row_id) {
-        return Err(corrupt(
-            "Preserved rewrite first-row-id marker differs from the physical row-id minimum",
-        ));
-    }
-    Ok(first_row_id)
+    Ok(())
 }
 
 fn addition_counts(fragment: &IcebergCommitFragment) -> Result<AddedCounters, ConnectorError> {

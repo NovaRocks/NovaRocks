@@ -48,16 +48,11 @@ No patches applied in the initial source commit.
 - Exit: remove when upstream exposes the same complete reference-map accessor, or a reviewed consumer migration removes the need for it.
 - Coverage: connector dependency/ref tests, fixed retention graphs and actual reclamation root/freshness tests; V2 standalone core check.
 
-## P7a — missing v3 next-row-id read compatibility
-
-- Purpose: preserve the 0.9 read default of `INITIAL_ROW_ID` when v3 metadata omits `next-row-id`; serialization continues emitting it.
-- Files: `src/spec/table_metadata.rs`.
-- Upstream status: no tracked upstream issue; 0.11.0 requires the field.
-- Production dependency: reading existing Spark REST v3 metadata without the field.
-- Exit: IRU-8 replaces the external semantic-identity compatibility boundary and removes this patch.
-- Coverage: migrated `test_table_metadata_v3_missing_next_row_id_defaults_to_initial`; existing v3 metadata serde tests.
-
 ## Retired patches
+
+P7a (defaulting a missing v3 `next-row-id` to zero) has been removed. The
+upstream v3 decoder requires the allocation watermark. The first-party Iceberg
+metadata reader reports the missing field without guessing its value.
 
 U4 (direct child directory listing) has been removed. Hadoop discovery now
 uses NovaRocks' own bounded filesystem helpers; the four former U4 source files
@@ -91,7 +86,8 @@ Iceberg family and does not extend to other vendored crates.
   development-only `serde_arrow` uses `0.15` with `arrow-60`. Features and lints
   otherwise remain unchanged. `Cargo.toml.orig` and `DEPENDENCIES.rust.tsv`
   retain the official 0.11.0 release as provenance.
-- U3 and P7a remain unchanged: both only modify `src/spec/table_metadata.rs`.
+- U3 remains independent of this backport and only modifies
+  `src/spec/table_metadata.rs`.
 
 The page-index evaluator change in #3257 selects all rows when the offset index
 is absent. It affects the SDK ArrowReader, which NovaRocks does not use for

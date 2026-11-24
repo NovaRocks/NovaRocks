@@ -30,15 +30,15 @@ use novarocks_spi::connector::write_stack::{
     ConnectorWriterPhysicalContext, WriteTargetOrdinal,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogVersion, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
+    CatalogHandle, CatalogVersion, ConnectorError, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext, ConnectorStopOwner,
     ConnectorWriteAdmissionPurpose,
 };
 
 use crate::commit::dependency::ValidationInputs;
 use crate::commit::model::{
-    AddedContent, CommitProtocol, EntryIdentity, FileChanges, ObjectIdentity, OperationIntent,
-    OperationIntentParts, RequestShape, SeqField, StartSnapshot,
+    AddedContent, ArtifactWriter, CommitProtocol, EntryIdentity, FileChanges, ObjectIdentity,
+    OperationIntent, OperationIntentParts, RequestShape, SeqField, StartSnapshot,
 };
 use crate::commit::new_manifests::PendingNewFiles;
 use crate::commit::overwrite::preparer_tests::{Fixture, data};
@@ -47,10 +47,10 @@ use crate::commit::staging::{StagingBase, StagingEngine};
 use crate::commit::write_stack::codec::CompactFragmentCodec;
 use crate::commit::write_stack::control::written_file_from_fragment;
 use crate::commit::write_stack::domain::{
-    IcebergArtifactMetrics, IcebergCommitFragment, IcebergDataBranchRecipe,
-    IcebergDataFileArtifact, IcebergFrozenRewriteBranchInput, IcebergSealedWriteTarget,
-    IcebergSessionFacts, IcebergWriteBranch, IcebergWriteCommitSession, IcebergWriteFlavor,
-    IcebergWriteSessionId, IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput,
+    IcebergCommitFragment, IcebergDataBranchRecipe, IcebergFrozenRewriteBranchInput,
+    IcebergSealedWriteTarget, IcebergSessionFacts, IcebergWriteBranch, IcebergWriteCommitSession,
+    IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteTableFacts, IcebergWriterHandle,
+    IcebergWriterOutput,
 };
 use crate::commit::write_stack::execution::IcebergWriteStackExecution;
 use crate::commit::write_stack::runtime::{IcebergWriteAdapter, build_write_adapter};
@@ -166,8 +166,8 @@ async fn real_writer_fragment(
     let table = table_facts(metadata);
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
-        Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, false),
-        Field::new(ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, false),
+        Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, true),
+        Field::new(ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true),
     ]));
     let public_input = novarocks_spi::connector::ConnectorWriteInputShape::Data {
         fields: schema
@@ -206,9 +206,9 @@ async fn real_writer_fragment(
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(Int64Array::from(vec![10, 30])),
-            Arc::new(Int64Array::from(vec![0, 2])),
-            Arc::new(Int64Array::from(vec![0, 1])),
+            Arc::new(Int64Array::from(vec![10, 20, 30])),
+            Arc::new(Int64Array::from(vec![Some(0), None, Some(2)])),
+            Arc::new(Int64Array::from(vec![Some(0), None, Some(1)])),
         ],
     )
     .unwrap();
@@ -239,7 +239,7 @@ async fn real_writer_fragment(
 }
 
 #[tokio::test]
-async fn production_writer_preserves_source_ids_through_canonical_selected_rewrite() {
+async fn production_rewrite_preserves_stored_lineage_and_inherits_a_fresh_file_base() {
     let fixture = Fixture::new();
     let initial = fixture.metadata(FormatVersion::V3);
     let old_path = format!("{}/data/source.parquet", initial.location());
@@ -284,14 +284,30 @@ async fn production_writer_preserves_source_ids_through_canonical_selected_rewri
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    assert_eq!(row_ids.values().as_ref(), &[0, 2]);
+    assert_eq!(row_ids.iter().collect::<Vec<_>>(), [Some(0), None, Some(2)]);
     let last_updated = batch
         .column_by_name(ICEBERG_LAST_UPDATED_SEQ_COL)
         .unwrap()
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    assert_eq!(last_updated.values().as_ref(), &[0, 1]);
+    assert_eq!(
+        last_updated.iter().collect::<Vec<_>>(),
+        [Some(0), None, Some(1)]
+    );
+    for (column, field_id) in [
+        (ICEBERG_ROW_ID_COL, ICEBERG_RESERVED_FIELD_ID_ROW_ID),
+        (
+            ICEBERG_LAST_UPDATED_SEQ_COL,
+            ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+        ),
+    ] {
+        assert_eq!(
+            batch.schema().field_with_name(column).unwrap().metadata()
+                [parquet::arrow::PARQUET_FIELD_ID_META_KEY],
+            field_id.to_string()
+        );
+    }
     let attempt = fixture.operation.begin_attempt().unwrap();
     let mut inputs = ValidationInputs::new(&source, source.current_snapshot_id(), &attempt);
     let live = inputs.live_set().await.unwrap().clone();
@@ -310,7 +326,6 @@ async fn production_writer_preserves_source_ids_through_canonical_selected_rewri
         let addition = entries.next().unwrap().addition.as_ref().unwrap();
         assert!(entries.next().is_none());
         assert_eq!(addition.object_path.as_ref(), output_path);
-        assert_eq!(addition.first_row_id, Some(0));
         assert_eq!(addition.data_sequence, SeqField::Explicit(frozen_sequence));
         ObjectIdentity::from_shared_path(Arc::clone(&addition.object_path)).unwrap()
     };
@@ -370,184 +385,34 @@ async fn production_writer_preserves_source_ids_through_canonical_selected_rewri
     assert_eq!(retained.load(Ordering::SeqCst), 0);
     let after = engine.metadata().clone();
     engine.freeze().unwrap();
-    assert_eq!(after.next_row_id(), 3);
+    assert_eq!(after.next_row_id(), 6);
     let snapshot = after.current_snapshot().unwrap();
-    assert_eq!(snapshot.row_range(), Some((3, 0)));
+    assert_eq!(snapshot.row_range(), Some((3, 3)));
     assert_eq!(snapshot.summary().operation, Operation::Replace);
+    let manifests = crate::manifest::load_manifest_list(snapshot, attempt.file_io(), &after)
+        .await
+        .unwrap();
+    let manifest = manifests
+        .entries()
+        .iter()
+        .find(|manifest| manifest.added_files_count == Some(1))
+        .unwrap();
+    assert_eq!(manifest.first_row_id, Some(3));
+    let raw = crate::manifest::source::ManifestSource::committed(
+        snapshot.snapshot_id(),
+        snapshot.manifest_list(),
+        manifest,
+    )
+    .load_sized(attempt.file_io())
+    .await
+    .unwrap();
+    assert_eq!(raw.entries()[0].data_file().first_row_id(), None);
     let mut inputs = ValidationInputs::new(&after, Some(snapshot.snapshot_id()), &attempt);
     let live = inputs.live_set().await.unwrap();
     assert_eq!(live.len(), 1);
     let output = &live[&EntryIdentity::DataFile { path: output_path }];
     let facts = output.frozen.facts();
-    assert_eq!(facts.first_row_id, Some(0));
+    assert_eq!(facts.first_row_id, Some(3));
     assert_eq!(facts.data_sequence, Some(frozen_sequence));
     assert_eq!(facts.file_sequence, Some(snapshot.sequence_number()));
-}
-
-#[tokio::test]
-async fn preserved_row_ids_reject_untrusted_footer_and_inconsistent_explicit_markers() {
-    let fixture = Fixture::new();
-    let metadata = fixture.metadata(FormatVersion::V3);
-    let append = fixture.intent(
-        &metadata,
-        "main",
-        vec![
-            AddedContent::new_logical_data(data("file:///source.parquet", 3, Struct::empty()), 0)
-                .unwrap(),
-        ],
-    );
-    let (source, _) = fixture
-        .stage(
-            metadata,
-            &append,
-            &crate::commit::fast_append::FastAppendPreparer,
-        )
-        .await;
-    let (adapter, original) = real_writer_fragment(&source).await;
-    let handle = rewrite_session(
-        &source,
-        BTreeSet::from([EntryIdentity::DataFile {
-            path: "file:///source.parquet".into(),
-        }]),
-    );
-    let query = begin_rewrite(&handle);
-    for invalid in 0..15 {
-        let mut stats = original.metrics().unwrap().column_stats().unwrap().clone();
-        match invalid {
-            0 => {
-                stats.lower_bounds.remove(&ICEBERG_RESERVED_FIELD_ID_ROW_ID);
-            }
-            1 => {
-                stats.lower_bounds.insert(
-                    ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-                    0i32.to_le_bytes().to_vec(),
-                );
-            }
-            2 => {
-                stats.lower_bounds.insert(
-                    ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-                    (-1i64).to_le_bytes().to_vec(),
-                );
-            }
-            3 => {
-                stats
-                    .null_value_counts
-                    .insert(ICEBERG_RESERVED_FIELD_ID_ROW_ID, 1);
-            }
-            4 => {
-                stats
-                    .null_value_counts
-                    .remove(&ICEBERG_RESERVED_FIELD_ID_ROW_ID);
-            }
-            6 => {
-                stats
-                    .null_value_counts
-                    .insert(ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, 1);
-            }
-            7 => {
-                stats
-                    .null_value_counts
-                    .remove(&ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER);
-            }
-            8 => {
-                stats
-                    .lower_bounds
-                    .remove(&ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER);
-            }
-            9 => {
-                stats.lower_bounds.insert(
-                    ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                    0i32.to_le_bytes().to_vec(),
-                );
-            }
-            10 => {
-                stats.lower_bounds.insert(
-                    ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                    (-1i64).to_le_bytes().to_vec(),
-                );
-            }
-            11 => {
-                stats
-                    .upper_bounds
-                    .remove(&ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER);
-            }
-            12 => {
-                stats.upper_bounds.insert(
-                    ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                    (-1i64).to_le_bytes().to_vec(),
-                );
-            }
-            13 => {
-                stats.lower_bounds.insert(
-                    ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                    2i64.to_le_bytes().to_vec(),
-                );
-            }
-            14 => {
-                stats.upper_bounds.insert(
-                    ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                    1i32.to_le_bytes().to_vec(),
-                );
-            }
-            _ => {}
-        }
-        let fragment = IcebergCommitFragment::data_file(
-            IcebergDataFileArtifact::try_new(
-                format!("{}.invalid.parquet", original.path()),
-                crate::delete_file::IcebergFileFormat::Parquet,
-                original.partition().unwrap().clone(),
-                IcebergArtifactMetrics::try_new(
-                    2,
-                    original.metrics().unwrap().file_size_in_bytes(),
-                    original.metrics().unwrap().split_offsets().to_vec(),
-                    Some(stats),
-                )
-                .unwrap(),
-                (invalid == 5).then_some(99),
-            )
-            .unwrap(),
-        );
-        let (arrival, retained) =
-            arrive_rewrite(&handle, &adapter, query, vec![original.clone(), fragment]);
-        let error = arrival.unwrap_err();
-        assert_eq!(
-            error.kind(),
-            ConnectorErrorKind::CorruptData,
-            "case {invalid}: {error}"
-        );
-        assert_eq!(retained.load(Ordering::SeqCst), 0);
-        handle
-            .with_active_receiving(|receiving| {
-                assert!(receiving.compact_files().is_empty());
-                assert_eq!(receiving.compact_files().counts.data.rows, 0);
-                Ok(())
-            })
-            .unwrap();
-    }
-    let original_metrics = original.metrics().unwrap().clone();
-    let explicit = IcebergCommitFragment::data_file(
-        IcebergDataFileArtifact::try_new(
-            original.path().to_owned(),
-            crate::delete_file::IcebergFileFormat::Parquet,
-            original.partition().unwrap().clone(),
-            original_metrics,
-            Some(0),
-        )
-        .unwrap(),
-    );
-    let (arrival, _) = arrive_rewrite(&handle, &adapter, query, vec![explicit]);
-    arrival.unwrap();
-    handle
-        .with_active_receiving(|receiving| receiving.confirm(query))
-        .unwrap();
-    let received = handle.begin_commit().unwrap().take_compact_files();
-    let addition = received
-        .entries()
-        .next()
-        .unwrap()
-        .addition
-        .as_ref()
-        .unwrap();
-    assert_eq!(addition.object_path.as_ref(), original.path());
-    assert_eq!(addition.first_row_id, Some(0));
 }
