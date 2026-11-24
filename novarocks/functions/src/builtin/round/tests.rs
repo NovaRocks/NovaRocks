@@ -195,12 +195,12 @@ fn selected_rounding_body_observes_cancellation_before_publication() {
     let args = [EvaluatedArgument::Column(&value)];
     for prepared in [
         super::super::round_owner::prepared_for_test(
-            &[ty.clone()],
+            std::slice::from_ref(&ty),
             &[None],
             DecimalOverflowPolicy::ReportError,
         ),
         super::super::truncate_owner::prepared_for_test(
-            &[ty.clone()],
+            std::slice::from_ref(&ty),
             &[None],
             DecimalOverflowPolicy::ReportError,
         ),

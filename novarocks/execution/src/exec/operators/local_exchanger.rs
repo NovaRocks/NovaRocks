@@ -1154,14 +1154,13 @@ mod hierarchical_tests {
         assert_eq!(bypass, 0);
         let groups = rows
             .iter()
-            .filter_map(|(_, chunk)| {
-                (!chunk.is_empty()).then(|| {
-                    chunk.columns()[1]
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap()
-                        .values()
-                })
+            .filter(|(_, chunk)| !chunk.is_empty())
+            .map(|(_, chunk)| {
+                chunk.columns()[1]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
             })
             .collect::<Vec<_>>();
         assert!(groups.iter().any(|group| group.starts_with(&[0, 1])));

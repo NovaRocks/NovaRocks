@@ -599,7 +599,6 @@ fn typeof_preserves_extract_child_resolution() {
         &catalog,
         crate::constant::test_constant_policy(),
     )
-    .err()
-    .expect("the extracted operand must be resolved");
+    .expect_err("the extracted operand must be resolved");
     assert_eq!(error.kind(), AnalyzeErrorKind::UnknownColumn);
 }

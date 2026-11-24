@@ -682,6 +682,140 @@ impl CanonicalBytes {
     }
 }
 
+/// Check the aggregate contract attached to an actual publication before using
+/// its values for rewrite or consuming its state columns as a predecessor.
+pub fn validate_published_aggregate_contracts(
+    interpretation: &super::codec::InterpretationDocument,
+) -> Result<(), String> {
+    use novarocks_functions::builtin::catalogue::builtin_engine_function_catalog;
+    let catalogue = builtin_engine_function_catalog();
+    for aggregate in &interpretation.aggregates {
+        let function = aggregate.function_identity.as_str();
+        match &aggregate.semantic_contract {
+            Some(contract) if catalogue.admits_persistent_aggregate(contract) => {}
+            Some(contract) => {
+                return Err(format!(
+                    "MV aggregate {function} requires a full rebuild: publication overload {} carries result contract {} and state format {}, which are no longer admitted",
+                    contract.overload.as_str(),
+                    contract.result_semantics,
+                    contract.state_format.as_str(),
+                ));
+            }
+            None if matches!(
+                function,
+                "min"
+                    | "max"
+                    | "min_by"
+                    | "max_by"
+                    | "min_n"
+                    | "max_n"
+                    | "bool_and"
+                    | "bool_or"
+                    | "booland_agg"
+                    | "boolor_agg"
+                    | "map_agg"
+                    | "array_agg"
+                    | "array_agg_distinct"
+                    | "variance"
+                    | "stddev"
+                    | "ndv"
+                    | "approx_distinct"
+                    | "approx_count_distinct"
+                    | "approx_most_frequent"
+                    | "approx_top_k"
+                    | "approx_percentile"
+                    | "percentile_approx"
+                    | "percentile_approx_weighted"
+                    | "group_concat"
+                    | "string_agg"
+                    | "listagg"
+            ) =>
+            {
+                return Err(format!(
+                    "MV aggregate {function} requires a full rebuild: publication has no selected aggregate semantic contract"
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Author a replacement interpretation from the original definition's freshly
+/// analyzed calls. A full rebuild retains the same logical aggregate and state
+/// column identities. Only the publication author may install this revision
+/// with the successfully rebuilt rows.
+pub fn rebind_aggregate_semantic_contracts(
+    definition: &super::codec::DefinitionDocument,
+    interpretation: &super::codec::InterpretationDocument,
+    current: &novarocks_sql::planning::mv::SqlMvCreatePersistenceFacts,
+) -> Result<super::codec::InterpretationDocument, String> {
+    use super::codec::internal_retraction_count_aggregate_identity;
+
+    let mut rebound = interpretation.clone();
+    let mut seen = BTreeSet::new();
+    for call in current.aggregates() {
+        let output = call
+            .output_ordinal()
+            .and_then(|ordinal| definition.outputs.get(ordinal as usize))
+            .ok_or("MV rebuild aggregate does not bind a retained output")?;
+        let branch = call
+            .branch_ordinal()
+            .map(|ordinal| {
+                interpretation
+                    .branches
+                    .get(ordinal as usize)
+                    .map(|branch| &branch.branch_id)
+                    .ok_or("MV rebuild aggregate does not bind a retained branch")
+            })
+            .transpose()?;
+        let source_fields = call
+            .source_fields()
+            .iter()
+            .map(|source| {
+                let occurrence_id = source.occurrence_id().get();
+                let occurrence = definition
+                    .relation_occurrences
+                    .iter()
+                    .find(|occurrence| occurrence.occurrence_id == occurrence_id)
+                    .ok_or("MV rebuild aggregate does not bind a retained source occurrence")?;
+                let field = occurrence
+                    .fields
+                    .iter()
+                    .find(|field| field.name_at_binding == source.field_name())
+                    .ok_or("MV rebuild aggregate does not bind a retained source field")?;
+                Ok(RuntimeSourceFieldReference {
+                    occurrence_id,
+                    field_id: field.field_id.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, &'static str>>()?;
+        let identity = normal_aggregate_identity(
+            call.function_identity(),
+            branch,
+            &output.output_id,
+            &source_fields,
+        );
+        let aggregate = rebound
+            .aggregates
+            .iter_mut()
+            .find(|aggregate| aggregate.aggregate_id == identity)
+            .ok_or("MV rebuild aggregate differs from its retained source and output contract")?;
+        if !seen.insert(identity) {
+            return Err("MV rebuild aggregate repeats a retained aggregate identity".into());
+        }
+        aggregate.semantic_contract = Some(call.semantic_contract().clone());
+    }
+    let internal = internal_retraction_count_aggregate_identity();
+    if rebound.aggregates.iter().any(|aggregate| {
+        aggregate.aggregate_id != internal && !seen.contains(&aggregate.aggregate_id)
+    }) {
+        return Err("MV rebuild does not cover every retained aggregate".into());
+    }
+    validate_published_aggregate_contracts(&rebound)?;
+    Ok(rebound)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1054,138 +1188,4 @@ mod tests {
 
         validate_interpretation(&interpretation).expect("R2-valid interpretation");
     }
-}
-
-/// Check the aggregate contract attached to an actual publication before using
-/// its values for rewrite or consuming its state columns as a predecessor.
-pub fn validate_published_aggregate_contracts(
-    interpretation: &super::codec::InterpretationDocument,
-) -> Result<(), String> {
-    use novarocks_functions::builtin::catalogue::builtin_engine_function_catalog;
-    let catalogue = builtin_engine_function_catalog();
-    for aggregate in &interpretation.aggregates {
-        let function = aggregate.function_identity.as_str();
-        match &aggregate.semantic_contract {
-            Some(contract) if catalogue.admits_persistent_aggregate(contract) => {}
-            Some(contract) => {
-                return Err(format!(
-                    "MV aggregate {function} requires a full rebuild: publication overload {} carries result contract {} and state format {}, which are no longer admitted",
-                    contract.overload.as_str(),
-                    contract.result_semantics,
-                    contract.state_format.as_str(),
-                ));
-            }
-            None if matches!(
-                function,
-                "min"
-                    | "max"
-                    | "min_by"
-                    | "max_by"
-                    | "min_n"
-                    | "max_n"
-                    | "bool_and"
-                    | "bool_or"
-                    | "booland_agg"
-                    | "boolor_agg"
-                    | "map_agg"
-                    | "array_agg"
-                    | "array_agg_distinct"
-                    | "variance"
-                    | "stddev"
-                    | "ndv"
-                    | "approx_distinct"
-                    | "approx_count_distinct"
-                    | "approx_most_frequent"
-                    | "approx_top_k"
-                    | "approx_percentile"
-                    | "percentile_approx"
-                    | "percentile_approx_weighted"
-                    | "group_concat"
-                    | "string_agg"
-                    | "listagg"
-            ) =>
-            {
-                return Err(format!(
-                    "MV aggregate {function} requires a full rebuild: publication has no selected aggregate semantic contract"
-                ));
-            }
-            None => {}
-        }
-    }
-    Ok(())
-}
-
-/// Author a replacement interpretation from the original definition's freshly
-/// analyzed calls. A full rebuild retains the same logical aggregate and state
-/// column identities. Only the publication author may install this revision
-/// with the successfully rebuilt rows.
-pub fn rebind_aggregate_semantic_contracts(
-    definition: &super::codec::DefinitionDocument,
-    interpretation: &super::codec::InterpretationDocument,
-    current: &novarocks_sql::planning::mv::SqlMvCreatePersistenceFacts,
-) -> Result<super::codec::InterpretationDocument, String> {
-    use super::codec::internal_retraction_count_aggregate_identity;
-
-    let mut rebound = interpretation.clone();
-    let mut seen = BTreeSet::new();
-    for call in current.aggregates() {
-        let output = call
-            .output_ordinal()
-            .and_then(|ordinal| definition.outputs.get(ordinal as usize))
-            .ok_or("MV rebuild aggregate does not bind a retained output")?;
-        let branch = call
-            .branch_ordinal()
-            .map(|ordinal| {
-                interpretation
-                    .branches
-                    .get(ordinal as usize)
-                    .map(|branch| &branch.branch_id)
-                    .ok_or("MV rebuild aggregate does not bind a retained branch")
-            })
-            .transpose()?;
-        let source_fields = call
-            .source_fields()
-            .iter()
-            .map(|source| {
-                let occurrence_id = source.occurrence_id().get();
-                let occurrence = definition
-                    .relation_occurrences
-                    .iter()
-                    .find(|occurrence| occurrence.occurrence_id == occurrence_id)
-                    .ok_or("MV rebuild aggregate does not bind a retained source occurrence")?;
-                let field = occurrence
-                    .fields
-                    .iter()
-                    .find(|field| field.name_at_binding == source.field_name())
-                    .ok_or("MV rebuild aggregate does not bind a retained source field")?;
-                Ok(RuntimeSourceFieldReference {
-                    occurrence_id,
-                    field_id: field.field_id.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, &'static str>>()?;
-        let identity = normal_aggregate_identity(
-            call.function_identity(),
-            branch,
-            &output.output_id,
-            &source_fields,
-        );
-        let aggregate = rebound
-            .aggregates
-            .iter_mut()
-            .find(|aggregate| aggregate.aggregate_id == identity)
-            .ok_or("MV rebuild aggregate differs from its retained source and output contract")?;
-        if !seen.insert(identity) {
-            return Err("MV rebuild aggregate repeats a retained aggregate identity".into());
-        }
-        aggregate.semantic_contract = Some(call.semantic_contract().clone());
-    }
-    let internal = internal_retraction_count_aggregate_identity();
-    if rebound.aggregates.iter().any(|aggregate| {
-        aggregate.aggregate_id != internal && !seen.contains(&aggregate.aggregate_id)
-    }) {
-        return Err("MV rebuild does not cover every retained aggregate".into());
-    }
-    validate_published_aggregate_contracts(&rebound)?;
-    Ok(rebound)
 }

@@ -869,17 +869,15 @@ mod tests {
 
     #[test]
     fn stored_replay_keeps_the_existing_uncaptured_semantics_refusals() {
-        for (hint, feature) in [("sql_mode='ERROR_IF_OVERFLOW'", "ERROR_IF_OVERFLOW")] {
-            let catalog = catalog(declaration(
-                &format!("WITH SESSION {hint} SELECT 1 AS x"),
-                "x",
-                FunctionValueType::new(D::Int64, false),
-            ));
-            let error = analyze("SELECT x FROM v", &catalog).unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-            assert!(error.message().contains(feature));
-            assert!(catalog.table_lookups.borrow().is_empty());
-        }
+        let catalog = catalog(declaration(
+            "WITH SESSION sql_mode='ERROR_IF_OVERFLOW' SELECT 1 AS x",
+            "x",
+            FunctionValueType::new(D::Int64, false),
+        ));
+        let error = analyze("SELECT x FROM v", &catalog).unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+        assert!(error.message().contains("ERROR_IF_OVERFLOW"));
+        assert!(catalog.table_lookups.borrow().is_empty());
     }
 
     #[test]
