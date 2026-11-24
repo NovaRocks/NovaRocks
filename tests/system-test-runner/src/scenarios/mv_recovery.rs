@@ -2913,35 +2913,6 @@ fn protobuf_varint(input: &[u8], offset: &mut usize) -> Result<u64> {
     bail!("L protobuf varint exceeds 64 bits")
 }
 
-fn assert_rest_snapshot_count(
-    context: &mut ScenarioContext,
-    rest_uri: &str,
-    namespace: &str,
-    table: &str,
-    expected: usize,
-) -> Result<()> {
-    let url = format!(
-        "{}/v1/namespaces/{namespace}/tables/{table}",
-        rest_uri.trim_end_matches('/')
-    );
-    let loaded: serde_json::Value = Client::builder()
-        .no_proxy()
-        .timeout(context.remaining("read old-format MV snapshot count")?)
-        .build()?
-        .get(&url)
-        .send()?
-        .error_for_status()?
-        .json()?;
-    let count = loaded["metadata"]["snapshots"]
-        .as_array()
-        .context("REST MV metadata has no snapshots")?
-        .len();
-    if count != expected {
-        bail!("old-format MV has {count} snapshots, expected {expected}");
-    }
-    Ok(())
-}
-
 fn assert_rest_snapshot_state_unchanged(
     before: &serde_json::Value,
     after: &serde_json::Value,

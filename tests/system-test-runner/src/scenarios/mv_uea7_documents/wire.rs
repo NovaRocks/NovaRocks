@@ -1177,9 +1177,9 @@ mod tests {
             "definition",
             format("definition", 2),
             vec![],
-            &bytes(concat!(
+            &bytes(
                 "080212290a1653454c4543542076616c75652046524f4d206261736510021a0d0a07636174616c6f6712026e73302a",
-            )),
+            ),
         )
         .unwrap();
         let mut l = vec![8, 3, 18, 32];
