@@ -490,12 +490,14 @@ impl<'a> SortCreation<'a> {
         &self,
         values: &arrow::array::ArrayRef,
         declared: &novarocks_type_contract::ValueTypeRef,
+        nan_first: Option<bool>,
         owner: &dyn InputConstructionOwner,
         types: &dyn InputConstructionOwner,
     ) -> ExecutionResult<arrow::array::ArrayRef> {
         use super::SortKeyConstruction;
         use arrow::array::{
-            Decimal128Array, FixedSizeBinaryArray, FixedSizeListArray, Int8Array, LargeListArray,
+            Decimal128Array, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Float64Array,
+            Int8Array, LargeListArray,
             ListArray, MapArray, StructArray,
         };
         use arrow::datatypes::DataType;
@@ -503,6 +505,7 @@ impl<'a> SortCreation<'a> {
         let result = super::normalize_sort_key_array_observed::<ConstructionFailure>(
             values,
             Some(declared),
+            nan_first,
             &mut |event| {
                 match event {
                 SortKeyConstruction::Field { source, target } => types.observe(
@@ -537,6 +540,8 @@ impl<'a> SortCreation<'a> {
                 SortKeyConstruction::ArrayHeader(ty) => {
                     let layout = match ty {
                         DataType::Int8 => std::alloc::Layout::new::<Int8Array>(),
+                        DataType::Float32 => std::alloc::Layout::new::<Float32Array>(),
+                        DataType::Float64 => std::alloc::Layout::new::<Float64Array>(),
                         DataType::Decimal128(_, _) => std::alloc::Layout::new::<Decimal128Array>(),
                         DataType::FixedSizeBinary(_) => std::alloc::Layout::new::<FixedSizeBinaryArray>(),
                         DataType::List(_) => std::alloc::Layout::new::<ListArray>(),

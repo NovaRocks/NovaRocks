@@ -136,10 +136,10 @@ SELECT
     if (idx % 19 = 0, date_add('day', idx, DATE '2023-01-01'), null),
     date_add('day', idx / 2, TIMESTAMP '2023-01-01 00:00:00.000000'),
     if (idx % 20 = 0, date_add('day', idx, TIMESTAMP '2023-01-01 00:00:00.000000'), null),
-    concat('char_', idx / CAST(2 AS DOUBLE)),
-    if (idx % 21 = 0, concat('char_', idx), null),
-    concat('varchar_', idx / CAST(2 AS DOUBLE)),
-    if (idx % 22 = 0, concat('varchar_', idx), null)
+    concat('char_', CAST(idx / CAST(2 AS DOUBLE) AS VARCHAR)),
+    if (idx % 21 = 0, concat('char_', CAST(idx AS VARCHAR)), null),
+    concat('varchar_', CAST(idx / CAST(2 AS DOUBLE) AS VARCHAR)),
+    if (idx % 22 = 0, concat('varchar_', CAST(idx AS VARCHAR)), null)
 FROM ${case_db}.__row_util;
 
 -- ========== c_bool_null ==========

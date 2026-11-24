@@ -1,11 +1,11 @@
 -- query 1
 -- types	integer	double
 id	d
-1	NULL
-2	NULL
-3	NULL
-4	NULL
-5	NULL
-6	NULL
+1	NaN
+4	NaN
+5	NaN
+6	NaN
+3	-Infinity
 8	-2.5
 7	1.25
+2	Infinity

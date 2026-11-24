@@ -448,6 +448,7 @@ impl CompiledGroupedTopNProcessor {
             normalized.push(creation.normalize_key(
                 array,
                 self.plan.rank_types[rank].value_type(),
+                None,
                 owner.as_ref(),
                 types.as_ref(),
             )?);

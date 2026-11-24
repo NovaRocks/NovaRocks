@@ -1,5 +1,5 @@
 -- query 25
--- types	bigint	varchar
+-- types	integer	varchar
 id	v1
 NULL	t1_null
 1	t1_1
@@ -8,7 +8,7 @@ NULL	t1_null
 10	t1_10
 
 -- query 26
--- types	bigint	varchar	varchar
+-- types	integer	varchar	varchar
 id	v1	v2
 NULL	NULL	t2_null
 NULL	t1_null	NULL
@@ -49,7 +49,7 @@ id	v1	v2	v3	v4	v5	v6
 60	NULL	NULL	NULL	NULL	NULL	t6_60
 
 -- query 29
--- types	integer	varchar	varchar	varchar	varchar	varchar	varchar
+-- types	bigint	varchar	varchar	varchar	varchar	varchar	varchar
 id	v1	v2	v3	v4	v5	v6
 2	t1_2	t2_2	NULL	t4_2	NULL	t6_2
 5	NULL	NULL	t3_5	NULL	NULL	t6_5
@@ -86,7 +86,7 @@ id	v1	v2	v3	v4	v5	v6	v7
 70	NULL	NULL	NULL	NULL	NULL	NULL	t7_70
 
 -- query 32
--- types	tinyint	varchar	varchar	varchar	varchar	varchar	varchar	varchar
+-- types	bigint	varchar	varchar	varchar	varchar	varchar	varchar	varchar
 id	v1	v2	v3	v4	v5	v6	v7
 
 -- query 33
@@ -121,7 +121,7 @@ id	v1	v2	v3	v4	v5	v6	v7	v8	table_count
 10	t1_10	NULL	NULL	NULL	NULL	NULL	NULL	NULL	1
 
 -- query 36
--- types	tinyint	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar
+-- types	bigint	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar
 id	v1	v2	v3	v4	v5	v6	v7	v8
 
 -- query 37
@@ -134,7 +134,7 @@ id	v1	v2	v3	v4	v5	v6	v7	v8
 80	NULL	NULL	NULL	NULL	NULL	NULL	NULL	t8_80
 
 -- query 38
--- types	smallint	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar
+-- types	bigint	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar
 id	v1	v2	v3	v4	v5	v6	v7	v8
 2	t1_2	t2_2	NULL	t4_2	NULL	t6_2	NULL	t8_2
 3	NULL	NULL	NULL	NULL	NULL	NULL	NULL	t8_3
@@ -161,7 +161,7 @@ id	row_count	t1_count	t2_count	t3_count	t4_count	t5_count	t6_count
 60	1	0	0	0	0	0	1
 
 -- query 41
--- types	bigint	varchar	varchar	varchar	varchar
+-- types	bigint	varchar(6)	varchar(6)	varchar(6)	varchar
 id	v1_status	v2_status	v3_status	first_valuea
 1	NO_V1	NO_V2	NO_V3	NONE
 2	HAS_V1	HAS_V2	NO_V3	t1_2
@@ -203,13 +203,13 @@ id	v1	v2	v3	v4	v5	v6	v7	v8
 80	NULL	NULL	NULL	NULL	NULL	NULL	NULL	t8_80
 
 -- query 45
--- types	bigint	varchar	varchar	integer
+-- types	bigint	varchar	varchar(6)	integer
 final_id	final_combined	final_status	final_count
 1	t1_1-t2_1	HAS_T3	2
 4	-	NO_T3	1
 
 -- query 46
--- types	bigint	varchar	varchar	varchar	varchar	varchar
+-- types	bigint	varchar	varchar	varchar	varchar(7)	varchar
 key_id	t1_value	t2_value	t3_value	join_result	first_non_null
 1	T1:t1_1	T2:t2_1	T3:t3_1	T5_ONLY	t1_1
 2	T1:NULL	T2:NULL	T3:NULL	T4_ONLY	t4_2
@@ -222,7 +222,7 @@ key_id	t1_value	t2_value	t3_value	join_result	first_non_null
 60	T1:NULL	T2:NULL	T3:NULL	NEITHER	t6_60
 
 -- query 47
--- types	bigint	varchar	varchar	varchar
+-- types	integer	varchar	varchar	varchar
 id	v1	v2	v3
 1	t1_1	t2_1	t3_1
 3	t1_3	NULL	t3_3
@@ -273,7 +273,7 @@ id	v1	v3	v5
 10	t1_10	NULL	NULL
 
 -- query 52
--- types	smallint	varchar	varchar	varchar
+-- types	smallint	varchar(7)	varchar	varchar
 id	presence_status	v1_with_default	v2_with_default
 1	BOTH	t1_1	t2_1
 2	BOTH	t1_2	t2_2
@@ -301,7 +301,7 @@ id	combined_1_2	combined_3_4	first_available
 30	NULL-NULL	t3_30-NULL	NO_VALUE
 
 -- query 55
--- types	bigint	varchar	varchar	varchar
+-- types	integer	varchar(4)	varchar	varchar
 id	val	v1	v2
 NULL	valN	NULL	NULL
 1	val1	t1_1	t2_1
@@ -312,7 +312,7 @@ NULL	valN	NULL	NULL
 20	NULL	NULL	t2_20
 
 -- query 56
--- types	bigint	varchar	varchar	varchar	varchar	varchar
+-- types	integer	varchar(2)	varchar(2)	varchar	varchar	varchar
 id	val1	val2	v1	v2	v3
 NULL	N1	NULL	NULL	NULL	NULL
 NULL	NULL	N2	NULL	NULL	NULL
@@ -326,13 +326,13 @@ NULL	NULL	N2	NULL	NULL	NULL
 30	NULL	NULL	NULL	NULL	t3_30
 
 -- query 57
--- types	tinyint	varchar	varchar	varchar	varchar	varchar
+-- types	integer	varchar	varchar	varchar	varchar	varchar(10)
 id	early_value	late_value	v2	v3	period_status
 1	t1_1	NULL	t2_1	t3_1	EARLY_ONLY
 2	t1_2	NULL	t2_2	NULL	EARLY_ONLY
 
 -- query 58
--- types	bigint	varchar	varchar	varchar	varchar	varchar	varchar	varchar
+-- types	bigint	varchar	varchar	varchar	varchar	varchar	varchar	varchar(11)
 id	v1	v2	v3	v4	v5	v6	data_source
 1	t1_1	t2_1	t3_1	NULL	t5_1	NULL	BOTH_SIDES
 2	t1_2	t2_2	NULL	NULL	NULL	t6_2	LEFT_ONLY
@@ -343,7 +343,7 @@ id	v1	v2	v3	v4	v5	v6	data_source
 50	NULL	NULL	NULL	NULL	t5_50	NULL	CENTER_ONLY
 
 -- query 59
--- types	smallint	varchar	varchar	varchar	varchar	varchar	bigint	bigint
+-- types	bigint	varchar	varchar	varchar	varchar	varchar	bigint	bigint
 id	v1	v2	v3	v4	v5	range_count	rn_by_v1_presence
 1	t1_1	t2_1	t3_1	NULL	t5_1	2	1
 3	t1_3	NULL	t3_3	NULL	t5_3	2	2

@@ -43,7 +43,7 @@ select count(*) from t0;
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into t0 values ROW('2024-01-01', 1, 1), ROW('2024-01-02', 2, 2), ROW('2024-01-03', 3, 3), ROW('2024-01-04', 4, 4), ROW('2024-01-05', 5, 5);
+insert into t0 values ROW(DATE '2024-01-01', 1, 1), ROW(DATE '2024-01-02', 2, 2), ROW(DATE '2024-01-03', 3, 3), ROW(DATE '2024-01-04', 4, 4), ROW(DATE '2024-01-05', 5, 5);
 
 -- query 6
 -- @skip_result_check=true
@@ -104,7 +104,7 @@ create table t1 (
 -- query 19
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 values ROW('2024-01-15', 10), ROW('2024-01-20', 20), ROW('2024-02-10', 30), ROW('2024-02-15', 40);
+insert into t1 values ROW(DATE '2024-01-15', 10), ROW(DATE '2024-01-20', 20), ROW(DATE '2024-02-10', 30), ROW(DATE '2024-02-15', 40);
 
 -- name: test_meta_scan_with_renamed_column
 -- query 20

@@ -43,8 +43,8 @@ CREATE TABLE ${case_db}.t1 (
 INSERT INTO ${case_db}.t1
 SELECT
     idx,
-    concat('str-abc-', idx),
-    concat('str-abc-', idx)
+    concat('str-abc-', CAST(idx AS VARCHAR)),
+    concat('str-abc-', CAST(idx AS VARCHAR))
 FROM ${case_db}.row_util;
 
 -- query 2
