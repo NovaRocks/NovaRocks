@@ -232,16 +232,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:complex-type/complex_test_arrays_zip",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/arrays_zip/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:complex-type/json_list_semantic_schema",
       "failure": {
         "class": "error_code",
