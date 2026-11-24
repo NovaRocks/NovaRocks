@@ -436,17 +436,18 @@ pub(in crate::catalog_application) fn validate_current_mv_format(
             &view,
         )
         .map_err(|error| {
-            let kind = if matches!(
-                error,
-                novarocks_mv_application::persistence::documents::MvDocumentError::KeyedStorage(
-                    KeyedDocumentReadError::LegacyFormat { .. }
-                )
-            ) {
-                ConnectorErrorKind::Unsupported
-            } else {
-                ConnectorErrorKind::CorruptData
+            use novarocks_mv_application::persistence::documents::MvDocumentError;
+            let failure = match error {
+                MvDocumentError::KeyedStorage(
+                    legacy @ KeyedDocumentReadError::LegacyFormat { .. },
+                ) => ConnectorError::from_domain_static(
+                    ConnectorErrorKind::Unsupported,
+                    legacy,
+                    "Retired MV persistence format supports DROP only",
+                ),
+                error => ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string()),
             };
-            CatalogResolutionError::from_connector(ConnectorError::new(kind, error.to_string()))
+            CatalogResolutionError::from_connector(failure)
         })?;
     }
     Ok(())
