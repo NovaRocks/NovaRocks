@@ -12,6 +12,8 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_types::{BackendProcessId, QueryId};
 
+use crate::query_execution::split_assignment::ScanNodeKey;
+
 use super::install_encoder::{
     FrontendRuntimeFilterFeedbackDeclaration, FrontendRuntimeFilterFeedbackPublisherSlot,
     FrontendRuntimeFilterFeedbackWaitEligibility,
@@ -28,7 +30,7 @@ struct ChannelState {
     max_encoded_domain_bytes: usize,
     data_type: arrow::datatypes::DataType,
     publishers: BTreeMap<u32, FrontendRuntimeFilterFeedbackPublisherSlot>,
-    scan_bindings: BTreeSet<(i32, u32)>,
+    scan_bindings: BTreeSet<(ScanNodeKey, u32)>,
     wait_eligible: bool,
     /// Which authorized publishers reported that they will never produce a
     /// usable domain for this channel.
@@ -57,6 +59,13 @@ pub(crate) struct RuntimeFilterFeedbackState {
 pub(crate) enum RuntimeFilterFeedbackAdmission {
     Applied,
     IgnoredRetiredAttempt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InitialSplitFeedbackWait {
+    Pending,
+    Ready,
+    IneligibleCycle,
 }
 
 impl RuntimeFilterFeedbackState {
@@ -99,7 +108,7 @@ impl RuntimeFilterFeedbackState {
     /// make a source omit a file merely because feedback was delayed.
     pub(crate) fn snapshot_for_scan(
         &self,
-        plan_node_id: i32,
+        scan: ScanNodeKey,
         bindings: &[(u32, ConnectorReadColumnHandle)],
     ) -> ConnectorReadDynamicFilterSnapshot {
         let state = self.state.lock().expect("runtime filter feedback state");
@@ -113,7 +122,7 @@ impl RuntimeFilterFeedbackState {
             let Some(channel) = state
                 .channels
                 .values()
-                .find(|channel| channel.scan_bindings.contains(&(plan_node_id, *binding_id)))
+                .find(|channel| channel.scan_bindings.contains(&(scan, *binding_id)))
             else {
                 continue;
             };
@@ -158,24 +167,28 @@ impl RuntimeFilterFeedbackState {
     /// exact/range domain is enough to start enumeration immediately, even if
     /// another channel remains pending; a terminal unavailable/`All` channel
     /// never becomes a pruning authority.
-    pub(crate) fn is_initial_wait_blocked(
+    pub(crate) fn initial_split_feedback_wait(
         &self,
-        plan_node_id: i32,
+        scan: ScanNodeKey,
         bindings: impl IntoIterator<Item = u32>,
-    ) -> bool {
+    ) -> InitialSplitFeedbackWait {
         let state = self.state.lock().expect("runtime filter feedback state");
         if state.closed {
-            return false;
+            return InitialSplitFeedbackWait::Ready;
         }
         let bindings = bindings.into_iter().collect::<BTreeSet<_>>();
         let relevant = state.channels.values().filter(|channel| {
-            channel.wait_eligible
-                && bindings
-                    .iter()
-                    .any(|binding_id| channel.scan_bindings.contains(&(plan_node_id, *binding_id)))
+            bindings
+                .iter()
+                .any(|binding_id| channel.scan_bindings.contains(&(scan, *binding_id)))
         });
         let mut pending = false;
+        let mut cyclic = false;
         for channel in relevant {
+            if !channel.wait_eligible {
+                cyclic = true;
+                continue;
+            }
             pending |= !channel.is_terminal();
             let Some(encoded) = channel.winner.as_deref() else {
                 continue;
@@ -189,10 +202,42 @@ impl RuntimeFilterFeedbackState {
                 Ok(RuntimeFilterFeedbackDomain::Exact(_)
                     | RuntimeFilterFeedbackDomain::EnclosingRange { .. })
             ) {
-                return false;
+                return InitialSplitFeedbackWait::Ready;
             }
         }
-        pending
+        if pending {
+            InitialSplitFeedbackWait::Pending
+        } else if cyclic {
+            InitialSplitFeedbackWait::IneligibleCycle
+        } else {
+            InitialSplitFeedbackWait::Ready
+        }
+    }
+
+    #[cfg(test)]
+    fn is_initial_wait_blocked(
+        &self,
+        scan: ScanNodeKey,
+        bindings: impl IntoIterator<Item = u32>,
+    ) -> bool {
+        self.initial_split_feedback_wait(scan, bindings) == InitialSplitFeedbackWait::Pending
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn observe_initial_split_feedback_wait(
+        &self,
+        scan: ScanNodeKey,
+        outcome: &'static str,
+    ) {
+        let query = self.execution_id.query_id();
+        let attempt = self.execution_id.attempt_id();
+        tracing::info!(
+            execution_id = %format_args!("{}:{}:{}", query.high(), query.low(), attempt.get()),
+            scan = %scan,
+            outcome,
+            "{}",
+            novarocks_failpoint::observation_marker::RF_SPLIT_INITIAL_WAIT_RESOLVED,
+        );
     }
 
     /// Admits one publisher's terminal feedback as the task carrier delivers it.
@@ -424,7 +469,12 @@ fn channel_states(
                 scan_bindings: channel
                     .scan_bindings()
                     .iter()
-                    .map(|binding| (binding.plan_node_id, binding.binding_id))
+                    .map(|binding| {
+                        (
+                            ScanNodeKey::new(binding.fragment_id, binding.plan_node_id),
+                            binding.binding_id,
+                        )
+                    })
                     .collect(),
                 wait_eligible: matches!(
                     channel.wait_eligibility(),
@@ -987,7 +1037,7 @@ mod tests {
         ])
         .expect("valid declaration");
         let state = RuntimeFilterFeedbackState::new(execution_id, declaration).expect("state");
-        assert!(state.is_initial_wait_blocked(17, [7, 8]));
+        assert!(state.is_initial_wait_blocked(ScanNodeKey::new(2, 17), [7, 8]));
         let feedback =
             TaskRuntimeFilterFeedback::parse(&task_envelope(execution_id, 7, [9; 32], exact(41)))
                 .expect("a legal envelope");
@@ -995,7 +1045,7 @@ mod tests {
             .admit_task_feedback(&feedback, first)
             .expect("usable domain");
         assert!(
-            !state.is_initial_wait_blocked(17, [7, 8]),
+            !state.is_initial_wait_blocked(ScanNodeKey::new(2, 17), [7, 8]),
             "a later pending channel must not delay the first usable domain"
         );
     }

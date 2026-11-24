@@ -34,9 +34,10 @@
 use crate::query_execution::completion_facts::test_support::FinalPlanCompletionDriverTestExt;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use novarocks_execution_contract::ExchangeEdgeId;
 use novarocks_physical_plan::PlanVersionId;
 use novarocks_physical_plan::{
-    Distribution, EdgeKind, FragmentId, FragmentSink, NodeId, NodeKind, PhysicalPlan,
+    Distribution, FragmentId, FragmentSink, NodeId, NodeKind, PhysicalPlan,
     ProviderReadOccurrenceId, WriteTargetOrdinal,
 };
 use novarocks_query_application::preparation::CompletedPlanWithAccess;
@@ -260,7 +261,6 @@ pub(crate) fn encode_empty_values_exchange_program_for_test(
     {
         return Err("empty two-core fixture requires its original zero-expression Values -> CountOnly Exchange program".into());
     }
-    refuse_uncompiled_plan_shapes(plan)?;
     let topology = completed_plan_topology(plan)?;
     let (encodings, capabilities) = split_frozen_reads(reads);
     if !encodings.is_empty() || !capabilities.is_empty() {
@@ -316,7 +316,7 @@ pub(crate) fn encode_empty_values_exchange_program_for_test(
         completed_plan_edge_facts(plan)?,
         completed_plan_scan_facts(plan, &encodings)?,
         submission,
-        AttemptRuntimeFilterFacts::from_completed(plan)?,
+        AttemptRuntimeFilterFacts::from_completed(plan, control)?,
         completed_plan_write_root_facts(plan, false)?,
     );
     control.checkpoint(CompilePhase::Encode, 0)?;
@@ -641,7 +641,6 @@ fn encode_static_packages(
     author: EncodingAuthor<'_>,
 ) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
     let plan = candidate.plan();
-    refuse_uncompiled_plan_shapes(plan)?;
     let topology = completed_plan_topology(plan)?;
     // Each written target's frozen recipe comes from the session that sealed
     // it; a plan that writes with no sealing session has no recipe author.
@@ -689,7 +688,7 @@ fn encode_static_packages(
         submission,
         // The attempt deploys the plan's filters by the same plan-global
         // binding numbering each package's cuts carry.
-        AttemptRuntimeFilterFacts::from_completed(plan)?,
+        AttemptRuntimeFilterFacts::from_completed(plan, control)?,
         // A plan that writes states which targets its root delivers, because
         // that is what the commit is taken over; a read plan says none.
         completed_plan_write_root_facts(plan, !written.is_empty())?,
@@ -701,55 +700,6 @@ fn encode_static_packages(
         topology,
         plan_facts,
     })
-}
-
-/// Refuse what the compiled package carrier cannot express yet.
-///
-/// Each refusal names the missing owner. None of them is a reason to encode
-/// the plan another way: the backend interprets only the carrier its own
-/// composition chose.
-fn refuse_uncompiled_plan_shapes(
-    plan: &PhysicalPlan,
-) -> Result<(), novarocks_plan_codec::PhysicalEncodeError> {
-    // Every node family has a package author: what the local compiler cannot
-    // lower yet is refused by the backend's compiler, by name.
-    for fragment in plan.fragments().values() {
-        if let Some(reason) = compiled_sink_refusal(fragment.sink()) {
-            return Err(
-                novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason.into()),
-            );
-        }
-    }
-    for edge in plan.edges().values() {
-        if let Some(reason) = compiled_edge_refusal(edge.kind) {
-            return Err(
-                novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason.into()),
-            );
-        }
-    }
-    Ok(())
-}
-
-const fn compiled_sink_refusal(sink: &FragmentSink) -> Option<&'static str> {
-    match sink {
-        FragmentSink::Multicast { .. } => {
-            Some("the compiled package carrier does not express CTE multicast sinks yet")
-        }
-        FragmentSink::Result
-        | FragmentSink::RootResult(_)
-        | FragmentSink::Stream { .. }
-        | FragmentSink::Router { .. }
-        | FragmentSink::Noop => None,
-    }
-}
-
-const fn compiled_edge_refusal(kind: EdgeKind) -> Option<&'static str> {
-    match kind {
-        EdgeKind::Stream | EdgeKind::ChangeStreamRouter => None,
-        EdgeKind::CteMulticast => {
-            Some("the compiled package carrier does not express CTE multicast edges yet")
-        }
-    }
 }
 
 /// How one completed plan's fragments relate to each other.
@@ -778,15 +728,11 @@ fn completed_plan_submission_fragments(
     public_result: Option<&novarocks_physical_plan::ResultPort>,
 ) -> Result<(Vec<SubmissionFragmentFacts>, BTreeSet<u32>), novarocks_plan_codec::PhysicalEncodeError>
 {
-    let mut stream_edge_sources = BTreeSet::new();
-    for edge in plan.edges().values() {
-        match edge.kind {
-            EdgeKind::Stream | EdgeKind::ChangeStreamRouter => {
-                stream_edge_sources.insert(edge.source.fragment.get());
-            }
-            EdgeKind::CteMulticast => {}
-        }
-    }
+    let stream_edge_sources = plan
+        .edges()
+        .values()
+        .map(|edge| edge.source.fragment.get())
+        .collect();
     let mut fragments = Vec::with_capacity(plan.fragments().len());
     for fragment in plan.fragments().values() {
         let role = match fragment.sink() {
@@ -968,7 +914,15 @@ fn completed_plan_scheduling_facts(
         .edges()
         .values()
         .map(|edge| {
+            let edge_id =
+                ExchangeEdgeId::from_physical_ordinal(edge.id.get()).ok_or_else(|| {
+                    format!(
+                        "physical edge {} does not fit the native exchange edge space",
+                        edge.id.get()
+                    )
+                })?;
             Ok(SchedulingEdgeFacts {
+                edge_id,
                 source: edge.source.fragment.get(),
                 target: edge.destination.fragment.get(),
                 target_exchange_node_id: wire_node_id(edge.destination.node)?,
@@ -1710,43 +1664,52 @@ mod tests {
         }
     }
 
-    /// What the compiled carrier cannot express yet is refused by name before
-    /// any package is authored, and is never encoded as a plan tree instead.
-    /// A scan is expressed, from the read its freeze kept, and a writer from
-    /// the session that sealed its target.
     #[test]
-    fn compiled_router_uses_package_validation_and_multicast_remains_refused() {
-        use novarocks_physical_plan::ValueId;
+    fn a_multicast_plan_freezes_ordered_static_targets_and_schedules_the_original_edges() {
+        use novarocks_physical_plan::EdgeKind;
 
-        let (plan, _) = crate::query_execution::package_writes::tests::insert_values_plan();
-        refuse_uncompiled_plan_shapes(&plan)
-            .expect("a writer and its finish have a compiled shape");
-        assert!(
-            compiled_sink_refusal(&FragmentSink::Router {
-                effect: ValueId::new(0),
-                routes: Box::default(),
+        let sql = "WITH t AS (SELECT 1 AS a) SELECT a FROM t UNION ALL SELECT a FROM t";
+        let (plan, encoded) = encode_with(sql, &compiled_carrier());
+        let encoded = encoded.expect("compiled multicast carrier");
+        let (source, branch_ids) = plan
+            .fragments()
+            .values()
+            .find_map(|fragment| match fragment.sink() {
+                FragmentSink::Multicast { edges } => Some((fragment.id(), edges)),
+                _ => None,
             })
-            .is_none()
-        );
-        assert!(
-            compiled_sink_refusal(&FragmentSink::Multicast {
-                edges: Box::default(),
-            })
-            .is_some_and(|reason| reason.contains("multicast"))
-        );
-        assert_eq!(compiled_edge_refusal(EdgeKind::ChangeStreamRouter), None);
-        assert!(
-            compiled_edge_refusal(EdgeKind::CteMulticast)
-                .is_some_and(|reason| reason.contains("multicast"))
-        );
-        assert_eq!(compiled_edge_refusal(EdgeKind::Stream), None);
-        assert_eq!(compiled_sink_refusal(&FragmentSink::Result), None);
+            .expect("shared CTE producer");
+        assert_eq!(branch_ids.len(), 2);
+        let artifact = encoded.native.get(source.get()).expect("producer package");
+        let actual = artifact
+            .facts()
+            .sink_targets()
+            .iter()
+            .map(|target| target.edge())
+            .collect::<Vec<_>>();
+        assert_eq!(actual.as_slice(), branch_ids.as_ref());
+        for id in branch_ids {
+            let edge = &plan.edges()[id];
+            assert_eq!(edge.kind, EdgeKind::CteMulticast);
+            let native_id = ExchangeEdgeId::from_physical_ordinal(id.get()).unwrap();
+            let scheduled = encoded
+                .plan_facts
+                .scheduling()
+                .edges
+                .iter()
+                .find(|scheduled| scheduled.edge_id == native_id)
+                .unwrap();
+            assert_eq!(scheduled.source, source.get());
+            assert_eq!(scheduled.target, edge.destination.fragment.get());
+        }
+        let (_, stream_sources) =
+            completed_plan_submission_fragments(&plan, None).expect("submission facts");
+        assert!(stream_sources.contains(&source.get()));
+    }
 
-        // A validated provider-read program has a compiled shape; its frozen
-        // read is authored from the freeze, and a scan with none is refused
-        // there rather than given guessed facts.
+    #[test]
+    fn compiled_provider_read_requires_original_frozen_facts() {
         let plan = scan_plan();
-        refuse_uncompiled_plan_shapes(&plan).expect("a scan has a compiled shape");
         assert!(matches!(
             crate::query_execution::package_reads::author_frozen_reads(
                 &plan,
@@ -1756,34 +1719,6 @@ mod tests {
             Err(crate::query_execution::package_freeze::PackageFreezeError::Facts(reason))
                 if reason.contains("no frozen read")
         ));
-        // A real FE plan has none of these shapes.
-        let (plan, _) = encode_with("SELECT 1", &compiled_carrier());
-        refuse_uncompiled_plan_shapes(&plan).expect("SELECT 1 has a compiled shape");
-    }
-
-    /// A real FE plan whose CTE feeds two consumers multicasts it. The
-    /// compiled carrier refuses that plan by name and freezes nothing.
-    #[test]
-    fn a_multicast_plan_is_refused_by_the_compiled_carrier_and_freezes_nothing() {
-        let sql = "WITH t AS (SELECT 1 AS a) SELECT a FROM t UNION ALL SELECT a FROM t";
-        let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
-        let (plan, refused) = encode_with(sql, &compiled_carrier());
-        assert!(
-            plan.edges()
-                .values()
-                .any(|edge| edge.kind == EdgeKind::CteMulticast),
-            "{sql}: the CTE is multicast"
-        );
-        assert!(matches!(
-            refused,
-            Err(novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason))
-                if reason.contains("multicast")
-        ));
-        assert_eq!(
-            crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread(),
-            freezes,
-            "a refused plan freezes nothing"
-        );
     }
 
     // A narrow test catalogue retains the actual ARRAY owner and installed

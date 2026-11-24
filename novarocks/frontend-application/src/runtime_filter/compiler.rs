@@ -20,7 +20,6 @@ use novarocks_proto_models::{common, filter, plan};
 use novarocks_types::{BackendProcessId, UniqueId};
 use sha2::{Digest, Sha256};
 
-use super::deployment::{RuntimeFilterWaitEdge, RuntimeFilterWaitGraph};
 use super::install_encoder::{
     EncodedRuntimeFilterDeployment, FrontendRuntimeFilterFeedbackChannel,
     FrontendRuntimeFilterFeedbackDeclaration, FrontendRuntimeFilterFeedbackPublisherOwner,
@@ -32,6 +31,7 @@ use super::model::{
     FrontendRuntimeFilterLifecycle, FrontendRuntimeFilterParticipant, RuntimeFilterChannelPolicy,
 };
 use super::semantic_encoder;
+use crate::query_execution::attempt_runtime_filter_facts::feedback_value_type_supported;
 
 /// Owner-local query configuration captured before the schedule is sealed.
 /// The lifecycle is still validated for RF-off queries so enabling channels
@@ -95,7 +95,6 @@ pub(crate) fn compile_scheduled_runtime_filter_deployment(
         config.lifecycle,
         view.scheduled_backend_ids(),
         std::iter::empty(),
-        &RuntimeFilterWaitGraph::default(),
     )
     .map_err(|error| compilation_error(error.to_string()))?;
     debug_assert!(deployment.is_empty());
@@ -127,23 +126,7 @@ struct BindingSpec {
     node_id: i32,
     witness: Option<u32>,
     role: BindingRole,
-}
-
-#[derive(Clone, Copy)]
-struct FragmentEdgeSpec {
-    source_fragment_id: u32,
-    target_fragment_id: u32,
-    target_exchange_node_id: i32,
-}
-
-#[derive(Clone)]
-struct JoinProgressProof {
-    channel_id: u32,
-    producer_binding_id: u32,
-    producer_fragment_id: u32,
-    join_node_id: i32,
-    build_frontier: Vec<(u32, i32)>,
-    non_build_inputs: Vec<(u32, i32)>,
+    feedback_wait: Option<FrontendRuntimeFilterFeedbackWaitEligibility>,
 }
 
 #[derive(Clone)]
@@ -167,7 +150,6 @@ struct ParticipantTopology {
 struct FeedbackCompilation {
     declaration: FrontendRuntimeFilterFeedbackDeclaration,
     publications: BTreeMap<(u32, u32), filter::RuntimeFilterFrontendFeedbackPublication>,
-    wait_graph: RuntimeFilterWaitGraph,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -215,8 +197,6 @@ type Instances = BTreeMap<(u32, u32, u32), BTreeSet<UniqueId>>;
 /// view before placement, routing and liveness compilation begins.
 struct DeploymentInput {
     topology: BTreeMap<usize, ParticipantTopology>,
-    fragment_edges: Vec<FragmentEdgeSpec>,
-    join_progress: BTreeMap<(u32, u32, u32), JoinProgressProof>,
     channels: BTreeMap<u32, ChannelSpec>,
     policies: Vec<RuntimeFilterChannelPolicy>,
     bindings: BTreeMap<u32, BindingSpec>,
@@ -227,56 +207,10 @@ impl DeploymentInput {
     fn from_sealed(view: RuntimeFilterScheduledView<'_>) -> Result<Self, DistributedQueryError> {
         let topology = sealed_topology(view.clone())?;
         let facts = view.deployment_facts();
-        let fragment_edges = facts
-            .fragment_edges()
-            .map(|edge| FragmentEdgeSpec {
-                source_fragment_id: edge.source_fragment_id(),
-                target_fragment_id: edge.target_fragment_id(),
-                target_exchange_node_id: edge.target_exchange_node_id(),
-            })
-            .collect();
-        let join_progress = facts
-            .join_progress()
-            .map(|progress| match progress {
-                crate::query_execution::preparation::runtime_filter_view::RuntimeFilterJoinProgressFacts::Proven {
-                    channel_id,
-                    producer_binding_id,
-                    producer_fragment_id,
-                    join_node_id,
-                    build_frontier,
-                    non_build_inputs,
-                } => JoinProgressProof {
-                    channel_id,
-                    producer_binding_id,
-                    producer_fragment_id,
-                    join_node_id,
-                    build_frontier: build_frontier
-                        .into_iter()
-                        .map(|edge| (edge.source_fragment_id, edge.target_exchange_node_id))
-                        .collect(),
-                    non_build_inputs: non_build_inputs
-                        .into_iter()
-                        .map(|edge| (edge.source_fragment_id, edge.target_exchange_node_id))
-                        .collect(),
-                },
-            })
-            .map(|proof| {
-                (
-                    (
-                        proof.channel_id,
-                        proof.producer_binding_id,
-                        proof.producer_fragment_id,
-                    ),
-                    proof,
-                )
-            })
-            .collect();
         let (channels, policies) = materialize_channels(facts)?;
         let (bindings, instances) = materialize_bindings(facts, &channels, &topology)?;
         Ok(Self {
             topology,
-            fragment_edges,
-            join_progress,
             channels,
             policies,
             bindings,
@@ -301,15 +235,8 @@ fn compile_nonempty_deployment(
         &input.instances,
         input.topology.len(),
     )?;
-    let wait_edges =
-        build_wait_edges(&input.bindings, &input.fragment_edges, &input.join_progress)?;
-    let feedback = compile_feedback_declaration(
-        &input.channels,
-        &input.bindings,
-        &roles,
-        &input.topology,
-        wait_edges,
-    )?;
+    let feedback =
+        compile_feedback_declaration(&input.channels, &input.bindings, &roles, &input.topology)?;
 
     let lifecycle_input = config.lifecycle.to_wire();
     let deployment_policy = FrontendRuntimeFilterDeploymentPolicy::derive(
@@ -354,7 +281,6 @@ fn compile_nonempty_deployment(
         deployment_policy.lifecycle,
         input.topology.keys().copied(),
         participants,
-        &feedback.wait_graph,
     )
     .map_err(|error| compilation_error(error.to_string()))?;
     let mut encoded = encode_install_contributions(&deployment, feedback.declaration)?;
@@ -583,6 +509,7 @@ fn materialize_bindings(
             node_id: fact.node_id(),
             witness: fact.coverage_witness_id(),
             role,
+            feedback_wait: fact.feedback_wait(),
         };
         if bindings.insert(binding_id, spec).is_some() {
             return Err(compilation_error(format!(
@@ -813,14 +740,7 @@ fn compile_feedback_declaration(
     bindings: &BTreeMap<u32, BindingSpec>,
     roles: &BTreeMap<u32, RoleChannel>,
     topology: &BTreeMap<usize, ParticipantTopology>,
-    base_wait_edges: Vec<RuntimeFilterWaitEdge>,
 ) -> Result<FeedbackCompilation, DistributedQueryError> {
-    let base_wait_graph = RuntimeFilterWaitGraph::new(base_wait_edges.clone());
-    base_wait_graph
-        .validate()
-        .map_err(|error| compilation_error(error.to_string()))?;
-
-    let mut accepted_wait_edges = base_wait_edges;
     let mut declarations = Vec::new();
     let mut publications = BTreeMap::new();
     for (&channel_id, channel) in channels {
@@ -909,41 +829,24 @@ fn compile_feedback_declaration(
             }
         }
 
-        let mut candidate_edges = Vec::new();
+        let mut eligibility = None;
         for scan in &scan_bindings {
-            for producer in bindings.values().filter(|binding| {
-                binding.channel_id == channel_id
-                    && matches!(binding.role, BindingRole::Producer { .. })
-            }) {
-                // A split round pumps typed sources independently.  When a
-                // producer and its probe scan share a fragment, withholding
-                // that one probe source still leaves the build-side source
-                // runnable; treating the fragment-local relationship as a
-                // graph self-edge would reject a safe bounded wait and force
-                // every file to expand before direct-source feedback arrives.
-                // Cross-fragment edges remain subject to the existing full
-                // cycle validation below.
-                if producer.fragment_id == scan.fragment_id {
-                    continue;
-                }
-                candidate_edges.push((
-                    (scan.fragment_id, scan.plan_node_id, channel_id),
-                    RuntimeFilterWaitEdge::new(producer.fragment_id, scan.fragment_id, true),
-                ));
+            let sealed = bindings[&scan.binding_id].feedback_wait.as_ref().ok_or_else(|| {
+                compilation_error(format!(
+                    "runtime filter channel {channel_id} scan binding {} lacks sealed feedback wait eligibility",
+                    scan.binding_id
+                ))
+            })?;
+            if eligibility.is_some_and(|original| original != sealed) {
+                return Err(compilation_error(format!(
+                    "runtime filter channel {channel_id} has inconsistent scan wait eligibility"
+                )));
             }
+            eligibility = Some(sealed);
         }
-        candidate_edges.sort_by_key(|(key, _)| *key);
-        let mut proposed_edges = accepted_wait_edges.clone();
-        proposed_edges.extend(candidate_edges.into_iter().map(|(_, edge)| edge));
-        let wait_eligibility = match RuntimeFilterWaitGraph::new(proposed_edges.clone()).validate() {
-            Ok(()) => {
-                accepted_wait_edges = proposed_edges;
-                FrontendRuntimeFilterFeedbackWaitEligibility::Eligible
-            }
-            Err(crate::runtime_filter::deployment::RuntimeFilterLivenessError::BlockingFeedbackCycle { witness }) => {
-                FrontendRuntimeFilterFeedbackWaitEligibility::IneligibleCycle { witness }
-            }
-        };
+        let wait_eligibility = eligibility
+            .expect("feedback declaration already checked at least one scan")
+            .clone();
         declarations.push(FrontendRuntimeFilterFeedbackChannel {
             channel_id,
             contract_digest,
@@ -956,7 +859,6 @@ fn compile_feedback_declaration(
     Ok(FeedbackCompilation {
         declaration: FrontendRuntimeFilterFeedbackDeclaration::new(declarations)?,
         publications,
-        wait_graph: RuntimeFilterWaitGraph::new(accepted_wait_edges),
     })
 }
 
@@ -1026,26 +928,6 @@ fn feedback_publishers(
         }
         Some(filter::runtime_filter_coverage::Kind::LeafWitnessId(_)) | None => Ok(None),
     }
-}
-
-fn feedback_value_type_supported(value: &arrow::datatypes::DataType) -> bool {
-    use arrow::datatypes::DataType;
-
-    matches!(
-        value,
-        DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Utf8
-            | DataType::Date32
-            | DataType::Decimal128(_, _)
-            | DataType::FixedSizeBinary(_)
-            | DataType::Timestamp(_, _)
-    )
 }
 
 fn participant_install(
@@ -1457,228 +1339,6 @@ fn routing_edge(
     })
 }
 
-fn build_wait_edges(
-    bindings: &BTreeMap<u32, BindingSpec>,
-    fragment_edges: &[FragmentEdgeSpec],
-    join_progress: &BTreeMap<(u32, u32, u32), JoinProgressProof>,
-) -> Result<Vec<RuntimeFilterWaitEdge>, DistributedQueryError> {
-    let dependencies = fragment_dependencies(fragment_edges)?;
-    let mut edges = fragment_edges
-        .iter()
-        .map(|edge| {
-            RuntimeFilterWaitEdge::new(edge.source_fragment_id, edge.target_fragment_id, true)
-        })
-        .collect::<Vec<_>>();
-    let mut next_virtual_node = bindings
-        .values()
-        .map(|binding| binding.fragment_id)
-        .chain(
-            fragment_edges
-                .iter()
-                .flat_map(|edge| [edge.source_fragment_id, edge.target_fragment_id]),
-        )
-        .max()
-        .unwrap_or_default()
-        .checked_add(1)
-        .ok_or_else(|| compilation_error("runtime filter wait graph node id overflow"))?;
-    let mut build_ready_nodes = BTreeMap::new();
-    let mut consumer_sources = Vec::new();
-
-    for consumer in bindings
-        .values()
-        .filter(|binding| matches!(binding.role, BindingRole::Consumer { .. }))
-    {
-        let BindingRole::Consumer { activation, .. } = &consumer.role else {
-            unreachable!()
-        };
-        let blocking = activation.kind.as_ref().is_some_and(|kind| {
-            matches!(
-                kind,
-                plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true)
-            )
-        });
-        if !blocking {
-            continue;
-        }
-
-        let mut sources = Vec::new();
-        for producer in bindings.values().filter(|binding| {
-            binding.channel_id == consumer.channel_id
-                && matches!(binding.role, BindingRole::Producer { .. })
-        }) {
-            let proof = join_progress
-                .get(&(
-                    producer.channel_id,
-                    producer.binding_id,
-                    producer.fragment_id,
-                ))
-                .filter(|proof| {
-                    valid_join_progress_proof(
-                        proof,
-                        producer,
-                        consumer.fragment_id,
-                        fragment_edges,
-                        &dependencies,
-                    )
-                });
-            let source = if let Some(proof) = proof {
-                let key = (proof.producer_fragment_id, proof.join_node_id);
-                let node = if let Some(node) = build_ready_nodes.get(&key) {
-                    *node
-                } else {
-                    let node = next_virtual_node;
-                    next_virtual_node = next_virtual_node.checked_add(1).ok_or_else(|| {
-                        compilation_error("runtime filter wait graph node id overflow")
-                    })?;
-                    build_ready_nodes.insert(key, node);
-                    node
-                };
-                for &(source_fragment_id, _) in &proof.build_frontier {
-                    edges.push(RuntimeFilterWaitEdge::new(source_fragment_id, node, true));
-                }
-                edges.push(RuntimeFilterWaitEdge::new(
-                    node,
-                    proof.producer_fragment_id,
-                    true,
-                ));
-                node
-            } else {
-                producer.fragment_id
-            };
-            edges.push(RuntimeFilterWaitEdge::new(
-                source,
-                consumer.fragment_id,
-                true,
-            ));
-            sources.push(source);
-        }
-        consumer_sources.push((consumer.fragment_id, sources));
-    }
-
-    let mut outgoing = BTreeMap::<u32, BTreeSet<(u32, i32)>>::new();
-    for edge in fragment_edges {
-        outgoing
-            .entry(edge.source_fragment_id)
-            .or_default()
-            .insert((edge.target_fragment_id, edge.target_exchange_node_id));
-    }
-    for (multicast_fragment, branches) in outgoing {
-        if branches.len() < 2 {
-            continue;
-        }
-        for (target_fragment, _) in branches {
-            for (consumer_fragment, sources) in &consumer_sources {
-                if *consumer_fragment != target_fragment
-                    && !dependencies
-                        .get(consumer_fragment)
-                        .is_some_and(|predecessors| predecessors.contains(&target_fragment))
-                {
-                    continue;
-                }
-                for source in sources {
-                    edges.push(RuntimeFilterWaitEdge::new(
-                        *source,
-                        multicast_fragment,
-                        true,
-                    ));
-                }
-            }
-        }
-    }
-    Ok(edges)
-}
-
-#[cfg(test)]
-fn build_wait_graph(
-    bindings: &BTreeMap<u32, BindingSpec>,
-    fragment_edges: &[FragmentEdgeSpec],
-    join_progress: &BTreeMap<(u32, u32, u32), JoinProgressProof>,
-) -> Result<RuntimeFilterWaitGraph, DistributedQueryError> {
-    build_wait_edges(bindings, fragment_edges, join_progress).map(RuntimeFilterWaitGraph::new)
-}
-
-fn fragment_dependencies(
-    fragment_edges: &[FragmentEdgeSpec],
-) -> Result<BTreeMap<u32, BTreeSet<u32>>, DistributedQueryError> {
-    let mut direct = BTreeMap::<u32, BTreeSet<u32>>::new();
-    let mut nodes = BTreeSet::new();
-    for edge in fragment_edges {
-        nodes.insert(edge.source_fragment_id);
-        nodes.insert(edge.target_fragment_id);
-        direct
-            .entry(edge.target_fragment_id)
-            .or_default()
-            .insert(edge.source_fragment_id);
-    }
-    let mut dependencies = BTreeMap::new();
-    for node in nodes {
-        let mut closure = BTreeSet::new();
-        let mut pending = direct
-            .get(&node)
-            .into_iter()
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
-        while let Some(fragment) = pending.pop() {
-            if closure.insert(fragment) {
-                pending.extend(direct.get(&fragment).into_iter().flatten().copied());
-            }
-        }
-        dependencies.insert(node, closure);
-    }
-    Ok(dependencies)
-}
-
-fn valid_join_progress_proof(
-    proof: &JoinProgressProof,
-    producer: &BindingSpec,
-    consumer_fragment_id: u32,
-    fragment_edges: &[FragmentEdgeSpec],
-    dependencies: &BTreeMap<u32, BTreeSet<u32>>,
-) -> bool {
-    if proof.channel_id != producer.channel_id
-        || proof.producer_binding_id != producer.binding_id
-        || proof.producer_fragment_id != producer.fragment_id
-        || proof.join_node_id != producer.node_id
-        || !matches!(
-            producer.role,
-            BindingRole::Producer { completion }
-                if completion == plan::RuntimeFilterCompletionRequirement::ProducerClosed as i32
-        )
-    {
-        return false;
-    }
-    let sealed_inputs = fragment_edges
-        .iter()
-        .filter(|edge| edge.target_fragment_id == proof.producer_fragment_id)
-        .map(|edge| (edge.source_fragment_id, edge.target_exchange_node_id))
-        .collect::<BTreeSet<_>>();
-    let frontier = proof
-        .build_frontier
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let non_build = proof
-        .non_build_inputs
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if frontier.len() != proof.build_frontier.len()
-        || non_build.len() != proof.non_build_inputs.len()
-        || !frontier.is_disjoint(&non_build)
-        || frontier.union(&non_build).copied().collect::<BTreeSet<_>>() != sealed_inputs
-    {
-        return false;
-    }
-    consumer_fragment_id == proof.producer_fragment_id
-        || non_build.iter().any(|(source_fragment_id, _)| {
-            *source_fragment_id == consumer_fragment_id
-                || dependencies
-                    .get(source_fragment_id)
-                    .is_some_and(|predecessors| predecessors.contains(&consumer_fragment_id))
-        })
-}
-
 fn coverage(
     value: RuntimeFilterCoverageFacts,
 ) -> Result<filter::RuntimeFilterCoverage, DistributedQueryError> {
@@ -2012,41 +1672,6 @@ fn allocate_edge(next: &mut u32) -> Result<u32, DistributedQueryError> {
 mod tests {
     use super::*;
 
-    fn producer(binding_id: u32, fragment_id: u32, node_id: i32) -> BindingSpec {
-        BindingSpec {
-            binding_id,
-            channel_id: 1,
-            fragment_id,
-            node_id,
-            witness: Some(binding_id),
-            role: BindingRole::Producer {
-                completion: plan::RuntimeFilterCompletionRequirement::ProducerClosed as i32,
-            },
-        }
-    }
-
-    fn consumer(binding_id: u32, fragment_id: u32, blocking: bool) -> BindingSpec {
-        let kind = if blocking {
-            plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true)
-        } else {
-            plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(
-                plan::RuntimeFilterLateApplyGranularity::Batch as i32,
-            )
-        };
-        BindingSpec {
-            binding_id,
-            channel_id: 1,
-            fragment_id,
-            node_id: 22,
-            witness: None,
-            role: BindingRole::Consumer {
-                capabilities: BTreeSet::from([Capability::Membership]),
-                activation: plan::RuntimeFilterConsumerActivation { kind: Some(kind) },
-                feedback_scan_type: None,
-            },
-        }
-    }
-
     fn membership_channel(membership_schema_digest: Option<[u8; 32]>) -> ChannelSpec {
         ChannelSpec {
             channel_id: 7,
@@ -2142,112 +1767,5 @@ mod tests {
         let error = membership_feedback_contract_digest(&channel)
             .expect_err("feedback must require the semantic encoding digest");
         assert!(error.to_string().contains("missing from semantic encoding"));
-    }
-
-    #[test]
-    fn fragment_dependency_closure_is_stable_under_input_order() {
-        let ordered = [
-            FragmentEdgeSpec {
-                source_fragment_id: 1,
-                target_fragment_id: 3,
-                target_exchange_node_id: 11,
-            },
-            FragmentEdgeSpec {
-                source_fragment_id: 2,
-                target_fragment_id: 3,
-                target_exchange_node_id: 12,
-            },
-            FragmentEdgeSpec {
-                source_fragment_id: 3,
-                target_fragment_id: 4,
-                target_exchange_node_id: 13,
-            },
-        ];
-        let reordered = [ordered[2], ordered[0], ordered[1]];
-
-        let dependencies = fragment_dependencies(&ordered).expect("sealed edges are valid");
-        assert_eq!(dependencies, fragment_dependencies(&reordered).unwrap());
-        assert_eq!(dependencies[&3], BTreeSet::from([1, 2]));
-        assert_eq!(dependencies[&4], BTreeSet::from([1, 2, 3]));
-    }
-
-    #[test]
-    fn join_progress_proof_rejects_mismatch_and_invalid_frontiers() {
-        let producer = producer(7, 2, 100);
-        let edges = [
-            FragmentEdgeSpec {
-                source_fragment_id: 1,
-                target_fragment_id: 2,
-                target_exchange_node_id: 11,
-            },
-            FragmentEdgeSpec {
-                source_fragment_id: 3,
-                target_fragment_id: 2,
-                target_exchange_node_id: 13,
-            },
-        ];
-        let dependencies = fragment_dependencies(&edges).unwrap();
-        let valid = JoinProgressProof {
-            channel_id: 1,
-            producer_binding_id: 7,
-            producer_fragment_id: 2,
-            join_node_id: 100,
-            build_frontier: vec![(1, 11)],
-            non_build_inputs: vec![(3, 13)],
-        };
-        assert!(valid_join_progress_proof(
-            &valid,
-            &producer,
-            3,
-            &edges,
-            &dependencies
-        ));
-
-        let mut wrong_binding = valid.clone();
-        wrong_binding.producer_binding_id = 8;
-        let mut incomplete = valid.clone();
-        incomplete.non_build_inputs.clear();
-        let mut overlap = valid.clone();
-        overlap.non_build_inputs = vec![(1, 11), (3, 13)];
-        let mut duplicate = valid.clone();
-        duplicate.build_frontier.push((1, 11));
-
-        for (name, proof) in [
-            ("binding mismatch", wrong_binding),
-            ("incomplete frontier", incomplete),
-            ("overlapping frontier", overlap),
-            ("duplicate frontier edge", duplicate),
-        ] {
-            assert!(
-                !valid_join_progress_proof(&proof, &producer, 3, &edges, &dependencies),
-                "{name} must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn blocking_consumer_cycle_is_rejected_but_live_apply_is_not() {
-        let producer = producer(1, 1, 10);
-        let edge = FragmentEdgeSpec {
-            source_fragment_id: 2,
-            target_fragment_id: 1,
-            target_exchange_node_id: 20,
-        };
-        for (name, blocking, expected_live) in [
-            ("blocking snapshot", true, false),
-            ("nonblocking live apply", false, true),
-        ] {
-            let bindings = BTreeMap::from([
-                (producer.binding_id, producer.clone()),
-                (2, consumer(2, 2, blocking)),
-            ]);
-            let graph = build_wait_graph(&bindings, &[edge], &BTreeMap::new())
-                .expect("sealed facts can construct a wait graph");
-            assert_eq!(
-                graph.validate().is_ok(),
-                expected_live,
-                "{name} must have the expected liveness result"
-            );
-        }
     }
 }

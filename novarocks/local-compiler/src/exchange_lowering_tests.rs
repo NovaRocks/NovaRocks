@@ -806,10 +806,10 @@ fn repeated_hash_imports_keep_each_channel_and_the_ordered_key_representative() 
 
 #[test]
 fn unsupported_sinks_and_partitionings_are_refused() {
-    refused(
+    assert!(matches!(
         compile(packages(Shape::Multicast).remove(&PRODUCER).unwrap(), None),
-        "multicast or noop sink",
-    );
+        Err(FragmentCompileError::Invalid(_))
+    ));
     let mut unconstrained = packages(Shape::Unconstrained);
     refused(
         compile(unconstrained.remove(&PRODUCER).unwrap(), None),
@@ -817,7 +817,7 @@ fn unsupported_sinks_and_partitionings_are_refused() {
     );
     refused(
         compile(unconstrained.remove(&CONSUMER).unwrap(), None),
-        "multicast or noop sink",
+        "noop sink",
     );
     // A hash receiver is not a singleton source tree yet.
     let hash_consumer = packages(Shape::Hash).remove(&CONSUMER).unwrap();

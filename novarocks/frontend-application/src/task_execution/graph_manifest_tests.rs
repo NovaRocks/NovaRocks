@@ -92,6 +92,7 @@ fn frozen_fragment(
 ) -> Arc<FragmentArtifact> {
     let target = match targets {
         [target] => Some((
+            target.edge(),
             target.target_fragment_id(),
             target.target_exchange_node_id(),
             target.delivery(),
@@ -118,9 +119,11 @@ fn edge_sink(
 ) -> Vec<StaticSinkTarget> {
     edges
         .iter()
-        .filter(|edge| edge.source_fragment_id == fragment_id)
-        .map(|edge| {
+        .enumerate()
+        .filter(|(_, edge)| edge.source_fragment_id == fragment_id)
+        .map(|(ordinal, edge)| {
             StaticSinkTarget::for_test(
+                novarocks_physical_plan::EdgeId::new(u32::try_from(ordinal).unwrap()),
                 edge.target_fragment_id,
                 edge.target_exchange_node_id,
                 edge.delivery,
@@ -129,21 +132,38 @@ fn edge_sink(
         .collect()
 }
 
-fn multicast_sink(targets: [(FragmentId, i32); 2]) -> Vec<StaticSinkTarget> {
+fn multicast_sink(
+    edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+    targets: [(FragmentId, i32); 2],
+) -> Vec<StaticSinkTarget> {
+    let declared = edge_sink(LEAF_FRAGMENT, edges);
     targets
         .into_iter()
         .map(|(fragment, node)| {
-            StaticSinkTarget::for_test(
-                fragment,
-                node,
-                novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
-            )
+            declared
+                .iter()
+                .copied()
+                .find(|target| {
+                    target.target_fragment_id() == fragment
+                        && target.target_exchange_node_id() == node
+                })
+                .unwrap_or_else(|| {
+                    StaticSinkTarget::for_test(
+                        novarocks_physical_plan::EdgeId::new(u32::MAX),
+                        fragment,
+                        node,
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                    )
+                })
         })
         .collect()
 }
 
-fn router_sink(targets: [(FragmentId, i32); 2]) -> Vec<StaticSinkTarget> {
-    multicast_sink(targets)
+fn router_sink(
+    edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+    targets: [(FragmentId, i32); 2],
+) -> Vec<StaticSinkTarget> {
+    multicast_sink(edges, targets)
 }
 
 struct FakePlans<'a> {
@@ -498,7 +518,8 @@ fn multicast_sink_edges_bind_actual_graph_ids_and_endpoint_changes_only_metadata
         &schedule,
         &edges,
         &processes,
-        &mut FakePlans::new(&schedule, &edges, 64).with_leaf_sink(multicast_sink(leaf_targets)),
+        &mut FakePlans::new(&schedule, &edges, 64)
+            .with_leaf_sink(multicast_sink(&edges, leaf_targets)),
     )
     .expect("multicast graph");
     let leaves = graph
@@ -545,7 +566,8 @@ fn multicast_sink_edges_bind_actual_graph_ids_and_endpoint_changes_only_metadata
         &moved,
         &edges,
         &processes,
-        &mut FakePlans::new(&moved, &edges, 64).with_leaf_sink(multicast_sink(leaf_targets)),
+        &mut FakePlans::new(&moved, &edges, 64)
+            .with_leaf_sink(multicast_sink(&edges, leaf_targets)),
     )
     .expect("moved graph");
     assert_eq!(
@@ -576,10 +598,13 @@ fn router_route_positions_bind_their_actual_exchange_edge_ids() {
         &schedule,
         &edges,
         &processes,
-        &mut FakePlans::new(&schedule, &edges, 64).with_leaf_sink(router_sink([
-            (ROOT_FRAGMENT, LEAF_TO_ROOT_NODE),
-            (MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
-        ])),
+        &mut FakePlans::new(&schedule, &edges, 64).with_leaf_sink(router_sink(
+            &edges,
+            [
+                (ROOT_FRAGMENT, LEAF_TO_ROOT_NODE),
+                (MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
+            ],
+        )),
     )
     .expect("router graph");
     let leaf = graph
@@ -622,9 +647,9 @@ fn same_node_targets_bind_distinct_edges(router: bool) {
         &edges,
         &processes,
         &mut FakePlans::new(&schedule, &edges, 64).with_leaf_sink(if router {
-            router_sink(targets)
+            router_sink(&edges, targets)
         } else {
-            multicast_sink(targets)
+            multicast_sink(&edges, targets)
         }),
     )
     .expect("same node IDs in different fragments have distinct edges");
@@ -687,7 +712,7 @@ fn static_sink_unknown_target_fragment_fails_closed() {
         &edges,
         &processes,
         &mut FakePlans::new(&schedule, &edges, 64)
-            .with_leaf_sink(multicast_sink([(ROOT_FRAGMENT, 0), (99, 0)])),
+            .with_leaf_sink(multicast_sink(&edges, [(ROOT_FRAGMENT, 0), (99, 0)])),
     )
     .expect_err("a static sink cannot guess the target from a reused node ID");
     assert!(
@@ -704,6 +729,27 @@ fn a_static_plan_beyond_the_old_descriptor_bound_is_built() {
     let graph = build_graph(&schedule, &chain_edges(), &processes, 16 * 1024 * 1024 + 1)
         .expect("message and preparation owners govern large immutable plans");
     assert!(graph.stages().len() > 0);
+}
+
+#[test]
+fn graph_checks_the_native_topology_limit_before_building_task_creations() {
+    use novarocks_task_codec::descriptor::MAX_TOPOLOGY_ENTRIES;
+
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let edges = |width| {
+        let mut edges = chain_edges();
+        edges.pop();
+        edges.extend((0..width).map(|node| stream_edge(MIDDLE_FRAGMENT, ROOT_FRAGMENT, node)));
+        edges
+    };
+    let width = i32::try_from(MAX_TOPOLOGY_ENTRIES).unwrap();
+    let accepted = edges(width);
+    let graph = build_graph(&schedule, &accepted, &processes, 0).expect("native topology boundary");
+    assert_eq!(graph.edges().len(), MAX_TOPOLOGY_ENTRIES + 1);
+    let error = build_graph(&schedule, &edges(width + 1), &processes, 0).unwrap_err();
+    assert!(matches!(error, TaskExecutionError::Schedule(message)
+        if message.contains("task topology has 257 ") && message.contains("native limit of 256")));
 }
 
 fn protocol_frozen_fragments(

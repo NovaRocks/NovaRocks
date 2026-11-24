@@ -217,7 +217,6 @@ impl RuntimeFilterNullOrder {
 pub struct RuntimeFilterDeploymentFactsView<'a> {
     runtime_filters:
         &'a crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts,
-    fragment_edges: &'a [crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
     schedule: &'a SchedulingPlan,
 }
 
@@ -229,12 +228,10 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
     /// `FragmentSchedulingFacts` instead of a plan representation.
     pub(crate) const fn new(
         runtime_filters: &'a crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts,
-        fragment_edges: &'a [crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
         schedule: &'a SchedulingPlan,
     ) -> Self {
         Self {
             runtime_filters,
-            fragment_edges,
             schedule,
         }
     }
@@ -263,23 +260,6 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
                 task_key: placement.task_key,
                 backend_idx: placement.backend_idx,
             })
-    }
-
-    pub fn fragment_edges(
-        self,
-    ) -> impl ExactSizeIterator<Item = RuntimeFilterFragmentEdgeFacts> + 'a {
-        self.fragment_edges
-            .iter()
-            .map(RuntimeFilterFragmentEdgeFacts::from_fragment_edge)
-    }
-
-    /// Each producer tuple has at most one sealed proof or skip provenance.
-    /// The source bindings are BTreeMap ordered, so this iterator is stable.
-    pub fn join_progress(self) -> impl Iterator<Item = RuntimeFilterJoinProgressFacts> + 'a {
-        self.runtime_filters
-            .join_progress()
-            .iter()
-            .map(RuntimeFilterJoinProgressFacts::from_attempt)
     }
 }
 
@@ -425,6 +405,12 @@ impl RuntimeFilterDeploymentBindingFacts<'_> {
         self.binding.coverage_witness_id
     }
 
+    pub(crate) fn feedback_wait(
+        self,
+    ) -> Option<attempt_facts::FrontendRuntimeFilterFeedbackWaitEligibility> {
+        self.binding.feedback_wait.clone()
+    }
+
     pub fn role(self) -> RuntimeFilterDeploymentBindingRoleFacts {
         match &self.binding.role {
             attempt_facts::AttemptRuntimeFilterBindingRoleFacts::Producer {
@@ -482,90 +468,5 @@ impl RuntimeFilterValidatedPlacementFacts {
 
     pub const fn backend_idx(self) -> usize {
         self.backend_idx
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct RuntimeFilterFragmentEdgeFacts {
-    source_fragment_id: u32,
-    target_fragment_id: u32,
-    target_exchange_node_id: i32,
-}
-
-impl RuntimeFilterFragmentEdgeFacts {
-    fn from_fragment_edge(
-        edge: &crate::query_execution::attempt_plan_facts::AttemptEdgeFacts,
-    ) -> Self {
-        Self {
-            source_fragment_id: edge.source_fragment_id,
-            target_fragment_id: edge.target_fragment_id,
-            target_exchange_node_id: edge.target_exchange_node_id,
-        }
-    }
-
-    pub const fn source_fragment_id(self) -> u32 {
-        self.source_fragment_id
-    }
-
-    pub const fn target_fragment_id(self) -> u32 {
-        self.target_fragment_id
-    }
-
-    pub const fn target_exchange_node_id(self) -> i32 {
-        self.target_exchange_node_id
-    }
-}
-
-pub enum RuntimeFilterJoinProgressFacts {
-    Proven {
-        channel_id: u32,
-        producer_binding_id: u32,
-        producer_fragment_id: u32,
-        join_node_id: i32,
-        build_frontier: Vec<RuntimeFilterFrontierEdgeFacts>,
-        non_build_inputs: Vec<RuntimeFilterFrontierEdgeFacts>,
-    },
-}
-
-impl RuntimeFilterJoinProgressFacts {
-    fn from_attempt(value: &attempt_facts::AttemptRuntimeFilterJoinProgressFacts) -> Self {
-        match value {
-            attempt_facts::AttemptRuntimeFilterJoinProgressFacts::Proven {
-                channel_id,
-                producer_binding_id,
-                producer_fragment_id,
-                join_node_id,
-                build_frontier,
-                non_build_inputs,
-            } => Self::Proven {
-                channel_id: *channel_id,
-                producer_binding_id: *producer_binding_id,
-                producer_fragment_id: *producer_fragment_id,
-                join_node_id: *join_node_id,
-                build_frontier: build_frontier
-                    .iter()
-                    .map(RuntimeFilterFrontierEdgeFacts::from_attempt)
-                    .collect(),
-                non_build_inputs: non_build_inputs
-                    .iter()
-                    .map(RuntimeFilterFrontierEdgeFacts::from_attempt)
-                    .collect(),
-            },
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct RuntimeFilterFrontierEdgeFacts {
-    pub source_fragment_id: u32,
-    pub target_exchange_node_id: i32,
-}
-
-impl RuntimeFilterFrontierEdgeFacts {
-    fn from_attempt(edge: &attempt_facts::AttemptRuntimeFilterFrontierEdgeFacts) -> Self {
-        Self {
-            source_fragment_id: edge.source_fragment_id,
-            target_exchange_node_id: edge.target_exchange_node_id,
-        }
     }
 }

@@ -17,17 +17,20 @@
 
 //! What deploying one plan's runtime filters reads about it.
 //!
-//! Three tables: the channels an artifact can be built for, where each
-//! binding sits and what role it plays there, and which exchange edges must
-//! close before a producer is done. Both plan representations state them, so
-//! deployment stops depending on which one built the execution.
+//! Channels and exact endpoint bindings, including the result of checking
+//! optional split feedback waits against the completed physical wait graph.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use novarocks_physical_plan::wait_graph::{CycleWitness, OperatorRef, WaitGraph, WaitGraphError};
 use novarocks_physical_plan::{
-    EdgeId, FragmentId as PhysicalFragmentId, PhysicalPlan, RuntimeFilter, RuntimeFilterCoverage,
-    RuntimeFilterCoverageNode, RuntimeFilterProducer,
+    FragmentId as PhysicalFragmentId, NodeId, PhysicalPlan, RuntimeFilter, RuntimeFilterCoverage,
+    RuntimeFilterCoverageNode, RuntimeFilterId, RuntimeFilterProducer,
     RuntimeFilterProducerTarget as PhysicalProducerTarget,
 };
-use novarocks_plan_codec::runtime_filter_comparator_digest;
+use novarocks_plan_codec::{PhysicalEncodeError, runtime_filter_comparator_digest};
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
 #[derive(Clone, Debug)]
 pub(crate) enum AttemptRuntimeFilterLogicalDomainFacts {
@@ -165,29 +168,19 @@ pub(crate) struct AttemptRuntimeFilterDeploymentBindingFacts {
     pub node_id: i32,
     pub coverage_witness_id: Option<u32>,
     pub role: AttemptRuntimeFilterBindingRoleFacts,
+    pub feedback_wait: Option<FrontendRuntimeFilterFeedbackWaitEligibility>,
 }
-#[derive(Clone, Debug)]
-pub(crate) enum AttemptRuntimeFilterJoinProgressFacts {
-    Proven {
-        channel_id: u32,
-        producer_binding_id: u32,
-        producer_fragment_id: u32,
-        join_node_id: i32,
-        build_frontier: Vec<AttemptRuntimeFilterFrontierEdgeFacts>,
-        non_build_inputs: Vec<AttemptRuntimeFilterFrontierEdgeFacts>,
-    },
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FrontendRuntimeFilterFeedbackWaitEligibility {
+    Eligible,
+    IneligibleCycle { witness: Arc<CycleWitness> },
 }
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct AttemptRuntimeFilterFrontierEdgeFacts {
-    pub source_fragment_id: u32,
-    pub target_exchange_node_id: i32,
-}
+
 /// One plan's runtime filters, as the attempt that deploys them reads them.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AttemptRuntimeFilterFacts {
     channels: Vec<AttemptRuntimeFilterChannelFacts>,
     deployment_bindings: Vec<AttemptRuntimeFilterDeploymentBindingFacts>,
-    join_progress: Vec<AttemptRuntimeFilterJoinProgressFacts>,
 }
 
 impl AttemptRuntimeFilterFacts {
@@ -197,13 +190,15 @@ impl AttemptRuntimeFilterFacts {
     /// plan's fragments already carry their encoded bindings, written by the
     /// same numbering this projection joins on, so nothing needs to encode
     /// them a second time from these facts.
-    pub(crate) fn from_completed(plan: &PhysicalPlan) -> Result<Self, String> {
+    pub(crate) fn from_completed(
+        plan: &PhysicalPlan,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, PhysicalEncodeError> {
         let mut channels = Vec::with_capacity(plan.runtime_filters().len());
         for filter in plan.runtime_filters().values() {
             channels.push(completed_channel(filter)?);
         }
         let mut deployment_bindings = Vec::new();
-        let mut join_progress = Vec::new();
         for binding in novarocks_physical_plan::runtime_filter_bindings(plan)
             .map_err(|error| error.to_string())?
         {
@@ -211,13 +206,6 @@ impl AttemptRuntimeFilterFacts {
             let (role, witness) = match binding.role {
                 novarocks_physical_plan::RuntimeFilterBindingRole::Producer(index) => {
                     let producer = &filter.producers[index];
-                    join_progress.push(completed_join_progress(
-                        plan,
-                        filter,
-                        producer,
-                        binding.binding_id,
-                        binding.fragment,
-                    )?);
                     (
                         completed_producer_role(filter, producer)?,
                         Some(producer.witness.get()),
@@ -251,12 +239,13 @@ impl AttemptRuntimeFilterFacts {
                 node_id: wire_node_id(binding.node.get())?,
                 coverage_witness_id: witness,
                 role,
+                feedback_wait: None,
             });
         }
+        seal_split_feedback_waits(plan, &mut deployment_bindings, control)?;
         Ok(Self {
             channels,
             deployment_bindings,
-            join_progress,
         })
     }
 
@@ -266,10 +255,6 @@ impl AttemptRuntimeFilterFacts {
 
     pub(crate) fn deployment_bindings(&self) -> &[AttemptRuntimeFilterDeploymentBindingFacts] {
         &self.deployment_bindings
-    }
-
-    pub(crate) fn join_progress(&self) -> &[AttemptRuntimeFilterJoinProgressFacts] {
-        &self.join_progress
     }
 
     pub(crate) fn has_channels(&self) -> bool {
@@ -690,55 +675,145 @@ fn completed_consumer_role(
     })
 }
 
-/// Which exchange edges must close before this producer is done.
-///
-/// The plan names them as edge identities; deployment names them the way it
-/// watches them, by the fragment that sends and the exchange node that
-/// receives.
-fn completed_join_progress(
+fn seal_split_feedback_waits(
     plan: &PhysicalPlan,
-    filter: &RuntimeFilter,
-    producer: &RuntimeFilterProducer,
-    binding_id: u32,
-    fragment: PhysicalFragmentId,
-) -> Result<AttemptRuntimeFilterJoinProgressFacts, String> {
-    Ok(AttemptRuntimeFilterJoinProgressFacts::Proven {
-        channel_id: filter.id.get(),
-        producer_binding_id: binding_id,
-        producer_fragment_id: fragment.get(),
-        join_node_id: wire_node_id(producer.endpoint.node.get())?,
-        build_frontier: frontier_edges(plan, &producer.progress.build_edges)?,
-        non_build_inputs: frontier_edges(plan, &producer.progress.non_build_edges)?,
-    })
+    bindings: &mut [AttemptRuntimeFilterDeploymentBindingFacts],
+    control: &dyn PureCompileControl,
+) -> Result<(), PhysicalEncodeError> {
+    if bindings.is_empty() {
+        return Ok(());
+    }
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result = seal_split_feedback_waits_observed(plan, bindings, &mut work);
+    work.finish_result(result, PhysicalEncodeError::Control)
 }
 
-fn frontier_edges(
+fn seal_split_feedback_waits_observed(
     plan: &PhysicalPlan,
-    edges: &[EdgeId],
-) -> Result<Vec<AttemptRuntimeFilterFrontierEdgeFacts>, String> {
-    edges
-        .iter()
-        .map(|edge_id| {
-            let edge = plan
-                .edges()
-                .get(edge_id)
-                .ok_or_else(|| format!("runtime filter names absent edge {}", edge_id.get()))?;
-            Ok(AttemptRuntimeFilterFrontierEdgeFacts {
-                source_fragment_id: edge.source.fragment.get(),
-                target_exchange_node_id: wire_node_id(edge.destination.node.get())?,
-            })
-        })
-        .collect()
+    bindings: &mut [AttemptRuntimeFilterDeploymentBindingFacts],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), PhysicalEncodeError> {
+    use novarocks_physical_plan::{RuntimeFilterDomain, RuntimeFilterLifecycle};
+
+    let mut by_filter = BTreeMap::<RuntimeFilterId, Vec<_>>::new();
+    for binding in bindings {
+        work.step()?;
+        if matches!(&binding.role, AttemptRuntimeFilterBindingRoleFacts::Consumer {
+            feedback_scan_type: Some(ty), ..
+        } if ty.value_type().temporal().is_none())
+        {
+            by_filter
+                .entry(RuntimeFilterId::new(binding.channel_id))
+                .or_default()
+                .push(binding);
+        }
+    }
+    let mut graph = None;
+    for (id, scans) in by_filter {
+        work.step()?;
+        let filter = &plan.runtime_filters()[&id];
+        if !matches!(filter.domain, RuntimeFilterDomain::Membership { .. })
+            || filter.lifecycle != RuntimeFilterLifecycle::CompleteOnce
+            || !matches!(
+                filter
+                    .terminal_coverage
+                    .nodes
+                    .get(filter.terminal_coverage.root as usize),
+                Some(
+                    RuntimeFilterCoverageNode::AllOf { .. }
+                        | RuntimeFilterCoverageNode::AnyOf { .. }
+                ),
+            )
+        {
+            continue;
+        }
+        let mut supported = true;
+        for binding in &scans {
+            work.step()?;
+            if matches!(&binding.role, AttemptRuntimeFilterBindingRoleFacts::Consumer {
+                feedback_scan_type: Some(ty), ..
+            } if !feedback_value_type_supported(ty.data_type()))
+            {
+                supported = false;
+                break;
+            }
+        }
+        if !supported {
+            continue;
+        }
+        // The placement may further narrow publisher eligibility. At seal
+        // time each admitted scan contributes the wait of its exact operator.
+        let graph = match &mut graph {
+            Some(graph) => graph,
+            slot @ None => slot.insert(
+                WaitGraph::build_observed(
+                    plan.fragments(),
+                    plan.edges(),
+                    plan.runtime_filters().values(),
+                    work,
+                )
+                .map_err(wait_graph_error)?,
+            ),
+        };
+        let witness = graph
+            .try_add_split_feedback_waits_observed(
+                id,
+                scans.iter().map(|scan| OperatorRef {
+                    fragment: PhysicalFragmentId::new(scan.fragment_id),
+                    node: NodeId::new(scan.node_id as u32),
+                }),
+                work,
+            )
+            .map_err(wait_graph_error)?;
+        let eligibility = match witness {
+            Some(witness) => FrontendRuntimeFilterFeedbackWaitEligibility::IneligibleCycle {
+                witness: Arc::new(witness),
+            },
+            None => FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
+        };
+        for binding in scans {
+            work.step()?;
+            binding.feedback_wait = Some(eligibility.clone());
+        }
+    }
+    Ok(())
+}
+
+fn wait_graph_error(error: WaitGraphError) -> PhysicalEncodeError {
+    match error {
+        WaitGraphError::Control(cause) => PhysicalEncodeError::Control(cause),
+        other => PhysicalEncodeError::Invalid(other.to_string()),
+    }
+}
+
+pub(crate) fn feedback_value_type_supported(value: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType;
+
+    matches!(
+        value,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Date32
+            | DataType::Decimal128(_, _)
+            | DataType::FixedSizeBinary(_)
+            | DataType::Timestamp(_, _)
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
     use novarocks_physical_plan::{
-        JoinSide, NodeId, RuntimeFilterApplyPoint as PhysicalApplyPoint, RuntimeFilterCompletion,
+        JoinSide, RuntimeFilterApplyPoint as PhysicalApplyPoint, RuntimeFilterCompletion,
         RuntimeFilterConsumer, RuntimeFilterContributionKind as PhysicalContributionKind,
         RuntimeFilterDomain, RuntimeFilterEndpoint, RuntimeFilterEqualityWitness,
-        RuntimeFilterEqualityWitnessId, RuntimeFilterId, RuntimeFilterKind, RuntimeFilterLifecycle,
+        RuntimeFilterEqualityWitnessId, RuntimeFilterKind, RuntimeFilterLifecycle,
         RuntimeFilterNullSemantics, RuntimeFilterPolicy, RuntimeFilterProducerProgress,
         RuntimeFilterReduction, RuntimeFilterWitnessId, TopNPhase, ValueId, ValueType,
     };

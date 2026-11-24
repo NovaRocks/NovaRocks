@@ -763,8 +763,12 @@ impl Chunk {
             output_column_metadata: self.output_column_metadata.clone(),
         };
         if let Some(ChunkAccountingCharge::WholeBatch(accounting)) = self.accounting.as_ref() {
-            let tracker = accounting.tracker();
-            out.transfer_to(&tracker);
+            if accounting.retained_at_original_owner() {
+                out.accounting = self.accounting.clone();
+            } else {
+                let tracker = accounting.tracker();
+                out.transfer_to(&tracker);
+            }
         }
         out
     }
@@ -894,6 +898,14 @@ impl Chunk {
         record_batch_bytes(&self.batch)
     }
 
+    /// Keep the existing backing invoice fixed before handing out branch
+    /// aliases. Provider and delta owners already retain their source charges.
+    pub(crate) fn retain_shared_accounting(&self) {
+        if let Some(ChunkAccountingCharge::WholeBatch(accounting)) = self.accounting.as_ref() {
+            accounting.retain_at_original_owner();
+        }
+    }
+
     pub fn transfer_to(&mut self, tracker: &Arc<MemTracker>) {
         if let Some(accounting) = self.accounting.as_ref() {
             if let ChunkAccountingCharge::WholeBatch(accounting) = accounting {
@@ -960,6 +972,12 @@ impl Chunk {
         if matches!(
             self.accounting,
             Some(ChunkAccountingCharge::AdditionalBuffers(_))
+        ) {
+            return None;
+        }
+        if matches!(
+            self.accounting.as_ref(),
+            Some(ChunkAccountingCharge::WholeBatch(accounting)) if accounting.retained_at_original_owner()
         ) {
             return None;
         }

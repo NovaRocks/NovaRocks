@@ -69,12 +69,13 @@ pub(crate) struct StaticSinkTarget {
 impl StaticSinkTarget {
     #[cfg(test)]
     pub(crate) const fn for_test(
+        edge: EdgeId,
         target_fragment_id: FragmentId,
         target_exchange_node_id: i32,
         delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
     ) -> Self {
         Self {
-            edge: EdgeId::new(0),
+            edge,
             role: novarocks_physical_plan::OutputRole::Relational,
             target_fragment_id,
             target_exchange_node_id,
@@ -501,6 +502,7 @@ pub(crate) mod tests {
         version: [u8; 16],
         dop_domain: PipelineDopDomain,
         target: Option<(
+            EdgeId,
             u32,
             i32,
             novarocks_execution_contract::ExchangeDeliveryRequirement,
@@ -584,8 +586,7 @@ pub(crate) mod tests {
                 values.clone().into_boxed_slice(),
             )
             .expect("Values node");
-        let edge_id = p::EdgeId::new(0);
-        let sink = if target.is_some() {
+        let sink = if let Some((edge_id, ..)) = target {
             p::FragmentSink::Stream { edge: edge_id }
         } else {
             p::FragmentSink::Result
@@ -614,7 +615,7 @@ pub(crate) mod tests {
         let mut edges = BTreeMap::new();
         let mut cuts = p::FragmentCuts::default();
         let result = match target {
-            Some((target_fragment, target_node, delivery)) => {
+            Some((edge_id, target_fragment, target_node, delivery)) => {
                 let delivery = match delivery {
                     novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven => {
                         p::DeliveryRequirement::DemandDriven
@@ -839,6 +840,7 @@ pub(crate) mod tests {
                 requires_power_of_two: false,
             },
             Some((
+                EdgeId::new(0),
                 5,
                 20,
                 novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
@@ -852,6 +854,7 @@ pub(crate) mod tests {
         assert_eq!(
             facts.sink_targets(),
             &[StaticSinkTarget::for_test(
+                EdgeId::new(0),
                 5,
                 20,
                 novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,

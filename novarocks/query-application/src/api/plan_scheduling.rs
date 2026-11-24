@@ -24,6 +24,7 @@
 //! values rather than reached for through whichever representation produced
 //! them.
 
+use novarocks_execution_contract::ExchangeEdgeId;
 use novarocks_physical_plan::PlanVersionId;
 
 use super::NativeScanWork;
@@ -98,6 +99,7 @@ pub enum SchedulingStreamKind {
 /// One exchange edge, as scheduling reads it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchedulingEdgeFacts {
+    pub edge_id: ExchangeEdgeId,
     pub source_fragment_id: u32,
     pub target_fragment_id: u32,
     pub target_exchange_node_id: i32,

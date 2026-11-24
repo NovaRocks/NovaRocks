@@ -1912,7 +1912,20 @@ impl LocalProgramGraph {
                     let source_layout = summary
                         .map(|summary| summary.layout())
                         .unwrap_or(&nodes[root.index()].output_layout);
-                    if !work.projection_matches(source_layout, branch.output_columns(), layout)? {
+                    let columns = branch.output_columns();
+                    let exact_empty_multicast = summary.is_none()
+                        && matches!(sink, StaticSinkProgram::MultiCastDataStream { .. })
+                        && *role == crate::ProgramOutputRole::Relational
+                        && columns.is_empty();
+                    let matches = if exact_empty_multicast {
+                        // A relational multicast branch can transport just row
+                        // cardinality. The ordinary empty selection still
+                        // denotes all source slots.
+                        source_layout.is_typed() && layout.is_typed() && layout.slots().is_empty()
+                    } else {
+                        work.projection_matches(source_layout, columns, layout)?
+                    };
+                    if !matches {
                         return Err(LocalProgramError::InvalidSink.into());
                     }
                 }

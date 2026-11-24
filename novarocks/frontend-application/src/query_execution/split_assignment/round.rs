@@ -35,7 +35,7 @@ use super::driver::{
     AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError, SplitAssignmentStop,
 };
 use super::transport::TaskUpdateTransport;
-use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
+use crate::runtime_filter::feedback::{InitialSplitFeedbackWait, RuntimeFilterFeedbackState};
 use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 
 /// How many splits one batch pulls from a source.
@@ -207,26 +207,39 @@ impl RoundSplitAssignment {
                 break;
             }
             if let Some(deadline) = source.initial_wait_deadline {
-                if Instant::now() < deadline
-                    && source.feedback.is_initial_wait_blocked(
-                        scan.plan_node_id(),
+                let decision = (Instant::now() < deadline).then(|| {
+                    source.feedback.initial_split_feedback_wait(
+                        scan,
                         source
                             .feedback_bindings
                             .iter()
                             .map(|(binding_id, _)| *binding_id),
                     )
-                {
+                });
+                if decision == Some(InitialSplitFeedbackWait::Pending) {
                     feedback_wait_deadline = Some(
                         feedback_wait_deadline
                             .map_or(deadline, |current: Instant| current.min(deadline)),
                     );
                     continue;
                 }
+                #[cfg(novarocks_dev_controls)]
+                if !source.feedback_bindings.is_empty() {
+                    let outcome = match decision {
+                        None => "deadline_elapsed",
+                        Some(InitialSplitFeedbackWait::Ready) => "ready",
+                        Some(InitialSplitFeedbackWait::IneligibleCycle) => "cycle_skip",
+                        Some(InitialSplitFeedbackWait::Pending) => unreachable!("wait is pending"),
+                    };
+                    source
+                        .feedback
+                        .observe_initial_split_feedback_wait(scan, outcome);
+                }
                 source.initial_wait_deadline = None;
             }
             let dynamic_filter = source
                 .feedback
-                .snapshot_for_scan(scan.plan_node_id(), &source.feedback_bindings);
+                .snapshot_for_scan(scan, &source.feedback_bindings);
             selected = Some((index, Some(dynamic_filter)));
             break;
         }

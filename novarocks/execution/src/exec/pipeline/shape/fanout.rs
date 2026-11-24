@@ -106,6 +106,7 @@ struct Branch {
     operator: OwnedOperator,
     next: NextStep,
     input_closed: bool,
+    exit_started: bool,
     admission: Option<AdmissionNext>,
     control_event: Option<Arc<Observable>>,
     exit_scope: OperatorExitScope,
@@ -113,6 +114,62 @@ struct Branch {
     wait: Option<(Arc<Observable>, ObserverSubscription)>,
 }
 impl Branch {
+    fn runnable(&self) -> bool {
+        match &self.next {
+            NextStep::Runnable | NextStep::Yield => true,
+            NextStep::Wait(wait) => wait.is_ready(),
+            NextStep::NeedInput => {
+                self.pending.is_some()
+                    && match &self.admission {
+                        Some(AdmissionNext::Wait(wait)) => wait.is_ready(),
+                        _ => true,
+                    }
+            }
+            NextStep::Finished => false,
+        }
+    }
+
+    fn begin_exit(&mut self, control: &RuntimeErrorState) {
+        if self.exit_started || !self.operator.is_live() {
+            return;
+        }
+        self.exit_started = true;
+        let result = self
+            .exit_scope
+            .run(
+                ExitAction::Begin,
+                control,
+                || fault(FanoutFailure::CleanupPanic("begin-exit")),
+                || self.operator.begin_exit(),
+            )
+            .into_cleanup_result();
+        if let Err(error) = result {
+            control.report_cleanup(&error);
+        }
+    }
+
+    fn withdraw(&mut self, control: &RuntimeErrorState) {
+        self.next = NextStep::Finished;
+        self.admission = None;
+        self.wait = None;
+        let result = self
+            .exit_scope
+            .run(
+                ExitAction::ReleaseInput,
+                control,
+                || fault(FanoutFailure::CleanupPanic("release-branch-input")),
+                || {
+                    drop(self.pending.take());
+                    Ok(())
+                },
+            )
+            .into_cleanup_result();
+        if let Err(error) = result {
+            control.report_cleanup(&error);
+        }
+        self.begin_exit(control);
+    }
+
     fn observe_owner(&mut self, failures: &RuntimeErrorState) -> (ExitObservations, bool) {
         let mut returned = false;
         let mut waiting = false;
@@ -263,6 +320,12 @@ fn subscribe(source: &Arc<Observable>, target: &Arc<Observable>) -> ObserverSubs
     }))
 }
 
+enum ChildWork {
+    Ready(usize),
+    Waiting { observed_generation: u64 },
+    Yield,
+}
+
 pub(crate) struct Fanout<R: FanoutRouter> {
     receiver: ReceiverSlot<FanoutPreparation>,
     cursor: Option<R::Cursor>,
@@ -277,8 +340,15 @@ pub(crate) struct Fanout<R: FanoutRouter> {
     failure: Option<ExecutionFailure>,
     prepared: bool,
     finishing: bool,
+    finish_scan: Option<usize>,
     exit_started: bool,
+    control_scan: Option<(u64, usize)>,
+    observed_controls: Option<u64>,
+    poll_unobserved_controls: bool,
+    outstanding_demand: usize,
     round_robin: usize,
+    child_scan: Option<(u64, usize)>,
+    routed_child: Option<usize>,
     pending_rows: Option<u64>,
     receiver_exit: OperatorExitScope,
     cursor_exit: OperatorExitScope,
@@ -295,6 +365,7 @@ impl<R: FanoutRouter> Fanout<R> {
                 .is_empty()
                 .then(|| fault(FanoutFailure::EmptyBranches))
         });
+        let outstanding_demand = branches.len();
         Self {
             receiver: ReceiverSlot::new(FanoutPreparation::default()),
             cursor: None,
@@ -307,6 +378,7 @@ impl<R: FanoutRouter> Fanout<R> {
                         operator: OwnedOperator::new(operator),
                         next,
                         input_closed: false,
+                        exit_started: false,
                         admission: None,
                         control_event: None,
                         exit_scope: OperatorExitScope::new(),
@@ -325,8 +397,15 @@ impl<R: FanoutRouter> Fanout<R> {
             failure,
             prepared: false,
             finishing: false,
+            finish_scan: None,
             exit_started: false,
+            control_scan: None,
+            observed_controls: None,
+            poll_unobserved_controls: false,
+            outstanding_demand,
             round_robin: 0,
+            child_scan: None,
+            routed_child: None,
             pending_rows: None,
             receiver_exit: OperatorExitScope::new(),
             cursor_exit: OperatorExitScope::new(),
@@ -436,24 +515,38 @@ impl<R: FanoutRouter> Fanout<R> {
         branch.next = result.next;
         Ok(())
     }
-    fn runnable_child(&self) -> Option<usize> {
-        (0..self.branches.len())
-            .map(|offset| (self.round_robin + offset) % self.branches.len())
-            .find(|index| {
-                let branch = &self.branches[*index];
-                match &branch.next {
-                    NextStep::Runnable | NextStep::Yield => true,
-                    NextStep::Wait(wait) => wait.is_ready(),
-                    NextStep::NeedInput => {
-                        branch.pending.is_some()
-                            && match &branch.admission {
-                                Some(AdmissionNext::Wait(wait)) => wait.is_ready(),
-                                _ => true,
-                            }
-                    }
-                    NextStep::Finished => false,
+    fn child_work(&mut self, ctx: &mut DriverStep<'_>, generation: u64) -> ChildWork {
+        if self.cursor.is_some() || self.receiver.is_occupied() {
+            // Advance the branch that just received one raw value. Branches
+            // that actually have to wait rejoin the ordinary sweep after the
+            // router has handed the current input to its other recipients.
+            if let Some(index) = self.routed_child.take() {
+                if !ctx.work().try_consume(1) {
+                    self.routed_child = Some(index);
+                    return ChildWork::Yield;
                 }
-            })
+                if self.branches[index].runnable() {
+                    return ChildWork::Ready(index);
+                }
+            }
+            return ChildWork::Waiting {
+                observed_generation: generation,
+            };
+        }
+        let (observed_generation, start) = self.child_scan.take().unwrap_or((generation, 0));
+        for offset in start..self.branches.len() {
+            if !ctx.work().try_consume(1) {
+                self.child_scan = Some((observed_generation, offset));
+                return ChildWork::Yield;
+            }
+            let index = (self.round_robin + offset) % self.branches.len();
+            if self.branches[index].runnable() {
+                return ChildWork::Ready(index);
+            }
+        }
+        ChildWork::Waiting {
+            observed_generation,
+        }
     }
     fn close_disabled_inputs(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<bool> {
         // A shared zero cannot overtake the last prefix claimed by this driver.
@@ -463,12 +556,23 @@ impl<R: FanoutRouter> Fanout<R> {
         {
             return Ok(false);
         }
-        if self.finishing {
-            self.router.input_exhausted(ctx)?;
-        }
+        let start = match self.finish_scan {
+            Some(start) => start,
+            None if self.finishing => {
+                self.router.input_exhausted(ctx)?;
+                0
+            }
+            None => 0,
+        };
         let mut changed = false;
-        for (index, branch) in self.branches.iter_mut().enumerate() {
+        for (index, branch) in self.branches.iter_mut().enumerate().skip(start) {
             if !branch.input_closed && (self.finishing || !self.router.accepts_branch(index)) {
+                if !ctx.work().try_consume(1) {
+                    if self.finishing {
+                        self.finish_scan = Some(index);
+                    }
+                    return Ok(true);
+                }
                 branch.input_closed = true;
                 if !matches!(branch.next, NextStep::Finished) {
                     ctx.perform(crate::runtime::task::PipelineOperation::Finishing, |ctx| {
@@ -479,12 +583,17 @@ impl<R: FanoutRouter> Fanout<R> {
                 }
             }
         }
+        if self.finishing {
+            self.finish_scan = Some(self.branches.len());
+        }
         Ok(changed)
     }
-    fn result(&mut self, observed_generation: u64) -> StepResult {
+    fn result(&mut self, observed_generation: u64, continue_work: bool) -> StepResult {
         let routing = self.receiver.is_occupied() || self.cursor.is_some();
-        let pending = self.branches.iter().any(|branch| branch.pending.is_some());
-        let next = if routing || self.runnable_child().is_some() {
+        let pending = !routing
+            && (!continue_work || self.pending_rows.is_some())
+            && self.branches.iter().any(|branch| branch.pending.is_some());
+        let next = if routing || continue_work {
             NextStep::Runnable
         } else if self
             .branches
@@ -546,83 +655,117 @@ impl<R: FanoutRouter> Fanout<R> {
             return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
         if self.close_disabled_inputs(ctx)? {
-            return Ok(self.result(generation));
+            self.child_scan = None;
+            return Ok(self.result(generation, true));
         }
-        if let Some(index) = self.runnable_child() {
-            let before = ctx.work().remaining();
-            self.round_robin = (index + 1) % self.branches.len();
-            let branch = &mut self.branches[index];
-            if matches!(branch.next, NextStep::NeedInput) {
-                let raw = branch.pending.take().expect("pending route selected");
-                branch.admission = None;
-                let admission =
-                    ctx.perform(crate::runtime::task::PipelineOperation::Admission, |ctx| {
-                        Ok(match branch.operator.as_mut().try_push(ctx, raw) {
-                            InputResult::Rejected { input, failure } => {
-                                let failure = ctx.locate(failure);
-                                ctx.report_failure(failure.clone());
-                                InputResult::Rejected { input, failure }
-                            }
-                            InputResult::Accepted(Err(failure)) => {
-                                let failure = ctx.locate(failure);
-                                ctx.report_failure(failure.clone());
-                                InputResult::Accepted(Err(failure))
-                            }
-                            result => result,
-                        })
-                    })?;
-                match admission {
-                    InputResult::Accepted(result) => self.record_branch(index, result?, ctx)?,
-                    InputResult::Deferred { input, next } => {
-                        branch.pending = Some(input);
-                        match next {
-                            AdmissionNext::ResumeExisting => {
-                                branch.next = NextStep::Runnable;
-                                branch.admission = Some(AdmissionNext::ResumeExisting);
-                            }
-                            AdmissionNext::Yield => {
-                                branch.admission = Some(AdmissionNext::Yield);
-                                self.next = NextStep::Yield;
-                                return Ok(StepResult::new(None, NextStep::Yield, 0));
-                            }
-                            AdmissionNext::Wait(wait) => {
-                                if branch
-                                    .control_event
-                                    .as_ref()
-                                    .is_none_or(|event| !Arc::ptr_eq(event, &wait.observable))
-                                    && branch
-                                        .wait
-                                        .as_ref()
-                                        .is_none_or(|(old, _)| !Arc::ptr_eq(old, &wait.observable))
-                                {
-                                    drop(branch.wait.take());
-                                    branch.wait = Some((
-                                        wait.observable.clone(),
-                                        subscribe(&wait.observable, &self.observable),
-                                    ));
-                                }
-                                branch.admission = Some(AdmissionNext::Wait(wait));
-                            }
-                        }
-                    }
-                    InputResult::Rejected { input, failure } => {
-                        ctx.report_failure(failure.clone());
-                        branch.pending = Some(input);
-                        return Err(failure);
-                    }
-                }
-            } else {
-                let result = branch.operator.as_mut().drive(ctx)?;
-                self.record_branch(index, result, ctx)?;
+        let generation = match self.child_work(ctx, generation) {
+            ChildWork::Ready(index) => {
+                return self.drive_child(index, ctx, generation);
             }
-            if ctx.work().remaining() == before {
-                ctx.work().try_consume(1);
+            ChildWork::Waiting {
+                observed_generation,
+            } => observed_generation,
+            ChildWork::Yield => {
+                self.next = NextStep::Yield;
+                return Ok(StepResult::new(None, NextStep::Yield, 0));
             }
-            return Ok(self.result(generation));
+        };
+        if !self.receiver.is_occupied() && self.cursor.is_none() {
+            return Ok(self.result(generation, false));
         }
         if !ctx.work().try_consume(1) {
+            self.next = NextStep::Yield;
             return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
+        self.drive_route(ctx, generation)
+    }
+
+    fn drive_child(
+        &mut self,
+        index: usize,
+        ctx: &mut DriverStep<'_>,
+        generation: u64,
+    ) -> ExecutionResult<StepResult> {
+        let before = ctx.work().remaining();
+        if self.cursor.is_some() {
+            self.routed_child = Some(index);
+        }
+        self.round_robin = (index + 1) % self.branches.len();
+        let branch = &mut self.branches[index];
+        if matches!(branch.next, NextStep::NeedInput) {
+            let raw = branch.pending.take().expect("pending route selected");
+            branch.admission = None;
+            let admission =
+                ctx.perform(crate::runtime::task::PipelineOperation::Admission, |ctx| {
+                    Ok(match branch.operator.as_mut().try_push(ctx, raw) {
+                        InputResult::Rejected { input, failure } => {
+                            let failure = ctx.locate(failure);
+                            ctx.report_failure(failure.clone());
+                            InputResult::Rejected { input, failure }
+                        }
+                        InputResult::Accepted(Err(failure)) => {
+                            let failure = ctx.locate(failure);
+                            ctx.report_failure(failure.clone());
+                            InputResult::Accepted(Err(failure))
+                        }
+                        result => result,
+                    })
+                })?;
+            match admission {
+                InputResult::Accepted(result) => self.record_branch(index, result?, ctx)?,
+                InputResult::Deferred { input, next } => {
+                    branch.pending = Some(input);
+                    match next {
+                        AdmissionNext::ResumeExisting => {
+                            branch.next = NextStep::Runnable;
+                            branch.admission = Some(AdmissionNext::ResumeExisting);
+                        }
+                        AdmissionNext::Yield => {
+                            branch.admission = Some(AdmissionNext::Yield);
+                            self.next = NextStep::Yield;
+                            return Ok(StepResult::new(None, NextStep::Yield, 0));
+                        }
+                        AdmissionNext::Wait(wait) => {
+                            if branch
+                                .control_event
+                                .as_ref()
+                                .is_none_or(|event| !Arc::ptr_eq(event, &wait.observable))
+                                && branch
+                                    .wait
+                                    .as_ref()
+                                    .is_none_or(|(old, _)| !Arc::ptr_eq(old, &wait.observable))
+                            {
+                                drop(branch.wait.take());
+                                branch.wait = Some((
+                                    wait.observable.clone(),
+                                    subscribe(&wait.observable, &self.observable),
+                                ));
+                            }
+                            branch.admission = Some(AdmissionNext::Wait(wait));
+                        }
+                    }
+                }
+                InputResult::Rejected { input, failure } => {
+                    ctx.report_failure(failure.clone());
+                    branch.pending = Some(input);
+                    return Err(failure);
+                }
+            }
+        } else {
+            let result = branch.operator.as_mut().drive(ctx)?;
+            self.record_branch(index, result, ctx)?;
+        }
+        if ctx.work().remaining() == before {
+            ctx.work().try_consume(1);
+        }
+        Ok(self.result(generation, true))
+    }
+
+    fn drive_route(
+        &mut self,
+        ctx: &mut DriverStep<'_>,
+        generation: u64,
+    ) -> ExecutionResult<StepResult> {
         if self.receiver.is_occupied() {
             let preparation = ctx.perform(
                 crate::runtime::task::PipelineOperation::Preparation,
@@ -646,7 +789,7 @@ impl<R: FanoutRouter> Fanout<R> {
                 }
                 ReceiverPreparation::Empty => {}
             }
-            return Ok(self.result(generation));
+            return Ok(self.result(generation, true));
         }
         if let Some(cursor) = &mut self.cursor {
             let route = self.router.advance(
@@ -675,6 +818,7 @@ impl<R: FanoutRouter> Fanout<R> {
                     }
                     if !matches!(child.next, NextStep::Finished) {
                         child.pending = Some(super::super::input::derived_raw_input(chunk));
+                        self.routed_child = Some(branch);
                     }
                 }
                 RouteStep::Finished => {
@@ -682,9 +826,9 @@ impl<R: FanoutRouter> Fanout<R> {
                 }
                 RouteStep::Skip => {}
             }
-            return Ok(self.result(generation));
+            return Ok(self.result(generation, true));
         }
-        Ok(self.result(generation))
+        Ok(self.result(generation, false))
     }
 }
 impl<R: FanoutRouter> StepOperator for Fanout<R> {
@@ -701,39 +845,56 @@ impl<R: FanoutRouter> StepOperator for Fanout<R> {
         if !self.prepared {
             return Err(self.fail(ctx, fault(FanoutFailure::NotPrepared)));
         }
+        if self.exit_started {
+            return Ok(ControlStep::Active);
+        }
         let result = (|| {
             let mut changed = false;
-            for (index, branch) in self.branches.iter_mut().enumerate() {
-                if matches!(branch.next, NextStep::Finished) {
-                    continue;
-                }
-                match branch.operator.as_mut().poll_control(ctx)? {
-                    ControlStep::Active => {}
-                    ControlStep::Runnable => {
-                        branch.next = NextStep::Runnable;
-                        changed = true;
+            let generation = self.observable.generation();
+            if self.control_scan.is_some()
+                || self.observed_controls != Some(generation)
+                || self.poll_unobserved_controls
+            {
+                let (generation, start) = self.control_scan.take().unwrap_or((generation, 0));
+                let control = self
+                    .control
+                    .as_ref()
+                    .ok_or_else(|| fault(FanoutFailure::MissingFailurePort))?;
+                for (index, branch) in self.branches.iter_mut().enumerate().skip(start) {
+                    if !ctx.work().try_consume(1) {
+                        self.control_scan = Some((generation, index));
+                        self.next = NextStep::Runnable;
+                        return Ok(ControlStep::Runnable);
                     }
-                    ControlStep::Withdrawn => {
-                        if !branch.input_closed && self.router.requires_branch_drain(index) {
-                            return Err(fault(FanoutFailure::RequiredBranchWithdrawn));
+                    if matches!(branch.next, NextStep::Finished) {
+                        continue;
+                    }
+                    match branch.operator.as_mut().poll_control(ctx)? {
+                        ControlStep::Active => {}
+                        ControlStep::Runnable => {
+                            branch.next = NextStep::Runnable;
+                            changed = true;
                         }
-                        branch.next = NextStep::Finished;
-                        drop(branch.pending.take());
-                        changed = true;
+                        ControlStep::Withdrawn => {
+                            if !branch.input_closed && self.router.requires_branch_drain(index) {
+                                return Err(fault(FanoutFailure::RequiredBranchWithdrawn));
+                            }
+                            branch.withdraw(control);
+                            self.outstanding_demand -= 1;
+                            changed = true;
+                        }
                     }
                 }
+                self.observed_controls = Some(generation);
             }
             changed |= self.close_disabled_inputs(ctx)?;
-            if self
-                .branches
-                .iter()
-                .all(|branch| matches!(branch.next, NextStep::Finished))
-            {
+            if !self.finishing && self.outstanding_demand == 0 {
                 self.discard_parent();
                 self.next = NextStep::Finished;
                 return Ok(ControlStep::Withdrawn);
             }
             if changed {
+                self.child_scan = None;
                 self.next = NextStep::Runnable;
                 Ok(ControlStep::Runnable)
             } else {
@@ -804,6 +965,7 @@ impl<R: FanoutRouter> StepOperator for Fanout<R> {
         let result = self.receiver.try_accept(ctx, input, &self.router);
         if matches!(&result, InputResult::Accepted(_)) {
             self.pending_rows = Some(rows);
+            self.child_scan = None;
             self.next = NextStep::Runnable;
         }
         result
@@ -818,6 +980,10 @@ impl<R: FanoutRouter> StepOperator for Fanout<R> {
         }
         if matches!(self.next, NextStep::Finished) {
             return Ok(StepResult::new(None, NextStep::Finished, 0));
+        }
+        if self.control_scan.is_some() {
+            self.next = NextStep::Yield;
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
         let generation = self.observable.generation();
         self.drive_once(ctx, generation)
@@ -918,6 +1084,8 @@ impl<R: FanoutRouter> OperatorLifecycle for Fanout<R> {
                     self.controls.push((event.clone(), subscription));
                 }
                 branch.control_event = Some(event);
+            } else {
+                self.poll_unobserved_controls = true;
             }
         }
         self.router.visit_demand_events(&mut |event| {
@@ -953,21 +1121,7 @@ impl<R: FanoutRouter> OperatorLifecycle for Fanout<R> {
         self.discard_parent();
         for branch in &mut self.branches {
             branch.next = NextStep::Finished;
-            if !branch.operator.is_live() {
-                continue;
-            }
-            let result = branch
-                .exit_scope
-                .run(
-                    ExitAction::Begin,
-                    &control,
-                    || fault(FanoutFailure::CleanupPanic("begin-exit")),
-                    || branch.operator.begin_exit(),
-                )
-                .into_cleanup_result();
-            if let Err(error) = result {
-                control.report_cleanup(&error);
-            }
+            branch.begin_exit(&control);
         }
         Ok(())
     }
@@ -986,7 +1140,9 @@ impl<R: FanoutRouter> OperatorLifecycle for Fanout<R> {
             }
         }
         for branch in &mut self.branches {
-            for observation in branch.advance_exit(self.exit_started, &control) {
+            for observation in
+                branch.advance_exit(self.exit_started || branch.exit_started, &control)
+            {
                 visit(observation);
             }
         }

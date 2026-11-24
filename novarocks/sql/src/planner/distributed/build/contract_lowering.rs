@@ -659,7 +659,6 @@ struct CteProducer {
     fragment: FragmentId,
     root: NodeId,
     outputs: BTreeMap<ColumnId, (ValueId, ValueType)>,
-    row_multiplicity: RowMultiplicity,
     edges: Vec<novarocks_physical_plan::EdgeId>,
 }
 
@@ -2186,6 +2185,9 @@ impl<'a> ContractLoweringVisitor<'a> {
                     | Distribution::BucketShuffle { .. } => {
                         input.1.insert(edge.source.fragment);
                     }
+                    Distribution::RoundRobin if edge.kind == EdgeKind::CteMulticast => {
+                        input.1.insert(edge.source.fragment);
+                    }
                     _ => {}
                 }
             }
@@ -2207,7 +2209,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 } else {
                     self.dop_domain
                 };
-                let (has_gather, hash_sources) =
+                let (has_gather, placement_sources) =
                     placement_inputs.remove(&fragment_id).unwrap_or_default();
                 let placement = if let Some(placement) =
                     self.write_stage_placements.remove(&fragment_id)
@@ -2230,15 +2232,15 @@ impl<'a> ContractLoweringVisitor<'a> {
                     novarocks_physical_plan::StagePlacementPolicy::Singleton
                 } else if builder.contains_scan() {
                     novarocks_physical_plan::StagePlacementPolicy::ScanWork
-                } else if hash_sources.is_empty() {
+                } else if placement_sources.is_empty() {
                     novarocks_physical_plan::StagePlacementPolicy::Singleton
                 } else {
                     let mut sources = Vec::new();
                     self.work.flush()?;
                     sources
-                        .try_reserve_exact(hash_sources.len())
+                        .try_reserve_exact(placement_sources.len())
                         .map_err(|_| CompileControlError::ResourceExhausted)?;
-                    for source in hash_sources {
+                    for source in placement_sources {
                         self.work.step()?;
                         sources.push(source);
                     }
@@ -2479,7 +2481,9 @@ impl<'a> ContractLoweringVisitor<'a> {
             PhysicalPlanKind::CTEProduce(_) => Err(ContractLoweringError::InvalidCte {
                 detail: "CTEProduce is only valid as the first child of its CTEAnchor".into(),
             }),
-            PhysicalPlanKind::CTEConsume(consume) => self.lower_cte_consume(plan, consume),
+            PhysicalPlanKind::CTEConsume(consume) => {
+                self.lower_cte_consume(plan, consume, ExchangeLayout::RoundRobin)
+            }
             PhysicalPlanKind::ChangeEventExpand(expand) => {
                 self.lower_change_event_expand(plan, expand)
             }
@@ -2865,7 +2869,6 @@ impl<'a> ContractLoweringVisitor<'a> {
                 fragment: producer_fragment,
                 root: producer_root.node,
                 outputs,
-                row_multiplicity: producer_root.properties.row_multiplicity,
                 edges: Vec::new(),
             },
         );
@@ -2906,6 +2909,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         &mut self,
         plan: &PhysicalPlanNode,
         consume: &crate::planner::payload::PlanCTEConsumeNode,
+        layout: ExchangeLayout,
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 0)?;
         require_output_shape("CTEConsume", &plan.output_columns, &consume.output_columns)?;
@@ -2936,7 +2940,6 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
         })?;
         let producer_fragment = producer.fragment;
-        let producer_multiplicity = producer.row_multiplicity;
         let selected_outputs = consume
             .output_columns
             .iter()
@@ -2984,6 +2987,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         let mut projection = Vec::with_capacity(consume.output_columns.len());
         let mut receive_mapping = Vec::with_capacity(consume.output_columns.len());
         let mut output = Vec::with_capacity(consume.output_columns.len());
+        let mut source_columns = BTreeMap::new();
         let mut columns = BTreeMap::new();
         for (consumer_column, (producer_value, consumer_type)) in
             consume.output_columns.iter().zip(selected_outputs)
@@ -2999,15 +3003,17 @@ impl<'a> ContractLoweringVisitor<'a> {
             projection.push(producer_value);
             receive_mapping.push((producer_value, imported));
             output.push(imported);
+            source_columns.insert(consumer_column.column_id, producer_value);
             columns.insert(consumer_column.column_id, imported);
         }
+        let partitioning = exchange_partitioning(layout, &source_columns, &columns)?;
         self.fragment_mut().add_exchange_source(
             receiver,
             edge,
             receive_mapping.clone().into_boxed_slice(),
             output.clone().into_boxed_slice(),
-            Distribution::Unconstrained,
-            producer_multiplicity,
+            partitioning.destination.clone(),
+            partitioning.destination_multiplicity,
         )?;
         let properties = self
             .fragment_mut()
@@ -3029,13 +3035,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 node: receiver,
                 receive_mapping: receive_mapping.into_boxed_slice(),
             },
-            partitioning: EdgePartitioning {
-                source: Distribution::Unconstrained,
-                source_multiplicity: producer_multiplicity,
-                destination: Distribution::Unconstrained,
-                destination_multiplicity: producer_multiplicity,
-                routing_only: Box::default(),
-            },
+            partitioning,
         };
         self.plan_builder.add_edge(edge_contract.clone())?;
         self.edges.insert(edge, edge_contract);
@@ -5490,29 +5490,29 @@ impl<'a> ContractLoweringVisitor<'a> {
         redistribute: &crate::planner::physical::RedistributeNode,
         shared_hash_scheme: Option<HashPartitionScheme>,
     ) -> Result<LoweredNode, ContractLoweringError> {
-        let source = self.lower_redistribute_source(plan, redistribute)?;
+        let child = redistribute_input(plan, redistribute)?;
+        if let PhysicalPlanKind::CTEConsume(consume) = &child.kind {
+            let layout = self.redistribute_layout(redistribute, shared_hash_scheme)?;
+            return self.lower_fused_cte_consume(child, consume, layout);
+        }
+        let source = self.lower_exchange_source(child, "Redistribute")?;
         let layout = self.redistribute_layout(redistribute, shared_hash_scheme)?;
         self.append_exchange(source, &plan.output_columns, layout)
     }
 
-    fn lower_redistribute_source(
+    fn lower_fused_cte_consume(
         &mut self,
         plan: &PhysicalPlanNode,
-        redistribute: &crate::planner::physical::RedistributeNode,
+        consume: &crate::planner::payload::PlanCTEConsumeNode,
+        layout: ExchangeLayout,
     ) -> Result<LoweredNode, ContractLoweringError> {
-        expect_children(plan, 1)?;
-        require_output_shape(
-            "Redistribute",
-            &plan.output_columns,
-            &redistribute.output_columns,
-        )?;
-        require_output_shape(
-            "Redistribute",
-            &plan.output_columns,
-            &plan.children[0].output_columns,
-        )?;
-
-        self.lower_exchange_source(&plan.children[0], "Redistribute")
+        // The CTE import is the receiver of the original redistribution.
+        // It keeps the child's probes and display names when the hop is fused.
+        self.work.step()?;
+        let lowered = self.lower_cte_consume(plan, consume, layout)?;
+        self.record_runtime_filter_probes(plan, &lowered)?;
+        self.annotate_node(plan, &lowered)?;
+        Ok(lowered)
     }
 
     fn lower_exchange_source(
@@ -5664,110 +5664,14 @@ impl<'a> ContractLoweringVisitor<'a> {
             output.push(imported);
         }
 
-        let (source_distribution, destination_distribution, destination_multiplicity) = match layout
-        {
-            ExchangeLayout::Gather => (
-                Distribution::Singleton,
-                Distribution::Singleton,
-                RowMultiplicity::SingleCopy,
-            ),
-            ExchangeLayout::Broadcast => (
-                Distribution::Broadcast,
-                Distribution::Broadcast,
-                RowMultiplicity::Replicated,
-            ),
-            ExchangeLayout::RoundRobin => (
-                Distribution::RoundRobin,
-                Distribution::RoundRobin,
-                RowMultiplicity::SingleCopy,
-            ),
-            ExchangeLayout::ConditionalKey {
-                applies,
-                keys,
-                scheme,
-            } => {
-                let source_applies = source
-                    .columns
-                    .get(&applies)
-                    .copied()
-                    .ok_or(ContractLoweringError::UnknownColumnReference(applies))?;
-                let destination_applies = columns
-                    .get(&applies)
-                    .copied()
-                    .ok_or(ContractLoweringError::UnknownColumnReference(applies))?;
-                let source_keys = keys
-                    .iter()
-                    .map(|column| {
-                        source
-                            .columns
-                            .get(column)
-                            .copied()
-                            .ok_or(ContractLoweringError::UnknownColumnReference(*column))
-                    })
-                    .collect::<Result<Box<[_]>, _>>()?;
-                let destination_keys = keys
-                    .iter()
-                    .map(|column| {
-                        columns
-                            .get(column)
-                            .copied()
-                            .ok_or(ContractLoweringError::UnknownColumnReference(*column))
-                    })
-                    .collect::<Result<Box<[_]>, _>>()?;
-                (
-                    Distribution::ConditionalKey {
-                        applies: source_applies,
-                        keys: source_keys,
-                        scheme: scheme.clone(),
-                    },
-                    Distribution::ConditionalKey {
-                        applies: destination_applies,
-                        keys: destination_keys,
-                        scheme,
-                    },
-                    RowMultiplicity::SingleCopy,
-                )
-            }
-            ExchangeLayout::Hash { keys, scheme } => {
-                let source_keys = keys
-                    .iter()
-                    .map(|column| {
-                        source
-                            .columns
-                            .get(column)
-                            .copied()
-                            .ok_or(ContractLoweringError::UnknownColumnReference(*column))
-                    })
-                    .collect::<Result<Box<[_]>, _>>()?;
-                let destination_keys = keys
-                    .iter()
-                    .map(|column| {
-                        columns
-                            .get(column)
-                            .copied()
-                            .ok_or(ContractLoweringError::UnknownColumnReference(*column))
-                    })
-                    .collect::<Result<Box<[_]>, _>>()?;
-                (
-                    Distribution::Hash {
-                        keys: source_keys,
-                        scheme: scheme.clone(),
-                    },
-                    Distribution::Hash {
-                        keys: destination_keys,
-                        scheme,
-                    },
-                    RowMultiplicity::SingleCopy,
-                )
-            }
-        };
+        let partitioning = exchange_partitioning(layout, &source.columns, &columns)?;
         self.fragment_mut().add_exchange_source(
             receiver,
             edge,
             receive_mapping.clone().into_boxed_slice(),
             output.clone().into_boxed_slice(),
-            destination_distribution.clone(),
-            destination_multiplicity,
+            partitioning.destination.clone(),
+            partitioning.destination_multiplicity,
         )?;
         let properties = self
             .fragment_mut()
@@ -5830,13 +5734,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 node: receiver,
                 receive_mapping: receive_mapping.into_boxed_slice(),
             },
-            partitioning: EdgePartitioning {
-                source: source_distribution,
-                source_multiplicity: RowMultiplicity::SingleCopy,
-                destination: destination_distribution,
-                destination_multiplicity,
-                routing_only: Box::default(),
-            },
+            partitioning,
         };
         self.plan_builder.add_edge(edge_contract.clone())?;
         self.edges.insert(edge, edge_contract);
@@ -6833,15 +6731,14 @@ impl<'a> ContractLoweringVisitor<'a> {
                 .map(|column| column.value_type.data_type()),
         );
         for (child, columns) in plan.children.iter().zip(&set_op.child_output_columns) {
-            let needs_cast = columns.iter().zip(&plan.output_columns).any(|(from, to)| {
-                let from = value_type(from);
-                from != set_op_comparison_type(to, &from)
-            });
             let needs_exchange = match &child.kind {
                 PhysicalPlanKind::Redistribute(redistribute) => {
                     matches!(redistribute.mode, RedistributeMode::Hash { .. })
                 }
-                _ => needs_cast && !self.is_set_op_singleton_source(child)?,
+                _ => {
+                    set_op_declared_types_need_cast(columns, &plan.output_columns)
+                        && !self.is_set_op_singleton_source(child)?
+                }
             };
             if needs_exchange {
                 inputs.push(None);
@@ -6912,10 +6809,20 @@ impl<'a> ContractLoweringVisitor<'a> {
         scheme: HashPartitionScheme,
     ) -> Result<LoweredNode, ContractLoweringError> {
         let (source, layout) = match &child.kind {
-            PhysicalPlanKind::Redistribute(redistribute) => (
-                self.lower_redistribute_source(child, redistribute)?,
-                Some(self.redistribute_layout(redistribute, Some(scheme.clone()))?),
-            ),
+            PhysicalPlanKind::Redistribute(redistribute) => {
+                let input = redistribute_input(child, redistribute)?;
+                if let PhysicalPlanKind::CTEConsume(consume) = &input.kind
+                    && !set_op_declared_types_need_cast(&consume.output_columns, published)
+                {
+                    let layout = self.redistribute_layout(redistribute, Some(scheme))?;
+                    let fused = self.lower_fused_cte_consume(input, consume, layout)?;
+                    return self.require_aligned_set_exchange(fused, columns, published);
+                }
+                (
+                    self.lower_exchange_source(input, "Redistribute")?,
+                    Some(self.redistribute_layout(redistribute, Some(scheme.clone()))?),
+                )
+            }
             _ => {
                 let source = self.lower_exchange_source(child, "SetOp")?;
                 if !matches!(source.properties.distribution, Distribution::Hash { .. }) {
@@ -6939,6 +6846,15 @@ impl<'a> ContractLoweringVisitor<'a> {
             ExchangeLayout::Hash { keys, scheme }
         });
         let input = self.append_exchange(source, &aligned_columns, layout)?;
+        self.require_aligned_set_exchange(input, columns, published)
+    }
+
+    fn require_aligned_set_exchange(
+        &mut self,
+        input: LoweredNode,
+        columns: &[OutputColumn],
+        published: &[OutputColumn],
+    ) -> Result<LoweredNode, ContractLoweringError> {
         if self.set_op_branch_needs_cast(&input, columns, published)? {
             return Err(ContractLoweringError::InvalidSetOp {
                 detail: "comparison exchange does not carry the aligned type",
@@ -11352,6 +11268,128 @@ enum ExchangeLayout {
     },
 }
 
+fn redistribute_input<'a>(
+    plan: &'a PhysicalPlanNode,
+    redistribute: &crate::planner::physical::RedistributeNode,
+) -> Result<&'a PhysicalPlanNode, ContractLoweringError> {
+    expect_children(plan, 1)?;
+    let input = &plan.children[0];
+    require_output_shape(
+        "Redistribute",
+        &plan.output_columns,
+        &redistribute.output_columns,
+    )?;
+    require_output_shape("Redistribute", &plan.output_columns, &input.output_columns)?;
+    Ok(input)
+}
+
+fn exchange_partitioning(
+    layout: ExchangeLayout,
+    source_columns: &BTreeMap<ColumnId, ValueId>,
+    destination_columns: &BTreeMap<ColumnId, ValueId>,
+) -> Result<EdgePartitioning, ContractLoweringError> {
+    let (source_distribution, destination_distribution, destination_multiplicity) = match layout {
+        ExchangeLayout::Gather => (
+            Distribution::Singleton,
+            Distribution::Singleton,
+            RowMultiplicity::SingleCopy,
+        ),
+        ExchangeLayout::Broadcast => (
+            Distribution::Broadcast,
+            Distribution::Broadcast,
+            RowMultiplicity::Replicated,
+        ),
+        ExchangeLayout::RoundRobin => (
+            Distribution::RoundRobin,
+            Distribution::RoundRobin,
+            RowMultiplicity::SingleCopy,
+        ),
+        ExchangeLayout::ConditionalKey {
+            applies,
+            keys,
+            scheme,
+        } => {
+            let source_applies = source_columns
+                .get(&applies)
+                .copied()
+                .ok_or(ContractLoweringError::UnknownColumnReference(applies))?;
+            let destination_applies = destination_columns
+                .get(&applies)
+                .copied()
+                .ok_or(ContractLoweringError::UnknownColumnReference(applies))?;
+            let source_keys = keys
+                .iter()
+                .map(|column| {
+                    source_columns
+                        .get(column)
+                        .copied()
+                        .ok_or(ContractLoweringError::UnknownColumnReference(*column))
+                })
+                .collect::<Result<Box<[_]>, _>>()?;
+            let destination_keys = keys
+                .iter()
+                .map(|column| {
+                    destination_columns
+                        .get(column)
+                        .copied()
+                        .ok_or(ContractLoweringError::UnknownColumnReference(*column))
+                })
+                .collect::<Result<Box<[_]>, _>>()?;
+            (
+                Distribution::ConditionalKey {
+                    applies: source_applies,
+                    keys: source_keys,
+                    scheme: scheme.clone(),
+                },
+                Distribution::ConditionalKey {
+                    applies: destination_applies,
+                    keys: destination_keys,
+                    scheme,
+                },
+                RowMultiplicity::SingleCopy,
+            )
+        }
+        ExchangeLayout::Hash { keys, scheme } => {
+            let source_keys = keys
+                .iter()
+                .map(|column| {
+                    source_columns
+                        .get(column)
+                        .copied()
+                        .ok_or(ContractLoweringError::UnknownColumnReference(*column))
+                })
+                .collect::<Result<Box<[_]>, _>>()?;
+            let destination_keys = keys
+                .iter()
+                .map(|column| {
+                    destination_columns
+                        .get(column)
+                        .copied()
+                        .ok_or(ContractLoweringError::UnknownColumnReference(*column))
+                })
+                .collect::<Result<Box<[_]>, _>>()?;
+            (
+                Distribution::Hash {
+                    keys: source_keys,
+                    scheme: scheme.clone(),
+                },
+                Distribution::Hash {
+                    keys: destination_keys,
+                    scheme,
+                },
+                RowMultiplicity::SingleCopy,
+            )
+        }
+    };
+    Ok(EdgePartitioning {
+        source: source_distribution,
+        source_multiplicity: RowMultiplicity::SingleCopy,
+        destination: destination_distribution,
+        destination_multiplicity,
+        routing_only: Box::default(),
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProviderPartitionDefinition {
     Hash(ProviderHashPartitionScheme),
@@ -12115,6 +12153,13 @@ fn hash_join_output_distribution(
         ) => right.properties.distribution.clone(),
         (ContractJoinKind::FullOuter | ContractJoinKind::Cross, _) => Distribution::Unconstrained,
     }
+}
+
+fn set_op_declared_types_need_cast(columns: &[OutputColumn], published: &[OutputColumn]) -> bool {
+    columns.iter().zip(published).any(|(column, published)| {
+        let source = value_type(column);
+        source != set_op_comparison_type(published, &source)
+    })
 }
 
 fn set_op_comparison_type(published: &OutputColumn, source: &ValueType) -> ValueType {
@@ -13949,6 +13994,7 @@ pub(super) mod lowered_writer_state_tests;
 
 #[cfg(test)]
 mod tests {
+    mod cte_multicast;
     mod set_operations;
 
     use std::collections::HashMap;
@@ -13976,11 +14022,10 @@ mod tests {
         ProviderReadRequestBinding, ProviderReadStaticContract, ProviderReadVersionNeed,
     };
     use crate::planner::payload::{
-        PlanAssertOneRowNode, PlanCTEAnchorNode, PlanCTEConsumeNode, PlanCTEProduceNode,
-        PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode, PlanProjectNode, PlanRepeatNode,
-        PlanRowCountAssertion, PlanSortNode, PlanTableFunctionNode, PlanUnpivotNode,
-        PlanUnpivotPassthroughColumn, PlanUnpivotValueMapping, PlanValuesNode, PlanWindowNode,
-        WindowExpr,
+        PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode,
+        PlanProjectNode, PlanRepeatNode, PlanRowCountAssertion, PlanSortNode,
+        PlanTableFunctionNode, PlanUnpivotNode, PlanUnpivotPassthroughColumn,
+        PlanUnpivotValueMapping, PlanValuesNode, PlanWindowNode, WindowExpr,
     };
     use crate::planner::physical::DistributedChangeEventExpandNode;
     use crate::planner::physical::{
@@ -15039,57 +15084,6 @@ mod tests {
                 },
             },
         );
-    }
-
-    fn cte_produce(
-        cte_id: CteId,
-        output_columns: Vec<OutputColumn>,
-        child: PhysicalPlanNode,
-    ) -> PhysicalPlanNode {
-        PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEProduce(PlanCTEProduceNode {
-                cte_id,
-                output_columns: output_columns.clone(),
-            }),
-            children: vec![child],
-            output_columns,
-            stats: stats(),
-            probe_runtime_filters: Vec::new(),
-        }
-    }
-
-    fn cte_consume(
-        cte_id: CteId,
-        alias: &str,
-        output_columns: Vec<OutputColumn>,
-        producer_column_ids: Vec<ColumnId>,
-    ) -> PhysicalPlanNode {
-        PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEConsume(PlanCTEConsumeNode {
-                cte_id,
-                alias: alias.to_string(),
-                output_columns: output_columns.clone(),
-                producer_column_ids,
-            }),
-            children: Vec::new(),
-            output_columns,
-            stats: stats(),
-            probe_runtime_filters: Vec::new(),
-        }
-    }
-
-    fn cte_anchor(
-        cte_id: CteId,
-        produce: PhysicalPlanNode,
-        body: PhysicalPlanNode,
-    ) -> PhysicalPlanNode {
-        PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEAnchor(PlanCTEAnchorNode { cte_id }),
-            children: vec![produce, body.clone()],
-            output_columns: body.output_columns,
-            stats: stats(),
-            probe_runtime_filters: Vec::new(),
-        }
     }
 
     fn checked_constant_for_test(
@@ -19901,390 +19895,6 @@ mod tests {
         assert_eq!(literal(*start), 2);
         assert_eq!(literal(*stop), 8);
         assert_eq!(literal(step.unwrap()), 2);
-    }
-
-    #[test]
-    fn cte_consume_preserves_aliases_and_repeated_producer_occurrences() {
-        let cte_id = 7;
-        let producer_key = column(1, "producer_key", DataType::Int64, false);
-        let producer_value = column(2, "producer_value", DataType::Utf8, false);
-        let producer_columns = vec![producer_key, producer_value.clone()];
-        let produce = cte_produce(
-            cte_id,
-            producer_columns.clone(),
-            values(
-                producer_columns,
-                vec![vec![
-                    literal_int(3),
-                    TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::String("payload".into())),
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Utf8,
-                            false,
-                        ),
-                    },
-                ]],
-            ),
-        );
-        let first_alias = column(10, "first_alias", DataType::Utf8, false);
-        let second_alias = column(11, "second_alias", DataType::Utf8, false);
-        let consume = cte_consume(
-            cte_id,
-            "renamed_cte",
-            vec![first_alias.clone(), second_alias.clone()],
-            vec![producer_value.column_id, producer_value.column_id],
-        );
-
-        let final_plan = finish_for_test(&cte_anchor(cte_id, produce, consume)).unwrap();
-        assert_eq!(final_plan.fragments().len(), 2);
-        assert_eq!(final_plan.edges().len(), 1);
-        let producer = final_plan.fragments().get(&FragmentId::new(1)).unwrap();
-        let FragmentSink::Multicast { edges } = producer.sink() else {
-            panic!("expected CTE producer multicast sink");
-        };
-        assert_eq!(edges.len(), 1);
-        let producer_root = producer.nodes().get(&producer.root()).unwrap();
-        let repeated_value = producer_root.output.columns[1];
-        let edge = final_plan.edges().get(&edges[0]).unwrap();
-        assert_eq!(edge.kind, EdgeKind::CteMulticast);
-        assert_eq!(
-            edge.source.projection.as_ref(),
-            &[repeated_value, repeated_value]
-        );
-        assert_eq!(edge.destination.receive_mapping[0].0, repeated_value);
-        assert_eq!(edge.destination.receive_mapping[1].0, repeated_value);
-        assert_ne!(
-            edge.destination.receive_mapping[0].1,
-            edge.destination.receive_mapping[1].1
-        );
-        let consumer = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
-        for (_, imported) in &edge.destination.receive_mapping {
-            assert!(matches!(
-                consumer.values().get(imported).unwrap().origin,
-                ValueOrigin::CteImport {
-                    edge: import_edge,
-                    producer_fragment,
-                    producer_value,
-                } if import_edge == edge.id
-                    && producer_fragment == FragmentId::new(1)
-                    && producer_value == repeated_value
-            ));
-        }
-        let fields = &final_plan.result_port().unwrap().fields;
-        assert_eq!(fields[0].name.as_ref(), first_alias.name);
-        assert_eq!(fields[1].name.as_ref(), second_alias.name);
-    }
-
-    #[test]
-    fn cte_self_join_rejects_the_data_wait_cycle_before_publication() {
-        for build_side in [
-            PhysicalHashJoinBuildSide::Left,
-            PhysicalHashJoinBuildSide::Right,
-        ] {
-            let cte_id = 80;
-            let shared = column(1, "shared", DataType::Int64, false);
-            let produce = cte_produce(
-                cte_id,
-                vec![shared.clone()],
-                values(vec![shared.clone()], vec![vec![literal_int(9)]]),
-            );
-            let left = column(10, "left_alias", DataType::Int64, false);
-            let right = column(20, "right_alias", DataType::Int64, false);
-            let branch = |column: &OutputColumn, alias| {
-                redistribute(
-                    cte_consume(cte_id, alias, vec![column.clone()], vec![shared.column_id]),
-                    RedistributeMode::Gather,
-                )
-            };
-            let join = hash_join(
-                crate::common::JoinKind::Inner,
-                build_side,
-                SqlJoinDistribution::Singleton,
-                Some(JoinExecutionMode::Singleton),
-                branch(&left, "left_cte"),
-                branch(&right, "right_cte"),
-                vec![left.clone(), right.clone()],
-            );
-            let error = finish_for_test(&cte_anchor(cte_id, produce, join)).unwrap_err();
-            let ContractLoweringError::UnsupportedWaitCycle(cause) = &error else {
-                panic!("shared producer must be rejected for its data wait cycle: {error}");
-            };
-            assert!(cause.to_string().contains("decoupled retained output (B4)"));
-            let expected = cause.clone();
-            let crate::compiler::SqlCompileError::CompilationSource(source) = error.into() else {
-                panic!("the planning capability must retain its original source");
-            };
-            assert_eq!(
-                source.downcast_ref::<crate::compiler::StructuralWaitCycle>(),
-                Some(&expected)
-            );
-            assert_eq!(
-                novarocks_failure_contract::FailureProjection::failure_fact(&source).reason(),
-                novarocks_failure_contract::sql_reason::STRUCTURAL_WAIT_CYCLE
-            );
-        }
-    }
-
-    #[test]
-    fn cte_multicast_has_one_exact_edge_per_consumer() {
-        let cte_id = 8;
-        let producer_column = column(1, "producer", DataType::Int64, false);
-        let produce = cte_produce(
-            cte_id,
-            vec![producer_column.clone()],
-            values(vec![producer_column.clone()], vec![vec![literal_int(9)]]),
-        );
-        let left_column = column(10, "left_alias", DataType::Int64, false);
-        let right_column = column(20, "right_alias", DataType::Int64, false);
-        let left = cte_consume(
-            cte_id,
-            "left_cte",
-            vec![left_column.clone()],
-            vec![producer_column.column_id],
-        );
-        let right = cte_consume(
-            cte_id,
-            "right_cte",
-            vec![right_column.clone()],
-            vec![producer_column.column_id],
-        );
-        let result_column = column(30, "combined", DataType::Int64, false);
-        let body = PhysicalPlanNode {
-            kind: PhysicalPlanKind::SetOp(crate::planner::physical::PhysicalSetOpNode {
-                kind: PlanSetOpKind::UnionAll,
-                output_columns: vec![result_column.clone()],
-                child_output_columns: vec![vec![left_column], vec![right_column]],
-            }),
-            children: vec![left, right],
-            output_columns: vec![result_column],
-            stats: stats(),
-            probe_runtime_filters: Vec::new(),
-        };
-
-        let final_plan = finish_for_test(&cte_anchor(cte_id, produce, body)).unwrap();
-        let producer = final_plan.fragments().get(&FragmentId::new(1)).unwrap();
-        let FragmentSink::Multicast { edges } = producer.sink() else {
-            panic!("expected CTE producer multicast sink");
-        };
-        assert_eq!(edges.len(), 2);
-        assert_eq!(final_plan.edges().len(), 2);
-        let producer_value = producer
-            .nodes()
-            .get(&producer.root())
-            .unwrap()
-            .output
-            .columns[0];
-        let mut destination_nodes = BTreeSet::new();
-        for edge_id in edges {
-            let edge = final_plan.edges().get(edge_id).unwrap();
-            assert_eq!(edge.kind, EdgeKind::CteMulticast);
-            assert_eq!(edge.source.fragment, FragmentId::new(1));
-            assert_eq!(edge.source.projection.as_ref(), &[producer_value]);
-            assert!(destination_nodes.insert(edge.destination.node));
-        }
-    }
-
-    #[test]
-    fn multicast_with_independent_builds_keeps_blocking_runtime_filters() {
-        let cte_id = 81;
-        let producer_column = column(1, "shared_key", DataType::Int64, false);
-        let produce = cte_produce(
-            cte_id,
-            vec![producer_column.clone()],
-            values(vec![producer_column.clone()], vec![vec![literal_int(9)]]),
-        );
-        let mut branches = Vec::new();
-        let mut branch_outputs = Vec::new();
-        for (filter_id, raw, shared) in [(81, 10, true), (82, 20, true), (83, 30, false)] {
-            let probe = column(raw, "probe", DataType::Int64, false);
-            let build = column(raw + 1, "build", DataType::Int64, false);
-            let probe_plan = if shared {
-                // A CTE import preserves single-copy rows but does not promise
-                // singleton distribution. Gather establishes the Join's input
-                // requirement without changing the shared multicast ancestry.
-                redistribute(
-                    cte_consume(
-                        cte_id,
-                        "shared",
-                        vec![probe.clone()],
-                        vec![producer_column.column_id],
-                    ),
-                    RedistributeMode::Gather,
-                )
-            } else {
-                values(vec![probe.clone()], vec![vec![literal_int(9)]])
-            };
-            let mut branch = hash_join(
-                crate::common::JoinKind::Inner,
-                PhysicalHashJoinBuildSide::Right,
-                SqlJoinDistribution::Singleton,
-                Some(JoinExecutionMode::Singleton),
-                probe_plan,
-                values(vec![build], vec![vec![literal_int(9)]]),
-                vec![probe.clone()],
-            );
-            attach_singleton_join_runtime_filter(&mut branch, filter_id, false, true);
-            branches.push(branch);
-            branch_outputs.push(vec![probe]);
-        }
-        let output = column(40, "key", DataType::Int64, false);
-        let body = PhysicalPlanNode {
-            kind: PhysicalPlanKind::SetOp(crate::planner::physical::PhysicalSetOpNode {
-                kind: PlanSetOpKind::UnionAll,
-                output_columns: vec![output.clone()],
-                child_output_columns: branch_outputs,
-            }),
-            children: branches,
-            output_columns: vec![output],
-            stats: stats(),
-            probe_runtime_filters: Vec::new(),
-        };
-        let plan = finish_for_test(&cte_anchor(cte_id, produce, body))
-            .expect("independent RF builds must not leave the shared multicast blocked");
-        assert_runtime_filter_attachments_match_endpoints(&plan);
-        assert!(plan.fragments().values().any(|fragment| {
-            matches!(fragment.sink(), FragmentSink::Multicast { edges } if edges.len() == 2)
-        }));
-        for id in [82, 83] {
-            let filter = &plan.runtime_filters()[&RuntimeFilterId::new(id)];
-            let producer = &filter.producers[0];
-            let fragment = &plan.fragments()[&producer.endpoint.fragment];
-            let join = &fragment.nodes()[&producer.endpoint.node];
-            assert!(
-                matches!(
-                    fragment.nodes()[&join.inputs[1]].kind,
-                    NodeKind::Values { .. }
-                ),
-                "the filter build is independent of the shared multicast"
-            );
-            assert_eq!(filter.consumers.len(), 1);
-            assert_eq!(
-                filter.consumers[0].activation,
-                RuntimeFilterConsumerActivation::BlockingSnapshot
-            );
-        }
-        assert_eq!(
-            plan.runtime_filters()[&RuntimeFilterId::new(84)].consumers[0].activation,
-            RuntimeFilterConsumerActivation::BlockingSnapshot
-        );
-    }
-
-    #[test]
-    fn cte_consume_rejects_unknown_duplicate_and_inexact_mappings() {
-        let unknown = cte_consume(
-            99,
-            "missing",
-            vec![column(10, "x", DataType::Int64, false)],
-            vec![ColumnId(1)],
-        );
-        assert!(
-            finish_for_test(&unknown)
-                .unwrap_err()
-                .to_string()
-                .contains("unknown or out-of-scope producer 99")
-        );
-
-        let cte_id = 9;
-        let producer_column = column(1, "producer", DataType::Int64, false);
-        let produce = || {
-            cte_produce(
-                cte_id,
-                vec![producer_column.clone()],
-                values(vec![producer_column.clone()], vec![vec![literal_int(1)]]),
-            )
-        };
-        let arity = cte_consume(
-            cte_id,
-            "arity",
-            vec![column(10, "x", DataType::Int64, false)],
-            Vec::new(),
-        );
-        assert!(
-            finish_for_test(&cte_anchor(cte_id, produce(), arity))
-                .unwrap_err()
-                .to_string()
-                .contains("CTEConsume producer mapping expected 1 item(s), got 0")
-        );
-
-        let duplicate = cte_consume(
-            cte_id,
-            "duplicate",
-            vec![
-                column(10, "x", DataType::Int64, false),
-                column(10, "y", DataType::Int64, false),
-            ],
-            vec![producer_column.column_id, producer_column.column_id],
-        );
-        assert!(
-            finish_for_test(&cte_anchor(cte_id, produce(), duplicate))
-                .unwrap_err()
-                .to_string()
-                .contains("repeats output column c10")
-        );
-
-        let missing_column = cte_consume(
-            cte_id,
-            "missing_column",
-            vec![column(10, "x", DataType::Int64, false)],
-            vec![ColumnId(404)],
-        );
-        assert!(
-            finish_for_test(&cte_anchor(cte_id, produce(), missing_column))
-                .unwrap_err()
-                .to_string()
-                .contains("missing producer column c404")
-        );
-
-        let wrong_type = cte_consume(
-            cte_id,
-            "wrong_type",
-            vec![column(10, "x", DataType::Utf8, false)],
-            vec![producer_column.column_id],
-        );
-        assert!(
-            finish_for_test(&cte_anchor(cte_id, produce(), wrong_type))
-                .unwrap_err()
-                .to_string()
-                .contains("producer column c1 has type")
-        );
-    }
-
-    #[test]
-    fn cte_anchor_rejects_duplicate_active_definition() {
-        let cte_id = 10;
-        let outer_column = column(1, "outer", DataType::Int64, false);
-        let inner_column = column(2, "inner", DataType::Int64, false);
-        let inner_consume = cte_consume(
-            cte_id,
-            "inner",
-            vec![column(20, "value", DataType::Int64, false)],
-            vec![inner_column.column_id],
-        );
-        let inner = cte_anchor(
-            cte_id,
-            cte_produce(
-                cte_id,
-                vec![inner_column.clone()],
-                values(vec![inner_column], vec![vec![literal_int(2)]]),
-            ),
-            inner_consume,
-        );
-        let outer = cte_anchor(
-            cte_id,
-            cte_produce(
-                cte_id,
-                vec![outer_column.clone()],
-                values(vec![outer_column], vec![vec![literal_int(1)]]),
-            ),
-            inner,
-        );
-
-        assert!(
-            finish_for_test(&outer)
-                .unwrap_err()
-                .to_string()
-                .contains("duplicate active CTE definition 10")
-        );
     }
 
     #[test]

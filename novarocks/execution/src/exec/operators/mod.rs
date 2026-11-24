@@ -41,6 +41,7 @@ pub(crate) mod compiled_expression;
 pub(crate) mod compiled_generate_series;
 pub(crate) mod compiled_grouped_topn;
 pub(crate) mod compiled_grouped_topn_resources;
+pub(crate) mod compiled_multicast;
 pub(crate) mod compiled_repeat;
 pub(crate) mod compiled_sort;
 pub(crate) mod compiled_table_function;

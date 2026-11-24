@@ -82,12 +82,14 @@ fn lower_core_with_creation<H>(
         ))
         .into());
     }
-    if cut.kind != EdgeKind::Stream && cut.kind != EdgeKind::ChangeStreamRouter {
-        return Err((FragmentCompileError::Unsupported {
-            node: Some(node.id),
-            feature: "inbound CTE edge",
-        })
-        .into());
+    if cut.kind == EdgeKind::CteMulticast {
+        crate::stream_sink::admit_multicast_cut(
+            cut.kind,
+            cut.delivery,
+            cut.source_port,
+            &cut.payload,
+            &cut.partitioning,
+        )?;
     }
     // A writer-result receiver presents the writer relation positionally,
     // named by its frozen relation fields; the finish admission proved that

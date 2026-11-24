@@ -1826,7 +1826,9 @@ fn protocol_fixture_material(
             }
             Ok((fragment, SchedulingFragmentFacts { placement: novarocks_physical_plan::StagePlacementPolicy::ScanWork, scans }))
         }).collect::<Result<_, DistributedQueryError>>()?,
-        edges: edges.iter().map(|edge| SchedulingEdgeFacts {
+        edges: edges.iter().enumerate().map(|(ordinal, edge)| SchedulingEdgeFacts {
+            edge_id: ExchangeEdgeId::from_physical_ordinal(u32::try_from(ordinal).expect("fixture edge ordinal"))
+                .expect("fixture exchange edge id"),
             source: edge.source_fragment_id,
             target: edge.target_fragment_id,
             target_exchange_node_id: edge.target_exchange_node_id,
@@ -2333,8 +2335,7 @@ mod tests {
         let edges = prepared
             .edges
             .iter()
-            .enumerate()
-            .map(|(index, (&(source, target, exchange), &partition))| {
+            .map(|(&(source, target, exchange), &partition)| {
                 assert_eq!(
                     partition.partition_kind,
                     super::BoundManifestPartitionKind::Unpartitioned
@@ -2360,10 +2361,7 @@ mod tests {
                     "the real gather terminates at the public root"
                 );
                 super::ProjectedEdge {
-                    edge_id: ExchangeEdgeId::new(
-                        u32::try_from(index + 1).expect("finite fixture edge ordinal"),
-                    )
-                    .expect("one nonzero edge per real edge"),
+                    edge_id: original.edge_id,
                     source_fragment_id: source,
                     target_fragment_id: target,
                     target_exchange_node_id: exchange,

@@ -866,7 +866,6 @@ impl ScheduleBoundDistributedQuery {
             has_runtime_filter_channels: self.plan_facts.runtime_filters().has_channels(),
             deployment_facts: RuntimeFilterDeploymentFactsView::new(
                 self.plan_facts.runtime_filters(),
-                self.plan_facts.edges(),
                 self.schedule.planning_schedule(),
             ),
             _private: std::marker::PhantomData,
