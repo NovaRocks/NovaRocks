@@ -8580,10 +8580,11 @@ mod tests {
             nullable: false,
             logical_type: Some(novarocks_types::schema::SqlType::LargeInt),
         };
+        let registry = crate::functions::builtin_sql_function_catalog();
         let nominal = analyze_projection_expr_with_catalog(
-            "SELECT abs(CASE WHEN TRUE THEN NULL ELSE k END) FROM unary_input",
+            "SELECT CASE WHEN TRUE THEN NULL ELSE k END FROM unary_input",
             &catalog,
-            crate::functions::builtin_sql_function_catalog(),
+            registry,
         )
         .unwrap();
         assert_eq!(
@@ -8595,11 +8596,14 @@ mod tests {
             &DataType::FixedSizeBinary(16)
         );
         assert!(nominal.value_type.nullable());
-        let ExprKind::FunctionCall { args, .. } = nominal.kind else {
-            panic!("expected nominal ABS call");
-        };
-        assert!(matches!(args[0].kind, ExprKind::Case { .. }));
-        assert_eq!(args[0].value_type, nominal.value_type);
+        assert!(matches!(nominal.kind, ExprKind::Case { .. }));
+        let error = analyze_projection_expr_with_catalog(
+            "SELECT abs(CASE WHEN TRUE THEN NULL ELSE k END) FROM unary_input",
+            &catalog,
+            registry,
+        )
+        .unwrap_err();
+        assert_eq!(error, "no matching declared overload");
 
         let control = crate::compiler::SqlCompileControl::unbounded();
         let query = novarocks_parser::parser::parse_query("select abs(NULL)").unwrap();
