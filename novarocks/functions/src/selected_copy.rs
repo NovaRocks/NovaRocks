@@ -2507,7 +2507,7 @@ fn validate_interleave_plan<E: From<CopyError>>(
     Ok(())
 }
 
-/// Exact multi-source flat or closed List/Struct plan. Views, encoded and
+/// Exact multi-source flat or closed List/Map/Struct plan. Views, encoded and
 /// other nested carriers retain their separate boundary; this mints no grant.
 pub fn preflight_guarded_interleave(
     ty: &DataType,
@@ -2515,7 +2515,10 @@ pub fn preflight_guarded_interleave(
     choices: &[(usize, usize)],
     mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
 ) -> Result<(), CopyError> {
-    if matches!(ty, DataType::List(_) | DataType::Struct(_)) {
+    if matches!(
+        ty,
+        DataType::List(_) | DataType::Map(_, _) | DataType::Struct(_)
+    ) {
         return guarded_nested::preflight_nested_interleave(ty, sources, choices, observe);
     }
     if !matches!(
