@@ -332,16 +332,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:cte/cte_in_where_subquery",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:cte/cte_multi_alias",
       "failure": {
         "class": "error_code",
@@ -947,28 +937,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Historical CTE carrier refusal in the shared-input suffix. Native baseline f4bd895533 stops earlier at step 11 with sql.analyze.unknown_function for concat('str-', idx); this entry does not cover that failure. Reassess the suffix after the setup succeeds and remove only after the original complete native case and cleanup pass.",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_reorder_no_op_invocations",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:limit/limit_offset_basic",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
+      "reason": "Historical CTE carrier refusal in the shared-input suffix. Native baseline f4bd895533 and the B4b candidate stop earlier at step 11 with sql.analyze.unknown_function for concat('str-', idx); this entry does not cover that failure. B4c owns reassessment of the shared-input suffix after setup succeeds. Remove only after the original complete native case and cleanup pass.",
+      "owner": "UEA-5E B4c",
       "expires": "2026-12-15"
     },
     {
@@ -1057,18 +1027,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "The historical B3 full-case run reaches step 32 and reports StructuralWaitCycle (domain 11, reason 14) before BE execution. Its record retains 80 required, 30 executed passing and 50 unexecuted suffix oracles. Evidence: B3 plan v5 P08/P10 and p13-rf-multicolumns-original-source-diagnostic-evidence-01/sql.results.jsonl. Native baseline f4bd895533 fails earlier at step 1, statement 5, when the setup assigns bigint sequence output to varchar. This entry does not cover that analysis error. Remove only after the complete native case and cleanup pass.",
-      "owner": "B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:runtime-filter/runtime_filter_outer_cross_exchange_guard",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4; remove after capability repair and native verification",
-      "owner": "B4",
+      "reason": "The historical B3 full-case run reaches step 32 and reports StructuralWaitCycle (domain 11, reason 14) before BE execution. Its record retains 80 required, 30 executed passing and 50 unexecuted suffix oracles. Evidence: B3 plan v5 P08/P10 and p13-rf-multicolumns-original-source-diagnostic-evidence-01/sql.results.jsonl. Native baseline f4bd895533 and the B4b candidate fail earlier at step 1, statement 5, when the setup assigns bigint sequence output to varchar. This entry does not cover that analysis error. B4c owns the historical shared-input suffix. Remove only after the complete native case and cleanup pass.",
+      "owner": "UEA-5E B4c",
       "expires": "2026-12-15"
     },
     {

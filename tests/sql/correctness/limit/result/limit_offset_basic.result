@@ -89,11 +89,11 @@ _col0
 1000
 
 -- query 21
--- legacy
+-- types	bigint
 _col0
 7
 
 -- query 24
--- legacy
+-- types	bigint
 _col0
 7

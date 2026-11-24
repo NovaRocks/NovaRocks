@@ -25,6 +25,14 @@ paths = [
     "novarocks/sql/src/compiler/table_sequence.rs",
     "novarocks/sql/src/compiler/completion_driver.rs",
     "novarocks/sql/src/compiler/dml_catalog.rs",
+    "novarocks/local-compiler/src/lowering.rs",
+    "novarocks/local-compiler/src/stream_sink.rs",
+    "novarocks/execution/src/runtime/task/sink.rs",
+    "novarocks/execution/src/exec/operators/compiled_multicast.rs",
+    "novarocks/execution/src/exec/pipeline/shape/fanout.rs",
+    "novarocks/frontend-application/src/query_execution/physical_encoding.rs",
+    "novarocks/native-adapter/src/task_submission.rs",
+    "novarocks/sql/src/planner/distributed/build/contract_lowering.rs",
 ]
 
 [reuse]

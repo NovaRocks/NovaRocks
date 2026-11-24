@@ -1,0 +1,4 @@
+-- query 1
+-- types	bigint
+distinct_uuid_count
+128

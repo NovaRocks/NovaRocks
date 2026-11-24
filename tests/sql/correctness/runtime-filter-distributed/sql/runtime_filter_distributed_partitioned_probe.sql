@@ -178,3 +178,69 @@ SELECT CASE
 FROM ${case_db}.rf_dist_part_probe p
 JOIN ${case_db}.rf_dist_part_build b ON p.k  IS NOT DISTINCT FROM  b.k
 WHERE p.id >= 2001 AND b.flag = 'Y';
+
+-- Grouping absorbs the probe input while the smaller direct branch builds.
+-- @skip_result_check=true
+-- @result_contains=SINK multicast
+-- @result_contains=BlockingSnapshot
+EXPLAIN WITH SESSION explain_detail = 'CONTRACT'
+WITH shared AS (
+    SELECT k FROM ${case_db}.rf_dist_part_probe
+),
+grouped AS (
+    SELECT k, count(*) AS key_rows FROM shared GROUP BY k
+),
+small_build AS (
+    SELECT k FROM shared WHERE k BETWEEN 0 AND 3
+    LIMIT 1
+)
+SELECT count(*) AS matching_rows, sum(g.key_rows) AS grouped_rows
+FROM grouped g
+JOIN small_build b ON g.k = b.k;
+
+WITH shared AS (
+    SELECT k FROM ${case_db}.rf_dist_part_probe
+),
+grouped AS (
+    SELECT k, count(*) AS key_rows FROM shared GROUP BY k
+),
+small_build AS (
+    SELECT k FROM shared WHERE k BETWEEN 0 AND 3
+    LIMIT 1
+)
+SELECT count(*) AS matching_rows, sum(g.key_rows) AS grouped_rows
+FROM grouped g
+JOIN small_build b ON g.k = b.k;
+
+-- Preserve the nested join order so the full producer/scan wait remains visible.
+SET SESSION disable_optimizer_rules = 'JoinCommutativity,JoinAssociativity,MultiJoinReorder';
+
+-- @skip_result_check=true
+-- @result_contains=SINK multicast
+-- @result_contains=BlockingSnapshot
+-- @result_contains=StartUnfilteredThenApplyComplete
+EXPLAIN WITH SESSION explain_detail = 'CONTRACT'
+WITH shared AS (
+    SELECT k FROM ${case_db}.rf_dist_part_probe
+),
+small_build AS (
+    SELECT k FROM shared WHERE k BETWEEN 0 AND 3
+    LIMIT 1
+)
+SELECT count(*) AS competing_wait_rows
+FROM ${case_db}.rf_dist_part_build v
+JOIN (shared q JOIN ${case_db}.rf_dist_part_build x ON q.k = x.k) ON v.k = q.k
+JOIN small_build b ON q.k = b.k;
+
+-- The chosen key has ten probe rows and one match on each independent build.
+WITH shared AS (
+    SELECT k FROM ${case_db}.rf_dist_part_probe
+),
+small_build AS (
+    SELECT k FROM shared WHERE k BETWEEN 0 AND 3
+    LIMIT 1
+)
+SELECT count(*) AS competing_wait_rows
+FROM ${case_db}.rf_dist_part_build v
+JOIN (shared q JOIN ${case_db}.rf_dist_part_build x ON q.k = x.k) ON v.k = q.k
+JOIN small_build b ON q.k = b.k;
