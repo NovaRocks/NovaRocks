@@ -45,7 +45,8 @@ use crate::optimizer::scalar::{self, ScalarArena, ScalarId, ScalarNode};
 fn is_assert_true_item(arena: &ScalarArena, item: &ScalarProjectItem) -> bool {
     matches!(
         arena.node(item.expr),
-        ScalarNode::FunctionCall { name, .. } if name == "assert_true"
+        ScalarNode::FunctionCall { binding, .. }
+            if binding.function_id.as_str() == crate::functions::ASSERT_TRUE_ID
     )
 }
 
@@ -482,13 +483,18 @@ mod tests {
                 )),
                 novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
             );
-            let binding = crate::optimizer::scalar::test_function_binding(
-                &arena,
-                "assert_true",
-                &[true_lit],
-                DataType::Boolean,
-                false,
-                crate::functions::FunctionVolatility::Immutable,
+            let control = crate::optimizer::test_optimizer_control();
+            let argument =
+                crate::optimizer::scalar::function_argument(&arena, true_lit, control).unwrap();
+            let selected = crate::functions::bind_assert_true(
+                crate::functions::builtin_engine_function_catalog(),
+                &[argument],
+                control,
+            )
+            .unwrap();
+            let binding = crate::binding::SqlFunctionBinding::new(
+                selected,
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
             );
             let assert_expr = arena.intern(
                 ScalarNode::FunctionCall {
@@ -539,7 +545,8 @@ mod tests {
         let has_assert_true = pruned.items.iter().any(|item| {
             matches!(
                 arena.node(item.expr),
-                ScalarNode::FunctionCall { name, .. } if name == "assert_true"
+                ScalarNode::FunctionCall { binding, .. }
+                    if binding.function_id.as_str() == crate::functions::ASSERT_TRUE_ID
             )
         });
         assert!(

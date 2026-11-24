@@ -74,6 +74,7 @@ pub enum TypeSpec {
     Character(CharacterKind, CharacterWidth),
     /// Explicit JSON semantics; Utf8 is its canonical storage, not its identity.
     Json,
+    Uuid,
     Binary,
     /// Explicit bitmap bytes; the Binary carrier does not authorize this domain.
     Bitmap,
@@ -94,6 +95,10 @@ pub enum TypeSpec {
     /// same decimal on both sides of the signature. `AnyDecimal128`
     /// carries no name to refer back to.
     Decimal128Of(&'static str),
+    /// Result of rounding a declared decimal towards an integer.
+    DecimalIntegralOf(&'static str),
+    /// Result of taking the sign of a decimal.
+    DecimalSign,
     /// Analogous named decimal template for the Decimal256 carrier.
     Decimal256Of(&'static str),
     /// LARGEINT, whose physical carrier is `FixedSizeBinary(16)`. It is one
@@ -145,7 +150,7 @@ impl ArgumentBindingPolicy {
 ///
 /// `widening` opts the signature into the resolver's widening-cast match
 /// pass. Default-off: only the `coalesce` / `if` / `ifnull` / `case` /
-/// `nvl` / `nullif` family — whose return type is the wider type of all
+/// `nvl` family — whose return type is the wider type of all
 /// argument types — should enable this. Structural polymorphic
 /// signatures like `array_append(List<T>, T) -> List<T>` must stay
 /// `widening: false` so a call like `array_append(List<Int64>, Utf8)`
@@ -274,6 +279,7 @@ impl TypeSpec {
             Self::Utf8 => output.push_str("varchar"),
             Self::Character(_, _) => self.write_canonical(output),
             Self::Json => output.push_str("json"),
+            Self::Uuid => output.push_str("uuid"),
             Self::Binary => output.push_str("varbinary"),
             Self::Bitmap => output.push_str("bitmap"),
             Self::Date => output.push_str("date"),
@@ -281,6 +287,8 @@ impl TypeSpec {
             Self::AnyDecimal128 | Self::Decimal128Of(_) | Self::Decimal256Of(_) => {
                 output.push_str("decimal(p,s)");
             }
+            Self::DecimalIntegralOf(_) => output.push_str("decimal(rp,0)"),
+            Self::DecimalSign => output.push_str("decimal(1,0)"),
             Self::LargeInt => output.push_str("largeint"),
             Self::List(item) => {
                 output.push_str("array(");
@@ -344,6 +352,7 @@ impl TypeSpec {
                 .expect("writing to a String cannot fail");
             }
             Self::Json => output.push_str("json"),
+            Self::Uuid => output.push_str("uuid"),
             Self::Binary => output.push_str("binary"),
             Self::Bitmap => output.push_str("bitmap"),
             Self::Date => output.push_str("date"),
@@ -375,6 +384,12 @@ impl TypeSpec {
                 output.push_str(name);
                 output.push('>');
             }
+            Self::DecimalIntegralOf(name) => {
+                output.push_str("decimal128-integral<");
+                output.push_str(name);
+                output.push('>');
+            }
+            Self::DecimalSign => output.push_str("decimal128(1,0)"),
             Self::Decimal256Of(name) => {
                 output.push_str("decimal256<");
                 output.push_str(name);
@@ -413,6 +428,7 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
         (TypeSpec::Utf8, DataType::Utf8) => true,
         (TypeSpec::Utf8, DataType::LargeUtf8) => true,
         (TypeSpec::Json, DataType::Utf8) => true,
+        (TypeSpec::Uuid, DataType::FixedSizeBinary(16)) => true,
         (TypeSpec::Bitmap, DataType::Binary) => true,
         (TypeSpec::Binary, DataType::Binary) => true,
         (TypeSpec::Binary, DataType::LargeBinary) => true,
@@ -487,6 +503,14 @@ fn names_a_type(spec: &TypeSpec) -> bool {
     }
 }
 
+pub(super) fn integral_decimal_precision(precision: u8, scale: i8) -> Option<u8> {
+    if (1..=38).contains(&precision) && (0..=precision as i8).contains(&scale) {
+        Some(precision - scale as u8 + u8::from(scale > 0))
+    } else {
+        None
+    }
+}
+
 /// Realize a `TypeSpec` (the return-type slot of a matched signature) into
 /// a concrete `DataType`. `bindings` carries the type-variable assignments
 /// produced by the polymorphic match — looking up `Any("T")` returns the
@@ -505,6 +529,7 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
         TypeSpec::Float32 => DataType::Float32,
         TypeSpec::Float64 => DataType::Float64,
         TypeSpec::Utf8 | TypeSpec::Json => DataType::Utf8,
+        TypeSpec::Uuid => DataType::FixedSizeBinary(16),
         TypeSpec::Character(..) => {
             return Err("character declarations require complete SQL value types".into());
         }
@@ -517,6 +542,17 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
         TypeSpec::Decimal128Of(name) | TypeSpec::Decimal256Of(name) => bindings
             .lookup(name)
             .ok_or_else(|| format!("decimal type variable {name} is unbound in the return type"))?,
+        TypeSpec::DecimalIntegralOf(name) => {
+            let precision = match bindings.lookup(name) {
+                Some(DataType::Decimal128(precision, scale)) => {
+                    integral_decimal_precision(precision, scale)
+                }
+                _ => None,
+            }
+            .ok_or_else(|| format!("invalid decimal type for integral result {name}"))?;
+            DataType::Decimal128(precision, 0)
+        }
+        TypeSpec::DecimalSign => DataType::Decimal128(1, 0),
         TypeSpec::MapWithUninhabitedKey { map, .. } => bindings
             .lookup(map)
             .ok_or_else(|| format!("uninhabited-key Map variable {map} is unbound"))?,
@@ -1411,6 +1447,11 @@ pub(super) fn unify_value_with_construction<E>(
             ty.data_type() == &DataType::Null
                 || (ty.logical_type() == ValueLogicalType::Json
                     && ty.data_type() == &DataType::Utf8)
+        }
+        TypeSpec::Uuid => {
+            ty.data_type() == &DataType::Null
+                || (ty.logical_type() == ValueLogicalType::Uuid
+                    && ty.data_type() == &DataType::FixedSizeBinary(16))
         }
         TypeSpec::Utf8 if ty.logical_type() == ValueLogicalType::Json => {
             let target =

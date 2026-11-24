@@ -92,6 +92,8 @@ pub(super) fn evaluate<'a>(
         enum Output {
             Boolean(Vec<Option<bool>>),
             Text(Vec<Option<String>>),
+            FixedUuid(arrow_array::builder::FixedSizeBinaryBuilder),
+            BinaryUuid(arrow_array::builder::BinaryBuilder),
             I8(Vec<Option<i8>>),
             I16(Vec<Option<i16>>),
             I32(Vec<Option<i32>>),
@@ -110,6 +112,27 @@ pub(super) fn evaluate<'a>(
         let mut output = match ty {
             DataType::Boolean => Output::Boolean(Vec::new()),
             DataType::Utf8 => Output::Text(Vec::new()),
+            DataType::FixedSizeBinary(16) | DataType::Binary
+                if matches!(recipe.body, CastBody::Trino(super::trino::Scalar::Uuid(_))) =>
+            {
+                let payload = selection
+                    .len()
+                    .checked_mul(16)
+                    .filter(|bytes| *bytes <= i32::MAX as usize)
+                    .ok_or(KernelFailure::ResourceExhausted)?;
+                if *ty == &DataType::Binary {
+                    Output::BinaryUuid(arrow_array::builder::BinaryBuilder::with_capacity(
+                        selection.len(),
+                        payload,
+                    ))
+                } else {
+                    Output::FixedUuid(arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(
+                        selection.len(),
+                        16,
+                    ))
+                }
+            }
+
             DataType::Int8 => Output::I8(Vec::new()),
             DataType::Int16 => Output::I16(Vec::new()),
             DataType::Int32 => Output::I32(Vec::new()),
@@ -131,6 +154,7 @@ pub(super) fn evaluate<'a>(
         match &mut output {
             Output::Boolean(v) => v.try_reserve_exact(selection.len()),
             Output::Text(v) => v.try_reserve_exact(selection.len()),
+            Output::FixedUuid(_) | Output::BinaryUuid(_) => Ok(()),
             Output::I8(v) => v.try_reserve_exact(selection.len()),
             Output::I16(v) => v.try_reserve_exact(selection.len()),
             Output::I32(v) => v.try_reserve_exact(selection.len()),
@@ -183,6 +207,13 @@ pub(super) fn evaluate<'a>(
                     v.push(Some(n));
                 }
                 (Output::Text(v), R::Null) => v.push(None),
+                (Output::FixedUuid(v), R::UuidBytes(bytes)) => v
+                    .append_value(bytes)
+                    .map_err(|_| internal("CAST result lost its UUID byte width"))?,
+                (Output::BinaryUuid(v), R::UuidBytes(bytes)) => v.append_value(bytes),
+                (Output::FixedUuid(v), R::Null) => v.append_null(),
+                (Output::BinaryUuid(v), R::Null) => v.append_null(),
+
                 (Output::I8(v), R::Signed(n)) => v.push(Some(
                     i8::try_from(n).map_err(|_| internal("cast returned an out-of-range Int8"))?,
                 )),
@@ -246,6 +277,9 @@ pub(super) fn evaluate<'a>(
         let array: ArrayRef = match output {
             Output::Boolean(v) => Arc::new(BooleanArray::from(v)),
             Output::Text(v) => Arc::new(arrow_array::StringArray::from(v)),
+            Output::FixedUuid(mut v) => Arc::new(v.finish()),
+            Output::BinaryUuid(mut v) => Arc::new(v.finish()),
+
             Output::I8(v) => Arc::new(Int8Array::from(v)),
             Output::I16(v) => Arc::new(Int16Array::from(v)),
             Output::I32(v) => Arc::new(Int32Array::from(v)),

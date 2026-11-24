@@ -1616,7 +1616,7 @@ mod client_render_error_tests {
 
     #[test]
     fn preexisting_render_errors_keep_original_engine_message() {
-        let message = "public output logical type UUID is unsupported";
+        let message = "client render identity or storage is unsupported or inconsistent";
         let error = client_render_schema_error(
             novarocks_sql::compiler::ClientRenderSchemaError::Invalid(message.into()),
         );

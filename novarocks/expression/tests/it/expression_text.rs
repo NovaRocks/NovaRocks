@@ -184,11 +184,25 @@ fn shared_call_keeps_port_order_and_repeated_references() {
             ],
         ),
     );
-    assert_compared(&result, 2, 3);
+    assert_eq!(
+        result.batch.shape,
+        EvaluationShape {
+            port_count: 1,
+            input_columns: 2,
+            input_rows: 3,
+        }
+    );
+    assert!(matches!(
+        result.consistency,
+        Consistency::NotApplicable(Inapplicability::Call {
+            function,
+            reason: CallInapplicability::WholeInvocation,
+        }) if function.as_str() == "builtin.scalar/nullif/v1"
+    ));
     assert!(result.batch.errors.is_empty());
     assert_eq!(
         result.batch.values.to_data(),
-        Int64Array::from(vec![8, 7, 5]).to_data()
+        Int32Array::from(vec![8, 7, 5]).to_data()
     );
 }
 
@@ -370,7 +384,6 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
     ));
     for (text, name) in [
         ("count(x)", "count"),
-        ("IF(TRUE, x, x)", "if"),
         ("x.y", "qualified name or field reference"),
     ] {
         assert!(
@@ -470,6 +483,360 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
             })
         ),
         "{mixed_coalesce:?}"
+    );
+}
+
+#[test]
+fn two_argument_if_preserves_the_selected_type_and_null_branch() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let columns = [
+        column("condition", 1, DataType::Boolean, true),
+        column("value", 2, DataType::Int32, false),
+    ];
+    let typed = compile("IF(condition, value)", &columns, &context);
+    let input = batch(
+        &columns,
+        vec![
+            Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
+            Arc::new(Int32Array::from(vec![7, 8, 9])),
+        ],
+    );
+    let result = evaluate(&typed, &input);
+    assert!(result.batch.errors.is_empty());
+    assert_eq!(
+        result.batch.result_type,
+        FunctionValueType::new(DataType::Int32, true)
+    );
+    assert_eq!(
+        result.batch.values.to_data(),
+        Int32Array::from(vec![Some(7), None, None]).to_data()
+    );
+}
+
+#[test]
+fn uuid_literals_and_explicit_casts_keep_the_exact_nominal_bytes() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let literal = "UUID 'F24F9B64-81FA-49D1-B74E-8C09A6E31C56'";
+    let uuid = constant(literal, &context);
+    assert!(uuid.batch.errors.is_empty());
+    assert_eq!(
+        uuid.batch.result_type.logical_type(),
+        ValueLogicalType::Uuid
+    );
+    assert_eq!(
+        uuid.batch.result_type.data_type(),
+        &DataType::FixedSizeBinary(16)
+    );
+    let text = constant(&format!("CAST({literal} AS VARCHAR)"), &context);
+    assert_eq!(
+        text.batch.values.to_data(),
+        StringArray::from(vec!["f24f9b64-81fa-49d1-b74e-8c09a6e31c56"]).to_data()
+    );
+    for sql in [
+        format!("CAST(CAST({literal} AS VARBINARY) AS UUID)"),
+        format!("CAST(CAST({literal} AS VARCHAR) AS UUID)"),
+    ] {
+        let roundtrip = constant(&sql, &context);
+        assert!(roundtrip.batch.errors.is_empty(), "{sql}");
+        assert_eq!(roundtrip.batch.result_type, uuid.batch.result_type);
+        assert_eq!(
+            roundtrip.batch.values.to_data(),
+            uuid.batch.values.to_data()
+        );
+    }
+    for invalid in [
+        format!("CAST({literal} AS VARCHAR(35))"),
+        "CAST(X'0001' AS UUID)".into(),
+        "CAST('f24f9b6481fa49d1b74e8c09a6e31c56' AS UUID)".into(),
+    ] {
+        let result = evaluate(&compile(&invalid, &[], &context), &batch(&[], vec![]));
+        let [error] = result.batch.errors.as_ref() else {
+            panic!("expected one row error from {invalid}");
+        };
+        assert_eq!(
+            error.reason(),
+            DataFailureReason::Domain(
+                novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT
+            )
+        );
+    }
+}
+
+#[test]
+fn nullif_preserves_left_type_and_demands_only_present_rows() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let columns = [
+        column("x", 1, DataType::Int32, true),
+        column("d", 2, DataType::Int64, true),
+    ];
+    let input = batch(
+        &columns,
+        vec![
+            Arc::new(Int32Array::from(vec![
+                None,
+                Some(7),
+                Some(5),
+                Some(7),
+                Some(9),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(0),
+                Some(0),
+                Some(2),
+                Some(2),
+                None,
+            ])),
+        ],
+    );
+    let checked = evaluate(&compile("NULLIF(x, 10 / d)", &columns, &context), &input);
+    assert_eq!(
+        checked.batch.result_type,
+        FunctionValueType::new(DataType::Int32, true)
+    );
+    assert_eq!(
+        checked.batch.values.to_data(),
+        Int32Array::from(vec![None, None, None, Some(7), Some(9)]).to_data()
+    );
+    let [error] = checked.batch.errors.as_ref() else {
+        panic!("only the present left row with zero divisor fails");
+    };
+    assert_eq!(error.selected_ordinal(), 1);
+    assert_eq!(error.reason(), DataFailureReason::DivisionByZero);
+    let caught = evaluate(
+        &compile("TRY(NULLIF(x, 10 / d))", &columns, &context),
+        &input,
+    );
+    assert!(caught.batch.errors.is_empty());
+    assert_eq!(
+        caught.batch.values.to_data(),
+        checked.batch.values.to_data()
+    );
+}
+
+#[test]
+fn nullif_evaluates_its_left_once_per_demanded_row() {
+    use novarocks_functions::{KernelEvaluationControl, KernelFailure};
+    use std::{sync::Mutex, time::Duration};
+
+    #[derive(Default)]
+    struct Waits(Mutex<Vec<Duration>>);
+
+    impl KernelEvaluationControl for Waits {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+
+        fn wait(&self, duration: Duration) -> Result<(), KernelFailure> {
+            self.0.lock().unwrap().push(duration);
+            Ok(())
+        }
+    }
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let columns = [column("d", 1, DataType::Int64, true)];
+    let input = batch(
+        &columns,
+        vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(2)]))],
+    );
+    let typed = compile("NULLIF(sleep(d), FALSE)", &columns, &context);
+    let control = Waits::default();
+    let checked = typed.check_rows(&input, &HarnessControl, &control).unwrap();
+    assert!(checked.batch.errors.is_empty());
+    assert_eq!(
+        checked.batch.values.to_data(),
+        BooleanArray::from(vec![Some(true), None, Some(true)]).to_data()
+    );
+    assert_eq!(
+        control.0.into_inner().unwrap(),
+        [Duration::from_secs(1), Duration::from_secs(2)]
+    );
+}
+
+#[test]
+fn nullif_nested_unknown_keeps_the_original_array() {
+    use arrow::array::{ListArray, types};
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let left: ArrayRef = Arc::new(ListArray::from_iter_primitive::<types::Int32Type, _, _>([
+        Some(vec![Some(1), None]),
+    ]));
+    let right: ArrayRef = Arc::new(ListArray::from_iter_primitive::<types::Int64Type, _, _>([
+        Some(vec![Some(1), None]),
+    ]));
+    let columns = [
+        column("x", 1, left.data_type().clone(), false),
+        column("y", 2, right.data_type().clone(), false),
+    ];
+    let input = batch(&columns, vec![left.clone(), right]);
+    let checked = evaluate(&compile("NULLIF(x, y)", &columns, &context), &input);
+    assert!(checked.batch.errors.is_empty());
+    assert_eq!(checked.batch.values.to_data(), left.to_data());
+}
+
+#[test]
+fn extrema_keep_selected_values_with_exact_width_and_nested_null_order() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let widest = constant(
+        "greatest(BIGINT '9007199254740993', 9007199254740992)",
+        &context,
+    );
+    assert_eq!(
+        widest.batch.values.to_data(),
+        Int64Array::from(vec![9007199254740993]).to_data()
+    );
+    let labels = [
+        ("greatest(DOUBLE 'NaN', DOUBLE 'Infinity')", f64::INFINITY),
+        ("least(DOUBLE 'NaN', DOUBLE '-Infinity')", f64::NEG_INFINITY),
+        ("greatest(DOUBLE '-0.0', DOUBLE '0.0')", -0.0),
+        ("least(DOUBLE '0.0', DOUBLE '-0.0')", 0.0),
+    ];
+    for (text, expected) in labels {
+        let values = constant(text, &context).batch.values;
+        let floats = values.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(floats.value(0).to_bits(), expected.to_bits(), "{text}");
+    }
+    let values = constant("least(DOUBLE 'NaN', DOUBLE 'NaN')", &context)
+        .batch
+        .values;
+    assert!(
+        values
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0)
+            .is_nan()
+    );
+
+    let null = constant("greatest(NULL, NULL)", &context);
+    assert_eq!(null.batch.values.data_type(), &DataType::Null);
+    let fields = arrow::datatypes::Fields::from(vec![
+        arrow::datatypes::Field::new("a", DataType::Float64, true),
+        arrow::datatypes::Field::new("b", DataType::Int32, true),
+    ]);
+    let left = arrow::array::StructArray::new(
+        fields.clone(),
+        vec![
+            Arc::new(Float64Array::from(vec![None])),
+            Arc::new(Int32Array::from(vec![2])),
+        ],
+        None,
+    );
+    let right = arrow::array::StructArray::new(
+        fields.clone(),
+        vec![
+            Arc::new(Float64Array::from(vec![1.0])),
+            Arc::new(Int32Array::from(vec![3])),
+        ],
+        None,
+    );
+    let columns = [
+        column("left_row", 1, DataType::Struct(fields.clone()), false),
+        column("right_row", 2, DataType::Struct(fields), false),
+    ];
+    let expected = right.to_data();
+    let input = batch(&columns, vec![Arc::new(left), Arc::new(right)]);
+    let row = compile("least(left_row, right_row)", &columns, &context);
+    assert_eq!(evaluate(&row, &input).batch.values.to_data(), expected);
+
+    let arrays =
+        arrow::array::ListArray::from_iter_primitive::<arrow::datatypes::Float64Type, _, _>([
+            Some(vec![Some(f64::NAN)]),
+            Some(vec![None]),
+            None,
+            Some(vec![Some(2.0)]),
+        ]);
+    let other =
+        arrow::array::ListArray::from_iter_primitive::<arrow::datatypes::Float64Type, _, _>([
+            Some(vec![Some(1.0)]),
+            Some(vec![Some(1.0)]),
+            Some(vec![Some(1.0)]),
+            Some(vec![Some(1.0)]),
+        ]);
+    let columns = [
+        column("left_value", 1, arrays.data_type().clone(), true),
+        column("right_value", 2, other.data_type().clone(), true),
+    ];
+    let input = batch(&columns, vec![Arc::new(arrays), Arc::new(other)]);
+    for (name, last) in [("greatest", 2.0), ("least", 1.0)] {
+        let typed = compile(
+            &format!("{name}(left_value, right_value)"),
+            &columns,
+            &context,
+        );
+        let result = evaluate(&typed, &input);
+        assert!(result.batch.errors.is_empty());
+        let expected =
+            arrow::array::ListArray::from_iter_primitive::<arrow::datatypes::Float64Type, _, _>([
+                Some(vec![Some(1.0)]),
+                Some(vec![Some(1.0)]),
+                None,
+                Some(vec![Some(last)]),
+            ]);
+        assert_eq!(result.batch.values.to_data(), expected.to_data(), "{name}");
+    }
+}
+
+#[test]
+fn typeof_describes_exact_types_and_demands_the_selected_argument_rows() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    for (sql, expected) in [
+        ("typeof(NULL)", "unknown"),
+        ("typeof(INTEGER '7')", "integer"),
+        ("typeof(REAL '1.5')", "real"),
+        ("typeof('é中')", "varchar(2)"),
+        ("typeof(CAST(NULL AS DECIMAL(5,2)))", "decimal(5,2)"),
+        ("typeof(CAST(NULL AS TIMESTAMP(12)))", "timestamp(12)"),
+        (
+            "typeof(CAST(NULL AS ROW(a INTEGER, \"B\" VARCHAR(2))))",
+            "row(\"a\" integer, \"B\" varchar(2))",
+        ),
+        (
+            "typeof(CAST(NULL AS MAP(VARCHAR(3), ARRAY(DECIMAL(5,2)))))",
+            "map(varchar(3), array(decimal(5,2)))",
+        ),
+        ("typeof(JSON 'null')", "json"),
+    ] {
+        let result = constant(sql, &context);
+        assert_eq!(
+            result.batch.result_type,
+            FunctionValueType::new(DataType::Utf8, false)
+        );
+        assert_eq!(
+            result.batch.values.to_data(),
+            StringArray::from(vec![expected]).to_data(),
+            "{sql}"
+        );
+    }
+
+    let columns = [column("denominator", 1, DataType::Int32, true)];
+    let input = batch(
+        &columns,
+        vec![Arc::new(Int32Array::from(vec![Some(2), Some(0), None]))],
+    );
+    let typed = compile("typeof(10 / denominator)", &columns, &context);
+    let result = evaluate(&typed, &input);
+    let [error] = result.batch.errors.as_ref() else {
+        panic!("expected the original failure on the zero row");
+    };
+    assert_eq!(error.selected_ordinal(), 1);
+    assert_eq!(error.reason(), DataFailureReason::DivisionByZero);
+    assert_eq!(
+        result.batch.values.to_data(),
+        StringArray::from(vec![Some("integer"), None, Some("integer")]).to_data()
     );
 }
 

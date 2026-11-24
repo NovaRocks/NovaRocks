@@ -1262,14 +1262,12 @@ fn assert_true_call(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![predicate, string_literal(message)];
-    let binding = crate::analysis::resolve_function_binding(
-        function_catalog,
-        "assert_true",
-        &args,
-        policy,
-        constant_policy,
-        control,
-    )?;
+    let arguments = args
+        .iter()
+        .map(|argument| crate::analysis::function_argument(argument, constant_policy, control))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected = crate::functions::bind_assert_true(function_catalog, &arguments, control)?;
+    let binding = crate::binding::SqlFunctionBinding::new(selected, policy);
     Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::builtin_function_volatility("assert_true"),

@@ -17,7 +17,7 @@
 
 //! Explicit finite fixtures and actual CV-dependent binder regressions.
 use crate::{ConstantPolicy, ConstantPool, ConstantValue, FunctionValueType};
-use arrow_array::{Array, ArrayRef, Int64Array, StringArray};
+use arrow_array::{Array, ArrayRef, Int32Array, StringArray};
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{CompilePhase, PureCompileControl};
 use std::sync::Arc;
@@ -51,14 +51,6 @@ pub(crate) fn pool(array: ArrayRef, ty: FunctionValueType) -> ConstantPool {
     )
     .unwrap()
 }
-pub(crate) fn i64(value: i64, nullable: bool) -> ConstantValue {
-    pool(
-        Arc::new(Int64Array::from(vec![value])),
-        FunctionValueType::new(DataType::Int64, nullable),
-    )
-    .value(0)
-    .unwrap()
-}
 pub(crate) fn i32(value: i32, nullable: bool) -> ConstantValue {
     pool(
         Arc::new(arrow_array::Int32Array::from(vec![value])),
@@ -75,39 +67,6 @@ pub(crate) fn utf8_typed(value: &str, ty: FunctionValueType) -> ConstantValue {
         .value(0)
         .unwrap()
 }
-pub(crate) fn null(ty: DataType) -> ConstantValue {
-    pool(
-        arrow_array::new_null_array(&ty, 1),
-        FunctionValueType::from_legacy_declared_projection(ty, true),
-    )
-    .value(0)
-    .unwrap()
-}
-pub(crate) fn boolean(value: bool) -> ConstantValue {
-    pool(
-        Arc::new(arrow_array::BooleanArray::from(vec![value])),
-        FunctionValueType::new(DataType::Boolean, false),
-    )
-    .value(0)
-    .unwrap()
-}
-pub(crate) fn u64(value: u64) -> ConstantValue {
-    pool(
-        Arc::new(arrow_array::UInt64Array::from(vec![value])),
-        FunctionValueType::new(DataType::UInt64, false),
-    )
-    .value(0)
-    .unwrap()
-}
-pub(crate) fn f64(value: f64) -> ConstantValue {
-    pool(
-        Arc::new(arrow_array::Float64Array::from(vec![value])),
-        FunctionValueType::new(DataType::Float64, false),
-    )
-    .value(0)
-    .unwrap()
-}
-
 use crate::{
     FunctionArgument, FunctionBindingError, FunctionBindingRequest, FunctionBindingResolver,
     FunctionResultType,
@@ -168,18 +127,19 @@ fn selected_text_ordinal_and_typed_null_are_actual_dynamic_binding_facts() {
 }
 
 #[test]
-fn selected_signed_digits_preserve_i8_wrapping_and_null_is_not_nonconstant() {
+fn selected_integer_digits_keep_declared_scale_and_the_original_null_constant() {
     let digits = pool(
-        Arc::new(Int64Array::from(vec![None, Some(257), Some(2)])),
-        FunctionValueType::new(DataType::Int64, true),
+        Arc::new(Int32Array::from(vec![None, Some(257), Some(2)])),
+        FunctionValueType::new(DataType::Int32, true),
     );
-    for name in ["round", "truncate"] {
+    for (name, precision) in [("round", 13), ("truncate", 12)] {
         let (_, resolver) = super::dynamic_definition_parts(name).unwrap();
-        for (value, scale) in [
-            (digits.value(1).unwrap(), 1),
-            (digits.value(0).unwrap(), 5),
-            (i32(257, false), 1),
+        for value in [
+            digits.value(1).unwrap(),
+            digits.value(0).unwrap(),
+            i32(257, false),
         ] {
+            let nullable = value.value_type().nullable();
             let args = [
                 FunctionArgument::Value {
                     value_type: FunctionValueType::new(DataType::Decimal128(12, 5), false),
@@ -193,8 +153,8 @@ fn selected_signed_digits_preserve_i8_wrapping_and_null_is_not_nonconstant() {
             assert_eq!(
                 selected.result_type,
                 FunctionResultType::Scalar(FunctionValueType::new(
-                    DataType::Decimal128(38, scale),
-                    true
+                    DataType::Decimal128(precision, 5),
+                    nullable,
                 ))
             );
             resolver
@@ -202,7 +162,7 @@ fn selected_signed_digits_preserve_i8_wrapping_and_null_is_not_nonconstant() {
                 .unwrap();
         }
     }
-    let typed_null = null(DataType::Int64);
+    let typed_null = digits.value(0).unwrap();
     assert!(
         typed_null
             .is_null_observed(

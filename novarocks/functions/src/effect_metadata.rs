@@ -59,6 +59,7 @@ pub(crate) fn digest_effect_declaration(hasher: &mut Sha256, effects: &FunctionE
         ArgumentControl::Coalesce => hasher.update([4]),
         ArgumentControl::Try => hasher.update([13]),
         ArgumentControl::OrderedRegexp => hasher.update([14]),
+        ArgumentControl::NullIf => hasher.update([15]),
         ArgumentControl::SimpleCase => hasher.update([5]),
         ArgumentControl::SearchedCase => hasher.update([6]),
         ArgumentControl::HigherOrder {

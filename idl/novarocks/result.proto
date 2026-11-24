@@ -44,6 +44,7 @@ enum RenderTypeKind {
   CHAR = 20;
   VARCHAR = 21;
   TEMPORAL = 22;
+  UUID = 23;
 }
 enum RenderTimeUnit {
   RENDER_TIME_UNIT_UNSPECIFIED = 0;

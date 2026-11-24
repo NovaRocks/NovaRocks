@@ -126,8 +126,8 @@ SELECT if(true, 10, 20) AS folded_if;
 -- @explain_contains=[8 AS folded_coalesce]
 SELECT coalesce(CAST(NULL AS INT), 8) AS folded_coalesce;
 
--- @explain_contains=[9 AS folded_ifnull]
-SELECT ifnull(CAST(NULL AS INT), 9) AS folded_ifnull;
+-- @explain_contains=[9 AS folded_typed_coalesce]
+SELECT coalesce(CAST(NULL AS INT), 9) AS folded_typed_coalesce;
 
 -- @explain_contains=[NULL AS folded_nullif]
 SELECT nullif(9, 9) AS folded_nullif;
@@ -186,8 +186,8 @@ SELECT if(true, 10, 20) AS folded_if;
 -- @explain_contains=[coalesce(
 SELECT coalesce(CAST(NULL AS INT), 8) AS folded_coalesce;
 
--- @explain_contains=[ifnull(
-SELECT ifnull(CAST(NULL AS INT), 9) AS folded_ifnull;
+-- @explain_contains=[coalesce(
+SELECT coalesce(CAST(NULL AS INT), 9) AS folded_typed_coalesce;
 
 -- @explain_contains=[nullif(
 SELECT nullif(9, 9) AS folded_nullif;

@@ -15,14 +15,75 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The original NULLIF calculation shared by legacy and exact selected calls.
-//! Legacy complex display comparison and zoned timestamp rebuilding remain
-//! available only through the already-evaluated compatibility input boundary.
+//! NULLIF comparison setup and the compatibility entry for already evaluated inputs.
+use novarocks_type_contract::{OperatorFunction, PureCompileControl, TrinoCastMode};
+
+/// Exact control recipe prepared from the verified left value and right comparison domain.
+#[derive(Clone, Debug)]
+pub struct PreparedNullIf {
+    call: std::sync::Arc<crate::FunctionCallContract>,
+    left_cast: crate::PreparedCastRecipe,
+    equality: crate::PreparedComparisonRecipe,
+}
+impl PreparedNullIf {
+    pub(crate) fn from_call(
+        call: std::sync::Arc<crate::FunctionCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, crate::FunctionSpecializationFailure> {
+        use crate::FunctionSpecializationFailure;
+        let [
+            FunctionArgumentType::Value(left),
+            FunctionArgumentType::Value(right),
+        ] = call.selected().argument_types.as_ref()
+        else {
+            return Err(FunctionSpecializationFailure::InvalidInput(
+                "NULLIF requires two exact values",
+            ));
+        };
+        let compare_left = right.with_nullable(left.nullable()).map_err(|error| {
+            FunctionSpecializationFailure::Binding(crate::FunctionBindingError::ValueType(error))
+        })?;
+        let left_cast = crate::PreparedCastRecipe::try_new_trino(
+            left,
+            &compare_left,
+            TrinoCastMode::Implicit,
+            control,
+        )
+        .map_err(|error| {
+            error.control_error().map_or(
+                FunctionSpecializationFailure::InvalidInput(
+                    "NULLIF left comparison conversion is unavailable",
+                ),
+                FunctionSpecializationFailure::Control,
+            )
+        })?;
+        let equality = super::operator_kernel::comparison_recipe(
+            OperatorFunction::Equal,
+            [&compare_left, right],
+            control,
+        )
+        .map_err(FunctionSpecializationFailure::Binding)?;
+        Ok(Self {
+            call,
+            left_cast,
+            equality,
+        })
+    }
+
+    pub fn call(&self) -> &crate::FunctionCallContract {
+        &self.call
+    }
+    pub fn left_cast(&self) -> &crate::PreparedCastRecipe {
+        &self.left_cast
+    }
+    pub fn equality(&self) -> &crate::PreparedComparisonRecipe {
+        &self.equality
+    }
+}
+
 use crate::{
-    EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure,
-    ScalarCallContract, ScalarCallInput, SelectedValues, Selection,
-    kernel_control::{internal, invalid},
-    kernel_input::EvaluationCheckpoints,
+    EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure, Selection,
+    kernel_control::internal, kernel_input::EvaluationCheckpoints,
 };
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, PrimitiveArray, StringArray,
@@ -40,7 +101,6 @@ use arrow_cast::{
     display::{ArrayFormatter, FormatOptions},
 };
 use arrow_schema::{DataType, TimeUnit};
-use novarocks_type_contract::ValueLogicalType;
 use std::{alloc::Layout, sync::Arc};
 
 use crate::control_values::{AssemblyFailure, ConditionalTextExtent};
@@ -63,72 +123,6 @@ fn observe_bytes(text: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<(),
     }
     Ok(())
 }
-/// No implicit type downgrade: every admitted concrete Any<T> instantiation
-/// preserves its exact physical and logical result identity.
-pub(super) fn validate_profile(contract: &ScalarCallContract) -> Result<(), KernelFailure> {
-    let [
-        FunctionArgumentType::Value(left),
-        FunctionArgumentType::Value(right),
-    ] = contract.selected().argument_types.as_ref()
-    else {
-        return Err(invalid("nullif requires two exact checked value arguments"));
-    };
-    let target = contract.result_type();
-    let admitted = matches!(
-        target.data_type(),
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Boolean
-            | DataType::Utf8
-            | DataType::Date32
-            | DataType::Decimal128(_, _)
-            | DataType::Timestamp(TimeUnit::Second, None)
-            | DataType::Timestamp(TimeUnit::Millisecond, None)
-            | DataType::Timestamp(TimeUnit::Microsecond, None)
-            | DataType::Timestamp(TimeUnit::Nanosecond, None)
-    );
-    if !admitted
-        || !target.nullable()
-        || target.logical_type() != ValueLogicalType::Physical
-        || left.logical_type() != ValueLogicalType::Physical
-        || right.logical_type() != ValueLogicalType::Physical
-        || left.data_type() != target.data_type()
-        || right.data_type() != target.data_type()
-    {
-        return Err(invalid(
-            "nullif requires its exact admitted nullable flat result profile",
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn evaluate<'a>(
-    input: ScalarCallInput<'_, 'a>,
-    control: &dyn KernelEvaluationControl,
-) -> Result<SelectedValues<'a>, KernelFailure> {
-    control.checkpoint(0)?;
-    let mut work = EvaluationCheckpoints::new(control);
-    let result = (|| {
-        validate_profile(input.contract())?;
-        let [left, right] = input.arguments() else {
-            return Err(invalid("nullif requires two evaluated arguments"));
-        };
-        let output = evaluate_values(*left, *right, input.selection(), &mut work)?;
-        SelectedValues::try_new_observed(
-            input.selection(),
-            input.contract().result_type().data_type(),
-            output,
-            Box::default(),
-            || work.step(),
-        )
-    })();
-    work.finish_result(result)
-}
-
 /// V1 owns child demand. This entrypoint only casts already-evaluated inputs
 /// with the original target inference and full, unbounded diagnostic strings.
 pub fn evaluate_legacy(

@@ -237,7 +237,7 @@ fn ordinary_selected_fresh_uses_the_actual_abs_attachment_once_without_a_catalog
     );
     assert_eq!(
         prepared.call_contract().effects().own_row_error,
-        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
+        novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
     );
     assert!(prepared.call_contract().effects().environment.is_empty());
 

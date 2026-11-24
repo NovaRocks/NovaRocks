@@ -27,6 +27,7 @@ use novarocks_type_contract::{
 };
 use std::{cmp::Ordering, error::Error, fmt};
 
+use crate::aggregate_scalar::ExtremaDirection;
 use crate::arithmetic::SignedWidth;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::{EvaluationCheckpoints, validate_type_observed};
@@ -451,11 +452,6 @@ impl PreparedComparisonRecipe {
         r: usize,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<Option<bool>, KernelFailure> {
-        macro_rules! p {
-            ($ty:ty) => {
-                primitive::<$ty>(left, l, right, r, self.operator, work)
-            };
-        }
         let leaf = match self.algorithm {
             Algorithm::Flat(leaf) => leaf,
             Algorithm::IntegerArray {
@@ -490,116 +486,185 @@ impl PreparedComparisonRecipe {
                 return Ok((!unknown).then_some(equal));
             }
         };
-        macro_rules! b {
-            ($ty:ty, $bytes:expr) => {{
-                let left = cast::<$ty>(left)?;
-                let right = cast::<$ty>(right)?;
-                if left.is_null(l) || right.is_null(r) {
-                    Ok(None)
-                } else {
-                    let bytes: fn(&$ty, usize) -> &[u8] = $bytes;
-                    compare_bytes(
-                        self.operator,
-                        bytes(left, l),
-                        bytes(right, r),
-                        leaf == FlatLeaf::Char,
-                        work,
-                    )
-                    .map(Some)
-                }
-            }};
-        }
-        match leaf {
-            FlatLeaf::Temporal(declaration) => {
-                use novarocks_value_arrays::decode::PreparedTemporalArray;
-                let left = PreparedTemporalArray::bind(declaration, left, self.left.nullable())
-                    .and_then(|values| values.relation_key(l))
-                    .map_err(|error| internal(&error.to_string()))?;
-                let right = PreparedTemporalArray::bind(declaration, right, self.right.nullable())
-                    .and_then(|values| values.relation_key(r))
-                    .map_err(|error| internal(&error.to_string()))?;
-                work.step()?;
-                Ok(left
-                    .zip(right)
-                    .map(|(left, right)| self.operator.apply(left.cmp(&right))))
-            }
-            FlatLeaf::Null => {
-                cast::<NullArray>(left)?;
-                cast::<NullArray>(right)?;
-                Ok(None)
-            }
-            FlatLeaf::Boolean => {
-                let left = cast::<BooleanArray>(left)?;
-                let right = cast::<BooleanArray>(right)?;
-                if left.is_null(l) || right.is_null(r) {
-                    Ok(None)
-                } else {
-                    let eq = self.operator.apply(left.value(l).cmp(&right.value(r)));
-                    work.step()?;
-                    Ok(Some(eq))
-                }
-            }
-            FlatLeaf::Int8 => p!(Int8Type),
-            FlatLeaf::Int16 => p!(Int16Type),
-            FlatLeaf::Int32 => p!(Int32Type),
-            FlatLeaf::Int64 => p!(Int64Type),
-            FlatLeaf::UInt8 => p!(UInt8Type),
-            FlatLeaf::UInt16 => p!(UInt16Type),
-            FlatLeaf::UInt32 => p!(UInt32Type),
-            FlatLeaf::UInt64 => p!(UInt64Type),
-            FlatLeaf::Float16 => p!(Float16Type),
-            FlatLeaf::Float32 if self.ieee_float_equality => {
+        if let (true, FlatLeaf::Float32 | FlatLeaf::Float64) = (self.ieee_float_equality, leaf) {
+            return if leaf == FlatLeaf::Float32 {
                 ieee_float_eq::<Float32Type>(left, l, right, r, work)
-            }
-            FlatLeaf::Float64 if self.ieee_float_equality => {
+            } else {
                 ieee_float_eq::<Float64Type>(left, l, right, r, work)
+            };
+        }
+        compare_flat(
+            leaf,
+            (left, l),
+            (right, r),
+            (self.left.nullable(), self.right.nullable()),
+            FlatOrderPolicy::Operator(self.operator),
+            work,
+        )
+        .map(|order| order.map(|order| self.operator.apply(order)))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FlatOrderPolicy {
+    Operator(ComparisonOperator),
+    Extrema(ExtremaDirection),
+}
+
+impl FlatOrderPolicy {
+    fn compare_float<T: ArrowNativeTypeOp>(
+        self,
+        left: T,
+        right: T,
+        as_f64: impl Fn(T) -> f64,
+    ) -> Ordering {
+        match self {
+            Self::Operator(_) => left.compare(right),
+            Self::Extrema(direction) => direction.compare_float(as_f64(left), as_f64(right)),
+        }
+    }
+}
+
+fn compare_flat(
+    leaf: FlatLeaf,
+    (left, l): (&dyn Array, usize),
+    (right, r): (&dyn Array, usize),
+    nullable: (bool, bool),
+    policy: FlatOrderPolicy,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<Option<Ordering>, KernelFailure> {
+    macro_rules! p {
+        ($ty:ty) => {
+            primitive_order::<$ty>(left, l, right, r, |left, right| left.compare(right), work)
+        };
+    }
+    macro_rules! b {
+        ($ty:ty, $bytes:expr) => {{
+            let left = cast::<$ty>(left)?;
+            let right = cast::<$ty>(right)?;
+            if left.is_null(l) || right.is_null(r) {
+                Ok(None)
+            } else {
+                let bytes: fn(&$ty, usize) -> &[u8] = $bytes;
+                let left = bytes(left, l);
+                let right = bytes(right, r);
+                let order =
+                    if matches!(policy, FlatOrderPolicy::Operator(op) if !op.is_ordering()) && left.len() != right.len() {
+                        work.step()?;
+                        left.len().cmp(&right.len())
+                    } else {
+                        byte_order(left, right, leaf == FlatLeaf::Char, work)?
+                    };
+                Ok(Some(order))
             }
-            FlatLeaf::Float32 => p!(Float32Type),
-            FlatLeaf::Float64 => p!(Float64Type),
-            FlatLeaf::Decimal32 => p!(Decimal32Type),
-            FlatLeaf::Decimal64 => p!(Decimal64Type),
-            FlatLeaf::Decimal128 => p!(Decimal128Type),
-            FlatLeaf::Decimal256 => p!(Decimal256Type),
-            FlatLeaf::Date32 => p!(Date32Type),
-            FlatLeaf::Date64 => p!(Date64Type),
-            FlatLeaf::Time32Second => p!(Time32SecondType),
-            FlatLeaf::Time32Millisecond => p!(Time32MillisecondType),
-            FlatLeaf::Time64Microsecond => p!(Time64MicrosecondType),
-            FlatLeaf::Time64Nanosecond => p!(Time64NanosecondType),
-            FlatLeaf::TimestampSecond => p!(TimestampSecondType),
-            FlatLeaf::TimestampMillisecond => p!(TimestampMillisecondType),
-            FlatLeaf::TimestampMicrosecond => p!(TimestampMicrosecondType),
-            FlatLeaf::TimestampNanosecond => p!(TimestampNanosecondType),
-            FlatLeaf::DurationSecond => p!(DurationSecondType),
-            FlatLeaf::DurationMillisecond => p!(DurationMillisecondType),
-            FlatLeaf::DurationMicrosecond => p!(DurationMicrosecondType),
-            FlatLeaf::DurationNanosecond => p!(DurationNanosecondType),
-            FlatLeaf::IntervalYearMonth => p!(IntervalYearMonthType),
-            FlatLeaf::IntervalDayTime => p!(IntervalDayTimeType),
-            FlatLeaf::IntervalMonthDayNano => p!(IntervalMonthDayNanoType),
-            FlatLeaf::Utf8 | FlatLeaf::Char => b!(StringArray, |a, i| a.value(i).as_bytes()),
-            FlatLeaf::LargeUtf8 => b!(LargeStringArray, |a, i| a.value(i).as_bytes()),
-            FlatLeaf::Binary => b!(BinaryArray, |a, i| a.value(i)),
-            FlatLeaf::LargeBinary => b!(LargeBinaryArray, |a, i| a.value(i)),
-            FlatLeaf::FixedSizeBinary => b!(FixedSizeBinaryArray, |a, i| a.value(i)),
-            FlatLeaf::LargeInt => {
-                let left = cast::<FixedSizeBinaryArray>(left)?;
-                let right = cast::<FixedSizeBinaryArray>(right)?;
-                if left.is_null(l) || right.is_null(r) {
-                    Ok(None)
-                } else {
-                    let l =
-                        i128::from_be_bytes(left.value(l).try_into().map_err(|_| {
-                            internal("LARGEINT comparison value is not sixteen bytes")
-                        })?);
-                    let r =
-                        i128::from_be_bytes(right.value(r).try_into().map_err(|_| {
-                            internal("LARGEINT comparison value is not sixteen bytes")
-                        })?);
-                    let result = self.operator.apply(l.cmp(&r));
-                    work.step()?;
-                    Ok(Some(result))
-                }
+        }};
+    }
+    match leaf {
+        FlatLeaf::Temporal(declaration) => {
+            use novarocks_value_arrays::decode::PreparedTemporalArray;
+            let left = PreparedTemporalArray::bind(declaration, left, nullable.0)
+                .and_then(|values| values.relation_key(l))
+                .map_err(|error| internal(&error.to_string()))?;
+            let right = PreparedTemporalArray::bind(declaration, right, nullable.1)
+                .and_then(|values| values.relation_key(r))
+                .map_err(|error| internal(&error.to_string()))?;
+            work.step()?;
+            Ok(left.zip(right).map(|(left, right)| left.cmp(&right)))
+        }
+        FlatLeaf::Null => {
+            cast::<NullArray>(left)?;
+            cast::<NullArray>(right)?;
+            Ok(None)
+        }
+        FlatLeaf::Boolean => {
+            let left = cast::<BooleanArray>(left)?;
+            let right = cast::<BooleanArray>(right)?;
+            if left.is_null(l) || right.is_null(r) {
+                Ok(None)
+            } else {
+                let order = left.value(l).cmp(&right.value(r));
+                work.step()?;
+                Ok(Some(order))
+            }
+        }
+        FlatLeaf::Int8 => p!(Int8Type),
+        FlatLeaf::Int16 => p!(Int16Type),
+        FlatLeaf::Int32 => p!(Int32Type),
+        FlatLeaf::Int64 => p!(Int64Type),
+        FlatLeaf::UInt8 => p!(UInt8Type),
+        FlatLeaf::UInt16 => p!(UInt16Type),
+        FlatLeaf::UInt32 => p!(UInt32Type),
+        FlatLeaf::UInt64 => p!(UInt64Type),
+        FlatLeaf::Float16 => primitive_order::<Float16Type>(
+            left,
+            l,
+            right,
+            r,
+            |left, right| policy.compare_float(left, right, |value| value.to_f64()),
+            work,
+        ),
+        FlatLeaf::Float32 => primitive_order::<Float32Type>(
+            left,
+            l,
+            right,
+            r,
+            |left, right| policy.compare_float(left, right, f64::from),
+            work,
+        ),
+        FlatLeaf::Float64 => primitive_order::<Float64Type>(
+            left,
+            l,
+            right,
+            r,
+            |left, right| policy.compare_float(left, right, |value| value),
+            work,
+        ),
+        FlatLeaf::Decimal32 => p!(Decimal32Type),
+        FlatLeaf::Decimal64 => p!(Decimal64Type),
+        FlatLeaf::Decimal128 => p!(Decimal128Type),
+        FlatLeaf::Decimal256 => p!(Decimal256Type),
+        FlatLeaf::Date32 => p!(Date32Type),
+        FlatLeaf::Date64 => p!(Date64Type),
+        FlatLeaf::Time32Second => p!(Time32SecondType),
+        FlatLeaf::Time32Millisecond => p!(Time32MillisecondType),
+        FlatLeaf::Time64Microsecond => p!(Time64MicrosecondType),
+        FlatLeaf::Time64Nanosecond => p!(Time64NanosecondType),
+        FlatLeaf::TimestampSecond => p!(TimestampSecondType),
+        FlatLeaf::TimestampMillisecond => p!(TimestampMillisecondType),
+        FlatLeaf::TimestampMicrosecond => p!(TimestampMicrosecondType),
+        FlatLeaf::TimestampNanosecond => p!(TimestampNanosecondType),
+        FlatLeaf::DurationSecond => p!(DurationSecondType),
+        FlatLeaf::DurationMillisecond => p!(DurationMillisecondType),
+        FlatLeaf::DurationMicrosecond => p!(DurationMicrosecondType),
+        FlatLeaf::DurationNanosecond => p!(DurationNanosecondType),
+        FlatLeaf::IntervalYearMonth => p!(IntervalYearMonthType),
+        FlatLeaf::IntervalDayTime => p!(IntervalDayTimeType),
+        FlatLeaf::IntervalMonthDayNano => p!(IntervalMonthDayNanoType),
+        FlatLeaf::Utf8 | FlatLeaf::Char => b!(StringArray, |a, i| a.value(i).as_bytes()),
+        FlatLeaf::LargeUtf8 => b!(LargeStringArray, |a, i| a.value(i).as_bytes()),
+        FlatLeaf::Binary => b!(BinaryArray, |a, i| a.value(i)),
+        FlatLeaf::LargeBinary => b!(LargeBinaryArray, |a, i| a.value(i)),
+        FlatLeaf::FixedSizeBinary => b!(FixedSizeBinaryArray, |a, i| a.value(i)),
+        FlatLeaf::LargeInt => {
+            let left = cast::<FixedSizeBinaryArray>(left)?;
+            let right = cast::<FixedSizeBinaryArray>(right)?;
+            if left.is_null(l) || right.is_null(r) {
+                Ok(None)
+            } else {
+                let l = i128::from_be_bytes(
+                    left.value(l)
+                        .try_into()
+                        .map_err(|_| internal("LARGEINT comparison value is not sixteen bytes"))?,
+                );
+                let r = i128::from_be_bytes(
+                    right
+                        .value(r)
+                        .try_into()
+                        .map_err(|_| internal("LARGEINT comparison value is not sixteen bytes"))?,
+                );
+                let result = l.cmp(&r);
+                work.step()?;
+                Ok(Some(result))
             }
         }
     }
@@ -611,22 +676,22 @@ fn cast<T: Array + 'static>(array: &dyn Array) -> Result<&T, KernelFailure> {
         .downcast_ref::<T>()
         .ok_or_else(|| internal("exact comparison carrier cannot be downcast"))
 }
-fn primitive<T: ArrowPrimitiveType>(
+fn primitive_order<T: ArrowPrimitiveType>(
     left: &dyn Array,
     l: usize,
     right: &dyn Array,
     r: usize,
-    operator: ComparisonOperator,
+    compare: impl FnOnce(T::Native, T::Native) -> Ordering,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<Option<bool>, KernelFailure> {
+) -> Result<Option<Ordering>, KernelFailure> {
     let left = cast::<PrimitiveArray<T>>(left)?;
     let right = cast::<PrimitiveArray<T>>(right)?;
     if left.is_null(l) || right.is_null(r) {
         return Ok(None);
     }
-    let equal = operator.apply(left.value(l).compare(right.value(r)));
+    let order = compare(left.value(l), right.value(r));
     work.step()?;
-    Ok(Some(equal))
+    Ok(Some(order))
 }
 pub(crate) fn ieee_float_comparison<T: PartialOrd>(
     operator: ComparisonOperator,
@@ -677,11 +742,20 @@ fn compare_bytes(
         work.step()?;
         return Ok(operator == ComparisonOperator::Ne);
     }
+    byte_order(left, right, pad_char, work).map(|order| operator.apply(order))
+}
+
+fn byte_order(
+    left: &[u8],
+    right: &[u8],
+    pad_char: bool,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<Ordering, KernelFailure> {
     for (left, right) in left.iter().zip(right) {
         let ordering = left.cmp(right);
         work.step()?;
         if ordering != Ordering::Equal {
-            return Ok(operator.apply(ordering));
+            return Ok(ordering);
         }
     }
     let length_order = left.len().cmp(&right.len());
@@ -695,17 +769,17 @@ fn compare_bytes(
             let ordering = b' '.cmp(&byte);
             work.step()?;
             if ordering != Ordering::Equal {
-                return Ok(operator.apply(if length_order == Ordering::Less {
+                return Ok(if length_order == Ordering::Less {
                     ordering
                 } else {
                     ordering.reverse()
-                }));
+                });
             }
         }
-        return Ok(operator.apply(Ordering::Equal));
+        return Ok(Ordering::Equal);
     }
     work.step()?;
-    Ok(operator.apply(length_order))
+    Ok(length_order)
 }
 
 fn char_declaration(ty: &FunctionValueType) -> Option<novarocks_type_contract::CharacterType> {
@@ -786,3 +860,6 @@ fn checked_row(
 
 mod nullsafe;
 pub use nullsafe::PreparedNullSafeComparisonRecipe;
+
+mod extrema;
+pub(crate) use extrema::ExtremaOrder;

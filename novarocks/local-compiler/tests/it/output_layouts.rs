@@ -293,6 +293,11 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
                     .clone(),
             )
             .unwrap();
+        let implementation = if name == "round" {
+            "selected-v2"
+        } else {
+            "selected-v1"
+        };
         for overload in overloads {
             manifest.push(InstalledPureKernel {
                 function: FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap(),
@@ -303,7 +308,7 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
                     ))
                     .unwrap(),
                     implementation: PureImplementationId::try_new(format!(
-                        "builtin.scalar/{name}/selected-v1"
+                        "builtin.scalar/{name}/{implementation}"
                     ))
                     .unwrap(),
                     abi,

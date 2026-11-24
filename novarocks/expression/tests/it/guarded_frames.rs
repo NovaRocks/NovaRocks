@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::{Array, Decimal128Array, Float64Array};
+use arrow::array::{Array, Decimal128Array, Int64Array};
 use novarocks_expression::{
     CompiledExpressionInstance, EvaluationInput, ExprEvaluationFailure,
     testkit::{
         CallbackControl, PassThroughCallHost, callback_causes,
         frame_fixtures::{
             Control, FrameFixture,
-            guarded::{SEED_1_FIRST, SEED_42, Shape, batch, decimal_batch, program},
+            guarded::{Shape, batch, decimal_batch, program},
         },
     },
 };
@@ -47,7 +47,7 @@ fn nested_if_coalesce_maps_sparse_original_rows_and_constant_versus_column_rng()
             Some(true),
             None,
         ],
-        vec![Some(42), Some(1), None, Some(99), Some(42), None],
+        vec![Some(0), Some(1), None, Some(0), Some(0), None],
     );
     let rows = [1, 3, 5];
     let selection = Selection::try_sparse(6, &rows).unwrap();
@@ -69,15 +69,9 @@ fn nested_if_coalesce_maps_sparse_original_rows_and_constant_versus_column_rng()
     let values = output
         .values()
         .as_any()
-        .downcast_ref::<Float64Array>()
+        .downcast_ref::<Int64Array>()
         .unwrap();
-    assert_eq!(
-        values
-            .iter()
-            .map(|v| v.unwrap().to_bits())
-            .collect::<Vec<_>>(),
-        vec![SEED_1_FIRST, SEED_42[0], SEED_42[1]]
-    );
+    assert_eq!(values.iter().collect::<Vec<_>>(), vec![Some(0); 3]);
     let next = batch(
         &program,
         vec![Some(true), Some(false), None],
@@ -98,15 +92,9 @@ fn nested_if_coalesce_maps_sparse_original_rows_and_constant_versus_column_rng()
     let values = output
         .values()
         .as_any()
-        .downcast_ref::<Float64Array>()
+        .downcast_ref::<Int64Array>()
         .unwrap();
-    assert_eq!(
-        values
-            .iter()
-            .map(|v| v.unwrap().to_bits())
-            .collect::<Vec<_>>(),
-        vec![SEED_1_FIRST, SEED_42[2], SEED_42[3]]
-    );
+    assert_eq!(values.iter().collect::<Vec<_>>(), vec![Some(0); 3]);
 }
 
 #[test]

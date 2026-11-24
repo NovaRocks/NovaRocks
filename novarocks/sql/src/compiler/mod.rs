@@ -948,6 +948,8 @@ pub enum RootDistributionRequirement {
 /// SQL-relevant session state frozen at statement admission.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqlSessionContext {
+    /// Relation lookup uses these names, including any defaults from admission.
+    /// Caller session expressions consume the original facts in `sql_semantics`.
     pub current_catalog: Option<String>,
     pub current_database: String,
     pub optimizer_settings: SessionOptimizerSettings,
@@ -1479,7 +1481,15 @@ pub fn analyze_mv_refresh_input(
     )?;
     crate::planning::mv::validate_persistable_output(&resolved, &factory)
         .map_err(SqlCompileError::Compilation)?;
-    Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_validated_analysis(resolved, names))
+    let scalar_contracts =
+        crate::planning::mv_persistence::collect_scalar_contracts(&resolved, &control)?;
+    Ok(
+        crate::planning::mv::SqlResolvedMvRefreshInput::from_validated_analysis(
+            resolved,
+            names,
+            scalar_contracts,
+        ),
+    )
 }
 
 /// Compile and render an IMV refresh EXPLAIN request without exposing its

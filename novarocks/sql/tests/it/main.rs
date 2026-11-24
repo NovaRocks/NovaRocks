@@ -25,6 +25,7 @@ mod numeric_negation;
 mod numeric_operators;
 mod prepared_binding;
 mod prepared_description;
+mod root_render_type;
 mod set_operations;
 mod system_relation_visibility;
 mod table_sequence;

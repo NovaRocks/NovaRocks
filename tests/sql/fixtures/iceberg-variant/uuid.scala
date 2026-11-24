@@ -17,6 +17,8 @@
 
 val schema=new Schema(Types.NestedField.required(1,"id",Types.IntegerType.get()),Types.NestedField.optional(2,"k",Types.UUIDType.get()))
 val t=VariantFixture.create(schema)
-VariantFixture.write(t,Seq(Seq[Any](1,java.util.UUID.fromString("f24f9b64-81fa-49d1-b74e-8c09a6e31c56")),Seq[Any](2,null)))
+val key = java.util.UUID.fromString("f24f9b64-81fa-49d1-b74e-8c09a6e31c56")
+VariantFixture.write(t, Seq(Seq[Any](1, key), Seq[Any](2, null)))
+VariantFixture.write(t, Seq(Seq[Any](3, key)))
 VariantFixture.remember(t)
 println("IRU9_UUID_OK")

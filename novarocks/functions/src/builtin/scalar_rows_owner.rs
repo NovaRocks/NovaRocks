@@ -42,6 +42,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Operation {
     AssertTrue,
+    TypeOf,
     Uuid,
     Bar,
     Bucket,
@@ -51,6 +52,7 @@ pub(super) enum Operation {
 pub(super) fn operation(name: &str) -> Option<Operation> {
     Some(match name {
         "assert_true" => Operation::AssertTrue,
+        "typeof" => Operation::TypeOf,
         "uuid" => Operation::Uuid,
         "bar" => Operation::Bar,
         "width_bucket" => Operation::Bucket,
@@ -74,7 +76,9 @@ pub(super) fn effects(operation: Operation) -> FunctionEffectDeclaration {
         },
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: match operation {
-            Operation::Bar | Operation::Bucket => FunctionNullBehavior::Strict,
+            Operation::Bar | Operation::Bucket | Operation::Vector(_) => {
+                FunctionNullBehavior::Strict
+            }
             _ => FunctionNullBehavior::CalledOnNull,
         },
         argument_control: ArgumentControl::Eager,
@@ -97,12 +101,17 @@ pub(super) fn definition(
     resolver: BuiltinScalarResolver,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
     let owner = Arc::new(ScalarRowsOwner::new(name, declaration, resolver)?);
-    FunctionDefinition::try_new_pure_scalar(name, FunctionVisibility::Public, owner).map_err(
-        |error| FunctionCatalogError::InvalidStableIdentity {
+    let visibility = if owner.operation == Operation::AssertTrue {
+        FunctionVisibility::Hidden
+    } else {
+        FunctionVisibility::Public
+    };
+    FunctionDefinition::try_new_pure_scalar(name, visibility, owner).map_err(|error| {
+        FunctionCatalogError::InvalidStableIdentity {
             subject: "builtin scalar row pure owner",
             value: error.to_string().into(),
-        },
-    )
+        }
+    })
 }
 
 pub(super) struct ScalarRowsOwner {
@@ -135,8 +144,10 @@ impl ScalarRowsOwner {
                 value: declaration.function_id().as_str().into(),
             });
         }
-        let implementation =
-            PureImplementationId::try_new(format!("builtin.scalar/{name}/selected-v1"))?;
+        let implementation_version = if operation == Operation::Uuid { 2 } else { 1 };
+        let implementation = PureImplementationId::try_new(format!(
+            "builtin.scalar/{name}/selected-v{implementation_version}"
+        ))?;
         let implementations = declaration
             .overloads()
             .iter()
@@ -307,9 +318,12 @@ impl ScalarKernelInstance for ScalarRowsInstance {
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        use super::{assert_true_owner, synopse_owner::TrinoSynopse, vector_distance_owner};
+        use super::{
+            assert_true_owner, synopse_owner::TrinoSynopse, typeof_owner, vector_distance_owner,
+        };
         match self.0 {
             Operation::AssertTrue => assert_true_owner::evaluate(input, control),
+            Operation::TypeOf => typeof_owner::evaluate(input, control),
             Operation::Vector(operation) => {
                 vector_distance_owner::evaluate(operation, input, control)
             }
@@ -395,12 +409,17 @@ impl ScalarRowsOwner {
             })?;
             let result_type = match self.operation {
                 Operation::AssertTrue => DataType::Boolean,
-                Operation::Uuid | Operation::Bar => DataType::Utf8,
+                Operation::TypeOf | Operation::Bar => DataType::Utf8,
+                Operation::Uuid => DataType::FixedSizeBinary(16),
                 Operation::Bucket => DataType::Int64,
                 Operation::Vector(_) => DataType::Float64,
             };
-            if contract.result_type().logical_type()
-                != novarocks_type_contract::ValueLogicalType::Physical
+            let result_domain = if self.operation == Operation::Uuid {
+                novarocks_type_contract::ValueLogicalType::Uuid
+            } else {
+                novarocks_type_contract::ValueLogicalType::Physical
+            };
+            if contract.result_type().logical_type() != result_domain
                 || contract.result_type().data_type() != &result_type
             {
                 return Err(invalid(

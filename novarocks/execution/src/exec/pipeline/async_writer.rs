@@ -2729,7 +2729,7 @@ pub(crate) mod tests {
 
     fn compiled_writer_source_loan(provider: bool) {
         use crate::exec::chunk::{record_batch_additional_bytes, record_batch_shared_owner_bytes};
-        use crate::exec::expr::fixtures::{SeedMode, input_chunk, program};
+        use crate::exec::expr::fixtures::{RandArgument, input_chunk, program};
         use crate::exec::operators::compiled_expression::{
             InputAdapterObserver, assert_original_chunk_input,
         };
@@ -2877,7 +2877,7 @@ pub(crate) mod tests {
             }
         }
 
-        let program = program(SeedMode::Input, false);
+        let program = program(RandArgument::Input, false);
         let mut input = input_chunk(&program, vec![Some(42), None, Some(7)]);
         let mut open_request = request();
         open_request.expected_schema = Arc::new(Schema::new(vec![

@@ -1062,7 +1062,6 @@ impl FrontendQuerySession {
             let control = crate::query_execution::planning::sql_compile_control_from_execution(
                 input.request.execution(),
             );
-            let state = self.state.lock().map_err(poisoned_state)?.clone();
             let context = self.service.query_compiler.property_cpu_context(
                 input.request.session().current_database().to_owned(),
                 input.request.execution().sql_semantics().clone(),
@@ -1085,7 +1084,6 @@ impl FrontendQuerySession {
                     super::session_property_computation::complete_prepared_context(
                         parameters,
                         &query,
-                        &state,
                         &context,
                         &argument_source,
                     )
@@ -1300,6 +1298,7 @@ impl FrontendQuerySession {
                     command,
                     request.session().current_catalog(),
                     request.session().current_database(),
+                    request.session().sql_semantics().statement_session(),
                     context.connector_context(),
                 )
                 .map_err(|error| error.with_analysis_source(&source))

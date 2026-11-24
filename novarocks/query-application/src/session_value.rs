@@ -20,7 +20,7 @@ use std::{fmt, sync::Arc};
 
 use crate::session_error::QueryServiceError;
 use novarocks_result_contract::ClientPresentationFamily;
-use novarocks_types::naming::{DEFAULT_CATALOG, normalize_identifier};
+use novarocks_types::naming::normalize_identifier;
 
 /// One validated definition, shared with the statement that uses its text.
 #[derive(Clone, PartialEq, Eq)]
@@ -130,10 +130,7 @@ impl SessionValue {
                 ))
             })
         };
-        let catalog = catalog
-            .map(normalize)
-            .transpose()?
-            .filter(|name| name != DEFAULT_CATALOG);
+        let catalog = catalog.map(normalize).transpose()?;
         let schema = schema.map(normalize).transpose()?;
         let time_zone = time_zone.map(parse_session_header_zone).transpose()?;
         Ok(Self {
@@ -191,6 +188,8 @@ impl From<QueryServiceError> for StatementSessionError {
 
 #[cfg(test)]
 mod tests {
+    use novarocks_types::naming::DEFAULT_CATALOG;
+
     struct NoCatalogAccess;
     impl crate::sql::session::registry::SessionCatalogPropertyPort for NoCatalogAccess {
         fn session_property_catalog(
@@ -301,7 +300,7 @@ mod tests {
         .unwrap();
         assert_eq!(value.catalog.as_deref(), Some("unknown_lake"));
         assert_eq!(value.schema.as_deref(), Some("removed_schema"));
-        assert!(
+        assert_eq!(
             SessionValue::try_new(
                 Some(DEFAULT_CATALOG),
                 None,
@@ -316,8 +315,64 @@ mod tests {
             )
             .unwrap()
             .catalog
-            .is_none()
+            .as_deref(),
+            Some(DEFAULT_CATALOG),
         );
+    }
+
+    #[test]
+    fn statement_session_bindings_preserve_absence_before_lookup_defaults() {
+        use crate::session_effects::SessionEffects;
+        use crate::sql::session::{SessionSqlState, registry::SessionPropertyRegistry};
+        use novarocks_types::naming::DEFAULT_DATABASE;
+        use std::sync::Arc;
+
+        let registry = SessionPropertyRegistry::new().unwrap();
+        let presentation =
+            ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
+                parametric_datetime: true,
+                parametric_interval: false,
+                variant: true,
+                variant_binary: true,
+            });
+        for (catalog, schema) in [
+            (None, None),
+            (Some("lake"), None),
+            (Some("lake"), Some("calling")),
+            (Some(DEFAULT_CATALOG), Some(DEFAULT_DATABASE)),
+        ] {
+            let value = SessionValue::try_new(catalog, schema, vec![], None, presentation).unwrap();
+            let mut state = SessionSqlState::from_session_value(value, &registry, &NoCatalogAccess)
+                .unwrap()
+                .with_client_principal(Arc::from("Caller"));
+            let (lookup_catalog, lookup_db, _, _, semantics, _) =
+                state.clone().into_query_attempt_inputs();
+            assert_eq!(
+                lookup_catalog.as_deref(),
+                catalog.filter(|name| *name != DEFAULT_CATALOG)
+            );
+            assert_eq!(lookup_db, schema.unwrap_or(DEFAULT_DATABASE));
+            let old = semantics.statement_session().unwrap();
+            assert_eq!(old.principal(), "Caller");
+            assert_eq!(old.catalog(), catalog);
+            assert_eq!(old.schema(), schema);
+
+            state
+                .apply_effects(&SessionEffects::set_catalog_schema(
+                    None,
+                    "after_use".into(),
+                ))
+                .unwrap();
+            let (lookup_catalog, lookup_db, _, _, semantics, _) = state.into_query_attempt_inputs();
+            assert!(lookup_catalog.is_none());
+            assert_eq!(lookup_db, "after_use");
+            let next = semantics.statement_session().unwrap();
+            assert_eq!(next.principal(), "Caller");
+            assert_eq!(next.catalog(), Some(DEFAULT_CATALOG));
+            assert_eq!(next.schema(), Some("after_use"));
+            assert_eq!(old.catalog(), catalog);
+            assert_eq!(old.schema(), schema);
+        }
     }
 
     #[test]

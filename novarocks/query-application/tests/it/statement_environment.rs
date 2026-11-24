@@ -19,10 +19,16 @@ use novarocks_query_application::{
     api::BackendTopologySnapshot,
     cancellation::{QueryCancellationReason, QueryCancellationSource},
 };
-use novarocks_sql::{compiler::SessionOptimizerSettings, sql_mode::SqlSemanticSettings};
+use novarocks_sql::{
+    compiler::SessionOptimizerSettings,
+    sql_mode::{SqlSemanticSettings, StatementSessionEnvironment},
+};
 use novarocks_type_contract::{StatementStartUtc, StatementTimeEnvironment, TimeZoneKey};
 use novarocks_types::ClusterRole;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[test]
 fn statement_environment_survives_initial_admission_and_later_topology_rounds() {
@@ -32,7 +38,10 @@ fn statement_environment_survives_initial_admission_and_later_topology_rounds() 
     };
     let cancellation = QueryCancellationSource::new();
     let deadline = Some(Instant::now() + Duration::from_secs(30));
-    let settings = SqlSemanticSettings::default().with_statement_time(environment);
+    let caller = StatementSessionEnvironment::new(Arc::from("alice"), Some("iceberg".into()), None);
+    let settings = SqlSemanticSettings::default()
+        .with_statement_time(environment)
+        .with_statement_session(Some(caller.clone()));
     let initial = RequestContext::admit(RequestAdmission::new(
         None,
         "db".into(),
@@ -70,6 +79,14 @@ fn statement_environment_survives_initial_admission_and_later_topology_rounds() 
         assert_eq!(
             context.execution().sql_semantics().statement_time(),
             Some(environment)
+        );
+        assert_eq!(
+            context.session().sql_semantics().statement_session(),
+            Some(&caller)
+        );
+        assert_eq!(
+            context.execution().sql_semantics().statement_session(),
+            Some(&caller)
         );
     }
 }

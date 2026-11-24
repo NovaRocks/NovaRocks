@@ -283,7 +283,7 @@ impl Parser<'_> {
                 }
             }
             "unknown" | "boolean" | "tinyint" | "smallint" | "integer" | "bigint" | "real"
-            | "double" | "varbinary" | "date" | "json" | "variant" => {}
+            | "double" | "varbinary" | "uuid" | "date" | "json" | "variant" => {}
             _ => bail!("unsupported Trino type: {name}"),
         }
         signature.validate()?;

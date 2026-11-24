@@ -334,6 +334,7 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
+- [ADR-0263](ADR-0263-trino-scalar-values-and-publication-eligibility.md) — Trino 标量定型、UUID 呈现与受影响 MV 的发布资格（active）
 - [ADR-0256](ADR-0256-temporal-calls-freeze-overloads-and-selected-row-effects.md) — 时态调用如何冻结重载、环境和选中行错误，并以实际发布验值完成 MV 切换（active）
 
 - [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — 聚合所选重载如何贯穿原行更新、状态交换和实际物化发布（active）
@@ -406,6 +407,7 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 
 ### map-semantics
 
+- [ADR-0263](ADR-0263-trino-scalar-values-and-publication-eligibility.md) — Trino 标量定型、UUID 呈现与受影响 MV 的发布资格（active）
 领域哲学：Map 键域在构造时成立，不能由写出路径或运行时字段放宽来补救。非空且唯一是值语义；构造拒绝与具有明确优先级的合并分开，唯一性复用 GROUP BY 规范键等价。实施覆盖必须如实记录，局部入口的校验不代表所有生产者已经收敛。
 
 - [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — MAP 聚合空结果、所选状态以及已发布聚合语义的准入（active）

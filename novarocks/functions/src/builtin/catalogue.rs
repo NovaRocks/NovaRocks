@@ -1070,25 +1070,6 @@ fn scalar_result_nullable_from_types(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<bool, FunctionBindingError> {
     Ok(match name {
-        // POSITIVE uses the math output conversion, which turns non-finite
-        // Float32/Float64 values into SQL NULL. Only admitted signed integers
-        // and decimals prove a finite Float64 result for every non-NULL value.
-        "positive" => match first_value {
-            Some(value_type)
-                if value_type.logical_type() == ValueLogicalType::Physical
-                    && matches!(
-                        value_type.data_type(),
-                        DataType::Int8
-                            | DataType::Int16
-                            | DataType::Int32
-                            | DataType::Int64
-                            | DataType::Decimal128(_, _)
-                    ) =>
-            {
-                value_type.nullable()
-            }
-            _ => true,
-        },
         // Invalid JSON and integer negation overflow are required Data failures.
         "__json_canonical_key" | super::negation_owner::NAME => {
             first_value.is_some_and(FunctionValueType::nullable)
@@ -1106,6 +1087,7 @@ fn scalar_result_nullable_from_types(
         // FIELD returns zero for NULL or absence, and a non-NULL first-match index otherwise.
         // A NULL predicate fails the assertion; successful evaluations are true.
         "assert_true"
+        | "typeof"
         | "mv_group_row_id"
         | "state_all_zero"
         | "count_state_visible"
@@ -1174,6 +1156,32 @@ const TOTAL_SCALAR_FUNCTIONS: &[&str] = &[
     // error here, not a null.
     "abs",
     "sign",
+    "ceil",
+    "ceiling",
+    "floor",
+    "log",
+    "ln",
+    "log2",
+    "log10",
+    "sqrt",
+    "cbrt",
+    "exp",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "radians",
+    "degrees",
+    "pow",
+    "power",
+    "pi",
+    "e",
+    "rand",
+    "random",
+    "euclidean_distance",
     // Measuring a string cannot fail.
     "length",
     "bar",
@@ -1491,8 +1499,9 @@ impl BuiltinScalarResolver {
         // This declared ARRAY shape has no executable owner yet. Its
         // signature is selected by the public resolver, but never enters the
         // pure attachment that contains the installed VARCHAR overload.
-        if self.canonical_name.as_ref() == "reverse"
-            && matches!(resolved.return_type.data_type(), DataType::List(_))
+        if matches!(self.canonical_name.as_ref(), "cosh" | "sinh" | "tanh")
+            || (self.canonical_name.as_ref() == "reverse"
+                && matches!(resolved.return_type.data_type(), DataType::List(_)))
         {
             return Err(FunctionBindingError::UnavailableImplementation(
                 self.overloads[index].clone(),
@@ -1875,6 +1884,7 @@ const DYNAMIC_SCALAR_FUNCTIONS: &[&str] = &[
     "zip",
     "greatest",
     "least",
+    "nullif",
     "map",
     "map_concat",
     "map_entries",
@@ -2327,14 +2337,6 @@ fn bind_dynamic_scalar_result_with_creation<H>(
             borrow_creator(&mut creation),
         );
     }
-    if matches!(name, "round" | "truncate") {
-        return super::rounding_binding::bind_result_with_creation(
-            name,
-            request,
-            work,
-            borrow_creator(&mut creation),
-        );
-    }
     if function_id.as_str() == "builtin.scalar/__array_literal/v1" {
         let arguments = dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
         return with_binding_creation(borrow_creator(&mut creation), work, |cx| {
@@ -2548,33 +2550,6 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                 work,
                 borrow_creator(&mut creation),
             )?;
-        }
-        "greatest" | "least" => {
-            let values =
-                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
-            if !observed_all(
-                values.iter().copied(),
-                |value| value.value_type().temporal().is_none(),
-                work,
-            )? {
-                full_result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                    cx.value(DataType::Null, true, ValueLogicalType::Physical)
-                })?;
-                for value in values {
-                    work.step()?;
-                    full_result =
-                        with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                            cx.trino_common(&full_result, value)
-                        })?
-                        .ok_or(FunctionBindingError::NoMatchingOverload)?;
-                }
-            } else {
-                full_result = fold_value_types_with_creation(
-                    values.into_iter(),
-                    work,
-                    borrow_creator(&mut creation),
-                )?;
-            }
         }
         "map_concat" => {
             let arguments =
@@ -2792,13 +2767,122 @@ impl BuiltinDynamicScalarResolver {
         work: &mut CompileCheckpoints<'_>,
         mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
     ) -> Result<FunctionBindingSelection, FunctionBindingCreationFailure<H>> {
-        if !matches!(self.canonical_name.as_ref(), "round" | "truncate") {
-            request_types_with_constants(request, work)?;
-        }
+        request_types_with_constants(request, work)?;
         if request.logical_argument_count != request.arguments.len() {
             return Err(FunctionBindingError::NoMatchingOverload.into());
         }
         let overload = self.overload_for_request(request);
+        if matches!(self.canonical_name.as_ref(), "round" | "truncate") {
+            let (arguments, result) = super::rounding_binding::bind(
+                self.canonical_name.as_ref() == "round",
+                request,
+                work,
+                borrow_creator(&mut creation),
+            )?;
+            let argument_types =
+                with_binding_creation(creation, work, |cx| cx.publish_arguments(arguments))?;
+            return Ok(FunctionBindingSelection {
+                overload: overload.clone(),
+                argument_types,
+                result_type: FunctionResultType::Scalar(result),
+                aggregate: None,
+            });
+        }
+        if super::scalar_extrema_owner::operation(&self.canonical_name) {
+            let sources =
+                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
+            let Some((first, rest)) = sources.split_first() else {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
+            };
+            let mut result = (*first).clone();
+            for source in rest {
+                work.step()?;
+                result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                    cx.trino_common(&result, source)
+                })?
+                .ok_or(FunctionBindingError::NoMatchingOverload)?;
+            }
+            if !crate::comparison::ExtremaOrder::supports(
+                result.value_type(),
+                result.data_type(),
+                || work.step(),
+            )? {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
+            }
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.collected_vec::<FunctionArgumentType>(sources.len())
+            })?;
+            let mut targets = Vec::with_capacity(sources.len());
+            for source in sources {
+                work.step()?;
+                let ty = dynamic_nullable(
+                    &result,
+                    source.nullable() || source.data_type() == &DataType::Null,
+                    work,
+                    borrow_creator(&mut creation),
+                )?;
+                targets.push(FunctionArgumentType::Value(ty));
+            }
+            let argument_types =
+                with_binding_creation(creation, work, |cx| cx.publish_arguments(targets))?;
+            return Ok(FunctionBindingSelection {
+                overload: overload.clone(),
+                argument_types,
+                result_type: FunctionResultType::Scalar(result),
+                aggregate: None,
+            });
+        }
+        if self.canonical_name.as_ref() == "nullif" {
+            let [
+                FunctionArgument::Value {
+                    value_type: left, ..
+                },
+                FunctionArgument::Value {
+                    value_type: right, ..
+                },
+            ] = request.arguments
+            else {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
+            };
+            let common = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.trino_common(left, right)
+            })?
+            .ok_or(FunctionBindingError::NoMatchingOverload)?;
+            let left_comparison = dynamic_nullable(
+                &common,
+                left.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
+            let right = dynamic_nullable(
+                &common,
+                right.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
+            work.flush()?;
+            super::operator_kernel::comparison_recipe(
+                novarocks_type_contract::OperatorFunction::Equal,
+                [&left_comparison, &right],
+                work.control(),
+            )?;
+            let result = dynamic_nullable(left, true, work, borrow_creator(&mut creation))?;
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.array::<FunctionArgumentType>(2)
+            })?;
+            let argument_types = with_binding_creation(creation, work, |cx| {
+                cx.publish_arguments(vec![
+                    FunctionArgumentType::Value(left.clone()),
+                    FunctionArgumentType::Value(right),
+                ])
+            })?;
+            return Ok(FunctionBindingSelection {
+                overload: overload.clone(),
+                argument_types,
+                result_type: FunctionResultType::Scalar(result),
+                aggregate: None,
+            });
+        }
         let result = bind_dynamic_scalar_result_with_creation(
             &self.function_id,
             overload,
@@ -2836,32 +2920,6 @@ impl BuiltinDynamicScalarResolver {
                         .map_err(super::scalar_construction::binding_owner_failure)
                     })?;
                     work.step()?;
-                    Ok(FunctionArgumentType::Value(target))
-                })
-                .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?
-        } else if super::scalar_extrema_owner::operation(&self.canonical_name)
-            && (result.value_type().temporal().is_some() || *result.data_type() == DataType::Date32)
-        {
-            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                cx.collected_vec::<FunctionArgumentType>(request.arguments.len())
-            })?;
-            request
-                .arguments
-                .iter()
-                .map(|argument| {
-                    let FunctionArgument::Value {
-                        value_type: source, ..
-                    } = argument
-                    else {
-                        return Err(FunctionBindingError::NoMatchingOverload.into());
-                    };
-                    work.step()?;
-                    let target = dynamic_nullable(
-                        &result,
-                        source.nullable(),
-                        work,
-                        borrow_creator(&mut creation),
-                    )?;
                     Ok(FunctionArgumentType::Value(target))
                 })
                 .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?
@@ -3003,12 +3061,11 @@ fn scalar_overload_effects(
         name if super::window_offset_owner::operation(name).is_some() => {
             Some(super::window_offset_owner::effects())
         }
-        "abs" => Some(super::abs_owner::effects()),
+        "abs" => Some(super::abs_owner::effects(signature)),
         super::negation_owner::NAME => super::negation_owner::effects(signature),
         name if super::scalar_rows_owner::operation(name).is_some() => {
             super::scalar_rows_owner::operation(name).map(super::scalar_rows_owner::effects)
         }
-        "nullif" => Some(super::nullif_owner::effects()),
         name if super::control_owner::operation(name).is_some() => {
             Some(super::control_owner::effects(
                 super::control_owner::operation(name).expect("matched control operation"),
@@ -3079,25 +3136,23 @@ fn scalar_overload_effects(
             Some(super::collection_cardinality_owner::effects())
         }
         "reverse" => Some(super::string_reverse_owner::effects()),
-        "dround" => Some(super::dround_owner::effects()),
         name if super::bit_shift_owner::operation(name).is_some() => {
             Some(super::bit_shift_owner::effects())
         }
         name if super::bitwise_owner::operation(name).is_some() => {
             Some(super::bitwise_owner::effects())
         }
-        "rand" | "random" => Some(super::rand_owner::effects()),
+        "rand" | "random" => Some(super::rand_owner::effects(!signature.starts_with("()"))),
         "sleep" => Some(super::sleep_owner::effects()),
         name if super::numeric_elementary_owner::is_installed(name) => {
             Some(super::numeric_elementary_owner::effects())
         }
-        name if super::numeric_mod_owner::operation(name).is_some() => {
-            Some(super::numeric_mod_owner::effects())
-        }
         name if super::numeric_binary_owner::operation(name).is_some() => {
             Some(super::numeric_binary_owner::effects())
         }
-        name if super::numeric_unary_owner::operation(name).is_some() => {
+        name if super::numeric_unary_owner::operation(name).is_some()
+            || matches!(name, "cosh" | "sinh" | "tanh") =>
+        {
             Some(super::numeric_unary_owner::effects())
         }
         _ => None,
@@ -3182,6 +3237,8 @@ pub(super) fn dynamic_definition_parts(
         })?;
     let overload_identity = if name == "map" {
         "builtin.scalar/map/array-keys-array-values-v1".to_string()
+    } else if super::scalar_extrema_owner::operation(name) || name == "nullif" {
+        format!("builtin.scalar/{name}/dynamic-v2")
     } else {
         format!("builtin.scalar/{name}/dynamic-v1")
     };
@@ -3205,6 +3262,7 @@ pub(super) fn dynamic_definition_parts(
         "__array_literal" => Some(super::array_literal_owner::effects()),
         "truncate" => Some(super::truncate_owner::effects()),
         "round" => Some(super::round_owner::effects()),
+        "nullif" => Some(super::nullif_owner::effects()),
         name if super::scalar_extrema_owner::operation(name) => {
             Some(super::scalar_extrema_owner::effects())
         }
@@ -3217,6 +3275,7 @@ pub(super) fn dynamic_definition_parts(
         "map_entries" => &[("map(K,V)", "array(row(K,V))")],
         "greatest" | "least" => &[("T...", "T")],
         "round" | "truncate" => super::rounding_binding::public_signatures(name),
+        "nullif" => &[("T, T", "T")],
         _ => &[],
     };
     let overload_declaration = if let Some(effects) = pure_effects {
@@ -3344,6 +3403,7 @@ pub fn contribute_builtin_functions(
             builder.register(super::binary_operator_owner::definition(operator)?)?;
         }
     }
+    builder.register(super::binary_operator_owner::modulus_definition()?)?;
     super::collection_lambda::register(builder)?;
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         let (declaration, resolver) = dynamic_definition_parts(name)?;
@@ -3357,6 +3417,7 @@ pub fn contribute_builtin_functions(
             }
             "truncate" => super::truncate_owner::definition(declaration, resolver)?,
             "round" => super::round_owner::definition(declaration, resolver)?,
+            "nullif" => super::nullif_owner::definition(declaration, resolver)?,
             name if super::scalar_extrema_owner::operation(name) => {
                 super::scalar_extrema_owner::definition(name, declaration, resolver)?
             }
@@ -3378,6 +3439,11 @@ pub fn contribute_builtin_functions(
         let kind = match builtin_disposition(&name) {
             Some(BuiltinDisposition::InstalledScalar(_)) => FunctionKind::Scalar,
             Some(BuiltinDisposition::WindowBoundary) => FunctionKind::Window,
+            Some(BuiltinDisposition::Unavailable)
+                if matches!(name.as_str(), "cosh" | "sinh" | "tanh") =>
+            {
+                FunctionKind::Scalar
+            }
             Some(
                 BuiltinDisposition::AggregateBoundary
                 | BuiltinDisposition::LoweredOnly
@@ -3438,7 +3504,6 @@ pub fn contribute_builtin_functions(
             name if super::scalar_rows_owner::operation(name).is_some() => {
                 super::scalar_rows_owner::definition(name, declaration, resolver)?
             }
-            "nullif" => super::nullif_owner::definition(&name, declaration, resolver)?,
             name if super::control_owner::operation(name).is_some() => {
                 super::control_owner::definition(name, declaration, resolver)?
             }
@@ -3511,7 +3576,6 @@ pub fn contribute_builtin_functions(
             name if super::string_reverse_owner::operation(name).is_some() => {
                 super::string_reverse_owner::definition(name, declaration, resolver)?
             }
-            "dround" => super::dround_owner::definition(declaration, resolver)?,
             name if super::bit_shift_owner::operation(name).is_some() => {
                 super::bit_shift_owner::definition(name, declaration, resolver)?
             }
@@ -3522,9 +3586,6 @@ pub fn contribute_builtin_functions(
             "sleep" => super::sleep_owner::definition(declaration, resolver)?,
             name if super::numeric_elementary_owner::is_installed(name) => {
                 super::numeric_elementary_owner::definition(name, declaration, resolver)?
-            }
-            name if super::numeric_mod_owner::operation(name).is_some() => {
-                super::numeric_mod_owner::definition(name, declaration, resolver)?
             }
             name if super::numeric_binary_owner::operation(name).is_some() => {
                 super::numeric_binary_owner::definition(name, declaration, resolver)?
@@ -4014,42 +4075,6 @@ mod tests {
     }
 
     #[test]
-    fn positive_result_nullability_preserves_nonfinite_float_and_total_numeric_domains() {
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        for data_type in [DataType::Float32, DataType::Float64] {
-            for nullable in [false, true] {
-                let arguments = [value_argument(data_type.clone(), nullable, None)];
-                let selected = resolve_exact_scalar(&catalog, "positive", &arguments);
-                assert_eq!(
-                    scalar_result(&selected).data_type().clone(),
-                    DataType::Float64
-                );
-                assert!(scalar_result(&selected).nullable());
-            }
-        }
-        for data_type in [
-            DataType::Int8,
-            DataType::Int16,
-            DataType::Int32,
-            DataType::Int64,
-            DataType::Decimal128(38, -2),
-        ] {
-            for nullable in [false, true] {
-                let arguments = [value_argument(data_type.clone(), nullable, None)];
-                let selected = resolve_exact_scalar(&catalog, "positive", &arguments);
-                assert_eq!(
-                    scalar_result(&selected).data_type().clone(),
-                    DataType::Float64
-                );
-                assert_eq!(scalar_result(&selected).nullable(), nullable);
-            }
-        }
-        let float = [value_argument(DataType::Float64, false, None)];
-        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "abs", &float)).nullable());
-        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "sign", &float)).nullable());
-    }
-
-    #[test]
     fn exact_scalar_nullability_is_owned_by_the_binding() {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
         let nonnull = [value_argument(DataType::Int64, false, None)];
@@ -4130,15 +4155,15 @@ mod tests {
             &[
                 value_argument(DataType::Decimal128(18, 6), false, None),
                 value_argument(
-                    DataType::Int64,
+                    DataType::Int32,
                     false,
-                    Some(constant_binding_tests::i64(2, false)),
+                    Some(constant_binding_tests::i32(2, false)),
                 ),
             ],
         );
         assert_eq!(
             scalar_result(&rounded).data_type().clone(),
-            DataType::Decimal128(38, 2)
+            DataType::Decimal128(19, 6)
         );
 
         let variant = resolve_exact_scalar(
@@ -4170,78 +4195,137 @@ mod tests {
     }
 
     #[test]
-    fn rounding_catalogue_keeps_actual_source_domains_in_fresh_and_frozen_bindings() {
+    fn rounding_catalogue_selects_only_trino_numeric_types_and_integer_digits() {
         let catalog = build_builtin_engine_function_catalog().unwrap();
-        let encoded = DataType::Dictionary(
-            Box::new(DataType::UInt8),
-            Box::new(DataType::Decimal128(18, 6)),
-        );
-        // Binding follows the decoded value domain. Actual encoded arrays need
-        // explicit BE hydration before these Plain runtime implementations.
         let cases = [
-            (DataType::UInt64, true, false, DataType::Int64),
-            (DataType::Float16, true, false, DataType::Int64),
-            (DataType::Boolean, true, false, DataType::Int64),
-            (DataType::Utf8, true, false, DataType::Int64),
-            (DataType::Decimal256(76, 6), true, false, DataType::Int64),
-            (encoded, true, true, DataType::Decimal128(38, 6)),
-            (DataType::Date32, false, false, DataType::Int64),
-            (DataType::Float32, true, true, DataType::Int64),
-            (DataType::Null, true, true, DataType::Int64),
             (
+                "round",
+                DataType::Int16,
+                Some(DataType::Int16),
+                Some((DataType::Int16, DataType::Int16)),
+            ),
+            (
+                "round",
+                DataType::Float32,
+                None,
+                Some((DataType::Float32, DataType::Float32)),
+            ),
+            ("round", DataType::Float64, Some(DataType::Int64), None),
+            ("round", DataType::Utf8, None, None),
+            (
+                "round",
+                DataType::Null,
+                None,
+                Some((DataType::Int8, DataType::Int8)),
+            ),
+            (
+                "round",
                 DataType::Decimal128(18, 6),
-                true,
-                true,
-                DataType::Decimal128(38, 6),
+                None,
+                Some((DataType::Decimal128(18, 6), DataType::Decimal128(13, 0))),
+            ),
+            (
+                "truncate",
+                DataType::Int32,
+                Some(DataType::Int16),
+                Some((DataType::Decimal128(10, 0), DataType::Decimal128(10, 0))),
+            ),
+            ("truncate", DataType::Float64, Some(DataType::Int32), None),
+            (
+                "truncate",
+                DataType::Float64,
+                None,
+                Some((DataType::Float64, DataType::Float64)),
+            ),
+            (
+                "truncate",
+                DataType::Null,
+                None,
+                Some((DataType::Decimal128(1, 0), DataType::Decimal128(1, 0))),
             ),
         ];
-        for (source, round, truncate, expected) in cases {
-            for (name, admitted) in [("round", round), ("truncate", truncate)] {
-                let arguments = [value_argument(source.clone(), true, None)];
-                let request = FunctionBindingRequest {
-                    expected_result_type: None,
-                    arguments: &arguments,
-                    logical_argument_count: 1,
-                };
-                let result = catalog.resolve_bound_user(
-                    name,
-                    FunctionKind::Scalar,
-                    request,
-                    crate::binding_test_control(),
-                );
-                if !admitted {
-                    assert!(result.is_err(), "{name} must reject {source:?}");
-                    continue;
-                }
-                let binding = result.unwrap();
-                assert_eq!(
-                    scalar_result(&binding),
-                    &FunctionValueType::from_legacy_declared_projection(expected.clone(), true)
-                );
-                assert_eq!(
-                    binding.selected.argument_types.as_ref(),
-                    &[FunctionArgumentType::Value(
-                        FunctionValueType::from_legacy_declared_projection(source.clone(), true,)
-                    )]
-                );
-                catalog
-                    .validate_bound(&binding, request, crate::binding_test_control())
-                    .unwrap();
+        for (name, source, digits, expected) in cases {
+            let mut arguments = vec![value_argument(source, true, None)];
+            if let Some(digits) = digits {
+                arguments.push(value_argument(digits, true, None));
             }
+            let request = FunctionBindingRequest {
+                expected_result_type: None,
+                arguments: &arguments,
+                logical_argument_count: arguments.len(),
+            };
+            let result = catalog.resolve_bound_user(
+                name,
+                FunctionKind::Scalar,
+                request,
+                crate::binding_test_control(),
+            );
+            let Some((formal, expected)) = expected else {
+                assert!(matches!(
+                    result,
+                    Err(FunctionBindingError::NoMatchingOverload)
+                ));
+                continue;
+            };
+            let binding = result.unwrap();
+            assert_eq!(
+                scalar_result(&binding),
+                &FunctionValueType::new(expected, true)
+            );
+            let mut coerced = vec![value_argument(formal, true, None)];
+            if arguments.len() == 2 {
+                coerced.push(value_argument(DataType::Int32, true, None));
+            }
+            let exact_types = coerced
+                .iter()
+                .map(FunctionArgument::argument_type)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                binding.selected.argument_types.as_ref(),
+                exact_types.as_slice()
+            );
+            let control = crate::binding_test_control();
+            if arguments
+                .iter()
+                .map(FunctionArgument::argument_type)
+                .ne(exact_types)
+            {
+                assert!(matches!(
+                    catalog.validate_bound(&binding, request, control),
+                    Err(FunctionBindingError::InvalidBinding(_))
+                ));
+            }
+            let exact_request = FunctionBindingRequest {
+                arguments: &coerced,
+                ..request
+            };
+            let finalized = catalog
+                .select_exact_overload_observed(
+                    &binding.function_id,
+                    binding.kind,
+                    &binding.selected.overload,
+                    exact_request,
+                    control,
+                )
+                .unwrap();
+            assert_eq!(finalized.as_ref(), &binding.selected);
+            catalog
+                .validate_bound(&binding, exact_request, control)
+                .unwrap();
         }
     }
 
     #[test]
     fn rounding_catalogue_has_one_result_author_and_refuses_forged_frozen_scale() {
         let catalog = build_builtin_engine_function_catalog().unwrap();
-        for name in ["round", "truncate"] {
-            for (digits, scale) in [(2, 2), (-1, 0), (128, 0), (256, 0), (258, 2)] {
+        for (name, precision) in [("round", 19), ("truncate", 18)] {
+            for digits in [2, -1, 128, 256, 258] {
                 let arguments = [
                     value_argument(DataType::Decimal128(18, 6), false, None),
                     value_argument(
-                        DataType::Int64,
+                        DataType::Int32,
                         false,
-                        Some(constant_binding_tests::i64(digits, false)),
+                        Some(constant_binding_tests::i32(digits, false)),
                     ),
                 ];
                 let expected_override = FunctionValueType::new(DataType::Int32, false);
@@ -4260,14 +4344,14 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     scalar_result(&binding),
-                    &FunctionValueType::new(DataType::Decimal128(38, scale), true)
+                    &FunctionValueType::new(DataType::Decimal128(precision, 6), false)
                 );
                 catalog
                     .validate_bound(&binding, request, crate::binding_test_control())
                     .unwrap();
                 binding.selected.result_type = FunctionResultType::Scalar(FunctionValueType::new(
-                    DataType::Decimal128(38, 5),
-                    true,
+                    DataType::Decimal128(precision, 5),
+                    false,
                 ));
                 assert!(
                     catalog
@@ -4544,14 +4628,13 @@ mod tests {
     }
 
     #[test]
-    fn abs_exact_bindings_freeze_input_and_promoted_output_widths() {
+    fn abs_exact_bindings_freeze_input_and_result_widths() {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
         for (input, output) in [
-            (DataType::Int8, DataType::Int16),
-            (DataType::Int16, DataType::Int32),
-            (DataType::Int32, DataType::Int64),
-            (DataType::Int64, DataType::FixedSizeBinary(16)),
-            (DataType::FixedSizeBinary(16), DataType::FixedSizeBinary(16)),
+            (DataType::Int8, DataType::Int8),
+            (DataType::Int16, DataType::Int16),
+            (DataType::Int32, DataType::Int32),
+            (DataType::Int64, DataType::Int64),
             (DataType::Float32, DataType::Float32),
             (DataType::Float64, DataType::Float64),
             (DataType::Decimal128(18, 3), DataType::Decimal128(18, 3)),
@@ -4606,7 +4689,7 @@ mod tests {
     }
 
     #[test]
-    fn abs_exact_binding_rejects_a_stale_same_width_integer_result() {
+    fn abs_exact_binding_rejects_a_stale_promoted_integer_result() {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
         for input in [
             DataType::Int8,
@@ -4617,7 +4700,7 @@ mod tests {
             let arguments = [value_argument(input.clone(), true, None)];
             let mut binding = resolve_exact_scalar(&catalog, "abs", &arguments);
             binding.selected.result_type = FunctionResultType::Scalar(
-                FunctionValueType::from_legacy_declared_projection(input, true),
+                FunctionValueType::from_legacy_declared_projection(DataType::Float64, true),
             );
             assert!(
                 catalog
@@ -4631,7 +4714,7 @@ mod tests {
                         crate::binding_test_control()
                     )
                     .is_err(),
-                "a stale same-width result must fail exact catalog validation before encoding"
+                "a stale changed-width result must fail exact catalog validation before encoding"
             );
         }
     }

@@ -241,7 +241,7 @@ impl TypeSignature {
         while let Some(signature) = work.pop() {
             let supported = match signature.raw_type.as_str() {
                 "unknown" | "boolean" | "tinyint" | "smallint" | "integer" | "bigint" | "real"
-                | "double" | "varbinary" | "date" | "json" | "variant" => {
+                | "double" | "varbinary" | "uuid" | "date" | "json" | "variant" => {
                     signature.arguments.is_empty()
                 }
                 "varchar" => matches!(signature.arguments.as_slice(), [] | [A::Long(_)]),

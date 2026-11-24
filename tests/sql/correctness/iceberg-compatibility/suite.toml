@@ -45,6 +45,7 @@ paths = [
     "novarocks/value-arrays/src/hydrate/**",
     "tests/sql/fixtures/iceberg-add-files/**",
     "tests/sql/fixtures/iceberg-variant/generate.scala",
+    "tests/sql/fixtures/iceberg-variant/uuid.scala",
     "tests/sql/fixtures/iceberg-delete-applicability/generate.scala",
     "tests/sql/fixtures/iceberg-delete-applicability/avro.scala",
     "tests/sql/fixtures/iceberg-delete-applicability/row_lineage.scala",

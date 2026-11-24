@@ -1090,7 +1090,8 @@ fn admit_call_protocol(
             call.call_contract().effects().null_behavior == FunctionNullBehavior::ControlDefined
                 && guarded::supports_result(result)
         }
-        (ControlShape::OrderedRegexp, PreparedPureKernel::OrderedRegexp(_)) => {
+        (ControlShape::OrderedRegexp, PreparedPureKernel::OrderedRegexp(_))
+        | (ControlShape::NullIf, PreparedPureKernel::NullIf(_)) => {
             call.call_contract().effects().null_behavior == FunctionNullBehavior::ControlDefined
                 && guarded::supports_result(result)
         }

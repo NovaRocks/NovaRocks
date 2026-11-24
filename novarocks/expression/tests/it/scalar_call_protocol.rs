@@ -16,7 +16,7 @@
 // under the License.
 
 use arrow::{
-    array::{Array, ArrayRef, Date32Array, FixedSizeBinaryArray, Int64Array, StringArray},
+    array::{Array, ArrayRef, Date32Array, Int32Array, Int64Array, StringArray},
     datatypes::Schema,
     record_batch::RecordBatch,
 };
@@ -187,10 +187,10 @@ fn complete_batch(batch: &RecordBatch) -> ScalarInvocationScope<'_> {
 #[test]
 fn profiled_scalar_admits_the_body_with_the_original_requests() {
     let (program, root, batch) = fixture(
-        "bit_shift_left",
+        "bitwise_left_shift",
         vec![
             Arc::new(Int64Array::from(vec![1, 2])),
-            Arc::new(Int64Array::from(vec![2, 1])),
+            Arc::new(Int32Array::from(vec![2, 1])),
         ],
     );
     let use_id = program.root(root).unwrap().use_id;
@@ -334,9 +334,9 @@ fn unprofiled_scalar_only_observes_the_call_start() {
     let value = out
         .values()
         .as_any()
-        .downcast_ref::<FixedSizeBinaryArray>()
-        .expect("BIGINT ABS returns the LARGEINT carrier");
-    assert_eq!(value.value(0), 5_i128.to_be_bytes());
+        .downcast_ref::<Int64Array>()
+        .expect("BIGINT ABS retains the BIGINT carrier");
+    assert_eq!(value.value(0), 5);
     assert_eq!(host.events, vec![Event::Begin]);
 }
 

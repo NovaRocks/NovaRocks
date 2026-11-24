@@ -693,12 +693,9 @@ fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly()
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let scope = ctx.new_scope();
-    for (sql, type_name) in [
-        ("SELECT ROW(7)", "struct<col1 int>"),
-        (
-            "SELECT ROW(CAST(1.25 AS DECIMAL(5,2)), [1, NULL])",
-            "struct<col1 decimal128(5, 2), col2 array<int>>",
-        ),
+    for sql in [
+        "SELECT ROW(7)",
+        "SELECT ROW(CAST(1.25 AS DECIMAL(5,2)), [1, NULL])",
     ] {
         let parsed = query(sql);
         let ast::Expr::Row(row) = projection(&parsed) else {
@@ -774,10 +771,10 @@ fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly()
             inspected.value_type,
             novarocks_functions::FunctionValueType::new(DataType::Utf8, false)
         );
-        assert!(matches!(
-            inspected.kind,
-            ExprKind::Literal(crate::analysis::LiteralValue::String(value)) if value == type_name
-        ));
+        let ExprKind::FunctionCall { args, .. } = inspected.kind else {
+            panic!("typeof retains its row argument");
+        };
+        same_typed(&args[0], &actual, &control);
     }
     let names = ctx
         .analyze_query(&query("SELECT ROW(7), map(), ROW(7) AS Kept"))

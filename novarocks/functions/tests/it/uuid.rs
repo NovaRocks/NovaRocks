@@ -17,13 +17,13 @@
 
 use std::collections::HashSet;
 
-use arrow_array::StringArray;
+use arrow_array::FixedSizeBinaryArray;
 use novarocks_functions::Selection;
 
 use super::scalar_rows::{Control, prepare};
 
 #[test]
-fn uuid_produces_fresh_v4_text_across_rows_and_batches() {
+fn uuid_produces_fresh_v4_bytes_across_rows_and_batches() {
     let mut instance = prepare("uuid", &[]);
     let mut seen = HashSet::new();
     for _ in 0..2 {
@@ -31,21 +31,13 @@ fn uuid_produces_fresh_v4_text_across_rows_and_batches() {
         let uuids = output
             .values()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<FixedSizeBinaryArray>()
             .unwrap();
         for uuid in uuids.iter().map(Option::unwrap) {
-            let bytes = uuid.as_bytes();
-            assert_eq!(bytes.len(), 36);
-            for (index, byte) in bytes.iter().copied().enumerate() {
-                if matches!(index, 8 | 13 | 18 | 23) {
-                    assert_eq!(byte, b'-');
-                } else {
-                    assert!(byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-                }
-            }
-            assert_eq!(bytes[14], b'4');
-            assert!(matches!(bytes[19], b'8' | b'9' | b'a' | b'b'));
-            assert!(seen.insert(uuid.to_owned()));
+            let bytes: [u8; 16] = uuid.try_into().unwrap();
+            assert_eq!(bytes[6] >> 4, 4);
+            assert_eq!(bytes[8] >> 6, 2);
+            assert!(seen.insert(bytes));
         }
     }
 }

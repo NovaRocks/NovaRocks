@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Seeded RAND fixture with the original physical Project, Filter and Limit.
+//! Checked RAND fixture with the original physical Project, Filter and Limit.
 use super::{FixtureControl, options, package_admission};
 use arrow::datatypes::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
@@ -40,13 +40,11 @@ use novarocks_type_contract::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 
-// Frozen independent rand 0.8.5 StdRng seed_from_u64 oracle.
-pub(crate) const SEED_42_FIRST: u64 = 0x3fe0d98eec6444e4;
-
 #[derive(Clone, Copy)]
-pub(crate) enum SeedMode {
+pub(crate) enum RandArgument {
     Input,
     DirectConstant,
+    Unbounded,
 }
 
 fn checked_source(
@@ -104,7 +102,7 @@ fn null_source(
 
 fn package(
     functions: &PureEngineFunctionCatalog,
-    mode: SeedMode,
+    mode: RandArgument,
     twin: bool,
 ) -> Arc<FragmentPackage> {
     package_with_dictionary(functions, mode, twin, false)
@@ -112,35 +110,34 @@ fn package(
 
 fn package_with_dictionary(
     functions: &PureEngineFunctionCatalog,
-    mode: SeedMode,
+    mode: RandArgument,
     twin: bool,
     dictionary: bool,
 ) -> Arc<FragmentPackage> {
-    let seed_type = FunctionValueType::new(DataType::Int64, matches!(mode, SeedMode::Input));
-    let arguments = [FunctionArgument::Value {
-        value_type: seed_type.clone(),
-        constant: if matches!(mode, SeedMode::DirectConstant) {
-            Some(
-                ConstantValue::from_i64(
-                    Arc::new(seed_type.try_to_field("fixture").unwrap()),
-                    seed_type.clone(),
-                    42,
-                    options(1).constants,
-                    CompilePhase::FunctionSpecialization,
-                    &FixtureControl,
-                )
-                .unwrap(),
-            )
-        } else {
-            None
-        },
-    }];
+    let bound_type = FunctionValueType::new(
+        DataType::Int64,
+        !matches!(mode, RandArgument::DirectConstant),
+    );
+    let constant = matches!(mode, RandArgument::DirectConstant).then(|| {
+        ConstantValue::from_i64(
+            Arc::new(bound_type.try_to_field("fixture").unwrap()),
+            bound_type.clone(),
+            1,
+            options(1).constants,
+            CompilePhase::FunctionSpecialization,
+            &FixtureControl,
+        )
+        .unwrap()
+    });
+    let arguments = match mode {
+        RandArgument::Unbounded => Vec::new(),
+        RandArgument::Input | RandArgument::DirectConstant => vec![FunctionArgument::Value {
+            value_type: bound_type.clone(),
+            constant: constant.clone(),
+        }],
+    };
     let mut constants = novarocks_physical_plan::ConstantPools::empty();
-    if let FunctionArgument::Value {
-        constant: Some(value),
-        ..
-    } = &arguments[0]
-    {
+    if let Some(value) = &constant {
         constants
             .insert(
                 novarocks_physical_plan::ConstantPoolId::new(u32::MAX),
@@ -151,7 +148,7 @@ fn package_with_dictionary(
     let owner = ClaimAuthor::with_legacy_binding(
         functions,
         "rand",
-        arguments.to_vec(),
+        arguments,
         ControlShape::Eager,
         None,
         options(1).constants,
@@ -166,7 +163,7 @@ fn package_with_dictionary(
     let filter = NodeId::new(3);
     let second_project = NodeId::new(8);
     let limit = NodeId::new(1);
-    let seed_value = ValueId::new(100);
+    let bound_value = ValueId::new(100);
     let bool_value = ValueId::new(7);
     let sample_value = ValueId::new(200);
     let extra_value = ValueId::new(0);
@@ -185,13 +182,13 @@ fn package_with_dictionary(
             i64_source(&mut constants, &extra_type, 999),
         )
         .unwrap();
-    let seed_expr = builder
+    let bound_expr = builder
         .unit(first_project)
         .unwrap()
         .add(
             None,
-            seed_type.clone(),
-            i64_source(&mut constants, &seed_type, 42),
+            bound_type.clone(),
+            i64_source(&mut constants, &bound_type, 1),
         )
         .unwrap();
     let bool_type = FunctionValueType::new(DataType::Boolean, false);
@@ -206,7 +203,7 @@ fn package_with_dictionary(
         .unwrap();
     let mut first_definitions = vec![
         (extra_value, extra_type, extra_expr),
-        (seed_value, seed_type.clone(), seed_expr),
+        (bound_value, bound_type.clone(), bound_expr),
         (bool_value, bool_type.clone(), bool_expr),
     ];
     if dictionary {
@@ -242,7 +239,7 @@ fn package_with_dictionary(
             })
             .unwrap();
     }
-    // The extra actual output shifts the seed channel to ordinal one. ValueId
+    // The extra actual output shifts the bound channel to ordinal one. ValueId
     // 100 must never become either its ordinal or a local SlotId.
     builder
         .add_project(
@@ -265,33 +262,28 @@ fn package_with_dictionary(
     builder
         .add_filter(filter, first_project, Box::from([predicate]))
         .unwrap();
-    let call_argument = builder
-        .unit(second_project)
-        .unwrap()
-        .add(
-            None,
-            seed_type.clone(),
-            match mode {
-                SeedMode::Input => ExprKind::Value(seed_value),
-                SeedMode::DirectConstant => checked_source(
-                    &mut constants,
-                    match &arguments[0] {
-                        FunctionArgument::Value {
-                            constant: Some(value),
-                            ..
-                        } => value,
-                        _ => panic!("direct seed has its actual request value"),
-                    },
-                ),
-            },
-        )
-        .unwrap();
+    let call_arguments = match mode {
+        RandArgument::Unbounded => vec![],
+        RandArgument::Input | RandArgument::DirectConstant => {
+            let argument = match constant {
+                Some(value) => checked_source(&mut constants, &value),
+                None => ExprKind::Value(bound_value),
+            };
+            vec![
+                builder
+                    .unit(second_project)
+                    .unwrap()
+                    .add(None, bound_type.clone(), argument)
+                    .unwrap(),
+            ]
+        }
+    };
     let mut authors = BTreeMap::new();
     let call = add_call(
         builder.unit(second_project).unwrap(),
         &mut authors,
         owner,
-        vec![call_argument],
+        call_arguments,
     );
     register_call_requests(
         builder.unit(second_project).unwrap(),
@@ -316,12 +308,12 @@ fn package_with_dictionary(
     let identity_a = builder
         .unit(second_project)
         .unwrap()
-        .add(None, seed_type.clone(), ExprKind::Value(seed_value))
+        .add(None, bound_type.clone(), ExprKind::Value(bound_value))
         .unwrap();
     let identity_b = builder
         .unit(second_project)
         .unwrap()
-        .add(None, seed_type.clone(), ExprKind::Value(seed_value))
+        .add(None, bound_type.clone(), ExprKind::Value(bound_value))
         .unwrap();
     let mut project_expressions = vec![(call_root, sample_value)];
     let mut project_output = vec![sample_value];
@@ -355,8 +347,8 @@ fn package_with_dictionary(
         .unwrap()
         .root(identity_b, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
-    project_expressions.extend([(identity_a, seed_value), (identity_b, seed_value)]);
-    project_output.extend([seed_value, seed_value]);
+    project_expressions.extend([(identity_a, bound_value), (identity_b, bound_value)]);
+    project_output.extend([bound_value, bound_value]);
     builder
         .add_project(
             second_project,
@@ -431,18 +423,18 @@ fn package_with_dictionary(
     }
     result_fields.extend([
         ResultField {
-            domain: crate::test_result_domain::result_value_domain(&seed_type),
-            name: "seed_a".into(),
+            domain: crate::test_result_domain::result_value_domain(&bound_type),
+            name: "bound_a".into(),
             alias: None,
-            value: seed_value,
-            ty: seed_type.clone(),
+            value: bound_value,
+            ty: bound_type.clone(),
         },
         ResultField {
-            domain: crate::test_result_domain::result_value_domain(&seed_type),
-            name: "seed_b".into(),
+            domain: crate::test_result_domain::result_value_domain(&bound_type),
+            name: "bound_b".into(),
             alias: None,
-            value: seed_value,
-            ty: seed_type,
+            value: bound_value,
+            ty: bound_type,
         },
     ]);
     let result = ResultPort {
@@ -476,7 +468,7 @@ fn package_with_dictionary(
     )
 }
 
-pub(crate) fn program(mode: SeedMode, twin: bool) -> Arc<LocalProgram> {
+pub(crate) fn program(mode: RandArgument, twin: bool) -> Arc<LocalProgram> {
     let functions = rng_subset();
     let source = package(&functions, mode, twin);
     let providers =

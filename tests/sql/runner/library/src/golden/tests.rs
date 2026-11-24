@@ -77,6 +77,9 @@ fn scalar_cells_have_typed_inverses_and_explicit_nulls() {
     ] {
         check(ty, V::Text(text.to_string()), expected);
     }
+    let uuid = "f24f9b64-81fa-49d1-b74e-8c09a6e31c56";
+    check("uuid", V::Text(uuid.into()), uuid);
+    assert!(parse_cell(&parse_type("uuid").unwrap(), &uuid.to_uppercase()).is_err());
     check("varbinary", V::Binary(vec![0, 255, 128]), "AP+A");
     check("varbinary", V::Binary(vec![]), r#""""#);
     check(

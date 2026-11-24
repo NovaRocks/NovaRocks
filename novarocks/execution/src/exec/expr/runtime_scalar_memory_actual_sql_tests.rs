@@ -30,7 +30,7 @@ use crate::{
     },
 };
 use arrow::{
-    array::{ArrayRef, Int64Array},
+    array::{ArrayRef, Int32Array, Int64Array},
     datatypes::DataType,
     record_batch::RecordBatch,
 };
@@ -46,8 +46,8 @@ use std::sync::Arc;
 #[test]
 fn runtime_scalar_memory_actual_sql_window_target_uses_same_binding() {
     let source = sql_source_with_columns(
-        "SELECT first_value(bit_shift_left(v,c)) OVER () AS r FROM fixture.ndv_null_contract",
-        &[("v", DataType::Int64), ("c", DataType::Int64)],
+        "SELECT first_value(bitwise_left_shift(v,c)) OVER () AS r FROM fixture.ndv_null_contract",
+        &[("v", DataType::Int64), ("c", DataType::Int32)],
     );
     let mut found = None;
     for program in compiler_results(&source, &installed_builtin_owner_catalogue()).into_values() {
@@ -80,7 +80,7 @@ fn runtime_scalar_memory_actual_sql_window_target_uses_same_binding() {
         layout.schema().clone(),
         vec![
             Arc::new(Int64Array::from(vec![Some(7), None, Some(3)])) as ArrayRef,
-            Arc::new(Int64Array::from(vec![1, 1, 1])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![1, 1, 1])) as ArrayRef,
         ],
     )
     .unwrap();
@@ -191,8 +191,8 @@ pub(crate) fn scan_shift_source() -> (
     novarocks_functions::PureEngineFunctionCatalog,
 ) {
     let source = sql_source_with_columns(
-        "SELECT bit_shift_left(v,c) AS r FROM fixture.ndv_null_contract",
-        &[("v", DataType::Int64), ("c", DataType::Int64)],
+        "SELECT bitwise_left_shift(v,c) AS r FROM fixture.ndv_null_contract",
+        &[("v", DataType::Int64), ("c", DataType::Int32)],
     );
     let functions = installed_builtin_owner_catalogue();
     (source, functions)

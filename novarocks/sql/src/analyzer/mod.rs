@@ -7388,12 +7388,8 @@ mod tests {
                 assert_eq!(argument.data_type(), &carrier);
                 assert_eq!(
                     resolved.output_columns[2].value_type.data_type(),
-                    if carrier == DataType::Int32 {
-                        &DataType::Int64
-                    } else {
-                        &DataType::FixedSizeBinary(16)
-                    },
-                    "existing ABS promotion remains unchanged"
+                    &carrier,
+                    "ABS preserves the bound GROUPING width"
                 );
                 assert_eq!(
                     resolved.output_columns[3].value_type.data_type(),

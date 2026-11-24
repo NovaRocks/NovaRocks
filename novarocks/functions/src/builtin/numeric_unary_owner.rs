@@ -39,15 +39,6 @@ use crate::{
 
 use super::numeric_unary::NumericUnaryOp;
 
-#[cfg(test)]
-pub(super) fn names() -> &'static [&'static str] {
-    &[
-        "acos", "asin", "atan", "cbrt", "ceil", "ceiling", "dceil", "cos", "degress", "dlog1",
-        "exp", "dexp", "floor", "dfloor", "ln", "log10", "dlog10", "log2", "radians", "sin",
-        "sqrt", "dsqrt", "tan", "positive",
-    ]
-}
-
 /// This startup mapping covers only the names installed by unary_ops. The
 /// private prepared operation avoids function-name resolution at evaluation.
 pub(super) fn operation(name: &str) -> Option<NumericUnaryOp> {
@@ -57,27 +48,24 @@ pub(super) fn operation(name: &str) -> Option<NumericUnaryOp> {
         "asin" => Asin,
         "atan" => Atan,
         "cbrt" => Cbrt,
-        "ceil" | "ceiling" | "dceil" => Ceil,
+        "ceil" | "ceiling" => Ceil,
         "cos" => Cos,
-        "degress" => Degrees,
-        "dlog1" => Dlog1,
-        "exp" | "dexp" => Exp,
-        "floor" | "dfloor" => Floor,
+        "degrees" => Degrees,
+        "exp" => Exp,
+        "floor" => Floor,
         "ln" => Ln,
-        "log10" | "dlog10" => Log10,
+        "log10" => Log10,
         "log2" => Log2,
         "radians" => Radians,
         "sin" => Sin,
-        "sqrt" | "dsqrt" => Sqrt,
+        "sqrt" => Sqrt,
         "tan" => Tan,
-        "positive" => Positive,
+        "sign" => Sign,
         _ => return None,
     })
 }
 
-/// Valid inputs have the seven existing Physical numeric profiles. Domain and
-/// finite-range failures return successful NULL; malformed calls remain outer
-/// failures. No mutable state or environment authority is retained.
+/// CEIL, FLOOR and SIGN preserve the numeric family; other unary math consumes DOUBLE.
 pub(super) fn effects() -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
@@ -125,7 +113,7 @@ impl NumericUnaryOwner {
         let expected = effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 7
+            || declaration.overloads().len() != if op.preserves_width() { 7 } else { 1 }
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
@@ -396,8 +384,8 @@ impl NumericUnaryOwner {
 mod tests {
     use super::*;
     use crate::{
-        FunctionArgument, FunctionArgumentType, FunctionResultType, FunctionSpecializationFailure,
-        FunctionValueType, ScopedExpressionEffects, specialize_frozen_scalar, specialize_scalar,
+        FunctionArgument, FunctionResultType, FunctionSpecializationFailure, FunctionValueType,
+        ScopedExpressionEffects, specialize_frozen_scalar, specialize_scalar,
     };
     use arrow_schema::DataType;
     use novarocks_type_contract::{
@@ -488,178 +476,9 @@ mod tests {
     }
 
     #[test]
-    fn startup_operation_mapping_covers_exact_installed_names_and_aliases() {
-        assert_eq!(names().len(), 24);
-        let mut operations = Vec::new();
-        for name in names() {
-            let op = operation(name).unwrap();
-            if !operations.contains(&op) {
-                operations.push(op);
-            }
-        }
-        assert_eq!(operations.len(), 18);
-        for (alias, original) in [
-            ("ceiling", "ceil"),
-            ("dceil", "ceil"),
-            ("dfloor", "floor"),
-            ("dexp", "exp"),
-            ("dlog10", "log10"),
-            ("dsqrt", "sqrt"),
-        ] {
-            assert_eq!(operation(alias), operation(original));
-            assert_ne!(
-                owner(alias).declaration.function_id(),
-                owner(original).declaration.function_id()
-            );
-        }
-        for unavailable in [
-            "degrees", "sinh", "cosh", "tanh", "log", "dround", "sign", "negative",
-        ] {
-            assert_eq!(operation(unavailable), None);
-        }
-    }
-
-    #[test]
-    fn whole_production_catalogue_attaches_all_unary_owners_and_168_exact_records() {
-        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
-        let mut total = 0;
-        for name in names() {
-            let owner = owner(name);
-            let definition = catalog
-                .definition_by_id(owner.declaration.function_id())
-                .unwrap();
-            assert!(definition.binding.as_ref().unwrap().pure.is_some());
-            let declaration = definition.binding_declaration().unwrap();
-            assert_eq!(declaration, owner.binding_declaration());
-            assert_eq!(declaration.overloads().len(), 7);
-            assert_eq!(owner.implementation_declarations().len(), 7);
-            for (overload, implementation) in declaration
-                .overloads()
-                .iter()
-                .zip(owner.implementation_declarations())
-            {
-                assert_eq!(implementation.overload, overload.identity);
-                assert_eq!(implementation.abi, PureKernelAbi::ScalarV1);
-                assert_eq!(
-                    implementation.implementation.as_str(),
-                    format!("builtin.scalar/{name}/selected-v1")
-                );
-                assert_eq!(overload.effects.as_ref(), Some(&effects()));
-            }
-            total += owner.implementation_declarations().len();
-        }
-        assert_eq!(total, 168);
-    }
-
-    #[test]
-    fn all_24_names_and_seven_profiles_preserve_full_types_fresh_and_frozen() {
-        let parameters = SemanticParameters::try_new([]).unwrap();
-        let uses = [Some(ExpressionUseId::new(42))];
-        for name in names() {
-            let owner = owner(name);
-            for source in [
-                DataType::Int8,
-                DataType::Int16,
-                DataType::Int32,
-                DataType::Int64,
-                DataType::Float32,
-                DataType::Float64,
-                DataType::Decimal128(38, -3),
-            ] {
-                for nullable in [false, true] {
-                    let source_type = FunctionValueType::from_legacy_declared_projection(
-                        source.clone(),
-                        nullable,
-                    );
-                    let arguments = [argument(source_type.clone())];
-                    let selected = Arc::new(
-                        owner
-                            .resolve(request(&arguments), crate::binding_test_control())
-                            .unwrap(),
-                    );
-                    assert_eq!(
-                        selected.argument_types.as_ref(),
-                        &[FunctionArgumentType::Value(source_type)]
-                    );
-                    let FunctionResultType::Scalar(result) = &selected.result_type else {
-                        panic!("scalar result required")
-                    };
-                    let target = if matches!(
-                        owner.operation,
-                        NumericUnaryOp::Ceil | NumericUnaryOp::Floor
-                    ) {
-                        DataType::Int64
-                    } else {
-                        DataType::Float64
-                    };
-                    assert_eq!(result.data_type().clone(), target);
-                    assert_eq!(result.logical_type(), ValueLogicalType::Physical);
-                    assert_eq!(
-                        result.nullable(),
-                        if *name == "positive"
-                            && !matches!(source, DataType::Float32 | DataType::Float64)
-                        {
-                            nullable
-                        } else {
-                            true
-                        }
-                    );
-                    let input = input(&owner, &selected, &arguments, &parameters, &uses);
-                    let fresh = specialize_scalar(
-                        &owner,
-                        input,
-                        selected.clone(),
-                        ScopedExpressionEffects::pure_value(context()),
-                        crate::binding_test_control(),
-                    )
-                    .unwrap();
-                    let canonical = Arc::clone(fresh.prepared().contract());
-                    let direct = owner
-                        .prepare_scalar(input, canonical.clone(), crate::binding_test_control())
-                        .unwrap();
-                    assert!(Arc::ptr_eq(direct.contract(), &canonical));
-                    assert!(std::ptr::eq(
-                        fresh.prepared().contract().selected(),
-                        selected.as_ref()
-                    ));
-                    let frozen = fresh.prepared().contract().effects().clone();
-                    let be = specialize_frozen_scalar(
-                        &owner,
-                        input,
-                        selected.clone(),
-                        &frozen,
-                        ScopedExpressionEffects::pure_value(context()),
-                        crate::binding_test_control(),
-                    )
-                    .unwrap();
-                    let canonical = Arc::clone(be.prepared().contract());
-                    let direct = owner
-                        .prepare_scalar(input, canonical.clone(), crate::binding_test_control())
-                        .unwrap();
-                    assert!(Arc::ptr_eq(direct.contract(), &canonical));
-                    assert!(std::ptr::eq(
-                        be.prepared().contract().selected(),
-                        selected.as_ref()
-                    ));
-                    assert_eq!(be.prepared().contract().effects(), &frozen);
-                    let instance = be.prepared().create_instance().unwrap();
-                    assert_eq!(
-                        instance.retained_bytes(),
-                        std::mem::size_of::<NumericUnaryInstance>()
-                    );
-                    assert_eq!(
-                        be.prepared().instance_retained_upper_bound(),
-                        instance.retained_bytes()
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn exact_owner_rejects_stale_output_overload_and_foreign_frozen_effects() {
         let owner = owner("sqrt");
-        let arguments = [argument(FunctionValueType::new(DataType::Int8, false))];
+        let arguments = [argument(FunctionValueType::new(DataType::Float64, false))];
         let selected = Arc::new(
             owner
                 .resolve(request(&arguments), crate::binding_test_control())
@@ -667,7 +486,7 @@ mod tests {
         );
         let mut stale = (*selected).clone();
         stale.result_type =
-            FunctionResultType::Scalar(FunctionValueType::new(DataType::Float64, false));
+            FunctionResultType::Scalar(FunctionValueType::new(DataType::Float32, false));
         assert!(
             owner
                 .validate_selected(&stale, request(&arguments), crate::binding_test_control())
@@ -756,7 +575,7 @@ mod tests {
 
     #[test]
     fn preparation_rejects_foreign_context_policy_selected_pointer_and_opaque_sources() {
-        let owner = owner("positive");
+        let owner = owner("sqrt");
         let arguments = [argument(FunctionValueType::new(DataType::Float64, false))];
         let selected = Arc::new(
             owner

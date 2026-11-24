@@ -147,7 +147,8 @@ fn encode_shape(shape: ControlShape) -> wire::ControlShape {
         ControlShape::Coalesce => Some(wire::SimpleControl::Coalesce),
         ControlShape::Try => Some(wire::SimpleControl::Try),
         ControlShape::OrderedRegexp => Some(wire::SimpleControl::OrderedRegexp),
-        ControlShape::Case { .. }
+        ControlShape::NullIf
+        | ControlShape::Case { .. }
         | ControlShape::HigherOrder { .. }
         | ControlShape::TemporalSource(_)
         | ControlShape::Between { .. }
@@ -179,6 +180,11 @@ fn encode_shape(shape: ControlShape) -> wire::ControlShape {
         }),
         (None, ControlShape::Between { negated }) => Kind::BetweenNegated(negated),
         (None, ControlShape::Membership { negated }) => Kind::MembershipNegated(negated),
+        (None, ControlShape::NullIf) => Kind::NullIf(wire::NullIfControl {
+            equality_function: novarocks_type_contract::OperatorFunction::Equal
+                .function_id_text()
+                .into(),
+        }),
         (None, ControlShape::TemporalSource(shape)) => {
             Kind::TemporalSource(encode_temporal_shape(shape))
         }
@@ -210,6 +216,16 @@ fn decode_shape(shape: &wire::ControlShape) -> Result<ControlShape, ControlCodec
         },
         Kind::BetweenNegated(negated) => Ok(ControlShape::Between { negated: *negated }),
         Kind::MembershipNegated(negated) => Ok(ControlShape::Membership { negated: *negated }),
+        Kind::NullIf(plan) => {
+            if plan.equality_function
+                != novarocks_type_contract::OperatorFunction::Equal.function_id_text()
+            {
+                return Err(ControlCodecError::InvalidShape(
+                    "NULLIF requires its exact equality identity",
+                ));
+            }
+            Ok(ControlShape::NullIf)
+        }
         Kind::TemporalSource(value) => {
             decode_temporal_shape(*value).map(ControlShape::TemporalSource)
         }
@@ -231,6 +247,7 @@ fn encode_guard(guard: RegionGuard) -> wire::RegionGuard {
         GuardKind::IfElse => Kind::Simple(wire::SimpleGuard::IfElse as i32),
         GuardKind::CaseElse => Kind::Simple(wire::SimpleGuard::CaseElse as i32),
         GuardKind::TryBody => Kind::Simple(wire::SimpleGuard::TryBody as i32),
+        GuardKind::NullIfAfterLeft => Kind::Simple(wire::SimpleGuard::NullIfAfterLeft as i32),
         GuardKind::LambdaInvocation => Kind::Simple(wire::SimpleGuard::LambdaInvocation as i32),
         GuardKind::CoalesceAfterNull { ordinal } => Kind::CoalesceAfterNullOrdinal(ordinal),
         GuardKind::CaseWhen { arm } => Kind::CaseWhenArm(arm),
@@ -263,6 +280,7 @@ fn decode_guard(guard: &wire::RegionGuard) -> Result<RegionGuard, ControlCodecEr
             Ok(wire::SimpleGuard::IfElse) => GuardKind::IfElse,
             Ok(wire::SimpleGuard::CaseElse) => GuardKind::CaseElse,
             Ok(wire::SimpleGuard::TryBody) => GuardKind::TryBody,
+            Ok(wire::SimpleGuard::NullIfAfterLeft) => GuardKind::NullIfAfterLeft,
             Ok(wire::SimpleGuard::LambdaInvocation) => GuardKind::LambdaInvocation,
             Ok(wire::SimpleGuard::TemporalInvocationNull) => GuardKind::TemporalInvocationNull,
             _ => {

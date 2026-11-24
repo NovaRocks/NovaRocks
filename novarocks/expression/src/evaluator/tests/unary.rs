@@ -15,30 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::evaluator::scalar_invocation::{LeafCallObservation, observe_calls};
 use crate::{
     CompiledExpressionInstance, EvaluationInput,
     testkit::{
         PassThroughCallHost,
         guarded_fixtures::{
-            GUARDED_CONTROL as Control, SEED_42,
+            GUARDED_CONTROL as Control,
             unary::{UnaryCase, booleans, max38, unary_batch, unary_program},
         },
     },
 };
-use arrow::array::{ArrayRef, Float64Array, Int64Array};
+use arrow::array::{ArrayRef, Int64Array};
 use novarocks_functions::{
     EvaluatedArgument, ScalarInvocationActivation, ScalarInvocationScope, Selection,
 };
 use std::sync::Arc;
 
-fn next_actual_rand(evaluator: &mut CompiledExpressionInstance) -> u64 {
+fn next_actual_rand(evaluator: &mut CompiledExpressionInstance) -> i64 {
     let rand = evaluator
         .instances
         .values_mut()
         .find(|instance| instance.contract().function_id().as_str() == "builtin.scalar/rand/v1")
         .unwrap();
-    let seed = Arc::new(Int64Array::from(vec![42])) as ArrayRef;
-    let arguments = [EvaluatedArgument::Scalar(&seed)];
+    let bound = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
+    let arguments = [EvaluatedArgument::Scalar(&bound)];
     let crate::evaluator::scalar_invocation::CallInstance::Kernel(rand) = rand else {
         panic!("actual RAND uses its scalar kernel");
     };
@@ -53,10 +54,9 @@ fn next_actual_rand(evaluator: &mut CompiledExpressionInstance) -> u64 {
     output
         .values()
         .as_any()
-        .downcast_ref::<Float64Array>()
+        .downcast_ref::<Int64Array>()
         .unwrap()
         .value(0)
-        .to_bits()
 }
 fn rand_instances(evaluator: &CompiledExpressionInstance) -> usize {
     evaluator
@@ -87,18 +87,20 @@ fn actual_rand_null_test_state_boundary_promotes_pending_and_skips_failed_parent
     );
     let rows = [2, 4, 6, 8];
     let selection = Selection::try_sparse(9, &rows).unwrap();
-    let output = evaluator
-        .evaluate(
-            EvaluationInput::Batch {
-                batch: &input,
-                source: None,
-            },
-            ScalarInvocationScope::new(selection, selection),
-            ScalarInvocationActivation::Activated,
-            &Control,
-            &mut PassThroughCallHost,
-        )
-        .unwrap();
+    let (output, events) = observe_calls(|| {
+        evaluator
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap()
+    });
     assert_eq!(
         booleans(&output),
         vec![Some(true), Some(true), Some(true), None]
@@ -107,9 +109,16 @@ fn actual_rand_null_test_state_boundary_promotes_pending_and_skips_failed_parent
     assert_eq!(output.errors()[0].selected_ordinal(), 3);
     assert_eq!(output.selection().row(3), Some(8));
     assert_eq!(rand_instances(&evaluator), 1);
-    // Only original rows 2 and 6 reached the same real constant-seed instance.
-    // Original row 4 decided TRUE before RAND; row 8 failed at its boundary.
-    assert_eq!(next_actual_rand(&mut evaluator), SEED_42[2]);
+    // The strict ROUND kernel skips NULL row 4. Row 8 fails before RAND.
+    let domains = events
+        .into_iter()
+        .filter_map(|event| match event {
+            LeafCallObservation::Rows { actual, .. } => Some(actual),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(domains, vec![vec![2, 6, 8], vec![2, 6]]);
+    assert_eq!(next_actual_rand(&mut evaluator), 0);
     let unit = &program.unit;
     let flow = unit.control_flow();
     let root_use = unit.root(program.root).unwrap().use_id;
@@ -163,19 +172,28 @@ fn all_pending_round_errors_stop_before_rand_instantiation_and_do_not_advance_ex
         )
         .unwrap();
     assert_eq!(rand_instances(&evaluator), 1);
-    let output = evaluator
-        .evaluate(
-            EvaluationInput::Batch {
-                batch: &failing,
-                source: None,
-            },
-            ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
-            ScalarInvocationActivation::Activated,
-            &Control,
-            &mut PassThroughCallHost,
-        )
-        .unwrap();
+    let (output, events) = observe_calls(|| {
+        evaluator
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &failing,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap()
+    });
     assert_eq!(output.errors().len(), 2);
-    // One successful parent advanced the instance; both failing batches did not.
-    assert_eq!(next_actual_rand(&mut evaluator), SEED_42[1]);
+    // Only the failing ROUND call reached a leaf on this batch.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, LeafCallObservation::Rows { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(next_actual_rand(&mut evaluator), 0);
 }

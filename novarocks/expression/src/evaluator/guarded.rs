@@ -340,13 +340,17 @@ impl<K> Frame<K> {
         let tracks_remaining = matches!(
             shape,
             ControlShape::Coalesce
+                | ControlShape::NullIf
                 | ControlShape::Conjunction
                 | ControlShape::Disjunction
                 | ControlShape::Case { .. }
         );
         let tracks_choices = matches!(
             shape,
-            ControlShape::If | ControlShape::Coalesce | ControlShape::Case { .. }
+            ControlShape::If
+                | ControlShape::Coalesce
+                | ControlShape::NullIf
+                | ControlShape::Case { .. }
         );
         let mut remaining = Vec::new();
         let mut choices = Vec::new();
@@ -426,7 +430,10 @@ impl<K> Frame<K> {
         if self.next >= arity
             || (matches!(
                 shape,
-                ControlShape::Coalesce | ControlShape::Conjunction | ControlShape::Disjunction
+                ControlShape::Coalesce
+                    | ControlShape::NullIf
+                    | ControlShape::Conjunction
+                    | ControlShape::Disjunction
             ) && self.remaining.is_empty())
         {
             return Ok(None);
@@ -519,7 +526,10 @@ impl<K> Frame<K> {
                     work.step()?;
                 }
             }
-            ControlShape::Coalesce | ControlShape::Conjunction | ControlShape::Disjunction => {
+            ControlShape::Coalesce
+            | ControlShape::NullIf
+            | ControlShape::Conjunction
+            | ControlShape::Disjunction => {
                 for &ordinal in &self.remaining {
                     ordinals.push(ordinal);
                     work.step()?;
@@ -841,6 +851,123 @@ impl<K> Frame<K> {
         work.flush()?;
         Ok(())
     }
+    fn attach_null_if(
+        &mut self,
+        child: Child,
+        prepared: &novarocks_functions::PreparedNullIf,
+        batch_rows: usize,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<(), KernelFailure> {
+        let mut child_rows = Vec::with_capacity(child.ordinals.len());
+        for &ordinal in &child.ordinals {
+            child_rows.push(self.rows[ordinal]);
+            work.step()?;
+        }
+        let selected = Selection::try_sparse_observed(batch_rows, &child_rows, || work.step())?;
+        let child_value = child.value.into_value(selected, work)?;
+        let ty = child_value.argument().array().data_type().clone();
+        let materialized = child_value.materialize(selected, &ty, work)?;
+        if self.children.is_empty() {
+            let mut present = Vec::with_capacity(child.ordinals.len());
+            self.matched.clear();
+            self.remaining.clear();
+            let mut errors = materialized.errors().iter().peekable();
+            for (local, &parent) in child.ordinals.iter().enumerate() {
+                if errors
+                    .peek()
+                    .is_some_and(|error| error.selected_ordinal() == local)
+                {
+                    let error = errors.next().expect("checked NULLIF left journal");
+                    self.errors
+                        .insert(parent, error.with_selected_ordinal(parent));
+                } else if ty != DataType::Null && !materialized.values().is_null(local) {
+                    present.push(local);
+                    self.matched.push(parent);
+                    self.choices[parent] = Some((0, local));
+                }
+                work.step()?;
+            }
+            if !present.is_empty() {
+                let left_rows =
+                    Selection::try_sparse_observed(materialized.values().len(), &present, || {
+                        work.step()
+                    })?;
+                work.flush()?;
+                let converted = prepared.left_cast().evaluate_selected(
+                    EvaluatedArgument::Column(materialized.values()),
+                    left_rows,
+                    &[],
+                    work.control,
+                )?;
+                let mut errors = converted.errors().iter().peekable();
+                for (local, &parent) in self.matched.iter().enumerate() {
+                    if errors
+                        .peek()
+                        .is_some_and(|error| error.selected_ordinal() == local)
+                    {
+                        let error = errors.next().expect("checked NULLIF conversion journal");
+                        self.errors
+                            .insert(parent, error.with_selected_ordinal(parent));
+                        self.choices[parent] = None;
+                    } else {
+                        self.remaining.push(parent);
+                    }
+                    work.step()?;
+                }
+                self.operand = Some(Arc::clone(converted.values()));
+            }
+            self.children.push(Child {
+                ordinals: child.ordinals,
+                value: OwnedValue::from_materialized(materialized),
+            });
+            return Ok(());
+        }
+        let operand = self
+            .operand
+            .as_ref()
+            .ok_or_else(|| invalid("NULLIF comparison has no retained left values"))?;
+        let mut compared = self.matched.iter().enumerate().peekable();
+        let mut errors = materialized.errors().iter().peekable();
+        for (local, &parent) in child.ordinals.iter().enumerate() {
+            while compared
+                .peek()
+                .is_some_and(|(_, candidate)| **candidate < parent)
+            {
+                compared.next();
+                work.step()?;
+            }
+            let (left, _) = compared
+                .next()
+                .filter(|(_, row)| **row == parent)
+                .ok_or_else(|| invalid("NULLIF comparison has a foreign retained row"))?;
+            if errors
+                .peek()
+                .is_some_and(|error| error.selected_ordinal() == local)
+            {
+                let error = errors.next().expect("checked NULLIF right journal");
+                self.errors
+                    .insert(parent, error.with_selected_ordinal(parent));
+                self.choices[parent] = None;
+            } else {
+                work.flush()?;
+                let equal = prepared.equality().compare_rows(
+                    EvaluatedArgument::Column(operand),
+                    left,
+                    left,
+                    EvaluatedArgument::SelectedColumn(&materialized),
+                    local,
+                    self.rows[parent],
+                    work.control,
+                )?;
+                if equal == Some(true) {
+                    self.choices[parent] = None;
+                }
+            }
+            work.step()?;
+        }
+        Ok(())
+    }
+
     fn attach(
         &mut self,
         child: Child,
@@ -852,6 +979,14 @@ impl<K> Frame<K> {
         work: &mut Work<'_, '_, impl Sized>,
         allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     ) -> Result<(), KernelFailure> {
+        if shape == ControlShape::NullIf {
+            let Some(PreparedPureKernel::NullIf(prepared)) = recipes.prepared_call() else {
+                return Err(invalid(
+                    "NULLIF occurrence has no exact prepared comparison",
+                ));
+            };
+            return self.attach_null_if(child, prepared, batch_rows, work);
+        }
         if let ControlShape::Membership { .. } = shape {
             return self.attach_membership(child, recipes, batch_rows, work, allocator);
         }
@@ -1453,6 +1588,14 @@ fn complete_node<'a, R, K: Ord + Clone>(
                         )?)
                     }
                 }
+                PreparedPureKernel::NullIf(_) => assemble(
+                    &frame.children,
+                    &frame.choices,
+                    &mut frame.errors,
+                    result_type.data_type(),
+                    local_selection,
+                    work,
+                )?,
                 PreparedPureKernel::ControlIntrinsic(_)
                     if matches!(shape, ControlShape::TemporalSource(_)) =>
                 {

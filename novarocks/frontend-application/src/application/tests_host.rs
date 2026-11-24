@@ -152,6 +152,7 @@ impl ViewEngine for SessionViewEngine {
                 novarocks_sql::compiler::builtin_sql_function_catalog(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 crate::application::test_constant_policy(),
+                request.statement_session,
             )
             .map(|columns| columns.into_vec())
     }
@@ -172,6 +173,7 @@ fn view_context() -> ViewRequestContext<'static> {
     ViewRequestContext {
         current_catalog: None,
         current_database: "db",
+        statement_session: None,
         connector_context: Some(connector_context),
     }
 }

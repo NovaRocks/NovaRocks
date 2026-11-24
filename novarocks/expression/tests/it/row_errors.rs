@@ -116,11 +116,11 @@ fn nested_round_keeps_required_child_error_and_successful_null_distinct() {
 }
 
 #[test]
-fn eager_rng_child_advances_even_when_parent_strict_digits_are_null() {
+fn eager_rng_child_keeps_row_errors_when_parent_strict_digits_are_null() {
     let program = program(Shape::ObservableSibling);
     let mut parent = instance(&program, 0);
     let mut reference = instance(&program, 1);
-    let null_digits = batch(&program, vec![None; 2], vec![None; 2]);
+    let null_digits = batch(&program, vec![Some(1), Some(-1)], vec![None; 2]);
     let skipped = parent
         .evaluate(
             EvaluationInput::Batch {
@@ -134,21 +134,9 @@ fn eager_rng_child_advances_even_when_parent_strict_digits_are_null() {
         )
         .unwrap();
     assert_eq!(skipped.values().null_count(), 2);
-    assert!(skipped.errors().is_empty());
-    let first_two = reference
-        .evaluate(
-            EvaluationInput::Batch {
-                batch: &null_digits,
-                source: None,
-            },
-            ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
-            ScalarInvocationActivation::Activated,
-            &Control,
-            &mut PassThroughCallHost,
-        )
-        .unwrap();
-    assert_eq!(first_two.values().null_count(), 0);
-    let next = batch(&program, vec![None], vec![Some(15)]);
+    assert_eq!(skipped.errors().len(), 1);
+    assert_eq!(skipped.errors()[0].selected_ordinal(), 1);
+    let next = batch(&program, vec![Some(1)], vec![Some(15)]);
     let actual = parent
         .evaluate(
             EvaluationInput::Batch {
@@ -179,8 +167,7 @@ fn eager_rng_child_advances_even_when_parent_strict_digits_are_null() {
         .downcast_ref::<Float64Array>()
         .unwrap()
         .value(0);
-    // Independent formula for this finite, positive, small-magnitude digit case.
-    let expected = (source * 1e15).round() / 1e15;
+    assert_eq!(source, 0.0);
     assert_eq!(
         actual
             .values()
@@ -189,7 +176,7 @@ fn eager_rng_child_advances_even_when_parent_strict_digits_are_null() {
             .unwrap()
             .value(0)
             .to_bits(),
-        expected.to_bits()
+        0.0_f64.to_bits()
     );
     assert!(actual.errors().is_empty());
 }

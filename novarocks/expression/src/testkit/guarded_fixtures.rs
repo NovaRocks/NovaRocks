@@ -97,7 +97,13 @@ pub fn catalogue(shape: Shape) -> PureEngineFunctionCatalog {
         ),
         (
             "rand",
-            &["()->f64;strict;legacy", "(i64)->f64;strict;legacy"][..],
+            &[
+                "()->f64;strict;legacy",
+                "(i8)->i8;strict;coerce",
+                "(i16)->i16;strict;coerce",
+                "(i32)->i32;strict;coerce",
+                "(i64)->i64;strict;coerce",
+            ][..],
             PureKernelAbi::ScalarV1,
         ),
         ("round", &["dynamic-v1"][..], PureKernelAbi::ScalarV1),
@@ -113,6 +119,11 @@ pub fn catalogue(shape: Shape) -> PureEngineFunctionCatalog {
                     .clone(),
             )
             .unwrap();
+        let implementation = if name == "round" {
+            "selected-v2"
+        } else {
+            "selected-v1"
+        };
         for overload in overloads {
             manifest.push(InstalledPureKernel {
                 function: FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap(),
@@ -123,7 +134,7 @@ pub fn catalogue(shape: Shape) -> PureEngineFunctionCatalog {
                     ))
                     .unwrap(),
                     implementation: PureImplementationId::try_new(format!(
-                        "builtin.scalar/{name}/selected-v1"
+                        "builtin.scalar/{name}/{implementation}"
                     ))
                     .unwrap(),
                     abi,
@@ -197,24 +208,31 @@ fn random(
     functions: &PureEngineFunctionCatalog,
     source_pools: &mut ConstantPools,
 ) -> ExprId {
-    let integer = FunctionValueType::new(DataType::Int64, false);
-    let seed = literal(
-        builder,
-        integer.clone(),
-        checked_constants::i64(&integer, 42, fixture_constant_policy()),
-        source_pools,
-    );
-    add_call(
+    let integer = FunctionValueType::new(DataType::Int64, true);
+    let bound = checked_constants::i64(&integer, 1, fixture_constant_policy());
+    let input = literal(builder, integer.clone(), bound.clone(), source_pools);
+    let sample = add_call(
         builder,
         authors,
         author(
             functions,
             "rand",
-            vec![integer_argument(integer, 42)],
+            vec![argument(integer, Some(bound))],
             ControlShape::Eager,
         ),
-        vec![seed],
-    )
+        vec![input],
+    );
+    builder
+        .add(
+            None,
+            FunctionValueType::new(DataType::Float64, true),
+            ExprKind::Cast {
+                cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
+                expr: sample,
+                target: DataType::Float64,
+            },
+        )
+        .unwrap()
 }
 
 pub fn round_value(
@@ -224,13 +242,17 @@ pub fn round_value(
     value: ExprId,
     source_pools: &mut ConstantPools,
 ) -> ExprId {
-    let integer = FunctionValueType::new(DataType::Int64, false);
-    let digits = literal(
-        builder,
+    let integer = FunctionValueType::new(DataType::Int32, false);
+    let places = ConstantValue::from_i32(
+        Arc::new(integer.try_to_field("places").unwrap()),
         integer.clone(),
-        checked_constants::i64(&integer, -1, fixture_constant_policy()),
-        source_pools,
-    );
+        -1,
+        fixture_constant_policy(),
+        CompilePhase::FunctionSpecialization,
+        &HarnessControl,
+    )
+    .unwrap();
+    let digits = literal(builder, integer.clone(), places.clone(), source_pools);
     add_call(
         builder,
         authors,
@@ -242,7 +264,7 @@ pub fn round_value(
                     FunctionValueType::new(DataType::Decimal128(38, 0), true),
                     None,
                 ),
-                integer_argument(integer, -1),
+                argument(integer, Some(places)),
             ],
             ControlShape::Eager,
         ),
@@ -420,29 +442,19 @@ pub fn causes(owner: &str) -> [KernelFailure; 7] {
     ]
 }
 
-// Frozen independent rand 0.8.5 StdRng seed_from_u64 oracle, not evaluator output.
-pub const SEED_42: [u64; 6] = [
-    0x3fe0d98eec6444e4,
-    0x3fe15e014267f5aa,
-    0x3fe45dec0e3bca26,
-    0x3fd9fa4b5e3f5d8c,
-    0x3fa19561bff02330,
-    0x3fda8ea728e783e0,
-];
 pub fn guarded_program(shape: Shape) -> Fixture {
     let mut source_pools = ConstantPools::empty();
     let functions = catalogue(shape);
     let flag = ValueId::new(901);
-    let seed = ValueId::new(3);
+    let bound = ValueId::new(3);
     let decimal_value = ValueId::new(71);
     let fallback = ValueId::new(72);
     let bool_type = FunctionValueType::new(DataType::Boolean, true);
     let integer = FunctionValueType::new(DataType::Int64, true);
     let scalar_integer = FunctionValueType::new(DataType::Int64, false);
-    let floating = FunctionValueType::new(DataType::Float64, true);
     let decimal = FunctionValueType::new(DataType::Decimal128(38, 0), true);
     let mut builder = unit_draft();
-    let mut columns = vec![(flag, bool_type.clone()), (seed, integer.clone())];
+    let mut columns = vec![(flag, bool_type.clone()), (bound, integer.clone())];
     if matches!(shape, Shape::Decimal) {
         columns.extend([
             (decimal_value, decimal.clone()),
@@ -455,8 +467,8 @@ pub fn guarded_program(shape: Shape) -> Fixture {
         .add(None, bool_type.clone(), ExprKind::Value(flag))
         .unwrap();
     let root = if matches!(shape, Shape::Random) {
-        let seed_expr = builder
-            .add(None, integer.clone(), ExprKind::Value(seed))
+        let bound_expr = builder
+            .add(None, integer.clone(), ExprKind::Value(bound))
             .unwrap();
         let from_column = add_call(
             &mut builder,
@@ -464,18 +476,18 @@ pub fn guarded_program(shape: Shape) -> Fixture {
             author(
                 &functions,
                 "rand",
-                vec![argument(integer, None)],
+                vec![argument(integer.clone(), None)],
                 ControlShape::Eager,
             ),
-            vec![seed_expr],
+            vec![bound_expr],
         );
         let null = builder
             .add(
                 None,
-                floating.clone(),
+                integer.clone(),
                 checked_constants::kind(
                     &mut source_pools,
-                    checked_constants::null(&(floating.clone()), fixture_constant_policy()),
+                    checked_constants::null(&(integer.clone()), fixture_constant_policy()),
                 ),
             )
             .unwrap();
@@ -487,24 +499,20 @@ pub fn guarded_program(shape: Shape) -> Fixture {
                 "if",
                 vec![
                     argument(bool_type, None),
-                    argument(floating.clone(), None),
-                    argument(floating.clone(), None),
+                    argument(integer.clone(), None),
+                    argument(integer.clone(), None),
                 ],
                 ControlShape::If,
             ),
             vec![flag_expr, from_column, null],
         );
-        let literal_seed = builder
+        let literal_bound = builder
             .add(
                 None,
                 scalar_integer.clone(),
                 checked_constants::kind(
                     &mut source_pools,
-                    checked_constants::i64(
-                        &(scalar_integer.clone()),
-                        42,
-                        fixture_constant_policy(),
-                    ),
+                    checked_constants::i64(&(scalar_integer.clone()), 1, fixture_constant_policy()),
                 ),
             )
             .unwrap();
@@ -514,10 +522,10 @@ pub fn guarded_program(shape: Shape) -> Fixture {
             author(
                 &functions,
                 "rand",
-                vec![integer_argument(scalar_integer, 42)],
+                vec![integer_argument(scalar_integer.clone(), 1)],
                 ControlShape::Eager,
             ),
-            vec![literal_seed],
+            vec![literal_bound],
         );
         add_call(
             &mut builder,
@@ -525,7 +533,10 @@ pub fn guarded_program(shape: Shape) -> Fixture {
             author(
                 &functions,
                 "coalesce",
-                vec![argument(floating.clone(), None), argument(floating, None)],
+                vec![
+                    argument(integer.clone(), None),
+                    argument(scalar_integer, None),
+                ],
                 ControlShape::Coalesce,
             ),
             vec![conditional, from_constant],
@@ -537,18 +548,21 @@ pub fn guarded_program(shape: Shape) -> Fixture {
         let fallback_expr = builder
             .add(None, decimal.clone(), ExprKind::Value(fallback))
             .unwrap();
+        let digit_type = FunctionValueType::new(DataType::Int32, false);
+        let places = ConstantValue::from_i32(
+            Arc::new(digit_type.try_to_field("places").unwrap()),
+            digit_type.clone(),
+            -1,
+            fixture_constant_policy(),
+            CompilePhase::FunctionSpecialization,
+            &HarnessControl,
+        )
+        .unwrap();
         let digits = builder
             .add(
                 None,
-                scalar_integer.clone(),
-                checked_constants::kind(
-                    &mut source_pools,
-                    checked_constants::i64(
-                        &(scalar_integer.clone()),
-                        -1,
-                        fixture_constant_policy(),
-                    ),
-                ),
+                digit_type.clone(),
+                checked_constants::kind(&mut source_pools, places.clone()),
             )
             .unwrap();
         let rounded = add_call(
@@ -559,7 +573,7 @@ pub fn guarded_program(shape: Shape) -> Fixture {
                 "round",
                 vec![
                     argument(decimal.clone(), None),
-                    integer_argument(scalar_integer, -1),
+                    argument(digit_type, Some(places)),
                 ],
                 ControlShape::Eager,
             ),

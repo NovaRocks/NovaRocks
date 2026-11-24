@@ -212,8 +212,9 @@ fn between_actual_after_upper_error_is_required_even_after_false_lower_and_lower
     }
 }
 #[test]
-fn between_actual_after_seeded_rand_keeps_two_observable_uses_of_one_operand_definition() {
-    let (program, site) = compiled("SELECT rand(k) BETWEEN -1.0 AND 2.0 FROM fixture.source");
+fn between_actual_after_bounded_rand_keeps_two_observable_uses_of_one_operand_definition() {
+    let (program, site) =
+        compiled("SELECT rand(k) BETWEEN BIGINT '-1' AND BIGINT '42' FROM fixture.source");
     let flow = program.control_flow();
     let root = &flow.uses()[&program.root(site).unwrap().use_id];
     assert_ne!(root.arguments[0], root.arguments[2]);

@@ -1231,12 +1231,12 @@ mod tests {
     }
     #[test]
     fn typed_failure_required_root_preserves_original_sparse_row_journal_and_typed_site() {
-        use crate::exec::expr::fixtures::{SeedMode, program};
+        use crate::exec::expr::fixtures::{RandArgument, program};
         use crate::runtime::task::ExecutionFailureCause;
         use novarocks_expression::RequiredExpressionRowError;
         use novarocks_functions::{RowDataError, Selection};
         use novarocks_local_program::ProgramNodeKind;
-        let program = program(SeedMode::Input, false);
+        let program = program(RandArgument::Input, false);
         let (node, site) = program
             .graph()
             .nodes()

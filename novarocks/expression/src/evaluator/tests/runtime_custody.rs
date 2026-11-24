@@ -29,7 +29,7 @@ use crate::{
     ScalarCallHost, ScalarCallPhase, ScalarCallRequestFacts, ScopeLayouts,
 };
 use arrow::{
-    array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray},
+    array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -170,7 +170,7 @@ fn runtime_scalar_memory_required_helper_missing_binding_fails_root_without_scal
     let catalogue = installed_builtin_owner_catalogue();
     let (port, schema) = nullable_port(&[
         ("local_1_0", DataType::Int64),
-        ("local_1_1", DataType::Int64),
+        ("local_1_1", DataType::Int32),
         ("local_1_2", DataType::Boolean),
     ]);
     let mut builder = unit_draft();
@@ -179,7 +179,7 @@ fn runtime_scalar_memory_required_helper_missing_binding_fails_root_without_scal
     let mut authors = BTreeMap::new();
     let owner = ClaimAuthor::with_legacy_binding(
         &catalogue,
-        "bit_shift_left",
+        "bitwise_left_shift",
         vec![argument(&port.values[0].1), argument(&port.values[1].1)],
         ControlShape::Eager,
         None,
@@ -192,7 +192,7 @@ fn runtime_scalar_memory_required_helper_missing_binding_fails_root_without_scal
         .unwrap();
     let unit = compile(builder, port, schema.clone(), &catalogue, &authors);
     let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(7)]));
-    let counts: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let counts: ArrayRef = Arc::new(Int32Array::from(vec![1]));
     let batch = RecordBatch::try_new(
         schema,
         vec![

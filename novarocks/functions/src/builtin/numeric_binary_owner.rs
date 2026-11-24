@@ -41,7 +41,7 @@ use super::numeric_binary::NumericBinaryOp;
 
 #[cfg(test)]
 pub(super) fn names() -> &'static [&'static str] {
-    &["atan2", "fmod", "pow", "fpow", "dpow", "power"]
+    &["atan2", "pow", "power"]
 }
 
 /// Startup selection covers only the installed binary_ops names. Evaluation
@@ -49,15 +49,12 @@ pub(super) fn names() -> &'static [&'static str] {
 pub(super) fn operation(name: &str) -> Option<NumericBinaryOp> {
     Some(match name {
         "atan2" => NumericBinaryOp::Atan2,
-        "fmod" => NumericBinaryOp::Fmod,
-        "pow" | "fpow" | "dpow" | "power" => NumericBinaryOp::Pow,
+        "pow" | "power" => NumericBinaryOp::Pow,
         _ => return None,
     })
 }
 
-/// Valid inputs have the thirty-six existing signed/float Physical pairs. Domain and
-/// finite-range failures return successful NULL; malformed calls remain outer
-/// failures. No mutable state or environment authority is retained.
+/// Binary math consumes two DOUBLEs and retains the IEEE result.
 pub(super) fn effects() -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
@@ -105,7 +102,7 @@ impl NumericBinaryOwner {
         let expected = effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 36
+            || declaration.overloads().len() != 1
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
@@ -376,8 +373,8 @@ impl NumericBinaryOwner {
 mod tests {
     use super::*;
     use crate::{
-        FunctionArgument, FunctionArgumentType, FunctionResultType, FunctionSpecializationFailure,
-        FunctionValueType, ScopedExpressionEffects, specialize_frozen_scalar, specialize_scalar,
+        FunctionArgument, FunctionResultType, FunctionSpecializationFailure, FunctionValueType,
+        ScopedExpressionEffects, specialize_frozen_scalar, specialize_scalar,
     };
     use arrow_schema::DataType;
     use novarocks_type_contract::{
@@ -443,17 +440,6 @@ mod tests {
         }
     }
 
-    fn sources() -> [DataType; 6] {
-        [
-            DataType::Int8,
-            DataType::Int16,
-            DataType::Int32,
-            DataType::Int64,
-            DataType::Float32,
-            DataType::Float64,
-        ]
-    }
-
     pub(super) fn prepared_for_test(
         name: &str,
         sources: &[FunctionValueType; 2],
@@ -482,26 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_binary_mapping_retains_six_exact_names_and_three_operations() {
-        assert_eq!(names().len(), 6);
-        assert_eq!(operation("atan2"), Some(NumericBinaryOp::Atan2));
-        assert_eq!(operation("fmod"), Some(NumericBinaryOp::Fmod));
-        for name in ["pow", "fpow", "dpow", "power"] {
-            assert_eq!(operation(name), Some(NumericBinaryOp::Pow));
-            if name != "pow" {
-                assert_ne!(
-                    owner(name).declaration.function_id(),
-                    owner("pow").declaration.function_id()
-                );
-            }
-        }
-        for outside in ["mod", "pmod", "log", "atan", "sqrt", "degrees", "sinh"] {
-            assert_eq!(operation(outside), None);
-        }
-    }
-
-    #[test]
-    fn whole_production_catalogue_attaches_binary_owners_and_216_exact_records() {
+    fn whole_production_catalogue_attaches_binary_owners_for_double_contracts() {
         let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
         let mut total = 0;
         for name in names() {
@@ -512,8 +479,8 @@ mod tests {
             assert!(definition.binding.as_ref().unwrap().pure.is_some());
             let declaration = definition.binding_declaration().unwrap();
             assert_eq!(declaration, owner.binding_declaration());
-            assert_eq!(declaration.overloads().len(), 36);
-            assert_eq!(owner.implementation_declarations().len(), 36);
+            assert_eq!(declaration.overloads().len(), 1);
+            assert_eq!(owner.implementation_declarations().len(), 1);
             for (overload, implementation) in declaration
                 .overloads()
                 .iter()
@@ -529,118 +496,14 @@ mod tests {
             }
             total += owner.implementation_declarations().len();
         }
-        assert_eq!(total, 216);
-    }
-
-    #[test]
-    fn all_216_binary_profiles_and_nullable_pairs_preserve_exact_fresh_frozen_contracts() {
-        let parameters = SemanticParameters::try_new([]).unwrap();
-        let uses = [
-            Some(ExpressionUseId::new(42)),
-            Some(ExpressionUseId::new(43)),
-        ];
-        for name in names() {
-            let owner = owner(name);
-            for left in sources() {
-                for right in sources() {
-                    for left_nullable in [false, true] {
-                        for right_nullable in [false, true] {
-                            let full_sources = [
-                                FunctionValueType::from_legacy_declared_projection(
-                                    left.clone(),
-                                    left_nullable,
-                                ),
-                                FunctionValueType::from_legacy_declared_projection(
-                                    right.clone(),
-                                    right_nullable,
-                                ),
-                            ];
-                            let arguments = full_sources.clone().map(argument);
-                            let selected = Arc::new(
-                                owner
-                                    .resolve(request(&arguments), crate::binding_test_control())
-                                    .unwrap(),
-                            );
-                            assert_eq!(
-                                selected.argument_types.as_ref(),
-                                full_sources
-                                    .clone()
-                                    .map(FunctionArgumentType::Value)
-                                    .as_slice()
-                            );
-                            let FunctionResultType::Scalar(result) = &selected.result_type else {
-                                panic!("scalar result required")
-                            };
-                            assert_eq!(result.data_type().clone(), DataType::Float64);
-                            assert_eq!(result.logical_type(), ValueLogicalType::Physical);
-                            assert!(result.nullable());
-                            let input = input(&owner, &selected, &arguments, &parameters, &uses);
-                            let fresh = specialize_scalar(
-                                &owner,
-                                input,
-                                selected.clone(),
-                                ScopedExpressionEffects::pure_value(context()),
-                                crate::binding_test_control(),
-                            )
-                            .unwrap();
-                            let canonical = fresh.prepared().contract().clone();
-                            let direct = owner
-                                .prepare_scalar(
-                                    input,
-                                    canonical.clone(),
-                                    crate::binding_test_control(),
-                                )
-                                .unwrap();
-                            assert!(Arc::ptr_eq(direct.contract(), &canonical));
-                            assert!(std::ptr::eq(
-                                fresh.prepared().contract().selected(),
-                                selected.as_ref()
-                            ));
-                            let frozen = canonical.effects().clone();
-                            let be = specialize_frozen_scalar(
-                                &owner,
-                                input,
-                                selected.clone(),
-                                &frozen,
-                                ScopedExpressionEffects::pure_value(context()),
-                                crate::binding_test_control(),
-                            )
-                            .unwrap();
-                            let canonical = be.prepared().contract().clone();
-                            let direct = owner
-                                .prepare_scalar(
-                                    input,
-                                    canonical.clone(),
-                                    crate::binding_test_control(),
-                                )
-                                .unwrap();
-                            assert!(Arc::ptr_eq(direct.contract(), &canonical));
-                            assert!(std::ptr::eq(
-                                be.prepared().contract().selected(),
-                                selected.as_ref()
-                            ));
-                            assert_eq!(canonical.effects(), &frozen);
-                            let instance = be.prepared().create_instance().unwrap();
-                            assert_eq!(
-                                instance.retained_bytes(),
-                                std::mem::size_of::<NumericBinaryInstance>()
-                            );
-                            assert_eq!(
-                                instance.retained_bytes(),
-                                be.prepared().instance_retained_upper_bound()
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        assert_eq!(total, 3);
     }
 
     #[test]
     fn exact_binary_owner_rejects_stale_output_overload_and_foreign_frozen_effects() {
         let owner = owner("atan2");
         let arguments = [
-            argument(FunctionValueType::new(DataType::Int8, false)),
+            argument(FunctionValueType::new(DataType::Float64, false)),
             argument(FunctionValueType::new(DataType::Float64, true)),
         ];
         let selected = Arc::new(
@@ -657,7 +520,7 @@ mod tests {
                 .is_err()
         );
         stale = (*selected).clone();
-        stale.overload = self::owner("fmod").declaration.overloads()[0]
+        stale.overload = self::owner("pow").declaration.overloads()[0]
             .identity
             .clone();
         assert!(
@@ -748,10 +611,10 @@ mod tests {
 
     #[test]
     fn binary_preparation_rejects_foreign_context_policy_pointer_and_uncoerced_types() {
-        let owner = owner("fmod");
+        let owner = owner("pow");
         let arguments = [
             argument(FunctionValueType::new(DataType::Float64, false)),
-            argument(FunctionValueType::new(DataType::Int64, true)),
+            argument(FunctionValueType::new(DataType::Float64, true)),
         ];
         let selected = Arc::new(
             owner

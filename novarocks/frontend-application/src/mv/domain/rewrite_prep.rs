@@ -289,6 +289,7 @@ async fn freeze_mv_rewrite_definition_async(
         }),
         sources,
     )?
+    .with_scalar_contracts(definition.scalar_contracts.clone().into_boxed_slice())
     .with_selection_facts(selection)
     .map_err(MvRewriteDefinitionError::from)
 }

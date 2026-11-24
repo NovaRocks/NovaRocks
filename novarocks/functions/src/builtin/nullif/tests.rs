@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use super::*;
+use crate::{SelectedValues, kernel_control::invalid};
 use arrow_array::{Int64Array, TimestampSecondArray, new_null_array};
 use arrow_schema::Field;
 use std::sync::atomic::{AtomicUsize, Ordering};

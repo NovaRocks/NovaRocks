@@ -588,19 +588,18 @@ fn extract_binding_uses_the_exact_scalar_identity_even_when_a_custom_name_exists
 }
 
 #[test]
-fn extract_keeps_typeof_cast_hint_without_analyzing_input() {
+fn typeof_preserves_extract_child_resolution() {
     let catalog = TemporalCatalog {
         carrier: DataType::Date32,
         logical: None,
         nullable: false,
     };
-    let query = analyze(
+    let error = analyze(
         "SELECT typeof(CAST(EXTRACT(HOUR FROM must_not_resolve) AS INT))",
         &catalog,
         crate::constant::test_constant_policy(),
     )
-    .unwrap();
-    assert!(
-        matches!(&project(&query, 0).kind, ExprKind::Literal(crate::analysis::LiteralValue::String(value)) if value == "int")
-    );
+    .err()
+    .expect("the extracted operand must be resolved");
+    assert_eq!(error.kind(), AnalyzeErrorKind::UnknownColumn);
 }

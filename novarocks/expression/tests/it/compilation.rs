@@ -682,7 +682,14 @@ fn scalar_catalogue() -> PureEngineFunctionCatalog {
     )
     .unwrap();
     b.seal_pure(
-        ["()->f64;strict;legacy", "(i64)->f64;strict;legacy"].map(|overload| InstalledPureKernel {
+        [
+            "()->f64;strict;legacy",
+            "(i8)->i8;strict;coerce",
+            "(i16)->i16;strict;coerce",
+            "(i32)->i32;strict;coerce",
+            "(i64)->i64;strict;coerce",
+        ]
+        .map(|overload| InstalledPureKernel {
             function: FunctionId::try_new("builtin.scalar/rand/v1").unwrap(),
             kind: FunctionKind::Scalar,
             implementation: PureImplementationDeclaration {

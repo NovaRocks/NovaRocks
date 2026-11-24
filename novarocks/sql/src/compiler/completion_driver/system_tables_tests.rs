@@ -552,6 +552,7 @@ fn view_definition_needs_only_the_declaration_and_saved_context_is_exact() {
             crate::compiler::builtin_sql_function_catalog(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::constant::test_constant_policy(),
+            None,
         )
         .unwrap();
     assert_eq!(

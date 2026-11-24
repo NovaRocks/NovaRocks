@@ -61,3 +61,17 @@ SELECT array_min(ARRAY[NULL]);
 -- query 12
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 SELECT array_max(ARRAY[NULL]);
+
+-- query 13
+-- A NULL left value skips the right expression on that row.
+SELECT NULLIF(x, 10 / divisor) AS result
+FROM (VALUES (CAST(NULL AS SMALLINT), 0), (SMALLINT '7', 2)) AS t(x, divisor);
+
+-- query 14
+-- @expect_trino_error=DIVISION_BY_ZERO,USER_ERROR
+SELECT NULLIF(x, 10 / divisor)
+FROM (VALUES (CAST(NULL AS SMALLINT), 0), (SMALLINT '7', 0)) AS t(x, divisor);
+
+-- query 15
+-- UNKNOWN equality retains the original left array and its element type.
+SELECT NULLIF(ARRAY[1, NULL], ARRAY[BIGINT '1', NULL]) AS result;

@@ -202,6 +202,7 @@ fn encode_type(
             }
         }
         NativeRenderType::Binary => K::Binary,
+        NativeRenderType::Uuid => K::Uuid,
         NativeRenderType::Date => K::Date,
         NativeRenderType::Temporal(temporal) => {
             let temporal = (*temporal)
@@ -547,6 +548,7 @@ fn decode_type(
             NativeRenderType::BoundedCharacter(character)
         }
         K::Binary => NativeRenderType::Binary,
+        K::Uuid => NativeRenderType::Uuid,
         K::Date => NativeRenderType::Date,
         K::Temporal => NativeRenderType::Temporal(
             crate::temporal_type::decode(src.temporal_type.as_ref().expect("validated presence"))

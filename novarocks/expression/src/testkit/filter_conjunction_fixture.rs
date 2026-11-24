@@ -205,25 +205,24 @@ fn rand_lt_half(
     authors: &mut BTreeMap<ExprId, ClaimAuthor>,
     functions: &PureEngineFunctionCatalog,
 ) -> ExprId {
-    let seed_type = FunctionValueType::new(DataType::Int64, false);
-    let source_seed = ConstantValue::from_i64(
-        Arc::new(Field::new("literal", DataType::Int64, false)),
-        seed_type.clone(),
-        13,
+    let bound_type = FunctionValueType::new(DataType::Int32, false);
+    let source_bound = ConstantValue::from_i32(
+        Arc::new(Field::new("literal", DataType::Int32, false)),
+        bound_type.clone(),
+        1,
         POLICY,
         CompilePhase::FunctionSpecialization,
         &HarnessControl,
     )
     .unwrap();
-    // SQL emits its canonical BIGINT seed directly. Its frozen request
-    // retains the same backing as the actual constant definition.
-    let seed = constant(draft, pools, &source_seed, seed_type.clone());
+    // The frozen INTEGER upper bound retains its original constant backing.
+    let bound = constant(draft, pools, &source_bound, bound_type.clone());
     let owner = ClaimAuthor::with_legacy_binding(
         functions,
         "rand",
         vec![FunctionArgument::Value {
-            value_type: seed_type,
-            constant: Some(source_seed),
+            value_type: bound_type,
+            constant: Some(source_bound),
         }],
         ControlShape::Eager,
         None,
@@ -231,7 +230,13 @@ fn rand_lt_half(
         &HarnessControl,
     )
     .with_decimal_policy(OUTPUT_NULL);
-    let random = add_call(draft, authors, owner, vec![seed]);
+    let random = add_call(draft, authors, owner, vec![bound]);
+    let random = cast(
+        draft,
+        random,
+        FunctionValueType::new(DataType::Float64, false),
+        TrinoCastMode::Implicit,
+    );
     let decimal = FunctionValueType::new(DataType::Decimal128(2, 1), false);
     let half = ConstantValue::from_decimal128(
         Arc::new(Field::new("literal", DataType::Decimal128(2, 1), false)),

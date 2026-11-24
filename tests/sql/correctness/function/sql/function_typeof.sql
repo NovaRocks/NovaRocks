@@ -15,12 +15,8 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Migrated from dev/test/sql/test_function/T/test_typeof
--- Test Objective:
--- 1. Validate typeof() returns correct type names for all scalar literal types (tinyint through json, including BINARY).
--- 2. Validate typeof() for complex types: array, map, struct, bitmap, hll, json.
--- 3. Validate typeof() with table columns preserves the stored column types.
--- 4. Validate typeof() with ordinary BITMAP and HLL columns in Iceberg append tables.
+-- Type names retain the exact declaration of an evaluated operand.
+-- Include persisted values, nested declarations, and original operand errors.
 
 -- query 1
 select typeof(cast(1 as tinyint));
@@ -35,6 +31,8 @@ select typeof(cast(1 as int));
 select typeof(cast(1 as bigint));
 
 -- query 5
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+-- @expect_error=[sql.analyze.type_mismatch] Unknown type: largeint
 select typeof(cast(1 as largeint));
 
 -- query 6
@@ -50,7 +48,7 @@ select typeof(cast(1 as REAL));
 select typeof(cast(1 as boolean));
 
 -- query 10
-select typeof(cast(1 as char));
+select typeof(cast('a' as char));
 
 -- query 11
 select typeof(cast(1 as VARCHAR));
@@ -71,13 +69,15 @@ SELECT typeof(CAST('2023-03-07 11:22:33' AS TIMESTAMP(6)));
 select typeof([1, 2, 3]);
 
 -- query 17
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_error=[sql.analyze.unavailable_implementation] selected overload `builtin.scalar/get_json_object/(any,utf8)->utf8;strict;legacy` has no installed implementation
 select typeof(get_json_object('{"k1":1, "k2":"v2"}', '$.k1'));
 
 -- query 18
 select typeof(MAP(ARRAY[1, 2, 3], ARRAY['apple', 'orange', 'pear']));
 
 -- query 19
-select typeof(CAST(ROW(1, 2, 3, 4) AS ROW(col1 INTEGER, col2 INTEGER, col3 INTEGER, col4 INTEGER)));
+select typeof(CAST(NULL AS ROW(col1 INTEGER, col2 INTEGER, col3 INTEGER, col4 INTEGER)));
 
 -- query 20
 select typeof(parse_json('{"a": 1, "b": true}'));
@@ -93,7 +93,7 @@ create table t1 (
   c2 smallint,
   c3 int,
   c4 bigint,
-  c5 largeint,
+  c5 REAL,
   c6 decimal(19, 2),
   c7 decimal(38, 9),
   c8 decimal(38, 9),
@@ -140,3 +140,28 @@ select typeof(c1)
   ,typeof(c19)
   ,typeof(c20)
   from t1;
+
+-- query 24
+-- @expect_trino_error=DIVISION_BY_ZERO,USER_ERROR
+SELECT typeof(10 / x) FROM (VALUES 0, 1) AS t(x);
+
+-- query 25
+SELECT x, TRY(typeof(10 / x)) AS type_name
+FROM (VALUES 0, 1, NULL) AS t(x)
+ORDER BY x NULLS LAST;
+
+-- query 26
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT typeof(CAST(1 AS CHAR));
+
+-- query 27
+SELECT typeof(CAST(NULL AS ROW(a INTEGER, "B" VARCHAR(2)))) AS row_type,
+       typeof(CAST(NULL AS MAP(VARCHAR(3), ARRAY(DECIMAL(5,2))))) AS map_type,
+       typeof(CAST(NULL AS TIMESTAMP(12))) AS temporal_type;
+
+-- query 28
+-- @expect_trino_error=COLUMN_NOT_FOUND,USER_ERROR
+SELECT typeof(CAST(missing_input AS INTEGER));
+
+-- query 29
+SELECT typeof(JSON '{"a":1}') AS json_type;

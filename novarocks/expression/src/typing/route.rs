@@ -33,8 +33,8 @@ pub enum ScalarTypingRoute {
 pub fn scalar_typing_route(name: &str) -> ScalarTypingRoute {
     match name {
         // SQL-specific rewrites or validation.
-        "__array_element_at" | "__map_element_at" | "typeof"
-       | "flatten" | "if" | "variant_get" | "try_variant_get" | "named_struct"
+        "__array_element_at" | "__map_element_at"
+       | "flatten" | "variant_get" | "try_variant_get" | "named_struct"
        | "arrays_overlap"
        | "contains_sequence" | "map_keys" | "map_values" | "array_min"
        | "array_max" | "__array_struct_subfield"

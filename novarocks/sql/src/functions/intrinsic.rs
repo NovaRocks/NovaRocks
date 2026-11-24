@@ -45,6 +45,9 @@ mod tests {
                     .any(|overload| overload.identity == signature.overload())
                     .then_some(definition.canonical_name().to_owned())
             });
+        let modulus = catalog
+            .definition("mod", FunctionKind::Scalar)
+            .expect("the exact arithmetic owner publishes MOD");
         let mut declared = novarocks_functions::builtin::registry::builtin_scalar_declarations()
             .into_iter()
             .map(|(name, _)| name)
@@ -54,6 +57,7 @@ mod tests {
                     .map(|name| (*name).to_owned()),
             )
             .chain(collection_lambdas)
+            .chain(std::iter::once(modulus.canonical_name().to_owned()))
             .collect::<BTreeSet<_>>();
         // TRC-6d6 moved these existing disposition entries to dedicated
         // temporal owners outside the generic registry and dynamic resolver.
@@ -181,6 +185,33 @@ mod tests {
                             signature.overload()
                         )),
                         "{name}"
+                    );
+                } else if matches!(*name, "cosh" | "sinh" | "tanh") {
+                    assert_eq!(
+                        empty,
+                        Err(FunctionBindingError::NoMatchingOverload),
+                        "{name}"
+                    );
+                    let arguments = [FunctionArgument::Value {
+                        value_type: FunctionValueType::new(DataType::Float64, false),
+                        constant: None,
+                    }];
+                    let result = catalog.resolve_bound_user(
+                        name,
+                        FunctionKind::Scalar,
+                        FunctionBindingRequest {
+                            expected_result_type: None,
+                            arguments: &arguments,
+                            logical_argument_count: arguments.len(),
+                        },
+                        &control,
+                    );
+                    assert!(
+                        matches!(
+                            result,
+                            Err(FunctionBindingError::UnavailableImplementation(_))
+                        ),
+                        "{name}: {result:?}",
                     );
                 } else {
                     assert_eq!(empty, Err(FunctionBindingError::UnknownFunction), "{name}");

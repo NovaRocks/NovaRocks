@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use arrow_array::{Int64Array, StringArray};
+use arrow_array::{Int32Array, Int64Array, StringArray};
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{collections::HashMap, sync::Mutex};
 
@@ -204,6 +204,20 @@ fn ordinal_i64() -> ConstantValue {
     .value(1)
     .unwrap()
 }
+fn ordinal_i32() -> ConstantValue {
+    let ty = FunctionValueType::new(DataType::Int32, false);
+    ConstantPool::try_new(
+        Arc::new(Field::new("digits", DataType::Int32, false)),
+        ty,
+        Int32Array::from(vec![901, 3, 777]).to_data(),
+        policy(),
+        CompilePhase::FunctionSpecialization,
+        &Control::default(),
+    )
+    .unwrap()
+    .value(1)
+    .unwrap()
+}
 fn constant(value: &ConstantValue) -> FunctionArgument {
     FunctionArgument::Value {
         value_type: value.value_type().clone(),
@@ -252,7 +266,7 @@ fn prefixes(
 fn installed_exact_scalar_owners_reauthor_nullable_numeric_text_calendar_and_collection() {
     let catalog = catalog();
     for (name, input, carrier) in [
-        ("abs", DataType::Int64, DataType::FixedSizeBinary(16)),
+        ("abs", DataType::Int64, DataType::Int64),
         ("upper", DataType::Utf8, DataType::Utf8),
         ("year", DataType::Date32, DataType::Int64),
     ] {
@@ -268,14 +282,7 @@ fn installed_exact_scalar_owners_reauthor_nullable_numeric_text_calendar_and_col
         if name == "abs" {
             assert_eq!(
                 selected.result_type,
-                FunctionResultType::Scalar(
-                    FunctionValueType::try_with_logical_type(
-                        DataType::FixedSizeBinary(16),
-                        true,
-                        ValueLogicalType::LargeInt,
-                    )
-                    .unwrap(),
-                ),
+                FunctionResultType::Scalar(FunctionValueType::new(DataType::Int64, true),),
             );
         }
     }
@@ -299,10 +306,10 @@ fn installed_exact_scalar_owners_reauthor_nullable_numeric_text_calendar_and_col
 #[test]
 fn installed_exact_round_and_truncate_reuse_original_precision_constant_and_overload() {
     let catalog = catalog();
-    let digits = ordinal_i64();
-    for name in ["round", "truncate"] {
-        let initial = [value(DataType::Float64, false), constant(&digits)];
-        let late = [value(DataType::Float64, true), constant(&digits)];
+    let digits = ordinal_i32();
+    for (name, precision) in [("round", 19), ("truncate", 18)] {
+        let initial = [value(DataType::Decimal128(18, 6), false), constant(&digits)];
+        let late = [value(DataType::Decimal128(18, 6), true), constant(&digits)];
         let selected = canonical(
             &catalog,
             name,
@@ -313,7 +320,10 @@ fn installed_exact_round_and_truncate_reuse_original_precision_constant_and_over
         );
         assert_eq!(
             selected.result_type,
-            FunctionResultType::Scalar(FunctionValueType::new(DataType::Float64, true))
+            FunctionResultType::Scalar(FunctionValueType::new(
+                DataType::Decimal128(precision, 6),
+                true,
+            ))
         );
         assert_eq!(
             selected.argument_types.as_ref(),
@@ -599,6 +609,7 @@ fn installed_exact_unknown_and_other_declared_overload_refuse_without_fallback()
 fn installed_exact_actual_small_prefixes_and_wide_collection_quantum_preserve_first_cause() {
     let catalog = catalog();
     let count = ordinal_i64();
+    let digits = ordinal_i32();
     let cases = vec![
         (
             "abs",
@@ -619,12 +630,12 @@ fn installed_exact_actual_small_prefixes_and_wide_collection_quantum_preserve_fi
         (
             "round",
             FunctionKind::Scalar,
-            vec![value(DataType::Float64, true), constant(&count)],
+            vec![value(DataType::Decimal128(12, 5), true), constant(&digits)],
         ),
         (
             "truncate",
             FunctionKind::Scalar,
-            vec![value(DataType::Float64, true), constant(&count)],
+            vec![value(DataType::Decimal128(12, 5), true), constant(&digits)],
         ),
         ("count", FunctionKind::Aggregate, vec![]),
         (

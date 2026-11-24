@@ -191,10 +191,15 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     // observation L was validated against, never from a persisted contract.
     let runtime_bindings = validate_projection_target(&mv_definition, &target_schema_observation)
         .map_err(RefreshError::from)?;
-    if !stmt.full && mv_definition.facts.publication().is_some() {
-        novarocks_mv_application::persistence::aggregate_bindings::validate_published_aggregate_contracts(mv_definition.facts.interpretation())
-            .map_err(RefreshError::user)?;
-    }
+    validate_published_refresh_contracts(
+        io,
+        source,
+        &mv_definition,
+        &canonical_select_query,
+        stmt.full,
+        connector_context,
+    )
+    .await?;
     let caps = RefreshCapabilities::from_canonical_facts(
         mv_definition.facts.interpretation(),
         &runtime_bindings,
@@ -1183,6 +1188,45 @@ pub(crate) async fn plan_iceberg_aggregate_mv_refresh(
     }
 }
 
+/// Validate the original predecessor after its source pins and saved name
+/// context have been captured, including decisions that would reuse its data
+/// without executing a new query.
+async fn validate_published_refresh_contracts(
+    io: &MvRefreshPreparationIo,
+    ports: &IcebergMvCorePorts,
+    projection: &StoredKeyedMvProjection,
+    query: &novarocks_parser::ast::Query,
+    full: bool,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), RefreshError> {
+    if projection.facts.publication().is_none() {
+        return Ok(());
+    }
+    if !full {
+        novarocks_mv_application::persistence::aggregate_bindings::validate_published_aggregate_contracts(
+            projection.facts.interpretation(),
+        ).map_err(RefreshError::user)?;
+    }
+    let definition = projection.facts.definition();
+    let resolved = crate::query_execution::mv_assembly::refresh_preparation::pure_reader::analyze_visible_refresh_query(
+        io,
+        ports,
+        Some(definition.query.resolution.default_catalog.as_str()),
+        &definition.query.resolution.default_namespace,
+        query,
+        context,
+    ).await?;
+    novarocks_functions::validate_published_scalar_contracts(
+        &definition.scalar_contracts,
+        resolved.refresh_input.scalar_contracts(),
+    )
+    .map_err(|detail| {
+        RefreshError::user(format!(
+            "{detail}; recreate the materialized view to publish its new definition"
+        ))
+    })
+}
+
 /// Read-only policy projection over the already captured source/target facts.
 /// It performs no target reload, management recovery, publication or split opening.
 pub(crate) async fn captured_refresh_decision_original(
@@ -1195,10 +1239,7 @@ pub(crate) async fn captured_refresh_decision_original(
     full: bool,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<ExecutableRefreshDecision, RefreshError> {
-    if !full && projection.facts.publication().is_some() {
-        novarocks_mv_application::persistence::aggregate_bindings::validate_published_aggregate_contracts(projection.facts.interpretation())
-            .map_err(RefreshError::user)?;
-    }
+    validate_published_refresh_contracts(io, source, projection, query, full, context).await?;
     let refs = definition_base_refs(projection)?;
     let bases = base_relation_occurrences(projection, &refs)?;
     let previous =

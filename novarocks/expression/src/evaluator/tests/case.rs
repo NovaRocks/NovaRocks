@@ -20,16 +20,17 @@ use crate::{
     testkit::{
         PassThroughCallHost,
         guarded_fixtures::{
-            GUARDED_CONTROL as Control, SEED_42,
+            GUARDED_CONTROL as Control,
             case::{CaseKind, case_batch, case_program, rand_bits},
         },
     },
 };
 
+use crate::evaluator::scalar_invocation::{LeafCallObservation, observe_calls};
 use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope, Selection};
 
 #[test]
-fn searched_case_then_and_else_rng_instances_advance_only_actual_matches_across_batches() {
+fn searched_case_rng_instances_visit_only_actual_matches_across_batches() {
     let program = case_program(CaseKind::Random);
     let input = case_batch(
         &program,
@@ -62,27 +63,29 @@ fn searched_case_then_and_else_rng_instances_advance_only_actual_matches_across_
     let rows = [1, 3, 5, 9];
     let selection = Selection::try_sparse(10, &rows).unwrap();
     let mut evaluator = program.instance(&Control);
-    let output = evaluator
-        .evaluate(
-            EvaluationInput::Batch {
-                batch: &input,
-                source: None,
-            },
-            ScalarInvocationScope::new(selection, selection),
-            ScalarInvocationActivation::Activated,
-            &Control,
-            &mut PassThroughCallHost,
-        )
-        .unwrap();
-    assert_eq!(
-        rand_bits(&output),
-        vec![
-            Some(SEED_42[0]),
-            Some(SEED_42[0]),
-            Some(SEED_42[0]),
-            Some(SEED_42[1])
-        ]
-    );
+    let (output, events) = observe_calls(|| {
+        evaluator
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap()
+    });
+    let domains = events
+        .into_iter()
+        .filter_map(|event| match event {
+            LeafCallObservation::Rows { actual, .. } => Some(actual),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(domains, vec![vec![1, 9], vec![3], vec![5]]);
+    assert_eq!(rand_bits(&output), vec![Some(0), Some(0), Some(0), Some(0)]);
     assert!(output.errors().is_empty());
     assert_eq!(evaluator.instances.len(), 3);
     let next = case_batch(
@@ -103,10 +106,7 @@ fn searched_case_then_and_else_rng_instances_advance_only_actual_matches_across_
             &mut PassThroughCallHost,
         )
         .unwrap();
-    assert_eq!(
-        rand_bits(&output),
-        vec![Some(SEED_42[1]), Some(SEED_42[2]), Some(SEED_42[1])]
-    );
+    assert_eq!(rand_bits(&output), vec![Some(0), Some(0), Some(0)]);
     assert!(output.errors().is_empty());
 }
 
@@ -155,7 +155,7 @@ fn searched_case_empty_selection_does_not_instantiate_any_then_else_or_when_kern
             &mut PassThroughCallHost,
         )
         .unwrap();
-    assert_eq!(rand_bits(&output), vec![Some(SEED_42[0]); 3]);
+    assert_eq!(rand_bits(&output), vec![Some(0); 3]);
 }
 
 #[test]
@@ -185,10 +185,7 @@ fn searched_case_all_rows_match_first_when_still_runs_then_before_empty_remainin
         )
         .unwrap();
     assert_eq!(output.selection(), selection);
-    assert_eq!(
-        rand_bits(&output),
-        SEED_42[..3].iter().copied().map(Some).collect::<Vec<_>>()
-    );
+    assert_eq!(rand_bits(&output), vec![Some(0); 3]);
     assert!(output.errors().is_empty());
     assert_eq!(evaluator.instances.len(), 1);
     let next = case_batch(&program, vec![Some(true)], vec![Some(true)], vec![None]);
@@ -204,7 +201,7 @@ fn searched_case_all_rows_match_first_when_still_runs_then_before_empty_remainin
             &mut PassThroughCallHost,
         )
         .unwrap();
-    assert_eq!(rand_bits(&output), vec![Some(SEED_42[3])]);
+    assert_eq!(rand_bits(&output), vec![Some(0)]);
     assert!(output.errors().is_empty());
     assert_eq!(evaluator.instances.len(), 1);
 }

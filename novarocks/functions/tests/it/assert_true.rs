@@ -19,10 +19,13 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BooleanArray, StringArray};
 use arrow_schema::DataType;
-use novarocks_functions::{EvaluatedArgument, FunctionArgument, Selection};
+use novarocks_functions::{
+    EvaluatedArgument, FunctionArgument, FunctionBindingError, FunctionBindingRequest,
+    FunctionKind, Selection, builtin::catalogue::builtin_engine_function_catalog,
+};
 use novarocks_type_contract::FunctionValueType;
 
-use super::scalar_rows::{Control, prepare};
+use super::scalar_rows::{Control, prepare_bound};
 
 #[test]
 fn failed_assertion_uses_default_or_first_non_null_message_and_tracks_the_failed_row() {
@@ -32,8 +35,21 @@ fn failed_assertion_uses_default_or_first_non_null_message_and_tracks_the_failed
         value_type: FunctionValueType::new(data_type, true),
         constant: None,
     });
+    let catalog = builtin_engine_function_catalog();
     for argc in 1..=2 {
-        let mut instance = prepare("assert_true", &arguments[..argc]);
+        let request = FunctionBindingRequest {
+            arguments: &arguments[..argc],
+            logical_argument_count: argc,
+            expected_result_type: None,
+        };
+        assert!(matches!(
+            catalog.resolve_bound_user("assert_true", FunctionKind::Scalar, request, &Control),
+            Err(FunctionBindingError::HiddenFunction)
+        ));
+        let bound = catalog
+            .resolve_bound_trusted("assert_true", FunctionKind::Scalar, request, &Control)
+            .unwrap();
+        let mut instance = prepare_bound(catalog, bound, request);
         let values = [
             EvaluatedArgument::Column(&condition),
             EvaluatedArgument::Column(&message),

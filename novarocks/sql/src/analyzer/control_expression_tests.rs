@@ -557,7 +557,7 @@ fn dedicated_controls_keep_original_bindings_display_and_direct_refusals() {
     for (sql, kind) in [
         (
             "SELECT if(TRUE, missing_value)",
-            AnalyzeErrorKind::UnsupportedExpression,
+            AnalyzeErrorKind::UnknownColumn,
         ),
         ("SELECT try(missing_value)", AnalyzeErrorKind::UnknownColumn),
         (
@@ -575,10 +575,11 @@ fn dedicated_controls_keep_original_bindings_display_and_direct_refusals() {
         "SELECT typeof(CAST(format(missing_format, missing_value) AS INT))",
     ] {
         let parsed = query(sql);
-        let actual = ctx.analyze_expr(projection(&parsed), &scope).unwrap();
-        assert!(
-            matches!(&actual.kind, ExprKind::Literal(crate::analysis::LiteralValue::String(value)) if value == "int"),
-            "{sql}: {actual:?}"
+        let error = ctx.analyze_expr(projection(&parsed), &scope).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            AnalyzeErrorKind::UnknownColumn,
+            "{sql}: {error}"
         );
     }
 }

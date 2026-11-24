@@ -17,19 +17,16 @@
 
 //! Selected ABS contracts and addresses delegate to the ONE original core.
 use super::abs_core::{AbsError, AbsObservation, evaluate_abs_core};
-#[cfg(test)]
-use crate::{EvaluatedArgument, Selection};
 use crate::{
-    FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
+    DataFailureReason, FunctionArgumentType, KernelEvaluationControl, KernelFailure, RowDataError,
+    ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
 #[cfg(test)]
+use crate::{EvaluatedArgument, Selection};
+#[cfg(test)]
 use arrow_array::ArrayRef;
-#[cfg(test)]
-use arrow_array::FixedSizeBinaryArray;
-#[cfg(test)]
-use arrow_array::builder::FixedSizeBinaryBuilder;
 use arrow_array::types::{Decimal128Type, DecimalType, validate_decimal_precision_and_scale};
 use arrow_array::{Array, Decimal128Array, UInt64Array};
 use arrow_schema::DataType;
@@ -53,69 +50,23 @@ pub(super) fn evaluate_abs<'a>(
             "ABS result must preserve selected input nullability",
         ));
     }
-    let width = match (
-        source.logical_type(),
-        source.data_type(),
-        target.logical_type(),
-        target.data_type(),
-    ) {
-        (
-            ValueLogicalType::Physical,
-            DataType::Int8,
-            ValueLogicalType::Physical,
-            DataType::Int16,
-        ) => 2,
-        (
-            ValueLogicalType::Physical,
-            DataType::Int16,
-            ValueLogicalType::Physical,
-            DataType::Int32,
-        ) => 4,
-        (
-            ValueLogicalType::Physical,
-            DataType::Int32,
-            ValueLogicalType::Physical,
-            DataType::Int64,
-        ) => 8,
-        (
-            ValueLogicalType::Physical,
-            DataType::Int64,
-            ValueLogicalType::LargeInt,
-            DataType::FixedSizeBinary(16),
-        ) => 16,
-        (
-            ValueLogicalType::LargeInt,
-            DataType::FixedSizeBinary(16),
-            ValueLogicalType::LargeInt,
-            DataType::FixedSizeBinary(16),
-        ) => 16,
-        (
-            ValueLogicalType::Physical,
-            DataType::Float32,
-            ValueLogicalType::Physical,
-            DataType::Float32,
-        ) => 4,
-        (
-            ValueLogicalType::Physical,
-            DataType::Float64,
-            ValueLogicalType::Physical,
-            DataType::Float64,
-        ) => 8,
-        (
-            ValueLogicalType::Physical,
-            DataType::Decimal128(p, s),
-            ValueLogicalType::Physical,
-            DataType::Decimal128(op, os),
-        ) if p == op && s == os => {
+    if source.logical_type() != ValueLogicalType::Physical
+        || target.logical_type() != ValueLogicalType::Physical
+        || target.data_type() != source.data_type()
+    {
+        return Err(invalid("ABS must preserve its exact input type"));
+    }
+    let width = match source.data_type() {
+        DataType::Int8 => 1,
+        DataType::Int16 => 2,
+        DataType::Int32 | DataType::Float32 => 4,
+        DataType::Int64 | DataType::Float64 => 8,
+        DataType::Decimal128(p, s) => {
             validate_decimal_precision_and_scale::<Decimal128Type>(*p, *s)
                 .map_err(|_| invalid("ABS selected Decimal128 precision or scale is invalid"))?;
             16
         }
-        _ => {
-            return Err(invalid(
-                "ABS input and output differ from an exact installed overload",
-            ));
-        }
+        _ => return Err(invalid("ABS input differs from its installed types")),
     };
     let selection = input.selection();
     output_capacity(selection.len(), width.max(8))?;
@@ -135,6 +86,21 @@ pub(super) fn evaluate_abs<'a>(
     } else {
         None
     };
+    let signed_min = match source.data_type() {
+        DataType::Int8 => Some(i64::from(i8::MIN)),
+        DataType::Int16 => Some(i64::from(i16::MIN)),
+        DataType::Int32 => Some(i64::from(i32::MIN)),
+        DataType::Int64 => Some(i64::MIN),
+        _ => None,
+    };
+    let signed = signed_min
+        .map(|min| {
+            crate::math_numeric::NumericArrayView::new(array)
+                .map(|view| (view, min))
+                .map_err(KernelFailure::from_domain)
+        })
+        .transpose()?;
+    let mut errors = Vec::new();
     let mut work = EvaluationCheckpoints::new(control);
     let mut identity = selection.len() == array.len();
     for (ordinal, batch_row) in selection.iter().enumerate() {
@@ -149,6 +115,19 @@ pub(super) fn evaluate_abs<'a>(
             if !target.nullable() {
                 return Err(internal("ABS non-null selected argument contains SQL NULL"));
             }
+        } else if signed
+            .as_ref()
+            .is_some_and(|(view, min)| view.value_i64(row) == Some(*min))
+        {
+            errors
+                .try_reserve(1)
+                .map_err(|_| KernelFailure::ResourceExhausted)?;
+            errors.push(RowDataError::with_reason(
+                ordinal,
+                DataFailureReason::NumericOutOfRange,
+                "Absolute value exceeds the signed result width",
+            ));
+            identity = false;
         } else if let (Some(decimal), DataType::Decimal128(p, s)) = (decimal, source.data_type()) {
             // This is the original selected input contract check, not a second ABS
             // algorithm or another decimal rescaling author.
@@ -164,9 +143,14 @@ pub(super) fn evaluate_abs<'a>(
         work.flush()?;
         let mut addresses = Vec::with_capacity(selection.len());
         work.flush()?;
+        let mut invalid_rows = errors.iter().map(RowDataError::selected_ordinal).peekable();
         for (ordinal, batch_row) in selection.iter().enumerate() {
             work.step()?;
-            addresses.push(argument.value_row(ordinal, batch_row) as u64);
+            if invalid_rows.next_if_eq(&ordinal).is_some() {
+                addresses.push(None);
+            } else {
+                addresses.push(Some(argument.value_row(ordinal, batch_row) as u64));
+            }
         }
         work.flush()?;
         let addresses = UInt64Array::from(addresses);
@@ -186,8 +170,13 @@ pub(super) fn evaluate_abs<'a>(
     )
     .map_err(AbsError::into_kernel)?;
     work.finish()?;
-    SelectedValues::try_new(selection, target.data_type(), values, Box::default())
-        .map_err(|_| internal("ABS compact output violates its selected contract"))
+    SelectedValues::try_new(
+        selection,
+        target.data_type(),
+        values,
+        errors.into_boxed_slice(),
+    )
+    .map_err(|_| internal("ABS compact output violates its selected contract"))
 }
 /// Check Rust allocation representability, not an application capacity grant.
 fn output_capacity(rows: usize, width: usize) -> Result<(), KernelFailure> {
@@ -210,9 +199,7 @@ fn output_capacity(rows: usize, width: usize) -> Result<(), KernelFailure> {
 mod tests {
     use super::*;
     use crate::{ConstantPolicy, ConstantPool, FunctionValueType, ScalarEvaluationInstance};
-    use arrow_array::{
-        Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    };
+    use arrow_array::{Decimal128Array, Float32Array, Float64Array, Int8Array, Int64Array};
     use novarocks_type_contract::CompilePhase;
     use std::{sync::Mutex, time::Duration};
 
@@ -265,123 +252,6 @@ mod tests {
             .unwrap();
         assert!(output.errors().is_empty());
         output.into_parts().1
-    }
-    fn largeints(values: &[Option<i128>]) -> ArrayRef {
-        let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), 16);
-        for value in values {
-            match value {
-                Some(value) => builder.append_value(value.to_be_bytes()).unwrap(),
-                None => builder.append_null(),
-            }
-        }
-        Arc::new(builder.finish())
-    }
-    fn assert_largeints(array: &ArrayRef, expected: &[Option<i128>]) {
-        assert_eq!(array.data_type(), &DataType::FixedSizeBinary(16));
-        let array = array
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .unwrap();
-        assert_eq!(array.len(), expected.len());
-        for (row, expected) in expected.iter().enumerate() {
-            match expected {
-                Some(value) => {
-                    assert!(!array.is_null(row));
-                    assert_eq!(array.value(row), value.to_be_bytes());
-                }
-                None => assert!(array.is_null(row)),
-            }
-        }
-    }
-
-    #[test]
-    fn int8_minimum_widens_to_int16_with_nulls() {
-        let output = column_result(
-            Arc::new(Int8Array::from(vec![
-                Some(i8::MIN),
-                Some(-1),
-                Some(0),
-                Some(i8::MAX),
-                None,
-            ])),
-            physical(DataType::Int8, true),
-        );
-        let values = output.as_any().downcast_ref::<Int16Array>().unwrap();
-        assert_eq!(
-            values.iter().collect::<Vec<_>>(),
-            vec![Some(128), Some(1), Some(0), Some(127), None]
-        );
-    }
-    #[test]
-    fn int16_minimum_widens_to_int32() {
-        let output = column_result(
-            Arc::new(Int16Array::from(vec![i16::MIN, -1, 0, i16::MAX])),
-            physical(DataType::Int16, false),
-        );
-        assert_eq!(
-            output
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .values()
-                .as_ref(),
-            &[32768, 1, 0, 32767]
-        );
-    }
-    #[test]
-    fn int32_minimum_widens_to_int64() {
-        let output = column_result(
-            Arc::new(Int32Array::from(vec![i32::MIN, -1, 0, i32::MAX])),
-            physical(DataType::Int32, false),
-        );
-        assert_eq!(
-            output
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .values()
-                .as_ref(),
-            &[2147483648, 1, 0, 2147483647]
-        );
-    }
-    #[test]
-    fn int64_minimum_widens_to_big_endian_largeint() {
-        let output = column_result(
-            Arc::new(Int64Array::from(vec![
-                Some(i64::MIN),
-                Some(-1),
-                Some(0),
-                Some(i64::MAX),
-                None,
-            ])),
-            physical(DataType::Int64, true),
-        );
-        assert_largeints(
-            &output,
-            &[
-                Some(9223372036854775808),
-                Some(1),
-                Some(0),
-                Some(9223372036854775807),
-                None,
-            ],
-        );
-    }
-    #[test]
-    fn largeint_minimum_preserves_wrapping_contract_and_exact_bytes() {
-        let output = column_result(
-            largeints(&[Some(i128::MIN), Some(-123), Some(0), Some(i128::MAX), None]),
-            FunctionValueType::try_with_logical_type(
-                DataType::FixedSizeBinary(16),
-                true,
-                ValueLogicalType::LargeInt,
-            )
-            .unwrap(),
-        );
-        assert_largeints(
-            &output,
-            &[Some(i128::MIN), Some(123), Some(0), Some(i128::MAX), None],
-        );
     }
     #[test]
     fn float32_abs_clears_only_sign_bits_including_nan_payloads() {
@@ -500,7 +370,7 @@ mod tests {
     fn selected_column_uses_compact_ordinals_and_scalar_broadcast_is_explicit() {
         let rows = [2, 7, 9];
         let selection = Selection::try_sparse(10, &rows).unwrap();
-        let array: ArrayRef = Arc::new(Int8Array::from(vec![Some(-4), None, Some(i8::MIN)]));
+        let array: ArrayRef = Arc::new(Int8Array::from(vec![Some(-4), None, Some(-8)]));
         let compact =
             SelectedValues::try_new(selection, &DataType::Int8, array, Box::default()).unwrap();
         let arguments = [EvaluatedArgument::SelectedColumn(&compact)];
@@ -513,11 +383,11 @@ mod tests {
             result
                 .values()
                 .as_any()
-                .downcast_ref::<Int16Array>()
+                .downcast_ref::<Int8Array>()
                 .unwrap()
                 .iter()
                 .collect::<Vec<_>>(),
-            vec![Some(4), None, Some(128)]
+            vec![Some(4), None, Some(8)]
         );
 
         let scalar: ArrayRef = Arc::new(Int8Array::from(vec![-7]));
@@ -530,7 +400,7 @@ mod tests {
             result
                 .values()
                 .as_any()
-                .downcast_ref::<Int16Array>()
+                .downcast_ref::<Int8Array>()
                 .unwrap()
                 .values()
                 .as_ref(),
@@ -547,7 +417,7 @@ mod tests {
     #[test]
     fn constant_nonzero_pool_ordinal_broadcasts_only_its_value() {
         let ty = physical(DataType::Int8, true);
-        let array: ArrayRef = Arc::new(Int8Array::from(vec![None, Some(-3), Some(i8::MIN)]));
+        let array: ArrayRef = Arc::new(Int8Array::from(vec![None, Some(-3), Some(-8)]));
         // Explicit finite fixture limits, not a production policy or MEM grant.
         let policy = ConstantPolicy {
             max_rows: 3,
@@ -585,11 +455,11 @@ mod tests {
             result
                 .values()
                 .as_any()
-                .downcast_ref::<Int16Array>()
+                .downcast_ref::<Int8Array>()
                 .unwrap()
                 .values()
                 .as_ref(),
-            &[128, 128]
+            &[8, 8]
         );
         assert!(Arc::ptr_eq(value.pool().array(), pool.array()));
     }
@@ -604,10 +474,10 @@ mod tests {
         let control = Control::default();
         let output = instance.evaluate(selection, &arguments, &control).unwrap();
         assert!(output.values().is_empty());
-        assert_eq!(output.values().data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(output.values().data_type(), &DataType::Int64);
         assert_eq!(
             instance.contract().result_type().logical_type(),
-            ValueLogicalType::LargeInt
+            ValueLogicalType::Physical
         );
         assert!(output.errors().is_empty());
         // Wrapper entry and argument entry only; the private body has its own
@@ -738,8 +608,8 @@ mod shared_core_failure_tests {
         ]
     }
     #[test]
-    fn shared_abs_largeint_gather_builder_preserves_every_checkpoint_cause_and_latch() {
-        let scalar: ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![i64::MIN]));
+    fn shared_abs_signed_gather_builder_preserves_every_checkpoint_cause_and_latch() {
+        let scalar: ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![i64::MIN + 1]));
         let source = FunctionValueType::new(DataType::Int64, false);
         let make = || {
             ScalarEvaluationInstance::instantiate(super::super::abs_owner::prepared_for_test(

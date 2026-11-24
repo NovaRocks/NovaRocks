@@ -116,15 +116,24 @@ fn canonical_call_borrows_original_nested_nodes() {
 
 #[test]
 fn syntax_without_a_canonical_call_preserves_the_rejection() {
-    for (source, message) in [
-        (
-            "ROW(a, b AS named_field)",
-            "named ROW fields are not supported",
-        ),
-        ("IF(a, b)", "two-argument IF is not supported"),
-        ("\"if\"(a, b)", "two-argument IF is not supported"),
-    ] {
-        assert_unsupported(source, message);
+    assert_unsupported(
+        "ROW(a, b AS named_field)",
+        "named ROW fields are not supported",
+    );
+}
+
+#[test]
+fn two_argument_if_has_a_synthetic_null_branch() {
+    for source in ["IF(a, b)", "\"if\"(a, b)"] {
+        let expr = parse_expression(source).unwrap();
+        let call = canonical_call(&expr).unwrap().unwrap();
+        assert_eq!(call.name, "if");
+        assert_eq!(call.arguments.len(), 3);
+        assert!(matches!(
+            call.arguments[2],
+            Expr::Literal(literal) if literal.kind == novarocks_parser::ast::LiteralKind::Null
+                && literal.span == novarocks_parser::SYNTHETIC
+        ));
     }
 }
 

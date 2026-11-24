@@ -87,7 +87,7 @@ pub(super) fn compiled_unit_can_fold(
         match call.prepared() {
             PreparedPureKernel::Scalar(kernel)
                 if kernel.instance_inline_allocation_bytes() == 0 => {}
-            PreparedPureKernel::ControlIntrinsic(_) => {}
+            PreparedPureKernel::ControlIntrinsic(_) | PreparedPureKernel::NullIf(_) => {}
             // The optional optimizer has no original evaluation allocator.
             // Ordered calls with known NULL are simplified before this step.
             PreparedPureKernel::OrderedRegexp(_) => return Ok(false),
@@ -104,6 +104,7 @@ pub(super) fn compiled_unit_can_fold(
             ArgumentControl::Eager
             | ArgumentControl::If
             | ArgumentControl::Coalesce
+            | ArgumentControl::NullIf
             | ArgumentControl::Try
             | ArgumentControl::NoArguments => {}
             ArgumentControl::TemporalSource(_) => return Ok(false),

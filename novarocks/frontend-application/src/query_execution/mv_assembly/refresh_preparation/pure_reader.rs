@@ -324,7 +324,7 @@ async fn build_aggregate_layout_for_refresh_query(
         .map_err(PreparationError::from)
 }
 
-async fn analyze_visible_refresh_query(
+pub(crate) async fn analyze_visible_refresh_query(
     io: &MvRefreshPreparationIo,
     ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,

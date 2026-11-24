@@ -19,7 +19,7 @@
 //! a subset algorithm test, not Server catalogue or native execution closure.
 
 use crate::*;
-use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_functions::{
     CallEffectInput, ConstantPolicy, ConstantValue, EvaluatedArgument, FunctionArgument,
@@ -63,7 +63,7 @@ impl KernelEvaluationControl for Evaluation {
 fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
     let control = OriginalCompileControl::default();
     let catalogue = crate::test_support::actual_rng_catalogue();
-    let seed_type = FunctionValueType::new(DataType::Int64, false);
+    let bound_type = FunctionValueType::new(DataType::Int64, false);
     let policy = ConstantPolicy {
         max_rows: 1,
         max_array_nodes: 1,
@@ -77,12 +77,12 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
         max_library_validation_bytes: 65536,
     };
     let arguments = [FunctionArgument::Value {
-        value_type: seed_type.clone(),
+        value_type: bound_type.clone(),
         constant: Some(
             ConstantValue::from_i64(
-                Arc::new(seed_type.try_to_field("fixture").unwrap()),
-                seed_type.clone(),
-                42,
+                Arc::new(bound_type.try_to_field("fixture").unwrap()),
+                bound_type.clone(),
+                1,
                 policy,
                 CompilePhase::FunctionSpecialization,
                 &control,
@@ -104,7 +104,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
         panic!("RNG is scalar");
     };
     let result_type = result_type.clone();
-    assert_eq!(result_type.data_type(), &DataType::Float64);
+    assert_eq!(result_type.data_type(), &DataType::Int64);
     use novarocks_constant_contract::{ConstantPoolId, ConstantPools, ConstantReference};
     use novarocks_expression::{EvaluationEnvironment, ScopeLayouts, compile_expr_set_pure};
     use novarocks_expression_contract::{
@@ -120,7 +120,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
             false,
         )])),
         Arc::from([SlotId::new(77)]),
-        vec![(seed_type.typed_binding().clone(), None)],
+        vec![(bound_type.typed_binding().clone(), None)],
         novarocks_type_contract::ValueTypeStorageLifetime::pure(),
         |_| Ok(()),
         &control,
@@ -131,7 +131,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
         ..
     } = &arguments[0]
     else {
-        panic!("actual admitted seed constant")
+        panic!("actual admitted bound constant")
     };
     let value = value.clone();
     let reference = ConstantReference {
@@ -143,8 +143,8 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
     let mut builder = BoundExprSetBuilder::new(UnitLimits {
         expression_semantic_depth: MAX_CONTROL_DEPTH,
     });
-    let seed = builder
-        .add(None, seed_type.clone(), ExprKind::Constant(reference))
+    let bound_expression = builder
+        .add(None, bound_type.clone(), ExprKind::Constant(reference))
         .unwrap();
     let call = builder
         .add(
@@ -158,7 +158,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
                     selected.argument_types.clone(),
                     result_type.clone(),
                 ),
-                args: Box::from([seed]),
+                args: Box::from([bound_expression]),
             },
         )
         .unwrap();
@@ -167,7 +167,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
             call,
             PhysicalCallRequest {
                 arguments: Box::from([novarocks_function_contract::FunctionArgument::Value {
-                    value_type: seed_type.clone(),
+                    value_type: bound_type.clone(),
                     constant: Some(reference),
                 }]),
                 logical_argument_count: 1,
@@ -268,7 +268,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
     let values = StaticValues::try_new_for_compile(
         RecordBatch::try_new(
             source_layout.schema().clone(),
-            vec![Arc::new(Int64Array::from(vec![42]))],
+            vec![Arc::new(Int64Array::from(vec![1]))],
         )
         .unwrap(),
         source_layout.clone(),
@@ -335,7 +335,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
                 role: ProgramChannelLayoutRole::NodeOutput,
                 ordinal: 0,
             },
-            seed_type,
+            bound_type,
         ),
         (
             ProgramChannelSite::Layout {
@@ -410,33 +410,27 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
         kernel.contract().call().selected_owner(),
         &selected
     ));
-    // Independent seed-42 bits captured from official rand 0.8.5 StdRng.
-    // Advancing A does not consume B; both borrow the same immutable recipe.
+    // Both instances borrow the same immutable recipe and evaluate their own batches.
     let mut a = ScalarEvaluationInstance::instantiate(kernel.clone()).unwrap();
     let mut b = ScalarEvaluationInstance::instantiate(kernel.clone()).unwrap();
-    let seed: ArrayRef = Arc::new(Int64Array::from(vec![42]));
-    let evaluated = [EvaluatedArgument::Scalar(&seed)];
-    let bits = |instance: &mut ScalarEvaluationInstance, rows| {
+    let bound: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let evaluated = [EvaluatedArgument::Scalar(&bound)];
+    let evaluate = |instance: &mut ScalarEvaluationInstance, rows| {
         let output = instance
             .evaluate(Selection::all(rows), &evaluated, &Evaluation)
             .unwrap();
-        output
+        assert!(output.errors().is_empty());
+        let values = output
             .values()
             .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .values()
-            .iter()
-            .map(|value| value.to_bits())
-            .collect::<Vec<_>>()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), vec![Some(0); rows]);
     };
-    assert_eq!(
-        bits(&mut a, 2),
-        vec![0x3fe0d98eec6444e4, 0x3fe15e014267f5aa]
-    );
-    assert_eq!(bits(&mut b, 1), vec![0x3fe0d98eec6444e4]);
-    assert_eq!(bits(&mut a, 1), vec![0x3fe45dec0e3bca26]);
-    assert_eq!(bits(&mut b, 1), vec![0x3fe15e014267f5aa]);
+    evaluate(&mut a, 2);
+    evaluate(&mut b, 1);
+    evaluate(&mut a, 1);
+    evaluate(&mut b, 2);
     assert_eq!(a.retained_upper_bound(), b.retained_upper_bound());
     assert!(!control.0.lock().unwrap().is_empty());
 }

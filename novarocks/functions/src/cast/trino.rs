@@ -104,6 +104,108 @@ pub(super) enum Scalar {
         max_length: Option<u32>,
     },
     Temporal(trino_temporal::Operation),
+    Uuid(UuidConversion),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum UuidConversion {
+    ParseText,
+    FromBinary,
+    ToBinary,
+    ToText(Option<u32>),
+}
+
+impl UuidConversion {
+    fn may_raise(self) -> bool {
+        match self {
+            Self::ParseText | Self::FromBinary => true,
+            Self::ToBinary => false,
+            Self::ToText(limit) => limit.is_some_and(|length| length < 36),
+        }
+    }
+
+    fn prepare(
+        source: &FunctionValueType,
+        result: &FunctionValueType,
+        from_text: Option<TextKind>,
+        to_text: Option<TextKind>,
+    ) -> Option<Self> {
+        use DataType::{Binary, FixedSizeBinary};
+        use ValueKind::Nominal;
+        match (
+            source.value_type().kind(),
+            result.value_type().kind(),
+            source.data_type(),
+            result.data_type(),
+        ) {
+            (_, Nominal(ValueLogicalType::Uuid), DataType::Utf8, FixedSizeBinary(16))
+                if matches!(from_text, Some(TextKind::Varchar(_))) =>
+            {
+                Some(Self::ParseText)
+            }
+            (ValueKind::Binary, Nominal(ValueLogicalType::Uuid), Binary, FixedSizeBinary(16)) => {
+                Some(Self::FromBinary)
+            }
+            (Nominal(ValueLogicalType::Uuid), ValueKind::Binary, FixedSizeBinary(16), Binary) => {
+                Some(Self::ToBinary)
+            }
+            (Nominal(ValueLogicalType::Uuid), _, FixedSizeBinary(16), DataType::Utf8) => {
+                match to_text {
+                    Some(TextKind::Varchar(limit)) => Some(Self::ToText(limit)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn evaluate(self, array: &dyn Array, row: usize) -> Result<CastRowResult, ConversionFailure> {
+        use novarocks_value_arrays::uuid::{format_uuid, parse_uuid};
+        match self {
+            Self::ParseText => {
+                let text = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| internal("UUID text source differs from its frozen carrier"))?;
+                parse_uuid(text.value(row))
+                    .map(CastRowResult::UuidBytes)
+                    .ok_or(ConversionFailure::Invalid)
+            }
+            Self::FromBinary => {
+                let binary = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryArray>()
+                    .ok_or_else(|| internal("UUID byte source differs from its frozen carrier"))?;
+                let bytes = binary
+                    .value(row)
+                    .try_into()
+                    .map_err(|_| ConversionFailure::Invalid)?;
+                Ok(CastRowResult::UuidBytes(bytes))
+            }
+            Self::ToBinary | Self::ToText(_) => {
+                let uuid = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+                    .ok_or_else(|| internal("UUID input differs from its frozen carrier"))?;
+                let bytes = uuid
+                    .value(row)
+                    .try_into()
+                    .map_err(|_| internal("UUID input lost its exact byte width"))?;
+                match self {
+                    Self::ToBinary => Ok(CastRowResult::UuidBytes(bytes)),
+                    Self::ToText(limit) => {
+                        if limit.is_some_and(|length| length < 36) {
+                            return Err(ConversionFailure::Invalid);
+                        }
+                        let text = String::from_utf8(format_uuid(bytes).to_vec())
+                            .map_err(|_| internal("UUID formatter produced invalid UTF-8"))?;
+                        Ok(CastRowResult::Text(text))
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
 }
 
 impl Scalar {
@@ -115,6 +217,7 @@ impl Scalar {
             Self::ParseNumber(_) | Self::ParseBoolean => true,
             Self::Render { max_length } => max_length.is_some(),
             Self::Temporal(operation) => operation.may_raise(),
+            Self::Uuid(operation) => operation.may_raise(),
             Self::Numeric { source, target } => match (source, target) {
                 (Numeric::Integer(from), Numeric::Integer(to)) => from > to,
                 (Numeric::Decimal(sp, ss), Numeric::Decimal(tp, ts)) => {
@@ -245,6 +348,10 @@ fn prepare_value(
     }
     let from_text = TextKind::from_kind(from);
     let to_text = TextKind::from_kind(to);
+    if let Some(operation) = UuidConversion::prepare(source, result, from_text, to_text) {
+        recipe.body = CastBody::Trino(Scalar::Uuid(operation));
+        return Ok(recipe);
+    }
     let from_number = Numeric::from_kind(from);
     let to_number = Numeric::from_kind(to);
     if (from_text.is_some() && source.data_type() != &Utf8)
@@ -664,6 +771,12 @@ pub(super) fn evaluate_scalar(
                 DataType::Time64(TimeUnit::Microsecond) => {
                     array.as_any().is::<arrow_array::Time64MicrosecondArray>()
                 }
+                DataType::FixedSizeBinary(16) if matches!(body, Scalar::Uuid(_)) => {
+                    array.as_any().is::<arrow_array::FixedSizeBinaryArray>()
+                }
+                DataType::Binary if matches!(body, Scalar::Uuid(_)) => {
+                    array.as_any().is::<arrow_array::BinaryArray>()
+                }
                 ty => Source::from_type(ty).is_some_and(|source| source.validate(array)),
             },
         )?;
@@ -713,6 +826,7 @@ pub(super) fn evaluate_scalar(
                 CastRowResult::Text(text)
             }
             Scalar::Temporal(operation) => operation.evaluate(array, row, work)?,
+            Scalar::Uuid(operation) => operation.evaluate(array, row)?,
         })
     })();
     match output {

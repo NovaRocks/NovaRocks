@@ -236,7 +236,16 @@ fn sql_overload_declaration_borrows_same_installed_records_with_exact_lifecycle_
             assert_eq!(direct.effects().argument_control, arguments);
             assert_eq!(direct.effects().instance_state, state);
             assert_eq!(direct.effects().null_behavior, nulls);
-            assert_eq!(direct.effects().own_row_error, row_error);
+            let expected_row_error = if name == "abs"
+                && ["(i8)", "(i16)", "(i32)", "(i64)"]
+                    .iter()
+                    .any(|input| overload.argument_pattern.starts_with(input))
+            {
+                FunctionIntrinsicRowError::MayRaise
+            } else {
+                row_error
+            };
+            assert_eq!(direct.effects().own_row_error, expected_row_error);
             assert_eq!(
                 direct.effects().value_stability,
                 FunctionVolatility::Immutable

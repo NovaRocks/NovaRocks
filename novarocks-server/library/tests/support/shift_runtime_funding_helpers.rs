@@ -46,9 +46,9 @@ use novarocks_types::{
 use std::sync::Arc;
 
 pub(super) const NAMES: [&str; 3] = [
-    "bit_shift_left",
-    "bit_shift_right",
-    "bit_shift_right_logical",
+    "bitwise_left_shift",
+    "bitwise_right_shift_arithmetic",
+    "bitwise_right_shift",
 ];
 
 pub(super) fn binding() -> QueryMemoryBinding {
@@ -83,7 +83,7 @@ pub(super) fn program_typed(
         name,
         &[
             FunctionValueType::new(source_type.clone(), true),
-            FunctionValueType::new(DataType::Int64, true),
+            FunctionValueType::new(DataType::Int32, true),
         ],
         &NAMES,
         binding,
@@ -136,7 +136,7 @@ pub(super) fn batch(program: &LocalProgram, nullable: bool, rows: usize) -> Reco
         program,
         vec![
             values,
-            Arc::new(Int64Array::from(vec![1; rows])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![1; rows])) as ArrayRef,
         ],
     )
 }

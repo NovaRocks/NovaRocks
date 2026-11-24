@@ -989,7 +989,7 @@ mod tests {
             }];
             let catalog = crate::functions::builtin_engine_function_catalog();
             let bound = catalog
-                .resolve_bound_user(
+                .resolve_bound_trusted(
                     name,
                     FunctionKind::Scalar,
                     FunctionBindingRequest {

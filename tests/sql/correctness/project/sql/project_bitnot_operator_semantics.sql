@@ -19,12 +19,12 @@
 -- @tags=project,bit,bitnot
 -- Test Objective:
 -- 1. Validate unary bitwise NOT operator semantics.
--- 2. Prevent regressions where BITNOT is lowered as binary arithmetic.
+-- 2. Prevent regressions where BITWISE_NOT is lowered as binary arithmetic.
 -- Test Flow:
--- 1. Evaluate BITNOT on negative/zero/positive BIGINT literals.
--- 2. Assert scalar output matches StarRocks semantics.
+-- 1. Evaluate BITWISE_NOT on negative/zero/positive BIGINT literals.
+-- 2. Assert scalar output matches Trino semantics.
 SELECT
-  bitnot(CAST(-1 AS BIGINT)) AS n_neg1,
-  bitnot(CAST(0 AS BIGINT)) AS n_zero,
-  bitnot(CAST(1 AS BIGINT)) AS n_pos1,
-  bitnot(CAST(1024 AS BIGINT)) AS n_1024;
+  bitwise_not(CAST(-1 AS BIGINT)) AS n_neg1,
+  bitwise_not(CAST(0 AS BIGINT)) AS n_zero,
+  bitwise_not(CAST(1 AS BIGINT)) AS n_pos1,
+  bitwise_not(CAST(1024 AS BIGINT)) AS n_1024;

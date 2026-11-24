@@ -168,9 +168,6 @@ fn validate_public_fields(fields: &[ResultField]) -> Result<(), String> {
         if depth > P::MAX_DEPTH || *nodes > P::SCHEMA_TYPE_NODES {
             return Err(limited());
         }
-        if matches!(value.kind(), ValueKind::Nominal(V::Uuid)) {
-            return Err("public output logical type UUID is unsupported".into());
-        }
         for index in 0..value.child_count() {
             walk(
                 value.child_type_at(index).expect("validated child ordinal"),
@@ -248,6 +245,7 @@ fn kind(value: &ValueTypeRef, layout: &D) -> Result<Kind, String> {
             (V::Json, D::Utf8) => N::Json,
             (V::Variant, D::LargeBinary) => N::Variant,
             (V::LargeInt, D::FixedSizeBinary(16)) => N::LargeInt,
+            (V::Uuid, D::FixedSizeBinary(16)) => N::Uuid,
             (V::Hll, D::Binary) => N::Opaque(O::Hll),
             (V::Bitmap, D::Binary) => N::Opaque(O::Bitmap),
             (V::Object, D::Binary) => N::Opaque(O::Object),
@@ -582,76 +580,6 @@ mod tests {
     }
 
     #[test]
-    fn complete_public_identities_keep_original_declarations_and_refuse_uuid() {
-        let mut large = output("large", D::FixedSizeBinary(16), Domain::Plain);
-        large.ty =
-            ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::LargeInt).unwrap();
-        assert_eq!(
-            schema(&[large]),
-            Err(ClientRenderSchemaError::UnsupportedClientType {
-                column: "large".into(),
-                native_type: N::LargeInt,
-            })
-        );
-        let physical = output_type(
-            "large",
-            ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::LargeInt).unwrap(),
-            Domain::Plain,
-        );
-        assert_eq!(
-            schema(&[physical]),
-            Err(ClientRenderSchemaError::UnsupportedClientType {
-                column: "large".into(),
-                native_type: N::LargeInt,
-            })
-        );
-        let json_plain = output("j", D::Utf8, Domain::Plain);
-        assert_eq!(
-            schema(&[json_plain]).unwrap().columns()[0]
-                .field
-                .native_type,
-            N::String
-        );
-        let mut uuid = output("u", D::FixedSizeBinary(16), Domain::Plain);
-        uuid.ty = ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::Uuid).unwrap();
-        let error = schema(&[uuid]).unwrap_err().to_string();
-        assert!(error.contains("UUID") && error.contains("unsupported"));
-    }
-
-    #[test]
-    fn complete_nested_variant_uses_original_renderer_and_uuid_is_named_refusal() {
-        for (marker, storage, nominal) in [
-            ("variant", D::LargeBinary, V::Variant),
-            ("uuid", D::FixedSizeBinary(16), V::Uuid),
-        ] {
-            let hold = ValueTypeStorageLifetime::pure();
-            let child = ValueType::try_with_logical_type(storage.clone(), true, nominal).unwrap();
-            let semantic = ValueTypeRef::try_new(
-                ValueKind::List(child.value_type().clone()),
-                true,
-                hold.clone(),
-            )
-            .unwrap();
-            let layout = D::List(Arc::new(Field::new("item", storage, true)));
-            let ty =
-                ValueType::try_from_value(semantic, ValueLayout::try_new(&layout, hold).unwrap())
-                    .unwrap();
-            let field = output_type("items", ty, Domain::Plain);
-            if marker == "uuid" {
-                let error = schema(&[field]).unwrap_err().to_string();
-                assert!(error.contains("UUID") && error.contains("unsupported"));
-            } else {
-                let result = schema(&[field]).unwrap();
-                let N::List(child) = &result.columns()[0].field.native_type else {
-                    panic!("expected list")
-                };
-                assert_eq!(child.native_type, N::Variant);
-                assert_eq!(child.presentation, R::TrinoValue);
-            }
-        }
-    }
-
-    #[test]
     fn repeated_values_keep_ordered_occurrences_and_names_never_infer_domains() {
         let mut fields = vec![
             output("bitmap", D::Binary, Domain::Plain),
@@ -869,8 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_uninstalled_uuid_fixed_list_and_union_fail_at_authoring() {
-        let uuid = ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::Uuid).unwrap();
+    fn typed_uninstalled_fixed_list_and_union_fail_at_authoring() {
         let fixed = ValueType::new(
             D::FixedSizeList(Arc::new(Field::new("item", D::Int64, true)), 2),
             true,
@@ -883,7 +810,7 @@ mod tests {
             ),
             true,
         );
-        for ty in [uuid, fixed, union] {
+        for ty in [fixed, union] {
             assert!(schema(&[output_type("unsupported", ty, Domain::Plain)]).is_err());
         }
     }
@@ -1127,7 +1054,6 @@ mod tests {
     fn client_family_preserves_existing_unsupported_declaration_errors() {
         let facts = novarocks_result_contract::TrinoJsonFacts::default();
         let types = [
-            ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::Uuid).unwrap(),
             ValueType::new(
                 D::FixedSizeList(Arc::new(Field::new("item", D::Int64, true)), 2),
                 true,

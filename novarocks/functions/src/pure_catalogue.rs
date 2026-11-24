@@ -171,6 +171,7 @@ impl PureKernelAbi {
                         base.argument_control,
                         ArgumentControl::If
                             | ArgumentControl::Coalesce
+                            | ArgumentControl::NullIf
                             | ArgumentControl::Try
                             | ArgumentControl::SimpleCase
                             | ArgumentControl::SearchedCase
@@ -178,7 +179,7 @@ impl PureKernelAbi {
                             | ArgumentControl::OrderedRegexp
                     )
                     && match base.argument_control {
-                        ArgumentControl::OrderedRegexp => {
+                        ArgumentControl::OrderedRegexp | ArgumentControl::NullIf => {
                             base.own_row_error == FunctionIntrinsicRowError::MayRaise
                         }
                         ArgumentControl::TemporalSource(_) => matches!(
@@ -529,6 +530,7 @@ pub enum PreparedPureKernel {
     /// this variant never pretends to be an ordinary evaluated-argument CPU.
     ControlIntrinsic(Arc<FunctionCallContract>),
     OrderedRegexp(crate::PreparedRegexp),
+    NullIf(crate::builtin::nullif::PreparedNullIf),
 }
 impl PreparedPureKernel {
     /// Borrow the exact call owned by this resolved lifecycle implementation.
@@ -544,6 +546,7 @@ impl PreparedPureKernel {
             Self::Table(kernel) => kernel.contract().call(),
             Self::ControlIntrinsic(call) => call,
             Self::OrderedRegexp(prepared) => prepared.call(),
+            Self::NullIf(prepared) => prepared.call(),
         }
     }
 }
@@ -1637,7 +1640,7 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
             .map_err(FunctionSpecializationFailure::Control)?;
         Ok(PreparedPureCallDraft {
             effects: effects.into(),
-            prepared: prepared_control_call(call)?,
+            prepared: prepared_control_call(call, control)?,
         })
     }
 
@@ -1671,16 +1674,21 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
             .map_err(FunctionSpecializationFailure::Control)?;
         Ok(PreparedPureCallDraft {
             effects: effects.into(),
-            prepared: prepared_control_call(call)?,
+            prepared: prepared_control_call(call, control)?,
         })
     }
 }
 
 fn prepared_control_call(
     call: Arc<FunctionCallContract>,
+    control: &dyn PureCompileControl,
 ) -> Result<PreparedPureKernel, FunctionSpecializationFailure> {
     if call.effects().argument_control == ArgumentControl::OrderedRegexp {
         return crate::PreparedRegexp::from_call(call).map(PreparedPureKernel::OrderedRegexp);
+    }
+    if call.effects().argument_control == ArgumentControl::NullIf {
+        return crate::builtin::nullif::PreparedNullIf::from_call(call, control)
+            .map(PreparedPureKernel::NullIf);
     }
     Ok(PreparedPureKernel::ControlIntrinsic(call))
 }

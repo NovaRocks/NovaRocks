@@ -83,11 +83,7 @@ impl SessionPropertyCpuInput {
     pub(crate) fn run(mut self) -> Result<PreparedSessionProperties, QueryServiceError> {
         let evaluator = SessionPropertyEvaluation {
             interpreter: &self.interpreter,
-            sql_semantics: self
-                .staged
-                .sql_semantics()
-                .clone()
-                .with_statement_time(self.staged.statement_time(self.statement_time)),
+            sql_semantics: self.staged.statement_sql_semantics(self.statement_time),
             control: &self.control,
             scope: &self.scope,
             window: &self.window,
@@ -229,7 +225,6 @@ impl QueryContextsCpuInput {
             self.prepared.parameters = Some(complete_prepared_context(
                 parameters,
                 self.prepared.statement.query(),
-                &self.prepared.state,
                 &self.context,
                 &self.source,
             )?);
@@ -248,7 +243,6 @@ struct QueryContextsEnvironment {
 pub(super) fn complete_prepared_context(
     parameters: Arc<novarocks_sql::compiler::SqlPreparedParameters>,
     query: &ast::Query,
-    state: &SessionSqlState,
     context: &PropertyCpuContext,
     source: &str,
 ) -> Result<Arc<novarocks_sql::compiler::SqlPreparedParameters>, QueryServiceError> {
@@ -262,11 +256,6 @@ pub(super) fn complete_prepared_context(
             source,
         ))
     };
-    let semantic_settings = state.sql_semantics().clone();
-    let sql_semantics = match context.sql_semantics.statement_time() {
-        Some(time) => semantic_settings.with_statement_time(time),
-        None => semantic_settings,
-    };
     let mut evaluated = Vec::with_capacity(needs.len());
     for need in needs {
         let prepared = {
@@ -275,10 +264,10 @@ pub(super) fn complete_prepared_context(
                 input: need.input(),
                 target: need.target(),
                 catalog: &SqlPlannerTableSnapshot::new(&*catalog),
-                current_database: state.current_database(),
+                current_database: &context.current_database,
                 functions: context.functions.clone(),
                 sealed_functions: context.interpreter.sealed_functions(),
-                sql_semantics: &sql_semantics,
+                sql_semantics: &context.sql_semantics,
                 constant_policy: context.policy,
                 control: &context.control,
             })
@@ -416,11 +405,7 @@ impl QuerySessionPreparation {
             );
             let context = input.compiler.property_cpu_context(
                 input.original.current_database().to_owned(),
-                input
-                    .original
-                    .sql_semantics()
-                    .clone()
-                    .with_statement_time(input.original.statement_time(input.statement_time)),
+                input.original.statement_sql_semantics(input.statement_time),
                 input.interpreter,
                 control,
                 owner.scope().clone(),
@@ -494,17 +479,16 @@ impl QuerySessionPreparation {
                     .map(tokio::time::Instant::into_std),
                 crate::query_execution::planning::sql_cancellation_observation(cancellation),
             );
-            let context =
-                environment.compiler.property_cpu_context(
-                    prepared.state.current_database().to_owned(),
-                    prepared.state.sql_semantics().clone().with_statement_time(
-                        prepared.state.statement_time(environment.statement_time),
-                    ),
-                    environment.interpreter,
-                    control,
-                    owner.scope().clone(),
-                    window,
-                );
+            let context = environment.compiler.property_cpu_context(
+                prepared.state.current_database().to_owned(),
+                prepared
+                    .state
+                    .statement_sql_semantics(environment.statement_time),
+                environment.interpreter,
+                control,
+                owner.scope().clone(),
+                window,
+            );
             let input = QueryContextsCpuInput {
                 source: environment.source,
                 prepared,

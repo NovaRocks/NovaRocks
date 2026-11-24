@@ -1898,6 +1898,7 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                             (ControlShape::If, ArgumentControl::If)
                             | (ControlShape::Coalesce, ArgumentControl::Coalesce)
                             | (ControlShape::Try, ArgumentControl::Try)
+                            | (ControlShape::NullIf, ArgumentControl::NullIf)
                             | (ControlShape::OrderedRegexp, ArgumentControl::OrderedRegexp) => {
                                 (false, true)
                             }
@@ -2194,6 +2195,7 @@ fn validate_prepared_call(
                 | PreparedPureKernel::ScalarInvocation(_)
                 | PreparedPureKernel::ControlIntrinsic(_)
                 | PreparedPureKernel::OrderedRegexp(_)
+                | PreparedPureKernel::NullIf(_)
         )
         || call.function_id() != &function.function_id
         || call.selected().overload != function.overload

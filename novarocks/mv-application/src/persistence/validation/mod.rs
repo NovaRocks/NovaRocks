@@ -70,6 +70,16 @@ fn validate_timestamp(value: u64, path: &str) -> Result<(), ValidationError> {
 
 pub fn validate_definition(document: &DefinitionDocument) -> Result<(), ValidationError> {
     validate_timestamp(document.created_at_ms, "definition.created_at_ms")?;
+    if document
+        .scalar_contracts
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(ValidationError::new(
+            "definition.scalar_contracts",
+            "scalar contracts must be unique and in canonical order",
+        ));
+    }
     nonempty_text(
         "definition.query.effective_sql",
         &document.query.effective_sql,

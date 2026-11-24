@@ -66,6 +66,33 @@ pub(crate) use resolver::{ResolveError, ResolvedScalarFunction};
 /// the same decision.
 pub(crate) use novarocks_functions::FunctionVolatility;
 
+pub(crate) const ASSERT_TRUE_ID: &str = "builtin.scalar/assert_true/v1";
+
+pub(crate) fn bind_assert_true(
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    arguments: &[FunctionArgument],
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+    let function = novarocks_functions::FunctionId::try_new(ASSERT_TRUE_ID)
+        .expect("frozen assertion identity");
+    let overload = novarocks_functions::FunctionOverloadId::try_new(match arguments.len() {
+        1 => "builtin.scalar/assert_true/(bool)->bool;strict;legacy",
+        2 => "builtin.scalar/assert_true/(bool,utf8)->bool;strict;legacy",
+        _ => return Err(FunctionBindingError::NoMatchingOverload),
+    })
+    .expect("frozen assertion overload");
+    catalog.finish_scalar_binding(
+        &function,
+        &overload,
+        FunctionBindingRequest {
+            expected_result_type: None,
+            arguments,
+            logical_argument_count: arguments.len(),
+        },
+        control,
+    )
+}
+
 #[cfg(test)]
 fn declared_output_logical_type(
     result: &FunctionValueType,
@@ -1003,9 +1030,9 @@ mod tests {
         .unwrap()
     }
 
-    fn test_i64_constant(value: i64) -> novarocks_functions::ConstantValue {
-        let ty = FunctionValueType::new(DataType::Int64, false);
-        novarocks_functions::ConstantValue::from_i64(
+    fn test_i32_constant(value: i32) -> novarocks_functions::ConstantValue {
+        let ty = FunctionValueType::new(DataType::Int32, false);
+        novarocks_functions::ConstantValue::from_i32(
             Arc::new(ty.try_to_field("literal").unwrap()),
             ty,
             value,
@@ -1372,12 +1399,12 @@ mod tests {
             "round",
             &[
                 value_argument(DataType::Decimal128(18, 6), false, None),
-                value_argument(DataType::Int64, false, Some(test_i64_constant(2))),
+                value_argument(DataType::Int32, false, Some(test_i32_constant(2))),
             ],
         );
         assert_eq!(
             scalar_result(&rounded).data_type().clone(),
-            DataType::Decimal128(38, 2)
+            DataType::Decimal128(19, 6)
         );
 
         let variant = resolve_exact_scalar(
@@ -1571,31 +1598,21 @@ mod tests {
     }
 
     #[test]
-    fn abs_exact_bindings_freeze_input_and_promoted_output_widths() {
+    fn abs_exact_bindings_freeze_same_input_and_output_widths() {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
         let control = crate::compiler::SqlCompileControl::unbounded();
         let negate = novarocks_type_contract::OperatorFunction::Negation.function_id();
-        for (input, output) in [
-            (DataType::Int8, DataType::Int16),
-            (DataType::Int16, DataType::Int32),
-            (DataType::Int32, DataType::Int64),
-            (DataType::Int64, DataType::FixedSizeBinary(16)),
-            (DataType::FixedSizeBinary(16), DataType::FixedSizeBinary(16)),
-            (DataType::Float32, DataType::Float32),
-            (DataType::Float64, DataType::Float64),
-            (DataType::Decimal128(18, 3), DataType::Decimal128(18, 3)),
+        for input in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Decimal128(18, 3),
         ] {
             for nullable in [false, true] {
-                let input_type = if input == DataType::FixedSizeBinary(16) {
-                    FunctionValueType::try_with_logical_type(
-                        input.clone(),
-                        nullable,
-                        novarocks_type_contract::ValueLogicalType::LargeInt,
-                    )
-                    .unwrap()
-                } else {
-                    FunctionValueType::new(input.clone(), nullable)
-                };
+                let input_type = FunctionValueType::new(input.clone(), nullable);
                 let arguments = [FunctionArgument::Value {
                     value_type: input_type.clone(),
                     constant: None,
@@ -1606,8 +1623,7 @@ mod tests {
                     logical_argument_count: 1,
                 };
                 let binding = resolve_exact_scalar(&catalog, "abs", &arguments);
-                assert_eq!(scalar_result(&binding).data_type().clone(), output);
-                assert_eq!(scalar_result(&binding).nullable(), nullable);
+                assert_eq!(scalar_result(&binding), &input_type);
                 assert_eq!(
                     binding.selected.argument_types.as_ref(),
                     &[FunctionArgumentType::Value(input_type.clone())]
@@ -1625,18 +1641,34 @@ mod tests {
     }
 
     #[test]
-    fn abs_exact_binding_rejects_a_stale_same_width_integer_result() {
+    fn abs_exact_binding_rejects_a_stale_promoted_integer_result() {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
-        for input in [
-            DataType::Int8,
-            DataType::Int16,
-            DataType::Int32,
-            DataType::Int64,
+        for (input, retired_result) in [
+            (
+                DataType::Int8,
+                FunctionValueType::new(DataType::Int16, true),
+            ),
+            (
+                DataType::Int16,
+                FunctionValueType::new(DataType::Int32, true),
+            ),
+            (
+                DataType::Int32,
+                FunctionValueType::new(DataType::Int64, true),
+            ),
+            (
+                DataType::Int64,
+                FunctionValueType::try_with_logical_type(
+                    DataType::FixedSizeBinary(16),
+                    true,
+                    novarocks_type_contract::ValueLogicalType::LargeInt,
+                )
+                .unwrap(),
+            ),
         ] {
-            let arguments = [value_argument(input.clone(), true, None)];
+            let arguments = [value_argument(input, true, None)];
             let mut binding = resolve_exact_scalar(&catalog, "abs", &arguments);
-            binding.selected.result_type =
-                FunctionResultType::Scalar(FunctionValueType::new(input, true));
+            binding.selected.result_type = FunctionResultType::Scalar(retired_result);
             assert!(
                 catalog
                     .validate_bound(
@@ -1649,7 +1681,7 @@ mod tests {
                         &crate::compiler::SqlCompileControl::unbounded(),
                     )
                     .is_err(),
-                "a stale same-width result must fail exact catalog validation before encoding"
+                "a stale promoted result must fail exact catalog validation before encoding"
             );
         }
     }
@@ -1680,7 +1712,16 @@ mod tests {
                 Own::MayRaise,
             ),
         ] {
-            let bound = resolve_exact_scalar(&catalog, name, &arguments);
+            let bound = if name == "assert_true" {
+                bind_assert_true(
+                    &catalog,
+                    &arguments,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap()
+            } else {
+                resolve_exact_scalar(&catalog, name, &arguments)
+            };
             assert_eq!(bound.semantics.intrinsic_row_error, expected, "{name}");
             catalog
                 .validate_bound(

@@ -1,12 +1,12 @@
 -- query 2
--- types	decimal(38, 6)
+-- types	decimal(38, 9)
 _col0
-274.977900
+274.977900000
 
 -- query 3
--- types	decimal(38, 6)
+-- types	decimal(38, 9)
 _col0
-274.977900
+274.977900000
 
 -- query 4
 -- types	decimal(9, 0)

@@ -393,6 +393,36 @@ pub(super) fn evaluate<'a>(
             }
             _ => {}
         }
+        if recipe.body == CastBody::ArrayNull {
+            if recipe.source.data_type() != &DataType::Null || !recipe.result.nullable() {
+                return Err(invalid(
+                    "unknown CAST has a stale source or result declaration",
+                ));
+            }
+            if !recipe.source.nullable() && inherited.len() < selection.len() {
+                return Err(invalid(
+                    "non-null array CAST input contains a selected NULL",
+                ));
+            }
+            let data_type = recipe.result.data_type();
+            selected_copy::preflight_null_extent(data_type, selection.len(), &mut work)
+                .map_err(selected_copy::CopyError::into_kernel)?;
+            let mut errors = reserve::<RowDataError>(inherited.len(), &mut work)?;
+            for error in inherited {
+                work.step()?;
+                errors.push(error.clone());
+            }
+            work.flush()?;
+            let values = new_null_array(data_type, selection.len());
+            work.flush()?;
+            return SelectedValues::try_new_observed(
+                selection,
+                data_type,
+                values,
+                errors.into_boxed_slice(),
+                || work.step(),
+            );
+        }
         selected_copy::guarded_result_extent(recipe.result.data_type(), selection.len())
             .map_err(|e| e.into_kernel())?;
         let mut arrays = reserve::<ArrayRef>(selection.len(), &mut work)?;
@@ -424,10 +454,6 @@ pub(super) fn evaluate<'a>(
                 } else if recipe.body == CastBody::Identity {
                     work.flush()?;
                     argument.array().slice(row, 1)
-                } else if recipe.body == CastBody::ArrayNull {
-                    return Err(invalid(
-                        "unknown array CAST input contains a non-NULL value",
-                    ));
                 } else {
                     let list = argument
                         .array()

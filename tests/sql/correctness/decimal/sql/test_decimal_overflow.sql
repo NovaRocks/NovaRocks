@@ -40,7 +40,7 @@ insert into ${case_db}.avg_test values ROW(1, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 1
 insert into ${case_db}.avg_test values ROW(1, [11, 12, 13, 14, 15, 16, 17, 18, 19, 20], 123456789, 1);
 
 -- query 2
--- ROUND retains NovaRocks DECIMAL(38,16) results. The standard product is DECIMAL(38,6).
+-- ROUND retains the input scale, and the product has type DECIMAL(38,9).
 select 274.97790000000000000000 * (round(1103.00000000000000000000 * 1.0000,16) /round(1103.00000000000000000000,16));
 
 -- query 3

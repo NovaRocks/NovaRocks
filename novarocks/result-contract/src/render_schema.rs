@@ -37,6 +37,7 @@ pub enum NativeRenderType {
     String,
     BoundedCharacter(CharacterType),
     Binary,
+    Uuid,
     Date,
     Time {
         unit: RenderTimeUnit,

@@ -506,6 +506,7 @@ fn substring_from_normalizes_directly_to_substr_while_ordinary_call_names_stay_r
     for source in [
         "catalog.extract_field(part, payload)",
         "\"extract\"(part, payload)",
+        "truncate(payload, digits)",
     ] {
         let parsed = expression(source);
         assert!(matches!(parsed, Expr::FunctionCall(_)));

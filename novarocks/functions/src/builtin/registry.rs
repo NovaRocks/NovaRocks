@@ -455,121 +455,64 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
-    // Integer ABS widens before taking the absolute value, so each signed
-    // minimum has a representable result. LARGEINT has no wider integer
-    // carrier and preserves its existing two's-complement ABS contract.
-    for (input, output) in [
-        (TypeSpec::Int8, TypeSpec::Int16),
-        (TypeSpec::Int16, TypeSpec::Int32),
-        (TypeSpec::Int32, TypeSpec::Int64),
-        (TypeSpec::Int64, TypeSpec::LargeInt),
-        (TypeSpec::LargeInt, TypeSpec::LargeInt),
-        (TypeSpec::Float32, TypeSpec::Float32),
-        (TypeSpec::Float64, TypeSpec::Float64),
-        (TypeSpec::Decimal128Of("D"), TypeSpec::Decimal128Of("D")),
-    ] {
-        add(m, "abs", Signature::new(vec![input], output));
+    for name in ["abs", "ceil", "ceiling", "floor", "sign"] {
+        add_for_every(m, name, NUMERIC_PRESERVING_TYPES, |ty| {
+            Signature::new(vec![ty.clone()], ty.clone()).with_argument_coercion()
+        });
+        let result = match name {
+            "abs" => TypeSpec::Decimal128Of("D"),
+            "sign" => TypeSpec::DecimalSign,
+            _ => TypeSpec::DecimalIntegralOf("D"),
+        };
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Decimal128Of("D")], result).with_argument_coercion(),
+        );
     }
 
     for (signature, _) in super::negation_owner::signatures() {
         add(m, super::negation_owner::NAME, signature);
     }
 
-    // ceil / ceiling / floor: any numeric input, returns Int64.
-    for name in ["ceil", "ceiling", "dceil", "floor", "dfloor"] {
-        add_for_every(m, name, NUMERIC_PRESERVING_TYPES, |t| {
-            Signature::new(vec![t.clone()], TypeSpec::Int64)
-        });
+    for name in [
+        "sqrt", "cbrt", "exp", "ln", "log2", "log10", "sin", "cos", "tan", "asin", "acos", "atan",
+        "sinh", "cosh", "tanh", "radians", "degrees",
+    ] {
         add(
             m,
             name,
-            Signature::new(vec![TypeSpec::AnyDecimal128], TypeSpec::Int64),
+            Signature::new(vec![TypeSpec::Float64], TypeSpec::Float64).with_argument_coercion(),
         );
     }
 
-    // Single-arg floating-point math returning Float64. `positive` is
-    // here (not in preserve-input) because NovaRocks's legacy path puts
-    // it alongside the math family.
-    for name in [
-        "sqrt", "dsqrt", "cbrt", "exp", "dexp", "ln", "log2", "log10", "dlog10", "dlog1", "dround",
-        "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "radians", "degrees",
-        "degress", "sign", "positive",
-    ] {
-        for t in NUMERIC_PRESERVING_TYPES {
-            add(m, name, Signature::new(vec![t.clone()], TypeSpec::Float64));
-        }
-        // The shared numeric reader already decodes DECIMAL to f64; the
-        // answer is Float64 either way, so nothing has to be named back.
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::AnyDecimal128], TypeSpec::Float64),
-        );
-    }
-
-    // log(x) is also the one-argument form, over any numeric including
-    // DECIMAL -- the shared numeric reader decodes that to f64.
-    for t in NUMERIC_PRESERVING_TYPES {
-        add(m, "log", Signature::new(vec![t.clone()], TypeSpec::Float64));
-    }
-    add(
-        m,
-        "log",
-        Signature::new(vec![TypeSpec::AnyDecimal128], TypeSpec::Float64),
-    );
-
-    // round / dround additionally take how many digits to keep.
-    add(
-        m,
-        "dround",
-        Signature::new(vec![TypeSpec::Float64, TypeSpec::Int32], TypeSpec::Float64),
-    );
-
-    // Two-arg math returning Float64.
-    for name in [
-        "pow", "fpow", "dpow", "power", "log", "mod", "fmod", "atan2",
-    ] {
-        for tl in NUMERIC_PRESERVING_TYPES {
-            for tr in NUMERIC_PRESERVING_TYPES {
-                add(
-                    m,
-                    name,
-                    Signature::new(vec![tl.clone(), tr.clone()], TypeSpec::Float64),
-                );
-            }
-        }
-    }
-
-    // Constants returning Float64 with no args.
-    for name in ["pi", "e", "rand", "random"] {
-        add(m, name, Signature::new(vec![], TypeSpec::Float64));
-    }
-    // `rand(seed)` overload.
-    add(
-        m,
-        "rand",
-        Signature::new(vec![TypeSpec::Int64], TypeSpec::Float64),
-    );
-    add(
-        m,
-        "random",
-        Signature::new(vec![TypeSpec::Int64], TypeSpec::Float64),
-    );
-
-    // Vector distance — varies in arity but always returns Float64.
-    for name in ["cosine_similarity", "l2_distance"] {
-        // Take two list-of-numeric arguments. For simplicity we accept
-        // any List + List and let cast/runtime checks reject bad inputs.
+    for name in ["pow", "power", "log", "atan2"] {
         add(
             m,
             name,
             Signature::new(
-                vec![
-                    TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                    TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                ],
+                vec![TypeSpec::Float64, TypeSpec::Float64],
                 TypeSpec::Float64,
-            ),
+            )
+            .with_argument_coercion(),
+        );
+    }
+    for name in ["pi", "e", "rand", "random"] {
+        add(m, name, Signature::new(vec![], TypeSpec::Float64));
+    }
+    for name in ["rand", "random"] {
+        add_for_every(m, name, INTEGER_TYPES, |ty| {
+            Signature::new(vec![ty.clone()], ty.clone()).with_argument_coercion()
+        });
+    }
+
+    let vector = TypeSpec::List(Box::new(TypeSpec::Float64));
+    for name in ["cosine_similarity", "euclidean_distance"] {
+        add(
+            m,
+            name,
+            Signature::new(vec![vector.clone(), vector.clone()], TypeSpec::Float64)
+                .with_argument_coercion(),
         );
     }
 
@@ -631,12 +574,11 @@ fn register_condition_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // because the two `T` slots disagree concretely.
     //
     //   ifnull(a, b)     -> wider_type(a, b)
-    //   nullif(a, b)     -> wider_type(a, b)
     //   nvl(a, b)        -> wider_type(a, b)
     //   coalesce(...)    -> wider_type over all args
     //   case(...)        -> wider_type over all args
     //   if(cond, t, e)   -> wider_type(t, e) — first arg is Boolean
-    for name in ["ifnull", "nullif", "nvl"] {
+    for name in ["ifnull", "nvl"] {
         add(
             m,
             name,
@@ -977,44 +919,27 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_bitwise_fns(m: &mut HashMap<String, Vec<Signature>>) {
-    for name in ["bitand", "bitor", "bitxor"] {
-        add_for_every(m, name, INTEGER_TYPES, |t| {
-            Signature::new(vec![t.clone(), t.clone()], t.clone())
-        });
+    for name in ["bitwise_and", "bitwise_or", "bitwise_xor"] {
         add(
             m,
             name,
-            Signature::new(
-                vec![TypeSpec::LargeInt, TypeSpec::LargeInt],
-                TypeSpec::LargeInt,
-            ),
+            Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Int64)
+                .with_argument_coercion(),
         );
     }
-    add_for_every(m, "bitnot", INTEGER_TYPES, |t| {
-        Signature::new(vec![t.clone()], t.clone())
-    });
     add(
         m,
-        "bitnot",
-        Signature::new(vec![TypeSpec::LargeInt], TypeSpec::LargeInt),
+        "bitwise_not",
+        Signature::new(vec![TypeSpec::Int64], TypeSpec::Int64).with_argument_coercion(),
     );
-    // Shifts take (T, BIGINT) -> T.
     for name in [
-        "bit_shift_left",
-        "bit_shift_right",
-        "bit_shift_right_logical",
+        "bitwise_left_shift",
+        "bitwise_right_shift",
+        "bitwise_right_shift_arithmetic",
     ] {
         add_for_every(m, name, INTEGER_TYPES, |t| {
-            Signature::new(vec![t.clone(), TypeSpec::Int64], t.clone())
+            Signature::new(vec![t.clone(), TypeSpec::Int32], t.clone()).with_argument_coercion()
         });
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::LargeInt, TypeSpec::Int64],
-                TypeSpec::LargeInt,
-            ),
-        );
     }
 }
 
@@ -1327,17 +1252,13 @@ fn register_json_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_misc_fns(m: &mut HashMap<String, Vec<Signature>>) {
-    // -> Utf8 (no args / Utf8 args)
-    for name in [
-        "version",
-        "database",
-        "current_user",
-        "user",
-        "uuid",
+    add(m, "version", Signature::new(vec![], TypeSpec::Utf8));
+    add(m, "uuid", Signature::new(vec![], TypeSpec::Uuid));
+    add(
+        m,
         "typeof",
-    ] {
-        add(m, name, Signature::new(vec![], TypeSpec::Utf8));
-    }
+        Signature::new(vec![TypeSpec::AnyType], TypeSpec::Utf8),
+    );
     // cast: preserves first-arg type. (Special — analyzer's type_hint is
     // usually authoritative for cast, so the registry answer is rarely
     // used; we register defensively to avoid UnknownFunction.)

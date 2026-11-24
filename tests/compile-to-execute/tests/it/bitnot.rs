@@ -18,32 +18,18 @@
 //! Frame. The shared SQL fixture deliberately disables folding; native whole
 //! cases and production FE folding remain separate acceptance obligations.
 use arrow::array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use novarocks_expression::testkit::{PassThroughCallHost, fixture_scope};
-use novarocks_expression::{
-    CompiledExpressionInstance, EvaluationEnvironment, EvaluationInput, ScopeLayouts,
-    compile_expr_set_pure,
-};
+use arrow::datatypes::DataType;
+use novarocks_expression::CompiledExpressionInstance;
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression_contract::RootOrdinal;
 use novarocks_functions::{
     FunctionArgumentType, FunctionResultType, FunctionValueType, KernelEvaluationControl,
     KernelFailure, ScalarInvocationActivation, ScalarInvocationScope, Selection,
 };
 use novarocks_local_program::{ProgramNodeKind, ProgramRootRef, ProgramUnitId};
-use novarocks_sql::analyze_error::AnalyzeErrorKind;
-use novarocks_sql::compiler::{
-    SqlCompileControl, SqlCompileError, SqlCompileProgressError, SqlPlannerTableSnapshot,
-    SqlStandaloneScalarColumn, SqlStandaloneScalarRequest, author_standalone_scalar_for_test,
-    builtin_sql_function_catalog,
-};
-use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
-use novarocks_sql_testkit::{
-    sql_fixture_constant_policy, sql_source, try_sql_source_with_declared_fields,
-};
+use novarocks_sql_testkit::sql_source;
 use novarocks_test_compile_to_execute::programs::{batch, programs_with_catalogue};
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueLogicalType};
-
-use novarocks_expression_contract::{RootOrdinal, ValueId};
 use std::sync::Arc;
 use std::time::Duration;
 struct Control;
@@ -77,11 +63,12 @@ fn programs(
     let functions = novarocks_functions::testkit::installed_builtin_owner_catalogue();
     programs_with_catalogue(source, &functions)
 }
-fn bitnot_call_root(
+fn scalar_call_root(
     plans: &std::collections::BTreeMap<
         novarocks_physical_plan::FragmentId,
         Arc<novarocks_local_program::LocalProgram>,
     >,
+    function_id: &str,
     argument: &FunctionValueType,
     result: &FunctionValueType,
 ) -> (Arc<novarocks_local_program::LocalProgram>, ProgramRootRef) {
@@ -90,9 +77,12 @@ fn bitnot_call_root(
         for (unit_ordinal, unit) in program.units().iter().enumerate() {
             for (root_ordinal, root) in unit.roots().iter().enumerate() {
                 if let Some(call) = unit.calls().get(&root.use_id)
-                    && call.call_contract().function_id().as_str() == "builtin.scalar/bitnot/v1"
+                    && call.call_contract().function_id().as_str() == function_id
                 {
-                    assert!(found.is_none(), "the SQL has exactly one named bitnot root");
+                    assert!(
+                        found.is_none(),
+                        "the SQL has exactly one root for {function_id}"
+                    );
                     let contract = call.call_contract();
                     assert_eq!(contract.logical_argument_count(), 1);
                     assert_eq!(
@@ -121,25 +111,24 @@ fn bitnot_call_root(
             }
         }
     }
-    found.expect("the actual SQL output retains the bound bitnot call")
+    found.expect("the actual SQL output retains the bound scalar call")
 }
 #[test]
-fn named_bitnot_actual_sql_signed_four_widths_preserve_full_fvt_and_frame_results() {
-    // For a fixed signed two's-complement width, complement swaps MIN/MAX,
-    // maps -1 to zero, zero to -1, and one to -2. These are independent inputs
-    // and fixed expected arrays, not an evaluator over the supplied input.
+fn bitwise_not_widens_signed_input_widths_to_bigint_in_the_frame() {
+    // Narrow inputs are sign-extended to BIGINT before complement. The
+    // expected arrays contain independent known complements of those values.
     let cases: Vec<(ArrayRef, ArrayRef)> = vec![
         (
             Arc::new(Int8Array::from(vec![i8::MIN, -1, 0, 1, i8::MAX])),
-            Arc::new(Int8Array::from(vec![i8::MAX, 0, -1, -2, i8::MIN])),
+            Arc::new(Int64Array::from(vec![127, 0, -1, -2, -128])),
         ),
         (
             Arc::new(Int16Array::from(vec![i16::MIN, -1, 0, 1, i16::MAX])),
-            Arc::new(Int16Array::from(vec![i16::MAX, 0, -1, -2, i16::MIN])),
+            Arc::new(Int64Array::from(vec![32767, 0, -1, -2, -32768])),
         ),
         (
             Arc::new(Int32Array::from(vec![i32::MIN, -1, 0, 1, i32::MAX])),
-            Arc::new(Int32Array::from(vec![i32::MAX, 0, -1, -2, i32::MIN])),
+            Arc::new(Int64Array::from(vec![2147483647, 0, -1, -2, -2147483648])),
         ),
         (
             Arc::new(Int64Array::from(vec![i64::MIN, -1, 0, 1, i64::MAX])),
@@ -148,7 +137,7 @@ fn named_bitnot_actual_sql_signed_four_widths_preserve_full_fvt_and_frame_result
     ];
     for (input, expected) in cases {
         let source = sql_source(
-            "SELECT bitnot(k) AS original_inverted FROM fixture.source",
+            "SELECT bitwise_not(k) AS original_inverted FROM fixture.source",
             input.data_type().clone(),
         );
         let public = source
@@ -157,11 +146,12 @@ fn named_bitnot_actual_sql_signed_four_widths_preserve_full_fvt_and_frame_result
             .unwrap();
         let computed = source.plan().result_port().unwrap();
         assert_eq!(public.original_port(), computed);
-        let argument = FunctionValueType::new(input.data_type().clone(), false);
-        let result = FunctionValueType::new(input.data_type().clone(), true);
+        let argument = FunctionValueType::new(DataType::Int64, false);
+        let result = FunctionValueType::new(DataType::Int64, true);
         assert_eq!(public.fields()[0].ty, result);
         let plans = programs(&source);
-        let (program, root) = bitnot_call_root(&plans, &argument, &result);
+        let (program, root) =
+            scalar_call_root(&plans, "builtin.scalar/bitwise_not/v1", &argument, &result);
         let data = batch(&program, root, input.clone());
         let mut frame = CompiledExpressionInstance::try_new(
             program.unit(root.unit).unwrap().clone(),
@@ -245,19 +235,52 @@ fn named_bitnot_actual_sql_signed_four_widths_preserve_full_fvt_and_frame_result
                 .unwrap()
                 .values()
                 .data_type(),
-            input.data_type()
+            &DataType::Int64
         );
     }
 }
 #[test]
-fn named_bitnot_actual_sql_nullable_values_preserve_nulls_and_sparse_results() {
+fn actual_sql_rejects_retired_largeint_casts_at_the_type_declaration() {
+    use arrow::datatypes::Field;
+    use novarocks_sql::analyze_error::AnalyzeErrorKind;
+    use novarocks_sql::compiler::{SqlCompileError, SqlCompileProgressError};
+    use novarocks_sql_testkit::try_sql_source_with_declared_fields;
+
+    let columns = [Field::new("k", DataType::Int64, false)];
+    for sql in [
+        "SELECT CAST(k AS LARGEINT) AS original_value FROM fixture.source",
+        "SELECT CAST('-170141183460469231731687303715884105728' AS LARGEINT)",
+        "SELECT CAST('170141183460469231731687303715884105727' AS LARGEINT)",
+        "SELECT CAST('1267650600228229401496703205381' AS LARGEINT)",
+        "SELECT CAST(NULL AS LARGEINT)",
+        "SELECT bitwise_not(CAST(k AS LARGEINT)) FROM fixture.source",
+    ] {
+        let Err(SqlCompileProgressError::Compile(SqlCompileError::Analyze(error))) =
+            try_sql_source_with_declared_fields(sql, &columns)
+        else {
+            panic!("Expected a SQL analysis error for {sql}");
+        };
+        assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch, "{sql}");
+        assert_eq!(error.code().as_str(), "sql.analyze.type_mismatch", "{sql}");
+        assert_eq!(error.message(), "Unknown type: largeint", "{sql}");
+        let span = error.span().expect("retired type's source span");
+        assert_eq!(&sql[span.start()..span.end()], "LARGEINT", "{sql}");
+    }
+}
+#[test]
+fn named_bitwise_not_actual_sql_nullable_values_preserve_nulls_and_sparse_results() {
     let source = sql_source(
-        "SELECT bitnot(i) AS original_inverted FROM (VALUES (CAST(1 AS BIGINT)),(CAST(NULL AS BIGINT)),(CAST(-2 AS BIGINT))) AS source(i)",
+        "SELECT bitwise_not(i) AS original_inverted FROM (VALUES (CAST(1 AS BIGINT)),(CAST(NULL AS BIGINT)),(CAST(-2 AS BIGINT))) AS source(i)",
         DataType::Int64,
     );
     let nullable_bigint = FunctionValueType::new(DataType::Int64, true);
     let plans = programs(&source);
-    let (program, root) = bitnot_call_root(&plans, &nullable_bigint, &nullable_bigint);
+    let (program, root) = scalar_call_root(
+        &plans,
+        "builtin.scalar/bitwise_not/v1",
+        &nullable_bigint,
+        &nullable_bigint,
+    );
     let input: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(-2)]));
     let data = batch(&program, root, input.clone());
     let mut frame = CompiledExpressionInstance::try_new(
@@ -356,7 +379,7 @@ fn constant_outputs(sql: &str) -> Vec<ArrayRef> {
     actual
 }
 #[test]
-fn native_bitnot_intrinsic_actual_project_sql_unchanged_constants_execute_each_root() {
+fn native_bitwise_not_intrinsic_actual_project_sql_unchanged_constants_execute_each_root() {
     let sql = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/sql/correctness/project/sql/project_bitnot_operator_semantics.sql"
@@ -368,157 +391,114 @@ fn native_bitnot_intrinsic_actual_project_sql_unchanged_constants_execute_each_r
         .collect::<Vec<_>>();
     assert_eq!(actual, vec![0, -1, -2, -1025]);
 }
-fn nominal_largeint_type() -> FunctionValueType {
-    FunctionValueType::try_with_logical_type(
-        DataType::FixedSizeBinary(16),
-        true,
-        ValueLogicalType::LargeInt,
-    )
-    .unwrap()
-}
-
 #[test]
-fn named_bitnot_sql_on_declared_largeint_keeps_nominal_binding_and_frame_results() {
-    let ty = nominal_largeint_type();
-    // Historical data can already declare this nominal type. The standalone
-    // SQL author consumes that declaration as an input to the scalar expression.
-    let columns = [SqlStandaloneScalarColumn {
-        name: "k",
-        value: ValueId::new(7),
-        value_type: ty.clone(),
-    }];
-    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
-    let catalog = PlannerMemoryCatalog::default();
-    let source = author_standalone_scalar_for_test(SqlStandaloneScalarRequest {
-        text: "bitnot(k)",
-        columns: &columns,
-        catalog: &SqlPlannerTableSnapshot::new(&catalog),
-        current_database: "fixture",
-        functions: builtin_sql_function_catalog().snapshot(),
-        sealed_functions: functions.clone(),
-        sql_semantics: &Default::default(),
-        constant_policy: sql_fixture_constant_policy(),
-        control: &SqlCompileControl::unbounded(),
-    })
-    .unwrap();
-    assert_eq!(source.value_type(), &ty);
-    let [port] = source.unit().ports() else {
-        panic!("one original scalar input port");
+fn typed_largeint_conversion_retains_exact_signed_text_and_null_results() {
+    use arrow::array::{NullArray, StringArray};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_expression::testkit::guarded_fixtures::value_conversion::{
+        direct_program, largeint_type,
     };
-    assert_eq!(port.values.as_ref(), &[(columns[0].value, ty.clone())]);
-    let schema = Arc::new(Schema::new(vec![ty.try_to_field("k").unwrap()]));
-    let scope = fixture_scope(port, schema.clone());
-    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::LowerProgram).unwrap();
-    let compiled = compile_expr_set_pure(
-        source.unit(),
-        EvaluationEnvironment {
-            constants: source.constants(),
-            parameters: source.parameters(),
-        },
-        ScopeLayouts {
-            ports: &[scope],
-            all_ports: None,
-        },
-        source.constant_policy(),
-        &functions,
-        &mut work,
-    )
-    .unwrap();
-    work.finish().unwrap();
-    let root = compiled.root(source.root()).unwrap();
-    let call = compiled.calls()[&root.use_id].call_contract();
-    assert_eq!(call.function_id().as_str(), "builtin.scalar/bitnot/v1");
-    assert_eq!(call.logical_argument_count(), 1);
-    assert_eq!(
-        call.selected().argument_types.as_slice(),
-        &[FunctionArgumentType::Value(ty.clone())]
-    );
-    assert_eq!(call.selected().result_type, FunctionResultType::Scalar(ty));
+    use novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID;
 
-    let input = novarocks_types::largeint::array_from_i128(&[
-        Some(i64::MIN as i128),
-        Some(-1),
-        Some(0),
-        Some(i64::MAX as i128),
-        Some(i128::MIN),
-        Some(i128::MAX),
-        Some((1_i128 << 100) + 5),
-        None,
-    ])
-    .unwrap();
-    let data = RecordBatch::try_new(schema, vec![Arc::new(input)]).unwrap();
-    let mut frame = CompiledExpressionInstance::try_new(compiled, source.root(), &Control).unwrap();
-    let selection = Selection::all(data.num_rows());
-    let out = frame
-        .evaluate(
-            EvaluationInput::Batch {
-                batch: &data,
-                source: None,
-            },
-            ScalarInvocationScope::new(selection, selection),
-            ScalarInvocationActivation::Activated,
-            &Control,
-            &mut PassThroughCallHost,
-        )
-        .unwrap();
-    let expected = novarocks_types::largeint::array_from_i128(&[
-        Some(9_223_372_036_854_775_807),
-        Some(0),
-        Some(-1),
-        Some(-9_223_372_036_854_775_808),
-        Some(i128::MAX),
-        Some(i128::MIN),
-        Some(-1_267_650_600_228_229_401_496_703_205_382_i128),
-        None,
-    ])
-    .unwrap();
-    assert!(out.errors().is_empty());
-    assert_eq!(out.values().to_data(), expected.to_data());
-}
+    let signed = [i64::MIN, -1, 0, i64::MAX];
+    let wide = [i128::MIN, i128::MAX, (1_i128 << 100) + 5];
+    let cases: [(ArrayRef, &str, Vec<Option<i128>>); 3] = [
+        (
+            Arc::new(Int64Array::from(signed.to_vec())),
+            "builtin.scalar/value_domain_conversion/signed_to_largeint/v1",
+            signed
+                .into_iter()
+                .map(|value| Some(i128::from(value)))
+                .collect(),
+        ),
+        (
+            Arc::new(StringArray::from(
+                wide.map(|value| value.to_string()).to_vec(),
+            )),
+            "builtin.scalar/value_domain_conversion/utf8_to_largeint_null_invalid/v1",
+            wide.into_iter().map(Some).collect(),
+        ),
+        (
+            Arc::new(NullArray::new(1)),
+            "builtin.scalar/value_domain_conversion/null_to_typed_nullable/v1",
+            vec![None],
+        ),
+    ];
+    let target = largeint_type();
+    for (input, overload, expected) in cases {
+        let source = FunctionValueType::new(input.data_type().clone(), true);
+        let program = direct_program(source.clone(), target.clone());
+        let root = program.unit.root(program.root).unwrap();
+        let call = program
+            .unit
+            .calls()
+            .get(&root.use_id)
+            .unwrap()
+            .call_contract();
+        assert_eq!(call.function_id().as_str(), VALUE_CONVERSION_FUNCTION_ID);
+        assert_eq!(call.logical_argument_count(), 1);
+        assert_eq!(call.selected().overload.as_str(), overload);
+        assert_eq!(
+            call.selected().argument_types.as_slice(),
+            &[FunctionArgumentType::Value(source)]
+        );
+        assert_eq!(
+            call.selected().result_type,
+            FunctionResultType::Scalar(target.clone())
+        );
+        assert_eq!(
+            program
+                .unit
+                .definitions()
+                .node(root.definition)
+                .unwrap()
+                .value_type(),
+            Some(&target)
+        );
 
-#[test]
-fn public_sql_bitnot_reports_the_retired_largeint_target() {
-    let fields = [Field::new("k", DataType::Int64, false)];
-    for sql in [
-        "SELECT bitnot(CAST(k AS LARGEINT)) AS original_inverted FROM fixture.source",
-        "SELECT bitnot(CAST('-170141183460469231731687303715884105728' AS LARGEINT))",
-        "SELECT bitnot(CAST('170141183460469231731687303715884105727' AS LARGEINT))",
-        "SELECT bitnot(CAST(NULL AS LARGEINT))",
-    ] {
-        let result = try_sql_source_with_declared_fields(sql, &fields);
-        let Err(SqlCompileProgressError::Compile(SqlCompileError::Analyze(error))) = result else {
-            panic!("expected the original analysis error for {sql}");
-        };
-        assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch, "{sql}");
-        assert_eq!(error.code().as_str(), "sql.analyze.type_mismatch", "{sql}");
-        assert_eq!(error.message(), "Unknown type: largeint", "{sql}");
-        let span = error.span().expect("the retired declaration has a span");
-        assert_eq!(&sql[span.start()..span.end()], "LARGEINT", "{sql}");
+        let data = RecordBatch::try_new(program.input_schema().clone(), vec![input]).unwrap();
+        let selection = Selection::all(data.num_rows());
+        let out = program
+            .instance(&Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
+        assert!(out.errors().is_empty());
+        let expected = novarocks_types::largeint::array_from_i128(&expected).unwrap();
+        assert_eq!(out.values().to_data(), expected.to_data());
     }
 }
 
 #[test]
-fn internal_largeint_conversion_preserves_utf8_and_rejects_equal_width_carriers() {
+fn typed_largeint_conversion_accepts_exact_nonnull_text_and_rejects_equal_width_aliases() {
+    use novarocks_expression::testkit::guarded_fixtures::value_conversion::largeint_type;
     use novarocks_functions::builtin::value_conversion::resolve_value_conversion;
+    use novarocks_type_contract::ValueLogicalType;
 
-    let expected_type = nominal_largeint_type();
-    let utf8 = FunctionValueType::new(DataType::Utf8, false);
-    let binding = resolve_value_conversion(&utf8, &expected_type, &Control).unwrap();
+    let target = largeint_type();
+    let text = FunctionValueType::new(DataType::Utf8, false);
+    let selected = resolve_value_conversion(&text, &target, &Control).unwrap();
     assert_eq!(
-        binding.overload.as_str(),
+        selected.overload.as_str(),
         "builtin.scalar/value_domain_conversion/utf8_to_largeint_null_invalid/v1"
     );
     assert_eq!(
-        binding.argument_types.as_slice(),
-        &[FunctionArgumentType::Value(utf8)]
+        selected.argument_types.as_slice(),
+        &[FunctionArgumentType::Value(text)]
     );
     assert_eq!(
-        binding.result_type,
-        FunctionResultType::Scalar(expected_type.clone())
+        selected.result_type,
+        FunctionResultType::Scalar(target.clone())
     );
 
-    // The value conversion owner must not authorize a nominal LARGEINT
-    // conversion from another equal-width byte carrier.
     for source in [
         FunctionValueType::new(DataType::FixedSizeBinary(16), true),
         FunctionValueType::try_with_logical_type(
@@ -528,6 +508,6 @@ fn internal_largeint_conversion_preserves_utf8_and_rejects_equal_width_carriers(
         )
         .unwrap(),
     ] {
-        assert!(resolve_value_conversion(&source, &expected_type, &Control).is_err());
+        assert!(resolve_value_conversion(&source, &target, &Control).is_err());
     }
 }

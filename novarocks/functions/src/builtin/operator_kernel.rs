@@ -121,7 +121,7 @@ impl BinaryOperatorKernel {
     }
 }
 
-fn comparison_recipe(
+pub(super) fn comparison_recipe(
     operator: OperatorFunction,
     [left, right]: [&FunctionValueType; 2],
     control: &dyn PureCompileControl,

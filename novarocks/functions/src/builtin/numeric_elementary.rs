@@ -275,9 +275,7 @@ impl ElementaryInput<'_> {
                     base.value(ordinal, batch_row)?,
                     value.value(ordinal, batch_row)?,
                 ) {
-                    (Some(base), Some(value)) if base > 0.0 && base != 1.0 && value > 0.0 => {
-                        Some(value.log(base))
-                    }
+                    (Some(base), Some(value)) => Some(value.ln() / base.ln()),
                     _ => None,
                 }
             }
@@ -287,9 +285,7 @@ impl ElementaryInput<'_> {
                 ));
             }
         };
-        // Filter only the result: LOG(Inf, finite) gives finite zero; SIGN
-        // receives NaN and infinities and owns their comparison answers.
-        Ok(result.filter(|value| value.is_finite()))
+        Ok(result)
     }
 }
 
@@ -319,12 +315,8 @@ pub(super) fn evaluate_numeric_elementary<'a>(
         input.contract().selected().argument_types.as_ref(),
         input.arguments(),
     ) {
-        (NumericElementaryOp::E, [], []) if target.nullable() => {
-            ElementaryInput::Constant(std::f64::consts::E)
-        }
-        (NumericElementaryOp::Pi, [], []) if target.nullable() => {
-            ElementaryInput::Constant(std::f64::consts::PI)
-        }
+        (NumericElementaryOp::E, [], []) => ElementaryInput::Constant(std::f64::consts::E),
+        (NumericElementaryOp::Pi, [], []) => ElementaryInput::Constant(std::f64::consts::PI),
         (
             NumericElementaryOp::LogNatural | NumericElementaryOp::Sign,
             [FunctionArgumentType::Value(source)],
@@ -346,7 +338,7 @@ pub(super) fn evaluate_numeric_elementary<'a>(
                 FunctionArgumentType::Value(value),
             ],
             [left, right],
-        ) if target.nullable() => ElementaryInput::Binary(
+        ) if target.nullable() == (base.nullable() || value.nullable()) => ElementaryInput::Binary(
             NumericValue::checked(*left, base, false)?,
             NumericValue::checked(*right, value, false)?,
         ),
@@ -536,11 +528,7 @@ fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ConstantPolicy, ConstantPool, EvaluatedArgument, FunctionValueType,
-        ScalarEvaluationInstance, Selection,
-    };
-    use novarocks_type_contract::CompilePhase;
+    use crate::{EvaluatedArgument, FunctionValueType, ScalarEvaluationInstance, Selection};
     use std::{sync::Mutex, time::Duration};
 
     #[derive(Default)]
@@ -581,184 +569,12 @@ mod tests {
             super::super::numeric_elementary_owner::prepared_for_test(name, types).unwrap();
         ScalarEvaluationInstance::instantiate(prepared).unwrap()
     }
-    fn dense(name: &str, arrays: Vec<ArrayRef>, rows: usize) -> ArrayRef {
-        let types: Vec<_> = arrays
-            .iter()
-            .map(|array| {
-                FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true)
-            })
-            .collect();
-        let mut instance = instance(name, &types);
-        let arguments: Vec<_> = arrays.iter().map(EvaluatedArgument::Column).collect();
-        let output = instance
-            .evaluate(Selection::all(rows), &arguments, &Control::default())
-            .unwrap();
-        assert!(output.errors().is_empty());
-        output.into_parts().1
-    }
-    fn unary(name: &str, values: Vec<Option<f64>>) -> ArrayRef {
-        let len = values.len();
-        dense(name, vec![Arc::new(Float64Array::from(values))], len)
-    }
-    fn binary_log(base: Vec<Option<f64>>, values: Vec<Option<f64>>) -> ArrayRef {
-        let len = values.len();
-        dense(
-            "log",
-            vec![
-                Arc::new(Float64Array::from(base)),
-                Arc::new(Float64Array::from(values)),
-            ],
-            len,
-        )
-    }
-    fn assert_values(array: &ArrayRef, expected: &[Option<f64>]) {
-        let array = array.as_any().downcast_ref::<Float64Array>().unwrap();
-        assert_eq!(array.len(), expected.len());
-        for (row, expected) in expected.iter().enumerate() {
-            match expected {
-                Some(value) => {
-                    assert!(!array.is_null(row));
-                    let actual = array.value(row);
-                    if *value == 0.0 {
-                        assert_eq!(actual.to_bits(), value.to_bits(), "signed zero");
-                    } else {
-                        assert!(
-                            (actual - value).abs() <= value.abs().max(1.0) * 1e-14,
-                            "actual={actual:?} expected={value:?}"
-                        );
-                    }
-                }
-                None => assert!(array.is_null(row)),
-            }
-        }
-    }
-
-    #[test]
-    fn natural_log_has_independent_finite_and_domain_oracles() {
-        let output = unary(
-            "log",
-            vec![
-                Some(1.0),
-                Some(2.0),
-                Some(0.0),
-                Some(-1.0),
-                Some(f64::INFINITY),
-                Some(f64::NEG_INFINITY),
-                Some(f64::NAN),
-                Some(-0.0),
-                None,
-            ],
-        );
-        assert_values(
-            &output,
-            &[
-                Some(0.0),
-                Some(f64::from_bits(0x3fe62e42fefa39ef)),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ],
-        );
-    }
-
-    #[test]
-    fn base_log_keeps_base_value_order_and_raw_infinite_base_signed_zero() {
-        let output = binary_log(
-            vec![
-                Some(2.0),
-                Some(10.0),
-                Some(0.5),
-                Some(f64::INFINITY),
-                Some(f64::INFINITY),
-                Some(1.0),
-                Some(0.0),
-                Some(-2.0),
-                Some(f64::NAN),
-                Some(2.0),
-                Some(2.0),
-                Some(f64::INFINITY),
-                None,
-            ],
-            vec![
-                Some(8.0),
-                Some(100.0),
-                Some(2.0),
-                Some(2.0),
-                Some(0.5),
-                Some(8.0),
-                Some(8.0),
-                Some(8.0),
-                Some(8.0),
-                Some(0.0),
-                Some(f64::INFINITY),
-                Some(f64::INFINITY),
-                Some(8.0),
-            ],
-        );
-        assert_values(
-            &output,
-            &[
-                Some(3.0),
-                Some(2.0),
-                Some(-1.0),
-                Some(0.0),
-                Some(-0.0),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ],
-        );
-    }
-
-    #[test]
-    fn sign_compares_raw_nan_infinity_and_signed_zero_without_sanitizing_inputs() {
-        let array: ArrayRef = Arc::new(Float64Array::from(vec![
-            f64::NAN,
-            f64::from_bits(0xfff8123456789abc),
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            -0.0,
-            0.0,
-            2.0,
-            -2.0,
-        ]));
-        let mut instance = instance("sign", &[FunctionValueType::new(DataType::Float64, false)]);
-        assert!(!instance.contract().result_type().nullable());
-        let arguments = [EvaluatedArgument::Column(&array)];
-        let output = instance
-            .evaluate(Selection::all(8), &arguments, &Control::default())
-            .unwrap();
-        assert!(output.errors().is_empty());
-        assert_values(
-            output.values(),
-            &[
-                Some(0.0),
-                Some(0.0),
-                Some(1.0),
-                Some(-1.0),
-                Some(0.0),
-                Some(0.0),
-                Some(1.0),
-                Some(-1.0),
-            ],
-        );
-        assert_values(&unary("sign", vec![None, Some(-0.0)]), &[None, Some(0.0)]);
-    }
 
     #[test]
     fn e_pi_are_zero_argument_exact_bits_for_dense_and_sparse_outputs() {
         for (name, expected) in [("e", 0x4005bf0a8b145769u64), ("pi", 0x400921fb54442d18)] {
             let mut instance = instance(name, &[]);
-            assert!(instance.contract().result_type().nullable());
+            assert!(!instance.contract().result_type().nullable());
             let output = instance
                 .evaluate(Selection::all(3), &[], &Control::default())
                 .unwrap();
@@ -799,174 +615,10 @@ mod tests {
     }
 
     #[test]
-    fn unary_log_and_sign_preserve_all_seven_numeric_profiles() {
-        let profiles: [ArrayRef; 7] = [
-            Arc::new(Int8Array::from(vec![Some(1), None])),
-            Arc::new(Int16Array::from(vec![Some(1), None])),
-            Arc::new(Int32Array::from(vec![Some(1), None])),
-            Arc::new(Int64Array::from(vec![Some(1), None])),
-            Arc::new(Float32Array::from(vec![Some(1.0), None])),
-            Arc::new(Float64Array::from(vec![Some(1.0), None])),
-            Arc::new(
-                Decimal128Array::from(vec![Some(1000), None])
-                    .with_precision_and_scale(18, 3)
-                    .unwrap(),
-            ),
-        ];
-        for array in profiles {
-            assert_values(&dense("log", vec![array.clone()], 2), &[Some(0.0), None]);
-            assert_values(&dense("sign", vec![array], 2), &[Some(1.0), None]);
-        }
-    }
-
-    #[test]
-    fn base_log_preserves_all_36_installed_numeric_profile_pairs() {
-        fn profiles(value: i8) -> [ArrayRef; 6] {
-            [
-                Arc::new(Int8Array::from(vec![value])),
-                Arc::new(Int16Array::from(vec![i16::from(value)])),
-                Arc::new(Int32Array::from(vec![i32::from(value)])),
-                Arc::new(Int64Array::from(vec![i64::from(value)])),
-                Arc::new(Float32Array::from(vec![f32::from(value)])),
-                Arc::new(Float64Array::from(vec![f64::from(value)])),
-            ]
-        }
-        let mut pairs = 0;
-        for base in profiles(2) {
-            for value in profiles(8) {
-                assert_values(&dense("log", vec![base.clone(), value], 1), &[Some(3.0)]);
-                pairs += 1;
-            }
-        }
-        assert_eq!(pairs, 36);
-    }
-
-    #[test]
-    fn decimal_reader_preserves_original_scale_precision_and_sign_rules() {
-        for (precision, scale, raw, expected) in [
-            (18, 3, 1000i128, 0.0_f64),
-            (18, -2, 1, 4.605170185988092),
-            (
-                38,
-                0,
-                10000000000000000000000000000000000000,
-                85.1956484407797,
-            ),
-        ] {
-            let array: ArrayRef = Arc::new(
-                Decimal128Array::from(vec![raw])
-                    .with_precision_and_scale(precision, scale)
-                    .unwrap(),
-            );
-            assert_values(&dense("log", vec![array], 1), &[Some(expected)]);
-        }
-        for scale in [-3, 0, 3] {
-            let array: ArrayRef = Arc::new(
-                Decimal128Array::from(vec![Some(-1), Some(0), Some(1), None])
-                    .with_precision_and_scale(38, scale)
-                    .unwrap(),
-            );
-            assert_values(
-                &dense("sign", vec![array], 4),
-                &[Some(-1.0), Some(0.0), Some(1.0), None],
-            );
-        }
-    }
-
-    #[test]
-    fn selected_original_compact_and_scalar_arguments_have_independent_maps() {
-        let rows = [1, 4];
-        let selection = Selection::try_sparse(6, &rows).unwrap();
-        let base: ArrayRef = Arc::new(Int8Array::from(vec![0, 2, 0, 0, 10, 0]));
-        let values: ArrayRef = Arc::new(Float64Array::from(vec![8.0, 100.0]));
-        let compact =
-            SelectedValues::try_new(selection, &DataType::Float64, values, Box::default()).unwrap();
-        let arguments = [
-            EvaluatedArgument::Column(&base),
-            EvaluatedArgument::SelectedColumn(&compact),
-        ];
-        let mut binary = instance(
-            "log",
-            &[
-                FunctionValueType::new(DataType::Int8, false),
-                FunctionValueType::new(DataType::Float64, false),
-            ],
-        );
-        let output = binary
-            .evaluate(selection, &arguments, &Control::default())
-            .unwrap();
-        assert_eq!(output.selection(), selection);
-        assert_values(output.values(), &[Some(3.0), Some(2.0)]);
-        let scalar: ArrayRef = Arc::new(Int8Array::from(vec![-2]));
-        let arguments = [EvaluatedArgument::Scalar(&scalar)];
-        let mut unary = instance("sign", &[FunctionValueType::new(DataType::Int8, false)]);
-        assert_values(
-            unary
-                .evaluate(selection, &arguments, &Control::default())
-                .unwrap()
-                .values(),
-            &[Some(-1.0), Some(-1.0)],
-        );
-    }
-
-    #[test]
-    fn constant_ordinal_broadcast_and_unary_null_keep_exact_pool_backing() {
-        let ty = FunctionValueType::new(DataType::Int64, true);
-        let array: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(2), Some(8)]));
-        // Explicit finite fixture bounds, never a production policy or grant.
-        let policy = ConstantPolicy {
-            max_rows: 3,
-            max_array_nodes: 1,
-            max_logical_elements: 3,
-            max_retained_buffer_bytes: 1024,
-            max_type_depth: 1,
-            max_type_nodes: 1,
-            max_dictionary_depth: 0,
-            max_metadata_bytes: 1024,
-            max_library_validation_work: 4096,
-            max_library_validation_bytes: 8192,
-        };
-        let pool = ConstantPool::try_new(
-            Arc::new(ty.try_to_field("elementary-input").unwrap()),
-            ty.clone(),
-            array.to_data(),
-            policy,
-            CompilePhase::Validate,
-            crate::binding_test_control(),
-        )
-        .unwrap();
-        let base = pool.value(1).unwrap();
-        let value = pool.value(2).unwrap();
-        let arguments = [
-            EvaluatedArgument::Constant(&base),
-            EvaluatedArgument::Constant(&value),
-        ];
-        let mut binary = instance("log", &[ty.clone(), ty.clone()]);
-        assert_values(
-            binary
-                .evaluate(Selection::all(3), &arguments, &Control::default())
-                .unwrap()
-                .values(),
-            &[Some(3.0); 3],
-        );
-        assert!(Arc::ptr_eq(base.pool().array(), value.pool().array()));
-        let null = pool.value(0).unwrap();
-        let arguments = [EvaluatedArgument::Constant(&null)];
-        let mut unary = instance("sign", &[ty]);
-        assert_values(
-            unary
-                .evaluate(Selection::all(2), &arguments, &Control::default())
-                .unwrap()
-                .values(),
-            &[None, None],
-        );
-    }
-
-    #[test]
     fn every_arity_empty_domain_skips_private_body_and_keeps_float_result() {
         let scalar: ArrayRef = Arc::new(Float64Array::from(vec![None]));
         let source = FunctionValueType::new(DataType::Float64, true);
-        for (name, arity) in [("log", 1), ("log", 2), ("sign", 1), ("e", 0), ("pi", 0)] {
+        for (name, arity) in [("log", 2), ("e", 0), ("pi", 0)] {
             let types = vec![source.clone(); arity];
             let arguments = vec![EvaluatedArgument::Scalar(&scalar); arity];
             let mut instance = instance(name, &types);
@@ -989,7 +641,7 @@ mod tests {
         let scalar: ArrayRef = Arc::new(Float64Array::from(vec![2.0]));
         let source = FunctionValueType::new(DataType::Float64, true);
         let selection = Selection::all(320);
-        for (name, arity) in [("log", 1), ("log", 2), ("sign", 1), ("e", 0), ("pi", 0)] {
+        for (name, arity) in [("log", 2), ("e", 0), ("pi", 0)] {
             let types = vec![source.clone(); arity];
             let arguments = vec![EvaluatedArgument::Scalar(&scalar); arity];
             let mut baseline = instance(name, &types);
@@ -1036,7 +688,7 @@ mod tests {
     fn capacity_overflow_refuses_before_allocation_or_actual_elementary_row_work() {
         let scalar: ArrayRef = Arc::new(Float64Array::from(vec![2.0]));
         let source = FunctionValueType::new(DataType::Float64, true);
-        for (name, arity) in [("log", 1), ("log", 2), ("sign", 1), ("e", 0), ("pi", 0)] {
+        for (name, arity) in [("log", 2), ("e", 0), ("pi", 0)] {
             let types = vec![source.clone(); arity];
             let arguments = vec![EvaluatedArgument::Scalar(&scalar); arity];
             let mut instance = instance(name, &types);

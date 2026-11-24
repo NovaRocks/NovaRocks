@@ -85,7 +85,7 @@ fn folds_immutable_function_call() {
         vec![one],
         false,
         FunctionVolatility::Immutable,
-        DataType::Int64,
+        DataType::Int32,
         false,
     );
     let plan = project(call);

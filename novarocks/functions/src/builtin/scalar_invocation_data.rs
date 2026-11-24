@@ -440,9 +440,9 @@ mod request_layout_tests {
     fn invocation_scalar_resources_direct_slot_matches_independent_original_requests() {
         // This original prepared author supplies only the immutable carrier
         // contract. This is a slot request probe, not a JSON funding receipt.
-        let prepared = super::super::numeric_elementary_owner::prepared_for_test(
+        let prepared = super::super::numeric_unary_owner::prepared_for_test(
             "sign",
-            &[FunctionValueType::new(DataType::Int64, true)],
+            FunctionValueType::new(DataType::Int64, true),
         )
         .unwrap();
         let rows: Vec<_> = (0..321).map(|i| 2 * i).collect();

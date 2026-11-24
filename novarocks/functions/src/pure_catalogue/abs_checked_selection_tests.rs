@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use arrow_array::{Array, ArrayRef, Int32Array, Int64Array};
+use arrow_array::{Array, ArrayRef, Int32Array};
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, DecimalOverflowPolicy, EvaluationDemand,
@@ -261,7 +261,7 @@ fn assert_original_abs_values(prepared: &PureCallSpecialization) {
     };
     assert_eq!(
         kernel.contract().result_type(),
-        &FunctionValueType::new(DataType::Int64, false)
+        &FunctionValueType::new(DataType::Int32, false)
     );
     let mut instance = crate::ScalarEvaluationInstance::instantiate(kernel.clone()).unwrap();
     let array: ArrayRef = Arc::new(Int32Array::from(vec![i32::MIN, 5, -7]));
@@ -274,13 +274,17 @@ fn assert_original_abs_values(prepared: &PureCallSpecialization) {
             &EvaluationControl,
         )
         .unwrap();
-    assert!(output.errors().is_empty());
+    assert_eq!(output.errors().len(), 1);
+    let error = &output.errors()[0];
+    assert_eq!(error.selected_ordinal(), 0);
+    assert_eq!(error.reason(), crate::DataFailureReason::NumericOutOfRange);
     let output = output
         .values()
         .as_any()
-        .downcast_ref::<Int64Array>()
+        .downcast_ref::<Int32Array>()
         .unwrap();
-    assert_eq!(output.values().as_ref(), &[2147483648, 7]);
+    assert!(output.is_null(0));
+    assert_eq!(output.value(1), 7);
 }
 #[test]
 fn abs_checked_registered_adapter_preserves_actual_fresh_frozen_values_and_exact_contract() {

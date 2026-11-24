@@ -786,6 +786,7 @@ async fn default_catalog_reads_the_original_local_view_snapshot_without_table_li
             novarocks_query_application::view::ViewRequestContext {
                 current_catalog: None,
                 current_database: "db",
+                statement_session: None,
                 connector_context: Some(&context),
             },
         )

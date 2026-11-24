@@ -14,28 +14,25 @@
 // KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! The original greatest/least values shared by evaluated legacy and selected calls.
+//! Scalar extrema select one original row in the bound common value domain.
 use crate::{
     EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure,
     ScalarCallContract, ScalarCallInput, SelectedValues, Selection,
+    aggregate_scalar::ExtremaDirection,
+    comparison::ExtremaOrder,
+    control_values::{AssemblyPlan, assemble_values},
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
     math_numeric::{
-        MathNumericError, MathNumericObservation, NumericArrayView, cast_output,
-        cast_output_observed, value_at_f64,
+        MathNumericError, MathNumericObservation, NumericArrayView, cast_output_observed,
+        value_at_f64,
     },
 };
-use arrow_array::{
-    Array, ArrayRef, Date32Array, Float64Array, StringArray, TimestampMicrosecondArray,
-};
+use arrow_array::{Array, ArrayRef, Float64Array, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
-use novarocks_type_contract::{TemporalType, ValueLogicalType};
-use novarocks_value_arrays::decode::PreparedTemporalArray;
-use std::{alloc::Layout, sync::Arc};
+use std::{alloc::Layout, cmp::Ordering, sync::Arc};
 
-use super::temporal_output::TemporalOutputBuilder;
-use crate::temporal_cast::Type;
 #[derive(Clone, Copy, Debug)]
 pub enum ExtremaOperation {
     Greatest,
@@ -66,19 +63,6 @@ fn temporal(dt: &DataType) -> bool {
         DataType::Date32 | DataType::Timestamp(_, _) | DataType::Utf8 | DataType::Null
     )
 }
-fn numeric(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-            | DataType::Null
-    )
-}
 /// The original short temporal argument reads NULL, while len-one broadcasts.
 pub fn datetime_value_at(
     values: &[Option<NaiveDateTime>],
@@ -88,223 +72,106 @@ pub fn datetime_value_at(
     let idx = if values.len() == 1 && len > 1 { 0 } else { row };
     values.get(idx).copied().flatten()
 }
-pub(super) fn validate_profile(
+pub(super) fn prepare(
     contract: &ScalarCallContract,
     mut observe: impl FnMut() -> Result<(), KernelFailure>,
-) -> Result<(), KernelFailure> {
+) -> Result<ExtremaOrder, KernelFailure> {
     let arguments = &contract.selected().argument_types;
-    if arguments.is_empty()
-        || !contract.result_type().nullable()
-        || contract.result_type().logical_type() != ValueLogicalType::Physical
-    {
-        return Err(invalid(
-            "extrema requires a nonempty exact nullable Physical result profile",
-        ));
+    if arguments.is_empty() {
+        return Err(invalid("extrema requires at least one value argument"));
     }
     let result = contract.result_type();
-    if result.value_type().temporal().is_some() || *result.data_type() == DataType::Date32 {
-        for argument in arguments.iter() {
-            observe()?;
-            let FunctionArgumentType::Value(value) = argument else {
-                return Err(invalid("extrema requires value arguments"));
-            };
-            if !value.same_value_domain(result) || value.data_type() != result.data_type() {
-                return Err(invalid(
-                    "extrema argument is outside its selected temporal domain",
-                ));
-            }
-        }
-        return Ok(());
-    }
-    let mut is_temporal = true;
-    let mut is_numeric = true;
+    let mut nullable = false;
     for argument in arguments.iter() {
         observe()?;
         let FunctionArgumentType::Value(value) = argument else {
             return Err(invalid("extrema requires value arguments"));
         };
-        if value.logical_type() != ValueLogicalType::Physical
-            && !(value.logical_type() == ValueLogicalType::Json
-                && value.data_type() == &DataType::Utf8)
-        {
+        if !value.same_physical_binding_ignoring_root_nullability_observed(result, &mut observe)? {
             return Err(invalid(
-                "extrema has no value-preserving implementation for this logical domain",
+                "extrema argument differs from the common value domain",
             ));
         }
-        is_temporal &= temporal(value.data_type());
-        is_numeric &= numeric(value.data_type());
+        nullable |= value.nullable() || value.data_type() == &DataType::Null;
     }
-    let target = contract.result_type().data_type();
-    if *target == DataType::Null {
+    if nullable != result.nullable() {
         return Err(invalid(
-            "greatest/least has no v1 value result for an exact Null target",
+            "extrema result nullability differs from its arguments",
         ));
     }
-    let target_admitted = if is_temporal {
-        matches!(
-            target,
-            DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _) | DataType::Null
-        )
-    } else if is_numeric {
-        numeric(target) || matches!(target, DataType::Decimal256(_, _))
-    } else {
-        false
-    };
-    if !target_admitted {
-        return Err(invalid(
-            "extrema source/result carriers are not an installed v1 calculation profile",
-        ));
-    }
-    // Target zone adjustment belongs to the static Arrow conversion, not a session clock.
-    // The owner validates library support before admitting that exact target.
-    Ok(())
+    ExtremaOrder::prepare(result.value_type(), result.data_type(), observe)?
+        .ok_or_else(|| invalid("extrema has no ordering for the frozen value domain"))
 }
-/// Check a temporal target's exact static conversion, including timezone support.
-pub(super) fn validate_target(contract: &ScalarCallContract) -> Result<(), KernelFailure> {
-    if matches!(
-        contract.result_type().data_type(),
-        DataType::Timestamp(_, Some(_))
-    ) {
-        let empty =
-            Arc::new(TimestampMicrosecondArray::from(Vec::<Option<i64>>::new())) as ArrayRef;
-        cast_output(empty, Some(contract.result_type().data_type()))
-            .map_err(MathNumericError::into_kernel)?;
-    }
-    Ok(())
-}
+
 pub(super) fn evaluate<'a>(
     operation: ExtremaOperation,
+    order: &ExtremaOrder,
     input: ScalarCallInput<'_, 'a>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
+    let direction = match operation {
+        ExtremaOperation::Greatest => ExtremaDirection::Maximum,
+        ExtremaOperation::Least => ExtremaDirection::Minimum,
+    };
+    let preferred = match direction {
+        ExtremaDirection::Minimum => Ordering::Less,
+        ExtremaDirection::Maximum => Ordering::Greater,
+    };
     let result = (|| {
-        validate_profile(input.contract(), || work.step())?;
-        let out = if let Some(ty) = input.contract().result_type().value_type().temporal() {
-            evaluate_temporal(operation, &input, ty, &mut work)?
-        } else if *input.contract().result_type().data_type() == DataType::Date32 {
-            evaluate_date(operation, &input, &mut work)?
-        } else {
-            evaluate_values(
-                operation,
-                input.arguments(),
-                input.selection(),
-                Some(input.contract().result_type().data_type()),
-                false,
-                &mut work,
-                None,
-            )?
-        };
-        SelectedValues::try_new_observed(
-            input.selection(),
-            input.contract().result_type().data_type(),
-            out,
-            Box::default(),
-            || work.step(),
+        let arguments = input.arguments();
+        let selection = input.selection();
+        let ty = input.contract().result_type().data_type();
+        let mut sources = reserve(arguments.len(), &mut work)?;
+        for argument in arguments {
+            work.step()?;
+            sources.push(Some(argument.array()));
+        }
+        let mut choices = reserve(selection.len(), &mut work)?;
+        for (ordinal, batch_row) in selection.iter().enumerate() {
+            work.step()?;
+            let mut chosen: Option<(usize, usize)> = None;
+            for (index, argument) in arguments.iter().enumerate() {
+                work.step()?;
+                let row = argument.value_row(ordinal, batch_row);
+                let candidate = argument.array().as_ref();
+                if candidate.data_type() == &DataType::Null || candidate.is_null(row) {
+                    chosen = None;
+                    break;
+                }
+                let choose = if let Some((current_index, current_row)) = chosen {
+                    let current: &EvaluatedArgument<'_> = &arguments[current_index];
+                    order.compare(
+                        (candidate, row),
+                        (current.array().as_ref(), current_row),
+                        direction,
+                        &mut work,
+                    )? == preferred
+                } else {
+                    true
+                };
+                if choose {
+                    chosen = Some((index, row));
+                }
+            }
+            choices.push(chosen);
+        }
+        work.flush()?;
+        let values = assemble_values(
+            AssemblyPlan::Indexed {
+                result_type: ty,
+                sources: &sources,
+                choices: &choices,
+            },
+            control,
         )
+        .map_err(crate::control_values::AssemblyFailure::into_kernel)?;
+        SelectedValues::try_new_observed(selection, ty, values, Box::default(), || work.step())
     })();
     work.finish_result(result)
 }
 
-fn prefer<T: Ord>(operation: ExtremaOperation, candidate: T, current: T) -> bool {
-    match operation {
-        ExtremaOperation::Greatest => candidate > current,
-        ExtremaOperation::Least => candidate < current,
-    }
-}
-
-fn evaluate_date(
-    operation: ExtremaOperation,
-    input: &ScalarCallInput<'_, '_>,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<ArrayRef, KernelFailure> {
-    let mut sources = reserve(input.arguments().len(), work)?;
-    for argument in input.arguments() {
-        let array = argument
-            .array()
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .ok_or_else(|| invalid("extrema DATE argument violates its frozen carrier"))?;
-        sources.push((*argument, array));
-        work.step()?;
-    }
-    let selection = input.selection();
-    work.flush()?;
-    let mut output = TemporalOutputBuilder::new(Type::Date, selection.len())?;
-    work.flush()?;
-    for (ordinal, row) in selection.iter().enumerate() {
-        work.step()?;
-        let mut chosen = None;
-        for &(argument, array) in &sources {
-            work.step()?;
-            let row = argument.value_row(ordinal, row);
-            if array.is_null(row) {
-                chosen = None;
-                break;
-            }
-            let candidate = array.value(row);
-            if chosen.is_none_or(|current| prefer(operation, candidate, current)) {
-                chosen = Some(candidate);
-            }
-        }
-        match chosen {
-            Some(day) => output.date(day)?,
-            None => output.null(),
-        }
-    }
-    work.flush()?;
-    Ok(output.finish())
-}
-
-fn evaluate_temporal(
-    operation: ExtremaOperation,
-    input: &ScalarCallInput<'_, '_>,
-    ty: TemporalType,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<ArrayRef, KernelFailure> {
-    let arguments = &input.contract().selected().argument_types;
-    let mut sources = reserve(arguments.len(), work)?;
-    for (argument, binding) in input.arguments().iter().zip(arguments.iter()) {
-        let FunctionArgumentType::Value(binding) = binding else {
-            return Err(invalid("extrema requires value arguments"));
-        };
-        let source = PreparedTemporalArray::bind(ty, argument.array().as_ref(), binding.nullable())
-            .map_err(|_| invalid("extrema temporal argument violates its frozen carrier"))?;
-        sources.push((*argument, source));
-        work.step()?;
-    }
-    let selection = input.selection();
-    work.flush()?;
-    let mut output = TemporalOutputBuilder::new(Type::Temporal(ty), selection.len())?;
-    work.flush()?;
-    for (ordinal, row) in selection.iter().enumerate() {
-        work.step()?;
-        let mut chosen = None;
-        for (argument, source) in &sources {
-            work.step()?;
-            let Some(value) = source
-                .value(argument.value_row(ordinal, row))
-                .map_err(|_| invalid("extrema has an invalid frozen temporal operand"))?
-            else {
-                chosen = None;
-                break;
-            };
-            let key = value
-                .relation_key(ty)
-                .map_err(|_| invalid("extrema temporal value violates its declared ordering"))?;
-            if chosen.is_none_or(|(current, _)| prefer(operation, key, current)) {
-                chosen = Some((key, value));
-            }
-        }
-        match chosen {
-            Some((_, value)) => output.temporal(ty, value)?,
-            None => output.null(),
-        }
-    }
-    work.flush()?;
-    Ok(output.finish())
-}
 /// The caller owns eager child evaluation. This boundary receives values only
 /// and preserves domain causes at the bounded owner boundary.
 pub fn evaluate_legacy(

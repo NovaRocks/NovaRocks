@@ -9,7 +9,7 @@ id	deep
 -- query 6
 -- types	varchar	bigint
 leaf_type	row_count
-int	4
+integer	4
 
 -- query 8
 -- types	bigint

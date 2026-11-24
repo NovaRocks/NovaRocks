@@ -228,6 +228,47 @@ impl AnalyzerContext<'_> {
         })
     }
 
+    pub(super) fn type_session_expression(
+        &self,
+        expression: &ast::Expr,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let span = expression.span();
+        if self.purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition {
+            return Err(AnalyzeError::unsupported_expression(
+                "Materialized view expressions cannot depend on the caller's session",
+                span,
+            ));
+        }
+        let session = self.sql_semantics.statement_session().ok_or_else(|| {
+            AnalyzeError::unsupported_expression(
+                "Session expressions require an admitted caller session",
+                span,
+            )
+        })?;
+        let (value, nullable) = match expression {
+            ast::Expr::CurrentUser(_) => (Some(session.principal()), false),
+            ast::Expr::CurrentCatalog(_) => (session.catalog(), true),
+            ast::Expr::CurrentSchema(_) => (session.schema(), true),
+            _ => unreachable!("session expression dispatched by the original syntax"),
+        };
+        self.with_typing(span, |context, work| {
+            let value_type = FunctionValueType::new(arrow::datatypes::DataType::Utf8, nullable);
+            let literal =
+                value.map_or(LiteralValue::Null, |text| LiteralValue::String(text.into()));
+            work.flush()?;
+            let constant = typing::admit_syntax_constant(
+                &literal,
+                &value_type,
+                context.constant_policy,
+                work.control(),
+            )?;
+            Ok(TypedExpr {
+                kind: ExprKind::Constant(constant),
+                value_type,
+            })
+        })
+    }
+
     pub(super) fn type_clock(&self, expression: &ast::Expr) -> Result<TypedExpr, AnalyzeError> {
         let span = expression.span();
         self.with_typing(span, |context, work| {

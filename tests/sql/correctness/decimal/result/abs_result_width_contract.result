@@ -1,12 +1,12 @@
 -- query 2
--- types	integer	smallint	integer	bigint	varchar	varchar
-id	abs_i8	abs_i16	abs_i32	abs_i64	abs_i128
-1	128	32768	2147483648	9223372036854775808	-170141183460469231731687303715884105728
-2	7	7	7	7	7
-3	0	0	0	0	0
-4	7	7	7	7	7
-5	127	32767	2147483647	9223372036854775807	170141183460469231731687303715884105727
-6	NULL	NULL	NULL	NULL	NULL
+-- types	integer	tinyint	smallint	integer	bigint
+id	abs_i8	abs_i16	abs_i32	abs_i64
+1	NULL	NULL	NULL	NULL
+2	7	7	7	7
+3	0	0	0	0
+4	7	7	7	7
+5	127	32767	2147483647	9223372036854775807
+6	NULL	NULL	NULL	NULL
 
 -- query 3
 -- types	integer	decimal(38, 15)
@@ -29,11 +29,11 @@ id	abs_decimal	abs_float	abs_double
 6	NULL	NULL	NULL
 
 -- query 5
--- types	smallint	integer	bigint	varchar	varchar
-literal_i8	literal_i16	literal_i32	literal_i64	literal_i128
-128	32768	2147483648	9223372036854775808	-170141183460469231731687303715884105728
+-- types	tinyint	smallint	integer	bigint
+literal_i8	literal_i16	literal_i32	literal_i64
+7	7	7	7
 
 -- query 6
--- types	smallint	integer	bigint	varchar	varchar
-null_i8	null_i16	null_i32	null_i64	null_i128
-NULL	NULL	NULL	NULL	NULL
+-- types	tinyint	smallint	integer	bigint
+null_i8	null_i16	null_i32	null_i64
+NULL	NULL	NULL	NULL

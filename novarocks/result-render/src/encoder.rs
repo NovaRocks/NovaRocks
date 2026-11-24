@@ -1122,18 +1122,8 @@ impl CellCursor {
                         None
                     }
                     20 => {
-                        if payload.len() != 16 {
-                            return Err(error(E::InvalidVariant));
-                        }
-                        let mut a = Atom::literal(b"\"");
-                        for (i, byte) in payload.iter().enumerate() {
-                            if matches!(i, 4 | 6 | 8 | 10) {
-                                a.write_str("-").map_err(|_| invalid())?;
-                            }
-                            write!(&mut a, "{byte:02x}").map_err(|_| invalid())?;
-                        }
-                        a.write_str("\"").map_err(|_| invalid())?;
-                        Some(a)
+                        let raw = payload.try_into().map_err(|_| error(E::InvalidVariant))?;
+                        Some(trino_json::uuid(raw)?)
                     }
                     _ => return Err(error(E::InvalidVariant)),
                 };
@@ -1315,7 +1305,7 @@ fn validate_field(f: &RenderField, d: &DataType, nested: bool) -> Result<(), Ren
         | (N::UnsignedInteger(16), DataType::UInt16)
         | (N::UnsignedInteger(32), DataType::UInt32)
         | (N::UnsignedInteger(64), DataType::UInt64)
-        | (N::LargeInt, DataType::FixedSizeBinary(16))
+        | (N::LargeInt | N::Uuid, DataType::FixedSizeBinary(16))
         | (N::Float32, DataType::Float32)
         | (N::Float64, DataType::Float64)
         | (N::String | N::Json | N::BoundedCharacter(_), DataType::Utf8 | DataType::LargeUtf8)

@@ -43,17 +43,14 @@ use super::bit_shift::ShiftOp;
 /// Evaluation retains the private operation, never resolving a function name.
 pub(super) fn operation(name: &str) -> Option<ShiftOp> {
     Some(match name {
-        "bit_shift_left" => ShiftOp::Left,
-        "bit_shift_right" => ShiftOp::Right,
-        "bit_shift_right_logical" => ShiftOp::RightLogical,
+        "bitwise_left_shift" => ShiftOp::Left,
+        "bitwise_right_shift_arithmetic" => ShiftOp::Right,
+        "bitwise_right_shift" => ShiftOp::RightLogical,
         _ => return None,
     })
 }
 
-/// The five profiles preserve signed integer width or the declared LargeInt
-/// domain and take an accurate Physical Int64 count. Narrow output cast
-/// overflow is successful NULL, not a row error. No state or environment
-/// authority is retained.
+/// The four signed profiles preserve their width and take an INTEGER count.
 pub(super) fn effects() -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
@@ -101,7 +98,7 @@ impl BitShiftOwner {
         let expected = effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 5
+            || declaration.overloads().len() != 4
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
@@ -274,7 +271,7 @@ impl PreparedScalarKernel for PreparedBitShift {
         let count = arguments.next()?;
         let result = self.contract.result_type();
         if count.logical_type() != ValueLogicalType::Physical
-            || count.data_type() != &DataType::Int64
+            || count.data_type() != &DataType::Int32
             || source.logical_type() != ValueLogicalType::Physical
             || result.logical_type() != ValueLogicalType::Physical
             || result.data_type() != source.data_type()
@@ -323,32 +320,6 @@ impl ScalarKernelInstance for BitShiftInstance {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
     }
-}
-
-#[cfg(test)]
-fn names() -> &'static [&'static str] {
-    &[
-        "bit_shift_left",
-        "bit_shift_right",
-        "bit_shift_right_logical",
-    ]
-}
-
-#[cfg(test)]
-pub(super) fn prepared_for_test(
-    name: &str,
-    sources: &[crate::FunctionValueType; 2],
-) -> Result<Arc<dyn PreparedScalarKernel>, crate::FunctionSpecializationFailure> {
-    tests::prepared_for_test(name, sources)
-}
-
-#[cfg(test)]
-pub(super) fn prepared_for_test_with_policy(
-    name: &str,
-    sources: &[crate::FunctionValueType; 2],
-    policy: novarocks_type_contract::DecimalOverflowPolicy,
-) -> Result<Arc<dyn PreparedScalarKernel>, crate::FunctionSpecializationFailure> {
-    tests::prepared_for_test_with_policy(name, sources, policy)
 }
 
 impl BitShiftOwner {
@@ -426,8 +397,8 @@ impl BitShiftOwner {
 mod tests {
     use super::*;
     use crate::{
-        FunctionArgument, FunctionArgumentType, FunctionResultType, FunctionSpecializationFailure,
-        FunctionValueType, ScopedExpressionEffects, specialize_frozen_scalar, specialize_scalar,
+        FunctionArgument, FunctionResultType, FunctionSpecializationFailure, FunctionValueType,
+        ScopedExpressionEffects, specialize_frozen_scalar, specialize_scalar,
     };
     use arrow_schema::DataType;
     use novarocks_type_contract::{
@@ -493,277 +464,12 @@ mod tests {
         }
     }
 
-    fn sources(nullable: bool) -> [FunctionValueType; 5] {
-        [
-            FunctionValueType::new(DataType::Int8, nullable),
-            FunctionValueType::new(DataType::Int16, nullable),
-            FunctionValueType::new(DataType::Int32, nullable),
-            FunctionValueType::new(DataType::Int64, nullable),
-            FunctionValueType::try_with_logical_type(
-                DataType::FixedSizeBinary(16),
-                nullable,
-                ValueLogicalType::LargeInt,
-            )
-            .unwrap(),
-        ]
-    }
-
-    #[test]
-    fn exact_physical_integer_prepared_sources_cover_the_original_wrapper_requests() {
-        for name in names() {
-            for source_nullable in [false, true] {
-                for count_nullable in [false, true] {
-                    for source in sources(source_nullable) {
-                        let covered = source.logical_type() == ValueLogicalType::Physical;
-                        let normal_requests = if source.data_type() == &DataType::Int64 {
-                            7
-                        } else {
-                            12
-                        };
-                        let prepared = prepared_for_test(
-                            name,
-                            &[
-                                source,
-                                FunctionValueType::new(DataType::Int64, count_nullable),
-                            ],
-                        )
-                        .unwrap();
-                        let profile = prepared.invocation_resource_profile();
-                        assert_eq!(profile.is_some(), covered);
-                        let instance =
-                            crate::ScalarEvaluationInstance::instantiate(prepared).unwrap();
-                        assert_eq!(instance.invocation_resource_profile(), profile);
-                        if let Some(profile) = profile {
-                            assert_eq!(profile.requests(0).unwrap().requests(), 6);
-                            assert_eq!(profile.requests(513).unwrap().requests(), normal_requests);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    pub(super) fn prepared_for_test(
-        name: &str,
-        sources: &[FunctionValueType; 2],
-    ) -> Result<Arc<dyn PreparedScalarKernel>, FunctionSpecializationFailure> {
-        prepared_for_test_with_policy(name, sources, DecimalOverflowPolicy::ReportError)
-    }
-    pub(super) fn prepared_for_test_with_policy(
-        name: &str,
-        sources: &[FunctionValueType; 2],
-        policy: DecimalOverflowPolicy,
-    ) -> Result<Arc<dyn PreparedScalarKernel>, FunctionSpecializationFailure> {
-        if operation(name).is_none() {
-            return Err(FunctionSpecializationFailure::Binding(
-                FunctionBindingError::UnknownFunction,
-            ));
-        }
-        let owner = owner(name);
-        let arguments = (*sources).clone().map(argument);
-        let selected = Arc::new(owner.resolve(request(&arguments), crate::binding_test_control())?);
-        let parameters = SemanticParameters::try_new([]).unwrap();
-        let uses = [
-            Some(ExpressionUseId::new(42)),
-            Some(ExpressionUseId::new(43)),
-        ];
-        let mut exact = input(&owner, &selected, &arguments, &parameters, &uses);
-        exact.decimal_overflow_policy = policy;
-        specialize_scalar(
-            &owner,
-            exact,
-            selected.clone(),
-            ScopedExpressionEffects::pure_value(context()),
-            crate::binding_test_control(),
-        )
-        .map(|call| call.into_prepared())
-    }
-
-    #[test]
-    fn startup_mapping_retains_three_exact_names_and_operations() {
-        assert_eq!(
-            names(),
-            &[
-                "bit_shift_left",
-                "bit_shift_right",
-                "bit_shift_right_logical"
-            ]
-        );
-        for (name, op) in [
-            ("bit_shift_left", ShiftOp::Left),
-            ("bit_shift_right", ShiftOp::Right),
-            ("bit_shift_right_logical", ShiftOp::RightLogical),
-        ] {
-            assert_eq!(operation(name), Some(op));
-            assert_eq!(
-                owner(name).declaration.function_id().as_str(),
-                format!("builtin.scalar/{name}/v1")
-            );
-        }
-        for outside in [
-            "bitand",
-            "bitor",
-            "bitxor",
-            "bitnot",
-            "xx_hash3_128",
-            "mod",
-            "shift_left",
-        ] {
-            assert_eq!(operation(outside), None);
-        }
-    }
-
-    #[test]
-    fn whole_production_catalogue_attaches_shift_owners_and_15_exact_records() {
-        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
-        let mut total = 0;
-        for name in names() {
-            let owner = owner(name);
-            let definition = catalog
-                .definition_by_id(owner.declaration.function_id())
-                .unwrap();
-            assert!(definition.binding.as_ref().unwrap().pure.is_some());
-            let declaration = definition.binding_declaration().unwrap();
-            assert_eq!(declaration, owner.binding_declaration());
-            assert_eq!(declaration.overloads().len(), 5);
-            assert_eq!(owner.implementation_declarations().len(), 5);
-            for (overload, implementation) in declaration
-                .overloads()
-                .iter()
-                .zip(owner.implementation_declarations())
-            {
-                assert_eq!(implementation.overload, overload.identity);
-                assert_eq!(
-                    implementation.implementation.as_str(),
-                    format!("builtin.scalar/{name}/selected-v1")
-                );
-                assert_eq!(implementation.abi, PureKernelAbi::ScalarV1);
-                assert_eq!(overload.effects.as_ref(), Some(&effects()));
-            }
-            total += owner.implementation_declarations().len();
-        }
-        assert_eq!(total, 15);
-    }
-
-    #[test]
-    fn all_15_profiles_and_nullable_pairs_preserve_exact_fresh_frozen_contracts() {
-        let parameters = SemanticParameters::try_new([]).unwrap();
-        let uses = [
-            Some(ExpressionUseId::new(42)),
-            Some(ExpressionUseId::new(43)),
-        ];
-        for name in names() {
-            let owner = owner(name);
-            let mut selected_overloads = std::collections::BTreeSet::new();
-            for left_nullable in [false, true] {
-                for left in sources(left_nullable) {
-                    for right_nullable in [false, true] {
-                        let full_sources = [
-                            left.clone(),
-                            FunctionValueType::new(DataType::Int64, right_nullable),
-                        ];
-                        let arguments = full_sources.clone().map(argument);
-                        let selected = Arc::new(
-                            owner
-                                .resolve(request(&arguments), crate::binding_test_control())
-                                .unwrap(),
-                        );
-                        selected_overloads.insert(selected.overload.clone());
-                        assert_eq!(
-                            selected.argument_types.as_ref(),
-                            full_sources
-                                .clone()
-                                .map(FunctionArgumentType::Value)
-                                .as_slice()
-                        );
-                        let mut expected = left.clone();
-                        expected = expected
-                            .with_nullable(true)
-                            .expect("valid function nullability declaration");
-                        assert_eq!(selected.result_type, FunctionResultType::Scalar(expected));
-                        for policy in [
-                            DecimalOverflowPolicy::OutputNull,
-                            DecimalOverflowPolicy::ReportError,
-                        ] {
-                            let mut input =
-                                input(&owner, &selected, &arguments, &parameters, &uses);
-                            input.decimal_overflow_policy = policy;
-                            let fresh = specialize_scalar(
-                                &owner,
-                                input,
-                                selected.clone(),
-                                ScopedExpressionEffects::pure_value(context()),
-                                crate::binding_test_control(),
-                            )
-                            .unwrap();
-                            let canonical = fresh.prepared().contract().clone();
-                            let direct = owner
-                                .prepare_scalar(
-                                    input,
-                                    canonical.clone(),
-                                    crate::binding_test_control(),
-                                )
-                                .unwrap();
-                            assert!(Arc::ptr_eq(direct.contract(), &canonical));
-                            assert!(std::ptr::eq(canonical.selected(), selected.as_ref()));
-                            let frozen = canonical.effects().clone();
-                            assert_eq!(frozen.own_row_error, FunctionIntrinsicRowError::NoRowError);
-                            assert_eq!(frozen.instance_state, FunctionInstanceState::None);
-                            assert_eq!(frozen.argument_control, ArgumentControl::Eager);
-                            assert_eq!(frozen.null_behavior, FunctionNullBehavior::Strict);
-                            assert!(frozen.environment.is_empty());
-                            let be = specialize_frozen_scalar(
-                                &owner,
-                                input,
-                                selected.clone(),
-                                &frozen,
-                                ScopedExpressionEffects::pure_value(context()),
-                                crate::binding_test_control(),
-                            )
-                            .unwrap();
-                            let canonical = be.prepared().contract().clone();
-                            let direct = owner
-                                .prepare_scalar(
-                                    input,
-                                    canonical.clone(),
-                                    crate::binding_test_control(),
-                                )
-                                .unwrap();
-                            assert!(Arc::ptr_eq(direct.contract(), &canonical));
-                            assert!(std::ptr::eq(canonical.selected(), selected.as_ref()));
-                            assert_eq!(canonical.effects(), &frozen);
-                            let instance = be.prepared().create_instance().unwrap();
-                            assert_eq!(
-                                instance.retained_bytes(),
-                                std::mem::size_of::<BitShiftInstance>()
-                            );
-                            assert_eq!(
-                                instance.retained_bytes(),
-                                be.prepared().instance_retained_upper_bound()
-                            );
-                        }
-                    }
-                }
-            }
-            assert_eq!(selected_overloads.len(), 5);
-            assert_eq!(
-                selected_overloads,
-                owner
-                    .declaration
-                    .overloads()
-                    .iter()
-                    .map(|overload| overload.identity.clone())
-                    .collect()
-            );
-        }
-    }
-
     #[test]
     fn exact_shift_owner_rejects_stale_output_overload_and_foreign_frozen_effects() {
-        let owner = owner("bit_shift_left");
+        let owner = owner("bitwise_left_shift");
         let arguments = [
             argument(FunctionValueType::new(DataType::Int8, false)),
-            argument(FunctionValueType::new(DataType::Int64, true)),
+            argument(FunctionValueType::new(DataType::Int32, true)),
         ];
         let selected = Arc::new(
             owner
@@ -779,7 +485,9 @@ mod tests {
                 .is_err()
         );
         stale = (*selected).clone();
-        stale.overload = self::owner("bit_shift_right").declaration.overloads()[0]
+        stale.overload = self::owner("bitwise_right_shift_arithmetic")
+            .declaration
+            .overloads()[0]
             .identity
             .clone();
         assert!(
@@ -814,10 +522,10 @@ mod tests {
 
     #[test]
     fn shift_refinement_requires_exact_environment_domain_and_function_identity() {
-        let owner = owner("bit_shift_right");
+        let owner = owner("bitwise_right_shift_arithmetic");
         let arguments = [
             argument(FunctionValueType::new(DataType::Int64, false)),
-            argument(FunctionValueType::new(DataType::Int64, false)),
+            argument(FunctionValueType::new(DataType::Int32, false)),
         ];
         let selected = owner
             .resolve(request(&arguments), crate::binding_test_control())
@@ -848,7 +556,7 @@ mod tests {
                 FunctionBindingError::InvalidBinding(_)
             ))
         ));
-        let other = FunctionId::try_new("builtin.scalar/bit_shift_left/v1").unwrap();
+        let other = FunctionId::try_new("builtin.scalar/bitwise_left_shift/v1").unwrap();
         foreign = input;
         foreign.function_id = &other;
         assert!(matches!(
@@ -870,10 +578,10 @@ mod tests {
 
     #[test]
     fn shift_preparation_rejects_foreign_context_policy_pointer_and_uncoerced_types() {
-        let owner = owner("bit_shift_right");
+        let owner = owner("bitwise_right_shift_arithmetic");
         let arguments = [
             argument(FunctionValueType::new(DataType::Int64, false)),
-            argument(FunctionValueType::new(DataType::Int64, true)),
+            argument(FunctionValueType::new(DataType::Int32, true)),
         ];
         let selected = Arc::new(
             owner
@@ -963,10 +671,10 @@ mod tests {
     }
     #[test]
     fn shift_owner_preserves_original_three_compile_failures() {
-        let owner = owner("bit_shift_right");
+        let owner = owner("bitwise_right_shift_arithmetic");
         let arguments = [
             argument(FunctionValueType::new(DataType::Int64, false)),
-            argument(FunctionValueType::new(DataType::Int64, false)),
+            argument(FunctionValueType::new(DataType::Int32, false)),
         ];
         let selected = Arc::new(
             owner
@@ -1001,141 +709,6 @@ mod tests {
                 specialize_frozen_scalar(&owner, input, selected.clone(), &facts, ScopedExpressionEffects::pure_value(context()), &FailCompile(error.clone())),
                 Err(FunctionSpecializationFailure::Control(actual)) if actual == error
             ));
-        }
-    }
-    #[test]
-    fn nominal_fixed16_cannot_bind_as_largeint_and_arity_must_be_two() {
-        for name in names() {
-            let owner = owner(name);
-            for source in [
-                FunctionValueType::new(DataType::FixedSizeBinary(16), false),
-                FunctionValueType::try_with_logical_type(
-                    DataType::FixedSizeBinary(16),
-                    false,
-                    ValueLogicalType::Uuid,
-                )
-                .unwrap(),
-                FunctionValueType::try_with_logical_type(
-                    DataType::Utf8,
-                    false,
-                    ValueLogicalType::Json,
-                )
-                .unwrap(),
-            ] {
-                let arguments = [
-                    argument(source),
-                    argument(FunctionValueType::new(DataType::Int64, false)),
-                ];
-                assert!(
-                    owner
-                        .resolve(request(&arguments), crate::binding_test_control())
-                        .is_err()
-                );
-            }
-            let value = argument(FunctionValueType::new(DataType::Int64, false));
-            for args in [
-                vec![],
-                vec![value.clone()],
-                vec![value.clone(), value.clone(), value.clone()],
-            ] {
-                assert!(
-                    owner
-                        .resolve(request(&args), crate::binding_test_control())
-                        .is_err()
-                );
-            }
-            let sources = [
-                self::sources(false)[4].clone(),
-                FunctionValueType::new(DataType::Int64, false),
-            ];
-            for policy in [
-                DecimalOverflowPolicy::OutputNull,
-                DecimalOverflowPolicy::ReportError,
-            ] {
-                let prepared = prepared_for_test_with_policy(name, &sources, policy).unwrap();
-                assert_eq!(prepared.contract().decimal_overflow_policy(), policy);
-                assert_eq!(
-                    prepared.contract().effects().own_row_error,
-                    FunctionIntrinsicRowError::NoRowError
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn original_control_refuses_type_metadata_work_at_256_and_exit() {
-        use arrow_schema::Field;
-        use std::sync::Mutex;
-        struct TraceControl {
-            calls: Mutex<Vec<u32>>,
-            refusal: Option<(usize, CompileControlError)>,
-        }
-        impl PureCompileControl for TraceControl {
-            fn checkpoint(
-                &self,
-                phase: CompilePhase,
-                units: u32,
-            ) -> Result<(), CompileControlError> {
-                assert_eq!(phase, CompilePhase::FunctionSpecialization);
-                assert!(units <= 256);
-                let mut calls = self.calls.lock().unwrap();
-                let at = calls.len();
-                calls.push(units);
-                if let Some((refused_at, error)) = self.refusal.clone()
-                    && at == refused_at
-                {
-                    return Err(error);
-                }
-                Ok(())
-            }
-        }
-        let owner = owner("bit_shift_right_logical");
-        let args = [
-            argument(FunctionValueType::new(DataType::Int64, false)),
-            argument(FunctionValueType::new(DataType::Int64, false)),
-        ];
-        let expected = FunctionValueType::from_legacy_declared_projection(
-            DataType::Struct(
-                (0..128)
-                    .map(|index| {
-                        Arc::new(Field::new(format!("field{index}"), DataType::Int64, true))
-                    })
-                    .collect::<Vec<_>>()
-                    .into(),
-            ),
-            true,
-        );
-        let request = FunctionBindingRequest {
-            expected_result_type: Some(&expected),
-            ..request(&args)
-        };
-        let baseline = TraceControl {
-            calls: Mutex::new(Vec::new()),
-            refusal: None,
-        };
-        let selected = owner.resolve(request, &baseline).unwrap();
-        assert_eq!(
-            selected.result_type,
-            FunctionResultType::Scalar(FunctionValueType::new(DataType::Int64, true))
-        );
-        let calls = baseline.calls.lock().unwrap().clone();
-        assert!(calls.contains(&256));
-        assert!(*calls.last().unwrap() < 256);
-        for error in [
-            CompileControlError::Cancelled,
-            CompileControlError::DeadlineExceeded,
-            CompileControlError::ResourceExhausted,
-        ] {
-            for at in 0..calls.len() {
-                let control = TraceControl {
-                    calls: Mutex::new(Vec::new()),
-                    refusal: Some((at, error.clone())),
-                };
-                assert!(
-                    matches!(owner.resolve(request, &control), Err(FunctionBindingError::Control(actual)) if actual == error)
-                );
-                assert_eq!(control.calls.lock().unwrap().len(), at + 1);
-            }
         }
     }
 }

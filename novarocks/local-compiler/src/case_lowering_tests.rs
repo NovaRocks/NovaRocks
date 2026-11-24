@@ -59,7 +59,13 @@ fn functions() -> PureEngineFunctionCatalog {
     for (name, overloads, abi) in [
         (
             "rand",
-            &["()->f64;strict;legacy", "(i64)->f64;strict;legacy"][..],
+            &[
+                "()->f64;strict;legacy",
+                "(i8)->i8;strict;coerce",
+                "(i16)->i16;strict;coerce",
+                "(i32)->i32;strict;coerce",
+                "(i64)->i64;strict;coerce",
+            ][..],
             PureKernelAbi::ScalarV1,
         ),
         (
@@ -77,6 +83,11 @@ fn functions() -> PureEngineFunctionCatalog {
                     .clone(),
             )
             .unwrap();
+        let implementation = if name == "round" {
+            "selected-v2"
+        } else {
+            "selected-v1"
+        };
         for overload in overloads {
             manifest.push(InstalledPureKernel {
                 function: FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap(),
@@ -87,7 +98,7 @@ fn functions() -> PureEngineFunctionCatalog {
                     ))
                     .unwrap(),
                     implementation: PureImplementationId::try_new(format!(
-                        "builtin.scalar/{name}/selected-v1"
+                        "builtin.scalar/{name}/{implementation}"
                     ))
                     .unwrap(),
                     abi,
@@ -215,21 +226,6 @@ fn original_request_sources(
     }
 }
 
-fn integer_constant(ty: &FunctionValueType, value: i64) -> ConstantValue {
-    ConstantValue::from_i64(
-        Arc::new(ty.try_to_field("fixture").unwrap()),
-        ty.clone(),
-        value,
-        options().constants,
-        CompilePhase::FunctionSpecialization,
-        &Control,
-    )
-    .unwrap()
-}
-fn integer_argument(ty: FunctionValueType, value: i64) -> FunctionArgument {
-    let constant = integer_constant(&ty, value);
-    argument(ty, Some(constant))
-}
 fn argument(ty: FunctionValueType, constant: Option<ConstantValue>) -> FunctionArgument {
     FunctionArgument::Value {
         value_type: ty,
@@ -550,23 +546,27 @@ fn fixture(
                     ExprKind::Value(decimal_value.unwrap()),
                 )
                 .unwrap();
-            let integer = FunctionValueType::new(DataType::Int64, false);
+            let integer = FunctionValueType::new(DataType::Int32, false);
+            let digit = ConstantValue::from_i32(
+                Arc::new(integer.try_to_field("fixture").unwrap()),
+                integer.clone(),
+                -1,
+                options().constants,
+                CompilePhase::FunctionSpecialization,
+                &Control,
+            )
+            .unwrap();
             let digits = literal(
                 &mut builder,
-                (integer.clone()).clone(),
-                crate::test_constants::i64(
-                    &mut constants,
-                    &(integer.clone()),
-                    -1,
-                    options().constants,
-                ),
+                integer.clone(),
+                crate::test_constants::insert(&mut constants, digit.clone()),
             );
             let round = author(
                 functions,
                 "round",
                 vec![
                     argument(decimal.clone(), None),
-                    integer_argument(integer, -1),
+                    argument(integer, Some(digit)),
                 ],
                 ControlShape::Eager,
             );

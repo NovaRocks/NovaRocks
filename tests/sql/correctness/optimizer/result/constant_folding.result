@@ -34,7 +34,7 @@ folded_upper
 MIXED
 
 -- query 18
--- types	bigint
+-- types	integer
 folded_abs
 7
 
@@ -50,7 +50,7 @@ folded_coalesce
 
 -- query 21
 -- types	integer
-folded_ifnull
+folded_typed_coalesce
 9
 
 -- query 22
@@ -124,7 +124,7 @@ folded_upper
 MIXED
 
 -- query 37
--- types	bigint
+-- types	integer
 folded_abs
 7
 
@@ -140,7 +140,7 @@ folded_coalesce
 
 -- query 40
 -- types	integer
-folded_ifnull
+folded_typed_coalesce
 9
 
 -- query 41

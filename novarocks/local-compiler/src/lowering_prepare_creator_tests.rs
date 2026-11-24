@@ -356,7 +356,7 @@ fn assert_rand(prepared: &novarocks_functions::PureCallSpecialization) {
     };
     assert_eq!(
         kernel.contract().result_type(),
-        &FunctionValueType::new(DataType::Float64, true)
+        &FunctionValueType::new(DataType::Float64, false)
     );
     let mut instance = ScalarEvaluationInstance::instantiate(kernel.clone()).unwrap();
     let result = instance

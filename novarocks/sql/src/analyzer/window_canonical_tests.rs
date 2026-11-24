@@ -1007,21 +1007,21 @@ fn complete_window_metadata_refuses_before_missing_names_or_catalog_lookup() {
 }
 
 #[test]
-fn original_typeof_cast_window_metadata_surface_keeps_its_declared_type() {
+fn typeof_keeps_original_window_resolution() {
     let source = SourceCatalog {
         offset_nullable: false,
     };
     let functions = crate::compiler::build_builtin_engine_function_catalog().unwrap();
-    for sql in [
-        "SELECT typeof(CAST(row_number() OVER missing_window AS INT))",
-        "SELECT typeof(CAST(row_number() OVER (missing_window) AS INT))",
-        "SELECT typeof(CAST(row_number() OVER (GROUPS CURRENT ROW) AS INT))",
-    ] {
-        let resolved = analyze(sql, &source, &functions).unwrap();
-        assert!(
-            matches!(&projection(&resolved, 0).kind,
-            ExprKind::Literal(crate::analysis::LiteralValue::String(value)) if value == "int"),
-            "{sql}"
-        );
+    for window in ["missing_window", "(missing_window)", "(GROUPS CURRENT ROW)"] {
+        let direct = format!("SELECT CAST(row_number() OVER {window} AS INT)");
+        let inspected = format!("SELECT typeof(CAST(row_number() OVER {window} AS INT))");
+        let direct = analyze(&direct, &source, &functions)
+            .err()
+            .expect("invalid window");
+        let inspected = analyze(&inspected, &source, &functions)
+            .err()
+            .expect("invalid inspected window");
+        assert_eq!(inspected.kind(), direct.kind());
+        assert_eq!(inspected.message(), direct.message());
     }
 }

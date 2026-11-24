@@ -26,6 +26,32 @@ use novarocks_type_contract::{
 };
 use std::sync::Mutex;
 
+#[test]
+fn nullif_control_requires_the_frozen_equality_identity() {
+    assert_eq!(
+        decode_shape(&encode_shape(ControlShape::NullIf)).unwrap(),
+        ControlShape::NullIf
+    );
+    let mut shape = encode_shape(ControlShape::NullIf);
+    let Some(wire::control_shape::Kind::NullIf(frozen)) = shape.kind.as_mut() else {
+        panic!("expected a NULLIF control shape");
+    };
+    frozen.equality_function = novarocks_type_contract::OperatorFunction::NotEqual
+        .function_id_text()
+        .into();
+    assert!(matches!(
+        decode_shape(&shape),
+        Err(ControlCodecError::InvalidShape(
+            "NULLIF requires its exact equality identity"
+        ))
+    ));
+    let guard = RegionGuard {
+        owner: ExpressionUseId::new(17),
+        kind: GuardKind::NullIfAfterLeft,
+    };
+    assert_eq!(decode_guard(&encode_guard(guard)).unwrap(), guard);
+}
+
 #[derive(Default)]
 struct Control {
     failure: Option<(CompilePhase, CompileControlError)>,

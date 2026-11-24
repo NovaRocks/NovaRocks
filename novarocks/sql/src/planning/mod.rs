@@ -25,5 +25,5 @@ pub mod catalog;
 pub mod dml;
 pub mod mv;
 pub mod mv_aggregate_layout;
-mod mv_persistence;
+pub(crate) mod mv_persistence;
 pub mod query_execution;
