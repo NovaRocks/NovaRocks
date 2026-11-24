@@ -1,13 +1,13 @@
 -- query 1
 -- types	integer	double
 id	k
+1	NaN
+2	NaN
+4	NaN
+5	Infinity
 7	3.5
 9	2.2
 6	1.0
 10	0.0
-1	NULL
-2	NULL
-3	NULL
-4	NULL
-5	NULL
+3	-Infinity
 8	NULL

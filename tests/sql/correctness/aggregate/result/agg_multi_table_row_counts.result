@@ -1,5 +1,5 @@
 -- query 11
--- types	varchar	bigint
+-- types	varchar(9)	bigint
 table_name	row_count
 customer	4
 dates	3

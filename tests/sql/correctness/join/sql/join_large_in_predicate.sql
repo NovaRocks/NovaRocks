@@ -70,7 +70,7 @@ CREATE TABLE ${case_db}.t_string (
     id int NOT NULL,
     varchar_col varchar(50),
     char_col char(10),
-    text_col text,
+    text_col VARCHAR,
     category varchar(20)
 ) WITH (format_version = 3);
 
@@ -147,40 +147,40 @@ ROW(15, null, null, null, null);
 -- query 15
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_mixed VALUES
-ROW(1, 100, 'str100', 1.1, 1.11, 100.50, '2024-01-01', '2024-01-01 10:00:00', true),
-ROW(2, 200, 'str200', 2.2, 2.22, 200.75, '2024-01-02', '2024-01-02 11:00:00', false),
-ROW(3, 300, 'str300', 3.3, 3.33, 300.25, '2024-01-03', '2024-01-03 12:00:00', true),
-ROW(4, 400, 'str400', 4.4, 4.44, 400.00, '2024-01-04', '2024-01-04 13:00:00', false),
-ROW(5, 500, 'str500', 5.5, 5.55, 500.99, '2024-01-05', '2024-01-05 14:00:00', true),
-ROW(6, 600, 'str600', 6.6, 6.66, 600.10, '2024-01-06', '2024-01-06 15:00:00', false),
-ROW(7, 700, 'str700', 7.7, 7.77, 700.20, '2024-01-07', '2024-01-07 16:00:00', true),
-ROW(8, 800, 'str800', 8.8, 8.88, 800.30, '2024-01-08', '2024-01-08 17:00:00', false),
-ROW(9, 900, 'str900', 9.9, 9.99, 900.40, '2024-01-09', '2024-01-09 18:00:00', true),
-ROW(10, 1000, 'str1000', 10.0, 10.10, 1000.50, '2024-01-10', '2024-01-10 19:00:00', false);
+ROW(1, 100, 'str100', 1.1, 1.11, 100.50, DATE '2024-01-01', TIMESTAMP '2024-01-01 10:00:00', true),
+ROW(2, 200, 'str200', 2.2, 2.22, 200.75, DATE '2024-01-02', TIMESTAMP '2024-01-02 11:00:00', false),
+ROW(3, 300, 'str300', 3.3, 3.33, 300.25, DATE '2024-01-03', TIMESTAMP '2024-01-03 12:00:00', true),
+ROW(4, 400, 'str400', 4.4, 4.44, 400.00, DATE '2024-01-04', TIMESTAMP '2024-01-04 13:00:00', false),
+ROW(5, 500, 'str500', 5.5, 5.55, 500.99, DATE '2024-01-05', TIMESTAMP '2024-01-05 14:00:00', true),
+ROW(6, 600, 'str600', 6.6, 6.66, 600.10, DATE '2024-01-06', TIMESTAMP '2024-01-06 15:00:00', false),
+ROW(7, 700, 'str700', 7.7, 7.77, 700.20, DATE '2024-01-07', TIMESTAMP '2024-01-07 16:00:00', true),
+ROW(8, 800, 'str800', 8.8, 8.88, 800.30, DATE '2024-01-08', TIMESTAMP '2024-01-08 17:00:00', false),
+ROW(9, 900, 'str900', 9.9, 9.99, 900.40, DATE '2024-01-09', TIMESTAMP '2024-01-09 18:00:00', true),
+ROW(10, 1000, 'str1000', 10.0, 10.10, 1000.50, DATE '2024-01-10', TIMESTAMP '2024-01-10 19:00:00', false);
 
 -- query 16
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_large VALUES
-ROW(1, 1, 'active', 85.5, '2024-01-01'),
-ROW(2, 1, 'inactive', 72.3, '2024-01-02'),
-ROW(3, 2, 'active', 91.2, '2024-01-03'),
-ROW(4, 2, 'pending', 68.7, '2024-01-04'),
-ROW(5, 3, 'active', 94.1, '2024-01-05'),
-ROW(6, 3, 'inactive', 55.9, '2024-01-06'),
-ROW(7, 4, 'active', 88.8, '2024-01-07'),
-ROW(8, 4, 'pending', 77.4, '2024-01-08'),
-ROW(9, 5, 'active', 92.6, '2024-01-09'),
-ROW(10, 5, 'inactive', 63.2, '2024-01-10'),
-ROW(11, 1, 'active', 89.3, '2024-01-11'),
-ROW(12, 2, 'active', 95.7, '2024-01-12'),
-ROW(13, 3, 'pending', 71.8, '2024-01-13'),
-ROW(14, 4, 'active', 84.4, '2024-01-14'),
-ROW(15, 5, 'inactive', 59.6, '2024-01-15'),
-ROW(16, 1, 'pending', 78.9, '2024-01-16'),
-ROW(17, 2, 'active', 93.2, '2024-01-17'),
-ROW(18, 3, 'active', 87.1, '2024-01-18'),
-ROW(19, 4, 'inactive', 66.5, '2024-01-19'),
-ROW(20, 5, 'active', 90.8, '2024-01-20');
+ROW(1, 1, 'active', 85.5, DATE '2024-01-01'),
+ROW(2, 1, 'inactive', 72.3, DATE '2024-01-02'),
+ROW(3, 2, 'active', 91.2, DATE '2024-01-03'),
+ROW(4, 2, 'pending', 68.7, DATE '2024-01-04'),
+ROW(5, 3, 'active', 94.1, DATE '2024-01-05'),
+ROW(6, 3, 'inactive', 55.9, DATE '2024-01-06'),
+ROW(7, 4, 'active', 88.8, DATE '2024-01-07'),
+ROW(8, 4, 'pending', 77.4, DATE '2024-01-08'),
+ROW(9, 5, 'active', 92.6, DATE '2024-01-09'),
+ROW(10, 5, 'inactive', 63.2, DATE '2024-01-10'),
+ROW(11, 1, 'active', 89.3, DATE '2024-01-11'),
+ROW(12, 2, 'active', 95.7, DATE '2024-01-12'),
+ROW(13, 3, 'pending', 71.8, DATE '2024-01-13'),
+ROW(14, 4, 'active', 84.4, DATE '2024-01-14'),
+ROW(15, 5, 'inactive', 59.6, DATE '2024-01-15'),
+ROW(16, 1, 'pending', 78.9, DATE '2024-01-16'),
+ROW(17, 2, 'active', 93.2, DATE '2024-01-17'),
+ROW(18, 3, 'active', 87.1, DATE '2024-01-18'),
+ROW(19, 4, 'inactive', 66.5, DATE '2024-01-19'),
+ROW(20, 5, 'active', 90.8, DATE '2024-01-20');
 
 -- query 17
 -- @skip_result_check=true
@@ -608,13 +608,13 @@ SELECT id, int_col FROM ${case_db}.t_int WHERE id IN (
 -- ============================================================
 -- query 66
 -- @order_sensitive=true
-SELECT id, date_val FROM ${case_db}.t_mixed WHERE date_val IN ('2024-01-01', '2024-01-02', '2024-01-03', '2024-01-04') ORDER BY id;
+SELECT id, date_val FROM ${case_db}.t_mixed WHERE date_val IN (DATE '2024-01-01', DATE '2024-01-02', DATE '2024-01-03', DATE '2024-01-04') ORDER BY id;
 
 -- ============================================================
--- varchar IN numeric (cross-type, empty result)
+-- A VARCHAR cannot be compared to numeric IN-list items without a cast.
 -- ============================================================
 -- query 67
--- @order_sensitive=true
+-- @expect_error=[sql.analyze.type_mismatch]
 SELECT id, varchar_col FROM ${case_db}.t_string WHERE varchar_col IN (1, 2, 3, 4) ORDER BY id;
 
 -- ============================================================

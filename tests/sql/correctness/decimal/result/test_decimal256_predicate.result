@@ -1838,25 +1838,25 @@ min_big_decimal	max_big_decimal	min_huge_decimal	max_huge_decimal	min_max_decima
 -999999999999.999999999999999	999999999999.999999999999999	-9999999999.99999999999999999999	9999999999.99999999999999999999	-99999999999999	99999999999999
 
 -- query 145
--- types	varchar	bigint
+-- types	varchar(8)	bigint
 big_decimal_status	count
 NOT NULL	19
 "NULL"	6
 
 -- query 146
--- types	varchar	bigint
+-- types	varchar(8)	bigint
 huge_decimal_status	count
 NOT NULL	19
 "NULL"	6
 
 -- query 147
--- types	varchar	bigint
+-- types	varchar(8)	bigint
 max_decimal_status	count
 NOT NULL	19
 "NULL"	6
 
 -- query 148
--- types	varchar	varchar	bigint
+-- types	varchar(8)	varchar(8)	bigint
 big_decimal_status	huge_decimal_status	count
 NOT NULL	NOT NULL	16
 NOT NULL	"NULL"	3
@@ -1864,7 +1864,7 @@ NOT NULL	"NULL"	3
 "NULL"	"NULL"	3
 
 -- query 149
--- types	varchar	varchar	bigint
+-- types	varchar(8)	varchar(8)	bigint
 big_decimal_status	max_decimal_status	count
 NOT NULL	NOT NULL	17
 NOT NULL	"NULL"	2
@@ -1872,7 +1872,7 @@ NOT NULL	"NULL"	2
 "NULL"	"NULL"	4
 
 -- query 150
--- types	varchar	varchar	varchar	bigint
+-- types	varchar(8)	varchar(8)	varchar(8)	bigint
 big_decimal_status	huge_decimal_status	max_decimal_status	count
 NOT NULL	NOT NULL	NOT NULL	15
 NOT NULL	NOT NULL	"NULL"	1
@@ -1884,13 +1884,13 @@ NOT NULL	"NULL"	"NULL"	1
 "NULL"	"NULL"	"NULL"	2
 
 -- query 151
--- types	varchar	bigint
+-- types	varchar(8)	bigint
 big_decimal_status	count
 NOT NULL	19
 "NULL"	6
 
 -- query 152
--- types	varchar	bigint
+-- types	varchar(8)	bigint
 huge_decimal_status	count
 NOT NULL	19
 "NULL"	6

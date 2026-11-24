@@ -92,6 +92,7 @@ pub struct CompiledSortProcessorFactory {
     program: Arc<LocalProgram>,
     sites: Vec<ProgramRootRef>,
     options: Vec<SortOptions>,
+    global_order: bool,
     retention: Option<RankRetention>,
     limit: Option<usize>,
     offset: usize,
@@ -121,6 +122,8 @@ impl CompiledSortProcessorFactory {
         };
         let at = node.index();
         let partition_exprs = mode.partition_by();
+        // The analytic sort contract also supplies partition/peer boundaries.
+        let global_order = matches!(mode, LocalSortMode::Full | LocalSortMode::RowsTopN { .. });
         let (limit, offset, retention) = match mode {
             LocalSortMode::Full | LocalSortMode::Partitioned { .. } => (None, 0, None),
             LocalSortMode::RowsTopN { limit, offset } => {
@@ -188,6 +191,7 @@ impl CompiledSortProcessorFactory {
             program,
             sites,
             options,
+            global_order,
             retention,
             limit,
             offset,
@@ -221,6 +225,7 @@ impl OperatorFactory for CompiledSortProcessorFactory {
             program: Arc::clone(&self.program),
             sites: self.sites.clone(),
             options: self.options.clone(),
+            global_order: self.global_order,
             retention: self.retention,
             limit: self.limit,
             offset: self.offset,
@@ -249,6 +254,7 @@ struct CompiledSortProcessor {
     program: Arc<LocalProgram>,
     sites: Vec<ProgramRootRef>,
     options: Vec<SortOptions>,
+    global_order: bool,
     retention: Option<RankRetention>,
     limit: Option<usize>,
     offset: usize,
@@ -620,7 +626,7 @@ impl TransformKernel for CompiledSortProcessor {
             )?;
         let instances = self.instances.as_mut().expect("instances were created");
         let mut keys = creation.vector::<ArrayRef>(self.sites.len(), owner.as_ref())?;
-        for (instance, site) in instances.iter_mut().zip(&self.sites) {
+        for ((instance, site), options) in instances.iter_mut().zip(&self.sites).zip(&self.options) {
             let values = evaluate_chunk_all(instance, *site, &chunk, &self.control)?;
             let declared = root_value_type(&self.program, *site)?;
             type_storage = type_storage.retaining_observed::<ConstructionFailure>(
@@ -633,6 +639,7 @@ impl TransformKernel for CompiledSortProcessor {
             keys.push(creation.normalize_key(
                 &values,
                 declared.value_type(),
+                self.global_order.then_some(options.nulls_first),
                 owner.as_ref(),
                 types.as_ref(),
             )?);

@@ -1,5 +1,5 @@
 -- query 1
--- types	varchar	bigint	bigint	bigint	bigint	bigint
+-- types	varchar(14)	bigint	bigint	bigint	bigint	bigint
 scenario	row_count	left_non_null	right_non_null	sum_left	sum_right
 01_inner	7	7	7	26	10
 02_left_outer	8	8	7	27	10
@@ -11,7 +11,7 @@ scenario	row_count	left_non_null	right_non_null	sum_left	sum_right
 08_right_anti	4	0	4	0	26
 
 -- query 2
--- types	varchar	bigint	bigint	bigint	bigint	bigint
+-- types	varchar(14)	bigint	bigint	bigint	bigint	bigint
 scenario	row_count	left_non_null	right_non_null	sum_left	sum_right
 01_inner	0	0	0	0	0
 02_left_outer	5	5	0	15	0
@@ -23,7 +23,7 @@ scenario	row_count	left_non_null	right_non_null	sum_left	sum_right
 08_right_anti	0	0	0	0	0
 
 -- query 3
--- types	varchar	bigint	bigint	bigint	bigint	bigint
+-- types	varchar(14)	bigint	bigint	bigint	bigint	bigint
 scenario	row_count	left_non_null	right_non_null	sum_left	sum_right
 01_inner	0	0	0	0	0
 02_left_outer	0	0	0	0	0
@@ -35,7 +35,7 @@ scenario	row_count	left_non_null	right_non_null	sum_left	sum_right
 08_right_anti	2	0	2	0	3
 
 -- query 4
--- types	varchar	bigint	bigint	bigint
+-- types	varchar(10)	bigint	bigint	bigint
 scenario	row_count	sum_left	sum_right
 left_large	28651	58791838	143227
 
@@ -64,7 +64,7 @@ c2	c2
 4097	6
 
 -- query 7
--- types	varchar	bigint	bigint	bigint
+-- types	varchar(11)	bigint	bigint	bigint
 scenario	row_count	sum_left	sum_right
 right_large	28	168	84
 
@@ -97,7 +97,7 @@ c2	c2
 7	4
 
 -- query 10
--- types	varchar	bigint	bigint	bigint
+-- types	varchar(17)	bigint	bigint	bigint
 scenario	row_count	sum_left	sum_right
 multi_chunk_equal	8394753	22940061698	11470030849
 
@@ -130,7 +130,7 @@ c2	c2
 4098	4088
 
 -- query 13
--- types	varchar	bigint	bigint	bigint
+-- types	varchar(25)	bigint	bigint	bigint
 scenario	row_count	sum_left	sum_right
 multi_chunk_left_boundary	8386560	22906490880	11453245440
 
@@ -163,7 +163,7 @@ c2	c2
 4096	4086
 
 -- query 16
--- types	varchar	bigint	bigint	bigint
+-- types	varchar(26)	bigint	bigint	bigint
 scenario	row_count	sum_left	sum_right
 multi_chunk_right_boundary	8394752	22940057600	11470026752
 
@@ -196,7 +196,7 @@ c2	c2
 4098	4087
 
 -- query 19
--- types	varchar	bigint	bigint	bigint
+-- types	varchar(17)	bigint	bigint	bigint
 scenario	row_count	sum_left	sum_right
 multi_small_chunk	2926	152152	76076
 

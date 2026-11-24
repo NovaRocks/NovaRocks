@@ -36,7 +36,7 @@ INSERT INTO ${case_db}.t1 SELECT k1 + 65535 * 3 FROM ${case_db}.t1;
 -- GRF build size limit=1 forces the runtime filter to exceed limit and be disabled.
 -- The result must still be correct (no rows dropped, no extra rows from GRF bypass).
 with tw1 as (
-    select t1.k1 from ${case_db}.t1 join  ${case_db}.t1 t2 using(k1)
+    select k1 from ${case_db}.t1 join  ${case_db}.t1 t2 using(k1)
 )
 select
     count(1) from tw1 join  ${case_db}.t1 t3 using(k1);

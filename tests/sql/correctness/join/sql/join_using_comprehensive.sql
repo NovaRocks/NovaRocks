@@ -813,12 +813,7 @@ ORDER BY id
 LIMIT 50;
 
 -- query 61
--- StarRocks FE rejected this with "cannot be resolved" — its analyzer
--- was dropping the CTE's `agg` alias when the outer USING(id) merge
--- ran, so the downstream `agg.l1_count` failed to resolve. NovaRocks's
--- scope-merge "left wins" semantics (see JN-8) preserves the aliased
--- relation's qualified bindings across USING, so the query is now
--- analyzable. Just smoke-check that execution succeeds.
+-- Resolve the merged USING key alongside the CTE's qualified aggregate columns.
 -- @skip_result_check=true
 WITH agg_level1 AS (
     SELECT id,
@@ -832,7 +827,7 @@ WITH agg_level1 AS (
     WHERE id > 0
     GROUP BY id
 )
-SELECT agg.id,
+SELECT id,
        agg.l1_count,
        agg.l1_max_v1,
        agg.l1_min_v2,
@@ -847,6 +842,6 @@ SELECT agg.id,
 FROM agg_level1 agg
      LEFT JOIN ${case_db}.t5 USING(id)
      FULL OUTER JOIN ${case_db}.t6 USING(id)
-WHERE agg.id IS NOT NULL
-ORDER BY agg.l1_count DESC, agg.id
+WHERE agg.l1_count IS NOT NULL
+ORDER BY agg.l1_count DESC, id
 LIMIT 50;

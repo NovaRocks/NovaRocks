@@ -492,10 +492,6 @@ id	date_val
 3	2024-01-03
 4	2024-01-04
 
--- query 67
--- types	integer	varchar
-id	varchar_col
-
 -- query 68
 -- types	bigint	integer	varchar	double	bigint
 id	category_id	status	score	rank_in_category

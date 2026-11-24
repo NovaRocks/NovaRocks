@@ -68,7 +68,7 @@ CREATE TABLE ${case_db}.fpj_t1 (
 
 -- query 8
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fpj_t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(sequence(1, 40960)) AS generate_series(generate_series);
+INSERT INTO ${case_db}.fpj_t0 SELECT generate_series, CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series FROM TABLE(sequence(1, 40960)) AS generate_series(generate_series);
 
 -- query 9
 -- @skip_result_check=true
@@ -76,7 +76,7 @@ INSERT INTO ${case_db}.fpj_t1 SELECT * FROM ${case_db}.fpj_t0;
 
 -- query 10
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fpj_t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(sequence(40960, 40960 + 20000)) AS generate_series(generate_series);
+INSERT INTO ${case_db}.fpj_t0 SELECT generate_series, CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series FROM TABLE(sequence(40960, 40960 + 20000)) AS generate_series(generate_series);
 
 -- query 11
 -- INNER JOIN with multi-column equality
@@ -99,7 +99,7 @@ SELECT count(*) FROM (SELECT * FROM ${case_db}.fpj_t0 WHERE c0 NOT IN (SELECT c0
 
 -- query 15
 -- NOT IN with correlated predicate
-SELECT count(*) FROM (SELECT * FROM ${case_db}.fpj_t0 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t1 WHERE ${case_db}.fpj_t0.c1)) t;
+SELECT count(*) FROM (SELECT * FROM ${case_db}.fpj_t0 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t1 WHERE CAST(${case_db}.fpj_t0.c1 AS BIGINT) <> 0)) t;
 
 -- query 16
 -- @skip_result_check=true
@@ -170,11 +170,11 @@ INSERT INTO ${case_db}.fpj_t2 VALUES ROW(NULL, NULL, NULL, NULL);
 
 -- query 28
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fpj_t3 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(sequence(1, 409600)) AS generate_series(generate_series);
+INSERT INTO ${case_db}.fpj_t3 SELECT generate_series, CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series FROM TABLE(sequence(1, 409600)) AS generate_series(generate_series);
 
 -- query 29
 -- NOT IN with correlated IF predicate (null row, expect 0)
-SELECT count(*) FROM (SELECT * FROM ${case_db}.fpj_t2 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t3 WHERE if(${case_db}.fpj_t3.c0=1, ${case_db}.fpj_t2.c1, true))) t;
+SELECT count(*) FROM (SELECT * FROM ${case_db}.fpj_t2 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t3 WHERE if(${case_db}.fpj_t3.c0=1, CAST(${case_db}.fpj_t2.c1 AS BIGINT) <> 0, true))) t;
 
 -- query 30
 -- NOT IN with correlated IF and IS NOT NULL predicate (null row, expect 0)

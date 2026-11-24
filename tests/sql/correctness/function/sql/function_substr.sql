@@ -17,40 +17,32 @@
 
 -- Migrated from dev/test/sql/test_function/T/test_substr
 -- Test Objective:
--- 1. Validate SUBSTR/SUBSTRING with out-of-range BIGINT literal arguments produce cast errors.
--- 2. Validate SUBSTR/SUBSTRING with BIGINT column arguments handle overflow gracefully (return NULL).
--- 3. Cover both one-arg and two-arg offset/length forms.
+-- 1. Validate SUBSTR/SUBSTRING with extreme BIGINT offsets on empty and nonempty strings.
+-- 2. Assert an empty string for out-of-range offsets supplied as literals or columns.
+-- 3. Cover calls with an offset alone and with an explicit length.
 
 -- query 1
--- @expect_error=Cast argument 9223372036854775807 to int type failed
 select SUBSTR('', 9223372036854775807) ;
 
 -- query 2
--- @expect_error=Cast argument 9223372036854775807 to int type failed
 select SUBSTR('', 9223372036854775807, 465254298) ;
 
 -- query 3
--- @expect_error=Cast argument -9223372036854775807 to int type failed
 select SUBSTR('', -9223372036854775807, 465254298) ;
 
 -- query 4
--- @expect_error=Cast argument 9223372036854775806 to int type failed
 select SUBSTR('', 9223372036854775806, 465254298) ;
 
 -- query 5
--- @expect_error=Cast argument 9223372036854775807 to int type failed
 select SUBSTRING('', 9223372036854775807) ;
 
 -- query 6
--- @expect_error=Cast argument 9223372036854775807 to int type failed
 select SUBSTRING('', 9223372036854775807, 465254298) ;
 
 -- query 7
--- @expect_error=Cast argument -9223372036854775807 to int type failed
 select SUBSTRING('', -9223372036854775807, 465254298) ;
 
 -- query 8
--- @expect_error=Cast argument 9223372036854775806 to int type failed
 select SUBSTRING('', 9223372036854775806, 465254298) ;
 
 -- query 9
@@ -95,9 +87,7 @@ select SUBSTRING('STARROCKS' FROM 2 FOR 3) AS substring_result;
 select SUBSTRING('STARROCKS' FROM 5) AS substring_result;
 
 -- query 19
--- @expect_error=Cast argument 9223372036854775807 to int type failed
 select SUBSTRING('' FROM 9223372036854775807);
 
 -- query 20
--- @expect_error=Cast argument -9223372036854775807 to int type failed
 select SUBSTRING('' FROM -9223372036854775807 FOR 1);
