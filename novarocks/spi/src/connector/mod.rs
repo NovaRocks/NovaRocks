@@ -260,7 +260,9 @@ pub use mv_storage_observation::{
     MvObservedMaintenancePolicy, MvObservedPartitionField, MvObservedPartitionSpec,
     MvObservedPartitionTransform, MvObservedRefreshMarker, MvObservedSnapshot,
     MvObservedSourceField, MvRefreshBaseObservation, MvRefreshTargetObservation,
-    MvSchemaValidationObservation, MvSourceSchemaObservation, MvStorageObservationPort,
+    MvSchemaValidationObservation, MvSourceBindingFact, MvSourceBindingObservation,
+    MvSourceFieldBinding, MvSourceFieldCoordinate, MvSourceFieldKind, MvSourceFieldPath,
+    MvSourceObjectKind, MvSourcePathBinding, MvSourceSchemaObservation, MvStorageObservationPort,
     UnavailableMvStorageObservationPort,
 };
 pub use original_result_scope::{

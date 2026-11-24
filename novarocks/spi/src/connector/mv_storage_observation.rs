@@ -27,10 +27,11 @@
 use std::collections::{BTreeMap, HashSet};
 
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorCommittedVersion, ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
     ConnectorTableObjectId, ProviderSourceType,
 };
 
@@ -45,6 +46,92 @@ const SNAPSHOT_BYTES: usize = 16;
 const REF_FIXED_BYTES: usize = 16;
 const MARKER_FIXED_BYTES: usize = 24;
 const MAX_MV_SOURCE_FIELD_ID_BYTES: usize = 1024;
+
+/// One coordinate in the analyzed source schema. The name verifies that the
+/// original ordinal still selects the same field. Neither enters fact bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSourceFieldCoordinate {
+    pub ordinal: u32,
+    pub name: String,
+}
+
+/// A field or a whole subtree consumed by one analyzed relation occurrence.
+/// Paths descend through structs. Lists/maps used as values are requested as a
+/// whole subtree, including when SQL indexes or applies a lambda to them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSourceFieldPath {
+    pub fields: Vec<MvSourceFieldCoordinate>,
+    pub whole_subtree: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvSourceObjectKind {
+    Table,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvSourceFieldKind {
+    Scalar,
+    Struct,
+    List,
+    Map,
+}
+
+/// Only the selected path is described here. A struct header carries no child
+/// count. Exact leaf parameters and any consumed subtree are in `leaf_type`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSourceFieldBinding {
+    pub provider_field_id: Bytes,
+    pub required: bool,
+    pub kind: MvSourceFieldKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSourcePathBinding {
+    pub fields: Vec<MvSourceFieldBinding>,
+    pub leaf_type: ProviderSourceType,
+    pub whole_subtree: bool,
+}
+
+/// The original Provider authors the domain, version and bytes. The digest
+/// always describes these exact bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSourceBindingFact {
+    bytes: Bytes,
+    digest: [u8; 32],
+}
+
+impl MvSourceBindingFact {
+    pub fn from_canonical_bytes(bytes: Vec<u8>) -> Self {
+        let digest = Sha256::digest(&bytes).into();
+        Self {
+            bytes: Bytes::from(bytes),
+            digest,
+        }
+    }
+
+    pub fn canonical_bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    pub const fn sub_digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+/// A1–A4 for one source occurrence. Response paths correspond exactly to the
+/// request order. The Provider separately canonicalizes the unordered set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSourceBindingObservation {
+    pub catalog_instance: ConnectorInstanceId,
+    pub object_id: ConnectorTableObjectId,
+    pub object_kind: MvSourceObjectKind,
+    pub paths: Vec<MvSourcePathBinding>,
+    pub object_fact: MvSourceBindingFact,
+    pub path_fact: MvSourceBindingFact,
+    pub type_fact: MvSourceBindingFact,
+    pub read_declarations_fact: MvSourceBindingFact,
+}
 
 /// One source-schema field whose provider-owned identity is safe to persist
 /// only through a consumer-owned document. The field's position in the
@@ -883,6 +970,18 @@ impl MvMaintenanceMetadataObservation {
 /// answer from the supplied exact lease and sealed metadata only.
 // Design: ADR-0086 (docs/adr/ADR-0086-frontend-mv-storage-observation-spi-relocation.md)
 pub trait MvStorageObservationPort: Send + Sync {
+    /// Projects A1–A4 from the original observed table generation, without
+    /// resolving another table or acquiring any I/O capability.
+    fn observe_source_binding(
+        &self,
+        _exact_lease: &ConnectorControlPlanningPin,
+        _metadata: &ConnectorTableMetadata,
+        _paths: &[MvSourceFieldPath],
+        _context: ConnectorRequestContext,
+    ) -> Result<MvSourceBindingObservation, ConnectorError> {
+        Err(unavailable())
+    }
+
     /// Projects opaque source identities from the same retained generation as
     /// `metadata`. A caller must reject this observation if its table or schema
     /// version does not exactly match that admitted metadata.

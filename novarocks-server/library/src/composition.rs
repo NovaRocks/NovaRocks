@@ -57,8 +57,8 @@ use novarocks_spi::connector::{
     MvObservedField, MvObservedMaintenancePolicy, MvObservedPartitionField,
     MvObservedPartitionSpec, MvObservedPartitionTransform, MvObservedRefreshMarker,
     MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
-    MvRefreshTargetObservation, MvSchemaValidationObservation, MvSourceSchemaObservation,
-    MvStorageObservationPort,
+    MvRefreshTargetObservation, MvSchemaValidationObservation, MvSourceBindingObservation,
+    MvSourceFieldPath, MvSourceSchemaObservation, MvStorageObservationPort,
 };
 
 use novarocks_state_store_runtime::{
@@ -147,6 +147,17 @@ fn mv_partition_observation(
 }
 
 impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
+    fn observe_source_binding(
+        &self,
+        exact_lease: &ConnectorControlPlanningPin,
+        metadata: &ConnectorTableMetadata,
+        paths: &[MvSourceFieldPath],
+        context: ConnectorRequestContext,
+    ) -> Result<MvSourceBindingObservation, ConnectorError> {
+        self.inspector
+            .observe_source_binding(exact_lease, metadata, paths, context)
+    }
+
     fn observe_source_schema(
         &self,
         exact_lease: &ConnectorControlPlanningPin,
