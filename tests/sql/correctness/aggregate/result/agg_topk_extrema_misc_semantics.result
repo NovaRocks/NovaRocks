@@ -16,8 +16,8 @@ min_three_values	min_two_texts
 [10,10,10]	["alpha","beta"]
 
 -- query 4
--- types	integer	decimal(38, 6)
+-- types	integer	decimal(38, 17)
 grp	expr_avg
-1	32499997.316162
-2	29999997.627262
-3	24999998.249461
+1	32499997.31616200000000000
+2	29999997.62726200000000000
+3	24999998.24946100000000000

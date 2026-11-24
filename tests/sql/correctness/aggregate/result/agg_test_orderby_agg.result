@@ -44,17 +44,17 @@ NULL	NULL
 1	1
 
 -- query 9
--- types	decimal(38, 4)	bigint
+-- types	decimal(38, 16)	bigint
 potential_customer_rate	v2
 NULL	NULL
-33.3333	3
-150.0000	2
-200.0000	1
+33.3333000000000000	3
+150.0000000000000000	2
+200.0000000000000000	1
 
 -- query 10
--- types	decimal(38, 4)	bigint
+-- types	decimal(38, 16)	bigint
 potential_customer_rate	v2
 NULL	NULL
-33.3333	3
-150.0000	2
-200.0000	1
+33.3333000000000000	3
+150.0000000000000000	2
+200.0000000000000000	1

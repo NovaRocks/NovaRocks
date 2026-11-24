@@ -1,5 +1,5 @@
 -- query 3
--- types	double	varchar
+-- types	integer	varchar
 g	gc
-0.0	a
-1.0	b,c
+0	a
+1	b,c
