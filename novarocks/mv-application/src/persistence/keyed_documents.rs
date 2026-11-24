@@ -6,7 +6,10 @@
 //! MV-owned keyed document mapping. Legacy documents remain only for the
 //! staged FE migration; this path never converts a keyed record into legacy P.
 
-use super::{codec::keyed::*, codec::*, documents::MvDocumentError, identity::DocumentRevision};
+use super::{
+    binding_envelope::inspect_binding, codec::keyed::*, codec::*, documents::MvDocumentError,
+    identity::DocumentRevision,
+};
 use crate::management::{DeploymentOwner, ManagedMvTarget, ProcessIncarnation};
 use bytes::Bytes;
 use novarocks_spi::connector::*;
@@ -21,8 +24,10 @@ pub const MANAGEMENT_SLOT_NAME: &str = "management";
 pub struct MvKeyedVersions {
     pub definition: ConnectorDocumentVersion,
     pub interpretation: ConnectorDocumentVersion,
+    pub mapping: ConnectorDocumentVersion,
     pub binding: ConnectorDocumentVersion,
     pub binding_document: BindingDocument,
+    pub mapping_document: StorageMappingDocument,
 }
 impl MvKeyedVersions {
     pub fn definition_revision(&self) -> DocumentRevision {
@@ -35,6 +40,7 @@ impl MvKeyedVersions {
         vec![
             self.definition.clone(),
             self.interpretation.clone(),
+            self.mapping.clone(),
             self.binding.clone(),
         ]
     }
@@ -76,7 +82,7 @@ pub(crate) fn definition_version(
 ) -> Result<ConnectorDocumentVersion, MvDocumentError> {
     version(
         "definition",
-        1,
+        DEFINITION_FORMAT_VERSION,
         vec![],
         encode_definition(definition)
             .map_err(|e| MvDocumentError::Contract(format!("document version definition: {e}")))?
@@ -95,56 +101,46 @@ pub fn build_keyed_versions(
     definition: &DefinitionDocument,
     interpretation: &InterpretationDocument,
     binding: BindingDocument,
+    mapping: StorageMappingDocument,
 ) -> Result<MvKeyedVersions, MvDocumentError> {
-    if binding.data_versions.len() != definition.relation_occurrences.len() {
-        return contract("binding occurrence count differs from definition");
-    }
-    for (occurrence, descriptor) in definition
-        .relation_occurrences
-        .iter()
-        .zip(&binding.data_versions)
-    {
-        let object = super::exact_revision::decode_fact(occurrence.object_id.as_bytes())?;
-        if object.provider != descriptor.provider {
-            return contract(
-                "binding data-version provider differs from definition object provider",
-            );
-        }
-    }
     let d = definition_version(definition)?;
     let mut interpretation = interpretation.clone();
     interpretation.definition_revision = revision(d.identity());
-    super::validation::validate_definition_interpretation(
-        definition,
-        revision(d.identity()),
+    super::validation::validate_binding_interpretation(
+        &binding,
+        interpretation.definition_revision,
         &interpretation,
+        &mapping,
     )?;
     let l = version(
         "interpretation",
-        2,
+        KEYED_INTERPRETATION_FORMAT_VERSION,
         vec![("definition".into(), d.identity())],
-        encode_keyed_interpretation(&interpretation)
-            .map_err(|e| {
-                MvDocumentError::Contract(format!("document version interpretation: {e}"))
-            })?
-            .into_bytes(),
+        encode_keyed_interpretation(&interpretation)?.into_bytes(),
+    )?;
+    let m = version(
+        "mapping",
+        STORAGE_MAPPING_FORMAT_VERSION,
+        vec![],
+        encode_storage_mapping(&mapping)?.into_bytes(),
     )?;
     let b = version(
         "binding",
-        1,
+        BINDING_FORMAT_VERSION,
         vec![
             ("definition".into(), d.identity()),
             ("interpretation".into(), l.identity()),
+            ("mapping".into(), m.identity()),
         ],
-        encode_binding(&binding)
-            .map_err(|e| MvDocumentError::Contract(format!("document version binding: {e}")))?
-            .into_bytes(),
+        encode_binding(&binding)?.into_bytes(),
     )?;
     Ok(MvKeyedVersions {
         definition: d,
         interpretation: l,
+        mapping: m,
         binding: b,
         binding_document: binding,
+        mapping_document: mapping,
     })
 }
 
@@ -153,12 +149,13 @@ pub fn keyed_create_document_set(
     interpretation: &InterpretationDocument,
     configuration: &ConfigurationDocument,
     binding: BindingDocument,
+    mapping: StorageMappingDocument,
     target: &ConnectorPreparedCreateDocumentTarget,
     owner: &DeploymentOwner,
     incarnation: &ProcessIncarnation,
 ) -> Result<KeyedCreate, MvDocumentError> {
     super::documents::validate_create_target(interpretation, target)?;
-    let versions = build_keyed_versions(definition, interpretation, binding)?;
+    let versions = build_keyed_versions(definition, interpretation, binding, mapping)?;
     Ok(KeyedCreate {
         versions: versions.versions(),
         slots: BTreeMap::from([
@@ -176,7 +173,6 @@ pub fn keyed_create_document_set(
 }
 pub fn keyed_publication_document_set(
     versions: &MvKeyedVersions,
-    definition: &DefinitionDocument,
     publication: &KeyedPublicationDocument,
 ) -> Result<KeyedPublication, MvDocumentError> {
     if publication.definition_revision != versions.definition_revision()
@@ -184,7 +180,7 @@ pub fn keyed_publication_document_set(
     {
         return contract("publication revisions do not bind the exact D/L identities");
     }
-    let payload = encode_publication_payload(publication, definition, &versions.binding_document)?;
+    let payload = encode_publication_payload(publication, &versions.binding_document)?;
     let record = ConnectorSnapshotRecord {
         owner: MV_DOCUMENT_OWNER.into(),
         name: "publication".into(),
@@ -202,10 +198,11 @@ pub fn keyed_repartition_document_set(
     definition: &DefinitionDocument,
     interpretation: &InterpretationDocument,
     binding: BindingDocument,
+    mapping: StorageMappingDocument,
     publication: &KeyedPublicationDocument,
 ) -> Result<KeyedPublication, MvDocumentError> {
-    let versions = build_keyed_versions(definition, interpretation, binding)?;
-    keyed_publication_document_set(&versions, definition, publication)
+    let versions = build_keyed_versions(definition, interpretation, binding, mapping)?;
+    keyed_publication_document_set(&versions, publication)
 }
 pub fn configuration_slot_name() -> Result<ConnectorSlotName, MvDocumentError> {
     Ok(ConnectorSlotName::try_new(
@@ -338,79 +335,59 @@ pub fn never_published(view: &KeyedDocumentView) -> bool {
             .any(|r| r.owner == MV_DOCUMENT_OWNER && r.name == "publication")
             && view.current_snapshot_file_totals.is_empty())
 }
-fn exact_version<'a>(
-    view: &'a KeyedDocumentView,
-    id: DocumentIdentity,
-    name: &str,
-    version: u32,
-) -> Result<&'a ConnectorDocumentVersion, MvDocumentError> {
-    let value = view
-        .versions
-        .get(&id)
-        .ok_or_else(|| MvDocumentError::Contract(format!("missing MV document version {name}")))?;
-    if value.identity() != id
-        || value.owner() != MV_DOCUMENT_OWNER
-        || value.name() != name
-        || value.format() != &format(name, version)?
-    {
-        return contract(format!("invalid MV document version {name}"));
-    }
-    Ok(value)
-}
 fn decode_keyed_binding_documents(
     view: &KeyedDocumentView,
     binding_id: DocumentIdentity,
     configuration_content: &[u8],
 ) -> Result<(DefinitionDocument, InterpretationDocument, MvKeyedVersions), MvDocumentError> {
-    let b = exact_version(view, binding_id, "binding", 1)?;
-    let d_id = *b
-        .references()
-        .get("definition")
-        .ok_or_else(|| MvDocumentError::Contract("binding lacks definition reference".into()))?;
-    let l_id = *b.references().get("interpretation").ok_or_else(|| {
-        MvDocumentError::Contract("binding lacks interpretation reference".into())
+    let envelope = inspect_binding(view, binding_id)?;
+    envelope.require_current()?;
+    let m = envelope.mapping.ok_or_else(|| {
+        MvDocumentError::Contract("current binding lacks its storage mapping".into())
     })?;
-    if b.references().len() != 2 {
-        return contract("binding has unexpected references");
-    }
-    let d = exact_version(view, d_id, "definition", 1)?;
-    let l = exact_version(view, l_id, "interpretation", 2)?;
-    if !d.references().is_empty()
-        || l.references() != &BTreeMap::from([("definition".into(), d_id)])
-    {
-        return contract("invalid D/L document reference closure");
-    }
-    preflight_keyed_document_set(d.content(), l.content(), b.content(), configuration_content)?;
+    let d = envelope.definition;
+    let l = envelope.interpretation;
+    let b = envelope.binding;
+    preflight_keyed_document_set(
+        d.content(),
+        l.content(),
+        b.content(),
+        m.content(),
+        configuration_content,
+    )?;
     let definition = decode_definition(d.content())?;
     let interpretation = decode_keyed_interpretation(l.content())?;
     let binding = decode_binding(b.content())?;
-    super::validation::validate_definition_interpretation(
-        &definition,
-        revision(d_id),
+    let mapping = decode_storage_mapping(m.content())?;
+    super::validation::validate_binding_interpretation(
+        &binding,
+        revision(d.identity()),
         &interpretation,
+        &mapping,
     )?;
     if interpretation.target.object_id.as_bytes() != view.object_id.as_bytes().as_ref() {
         return contract("interpretation binds a different target object");
     }
-    if binding.data_versions.len() != definition.relation_occurrences.len() {
-        return contract("binding occurrence count differs from definition");
-    }
     let versions = MvKeyedVersions {
         definition: d.clone(),
         interpretation: l.clone(),
+        mapping: m.clone(),
         binding: b.clone(),
         binding_document: binding,
+        mapping_document: mapping,
     };
     Ok((definition, interpretation, versions))
 }
 
-/// Strict root facts used solely for deletion of an already admitted target.
-/// This is neither a current data projection nor a readmission capability.
+/// Exact root facts used solely for deletion of an already observed target.
+/// The body of a retired binding is deliberately never decoded by this path.
 pub(crate) struct MvKeyedDropDocuments {
     pub target: ManagedMvTarget,
     pub owner: DeploymentOwner,
     pub incarnation: ProcessIncarnation,
-    pub versions: MvKeyedVersions,
+    pub root_binding: DocumentIdentity,
+    pub definition_revision: DocumentRevision,
+    pub interpretation_revision: DocumentRevision,
     pub configuration_revision: DocumentRevision,
 }
 
@@ -444,13 +421,14 @@ pub(crate) fn decode_keyed_drop_documents(
         .get(MV_DOCUMENT_OWNER)
         .filter(|root| !root.dangling)
         .ok_or_else(|| MvDocumentError::Contract("MV binding root is absent or dangling".into()))?;
-    let (_, _, versions) =
-        decode_keyed_binding_documents(view, root.identity, &configuration.value.content)?;
+    let envelope = inspect_binding(view, root.identity)?;
     Ok(MvKeyedDropDocuments {
         target,
         owner,
         incarnation,
-        versions,
+        root_binding: envelope.binding.identity(),
+        definition_revision: revision(envelope.definition.identity()),
+        interpretation_revision: revision(envelope.interpretation.identity()),
         configuration_revision: DocumentRevision::from_canonical_bytes(
             &configuration.value.content,
         ),
@@ -519,7 +497,6 @@ pub fn decode_current_keyed_documents(
         .map(|r| {
             decode_publication_payload(
                 &r.payload,
-                &definition,
                 versions.definition_revision(),
                 versions.interpretation_revision(),
                 &versions.binding_document,
@@ -644,6 +621,12 @@ impl MvKeyedDocumentProjection {
     }
     pub fn definition(&self) -> &DefinitionDocument {
         &self.definition
+    }
+    pub fn binding(&self) -> &BindingDocument {
+        &self.versions.binding_document
+    }
+    pub fn mapping(&self) -> &StorageMappingDocument {
+        &self.versions.mapping_document
     }
     pub fn interpretation(&self) -> &InterpretationDocument {
         &self.interpretation
@@ -795,8 +778,7 @@ pub fn keyed_view_fixture(
 ) -> (CatalogHandle, KeyedDocumentView) {
     let f = crate::persistence::test_support::MvDocumentFixture::new();
     let mut inputs = Vec::new();
-    let mut formats = Vec::new();
-    for occurrence in &f.definition.relation_occurrences {
+    for occurrence in &f.binding.occurrences {
         let raw = super::exact_revision::restore_persisted_object(&occurrence.object_id).unwrap();
         let source = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
             ConnectorProviderId::parse("iceberg").unwrap(),
@@ -804,7 +786,6 @@ pub fn keyed_view_fixture(
             Some(17),
         )
         .unwrap();
-        formats.push(DataVersionFormat::from_issued_fact(source.data_version()).unwrap());
         let (_, native_data_version) =
             super::exact_revision::persist_exact_connector_revision(&source).unwrap();
         inputs.push(PublicationInput {
@@ -813,14 +794,8 @@ pub fn keyed_view_fixture(
             native_data_version,
         });
     }
-    let versions = build_keyed_versions(
-        &f.definition,
-        &f.interpretation,
-        BindingDocument {
-            data_versions: formats,
-        },
-    )
-    .unwrap();
+    let versions =
+        build_keyed_versions(&f.definition, &f.interpretation, f.binding, f.mapping).unwrap();
     let publication = KeyedPublicationDocument {
         publication_prepared_at_ms: 42,
         publication_id: super::identity::PublicationIdentity::try_new(vec![0x11; 16]).unwrap(),
@@ -830,7 +805,7 @@ pub fn keyed_view_fixture(
         logical_result_rows: Some(1),
     };
     let records = if published {
-        keyed_publication_document_set(&versions, &f.definition, &publication)
+        keyed_publication_document_set(&versions, &publication)
             .unwrap()
             .records
     } else {
@@ -991,34 +966,29 @@ pub(crate) mod tests {
         let expected_inputs = fixture.publication.as_ref().unwrap().inputs.clone();
         let facts = fixture.build().unwrap();
         let d = facts.definition();
-        let items = d.relation_occurrences.len()
-            + d.outputs.len()
-            + d.relation_occurrences
+        let b = facts.binding();
+        let items = b.occurrences.len()
+            + b.outputs.len()
+            + b.occurrences.iter().map(|r| r.paths.len()).sum::<usize>()
+            + b.outputs
                 .iter()
-                .map(|r| r.fields.len())
-                .sum::<usize>()
-            + d.outputs
-                .iter()
-                .map(|o| o.expression.source_fields.len())
+                .map(|o| o.source_fields.len())
                 .sum::<usize>();
-        assert_eq!(d.relation_occurrences.len(), 370);
-        assert_eq!(d.outputs.len(), 10);
+        assert_eq!(b.occurrences.len(), 370);
+        assert_eq!(b.outputs.len(), 10);
         assert_eq!(items, 4_450);
         assert_eq!(d, &expected_definition);
         assert!(facts.versions().definition.content().len() > 65_536);
         assert_eq!(facts.interpretation().branches.len(), 370);
-        assert_eq!(facts.versions().binding_document.data_versions.len(), 370);
         let publication = facts.publication().unwrap();
         assert_eq!(publication.inputs, expected_inputs);
         assert_eq!(publication.logical_result_rows, Some(740));
-        let payload =
-            encode_publication_payload(publication, d, &facts.versions().binding_document).unwrap();
+        let payload = encode_publication_payload(publication, b).unwrap();
         assert!(payload.len() > 4_096);
         assert_eq!(payload.len(), 4_106);
         assert_eq!(
             decode_publication_payload(
                 &payload,
-                d,
                 facts.versions().definition_revision(),
                 facts.versions().interpretation_revision(),
                 &facts.versions().binding_document,
@@ -1026,7 +996,7 @@ pub(crate) mod tests {
             .unwrap(),
             *publication
         );
-        let set = keyed_publication_document_set(facts.versions(), d, publication).unwrap();
+        let set = keyed_publication_document_set(facts.versions(), publication).unwrap();
         assert_eq!(set.records.len(), 1);
         assert!(snapshot_record_frame(&set.records[0]).len() > 4_096);
         let catalog = CatalogHandle::new(
@@ -1062,8 +1032,8 @@ pub(crate) mod tests {
         assert!(encoded_projection.as_bytes().len() > 65_536);
         eprintln!(
             "P04 component documents: occurrences={}, outputs={}, items={}, sql_bytes={}, D_bytes={}, L_bytes={}, B_bytes={}, P_bytes={}, record_frame_bytes={}, projection_bytes={}",
-            d.relation_occurrences.len(),
-            d.outputs.len(),
+            b.occurrences.len(),
+            b.outputs.len(),
             items,
             d.query.effective_sql.len(),
             facts.versions().definition.content().len(),
@@ -1073,6 +1043,49 @@ pub(crate) mod tests {
             snapshot_record_frame(&set.records[0]).len(),
             encoded_projection.as_bytes().len(),
         );
+    }
+
+    #[test]
+    fn retired_root_grants_exact_drop_dependencies_without_decoding_retired_payloads() {
+        let (catalog, mut view) = fixture(None, false);
+        let definition = version("definition", 1, vec![], vec![8, 1, 0xff]).unwrap();
+        let interpretation = version(
+            "interpretation",
+            2,
+            vec![("definition".into(), definition.identity())],
+            vec![8, 2, 0xff],
+        )
+        .unwrap();
+        let binding = version(
+            "binding",
+            1,
+            vec![
+                ("definition".into(), definition.identity()),
+                ("interpretation".into(), interpretation.identity()),
+            ],
+            vec![8, 1, 0xff],
+        )
+        .unwrap();
+        view.roots.get_mut(MV_DOCUMENT_OWNER).unwrap().identity = binding.identity();
+        view.versions = [definition.clone(), interpretation.clone(), binding.clone()]
+            .into_iter()
+            .map(|document| (document.identity(), document))
+            .collect();
+        assert!(matches!(
+            decode_current_keyed_documents(view.clone(), catalog.clone()),
+            Err(MvDocumentError::KeyedStorage(
+                KeyedDocumentReadError::LegacyFormat { .. }
+            ))
+        ));
+        let drop = decode_keyed_drop_documents(&view, catalog.clone()).unwrap();
+        assert_eq!(drop.root_binding, binding.identity());
+        assert_eq!(drop.definition_revision, revision(definition.identity()));
+        assert_eq!(
+            drop.interpretation_revision,
+            revision(interpretation.identity())
+        );
+        view.versions.remove(&interpretation.identity());
+        assert!(decode_keyed_drop_documents(&view, catalog).is_err());
     }
 
     #[test]

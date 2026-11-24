@@ -173,6 +173,11 @@ fn schema_sources() -> &'static [SchemaSource] {
             raw_schema: include_str!("schemas/mv.accelerator_projection/0004.avsc"),
         },
         SchemaSource {
+            subject: "mv.accelerator_projection",
+            id: 5,
+            raw_schema: include_str!("schemas/mv.accelerator_projection/0005.avsc"),
+        },
+        SchemaSource {
             subject: "mv.accelerator_target_lookup",
             id: 3,
             raw_schema: include_str!("schemas/mv.accelerator_target_lookup/0003.avsc"),

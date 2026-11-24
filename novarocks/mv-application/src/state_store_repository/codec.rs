@@ -124,6 +124,8 @@ struct StoredMvProjectionAvro {
     current_data_files: Option<i64>,
     #[serde(default)]
     current_delete_files: Option<i64>,
+    #[serde(default)]
+    mapping: Option<serde_bytes::ByteBuf>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -339,10 +341,10 @@ where
 {
     decode_record_checked(key, value, |kind, schema_id, payload| {
         if kind == MvRecordKind::Projection {
-            if !matches!(schema_id, 3 | 4) {
+            if !matches!(schema_id, 4 | 5) {
                 return Err("MV projection preflight requires a registered schema".into());
             }
-            preflight::projection(payload, schema_id == 4)?;
+            preflight::projection(payload, schema_id)?;
         }
         Ok(())
     })
@@ -479,7 +481,6 @@ pub fn encode_keyed_projection(
             .map(|p| {
                 crate::persistence::codec::keyed::encode_publication_payload(
                     p,
-                    &facts.definition,
                     &facts.versions.binding_document,
                 )
                 .map(serde_bytes::ByteBuf::from)
@@ -495,26 +496,74 @@ pub fn encode_keyed_projection(
         source_revision: (&facts.source).into(),
         current_data_files: facts.file_totals.data_files.map(to_long).transpose()?,
         current_delete_files: facts.file_totals.delete_files.map(to_long).transpose()?,
+        mapping: Some(serde_bytes::ByteBuf::from(
+            facts.versions.mapping.content().to_vec(),
+        )),
     };
     encode_record(MvRecordKind::Projection, operation_id, &dto)
 }
+pub(super) enum ProjectionRow {
+    Current(crate::persistence::keyed_documents::StoredKeyedMvProjection),
+    Retired {
+        mv_id: i64,
+        source: MvAcceleratorSourceRevision,
+    },
+}
+
 pub fn decode_keyed_projection(
     key: &Key,
     value: &Value,
 ) -> Result<DecodedMvRecord<crate::persistence::keyed_documents::StoredKeyedMvProjection>, String> {
-    use crate::persistence::{codec::keyed::*, keyed_documents::*};
+    let decoded = decode_projection_row(key, value)?;
+    match decoded.value {
+        ProjectionRow::Current(value) => Ok(DecodedMvRecord {
+            operation_id: decoded.operation_id,
+            value,
+        }),
+        ProjectionRow::Retired { .. } => {
+            Err("retired MV projection is available for DROP only".into())
+        }
+    }
+}
+
+pub(super) fn decode_projection_row(
+    key: &Key,
+    value: &Value,
+) -> Result<DecodedMvRecord<ProjectionRow>, String> {
+    use crate::persistence::{
+        codec::{decode_storage_mapping, keyed::*},
+        keyed_documents::*,
+    };
     use novarocks_spi::connector::{ConnectorSnapshotRecord, SnapshotFileTotals};
+    let mut retired = false;
     let decoded: DecodedMvRecord<StoredMvProjectionAvro> =
         decode_record_checked(key, value, |kind, schema, payload| {
-            if kind != MvRecordKind::Projection || schema != 4 {
-                return Err("legacy MV projection cannot be read through the keyed API".into());
+            if kind != MvRecordKind::Projection || !matches!(schema, 4 | 5) {
+                return Err("unsupported MV projection schema".into());
             }
-            preflight::projection(payload, true)?;
+            preflight::projection(payload, schema)?;
+            retired = schema == 4;
             Ok(())
         })?;
     let d = decoded.value;
     if d.mv_id <= 0 {
         return Err("MV projection ID must be positive".into());
+    }
+    let source: MvAcceleratorSourceRevision = d.source_revision.try_into()?;
+    let metadata_version: ConnectorCommittedVersion = d.metadata_version.try_into()?;
+    if source.metadata_version
+        != MvAcceleratorCommittedVersionRevision::from_committed(&metadata_version)
+    {
+        return Err("MV cache metadata version differs from its source revision".into());
+    }
+    if retired {
+        return Ok(DecodedMvRecord {
+            operation_id: decoded.operation_id,
+            value: ProjectionRow::Retired {
+                mv_id: d.mv_id,
+                source,
+            },
+        });
     }
     let binding = d
         .binding
@@ -523,10 +572,10 @@ pub fn decode_keyed_projection(
     let interpretation =
         decode_keyed_interpretation(&d.interpretation).map_err(|e| e.to_string())?;
     let binding = decode_binding(&binding).map_err(|e| e.to_string())?;
-    let versions =
-        build_keyed_versions(&definition, &interpretation, binding).map_err(|e| e.to_string())?;
-    let source: MvAcceleratorSourceRevision = d.source_revision.try_into()?;
-    let metadata_version: ConnectorCommittedVersion = d.metadata_version.try_into()?;
+    let mapping = decode_storage_mapping(d.mapping.as_deref().ok_or("missing keyed mapping")?)
+        .map_err(|e| e.to_string())?;
+    let versions = build_keyed_versions(&definition, &interpretation, binding, mapping)
+        .map_err(|e| e.to_string())?;
     let configuration = decode_configuration(&d.configuration).map_err(|e| e.to_string())?;
     let publication = d
         .publication
@@ -534,7 +583,6 @@ pub fn decode_keyed_projection(
         .map(|bytes| {
             decode_publication_payload(
                 bytes,
-                &definition,
                 versions.definition_revision(),
                 versions.interpretation_revision(),
                 &versions.binding_document,
@@ -563,8 +611,6 @@ pub fn decode_keyed_projection(
                 .map_err(|e| e.to_string())?
                 .revision()
         || source.publication_revision != record_revision
-        || source.metadata_version
-            != MvAcceleratorCommittedVersionRevision::from_committed(&metadata_version)
         || source.publication_output_version
             != output
                 .as_ref()
@@ -595,9 +641,9 @@ pub fn decode_keyed_projection(
     }
     Ok(DecodedMvRecord {
         operation_id: decoded.operation_id,
-        value: StoredKeyedMvProjection {
+        value: ProjectionRow::Current(StoredKeyedMvProjection {
             mv_id: d.mv_id,
             facts,
-        },
+        }),
     })
 }

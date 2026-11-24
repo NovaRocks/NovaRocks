@@ -828,6 +828,7 @@ impl ReadRepository<'_> {
                     mv_id: root.mv_id,
                     target: root.facts.target(),
                     object_id: root.facts.source_revision().target_object_id.clone(),
+                    retired_version: None,
                 })
                 .collect::<Vec<_>>();
             crate::dependency_validation::classify(&mut dependencies, &inventory);
@@ -999,7 +1000,8 @@ impl ReadRepository<'_> {
             }
             validate_canonical_parts(
                 projection.mv_id,
-                projection.facts.definition(),
+                projection.facts.definition().created_at_ms,
+                projection.facts.binding(),
                 &dependencies,
             )?;
             drop(projection);

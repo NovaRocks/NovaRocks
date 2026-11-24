@@ -1,0 +1,88 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file distributed
+// with this work for additional information regarding copyright ownership.
+// The ASF licenses this file to you under the Apache License, Version 2.0.
+
+syntax = "proto3";
+package novarocks.mv.persistence.v1;
+
+// The key authenticates the kind and the whole scope, including a pending
+// attempt if present. The body repeats the exact scope for checked decoding.
+message MarkerDocument {
+  optional uint32 format_version = 1;
+  oneof scope {
+    bytes publication = 2;
+    bytes unpublished_binding = 3;
+  }
+  oneof body {
+    PendingMarker pending = 4;
+    PendingReleasedMarker pending_released = 5;
+    NeedsRebuildMarker needs_rebuild = 6;
+    InvalidDefinitionMarker invalid_definition = 7;
+    InvalidMarker invalid = 8;
+  }
+}
+
+message PendingMarker {
+  optional bytes attempt = 1;
+  optional bytes refresh_identity = 2;
+  repeated SourceVersionWindow source_windows = 3;
+  optional bytes storage_object_id = 4;
+  optional sint64 baseline_snapshot = 5;
+  optional bytes mapping_revision = 6;
+  optional bytes verification_requirement = 7;
+}
+
+message SourceVersionWindow {
+  optional uint32 occurrence = 1;
+  optional bytes from_data_version = 2;
+  optional bytes to_data_version = 3;
+}
+
+message PendingReleasedMarker {
+  optional bytes attempt = 1;
+}
+
+enum BindingChangeKind {
+  BINDING_CHANGE_KIND_UNSPECIFIED = 0;
+  BINDING_CHANGE_KIND_RESOLUTION = 1;
+  BINDING_CHANGE_KIND_DEPENDENCY = 2;
+  BINDING_CHANGE_KIND_INTERPRETATION = 3;
+  BINDING_CHANGE_KIND_STORAGE_MAPPING = 4;
+  BINDING_CHANGE_KIND_RECOVERED_DEFINITION = 5;
+}
+
+message BindingChange {
+  optional BindingChangeKind kind = 1;
+  optional bytes observed_revision = 2;
+  optional bytes current_revision = 3;
+}
+
+message NeedsRebuildMarker {
+  repeated BindingChange changes = 1;
+}
+
+enum InvalidDefinitionKind {
+  INVALID_DEFINITION_KIND_UNSPECIFIED = 0;
+  INVALID_DEFINITION_KIND_RESOLUTION = 1;
+  INVALID_DEFINITION_KIND_OUTPUT_DECLARATION = 2;
+}
+
+message InvalidDefinitionMarker {
+  optional InvalidDefinitionKind kind = 1;
+  optional string diagnostic = 2;
+}
+
+message InvalidMarker {
+  optional bytes retirement_record_revision = 1;
+}
+
+message RetirementRecord {
+  optional uint32 format_version = 1;
+  optional bytes retired_publication = 2;
+  optional bytes operation = 3;
+  optional uint64 requested = 4;
+  optional uint64 matched = 5;
+  optional uint64 insufficient_keys = 6;
+  optional bytes content_fingerprint = 7;
+}

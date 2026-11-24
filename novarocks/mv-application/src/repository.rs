@@ -191,6 +191,7 @@ pub struct MvProjectionInventoryEntry {
     pub mv_id: i64,
     pub target: MvTarget,
     pub object_id: novarocks_spi::connector::ConnectorTableObjectId,
+    pub retired_version: Option<MvProjectionVersion>,
 }
 
 pub(crate) struct MvProjectionInventoryBuilder {
@@ -213,6 +214,7 @@ impl MvProjectionInventoryBuilder {
         mv_id: i64,
         target: &MvTarget,
         object: &novarocks_spi::connector::ConnectorTableObjectId,
+        retired_version: Option<MvProjectionVersion>,
     ) -> Result<(), MvRepositoryError> {
         self.entries
             .try_reserve(1)
@@ -229,6 +231,7 @@ impl MvProjectionInventoryBuilder {
             mv_id,
             target: target.clone(),
             object_id,
+            retired_version,
         });
         Ok(())
     }
@@ -256,7 +259,7 @@ mod inventory_capacity_tests {
                 "sales",
                 &format!("{index:08}-{}", "n".repeat(256)),
             );
-            inventory.push_facts(index, &target, &object).unwrap();
+            inventory.push_facts(index, &target, &object, None).unwrap();
         }
         let entries = inventory.finish();
         assert_eq!(entries.len(), 65_537);

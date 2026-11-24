@@ -109,9 +109,8 @@ use novarocks_sql::planning::mv::UnionBranchKind;
 use novarocks_sql::planning::mv::{
     MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
     MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
-    MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvAggregateCalls,
-    SqlMvAggregateLayoutScope, SqlMvApplyKeySourceFacts, extract_join_aliases,
-    mv_apply_key_source_from_column_name,
+    MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvAggregateLayoutScope,
+    SqlMvApplyKeySourceFacts, extract_join_aliases, mv_apply_key_source_from_column_name,
 };
 use novarocks_sql::semantic::TableColumnDef;
 use novarocks_types::naming::TableIdentity;
@@ -1544,52 +1543,6 @@ mod tests {
         assert_eq!(status.previous_snapshot_id, Some(10));
         assert_eq!(status.current_snapshot_id_before_pin, Some(11));
     }
-}
-
-// A-family aggregate-union execution is orchestrated by the shared fan-in
-// refresh path below. It pins every base, builds one refresh context, and
-// drives the aggregate merge with one canonical change per base.
-
-/// The per-shape payload distinguishing the two `AllBasesRequired` aggregate
-/// refresh variants that share the wrapper [`refresh_fan_in_aggregate_iceberg_mv`].
-///
-/// This enum is the *identity gate* the folded wrapper dispatches on: the
-/// `BranchUnion` variant corresponds to a `BranchScoped` row identity (UNION
-/// ALL of aggregate branches), while `FanIn` corresponds to a plain
-/// `GroupRowId` aggregate fanning in over a UNION ALL of scans. Both produce an
-/// `AllBasesRequired` snapshot policy and an aggregate state contract; only the
-/// branch-contract validation and the first-refresh strategy differ.
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-enum AllBasesAggregateRefresh<'a> {
-    /// Aggregate-over-UNION-ALL fan-in: one aggregate above a union of scans.
-    /// The aggregate-call surface is sourced from the focused extractor
-    /// (`extract_aggregate_sql_calls`), not the legacy classifier.
-    FanIn {
-        schema_contract: &'a mv_schema::MvSchemaContract,
-        aggregate_calls: &'a SqlMvAggregateCalls,
-    },
-    /// Aggregate over a composed multi-base relation, such as a nested join or
-    /// a zero-key CROSS JOIN. The change stream still uses the aggregate
-    /// rewrite-merge path; the apply-key evidence decides whether join-delta
-    /// proof is required.
-    ComposedAggregate {
-        schema_contract: &'a mv_schema::MvSchemaContract,
-        aggregate_calls: &'a SqlMvAggregateCalls,
-    },
-    /// UNION ALL of aggregate branches (`BranchScoped` identity): the union sits
-    /// above per-branch aggregates and the first refresh injects `__branch_id__`.
-    /// The per-branch aggregate-call model is sourced from the focused extractor
-    /// (not the legacy classifier), so a composed branch (`Agg(a JOIN b)` /
-    /// `Agg(fan-in)`) is supported. `branch_count` is the persisted branch count;
-    /// `first_branch_calls` is the first branch's aggregate-call surface, which is
-    /// representative of every branch under the CREATE-time homogeneity gate.
-    BranchUnion {
-        branch_count: usize,
-        first_branch_calls: &'a SqlMvAggregateCalls,
-    },
 }
 
 #[allow(

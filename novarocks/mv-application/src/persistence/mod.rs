@@ -18,6 +18,7 @@
 //! Lake-authoritative MV documents and rebuildable Accelerator values.
 
 pub mod aggregate_bindings;
+mod binding_envelope;
 pub mod codec;
 pub mod create_documents;
 pub mod definition;

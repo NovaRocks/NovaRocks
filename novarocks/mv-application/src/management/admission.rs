@@ -697,10 +697,9 @@ impl ManagementEntrance {
                 "MV DROP Current management slot names another owner or incarnation",
             ));
         }
-        if current.dependencies.definition_revision
-            != *documents.versions.definition_revision().as_bytes()
+        if current.dependencies.definition_revision != *documents.definition_revision.as_bytes()
             || current.dependencies.interpretation_revision
-                != *documents.versions.interpretation_revision().as_bytes()
+                != *documents.interpretation_revision.as_bytes()
         {
             return Err(error(
                 "MV DROP current root definition or interpretation changed",
@@ -713,7 +712,7 @@ impl ManagementEntrance {
             MvDropManagementObservation {
                 target: documents.target,
                 dependencies: current.dependencies.clone(),
-                root_binding: documents.versions.binding.identity(),
+                root_binding: documents.root_binding,
                 configuration_revision: documents.configuration_revision,
             },
             convergence,

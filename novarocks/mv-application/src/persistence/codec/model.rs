@@ -22,15 +22,18 @@
 //! Design: ADR-0154 (docs/adr/ADR-0154-mv-documents-are-the-lake-authority.md).
 
 use crate::persistence::identity::{
-    AggregateIdentity, ApplyKeyIdentity, BranchIdentity, ComputationIdentity, DocumentRevision,
-    FieldIdentity, NativeDataVersion, ObjectIdentity, OutputIdentity, PartitionSpecVersion,
-    SchemaVersion, StateSlotIdentity,
+    AggregateIdentity, ApplyKeyIdentity, BranchIdentity, DocumentRevision, FieldIdentity,
+    NativeDataVersion, ObjectIdentity, OutputIdentity, PartitionSpecVersion, SchemaVersion,
+    StateSlotIdentity,
 };
+use bytes::Bytes;
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
+use novarocks_spi::connector::ProviderSourceType;
 
 pub const MV_PERSISTENCE_FORMAT_VERSION: u32 = 1;
+pub const DEFINITION_FORMAT_VERSION: u32 = 2;
 
 /// The versioned durable identity of the system aggregate that owns the
 /// automatically added retraction-count state. It is intentionally distinct
@@ -54,11 +57,6 @@ pub fn internal_retraction_count_aggregate_identity() -> AggregateIdentity {
 pub struct DefinitionDocument {
     pub created_at_ms: u64,
     pub query: QuerySource,
-    /// Ordered syntactic occurrences. Duplicates are meaningful.
-    pub relation_occurrences: Vec<RelationOccurrence>,
-    /// Ordered result contract.
-    pub outputs: Vec<OutputDefinition>,
-    pub computation_identity: ComputationIdentity,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,53 +112,6 @@ impl TryFrom<QuerySource> for PersistedQueryDefinition {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RelationOccurrence {
-    pub occurrence_id: u32,
-    pub catalog_at_binding: String,
-    pub namespace_at_binding: String,
-    pub relation_at_binding: String,
-    pub qualifier_at_binding: String,
-    pub object_id: ObjectIdentity,
-    pub schema_version: SchemaVersion,
-    /// Set semantics, canonically sorted by stable field identity.
-    pub fields: Vec<SourceFieldBinding>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SourceFieldBinding {
-    pub field_id: FieldIdentity,
-    pub name_at_binding: String,
-    pub type_signature: String,
-    pub nullable: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutputDefinition {
-    pub output_id: OutputIdentity,
-    pub name: String,
-    pub type_signature: String,
-    pub nullable: bool,
-    pub expression: ExpressionShape,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExpressionShape {
-    pub kind: ExpressionKind,
-    pub function_identity: Option<String>,
-    /// Set semantics, canonically sorted by occurrence and field identity.
-    pub source_fields: Vec<SourceFieldReference>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExpressionKind {
-    Field,
-    Literal,
-    Cast,
-    Function,
-    Mixed,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SourceFieldReference {
     pub occurrence_id: u32,
@@ -170,7 +121,6 @@ pub struct SourceFieldReference {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterpretationDocument {
     pub definition_revision: DocumentRevision,
-    pub computation_identity: ComputationIdentity,
     /// Set semantics, canonically sorted by output identity.
     pub outputs: Vec<OutputBinding>,
     /// Set semantics, canonically sorted by slot identity.
@@ -187,7 +137,7 @@ pub struct InterpretationDocument {
 pub struct OutputBinding {
     pub output_id: OutputIdentity,
     pub target_field_id: FieldIdentity,
-    pub type_signature: String,
+    pub source_type: ProviderSourceType,
     pub nullable: bool,
 }
 
@@ -195,7 +145,7 @@ pub struct OutputBinding {
 pub struct StateSlot {
     pub slot_id: StateSlotIdentity,
     pub target_field_id: FieldIdentity,
-    pub type_signature: String,
+    pub source_type: ProviderSourceType,
     pub nullable: bool,
     pub role: StateRole,
     pub encoding: StateEncoding,
@@ -239,6 +189,7 @@ pub struct AggregateInterpretation {
     pub aggregate_id: AggregateIdentity,
     pub function_identity: String,
     pub semantic_contract: Option<novarocks_functions::PersistentAggregateContract>,
+    pub binding_signature: Option<Bytes>,
     pub source_fields: Vec<SourceFieldReference>,
     /// Ordered algorithm state, e.g. AVG sum followed by count.
     pub state_slot_ids: Vec<StateSlotIdentity>,
@@ -331,7 +282,7 @@ impl TryFrom<&novarocks_spi::connector::MvExactPartitionField> for TargetPartiti
 pub struct PhysicalFieldBinding {
     pub logical_identity: PhysicalFieldLogicalIdentity,
     pub target_field_id: FieldIdentity,
-    pub type_signature: String,
+    pub source_type: ProviderSourceType,
     pub nullable: bool,
 }
 

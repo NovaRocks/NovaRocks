@@ -19,7 +19,7 @@
 //! The envelope's registered schema and fingerprint are checked by the caller.
 //! No Avro Value, ByteBuf or document model exists until this check succeeds.
 
-pub(super) fn projection(payload: &[u8], version_four: bool) -> Result<(), String> {
+pub(super) fn projection(payload: &[u8], schema: i32) -> Result<(), String> {
     let mut input = Datum { remaining: payload };
     input.long()?; // mv_id
     let definition = input.bytes()?;
@@ -42,7 +42,7 @@ pub(super) fn projection(payload: &[u8], version_four: bool) -> Result<(), Strin
     input.string()?;
     input.string()?;
     input.string()?;
-    let binding = if version_four {
+    let binding = if schema >= 4 {
         let binding = input.optional(Datum::bytes)?;
         input.optional(Datum::long)?;
         input.optional(Datum::long)?;
@@ -50,20 +50,33 @@ pub(super) fn projection(payload: &[u8], version_four: bool) -> Result<(), Strin
     } else {
         None
     };
+    let mapping = if schema == 5 {
+        input.optional(Datum::bytes)?
+    } else {
+        None
+    };
     if !input.remaining.is_empty() {
         return Err("MV Accelerator Avro payload has trailing bytes".into());
     }
-    if let Some(binding) = binding {
+    if schema == 4
+        && definition.starts_with(&[8, 1])
+        && interpretation.starts_with(&[8, 2])
+        && binding.is_some_and(|binding| binding.starts_with(&[8, 1]))
+    {
+        return Ok(());
+    }
+    if let (Some(binding), Some(mapping)) = (binding, mapping) {
         crate::persistence::codec::keyed::preflight_keyed_document_set(
             definition,
             interpretation,
             binding,
+            mapping,
             configuration,
         )
         .map_err(|e| e.to_string())?;
         return Ok(());
     }
-    Err("legacy MV projection has no keyed binding".into())
+    Err("MV projection has no keyed binding or storage mapping".into())
 }
 
 /// The registered dependency V3 is a fixed record, with no collections.

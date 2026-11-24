@@ -19,16 +19,12 @@ syntax = "proto3";
 
 package novarocks.mv.persistence.v1;
 
-// The durable computation definition. It intentionally stores neither an AST
-// nor an execution plan. The effective SQL remains the sole query source, and
-// the stable bindings make reparsing independent of Current catalog state.
+// The durable query source and its original resolution context. The binding
+// document records facts from one successful analysis of this source.
 message DefinitionDocument {
   optional uint32 format_version = 1;
   optional QuerySource query = 2;
-  repeated RelationOccurrence relation_occurrences = 3;
-  repeated OutputDefinition outputs = 4;
-  optional bytes computation_identity = 5;
-  // Frozen CREATE fact; not part of computation identity.
+  reserved 3, 4, 5;
   optional uint64 created_at_ms = 6;
   reserved 7;
 }
@@ -49,51 +45,6 @@ enum QueryDialect {
 message ResolutionContext {
   optional string default_catalog = 1;
   optional string default_namespace = 2;
-}
-
-// One syntactic relation occurrence. Two occurrences of the same object are
-// distinct values and must never be coalesced by a codec.
-message RelationOccurrence {
-  optional uint32 occurrence_id = 1;
-  optional string catalog_at_binding = 2;
-  optional string namespace_at_binding = 3;
-  optional string relation_at_binding = 4;
-  optional string qualifier_at_binding = 5;
-  optional bytes object_id = 6;
-  optional bytes schema_version = 7;
-  repeated SourceFieldBinding fields = 8;
-}
-
-message SourceFieldBinding {
-  optional bytes field_id = 1;
-  optional string name_at_binding = 2;
-  optional string type_signature = 3;
-  optional bool nullable = 4;
-}
-
-message OutputDefinition {
-  optional bytes output_id = 1;
-  optional string name = 2;
-  optional string type_signature = 3;
-  optional bool nullable = 4;
-  optional ExpressionShape expression = 5;
-}
-
-// This is a semantic declaration used for stable binding validation, not a
-// persisted planner expression. The effective SQL remains the only plan input.
-message ExpressionShape {
-  optional ExpressionKind kind = 1;
-  optional string function_identity = 2;
-  repeated SourceFieldReference source_fields = 3;
-}
-
-enum ExpressionKind {
-  EXPRESSION_KIND_UNSPECIFIED = 0;
-  EXPRESSION_KIND_FIELD = 1;
-  EXPRESSION_KIND_LITERAL = 2;
-  EXPRESSION_KIND_CAST = 3;
-  EXPRESSION_KIND_FUNCTION = 4;
-  EXPRESSION_KIND_MIXED = 5;
 }
 
 message SourceFieldReference {

@@ -18,9 +18,7 @@
 use super::*;
 use crate::management::{DeploymentOwner, ProcessIncarnation};
 use crate::persistence::{
-    codec::keyed::{BindingDocument, DataVersionFormat},
-    keyed_documents::keyed_create_document_set,
-    test_support::MvDocumentFixture,
+    keyed_documents::keyed_create_document_set, test_support::MvDocumentFixture,
 };
 use bytes::Bytes;
 use novarocks_spi::connector::*;
@@ -57,10 +55,11 @@ fn fixture() -> (MvDocumentFixture, ConnectorPreparedCreateDocumentTarget) {
                 i as u32,
                 Bytes::copy_from_slice(value.target_field_id.as_bytes()),
                 format!("field_{i}"),
-                value.type_signature.clone(),
+                "fixture".into(),
                 value.nullable,
             )
             .unwrap()
+            .with_source_type(value.source_type.clone())
         })
         .collect();
     let target = ConnectorPreparedCreateDocumentTarget::try_new(
@@ -103,29 +102,12 @@ fn create(
     f: &MvDocumentFixture,
     target: &ConnectorPreparedCreateDocumentTarget,
 ) -> Result<KeyedCreate, MvDocumentError> {
-    let formats = f
-        .definition
-        .relation_occurrences
-        .iter()
-        .map(|r| {
-            let object =
-                crate::persistence::exact_revision::restore_persisted_object(&r.object_id).unwrap();
-            let exact = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
-                ConnectorProviderId::parse("iceberg").unwrap(),
-                &object,
-                Some(9),
-            )
-            .unwrap();
-            DataVersionFormat::from_issued_fact(exact.data_version()).unwrap()
-        })
-        .collect();
     keyed_create_document_set(
         &f.definition,
         &f.interpretation,
         &f.configuration,
-        BindingDocument {
-            data_versions: formats,
-        },
+        f.binding.clone(),
+        f.mapping.clone(),
         target,
         &DeploymentOwner::parse("owner").unwrap(),
         &ProcessIncarnation::parse("process").unwrap(),
@@ -135,7 +117,7 @@ fn create(
 fn keyed_create_preserves_exact_prepared_versions_and_full_definition_identity() {
     let (f, target) = fixture();
     let documents = create(&f, &target).unwrap();
-    assert_eq!(documents.versions.len(), 3);
+    assert_eq!(documents.versions.len(), 4);
     assert!(
         documents
             .versions
@@ -179,6 +161,7 @@ fn keyed_create_binds_by_identity_in_the_providers_own_column_order() {
                 v.nullable(),
             )
             .unwrap()
+            .with_source_type(v.source_type().unwrap().clone())
         })
         .collect();
     create(&f, &with_fields(&target, reversed).unwrap()).unwrap();

@@ -61,7 +61,7 @@ pub(crate) fn projection_facts(
     let upstream = crate::persistence::test_support::source_object_identity_bytes(
         format!("base-{dependency}").as_bytes(),
     );
-    for relation in &mut fixture.definition.relation_occurrences {
+    for relation in &mut fixture.binding.occurrences {
         relation.relation_at_binding = dependency.into();
         relation.object_id = upstream.clone();
     }

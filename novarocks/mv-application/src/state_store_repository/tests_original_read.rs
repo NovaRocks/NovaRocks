@@ -256,7 +256,7 @@ async fn catalog_original_scan_keeps_target_dependency_and_absent_selection() {
         tests_definition::target("target"),
         Some(1),
     );
-    for relation in &mut fixture.definition.relation_occurrences {
+    for relation in &mut fixture.binding.occurrences {
         relation.catalog_at_binding = "upstream".into();
     }
     legacy

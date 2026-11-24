@@ -1,0 +1,134 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file distributed
+// with this work for additional information regarding copyright ownership.
+// The ASF licenses this file to you under the Apache License, Version 2.0.
+
+syntax = "proto3";
+package novarocks.mv.persistence.v1;
+
+import "persistence/definition.proto";
+
+// The reference envelope binds D, L and M. Ordered occurrences author the
+// compact publication payload, including repeated reads of the same object.
+message BindingDocument {
+  optional uint32 format_version = 1;
+  reserved 2;
+  repeated BindingOccurrence occurrences = 3;
+  repeated BoundOutput outputs = 4;
+  repeated BindingDependency dependencies = 5;
+  optional BindingDigests digests = 6;
+}
+
+message BindingOccurrence {
+  optional uint32 occurrence_id = 1;
+  optional string catalog_at_binding = 2;
+  optional string namespace_at_binding = 3;
+  optional string relation_at_binding = 4;
+  optional string qualifier_at_binding = 5;
+  optional bytes object_id = 6;
+  optional ReadSelection selection = 7;
+  optional DataVersionFormat data_version = 8;
+  optional bytes object_fact = 9;
+  optional bytes path_fact = 10;
+  optional bytes type_fact = 11;
+  optional bytes declarations_fact = 12;
+  repeated BoundSourcePath paths = 13;
+  optional bytes occurrence_fact = 14;
+}
+
+enum ReadSelection {
+  READ_SELECTION_UNSPECIFIED = 0;
+  READ_SELECTION_CURRENT = 1;
+  READ_SELECTION_SNAPSHOT = 2;
+  READ_SELECTION_BRANCH = 3;
+  READ_SELECTION_TAG = 4;
+}
+
+message BoundSourcePath {
+  repeated BoundSourceNode nodes = 1;
+  optional bytes leaf_type = 2;
+  optional bool whole_subtree = 3;
+}
+
+message BoundSourceNode {
+  optional bytes field_id = 1;
+  optional bool required = 2;
+  optional SourceNodeKind kind = 3;
+}
+
+enum SourceNodeKind {
+  SOURCE_NODE_KIND_UNSPECIFIED = 0;
+  SOURCE_NODE_KIND_SCALAR = 1;
+  SOURCE_NODE_KIND_STRUCT = 2;
+  SOURCE_NODE_KIND_LIST = 3;
+  SOURCE_NODE_KIND_MAP = 4;
+}
+
+message BoundOutput {
+  optional uint32 ordinal = 1;
+  optional string name = 2;
+  optional bytes logical_type_identity = 3;
+  repeated SourceFieldReference source_fields = 4;
+}
+
+message BindingDependency {
+  oneof kind {
+    ViewDependency view = 1;
+    NestedMvDependency nested_mv = 2;
+  }
+  optional bytes canonical = 3;
+}
+
+message ViewDependency {
+  optional bytes identity = 1;
+  optional uint32 depth = 2;
+  optional bytes exact_declaration = 3;
+  optional bytes iceberg_uuid = 4;
+  optional sint32 iceberg_version_id = 5;
+  optional QueryDialect dialect = 6;
+}
+
+message NestedMvDependency {
+  optional bytes object_id = 1;
+  optional bytes definition_revision = 2;
+  optional QueryDialect dialect = 3;
+}
+
+message BindingDigests {
+  optional bytes resolution = 1;
+  optional bytes dependencies = 2;
+  optional bytes outputs = 3;
+}
+
+message DataVersionFormat {
+  optional string provider = 1;
+  optional string name = 2;
+  optional uint32 version = 3;
+  optional uint32 max_value_bytes = 4;
+}
+
+message StorageMappingDocument {
+  optional uint32 format_version = 1;
+  repeated StorageColumnMapping columns = 2;
+}
+
+message StorageColumnMapping {
+  optional uint32 output_ordinal = 1;
+  optional bytes storage_field_id = 2;
+  optional bytes logical_type_identity = 3;
+  optional bytes storage_type_identity = 4;
+  optional bytes encode_identity = 5;
+  optional bytes decode_identity = 6;
+  optional bytes content_contract = 7;
+  optional MappingPushdownClass pushdown = 8;
+  optional bool storage_nullable = 9;
+  optional bytes provider_storage_declaration = 10;
+  optional uint32 storage_format_version = 11;
+}
+
+enum MappingPushdownClass {
+  MAPPING_PUSHDOWN_CLASS_UNSPECIFIED = 0;
+  MAPPING_PUSHDOWN_CLASS_IDENTITY = 1;
+  MAPPING_PUSHDOWN_CLASS_ORDER_PRESERVING_INJECTIVE = 2;
+  MAPPING_PUSHDOWN_CLASS_OPAQUE = 3;
+}

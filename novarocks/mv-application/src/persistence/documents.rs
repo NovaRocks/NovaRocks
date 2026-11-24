@@ -19,7 +19,7 @@
 use crate::persistence::codec::{InterpretationDocument, PersistenceCodecError};
 use crate::persistence::validation::ValidationError;
 use novarocks_spi::connector::ConnectorPreparedCreateDocumentTarget;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug)]
 pub enum MvDocumentError {
@@ -110,15 +110,21 @@ pub(crate) fn validate_create_target(
     let prepared_fields = target
         .fields()
         .iter()
-        .map(|prepared| prepared.provider_field_id().as_ref())
-        .collect::<BTreeSet<_>>();
+        .map(|prepared| (prepared.provider_field_id().as_ref(), prepared))
+        .collect::<BTreeMap<_, _>>();
     let bound_fields = interpretation
         .target
         .fields
         .iter()
         .map(|field| field.target_field_id.as_bytes())
         .collect::<BTreeSet<_>>();
-    if prepared_fields != bound_fields {
+    if !prepared_fields.keys().copied().eq(bound_fields)
+        || interpretation.target.fields.iter().any(|binding| {
+            let prepared = prepared_fields[binding.target_field_id.as_bytes()];
+            prepared.source_type() != Some(&binding.source_type)
+                || prepared.nullable() != binding.nullable
+        })
+    {
         return Err(MvDocumentError::Contract(
             "interpretation target bindings and the provider-prepared columns are not the same set"
                 .to_string(),

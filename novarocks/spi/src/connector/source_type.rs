@@ -23,6 +23,8 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::sync::Arc;
 
+const ICEBERG_SOURCE_TYPE_DOMAIN: &str = "novarocks.iceberg.source-type";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderSourceType {
     Iceberg(IcebergSourceType),
@@ -137,7 +139,7 @@ impl ProviderSourceType {
         match self {
             Self::Iceberg(source) => {
                 let mut writer = CanonicalFactWriter::new(
-                    "novarocks.iceberg.source-type",
+                    ICEBERG_SOURCE_TYPE_DOMAIN,
                     IcebergSourceType::FORMAT_VERSION,
                 );
                 writer.sequence(source.nodes.len());
@@ -147,6 +149,33 @@ impl ProviderSourceType {
                 writer.finish()
             }
         }
+    }
+
+    /// Read the provider-authored versioned preorder identity used by durable
+    /// bindings. The flat framing bounds the allocation by the available input.
+    pub fn from_canonical_bytes(mut input: &[u8]) -> Result<Self, ConnectorError> {
+        let domain = take_framed(&mut input)?;
+        let version = u32::from_be_bytes(take_fixed(&mut input)?);
+        if domain != ICEBERG_SOURCE_TYPE_DOMAIN.as_bytes()
+            || version != IcebergSourceType::FORMAT_VERSION
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "unsupported provider source type domain or format version",
+            ));
+        }
+        let count = take_length(&mut input)?;
+        if count > input.len() / std::mem::size_of::<u32>() {
+            return Err(invalid_structure());
+        }
+        let mut nodes = Vec::with_capacity(count);
+        for _ in 0..count {
+            nodes.push(read_node(&mut input)?);
+        }
+        if !input.is_empty() {
+            return Err(invalid_structure());
+        }
+        Ok(Self::Iceberg(IcebergSourceType::try_new(nodes)?))
     }
 
     pub fn sub_digest(&self) -> [u8; 32] {
@@ -234,6 +263,87 @@ impl PartialEq for ProviderSourceTypeShape<'_> {
 }
 
 impl Eq for ProviderSourceTypeShape<'_> {}
+
+fn take_fixed<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], ConnectorError> {
+    let (head, tail) = input.split_at_checked(N).ok_or_else(invalid_structure)?;
+    *input = tail;
+    Ok(head.try_into().expect("the slice has the checked size"))
+}
+
+fn take_length(input: &mut &[u8]) -> Result<usize, ConnectorError> {
+    usize::try_from(u64::from_be_bytes(take_fixed(input)?)).map_err(|_| invalid_structure())
+}
+
+fn take_framed<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], ConnectorError> {
+    let length = take_length(input)?;
+    let (head, tail) = input
+        .split_at_checked(length)
+        .ok_or_else(invalid_structure)?;
+    *input = tail;
+    Ok(head)
+}
+
+fn read_bool(input: &mut &[u8]) -> Result<bool, ConnectorError> {
+    match take_fixed(input)? {
+        [0] => Ok(false),
+        [1] => Ok(true),
+        _ => Err(invalid_structure()),
+    }
+}
+
+fn read_node(input: &mut &[u8]) -> Result<IcebergSourceTypeNode, ConnectorError> {
+    use IcebergSourceTypeNode as Node;
+    Ok(match u32::from_be_bytes(take_fixed(input)?) {
+        1 => Node::Primitive(read_primitive(input)?),
+        2 => Node::Struct {
+            field_count: u32::from_be_bytes(take_fixed(input)?),
+        },
+        3 => Node::Field {
+            id: i32::from_be_bytes(take_fixed(input)?),
+            name: std::str::from_utf8(take_framed(input)?)
+                .map_err(|_| invalid_structure())?
+                .into(),
+            required: read_bool(input)?,
+        },
+        4 => Node::List {
+            element_id: i32::from_be_bytes(take_fixed(input)?),
+            element_required: read_bool(input)?,
+        },
+        5 => Node::Map {
+            key_id: i32::from_be_bytes(take_fixed(input)?),
+            value_id: i32::from_be_bytes(take_fixed(input)?),
+            value_required: read_bool(input)?,
+        },
+        _ => return Err(invalid_structure()),
+    })
+}
+
+fn read_primitive(input: &mut &[u8]) -> Result<IcebergSourcePrimitive, ConnectorError> {
+    use IcebergSourcePrimitive as Primitive;
+    Ok(match u32::from_be_bytes(take_fixed(input)?) {
+        1 => Primitive::Boolean,
+        2 => Primitive::Int,
+        3 => Primitive::Long,
+        4 => Primitive::Float,
+        5 => Primitive::Double,
+        6 => Primitive::Decimal {
+            precision: u32::from_be_bytes(take_fixed(input)?),
+            scale: u32::from_be_bytes(take_fixed(input)?),
+        },
+        7 => Primitive::Date,
+        8 => Primitive::Time,
+        9 => Primitive::Timestamp,
+        10 => Primitive::Timestamptz,
+        11 => Primitive::TimestampNs,
+        12 => Primitive::TimestamptzNs,
+        13 => Primitive::String,
+        14 => Primitive::Uuid,
+        15 => Primitive::Fixed(u64::from_be_bytes(take_fixed(input)?)),
+        16 => Primitive::Binary,
+        17 => Primitive::Variant,
+        _ => return Err(invalid_structure()),
+    })
+}
 
 fn write_node(writer: &mut CanonicalFactWriter, node: &IcebergSourceTypeNode) {
     use IcebergSourceTypeNode as Node;

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Pure CREATE-time projection of frozen SQL/provider facts into MV D/L/C.
+//! Pure CREATE-time projection of frozen SQL and provider facts into MV documents.
 //!
 //! This module has no connector calls.  In particular, the target facts come
 //! only from the staged-create handle, never from a legacy post-create reload.
@@ -23,29 +23,26 @@
 use std::collections::BTreeMap;
 
 use crate::persistence::codec::{
-    ApplyKeyKind, ConfigurationDocument, DefinitionDocument, ExpressionKind,
-    InterpretationDocument, PhysicalFieldLogicalIdentity,
+    ApplyKeyKind, BoundOutput, ConfigurationDocument, DefinitionDocument, InterpretationDocument,
+    PhysicalFieldLogicalIdentity, QuerySource, SourceFieldReference, build_definition,
 };
 use crate::persistence::identity::{
     ApplyKeyIdentity, FieldIdentity, ObjectIdentity, PartitionSpecVersion, SchemaVersion,
 };
 use crate::persistence::validation::runtime::{
     RuntimeApplyKeyComponentFacts, RuntimeApplyKeyFacts, RuntimeBranchFacts,
-    RuntimeDefinitionFacts, RuntimeInterpretationFacts, RuntimeOutputBindingFacts,
-    RuntimeOutputFacts, RuntimePhysicalFieldFacts, RuntimeRelationOccurrenceFacts,
-    RuntimeSourceFieldFacts, RuntimeSourceFieldReference, RuntimeTargetFacts,
+    RuntimeInterpretationFacts, RuntimeOutputBindingFacts, RuntimePhysicalFieldFacts,
+    RuntimeTargetFacts,
 };
 use bytes::Bytes;
 use novarocks_spi::connector::ConnectorPreparedCreateDocumentTarget;
-use novarocks_sql::planning::mv::{
-    SqlMvCreatePersistenceFacts, SqlMvPersistenceExpressionKind, TargetIdentity,
-};
+use novarocks_sql::planning::mv::{SqlMvCreatePersistenceFacts, TargetIdentity};
 use novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout;
 use sha2::{Digest, Sha256};
 
 use super::aggregate_bindings::{
     MvAggregateCreateBindingInput, MvCreateRelationObservation, MvCreateTargetFieldObservation,
-    build_mv_aggregate_create_bindings,
+    build_mv_aggregate_create_bindings, source_field_map,
 };
 
 const APPLY_KEY_IDENTITY_DOMAIN: &[u8] = b"novarocks.mv.apply-key.v1";
@@ -82,21 +79,10 @@ pub fn build_mv_create_documents(
         prepared_target: input.prepared_target,
     })?;
     let targets = target_by_name(&target_observations)?;
-    let definition = DefinitionDocument::try_from(RuntimeDefinitionFacts {
-        created_at_ms: input.created_at_ms,
-        query_definition: input.query_definition,
-        relation_occurrences: definition_relations(
-            input.sql_facts,
-            input.source_observations,
-            &aggregate.source_fields,
-        )?,
-        outputs: definition_outputs(
-            input.sql_facts,
-            &aggregate.source_fields,
-            &aggregate.output_identities,
-            &targets,
-        )?,
-    })
+    let definition = build_definition(
+        input.created_at_ms,
+        QuerySource::try_from(input.query_definition)?,
+    )
     .map_err(|error| format!("build MV definition document: {error}"))?;
 
     let output_bindings = output_bindings(input.sql_facts, &aggregate.output_identities, &targets)?;
@@ -119,7 +105,7 @@ pub fn build_mv_create_documents(
             .map(|output| RuntimePhysicalFieldFacts {
                 logical_identity: PhysicalFieldLogicalIdentity::Output(output.output_id.clone()),
                 target_field_id: output.target_field_id.clone(),
-                type_signature: output.type_signature.clone(),
+                source_type: output.source_type.clone(),
                 nullable: output.nullable,
             }),
     );
@@ -133,14 +119,13 @@ pub fn build_mv_create_documents(
         target_fields.extend(branches.iter().map(|branch| RuntimePhysicalFieldFacts {
             logical_identity: PhysicalFieldLogicalIdentity::Branch(branch.branch_id.clone()),
             target_field_id: id.clone(),
-            type_signature: target.type_signature.clone(),
+            source_type: target.source_type.clone(),
             nullable: target.nullable,
         }));
     }
     let interpretation = InterpretationDocument::try_from(RuntimeInterpretationFacts {
         definition_revision: super::keyed_documents::definition_revision(&definition)
             .map_err(|error| format!("build MV definition semantic revision: {error}"))?,
-        computation_identity: definition.computation_identity,
         output_bindings,
         aggregate_layout: aggregate.aggregate_layout,
         apply_key,
@@ -185,7 +170,9 @@ fn target_observations(
                 request_ordinal: field.request_ordinal(),
                 physical_name: field.name().to_string(),
                 provider_field_id: field.provider_field_id().clone(),
-                type_signature: field.type_signature().to_string(),
+                source_type: field.source_type().cloned().ok_or_else(|| {
+                    "prepared target has no complete provider source type".to_string()
+                })?,
                 nullable: field.nullable(),
             })
         })
@@ -218,105 +205,36 @@ fn field_identity(value: Bytes) -> Result<FieldIdentity, String> {
     FieldIdentity::try_new(value.to_vec()).map_err(|error| error.to_string())
 }
 
-fn definition_relations(
-    facts: &SqlMvCreatePersistenceFacts,
-    observations: &[MvCreateRelationObservation],
-    source_fields: &BTreeMap<(u32, u32), FieldIdentity>,
-) -> Result<Vec<RuntimeRelationOccurrenceFacts>, String> {
-    let observed = observations
-        .iter()
-        .map(|item| (item.occurrence_id, item))
-        .collect::<BTreeMap<_, _>>();
-    facts
-        .relation_occurrences()
-        .iter()
-        .map(|relation| {
-            let item = observed
-                .get(&relation.occurrence_id().get())
-                .ok_or_else(|| {
-                    "definition relation is missing exact source observation".to_string()
-                })?;
-            let fields = item
-                .fields
-                .iter()
-                .map(|field| {
-                    Ok(RuntimeSourceFieldFacts {
-                        field_id: source_fields
-                            .get(&(relation.occurrence_id().get(), field.field_ordinal))
-                            .cloned()
-                            .ok_or_else(|| "definition field is not SQL referenced".to_string())?,
-                        name_at_binding: field.field_name.clone(),
-                        type_signature: field.type_signature.clone(),
-                        nullable: field.nullable,
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            Ok(RuntimeRelationOccurrenceFacts {
-                occurrence_id: relation.occurrence_id().get(),
-                catalog_at_binding: relation.catalog().to_string(),
-                namespace_at_binding: relation.namespace().to_string(),
-                relation_at_binding: relation.relation().to_string(),
-                qualifier_at_binding: relation.qualifier().to_string(),
-                object_id: ObjectIdentity::try_new(item.provider_object_id.to_vec())
-                    .map_err(|e| e.to_string())?,
-                schema_version: SchemaVersion::try_new(item.provider_schema_version.to_vec())
-                    .map_err(|e| e.to_string())?,
-                referenced_fields: fields,
-            })
-        })
-        .collect()
-}
-
-fn expression_kind(value: SqlMvPersistenceExpressionKind) -> ExpressionKind {
-    match value {
-        SqlMvPersistenceExpressionKind::Field => ExpressionKind::Field,
-        SqlMvPersistenceExpressionKind::Literal => ExpressionKind::Literal,
-        SqlMvPersistenceExpressionKind::Cast => ExpressionKind::Cast,
-        SqlMvPersistenceExpressionKind::Function => ExpressionKind::Function,
-        SqlMvPersistenceExpressionKind::Mixed => ExpressionKind::Mixed,
-    }
-}
-
-fn references(
-    values: &[novarocks_sql::planning::mv::SqlMvPersistenceSourceFieldReference],
-    source: &BTreeMap<(u32, u32), FieldIdentity>,
-) -> Result<Vec<RuntimeSourceFieldReference>, String> {
-    values
-        .iter()
-        .map(|item| {
-            Ok(RuntimeSourceFieldReference {
-                occurrence_id: item.occurrence_id().get(),
-                field_id: source
-                    .get(&(item.occurrence_id().get(), item.field_ordinal()))
-                    .cloned()
-                    .ok_or_else(|| "SQL output source has no frozen provider field".to_string())?,
-            })
-        })
-        .collect()
-}
-
-fn definition_outputs(
-    facts: &SqlMvCreatePersistenceFacts,
-    source: &BTreeMap<(u32, u32), FieldIdentity>,
-    ids: &BTreeMap<u32, crate::persistence::identity::OutputIdentity>,
-    targets: &BTreeMap<&str, &MvCreateTargetFieldObservation>,
-) -> Result<Vec<RuntimeOutputFacts>, String> {
-    facts
-        .outputs()
+/// Project B5 and the exact root fields whose values supply the output.
+pub fn build_binding_outputs(
+    sql: &SqlMvCreatePersistenceFacts,
+    source_observations: &[MvCreateRelationObservation],
+) -> Result<Vec<BoundOutput>, String> {
+    let source = source_field_map(sql, source_observations)?;
+    sql.outputs()
         .iter()
         .map(|output| {
-            let target = target(targets, output.name())?;
-            Ok(RuntimeOutputFacts {
-                output_id: ids
-                    .get(&output.output_ordinal())
-                    .cloned()
-                    .ok_or_else(|| "SQL output has no semantic identity".to_string())?,
+            let source_fields = output
+                .source_fields()
+                .iter()
+                .map(|reference| {
+                    let occurrence_id = reference.occurrence_id().get();
+                    let field_id = source
+                        .get(&(occurrence_id, reference.field_ordinal()))
+                        .ok_or_else(|| {
+                            "SQL output source has no frozen provider field".to_string()
+                        })?;
+                    Ok(SourceFieldReference {
+                        occurrence_id,
+                        field_id: field_id.clone(),
+                    })
+                })
+                .collect::<Result<std::collections::BTreeSet<_>, String>>()?;
+            Ok(BoundOutput {
+                ordinal: output.output_ordinal(),
                 name: output.name().to_string(),
-                type_signature: target.type_signature.clone(),
-                nullable: target.nullable,
-                expression_kind: expression_kind(output.expression().kind()),
-                function_identity: output.expression().function_identity().map(str::to_string),
-                source_fields: references(output.expression().source_fields(), source)?,
+                logical_type_identity: Bytes::copy_from_slice(output.canonical_bytes()),
+                source_fields: source_fields.into_iter().collect(),
             })
         })
         .collect()
@@ -338,7 +256,7 @@ fn output_bindings(
                     .cloned()
                     .ok_or_else(|| "SQL output has no semantic identity".to_string())?,
                 target_field_id: field_identity(target.provider_field_id.clone())?,
-                type_signature: target.type_signature.clone(),
+                source_type: target.source_type.clone(),
                 nullable: target.nullable,
             })
         })
@@ -431,7 +349,7 @@ fn apply_key_bindings(
         vec![RuntimePhysicalFieldFacts {
             logical_identity: PhysicalFieldLogicalIdentity::ApplyKey(logical_id),
             target_field_id,
-            type_signature: target.type_signature.clone(),
+            source_type: target.source_type.clone(),
             nullable: target.nullable,
         }],
     ))

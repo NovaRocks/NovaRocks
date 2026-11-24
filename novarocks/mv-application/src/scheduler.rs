@@ -21,7 +21,7 @@ use crate::freshness::exact_inputs_match;
 use std::collections::BTreeMap;
 
 use crate::persistence::codec::{
-    ConfigurationDocument, PublicationInput, RefreshPolicy, RelationOccurrence,
+    BindingOccurrence, ConfigurationDocument, PublicationInput, RefreshPolicy,
 };
 use crate::persistence::definition::MvAcceleratorSourceRevision;
 use crate::persistence::keyed_documents::StoredKeyedMvProjection;
@@ -97,7 +97,7 @@ fn semantic_decision(
 }
 
 fn validate_current_inputs(
-    occurrences: &[RelationOccurrence],
+    occurrences: &[BindingOccurrence],
     inputs: &[PublicationInput],
 ) -> Result<(), String> {
     let expected = occurrences
@@ -128,8 +128,7 @@ pub fn mv_keyed_scheduler_semantic_decision(
     inputs: Option<&[PublicationInput]>,
 ) -> MvSchedulerSemanticDecision {
     if let Some(inputs) = inputs
-        && let Err(reason) =
-            validate_current_inputs(&facts.definition().relation_occurrences, inputs)
+        && let Err(reason) = validate_current_inputs(&facts.binding().occurrences, inputs)
     {
         return MvSchedulerSemanticDecision::Invalid { reason };
     }
@@ -168,7 +167,7 @@ impl MvScheduledRefreshRequest {
     }
 }
 
-/// Frozen D/C/P facts whose Current source observation is still outstanding.
+/// Frozen B/C/P facts whose Current source observation is still outstanding.
 pub struct MvCurrentInputObservation {
     projection: StoredKeyedMvProjection,
     target: MvTarget,
@@ -181,8 +180,8 @@ impl MvCurrentInputObservation {
     pub fn projection(&self) -> &StoredKeyedMvProjection {
         &self.projection
     }
-    pub fn occurrences(&self) -> &[RelationOccurrence] {
-        &self.projection.facts.definition().relation_occurrences
+    pub fn occurrences(&self) -> &[BindingOccurrence] {
+        &self.projection.facts.binding().occurrences
     }
 }
 

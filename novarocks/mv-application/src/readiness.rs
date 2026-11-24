@@ -812,7 +812,7 @@ impl MvKeyedReadinessExecution {
         upstream: &MvDependencyObjectIdentity,
     ) -> Result<(), MvRepositoryError> {
         for loaded in self.list_ready_projections().await? {
-            for r in &loaded.projection.facts.definition().relation_occurrences {
+            for r in &loaded.projection.facts.binding().occurrences {
                 if r.catalog_at_binding == upstream.catalog_instance.as_str()
                     && crate::persistence::exact_revision::persisted_object_names(
                         &r.object_id,

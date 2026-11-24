@@ -16,16 +16,16 @@
 // under the License.
 
 //! Freeze the exact occurrence watermark and the result carried by compact P.
-use crate::persistence::codec::{DefinitionDocument, PublicationInput};
+use crate::persistence::codec::{BindingDocument, PublicationInput};
 use crate::persistence::definition::MvAcceleratorSourceRevision;
 use crate::persistence::exact_revision::persist_exact_connector_revision;
 use crate::persistence::identity::PublicationIdentity;
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, LakePublicationId};
 use std::collections::BTreeMap;
 
-/// One refresh's complete input watermark, in D's own occurrence order.
+/// One refresh's complete input watermark, in B's own occurrence order.
 ///
-/// The order and multiplicity are D's, not a table's: a self-join occupies two
+/// The order and multiplicity are B's, not a table's: a self-join occupies two
 /// occurrences of one physical object and records two inputs, because the
 /// publication has to be able to say what each occurrence read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,47 +34,47 @@ pub struct MvPublicationInputs {
 }
 
 impl MvPublicationInputs {
-    /// Freeze the watermark from the exact revision each D occurrence was
+    /// Freeze the watermark from the exact revision each B occurrence was
     /// pinned at.
     ///
-    /// Every occurrence must be present and must still name the object D
+    /// Every occurrence must be present and must still name the object B
     /// bound: a refresh that read something else is not a refresh of this
     /// definition, and saying so here is cheaper than discovering it when the
     /// document set is validated.
     pub fn freeze(
-        definition: &DefinitionDocument,
+        binding: &BindingDocument,
         revision_by_occurrence: &BTreeMap<u32, ConnectorExactSemanticRevision>,
     ) -> Result<Self, String> {
-        if revision_by_occurrence.len() != definition.relation_occurrences.len() {
+        if revision_by_occurrence.len() != binding.occurrences.len() {
             return Err(format!(
-                "MV publication needs one pinned revision per definition occurrence, but {} \
+                "MV publication needs one pinned revision per binding occurrence, but {} \
                  occurrences were pinned for {} occurrences",
                 revision_by_occurrence.len(),
-                definition.relation_occurrences.len(),
+                binding.occurrences.len(),
             ));
         }
-        let inputs = definition
-            .relation_occurrences
+        let inputs = binding
+            .occurrences
             .iter()
             .map(|occurrence| {
                 let revision = revision_by_occurrence
                     .get(&occurrence.occurrence_id)
                     .ok_or_else(|| {
                         format!(
-                            "MV publication has no pinned revision for definition occurrence {}",
+                            "MV publication has no pinned revision for binding occurrence {}",
                             occurrence.occurrence_id,
                         )
                     })?;
                 let (object_id, native_data_version) = persist_exact_connector_revision(revision)
                     .map_err(|error| {
                     format!(
-                        "persist the exact revision of definition occurrence {}: {error}",
+                        "persist the exact revision of binding occurrence {}: {error}",
                         occurrence.occurrence_id,
                     )
                 })?;
                 if object_id != occurrence.object_id {
                     return Err(format!(
-                        "MV publication read a different object than definition occurrence {} \
+                        "MV publication read a different object than binding occurrence {} \
                          binds",
                         occurrence.occurrence_id,
                     ));
@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn a_self_join_records_one_input_per_occurrence() {
         let fixture = crate::persistence::test_support::MvDocumentFixture::new();
-        let inputs = MvPublicationInputs::freeze(&fixture.definition, &pinned_at_binding())
+        let inputs = MvPublicationInputs::freeze(&fixture.binding, &pinned_at_binding())
             .expect("every occurrence is pinned");
 
         assert_eq!(
@@ -159,14 +159,12 @@ mod tests {
     #[test]
     fn an_unpinned_occurrence_fails_closed() {
         let fixture = crate::persistence::test_support::MvDocumentFixture::new();
-        let error = MvPublicationInputs::freeze(
-            &fixture.definition,
-            &BTreeMap::from([(7, revision(11, 9))]),
-        )
-        .expect_err("a partial watermark cannot describe this refresh");
+        let error =
+            MvPublicationInputs::freeze(&fixture.binding, &BTreeMap::from([(7, revision(11, 9))]))
+                .expect_err("a partial watermark cannot describe this refresh");
 
         assert!(
-            error.contains("one pinned revision per definition occurrence"),
+            error.contains("one pinned revision per binding occurrence"),
             "{error}"
         );
     }
@@ -175,13 +173,13 @@ mod tests {
     fn an_occurrence_read_at_another_object_fails_closed() {
         let fixture = crate::persistence::test_support::MvDocumentFixture::new();
         let error = MvPublicationInputs::freeze(
-            &fixture.definition,
+            &fixture.binding,
             &BTreeMap::from([(7, revision(11, 9)), (8, revision(12, 9))]),
         )
         .expect_err("a refresh that read elsewhere is not a refresh of this definition");
 
         assert!(
-            error.contains("different object than definition occurrence 8"),
+            error.contains("different object than binding occurrence 8"),
             "{error}"
         );
     }
@@ -198,7 +196,7 @@ mod tests {
         )
         .build()
         .unwrap();
-        let inputs = MvPublicationInputs::freeze(facts.definition(), &pinned_at_binding()).unwrap();
+        let inputs = MvPublicationInputs::freeze(facts.binding(), &pinned_at_binding()).unwrap();
         let frozen = freeze_keyed_publication_document(
             facts.source_revision(),
             LakePublicationId::try_from_uuid(uuid::Uuid::now_v7()).unwrap(),
@@ -207,15 +205,10 @@ mod tests {
             1_700_000_020_000,
         )
         .unwrap();
-        let encoded = encode_publication_payload(
-            &frozen,
-            facts.definition(),
-            &facts.versions().binding_document,
-        )
-        .unwrap();
+        let encoded =
+            encode_publication_payload(&frozen, &facts.versions().binding_document).unwrap();
         let decoded = decode_publication_payload(
             &encoded,
-            facts.definition(),
             facts.source_revision().definition_revision,
             facts.source_revision().interpretation_revision,
             &facts.versions().binding_document,

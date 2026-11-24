@@ -22,59 +22,19 @@
 //! mandatory typed field here, so the adapter cannot fall back to persisting
 //! the old contract, an AST, a plan, an owner, or a registry handle.
 
-use novarocks_query_application::persisted_query_definition::PersistedQueryDefinition;
+use bytes::Bytes;
+use novarocks_spi::connector::ProviderSourceType;
 
 use crate::persistence::codec::{
     AggregateInterpretation, ApplyKey, ApplyKeyComponent, ApplyKeyKind, BranchInterpretation,
-    DefinitionDocument, ExpressionKind, ExpressionShape, InterpretationDocument, OutputBinding,
-    OutputDefinition, PhysicalFieldBinding, PhysicalFieldLogicalIdentity, QuerySource,
-    RelationOccurrence, SourceFieldBinding, SourceFieldReference, StateEncoding, StateRole,
-    StateSlot, TargetBinding, TargetPartitionFieldBinding, build_definition,
+    InterpretationDocument, OutputBinding, PhysicalFieldBinding, PhysicalFieldLogicalIdentity,
+    SourceFieldReference, StateEncoding, StateRole, StateSlot, TargetBinding,
+    TargetPartitionFieldBinding,
 };
 use crate::persistence::identity::{
-    AggregateIdentity, ApplyKeyIdentity, BranchIdentity, ComputationIdentity, DocumentRevision,
-    FieldIdentity, ObjectIdentity, OutputIdentity, PartitionSpecVersion, SchemaVersion,
-    StateSlotIdentity,
+    AggregateIdentity, ApplyKeyIdentity, BranchIdentity, DocumentRevision, FieldIdentity,
+    ObjectIdentity, OutputIdentity, PartitionSpecVersion, SchemaVersion, StateSlotIdentity,
 };
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeDefinitionFacts {
-    pub created_at_ms: u64,
-    pub query_definition: PersistedQueryDefinition,
-    pub relation_occurrences: Vec<RuntimeRelationOccurrenceFacts>,
-    pub outputs: Vec<RuntimeOutputFacts>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeRelationOccurrenceFacts {
-    pub occurrence_id: u32,
-    pub catalog_at_binding: String,
-    pub namespace_at_binding: String,
-    pub relation_at_binding: String,
-    pub qualifier_at_binding: String,
-    pub object_id: ObjectIdentity,
-    pub schema_version: SchemaVersion,
-    pub referenced_fields: Vec<RuntimeSourceFieldFacts>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeSourceFieldFacts {
-    pub field_id: FieldIdentity,
-    pub name_at_binding: String,
-    pub type_signature: String,
-    pub nullable: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeOutputFacts {
-    pub output_id: OutputIdentity,
-    pub name: String,
-    pub type_signature: String,
-    pub nullable: bool,
-    pub expression_kind: ExpressionKind,
-    pub function_identity: Option<String>,
-    pub source_fields: Vec<RuntimeSourceFieldReference>,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RuntimeSourceFieldReference {
@@ -85,7 +45,6 @@ pub struct RuntimeSourceFieldReference {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeInterpretationFacts {
     pub definition_revision: DocumentRevision,
-    pub computation_identity: ComputationIdentity,
     pub output_bindings: Vec<RuntimeOutputBindingFacts>,
     pub aggregate_layout: RuntimeAggregateLayoutFacts,
     pub apply_key: RuntimeApplyKeyFacts,
@@ -101,7 +60,7 @@ pub struct RuntimeInterpretationFacts {
 pub struct RuntimeOutputBindingFacts {
     pub output_id: OutputIdentity,
     pub target_field_id: FieldIdentity,
-    pub type_signature: String,
+    pub source_type: ProviderSourceType,
     pub nullable: bool,
 }
 
@@ -115,7 +74,7 @@ pub struct RuntimeAggregateLayoutFacts {
 pub struct RuntimeStateSlotFacts {
     pub slot_id: StateSlotIdentity,
     pub target_field_id: FieldIdentity,
-    pub type_signature: String,
+    pub source_type: ProviderSourceType,
     pub nullable: bool,
     pub role: StateRole,
     pub encoding: StateEncoding,
@@ -126,6 +85,7 @@ pub struct RuntimeAggregateFacts {
     pub aggregate_id: AggregateIdentity,
     pub function_identity: String,
     pub semantic_contract: Option<novarocks_functions::PersistentAggregateContract>,
+    pub binding_signature: Option<Bytes>,
     pub source_fields: Vec<RuntimeSourceFieldReference>,
     /// Ordered algorithm state; AVG is sum followed by count.
     pub state_slot_ids: Vec<StateSlotIdentity>,
@@ -165,121 +125,8 @@ pub struct RuntimeTargetFacts {
 pub struct RuntimePhysicalFieldFacts {
     pub logical_identity: PhysicalFieldLogicalIdentity,
     pub target_field_id: FieldIdentity,
-    pub type_signature: String,
+    pub source_type: ProviderSourceType,
     pub nullable: bool,
-}
-
-impl TryFrom<RuntimeDefinitionFacts> for DefinitionDocument {
-    type Error = String;
-
-    fn try_from(value: RuntimeDefinitionFacts) -> Result<Self, Self::Error> {
-        let query = QuerySource::try_from(value.query_definition)?;
-        build_definition(
-            value.created_at_ms,
-            query,
-            value
-                .relation_occurrences
-                .into_iter()
-                .map(|relation| RelationOccurrence {
-                    occurrence_id: relation.occurrence_id,
-                    catalog_at_binding: relation.catalog_at_binding,
-                    namespace_at_binding: relation.namespace_at_binding,
-                    relation_at_binding: relation.relation_at_binding,
-                    qualifier_at_binding: relation.qualifier_at_binding,
-                    object_id: relation.object_id,
-                    schema_version: relation.schema_version,
-                    fields: relation
-                        .referenced_fields
-                        .into_iter()
-                        .map(|field| SourceFieldBinding {
-                            field_id: field.field_id,
-                            name_at_binding: field.name_at_binding,
-                            type_signature: field.type_signature,
-                            nullable: field.nullable,
-                        })
-                        .collect(),
-                })
-                .collect(),
-            value
-                .outputs
-                .into_iter()
-                .map(|output| OutputDefinition {
-                    output_id: output.output_id,
-                    name: output.name,
-                    type_signature: output.type_signature,
-                    nullable: output.nullable,
-                    expression: ExpressionShape {
-                        kind: output.expression_kind,
-                        function_identity: output.function_identity,
-                        source_fields: output
-                            .source_fields
-                            .into_iter()
-                            .map(|reference| SourceFieldReference {
-                                occurrence_id: reference.occurrence_id,
-                                field_id: reference.field_id,
-                            })
-                            .collect(),
-                    },
-                })
-                .collect(),
-        )
-        .map_err(|error| error.to_string())
-    }
-}
-
-impl TryFrom<&DefinitionDocument> for RuntimeDefinitionFacts {
-    type Error = String;
-
-    fn try_from(value: &DefinitionDocument) -> Result<Self, Self::Error> {
-        Ok(Self {
-            created_at_ms: value.created_at_ms,
-            query_definition: PersistedQueryDefinition::try_from(value.query.clone())?,
-            relation_occurrences: value
-                .relation_occurrences
-                .iter()
-                .map(|relation| RuntimeRelationOccurrenceFacts {
-                    occurrence_id: relation.occurrence_id,
-                    catalog_at_binding: relation.catalog_at_binding.clone(),
-                    namespace_at_binding: relation.namespace_at_binding.clone(),
-                    relation_at_binding: relation.relation_at_binding.clone(),
-                    qualifier_at_binding: relation.qualifier_at_binding.clone(),
-                    object_id: relation.object_id.clone(),
-                    schema_version: relation.schema_version.clone(),
-                    referenced_fields: relation
-                        .fields
-                        .iter()
-                        .map(|field| RuntimeSourceFieldFacts {
-                            field_id: field.field_id.clone(),
-                            name_at_binding: field.name_at_binding.clone(),
-                            type_signature: field.type_signature.clone(),
-                            nullable: field.nullable,
-                        })
-                        .collect(),
-                })
-                .collect(),
-            outputs: value
-                .outputs
-                .iter()
-                .map(|output| RuntimeOutputFacts {
-                    output_id: output.output_id.clone(),
-                    name: output.name.clone(),
-                    type_signature: output.type_signature.clone(),
-                    nullable: output.nullable,
-                    expression_kind: output.expression.kind,
-                    function_identity: output.expression.function_identity.clone(),
-                    source_fields: output
-                        .expression
-                        .source_fields
-                        .iter()
-                        .map(|reference| RuntimeSourceFieldReference {
-                            occurrence_id: reference.occurrence_id,
-                            field_id: reference.field_id.clone(),
-                        })
-                        .collect(),
-                })
-                .collect(),
-        })
-    }
 }
 
 impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
@@ -299,14 +146,13 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
         }
         Ok(Self {
             definition_revision: value.definition_revision,
-            computation_identity: value.computation_identity,
             outputs: value
                 .output_bindings
                 .into_iter()
                 .map(|output| OutputBinding {
                     output_id: output.output_id,
                     target_field_id: output.target_field_id,
-                    type_signature: output.type_signature,
+                    source_type: output.source_type,
                     nullable: output.nullable,
                 })
                 .collect(),
@@ -317,7 +163,7 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
                 .map(|slot| StateSlot {
                     slot_id: slot.slot_id,
                     target_field_id: slot.target_field_id,
-                    type_signature: slot.type_signature,
+                    source_type: slot.source_type,
                     nullable: slot.nullable,
                     role: slot.role,
                     encoding: slot.encoding,
@@ -344,6 +190,7 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
                     branch_id: aggregate.branch_id,
                     function_identity: aggregate.function_identity,
                     semantic_contract: aggregate.semantic_contract,
+                    binding_signature: aggregate.binding_signature,
                     source_fields: aggregate
                         .source_fields
                         .into_iter()
@@ -375,7 +222,7 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
                     .map(|field| PhysicalFieldBinding {
                         logical_identity: field.logical_identity,
                         target_field_id: field.target_field_id,
-                        type_signature: field.type_signature,
+                        source_type: field.source_type,
                         nullable: field.nullable,
                     })
                     .collect(),
@@ -389,14 +236,13 @@ impl From<&InterpretationDocument> for RuntimeInterpretationFacts {
     fn from(value: &InterpretationDocument) -> Self {
         Self {
             definition_revision: value.definition_revision,
-            computation_identity: value.computation_identity,
             output_bindings: value
                 .outputs
                 .iter()
                 .map(|output| RuntimeOutputBindingFacts {
                     output_id: output.output_id.clone(),
                     target_field_id: output.target_field_id.clone(),
-                    type_signature: output.type_signature.clone(),
+                    source_type: output.source_type.clone(),
                     nullable: output.nullable,
                 })
                 .collect(),
@@ -407,7 +253,7 @@ impl From<&InterpretationDocument> for RuntimeInterpretationFacts {
                     .map(|slot| RuntimeStateSlotFacts {
                         slot_id: slot.slot_id.clone(),
                         target_field_id: slot.target_field_id.clone(),
-                        type_signature: slot.type_signature.clone(),
+                        source_type: slot.source_type.clone(),
                         nullable: slot.nullable,
                         role: slot.role,
                         encoding: slot.encoding,
@@ -421,6 +267,7 @@ impl From<&InterpretationDocument> for RuntimeInterpretationFacts {
                         branch_id: aggregate.branch_id.clone(),
                         function_identity: aggregate.function_identity.clone(),
                         semantic_contract: aggregate.semantic_contract.clone(),
+                        binding_signature: aggregate.binding_signature.clone(),
                         source_fields: aggregate
                             .source_fields
                             .iter()
@@ -470,7 +317,7 @@ impl From<&InterpretationDocument> for RuntimeInterpretationFacts {
                     .map(|field| RuntimePhysicalFieldFacts {
                         logical_identity: field.logical_identity.clone(),
                         target_field_id: field.target_field_id.clone(),
-                        type_signature: field.type_signature.clone(),
+                        source_type: field.source_type.clone(),
                         nullable: field.nullable,
                     })
                     .collect(),

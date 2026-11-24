@@ -56,7 +56,6 @@ macro_rules! digest_identity {
 }
 
 digest_identity!(DocumentRevision, "document revision");
-digest_identity!(ComputationIdentity, "computation identity");
 
 macro_rules! opaque_identity {
     ($name:ident, $label:literal) => {
@@ -169,14 +168,6 @@ impl std::error::Error for IdentityError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn digest_identities_are_domain_types_not_interchangeable_bytes() {
-        let revision = DocumentRevision::from_canonical_bytes(b"document");
-        let computation = ComputationIdentity::from_canonical_bytes(b"document");
-        assert_eq!(revision.as_bytes(), computation.as_bytes());
-        assert_eq!(revision.as_bytes().len(), SHA256_IDENTITY_BYTES);
-    }
 
     #[test]
     fn publication_identity_is_bounded_and_nonempty() {
