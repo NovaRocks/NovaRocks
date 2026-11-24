@@ -16,14 +16,19 @@
 -- under the License.
 
 -- @order_sensitive=true
--- @tags=project,function,abs,largeint
--- Test Objective:
--- 1. Validate ABS on LARGEINT boundary values follows FE planned LARGEINT semantics.
--- 2. Prevent BIGINT-overflow style regression where ABS(min_bigint_literal) wraps to negative.
--- Test Flow:
--- 1. Execute deterministic projection-only query (no table dependency).
--- 2. Assert ABS result, comparison against BIGINT max, and +1 arithmetic on the same row.
+-- @tags=project,function,abs,decimal
+-- ABS rejects the unrepresentable BIGINT minimum and succeeds after explicit widening.
+
+-- query 1
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
+SELECT ABS(BIGINT '-9223372036854775808');
+
+-- query 2
+WITH input AS (
+    SELECT CAST(BIGINT '-9223372036854775808' AS DECIMAL(20,0)) AS widened
+)
 SELECT
-  CAST(ABS(-9223372036854775808) AS VARCHAR) AS abs_largeint_min,
-  ABS(-9223372036854775808) > 9223372036854775807 AS gt_bigint_max,
-  CAST(ABS(-9223372036854775808) + 1 AS VARCHAR) AS abs_largeint_min_plus_one;
+    CAST(ABS(widened) AS VARCHAR) AS abs_widened_min,
+    ABS(widened) > BIGINT '9223372036854775807' AS gt_bigint_max,
+    CAST(ABS(widened) + 1 AS VARCHAR) AS abs_widened_min_plus_one
+FROM input;

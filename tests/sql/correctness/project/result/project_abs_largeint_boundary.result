@@ -1,4 +1,4 @@
--- query 1
+-- query 2
 -- types	varchar	boolean	varchar
-abs_largeint_min	gt_bigint_max	abs_largeint_min_plus_one
+abs_widened_min	gt_bigint_max	abs_widened_min_plus_one
 9223372036854775808	true	9223372036854775809
