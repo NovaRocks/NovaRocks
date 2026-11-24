@@ -983,8 +983,10 @@ fn run_expiry(
     let expected: BTreeSet<_> = [
         before.definition.clone(),
         before.interpretation.clone(),
+        before.mapping.clone(),
         before.binding.clone(),
         second_graph.interpretation,
+        second_graph.mapping,
         second_graph.binding,
     ]
     .into_iter()
