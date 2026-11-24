@@ -69,7 +69,7 @@ pub(crate) enum RefreshBindingObservation {
     IncompatibleStorage {
         binding: novarocks_mv_application::persistence::codec::BindingDigests,
         target_revision: DocumentRevision,
-        cause: RefreshError,
+        cause: Box<RefreshError>,
     },
 }
 
@@ -87,7 +87,7 @@ impl RefreshBindingObservation {
             } => ReplacementEvidence::IncompatibleStorage {
                 binding: *binding,
                 target_revision: *target_revision,
-                cause: cause.clone(),
+                cause: cause.as_ref().clone(),
             },
         }
     }
@@ -205,7 +205,7 @@ pub(crate) async fn prepare_refresh_binding_candidate(
             binding,
             target_revision: DocumentRevision::try_from_bytes(&Sha256::digest(facts.finish()))
                 .expect("a SHA-256 digest is an exact document revision"),
-            cause,
+            cause: Box::new(cause),
         }
     };
     let control =

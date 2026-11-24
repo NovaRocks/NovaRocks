@@ -236,9 +236,8 @@ pub(crate) fn observe_mv_binding(
             metadata.identity.namespace,
             metadata.identity.table
         );
-        if !schemas.contains_key(&identity) {
-            schemas.insert(
-                identity,
+        if let std::collections::btree_map::Entry::Vacant(entry) = schemas.entry(identity) {
+            entry.insert(
                 storage::source_schema_from_spi(schema, &context)
                     .map_err(|error| provider(error, "project MV base schema"))?,
             );
