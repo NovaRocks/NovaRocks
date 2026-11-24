@@ -979,18 +979,19 @@ fn run_expiry(
         !after.versions.contains_key(&first_graph.binding),
         "expiry retained unreferenced old binding"
     );
+    let binding_closure = |graph: &Graph| {
+        [
+            graph.definition.clone(),
+            graph.interpretation.clone(),
+            graph.mapping.clone(),
+            graph.binding.clone(),
+        ]
+    };
     let second_graph = Graph::from_metadata(&a2)?;
-    let expected: BTreeSet<_> = [
-        before.definition.clone(),
-        before.interpretation.clone(),
-        before.mapping.clone(),
-        before.binding.clone(),
-        second_graph.interpretation,
-        second_graph.mapping,
-        second_graph.binding,
-    ]
-    .into_iter()
-    .collect();
+    let expected: BTreeSet<_> = binding_closure(&before)
+        .into_iter()
+        .chain(binding_closure(&second_graph))
+        .collect();
     ensure!(
         after.versions.keys().cloned().collect::<BTreeSet<_>>() == expected,
         "expiry did not collect exactly the old unreferenced D/L/M/B closure"
@@ -1015,13 +1016,7 @@ fn run_expiry(
     expire(context, conn, catalog, "a", "a-orphans", 1)?;
     let orphan_pruned = load_metadata(context, rest, NS, "a")?;
     let orphan_graph = save_graph(context, "a-orphan-versions-collected", &orphan_pruned)?;
-    let expected: BTreeSet<_> = [
-        before.definition.clone(),
-        before.interpretation.clone(),
-        before.binding.clone(),
-    ]
-    .into_iter()
-    .collect();
+    let expected: BTreeSet<_> = binding_closure(&before).into_iter().collect();
     ensure!(
         orphan_graph
             .versions
