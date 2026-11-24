@@ -52,7 +52,7 @@ fn a_retained_projection_keeps_the_limit_gather_after_the_cte_receiver() {
     let consumer = &plan.fragments()[&limited.destination.fragment];
     assert!(matches!(
         consumer.stage_placement(),
-        StagePlacementPolicy::FollowSources { sources } if sources.as_ref() == &[producer]
+        StagePlacementPolicy::FollowSources { sources } if sources.as_ref() == [producer]
     ));
     let projection = &consumer.nodes()[&consumer.root()];
     assert!(matches!(&projection.kind, NodeKind::Project { .. }));
@@ -73,7 +73,7 @@ fn a_retained_projection_keeps_the_limit_gather_after_the_cte_receiver() {
     );
     assert!(limit_stage.nodes().values().any(|node| {
         matches!(&node.kind, NodeKind::Limit { .. })
-            && node.inputs.as_ref() == &[gather.destination.node]
+            && node.inputs.as_ref() == [gather.destination.node]
     }));
 }
 
@@ -102,7 +102,7 @@ fn a_filter_stays_before_the_gather_and_follows_the_cte_width() {
     assert_eq!(edge.partitioning.destination, Distribution::RoundRobin);
     assert!(matches!(
         consumer.stage_placement(),
-        StagePlacementPolicy::FollowSources { sources } if sources.as_ref() == &[edge.source.fragment]
+        StagePlacementPolicy::FollowSources { sources } if sources.as_ref() == [edge.source.fragment]
     ));
     assert!(plan.edges().values().any(|outbound| {
         outbound.kind == EdgeKind::Stream

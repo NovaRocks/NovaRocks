@@ -229,7 +229,7 @@ fn comparison_exchange_fuses_only_when_the_original_cte_value_is_aligned() {
             assert!(matches!(
                 stage.stage_placement(),
                 novarocks_physical_plan::StagePlacementPolicy::FollowSources { sources }
-                if sources.as_ref() == &[cte_edge.source.fragment]
+                if sources.as_ref() == [cte_edge.source.fragment]
             ));
             let hash_edge = plan
                 .edges()
