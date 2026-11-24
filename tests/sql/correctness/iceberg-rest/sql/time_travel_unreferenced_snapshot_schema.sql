@@ -21,6 +21,10 @@
 -- and historical reads have different schemas, and CTAS writes the old one.
 
 -- query 1
+-- @skip_result_check=true
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.history_schema_${uuid0};
+
+-- query 2
 -- @result_contains=SPARK_UNREFERENCED_HISTORY_READY
 shell: set -eu
 repo="${NOVAROCKS_WORKSPACE_ROOT:-.}"
@@ -29,40 +33,41 @@ trap 'rm -f "$tmp_scala"' EXIT
 cat "$repo/tests/sql/fixtures/iru5-commit-interop/SparkCommitInterop.scala" > "$tmp_scala"
 cat >> "$tmp_scala" <<'SPARK_SCALA'
 Iru5SparkCommitInterop.checked("SPARK_UNREFERENCED_HISTORY_READY") {
-  Iru5SparkCommitInterop.createUnreferencedHistory(spark, "ice_rest.${case_db}.history_${uuid0}")
+  Iru5SparkCommitInterop.createUnreferencedHistory(spark, "ice_rest.history_schema_${uuid0}.history_${uuid0}")
 }
 SPARK_SCALA
 "$repo/docker/iceberg-rest/spark-shell.sh" "$tmp_scala"
 
--- query 2
+-- query 3
 SELECT current_rows.added, historical_rows.*
-FROM iceberg_rest_${suite_uuid0}.${case_db}.history_${uuid0} current_rows
-CROSS JOIN iceberg_rest_${suite_uuid0}.${case_db}.history_${uuid0}
+FROM iceberg_rest_${suite_uuid0}.history_schema_${uuid0}.history_${uuid0} current_rows
+CROSS JOIN iceberg_rest_${suite_uuid0}.history_schema_${uuid0}.history_${uuid0}
   FOR VERSION AS OF 42 historical_rows
 WHERE current_rows.id = 2;
 
--- query 3
+-- query 4
 -- @skip_result_check=true
-CREATE TABLE iceberg_rest_${suite_uuid0}.${case_db}.historical_copy_${uuid0} AS
-SELECT * FROM iceberg_rest_${suite_uuid0}.${case_db}.history_${uuid0}
+CREATE TABLE iceberg_rest_${suite_uuid0}.history_schema_${uuid0}.historical_copy_${uuid0} AS
+SELECT * FROM iceberg_rest_${suite_uuid0}.history_schema_${uuid0}.history_${uuid0}
   FOR VERSION AS OF 42;
 
--- query 4
-SELECT * FROM iceberg_rest_${suite_uuid0}.${case_db}.historical_copy_${uuid0};
-
 -- query 5
+SELECT * FROM iceberg_rest_${suite_uuid0}.history_schema_${uuid0}.historical_copy_${uuid0};
+
+-- query 6
 -- @skip_result_check=true
-MERGE INTO iceberg_rest_${suite_uuid0}.${case_db}.history_${uuid0} target
+MERGE INTO iceberg_rest_${suite_uuid0}.history_schema_${uuid0}.history_${uuid0} target
 USING (
   SELECT id + 2 AS id, value
-  FROM iceberg_rest_${suite_uuid0}.${case_db}.history_${uuid0} FOR VERSION AS OF 42
+  FROM iceberg_rest_${suite_uuid0}.history_schema_${uuid0}.history_${uuid0} FOR VERSION AS OF 42
 ) source ON target.id = source.id
 WHEN NOT MATCHED THEN INSERT (id, value, added) VALUES (source.id, source.value, 9);
 
--- query 6
-SELECT id, value, added FROM iceberg_rest_${suite_uuid0}.${case_db}.history_${uuid0} WHERE id = 3;
-
 -- query 7
+SELECT id, value, added FROM iceberg_rest_${suite_uuid0}.history_schema_${uuid0}.history_${uuid0} WHERE id = 3;
+
+-- query 8
 -- @skip_result_check=true
-DROP TABLE iceberg_rest_${suite_uuid0}.${case_db}.historical_copy_${uuid0};
-DROP TABLE iceberg_rest_${suite_uuid0}.${case_db}.history_${uuid0};
+DROP TABLE iceberg_rest_${suite_uuid0}.history_schema_${uuid0}.historical_copy_${uuid0};
+DROP TABLE iceberg_rest_${suite_uuid0}.history_schema_${uuid0}.history_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.history_schema_${uuid0};
