@@ -24,7 +24,7 @@
 --    joins against single-row constant tables.
 -- Test Flow:
 -- 1. Create a lineitem table with mixed data including NULLs.
--- 2. Execute joins against (SELECT '2000-01-01' AS col1) with various join types
+-- 2. Execute joins against (SELECT DATE '2000-01-01' AS col1) with various join types
 --    and predicates (ON TRUE, equality, WHERE filters).
 -- 3. Assert ordered result correctness.
 
@@ -39,72 +39,72 @@ CREATE TABLE ${case_db}.lineitem (
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.lineitem VALUES ROW(1,1,1,'2000-01-01'),ROW(1,2,1,'2000-01-01'),ROW(1,3,2,'2000-01-02'),ROW(11,1,11,'2000-01-01'),ROW(11,2,1,'2000-01-02'),ROW(2,3,2,'2000-01-03'),ROW(2,3,null,null);
+INSERT INTO ${case_db}.lineitem VALUES ROW(1,1,1,DATE '2000-01-01'),ROW(1,2,1,DATE '2000-01-01'),ROW(1,3,2,DATE '2000-01-02'),ROW(11,1,11,DATE '2000-01-01'),ROW(11,2,1,DATE '2000-01-02'),ROW(2,3,2,DATE '2000-01-03'),ROW(2,3,null,null);
 
 -- query 3
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 JOIN (SELECT '2000-01-01' AS col1) t2 ON true ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1 JOIN (SELECT DATE '2000-01-01' AS col1) t2 ON true ORDER BY 1,2,3 LIMIT 3;
 
 -- query 4
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 INNER JOIN (SELECT '2000-01-01' AS col1) t2 ON true WHERE t1.l_orderkey > 10 ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1 INNER JOIN (SELECT DATE '2000-01-01' AS col1) t2 ON true WHERE t1.l_orderkey > 10 ORDER BY 1,2,3 LIMIT 3;
 
 -- query 5
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 LEFT OUTER JOIN (SELECT '2000-01-01' AS col1) t2 ON true WHERE t1.l_orderkey > 10 ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1 LEFT OUTER JOIN (SELECT DATE '2000-01-01' AS col1) t2 ON true WHERE t1.l_orderkey > 10 ORDER BY 1,2,3 LIMIT 3;
 
 -- query 6
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 JOIN (SELECT '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1 JOIN (SELECT DATE '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 ORDER BY 1,2,3 LIMIT 3;
 
 -- query 7
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 JOIN (SELECT '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 WHERE t1.l_orderkey > 10 ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1 JOIN (SELECT DATE '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 WHERE t1.l_orderkey > 10 ORDER BY 1,2,3 LIMIT 3;
 
 -- query 8
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 LEFT JOIN (SELECT '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1 LEFT JOIN (SELECT DATE '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 ORDER BY 1,2,3 LIMIT 3;
 
 -- query 9
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 LEFT JOIN (SELECT '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 WHERE t1.l_orderkey > 10 ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1 LEFT JOIN (SELECT DATE '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 WHERE t1.l_orderkey > 10 ORDER BY 1,2,3 LIMIT 3;
 
 -- query 10
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 RIGHT JOIN (SELECT '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1 RIGHT JOIN (SELECT DATE '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 ORDER BY 1,2,3 LIMIT 3;
 
 -- query 11
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 RIGHT JOIN (SELECT '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 WHERE t1.l_orderkey > 10 ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1 RIGHT JOIN (SELECT DATE '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 WHERE t1.l_orderkey > 10 ORDER BY 1,2,3 LIMIT 3;
 
 -- query 12
 -- @order_sensitive=true
 SELECT * FROM ${case_db}.lineitem t1
-WHERE EXISTS (SELECT 1 FROM (SELECT '2000-01-01' AS col1) t2 WHERE t1.l_shipdate=t2.col1)
+WHERE EXISTS (SELECT 1 FROM (SELECT DATE '2000-01-01' AS col1) t2 WHERE t1.l_shipdate=t2.col1)
 ORDER BY 1,2,3 LIMIT 3;
 
 -- query 13
 -- @order_sensitive=true
 SELECT * FROM ${case_db}.lineitem t1
-WHERE EXISTS (SELECT 1 FROM (SELECT '2000-01-01' AS col1) t2 WHERE t1.l_shipdate=t2.col1) AND (t1.l_orderkey > 10)
+WHERE EXISTS (SELECT 1 FROM (SELECT DATE '2000-01-01' AS col1) t2 WHERE t1.l_shipdate=t2.col1) AND (t1.l_orderkey > 10)
 ORDER BY 1,2,3 LIMIT 3;
 
 -- query 14
 -- @order_sensitive=true
-SELECT * FROM (SELECT '2000-01-01' AS col1) t2
+SELECT * FROM (SELECT DATE '2000-01-01' AS col1) t2
 WHERE EXISTS (SELECT 1 FROM ${case_db}.lineitem t1 WHERE t1.l_shipdate=t2.col1)
 ORDER BY 1 LIMIT 3;
 
 -- query 15
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 FULL OUTER JOIN (SELECT '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1 FULL OUTER JOIN (SELECT DATE '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 ORDER BY 1,2,3 LIMIT 3;
 
 -- query 16
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 FULL OUTER JOIN (SELECT '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 WHERE t1.l_orderkey > 10 ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1 FULL OUTER JOIN (SELECT DATE '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 WHERE t1.l_orderkey > 10 ORDER BY 1,2,3 LIMIT 3;
 
 -- query 17
 -- @order_sensitive=true
 SELECT * FROM ${case_db}.lineitem t1
-WHERE NOT EXISTS (SELECT 1 FROM (SELECT '2000-01-01' AS col1) t2 WHERE t1.l_shipdate=t2.col1)
+WHERE NOT EXISTS (SELECT 1 FROM (SELECT DATE '2000-01-01' AS col1) t2 WHERE t1.l_shipdate=t2.col1)
 ORDER BY 1,2,3 LIMIT 3;

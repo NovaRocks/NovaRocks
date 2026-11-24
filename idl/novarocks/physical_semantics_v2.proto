@@ -196,6 +196,7 @@ enum SimpleArgumentControl {
   // Demand the original arguments in order and convert the pattern at ordinal 1.
   SIMPLE_ARGUMENT_CONTROL_ORDERED_REGEXP = 12;
   SIMPLE_ARGUMENT_CONTROL_NULL_IF = 13;
+  SIMPLE_ARGUMENT_CONTROL_ORDERED_NULL = 14;
 }
 enum InstanceState {
   INSTANCE_STATE_UNSPECIFIED = 0;

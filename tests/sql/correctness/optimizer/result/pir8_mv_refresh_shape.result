@@ -1,4 +1,4 @@
 -- query 5
--- types	varchar
+-- types	varchar(24)
 status
 pir8_mv_refresh_shape_ok

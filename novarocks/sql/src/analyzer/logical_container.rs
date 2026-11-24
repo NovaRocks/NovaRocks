@@ -36,6 +36,7 @@ fn supported(binding: &ResolvedFunctionBinding) -> bool {
             | "builtin.scalar/row/v1"
             | "builtin.scalar/named_struct/v1"
             | "builtin.scalar/__struct_subfield/v1"
+            | "builtin.scalar/__row_field/v1"
             | "builtin.scalar/__array_element_at/v1"
             | "builtin.scalar/__map_element_at/v1"
             | "builtin.scalar/__map_subscript/v1"

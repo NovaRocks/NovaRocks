@@ -1890,7 +1890,10 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                     }
                     let (type_only, control_intrinsic) =
                         match (invocation.control, frozen.effects.argument_control) {
-                            (ControlShape::Eager, ArgumentControl::Eager) => (false, false),
+                            (ControlShape::Eager, ArgumentControl::Eager)
+                            | (ControlShape::OrderedNull, ArgumentControl::OrderedNull) => {
+                                (false, false)
+                            }
                             (ControlShape::TypeOnly, ArgumentControl::TypeOnly) => (true, false),
                             (ControlShape::NoArguments, ArgumentControl::NoArguments) => {
                                 (true, false)

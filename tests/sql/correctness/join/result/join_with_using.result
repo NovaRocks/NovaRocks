@@ -173,12 +173,6 @@ join_key
 1
 2
 
--- query 29
--- types	integer
-l_id1
-1
-2
-
 -- query 30
 -- types	integer
 l_id1

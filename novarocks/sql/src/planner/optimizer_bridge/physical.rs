@@ -850,6 +850,8 @@ fn map_hash_source(source: crate::optimizer::property::HashSource) -> HashSource
     match source {
         O::ShuffleAgg => HashSource::ShuffleAgg,
         O::ShuffleJoin => HashSource::ShuffleJoin,
+        O::MapGrouping => HashSource::MapGrouping,
+        O::MapSet => HashSource::MapSet,
     }
 }
 

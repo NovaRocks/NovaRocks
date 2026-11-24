@@ -45,6 +45,8 @@ message RegionGuard {
     uint32 membership_after_source_ordinal = 8;
     // Zero-based preceding argument in the ordered regexp call.
     uint32 ordered_regexp_after_argument_ordinal = 9;
+    // Zero-based preceding non-NULL argument in an ordered scalar call.
+    uint32 ordered_null_after_argument_ordinal = 10;
   }
 }
 enum SimpleGuard {
@@ -95,6 +97,7 @@ enum SimpleControl {
   SIMPLE_CONTROL_TRY = 9;
   // Source is argument 0 and the pattern conversion occurs at argument 1.
   SIMPLE_CONTROL_ORDERED_REGEXP = 10;
+  SIMPLE_CONTROL_ORDERED_NULL = 11;
 }
 // Argument 0 is the retained value. Argument 1 belongs to its non-NULL region;
 // the comparison consumes the exact catalogue equality identity.

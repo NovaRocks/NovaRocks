@@ -262,6 +262,19 @@ pub(crate) fn validate_core<'a, H>(
             let child = parts.control.uses().get(argument).ok_or_else(|| {
                 ValidationFailure::invalid(Some(node.id), None, "invocation child use is absent")
             })?;
+            if invocation.control == ControlShape::OrderedNull
+                && !node.ty.nullable()
+                && parts
+                    .definitions
+                    .get(definition.get() as usize)
+                    .is_some_and(|argument| argument.ty.nullable())
+            {
+                return Err(ValidationFailure::invalid(
+                    Some(node.id),
+                    None,
+                    "ordered NULL propagation requires a nullable result",
+                ));
+            }
             if child.definition != definition {
                 return Err(ValidationFailure::invalid(
                     Some(node.id),

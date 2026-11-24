@@ -1,35 +1,50 @@
 -- query 2
--- legacy
+-- types	map(varchar(1), integer)
 _col0
 {"a":1,"b":2}
 
 -- query 3
--- legacy
+-- types	map(varchar(1), integer)
 _col0
 {"a":1,"b":2}
 
 -- query 4
--- legacy
+-- types	map(unknown, unknown)
 _col0
 {}
 
 -- query 5
--- legacy
+-- types	map(integer, integer)
 _col0
-{1:2}
+{"1":2}
+
+-- query 6
+-- types	bigint	bigint	bigint
+merged_entries	key_entries	value_entries
+1	0	0
+
+-- query 7
+-- types	bigint	bigint	bigint
+merged_entries	key_entries	value_entries
+1	0	0
+
+-- query 8
+-- types	bigint	integer	bigint	bigint
+merged_entries	key_value	value_array_entries	nested_map_entries
+1	2	1	0
 
 -- query 9
--- legacy
+-- types	integer	array(row(varchar, integer))
 col_int	_col1
-1	[{"key":"a","value":1},{"key":"b","value":2}]
-2	[{"key":"c","value":3}]
-3	[{"key":"d","value":4},{"key":"e","value":5}]
+1	[["a",1],["b",2]]
+2	[["c",3]]
+3	[["d",4],["e",5]]
 
 -- query 10
--- legacy
+-- types	integer	array(row(varchar, integer))	row(varchar, integer)
 col_int	_col1	unnest
-1	[{"key":"a","value":1},{"key":"b","value":2}]	{"key":"a","value":1}
-1	[{"key":"a","value":1},{"key":"b","value":2}]	{"key":"b","value":2}
-2	[{"key":"c","value":3}]	{"key":"c","value":3}
-3	[{"key":"d","value":4},{"key":"e","value":5}]	{"key":"d","value":4}
-3	[{"key":"d","value":4},{"key":"e","value":5}]	{"key":"e","value":5}
+1	[["a",1],["b",2]]	["a",1]
+1	[["a",1],["b",2]]	["b",2]
+2	[["c",3]]	["c",3]
+3	[["d",4],["e",5]]	["d",4]
+3	[["d",4],["e",5]]	["e",5]

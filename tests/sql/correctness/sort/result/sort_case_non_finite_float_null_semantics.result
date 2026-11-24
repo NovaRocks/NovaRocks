@@ -1,13 +1,41 @@
 -- query 1
 -- types	integer	double
 id	k
-1	NULL
-2	NULL
-3	NULL
 8	NULL
+1	NaN
+3	-Infinity
 5	-7.25
 10	0.0
 6	1.0
 9	2.2
 7	3.5
 4	7.25
+2	Infinity
+
+-- query 2
+-- types	integer	double
+id	k
+3	-Infinity
+5	0.0
+4	-0.0
+6	Infinity
+2	NaN
+1	NULL
+
+-- query 3
+-- types	integer	double
+id	k
+1	NULL
+6	Infinity
+5	0.0
+4	-0.0
+3	-Infinity
+2	NaN
+
+-- query 4
+-- types	integer	real
+id	k
+1	NULL
+2	NaN
+3	-Infinity
+5	0.0

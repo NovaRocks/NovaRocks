@@ -285,7 +285,7 @@ fn prepare_value(
         source: source.clone(),
         result: result.clone(),
         body: CastBody::Identity,
-        array_child: None,
+        children: CastChildren::None,
         trino_mode: Some(mode),
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
         allow_throw_exception: false,
@@ -322,7 +322,7 @@ fn prepare_value(
         } else {
             ArrayCastFailureMode::ReportError
         });
-        recipe.array_child = Some(Box::new(child));
+        recipe.children = CastChildren::Array(Box::new(child));
         return Ok(recipe);
     }
     if matches!((from, to), (Struct(_), Struct(_)))
@@ -331,11 +331,39 @@ fn prepare_value(
         recipe.body = CastBody::SelectedArray(f3_array::Body::Structure);
         return Ok(recipe);
     }
-    if matches!(
-        (from, to),
-        (Map { .. }, Map { .. }) | (Struct(_), Struct(_))
-    ) {
-        // B7e owns recursive conversion after admission of the real shape.
+    if matches!((from, to), (Map { .. }, Map { .. })) {
+        let source_key = source.child_at(0).ok_or(CastPrepareError::TypeMismatch)?;
+        let target_key = result.child_at(0).ok_or(CastPrepareError::TypeMismatch)?;
+        let source_value = source.child_at(1).ok_or(CastPrepareError::TypeMismatch)?;
+        let target_value = result.child_at(1).ok_or(CastPrepareError::TypeMismatch)?;
+        let child_mode = if mode == TrinoCastMode::Try {
+            TrinoCastMode::Explicit
+        } else {
+            mode
+        };
+        let key = prepare_value(&source_key, &target_key, child_mode, work)?;
+        let value = prepare_value(&source_value, &target_value, child_mode, work)?;
+        if value.trino_can_return_null() && !target_value.nullable() {
+            return Err(CastPrepareError::TypeMismatch);
+        }
+        // Empty MAP(unknown, unknown) has no keys to compare. For all
+        // nonempty target domains the prepared key relation must be total.
+        if !matches!(target_key.value_type().kind(), Kind(Null)) {
+            novarocks_type_contract::KeyRelation::Identical
+                .validate_type_observed(target_key.value_type(), &mut |_| work.step())?
+                .map_err(|_| CastPrepareError::Unsupported)?;
+        }
+        recipe.body = CastBody::ExplicitMap;
+        recipe.array_failure_mode = Some(if mode == TrinoCastMode::Try {
+            ArrayCastFailureMode::OutputNull
+        } else {
+            ArrayCastFailureMode::ReportError
+        });
+        recipe.children = CastChildren::Map(Box::new([key, value]));
+        return Ok(recipe);
+    }
+    if matches!((from, to), (Struct(_), Struct(_))) {
+        // B7e owns recursive ROW conversion after admission of the real shape.
         return if shape_is_legal(source.value_type(), result.value_type(), mode, work)? {
             Err(CastPrepareError::Unsupported)
         } else {

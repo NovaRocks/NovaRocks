@@ -2516,9 +2516,7 @@ fn signed_state_input(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![
-        string_literal("value"),
         value,
-        string_literal("change_op"),
         TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: action_column,
@@ -2528,50 +2526,61 @@ fn signed_state_input(
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
         },
     ];
-    let function = novarocks_functions::FunctionId::try_new("builtin.scalar/named_struct/v1")
+    let function = novarocks_functions::FunctionId::try_new("builtin.scalar/row/v1")
         .expect("frozen IVM row constructor identity");
     let overload =
-        novarocks_functions::FunctionOverloadId::try_new("builtin.scalar/named_struct/dynamic-v1")
+        novarocks_functions::FunctionOverloadId::try_new("builtin.scalar/row/dynamic-v1")
             .expect("frozen IVM row constructor overload");
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::Validate,
+    )?;
+    let target = novarocks_expression::typing::row_constructor_result(
+        [Some("value"), Some("change_op")]
+            .into_iter()
+            .zip(args.iter().map(|arg| &arg.value_type)),
+        &mut work,
+    )
+    .map_err(|error| match error {
+        novarocks_expression::typing::TypingError::Control(error) => {
+            crate::compiler::SqlCompileError::from(error)
+        }
+        error => crate::compiler::SqlCompileError::from(error.to_string()),
+    })?;
+    work.finish()?;
     let arguments = args
         .iter()
         .map(|argument| crate::analysis::function_argument(argument, constant_policy, control))
         .collect::<Result<Vec<_>, _>>()?;
-    let binding = crate::binding::SqlFunctionBinding::new(
+    let binding = crate::binding::SqlFunctionBinding::new_with_row_constructor_constraint(
         function_catalog.finish_scalar_binding(
             &function,
             &overload,
             novarocks_functions::FunctionBindingRequest {
                 arguments: &arguments,
                 logical_argument_count: arguments.len(),
-                expected_result_type: None,
+                expected_result_type: Some(&target),
             },
             control,
         )?,
         policy,
+        target,
     );
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
     else {
-        return Err("named_struct must return a scalar value".to_string().into());
+        return Err("ROW must return a scalar value".to_string().into());
     };
     let value_type = result.clone();
     Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
-            name: "named_struct".to_string(),
+            name: "row".to_string(),
             args: (args).into(),
             distinct: false,
             binding,
         },
         value_type,
     })
-}
-
-fn string_literal(value: &str) -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::String(value.to_string())),
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
-    }
 }
 
 #[cfg(test)]
@@ -3567,27 +3576,25 @@ mod tests {
             ..
         } = &args[0].kind
         else {
-            panic!("expected named_struct signed input");
+            panic!("expected ROW signed input");
         };
-        assert_eq!(name, "named_struct");
-        assert_eq!(
-            binding.function_id.as_str(),
-            "builtin.scalar/named_struct/v1"
-        );
+        assert_eq!(name, "row");
+        assert_eq!(binding.function_id.as_str(), "builtin.scalar/row/v1");
         assert_eq!(
             binding.selected.overload.as_str(),
-            "builtin.scalar/named_struct/dynamic-v1",
+            "builtin.scalar/row/dynamic-v1"
         );
+        let Some(target) = binding.result_constraint() else {
+            panic!("signed input has its original ROW declaration");
+        };
+        let novarocks_type_contract::ValueKind::Struct(fields) = target.value_type().kind() else {
+            panic!("signed input target is ROW");
+        };
+        assert_eq!(fields[0].row_name(), Some("value"));
+        assert_eq!(fields[1].row_name(), Some("change_op"));
+        assert_eq!(struct_args.len(), 2);
         assert!(matches!(
-            &struct_args[0].kind,
-            ExprKind::Literal(LiteralValue::String(name)) if name == "value"
-        ));
-        assert!(matches!(
-            &struct_args[2].kind,
-            ExprKind::Literal(LiteralValue::String(name)) if name == "change_op"
-        ));
-        assert!(matches!(
-            &struct_args[3].kind,
+            &struct_args[1].kind,
             ExprKind::ColumnRef { column, .. } if column == "__change_op"
         ));
     }
@@ -4247,11 +4254,11 @@ mod tests {
             args: struct_args, ..
         } = &signed_arg.kind
         else {
-            panic!("expected signed aggregate named_struct input");
+            panic!("expected signed aggregate ROW input");
         };
         let ExprKind::ColumnRef {
             column_id, column, ..
-        } = &struct_args[3].kind
+        } = &struct_args[1].kind
         else {
             panic!("expected signed aggregate change_op column ref");
         };

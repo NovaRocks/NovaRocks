@@ -1046,13 +1046,23 @@ fn build_node(
                     gather_to_one(build, ctx, node_id)
                 } else {
                     let partitions = build.pipeline.dop as usize;
-                    shuffle_compiled_group_input_slots(
-                        build,
-                        ctx,
-                        node_id,
-                        partition_slots,
-                        partitions,
-                    )
+                    let layout = program.graph().nodes()[id.index()].output_layout();
+                    let keys = frozen_routing_keys(layout, &partition_slots)?;
+                    use novarocks_type_contract::PartitionHashAlgorithm;
+                    let algorithm = PartitionHashAlgorithm::for_grouping_keys(
+                        keys.iter().map(|(_, ty)| ty.data_type()),
+                    );
+                    if algorithm == PartitionHashAlgorithm::NativeExchangeV2 {
+                        shuffle_compiled_map_group_keys(build, ctx, node_id, keys, partitions)
+                    } else {
+                        shuffle_compiled_group_input_slots(
+                            build,
+                            ctx,
+                            node_id,
+                            partition_slots,
+                            partitions,
+                        )
+                    }
                 };
                 factory = final_stage;
             } else {

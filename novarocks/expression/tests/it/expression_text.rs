@@ -382,18 +382,19 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
         type_text("abs(unknown)"),
         Err(TextError::UnknownColumn { name, .. }) if name == "unknown"
     ));
-    for (text, name) in [
-        ("count(x)", "count"),
-        ("x.y", "qualified name or field reference"),
-    ] {
-        assert!(
-            matches!(
-                type_text(text),
-                Err(TextError::NotTypedByLayer { construct, .. }) if construct == name
+    assert!(matches!(
+        type_text("count(x)"),
+        Err(TextError::NotTypedByLayer { construct, .. }) if construct == "count"
+    ));
+    assert!(matches!(
+        type_text("x.y"),
+        Err(TextError::Typing {
+            cause: novarocks_expression::typing::TypingError::InvalidShape(
+                "Field access requires a ROW value"
             ),
-            "{text}"
-        );
-    }
+            ..
+        })
+    ));
     let conditional = type_text("CASE WHEN TRUE THEN x ELSE x END").unwrap();
     let values = Arc::new(StringArray::from(vec!["original value"]));
     let result = evaluate(&conditional, &batch(&columns, vec![values.clone()]));
@@ -1444,4 +1445,76 @@ fn integer_array_equality_keeps_nested_nulls_and_compares_mixed_width_elements()
             .unwrap();
         assert_eq!(values.iter().collect::<Vec<_>>(), expected, "{sql}");
     }
+}
+
+#[test]
+fn map_concat_ordered_null_short_circuits_only_later_conversions() {
+    use novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT;
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    use arrow::{
+        array::{MapArray, StructArray},
+        buffer::OffsetBuffer,
+        datatypes::Field,
+    };
+    let entries = StructArray::try_new(
+        vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("value", DataType::Int32, true),
+        ]
+        .into(),
+        vec![
+            Arc::new(Int64Array::from(vec![9007199254740992, 9007199254740993])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+        ],
+        None,
+    )
+    .unwrap();
+    let collision: ArrayRef = Arc::new(
+        MapArray::try_new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::new(vec![0, 2].into()),
+            entries,
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let columns = [column(
+        "collision",
+        72,
+        collision.data_type().clone(),
+        false,
+    )];
+    let input = batch(&columns, vec![collision]);
+    let null = "CAST(NULL AS MAP(DOUBLE, INTEGER))";
+
+    let left_null = evaluate(
+        &compile(
+            &format!("map_concat({null}, collision)"),
+            &columns,
+            &context,
+        ),
+        &input,
+    );
+    assert!(left_null.batch.values.is_null(0));
+    assert!(left_null.batch.errors.is_empty());
+
+    let left_error = evaluate(
+        &compile(
+            &format!("map_concat(collision, {null})"),
+            &columns,
+            &context,
+        ),
+        &input,
+    );
+    assert!(left_error.batch.values.is_null(0));
+    let [error] = left_error.batch.errors.as_ref() else {
+        panic!("conversion of the demanded first argument must fail");
+    };
+    assert_eq!(
+        error.reason(),
+        DataFailureReason::Domain(INVALID_CAST_ARGUMENT)
+    );
 }

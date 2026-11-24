@@ -115,11 +115,16 @@ fn canonical_call_borrows_original_nested_nodes() {
 }
 
 #[test]
-fn syntax_without_a_canonical_call_preserves_the_rejection() {
-    assert_unsupported(
-        "ROW(a, b AS named_field)",
-        "named ROW fields are not supported",
-    );
+fn row_projection_borrows_names_and_value_operands_separately() {
+    let expr = parse_expression(r#"ROW(7 AS ID, NULL AS "Note", 9)"#).unwrap();
+    let call = canonical_call(&expr).unwrap().unwrap();
+    let fields = call.row_fields.unwrap();
+    assert_eq!(fields[0].name.as_ref().unwrap().value, "ID");
+    assert!(fields[1].name.as_ref().unwrap().quoted);
+    assert!(fields[2].name.is_none());
+    for (field, argument) in fields.iter().zip(call.arguments) {
+        assert!(std::ptr::eq(&field.expression, argument));
+    }
 }
 
 #[test]
@@ -135,13 +140,6 @@ fn two_argument_if_has_a_synthetic_null_branch() {
                 && literal.span == novarocks_parser::SYNTHETIC
         ));
     }
-}
-
-fn assert_unsupported(source: &str, message: &str) {
-    let expr = parse_expression(source).unwrap();
-    let error = canonical_call(&expr).unwrap_err();
-    assert_eq!(error.span, Span::new(0, source.len()), "{source}");
-    assert_eq!(error.to_string(), message, "{source}");
 }
 
 #[test]

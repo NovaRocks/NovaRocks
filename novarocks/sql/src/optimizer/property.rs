@@ -208,6 +208,18 @@ impl PhysicalPropertySet {
 pub(crate) enum HashSource {
     ShuffleAgg,
     ShuffleJoin,
+    MapGrouping,
+    MapSet,
+}
+
+impl HashSource {
+    fn uses_canonical_map(self) -> bool {
+        matches!(self, Self::MapGrouping | Self::MapSet)
+    }
+
+    fn allows_subset(self) -> bool {
+        matches!(self, Self::ShuffleAgg | Self::MapGrouping)
+    }
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -289,20 +301,12 @@ impl DistributionSpec {
                 else {
                     return false;
                 };
-                match (*provided_source, *required_source) {
-                    (HashSource::ShuffleAgg, HashSource::ShuffleAgg) => {
+                provided_source.uses_canonical_map() == required_source.uses_canonical_map()
+                    && if required_source.allows_subset() {
                         hash_cols_subset(provided_cols, required_cols)
-                    }
-                    (HashSource::ShuffleJoin, HashSource::ShuffleJoin) => {
+                    } else {
                         provided_cols == required_cols
                     }
-                    (HashSource::ShuffleAgg, HashSource::ShuffleJoin) => {
-                        provided_cols == required_cols
-                    }
-                    (HashSource::ShuffleJoin, HashSource::ShuffleAgg) => {
-                        hash_cols_subset(provided_cols, required_cols)
-                    }
-                }
             }
         }
     }
@@ -406,6 +410,21 @@ mod tests {
         assert!(agg_exact.satisfies(&join_exact));
         assert!(join_finer.satisfies(&agg_finer_required));
         assert!(!join_exact.satisfies(&DistributionSpec::shuffle_agg([ColumnId(1)])));
+    }
+
+    #[test]
+    fn canonical_map_distribution_cannot_reuse_a_legacy_partition() {
+        let keys = [ColumnId(1), ColumnId(2)];
+        let legacy_set = DistributionSpec::shuffle_join(keys);
+        let map_set = DistributionSpec::hash_partitioned(keys, HashSource::MapSet);
+        let map_group = DistributionSpec::hash_partitioned(keys, HashSource::MapGrouping);
+        let coarser = DistributionSpec::hash_partitioned([ColumnId(1)], HashSource::MapGrouping);
+
+        assert!(!legacy_set.satisfies(&map_set));
+        assert!(!map_group.satisfies(&legacy_set));
+        assert!(map_set.satisfies(&map_group));
+        assert!(coarser.satisfies(&map_group));
+        assert!(!coarser.satisfies(&map_set));
     }
 
     #[test]

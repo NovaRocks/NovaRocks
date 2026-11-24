@@ -283,7 +283,7 @@ SQL client
   SQL occurrence、视图依赖和 Provider 观察；Iceberg 在 `storage_inspector/storage_mapping.rs`
   沿实际读写作者签发目标映射。 `novarocks/mv-application/src/persistence/keyed_documents.rs`
   核对 B 对 D/L/M 的完整引用，历史 P 使用自己的 B 解码源水位。见
-  [ADR-0265](docs/adr/ADR-0265-mv-publishes-bound-source-and-storage-facts.md)。
+  [ADR-0266](docs/adr/ADR-0266-mv-publishes-bound-source-and-storage-facts.md)。
 
 - `novarocks/frontend-application/src/catalog_application/statement.rs`
   Catalog, database and table DDL against the projected catalog.

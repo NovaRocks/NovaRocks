@@ -138,14 +138,14 @@ impl CellCursor {
                 })?;
                 self.literal(b"[")?;
             }
-            N::Map { .. } if !key => {
+            N::Map { .. } => {
                 let map = down::<MapArray>(&array)?;
                 let start = usize::try_from(map.value_offsets()[row]).map_err(|_| invalid())?;
                 let end = usize::try_from(map.value_offsets()[row + 1]).map_err(|_| invalid())?;
                 if start > end || end > map.keys().len() || end > map.values().len() {
                     return Err(invalid());
                 }
-                if end - start > 1 && !legacy_key_fields.is_empty() {
+                if !key && end - start > 1 && !legacy_key_fields.is_empty() {
                     budget.scan(usize::BITS as usize);
                     if legacy_key_fields
                         .binary_search(&std::ptr::from_ref(field).addr())
@@ -166,6 +166,7 @@ impl CellCursor {
                     path,
                     phase: 0,
                     first: true,
+                    object_text: key,
                 })?;
                 self.literal(b"{")?;
             }

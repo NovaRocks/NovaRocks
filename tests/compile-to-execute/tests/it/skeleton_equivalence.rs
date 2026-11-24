@@ -30,15 +30,13 @@ use novarocks_expression::{
         HarnessControl,
         expression_text::{TextColumn, TextContext, TextError, TypedText, type_expression_text},
     },
-    typing::TypingError,
 };
 use novarocks_expression_contract::{
     BoundFunction, ExprKind, ExpressionCallClaim, PhysicalCallRequest, RootScope, ValueId,
     materialize_call_request_observed,
 };
 use novarocks_functions::{
-    FunctionBindingError, PureEngineFunctionCatalog,
-    testkit::shared_installed_builtin_owner_catalogue,
+    PureEngineFunctionCatalog, testkit::shared_installed_builtin_owner_catalogue,
 };
 use novarocks_physical_plan::{ConstantPools, ConstantReference, ConstantValue};
 use novarocks_sql::{
@@ -543,25 +541,61 @@ fn trim_shares_the_catalogue_binding_and_result_type() {
 }
 
 #[test]
-fn row_syntax_reaches_catalogue_admission_without_an_installed_owner() {
+fn row_syntax_freezes_distinct_names_and_executes_the_same_selected_field() {
     let fixture = Fixture::new();
-    let source = "ROW(7, 9)";
-    let sql = fixture.sql(source, &[]);
-    assert!(matches!(
-        sql,
-        Err(SqlCompileError::Analyze(error))
-            if error.kind() == AnalyzeErrorKind::UnavailableImplementation
-                && error.message().contains("builtin.scalar/row/dynamic-v1")
-    ));
-    // The sealed catalogue cannot contribute a definition without a complete
-    // installed owner. The text entry reaches binding and retains that refusal.
-    assert!(matches!(
-        fixture.text(source, &[]),
-        Err(TextError::Typing {
-            cause: TypingError::Binding(FunctionBindingError::UnknownFunction),
-            ..
-        })
-    ));
+    let typed = fixture.equivalent(r#"ROW(7 AS id, NULL AS "Note", 9)"#, &[]);
+    let root = typed
+        .unit()
+        .definition(typed.unit().roots()[0].definition)
+        .unwrap();
+    let ExprKind::FunctionCall { function, .. } = &root.kind else {
+        panic!("compiled ROW constructor");
+    };
+    assert_eq!(function.function_id.as_str(), "builtin.scalar/row/v1");
+    let novarocks_type_contract::ValueKind::Struct(fields) = root.ty.value_type().kind() else {
+        panic!("declared ROW");
+    };
+    assert_eq!(
+        fields
+            .iter()
+            .map(|field| field.row_name())
+            .collect::<Vec<_>>(),
+        vec![Some("ID"), Some("Note"), None],
+    );
+    assert!(!root.ty.nullable());
+    assert!(!fields[0].value_type().nullable());
+    assert!(fields[1].value_type().nullable());
+
+    let rows = RecordBatch::new_empty(Arc::new(Schema::empty()));
+    let row = typed
+        .check_rows(&rows, &HarnessControl, &HarnessControl)
+        .unwrap()
+        .batch;
+    let data = row
+        .values
+        .as_any()
+        .downcast_ref::<arrow::array::StructArray>()
+        .unwrap();
+    assert!(data.is_valid(0));
+    assert_eq!(data.column(1).logical_null_count(), 1);
+    for (source, expected) in [
+        ("(ROW(7 AS id, 9)).id", Some(7)),
+        ("(ROW(7 AS id, 9))[2]", Some(9)),
+        ("(CAST(NULL AS ROW(id INTEGER)))[1]", None),
+        ("(ROW(7 AS x, 9 AS x))[2]", Some(9)),
+    ] {
+        let typed = fixture.equivalent(source, &[]);
+        let output = typed
+            .check_rows(&rows, &HarnessControl, &HarnessControl)
+            .unwrap()
+            .batch;
+        assert!(output.errors.is_empty(), "{source}");
+        assert_eq!(
+            output.values.to_data(),
+            arrow::array::Int32Array::from(vec![expected]).to_data(),
+            "{source}"
+        );
+    }
 }
 
 #[test]

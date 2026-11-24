@@ -29,14 +29,14 @@ use crate::exec::chunk::type_compatibility::check_exact;
 use crate::exec::chunk::type_compatibility::retag_column;
 use arrow::array::{
     Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, FixedSizeListArray, Int8Array,
-    LargeListArray, ListArray, MapArray, StructArray, UInt64Array,
+    LargeListArray, ListArray, MapArray, PrimitiveArray, StructArray, UInt64Array,
 };
 use arrow::compute::{SortColumn, SortOptions};
 #[cfg(test)]
 use arrow::datatypes::Schema;
 #[cfg(test)]
 use arrow::datatypes::SchemaRef;
-use arrow::datatypes::{DataType, Field, Fields};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Fields, Float32Type, Float64Type};
 #[cfg(test)]
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::Buffer;
@@ -270,6 +270,7 @@ impl<'a> SortKeyDeclaration<'a> {
 pub(crate) fn normalize_sort_key_array_observed<E: From<SortKeyFailure>>(
     values: &ArrayRef,
     declared: Option<&novarocks_type_contract::ValueTypeRef>,
+    nan_first: Option<bool>,
     observe: &mut impl FnMut(SortKeyConstruction<'_>) -> Result<(), E>,
 ) -> Result<ArrayRef, E> {
     let declared = declared.ok_or_else(|| E::from(SortKeyFailure::MissingDeclaration))?;
@@ -284,12 +285,91 @@ pub(crate) fn normalize_sort_key_array_observed<E: From<SortKeyFailure>>(
         SortKeyTypeCheckFailure::Declaration(error) => E::from(SortKeyFailure::Type(error)),
         SortKeyTypeCheckFailure::Observer(error) => error,
     })?;
+    // Trino selects unordered-first when NULLS FIRST is set, before
+    // applying the direction. Arrow orders floats by their bits, so only the
+    // private comparison key gets a canonical NaN of the matching sign.
+    if let Some(nan_first) = nan_first {
+        match values.data_type() {
+            DataType::Float32 => {
+                let nan = if nan_first { -f32::NAN } else { f32::NAN };
+                return normalize_float_key::<Float32Type, E>(
+                    values,
+                    |value| {
+                        let key = if value.is_nan() {
+                            nan
+                        } else if value == 0.0 {
+                            0.0
+                        } else {
+                            value
+                        };
+                        (key.to_bits() != value.to_bits()).then_some(key)
+                    },
+                    observe,
+                );
+            }
+            DataType::Float64 => {
+                let nan = if nan_first { -f64::NAN } else { f64::NAN };
+                return normalize_float_key::<Float64Type, E>(
+                    values,
+                    |value| {
+                        let key = if value.is_nan() {
+                            nan
+                        } else if value == 0.0 {
+                            0.0
+                        } else {
+                            value
+                        };
+                        (key.to_bits() != value.to_bits()).then_some(key)
+                    },
+                    observe,
+                );
+            }
+            _ => {}
+        }
+    }
     normalize_sort_key_array_body(
         values,
         SortKeyDeclaration::Value(declared),
         &ReachableRows::all(values.len()),
         observe,
     )
+}
+
+fn normalize_float_key<T: ArrowPrimitiveType, E: From<SortKeyFailure>>(
+    values: &ArrayRef,
+    replacement: impl Fn(T::Native) -> Option<T::Native>,
+    observe: &mut impl FnMut(SortKeyConstruction<'_>) -> Result<(), E>,
+) -> Result<ArrayRef, E> {
+    let array = values
+        .as_any()
+        .downcast_ref::<PrimitiveArray<T>>()
+        .ok_or_else(|| E::from(SortKeyFailure::PhysicalWrapper("PrimitiveArray")))?;
+    let source = array.values().as_ref();
+    let mut normalized = None;
+    for (row, value) in source.iter().copied().enumerate() {
+        observe(SortKeyConstruction::Work(1))?;
+        if array.is_valid(row)
+            && let Some(value) = replacement(value)
+        {
+            let buffer = match &mut normalized {
+                Some(buffer) => buffer,
+                None => {
+                    observe(SortKeyConstruction::ValueBuffer(std::mem::size_of_val(source)))?;
+                    normalized.insert(source.to_vec())
+                }
+            };
+            buffer[row] = value;
+        }
+    }
+    let Some(normalized) = normalized else {
+        return Ok(values.clone());
+    };
+    observe(SortKeyConstruction::BufferAdoption)?;
+    observe(SortKeyConstruction::ArrayHeader(values.data_type()))?;
+    Ok(Arc::new(PrimitiveArray::<T>::new(
+        normalized.into(),
+        array.nulls().cloned(),
+    )))
 }
 
 fn normalize_sort_key_array_body<E: From<SortKeyFailure>>(
@@ -840,7 +920,7 @@ mod tests {
         values: &ArrayRef,
         ty: &novarocks_type_contract::ValueTypeRef,
     ) -> ArrayRef {
-        normalize_sort_key_array_observed::<SortKeyFailure>(values, Some(ty), &mut |_| Ok(()))
+        normalize_sort_key_array_observed::<SortKeyFailure>(values, Some(ty), None, &mut |_| Ok(()))
             .unwrap()
     }
     fn actual_sort_order(values: ArrayRef) -> Vec<u32> {
@@ -974,7 +1054,7 @@ mod tests {
         }
         let values = fixed16_values();
         let mut seen = 0;
-        let missing = normalize_sort_key_array_observed::<Failure>(&values, None, &mut |_| {
+        let missing = normalize_sort_key_array_observed::<Failure>(&values, None, None, &mut |_| {
             seen += 1;
             Ok(())
         });
@@ -985,7 +1065,7 @@ mod tests {
         assert_eq!(seen, 0);
         let declared = semantic(ValueKind::Nominal(ValueLogicalType::LargeInt));
         let mut total = 0;
-        normalize_sort_key_array_observed::<Failure>(&values, Some(&declared), &mut |_| {
+        normalize_sort_key_array_observed::<Failure>(&values, Some(&declared), None, &mut |_| {
             total += 1;
             Ok(())
         })
@@ -995,7 +1075,7 @@ mod tests {
         for refused in 0..total {
             let mut seen = 0;
             let result =
-                normalize_sort_key_array_observed::<Failure>(&values, Some(&declared), &mut |_| {
+                normalize_sort_key_array_observed::<Failure>(&values, Some(&declared), None, &mut |_| {
                     let boundary = seen;
                     seen += 1;
                     if boundary == refused {

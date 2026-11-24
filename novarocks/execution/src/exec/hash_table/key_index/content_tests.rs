@@ -1261,3 +1261,119 @@ fn content_nan_bits_use_fixed_ieee_literals_and_preserve_every_other_input_bit()
         assert_eq!(content_f32_bits(f32::from_bits(bits)), bits);
     }
 }
+
+#[test]
+fn unordered_map_grouping_keeps_the_actual_representative_and_other_domains() {
+    use crate::exec::hash_table::key_builder::permuted_map_fixture;
+
+    let maps = permuted_map_fixture();
+    let array: ArrayRef = Arc::new(StructArray::new(
+        vec![Field::new("m", maps.data_type().clone(), true)].into(),
+        vec![maps],
+        None,
+    ));
+    let types = [FunctionValueType::new(array.data_type().clone(), false)];
+    let (owner, tracker) = owner_with_tracker();
+    let check = || Ok(());
+    for (spec, ids) in [
+        (
+            KeySpec::for_grouping(&types, owner.as_ref(), &check).unwrap(),
+            [0, 0, 1, 2],
+        ),
+        (
+            KeySpec::new(&types, &[NullPolicy::Equal], owner.as_ref(), &check).unwrap(),
+            [0, 1, 2, 3],
+        ),
+        (
+            KeySpec::with_equalities(
+                &types,
+                &[KeyEquality::ResultContent],
+                owner.as_ref(),
+                &check,
+            )
+            .unwrap(),
+            [0, 1, 2, 3],
+        ),
+    ] {
+        let keys = input(
+            std::slice::from_ref(&array),
+            &types,
+            &[0, 1, 2, 3],
+            owner.as_ref(),
+        );
+        let mut index = KeyIndex::new(
+            spec.clone(),
+            IndexPurpose::KeyIds,
+            tracker.clone(),
+            owner.as_ref(),
+        )
+        .unwrap();
+        let hashes = hash(&keys, &spec, index.policy(), owner.as_ref());
+        let values = prepared(&spec, &keys, &tracker, owner.as_ref());
+        if ids[0] == ids[1] {
+            assert_eq!(hashes.hash(0).unwrap(), hashes.hash(1).unwrap());
+            let first = values
+                .encode_component_row::<false, false>(0, 0, &check)
+                .unwrap();
+            let second = values
+                .encode_component_row::<false, false>(0, 1, &check)
+                .unwrap();
+            assert_eq!(first, second);
+            assert_ne!(
+                first,
+                values
+                    .encode_component_row::<false, false>(0, 2, &check)
+                    .unwrap()
+            );
+            let mut compared = [0; 3];
+            super::super::pairs::compare_prepared_pairs(
+                &values,
+                &[0, 0, 0],
+                &values,
+                &[0, 1, 2],
+                &mut compared,
+                owner.as_ref(),
+                &check,
+            )
+            .unwrap();
+            assert_eq!(compared, [1, 1, 0]);
+        }
+        let collisions = hashes.with_hashes_for_test(&[7; 4]);
+        let matches = ids.map(|id| KeyMatch::Found(KeyId(id)));
+        assert_eq!(
+            index
+                .intern_batch(&values, &collisions, owner.as_ref(), &CopyControl)
+                .unwrap()
+                .matches(),
+            matches
+        );
+        index.compact(owner.as_ref(), &CopyControl).unwrap();
+        assert_eq!(
+            index
+                .probe_batch(&values, &collisions, owner.as_ref(), &CopyControl)
+                .unwrap()
+                .matches(),
+            matches
+        );
+
+        let output = index
+            .export_keys(&[KeyId(0)], &types, owner.as_ref(), &CopyControl)
+            .unwrap();
+        let outer = output.arrays()[0]
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let map = outer.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        let map_keys = map.keys().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(map_keys.values(), &[2, 1]);
+        if ids[0] == ids[1] {
+            let values = map
+                .values()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            assert!(values.is_null(0));
+            assert_eq!(values.value(1).to_bits(), (-0.0_f64).to_bits());
+        }
+    }
+}

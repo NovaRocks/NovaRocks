@@ -97,7 +97,7 @@ select count(*) from (SELECT * from (SELECT if (generate_series <= 1000, null, g
 
 -- multi-column NOT IN with large generated dataset (int + string pair)
 -- query 14
-select count(*) from (SELECT * from (SELECT if (generate_series <= 1000, null, generate_series) x0 FROM TABLE(sequence(1, 8192)) AS generate_series(generate_series)) t where (x0, concat('l', x0)) not in ( select l3.l_orderkey, concat('l', l_orderkey) from ${case_db}.lineitem l3 ) order by 1) t;
+select count(*) from (SELECT * from (SELECT if (generate_series <= 1000, null, generate_series) x0 FROM TABLE(sequence(1, 8192)) AS generate_series(generate_series)) t where (x0, concat('l', CAST(x0 AS VARCHAR))) not in ( select l3.l_orderkey, concat('l', CAST(l_orderkey AS VARCHAR)) from ${case_db}.lineitem l3 ) order by 1) t;
 
 -- query 15
 -- @skip_result_check=true

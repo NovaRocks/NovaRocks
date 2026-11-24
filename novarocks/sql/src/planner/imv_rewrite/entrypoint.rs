@@ -3287,9 +3287,9 @@ pub(crate) mod tests {
             .column_id;
         let signed_input = &delta_aggregate.aggregates[0].source.arguments()[0];
         let ExprKind::FunctionCall { args, .. } = &signed_input.kind else {
-            panic!("expected signed state named_struct input");
+            panic!("expected signed state ROW input");
         };
-        let ExprKind::ColumnRef { column_id, .. } = &args[3].kind else {
+        let ExprKind::ColumnRef { column_id, .. } = &args[1].kind else {
             panic!("expected signed state input to reference action column");
         };
         assert_eq!(
@@ -4283,9 +4283,9 @@ crate::constant::test_constant_policy(),
     fn signed_action_column_id(aggregate: &LogicalAggregateNode) -> ColumnId {
         let signed_input = &aggregate.aggregates[0].source.arguments()[0];
         let ExprKind::FunctionCall { args, .. } = &signed_input.kind else {
-            panic!("expected signed state named_struct input");
+            panic!("expected signed state ROW input");
         };
-        let ExprKind::ColumnRef { column_id, .. } = &args[3].kind else {
+        let ExprKind::ColumnRef { column_id, .. } = &args[1].kind else {
             panic!("expected signed state input to reference action column");
         };
         *column_id

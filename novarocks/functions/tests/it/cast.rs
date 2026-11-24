@@ -444,6 +444,87 @@ mod standard_conversion {
     }
 
     #[test]
+    fn casts_map_rejects_converted_duplicates_and_nulls_only_the_failed_try_row() {
+        use arrow_array::{Int64Array, MapArray, StructArray};
+        use arrow_buffer::OffsetBuffer;
+        use arrow_schema::Field;
+
+        let entry_field = |key_type, value_type| {
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", key_type, false)),
+                        Arc::new(Field::new("value", value_type, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            ))
+        };
+        let entries = entry_field(DataType::Int64, DataType::Utf8);
+        let DataType::Struct(fields) = entries.data_type() else {
+            unreachable!();
+        };
+        let input: ArrayRef = Arc::new(MapArray::new(
+            Arc::clone(&entries),
+            OffsetBuffer::new(vec![0_i32, 2, 3, 3].into()),
+            StructArray::new(
+                fields.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![
+                        9_007_199_254_740_992,
+                        9_007_199_254_740_993,
+                        1,
+                    ])),
+                    Arc::new(StringArray::from(vec!["1", "2", "3"])),
+                ],
+                None,
+            ),
+            None,
+            false,
+        ));
+        let source = physical(input.data_type().clone(), false);
+        let target = physical(
+            DataType::Map(entry_field(DataType::Float64, DataType::Int32), false),
+            true,
+        );
+        let control = LargeIntConversionControl;
+        for (mode, errors) in [(TrinoCastMode::Explicit, 1), (TrinoCastMode::Try, 0)] {
+            let recipe =
+                PreparedCastRecipe::try_new_trino(&source, &target, mode, &control).unwrap();
+            let output = recipe
+                .evaluate_selected(
+                    EvaluatedArgument::Column(&input),
+                    Selection::all(3),
+                    &[],
+                    &control,
+                )
+                .unwrap();
+            let map = output.values().as_any().downcast_ref::<MapArray>().unwrap();
+            assert_eq!(output.errors().len(), errors);
+            if let Some(error) = output.errors().first() {
+                assert_eq!(
+                    error.reason(),
+                    DataFailureReason::Domain(INVALID_CAST_ARGUMENT)
+                );
+            }
+            assert!(map.is_null(0));
+            assert_eq!(map.value_length(1), 1);
+            assert!(map.is_valid(2));
+            assert_eq!(map.value_length(2), 0);
+            assert_eq!(
+                map.values()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                3
+            );
+        }
+    }
+
+    #[test]
     fn casts_canonicalize_char_and_comparison_orders_with_space_fill() {
         use novarocks_functions::PreparedComparisonRecipe;
         use novarocks_type_contract::ComparisonOperator;

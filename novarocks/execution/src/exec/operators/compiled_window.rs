@@ -1007,6 +1007,7 @@ impl CompiledWindowProcessor {
             *key = key_creation.normalize_key(
                 key,
                 declared.value_type(),
+                None,
                 key_arrays.as_ref(),
                 key_types.as_ref(),
             )?;
@@ -1637,7 +1638,13 @@ mod tests {
         let arrays = factory.begin_typed_construction(&schema).unwrap();
         let types = factory.begin_typed_construction(&schema).unwrap();
         let keys = creation
-            .normalize_key(&keys, binding.value_type(), arrays.as_ref(), types.as_ref())
+            .normalize_key(
+                &keys,
+                binding.value_type(),
+                None,
+                arrays.as_ref(),
+                types.as_ref(),
+            )
             .unwrap();
         let indices = lexsort_to_indices(
             &[SortColumn {

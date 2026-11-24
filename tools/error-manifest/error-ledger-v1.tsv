@@ -70,6 +70,7 @@ sql.admit.unknown_type	Admit	Active
 sql.admit.unsupported_statement	Admit	Active
 sql.admit.update_unsupported_form	Admit	Active
 sql.analyze.ambiguous_function_call	Analyze	Active
+sql.analyze.ambiguous_name	Analyze	Active
 sql.analyze.duplicate_column_name	Analyze	Active
 sql.analyze.expression_not_constant	Analyze	Active
 sql.analyze.expression_not_in_distinct	Analyze	Active

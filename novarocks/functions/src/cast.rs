@@ -54,6 +54,7 @@ mod array_json;
 pub use array_json::validate_trino_json_literal;
 mod array_mode;
 mod array_text;
+pub(crate) mod map_mode;
 #[path = "cast/selected.rs"]
 mod selected;
 mod trino;
@@ -409,6 +410,7 @@ impl DecimalTextSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CastBody {
     ExplicitArray,
+    ExplicitMap,
     ArrayNull,
     ArrayLeaf(trino_array_leaf::Leaf),
     ArrayText,
@@ -480,10 +482,16 @@ pub struct PreparedCastRecipe {
     source: FunctionValueType,
     result: FunctionValueType,
     body: CastBody,
-    array_child: Option<Box<PreparedCastRecipe>>,
+    children: CastChildren,
     trino_mode: Option<TrinoCastMode>,
     decimal_overflow_policy: DecimalOverflowPolicy,
     allow_throw_exception: bool,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CastChildren {
+    None,
+    Array(Box<PreparedCastRecipe>),
+    Map(Box<[PreparedCastRecipe; 2]>),
 }
 impl PreparedCastRecipe {
     /// Prepare the strict conversion authored by an ARRAY common-type binding.
@@ -517,19 +525,30 @@ impl PreparedCastRecipe {
         &self,
         mut observe: impl FnMut() -> Result<(), KernelFailure>,
     ) -> Result<usize, KernelFailure> {
+        self.retained_children_bytes(&mut observe)
+    }
+
+    fn retained_children_bytes(
+        &self,
+        observe: &mut dyn FnMut() -> Result<(), KernelFailure>,
+    ) -> Result<usize, KernelFailure> {
+        let children = match &self.children {
+            CastChildren::None => return Ok(0),
+            CastChildren::Array(child) => std::slice::from_ref(child.as_ref()),
+            CastChildren::Map(children) => children.as_slice(),
+        };
         let mut bytes = 0_usize;
-        let mut parent = self;
-        while let Some(child) = parent.array_child.as_deref() {
+        for (index, child) in children.iter().enumerate() {
             observe()?;
             bytes = bytes
                 .checked_add(std::mem::size_of::<Self>())
                 .ok_or(KernelFailure::ResourceExhausted)?;
-            for ty in [&parent.source, &parent.result] {
+            for ty in [&self.source, &self.result] {
                 observe()?;
                 if ty
                     .typed_binding()
                     .layout()
-                    .materialized_child_at(0)
+                    .materialized_child_at(index)
                     .is_none()
                 {
                     let layout = novarocks_type_contract::ValueLayout::storage_allocation_layout()
@@ -539,7 +558,9 @@ impl PreparedCastRecipe {
                         .ok_or(KernelFailure::ResourceExhausted)?;
                 }
             }
-            parent = child;
+            bytes = bytes
+                .checked_add(child.retained_children_bytes(observe)?)
+                .ok_or(KernelFailure::ResourceExhausted)?;
         }
         Ok(bytes)
     }
@@ -634,7 +655,7 @@ impl PreparedCastRecipe {
                         source: source.clone(),
                         result: result.clone(),
                         body: CastBody::ExtendedScalar(body),
-                        array_child: None,
+                        children: CastChildren::None,
                         trino_mode: None,
                         decimal_overflow_policy: policy,
                         allow_throw_exception,
@@ -662,7 +683,7 @@ impl PreparedCastRecipe {
                         precision: *precision,
                         scale: *scale,
                     },
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -703,7 +724,7 @@ impl PreparedCastRecipe {
                         precision: *precision,
                         scale: *scale,
                     },
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -733,7 +754,7 @@ impl PreparedCastRecipe {
                         precision: *precision,
                         scale: *scale,
                     },
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -769,7 +790,7 @@ impl PreparedCastRecipe {
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::Identity,
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -790,7 +811,7 @@ impl PreparedCastRecipe {
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::Collection,
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -815,7 +836,7 @@ impl PreparedCastRecipe {
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::TimeCalendar,
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -845,7 +866,7 @@ impl PreparedCastRecipe {
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::TimeText { mode },
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -865,7 +886,7 @@ impl PreparedCastRecipe {
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::BinaryText,
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -896,7 +917,7 @@ impl PreparedCastRecipe {
                             source: decimal,
                             scale: *scale,
                         },
-                        array_child: None,
+                        children: CastChildren::None,
                         trino_mode: None,
                         decimal_overflow_policy: policy,
                         allow_throw_exception,
@@ -940,7 +961,7 @@ impl PreparedCastRecipe {
                                 Target::F64
                             },
                         },
-                        array_child: None,
+                        children: CastChildren::None,
                         trino_mode: None,
                         decimal_overflow_policy: policy,
                         allow_throw_exception,
@@ -960,7 +981,7 @@ impl PreparedCastRecipe {
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::LargeIntText,
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -973,7 +994,7 @@ impl PreparedCastRecipe {
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::SelectedArray(body),
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -998,7 +1019,7 @@ impl PreparedCastRecipe {
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::DateFloat { target },
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -1016,7 +1037,7 @@ impl PreparedCastRecipe {
                     body: CastBody::TemporalCarrier {
                         source: source_kind,
                     },
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -1034,7 +1055,7 @@ impl PreparedCastRecipe {
                     body: CastBody::Text {
                         source: source_kind,
                     },
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -1052,7 +1073,7 @@ impl PreparedCastRecipe {
                     body: CastBody::FloatDate {
                         source: source_kind,
                     },
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -1080,7 +1101,7 @@ impl PreparedCastRecipe {
                         source: source_kind,
                         unit: unit.copied(),
                     },
-                    array_child: None,
+                    children: CastChildren::None,
                     trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
@@ -1118,7 +1139,7 @@ impl PreparedCastRecipe {
                     source: source_kind,
                     target,
                 },
-                array_child: None,
+                children: CastChildren::None,
                 trino_mode: None,
                 decimal_overflow_policy: policy,
                 allow_throw_exception,
@@ -1194,6 +1215,7 @@ impl PreparedCastRecipe {
             CastBody::Collection
                 | CastBody::SelectedArray(_)
                 | CastBody::ExplicitArray
+                | CastBody::ExplicitMap
                 | CastBody::ArrayNull
         )
     }
@@ -1205,7 +1227,7 @@ impl PreparedCastRecipe {
         control: &dyn KernelEvaluationControl,
     ) -> Result<crate::SelectedValues<'a>, KernelFailure> {
         match self.body {
-            CastBody::ExplicitArray | CastBody::ArrayNull => {
+            CastBody::ExplicitArray | CastBody::ExplicitMap | CastBody::ArrayNull => {
                 array_mode::evaluate(self, argument, selection, inherited, control)
             }
             CastBody::Collection => {
@@ -1256,11 +1278,9 @@ impl PreparedCastRecipe {
                 (self.trino_mode.is_some()
                     || self.array_failure_mode
                         == Some(novarocks_type_contract::ArrayCastFailureMode::ReportError))
-                    && self
-                        .array_child
-                        .as_ref()
-                        .is_some_and(|child| child.conversion_may_raise())
+                    && matches!(&self.children, CastChildren::Array(child) if child.conversion_may_raise())
             }
+            CastBody::ExplicitMap => true,
             CastBody::ArrayNull => false,
             CastBody::ArrayLeaf(leaf) => leaf.may_fail(),
             CastBody::ArrayJson(array_json::Operation::VarcharToJson)

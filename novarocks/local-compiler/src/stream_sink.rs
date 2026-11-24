@@ -316,7 +316,10 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             ),
             Distribution::Hash { keys, scheme } => {
                 let routing = match scheme.definition.algorithm {
-                    PartitionHashAlgorithm::NativeExchangeV1 => StaticStreamRouting::Ordinary,
+                    algorithm @ (PartitionHashAlgorithm::NativeExchangeV1
+                    | PartitionHashAlgorithm::NativeExchangeV2) => {
+                        StaticStreamRouting::OrdinaryHash { algorithm }
+                    }
                     PartitionHashAlgorithm::NativeHierarchicalV1 => {
                         StaticStreamRouting::HierarchicalHashV1
                     }

@@ -4200,8 +4200,8 @@ mod tests {
         // The original physical declaration author removes nested annotations;
         // provider raw facts and canonical function FVT remain separate checks.
         let expected_source = FunctionValueType::new(catalog.struct_type.clone(), false);
-        // The original Functions subfield owner declares its result nullable.
-        let expected_field = FunctionValueType::new(DataType::Int32, true);
+        // Both the provider's ROW and its selected field are required.
+        let expected_field = FunctionValueType::new(DataType::Int32, false);
         let expected_qualified = FunctionValueType::new(DataType::Utf8, true);
 
         for (sql, struct_access) in [
@@ -4271,13 +4271,14 @@ mod tests {
                 else {
                     panic!("qualified base must select original STRUCT-field owner")
                 };
-                assert_eq!(name, "__struct_subfield");
+                assert_eq!(name, "__row_field");
                 assert_eq!(args.len(), 2);
                 assert_eq!(args[0].value_type, expected_source);
                 assert_eq!(binding.logical_argument_count, 2);
-                assert!(
-                    matches!(&args[1].kind, ExprKind::Literal(LiteralValue::String(name)) if name == "y")
-                );
+                assert!(matches!(
+                    &args[1].kind,
+                    ExprKind::Literal(LiteralValue::Int(0))
+                ));
                 // Read the actual original base through its existing IR wrapper;
                 // success is decided by binding identity, not wrapper presence.
                 let mut base = &args[0];

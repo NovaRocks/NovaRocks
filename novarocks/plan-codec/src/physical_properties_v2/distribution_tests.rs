@@ -216,6 +216,10 @@ fn distribution_six_variants_and_both_hash_algorithms_have_independent_wire_orac
             expected_hash(1),
         ),
         (
+            hash(PartitionHashAlgorithm::NativeExchangeV2),
+            expected_hash(4),
+        ),
+        (
             hash(PartitionHashAlgorithm::NativeBucketCrc32V1),
             expected_hash(2),
         ),

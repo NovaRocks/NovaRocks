@@ -22,9 +22,7 @@ use crate::{
     EvaluatedArgument, FunctionSpecializationFailure, KernelDiagnostic, ScalarEvaluationInstance,
     SelectedValues, Selection,
 };
-use arrow_array::{
-    Array, ArrayRef, Int32Array, ListArray, MapArray, StringArray, StructArray, UInt64Array,
-};
+use arrow_array::{Array, ArrayRef, Int32Array, ListArray, MapArray, StringArray, StructArray};
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
@@ -174,14 +172,27 @@ fn collection_independent_column_scalar_compact_mappings_preserve_null_key_and_c
     );
 }
 #[test]
-fn map_lookup_original_unsupported_domain_is_bounded_rowdata_and_undemanded_errors_eliminate() {
+fn map_lookup_actual_key_indeterminacy_respects_the_selected_domain() {
+    use novarocks_failure_contract::{FailureProjection, kernel_reason::MAP_KEY_INDETERMINATE};
+    let stored = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>([
+        Some(vec![Some(1), None]),
+        Some(vec![Some(2), Some(9)]),
+    ]);
     let m = map(
-        Arc::new(UInt64Array::from(vec![1, 2])),
+        Arc::new(stored),
         Arc::new(Int32Array::from(vec![7, 8])),
         vec![0, 1, 2, 2],
         Some(vec![true, true, false]),
     );
-    let key: ArrayRef = Arc::new(UInt64Array::from(vec![Some(1), None, Some(2)]));
+    let key: ArrayRef = Arc::new(ListArray::from_iter_primitive::<
+        arrow_array::types::Int32Type,
+        _,
+        _,
+    >([
+        Some(vec![Some(1), Some(2)]),
+        None,
+        Some(vec![Some(2), Some(9)]),
+    ]));
     let args = [
         EvaluatedArgument::Column(&m),
         EvaluatedArgument::Column(&key),
@@ -199,8 +210,8 @@ fn map_lookup_original_unsupported_domain_is_bounded_rowdata_and_undemanded_erro
     assert_eq!(out.errors().len(), 1);
     assert_eq!(out.errors()[0].selected_ordinal(), 0);
     assert_eq!(
-        out.errors()[0].message(),
-        "map key compare unsupported type: UInt64"
+        out.errors()[0].failure_fact().reason(),
+        MAP_KEY_INDETERMINATE
     );
     assert_eq!(
         out.values()
@@ -242,17 +253,29 @@ fn collection_every_actual_runtime_checkpoint_preserves_seven_causes_quantum_and
         None,
     );
     let miss: ArrayRef = Arc::new(Int32Array::from(vec![-1]));
-    let unsupported = map(
-        Arc::new(UInt64Array::from(vec![1])),
+    let indeterminate = map(
+        Arc::new(ListArray::from_iter_primitive::<
+            arrow_array::types::Int32Type,
+            _,
+            _,
+        >([Some(vec![Some(1), None])])),
         Arc::new(Int32Array::from(vec![2])),
         vec![0, 1],
         None,
     );
-    let uk: ArrayRef = Arc::new(UInt64Array::from(vec![1]));
+    let uncertain_probe: ArrayRef = Arc::new(ListArray::from_iter_primitive::<
+        arrow_array::types::Int32Type,
+        _,
+        _,
+    >([Some(vec![Some(1), Some(2)])]));
     for (op, columns, rows) in [
         (Operation::ArrayLiteral, vec![text], 257),
         (Operation::MapLookup, vec![m, miss], 1),
-        (Operation::MapLookup, vec![unsupported, uk], 1),
+        (
+            Operation::MapLookup,
+            vec![indeterminate, uncertain_probe],
+            1,
+        ),
         (
             Operation::MapLookup,
             vec![

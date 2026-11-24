@@ -14,33 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-/// The bits a float is keyed by.
-///
-/// Two values SQL compares equal have to key the same, and bits alone do not
-/// say that: `-0.0` and `+0.0` are equal and carry different bits, while two
-/// NaNs carry different payloads and this engine groups them together. Both
-/// are folded here so that hashing, group-key encoding and partitioning all
-/// answer the same question.
-pub fn canonical_f64_bits(value: f64) -> u64 {
-    if value.is_nan() {
-        f64::NAN.to_bits()
-    } else if value == 0.0 {
-        0.0f64.to_bits()
-    } else {
-        value.to_bits()
-    }
-}
-
-/// See [`canonical_f64_bits`].
-pub fn canonical_f32_bits(value: f32) -> u32 {
-    if value.is_nan() {
-        f32::NAN.to_bits()
-    } else if value == 0.0 {
-        0.0f32.to_bits()
-    } else {
-        value.to_bits()
-    }
-}
+pub use novarocks_type_contract::{canonical_f32_bits, canonical_f64_bits};
 
 /// Result-content identity distinguishes signed zero and canonicalizes NaNs.
 /// The fixed IEEE bits are part of the deterministic content fingerprint input;

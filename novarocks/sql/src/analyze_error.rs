@@ -55,6 +55,11 @@ const UNKNOWN_TYPE: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const AMBIGUOUS_NAME: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.ambiguous_name"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const AMBIGUOUS_FUNCTION_CALL: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.ambiguous_function_call"),
     phase: ErrorPhase::Analyze,
@@ -201,6 +206,7 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     UNKNOWN_FUNCTION,
     UNKNOWN_TYPE,
     AMBIGUOUS_FUNCTION_CALL,
+    AMBIGUOUS_NAME,
     TYPE_MISMATCH,
     FUNCTION_NOT_AGGREGATE,
     EXPRESSION_NOT_SCALAR,
@@ -239,6 +245,7 @@ pub enum AnalyzeErrorKind {
     UnknownFunction,
     UnknownType,
     AmbiguousFunctionCall,
+    AmbiguousName,
     TypeMismatch,
     FunctionNotAggregate,
     ExpressionNotScalar,
@@ -279,6 +286,7 @@ impl AnalyzeErrorKind {
             Self::UnknownFunction => UNKNOWN_FUNCTION,
             Self::UnknownType => UNKNOWN_TYPE,
             Self::AmbiguousFunctionCall => AMBIGUOUS_FUNCTION_CALL,
+            Self::AmbiguousName => AMBIGUOUS_NAME,
             Self::TypeMismatch => TYPE_MISMATCH,
             Self::FunctionNotAggregate => FUNCTION_NOT_AGGREGATE,
             Self::ExpressionNotScalar => EXPRESSION_NOT_SCALAR,
@@ -770,6 +778,10 @@ impl AnalyzeError {
         }
     }
 
+    pub(crate) fn ambiguous_name(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::AmbiguousName, message, span)
+    }
+
     pub(crate) fn ambiguous_function_call(
         error: novarocks_functions::FunctionBindingError,
         span: Span,
@@ -1054,6 +1066,7 @@ mod tests {
                 "sql.analyze.unknown_function",
                 "sql.analyze.unknown_type",
                 "sql.analyze.ambiguous_function_call",
+                "sql.analyze.ambiguous_name",
                 "sql.analyze.type_mismatch",
                 "sql.analyze.function_not_aggregate",
                 "sql.analyze.expression_not_scalar",

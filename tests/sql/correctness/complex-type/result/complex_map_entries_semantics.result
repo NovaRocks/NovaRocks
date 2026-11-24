@@ -1,4 +1,4 @@
 -- query 1
--- legacy
+-- types	array(varchar(1))	array(integer)	array(row(varchar(1), integer))
 ks	vs	entries_v
-["a","b"]	[1,2]	[{"key":"a","value":1},{"key":"b","value":2}]
+["a","b"]	[1,2]	[["a",1],["b",2]]

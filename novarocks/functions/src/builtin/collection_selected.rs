@@ -228,6 +228,7 @@ pub(super) fn compact(
 }
 pub(super) fn evaluate<'a>(
     operation: Operation,
+    key_operations: Option<&novarocks_value_arrays::hash_eq::PreparedKeyOperations>,
     input: ScalarCallInput<'_, 'a>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
@@ -291,8 +292,11 @@ pub(super) fn evaluate<'a>(
                 Layout::array::<Option<u32>>(selection.len())
                     .map_err(|_| KernelFailure::ResourceExhausted)?;
                 let mut errors = reserve::<RowDataError>(selection.len(), &work)?;
+                let key_operations = key_operations
+                    .ok_or_else(|| invalid("MAP lookup lacks its prepared key comparison"))?;
                 let values = lookup_observed(
                     &inputs,
+                    key_operations,
                     selection,
                     |ordinal, row| {
                         let map_row = map.value_row(ordinal, row);

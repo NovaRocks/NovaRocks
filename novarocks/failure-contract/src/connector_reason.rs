@@ -71,3 +71,7 @@ pub const NOT_NULL_VIOLATION: FailureReason =
 /// The REST catalog rejected a staged Iceberg create because the table exists.
 pub const ICEBERG_TABLE_ALREADY_EXISTS: FailureReason =
     FailureReason::new(domain::CONNECTOR, NonZeroU16::new(62).unwrap());
+
+/// A new Iceberg struct declaration contains duplicate sibling names.
+pub const ICEBERG_DUPLICATE_ROW_FIELD_NAME: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(63).unwrap());

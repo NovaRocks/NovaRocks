@@ -2453,6 +2453,49 @@ fn hierarchical_network_uses_frozen_instance_domain_and_keeps_ordinary_mapping()
 }
 
 #[test]
+fn ordinary_v2_network_colocates_reordered_maps_without_changing_v1() {
+    use novarocks_type_contract::PartitionHashAlgorithm;
+
+    let fixture = Fixture::new();
+    let (source, ty) = crate::exec::chunk::typed_fixture::reordered_map_keys();
+    let mut sink = make_test_operator(&fixture);
+    prepare_test_operator(&fixture, &mut sink);
+    let owner = sink
+        .construction_factory
+        .as_ref()
+        .unwrap()
+        .begin_input_construction(&source)
+        .unwrap();
+    let batch = CompiledPartitionBatch {
+        arrays: vec![source.columns()[0].clone()],
+        types: vec![ty],
+        route: CompiledPartitionRoute::OrdinaryHash(PartitionHashAlgorithm::NativeExchangeV2),
+        selected_rows: None,
+        owner,
+    };
+    let state = fixture.state();
+    let control = state.error_state();
+    let mut work = crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut ctx = DriverStep::new(&control, &mut work, &mut conversions);
+    let mut bypass = 0;
+    let rows =
+        instance_partition_rows(&batch, &source, source.len(), 127, &mut bypass, &mut ctx).unwrap();
+    assert_eq!(bypass, 0);
+    assert!(rows.iter().any(|rows| rows.starts_with(&[0, 1])));
+    assert_eq!(rows.iter().map(Vec::len).sum::<usize>(), source.len());
+
+    let legacy = partition_chunk_by_hash_arrays(&source, &batch.arrays, 127, false).unwrap();
+    for chunk in legacy.iter().filter(|chunk| !chunk.is_empty()) {
+        let payload = chunk.columns()[1]
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert!(!(payload.values().contains(&0) && payload.values().contains(&1)));
+    }
+}
+
+#[test]
 fn network_partition_scope_preserves_the_exact_originating_stop() {
     let fixture = Fixture::new();
     let source = typed_int64_chunk(2);

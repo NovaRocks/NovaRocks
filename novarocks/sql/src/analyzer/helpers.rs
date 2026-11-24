@@ -1483,7 +1483,7 @@ mod tests {
         );
     }
     #[test]
-    fn final_row_and_datetime_nodes_preserve_names_and_exact_temporal_declarations() {
+    fn final_row_and_datetime_nodes_preserve_anonymity_and_exact_temporal_declarations() {
         use novarocks_parser::{Span, ast, build};
         use novarocks_type_contract::{
             TemporalPrecision, TemporalType, ValueKind, ValueLogicalType,
@@ -1498,7 +1498,7 @@ mod tests {
         let ValueKind::Struct(fields) = value.value_type().kind() else {
             panic!("row")
         };
-        assert_eq!(fields[0].name(), "f1");
+        assert_eq!(fields[0].row_name(), None);
         assert!(matches!(
             fields[0].value_type().kind(),
             ValueKind::Nominal(ValueLogicalType::Json)

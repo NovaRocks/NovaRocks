@@ -1,41 +1,91 @@
--- query 11
--- types	varchar
+-- query 1
+-- types	varchar(0)
 _col0
-NULL
-NULL
-NULL
+""
+
+-- query 2
+-- types	varchar(0)
+_col0
+""
+
+-- query 3
+-- types	varchar(0)
+_col0
+""
+
+-- query 4
+-- types	varchar(0)
+_col0
+""
+
+-- query 5
+-- types	varchar(0)
+_col0
+""
+
+-- query 6
+-- types	varchar(0)
+_col0
+""
+
+-- query 7
+-- types	varchar(0)
+_col0
+""
+
+-- query 8
+-- types	varchar(0)
+_col0
+""
+
+-- query 11
+-- types	varchar(0)
+_col0
+""
+""
+""
 
 -- query 12
--- types	varchar
+-- types	varchar(0)
 _col0
-NULL
-NULL
-NULL
+""
+""
+""
 
 -- query 13
--- types	varchar
+-- types	varchar(9)
 _col0
-NULL
-NULL
-NULL
+""
+""
+""
 
 -- query 14
--- types	varchar
+-- types	varchar(0)
 _col0
-NULL
-NULL
-NULL
+""
+""
+""
 
 -- query 15
--- types	varchar
+-- types	varchar(0)
 _col0
-NULL
-NULL
-NULL
+""
+""
+""
 
 -- query 16
--- types	varchar
+-- types	varchar(9)
 _col0
-NULL
-NULL
-NULL
+""
+""
+""
+
+-- query 19
+-- types	varchar(0)
+_col0
+""
+
+-- query 20
+-- types	varchar(0)
+_col0
+""

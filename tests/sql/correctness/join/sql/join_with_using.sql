@@ -196,8 +196,8 @@ ORDER BY id1;
 SELECT id1 AS join_key FROM ${case_db}.left_table JOIN ${case_db}.right_table USING(id1) ORDER BY join_key;
 
 -- query 29
--- USING with table alias: left table column ref
--- @order_sensitive=true
+-- USING exposes the merged key as an unqualified column.
+-- @expect_error=[sql.analyze.unknown_column]
 SELECT l.id1 l_id1 FROM ${case_db}.left_table l JOIN ${case_db}.right_table r USING(id1) ORDER BY l_id1;
 
 -- query 30
@@ -276,10 +276,10 @@ ORDER BY outer_query.id1;
 -- @order_sensitive=true
 SELECT id1, name, R.dept
 FROM ${case_db}.left_table L JOIN ${case_db}.right_table R USING(id1)
-WHERE L.id1 IN (
+WHERE id1 IN (
     SELECT id1 FROM ${case_db}.left_table WHERE salary > 6000
 )
-ORDER BY L.id1;
+ORDER BY id1;
 
 -- query 41
 -- Derived table with expressions + LEFT JOIN USING
@@ -301,7 +301,7 @@ ORDER BY sub.id1;
 -- Aggregated subqueries joined with USING
 -- @order_sensitive=true
 SELECT
-    L_AGG.id1,
+    id1,
     L_AGG.avg_salary,
     R_AGG.total_bonus
 FROM (
@@ -316,4 +316,4 @@ JOIN (
     WHERE bonus IS NOT NULL
     GROUP BY id1
 ) R_AGG USING(id1)
-ORDER BY L_AGG.id1;
+ORDER BY id1;

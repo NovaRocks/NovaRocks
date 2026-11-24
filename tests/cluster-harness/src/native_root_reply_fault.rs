@@ -344,6 +344,10 @@ pub struct RootReplyDownstreamReset {
 #[derive(Clone, Debug, Serialize)]
 pub struct RootReplyOriginalHold {
     pub identity: RootReplyOriginalIdentity,
+    // The connection may observe peer close after the stream consumes its
+    // live capture. Retain that capture's cutoff with the exact receipt.
+    #[serde(skip)]
+    capture_deadline: Instant,
     pub disposition: RootReplyOriginalDisposition,
     #[serde(serialize_with = "serialize_monotonic_instant")]
     pub held_at: Instant,
@@ -2513,6 +2517,19 @@ fn exact_cancel_peer_close_frames(frames: &IngressFrames) -> bool {
             })
 }
 
+fn original_cancel_completed(state: &State, held: &RootReplyOriginalHold) -> bool {
+    !state.lifecycle_closed
+        && state.first_failure.is_none()
+        && !state.failure_overflow
+        && state.claimed == 1
+        && state.deadline.is_none()
+        && state.expected_original_peer_exit.is_none()
+        && Instant::now() < held.capture_deadline
+        && held.disposition == RootReplyOriginalDisposition::ExactDownstreamCancelled
+        && held.release_requested_at.is_some()
+        && held.settled_at.is_some_and(|at| at < held.capture_deadline)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn original_peer_exit_candidate(
     state: &State,
@@ -2524,9 +2541,12 @@ fn original_peer_exit_candidate(
     downstream_accept_failed: bool,
     error: Option<&anyhow::Error>,
 ) -> Option<(RootReplyOriginalIdentity, Instant, OriginalPeerClose)> {
-    let identity = state.expected_original_peer_exit.as_ref()?;
-    let deadline = state.deadline?;
     let held = state.original_hold.as_ref()?;
+    let identity = &held.identity;
+    let deadline = held.capture_deadline;
+    let live_hold = application_children == 1
+        && state.expected_original_peer_exit.as_ref() == Some(identity)
+        && original_hold_live(state, identity, deadline).is_ok();
     let close = match frames.watched_reset.as_ref() {
         None if held.downstream_reset.is_none() => OriginalPeerClose::ConnectionOnly,
         Some(reset)
@@ -2544,20 +2564,20 @@ fn original_peer_exit_candidate(
         _ => return None,
     };
     (identity.connection_id == connection_id
-        && held.identity == *identity
         && accepted_rpcs == 1
-        && application_children == 1
         && held.expected_query_cancellation_at.is_some()
         && held.connection_exit.is_none()
-        && original_hold_live(state, identity, deadline).is_ok()
         && frames.preface_valid
         && frames.first_frame_non_ack_settings
         && frames.header_bytes == 0
         && frames.payload_remaining == 0
         && frames.frames == frames.completed_frames
         && match close {
-            OriginalPeerClose::ConnectionOnly => frames.goaways == 0,
-            OriginalPeerClose::ExactRawCancel => exact_cancel_peer_close_frames(frames),
+            OriginalPeerClose::ConnectionOnly => live_hold && frames.goaways == 0,
+            OriginalPeerClose::ExactRawCancel => {
+                exact_cancel_peer_close_frames(frames)
+                    && (live_hold || original_cancel_completed(state, held))
+            }
         }
         && frames.watched_reset_stream == Some(identity.downstream_stream)
         && original_peer_close_kind(downstream_eof, downstream_accept_failed, error))
@@ -2786,21 +2806,15 @@ async fn serve_connection(
         let completed_exact_cancel =
             peer_exit_candidate
                 .as_ref()
-                .is_some_and(|(identity, deadline, close)| {
+                .is_some_and(|(identity, _, close)| {
                     *close == OriginalPeerClose::ExactRawCancel
                         && children.is_empty()
                         && !cleanup_failed
                         && connection.bytes.load(Ordering::Acquire) == 0
                         && !*stop.borrow()
                         && !generation.has_changed().unwrap_or(true)
-                        && Instant::now() < *deadline
-                        && state.expected_original_peer_exit.is_none()
                         && state.original_hold.as_ref().is_some_and(|held| {
-                            held.identity == *identity
-                                && held.disposition
-                                    == RootReplyOriginalDisposition::ExactDownstreamCancelled
-                                && held.release_requested_at.is_some()
-                                && held.settled_at.is_some_and(|at| at < *deadline)
+                            held.identity == *identity && original_cancel_completed(&state, held)
                         })
                 });
         if let Some(held) = state.original_hold.as_mut()
@@ -2828,9 +2842,8 @@ async fn serve_connection(
         (permitted, completed_exact_cancel)
     };
     if permitted_peer_exit || completed_exact_cancel {
-        // Only the explicitly declared, sole original response qualifies.
-        // Its real error remains in connection_exit; this is not an RST or
-        // forwarding claim. An unconsumed declaration fails disarm/shutdown.
+        // Keep the actual connection error and Join alongside the original
+        // stream outcome. An unconsumed declaration fails disarm/shutdown.
         return Ok(());
     }
     if failed_at_downstream_accept && let Some(error) = actual_error.as_deref() {
@@ -3927,6 +3940,7 @@ async fn hold_original_response(
             state.original = Some(before);
             state.original_hold = Some(RootReplyOriginalHold {
                 identity: identity.clone(),
+                capture_deadline: deadline,
                 disposition: RootReplyOriginalDisposition::Held,
                 held_at: Instant::now(),
                 release_requested_at: None,
@@ -5407,6 +5421,7 @@ mod tests {
         Cancel,
         DeclaredCancelThenConnectionClose,
         DeclaredCancelThenGracefulConnectionClose,
+        DeclaredCancelSettledBeforeConnectionClose,
         OtherReset,
         SendDeadline,
         Expire,
@@ -5451,7 +5466,8 @@ mod tests {
             let data_body = if matches!(case, OriginalHoldCase::SendDeadline | OriginalHoldCase::StopSending | OriginalHoldCase::ConnectionClose
                 | OriginalHoldCase::ExpectedConnectionClose | OriginalHoldCase::ExpectedConnectionCloseBeforeRelease
                 | OriginalHoldCase::UnconfirmedConnectionClose | OriginalHoldCase::DeclaredCancelThenConnectionClose
-                | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose) {
+                | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose
+                | OriginalHoldCase::DeclaredCancelSettledBeforeConnectionClose) {
                 let mut bytes = vec![b'x'; RootProfileV1::SEGMENT_BYTES];
                 bytes[..4].copy_from_slice(&((RootProfileV1::SEGMENT_BYTES - 4) as u32).to_le_bytes());
                 Bytes::from(bytes)
@@ -5793,14 +5809,21 @@ mod tests {
                             && c.observation().claimed == 0, "disarm became original release");
                     }
                     OriginalHoldCase::Cancel | OriginalHoldCase::OtherReset | OriginalHoldCase::DeclaredCancelThenConnectionClose
-                    | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose => {
-                        let graceful_close = matches!(case, OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose);
+                    | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose
+                    | OriginalHoldCase::DeclaredCancelSettledBeforeConnectionClose => {
+                        let close_after_settlement =
+                            matches!(case, OriginalHoldCase::DeclaredCancelSettledBeforeConnectionClose);
+                        let graceful_close = close_after_settlement
+                            || matches!(case, OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose);
                         let close_before_release = matches!(case, OriginalHoldCase::DeclaredCancelThenConnectionClose
                             | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose);
-                        if close_before_release { c.expect_exact_original_query_cancellation(&held.identity)?; }
-                        let reason = if matches!(case, OriginalHoldCase::Cancel | OriginalHoldCase::DeclaredCancelThenConnectionClose
-                            | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose) { h2::Reason::CANCEL }
-                            else { h2::Reason::INTERNAL_ERROR };
+                        let declare_close = close_before_release || close_after_settlement;
+                        if declare_close { c.expect_exact_original_query_cancellation(&held.identity)?; }
+                        let reason = if matches!(case, OriginalHoldCase::OtherReset) {
+                            h2::Reason::INTERNAL_ERROR
+                        } else {
+                            h2::Reason::CANCEL
+                        };
                         send.send_reset(reason);
                         let reset = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
                             loop {
@@ -5820,7 +5843,27 @@ mod tests {
                         ensure!(reset.observed_at <= later_independent_phase,
                             "fixture did not retain the early reset observation");
                         let mut reply = Some(reply);
-                        if close_before_release {
+                        if close_after_settlement {
+                            c.release_exact_original(&held.identity)?;
+                            // Keep the client connection open until the proxy has
+                            // joined its exact response child.
+                            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                                loop {
+                                    let actual = c.observation();
+                                    if actual.joined_children == 1 && actual.active_streams == 0 {
+                                        let response = actual.original_hold.context("original hold disappeared")?;
+                                        ensure!(response.disposition == RootReplyOriginalDisposition::ExactDownstreamCancelled
+                                            && response.parent_close_observed_at.is_none()
+                                            && response.connection_exit.is_none()
+                                            && actual.active_connections == 1,
+                                            "original response child did not settle before its connection closed");
+                                        break Ok::<_, anyhow::Error>(());
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                }
+                            }).await.context("original response child Join deadline")??;
+                        }
+                        if declare_close {
                             if graceful_close {
                                 // Let the original h2 client retire itself and
                                 // emit its real GOAWAY after the exact reset.
@@ -5833,6 +5876,8 @@ mod tests {
                                 (false, Some(Err(error))) if error.is_cancelled() => {},
                                 (_, other) => anyhow::bail!("cancelled original client driver did not actually join: {other:?}"),
                             }
+                        }
+                        if close_before_release {
                             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
                                 loop {
                                     let changed = c.core.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
@@ -5857,10 +5902,11 @@ mod tests {
                                 }
                             }).await.context("declared exact CANCEL original parent close observation deadline")??;
                         }
-                        c.release_exact_original(&held.identity)?;
+                        if !close_after_settlement {
+                            c.release_exact_original(&held.identity)?;
+                        }
                         ensure!(c.release_exact_original(&held.identity).is_err(), "duplicate release accepted");
-                        if matches!(case, OriginalHoldCase::Cancel | OriginalHoldCase::DeclaredCancelThenConnectionClose
-                            | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose) {
+                        if reason == h2::Reason::CANCEL {
                             let outcome = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
                                 loop {
                                     let changed = c.core.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
@@ -5875,22 +5921,31 @@ mod tests {
                                 && outcome.actual_send_error.is_none()
                                 && c.observation().emitted_messages == 0,
                                 "exact cancellation was silently treated as forwarding or fabricated an error");
-                            if close_before_release {
+                            if declare_close {
                                 tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
                                     loop {
                                         let actual = c.observation();
                                         if actual.joined_connections == 1 {
                                             let response = actual.original_hold.as_ref().unwrap();
                                             let exit = response.connection_exit.as_ref().context("cancelled parent lost its actual Join")?;
+                                            let parent_closed = response.parent_close_observed_at
+                                                .context("declared exact CANCEL did not qualify at actual parent close")?;
+                                            let released = response.release_requested_at.unwrap();
+                                            let settled = response.settled_at.unwrap();
+                                            let ordered = if close_after_settlement {
+                                                settled <= parent_closed && response.parent_close_facts.as_ref().is_some_and(|facts|
+                                                    facts.application_children == 0 && !facts.original_hold_live)
+                                            } else {
+                                                parent_closed <= released
+                                            };
                                             ensure!(exit.all_children_joined && !exit.cleanup_failed
                                                 && exit.remaining_connection_bytes == 0 && !exit.permitted_peer_exit
                                                 && !exit.owner_stop_observed && !exit.generation_change_observed
                                                 && actual.owned_buffer_bytes == 0 && actual.active_streams == 0
                                                 && response.expected_query_cancellation_at.unwrap() <= reset.observed_at
-                                                && reset.observed_at <= response.parent_close_observed_at.unwrap()
-                                                && response.parent_close_observed_at.unwrap() <= response.release_requested_at.unwrap()
-                                                && response.release_requested_at.unwrap() <= response.settled_at.unwrap()
-                                                && response.settled_at.unwrap() <= exit.joined_at,
+                                                && reset.observed_at <= parent_closed
+                                                && released <= settled && settled <= exit.joined_at
+                                                && parent_closed <= exit.joined_at && ordered,
                                                 "exact stream cancellation did not preserve original close/release/Join order");
                                             break Ok::<_, anyhow::Error>(());
                                         }
@@ -5973,7 +6028,8 @@ mod tests {
                 }
                 if matches!(case, OriginalHoldCase::Forward | OriginalHoldCase::Cancel | OriginalHoldCase::Stop | OriginalHoldCase::StopSending
                     | OriginalHoldCase::ExpectedConnectionClose | OriginalHoldCase::ExpectedConnectionCloseBeforeRelease
-                    | OriginalHoldCase::DeclaredCancelThenConnectionClose | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose)
+                    | OriginalHoldCase::DeclaredCancelThenConnectionClose | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose
+                    | OriginalHoldCase::DeclaredCancelSettledBeforeConnectionClose)
                     && (!observation.failures.is_empty() || observation.failure_overflow) {
                     cleanup.get_or_insert(anyhow::anyhow!("unexpected original hold actor failure: {:?}", observation.failures));
                 }
@@ -6003,6 +6059,14 @@ mod tests {
     -> Result<()> {
         actual_original_hold_fixture(
             OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose,
+            false,
+        )
+        .await
+    }
+    #[tokio::test]
+    async fn declared_exact_cancel_can_settle_and_join_before_actual_parent_close() -> Result<()> {
+        actual_original_hold_fixture(
+            OriginalHoldCase::DeclaredCancelSettledBeforeConnectionClose,
             false,
         )
         .await

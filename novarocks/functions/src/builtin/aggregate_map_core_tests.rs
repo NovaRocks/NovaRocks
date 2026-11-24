@@ -255,13 +255,23 @@ fn map_agg_temporal_partial_keeps_the_first_zone_and_distinct_fraction() {
     let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
     let mut state = MapAggState::new(allocator.clone());
     let mut work = ScalarWork::new(None);
+    let full_key = FunctionValueType::try_from_value(
+        key_type.clone(),
+        novarocks_type_contract::ValueLayout::try_new(
+            keys.data_type(),
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let identity = KeyIdentity::prepare(&full_key, &mut |_| Ok::<_, KernelFailure>(())).unwrap();
     for row in 0..3 {
-        update_from_arrays_observed(
+        update_from_arrays(
             &mut state,
+            &identity,
             (&keys, row, Some(&key_type)),
             (&values, row, Some(&value_type)),
             &mut work,
-            &mut |_| Ok(()),
         )
         .unwrap();
     }
@@ -288,13 +298,13 @@ fn map_agg_temporal_partial_keeps_the_first_zone_and_distinct_fraction() {
 
     let mut merged = MapAggState::new(allocator.clone());
     let merge = merge_input(&partial).unwrap();
-    merge_row_observed(
+    merge_row_typed(
         &mut merged,
+        &identity,
         &merge,
         0,
         Some(&declaration),
         &mut work,
-        &mut |_| Ok(()),
     )
     .unwrap();
     let final_output = build_array_checked_states(
@@ -385,7 +395,7 @@ fn map_agg_core_duplicate_value_contract_precedes_lookup_and_has_no_control_tail
     assert_eq!(cause.failure_fact().reason().code(), 313);
     assert_eq!(cause.to_string(), "unsupported tracked scalar type: UInt32");
     assert_eq!(state.entries.len(), 1);
-    assert!(state.entries[0].1.is_none());
+    assert!(state.entries[0].value.is_none());
     drop(state);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }
@@ -534,12 +544,17 @@ fn nested_float_key_uses_the_map_identity_and_keeps_the_observed_key() {
     let mut work = ScalarWork::new(None);
     {
         let mut state = MapAggState::new(allocator.clone());
+        let identity = physical_test_identity(&DataType::List(Arc::new(Field::new_list_field(
+            DataType::Float64,
+            true,
+        ))));
         for signed_zero in [-0.0, 0.0] {
             let mut key = ScalarVec::new_in(allocator.clone());
             key.push(Some(TrackedAggScalarValue::Float64(signed_zero)));
             key.push(None);
             append_entry(
                 &mut state,
+                &identity,
                 TrackedAggScalarValue::List(key),
                 None,
                 &mut work,
@@ -547,7 +562,7 @@ fn nested_float_key_uses_the_map_identity_and_keeps_the_observed_key() {
             .unwrap();
         }
         assert_eq!(state.entries.len(), 1);
-        let TrackedAggScalarValue::List(key) = &state.entries[0].0 else {
+        let TrackedAggScalarValue::List(key) = &state.entries[0].key else {
             panic!("LIST key required")
         };
         assert!(matches!(
@@ -556,5 +571,37 @@ fn nested_float_key_uses_the_map_identity_and_keeps_the_observed_key() {
         ));
     }
     drop(allocator);
+    assert_eq!(host.ledger.lock().unwrap().bytes, 0);
+}
+
+#[test]
+fn map_agg_core_checks_colliding_hashes_against_the_retained_typed_values() {
+    let host = Arc::new(Host::default());
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let mut state = MapAggState::new(allocator.clone());
+    let identity = physical_test_identity(&DataType::Int64);
+    let mut work = ScalarWork::new(None);
+    for (key, value) in [(4, 31), (7, 32), (4, 99)] {
+        append_entry_with_hash(
+            &mut state,
+            &identity,
+            TrackedAggScalarValue::Int64(key),
+            Some(TrackedAggScalarValue::Int64(value)),
+            42,
+            &mut work,
+        )
+        .unwrap();
+    }
+    assert_eq!(state.key_heads.len(), 1);
+    assert_eq!(state.entries.len(), 2);
+    assert!(matches!(
+        state.entries[0].value,
+        Some(TrackedAggScalarValue::Int64(31))
+    ));
+    assert!(matches!(
+        state.entries[1].value,
+        Some(TrackedAggScalarValue::Int64(32))
+    ));
+    drop((state, allocator));
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }

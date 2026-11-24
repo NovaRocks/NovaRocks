@@ -24,6 +24,7 @@ use super::*;
 use arrow::array::{Array, BooleanArray};
 use novarocks_type_contract::EvaluationDemand;
 
+mod ordered_null;
 mod regexp;
 
 pub(super) fn supports_result(ty: &DataType) -> bool {
@@ -341,6 +342,7 @@ impl<K> Frame<K> {
             shape,
             ControlShape::Coalesce
                 | ControlShape::NullIf
+                | ControlShape::OrderedNull
                 | ControlShape::Conjunction
                 | ControlShape::Disjunction
                 | ControlShape::Case { .. }
@@ -432,6 +434,7 @@ impl<K> Frame<K> {
                 shape,
                 ControlShape::Coalesce
                     | ControlShape::NullIf
+                    | ControlShape::OrderedNull
                     | ControlShape::Conjunction
                     | ControlShape::Disjunction
             ) && self.remaining.is_empty())
@@ -528,6 +531,7 @@ impl<K> Frame<K> {
             }
             ControlShape::Coalesce
             | ControlShape::NullIf
+            | ControlShape::OrderedNull
             | ControlShape::Conjunction
             | ControlShape::Disjunction => {
                 for &ordinal in &self.remaining {
@@ -979,6 +983,9 @@ impl<K> Frame<K> {
         work: &mut Work<'_, '_, impl Sized>,
         allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     ) -> Result<(), KernelFailure> {
+        if shape == ControlShape::OrderedNull {
+            return self.attach_ordered_null(child, batch_rows, work);
+        }
         if shape == ControlShape::NullIf {
             let Some(PreparedPureKernel::NullIf(prepared)) = recipes.prepared_call() else {
                 return Err(invalid(
@@ -1545,6 +1552,8 @@ fn complete_node<'a, R, K: Ord + Clone>(
                 .prepared_call()
                 .ok_or_else(|| invalid("missing prepared node call"))?;
             match prepared_call {
+                PreparedPureKernel::Scalar(prepared) if shape == ControlShape::OrderedNull => frame
+                    .complete_ordered_null(prepared, local_selection, instances, allocator, work)?,
                 PreparedPureKernel::Scalar(_) | PreparedPureKernel::ScalarInvocation(_) => {
                     let prepared = match prepared_call {
                         PreparedPureKernel::Scalar(p) => scalar_invocation::PreparedCall::Kernel(p),
@@ -1861,8 +1870,10 @@ impl TreeDriver<'_, '_> {
                 frame.next += 1;
                 let (rows, child_domain, child_activation) =
                     child_context(&frame, invocation.control, &ordinals, original_domain, work)?;
-                let child_domain = if invocation.control == ControlShape::OrderedRegexp
-                    && self.needs_original.contains(&child_use)
+                let child_domain = if matches!(
+                    invocation.control,
+                    ControlShape::OrderedRegexp | ControlShape::OrderedNull
+                ) && self.needs_original.contains(&child_use)
                 {
                     child_domain.filtered(&rows, work.control)?
                 } else {

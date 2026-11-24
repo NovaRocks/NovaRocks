@@ -248,6 +248,11 @@ fn structural(
     if check_nullability && source_value.nullable() && !result_value.nullable() {
         return Ok(false);
     }
+    if order == StructureOrder::Position && *source == DataType::Null {
+        // An unknown child contributes no value. Preserve its NULL in the
+        // authored nullable slot without enabling other ROW conversions.
+        return Ok(result_value.nullable());
+    }
     match (source, result) {
         (DataType::Struct(from), DataType::Struct(to)) if from.len() == to.len() => {
             let by_name = match_struct_fields_by_name(from, to, order, || work.step())?;
@@ -1143,6 +1148,13 @@ fn retag(
         return Ok(Arc::clone(source));
     }
     match (source.data_type(), result) {
+        (DataType::Null, result) if order == StructureOrder::Position => {
+            selected_copy::preflight_null_extent(result, source.len(), &mut work.borrow_mut())
+                .map_err(copy_error)?;
+            let typed_nulls = new_null_array(result, source.len());
+            work.borrow_mut().flush()?;
+            Ok(typed_nulls)
+        }
         (DataType::Struct(from), DataType::Struct(to)) => {
             let source = source
                 .as_any()

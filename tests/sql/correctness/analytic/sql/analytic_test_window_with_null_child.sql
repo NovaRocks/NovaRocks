@@ -34,8 +34,8 @@ CREATE TABLE ${case_db}."tsmall" (
   "c2" bigint NOT NULL
 ) WITH (format_version = 3);
 
-INSERT INTO ${case_db}.test_window_with_null_child SELECT generate_series, 4096 - generate_series, generate_series FROM TABLE(sequence(1, 40960)) AS generate_series(generate_series);
-INSERT INTO ${case_db}.tsmall SELECT generate_series, 4096 - generate_series, generate_series FROM TABLE(sequence(1, 1)) AS generate_series(generate_series);
+INSERT INTO ${case_db}.test_window_with_null_child SELECT CAST(generate_series AS VARCHAR), 4096 - generate_series, generate_series FROM TABLE(sequence(1, 40960)) AS generate_series(generate_series);
+INSERT INTO ${case_db}.tsmall SELECT CAST(generate_series AS VARCHAR), 4096 - generate_series, generate_series FROM TABLE(sequence(1, 1)) AS generate_series(generate_series);
 
 -- query 2
 SELECT sum(rn) FROM ( SELECT rn FROM ( SELECT row_number() OVER (PARTITION BY c0 ORDER BY c1, c2) AS rn FROM ( SELECT c0, c1, c2 FROM ( SELECT l.c0 AS c0, l.c1 AS c1, r.c1 AS c2 FROM ${case_db}.test_window_with_null_child l LEFT JOIN ${case_db}.tsmall r ON l.c1 = r.c1 ) tx GROUP BY c0, c1, c2 ) ty ) t WHERE rn <= 2 ) t1;
