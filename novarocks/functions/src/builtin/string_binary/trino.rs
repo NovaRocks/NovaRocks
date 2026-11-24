@@ -34,7 +34,7 @@ use crate::{
     EvaluatedArgument, KernelEvaluationControl, KernelFailure, RowDataError, ScalarCallInput,
     SelectedValues,
     aggregate_host_allocator::HostAggregateAllocator,
-    arrow_result_custody::{custody_type_metadata_upper_bound, retain_result_backing_direct},
+    arrow_result_custody::retain_result_backing_direct,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
     opaque_memory::OpaqueRetainedCharge,
@@ -276,10 +276,7 @@ fn build_with_custody(
     let Some((charge, allocator)) = host else {
         return build(work);
     };
-    // The shared Arrow constructors round validity to 64-byte capacities.
-    let validity = add(add(rows, 7)? / 8, 63)? / 64 * 64;
-    let stock = add(buffers, validity)?;
-    let peak = add(stock, custody_type_metadata_upper_bound(1)?)?;
+    let peak = crate::scalar_output_resources::flat_arrow_output_peak(buffers, rows)?;
     work.flush()?;
     let mut reservation = charge.reserve_operation(peak)?;
     work.flush()?;

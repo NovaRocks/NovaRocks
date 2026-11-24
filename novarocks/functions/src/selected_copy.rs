@@ -46,6 +46,11 @@ pub use construction::{
 };
 #[path = "selected_copy/copy_buffer_peak.rs"]
 mod copy_buffer_peak;
+#[path = "selected_copy/list_output.rs"]
+mod list_output;
+pub(crate) use list_output::{
+    array_from_segments_in, list_child_count, list_from_segments_in, list_from_struct_children_in,
+};
 #[path = "selected_copy/slice_host.rs"]
 mod slice_host;
 pub use slice_host::{RetainedSliceResult, slice_copy_in};
@@ -252,6 +257,11 @@ fn limit(value: usize, maximum: usize, layout: CopyLayout) -> Result<(), CopyErr
         Ok(())
     }
 }
+pub(crate) fn checked_utf8_output_offset(bytes: usize) -> Result<i32, KernelFailure> {
+    limit(bytes, offset_max(false), CopyLayout::Byte32).map_err(CopyError::into_kernel)?;
+    Ok(bytes as i32)
+}
+
 fn buffer_extent(elements: usize, width: usize) -> Result<(), CopyError> {
     let required = elements as u128 * width as u128;
     if required > isize::MAX as u128 {

@@ -108,12 +108,18 @@ impl StringReverseOwner {
         }
         let implementation =
             PureImplementationId::try_new(format!("builtin.scalar/{name}/selected-v1"))?;
+        let array_implementation =
+            PureImplementationId::try_new("builtin.scalar/reverse/array-selected-v1")?;
         let implementations = declaration
             .overloads()
             .iter()
             .map(|overload| PureImplementationDeclaration {
                 overload: overload.identity.clone(),
-                implementation: implementation.clone(),
+                implementation: if overload.argument_pattern.starts_with("(list<") {
+                    array_implementation.clone()
+                } else {
+                    implementation.clone()
+                },
                 abi: PureKernelAbi::ScalarV1,
             })
             .collect();
@@ -422,6 +428,14 @@ impl StringReverseOwner {
                 FunctionBindingError::Control(error) => compile_failure(error),
                 _ => invalid("string reversal preparation has a stale selected binding"),
             })?;
+            if matches!(
+                contract.result_type().data_type(),
+                arrow_schema::DataType::List(_)
+            ) {
+                return super::array_structure_owner::prepare_reverse(contract, || {
+                    work.step().map_err(compile_failure)
+                });
+            }
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.
             Ok(Arc::new(PreparedStringReverse {

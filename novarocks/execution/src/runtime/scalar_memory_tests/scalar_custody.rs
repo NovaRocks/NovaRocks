@@ -76,6 +76,7 @@ fn functions() -> PureEngineFunctionCatalog {
         "bitwise_or",
         "bitwise_xor",
         "bitwise_not",
+        "slice",
     ] {
         let definition = actual.definition(name, FunctionKind::Scalar).unwrap();
         builder.register(definition.clone()).unwrap();
@@ -216,14 +217,22 @@ fn fixture_family(
         author(
             &functions,
             name,
-            if bitwise && name == "bitwise_not" {
+            if name == "slice" {
+                vec![
+                    argument(&integer),
+                    argument(&count_type),
+                    argument(&count_type),
+                ]
+            } else if bitwise && name == "bitwise_not" {
                 vec![argument(&integer)]
             } else {
                 vec![argument(&integer), argument(&count_type)]
             },
             ControlShape::Eager,
         ),
-        if bitwise && name == "bitwise_not" {
+        if name == "slice" {
+            vec![value, count, count]
+        } else if bitwise && name == "bitwise_not" {
             vec![value]
         } else {
             vec![value, count]
@@ -473,6 +482,56 @@ fn runtime_control(binding: Option<&QueryMemoryBinding>) -> RuntimeKernelControl
     let mut control = RuntimeKernelControl::new(state.error_state());
     control.bind_runtime_memory(&state);
     control
+}
+
+#[test]
+fn runtime_scalar_memory_array_slice_compacts_actual_selected_lists() {
+    use arrow::{array::ListArray, datatypes::Int64Type};
+    let rows = ListArray::from_iter_primitive::<Int64Type, _, _>([
+        Some(vec![Some(10), Some(20), Some(30), Some(40)]),
+        Some(vec![Some(88)]),
+        Some(vec![Some(11), Some(22), Some(33)]),
+    ]);
+    let program = fixture_family("slice", Shape::Direct, rows.data_type().clone(), true);
+    let batch = RecordBatch::try_new(
+        program.graph().nodes()[1].output_layout().schema().clone(),
+        vec![
+            Arc::new(rows),
+            Arc::new(Int64Array::from(vec![2, 0, 1])),
+            Arc::new(BooleanArray::from(vec![true; 3])),
+        ],
+    )
+    .unwrap();
+    let binding = bound();
+    let control = runtime_control(Some(&binding));
+    let root = root(&program);
+    let mut instance = CompiledExpressionInstance::try_new(
+        program.unit(root.unit).unwrap().clone(),
+        root.root,
+        &control,
+    )
+    .unwrap();
+    let selection = Selection::try_sparse(3, &[0, 2]).unwrap();
+    let mut journal = RuntimeScalarMemoryJournal::default();
+    let result = instance
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            Activation::Activated,
+            &control,
+            &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+        )
+        .unwrap();
+    assert!(result.errors().is_empty());
+    let expected = ListArray::from_iter_primitive::<Int64Type, _, _>([
+        Some(vec![Some(20), Some(30)]),
+        Some(vec![Some(11)]),
+    ]);
+    assert_eq!(result.values().to_data(), expected.to_data());
+    assert_eq!(journal.body.stopped, Some(Ok(())));
 }
 #[test]
 fn runtime_scalar_memory_original_frame_nested_and_selected_values_match_old_entry() {

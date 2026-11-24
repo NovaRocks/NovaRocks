@@ -959,33 +959,35 @@ fn required_ddl_property_port_projects_real_input_errors_and_retains_control_res
 fn required_array_child_buffers_keep_original_result_custody_until_last_alias_exits() {
     use arrow::array::{ListArray, StringArray};
     let fixture = Fixture::new();
-    let prepared = fixture.prepare_core_array(
+    for sql in [
         "ARRAY['selected child', NULL]",
-        &SqlCompileControl::unbounded(),
-    );
-    let value = fixture
-        .interpreter
-        .evaluate(prepared, &fixture.root.owner.scope(), &fixture.window)
-        .unwrap();
-    let alias = value.pool().array().clone();
-    drop(value);
-    assert!(
-        fixture.window.retained_payload_bytes() > 0,
-        "the real Array alias still owns its original result custody"
-    );
-    {
-        let array = alias.as_any().downcast_ref::<ListArray>().unwrap();
-        assert_eq!(array.value_offsets(), &[0, 2]);
-        let items = array
-            .values()
-            .as_any()
-            .downcast_ref::<StringArray>()
+        "slice(ARRAY['discarded prefix', 'selected child', NULL], BIGINT '2', BIGINT '9223372036854775807')",
+    ] {
+        let prepared = fixture.prepare_core_array(sql, &SqlCompileControl::unbounded());
+        let value = fixture
+            .interpreter
+            .evaluate(prepared, &fixture.root.owner.scope(), &fixture.window)
             .unwrap();
-        assert_eq!(items.value(0), "selected child");
-        assert!(items.is_null(1));
+        let alias = value.pool().array().clone();
+        drop(value);
+        assert!(
+            fixture.window.retained_payload_bytes() > 0,
+            "the real Array alias still owns its original result custody"
+        );
+        {
+            let array = alias.as_any().downcast_ref::<ListArray>().unwrap();
+            assert_eq!(array.value_offsets(), &[0, 2]);
+            let items = array
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(items.value(0), "selected child");
+            assert!(items.is_null(1));
+        }
+        drop(alias);
+        assert_eq!(fixture.window.retained_payload_bytes(), 0);
     }
-    drop(alias);
-    assert_eq!(fixture.window.retained_payload_bytes(), 0);
     fixture.close();
 }
 

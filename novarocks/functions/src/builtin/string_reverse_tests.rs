@@ -583,7 +583,9 @@ fn string_reverse_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
             owner.binding_declaration().function_id().as_str(),
             "builtin.scalar/reverse/v1"
         );
-        assert_eq!(owner.implementation_declarations().len(), 2);
+        assert!(owner.implementation_declarations().iter().any(|entry| {
+            entry.implementation.as_str() == "builtin.scalar/reverse/array-selected-v1"
+        }));
         assert_eq!(
             owner.implementation_declarations()[0]
                 .implementation

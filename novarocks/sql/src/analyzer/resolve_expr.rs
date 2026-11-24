@@ -9232,8 +9232,7 @@ mod tests {
 
     #[test]
     fn unavailable_builtin_is_explicitly_rejected_before_false_filter_pruning() {
-        let error = analyze_projection_expr("select reverse(ARRAY[1,2]) where false").unwrap_err();
-        assert!(error.contains("builtin.scalar/reverse/(list"), "{error}");
+        analyze_projection_expr("select reverse(ARRAY[1,2]) where false").unwrap();
         let isnull = analyze_projection_expr("select isnull(1) where false").unwrap_err();
         assert!(
             isnull.contains("no admitted selected scalar implementation"),

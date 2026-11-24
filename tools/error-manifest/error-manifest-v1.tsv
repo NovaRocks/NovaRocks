@@ -90,6 +90,7 @@ sql.analyze.missing_argument	Analyze
 sql.analyze.missing_column_name	Analyze
 sql.analyze.missing_order_by	Analyze
 sql.analyze.numeric_out_of_range	Analyze
+sql.analyze.operator_not_found	Analyze
 sql.analyze.too_many_arguments	Analyze
 sql.analyze.type_mismatch	Analyze
 sql.analyze.unavailable_implementation	Analyze

@@ -38,6 +38,7 @@ pub(crate) mod temporal_output;
 pub mod value_conversion;
 mod value_conversion_kernel;
 mod value_conversion_owner;
+mod value_conversion_temporal;
 
 pub(crate) mod binding_control;
 
@@ -223,6 +224,19 @@ mod array_access_selected;
 mod array_element_at_owner;
 
 mod array_concat;
+mod array_generation;
+pub(crate) mod array_generation_owner;
+mod array_join;
+mod array_join_owner;
+mod array_order;
+mod array_order_owner;
+mod array_relation;
+mod array_relation_owner;
+mod array_scalar_output;
+mod array_slice;
+mod array_slice_owner;
+mod array_structure;
+mod array_structure_owner;
 
 pub mod regexp_count;
 

@@ -119,10 +119,7 @@ impl PreparedTemporalCast {
                     .source
                     .temporal()
                     .ok_or_else(|| invalid("text source has no temporal declaration"))?;
-                let mut text = String::new();
-                work.flush()?;
-                format(&mut text, ty, value, TemporalTextFormat::Cast)
-                    .map_err(|_| internal("validated temporal value failed text projection"))?;
+                let text = format_cast_text(ty, value, work)?;
                 output.text(&text)?;
                 work.flush()?;
                 continue;
@@ -158,6 +155,53 @@ impl PreparedTemporalCast {
         work.flush()?;
         Ok(output)
     }
+}
+
+/// The original dependency-free temporal-to-VARCHAR conversion, available
+/// to collection calls which consume individual elements.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TemporalTextCast(Pair);
+
+impl TemporalTextCast {
+    pub(super) fn bind(source: &FunctionValueType, target: &FunctionValueType) -> Option<Self> {
+        let pair = Pair::bind(source, target)?;
+        (pair.target == Type::Text && pair.source.temporal().is_some()).then_some(Self(pair))
+    }
+
+    pub(super) fn evaluate(
+        self,
+        array: &dyn Array,
+        row: usize,
+        nullable: bool,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Option<String>, KernelFailure> {
+        let source = Source::bind(self.0.source, array, nullable)?;
+        let Some(Input::Temporal(value)) = source.value(row)? else {
+            return Ok(None);
+        };
+        let ty = self
+            .0
+            .source
+            .temporal()
+            .ok_or_else(|| invalid("text source has no temporal declaration"))?;
+        format_cast_text(ty, value, work).map(Some)
+    }
+}
+
+// A single canonical temporal rendering includes fixed-width calendar/time,
+// fraction, offset and an installed IANA zone name.
+pub(super) const TEMPORAL_CAST_TEXT_SCRATCH: usize = 512;
+
+fn format_cast_text(
+    ty: novarocks_type_contract::TemporalType,
+    value: novarocks_type_contract::TemporalValue,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<String, KernelFailure> {
+    let mut text = String::new();
+    work.flush()?;
+    format(&mut text, ty, value, TemporalTextFormat::Cast)
+        .map_err(|_| internal("validated temporal value failed text projection"))?;
+    Ok(text)
 }
 
 enum Source<'a> {
