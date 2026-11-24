@@ -4182,6 +4182,53 @@ mod tests {
     }
 
     #[test]
+    fn expression_join_keys_require_a_total_cast_and_operator() {
+        let source =
+            "SELECT TRY_CAST(sequential_number AS INTEGER) AS k FROM TABLE(sequence(1, 10000))";
+        for (predicate, join) in [
+            (
+                "-CAST(lhs.k AS DECIMAL(10, 0)) = CAST(rhs.k AS DECIMAL(10, 0))",
+                "HASH JOIN",
+            ),
+            (
+                "lhs.k = rhs.k AND CAST(lhs.k AS BIGINT) + 1 = CAST(rhs.k AS BIGINT) + 1",
+                "HASH JOIN",
+            ),
+            (
+                "-CAST(lhs.k AS DECIMAL(9, 0)) = CAST(rhs.k AS DECIMAL(9, 0))",
+                "NEST LOOP JOIN",
+            ),
+        ] {
+            let sql = format!(
+                "SELECT count(lhs.k), count(rhs.k) FROM ({source}) lhs JOIN ({source}) rhs ON {predicate}"
+            );
+            let request = request(
+                &sql,
+                SqlCompileIntent::Explain {
+                    level: crate::explain::ExplainLevel::Normal,
+                    analyze: false,
+                },
+            );
+            let control = SqlCompileControl::unbounded();
+            let completed =
+                SqlCompiler::start(request.try_into_completion().expect("seed"), &control)
+                    .expect("source-free compilation")
+                    .into_complete()
+                    .expect("no catalog/statistics/provider needs");
+            let text = crate::explain::completed_tree::render_completed_plan_tree(
+                completed.plan(),
+                crate::explain::ExplainLevel::Normal,
+                &control,
+            )
+            .expect("completed physical plan");
+            assert!(
+                text.iter().any(|line| line.contains(join)),
+                "{predicate}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn source_free_ctes_do_not_fabricate_base_statistics_or_known_zero_rows() {
         let scenarios = [
             (
