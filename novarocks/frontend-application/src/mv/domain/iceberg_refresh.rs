@@ -508,7 +508,8 @@ pub(crate) fn finish_mv_create_preparation(
     }))
 }
 
-fn stateless_mv_runtime_layout() -> novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout {
+pub(crate) fn stateless_mv_runtime_layout()
+-> novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout {
     novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout::try_new(
         "__row_id__".to_string(),
         Vec::new(),

@@ -1717,25 +1717,44 @@ mod original_stage_tests {
             leaf_type: novarocks_mv_application::persistence::test_support::fixture_type("long"),
             whole_subtree: false,
         }];
+        let source_fields = vec![
+            novarocks_mv_application::persistence::aggregate_bindings::MvCreateRelationObservation {
+                occurrence_id: 0,
+                provider_object_id: Bytes::copy_from_slice(persisted_object.as_bytes()),
+                fields: vec![novarocks_mv_application::persistence::aggregate_bindings::MvCreateSourceFieldObservation {
+                    field_ordinal: 0,
+                    field_name: "id".into(),
+                    provider_field_id: Bytes::from_static(b"id-1"),
+                    source_type: novarocks_mv_application::persistence::test_support::fixture_type("long"),
+                    nullable: true,
+                }],
+            },
+        ];
         let binding = BindingDocument {
             occurrences: vec![occurrence],
-            outputs: Vec::new(),
+            outputs:
+                novarocks_mv_application::persistence::create_documents::build_binding_outputs(
+                    &persistence,
+                    &source_fields,
+                )
+                .unwrap(),
             dependencies: Vec::new(),
         };
         // Pure captured facts use the same CREATE authors as the active reader.
         // These values grant neither Provider permission nor a management admission.
         let plan = finish_mv_create_preparation(
-            shape, statement, property, persistence,
-            vec![novarocks_mv_application::persistence::aggregate_bindings::MvCreateRelationObservation {
-                occurrence_id: 0, provider_object_id: Bytes::copy_from_slice(persisted_object.as_bytes()),
-                fields: vec![novarocks_mv_application::persistence::aggregate_bindings::MvCreateSourceFieldObservation {
-                    field_ordinal: 0, field_name: "id".into(), provider_field_id: Bytes::from_static(b"id-1"),
-                    source_type: novarocks_mv_application::persistence::test_support::fixture_type("long"), nullable: true,
-                }],
-            }],
+            shape,
+            statement,
+            property,
+            persistence,
+            source_fields,
             binding,
-            BTreeMap::from([(format!("{current_catalog}.{current_database}.orders"), observation)]),
-        ).unwrap();
+            BTreeMap::from([(
+                format!("{current_catalog}.{current_database}.orders"),
+                observation,
+            )]),
+        )
+        .unwrap();
         let seed = Arc::new(
             plan.projection_seed(statement, Some(current_catalog), current_database)
                 .unwrap(),
@@ -1973,6 +1992,11 @@ mod original_stage_tests {
         fixture.definition = reloaded.clone();
         fixture.interpretation = documents.interpretation.clone();
         fixture.configuration = documents.configuration.clone();
+        fixture.binding = plan.binding_document.clone();
+        fixture.mapping = novarocks_mv_application::persistence::test_support::fixture_mapping(
+            &fixture.binding,
+            &fixture.interpretation,
+        );
         let projection =
             novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection {
                 mv_id: 1,

@@ -308,19 +308,7 @@ async fn freeze_mv_rewrite_definition_async(
     } else {
         views
     };
-    verify_rewrite_dependencies(&binding.dependencies, views, &nested)?;
-    let markers = frozen
-        .decoded_markers()
-        .map_err(|error| error.to_string())?;
-    let eligibility = novarocks_mv_application::persistence::codec::marker_eligibility(
-        novarocks_mv_application::persistence::codec::PublicationEvidence::Current(
-            &publication.publication_id,
-        ),
-        &markers,
-    );
-    if eligibility.automatic_reuse_blocked {
-        return Err("The current materialized-view publication has an active blocker".into());
-    }
+    verify_rewrite_publication(&frozen, views, &nested)?;
     novarocks_mv_application::persistence::aggregate_bindings::validate_published_aggregate_contracts(&frozen.interpretation)?;
     let selection = freeze_mv_rewrite_selection(&frozen, target_revision)?;
     SqlMvRewriteDefinitionFacts::try_new(
@@ -482,6 +470,39 @@ fn freeze_base_table_state(
     Ok(SqlMvRewriteBaseTableFacts::resolved(revision))
 }
 
+fn verify_rewrite_publication(
+    frozen: &MvKeyedObservedCurrentDocuments,
+    views: &[Arc<novarocks_sql::planning::catalog::SqlViewDefinition>],
+    nested: &[(
+        novarocks_mv_application::persistence::identity::ObjectIdentity,
+        novarocks_mv_application::persistence::identity::DocumentRevision,
+    )],
+) -> Result<(), String> {
+    use novarocks_mv_application::persistence::codec::{PublicationEvidence, marker_eligibility};
+
+    verify_rewrite_dependencies(
+        &frozen.versions.binding_document.dependencies,
+        views,
+        nested,
+    )?;
+    let publication = frozen
+        .publication
+        .as_ref()
+        .ok_or("MV rewrite target has no current publication")?;
+    let markers = frozen
+        .decoded_markers()
+        .map_err(|error| error.to_string())?;
+    if marker_eligibility(
+        PublicationEvidence::Current(&publication.publication_id),
+        &markers,
+    )
+    .automatic_reuse_blocked
+    {
+        return Err("The current materialized-view publication has an active blocker".into());
+    }
+    Ok(())
+}
+
 fn verify_rewrite_dependencies(
     dependencies: &[BindingDependency],
     views: &[Arc<novarocks_sql::planning::catalog::SqlViewDefinition>],
@@ -534,6 +555,92 @@ mod tests {
     use super::{
         MvRewriteDefinitionError, accept_mv_rewrite_candidate, candidate_base_tables_are_requested,
     };
+
+    #[test]
+    fn rewrite_requires_the_exact_original_view_declaration() {
+        use super::{freeze_mv_rewrite_selection, verify_rewrite_publication};
+        use crate::mv::domain::persistence::source_bindings::view_binding_dependency;
+        use novarocks_mv_application::{
+            persistence::{
+                codec::{InvalidDefinitionKind, Marker, MarkerScope},
+                test_support::{KeyedProjectionFixture, observed_current_keyed},
+            },
+            product::MvTarget,
+        };
+        use novarocks_spi::connector::{
+            CatalogHandle, CatalogVersion, ConnectorExactSemanticRevision, ConnectorInstanceId,
+            ConnectorProviderId,
+        };
+        use novarocks_sql::planning::catalog::{
+            SqlMvViewDependency, SqlViewColumn, SqlViewDefinition, SqlViewDialect, SqlViewOrigin,
+        };
+        let stored = SqlViewDefinition {
+            identity: novarocks_types::naming::TableIdentity::new("ice", "sales", "orders_view"),
+            origin: SqlViewOrigin::Iceberg {
+                uuid: [7; 16],
+                version_id: 1,
+            },
+            dialect: SqlViewDialect::Trino,
+            version: "exact-original-declaration".into(),
+            raw_sql: "SELECT id FROM orders".into(),
+            default_catalog: "ice".into(),
+            default_database: "sales".into(),
+            columns: Arc::from([SqlViewColumn {
+                name: "id".into(),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+            }]),
+        };
+        let mut fixture =
+            KeyedProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+        fixture.binding.dependencies.push(view_binding_dependency(
+            &SqlMvViewDependency::try_from_definition(&stored, 1).unwrap(),
+        ));
+        let projection = fixture.build().unwrap();
+        let catalog = CatalogHandle::new(
+            ConnectorInstanceId::parse("ice").unwrap(),
+            CatalogVersion::from_bytes([1; 32]),
+        );
+        let mut frozen = observed_current_keyed(&projection, catalog);
+        assert!(verify_rewrite_publication(&frozen, &[Arc::new(stored.clone())], &[]).is_ok());
+        let output = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            &frozen.view.object_id,
+            frozen.publication_snapshot,
+        )
+        .unwrap();
+        assert!(freeze_mv_rewrite_selection(&frozen, output).is_ok());
+        assert!(verify_rewrite_publication(&frozen, &[], &[]).is_err());
+
+        let changed_declaration = SqlViewDefinition {
+            version: "exact-replacement-declaration".into(),
+            raw_sql: "SELECT id FROM replacement_orders".into(),
+            ..stored.clone()
+        };
+        let changed_version = SqlViewDefinition {
+            origin: SqlViewOrigin::Iceberg {
+                uuid: [7; 16],
+                version_id: 2,
+            },
+            ..stored.clone()
+        };
+        for current in [changed_declaration, changed_version] {
+            assert!(verify_rewrite_publication(&frozen, &[Arc::new(current)], &[]).is_err());
+        }
+        let (key, marker) = Marker::InvalidDefinition {
+            scope: MarkerScope::Publication(
+                frozen.publication.as_ref().unwrap().publication_id.clone(),
+            ),
+            kind: InvalidDefinitionKind::Resolution,
+            diagnostic: "The publication's stored view could not be resolved".into(),
+        }
+        .encode()
+        .unwrap();
+        frozen.view.markers.insert(key, marker);
+        assert!(verify_rewrite_publication(&frozen, &[Arc::new(stored)], &[]).is_err());
+    }
 
     struct CapturedEvent {
         level: tracing::Level,

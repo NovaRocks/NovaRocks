@@ -163,7 +163,7 @@ impl SourceFixture {
             CatalogVersion::from_bytes([1; 32]),
         );
         let current = observed_current_keyed(&projection.facts, catalog.clone());
-        Arc::new(Self {
+        let mut source = Arc::new(Self {
             descriptor: ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
                 instance_id: ConnectorInstanceId::parse("ice").unwrap(),
@@ -182,7 +182,170 @@ impl SourceFixture {
             snapshot: 18,
             background_composition,
             initial_schema: InitialSourceSchema::Original,
-        })
+        });
+        let facts = source.bind_original_projection();
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        source_mut.current = observed_current_keyed(&facts, source_mut.catalog.clone());
+        source_mut.projection.facts = facts;
+        *source_mut.schema_projections.get_mut() = 0;
+        source_mut.revision_selectors.get_mut().unwrap().clear();
+        source
+    }
+
+    fn bind_original_projection(
+        self: &Arc<Self>,
+    ) -> novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection {
+        use crate::catalog_application::{
+            query_bindings::{QueryTableBindingKey, QueryTableBindingStore},
+            query_catalog::connector_table_materialization_from_metadata,
+            query_materializer::connector_query_binding_from_materialization,
+        };
+        use crate::mv::domain::{
+            analysis::refresh_property::{derive_fragment_property, derive_imv_refresh_contract},
+            analysis_adapter::analyze_mv_select_with_captured_catalog,
+            persistence::source_bindings::observe_mv_binding,
+            refresh::definition::{read_stored_mv_query, stored_mv_identity},
+        };
+        use novarocks_mv_application::persistence::{
+            create_documents::{MvInterpretationFacts, build_mv_refresh_interpretation},
+            exact_revision::persist_exact_connector_revision,
+            storage_mapping::{build_storage_mapping, storage_mapping_requests},
+        };
+        use novarocks_sql::compiler::{
+            CatalogRelationFact, SqlCapturedCatalogPreparation, SqlCompileControl,
+            builtin_sql_function_catalog,
+        };
+
+        let context = crate::connector::test_request_context();
+        let host = self.control_host();
+        let pin = crate::connector::metadata_binding_typed(host.as_ref(), "ice").unwrap();
+        let metadata = |source| {
+            crate::connector::schema_creation::with_schema_creation(&context, |creation| {
+                self.metadata(source, creation)
+            })
+            .unwrap()
+        };
+        let source = metadata(true);
+        let materialization =
+            connector_table_materialization_from_metadata(source.clone(), pin.clone()).unwrap();
+        let bindings = QueryTableBindingStore::try_new().unwrap();
+        let binding = bindings
+            .resolve_or_insert_with_id(
+                QueryTableBindingKey::strict_base("ice", "sales", "orders"),
+                |id| {
+                    connector_query_binding_from_materialization(
+                        materialization,
+                        "ice",
+                        "sales",
+                        "orders",
+                        id,
+                    )
+                },
+            )
+            .unwrap();
+        let definition = self.projection.facts.definition();
+        let query = read_stored_mv_query(
+            &definition.query.effective_sql,
+            &stored_mv_identity(&self.projection),
+        )
+        .unwrap();
+        let query = crate::mv::domain::analysis::canonicalize_iceberg_mv_select_query(
+            &query,
+            Some("ice"),
+            "sales",
+        );
+        let control = SqlCompileControl::unbounded();
+        let preparation = SqlCapturedCatalogPreparation::try_new(
+            query.clone(),
+            Some("ice"),
+            "sales",
+            control.clone(),
+        )
+        .unwrap();
+        let relation = bindings.binding(binding).unwrap().resolved.clone();
+        let relations = preparation
+            .needs()
+            .iter()
+            .map(|need| CatalogRelationFact::resolved(need, relation.clone()).unwrap())
+            .collect::<Vec<_>>();
+        let catalog = preparation.capture(&relations).unwrap();
+        let analysis = analyze_mv_select_with_captured_catalog(
+            Some("ice"),
+            &catalog,
+            "sales",
+            &query,
+            builtin_sql_function_catalog(),
+            crate::application::test_constant_policy(),
+            control.clone(),
+        )
+        .unwrap();
+        let sql = analysis.refresh_input.create_persistence_facts().unwrap();
+        let observed =
+            observe_mv_binding(self.as_ref(), &sql, &bindings, &[], context.clone()).unwrap();
+        let property = derive_fragment_property(&analysis, &control).unwrap();
+        let contract = derive_imv_refresh_contract(&analysis, &control).unwrap();
+        let storage = metadata(false);
+        let schema = crate::mv::domain::storage_observation::observe_schema_validation(
+            self.as_ref(),
+            &pin,
+            &storage,
+            context.clone(),
+        )
+        .unwrap();
+        let interpretation = build_mv_refresh_interpretation(
+            MvInterpretationFacts {
+                definition,
+                sql_facts: &sql,
+                source_observations: &observed.relations,
+                runtime_layout: &crate::mv::domain::iceberg_refresh::stateless_mv_runtime_layout(),
+                target_identity: &property.identity,
+                apply_key_column_name: contract.apply_key.column_name,
+                branch_column_name: (!sql.union_branches().is_empty())
+                    .then_some(novarocks_sql::planning::mv::MV_BRANCH_ID_COLUMN_NAME),
+            },
+            schema.exact_schema(),
+        )
+        .unwrap();
+        let requests = storage_mapping_requests(&sql, &interpretation).unwrap();
+        let mapped = self
+            .observe_current_storage_mapping(&pin, &storage, &requests, context)
+            .unwrap();
+        let mapping = build_storage_mapping(&sql, &requests, mapped.columns).unwrap();
+        let prior = self
+            .exact_semantic_revision(&source.table, ConnectorReadSelector::SnapshotId(17))
+            .unwrap();
+        let (object_id, native_data_version) = persist_exact_connector_revision(&prior).unwrap();
+        let mut publication = self.current.publication.clone().unwrap();
+        publication.inputs = observed
+            .document
+            .occurrences
+            .iter()
+            .map(
+                |occurrence| novarocks_mv_application::persistence::codec::PublicationInput {
+                    relation_occurrence_id: occurrence.occurrence_id,
+                    object_id: object_id.clone(),
+                    native_data_version: native_data_version.clone(),
+                },
+            )
+            .collect();
+        KeyedProjectionFixture {
+            target: novarocks_mv_application::product::MvTarget::from_parts(
+                Some("ice"),
+                "sales",
+                "mv",
+            ),
+            object_id: self.current.view.object_id.clone(),
+            definition: definition.clone(),
+            binding: observed.document,
+            mapping,
+            interpretation,
+            configuration: self.projection.facts.configuration().clone(),
+            publication: Some(publication),
+            metadata_version: self.current.view.metadata_version.clone(),
+            file_totals: self.current.view.current_snapshot_file_totals,
+        }
+        .build()
+        .unwrap()
     }
     fn object(&self) -> ConnectorTableObjectId {
         novarocks_mv_application::persistence::exact_revision::restore_persisted_object(
@@ -206,22 +369,21 @@ impl SourceFixture {
         }
     }
     fn source_fields(&self) -> Vec<MvObservedSourceField> {
-        self.projection.facts.binding().occurrences[0]
-            .paths
-            .iter()
-            .map(|path| {
-                let [field] = path.nodes.as_slice() else {
-                    panic!("fixture has a nested field");
-                };
-                MvObservedSourceField::try_new(
-                    Bytes::copy_from_slice(field.field_id.as_bytes()),
-                    field.name_at_binding.clone(),
-                    path.leaf_type.clone(),
-                    !field.required,
-                )
-                .unwrap()
-            })
-            .collect()
+        [
+            (2, "amount", "double", true),
+            (1, "order_id", "bigint", false),
+        ]
+        .into_iter()
+        .map(|(id, name, kind, nullable)| {
+            MvObservedSourceField::try_new(
+                Bytes::from(vec![id]),
+                name.into(),
+                fixture_type(kind),
+                nullable,
+            )
+            .unwrap()
+        })
+        .collect()
     }
     fn observed_source_fields(&self, initial: bool) -> Vec<MvObservedSourceField> {
         let mut fields = self.source_fields();
@@ -424,11 +586,7 @@ impl SourceFixture {
             result
         })
     }
-    pub(super) fn ports(
-        self: &Arc<Self>,
-        readiness: Arc<MvReadinessPort>,
-        entrance: Arc<ManagementEntrance>,
-    ) -> IcebergMvCorePorts {
+    fn control_host(self: &Arc<Self>) -> Arc<novarocks_catalog_application::ConnectorControlHost> {
         let template = novarocks_catalog_application::test_support::test_control_binding_for(
             self.descriptor.instance_id.clone(),
             self.epoch.to_bytes()[0],
@@ -481,6 +639,15 @@ impl SourceFixture {
             .unwrap(),
         )
         .unwrap();
+        host
+    }
+
+    pub(super) fn ports(
+        self: &Arc<Self>,
+        readiness: Arc<MvReadinessPort>,
+        entrance: Arc<ManagementEntrance>,
+    ) -> IcebergMvCorePorts {
+        let host = self.control_host();
         if self.background_composition {
             // Exercise the same composition factory used by the production
             // background bindings, then the real SourceRead/public adapter path.
@@ -931,6 +1098,103 @@ impl ConnectorReadWireEncoder for NoEncoding {
     }
 }
 impl MvStorageObservationPort for SourceFixture {
+    fn observe_source_binding(
+        &self,
+        _: &ConnectorControlPlanningPin,
+        metadata: &ConnectorTableMetadata,
+        paths: &[MvSourceFieldPath],
+        _: ConnectorRequestContext,
+    ) -> Result<MvSourceBindingObservation, ConnectorError> {
+        use novarocks_type_contract::CanonicalFactWriter;
+
+        assert_eq!(metadata.table.payload().as_ref(), b"original-source-18");
+        let object_id = self.initial_object();
+        let fields = self.observed_source_fields(true);
+        let mut path_fact = CanonicalFactWriter::new("fixture.mv.source-paths", 1);
+        let mut type_fact = CanonicalFactWriter::new("fixture.mv.source-types", 1);
+        path_fact.sequence(paths.len());
+        type_fact.sequence(paths.len());
+        let paths = paths
+            .iter()
+            .map(|path| {
+                let [coordinate] = path.fields.as_slice() else {
+                    panic!("expected a scalar path");
+                };
+                let field = &fields[usize::try_from(coordinate.ordinal).unwrap()];
+                assert_eq!(field.name(), coordinate.name);
+                path_fact.bytes(field.provider_field_id());
+                path_fact.text(field.name());
+                path_fact.boolean(path.whole_subtree);
+                type_fact.bytes(&field.source_type().canonical_bytes());
+                type_fact.boolean(field.nullable());
+                MvSourcePathBinding {
+                    fields: vec![MvSourceFieldBinding {
+                        provider_field_id: field.provider_field_id().clone(),
+                        required: !field.nullable(),
+                        kind: MvSourceFieldKind::Scalar,
+                    }],
+                    leaf_type: field.source_type().clone(),
+                    whole_subtree: path.whole_subtree,
+                }
+            })
+            .collect();
+        Ok(MvSourceBindingObservation {
+            catalog_instance: self.descriptor.instance_id.clone(),
+            object_fact: MvSourceBindingFact::from_canonical_bytes(object_id.as_bytes().to_vec()),
+            object_id,
+            object_kind: MvSourceObjectKind::Table,
+            paths,
+            path_fact: MvSourceBindingFact::from_canonical_bytes(path_fact.finish()),
+            type_fact: MvSourceBindingFact::from_canonical_bytes(type_fact.finish()),
+            read_declarations_fact: MvSourceBindingFact::from_canonical_bytes(
+                b"fixture-declarations".to_vec(),
+            ),
+        })
+    }
+
+    fn observe_current_storage_mapping(
+        &self,
+        _: &ConnectorControlPlanningPin,
+        metadata: &ConnectorTableMetadata,
+        requests: &[MvStorageColumnRequest],
+        _: ConnectorRequestContext,
+    ) -> Result<MvCurrentStorageMapping, ConnectorError> {
+        assert_eq!(metadata.table.payload().as_ref(), b"original-target-11");
+        let fields = self.target_fields();
+        let columns = requests
+            .iter()
+            .map(|request| {
+                let field = fields
+                    .iter()
+                    .map(|(_, field)| field)
+                    .find(|field| field.provider_field_id() == &request.field_id)
+                    .unwrap();
+                MvObservedStorageMapping {
+                    output_ordinal: request.output_ordinal,
+                    field_id: request.field_id.clone(),
+                    logical_type: request.logical_type.clone(),
+                    storage_type: field.source_type().clone(),
+                    storage_nullable: field.nullable(),
+                    declaration: MvStorageColumnDeclaration {
+                        read_type: request.logical_type.clone(),
+                        write_type: request.logical_type.clone(),
+                        provider_declaration: Bytes::from_static(b"fixture-storage"),
+                        storage_format_version: 1,
+                        encode_identity: Bytes::from_static(b"fixture-encode"),
+                        decode_identity: Bytes::from_static(b"fixture-decode"),
+                        content_contract: Bytes::from_static(b"fixture-content"),
+                    },
+                    pushdown: MvStoragePushdownClass::Identity,
+                }
+            })
+            .collect();
+        Ok(MvCurrentStorageMapping {
+            target_object: self.current.view.object_id.clone(),
+            target_version: self.current.view.metadata_version.clone(),
+            columns,
+        })
+    }
+
     fn observe_source_schema(
         &self,
         _: &ConnectorControlPlanningPin,
@@ -950,7 +1214,7 @@ impl MvStorageObservationPort for SourceFixture {
             } else {
                 self.object()
             },
-            Bytes::from_static(&[1]),
+            metadata.version.clone().unwrap(),
             true,
             Some(1),
             true,
@@ -1132,19 +1396,19 @@ async fn background_composed_generation_prepares_actual_source_read_once() {
     explain_counted(false, true).await;
 }
 #[tokio::test(flavor = "current_thread")]
-async fn original_explain_rejects_initial_definition_drift_before_preparing_frozen_to() {
+async fn original_explain_classifies_initial_definition_drift_without_preparing_frozen_to() {
     for (drift, expected) in [
         (
             InitialSourceSchema::MissingBoundField,
-            "MV source field is missing for relation occurrence 7",
+            "MV refresh: InvalidDefinition",
         ),
         (
             InitialSourceSchema::ChangedBoundType,
-            "MV source field type or nullability changed for relation occurrence 7",
+            "MV refresh: InvalidDefinition",
         ),
         (
             InitialSourceSchema::ReplacedObject,
-            "MV source object changed for relation occurrence 7",
+            "MV refresh: NeedsRebuild",
         ),
     ] {
         let mut source = SourceFixture::new(false, false);
@@ -1156,24 +1420,27 @@ async fn original_explain_rejects_initial_definition_drift_before_preparing_froz
         .await;
         seed(&mut fixture, &source).await;
         let result = fixture.business().await;
-        let error = result
-            .as_ref()
-            .err()
-            .expect("initial D drift must reject EXPLAIN");
-        assert!(error.message().contains(expected), "{drift:?}: {error:?}");
+        let rows = match result {
+            Ok(StatementActionValue::Local(rows)) => rows,
+            Err(error) => panic!("definition drift must render EXPLAIN for {drift:?}: {error:?}"),
+            _ => panic!("definition drift must render local rows for {drift:?}"),
+        };
         let state = fixture.state.as_ref().unwrap();
         assert!(
             state.local_health().is_none(),
             "definition refusal is not Native health"
         );
-        assert!(matches!(
-            state.explain.as_ref().unwrap().result,
-            Some(Err(_))
-        ));
+        let mut cursor = rows.into_cursor();
+        let mut output = [0; 4096];
+        let rendered = cursor.step(&mut output).unwrap();
+        assert!(rendered.completed_rows > 0);
+        let first_row_len = u32::from_le_bytes(output[..4].try_into().unwrap()) as usize;
+        let first_row: Vec<String> = serde_json::from_slice(&output[4..4 + first_row_len]).unwrap();
+        assert_eq!(first_row, [expected], "{drift:?}");
         assert_eq!(source.initial_observations.load(Ordering::SeqCst), 1);
         assert_eq!(source.preparations.load(Ordering::SeqCst), 0);
         assert!(source.requests.lock().unwrap().is_empty());
-        drop(result);
+        drop(cursor);
         fixture.close(false).await;
     }
 }
@@ -1314,7 +1581,7 @@ async fn explain_counted_with_initial_schema(
         .unwrap();
         assert!(occurrences.insert(occurrence.occurrence_id));
     }
-    assert_eq!(occurrences, BTreeSet::from([7, 8]));
+    assert_eq!(occurrences, BTreeSet::from([0, 1]));
     assert_eq!(
         source.schema_projections.load(Ordering::SeqCst),
         projections_before + 2
