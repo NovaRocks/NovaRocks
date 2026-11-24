@@ -21,10 +21,8 @@
 -- rule must still push to the left side.
 -- Data design: 20 000 rows on the left, approx_distinct(k) = 100. ANALYZE TABLE
 -- ensures the cost gate fires.
--- Golden derivation: contract_lowering::append_exchange retains the sender's
--- frozen display name, so the old v3 import is b.k in the join and its sink.
--- Preserve RIGHT OUTER after commutation, the a-side LOCAL/GLOBAL aggregates,
--- the final sum(sum(a.v)), all exchanges, RF endpoints, and row estimates.
+-- Verify the a-side LOCAL/GLOBAL aggregation below the join and the final
+-- sum(sum(a.v)). The selected join retains the original LEFT orientation.
 DROP TABLE IF EXISTS ${case_db}.t_agg_pd_lo_a;
 DROP TABLE IF EXISTS ${case_db}.t_agg_pd_lo_b;
 CREATE TABLE ${case_db}.t_agg_pd_lo_a (k INT, v INT);

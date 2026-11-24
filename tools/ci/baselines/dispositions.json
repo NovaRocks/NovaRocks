@@ -1362,17 +1362,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg/iceberg_v3_optimize_row_lineage",
-      "failure": {
-        "class": "mismatch",
-        "statement": 7,
-        "actual_digest": "3da8eb2fb2d449a97685dcbf06d905139c83771e2ec7f231542b8b0e4d6b0d50"
-      },
-      "reason": "Statement 7 ALTER TABLE olineage EXECUTE optimize returns data/delete/added counts 4/2/1 against typed 3/1/1 at the clean 90a81eec8 baseline and after B4a. RWM-7 changed the preceding partial UPDATE from COW to MOR, retaining the original data file and adding a data file and a deletion vector. The prior COW golden remains in force. The original plain verify suffix is unexecuted after statement 7. Independent native B4a conversion proves equivalence of both original EXCEPT results at statements 10 and 11, and the isolated 4/2/1 diagnostic passes the remaining row and lineage oracles. Evidence: p00-iceberg-optimize-recheck, p07-exact/optimize-diagnostic and p07-plain/iceberg.jsonl. Remove after the Iceberg fixture owner verifies the complete native case with its exact rewrite and lineage checks.",
-      "owner": "RWM-7 Iceberg UPDATE and OPTIMIZE fixture",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:complex-type/array_comparison_null_contract",
       "failure": {
         "class": "error_code",

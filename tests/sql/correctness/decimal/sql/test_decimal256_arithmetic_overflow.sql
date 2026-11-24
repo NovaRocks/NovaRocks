@@ -241,64 +241,64 @@ select cast(d1 * d2 as VARCHAR) from ${case_db}.test_256min_result;
 -- query 23
 -- Test 1.1: 76-digit max * 76-digit max (definite overflow)
 SELECT
-    'Test 1.1: 76-digit max * 76-digit max (definite overflow)' as test_case,
+    CAST('Test 1.1: 76-digit max * 76-digit max (definite overflow)' AS VARCHAR) as test_case,
     cast(val_76_0 as VARCHAR),
     cast(val_76_0 * val_76_0 as VARCHAR) as result,
-    'Should overflow: 10^75 * 10^75 = 10^150, way beyond int256' as expected
+    CAST('Should overflow: 10^75 * 10^75 = 10^150, way beyond int256' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- query 24
 -- Test 1.2: 38-digit max * 38-digit max (may overflow)
 SELECT
-    'Test 1.2: 38-digit max * 38-digit max (may overflow)' as test_case,
+    CAST('Test 1.2: 38-digit max * 38-digit max (may overflow)' AS VARCHAR) as test_case,
     cast(val_38_0 as VARCHAR),
     cast(cast(val_38_0 as decimal(38,0)) * val_38_0 as VARCHAR) as result,
-    'not overflow' as expected
+    CAST('not overflow' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- query 25
 -- Test 1.3: 19-digit * 19-digit (should not overflow)
 SELECT
-    'Test 1.3: 19-digit * 19-digit (should not overflow)' as test_case,
+    CAST('Test 1.3: 19-digit * 19-digit (should not overflow)' AS VARCHAR) as test_case,
     cast(val_19_0 as VARCHAR),
     cast(val_19_0 * val_19_0 as VARCHAR) as result,
-    'Should not overflow: 10^18 * 10^18 = 10^36, within int256' as expected
+    CAST('Should not overflow: 10^18 * 10^18 = 10^36, within int256' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- query 26
 -- Test 1.4: Large value * 2
 SELECT
-    'Test 1.4: Large value * 2' as test_case,
+    CAST('Test 1.4: Large value * 2' AS VARCHAR) as test_case,
     cast(val_76_0 as VARCHAR),
     cast(val_76_0 * 2 as VARCHAR) as result,
-    'Should overflow: near-max * 2' as expected
+    CAST('Should overflow: near-max * 2' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- query 27
 -- Test 1.5: Large value * 5
 SELECT
-    'Test 1.5: Large value * 5' as test_case,
+    CAST('Test 1.5: Large value * 5' AS VARCHAR) as test_case,
     cast(val_76_0 as VARCHAR),
     cast(val_76_0 * 5 as VARCHAR) as result,
-    'Should overflow: near-max * 5' as expected
+    CAST('Should overflow: near-max * 5' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- query 28
 -- Test 1.6: Large value * 5.1 (overflow)
 SELECT
-    'Test 1.6: Large value * 5.1' as test_case,
+    CAST('Test 1.6: Large value * 5.1' AS VARCHAR) as test_case,
     cast(val_76_0 as VARCHAR),
     cast(val_76_0 * 5.1 as VARCHAR) as result,
-    'Should overflow: near-max * 5.1' as expected
+    CAST('Should overflow: near-max * 5.1' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- query 29
 -- Test 1.7: Large value * 6 (overflow)
 SELECT
-    'Test 1.7: Large value * 6' as test_case,
+    CAST('Test 1.7: Large value * 6' AS VARCHAR) as test_case,
     cast(val_76_0 as VARCHAR),
     cast(val_76_0 * 6 as VARCHAR) as result,
-    'Should overflow: near-max * 6' as expected
+    CAST('Should overflow: near-max * 6' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- =============================================================================
@@ -308,39 +308,39 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- query 30
 -- Test 2.1: Large negative * Large negative (positive overflow)
 SELECT
-    'Test 2.1: Large negative * Large negative (positive overflow)' as test_case,
+    CAST('Test 2.1: Large negative * Large negative (positive overflow)' AS VARCHAR) as test_case,
     cast(val_76_0 as VARCHAR),
     cast(val_76_0 * val_76_0 as VARCHAR) as result,
-    'Should overflow: (-10^75) * (-10^75) = +10^150' as expected
+    CAST('Should overflow: (-10^75) * (-10^75) = +10^150' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 2;
 
 -- query 31
 -- Test 2.2: Large negative * Large positive (negative overflow)
 SELECT
-    'Test 2.2: Large negative * Large positive (negative overflow)' as test_case,
+    CAST('Test 2.2: Large negative * Large positive (negative overflow)' AS VARCHAR) as test_case,
     cast(a.val_76_0 as VARCHAR) as neg_val,
     cast(b.val_76_0 as VARCHAR) as pos_val,
     cast(a.val_76_0 * b.val_76_0 as VARCHAR) as result,
-    'Should overflow: (-10^75) * (+10^75) = -10^150' as expected
+    CAST('Should overflow: (-10^75) * (+10^75) = -10^150' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values a, ${case_db}.test_boundary_values b
 WHERE a.id = 2 AND b.id = 1;
 
 -- query 32
 -- Test 2.3: Negative boundary * 5
 SELECT
-    'Test 2.3: Negative boundary * 5' as test_case,
+    CAST('Test 2.3: Negative boundary * 5' AS VARCHAR) as test_case,
     cast(val_76_0 as VARCHAR),
     cast(val_76_0 * 5 as VARCHAR) as result,
-    'Should not overflow' as expected
+    CAST('Should not overflow' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 2;
 
 -- query 33
 -- Test 2.4: Negative boundary * 6
 SELECT
-    'Test 2.4: Negative boundary * 6' as test_case,
+    CAST('Test 2.4: Negative boundary * 6' AS VARCHAR) as test_case,
     cast(val_76_0 as VARCHAR),
     cast(val_76_0 * 6 as VARCHAR) as result,
-    'Should overflow' as expected
+    CAST('Should overflow' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 2;
 
 -- =============================================================================
@@ -350,52 +350,52 @@ FROM ${case_db}.test_boundary_values WHERE id = 2;
 -- query 34
 -- Test 3.1: 76-digit * 38-digit
 SELECT
-    'Test 3.1: 76-digit * 38-digit' as test_case,
+    CAST('Test 3.1: 76-digit * 38-digit' AS VARCHAR) as test_case,
     cast(a.val_76_0 as VARCHAR),
     cast(b.val_38_0 as VARCHAR),
     cast(a.val_76_0 * b.val_38_0 as VARCHAR) as result,
-    'Should overflow: 10^75 * 10^37 = 10^112' as expected
+    CAST('Should overflow: 10^75 * 10^37 = 10^112' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values a, ${case_db}.test_boundary_values b
 WHERE a.id = 1 AND b.id = 1;
 
 -- query 35
 -- Test 3.2: 38-digit * 25-digit (can't auto scale up now)
 SELECT
-    'Test 3.2: 38-digit * 25-digit' as test_case,
+    CAST('Test 3.2: 38-digit * 25-digit' AS VARCHAR) as test_case,
     cast(a.val_38_0 as VARCHAR),
     cast(b.val_25_0 as VARCHAR),
     cast(a.val_38_0 * b.val_25_0 as VARCHAR) as result,
-    'overflow' as expected
+    CAST('overflow' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values a, ${case_db}.test_boundary_values b
 WHERE a.id = 1 AND b.id = 1;
 
 -- query 36
 -- Test 3.2: 38-digit * 25-digit (with explicit cast)
 SELECT
-    'Test 3.2: 38-digit * 25-digit' as test_case,
+    CAST('Test 3.2: 38-digit * 25-digit' AS VARCHAR) as test_case,
     cast(a.val_38_0 as VARCHAR),
     cast(b.val_25_0 as VARCHAR),
     cast(cast(a.val_38_0 as decimal(38,10)) * b.val_25_0 as VARCHAR) as result,
-    'should not overflow' as expected
+    CAST('should not overflow' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values a, ${case_db}.test_boundary_values b
 WHERE a.id = 1 AND b.id = 1;
 
 -- query 37
 -- Test 3.3: 25-digit * 25-digit (can't auto scale up now)
 SELECT
-    'Test 3.3: 25-digit * 25-digit' as test_case,
+    CAST('Test 3.3: 25-digit * 25-digit' AS VARCHAR) as test_case,
     cast(val_25_0 as VARCHAR),
     cast(val_25_0 * val_25_0 as VARCHAR) as result,
-    'overflow' as expected
+    CAST('overflow' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- query 38
 -- Test 3.3: 25-digit * 25-digit (with explicit cast)
 SELECT
-    'Test 3.3: 25-digit * 25-digit' as test_case,
+    CAST('Test 3.3: 25-digit * 25-digit' AS VARCHAR) as test_case,
     cast(val_25_0 as VARCHAR),
     cast(cast(val_25_0 as decimal(18,0)) * cast(val_25_0 as decimal(18,0)) as VARCHAR) as result,
-    'should not overflow' as expected
+    CAST('should not overflow' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- =============================================================================
@@ -408,12 +408,12 @@ SELECT
     digits,
     cast(test_val as VARCHAR),
     cast(test_val * test_val as VARCHAR) as result,
-    CASE
+    CAST(CASE
         WHEN digits <= 19 THEN 'Should succeed'
         WHEN digits <= 25 THEN 'May succeed'
         WHEN digits > 30 THEN 'Should succeed'
         ELSE 'Boundary case'
-    END as expected
+    END AS VARCHAR) as expected
 FROM ${case_db}.test_progressive_boundary ORDER BY id;
 
 -- =============================================================================
@@ -423,17 +423,17 @@ FROM ${case_db}.test_progressive_boundary ORDER BY id;
 -- query 40
 -- Test 5.1: Exact zero at high scale
 SELECT
-    'Test 5.1: Exact zero at high scale' as test_case,
-    cast(val_high_scale * val_high_scale as string) as result,
-    'Zero remains exactly representable' as expected
+    CAST('Test 5.1: Exact zero at high scale' AS VARCHAR) as test_case,
+    cast(val_high_scale * val_high_scale as VARCHAR) as result,
+    CAST('Zero remains exactly representable' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- query 41
 -- Test 5.2: Value overflow but reasonable scale
 SELECT
-    'Test 5.2: Value overflow, scale OK' as test_case,
+    CAST('Test 5.2: Value overflow, scale OK' AS VARCHAR) as test_case,
         cast(val_38_0 * val_38_0 as VARCHAR) as result,
-    'Should fail due to value overflow, scale=0 is fine' as expected
+    CAST('Should fail due to value overflow, scale=0 is fine' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- =============================================================================
@@ -443,33 +443,33 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- query 42
 -- Test 6.1: Large * 0
 SELECT
-    'Test 6.1: Large * 0' as test_case,
+    CAST('Test 6.1: Large * 0' AS VARCHAR) as test_case,
     cast(val_76_0 * 0 as VARCHAR) as result,
-    'Should return 0, no overflow' as expected
+    CAST('Should return 0, no overflow' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- query 43
 -- Test 6.2: Large * 1
 SELECT
-    'Test 6.2: Large * 1' as test_case,
+    CAST('Test 6.2: Large * 1' AS VARCHAR) as test_case,
     cast(val_76_0 * 1 as VARCHAR) as result,
-    'Should return original value' as expected
+    CAST('Should return original value' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- query 44
 -- Test 6.3: Large * 0.1
 SELECT
-    'Test 6.3: Large * 0.1' as test_case,
+    CAST('Test 6.3: Large * 0.1' AS VARCHAR) as test_case,
     cast(val_76_0 * 0.1 as VARCHAR) as result,
-    'Should succeed, reduces magnitude' as expected
+    CAST('Should succeed, reduces magnitude' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- query 45
 -- Test 6.4: Large * -1
 SELECT
-    'Test 6.4: Large * -1' as test_case,
+    CAST('Test 6.4: Large * -1' AS VARCHAR) as test_case,
     cast(val_76_0 * (-1) as VARCHAR) as result,
-    'Should return negative of original' as expected
+    CAST('Should return negative of original' AS VARCHAR) as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- =============================================================================
@@ -480,7 +480,7 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 -- Test 7.2: Scientific calculation
 SELECT
-    'Test 7.2: Scientific calculation' as test_case,
+    CAST('Test 7.2: Scientific calculation' AS VARCHAR) as test_case,
     cast(d76_10 * d76_10 as VARCHAR) as result,
-    'Simulates scientific computation overflow' as expected
+    CAST('Simulates scientific computation overflow' AS VARCHAR) as expected
 FROM ${case_db}.test_decimal_multiply_overflow WHERE id = 3;
