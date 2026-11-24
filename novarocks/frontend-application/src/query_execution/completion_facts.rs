@@ -389,6 +389,11 @@ impl CatalogFactPort for FrontendCatalogFacts {
         .with_catalog_application(self.owners.catalog_application.as_deref())
         .with_local_views(self.local_views.clone()?)
         .with_system_relations(self.owners.system_relations().clone());
+        let historical_names: std::collections::HashSet<_> = needs
+            .iter()
+            .filter(|need| need.version().is_some())
+            .map(CatalogRelationNeed::relation)
+            .collect();
         let mut facts = Vec::with_capacity(needs.len());
         for need in needs {
             // Local views and generated overlays retain their precedence.
@@ -396,7 +401,14 @@ impl CatalogFactPort for FrontendCatalogFacts {
                 facts.push(fact?);
                 continue;
             }
-            facts.push(materializer.resolve_relation_fact_async(need).await?);
+            facts.push(
+                materializer
+                    .resolve_relation_fact_with_coverage(
+                        need,
+                        historical_names.contains(need.relation()),
+                    )
+                    .await?,
+            );
         }
         Ok(facts)
     }

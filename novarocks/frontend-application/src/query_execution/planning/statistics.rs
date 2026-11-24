@@ -17,8 +17,6 @@
 
 use std::sync::Arc;
 
-#[cfg(test)]
-use crate::catalog_application::query_bindings::parse_time_travel_overlay_identity;
 use crate::catalog_application::query_bindings::{
     QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingStore,
 };
@@ -965,19 +963,5 @@ mod unified_tests {
                 .as_slice(),
             [requested]
         );
-    }
-
-    #[test]
-    fn sqlx1_resolution_time_travel_overlay_identity_is_canonical() {
-        assert_eq!(
-            parse_time_travel_overlay_identity("__sqlx1_tt_orders_42"),
-            Some(("orders", 42))
-        );
-        assert_eq!(
-            parse_time_travel_overlay_identity("__sqlx1_tt_sales_orders_-7"),
-            Some(("sales_orders", -7))
-        );
-        assert_eq!(parse_time_travel_overlay_identity("orders"), None);
-        assert_eq!(parse_time_travel_overlay_identity("__sqlx1_tt__bad"), None);
     }
 }

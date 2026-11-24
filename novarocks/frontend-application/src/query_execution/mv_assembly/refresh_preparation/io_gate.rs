@@ -103,9 +103,10 @@ enum Request {
         context: ConnectorRequestContext,
     },
 
-    ReferenceFacts {
+    CompleteTableObservation {
         planning_pin: ConnectorControlPlanningPin,
-        request: novarocks_spi::connector::ConnectorReadReferenceFactsRequest,
+        original: ConnectorTableMetadata,
+        context: ConnectorRequestContext,
     },
     ViewMetadata {
         planning_pin: ConnectorControlPlanningPin,
@@ -137,7 +138,6 @@ enum Response {
     Admit(Result<(), MvApplicationError>),
     InstallCurrent(Result<(), MvApplicationError>),
     MetadataReady,
-    ReferenceFactsReady,
     ViewMetadataReady,
     SourceRead(Result<(), ConnectorError>),
 }
@@ -250,9 +250,6 @@ pub(crate) struct MvRefreshPreparationIo {
     admission: Arc<MvPublicationAdmissionReceiving>,
     registration: Arc<CurrentProjectionRegistration>,
     metadata_result: Mutex<Option<Result<ConnectorTablePreparation, ConnectorError>>>,
-    reference_result: Mutex<
-        Option<Result<novarocks_spi::connector::ConnectorReadReferenceFacts, ConnectorError>>,
-    >,
     view_result:
         Mutex<Option<Result<novarocks_spi::connector::ConnectorViewPreparation, ConnectorError>>>,
     source_result: Mutex<Option<SourceReceiving>>,
@@ -300,7 +297,6 @@ impl MvRefreshPreparationIo {
             admission: Arc::new(MvPublicationAdmissionReceiving::new()),
             registration: Arc::new(CurrentProjectionRegistration::new()),
             metadata_result: Mutex::new(None),
-            reference_result: Mutex::new(None),
             view_result: Mutex::new(None),
             source_result: Mutex::new(None),
             current_metadata_cpu,
@@ -512,31 +508,32 @@ impl MvRefreshPreparationIo {
                         };
                         Response::InstallCurrent(result)
                     }
-                    Request::ReferenceFacts {
+                    Request::CompleteTableObservation {
                         planning_pin,
-                        request,
+                        original,
+                        context,
                     } => {
                         let mut child = planning_pin
                             .binding()
                             .metadata()
-                            .read_reference_facts_async(request);
+                            .complete_table_observation(&original, context);
                         let result = std::future::poll_fn(|cx| child.as_mut().poll(cx)).await;
                         {
                             let gate = original_gate
                                 .upgrade()
                                 .expect("original MV gate outlives its child");
                             let mut receiver = gate
-                                .reference_result
+                                .metadata_result
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
                             assert!(
                                 receiver.is_none(),
-                                "original MV reference receiver is occupied"
+                                "original MV observation receiver is occupied"
                             );
                             *receiver = Some(result);
                         }
                         drop(child);
-                        Response::ReferenceFactsReady
+                        Response::MetadataReady
                     }
                     Request::ViewMetadata {
                         planning_pin,
@@ -959,31 +956,28 @@ impl MvRefreshPreparationIo {
         .map_err(crate::connector::schema_creation::connector_schema_error)
     }
 
-    pub(crate) async fn reference_facts(
+    pub(crate) async fn complete_table_observation(
         &self,
         planning_pin: &ConnectorControlPlanningPin,
-        identity: ConnectorTableIdentity,
+        original: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
-    ) -> Result<novarocks_spi::connector::ConnectorReadReferenceFacts, ConnectorError> {
-        let context = crate::connector::context_for_planning_pin_typed(planning_pin, context)?;
+    ) -> Result<ConnectorTablePreparation, ConnectorError> {
         context.original_operation_control().check_active()?;
-        let Response::ReferenceFactsReady = self
-            .exchange(Request::ReferenceFacts {
+        let Response::MetadataReady = self
+            .exchange(Request::CompleteTableObservation {
                 planning_pin: planning_pin.clone(),
-                request: novarocks_spi::connector::ConnectorReadReferenceFactsRequest {
-                    table: identity,
-                    context,
-                },
+                original: original.clone(),
+                context,
             })
             .await
         else {
-            panic!("MV reference response changed kind")
+            panic!("MV complete observation response changed kind")
         };
-        self.reference_result
+        self.metadata_result
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
-            .expect("original reference result was received before its child exited")
+            .expect("original metadata result preceded its child exit")
     }
 
     pub(crate) async fn view_metadata(

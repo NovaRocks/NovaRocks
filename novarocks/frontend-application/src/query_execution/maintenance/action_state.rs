@@ -189,7 +189,6 @@ impl MaintenanceActionState {
             let mut borrowed = std::pin::pin!(super::iceberg::execute_action_with_ports(
                 &mut body.call,
                 engine.kernel.connector_control().as_ref(),
-                &engine.kernel,
                 request,
                 engine.connector_context.clone(),
             ));
@@ -216,7 +215,6 @@ impl MaintenanceActionState {
                 super::iceberg::execute_automatic_metadata_action_with_ports(
                     &mut body.call,
                     engine.kernel.connector_control().as_ref(),
-                    &engine.kernel,
                     request.clone(),
                     effect,
                     engine.connector_context.clone(),

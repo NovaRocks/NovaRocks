@@ -376,7 +376,7 @@ impl AddFilesEngine for DmlExecutionKernel {
             Ok(session) => session,
             Err(_) => return poisoned_session(),
         };
-        project_outcome(session.execute_registration_once(byte_author, self))
+        project_outcome(session.execute_registration_once(byte_author))
     }
 
     fn adjudicate_add_files(
@@ -408,7 +408,7 @@ impl AddFilesEngine for DmlExecutionKernel {
             Ok(session) => session,
             Err(_) => return poisoned_session(),
         };
-        project_outcome(session.adjudicate_once(evidence, self))
+        project_outcome(session.adjudicate_once(evidence))
     }
 }
 

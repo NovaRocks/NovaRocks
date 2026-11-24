@@ -43,6 +43,7 @@ struct Counts {
 }
 struct ObservedMetadata {
     owner: ConnectorInstanceId,
+    provider: ConnectorProviderId,
     epoch: ProviderBindingEpoch,
     error: Option<ConnectorError>,
     counts: Arc<Counts>,
@@ -117,6 +118,17 @@ impl ObservedMetadata {
 impl ConnectorMetadata for ObservedMetadata {
     fn instance_id(&self) -> &ConnectorInstanceId {
         &self.owner
+    }
+    fn exact_semantic_revision(
+        &self,
+        table: &ConnectorTableHandle,
+        _: ConnectorReadSelector,
+    ) -> Result<ConnectorExactSemanticRevision, ConnectorError> {
+        ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            self.provider.clone(),
+            &ConnectorTableObjectId::try_new(table.payload().clone())?,
+            Some(20),
+        )
     }
     fn namespace_exists(&self, _: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
         panic!("no namespace existence probe")
@@ -195,6 +207,48 @@ impl ConnectorMetadata for ObservedMetadata {
                 (request, true),
             ))
         })
+    }
+    fn prepare_complete_table_observation_sync(
+        &self,
+        request: ConnectorTableRequest,
+        _original: Option<&ConnectorTableMetadata>,
+    ) -> Result<ConnectorTablePreparation, ConnectorError> {
+        self.counts.source_prepare.fetch_add(1, Ordering::Relaxed);
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        Ok(ConnectorTablePreparation::new(
+            self.owner.clone(),
+            (request, true),
+        ))
+    }
+    fn observed_read_references(
+        &self,
+        original: &ConnectorTableMetadata,
+        context: &ConnectorRequestContext,
+    ) -> Result<(ConnectorReadReferenceFacts, bool), ConnectorError> {
+        let facts = self.references(ConnectorReadReferenceFactsRequest {
+            table: original.identity.clone(),
+            context: context.clone(),
+        })?;
+        Ok((facts, original.source_read_facts().is_some()))
+    }
+    fn create_observed_snapshot(
+        &self,
+        original: &ConnectorTableMetadata,
+        snapshot: i64,
+        context: &ConnectorRequestContext,
+        creation: &mut ConnectorReadSchemaCreation<'_>,
+    ) -> Result<ConnectorTableMetadata, PureProviderCompileError<ConnectorError>> {
+        self.create(
+            ConnectorTableRequest {
+                table: original.identity.clone(),
+                resolution: ConnectorTableResolution::HistoricalSnapshot(snapshot),
+                context: context.clone(),
+            },
+            false,
+            creation,
+        )
     }
     fn create_prepared_table(
         &self,
@@ -360,6 +414,7 @@ fn fixture(
     let counts = Arc::new(Counts::default());
     let metadata = Arc::new(ObservedMetadata {
         owner: base.descriptor().instance_id.clone(),
+        provider: base.descriptor().provider_id.clone(),
         epoch: base.incarnation(),
         error: table_error,
         counts: counts.clone(),
@@ -535,19 +590,72 @@ async fn historical_selection_uses_the_same_planning_pin_and_actual_selected_sch
         materialization.planning_pin.control_runtime_id(),
         resolver.binding.control_runtime_id()
     );
-    assert_eq!(
-        *resolver.counts.events.lock().unwrap(),
-        vec!["reference", "table-prepare"]
-    );
+    assert_eq!(*resolver.counts.events.lock().unwrap(), vec!["reference"]);
     assert_eq!(
         *resolver.counts.resolutions.lock().unwrap(),
-        vec![ConnectorTableResolution::HistoricalSnapshot(10)]
+        vec![ConnectorTableResolution::StrictBaseTable]
     );
     assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), 1);
     assert_eq!(resolver.counts.table_create.load(Ordering::Relaxed), 1);
     assert_eq!(resolver.counts.view_prepare.load(Ordering::Relaxed), 0);
     assert_eq!(resolver.counts.table_load.load(Ordering::Relaxed), 0);
 }
+#[tokio::test]
+async fn names_for_the_same_object_keep_the_first_observation_through_sealing() {
+    use crate::catalog_application::query_bindings::QueryTableBindingStore;
+
+    let resolver = fixture(None, None);
+    let bindings = QueryTableBindingStore::try_new().unwrap();
+    let load = |sql, complete_first| {
+        let need = need(sql);
+        let bindings = &bindings;
+        let resolver = &resolver;
+        async move {
+            load_statement_relation(
+                bindings,
+                resolver,
+                context(),
+                &need,
+                complete_first,
+                StatementCatalogIo::Async,
+            )
+            .await
+        }
+    };
+    load("SELECT x FROM ice.db.orders", true).await.unwrap();
+    load("SELECT x FROM ice.db.order_alias", false)
+        .await
+        .unwrap();
+    bindings.seal_catalog_observations().await;
+    let ConnectorQueryRelationMaterialization::Table {
+        materialization, ..
+    } = load(
+        "SELECT x FROM ice.db.order_alias FOR VERSION AS OF 10",
+        false,
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("the observed alias must retain its original table");
+    };
+    assert_eq!(
+        materialization.read_selector,
+        ConnectorReadSelector::SnapshotId(10)
+    );
+    assert_eq!(
+        materialization.source_metadata.identity.table.as_ref(),
+        "orders"
+    );
+    assert_eq!(
+        materialization.read_schema.field(0).data_type(),
+        &arrow::datatypes::DataType::Int32
+    );
+    assert!(load("SELECT x FROM ice.db.unseen", false).await.is_err());
+    assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), 2);
+    assert_eq!(resolver.counts.source_prepare.load(Ordering::Relaxed), 1);
+    assert_eq!(resolver.counts.table_prepare.load(Ordering::Relaxed), 1);
+}
+
 #[tokio::test]
 async fn production_relation_loader_memo_keeps_the_view_across_materializer_rounds() {
     use crate::catalog_application::{
@@ -609,6 +717,7 @@ async fn unknown_ref_is_a_pure_fact_and_its_memo_does_not_reload_provider_metada
     assert_eq!(resolver.counts.reference.load(Ordering::Relaxed), 1);
     assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), 1);
     assert_eq!(resolver.counts.table_prepare.load(Ordering::Relaxed), 0);
+    assert_eq!(resolver.counts.source_prepare.load(Ordering::Relaxed), 1);
     assert_eq!(resolver.counts.view_prepare.load(Ordering::Relaxed), 0);
 }
 
@@ -659,7 +768,8 @@ async fn production_materialization_keeps_the_frozen_snapshot_scan_and_reuses_it
     }
     assert_eq!(resolver.counts.reference.load(Ordering::Relaxed), 1);
     assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), 1);
-    assert_eq!(resolver.counts.table_prepare.load(Ordering::Relaxed), 1);
+    assert_eq!(resolver.counts.table_prepare.load(Ordering::Relaxed), 0);
+    assert_eq!(resolver.counts.source_prepare.load(Ordering::Relaxed), 1);
     assert_eq!(bindings.captured_bindings().len(), 1);
 }
 
@@ -682,64 +792,6 @@ fn original_schema_source_control_is_not_reclassified_as_absence_or_a_view_probe
         novarocks_sql::compiler::SqlCompileError::from(original)
     );
     assert_eq!(resolver.counts.view_load.load(Ordering::Relaxed), 0);
-}
-
-#[tokio::test]
-async fn legacy_and_explicit_snapshot_names_share_one_input_without_sharing_the_sql_identity() {
-    use crate::catalog_application::{
-        query_bindings::QueryTableBindingStore,
-        query_materializer::{CatalogServiceMaterializer, iceberg_table_binding_loader},
-    };
-    let legacy = "SELECT x FROM ice.db.__sqlx1_tt_orders_10";
-    let physical = "SELECT x FROM ice.db.orders FOR VERSION AS OF 10";
-    for inputs in [[legacy, physical], [physical, legacy]] {
-        let resolver = fixture(None, Some(None));
-        let service = crate::catalog_application::query_catalog::new_query_catalog_service();
-        let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
-        let mut first = None;
-        for sql in inputs {
-            let query = novarocks_parser::parser::parse_query(sql).unwrap();
-            let preparation = novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
-                query.clone(),
-                Some("ice"),
-                "db",
-                novarocks_sql::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap();
-            let request = &preparation.needs()[0];
-            let source = CatalogServiceMaterializer::new(
-                Some("ice"),
-                &service,
-                bindings.clone(),
-                iceberg_table_binding_loader(&resolver, context()),
-            );
-            let fact = source.resolve_relation_fact_async(request).await.unwrap();
-            let novarocks_sql::compiler::CatalogRelationOutcome::Resolved(table) = fact.outcome()
-            else {
-                panic!("frozen input")
-            };
-            assert_eq!(
-                novarocks_sql::planning::catalog::catalog_table(table).identity,
-                request.relation().clone()
-            );
-            assert_eq!(
-                novarocks_sql::planning::catalog::frozen_input_snapshot_id(table),
-                Some(10)
-            );
-            let binding = novarocks_sql::planning::catalog::table_binding_id(table);
-            if let Some(first) = first {
-                assert_eq!(binding, first)
-            } else {
-                first = Some(binding)
-            }
-            // The real captured catalog also validates both identity carriers.
-            preparation.capture(&[fact]).unwrap();
-        }
-        assert_eq!(bindings.captured_bindings().len(), 1);
-        assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), 1);
-        assert_eq!(resolver.counts.table_prepare.load(Ordering::Relaxed), 1);
-        assert!(resolver.counts.reference.load(Ordering::Relaxed) <= 1);
-    }
 }
 
 #[path = "tests/gated_original.rs"]

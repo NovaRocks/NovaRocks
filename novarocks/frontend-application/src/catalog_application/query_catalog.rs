@@ -18,7 +18,7 @@
 //! Application catalog registry and connector materialization.
 //!
 //! The SQL catalog vocabulary exposes neutral `ResolvedAnalyzerTable` facts.
-//! This module owns catalog registry cache entries and all connector control
+//! This module owns catalog registry membership and all connector control
 //! acquisition needed to materialize them.
 //!
 //! The seam against query assembly runs through
@@ -32,20 +32,15 @@
 use crate::connector::schema_creation::FrontendSchemaLoad;
 use std::sync::{Arc, RwLock};
 
-use novarocks_types::naming::TableIdentity;
-use novarocks_types::schema::CatalogTable;
-
 use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
 
 mod registry;
 pub(crate) mod relation;
-mod schema_cache;
 mod service;
 #[cfg(test)]
 mod variant_identity;
 
-use registry::{Catalog, CatalogRegistry};
-use schema_cache::SchemaCache;
+use registry::CatalogRegistry;
 pub use service::QueryCatalogService;
 
 /// Typed result of resolving one catalog relation for an admitted request.
@@ -137,6 +132,20 @@ impl CatalogResolutionError {
         }
     }
 
+    pub(super) fn is_object_outcome(&self) -> bool {
+        use novarocks_spi::connector::ConnectorErrorKind;
+        matches!(self, Self::Missing { .. })
+            || self.original_provider().is_some_and(|(error, _)| {
+                matches!(
+                    error.kind(),
+                    ConnectorErrorKind::NotFound
+                        | ConnectorErrorKind::PermissionDenied
+                        | ConnectorErrorKind::Unsupported
+                        | ConnectorErrorKind::CorruptData
+                )
+            })
+    }
+
     pub fn into_compile(self) -> novarocks_sql::compiler::SqlCompileError {
         match self {
             Self::Missing { reason } => {
@@ -205,9 +214,6 @@ pub type CatalogResolutionResult<T> = Result<T, CatalogResolutionError>;
 /// never decodes a provider table handle or metadata payload.
 #[derive(Clone)]
 pub struct ConnectorQueryTableMaterialization {
-    /// Frozen desired-state identity shared by every execution artifact this
-    /// query derives from the admitted control lease.
-    pub schema_version: Option<Vec<u8>>,
     /// The exact sealed metadata used to materialize this SQL relation. It
     /// remains request-local so CREATE can ask the provider for opaque source
     /// field identities without resolving a newer generation.
@@ -220,38 +226,6 @@ pub struct ConnectorQueryTableMaterialization {
     pub sql_planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts,
     pub statistics_pin: Option<crate::connector::backend::ResolvedTableStatisticsPin>,
     pub planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
-}
-
-pub fn load_connector_table_materialization_with_lease(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-) -> Result<ConnectorQueryTableMaterialization, String> {
-    load_connector_table_materialization_with_lease_typed(
-        controls, context, catalog, namespace, table,
-    )
-    .map_err(CatalogResolutionError::into_message)
-}
-
-/// Resolve a base table while retaining the distinction between an absent
-/// relation and a catalog/control failure.
-pub fn load_connector_table_materialization_with_lease_typed(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-) -> CatalogResolutionResult<ConnectorQueryTableMaterialization> {
-    load_connector_table_materialization_with_resolution_typed(
-        controls,
-        context,
-        catalog,
-        namespace,
-        table,
-        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-    )
 }
 
 /// Resolve a provider-defined alias while retaining typed absence semantics.
@@ -487,7 +461,6 @@ pub fn connector_table_materialization_from_metadata(
         );
     }
     Ok(ConnectorQueryTableMaterialization {
-        schema_version: metadata.version.as_ref().map(|version| version.to_vec()),
         source_metadata: metadata.clone(),
         columns,
         row_lineage_metadata_columns,
@@ -500,138 +473,6 @@ pub fn connector_table_materialization_from_metadata(
     })
 }
 
-#[derive(Clone, Debug)]
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific frontend integration and regression coverage."
-)]
-pub struct CatalogRuntimeMetadata {
-    table: CatalogTable,
-}
-
-impl CatalogRuntimeMetadata {
-    fn from_local_catalog_table(identity: TableIdentity, table: CatalogTable) -> Self {
-        // Registry cache entries describe only durable SQL catalog facts.
-        // They intentionally retain neither a scan source nor a connector
-        // descriptor: every query receives fresh provider authority through
-        // the query-local materialization envelope and binding store.
-        Self {
-            table: CatalogTable { identity, ..table },
-        }
-    }
-
-    fn from_connector_materialization(
-        identity: TableIdentity,
-        materialization: &ConnectorQueryTableMaterialization,
-    ) -> Self {
-        Self {
-            table: CatalogTable {
-                identity,
-                columns: materialization.columns.clone(),
-                hidden_columns: materialization.row_lineage_metadata_columns.clone(),
-            },
-        }
-    }
-}
-
-/// Query catalog registry owned by the Frontend composition root.
-///
-/// The registry keeps durable SQL catalog facts only. Provider authority is
-/// supplied separately through the exact Connector control lease captured for
-/// each request.
-struct InternalCatalog {
-    name: String,
-    local: Arc<RwLock<PlannerMemoryCatalog>>,
-}
-
-impl InternalCatalog {
-    fn new(name: &str, local: Arc<RwLock<PlannerMemoryCatalog>>) -> Self {
-        Self {
-            name: name.to_string(),
-            local,
-        }
-    }
-}
-
-impl Catalog for InternalCatalog {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn get_table_metadata(
-        &self,
-        namespace: &str,
-        table: &str,
-    ) -> Result<CatalogRuntimeMetadata, String> {
-        let local = self.local.read().expect("internal catalog read lock");
-        let catalog_table =
-            novarocks_sql::planning::catalog::local_catalog_table(&local, namespace, table)?;
-        Ok(CatalogRuntimeMetadata::from_local_catalog_table(
-            TableIdentity::new(&self.name, namespace, table),
-            catalog_table,
-        ))
-    }
-}
-
-/// Registry entry for one admitted external catalog runtime.
-///
-/// It holds no provider concrete: every schema fact is materialized through the
-/// exact connector control lease the Frontend published for this SQL name.
-struct ConnectorCatalog {
-    name: String,
-    controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-    cache: SchemaCache,
-}
-
-impl ConnectorCatalog {
-    fn new(
-        name: &str,
-        controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-    ) -> Self {
-        Self {
-            name: name.to_string(),
-            controls,
-            cache: SchemaCache::new(),
-        }
-    }
-}
-
-impl Catalog for ConnectorCatalog {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn get_table_metadata(
-        &self,
-        namespace: &str,
-        table: &str,
-    ) -> Result<CatalogRuntimeMetadata, String> {
-        let identity = TableIdentity::new(&self.name, namespace, table);
-        let materialization = load_connector_table_materialization_with_lease(
-            self.controls.as_ref(),
-            crate::connector::connector_request_context(
-                None,
-                novarocks_spi::connector::ConnectorStopOwner::new().view(),
-            )?,
-            &self.name,
-            namespace,
-            table,
-        )?;
-        self.cache
-            .get_or_build_validated(&identity, materialization.schema_version.clone(), || {
-                Ok(CatalogRuntimeMetadata::from_connector_materialization(
-                    identity.clone(),
-                    &materialization,
-                ))
-            })
-    }
-
-    fn invalidate_table(&self, namespace: &str, table: &str) {
-        self.cache
-            .invalidate(&TableIdentity::new(&self.name, namespace, table));
-    }
-}
-
 /// Create an empty Frontend query-catalog runtime with the built-in local
 /// catalog registered. External catalog runtimes must be bound through
 /// [`crate::catalog_application::CatalogRuntimeProjection`] after the
@@ -639,15 +480,8 @@ impl Catalog for ConnectorCatalog {
 pub fn new_query_catalog_service() -> QueryCatalogService {
     let local = Arc::new(RwLock::new(PlannerMemoryCatalog::default()));
     let service = QueryCatalogService::new(Arc::clone(&local), CatalogRegistry::new());
-    service.register_catalog(Arc::new(InternalCatalog::new("default_catalog", local)));
+    service.register_catalog("default_catalog");
     service
-}
-
-pub(crate) fn build_connector_catalog(
-    name: &str,
-    controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-) -> Arc<dyn Catalog> {
-    Arc::new(ConnectorCatalog::new(name, controls))
 }
 
 /// Narrow source for request-local catalog snapshots.

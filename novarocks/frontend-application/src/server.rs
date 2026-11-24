@@ -330,7 +330,6 @@ async fn build_frontend_role_products(
     core_capabilities::bind_catalog_runtime_projection(
         catalog_projection.as_ref(),
         Arc::clone(&catalog_service),
-        Arc::clone(&connector_control),
     )
     .map_err(FrontendApplicationError::server)?;
 

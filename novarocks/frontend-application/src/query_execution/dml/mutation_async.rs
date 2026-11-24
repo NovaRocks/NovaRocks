@@ -137,9 +137,6 @@ impl PreparedMutationFacts {
             Self::Merge(p) => &p.connector_context,
         }
     }
-    pub(crate) fn finalize(&self, state: &DmlExecutionKernel) -> Result<(), String> {
-        crate::catalog_application::resolver::invalidate_iceberg_caches(state, self.target())
-    }
     fn strategy(&self) -> ConnectorRowMutationStrategy {
         match self {
             Self::Update(p) => p.mode,
@@ -359,22 +356,11 @@ pub(crate) async fn compile_routed_mutation_write(
         std::slice::from_ref(match_read),
         provider,
     )?;
-    let mut query = query.clone();
-    if crate::query_execution::planning::time_travel::has_time_travel_refs(&query) {
-        crate::query_execution::planning::time_travel::rewrite_time_travel_refs_async(
-            state,
-            Some(&target.catalog),
-            &target.namespace,
-            &mut query,
-            context,
-        )
-        .await?;
-    }
     let control = crate::query_execution::planning::sql_compile_control_from_execution(execution);
-    let assignments = mutation_write_assignments(&query, &kind, &routes, &control)
+    let assignments = mutation_write_assignments(query, &kind, &routes, &control)
         .map_err(DmlError::from_compile)?;
     let qualifications = crate::query_execution::compiler::observe_dml_catalog_qualifications(
-        &query,
+        query,
         Some(target.catalog.as_str()),
         &target.namespace,
         &control,
@@ -384,7 +370,7 @@ pub(crate) async fn compile_routed_mutation_write(
     .map_err(DmlError::from_compile)?;
     let mut preparation =
         novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent_with_qualifications(
-            execution.sql_statement_input(Box::new(query), false),
+            execution.sql_statement_input(Box::new(query.clone()), false),
             novarocks_sql::compiler::SqlSessionContext {
                 sql_semantics: execution.sql_semantics().clone(),
                 // The old analyzer materializer supplied this effective catalog
@@ -412,6 +398,7 @@ pub(crate) async fn compile_routed_mutation_write(
             .continue_catalog(facts.into_boxed_slice())
             .map_err(DmlError::from_compile)?;
     }
+    bindings.seal_catalog_observations().await;
     let analyzed = provider
         .analyze_dml_source(
             preparation,

@@ -56,7 +56,7 @@ impl CatalogServiceMaterializer<'_> {
                             .registry()
                             .read()
                             .expect("catalog service declaration registry")
-                            .get_catalog(&relation.catalog)
+                            .require_catalog(&relation.catalog)
                             .is_err()
                         {
                             return CatalogRelationFact::system_table(

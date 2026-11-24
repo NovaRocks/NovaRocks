@@ -181,6 +181,7 @@ async fn prove_delete_path(
             .continue_catalog(response.into_boxed_slice())
             .map_err(DmlExecutionError::from_compile)?;
     }
+    bindings.seal_catalog_observations().await;
     let analyzed = facts
         .analyze_dml_source(
             preparation,

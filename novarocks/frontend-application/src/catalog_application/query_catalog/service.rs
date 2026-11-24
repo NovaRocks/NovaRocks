@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 
 use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
 
-use super::registry::{Catalog, CatalogRegistry};
+use super::registry::CatalogRegistry;
 
 pub struct QueryCatalogService {
     local: Arc<RwLock<PlannerMemoryCatalog>>,
@@ -56,11 +56,11 @@ impl QueryCatalogService {
             .clone()
     }
 
-    pub fn register_catalog(&self, catalog: Arc<dyn Catalog>) {
+    pub fn register_catalog(&self, name: &str) {
         self.registry
             .write()
             .expect("catalog service registry write lock")
-            .register(catalog);
+            .register(name);
     }
 
     pub fn unregister_catalog(&self, name: &str) {
@@ -69,44 +69,20 @@ impl QueryCatalogService {
             .expect("catalog service registry write lock")
             .unregister(name);
     }
-
-    pub fn invalidate_table(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Result<(), String> {
-        self.registry
-            .read()
-            .expect("catalog service registry read lock")
-            .invalidate_table(catalog, namespace, table)
-    }
 }
 
 #[cfg(test)]
 mod current_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, RwLock};
 
-    use novarocks_types::naming::{DEFAULT_DATABASE, TableIdentity};
-    use novarocks_types::schema::{CatalogTable, ColumnDef};
+    use novarocks_types::naming::DEFAULT_DATABASE;
+    use novarocks_types::schema::ColumnDef;
 
-    use super::super::registry::{Catalog, CatalogRegistry};
+    use super::super::registry::CatalogRegistry;
     use super::QueryCatalogService;
-    use crate::catalog_application::query_catalog::CatalogRuntimeMetadata;
     use novarocks_sql::planning::catalog::{
         PlannerMemoryCatalog, local_catalog_table, register_test_connector_read_table,
     };
-
-    fn metadata(catalog: &str, namespace: &str, table: &str) -> CatalogRuntimeMetadata {
-        CatalogRuntimeMetadata {
-            table: CatalogTable {
-                identity: TableIdentity::new(catalog, namespace, table),
-                columns: Vec::new(),
-                hidden_columns: Vec::new(),
-            },
-        }
-    }
 
     fn column(name: &str) -> ColumnDef {
         ColumnDef {
@@ -118,48 +94,10 @@ mod current_tests {
         }
     }
 
-    struct TestCatalog;
-
-    impl Catalog for TestCatalog {
-        fn name(&self) -> &str {
-            "named"
-        }
-
-        fn get_table_metadata(
-            &self,
-            namespace: &str,
-            table: &str,
-        ) -> Result<CatalogRuntimeMetadata, String> {
-            Ok(metadata("named", namespace, table))
-        }
-    }
-
-    struct InvalidatingCatalog {
-        invalidations: Arc<AtomicUsize>,
-    }
-
-    impl Catalog for InvalidatingCatalog {
-        fn name(&self) -> &str {
-            "invalidating"
-        }
-
-        fn get_table_metadata(
-            &self,
-            namespace: &str,
-            table: &str,
-        ) -> Result<CatalogRuntimeMetadata, String> {
-            Ok(metadata("invalidating", namespace, table))
-        }
-
-        fn invalidate_table(&self, _namespace: &str, _table: &str) {
-            self.invalidations.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
     fn service() -> QueryCatalogService {
         let local = Arc::new(RwLock::new(PlannerMemoryCatalog::default()));
         let mut registry = CatalogRegistry::new();
-        registry.register(Arc::new(TestCatalog));
+        registry.register("named");
         QueryCatalogService::new(local, registry)
     }
 
@@ -185,17 +123,13 @@ mod current_tests {
                 .name,
             "revision_1"
         );
-        assert_eq!(
+        assert!(
             service
                 .registry()
                 .read()
                 .expect("registry read lock")
-                .resolve("NAMED", "ns", "t")
-                .expect("named metadata")
-                .table
-                .identity
-                .fqn(),
-            "named.ns.t"
+                .require_catalog("NAMED")
+                .is_ok()
         );
     }
 
@@ -233,7 +167,7 @@ mod current_tests {
         snapshot.unregister("named");
 
         assert_eq!(
-            snapshot.resolve("named", "ns", "t").map(|_| ()),
+            snapshot.require_catalog("named"),
             Err("unknown catalog: named".to_string())
         );
         assert!(
@@ -241,7 +175,7 @@ mod current_tests {
                 .registry()
                 .read()
                 .expect("registry read lock")
-                .resolve("named", "ns", "t")
+                .require_catalog("named")
                 .is_ok()
         );
     }
@@ -255,25 +189,9 @@ mod current_tests {
                 .registry()
                 .read()
                 .expect("registry read lock")
-                .resolve("named", "ns", "t")
+                .require_catalog("named")
                 .map(|_| ()),
             Err("unknown catalog: named".to_string())
         );
-    }
-
-    #[test]
-    fn invalidate_table_is_forwarded_by_the_catalog_service() {
-        let local = Arc::new(RwLock::new(PlannerMemoryCatalog::default()));
-        let invalidations = Arc::new(AtomicUsize::new(0));
-        let mut registry = CatalogRegistry::new();
-        registry.register(Arc::new(InvalidatingCatalog {
-            invalidations: Arc::clone(&invalidations),
-        }));
-        let service = QueryCatalogService::new(local, registry);
-
-        service
-            .invalidate_table("invalidating", "ns", "orders")
-            .expect("invalidate");
-        assert_eq!(invalidations.load(Ordering::SeqCst), 1);
     }
 }

@@ -178,14 +178,6 @@ impl PreparedDeleteWrite {
             crate::query_execution::completion_facts::SystemTableSourcePolicy::Mutation,
         ).await
     }
-
-    pub(crate) fn finalize(&self) -> Result<(), String> {
-        self.state.catalog_service().invalidate_table(
-            &self.target.catalog,
-            &self.target.namespace,
-            &self.target.table,
-        )
-    }
 }
 
 pub(crate) async fn prepare_delete_write_async(

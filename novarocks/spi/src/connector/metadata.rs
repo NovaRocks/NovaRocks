@@ -1940,6 +1940,65 @@ pub trait ConnectorMetadata: Send + Sync {
         })
     }
 
+    /// Complete snapshot preparation for a synchronous catalog caller.
+    /// A supplied observation must be supplemented at its original revision.
+    fn prepare_complete_table_observation_sync(
+        &self,
+        _request: ConnectorTableRequest,
+        _original: Option<&ConnectorTableMetadata>,
+    ) -> Result<ConnectorTablePreparation, ConnectorError> {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector has no synchronous complete table observation",
+        ))
+    }
+
+    /// Reference facts and whether the held observation covers all snapshots.
+    fn observed_read_references(
+        &self,
+        _original: &ConnectorTableMetadata,
+        _context: &ConnectorRequestContext,
+    ) -> Result<(ConnectorReadReferenceFacts, bool), ConnectorError> {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector does not expose references from the original observation",
+        ))
+    }
+
+    /// Supplement the held metadata revision under the original request.
+    /// The returned preparation has complete snapshot coverage. A response
+    /// that cannot prove the held revision must not confer new authority.
+    fn complete_table_observation<'a>(
+        &'a self,
+        _original: &'a ConnectorTableMetadata,
+        _context: ConnectorRequestContext,
+    ) -> ConnectorTablePreparationFuture<'a> {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector cannot complete the original table observation",
+            ))
+        })
+    }
+
+    /// Project an already selected historical snapshot without catalog I/O.
+    fn create_observed_snapshot(
+        &self,
+        _original: &ConnectorTableMetadata,
+        _snapshot_id: i64,
+        _context: &ConnectorRequestContext,
+        _creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector cannot derive a snapshot from the original observation",
+        )
+        .into())
+    }
+
     /// Create the same public schema and opaque handle from already observed
     /// facts. This stage performs no external I/O and retains no observer.
     fn create_prepared_table(

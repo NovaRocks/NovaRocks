@@ -163,7 +163,7 @@ impl CatalogTableSelection {
 }
 
 impl CatalogRelationNeed {
-    pub(super) fn try_new(
+    pub fn try_new(
         id: CompileNeedId,
         relation: TableIdentity,
         target: CatalogLookupTarget,

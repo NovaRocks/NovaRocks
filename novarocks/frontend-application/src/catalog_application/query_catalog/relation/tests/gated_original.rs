@@ -256,6 +256,7 @@ async fn original_gate_keeps_one_table_to_view_planning_pin_and_statement_memo()
                         &resolver,
                         context.clone(),
                         gate,
+                        false,
                     ),
                 )
                 .await
@@ -309,6 +310,7 @@ async fn original_gate_resolves_reference_before_historical_schema_and_keeps_its
                     &resolver,
                     context.clone(),
                     gate,
+                    true,
                 ),
             )
             .await
@@ -331,12 +333,9 @@ async fn original_gate_resolves_reference_before_historical_schema_and_keeps_its
             assert_eq!(id, *binding);
             assert_eq!(
                 *resolver.counts.resolutions.lock().unwrap(),
-                vec![ConnectorTableResolution::HistoricalSnapshot(10)]
+                vec![ConnectorTableResolution::StrictBaseTable]
             );
-            assert_eq!(
-                *resolver.counts.events.lock().unwrap(),
-                vec!["reference", "table-prepare"]
-            );
+            assert_eq!(*resolver.counts.events.lock().unwrap(), vec!["reference"]);
             assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), 1);
             assert_eq!(resolver.counts.view_prepare.load(Ordering::Relaxed), 0);
         })
@@ -345,7 +344,7 @@ async fn original_gate_resolves_reference_before_historical_schema_and_keeps_its
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn original_gate_keeps_reference_refusals_as_facts_without_loading_a_table() {
+async fn original_gate_keeps_reference_refusals_from_one_complete_observation() {
     with_gate(|gate, context| Box::pin(async move {
         let resolver = fixture(None, Some(None));
         let service = crate::catalog_application::query_catalog::new_query_catalog_service();
@@ -356,20 +355,21 @@ async fn original_gate_keeps_reference_refusals_as_facts_without_loading_a_table
             "SELECT b.x FROM ice.db.other a JOIN ice.db.orders FOR VERSION AS OF 'missing' b ON 1=1",
         ] {
             let request = need(sql);
-            let fact = drive(gate, materializer.resolve_original_relation_fact(&request, &resolver, context.clone(), gate)).await.unwrap();
+            let fact = drive(gate, materializer.resolve_original_relation_fact(&request, &resolver, context.clone(), gate, true)).await.unwrap();
             assert_eq!(fact.id(), request.id());
             assert!(matches!(fact.outcome(), novarocks_sql::compiler::CatalogRelationOutcome::SelectionRefused(_)));
         }
         assert_eq!(resolver.counts.reference.load(Ordering::Relaxed), 1);
         assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), 1);
         assert_eq!(resolver.counts.table_prepare.load(Ordering::Relaxed), 0);
+        assert_eq!(resolver.counts.source_prepare.load(Ordering::Relaxed), 1);
         assert_eq!(resolver.counts.view_prepare.load(Ordering::Relaxed), 0);
         assert!(bindings.captured_bindings().is_empty());
     })).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn original_gate_preserves_provider_failures_without_entering_a_view_or_reloading() {
+async fn original_gate_preserves_provider_failures_and_retries_only_transient_outcomes() {
     with_gate(|gate, context| {
         Box::pin(async move {
             for kind in [
@@ -398,11 +398,14 @@ async fn original_gate_preserves_provider_failures_without_entering_a_view_or_re
                             &resolver,
                             context.clone(),
                             gate,
+                            false,
                         ),
                     )
                     .await
                     .unwrap_err();
-                    if let Some(original) = &original_cause {
+                    if let Some(original) = &original_cause
+                        && kind != ConnectorErrorKind::Unavailable
+                    {
                         assert_eq!(error.original_failure(), Some(original));
                     } else {
                         original_cause = error.original_failure().cloned();
@@ -425,8 +428,16 @@ async fn original_gate_preserves_provider_failures_without_entering_a_view_or_re
                         kind
                     );
                 }
-                assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), 1);
-                assert_eq!(resolver.counts.table_prepare.load(Ordering::Relaxed), 1);
+                let expected = if kind == ConnectorErrorKind::Unavailable {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), expected);
+                assert_eq!(
+                    resolver.counts.table_prepare.load(Ordering::Relaxed),
+                    expected
+                );
                 assert_eq!(resolver.counts.view_prepare.load(Ordering::Relaxed), 0);
                 assert!(bindings.captured_bindings().is_empty());
             }
@@ -489,7 +500,13 @@ async fn original_system_gate_resolves_declarations_without_provider_data_work()
             };
             let first = drive(
                 gate,
-                materializer.resolve_original_relation_fact(need, &resolver, context.clone(), gate),
+                materializer.resolve_original_relation_fact(
+                    need,
+                    &resolver,
+                    context.clone(),
+                    gate,
+                    true,
+                ),
             )
             .await
             .unwrap();
@@ -502,6 +519,7 @@ async fn original_system_gate_resolves_declarations_without_provider_data_work()
                     &resolver,
                     context.clone(),
                     gate,
+                    true,
                 ),
             )
             .await
@@ -622,6 +640,7 @@ async fn captured_numeric_overlay_keeps_the_original_binding_on_every_fact_path(
                     &resolver,
                     context.clone(),
                     gate,
+                    true,
                 ),
             )
             .await
@@ -677,6 +696,7 @@ async fn captured_numeric_overlay_keeps_the_original_binding_on_every_fact_path(
                         &resolver,
                         context.clone(),
                         gate,
+                        true,
                     ),
                 )
                 .await
@@ -701,7 +721,8 @@ async fn captured_numeric_overlay_keeps_the_original_binding_on_every_fact_path(
             assert_eq!(factory_calls.load(Ordering::Relaxed), 1);
             assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), 1);
             assert_eq!(resolver.counts.reference.load(Ordering::Relaxed), 1);
-            assert_eq!(resolver.counts.table_prepare.load(Ordering::Relaxed), 1);
+            assert_eq!(resolver.counts.table_prepare.load(Ordering::Relaxed), 0);
+            assert_eq!(resolver.counts.source_prepare.load(Ordering::Relaxed), 1);
             assert_eq!(resolver.counts.table_create.load(Ordering::Relaxed), 1);
             assert_eq!(resolver.counts.table_load.load(Ordering::Relaxed), 0);
             assert_eq!(resolver.counts.view_prepare.load(Ordering::Relaxed), 0);

@@ -323,13 +323,6 @@ impl PreparedIcebergWrite {
             crate::query_execution::completion_facts::SystemTableSourcePolicy::Query,
         ).await
     }
-
-    pub(crate) fn finalize(&self) -> Result<(), String> {
-        crate::catalog_application::resolver::invalidate_iceberg_caches(
-            &self.semantic_binding.state,
-            &self.semantic_binding.target,
-        )
-    }
 }
 
 /// Prepared execution payload consumed by frontend DML adapters.

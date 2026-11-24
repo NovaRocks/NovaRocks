@@ -247,8 +247,6 @@ pub enum AcceleratorResidence {
 /// The external authority an `Accelerator` family rebuilds from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcceleratorRebuildAuthority {
-    /// The connector's current schema and schema version.
-    ConnectorSchemaVersion,
     /// The connector's immutable statistics evidence revision.
     ConnectorStatisticsEvidenceRevision,
 }

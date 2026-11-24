@@ -24,10 +24,10 @@
 //! against this store rather than acquiring a current connector generation.
 
 use std::collections::{BTreeMap, HashMap};
-#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::query_catalog::{CatalogResolutionError, CatalogResolutionResult};
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use novarocks_query_application::api::ExactBindingReceiptStore;
 use novarocks_spi::connector::read_stack::{
@@ -42,8 +42,8 @@ use novarocks_sql::planning::catalog::{
     self, MetadataTableKind as SqlMetadataTableKind, ResolvedAnalyzerTable,
 };
 
-/// Canonical request-local lookup identity.  Names are normalized before the
-/// binding is inserted, so a resolve failure is memoized just like success.
+/// Canonical request-local binding identity. The name is normalized before
+/// any binding or typed object outcome is retained.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct QueryTableBindingKey {
     catalog: String,
@@ -101,16 +101,6 @@ pub enum QueryTableBindingSelector {
 }
 
 impl QueryTableBindingKey {
-    /// Resolve the synthetic time-travel analyzer identity to the canonical
-    /// physical table and snapshot selector before it reaches the request
-    /// local memo.  This overlay is intentionally local to the binding
-    /// store; it must never register a synthetic table in the global catalog.
-    pub fn analysis_lookup(catalog: &str, namespace: &str, table: &str) -> Self {
-        if let Some((base_table, snapshot_id)) = parse_time_travel_overlay_identity(table) {
-            return Self::snapshot(catalog, namespace, base_table, snapshot_id);
-        }
-        Self::strict_base(catalog, namespace, table)
-    }
     pub fn strict_base(catalog: &str, namespace: &str, table: &str) -> Self {
         Self::new(
             catalog,
@@ -218,18 +208,6 @@ impl QueryTableBindingKey {
     }
 }
 
-pub fn parse_time_travel_overlay_identity(table: &str) -> Option<(&str, i64)> {
-    let encoded = table.strip_prefix("__sqlx1_tt_")?;
-    let (base_table, snapshot_id) = encoded.rsplit_once('_')?;
-    (!base_table.is_empty())
-        .then(|| snapshot_id.parse::<i64>().ok())
-        .flatten()
-        .map(|snapshot_id| (base_table, snapshot_id))
-}
-
-/// One successful application materialization.  Opaque connector authority
-/// stays here; neither the SQL scan vocabulary nor SQL catalog facts contain
-/// a provider table, files, cloud properties, or serialized metadata.
 #[derive(Clone)]
 pub enum QueryTableBindingAdmission {
     /// Local SQL tables do not own a connector generation and cannot be used
@@ -301,8 +279,8 @@ pub struct QueryTableBinding {
     pub statistics_pin: Option<ResolvedTableStatisticsPin>,
     pub admission: QueryTableBindingAdmission,
     /// The exact provider metadata that SQL analysis used for a connector
-    /// base relation. It is retained solely for CREATE-time source identity
-    /// observation through the paired planning pin.
+    /// base relation. Derived selectors and scan preparation consume its
+    /// original provider provenance through the paired planning pin.
     pub source_metadata: Option<ConnectorTableMetadata>,
     /// Provider facts required by scan preparation.  This is deliberately
     /// application-owned and paired with the same token as `resolved`; it is
@@ -629,15 +607,12 @@ pub(crate) enum MemoizedQueryRelation {
 pub struct QueryTableBindingStore {
     allocator: Mutex<SqlTableBindingAllocator>,
     exact_binding_receipts: ExactBindingReceiptStore,
-    entries: Mutex<HashMap<QueryTableBindingKey, Result<StoredBinding, String>>>,
+    entries: Mutex<HashMap<QueryTableBindingKey, CatalogResolutionResult<StoredBinding>>>,
     by_id: Mutex<HashMap<SqlTableBindingId, Arc<QueryTableBinding>>>,
     qualifications: Mutex<super::quoted_metadata_qualification::CatalogQualificationBook>,
-    // The canonical table memo is shared across completion rounds. Its typed
-    // causes travel with it when a round recreates the materializer.
-    pub(super) resolution_errors:
-        Mutex<HashMap<QueryTableBindingKey, super::query_catalog::CatalogResolutionError>>,
-    pub(super) original_resolution_errors:
-        Mutex<HashMap<QueryTableBindingKey, crate::mv::domain::application::MvApplicationError>>,
+    pub(super) observed_relations:
+        tokio::sync::Mutex<super::query_catalog::relation::StatementRelationObservations>,
+    catalog_observations_sealed: AtomicBool,
     local_views: Mutex<
         Option<
             Result<
@@ -675,8 +650,8 @@ impl QueryTableBindingStore {
             by_id: Mutex::new(HashMap::new()),
             relations: Mutex::new(HashMap::new()),
             qualifications: Mutex::new(Default::default()),
-            resolution_errors: Mutex::new(HashMap::new()),
-            original_resolution_errors: Mutex::new(HashMap::new()),
+            observed_relations: tokio::sync::Mutex::new(Default::default()),
+            catalog_observations_sealed: AtomicBool::new(false),
             local_views: Mutex::new(None),
             #[cfg(test)]
             sealed_for_topology_replan: AtomicBool::new(false),
@@ -825,10 +800,21 @@ impl QueryTableBindingStore {
     }
 
     pub(crate) fn require_catalog_observation_allowed(&self) -> Result<(), String> {
+        if self.catalog_observations_sealed.load(Ordering::Acquire) {
+            return Err("statement catalog observation is sealed".into());
+        }
         if self.exact_binding_receipts.sealed_view().is_some() {
             return Err("topology replan attempted to observe a relation absent from its admitted catalog facts".into());
         }
         Ok(())
+    }
+
+    /// Close catalog capture after the owner's final round. An already
+    /// admitted write session can still register its write-target binding.
+    pub(crate) async fn seal_catalog_observations(&self) {
+        let _observations = self.observed_relations.lock().await;
+        self.catalog_observations_sealed
+            .store(true, Ordering::Release);
     }
 
     /// Observe a completed binding without starting another provider load.
@@ -836,7 +822,7 @@ impl QueryTableBindingStore {
     pub(crate) fn resolved_lookup(
         &self,
         key: &QueryTableBindingKey,
-    ) -> Option<Result<SqlTableBindingId, String>> {
+    ) -> Option<CatalogResolutionResult<SqlTableBindingId>> {
         self.entries
             .lock()
             .expect("query table binding lock")
@@ -844,8 +830,7 @@ impl QueryTableBindingStore {
             .map(|entry| entry.as_ref().map(|stored| stored.id).map_err(Clone::clone))
     }
 
-    /// Memoize both success and failure.  The supplied load closure executes
-    /// at most once for a canonical key in this request.
+    /// Reuse a completed binding or a typed object outcome.
     #[cfg(test)]
     pub fn resolve_or_insert(
         &self,
@@ -862,57 +847,78 @@ impl QueryTableBindingStore {
     /// This is the admission seam used by the `SqlScanSource` cutover: the
     /// application loader receives the exact token that the resulting SQL
     /// table will carry, while the concrete scan authority remains in this
-    /// store. Failed loads remain memoized and never publish their token.
+    /// store. An object failure is memoized without publishing its token.
     pub fn resolve_or_insert_with_id(
         &self,
         key: QueryTableBindingKey,
         load: impl FnOnce(SqlTableBindingId) -> Result<QueryTableBinding, String>,
     ) -> Result<SqlTableBindingId, String> {
+        self.resolve_catalog_binding(key, |id| load(id).map_err(CatalogResolutionError::failed))
+            .map_err(CatalogResolutionError::into_message)
+    }
+
+    pub(super) fn resolve_catalog_binding(
+        &self,
+        key: QueryTableBindingKey,
+        load: impl FnOnce(SqlTableBindingId) -> CatalogResolutionResult<QueryTableBinding>,
+    ) -> CatalogResolutionResult<SqlTableBindingId> {
         let mut entries = self.entries.lock().expect("query table binding lock");
         if let Some(entry) = entries.get(&key) {
             return entry.as_ref().map(|stored| stored.id).map_err(Clone::clone);
         }
         #[cfg(test)]
         if self.sealed_for_topology_replan.load(Ordering::Acquire) {
-            return Err(
-                "topology replan attempted to materialize a binding absent from the first admitted semantic snapshot"
-                    .to_string(),
-            );
+            return Err(CatalogResolutionError::failed(
+                "topology replan attempted to materialize a binding absent from the first admitted semantic snapshot",
+            ));
         }
 
-        let result = self.allocate_id().and_then(|id| {
-            load(id).and_then(|binding| {
-                if let Some(materialization) = &binding.scan_materialization {
-                    let identity = catalog::materialization_identity_facts(&binding.resolved);
-                    self.exact_binding_receipts.register_connector_binding(
-                        id,
-                        [identity.catalog(), identity.namespace(), identity.table()],
-                        &materialization.planning_pin,
-                        &materialization.table,
-                        materialization.selector,
-                    )?;
-                } else if let QueryTableBindingAdmission::FrozenRead(lease) = &binding.admission {
-                    let identity = catalog::materialization_identity_facts(&binding.resolved);
-                    self.exact_binding_receipts
-                        .register_frozen_connector_binding(
-                            id,
-                            [identity.catalog(), identity.namespace(), identity.table()],
-                            lease,
-                        )?;
-                }
-                let binding = Arc::new(binding);
-                self.by_id
-                    .lock()
-                    .expect("query table binding by-id lock")
-                    .insert(id, Arc::clone(&binding));
-                Ok(StoredBinding { id })
-            })
-        });
+        let result = self
+            .allocate_id()
+            .map_err(CatalogResolutionError::failed)
+            .and_then(|id| {
+                load(id).and_then(|binding| {
+                    if let Some(materialization) = &binding.scan_materialization {
+                        let identity = catalog::materialization_identity_facts(&binding.resolved);
+                        self.exact_binding_receipts
+                            .register_connector_binding(
+                                id,
+                                [identity.catalog(), identity.namespace(), identity.table()],
+                                &materialization.planning_pin,
+                                &materialization.table,
+                                materialization.selector,
+                            )
+                            .map_err(CatalogResolutionError::failed)?;
+                    } else if let QueryTableBindingAdmission::FrozenRead(lease) = &binding.admission
+                    {
+                        let identity = catalog::materialization_identity_facts(&binding.resolved);
+                        self.exact_binding_receipts
+                            .register_frozen_connector_binding(
+                                id,
+                                [identity.catalog(), identity.namespace(), identity.table()],
+                                lease,
+                            )
+                            .map_err(CatalogResolutionError::failed)?;
+                    }
+                    let binding = Arc::new(binding);
+                    self.by_id
+                        .lock()
+                        .expect("query table binding by-id lock")
+                        .insert(id, Arc::clone(&binding));
+                    Ok(StoredBinding { id })
+                })
+            });
         let response = result
             .as_ref()
             .map(|stored| stored.id)
             .map_err(Clone::clone);
-        entries.insert(key, result);
+        if result
+            .as_ref()
+            .err()
+            .is_none_or(CatalogResolutionError::is_object_outcome)
+        {
+            entries.insert(key, result);
+        }
         response
     }
 
@@ -1167,8 +1173,7 @@ mod tests {
 
     use super::{
         ConnectorReadSourceProjection, ConnectorReadSourceSelection, QueryPreparedSourceSelector,
-        QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
-        parse_time_travel_overlay_identity, prepared_source_selector,
+        QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore, prepared_source_selector,
     };
 
     #[test]
@@ -1201,26 +1206,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(original.to_string(), repeated.to_string());
         assert!(repeated.to_string().contains("original registry failure"));
-    }
-
-    #[test]
-    fn snapshot_identity_resolves_to_its_relation_and_snapshot() {
-        for (table, snapshot_id, identity) in [
-            ("orders", 42_i64, "__sqlx1_tt_orders_42"),
-            ("sales_orders", -7, "__sqlx1_tt_sales_orders_-7"),
-            ("v3", i64::MIN, "__sqlx1_tt_v3_-9223372036854775808"),
-        ] {
-            assert_eq!(
-                parse_time_travel_overlay_identity(identity),
-                Some((table, snapshot_id)),
-                "snapshot identity `{identity}` must resolve to its own relation"
-            );
-            assert_eq!(
-                QueryTableBindingKey::analysis_lookup("ICE", "DB", identity),
-                QueryTableBindingKey::snapshot("ice", "db", table, snapshot_id),
-                "a snapshot identity must resolve to the physical snapshot binding key"
-            );
-        }
     }
 
     fn local_binding() -> QueryTableBinding {
@@ -1317,26 +1302,6 @@ mod tests {
         };
 
         assert_eq!(error, "query binding has no connector planning pin");
-    }
-
-    #[test]
-    fn sqlx2_binding_store_memoizes_failure_once_per_request() {
-        let store = QueryTableBindingStore::try_new().expect("store");
-        let attempts = AtomicUsize::new(0);
-        let key = QueryTableBindingKey::strict_base("ICE", "DB", "ORDERS");
-
-        let first = store.resolve_or_insert(key.clone(), || {
-            attempts.fetch_add(1, Ordering::Relaxed);
-            Err("missing table".to_string())
-        });
-        let second = store.resolve_or_insert(key, || {
-            attempts.fetch_add(1, Ordering::Relaxed);
-            Err("must not load twice".to_string())
-        });
-
-        assert_eq!(first.unwrap_err(), "missing table");
-        assert_eq!(second.unwrap_err(), "missing table");
-        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1587,3 +1552,7 @@ mod tests {
         assert_ne!(first, later_snapshot);
     }
 }
+
+#[cfg(test)]
+#[path = "query_bindings/tests.rs"]
+mod observation_tests;

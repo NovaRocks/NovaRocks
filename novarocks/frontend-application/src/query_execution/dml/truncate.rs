@@ -354,7 +354,7 @@ impl TruncateEngine for DmlExecutionKernel {
             Ok(session) => session,
             Err(_) => return poisoned_session(),
         };
-        project_outcome(session.execute_once(self))
+        project_outcome(session.execute_once())
     }
 
     fn adjudicate_truncate(
@@ -386,7 +386,7 @@ impl TruncateEngine for DmlExecutionKernel {
             Ok(session) => session,
             Err(_) => return poisoned_session(),
         };
-        project_outcome(session.adjudicate_once(evidence, self))
+        project_outcome(session.adjudicate_once(evidence))
     }
 }
 

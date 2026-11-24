@@ -26,15 +26,12 @@ use novarocks_spi::connector::{
     ConnectorDataMutationOperation, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver,
     ConnectorDataMutationSession, ConnectorDeleteCondition, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceId, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorPayloadRetentionGuard, ConnectorProcessLocalPayload,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, REGISTER_EXISTING_FILES_KIND,
+    ConnectorInstanceId, ConnectorMutationFailure, ConnectorMutationOperationId,
+    ConnectorPayloadRetentionGuard, ConnectorProcessLocalPayload, ConnectorRequestContext,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome, REGISTER_EXISTING_FILES_KIND,
 };
-
-#[cfg(test)]
-use novarocks_query_application::engine_error::EngineError;
 
 /// The statement-level operation before its provider-owned table handle is
 /// loaded through the exact-generation metadata capability.
@@ -98,19 +95,6 @@ impl DataMutationIntent {
     }
 }
 
-/// Invalidates the application-owned catalog cache after provider finalization.
-///
-/// Provider-owned table-cache invalidation is part of the provider's returned
-/// `ExternalMutationFinalization`. Calling this port only after that outcome is
-/// received fixes the provider-before-generic ordering without exposing a
-/// concrete provider registry to core.
-pub trait DataMutationCacheFinalizer {
-    fn invalidate_generic_table(
-        &self,
-        table: &ConnectorTableIdentity,
-    ) -> Result<(), ConnectorError>;
-}
-
 #[derive(Clone, Debug)]
 pub struct CompletedDataMutation {
     #[allow(dead_code)]
@@ -169,50 +153,6 @@ pub enum ResolvedDataMutation {
     },
 }
 
-/// Execute a data mutation and project its typed truth state to the existing
-/// user-facing engine error vocabulary.
-#[cfg(test)]
-pub fn execute_data_mutation(
-    resolver: &dyn ConnectorDataMutationResolver,
-    cache_finalizer: &dyn DataMutationCacheFinalizer,
-    instance_id: &ConnectorInstanceId,
-    operation_id: ConnectorMutationOperationId,
-    table: ConnectorTableIdentity,
-    intent: DataMutationIntent,
-    context: ConnectorRequestContext,
-) -> Result<CompletedDataMutation, String> {
-    match resolve_data_mutation(
-        resolver,
-        cache_finalizer,
-        instance_id,
-        operation_id,
-        table,
-        intent,
-        context,
-    ) {
-        ResolvedDataMutation::KnownCommitted(completed) => {
-            if let ExternalMutationFinalization::Failed(failure) = &completed.finalization {
-                Err(
-                    EngineError::commit_known_committed_finalize_failed(failure.to_string())
-                        .to_string(),
-                )
-            } else {
-                Ok(*completed)
-            }
-        }
-        ResolvedDataMutation::KnownUncommitted { failure, cleanup } => Err(
-            EngineError::commit_known_uncommitted(super::mutation::known_uncommitted_message(
-                failure, &cleanup,
-            ))
-            .to_string(),
-        ),
-        ResolvedDataMutation::CommitUnknown { failure, .. } => {
-            Err(EngineError::commit_unknown(failure.to_string()).to_string())
-        }
-        ResolvedDataMutation::ContractFailure { error, .. } => Err(error.to_string()),
-    }
-}
-
 /// Plan and execute one operation on one exact-generation lease.
 ///
 /// The operation ID is supplied by the caller. Planning is read-only and any
@@ -222,7 +162,7 @@ pub fn execute_data_mutation(
 #[cfg(test)]
 pub fn resolve_data_mutation(
     resolver: &dyn ConnectorDataMutationResolver,
-    cache_finalizer: &dyn DataMutationCacheFinalizer,
+
     instance_id: &ConnectorInstanceId,
     operation_id: ConnectorMutationOperationId,
     table: ConnectorTableIdentity,
@@ -240,16 +180,15 @@ pub fn resolve_data_mutation(
         Ok(session) => session,
         Err(failure) => return failure,
     };
-    let executed = session.execute_once(cache_finalizer);
+    let executed = session.execute_once();
     let ResolvedDataMutation::CommitUnknown { evidence, .. } = &executed else {
         return executed;
     };
-    session.adjudicate_once(evidence.clone(), cache_finalizer)
+    session.adjudicate_once(evidence.clone())
 }
 
 pub struct DataMutationSession {
     session: ConnectorDataMutationSession,
-    table: ConnectorTableIdentity,
     plan: novarocks_spi::connector::ConnectorDataMutationPlan,
     context: ConnectorRequestContext,
     main_truncate: bool,
@@ -368,7 +307,6 @@ impl DataMutationSession {
             })?;
         Ok(Self {
             session,
-            table,
             plan,
             context,
             main_truncate,
@@ -391,25 +329,20 @@ impl DataMutationSession {
     /// The caller may make one same-statement, read-only adjudication with the
     /// exact evidence returned here. This session never recreates its lease or
     /// retries execution.
-    pub fn execute_once(
-        &mut self,
-        cache_finalizer: &dyn DataMutationCacheFinalizer,
-    ) -> ResolvedDataMutation {
-        self.execute_once_with_author(None, cache_finalizer)
+    pub fn execute_once(&mut self) -> ResolvedDataMutation {
+        self.execute_once_with_author(None)
     }
 
     pub(crate) fn execute_registration_once(
         &mut self,
         byte_author: ConnectorPayloadRetentionGuard,
-        cache_finalizer: &dyn DataMutationCacheFinalizer,
     ) -> ResolvedDataMutation {
-        self.execute_once_with_author(Some(byte_author), cache_finalizer)
+        self.execute_once_with_author(Some(byte_author))
     }
 
     fn execute_once_with_author(
         &mut self,
         byte_author: Option<ConnectorPayloadRetentionGuard>,
-        cache_finalizer: &dyn DataMutationCacheFinalizer,
     ) -> ResolvedDataMutation {
         if !matches!(self.phase, DataMutationSessionPhase::Planned) {
             return contract_failure(
@@ -459,17 +392,13 @@ impl DataMutationSession {
             }
             _ => DataMutationSessionPhase::Terminal,
         };
-        resolve_terminal_outcome(outcome, &self.table, cache_finalizer)
+        resolve_terminal_outcome(outcome)
     }
 
     /// Adjudicate one previously returned unknown outcome on the retained exact
     /// lease. The method is intentionally one-shot and has no mutation,
     /// cleanup, or retry branch.
-    pub fn adjudicate_once(
-        &mut self,
-        evidence: ExternalMutationEvidence,
-        cache_finalizer: &dyn DataMutationCacheFinalizer,
-    ) -> ResolvedDataMutation {
+    pub fn adjudicate_once(&mut self, evidence: ExternalMutationEvidence) -> ResolvedDataMutation {
         let DataMutationSessionPhase::AwaitingAdjudication {
             evidence: expected,
             failure: original_failure,
@@ -533,14 +462,12 @@ impl DataMutationSession {
                 evidence: original_evidence,
             };
         }
-        resolve_terminal_outcome(outcome, &self.table, cache_finalizer)
+        resolve_terminal_outcome(outcome)
     }
 }
 
 fn resolve_terminal_outcome(
     outcome: ExternalMutationOutcome<ConnectorDataMutationReceipt>,
-    table: &ConnectorTableIdentity,
-    cache_finalizer: &dyn DataMutationCacheFinalizer,
 ) -> ResolvedDataMutation {
     match outcome {
         ExternalMutationOutcome::KnownCommitted {
@@ -552,11 +479,10 @@ fn resolve_terminal_outcome(
             if let ExternalMutationFinalization::Failed(error) = &cleanup {
                 tracing::warn!(%error, "committed data mutation retains incomplete cleanup");
             }
-            let generic_finalization = cache_finalizer.invalidate_generic_table(table);
             ResolvedDataMutation::KnownCommitted(Box::new(CompletedDataMutation {
                 effect,
                 receipt,
-                finalization: merge_finalization(finalization, generic_finalization),
+                finalization,
                 cleanup,
             }))
         }
@@ -568,33 +494,6 @@ fn resolve_terminal_outcome(
         }
         ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
             ResolvedDataMutation::CommitUnknown { failure, evidence }
-        }
-    }
-}
-
-fn merge_finalization(
-    provider: ExternalMutationFinalization,
-    generic: Result<(), ConnectorError>,
-) -> ExternalMutationFinalization {
-    match (provider, generic) {
-        (ExternalMutationFinalization::Complete, Ok(())) => ExternalMutationFinalization::Complete,
-        (ExternalMutationFinalization::Failed(failure), Ok(())) => {
-            ExternalMutationFinalization::Failed(failure)
-        }
-        (ExternalMutationFinalization::Complete, Err(error)) => {
-            ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
-                ConnectorMutationFailureKind::Internal,
-                format!("generic catalog cache invalidation failed: {error}"),
-            ))
-        }
-        (ExternalMutationFinalization::Failed(failure), Err(error)) => {
-            ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
-                failure.kind(),
-                format!(
-                    "{}; generic catalog cache invalidation also failed: {error}",
-                    failure.message()
-                ),
-            ))
         }
     }
 }
@@ -618,8 +517,9 @@ mod tests {
         ConnectorControlRuntimeId, ConnectorDataMutation, ConnectorDataMutationPlan,
         ConnectorDataMutationPlanSummary, ConnectorDataMutationPlanningRequest,
         ConnectorInstanceDescriptor, ConnectorListTablesRequest, ConnectorMetadata,
-        ConnectorNamespaceRequest, ConnectorProviderBindingKey, ConnectorProviderId,
-        ConnectorTableMetadata, ConnectorTablePlanningFacts, ProviderBindingEpoch,
+        ConnectorMutationFailureKind, ConnectorNamespaceRequest, ConnectorProviderBindingKey,
+        ConnectorProviderId, ConnectorTableMetadata, ConnectorTablePlanningFacts,
+        ProviderBindingEpoch,
     };
 
     use super::*;
@@ -993,28 +893,6 @@ mod tests {
         }
     }
 
-    struct Finalizer {
-        events: Arc<Mutex<Vec<&'static str>>>,
-        fail: bool,
-    }
-
-    impl DataMutationCacheFinalizer for Finalizer {
-        fn invalidate_generic_table(
-            &self,
-            _table: &ConnectorTableIdentity,
-        ) -> Result<(), ConnectorError> {
-            self.events.lock().expect("events").push("generic");
-            if self.fail {
-                Err(ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "generic cache unavailable",
-                ))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(10),
@@ -1035,26 +913,17 @@ mod tests {
 
     #[test]
     fn uncommitted_cleanup_is_preserved_without_any_cache_finalization() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let finalizer = Finalizer {
-            events: events.clone(),
-            fail: false,
-        };
         let cleanup = ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
             ConnectorMutationFailureKind::Unavailable,
             "two owned files remain",
         ));
-        let outcome = resolve_terminal_outcome(
-            ExternalMutationOutcome::KnownUncommitted {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Conflict,
-                    "ref changed",
-                ),
-                cleanup: cleanup.clone(),
-            },
-            &table(&ConnectorInstanceId::parse("cleanup-test").unwrap()),
-            &finalizer,
-        );
+        let outcome = resolve_terminal_outcome(ExternalMutationOutcome::KnownUncommitted {
+            failure: ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::Conflict,
+                "ref changed",
+            ),
+            cleanup: cleanup.clone(),
+        });
         let ResolvedDataMutation::KnownUncommitted {
             failure,
             cleanup: observed,
@@ -1068,17 +937,15 @@ mod tests {
             super::super::mutation::known_uncommitted_message(failure, &observed)
                 .contains("two owned files remain")
         );
-        assert!(events.lock().unwrap().is_empty());
     }
 
     fn truncate_intent() -> DataMutationIntent {
         DataMutationIntent::truncate("main")
     }
 
-    fn resolve(provider: &Arc<FakeProvider>, finalizer: &Finalizer) -> ResolvedDataMutation {
+    fn resolve(provider: &Arc<FakeProvider>) -> ResolvedDataMutation {
         resolve_data_mutation(
             &Resolver::new(provider.clone()),
-            finalizer,
             &provider.descriptor.instance_id,
             ConnectorMutationOperationId::from_bytes([9; 16]),
             table(&provider.descriptor.instance_id),
@@ -1104,10 +971,7 @@ mod tests {
     #[test]
     fn missing_registration_author_refuses_before_dispatch() {
         let provider = FakeProvider::new(Mode::Committed);
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-            fail: false,
-        };
+
         let resolver = Resolver::new(provider.clone());
         let mut session = DataMutationSession::plan(
             &resolver,
@@ -1123,7 +987,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            session.execute_once(&finalizer),
+            session.execute_once(),
             ResolvedDataMutation::ContractFailure {
                 dispatch: DataMutationDispatchState::ConfirmedNotDispatched,
                 ..
@@ -1133,12 +997,9 @@ mod tests {
     }
 
     #[test]
-    fn exact_lease_loads_plans_and_executes_once_before_generic_finalization() {
+    fn exact_lease_loads_plans_executes_and_finalizes_once() {
         let provider = FakeProvider::new(Mode::Committed);
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-            fail: false,
-        };
+
         let operation_id = ConnectorMutationOperationId::from_bytes([8; 16]);
         let resolver = Resolver::new(provider.clone());
         let mut session = DataMutationSession::plan(
@@ -1157,7 +1018,7 @@ mod tests {
         assert_eq!(session.plan_ref().operation_id(), operation_id);
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
         assert!(matches!(
-            session.execute_registration_once(test_registration_author(), &finalizer),
+            session.execute_registration_once(test_registration_author()),
             ResolvedDataMutation::KnownCommitted(_)
         ));
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
@@ -1169,17 +1030,14 @@ mod tests {
         assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             provider.events.lock().expect("events").as_slice(),
-            ["provider", "generic"]
+            ["provider"]
         );
     }
 
     #[test]
     fn unknown_waits_for_explicit_reconcile_on_the_same_session() {
         let provider = FakeProvider::new(Mode::UnknownThenCommitted);
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-            fail: false,
-        };
+
         let resolver = Resolver::new(provider.clone());
         let mut session = DataMutationSession::plan(
             &resolver,
@@ -1191,8 +1049,7 @@ mod tests {
         )
         .expect("planned session");
 
-        let ResolvedDataMutation::CommitUnknown { evidence, .. } = session.execute_once(&finalizer)
-        else {
+        let ResolvedDataMutation::CommitUnknown { evidence, .. } = session.execute_once() else {
             panic!("expected commit unknown");
         };
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
@@ -1204,7 +1061,7 @@ mod tests {
                 .unwrap();
         assert!(decoded.process_local_payload().is_none());
         assert!(matches!(
-            session.adjudicate_once(decoded, &finalizer),
+            session.adjudicate_once(decoded),
             ResolvedDataMutation::KnownCommitted(_)
         ));
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
@@ -1212,7 +1069,7 @@ mod tests {
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 1);
         assert!(matches!(
-            session.execute_once(&finalizer),
+            session.execute_once(),
             ResolvedDataMutation::ContractFailure {
                 dispatch: DataMutationDispatchState::ConfirmedNotDispatched,
                 ..
@@ -1225,10 +1082,7 @@ mod tests {
     fn main_truncate_reconcile_refreshes_the_original_observation_only() {
         for main_truncate in [true, false] {
             let provider = FakeProvider::new(Mode::UnknownThenCommitted);
-            let finalizer = Finalizer {
-                events: provider.events.clone(),
-                fail: false,
-            };
+
             let context = context();
             let deadline = context.deadline();
             let planning = context.request_scope_extension_or_insert_with(|| PlanningObservation);
@@ -1246,13 +1100,12 @@ mod tests {
                 context,
             )
             .unwrap();
-            let ResolvedDataMutation::CommitUnknown { evidence, .. } =
-                session.execute_once(&finalizer)
+            let ResolvedDataMutation::CommitUnknown { evidence, .. } = session.execute_once()
             else {
                 panic!("expected one unknown dispatch");
             };
             assert!(matches!(
-                session.adjudicate_once(evidence, &finalizer),
+                session.adjudicate_once(evidence),
                 ResolvedDataMutation::KnownCommitted(_)
             ));
 
@@ -1271,10 +1124,7 @@ mod tests {
     fn negative_reconciliation_preserves_the_original_unknown_and_its_owner() {
         for mode in [Mode::UnknownThenNegative, Mode::UnknownThenReadError] {
             let provider = FakeProvider::new(mode);
-            let finalizer = Finalizer {
-                events: provider.events.clone(),
-                fail: false,
-            };
+
             let mut session = DataMutationSession::plan(
                 &Resolver::new(provider.clone()),
                 &provider.descriptor.instance_id,
@@ -1284,15 +1134,14 @@ mod tests {
                 context(),
             )
             .unwrap();
-            let ResolvedDataMutation::CommitUnknown { evidence, failure } =
-                session.execute_once(&finalizer)
+            let ResolvedDataMutation::CommitUnknown { evidence, failure } = session.execute_once()
             else {
                 panic!("unknown");
             };
             let ResolvedDataMutation::CommitUnknown {
                 evidence: after,
                 failure: original,
-            } = session.adjudicate_once(evidence.clone(), &finalizer)
+            } = session.adjudicate_once(evidence.clone())
             else {
                 panic!("negative observation cannot clear Unknown");
             };
@@ -1308,10 +1157,7 @@ mod tests {
     #[test]
     fn mismatched_evidence_fails_before_reconcile_dispatch() {
         let provider = FakeProvider::new(Mode::UnknownThenCommitted);
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-            fail: false,
-        };
+
         let mut session = DataMutationSession::plan(
             &Resolver::new(provider.clone()),
             &provider.descriptor.instance_id,
@@ -1321,8 +1167,7 @@ mod tests {
             context(),
         )
         .expect("planned session");
-        let ResolvedDataMutation::CommitUnknown { evidence, .. } = session.execute_once(&finalizer)
-        else {
+        let ResolvedDataMutation::CommitUnknown { evidence, .. } = session.execute_once() else {
             panic!("expected commit unknown");
         };
         let mismatched = ExternalMutationEvidence::try_new(
@@ -1336,7 +1181,7 @@ mod tests {
         .expect("mismatched evidence");
 
         assert!(matches!(
-            session.adjudicate_once(mismatched, &finalizer),
+            session.adjudicate_once(mismatched),
             ResolvedDataMutation::ContractFailure {
                 dispatch: DataMutationDispatchState::ConfirmedNotDispatched,
                 ..
@@ -1344,7 +1189,7 @@ mod tests {
         ));
         assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 0);
         assert!(matches!(
-            session.adjudicate_once(evidence, &finalizer),
+            session.adjudicate_once(evidence),
             ResolvedDataMutation::KnownCommitted(_)
         ));
         assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 1);
@@ -1353,12 +1198,9 @@ mod tests {
     #[test]
     fn planning_failure_is_known_uncommitted_without_execute() {
         let provider = FakeProvider::new(Mode::PlanningFailure);
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-            fail: false,
-        };
+
         assert!(matches!(
-            resolve(&provider, &finalizer),
+            resolve(&provider),
             ResolvedDataMutation::KnownUncommitted {
                 failure: KnownUncommittedDataMutation::Planning(_),
                 cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete
@@ -1371,12 +1213,9 @@ mod tests {
     #[test]
     fn metadata_failure_is_known_uncommitted_without_planning() {
         let provider = FakeProvider::new(Mode::MetadataFailure);
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-            fail: false,
-        };
+
         assert!(matches!(
-            resolve(&provider, &finalizer),
+            resolve(&provider),
             ResolvedDataMutation::KnownUncommitted {
                 failure: KnownUncommittedDataMutation::Planning(_),
                 cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete
@@ -1390,12 +1229,9 @@ mod tests {
     #[test]
     fn unknown_reconciles_once_without_reexecuting() {
         let provider = FakeProvider::new(Mode::UnknownThenCommitted);
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-            fail: false,
-        };
+
         assert!(matches!(
-            resolve(&provider, &finalizer),
+            resolve(&provider),
             ResolvedDataMutation::KnownCommitted(_)
         ));
         assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
@@ -1406,12 +1242,9 @@ mod tests {
     #[test]
     fn provider_uncommitted_does_not_finalize_cache() {
         let provider = FakeProvider::new(Mode::Uncommitted);
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-            fail: false,
-        };
+
         assert!(matches!(
-            resolve(&provider, &finalizer),
+            resolve(&provider),
             ResolvedDataMutation::KnownUncommitted {
                 failure: KnownUncommittedDataMutation::Provider(_),
                 cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete
@@ -1425,12 +1258,9 @@ mod tests {
     #[test]
     fn unresolved_unknown_is_returned_after_one_reconcile() {
         let provider = FakeProvider::new(Mode::UnknownStaysUnknown);
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-            fail: false,
-        };
+
         assert!(matches!(
-            resolve(&provider, &finalizer),
+            resolve(&provider),
             ResolvedDataMutation::CommitUnknown { .. }
         ));
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
@@ -1441,14 +1271,10 @@ mod tests {
     #[test]
     fn missing_lease_is_contract_failure_before_dispatch() {
         let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance");
-        let finalizer = Finalizer {
-            events: Arc::new(Mutex::new(Vec::new())),
-            fail: false,
-        };
+
         assert!(matches!(
             resolve_data_mutation(
                 &MissingResolver,
-                &finalizer,
                 &instance_id,
                 ConnectorMutationOperationId::from_bytes([9; 16]),
                 table(&instance_id),
@@ -1465,44 +1291,13 @@ mod tests {
     #[test]
     fn outer_execute_error_is_conservatively_possibly_dispatched() {
         let provider = FakeProvider::new(Mode::ExecuteContractFailure);
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-            fail: false,
-        };
+
         assert!(matches!(
-            resolve(&provider, &finalizer),
+            resolve(&provider),
             ResolvedDataMutation::ContractFailure {
                 dispatch: DataMutationDispatchState::PossiblyDispatched,
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn generic_cache_failure_stays_known_committed() {
-        let provider = FakeProvider::new(Mode::Committed);
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-            fail: true,
-        };
-        let ResolvedDataMutation::KnownCommitted(completed) = resolve(&provider, &finalizer) else {
-            panic!("expected known committed");
-        };
-        assert!(matches!(
-            completed.finalization,
-            ExternalMutationFinalization::Failed(_)
-        ));
-
-        let error = execute_data_mutation(
-            &Resolver::new(provider.clone()),
-            &finalizer,
-            &provider.descriptor.instance_id,
-            ConnectorMutationOperationId::from_bytes([10; 16]),
-            table(&provider.descriptor.instance_id),
-            truncate_intent(),
-            context(),
-        )
-        .expect_err("finalization failure must be projected");
-        assert!(error.contains("generic catalog cache invalidation failed"));
     }
 }

@@ -99,17 +99,12 @@ impl CatalogReferenceReader for MvCatalogReferenceReader {
 /// replayed under the same lock that guards the publication set.
 struct QueryCatalogBinding {
     service: Arc<crate::catalog_application::query_catalog::QueryCatalogService>,
-    controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
 }
 
 impl QueryCatalogBinding {
     fn register(&self, observation: &CatalogRuntimeObservation) {
-        self.service.register_catalog(
-            crate::catalog_application::query_catalog::build_connector_catalog(
-                observation.instance_id.as_str(),
-                Arc::clone(&self.controls),
-            ),
-        );
+        self.service
+            .register_catalog(observation.instance_id.as_str());
     }
 
     fn unregister(&self, instance_id: &ConnectorInstanceId) {
@@ -200,7 +195,6 @@ impl CatalogRuntimeProjection {
     pub fn bind_query_catalog(
         &self,
         service: Arc<crate::catalog_application::query_catalog::QueryCatalogService>,
-        controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
     ) -> Result<(), CatalogApplicationError> {
         let published = self.published.lock().map_err(|_| {
             CatalogApplicationError::new(
@@ -220,7 +214,7 @@ impl CatalogRuntimeProjection {
                 "catalog runtime projection is already bound to a query catalog",
             ));
         }
-        let bound = QueryCatalogBinding { service, controls };
+        let bound = QueryCatalogBinding { service };
         for observation in published.values() {
             bound.register(observation);
         }

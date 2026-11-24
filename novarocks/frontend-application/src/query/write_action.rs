@@ -74,8 +74,6 @@ pub(crate) trait WriteStatementFamily: Send + Sync + 'static {
         options: QueryOptions,
     ) -> impl Future<Output = Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError>>
     + Send;
-
-    fn finalize(prepared: &Self::Prepared) -> Result<(), String>;
 }
 
 pub(crate) struct WriteStatementStart<P: WriteStatementFamily> {
@@ -457,18 +455,6 @@ impl<P: WriteStatementFamily> WriteStatementAction<P> {
             .is_pending()
         {
             return Poll::Pending;
-        }
-        if self.publication.as_ref().unwrap().committed()
-            && self
-                .publication
-                .as_ref()
-                .unwrap()
-                .local_finalization
-                .is_none()
-        {
-            self.publication.as_mut().unwrap().local_finalization = Some(P::finalize(
-                self.prepared.as_ref().expect("committed original write"),
-            ));
         }
         if self.selected.is_none() {
             self.selected = Some(

@@ -283,6 +283,7 @@ impl FrontendCompletionCustody {
         request: novarocks_sql::compiler::SqlFinalPlanCompileRequest,
         scope: &novarocks_workload_control::WorkScope,
         cpu: &dyn novarocks_query_application::preparation::SqlCompletionCpuPort,
+        bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     ) -> Result<(), StatementNativeHealthFailure> {
         let facts = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -318,6 +319,7 @@ impl FrontendCompletionCustody {
                 return Err(selected);
             }
         };
+        bindings.seal_catalog_observations().await;
         let outcome =
             FinalPlanCompletionDriver::pair_completed(candidate, body.taken.take().unwrap());
         {

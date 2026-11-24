@@ -395,7 +395,6 @@ fn execute_iceberg_table_comment(
         },
         connector_context.clone(),
     )?;
-    crate::catalog_application::resolver::invalidate_iceberg_caches(executor, &target)?;
     Ok(StatementResult::Ok)
 }
 
@@ -499,7 +498,6 @@ fn execute_alter_iceberg_schema(
         instance_id,
         planning,
         mutation: IcebergTableMutation::Schema(change),
-        catalog_service: executor.catalog_service.clone(),
         storage_observation: executor.mv_storage_observation.clone(),
         readiness: executor.mv_readiness.clone(),
     }
@@ -512,7 +510,6 @@ pub(crate) struct PreparedIcebergTableMutation {
     pub(crate) instance_id: ConnectorInstanceId,
     pub(crate) planning: ConnectorControlPlanningPin,
     pub(crate) mutation: IcebergTableMutation,
-    pub(crate) catalog_service: Arc<QueryCatalogService>,
     pub(crate) storage_observation: Arc<dyn MvStorageObservationPort>,
     pub(crate) readiness: Arc<MvReadinessPort>,
 }
@@ -541,7 +538,6 @@ impl PreparedIcebergTableMutation {
             instance_id,
             planning,
             mutation,
-            catalog_service,
             storage_observation,
             readiness,
         } = self;
@@ -599,7 +595,6 @@ impl PreparedIcebergTableMutation {
                 Ok(())
             },
         )?;
-        catalog_service.invalidate_table(&target.catalog, &target.namespace, &target.table)?;
         Ok(StatementResult::Ok)
     }
 }

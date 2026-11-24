@@ -112,20 +112,6 @@ pub struct TargetBackend {
     pub table: String,
 }
 
-// Ownership: this drops the local catalog snapshot for an already-resolved
-// `TargetBackend`. Both the target type and `QueryCatalogService` are owned by
-// catalog_application, and the operation is pure catalog cache maintenance with
-// no plan, fragment, or write-transaction state, so it belongs beside the
-// resolution that produced the target rather than in a DML writer.
-pub fn invalidate_iceberg_caches(
-    state: &impl crate::catalog_application::query_catalog::CatalogServiceSource,
-    target: &TargetBackend,
-) -> Result<(), String> {
-    state
-        .catalog_service()
-        .invalidate_table(&target.catalog, &target.namespace, &target.table)
-}
-
 const DEFAULT_CATALOG_NAME: &str = "default_catalog";
 
 fn is_default_catalog(value: &str) -> bool {

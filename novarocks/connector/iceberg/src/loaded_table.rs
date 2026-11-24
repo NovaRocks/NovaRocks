@@ -974,6 +974,14 @@ impl IcebergAttemptTableAccess {
             })
     }
 
+    pub(crate) fn with_complete_metadata(
+        mut self,
+        metadata: crate::iceberg::spec::TableMetadataRef,
+    ) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
     pub(crate) fn validate_attempt_reacquisition(
         &self,
         observed: &crate::iceberg::table::Table,
