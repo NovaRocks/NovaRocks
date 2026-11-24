@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0264
+    scope: "The P7a compatibility patch for missing v3 next-row-id."
+    link: "ADR-0264-iceberg-rewrites-preserve-row-identity.md"
   - id: ADR-0216
     scope: "HMS H3 and H4 retention rows and their deletion conditions: both patches exit with the vendored HMS package, and the HMS consumer accepts read fallbacks instead of delivering an equivalent seam"
     link: "ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md"

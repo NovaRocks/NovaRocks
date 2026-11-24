@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0264
+    scope: "Row-lineage values and new manifest allocation for physical OPTIMIZE in section 3."
+    link: "ADR-0264-iceberg-rewrites-preserve-row-identity.md"
   - id: ADR-0262
     scope: "Application of a writer schema assertion and old head dependency to ordinary INSERT; its writer prerequisite is the exact default partition spec."
     link: "ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md"
