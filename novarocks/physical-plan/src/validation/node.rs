@@ -1038,12 +1038,12 @@ pub(crate) fn validate_node_semantics(
             if node.required_inputs.len() == 2 {
                 let left_keys = keys
                     .iter()
-                    .filter_map(|key| crate::expression_value(fragment, node.id, key.left))
-                    .collect::<Vec<_>>();
+                    .map(|key| crate::join_key_source_value(fragment, node.id, key.left))
+                    .collect::<Option<Vec<_>>>();
                 let right_keys = keys
                     .iter()
-                    .filter_map(|key| crate::expression_value(fragment, node.id, key.right))
-                    .collect::<Vec<_>>();
+                    .map(|key| crate::join_key_source_value(fragment, node.id, key.right))
+                    .collect::<Option<Vec<_>>>();
                 let compatible = match (
                     distribution,
                     &node.required_inputs[0],
@@ -1071,8 +1071,8 @@ pub(crate) fn validate_node_semantics(
                         },
                     ) => {
                         left_scheme == right_scheme
-                            && left.as_ref() == left_keys
-                            && right.as_ref() == right_keys
+                            && left_keys.as_deref() == Some(left.as_ref())
+                            && right_keys.as_deref() == Some(right.as_ref())
                     }
                     (
                         crate::JoinDistribution::Colocated,
@@ -1096,8 +1096,8 @@ pub(crate) fn validate_node_semantics(
                         },
                     ) => {
                         left_scheme == right_scheme
-                            && left.as_ref() == left_keys
-                            && right.as_ref() == right_keys
+                            && left_keys.as_deref() == Some(left.as_ref())
+                            && right_keys.as_deref() == Some(right.as_ref())
                     }
                     (crate::JoinDistribution::BroadcastBuild, left, right) => match build_side {
                         crate::JoinSide::Left => {

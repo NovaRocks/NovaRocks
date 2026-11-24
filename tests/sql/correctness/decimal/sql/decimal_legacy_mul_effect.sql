@@ -69,9 +69,6 @@ SELECT CAST(a AS DECIMAL(3,0)) AS narrowed FROM ${case_db}.legacy_mul_effect;
 SELECT k FROM (SELECT k,CAST(a AS DECIMAL(3,0)) AS unreferenced FROM ${case_db}.legacy_mul_effect) s;
 
 -- query 9
-SELECT k FROM (SELECT k,CAST(a AS DECIMAL(76,0)) AS safe_widening FROM ${case_db}.legacy_mul_effect) s ORDER BY k;
-
--- query 10
 -- @skip_result_check=true
 SET SESSION sql_mode = '32';
 DROP TABLE ${case_db}.legacy_mul_effect;

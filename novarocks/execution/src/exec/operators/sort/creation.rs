@@ -497,8 +497,7 @@ impl<'a> SortCreation<'a> {
         use super::SortKeyConstruction;
         use arrow::array::{
             Decimal128Array, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Float64Array,
-            Int8Array, LargeListArray,
-            ListArray, MapArray, StructArray,
+            Int8Array, LargeListArray, ListArray, MapArray, StructArray,
         };
         use arrow::datatypes::DataType;
         use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};

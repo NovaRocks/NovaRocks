@@ -145,7 +145,7 @@ pub fn expression_value(
         _ => None,
     }
 }
-/// Preserve key identity only through an injective widening signed conversion.
+/// Recover the original slot through conversions that preserve its key semantics.
 pub fn join_key_source_value(
     fragment: &crate::Fragment,
     node: crate::NodeId,
@@ -156,7 +156,9 @@ pub fn join_key_source_value(
         match &definition.kind {
             crate::ExprKind::Value(value) => Some(*value),
             crate::ExprKind::Cast { expr, target, .. } => {
-                let from = unit.definition(*expr)?.ty.data_type();
+                use novarocks_type_contract::{CharacterKind, ValueKind};
+                let from = &unit.definition(*expr)?.ty;
+                let to = &definition.ty;
                 fn width(ty: &arrow_schema::DataType) -> Option<u8> {
                     use arrow_schema::DataType::*;
                     match ty {
@@ -167,8 +169,22 @@ pub fn join_key_source_value(
                         _ => None,
                     }
                 }
-                if from == target || matches!((width(from),width(target)),(Some(a),Some(b)) if b>=a)
-                {
+                let same_kind = from.value_type().kind() == to.value_type().kind()
+                    && from.data_type() == target;
+                let signed_widening = matches!(
+                    (from.value_type().kind(), to.value_type().kind()),
+                    (ValueKind::Scalar(source), ValueKind::Scalar(destination))
+                        if matches!((width(source), width(destination)), (Some(a), Some(b)) if b >= a)
+                );
+                // Dropping the length declaration of an existing VARCHAR
+                // preserves the UTF-8 bytes used by equality and hashing.
+                let unbounded_varchar = matches!(
+                    (from.value_type().kind(), to.value_type().kind()),
+                    (ValueKind::BoundedCharacter(source), ValueKind::String)
+                        if source.kind() == CharacterKind::Varchar
+                ) && from.data_type() == &arrow_schema::DataType::Utf8
+                    && target == &arrow_schema::DataType::Utf8;
+                if same_kind || signed_widening || unbounded_varchar {
                     read(unit, *expr)
                 } else {
                     None

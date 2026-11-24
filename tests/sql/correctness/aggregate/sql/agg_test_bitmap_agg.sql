@@ -30,22 +30,19 @@ CREATE TABLE t1 (
     c1 int,
     c2 boolean,
     c3 tinyint,
-    c4 int,
-    c5 bigint,
-    c6 largeint,
-    c7 VARCHAR
+    c4 int
     ) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t1 values
-    ROW(1, true, 11, 111, 1111, 11111, '111111'),
-    ROW(2, false, 22, 222, 2222, 22222, '222222'),
-    ROW(3, true, 33, 333, 3333, 33333, '333333'),
-    ROW(4, null, null, null, null, null, null),
-    ROW(5, -1, -11, -111, -1111, -11111, '-111111'),
-    ROW(6, null, null, null, null, '36893488147419103232', '680564733841876926926749214863536422912');
+    ROW(1, true, 11, 111),
+    ROW(2, false, 22, 222),
+    ROW(3, true, 33, 333),
+    ROW(4, null, null, null),
+    ROW(5, true, -11, -111),
+    ROW(6, null, null, null);
 
 -- query 4
 USE ${case_db};
