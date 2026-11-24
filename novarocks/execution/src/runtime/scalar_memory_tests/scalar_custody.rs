@@ -503,12 +503,16 @@ fn runtime_scalar_memory_array_slice_compacts_actual_selected_lists() {
     )
     .unwrap();
     let binding = bound();
-    let control = runtime_control(Some(&binding));
+    let mut control = runtime_control(Some(&binding));
+    control.bind_mem_tracker(crate::runtime::mem_tracker::MemTracker::new_root(
+        "array-slice-selected-lists",
+    ));
     let root = root(&program);
-    let mut instance = CompiledExpressionInstance::try_new(
+    let mut instance = CompiledExpressionInstance::try_new_with_allocator(
         program.unit(root.unit).unwrap().clone(),
         root.root,
         &control,
+        control.allocator(),
     )
     .unwrap();
     let selection = Selection::try_sparse(3, &[0, 2]).unwrap();

@@ -26,7 +26,7 @@ code-anchors:
 ## 裁决
 
 1. SQL 和 Expression 冻结准确重载、完整类型、转换与实参求值顺序。目录按准确重载发布安装事实。自然排序、比较器排序、标量序列和表序列分别保留自己的实现合同。
-2. `contains`、`array_position`、`array_remove`、`contains_sequence` 和 `arrays_overlap` 使用 B7a 的普通等值，按各函数的访问和空值规则归约结果。`array_distinct` 与 `array_intersect` 使用同一规范身份和相容哈希，输出最先出现的代表。交集沿较长输入的顺序，等长用左侧。自然排序和极值使用共享顺序契约，`zip` 按位置形成匿名 ROW。
+2. `contains`、`array_position` 和 `array_remove` 使用 B7a 的普通等值，按各函数的访问和空值规则归约结果。`contains_sequence` 按规范身份匹配连续片段。`arrays_overlap`、`array_distinct` 和 `array_intersect` 使用规范身份和相容哈希。去重输出最先出现的代表，交集沿较长输入的顺序，等长用左侧。自然排序和极值使用共享顺序契约，`zip` 按位置形成匿名 ROW。
 3. 根据实际选行预检可达输入、List 几何和所需输出。共享构造入口使用原宿主准入与收据。临时索引、展开结果和实际复制所需的缓冲按原资源模型收费。共享子缓冲的最后实际别名退役时结算。List 偏移溢出沿原 Representation 失败。标量 `sequence` 保留 10,000 项上限，`repeat` 保留 100,000 次上限，计数不依赖载体。
 4. `array_join` 按准确元素类型使用 VARCHAR 转换的原作者。行的数据失败按原 CAST 类别传播，`TRY` 按原行错误作用域捕获。未安装的准确转换按绑定期错误处理。控制、容量及表示失败继续沿首因报告。
 

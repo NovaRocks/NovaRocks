@@ -199,6 +199,7 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.unknown_column" => "COLUMN_NOT_FOUND",
         "sql.analyze.ambiguous_name" => "AMBIGUOUS_NAME",
         "sql.analyze.unknown_function" => "FUNCTION_NOT_FOUND",
+        "sql.analyze.operator_not_found" => "OPERATOR_NOT_FOUND",
         "sql.analyze.ambiguous_function_call" => "AMBIGUOUS_FUNCTION_CALL",
         "sql.analyze.missing_column_name" => "MISSING_COLUMN_NAME",
         "sql.analyze.duplicate_column_name" => "DUPLICATE_COLUMN_NAME",
