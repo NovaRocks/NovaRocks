@@ -574,6 +574,106 @@ fn common_recursive_lists_keep_required_roots_parent_null_empty_and_null_child()
 }
 
 #[test]
+fn common_nested_timestamp_precision_widening_keeps_values_and_nulls() {
+    use arrow_array::{ListArray, TimestampMicrosecondArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use novarocks_type_contract::{
+        TemporalPrecision, TemporalType, TemporalValue, ValueKind, ValueLayout, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+    use novarocks_value_arrays::decode::PreparedTemporalArray;
+
+    let timestamp_array = |declaration: TemporalType| {
+        let storage = ValueTypeStorageLifetime::pure();
+        let item = FunctionValueType::try_from_value(
+            ValueTypeRef::try_new(ValueKind::Temporal(declaration), true, storage.clone()).unwrap(),
+            ValueLayout::try_new(&declaration.carrier(), storage).unwrap(),
+        )
+        .unwrap();
+        let inner = crate::builtin::signature::declared_list(&item, true).unwrap();
+        crate::builtin::signature::declared_list(&inner, false).unwrap()
+    };
+    for (source_precision, target_precision, micros) in [
+        (
+            TemporalPrecision::DEFAULT,
+            TemporalPrecision::MICROSECONDS,
+            1_000,
+        ),
+        (
+            TemporalPrecision::MICROSECONDS,
+            TemporalPrecision::new(7).unwrap(),
+            1_001,
+        ),
+    ] {
+        let source_decl = TemporalType::Timestamp(source_precision);
+        let target_decl = TemporalType::Timestamp(target_precision);
+        let source_type = timestamp_array(source_decl);
+        let target_type = timestamp_array(target_decl);
+        let DataType::List(inner_field) = source_type.data_type() else {
+            unreachable!()
+        };
+        let DataType::List(item_field) = inner_field.data_type() else {
+            unreachable!()
+        };
+        let inner: ArrayRef = Arc::new(
+            ListArray::try_new(
+                Arc::clone(item_field),
+                OffsetBuffer::new(vec![0_i32, 2, 2, 3, 3].into()),
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(-micros),
+                    None,
+                    Some(micros),
+                ])),
+                Some(NullBuffer::from(vec![true, true, true, false])),
+            )
+            .unwrap(),
+        );
+        let source: ArrayRef = Arc::new(
+            ListArray::try_new(
+                Arc::clone(inner_field),
+                OffsetBuffer::new(vec![0_i32, 3, 4].into()),
+                inner,
+                None,
+            )
+            .unwrap(),
+        );
+        let prepared = prepare(
+            source_type,
+            &target_type,
+            DecimalOverflowPolicy::ReportError,
+            &CompileControl::default(),
+        )
+        .unwrap();
+        let mut instance = ScalarEvaluationInstance::instantiate(prepared).unwrap();
+        let evaluated_arguments = [EvaluatedArgument::Column(&source)];
+        let output = instance
+            .evaluate(Selection::all(2), &evaluated_arguments, &Control::default())
+            .unwrap();
+        assert!(output.errors().is_empty());
+        assert_eq!(output.values().data_type(), target_type.data_type());
+        let outer = output
+            .values()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(outer.value_offsets(), &[0, 3, 4]);
+        let inner = outer.values().as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(inner.value_offsets(), &[0, 2, 2, 3, 3]);
+        assert!(inner.is_null(3));
+        let timestamps =
+            PreparedTemporalArray::bind(target_decl, inner.values().as_ref(), true).unwrap();
+        let expected = [
+            Some(TemporalValue::from_i64_carrier(source_decl, -micros).unwrap()),
+            None,
+            Some(TemporalValue::from_i64_carrier(source_decl, micros).unwrap()),
+        ];
+        for (row, expected) in expected.into_iter().enumerate() {
+            assert_eq!(timestamps.value(row).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
 fn common_recursive_cap38_data_is_owned_and_null_parent_hides_unreachable_child() {
     use arrow_array::ListArray;
     use arrow_buffer::{NullBuffer, OffsetBuffer};

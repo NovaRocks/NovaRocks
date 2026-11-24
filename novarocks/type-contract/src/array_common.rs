@@ -354,6 +354,11 @@ pub fn array_common_coercion_types_valid_observed<E>(
                 && target_layout == &DataType::Utf8
                 && crate::trino_can_coerce_scalar(source.kind(), target.kind()));
         }
+        if let (ValueKind::Temporal(source), ValueKind::Temporal(target)) =
+            (source.kind(), target.kind())
+        {
+            return Ok(source.is_lossless_widening_to(*target));
+        }
         Ok(matches!(
             (source.kind(), target.kind()),
             (ValueKind::Scalar(_), ValueKind::Scalar(_))

@@ -355,6 +355,45 @@ fn common_coercion_cannot_borrow_explicit_cast_or_narrowing_profiles() {
 }
 
 #[test]
+fn array_common_allows_lossless_datetime_precision_across_carriers() {
+    use crate::{TemporalPrecision, TemporalType};
+
+    let timestamp = |precision| {
+        let declaration = TemporalType::Timestamp(precision);
+        let storage = ValueTypeStorageLifetime::pure();
+        FunctionValueType::try_from_value(
+            ValueTypeRef::try_new(ValueKind::Temporal(declaration), true, storage.clone()).unwrap(),
+            ValueLayout::try_new(&declaration.carrier(), storage).unwrap(),
+        )
+        .unwrap()
+    };
+    let short = timestamp(TemporalPrecision::DEFAULT);
+    let wide = timestamp(TemporalPrecision::MICROSECONDS);
+    let long = timestamp(TemporalPrecision::new(7).unwrap());
+    assert_eq!(short.data_type(), wide.data_type());
+    assert_ne!(wide.data_type(), long.data_type());
+    let short_array = nested(&short, false);
+    let wide_array = nested(&wide, false);
+    let long_array = nested(&long, false);
+    for (source, target, allowed) in [
+        (&short, &wide, true),
+        (&short_array, &wide_array, true),
+        (&wide, &long, true),
+        (&wide_array, &long_array, true),
+        (&wide, &short, false),
+        (&wide_array, &short_array, false),
+        (&long, &wide, false),
+        (&long_array, &wide_array, false),
+    ] {
+        assert_eq!(
+            array_common_coercion_types_valid_observed::<Infallible>(source, target, || Ok(()))
+                .unwrap(),
+            allowed
+        );
+    }
+}
+
+#[test]
 fn array_common_does_not_promote_temporal_integer_carriers() {
     use crate::{TemporalPrecision, TemporalType};
 

@@ -472,6 +472,7 @@ enum CastBody {
     TemporalCarrier {
         source: Source,
     },
+    TemporalWiden(crate::builtin::LosslessTemporalWiden),
     Text {
         source: Source,
     },
@@ -1234,6 +1235,7 @@ impl PreparedCastRecipe {
                 | CastBody::ExplicitArray
                 | CastBody::ExplicitMap
                 | CastBody::ArrayNull
+                | CastBody::TemporalWiden(_)
         )
     }
     pub fn evaluate_selected_array<'a>(
@@ -1244,7 +1246,10 @@ impl PreparedCastRecipe {
         control: &dyn KernelEvaluationControl,
     ) -> Result<crate::SelectedValues<'a>, KernelFailure> {
         match self.body {
-            CastBody::ExplicitArray | CastBody::ExplicitMap | CastBody::ArrayNull => {
+            CastBody::ExplicitArray
+            | CastBody::ExplicitMap
+            | CastBody::ArrayNull
+            | CastBody::TemporalWiden(_) => {
                 array_mode::evaluate(self, argument, selection, inherited, control)
             }
             CastBody::Collection => {
@@ -1373,6 +1378,7 @@ impl PreparedCastRecipe {
             | CastBody::TimeText { .. }
             | CastBody::BinaryText
             | CastBody::LargeIntText
+            | CastBody::TemporalWiden(_)
             | CastBody::Identity
             | CastBody::Text { .. } => false,
             CastBody::Carrier { source, target } => {
