@@ -169,6 +169,7 @@ code-anchors:
 
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
+- [ADR-0264](ADR-0264-iceberg-rewrites-preserve-row-identity.md) — Iceberg OPTIMIZE 保留已分配的行身份，由 manifest list 为重写输出分配新范围，v3 缺 next-row-id 返回明确诊断（active。部分替代 ADR-0171 的重写 lineage 规则和 ADR-0174 的 P7a。原不可变 operation、依赖验证、产物归属和其余 vendor 补丁政策继续有效）
 - [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) — Iceberg 写类为何共用紧凑接收与 operation 账本，怎样选择建表位置、冻结追加条件并按精确对象清理（active；部分替代 lake publication ADR-0110、ADR-0171、ADR-0198、Iceberg ADR-0239 与维护 ADR-0243）
 - [ADR-0260](ADR-0260-iceberg-metadata-delete-proves-original-fields-on-each-round.md) — Iceberg 元数据 DELETE 如何在原读观察证明完全吸收，并按当轮最新文件与获胜快照解释原字段和计数（active；部分替代 ADR-0251）
 - [ADR-0251](ADR-0251-iceberg-maintenance-commits-by-operation.md) — Iceberg OPTIMIZE 与主分支 TRUNCATE 为何按各自协议在当轮基准验证，如何原子保护输出规范、保留统计来源并由 Provider 撰写提交失败（active；一般过滤删除由 ADR-0260 细化，TRUNCATE 和重试规则保留）

@@ -120,6 +120,7 @@ fn binding_at_epoch(epoch: u8, counts: Arc<Counts>) -> ConnectorControlBinding {
     let instance = base.descriptor().instance_id.clone();
     let metadata = Arc::new(ObservedMetadata {
         owner: instance.clone(),
+        provider: base.descriptor().provider_id.clone(),
         epoch,
         error: None,
         counts,
@@ -172,9 +173,7 @@ impl InstalledIcebergCatalog {
         let projection = CatalogRuntimeProjection::new();
         let service =
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
-        projection
-            .bind_query_catalog(service.clone(), controls.clone())
-            .unwrap();
+        projection.bind_query_catalog(service.clone()).unwrap();
         let owner = Arc::new(CatalogApplicationService::new(
             source,
             controls.clone(),
@@ -431,7 +430,7 @@ async fn installed_quoted_metadata_uses_one_exact_pin_and_a_separate_statement_m
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn original_mv_metadata_alias_preserves_actual_provider_cause_and_one_lookup() {
+async fn original_mv_metadata_alias_preserves_resource_failure_and_can_retry() {
     use novarocks_failure_contract::{FailureClass, FailureProjection};
     use novarocks_spi::connector::ConnectorErrorKind;
 
@@ -472,24 +471,26 @@ async fn original_mv_metadata_alias_preserves_actual_provider_cause_and_one_look
     assert_eq!(failed.original_failure(), Some(&cause));
     assert_eq!(cause.failure_fact(), fact);
     assert_eq!(fact.class(), FailureClass::Resource);
-    assert!(matches!(
-        bindings.resolved_lookup(&QueryTableBindingKey::metadata_with_qualification(
-            "ice",
-            "db",
-            "orders",
-            MetadataTableKind::Files,
-            need.quoted_metadata_binding(),
-        )),
-        Some(Err(_))
-    ));
-    // A subsequent completion round reuses the original memo and typed cause.
+    assert!(
+        bindings
+            .resolved_lookup(&QueryTableBindingKey::metadata_with_qualification(
+                "ice",
+                "db",
+                "orders",
+                MetadataTableKind::Files,
+                need.quoted_metadata_binding(),
+            ))
+            .is_none()
+    );
     let next_round = installed.materializer(&controls, context(), &bindings);
-    let repeated = match next_round.begin_original_metadata_lookup(need, &controls) {
-        Err(error) => error,
-        Ok(_) => panic!("failed original metadata may not be loaded again"),
+    let OriginalCatalogLookup::Metadata(retry) = next_round
+        .begin_original_metadata_lookup(need, &controls)
+        .unwrap()
+    else {
+        panic!("a resource failure must leave the metadata request retryable");
     };
-    assert_eq!(repeated.original_failure(), Some(&cause));
-    assert_eq!(*controls.acquired.lock().unwrap(), [exact_runtime]);
+    assert_eq!(retry.planning_pin.control_runtime_id(), exact_runtime);
+    assert_eq!(*controls.acquired.lock().unwrap(), [exact_runtime; 2]);
 }
 
 fn assert_catalog_refusal(

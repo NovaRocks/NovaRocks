@@ -551,7 +551,7 @@ async fn run_description(
         catalog,
         job.compiler.completion_fact_owners(),
         StatementFactScope::governed_read_io_in(
-            bindings,
+            Arc::clone(&bindings),
             connector,
             sql_session.current_catalog.as_deref(),
             capacity.scope(),
@@ -574,6 +574,7 @@ async fn run_description(
             .continue_catalog(facts.into_boxed_slice())
             .map_err(sql_error)?;
     }
+    bindings.seal_catalog_observations().await;
     let family = session
         .presentation()
         .copied()

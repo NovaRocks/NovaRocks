@@ -102,7 +102,7 @@ impl DeleteCommitInput {
             .unwrap_or_else(|poison| poison.into_inner())
             .mark_dispatch_possible()
             .map_err(|error| crate::query::internal_error(error.to_string()))?;
-        let result = session.execute_once(&self.kernel);
+        let result = session.execute_once();
         match result {
             ResolvedDataMutation::CommitUnknown { evidence, .. } => {
                 let adjudication = self
@@ -111,10 +111,7 @@ impl DeleteCommitInput {
                     .unwrap_or_else(|poison| poison.into_inner())
                     .begin_adjudication()
                     .map_err(|error| crate::query::internal_error(error.to_string()))?;
-                self.finish(
-                    session.adjudicate_once(evidence, &self.kernel),
-                    Some(adjudication),
-                )
+                self.finish(session.adjudicate_once(evidence), Some(adjudication))
             }
             other => self.finish(other, None),
         }

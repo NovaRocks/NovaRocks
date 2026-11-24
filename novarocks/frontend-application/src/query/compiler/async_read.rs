@@ -222,11 +222,11 @@ impl FrontendQueryCompiler {
         drop(query);
         let encoding_control = request.control().clone();
         planning_cpu.install_catalog_qualification_source(
-            bindings,
+            Arc::clone(&bindings),
             self.query.catalog_application().cloned(),
         );
         provider_source
-            .complete_in(request, scope, planning_cpu.as_ref())
+            .complete_in(request, scope, planning_cpu.as_ref(), &bindings)
             .await?;
         if let Some(error) = provider_source.completed_error() {
             return Ok(Err(FrontendQueryCompilerError::from_completion(&error)));

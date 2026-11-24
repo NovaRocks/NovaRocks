@@ -125,7 +125,6 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         Arc::clone(&ports.functions),
         Arc::clone(&ports.catalog_service),
         ports.catalog_application.clone(),
-        Arc::clone(&ports.connector_control),
         Arc::clone(&ports.typed_connector_control),
         Arc::clone(&ports.unified_statistics),
         ports.backend_topology.clone(),
@@ -656,13 +655,9 @@ pub fn session_catalog_resolver(
 pub fn bind_catalog_runtime_projection(
     projection: &crate::catalog_application::CatalogRuntimeProjection,
     catalog_service: Arc<QueryCatalogService>,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
 ) -> Result<(), String> {
     projection
-        .bind_query_catalog(
-            catalog_service,
-            connector_control as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-        )
+        .bind_query_catalog(catalog_service)
         .map_err(|error| format!("bind catalog runtime projection failed: {error}"))
 }
 
@@ -747,7 +742,6 @@ pub(crate) fn mv_refresh_provider_activation(
         Arc::clone(&ports.functions),
         Arc::clone(&ports.catalog_service),
         Some(Arc::clone(&ports.catalog_application)),
-        Arc::clone(&ports.connector_control),
         Arc::clone(&ports.typed_connector_control),
         ports.unified_statistics,
         ports.backend_topology,

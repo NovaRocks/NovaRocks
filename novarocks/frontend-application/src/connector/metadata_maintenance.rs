@@ -17,8 +17,8 @@
 
 //! Provider-neutral application bridge for one FE-only metadata maintenance operation.
 //!
-//! The bridge owns only exact-generation lease lifetime, dispatch certainty and
-//! generic cache finalization. Provider-specific maintenance planning, durable
+//! The bridge owns the exact-generation lease, dispatch certainty and original
+//! terminal outcome. Provider-specific maintenance planning, durable
 //! artifacts, markers and external mutation all remain behind the SPI.
 
 use std::fmt;
@@ -103,18 +103,6 @@ impl MetadataMaintenanceIntent {
             ),
         }
     }
-}
-
-/// Invalidates application-owned catalog state after provider finalization.
-///
-/// Provider cache invalidation is represented by the provider's returned
-/// finalization. This port is deliberately invoked only afterwards, preserving
-/// provider-before-generic invalidation without importing provider state here.
-pub trait MetadataMaintenanceCacheFinalizer: Send + Sync {
-    fn invalidate_generic_table(
-        &self,
-        table: &ConnectorTableIdentity,
-    ) -> Result<(), ConnectorError>;
 }
 
 #[derive(Clone, Debug)]
@@ -400,22 +388,18 @@ impl MetadataMaintenanceCall {
         }
     }
 
-    pub async fn resolve(
-        &mut self,
-        cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
-    ) -> ResolvedMetadataMaintenance {
+    pub async fn resolve(&mut self) -> ResolvedMetadataMaintenance {
         if let Err(failure) = std::future::poll_fn(|cx| self.poll_prepared(cx)).await {
             return failure;
         }
         self.session
             .as_mut()
             .expect("prepared session is stable")
-            .execute(cache_finalizer)
+            .execute()
             .await
     }
 
-    /// Original provider facts remain inspectable after a notification or
-    /// finalizer panic. They never authorize another physical dispatch.
+    /// Original provider facts remain inspectable after an interrupted owner frame. They never authorize another physical dispatch.
     pub fn retained_outcome(
         &self,
     ) -> Option<Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>> {
@@ -464,16 +448,14 @@ impl MetadataMaintenanceCall {
 
 pub async fn resolve_metadata_maintenance(
     call: &mut MetadataMaintenanceCall,
-    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
 ) -> ResolvedMetadataMaintenance {
-    call.resolve(cache_finalizer).await
+    call.resolve().await
 }
 
 pub async fn execute_metadata_maintenance(
     call: &mut MetadataMaintenanceCall,
-    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
 ) -> Result<CompletedMetadataMaintenance, String> {
-    completed_projection(call.resolve(cache_finalizer).await)
+    completed_projection(call.resolve().await)
 }
 
 fn completed_projection(
@@ -507,9 +489,8 @@ fn completed_projection(
 #[cfg(test)]
 pub async fn execute_planned_metadata_maintenance(
     session: &mut MetadataMaintenanceSession,
-    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
 ) -> Result<CompletedMetadataMaintenance, String> {
-    completed_projection(session.execute(cache_finalizer).await)
+    completed_projection(session.execute().await)
 }
 
 /// The original background source already formed this exact metadata
@@ -540,14 +521,12 @@ pub(crate) fn begin_captured_max_compactable_data_files(
 
 pub struct MetadataMaintenanceSession {
     session: ConnectorMetadataMaintenanceSession,
-    table: ConnectorTableIdentity,
     plan: ConnectorMetadataMaintenancePlan,
     context: ConnectorRequestContext,
     execution: Option<ConnectorMetadataMaintenanceExecution>,
     execution_begin_unproven: bool,
     provider_outcome: Option<Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>>,
     resolved: Option<ResolvedMetadataMaintenance>,
-    finalization_unproven: bool,
 }
 
 impl MetadataMaintenanceSession {
@@ -616,14 +595,12 @@ impl MetadataMaintenanceSession {
             })?;
         Ok(Self {
             session,
-            table,
             plan,
             context,
             execution: None,
             execution_begin_unproven: false,
             provider_outcome: None,
             resolved: None,
-            finalization_unproven: false,
         })
     }
     #[cfg(test)]
@@ -640,10 +617,7 @@ impl MetadataMaintenanceSession {
     }
     /// Installs the original provider execution handle before the first wait.
     /// Re-entry resumes this exact handle; it never constructs another request.
-    pub(crate) async fn execute(
-        &mut self,
-        cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
-    ) -> ResolvedMetadataMaintenance {
+    pub(crate) async fn execute(&mut self) -> ResolvedMetadataMaintenance {
         if let Some(resolved) = &self.resolved {
             return resolved.clone();
         }
@@ -720,22 +694,8 @@ impl MetadataMaintenanceSession {
                 }
             },
         };
-        if self.finalization_unproven {
-            // A cache callback panic cannot erase a known publication or call
-            // that callback again. The original outer owner retains its panic.
-            let outcome = outcome_after_frame_failure(
-                outcome,
-                &ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "generic cache finalization did not prove actual exit",
-                ),
-            );
-            return project_terminal_without_cache(outcome);
-        }
-        self.finalization_unproven = true;
-        let resolved = resolve_terminal_outcome(outcome, &self.table, cache_finalizer);
+        let resolved = project_terminal_outcome(outcome);
         self.resolved = Some(resolved.clone());
-        self.finalization_unproven = false;
         resolved
     }
 }
@@ -777,21 +737,7 @@ fn outcome_after_frame_failure(
     }
 }
 
-fn resolve_terminal_outcome(
-    mut outcome: ConnectorMetadataMaintenanceOutcome,
-    table: &ConnectorTableIdentity,
-    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
-) -> ResolvedMetadataMaintenance {
-    if let ExternalMutationOutcome::KnownCommitted { finalization, .. } = &mut outcome {
-        *finalization = merge_finalization(
-            finalization.clone(),
-            cache_finalizer.invalidate_generic_table(table),
-        );
-    }
-    project_terminal_without_cache(outcome)
-}
-
-fn project_terminal_without_cache(
+fn project_terminal_outcome(
     outcome: ConnectorMetadataMaintenanceOutcome,
 ) -> ResolvedMetadataMaintenance {
     match outcome {
@@ -819,33 +765,6 @@ fn project_terminal_without_cache(
         }
         ExternalMutationOutcome::CommitUnknown { failure, .. } => {
             ResolvedMetadataMaintenance::CommitUnknown { failure }
-        }
-    }
-}
-
-fn merge_finalization(
-    provider: ExternalMutationFinalization,
-    generic: Result<(), ConnectorError>,
-) -> ExternalMutationFinalization {
-    match (provider, generic) {
-        (ExternalMutationFinalization::Complete, Ok(())) => ExternalMutationFinalization::Complete,
-        (ExternalMutationFinalization::Failed(failure), Ok(())) => {
-            ExternalMutationFinalization::Failed(failure)
-        }
-        (ExternalMutationFinalization::Complete, Err(error)) => {
-            ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
-                ConnectorMutationFailureKind::Internal,
-                format!("generic catalog cache invalidation failed: {error}"),
-            ))
-        }
-        (ExternalMutationFinalization::Failed(failure), Err(error)) => {
-            ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
-                failure.kind(),
-                format!(
-                    "{}; generic catalog cache invalidation also failed: {error}",
-                    failure.message()
-                ),
-            ))
         }
     }
 }
@@ -1187,7 +1106,7 @@ mod tests {
     // callers must supply their stable named Call/Observation fields instead.
     async fn execute_metadata_maintenance(
         resolver: &dyn ConnectorMetadataMaintenanceResolver,
-        finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+
         instance: &ConnectorInstanceId,
         operation: ConnectorMutationOperationId,
         table: ConnectorTableIdentity,
@@ -1197,11 +1116,11 @@ mod tests {
         let mut call =
             MetadataMaintenanceCall::try_new(resolver, instance, operation, table, intent, context)
                 .map_err(|failure| format!("{failure:?}"))?;
-        super::execute_metadata_maintenance(&mut call, finalizer).await
+        super::execute_metadata_maintenance(&mut call).await
     }
     async fn resolve_metadata_maintenance(
         resolver: &dyn ConnectorMetadataMaintenanceResolver,
-        finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+
         instance: &ConnectorInstanceId,
         operation: ConnectorMutationOperationId,
         table: ConnectorTableIdentity,
@@ -1214,7 +1133,7 @@ mod tests {
             Ok(call) => call,
             Err(failure) => return failure,
         };
-        super::resolve_metadata_maintenance(&mut call, finalizer).await
+        super::resolve_metadata_maintenance(&mut call).await
     }
     struct Resolver {
         provider: Arc<FakeProvider>,
@@ -1265,18 +1184,6 @@ mod tests {
         }
     }
 
-    struct Finalizer {
-        events: Arc<Mutex<Vec<&'static str>>>,
-    }
-    impl MetadataMaintenanceCacheFinalizer for Finalizer {
-        fn invalidate_generic_table(
-            &self,
-            _: &ConnectorTableIdentity,
-        ) -> Result<(), ConnectorError> {
-            self.events.lock().unwrap().push("generic");
-            Ok(())
-        }
-    }
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(10),
@@ -1295,12 +1202,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_lease_plans_executes_once_and_finalizes_provider_before_generic() {
+    async fn exact_lease_plans_executes_once_and_retains_provider_finalization() {
         let provider = FakeProvider::new(Mode::Committed);
         let resolver = Resolver::new(provider.clone());
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-        };
+
         let mut session = MetadataMaintenanceSession::plan(
             &resolver,
             &provider.descriptor.instance_id,
@@ -1317,7 +1222,7 @@ mod tests {
         );
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
         assert!(matches!(
-            session.execute(&finalizer).await,
+            session.execute().await,
             ResolvedMetadataMaintenance::KnownCommitted(_)
         ));
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
@@ -1325,19 +1230,14 @@ mod tests {
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
         drop(session);
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            provider.events.lock().unwrap().as_slice(),
-            ["provider", "generic"]
-        );
+        assert_eq!(provider.events.lock().unwrap().as_slice(), ["provider"]);
     }
 
     #[tokio::test]
     async fn original_call_consumes_the_exact_maintenance_session() {
         let provider = FakeProvider::new(Mode::Committed);
         let resolver = Resolver::new(provider.clone());
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-        };
+
         let exact = resolver
             .acquire_exact_metadata_maintenance(ConnectorControlRuntimeId::from_bytes([8; 16]))
             .unwrap();
@@ -1355,7 +1255,7 @@ mod tests {
         assert!(call.matches(&target.instance_id, operation, &target, &intent));
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 0);
         assert!(matches!(
-            super::resolve_metadata_maintenance(&mut call, &finalizer).await,
+            super::resolve_metadata_maintenance(&mut call).await,
             ResolvedMetadataMaintenance::KnownCommitted(_)
         ));
         assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
@@ -1369,9 +1269,7 @@ mod tests {
     async fn unknown_execute_is_not_reexecuted() {
         let provider = FakeProvider::new(Mode::UnknownStaysUnknown);
         let resolver = Resolver::new(provider.clone());
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-        };
+
         let mut session = MetadataMaintenanceSession::plan(
             &resolver,
             &provider.descriptor.instance_id,
@@ -1383,7 +1281,7 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(
-            session.execute(&finalizer).await,
+            session.execute().await,
             ResolvedMetadataMaintenance::CommitUnknown { .. }
         ));
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
@@ -1397,9 +1295,7 @@ mod tests {
         for planned in [false, true] {
             let provider = FakeProvider::new(Mode::UnknownStaysUnknown);
             let resolver = Resolver::new(provider.clone());
-            let finalizer = Finalizer {
-                events: provider.events.clone(),
-            };
+
             let operation = ConnectorMutationOperationId::new();
             let outcome = if planned {
                 let mut session = MetadataMaintenanceSession::plan(
@@ -1412,11 +1308,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                execute_planned_metadata_maintenance(&mut session, &finalizer).await
+                execute_planned_metadata_maintenance(&mut session).await
             } else {
                 execute_metadata_maintenance(
                     &resolver,
-                    &finalizer,
                     &provider.descriptor.instance_id,
                     operation,
                     table(&provider.descriptor.instance_id),
@@ -1763,27 +1658,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_failure_is_retained_without_skipping_necessary_cache_finalization() {
-        struct CacheFailure;
-        impl MetadataMaintenanceCacheFinalizer for CacheFailure {
-            fn invalidate_generic_table(
-                &self,
-                _: &ConnectorTableIdentity,
-            ) -> Result<(), ConnectorError> {
-                Err(ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "necessary cache barrier failed",
-                ))
-            }
-        }
+    async fn cleanup_failure_is_retained_with_provider_finalization() {
         let provider = FakeProvider::new(Mode::CommittedCleanupFailed);
         let resolver = Resolver::new(provider.clone());
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-        };
+
         let ResolvedMetadataMaintenance::KnownCommitted(completed) = resolve_metadata_maintenance(
             &resolver,
-            &finalizer,
             &provider.descriptor.instance_id,
             ConnectorMutationOperationId::new(),
             table(&provider.descriptor.instance_id),
@@ -1801,31 +1681,8 @@ mod tests {
         assert!(
             matches!(completed.cleanup, ExternalMutationFinalization::Failed(ref error) if error.message() == "retired objects remain")
         );
-        assert_eq!(
-            *provider.events.lock().unwrap(),
-            vec!["provider", "generic"]
-        );
+        assert_eq!(*provider.events.lock().unwrap(), vec!["provider"]);
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
-        let ResolvedMetadataMaintenance::KnownCommitted(completed) = resolve_metadata_maintenance(
-            &resolver,
-            &CacheFailure,
-            &provider.descriptor.instance_id,
-            ConnectorMutationOperationId::new(),
-            table(&provider.descriptor.instance_id),
-            MetadataMaintenanceIntent::expire_table_versions(None, Some(1)),
-            context(),
-        )
-        .await
-        else {
-            panic!("necessary cache failure cannot erase the commit")
-        };
-        assert!(
-            matches!(completed.finalization, ExternalMutationFinalization::Failed(ref error) if error.message().contains("necessary cache barrier failed"))
-        );
-        assert!(
-            matches!(completed.cleanup, ExternalMutationFinalization::Failed(ref error) if error.message() == "retired objects remain")
-        );
-        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1840,9 +1697,7 @@ mod tests {
         ] {
             let provider = FakeProvider::new(mode);
             let resolver = Resolver::new(provider.clone());
-            let finalizer = Finalizer {
-                events: provider.events.clone(),
-            };
+
             let mut call = MetadataMaintenanceCall::try_new(
                 &resolver,
                 &provider.descriptor.instance_id,
@@ -1853,7 +1708,7 @@ mod tests {
             )
             .unwrap_or_else(|_| panic!("original Call construction"));
             assert_eq!(call.cleanup_responsibility(), R::Retained);
-            call.resolve(&finalizer).await;
+            call.resolve().await;
             for _ in 0..3 {
                 assert_eq!(call.cleanup_responsibility(), expected);
             }
@@ -1865,13 +1720,10 @@ mod tests {
     async fn planning_failure_is_known_uncommitted_without_dispatch() {
         let provider = FakeProvider::new(Mode::PlanningFailure);
         let resolver = Resolver::new(provider.clone());
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-        };
+
         assert!(matches!(
             resolve_metadata_maintenance(
                 &resolver,
-                &finalizer,
                 &provider.descriptor.instance_id,
                 ConnectorMutationOperationId::from_bytes([6; 16]),
                 table(&provider.descriptor.instance_id),
@@ -1890,9 +1742,7 @@ mod tests {
     async fn cancelled_execution_wait_resumes_same_installed_session_without_redispatch() {
         let provider = FakeProvider::new(Mode::Pending);
         let resolver = Resolver::new(provider.clone());
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-        };
+
         let mut session = MetadataMaintenanceSession::plan(
             &resolver,
             &provider.descriptor.instance_id,
@@ -1903,7 +1753,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut wait = Box::pin(session.execute(&finalizer));
+        let mut wait = Box::pin(session.execute());
         assert!(futures::poll!(&mut wait).is_pending());
         drop(wait);
         assert!(session.execution.is_some());
@@ -1912,78 +1762,25 @@ mod tests {
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
         provider.execution_ready.store(true, Ordering::SeqCst);
         assert!(matches!(
-            session.execute(&finalizer).await,
+            session.execute().await,
             ResolvedMetadataMaintenance::KnownCommitted(_)
         ));
         assert!(matches!(
-            session.execute(&finalizer).await,
+            session.execute().await,
             ResolvedMetadataMaintenance::KnownCommitted(_)
         ));
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            provider.events.lock().unwrap().as_slice(),
-            ["provider", "generic"]
-        );
+        assert_eq!(provider.events.lock().unwrap().as_slice(), ["provider"]);
         drop(session);
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn generic_finalizer_panic_keeps_original_provider_outcome_and_never_redispatches() {
-        struct PanickingFinalizer(AtomicUsize);
-        impl MetadataMaintenanceCacheFinalizer for PanickingFinalizer {
-            fn invalidate_generic_table(
-                &self,
-                _: &ConnectorTableIdentity,
-            ) -> Result<(), ConnectorError> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                panic!("original generic finalizer panic");
-            }
-        }
-        let provider = FakeProvider::new(Mode::Committed);
-        let resolver = Resolver::new(provider.clone());
-        let finalizer = PanickingFinalizer(AtomicUsize::new(0));
-        let mut call = MetadataMaintenanceCall::try_new(
-            &resolver,
-            &provider.descriptor.instance_id,
-            ConnectorMutationOperationId::new(),
-            table(&provider.descriptor.instance_id),
-            MetadataMaintenanceIntent::rewrite_metadata_layout(),
-            context(),
-        )
-        .unwrap();
-        let mut wait = Box::pin(call.resolve(&finalizer));
-        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let waker = futures::task::noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            wait.as_mut().poll(&mut cx)
-        }))
-        .expect_err("actual generic callback must unwind");
-        drop(wait);
-        assert!(matches!(
-            call.retained_outcome().unwrap().unwrap(),
-            ExternalMutationOutcome::KnownCommitted { .. }
-        ));
-        assert!(matches!(
-            call.resolve(&finalizer).await,
-            ResolvedMetadataMaintenance::KnownCommitted(completed)
-                if matches!(
-                    &completed.finalization,
-                    ExternalMutationFinalization::Failed(_)
-                )
-        ));
-        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(finalizer.0.load(Ordering::SeqCst), 1);
-        drop(failure);
-    }
-    #[tokio::test]
     async fn interrupted_begin_keeps_unknown_fact_and_never_begins_again() {
         use futures::FutureExt;
         let provider = FakeProvider::new(Mode::BeginPanic);
         let resolver = Resolver::new(provider.clone());
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-        };
+
         let mut call = MetadataMaintenanceCall::try_new(
             &resolver,
             &provider.descriptor.instance_id,
@@ -1993,7 +1790,7 @@ mod tests {
             context(),
         )
         .unwrap();
-        let Err(cause) = std::panic::AssertUnwindSafe(call.resolve(&finalizer))
+        let Err(cause) = std::panic::AssertUnwindSafe(call.resolve())
             .catch_unwind()
             .await
         else {
@@ -2005,7 +1802,7 @@ mod tests {
             Some(novarocks_spi::connector::LakePublicationDisposition::CommitUnknown)
         );
         assert!(matches!(
-            call.resolve(&finalizer).await,
+            call.resolve().await,
             ResolvedMetadataMaintenance::ContractFailure {
                 dispatch: MetadataMaintenanceDispatchState::PossiblyDispatched,
                 ..
@@ -2019,9 +1816,7 @@ mod tests {
     async fn pending_execution_publication_fact_becomes_actual_terminal_without_redispatch() {
         let provider = FakeProvider::new(Mode::Pending);
         let resolver = Resolver::new(provider.clone());
-        let finalizer = Finalizer {
-            events: provider.events.clone(),
-        };
+
         let mut call = MetadataMaintenanceCall::try_new(
             &resolver,
             &provider.descriptor.instance_id,
@@ -2031,7 +1826,7 @@ mod tests {
             context(),
         )
         .unwrap();
-        let mut wait = Box::pin(call.resolve(&finalizer));
+        let mut wait = Box::pin(call.resolve());
         assert!(futures::poll!(&mut wait).is_pending());
         drop(wait);
         assert_eq!(
@@ -2040,7 +1835,7 @@ mod tests {
         );
         provider.execution_ready.store(true, Ordering::SeqCst);
         assert!(matches!(
-            call.resolve(&finalizer).await,
+            call.resolve().await,
             ResolvedMetadataMaintenance::KnownCommitted(_)
         ));
         assert_eq!(

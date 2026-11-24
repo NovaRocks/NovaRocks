@@ -1,0 +1,14 @@
+-- query 3
+-- types	bigint	bigint	integer
+added	id	value
+8	1	10
+
+-- query 5
+-- types	bigint	integer
+id	value
+1	10
+
+-- query 7
+-- types	bigint	integer	bigint
+id	value	added
+3	10	9

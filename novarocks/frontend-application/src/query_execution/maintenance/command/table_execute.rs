@@ -190,7 +190,6 @@ impl MaintenanceCommandExecutor {
                     instance_id: instance,
                     planning,
                     mutation,
-                    catalog_service: self.kernel.catalog_service().clone(),
                     storage_observation: self.kernel.mv_storage_observation().clone(),
                     readiness: self.kernel.mv_readiness().clone(),
                 }),

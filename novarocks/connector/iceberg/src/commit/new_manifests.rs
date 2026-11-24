@@ -427,12 +427,13 @@ impl RollingInput<'_> {
             } => {
                 let remaining = entries.split_off(count);
                 let batch = std::mem::replace(entries, remaining);
-                let mut descriptor = if let Some(sequence) = *rewrite_sequence {
+                let descriptor = if let Some(sequence) = *rewrite_sequence {
                     if output.content != ManifestContentType::Data {
                         return Err(invariant(
                             "Iceberg rewrite output must use its frozen data partition",
                         ));
                     }
+                    // The manifest list allocates a new range from the table watermark.
                     output
                         .write_rewrite_data(&batch, codec, author, sequence)
                         .await?
@@ -473,17 +474,6 @@ impl RollingInput<'_> {
                             .await?
                     }
                 };
-                if rewrite_sequence.is_some()
-                    && view.metadata().format_version() == FormatVersion::V3
-                {
-                    descriptor.first_row_id = batch
-                        .iter()
-                        .filter_map(|entry| entry.addition.as_ref()?.first_row_id)
-                        .min()
-                        .map(u64::try_from)
-                        .transpose()
-                        .map_err(|_| invariant("Iceberg rewrite row ID must be nonnegative"))?;
-                }
                 // Compact inputs and their receipts survive the actual write.
                 drop(batch);
                 Ok(descriptor)
@@ -686,7 +676,7 @@ fn decode_addition(
 }
 
 fn finish_addition(
-    mut written: super::WrittenFile,
+    written: super::WrittenFile,
     source: &TableMetadata,
     addition: &CompactAddition,
     historical: Option<&StructType>,
@@ -708,9 +698,6 @@ fn finish_addition(
             ErrorKind::Unexpected,
             "Historical position output cannot carry table-column bounds",
         ));
-    }
-    if rewrite_sequence.is_some() {
-        written.first_row_id = addition.first_row_id;
     }
     let file = super::data_file::into_written_file(written)?;
     let added = match rewrite_sequence {

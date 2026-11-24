@@ -664,6 +664,7 @@ fn prepare_read_opening(
     // request is admitted as its own carrier, because the cohort is the read
     // and nothing could resolve it from a name and a version.
     let mut original_table = None;
+    let mut original_name = None;
     let mut original_reference = None;
     let admitted = if let ProviderReadRelationNeed::MvTarget {
         target_table_uuid,
@@ -782,14 +783,34 @@ fn prepare_read_opening(
                 } else {
                     match input {
                         QueryFrozenReadInput::Current | QueryFrozenReadInput::Snapshot(_) => {
-                            AdmittedRead::Relation(
-                                bindings.frozen_read_input(need.binding(), input).map_err(
-                                    |error| {
-                                        ProviderReadError::from(error)
-                                            .context(format!("provider read of {name}"))
+                            let materialization = bindings
+                                .frozen_read_input(need.binding(), input)
+                                .map_err(|error| {
+                                    ProviderReadError::from(error)
+                                        .context(format!("provider read of {name}"))
+                                })?;
+                            if matches!(
+                                relation,
+                                ProviderReadRelationNeed::Data { .. }
+                                    | ProviderReadRelationNeed::FrozenInputSet { .. }
+                            ) && let Some(original) = &binding.source_metadata
+                                && let Some(source) = original.source_read_facts()
+                            {
+                                if original.table != materialization.table {
+                                    return Err("statement scan differs from its original table observation".to_owned().into());
+                                }
+                                original_name = Some(SchemaTableName::try_new(
+                                    &original.identity.namespace,
+                                    &original.identity.table,
+                                )?);
+                                original_table = Some(
+                                    novarocks_spi::connector::read_stack::ConnectorReadOriginalTableObservation {
+                                        table: original.table.clone(),
+                                        source: source.clone(),
                                     },
-                                )?,
-                            )
+                                );
+                            }
+                            AdmittedRead::Relation(materialization)
                         }
                         QueryFrozenReadInput::PinnedFileSet => AdmittedRead::Cohort(
                             bindings.frozen_cohort_read(need.binding(), input).map_err(
@@ -822,9 +843,12 @@ fn prepare_read_opening(
     // plus the kind's suffix; the plan states the two separately, because
     // which metadata relation this is belongs to the read and not to the
     // name. Put them back together where the provider is asked.
-    let table = admitted
-        .provider_relation(relation)
-        .map_err(|error| error.context(format!("provider read of {name}")))?;
+    let table = match original_name {
+        Some(table) => table,
+        None => admitted
+            .provider_relation(relation)
+            .map_err(|error| error.context(format!("provider read of {name}")))?,
+    };
 
     Ok(ReadOpening {
         name,
@@ -1028,7 +1052,8 @@ pub(crate) async fn probe_delete_filter(
         ConnectorReadRelationPreparationRequest as Request,
     };
 
-    let opening = prepare_read_opening(need, control, bindings, context)?;
+    let original_context = context.clone().with_original_table_preparation_reuse();
+    let opening = prepare_read_opening(need, control, bindings, &original_context)?;
     let Some(source) = original.source_read_facts() else {
         return Ok(Outcome::Refused {
             reason: "DELETE target has no original provider read facts".into(),
@@ -1799,36 +1824,10 @@ const fn metadata_version(version: ProviderReadVersionNeed) -> ConnectorReadMeta
 /// A metadata relation is one of the relations a table carries, and the
 /// provider names it by the table's name with the kind's suffix -- the same
 /// spelling the statement wrote.
-///
-/// A time-travel read names a query-local overlay of its table, which exists
-/// only as an analyzer key: the provider has the table, and which snapshot of
-/// it this read wants is the read's own version. So the overlay is unwrapped
-/// here, and the snapshot its name carries has to be the one the read asks
-/// for -- two different snapshots would be two different reads.
 fn provider_relation_name(
     relation: &ProviderReadRelationNeed,
 ) -> Result<String, ProviderReadError> {
     let identity = relation_identity(relation);
-    if let Some((base_table, overlaid)) =
-        crate::catalog_application::query_bindings::parse_time_travel_overlay_identity(
-            &identity.table,
-        )
-    {
-        let version = match relation {
-            ProviderReadRelationNeed::Data { version, .. }
-            | ProviderReadRelationNeed::FrozenInputSet { version, .. }
-            | ProviderReadRelationNeed::Metadata { version, .. } => Some(*version),
-            _ => None,
-        };
-        if version != Some(ProviderReadVersionNeed::Snapshot(overlaid)) {
-            return Err(format!(
-                "provider read of {} names snapshot {overlaid} but asks for {version:?}",
-                identity.table
-            )
-            .into());
-        }
-        return Ok(base_table.to_string());
-    }
     match relation {
         ProviderReadRelationNeed::Metadata { kind, .. } => Ok(format!(
             "{}{}",

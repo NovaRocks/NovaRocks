@@ -126,21 +126,26 @@ fn start(
 
 #[test]
 fn compact_rewrite_freezes_data_age_and_lineage_on_the_original_paid_arrival() {
-    for (version, seq, marker) in [
+    // Stored lineage can be absent or partly null. It never supplies a file base.
+    for (version, seq, stats) in [
         (1, SeqField::Inherit, None),
         (2, SeqField::Explicit(27), None),
-        (3, SeqField::Explicit(27), Some(104)),
+        (3, SeqField::Explicit(27), None),
+        (
+            3,
+            SeqField::Explicit(27),
+            Some(IcebergColumnStats {
+                null_value_counts: BTreeMap::from([(ROW_ID, 1), (SEQUENCE, 1)]),
+                ..lineage()
+            }),
+        ),
     ] {
         let adapter = adapter("optimize-receiving", 1);
         let handle = rewrite_session(version, 1);
         let target = handle.targets()[0].ordinal();
         let (originals, author, live) = paid_fragments_counted(
             &adapter,
-            vec![adapter.wrap_commit_fragment(output(
-                "rewrite",
-                (version == 3).then(lineage),
-                None,
-            ))],
+            vec![adapter.wrap_commit_fragment(output("rewrite", stats, None))],
         );
         let original_bytes = live.load(Ordering::SeqCst);
         handle
@@ -165,7 +170,6 @@ fn compact_rewrite_freezes_data_age_and_lineage_on_the_original_paid_arrival() {
                 let file = entry.addition.as_ref().unwrap();
                 assert_eq!(entry.receipt.original_bytes, original_bytes);
                 assert_eq!(file.data_sequence, seq);
-                assert_eq!(file.first_row_id, marker);
                 assert!(live.load(Ordering::SeqCst) >= original_bytes);
                 Ok(())
             })
@@ -187,33 +191,39 @@ fn invalid_stored_lineage_refuses_the_entire_root_record_and_returns_its_receipt
                 (
                     {
                         let mut stats = lineage();
-                        stats.null_value_counts.insert(ROW_ID, 1);
+                        stats
+                            .lower_bounds
+                            .insert(ROW_ID, (-1_i64).to_le_bytes().to_vec());
                         stats
                     },
                     None,
-                    "non-null stored row-id",
-                ),
-                (
-                    {
-                        let mut stats = lineage();
-                        stats.null_value_counts.remove(&SEQUENCE);
-                        stats
-                    },
-                    None,
-                    "non-null stored last-updated",
+                    "stored lineage lower bound is negative",
                 ),
                 (
                     {
                         let mut stats = lineage();
                         stats
-                            .upper_bounds
-                            .insert(SEQUENCE, 1_i64.to_le_bytes().to_vec());
+                            .lower_bounds
+                            .insert(SEQUENCE, (-1_i64).to_le_bytes().to_vec());
                         stats
                     },
                     None,
-                    "bounds are reversed",
+                    "stored lineage lower bound is negative",
                 ),
-                (lineage(), Some(9), "marker differs"),
+                (
+                    {
+                        let mut stats = lineage();
+                        stats.lower_bounds.insert(SEQUENCE, vec![0; 7]);
+                        stats
+                    },
+                    None,
+                    "stored lineage lower bound is not an Iceberg Long",
+                ),
+                (
+                    lineage(),
+                    Some(104),
+                    "must not supply a first-row-id marker",
+                ),
             ] {
                 let (originals, author, live) = paid_fragments_counted(
                     &adapter,
@@ -245,7 +255,7 @@ fn invalid_stored_lineage_refuses_the_entire_root_record_and_returns_its_receipt
             // The previously refused records installed no duplicate keys.
             let (originals, author, _) = paid_fragments_counted(
                 &adapter,
-                vec![adapter.wrap_commit_fragment(output("valid", Some(lineage()), Some(104)))],
+                vec![adapter.wrap_commit_fragment(output("valid", Some(lineage()), None))],
             );
             state.arrive_original(
                 &handle,

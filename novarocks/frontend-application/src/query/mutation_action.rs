@@ -516,23 +516,6 @@ impl MutationAction {
                     {
                         return Poll::Pending;
                     }
-                    if self.publication.as_ref().unwrap().committed()
-                        && self
-                            .publication
-                            .as_ref()
-                            .unwrap()
-                            .local_finalization
-                            .is_none()
-                    {
-                        let result = self
-                            .facts
-                            .as_ref()
-                            .ok_or_else(|| {
-                                internal_error("committed mutation has no original facts")
-                            })?
-                            .finalize(&self.original.kernel);
-                        self.publication.as_mut().unwrap().local_finalization = Some(result);
-                    }
                     self.publication.as_mut().unwrap().freeze_terminal()?;
                     if self.failure.is_none() && self.selected.is_none() {
                         self.selected = Some(

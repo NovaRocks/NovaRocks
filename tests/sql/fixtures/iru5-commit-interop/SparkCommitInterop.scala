@@ -101,6 +101,111 @@ object Iru5SparkCommitInterop {
     require(rows == expected, "Independent Spark rows differ: " + rows)
   }
 
+  def createUnreferencedHistory(spark: SparkSession, qualified: String): Unit = {
+    import org.apache.iceberg.{BaseTable, TableOperations}
+    import org.apache.iceberg.types.Types
+
+    spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ${qualified.split("\\.").dropRight(1).mkString(".")}")
+    spark.sql(s"CREATE TABLE $qualified (id BIGINT, value INT) USING iceberg " +
+      "TBLPROPERTIES ('format-version'='3')")
+    val t = table(spark, qualified)
+    val ops = t.asInstanceOf[HasTableOperations].operations()
+    val historicalId = 42L
+    // The SDK still authors and commits all artifacts. Fix only the ID of
+    // this first snapshot so the SQL runner can name it independently.
+    val fixed = new TableOperations {
+      override def current(): TableMetadata = ops.current()
+      override def refresh(): TableMetadata = ops.refresh()
+      override def commit(base: TableMetadata, update: TableMetadata): Unit = ops.commit(base, update)
+      override def io() = ops.io()
+      override def encryption() = ops.encryption()
+      override def metadataFileLocation(name: String): String = ops.metadataFileLocation(name)
+      override def locationProvider() = ops.locationProvider()
+      override def newSnapshotId(): Long = historicalId
+      override def requireStrictCleanup(): Boolean = ops.requireStrictCleanup()
+    }
+    new BaseTable(fixed, qualified).newAppend()
+      .appendFile(data(t, "history-before", Seq((1L, 10)))).commit()
+    t.refresh()
+    t.updateSchema().addColumn("added", Types.LongType.get()).commit()
+    spark.catalog.refreshTable(qualified)
+    spark.sql(s"INSERT INTO $qualified VALUES (2, 20, 8)")
+    val current = table(spark, qualified)
+    require(current.snapshot(historicalId) != null &&
+      !current.refs().values().asScala.exists(_.snapshotId() == historicalId))
+    require(current.history().asScala.exists(_.snapshotId() == historicalId))
+  }
+
+  def createOptimizeLineage(spark: SparkSession, qualified: String, upgrade: Boolean): Unit = {
+    spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ${qualified.split("\\.").dropRight(1).mkString(".")}")
+    val format = if (upgrade) 2 else 3
+    spark.sql(s"CREATE TABLE $qualified (id BIGINT, value INT) USING iceberg " +
+      s"TBLPROPERTIES ('format-version'='$format')")
+    val t = table(spark, qualified)
+    // One append gives both files the same data sequence so they form one
+    // eligible rewrite group even when OPTIMIZE preserves lineage.
+    val first = data(t, "optimize-a", Seq((1L, 10), (2L, 20)))
+    val second = data(t, "optimize-b", Seq((3L, 30), (4L, 40)))
+    t.newAppend().appendFile(first).appendFile(second).commit()
+    if (upgrade) {
+      spark.sql(s"ALTER TABLE $qualified SET TBLPROPERTIES ('format-version'='3')")
+    }
+    val before = table(spark, qualified)
+    require(metadata(before).formatVersion() == 3)
+    require(before.currentSnapshot().addedDataFiles(before.io()).asScala.size == 2)
+    require((before.currentSnapshot().firstRowId() == null) == upgrade)
+    require(metadata(before).nextRowId() == (if (upgrade) 0L else 4L))
+  }
+
+  def verifyOptimizeLineage(spark: SparkSession, qualified: String, upgraded: Boolean): Unit = {
+    import org.apache.avro.file.DataFileStream
+    import org.apache.avro.generic.{GenericDatumReader, GenericRecord => AvroRecord}
+
+    val t = table(spark, qualified)
+    val snapshot = t.currentSnapshot()
+    require(snapshot.operation() == "replace", "OPTIMIZE must publish a replace snapshot")
+    require(snapshot.parentId() != null, "OPTIMIZE must retain its original append as parent")
+    val before = t.snapshot(snapshot.parentId())
+    require(before != null)
+    val sourceFiles = before.addedDataFiles(t.io()).asScala.map(_.location()).toSet
+    val rewritten = snapshot.addedDataFiles(t.io()).asScala.map(_.location()).toSet
+    require(sourceFiles.size == 2 && rewritten.nonEmpty && (rewritten intersect sourceFiles).isEmpty,
+      "OPTIMIZE must publish fresh data files in place of the two small sources")
+    val oldWatermark = if (upgraded) 0L else 4L
+    require(snapshot.firstRowId() == Long.box(oldWatermark) &&
+      snapshot.addedRows() == Long.box(4L) && metadata(t).nextRowId() == oldWatermark + 4L,
+      "Manifest-list allocation must advance the original row-ID watermark by four")
+    val manifests = snapshot.dataManifests(t.io()).asScala.filter(_.addedFilesCount() > 0)
+      .sortBy(_.firstRowId().longValue())
+    var checkedFiles = Set.empty[String]
+    var allocated = oldWatermark
+    manifests.foreach { manifest =>
+      require(manifest.firstRowId() == Long.box(allocated), "Unexpected manifest-list row range")
+      val stream = new DataFileStream[AvroRecord](
+        t.io().newInputFile(manifest.path()).newStream(), new GenericDatumReader[AvroRecord]())
+      try stream.iterator().asScala.foreach { row =>
+        val file = row.get("data_file").asInstanceOf[AvroRecord]
+        val path = file.get("file_path").toString
+        if (rewritten(path)) {
+          val assignment = Option(file.getSchema.getField("first_row_id")).map(field => file.get(field.pos()))
+          require(assignment.forall(_ == null), "Rewritten data file must lack a raw row-ID base")
+          checkedFiles += path
+          allocated += file.get("record_count").asInstanceOf[java.lang.Long].longValue()
+        }
+      } finally stream.close()
+    }
+    require(checkedFiles == rewritten && allocated == metadata(t).nextRowId())
+    val rows = lineage(spark, qualified)
+    require(rows.map(row => (row.id, row.value)) == Vector((1L, 10), (2L, 20), (3L, 30), (4L, 40)))
+    require(rows.map(_.rowId).distinct.size == rows.size, "Rewritten row identities must be unique")
+    if (!upgraded) {
+      val historical = lineage(spark, qualified, Some(before.snapshotId()))
+      require(rows.map(row => (row.id, row.rowId, row.sequence)) ==
+        historical.map(row => (row.id, row.rowId, row.sequence)),
+        "OPTIMIZE must preserve both assigned lineage columns by business key")
+    }
+  }
+
   def createSharedPuffin(spark: SparkSession, qualified: String): Unit = {
     require(IcebergBuild.version() == "1.11.0", "The fixture oracle requires pinned Iceberg 1.11.0")
     spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ${qualified.split("\\.").dropRight(1).mkString(".")}")

@@ -357,8 +357,10 @@ impl IcebergTypedBoundary {
                 "frozen write target",
             )?;
         let original = match selector {
-            OriginalTargetSnapshot::Signed(_) => original_source
-                .value::<IcebergObservedSourceReadFacts>(owner.instance_id.as_str())?,
+            OriginalTargetSnapshot::Signed(_) | OriginalTargetSnapshot::Statement(_) => {
+                original_source
+                    .value::<IcebergObservedSourceReadFacts>(owner.instance_id.as_str())?
+            }
             OriginalTargetSnapshot::Current => IcebergObservedSourceReadFacts::current_all(
                 original_source,
                 &owner,
@@ -392,6 +394,26 @@ impl IcebergTypedBoundary {
         let metadata = original.access.metadata();
         let snapshot_id = match selector {
             OriginalTargetSnapshot::Signed(snapshot_id) => snapshot_id,
+            OriginalTargetSnapshot::Statement(version) => {
+                use crate::metadata::TableMetadataProjection as P;
+                if !match (version, original.projection) {
+                    (ConnectorReadRelationVersion::Current, P::Current) => true,
+                    (
+                        ConnectorReadRelationVersion::SnapshotId(requested),
+                        P::SnapshotTo(projected),
+                    ) => requested == projected && metadata.snapshot_by_id(requested).is_some(),
+                    _ => false,
+                } || info.schema_id != metadata.current_schema_id()
+                {
+                    return Err(invalid(
+                        "statement read differs from its original snapshot or schema",
+                    ));
+                }
+                // The opaque table descriptor identifies the observed table
+                // revision. The original source projection identifies the
+                // historical input chosen within that revision.
+                metadata.current_snapshot_id()
+            }
             OriginalTargetSnapshot::Current => {
                 if info.schema_id != metadata.current_schema_id() {
                     return Err(invalid(
@@ -1562,6 +1584,7 @@ impl ProviderReadRuntime for IcebergTypedBoundary {
 enum OriginalTargetSnapshot {
     Signed(Option<i64>),
     Current,
+    Statement(ConnectorReadRelationVersion),
 }
 
 /// Completed facts for one exact original relation request. Fields are private.
@@ -1740,22 +1763,6 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             use novarocks_spi::connector::read_stack::ConnectorReadRelationPreparationKind as K;
             self.check_request_active()?;
             let name = request.name();
-            if request.original_table().is_some()
-                && !matches!(
-                    request.kind(),
-                    K::Table {
-                        version: ConnectorReadRelationVersion::Current,
-                        reference: None,
-                    } | K::Table {
-                        version: ConnectorReadRelationVersion::Reference,
-                        reference: Some(_),
-                    }
-                )
-            {
-                return Err(invalid(
-                    "Original Iceberg table observation requires Current or one named reference",
-                ));
-            }
             if let K::RowMutationMatch {
                 table,
                 original_source,
@@ -1778,12 +1785,39 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 }));
             }
             let physical = if let Some(original) = request.original_table() {
+                let selector = match request.kind() {
+                    K::Table {
+                        version: ConnectorReadRelationVersion::Reference,
+                        reference: Some(_),
+                    } => OriginalTargetSnapshot::Current,
+                    K::Table {
+                        version: ConnectorReadRelationVersion::Current,
+                        reference: None,
+                    } if self
+                        .request_context
+                        .as_ref()
+                        .is_some_and(|context| context.reuses_original_table_preparation()) =>
+                    {
+                        OriginalTargetSnapshot::Current
+                    }
+                    K::Table {
+                        version:
+                            version @ (ConnectorReadRelationVersion::Current
+                            | ConnectorReadRelationVersion::SnapshotId(_)),
+                        reference: None,
+                    } => OriginalTargetSnapshot::Statement(*version),
+                    _ => {
+                        return Err(invalid(
+                            "original Iceberg table observation has an incompatible read selector",
+                        ));
+                    }
+                };
                 Some(
                     self.prepare_original_write_target(
                         name,
                         &original.table,
                         &original.source,
-                        OriginalTargetSnapshot::Current,
+                        selector,
                     )?
                     .0,
                 )
@@ -1972,7 +2006,13 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             ),
             K::Table { version, reference } => {
                 let is_original = request.original_table().is_some();
-                let origin = if is_original && reference.is_none() {
+                let origin = if is_original
+                    && reference.is_none()
+                    && self
+                        .request_context
+                        .as_ref()
+                        .is_some_and(|context| context.reuses_original_table_preparation())
+                {
                     Some(
                         self.prepared_source_request_context()?
                             .request_scope_extension_or_insert_with(
@@ -1986,6 +2026,10 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 let handle = if is_original && let Some(reference) = reference {
                     let (snapshot, schema) = read_only_delete_ref(metadata, reference)?;
                     pinned_table_handle_with_schema(name, metadata, snapshot, schema, None)?
+                } else if is_original && let ConnectorReadRelationVersion::SnapshotId(id) = version
+                {
+                    let schema = crate::change_planning::resolved_window_schema(metadata, *id)?;
+                    pinned_table_handle_with_schema(name, metadata, Some(*id), schema, None)?
                 } else {
                     table_handle_for_version(name, metadata, *version, reference.as_deref())?
                 };
@@ -6232,13 +6276,19 @@ mod prepared_source_relation_tests {
         builder.build().unwrap().metadata
     }
 
-    /// Immutable owner-local matcher fixture, without CPU/IO grants.
-    pub(super) fn inventory_fixture() -> (
+    type InventoryFixture = (
         tokio::runtime::Runtime,
         tempfile::TempDir,
         Arc<IcebergTypedBoundary>,
         Arc<IcebergPreparedSourceRead>,
-    ) {
+    );
+
+    /// Immutable owner-local matcher fixture, without CPU/IO grants.
+    pub(super) fn inventory_fixture() -> InventoryFixture {
+        inventory_fixture_with_metadata(serde_json::to_value(metadata()).unwrap())
+    }
+
+    fn inventory_fixture_with_metadata(mut value: serde_json::Value) -> InventoryFixture {
         let executor = tokio::runtime::Runtime::new().unwrap();
         let warehouse = tempfile::tempdir().unwrap();
         let configuration = crate::catalog_config::parse_catalog_configuration(
@@ -6284,7 +6334,6 @@ mod prepared_source_relation_tests {
             novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .unwrap();
-        let mut value = serde_json::to_value(metadata()).unwrap();
         value["location"] = serde_json::json!(warehouse.path().display().to_string());
         let metadata: TableMetadata = serde_json::from_value(value).unwrap();
         let name = SchemaTableName::try_new("db", "t").unwrap();
@@ -6358,12 +6407,14 @@ mod prepared_source_relation_tests {
             has_deletes: false,
             partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
         };
+        let snapshot_schema =
+            crate::change_planning::resolved_window_schema(&metadata, 42).unwrap();
         let relations = frozen_prepared_source_relations(
             &name,
             &metadata,
             request.selection(),
-            metadata.current_schema().clone(),
-            metadata.current_schema_id(),
+            snapshot_schema.clone(),
+            snapshot_schema.schema_id(),
             Some(&admission),
         )
         .unwrap();
@@ -6556,6 +6607,87 @@ mod prepared_source_relation_tests {
             panic!("original MV target must be a table");
         };
         assert_eq!(table.snapshot_id(), None);
+    }
+
+    #[test]
+    fn statement_snapshot_scan_consumes_the_held_observation() {
+        use novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata;
+        use novarocks_spi::connector::read_stack::{
+            ConnectorReadOriginalTableObservation, ConnectorReadRelationPreparationKind as K,
+            ConnectorReadRelationPreparationRequest as R,
+        };
+        let mut metadata = serde_json::to_value(metadata()).unwrap();
+        let mut renamed = metadata["schemas"][0].clone();
+        renamed["schema-id"] = serde_json::json!(1);
+        renamed["fields"][0]["name"] = serde_json::json!("renamed_id");
+        metadata["schemas"].as_array_mut().unwrap().push(renamed);
+        metadata["current-schema-id"] = serde_json::json!(1);
+        for snapshot in metadata["snapshots"].as_array_mut().unwrap() {
+            snapshot["schema-id"] = serde_json::json!(0);
+        }
+        let (executor, _warehouse, boundary, source) = inventory_fixture_with_metadata(metadata);
+        assert!(
+            source
+                .access
+                .metadata()
+                .current_schema()
+                .field_by_name("renamed_id")
+                .is_some()
+        );
+        let observed = &source.to_metadata;
+        let name = source.request.name();
+        let session =
+            ConnectorSession::try_new("q", "u", "UTC", "en_US", std::time::SystemTime::UNIX_EPOCH)
+                .unwrap();
+        let read = || boundary.for_request(boundary.prepared_source_request_context().unwrap());
+        let request = |snapshot| {
+            R::new(
+                name.clone(),
+                K::Table {
+                    version: ConnectorReadRelationVersion::SnapshotId(snapshot),
+                    reference: None,
+                },
+            )
+            .with_original_table(ConnectorReadOriginalTableObservation {
+                table: observed.table.clone(),
+                source: observed.source_read_facts().unwrap().clone(),
+            })
+        };
+        // There is no named Catalog table in this fixture to reopen.
+        let original = read();
+        let prepared = executor
+            .block_on(original.prepare_relation(&session, &request(42)))
+            .unwrap()
+            .unwrap();
+        let (relation, _) = original
+            .create_prepared_relation(prepared)
+            .unwrap()
+            .unwrap()
+            .into_parts();
+        let crate::typed_read::IcebergRuntimeRelation::Table(table) = relation else {
+            panic!("statement snapshot must prepare a table");
+        };
+        assert_eq!(table.snapshot_id(), Some(42));
+        assert!(
+            table
+                .parse_table_schema()
+                .unwrap()
+                .field_by_name("id")
+                .is_some()
+        );
+        assert_eq!(
+            original
+                .load_pinned_relation(name)
+                .unwrap()
+                .table
+                .metadata(),
+            source.access.metadata(),
+        );
+        assert!(
+            executor
+                .block_on(read().prepare_relation(&session, &request(41)))
+                .is_err()
+        );
     }
 
     #[test]

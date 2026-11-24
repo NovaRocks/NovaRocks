@@ -1011,6 +1011,9 @@ async fn decode_document<T: DeserializeOwned>(
     let bytes = read_document_bytes(operation, body).await?;
     crate::metadata_json::from_slice_document(&bytes, crate::metadata_json::Document::TableResponse)
         .map_err(|error| {
+            if table_response && matches!(error, crate::metadata_json::Error::MissingNextRowId) {
+                return ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string());
+            }
             if table_response
                 && let Some(source) = crate::metadata_json::future_table_format_error(
                     &error,
@@ -1601,6 +1604,29 @@ mod tests {
             paths.iter().all(|path| path.starts_with("/v1/p1/")),
             "{paths:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn load_table_names_the_missing_required_v3_next_row_id() {
+        let mut response = load_response(false);
+        // The v2 and v3 empty-table shapes share all other required fields.
+        response["metadata"]["format-version"] = serde_json::json!(3);
+        let server = TestServer::start(
+            Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on(
+                    "GET",
+                    "/v1/namespaces/db/tables/t",
+                    Reply::json(200, &response),
+                ),
+        );
+        let error = generation(&server, &[], None)
+            .await
+            .load_table(&table("t"), false)
+            .await
+            .expect_err("missing required next-row-id");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(error.message().contains("next-row-id"));
     }
 
     #[tokio::test]

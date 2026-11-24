@@ -327,20 +327,6 @@ fn maintenance_target_rebind_from_connector_result(
     }
 }
 
-impl crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer
-    for RequestScopedMaintenanceEngine
-{
-    fn invalidate_generic_table(
-        &self,
-        table: &novarocks_spi::connector::ConnectorTableIdentity,
-    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
-        crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer::invalidate_generic_table(
-            &self.kernel,
-            table,
-        )
-    }
-}
-
 #[async_trait::async_trait]
 impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
     fn resolve_target(

@@ -50,7 +50,6 @@ pub struct QueryPreparationKernel {
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<ConnectorControlHost>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     backend_topology: BackendTopologyService,
@@ -74,15 +73,10 @@ impl SystemTableQueryKernel {
 }
 
 impl QueryPreparationKernel {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The query preparation kernel consumes separately owned topology, catalogue, connector, and compile capabilities."
-    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
-        connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<ConnectorControlHost>,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         backend_topology: BackendTopologyService,
@@ -98,7 +92,6 @@ impl QueryPreparationKernel {
             static_plan_carrier,
             catalog_service,
             catalog_application,
-            connector_control,
             typed_connector_control,
             unified_statistics,
             backend_topology,
@@ -134,10 +127,6 @@ impl QueryPreparationKernel {
 
     pub fn catalog_application(&self) -> Option<&Arc<dyn CatalogApplicationPort>> {
         self.catalog_application.as_ref()
-    }
-
-    pub fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
-        &self.connector_control
     }
 
     pub(crate) fn unified_statistics(&self) -> &Arc<UnifiedStatisticsResolver> {

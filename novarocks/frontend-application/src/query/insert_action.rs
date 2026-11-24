@@ -106,9 +106,6 @@ impl WriteStatementFamily for InsertFamily {
             .prepare_native_assembly_for_execution_async(&source, Some(options))
             .await
     }
-    fn finalize(prepared: &Self::Prepared) -> Result<(), String> {
-        prepared.finalize()
-    }
 }
 
 /// Validate the ordinary connector write declaration without beginning a write session.

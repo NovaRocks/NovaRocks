@@ -60,6 +60,7 @@ impl Document {
 #[derive(Debug)]
 pub(crate) enum Error {
     UnsupportedDepth { limit: usize },
+    MissingNextRowId,
     Scan(ScanError),
     Json(serde_json::Error),
 }
@@ -73,10 +74,10 @@ impl Error {
         &self,
         invalid: novarocks_spi::connector::ConnectorErrorKind,
     ) -> novarocks_spi::connector::ConnectorErrorKind {
-        if self.is_unsupported() {
-            novarocks_spi::connector::ConnectorErrorKind::Unsupported
-        } else {
-            invalid
+        match self {
+            Self::UnsupportedDepth { .. } => ConnectorErrorKind::Unsupported,
+            Self::MissingNextRowId => ConnectorErrorKind::CorruptData,
+            Self::Scan(_) | Self::Json(_) => invalid,
         }
     }
 
@@ -97,6 +98,9 @@ impl std::fmt::Display for Error {
                 "Iceberg document exceeds {limit} JSON container levels derived from logical type depth {}; deeper schemas are unsupported",
                 novarocks_type_contract::MAX_VALUE_TYPE_DEPTH
             ),
+            Self::MissingNextRowId => {
+                f.write_str("Iceberg v3 table metadata is missing next-row-id")
+            }
             Self::Scan(error) => error.fmt(f),
             Self::Json(error) => error.fmt(f),
         }
@@ -106,7 +110,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::UnsupportedDepth { .. } => None,
+            Self::UnsupportedDepth { .. } | Self::MissingNextRowId => None,
             Self::Scan(error) => Some(error),
             Self::Json(error) => Some(error),
         }
@@ -126,13 +130,21 @@ pub(crate) fn from_slice_document<'de, T: Deserialize<'de>>(
     // The iterative scanner authorizes precisely this document's finite
     // container geometry before the original SDK decoder runs once.
     decoder.disable_recursion_limit();
-    let value = T::deserialize(&mut decoder).map_err(Error::Json)?;
+    let value = T::deserialize(&mut decoder).map_err(|error| {
+        if table_header(bytes, document)
+            .is_some_and(|header| header.format_version == 3 && !header.next_row_id_present)
+        {
+            Error::MissingNextRowId
+        } else {
+            Error::Json(error)
+        }
+    })?;
     decoder.end().map_err(Error::Json)?;
     Ok(value)
 }
 
 /// Classify an already structurally validated table document which could not
-/// be decoded by the SDK. Only the original version field is retained.
+/// be decoded by the SDK.
 pub(crate) fn future_table_format_error(
     error: &Error,
     bytes: &[u8],
@@ -142,35 +154,41 @@ pub(crate) fn future_table_format_error(
         return None;
     }
 
-    #[derive(Deserialize)]
-    #[serde(rename_all = "kebab-case")]
-    struct TableVersion {
-        format_version: u64,
-    }
-
-    #[derive(Deserialize)]
-    struct TableEnvelope {
-        metadata: TableVersion,
-    }
-
-    let mut decoder = serde_json::Deserializer::from_slice(bytes);
-    decoder.disable_recursion_limit(); // The original scanner already bounded this document.
-    let version = match document {
-        Document::Schema | Document::ViewResponse => return None,
-        Document::TableMetadata => TableVersion::deserialize(&mut decoder).ok()?.format_version,
-        Document::TableResponse => {
-            TableEnvelope::deserialize(&mut decoder)
-                .ok()?
-                .metadata
-                .format_version
-        }
-    };
+    let version = table_header(bytes, document)?.format_version;
     (version > 3).then(|| {
         ConnectorError::from_domain(
             ConnectorErrorKind::Unsupported,
             ConnectorTableFormatVersionUnsupported(version),
         )
     })
+}
+
+#[derive(Deserialize)]
+struct TableHeader {
+    #[serde(rename = "format-version")]
+    format_version: u64,
+    #[serde(rename = "next-row-id", default, deserialize_with = "field_present")]
+    next_row_id_present: bool,
+}
+
+fn field_present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(true)
+}
+
+fn table_header(bytes: &[u8], document: Document) -> Option<TableHeader> {
+    #[derive(Deserialize)]
+    struct TableEnvelope {
+        metadata: TableHeader,
+    }
+
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    decoder.disable_recursion_limit(); // The original scanner already bounded this document.
+    match document {
+        Document::Schema | Document::ViewResponse => None,
+        Document::TableMetadata => TableHeader::deserialize(&mut decoder).ok(),
+        Document::TableResponse => Some(TableEnvelope::deserialize(&mut decoder).ok()?.metadata),
+    }
 }
 
 /// Provider-private schema re-parsing, including field/default projections.
@@ -195,6 +213,56 @@ mod tests {
         TableMetadata, TableMetadataBuilder, Type,
     };
     use std::{collections::HashMap, sync::Arc};
+
+    #[test]
+    fn only_v3_table_metadata_requires_next_row_id() {
+        for version in [FormatVersion::V1, FormatVersion::V2, FormatVersion::V3] {
+            let schema = Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    PrimitiveType::Long.into(),
+                ))])
+                .build()
+                .unwrap();
+            let metadata = TableMetadataBuilder::new(
+                schema,
+                PartitionSpec::unpartition_spec(),
+                SortOrder::unsorted_order(),
+                "file:///table".to_owned(),
+                version,
+                HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+            let mut document = serde_json::to_value(metadata).unwrap();
+            let present = document.as_object_mut().unwrap().remove("next-row-id");
+            let decoded = from_metadata_str::<TableMetadata>(&document.to_string());
+            match version {
+                FormatVersion::V3 => {
+                    assert!(present.is_some());
+                    let error = decoded.unwrap_err();
+                    assert!(matches!(error, Error::MissingNextRowId));
+                    assert_eq!(
+                        error.connector_kind(ConnectorErrorKind::Unavailable),
+                        ConnectorErrorKind::CorruptData
+                    );
+                    assert!(error.to_string().contains("next-row-id"));
+                    document["next-row-id"] = serde_json::Value::Null;
+                    assert!(matches!(
+                        from_metadata_str::<TableMetadata>(&document.to_string()),
+                        Err(Error::Json(_))
+                    ));
+                }
+                FormatVersion::V1 | FormatVersion::V2 => {
+                    assert!(present.is_none());
+                    assert_eq!(decoded.unwrap().format_version(), version);
+                }
+            }
+        }
+    }
 
     #[test]
     fn future_table_versions_are_classified_from_the_original_field() {

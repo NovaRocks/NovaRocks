@@ -833,16 +833,11 @@ pub(super) mod _serde {
         pub format_version: VersionNumber<3>,
         #[serde(flatten)]
         pub shared: TableMetadataV2V3Shared,
-        #[serde(default = "default_next_row_id")]
         pub next_row_id: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub encryption_keys: Option<Vec<EncryptedKey>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub snapshots: Option<Vec<SnapshotV3>>,
-    }
-
-    fn default_next_row_id() -> u64 {
-        INITIAL_ROW_ID
     }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -3058,23 +3053,6 @@ mod tests {
         };
 
         check_table_metadata_serde(&metadata_str, expected);
-    }
-
-    #[test]
-    fn test_table_metadata_v3_missing_next_row_id_defaults_to_initial() {
-        let metadata_str =
-            fs::read_to_string("testdata/table_metadata/TableMetadataV3ValidMinimal.json").unwrap();
-        let mut metadata_json: serde_json::Value = serde_json::from_str(&metadata_str).unwrap();
-        metadata_json
-            .as_object_mut()
-            .expect("metadata object")
-            .remove("next-row-id");
-
-        let table_metadata =
-            serde_json::from_value::<TableMetadata>(metadata_json).expect("v3 metadata");
-
-        assert_eq!(table_metadata.format_version, FormatVersion::V3);
-        assert_eq!(table_metadata.next_row_id, INITIAL_ROW_ID);
     }
 
     #[test]

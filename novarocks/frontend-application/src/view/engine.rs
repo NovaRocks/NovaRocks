@@ -287,10 +287,18 @@ impl ViewEngine for FrontendViewEngine {
             let facts = preparation
                 .needs()
                 .iter()
-                .map(|need| provider.resolve_relation_fact(need))
+                .map(|need| {
+                    provider.resolve_relation_fact_sync_with_coverage(
+                        need,
+                        preparation.needs().iter().any(|candidate| {
+                            candidate.version().is_some() && candidate.relation() == need.relation()
+                        }),
+                    )
+                })
                 .collect::<Result<Vec<_>, novarocks_sql::compiler::SqlCompileError>>()?;
             preparation = preparation.continue_catalog(facts.into_boxed_slice())?;
         }
+        provider.seal_catalog_observations();
         preparation
             .analyze_view_definition(
                 self.function_catalog(),

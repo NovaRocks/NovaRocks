@@ -35,9 +35,6 @@ use super::classification::{
 /// authority.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum StateFamily {
-    /// Resolved connector table metadata, validated against the connector's
-    /// current schema version.
-    SchemaCache,
     /// Immutable connector statistics artifacts, keyed by evidence revision.
     StatisticsArtifactCache,
     /// Views defined in the local (non-external) catalog.
@@ -53,7 +50,7 @@ impl StateFamily {
     /// The number of registered families.
     ///
     /// Hand-written, and checked against the chain below at compile time.
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 4;
 
     /// Every registered family, in manifest order.
     ///
@@ -63,7 +60,7 @@ impl StateFamily {
     /// automatically.
     pub const ALL: [Self; Self::COUNT] = Self::enumerate();
 
-    const FIRST: Self = Self::SchemaCache;
+    const FIRST: Self = Self::StatisticsArtifactCache;
 
     /// The contract this family declares.
     ///
@@ -71,13 +68,6 @@ impl StateFamily {
     /// classification, an authority, and a retain/clone policy before it exists.
     pub const fn classification(self) -> StateFamilyClassification {
         match self {
-            Self::SchemaCache => StateFamilyClassification::Accelerator(AcceleratorContract::new(
-                AcceleratorResidence::InProcess,
-                AcceleratorRebuildAuthority::ConnectorSchemaVersion,
-                RebuildDeterminism::UserVisibleIdentical,
-                false,
-                ClonePolicy::NotCloned,
-            )),
             Self::StatisticsArtifactCache => {
                 StateFamilyClassification::Accelerator(AcceleratorContract::new(
                     AcceleratorResidence::InProcess,
@@ -108,7 +98,6 @@ impl StateFamily {
     /// spelled out rather than derived from the variant name.
     pub const fn family_id(self) -> &'static str {
         match self {
-            Self::SchemaCache => "frontend/catalog/schema-cache",
             Self::StatisticsArtifactCache => "frontend/statistics/immutable-artifact-cache",
             Self::LocalViewRegistry => "frontend/view/local-registry",
             Self::DmlRuntime => "frontend/dml/runtime",
@@ -174,7 +163,6 @@ impl StateFamily {
     /// and rejects a length that disagrees with [`StateFamily::COUNT`].
     const fn next_in_manifest(self) -> Option<Self> {
         match self {
-            Self::SchemaCache => Some(Self::StatisticsArtifactCache),
             Self::StatisticsArtifactCache => Some(Self::LocalViewRegistry),
             Self::LocalViewRegistry => Some(Self::DmlRuntime),
             Self::DmlRuntime => Some(Self::BackendObservedRuntime),
@@ -213,7 +201,7 @@ mod tests {
     use super::super::classification::WipeEntry;
     use super::*;
 
-    /// Five Frontend families: two in-process `Accelerator` and
+    /// Four Frontend families: one in-process `Accelerator` and
     /// three `ProcessRuntime`.
     ///
     /// Backend desired state is deliberately absent. It was registered while
@@ -225,8 +213,8 @@ mod tests {
     fn manifest_registers_exactly_the_spec_family_table() {
         assert_eq!(
             StateFamily::ALL.len(),
-            5,
-            "the manifest registers five frontend state families"
+            4,
+            "the manifest registers four frontend state families"
         );
 
         let mut process_runtime = 0;
@@ -240,7 +228,7 @@ mod tests {
             }
         }
 
-        assert_eq!(accelerator, 2, "schema cache, statistics artifact cache");
+        assert_eq!(accelerator, 1, "statistics artifact cache");
         assert_eq!(process_runtime, 3, "local views, DML, backend observations");
     }
 
@@ -381,9 +369,6 @@ mod tests {
                         DurabilityAdmission::Forbidden
                     );
                     let expected_authority = match family {
-                        StateFamily::SchemaCache => {
-                            AcceleratorRebuildAuthority::ConnectorSchemaVersion
-                        }
                         StateFamily::StatisticsArtifactCache => {
                             AcceleratorRebuildAuthority::ConnectorStatisticsEvidenceRevision
                         }
@@ -400,7 +385,7 @@ mod tests {
                 family.family_id()
             );
         }
-        assert_eq!(accelerators, 2);
+        assert_eq!(accelerators, 1);
     }
 
     #[test]

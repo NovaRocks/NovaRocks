@@ -57,10 +57,9 @@ impl CatalogServiceMaterializer<'_> {
         controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
         context: novarocks_spi::connector::ConnectorRequestContext,
         io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
+        complete_first: bool,
     ) -> Result<CatalogRelationFact, crate::mv::domain::application::MvApplicationError> {
         use crate::catalog_application::query_catalog::relation as projection;
-        use novarocks_spi::connector::{ConnectorErrorKind, ConnectorTableResolution};
-        use novarocks_sql::compiler::CatalogTimeTravelResolution;
 
         if let Some(fact) = self.system_relation_fact(need) {
             return fact.map_err(crate::mv::domain::application::MvApplicationError::from_compile);
@@ -94,73 +93,14 @@ impl CatalogServiceMaterializer<'_> {
                 .map_err(
                 crate::query_execution::mv_assembly::refresh_preparation::io_gate::contract_error,
             )?;
-            let observed = async {
-                let (planning_pin, identity, context) = projection::begin(controls, context, need)?;
-                let selection = if need.version().is_some() {
-                    let references = io
-                        .reference_facts(&planning_pin, identity.clone(), context.clone())
-                        .await
-                        .map_err(|error| {
-                            super::super::query_catalog::connector_table_resolution_error(
-                                error,
-                                &identity.namespace,
-                                &identity.table,
-                            )
-                        })?;
-                    match projection::project_reference(need, references)? {
-                        CatalogTimeTravelResolution::Selected(binding) => Some(binding),
-                        CatalogTimeTravelResolution::Rejected(fact) => {
-                            return Ok(ConnectorQueryRelationMaterialization::SelectionRefused(
-                                fact,
-                            ));
-                        }
-                    }
-                } else {
-                    None
-                };
-                let resolution = selection
-                    .as_ref()
-                    .map_or(ConnectorTableResolution::StrictBaseTable, |binding| {
-                        ConnectorTableResolution::HistoricalSnapshot(binding.snapshot_id())
-                    });
-                match io
-                    .metadata(
-                        &planning_pin,
-                        context.clone(),
-                        &identity.namespace,
-                        &identity.table,
-                        resolution,
-                    )
-                    .await
-                {
-                    Ok(metadata) => {
-                        projection::finish_table(metadata, planning_pin, selection, &identity)
-                    }
-                    Err(error)
-                        if selection.is_none() && error.kind() == ConnectorErrorKind::NotFound =>
-                    {
-                        let view = io
-                            .view_metadata(&planning_pin, identity.clone(), context)
-                            .await
-                            .map_err(|error| {
-                                super::super::query_catalog::connector_table_resolution_error(
-                                    error,
-                                    &identity.namespace,
-                                    &identity.table,
-                                )
-                            })?;
-                        projection::project_view(view, planning_pin, &identity)
-                            .map(ConnectorQueryRelationMaterialization::View)
-                    }
-                    Err(error) => Err(
-                        super::super::query_catalog::connector_table_resolution_error(
-                            error,
-                            &identity.namespace,
-                            &identity.table,
-                        ),
-                    ),
-                }
-            }
+            let observed = projection::load_statement_relation(
+                &self.bindings,
+                controls,
+                context,
+                need,
+                complete_first,
+                projection::StatementCatalogIo::Governed(io),
+            )
             .await;
             self.retain_relation_observation(need, key, observed)
         };
@@ -181,7 +121,6 @@ impl CatalogServiceMaterializer<'_> {
         binding: SqlTableBindingId,
         snapshot: Option<i64>,
     ) -> Result<ResolvedAnalyzerTable, SqlCompileError> {
-        use crate::catalog_application::query_bindings::parse_time_travel_overlay_identity;
         use novarocks_sql::planning::catalog;
         let table = self
             .bindings
@@ -191,38 +130,16 @@ impl CatalogServiceMaterializer<'_> {
             .clone();
         let actual = catalog::materialization_identity_facts(&table);
         let requested = need.relation();
-        let requested_overlay = parse_time_travel_overlay_identity(&requested.table);
-        if actual.matches(&requested.catalog, &requested.namespace, &requested.table) {
-            return match snapshot.or_else(|| requested_overlay.map(|(_, snapshot)| snapshot)) {
-                Some(snapshot) => {
-                    catalog::project_frozen_snapshot_sql_name(table, requested, snapshot)
-                        .map_err(SqlCompileError::Compilation)
-                }
-                None => Ok(table),
-            };
-        }
-        let original_overlay = parse_time_travel_overlay_identity(actual.table());
-        let snapshot = snapshot
-            .or_else(|| requested_overlay.map(|(_, snapshot)| snapshot))
-            .ok_or_else(|| {
-                SqlCompileError::Compilation(
-                    "captured Current table cannot answer another SQL identity".into(),
-                )
-            })?;
-        let original_base = original_overlay.map_or(actual.table(), |(base, _)| base);
-        let requested_base = requested_overlay.map_or(requested.table.as_str(), |(base, _)| base);
-        if actual.catalog() != requested.catalog
-            || actual.namespace() != requested.namespace
-            || original_base != requested_base
-            || original_overlay.is_some_and(|(_, id)| id != snapshot)
-            || requested_overlay.is_some_and(|(_, id)| id != snapshot)
-        {
+        if !actual.matches(&requested.catalog, &requested.namespace, &requested.table) {
             return Err(SqlCompileError::Compilation(
-                "SQL snapshot alias does not name the original canonical input".into(),
+                "captured table cannot answer another SQL identity".into(),
             ));
         }
-        catalog::project_frozen_snapshot_sql_name(table, requested, snapshot)
-            .map_err(SqlCompileError::Compilation)
+        match snapshot {
+            Some(snapshot) => catalog::project_frozen_snapshot_sql_name(table, requested, snapshot)
+                .map_err(SqlCompileError::Compilation),
+            None => Ok(table),
+        }
     }
 
     fn view_fact(
@@ -339,7 +256,7 @@ impl CatalogServiceMaterializer<'_> {
                 let relation = need.relation();
                 let key = selection.as_ref().map_or_else(
                     || {
-                        QueryTableBindingKey::analysis_lookup(
+                        QueryTableBindingKey::strict_base(
                             &relation.catalog,
                             &relation.namespace,
                             &relation.table,
@@ -373,6 +290,10 @@ impl CatalogServiceMaterializer<'_> {
                 Ok(MemoizedQueryRelation::SelectionRefused(Arc::from(fact)))
             }
         });
+        if memo
+            .as_ref()
+            .err()
+            .is_none_or(CatalogResolutionError::is_object_outcome)
         {
             let mut entries = self
                 .bindings
@@ -397,7 +318,7 @@ impl CatalogServiceMaterializer<'_> {
             return None;
         }
         let relation = need.relation();
-        let key = QueryTableBindingKey::analysis_lookup(
+        let key = QueryTableBindingKey::strict_base(
             &relation.catalog,
             &relation.namespace,
             &relation.table,
@@ -546,10 +467,20 @@ impl CatalogServiceMaterializer<'_> {
         ))
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_relation_fact(
         &self,
         need: &CatalogRelationNeed,
     ) -> Result<CatalogRelationFact, SqlCompileError> {
+        self.resolve_relation_fact_sync_with_coverage(need, need.version().is_some())
+    }
+
+    pub(crate) fn resolve_relation_fact_sync_with_coverage(
+        &self,
+        need: &CatalogRelationNeed,
+        complete_first: bool,
+    ) -> Result<CatalogRelationFact, SqlCompileError> {
+        use super::super::query_catalog::relation::{StatementCatalogIo, load_statement_relation};
         let relation = need.relation();
         if let CatalogLookupTarget::IcebergMetadata { kind } = need.target() {
             return crate::query_execution::completion_facts::catalog_fact_from(
@@ -590,7 +521,18 @@ impl CatalogServiceMaterializer<'_> {
             self.bindings
                 .require_catalog_observation_allowed()
                 .map_err(SqlCompileError::Compilation)?;
-            self.retain_relation_observation(need, key, self.loader.prepare_relation(need))
+            let observed = match self.loader.connector_read_context() {
+                Some((controls, context)) => futures::executor::block_on(load_statement_relation(
+                    &self.bindings,
+                    controls,
+                    context.clone(),
+                    need,
+                    complete_first,
+                    StatementCatalogIo::Synchronous,
+                )),
+                None => self.loader.prepare_relation(need),
+            };
+            self.retain_relation_observation(need, key, observed)
                 .map_err(CatalogResolutionError::into_compile)
         };
         let admission = self
@@ -601,9 +543,19 @@ impl CatalogServiceMaterializer<'_> {
         Ok(fact)
     }
 
+    #[cfg(test)]
     pub(crate) async fn resolve_relation_fact_async(
         &self,
         need: &CatalogRelationNeed,
+    ) -> Result<CatalogRelationFact, SqlCompileError> {
+        self.resolve_relation_fact_with_coverage(need, need.version().is_some())
+            .await
+    }
+
+    pub(crate) async fn resolve_relation_fact_with_coverage(
+        &self,
+        need: &CatalogRelationNeed,
+        complete_first: bool,
     ) -> Result<CatalogRelationFact, SqlCompileError> {
         let relation = need.relation();
         if let CatalogLookupTarget::IcebergMetadata { kind } = need.target() {
@@ -646,12 +598,22 @@ impl CatalogServiceMaterializer<'_> {
             self.bindings
                 .require_catalog_observation_allowed()
                 .map_err(SqlCompileError::Compilation)?;
-            self.retain_relation_observation(
-                need,
-                key,
-                self.loader.prepare_relation_async(need).await,
-            )
-            .map_err(CatalogResolutionError::into_compile)
+            let observed = match self.loader.connector_read_context() {
+                Some((controls, context)) => {
+                    super::super::query_catalog::relation::load_statement_relation(
+                        &self.bindings,
+                        controls,
+                        context.clone(),
+                        need,
+                        complete_first,
+                        super::super::query_catalog::relation::StatementCatalogIo::Async,
+                    )
+                    .await
+                }
+                _ => self.loader.prepare_relation_async(need).await,
+            };
+            self.retain_relation_observation(need, key, observed)
+                .map_err(CatalogResolutionError::into_compile)
         };
         let admission = self
             .verify_catalog_admission(&relation.catalog, observation.as_ref())
@@ -1011,7 +973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_original_statement_memo_preserves_typed_failures_across_materializer_rounds() {
+    async fn the_original_statement_retries_typed_control_failures_across_materializer_rounds() {
         use novarocks_type_contract::{
             CompileControlError, owned_resources::layout::LayoutResourceError,
         };
@@ -1049,7 +1011,7 @@ mod tests {
             };
             assert_eq!(actual.unwrap_err(), expected);
         }
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert!(bindings.captured_bindings().is_empty());
     }
 

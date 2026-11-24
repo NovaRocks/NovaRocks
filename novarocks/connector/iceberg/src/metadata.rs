@@ -23,6 +23,8 @@
 
 pub(crate) mod existing_serde_projection;
 
+mod statement_observation;
+
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
@@ -1050,6 +1052,62 @@ impl ConnectorMetadata for IcebergMetadata {
         request: ConnectorTableRequest,
     ) -> novarocks_spi::connector::ConnectorTablePreparationFuture<'_> {
         Box::pin(self.prepare_source_table_original(request))
+    }
+
+    fn prepare_complete_table_observation_sync(
+        &self,
+        request: ConnectorTableRequest,
+        original: Option<&ConnectorTableMetadata>,
+    ) -> Result<novarocks_spi::connector::ConnectorTablePreparation, ConnectorError> {
+        self.runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(async move {
+                match original {
+                    Some(original)
+                        if original.identity == request.table
+                            && request.resolution == ConnectorTableResolution::StrictBaseTable =>
+                    {
+                        self.complete_statement_observation(original, request.context)
+                            .await
+                    }
+                    Some(_) => Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "Iceberg complete observation names a different original table",
+                    )),
+                    None => self.prepare_source_table_original(request).await,
+                }
+            })
+            .map_err(unavailable)?
+    }
+
+    fn observed_read_references(
+        &self,
+        original: &ConnectorTableMetadata,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<(ConnectorReadReferenceFacts, bool), ConnectorError> {
+        self.observation_references(original, context)
+    }
+
+    fn complete_table_observation<'a>(
+        &'a self,
+        original: &'a ConnectorTableMetadata,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> novarocks_spi::connector::ConnectorTablePreparationFuture<'a> {
+        Box::pin(self.complete_statement_observation(original, context))
+    }
+
+    fn create_observed_snapshot(
+        &self,
+        original: &ConnectorTableMetadata,
+        snapshot_id: i64,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        self.create_statement_snapshot(original, snapshot_id, context, creation)
     }
 
     fn create_prepared_table(
@@ -2756,6 +2814,14 @@ fn read_reference_facts(
     metadata: &crate::iceberg::spec::TableMetadata,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<ConnectorReadReferenceFacts, ConnectorError> {
+    read_reference_facts_with_coverage(metadata, context, true)
+}
+
+fn read_reference_facts_with_coverage(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    complete: bool,
+) -> Result<ConnectorReadReferenceFacts, ConnectorError> {
     ConnectorReadReferenceFacts::try_new(
         metadata
             .snapshots()
@@ -2764,6 +2830,7 @@ fn read_reference_facts(
         metadata
             .history()
             .iter()
+            .filter(|entry| complete || metadata.snapshot_by_id(entry.snapshot_id).is_some())
             .map(|entry| ConnectorReadSnapshotLogEntry {
                 snapshot_id: entry.snapshot_id,
                 timestamp_millis: entry.timestamp_ms(),
@@ -3036,6 +3103,144 @@ mod plan_splits_pruning_tests {
             runtime,
         );
         (executor, warehouse, provider)
+    }
+
+    #[test]
+    fn rest_statement_history_supplement_requires_the_same_frozen_location() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use serde_json::json;
+
+        let snapshot = |id, timestamp, schema| {
+            json!({
+                "snapshot-id": id, "timestamp-ms": timestamp, "sequence-number": id,
+                "manifest-list": format!("file:///tmp/statement-observation/list-{id}.avro"),
+                "summary": {"operation": "append"}, "schema-id": schema,
+            })
+        };
+        let full = json!({
+            "metadata-location": "file:///tmp/statement-observation/v17.json",
+            "metadata": {
+                "format-version": 2,
+                "table-uuid": "b6f3d296-e284-415b-abbb-46411bea3ec6",
+                "location": "file:///tmp/statement-observation",
+                "last-sequence-number": 20, "last-updated-ms": 2000,
+                "last-column-id": 2,
+                "schemas": [
+                    {"type": "struct", "schema-id": 0, "fields": [
+                        {"id": 1, "name": "x", "required": true, "type": "long"}
+                    ]},
+                    {"type": "struct", "schema-id": 1, "fields": [
+                        {"id": 1, "name": "x", "required": true, "type": "long"},
+                        {"id": 2, "name": "added", "required": false, "type": "long"}
+                    ]}
+                ],
+                "current-schema-id": 1,
+                "partition-specs": [{"spec-id": 0, "fields": []}],
+                "default-spec-id": 0, "last-partition-id": 999,
+                "properties": {},
+                "current-snapshot-id": 20,
+                "snapshots": [snapshot(10, 1000, 0), snapshot(20, 2000, 1)],
+                "snapshot-log": [
+                    {"timestamp-ms": 1000, "snapshot-id": 10},
+                    {"timestamp-ms": 2000, "snapshot-id": 20}
+                ],
+                "refs": {"main": {"snapshot-id": 20, "type": "branch"}},
+                "metadata-log": [],
+                "sort-orders": [{"order-id": 0, "fields": []}], "default-sort-order-id": 0
+            }
+        });
+        let mut refs = full.clone();
+        refs["metadata"]["snapshots"] = json!([snapshot(20, 2000, 1)]);
+        let mut advanced = full.clone();
+        advanced["metadata-location"] = json!("file:///tmp/statement-observation/v18.json");
+        let mut unproved = full.clone();
+        unproved
+            .as_object_mut()
+            .unwrap()
+            .remove("metadata-location");
+        let server = TestServer::start(
+            Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on_sequence(
+                    "GET",
+                    "/v1/namespaces/db/tables/t",
+                    vec![
+                        Reply::json(200, &refs),
+                        Reply::json(200, &advanced),
+                        Reply::json(200, &unproved),
+                        Reply::json(200, &full),
+                    ],
+                ),
+        );
+        let uri = server.url();
+        let (executor, _warehouse, provider) =
+            provider_with_catalog("rest", uri.strip_prefix("http://").unwrap());
+        executor.block_on(async {
+            let request = ConnectorTableRequest {
+                table: ConnectorTableIdentity {
+                    instance_id: provider.descriptor.instance_id.clone(),
+                    namespace: "db".into(),
+                    table: "t".into(),
+                },
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context(),
+            };
+            let first = provider.prepare_table(request.clone()).await.unwrap();
+            let original = with_pure_schema_creation(&request.context, |creation| {
+                provider
+                    .create_prepared_table(first, creation)
+                    .map_err(metadata_creation_error)
+            })
+            .unwrap();
+            assert!(original.schema().column_with_name("added").is_some());
+            let (references, complete) = provider
+                .observed_read_references(&original, &request.context)
+                .unwrap();
+            assert!(!complete);
+            assert_eq!(references.snapshot_ids(), &[20]);
+            for reason in [
+                "metadata location advanced",
+                "supplemental metadata location is missing",
+            ] {
+                let refusal = provider
+                    .complete_table_observation(&original, request.context.clone())
+                    .await
+                    .unwrap_err();
+                assert_eq!(refusal.kind(), ConnectorErrorKind::Unavailable);
+                assert!(refusal.to_string().contains(reason), "{refusal}");
+            }
+            let supplemental = provider
+                .complete_table_observation(&original, request.context.clone())
+                .await
+                .unwrap();
+            let full = with_pure_schema_creation(&request.context, |creation| {
+                provider
+                    .create_prepared_table(supplemental, creation)
+                    .map_err(metadata_creation_error)
+            })
+            .unwrap();
+            let (references, complete) = provider
+                .observed_read_references(&full, &request.context)
+                .unwrap();
+            assert!(complete);
+            assert_eq!(references.snapshot_ids(), &[10, 20]);
+            let historical = with_pure_schema_creation(&request.context, |creation| {
+                provider
+                    .create_observed_snapshot(&full, 10, &request.context, creation)
+                    .map_err(metadata_creation_error)
+            })
+            .unwrap();
+            assert!(historical.schema().column_with_name("added").is_none());
+            assert!(original.schema().column_with_name("added").is_some());
+        });
+        let requests = server.requests_to("GET", "/v1/namespaces/db/tables/t");
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].query(), Some("snapshots=refs"));
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.query().is_none())
+        );
     }
 
     #[test]

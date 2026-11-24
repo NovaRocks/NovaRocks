@@ -22,9 +22,7 @@
 //! the Connector; this module only routes maintenance intents to it and shapes
 //! the neutral outcome the frontend reports.
 
-use crate::connector::metadata_maintenance::{
-    MetadataMaintenanceCacheFinalizer, MetadataMaintenanceCall, MetadataMaintenanceIntent,
-};
+use crate::connector::metadata_maintenance::{MetadataMaintenanceCall, MetadataMaintenanceIntent};
 use novarocks_table_maintenance::runtime::TerminalError;
 use novarocks_table_maintenance::{
     AutomaticMaintenanceOutcome, MaintenanceActionOutcome, MaintenanceActionRequest,
@@ -36,7 +34,7 @@ use novarocks_table_maintenance::{
 pub(crate) async fn execute_automatic_metadata_action_with_ports(
     pending: &mut Option<MetadataMaintenanceCall>,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
-    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+
     request: MaintenanceActionRequest,
     effect_id: MaintenanceEffectId,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -102,32 +100,28 @@ pub(crate) async fn execute_automatic_metadata_action_with_ports(
             });
         }
     };
-    let completed = match crate::connector::metadata_maintenance::resolve_metadata_maintenance(
-        call,
-        cache_finalizer,
-    )
-    .await
-    {
-        ResolvedMetadataMaintenance::KnownCommitted(completed) => *completed,
-        ResolvedMetadataMaintenance::KnownUncommitted { failure, cleanup } => {
-            return Err(TerminalError::known_uncommitted(
-                crate::connector::mutation::known_uncommitted_message(failure, &cleanup),
-            ));
-        }
-        ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
-            return Err(TerminalError::commit_unknown(failure.to_string()));
-        }
-        ResolvedMetadataMaintenance::ContractFailure { error, dispatch } => {
-            return Err(match dispatch {
-                MetadataMaintenanceDispatchState::ConfirmedNotDispatched => {
-                    TerminalError::known_uncommitted(error.to_string())
-                }
-                MetadataMaintenanceDispatchState::PossiblyDispatched => {
-                    TerminalError::commit_unknown(error.to_string())
-                }
-            });
-        }
-    };
+    let completed =
+        match crate::connector::metadata_maintenance::resolve_metadata_maintenance(call).await {
+            ResolvedMetadataMaintenance::KnownCommitted(completed) => *completed,
+            ResolvedMetadataMaintenance::KnownUncommitted { failure, cleanup } => {
+                return Err(TerminalError::known_uncommitted(
+                    crate::connector::mutation::known_uncommitted_message(failure, &cleanup),
+                ));
+            }
+            ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
+                return Err(TerminalError::commit_unknown(failure.to_string()));
+            }
+            ResolvedMetadataMaintenance::ContractFailure { error, dispatch } => {
+                return Err(match dispatch {
+                    MetadataMaintenanceDispatchState::ConfirmedNotDispatched => {
+                        TerminalError::known_uncommitted(error.to_string())
+                    }
+                    MetadataMaintenanceDispatchState::PossiblyDispatched => {
+                        TerminalError::commit_unknown(error.to_string())
+                    }
+                });
+            }
+        };
     if let ExternalMutationFinalization::Failed(failure) = &completed.finalization {
         return Err(TerminalError::known_committed_finalization_failed(
             failure.to_string(),
@@ -170,12 +164,12 @@ pub(crate) async fn execute_automatic_metadata_action_with_ports(
 }
 
 /// Execute a non-rewrite maintenance action through explicit frontend-owned
-/// connector and cache-finalization ports. The caller owns the request context;
+/// connector ports. The caller owns the request context;
 /// this helper never captures a process-local cancellation or topology view.
 pub(crate) async fn execute_action_with_ports(
     pending: &mut Option<MetadataMaintenanceCall>,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
-    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+
     request: MaintenanceActionRequest,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MaintenanceActionOutcome, TerminalError> {
@@ -230,7 +224,7 @@ pub(crate) async fn execute_action_with_ports(
                 "EXECUTE differs from its retained metadata call",
             ));
         }
-        return run_trino_metadata_procedure(call, cache_finalizer).await;
+        return run_trino_metadata_procedure(call).await;
     }
     match request {
         MaintenanceActionRequest::RewriteManifests { .. } => {
@@ -244,7 +238,6 @@ pub(crate) async fn execute_action_with_ports(
             run_expire_snapshots_action_with_ports(
                 pending,
                 connector_control,
-                cache_finalizer,
                 target,
                 older_than_ms,
                 retain_last,
@@ -262,7 +255,6 @@ pub(crate) async fn execute_action_with_ports(
 
 async fn run_trino_metadata_procedure(
     call: &mut MetadataMaintenanceCall,
-    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
 ) -> Result<MaintenanceActionOutcome, TerminalError> {
     use crate::connector::metadata_maintenance::{
         KnownUncommittedMetadataMaintenance, MetadataMaintenanceDispatchState,
@@ -272,8 +264,7 @@ async fn run_trino_metadata_procedure(
     use novarocks_table_maintenance::ProcedureMetrics;
 
     let completion =
-        crate::connector::metadata_maintenance::resolve_metadata_maintenance(call, cache_finalizer)
-            .await;
+        crate::connector::metadata_maintenance::resolve_metadata_maintenance(call).await;
     let completed = match completion {
         ResolvedMetadataMaintenance::KnownCommitted(completed) => completed,
         ResolvedMetadataMaintenance::KnownUncommitted {
@@ -449,7 +440,7 @@ pub(super) fn procedure_connector_terminal(
 async fn run_expire_snapshots_action_with_ports(
     pending: &mut Option<MetadataMaintenanceCall>,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
-    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+
     target: MaintenanceTarget,
     older_than_ms: Option<i64>,
     retain_last: Option<u32>,
@@ -475,8 +466,7 @@ async fn run_expire_snapshots_action_with_ports(
         connector_context,
     )
     .map_err(|error| format!("{error:?}"))?;
-    crate::connector::metadata_maintenance::execute_metadata_maintenance(call, cache_finalizer)
-        .await?;
+    crate::connector::metadata_maintenance::execute_metadata_maintenance(call).await?;
 
     tracing::info!(
         catalog = %target.catalog,

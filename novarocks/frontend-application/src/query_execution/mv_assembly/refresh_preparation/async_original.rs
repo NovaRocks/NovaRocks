@@ -392,6 +392,9 @@ pub(crate) async fn capture_catalog(
                         input.ports.connector_control(),
                         input.context.clone(),
                         io,
+                        preparation.needs().iter().any(|candidate| {
+                            candidate.version().is_some() && candidate.relation() == need.relation()
+                        }),
                     )
                     .await?
             } else {
@@ -422,6 +425,7 @@ pub(crate) async fn capture_catalog(
     let catalog = preparation
         .capture(&[])
         .map_err(MvApplicationError::from_compile)?;
+    input.bindings.seal_catalog_observations().await;
     Ok(MvCatalogCaptureOutput {
         query: input.query,
         catalog,

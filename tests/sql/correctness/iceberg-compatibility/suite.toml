@@ -54,6 +54,7 @@ paths = [
     "tests/sql/fixtures/iceberg-delete-applicability/run.sh",
     "tests/sql/fixtures/iceberg-delete-applicability/validate_receipts.py",
     "docker/iceberg-rest/spark-shell.sh",
+    "tests/sql/fixtures/iru5-commit-interop/SparkCommitInterop.scala",
     "novarocks/functions/src/array_projection.rs",
     "novarocks/functions/src/selected_copy.rs",
     "novarocks/functions/src/selected_copy/guarded_nested.rs",

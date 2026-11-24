@@ -219,7 +219,7 @@ pub(crate) async fn prepare_physical_rewrite(
             ));
         }
     }
-    let mut added_groups: BTreeMap<(i32, bool), Vec<super::model::AddedContent>> = BTreeMap::new();
+    let mut added_groups: BTreeMap<i32, Vec<super::model::AddedContent>> = BTreeMap::new();
     for added in &intent.changes().added {
         if added.data_sequence() != SeqField::Explicit(source.sequence_number) {
             return Err(rewrite_invalid(
@@ -231,17 +231,19 @@ pub(crate) async fn prepare_physical_rewrite(
                 "Whole-data rewrite output must contain only data files",
             ));
         }
+        if added.file().first_row_id().is_some() {
+            return Err(rewrite_invalid(
+                "Physical rewrite output must not supply a first-row-id marker",
+            ));
+        }
         added_groups
-            .entry((
-                added.partition_spec_id(),
-                added.file().first_row_id().is_some(),
-            ))
+            .entry(added.partition_spec_id())
             .or_default()
             .push(added.clone());
     }
     let snapshot_id = view.stage_snapshot_id()?;
     let mut additions = Vec::new();
-    for (ordinal, ((spec_id, assigned), added)) in added_groups.into_iter().enumerate() {
+    for (ordinal, (spec_id, added)) in added_groups.into_iter().enumerate() {
         let basis = super::model::ManifestReuseBasis::added(
             view.stage_key(),
             super::model::AddedManifestAuthor::PhysicalRewrite,
@@ -256,15 +258,7 @@ pub(crate) async fn prepare_physical_rewrite(
         let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
             rewrite_invalid(format!("Rewrite partition spec {spec_id} is absent"))
         })?;
-        let assigned_min = (metadata.format_version() == FormatVersion::V3 && assigned)
-            .then(|| {
-                added
-                    .iter()
-                    .filter_map(|entry| entry.file().first_row_id())
-                    .min()
-            })
-            .flatten();
-        let mut manifest = write_manifest(
+        let manifest = write_manifest(
             view.artifacts(),
             metadata.format_version(),
             snapshot_id,
@@ -274,12 +268,6 @@ pub(crate) async fn prepare_physical_rewrite(
             added.into_iter().map(ManifestEntryWrite::Added),
         )
         .await?;
-        if let Some(first) = assigned_min {
-            manifest.first_row_id = Some(
-                u64::try_from(first)
-                    .map_err(|_| rewrite_invalid("Assigned rewrite row ID must be nonnegative"))?,
-            );
-        }
         view.artifacts()
             .remember_reusable_manifest(basis, manifest.clone())?;
         additions.push(manifest);

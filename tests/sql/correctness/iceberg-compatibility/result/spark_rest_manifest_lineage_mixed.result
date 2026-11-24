@@ -11,3 +11,10 @@ status	record_count	first_row_id	sequence_number	file_sequence_number
 1	10	NULL	4	4
 0	25	800	2	2
 1	50	NULL	4	4
+
+-- query 5
+-- types	bigint	bigint
+record_count	first_row_id
+10	1050
+25	800
+50	1000

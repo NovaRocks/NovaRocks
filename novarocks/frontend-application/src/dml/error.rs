@@ -209,24 +209,6 @@ impl From<&str> for DmlExecutionError {
     }
 }
 
-impl From<crate::query_execution::planning::time_travel::TimeTravelRewriteError>
-    for DmlExecutionError
-{
-    fn from(error: crate::query_execution::planning::time_travel::TimeTravelRewriteError) -> Self {
-        match error {
-            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Source(
-                source,
-            ) => Self::Compilation(source),
-            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Engine(
-                error,
-            ) => Self::Engine(error),
-            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Analyze(
-                error,
-            ) => Self::Analyze(error),
-        }
-    }
-}
-
 impl std::fmt::Display for DmlExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -26,7 +26,6 @@ use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog_application::query_catalog::{CatalogServiceSource, catalog_service_snapshot};
 use crate::query_execution::kernels as domain;
-use crate::query_execution::planning::time_travel::has_time_travel_refs;
 
 macro_rules! impl_kernel_catalog_service_source {
     ($kernel:ty) => {
@@ -54,9 +53,7 @@ pub fn query_catalog_service_snapshot(
 
 /// Leaf ports used by admitted asynchronous DML compilation and final encoding.
 pub(crate) trait DmlQueryExecutionKernel:
-    CatalogServiceSource
-    + crate::query_execution::planning::time_travel::TimeTravelResolver
-    + crate::query_execution::planning::statistics::QueryStatisticsResolver
+    CatalogServiceSource + crate::query_execution::planning::statistics::QueryStatisticsResolver
 {
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog;
     fn sealed_functions(&self) -> &std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>;
@@ -1057,22 +1054,12 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
         typed_connector_session()?,
         Arc::clone(execution.session_property_inputs()),
     )?;
-    let mut prepared = match execution.prepared_parameters() {
+    let prepared = match execution.prepared_parameters() {
         Some(parameters) => parameters
             .complete_query(query.clone())
             .map_err(crate::dml::error::DmlExecutionError::from_compile)?,
         None => query.clone(),
     };
-    if has_time_travel_refs(&prepared) {
-        crate::query_execution::planning::time_travel::rewrite_time_travel_refs_async(
-            state,
-            current_catalog,
-            current_database,
-            &mut prepared,
-            connector_context,
-        )
-        .await?;
-    }
     let compile_control =
         crate::query_execution::planning::sql_compile_control_from_execution(execution);
     let qualifications = observe_dml_catalog_qualifications(
@@ -1129,6 +1116,7 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
             .continue_catalog(facts.into_boxed_slice())
             .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     }
+    table_bindings.seal_catalog_observations().await;
     let analyzed = provider_source
         .analyze_dml_source(
             preparation,

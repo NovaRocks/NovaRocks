@@ -208,7 +208,9 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         .map_err(|error| {
             ConnectorError::new(
                 error.connector_kind(ConnectorErrorKind::CorruptData),
-                if error.is_unsupported() {
+                if error.is_unsupported()
+                    || matches!(error, crate::metadata_json::Error::MissingNextRowId)
+                {
                     error.to_string()
                 } else {
                     "REST stage-create response could not be decoded".to_owned()
@@ -2419,6 +2421,52 @@ mod evidence_tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn stage_create_keeps_known_commit_when_required_v3_next_row_id_is_missing() {
+        let mut response = staged_response();
+        // The v2 and v3 empty-table shapes share all other required fields.
+        response["metadata"]["format-version"] = serde_json::json!(3);
+        let server = TestServer::start(
+            Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on(
+                    "GET",
+                    "/v1/namespaces/db",
+                    Reply::json(
+                        200,
+                        &serde_json::json!({"namespace":["db"],"properties":{}}),
+                    ),
+                )
+                .on(
+                    "POST",
+                    "/v1/namespaces/db/tables",
+                    Reply::json(200, &response),
+                ),
+        );
+        let (outcome, document) = publish_catalog_request(
+            owner(&server).await,
+            crate::catalog::catalog_request::CatalogPublicationRequest::StageCreate {
+                namespace: CatalogNamespaceName::new("db"),
+                creation: creation(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+            "{outcome:?}"
+        );
+        let error = owner(&server)
+            .await
+            .materialize_staged_create_response(CatalogTableName::new("db", "t"), document.unwrap())
+            .err()
+            .expect("missing required next-row-id");
+        assert_eq!(
+            error.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+        assert!(error.message().contains("next-row-id"));
     }
 
     #[tokio::test]

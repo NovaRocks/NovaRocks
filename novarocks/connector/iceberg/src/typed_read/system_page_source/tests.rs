@@ -1531,6 +1531,112 @@ fn files_materializes_one_manifest_split_with_public_binary_bounds() {
 }
 
 #[test]
+fn files_inherit_first_row_ids_in_physical_order_and_entries_report_raw_values() {
+    let schema = Schema::builder()
+        .with_fields(vec![Arc::new(NestedField::optional(
+            1,
+            "id",
+            PrimitiveType::Long.into(),
+        ))])
+        .build()
+        .unwrap();
+    let spec = PartitionSpec::unpartition_spec();
+    let unified =
+        crate::partition_row::UnifiedPartitionRow::of(&schema, std::slice::from_ref(&spec))
+            .unwrap();
+    let manifest = Manifest::new(
+        crate::iceberg::spec::ManifestMetadata {
+            schema: Arc::new(schema),
+            schema_id: 0,
+            partition_spec: spec.clone(),
+            format_version: FormatVersion::V3,
+            content: crate::iceberg::spec::ManifestContentType::Data,
+        },
+        [
+            (ManifestStatus::Existing, 10, Some(80)),
+            (ManifestStatus::Added, 2, None),
+            (ManifestStatus::Deleted, 900, None),
+            (ManifestStatus::Added, 3, None),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, (status, record_count, first_row_id))| {
+            crate::iceberg::spec::ManifestEntry {
+                status,
+                snapshot_id: Some(SNAPSHOT_ID),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                data_file: DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path(format!("file:///data/{ordinal}.parquet"))
+                    .file_format(DataFileFormat::Parquet)
+                    .partition_spec_id(spec.spec_id())
+                    .record_count(record_count)
+                    .file_size_in_bytes(100)
+                    .first_row_id(first_row_id)
+                    .build()
+                    .unwrap(),
+            }
+        })
+        .collect(),
+    );
+    for (base, expected) in [
+        (Some(100), [Some(80), Some(100), Some(102)]),
+        (None, [None, None, None]),
+    ] {
+        let descriptor = TrinoManifestFile::try_new(TrinoManifestFileParams {
+            path: "metadata/data.avro".to_owned(),
+            length: 100,
+            partition_spec_id: spec.spec_id(),
+            content: crate::typed_read::TrinoManifestContent::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: SNAPSHOT_ID,
+            added_files_count: Some(2),
+            existing_files_count: Some(1),
+            deleted_files_count: Some(1),
+            added_rows_count: Some(5),
+            existing_rows_count: Some(10),
+            deleted_rows_count: Some(900),
+            first_row_id: base,
+            key_metadata: Vec::new(),
+        })
+        .unwrap();
+        let files = manifest_rows(
+            &descriptor,
+            &manifest,
+            &spec,
+            EntryStatusRule::SkipDeleted,
+            &unified,
+        )
+        .unwrap();
+        assert_eq!(
+            files.iter().map(|row| row.pos).collect::<Vec<_>>(),
+            [0, 1, 3]
+        );
+        assert_eq!(
+            files.iter().map(|row| row.first_row_id).collect::<Vec<_>>(),
+            expected
+        );
+        let entries = manifest_rows(
+            &descriptor,
+            &manifest,
+            &spec,
+            EntryStatusRule::KeepDeleted,
+            &unified,
+        )
+        .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|row| row.first_row_id)
+                .collect::<Vec<_>>(),
+            [Some(80), None, None, None]
+        );
+    }
+}
+
+#[test]
 fn a_uuid_or_snapshot_mismatch_fails_closed_before_any_row() {
     let (runtime, binding, context) = runtime_and_binding();
     let dir = tempfile::tempdir().expect("tempdir");

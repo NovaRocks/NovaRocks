@@ -1055,30 +1055,6 @@ async fn plan_query_for_ctas_source_async(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
 ) -> Result<PlannedCtasSourceQuery, CtasFailure> {
-    let mut query = query.clone();
-    if crate::query_execution::planning::time_travel::has_time_travel_refs(&query) {
-        crate::query_execution::planning::time_travel::rewrite_time_travel_refs_async(
-            state,
-            current_catalog,
-            current_database,
-            &mut query,
-            connector_context,
-        )
-        .await
-        .map_err(|error| match error {
-            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Source(
-                source,
-            ) => CtasFailure::from_compile(
-                novarocks_sql::compiler::SqlCompileError::CompilationSource(source),
-            ),
-            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Engine(
-                error,
-            ) => internal_failure(error),
-            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Analyze(
-                error,
-            ) => CtasFailure::analyze(error),
-        })?;
-    }
     let table_bindings = Arc::new(
         crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
             .map_err(internal_failure)?,
@@ -1108,7 +1084,7 @@ async fn plan_query_for_ctas_source_async(
     let compile_control =
         crate::query_execution::planning::sql_compile_control_from_execution(execution);
     let qualifications = crate::query_execution::compiler::observe_dml_catalog_qualifications(
-        &query,
+        query,
         current_catalog,
         current_database,
         &compile_control,
@@ -1118,7 +1094,7 @@ async fn plan_query_for_ctas_source_async(
     .map_err(CtasFailure::from_compile)?;
     let mut preparation =
         novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent_with_qualifications(
-            execution.sql_statement_input(Box::new(query), false),
+            execution.sql_statement_input(Box::new(query.clone()), false),
             novarocks_sql::compiler::SqlSessionContext {
                 sql_semantics: execution.sql_semantics().clone(),
                 current_catalog: current_catalog.map(str::to_string),
@@ -1141,6 +1117,7 @@ async fn plan_query_for_ctas_source_async(
             .continue_catalog(facts.into_boxed_slice())
             .map_err(CtasFailure::from_compile)?;
     }
+    table_bindings.seal_catalog_observations().await;
     let analyzed = provider_source
         .analyze_dml_source(
             preparation,

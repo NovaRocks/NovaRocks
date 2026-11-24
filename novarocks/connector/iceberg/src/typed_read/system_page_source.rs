@@ -66,7 +66,7 @@ use crate::iceberg::spec::{
     ManifestFile, ManifestList, ManifestStatus, MapType, NestedField, PartitionSpec,
     PrimitiveLiteral, PrimitiveType, Schema, SnapshotRetention, StructType, TableMetadata, Type,
 };
-use crate::manifest::binding::EntrySequences;
+use crate::manifest::binding::{EntrySequences, RowIdBinding};
 
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, type_to_json, unsupported};
 use super::page_source::{MaterializedPageStream, MaterializedPages, SplitOperations};
@@ -1027,14 +1027,16 @@ struct FileRow {
     content_size_in_bytes: Option<i64>,
 }
 
-/// Which manifest entries a relation keeps.
+/// How a system table projects manifest entries and file row IDs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EntryStatusRule {
     /// `$files` describes the files a snapshot *has*, so a `DELETED` entry --
     /// the tombstone of a file the snapshot no longer contains -- is skipped.
+    /// Live files expose their effective, inherited row-ID bases.
     SkipDeleted,
     /// `$entries` describes the manifest itself, tombstones included; dropping
-    /// them would hide exactly the rows the relation exists to show.
+    /// them would hide exactly the rows the relation exists to show, along
+    /// with their original, unprojected row-ID bases.
     KeepDeleted,
 }
 
@@ -1107,8 +1109,17 @@ fn manifest_rows(
     unified: &crate::partition_row::UnifiedPartitionRow,
 ) -> Result<Vec<FileRow>, ConnectorError> {
     let mut rows = Vec::with_capacity(manifest.entries().len());
+    let mut row_ids = (status_rule == EntryStatusRule::SkipDeleted)
+        .then(|| RowIdBinding::new(manifest_file.first_row_id(), false));
     for (ordinal, entry) in manifest.entries().iter().enumerate() {
         let status = entry.status();
+        let data_file = entry.data_file();
+        let first_row_id = match &mut row_ids {
+            Some(binding) => binding
+                .resolve(data_file, status)
+                .map_err(|error| corrupt(error.to_string()))?,
+            None => data_file.first_row_id(),
+        };
         if status_rule == EntryStatusRule::SkipDeleted && status == ManifestStatus::Deleted {
             continue;
         }
@@ -1128,7 +1139,6 @@ fn manifest_rows(
             data_sequence_number: sequences.data_sequence,
             file_sequence_number: sequences.file_sequence,
         };
-        let data_file = entry.data_file();
         let record_count = i64::try_from(data_file.record_count()).map_err(|_| {
             corrupt(format!(
                 "iceberg data file {} declares a record count beyond Int64",
@@ -1171,7 +1181,7 @@ fn manifest_rows(
                 ))
             })?,
             manifest_location: manifest_file.path().to_string(),
-            first_row_id: data_file.first_row_id(),
+            first_row_id,
             content_offset: data_file.content_offset(),
             content_size_in_bytes: data_file.content_size_in_bytes(),
         });

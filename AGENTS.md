@@ -578,8 +578,11 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   materializes only SQL catalog-visible values.
 
 - `novarocks/frontend-application/src/catalog_application/query_catalog/**`
-  Frontend-owned query catalog registry, schema cache, and service composition.
-  Connector admission and local-catalog snapshots remain application-owned.
+  Frontend-owned catalog membership and relation projection. The first table or
+  view observation lives in the statement's `query_bindings.rs` scope. Historical
+  lookup keeps the original Provider pin and derives its schema from the held
+  metadata revision. Statement owners seal catalog observations after capture.
+  A write session can still register the target it already admitted.
 
 - `novarocks/connector/starrocks/**`
   Retired reference implementation. It is not registered by the Server

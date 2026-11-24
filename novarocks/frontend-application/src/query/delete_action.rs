@@ -71,9 +71,6 @@ impl WriteStatementFamily for DeleteFamily {
             .prepare_native_assembly_for_execution_async(&source, Some(options))
             .await
     }
-    fn finalize(prepared: &Self::Prepared) -> Result<(), String> {
-        prepared.finalize()
-    }
 }
 
 fn completion_for_statement(statement: &OwnedDeleteStatement) -> WriteCompletion {

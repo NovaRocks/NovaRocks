@@ -351,11 +351,7 @@ pub(crate) fn execute_drop_database_statement(
                 },
                 connector_context.clone(),
             )?;
-            context.catalog_service().invalidate_table(
-                &target.catalog,
-                &target.namespace,
-                &table,
-            )?;
+
             drop_local_table_registration_if_exists(context, &target.namespace, &table)?;
         }
         for view in views {
@@ -611,11 +607,6 @@ pub(crate) fn execute_drop_table_statement(
                 return Err((novarocks_query_application::engine_error::EngineError::commit_known_committed_finalize_failed(failure.to_string()).to_string()).into());
             }
             if target.provider_id.as_str() == "iceberg" {
-                context.catalog_service().invalidate_table(
-                    &target.catalog,
-                    &target.namespace,
-                    &target.table,
-                )?;
                 drop_local_table_registration_if_exists(context, &target.namespace, &target.table)?;
             }
             Ok(StatementResult::Ok)
@@ -663,11 +654,6 @@ fn cleanup_iceberg_drop_table_registration_if_exists(
     context: &impl CatalogDropContext,
     target: &crate::catalog_application::resolver::TargetBackend,
 ) -> Result<(), String> {
-    context.catalog_service().invalidate_table(
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    )?;
     drop_local_table_registration_if_exists(context, &target.namespace, &target.table)
 }
 
