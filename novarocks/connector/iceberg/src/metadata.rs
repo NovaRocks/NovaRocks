@@ -1655,6 +1655,7 @@ impl IcebergMetadata {
 pub(crate) enum TableMetadataProjection {
     Current,
     SnapshotTo(i64),
+    CurrentSnapshotTo(i64),
 }
 
 pub(crate) struct TableMetadataBuildInput<'a> {
@@ -1694,7 +1695,8 @@ pub(crate) fn build_table_metadata(
             metadata.current_snapshot_id(),
             false,
         ),
-        TableMetadataProjection::SnapshotTo(snapshot_id) => {
+        TableMetadataProjection::SnapshotTo(snapshot_id)
+        | TableMetadataProjection::CurrentSnapshotTo(snapshot_id) => {
             if metadata_table_type.is_some() {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -1702,7 +1704,13 @@ pub(crate) fn build_table_metadata(
                 )
                 .into());
             }
-            let schema = crate::change_planning::resolved_window_schema(metadata, snapshot_id)?;
+            let schema = if matches!(projection, TableMetadataProjection::CurrentSnapshotTo(_)) {
+                crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::frozen_current_source_schema(
+                    metadata, snapshot_id,
+                )?
+            } else {
+                crate::change_planning::resolved_window_schema(metadata, snapshot_id)?
+            };
             (schema, Some(snapshot_id), true)
         }
     };

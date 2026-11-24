@@ -29,7 +29,9 @@ use novarocks_spi::connector::{
 };
 use novarocks_type_contract::CanonicalFactWriter;
 
-use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts;
+use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::{
+    IcebergObservedSourceReadFacts, frozen_current_source_schema,
+};
 use crate::iceberg::spec::{
     Literal, NestedField, Schema, StructType, TableMetadata, TableProperties, Type,
 };
@@ -82,6 +84,9 @@ impl IcebergStorageInspector {
             TableMetadataProjection::Current => table.current_schema().clone(),
             TableMetadataProjection::SnapshotTo(snapshot) => {
                 crate::change_planning::resolved_window_schema(table, snapshot)?
+            }
+            TableMetadataProjection::CurrentSnapshotTo(snapshot) => {
+                frozen_current_source_schema(table, snapshot)?
             }
         };
         if metadata.version.as_ref() != Some(&exact_schema_version(schema.schema_id())) {

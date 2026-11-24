@@ -449,7 +449,7 @@ impl MvRefreshPreparationIo {
                         captured.revision.clone(),
                     )
                 }
-                None => ConnectorReadSourcePreparationRequest::snapshot(
+                None => ConnectorReadSourcePreparationRequest::current_at_snapshot(
                     name,
                     captured.observed.table.clone(),
                     observed_facts,

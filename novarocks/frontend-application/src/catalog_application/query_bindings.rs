@@ -349,7 +349,9 @@ fn prepared_source_selector(
         return Err("prepared source does not authorize a From or Delta projection".into());
     }
     match (selection, projection) {
-        (S::Snapshot(id), P::To) => Ok(QueryPreparedSourceSelector::Snapshot(id)),
+        (S::Snapshot(id) | S::CurrentAtSnapshot(id), P::To) => {
+            Ok(QueryPreparedSourceSelector::Snapshot(id))
+        }
         (S::ChangeWindow(window), P::To) => Ok(QueryPreparedSourceSelector::Snapshot(
             window.to_snapshot_id(),
         )),
@@ -465,10 +467,7 @@ impl QueryTableBinding {
                     .into(),
             );
         }
-        let to_snapshot = match receipt.request().selection() {
-            ConnectorReadSourceSelection::Snapshot(id) => id,
-            ConnectorReadSourceSelection::ChangeWindow(window) => window.to_snapshot_id(),
-        };
+        let to_snapshot = receipt.request().selection().to_snapshot_id();
         let primary = self
             .scan_materialization
             .as_ref()
@@ -1279,10 +1278,14 @@ mod tests {
             has_deletes: false,
             partition_impact: I::Unpartitioned,
         };
-        assert_eq!(
-            prepared_source_selector(S::Snapshot(19), P::To, None).unwrap(),
-            QueryPreparedSourceSelector::Snapshot(19)
-        );
+        for selection in [S::Snapshot(19), S::CurrentAtSnapshot(19)] {
+            assert_eq!(
+                prepared_source_selector(selection, P::To, None).unwrap(),
+                QueryPreparedSourceSelector::Snapshot(19)
+            );
+            assert!(prepared_source_selector(selection, P::From, None).is_err());
+            assert!(prepared_source_selector(selection, P::Delta, None).is_err());
+        }
         assert_eq!(
             prepared_source_selector(window, P::To, Some(&admitted)).unwrap(),
             QueryPreparedSourceSelector::Snapshot(19)
@@ -1298,8 +1301,6 @@ mod tests {
                 to_inclusive: 19
             }
         );
-        assert!(prepared_source_selector(S::Snapshot(19), P::From, None).is_err());
-        assert!(prepared_source_selector(S::Snapshot(19), P::Delta, None).is_err());
         assert_eq!(
             prepared_source_selector(window, P::To, Some(&A::MetadataOnly)).unwrap(),
             QueryPreparedSourceSelector::Snapshot(19)

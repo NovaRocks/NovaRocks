@@ -636,7 +636,7 @@ pub(crate) fn source_schema_observation(
     context: &ConnectorRequestContext,
 ) -> Result<IcebergStorageSourceSchemaObservation, ConnectorError> {
     use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::{
-        IcebergObservedSourceReadFacts, frozen_snapshot_schema,
+        IcebergObservedSourceReadFacts, frozen_current_source_schema, frozen_snapshot_schema,
     };
     use crate::metadata::TableMetadataProjection;
     validate_context(context)?;
@@ -671,6 +671,10 @@ pub(crate) fn source_schema_observation(
         TableMetadataProjection::Current => return create_source_observation(table, context),
         TableMetadataProjection::SnapshotTo(snapshot) => {
             let schema = frozen_snapshot_schema(table, snapshot, table.current_schema_id())?;
+            selected_source_schema_observation(table, &schema, snapshot, admitted, context)?
+        }
+        TableMetadataProjection::CurrentSnapshotTo(snapshot) => {
+            let schema = frozen_current_source_schema(table, snapshot)?;
             selected_source_schema_observation(table, &schema, snapshot, admitted, context)?
         }
     };

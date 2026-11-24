@@ -68,6 +68,7 @@ REFRESH MATERIALIZED VIEW mv_${uuid0};
 SELECT id, region, amount FROM mv_${uuid0} ORDER BY id;
 
 -- query 8
+-- @explain_not_contains=rewritten with mv:
 SELECT id, region, amount FROM base_${uuid0} ORDER BY id;
 
 -- query 9
