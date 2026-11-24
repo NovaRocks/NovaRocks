@@ -34,7 +34,7 @@ use novarocks_type_contract::{
 };
 
 use crate::analysis::{
-    ExprKind, LiteralValue, QueryBody, Relation, ResolvedQuery, SetOpKind, SortItem, TypedExpr,
+    ExprKind, LiteralValue, QueryBody, Relation, ResolvedQuery, SortItem, TypedExpr,
 };
 use crate::analyze_error::AnalyzeError;
 use crate::binding::SqlTableBindingId;
@@ -42,6 +42,7 @@ use crate::column_id::ColumnId;
 use crate::compiler::SqlMvRelationOccurrenceId;
 use crate::planner::table::{ScanSource, SqlMvReadSelection};
 use crate::planning::catalog::SqlMvViewDependency;
+use crate::planning::mv::validate_mv_union_all;
 
 /// Complete SQL-owned input for CREATE-time MV persistence mapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -516,11 +517,8 @@ fn collect_union_leaves<'a>(
 ) -> Result<bool, AnalyzeError> {
     match &query.body {
         QueryBody::SetOperation(set_op) => {
-            if set_op.kind != SetOpKind::Union || !set_op.all {
-                return Err(AnalyzeError::unsupported_expression_without_span(
-                    "MV persistence facts require UNION ALL set operations",
-                ));
-            }
+            validate_mv_union_all(set_op)
+                .map_err(AnalyzeError::unsupported_expression_without_span)?;
             collect_union_leaves(&set_op.left, leaves)?;
             collect_union_leaves(&set_op.right, leaves)?;
             Ok(true)
@@ -614,11 +612,8 @@ fn register_query(
                 .collect::<Result<Vec<_>, AnalyzeError>>()?
         }
         QueryBody::SetOperation(set_op) => {
-            if set_op.kind != SetOpKind::Union || !set_op.all {
-                return Err(AnalyzeError::unsupported_expression_without_span(
-                    "MV persistence facts require UNION ALL set operations",
-                ));
-            }
+            validate_mv_union_all(set_op)
+                .map_err(AnalyzeError::unsupported_expression_without_span)?;
             let left = register_query(&set_op.left, builder)?;
             let right = register_query(&set_op.right, builder)?;
             merge_output_lineages(left, right)?

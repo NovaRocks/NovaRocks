@@ -5823,15 +5823,18 @@ fn group_row_id_names(identity: &TargetIdentity) -> &[String] {
     }
 }
 
+pub(super) fn validate_mv_union_all(set_op: &ResolvedSetOp) -> Result<(), &'static str> {
+    if set_op.kind != SetOpKind::Union || !set_op.all {
+        return Err("Iceberg IMV refresh contract only supports UNION ALL set operations");
+    }
+    Ok(())
+}
+
 fn collect_union_all_branches<'a>(
     set_op: &'a ResolvedSetOp,
     out: &mut Vec<&'a ResolvedQuery>,
 ) -> Result<(), String> {
-    if set_op.kind != SetOpKind::Union || !set_op.all {
-        return Err(
-            "Iceberg IMV refresh contract only supports UNION ALL set operations".to_string(),
-        );
-    }
+    validate_mv_union_all(set_op)?;
     collect_union_all_query(&set_op.left, out)?;
     collect_union_all_query(&set_op.right, out)
 }
