@@ -18,15 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,a11,base_rename,projection,filter
--- Test Objective:
--- 1. Validate A11 contract guard recognizes a base column rename (same field id)
---    and refreshes via CompatibleSafeWithRebind.
--- 2. Validate the MV's persisted contract is name-independent: after rename, the
---    incremental refresh still finds the underlying column by field id.
---
--- Setup: REST catalog (required for Spark schema evolution).
--- Spark renames base column `region` -> `area` (same field id).
--- NovaRocks must still refresh correctly using field-id-based rebind.
+-- An invalid original definition is reported as stale on refresh.
 
 -- query 1
 -- @skip_result_check=true
@@ -77,14 +69,11 @@ printf 'SPARK_SQL_OK\n'
 INSERT INTO ice_ivm_a11_rename_${uuid0}.ns_a11_rename_${uuid0}.base_${uuid0} VALUES ROW(4, 'US', 300);
 
 -- query 7
--- A11 contract guard fires CompatibleSafeWithRebind; refresh should succeed
--- and the new US row (id=4) should appear in the MV.
--- @skip_result_check=true
+-- @expect_trino_error=VIEW_IS_STALE,USER_ERROR
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 8
--- After rename + refresh: MV output column name is `region` (frozen at CREATE time).
--- New row id=4 should appear.
+-- The failed refresh leaves the previous published rows available.
 SELECT id, region, amount FROM mv_${uuid0} ORDER BY id;
 
 -- query 9

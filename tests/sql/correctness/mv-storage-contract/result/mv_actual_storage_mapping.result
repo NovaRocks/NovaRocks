@@ -1,0 +1,13 @@
+-- query 4
+-- types	bigint	decimal(12, 2)
+id	price
+1	1234567890.01
+2	-0.17
+3	NULL
+
+-- query 5
+-- types	bigint	decimal(12, 2)
+id	price
+1	1234567890.01
+2	-0.17
+3	NULL

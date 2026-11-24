@@ -18,13 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,a11,base_type_change,referenced,error
--- Test Objective:
--- Validate that changing the type of a referenced base column triggers
--- BaseFieldTypeChanged error, blocking incremental refresh.
--- Even a widening type change (INT -> BIGINT) is rejected because the
--- MV's expression output type was frozen at CREATE time.
---
--- The MV references `amount` (BIGINT). Spark changes `amount` to STRING.
+-- A referenced input widening rebuilds the MV when its declared output stays unchanged.
 
 -- query 1
 -- @skip_result_check=true
@@ -41,7 +35,8 @@ INSERT INTO ice_ivm_a11_type_chg_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES
 -- query 2
 -- @skip_result_check=true
 USE ice_ivm_a11_type_chg_${uuid0}.ns_${uuid0};
-CREATE MATERIALIZED VIEW mv_${uuid0} AS SELECT id, amount FROM base_${uuid0};
+SET SESSION enable_materialized_view_rewrite = false;
+CREATE MATERIALIZED VIEW mv_${uuid0} AS SELECT id, CAST(amount AS BIGINT) AS amount FROM base_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
@@ -52,7 +47,7 @@ REFRESH MATERIALIZED VIEW mv_${uuid0};
 SELECT id, amount FROM mv_${uuid0} ORDER BY id;
 
 -- query 5
--- Spark: widen `amount` from INT to BIGINT (still a type change, blocked by A11).
+-- Spark widens the referenced input without changing the MV output declaration.
 -- @result_contains=SPARK_SQL_OK
 shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-a11-type-chg-XXXXXX.sql")"
@@ -64,11 +59,17 @@ SPARK_SQL
 printf 'SPARK_SQL_OK\n'
 
 -- query 6
--- Refresh must fail: BaseFieldTypeChanged for `amount` (int -> long).
--- @expect_error=MV source field type or nullability changed for relation occurrence
+-- @skip_result_check=true
+INSERT INTO base_${uuid0} VALUES ROW(3, 2147483648);
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 7
+SELECT id, amount FROM mv_${uuid0} ORDER BY id;
+
+-- query 8
+SELECT id, CAST(amount AS BIGINT) AS amount FROM base_${uuid0} ORDER BY id;
+
+-- query 9
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_${uuid0};

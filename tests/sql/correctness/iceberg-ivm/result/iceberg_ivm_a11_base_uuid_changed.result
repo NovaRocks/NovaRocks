@@ -3,3 +3,13 @@
 id	amount
 1	100
 2	50
+
+-- query 7
+-- types	integer	bigint
+id	amount
+10	999
+
+-- query 8
+-- types	integer	bigint
+id	amount
+10	999

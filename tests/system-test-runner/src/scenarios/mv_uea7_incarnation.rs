@@ -263,6 +263,11 @@ fn load_rest_table(context: &ScenarioContext, rest_uri: &str) -> Result<Value> {
 
 fn marker(table: &Value) -> Result<String> {
     let graph = super::mv_uea7_documents::wire::Graph::from_metadata(&table["metadata"])?;
+    ensure!(
+        graph.diagnostics.is_empty(),
+        "the management slot did not accompany a closed MV document graph: {:?}",
+        graph.diagnostics
+    );
     Ok(super::mv_uea7_documents::wire::management(&graph.slots[MARKER_PROPERTY])?[2].clone())
 }
 
@@ -301,6 +306,11 @@ fn change_remote_incarnation(
     ensure!(
         marker(&current)? == COMPETING_INCARNATION,
         "isolated REST did not persist the competing incarnation"
+    );
+    let changed = Graph::from_metadata(&current["metadata"])?;
+    ensure!(
+        changed.binding == graph.binding && changed.mapping == graph.mapping,
+        "the management writer change modified the MV binding or storage mapping"
     );
     Ok(())
 }

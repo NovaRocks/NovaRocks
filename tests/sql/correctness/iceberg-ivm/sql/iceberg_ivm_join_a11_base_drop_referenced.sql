@@ -18,9 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,row_lineage,join,a11,base_drop,referenced,error
--- Test Point: Join IMV blocks refresh when a referenced column on either base is dropped.
--- Method: Create a two-base join MV, drop a right-base projected column through Spark, then refresh.
--- Scope: Multi-base A11 schema contract, current Iceberg schema validation, metadata-only evolution.
+-- An invalid original definition is reported as stale on refresh.
 
 -- query 1
 -- @skip_result_check=true
@@ -75,9 +73,7 @@ INSERT INTO ice_ivm_join_a11_drop_${uuid0}.ns_${uuid0}.join_left_${uuid0} VALUES
   ROW(3, 20, 300);
 
 -- query 7
--- The refusal names the occurrence whose reference lost its field, which
--- is what tells the two sides of a join apart.
--- @expect_error=MV source field is missing for relation occurrence
+-- @expect_trino_error=VIEW_IS_STALE,USER_ERROR
 REFRESH MATERIALIZED VIEW join_mv_${uuid0};
 
 -- query 8

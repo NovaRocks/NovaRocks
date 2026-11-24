@@ -18,13 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,a11,base_drop,add,same_name,error
--- Test Objective:
--- Validate that DROP + ADD COLUMN with the same name still triggers BaseFieldDropped,
--- because the new column has a different field id than the original.
--- The A11 contract tracks columns by field id, not by name.
---
--- The MV references `region`. Spark drops `region` and re-adds `region` as a new
--- column (new field id). The contract guard must still reject incremental refresh.
+-- Replacing a referenced field at the same name rebuilds from the new field identity.
 
 -- query 1
 -- @skip_result_check=true
@@ -66,15 +60,17 @@ SPARK_SQL
 printf 'SPARK_SQL_OK\n'
 
 -- query 6
--- Refresh must fail: original `region` field id no longer present (it was dropped).
--- Even though a new column named `region` exists, its field id differs.
--- The canonical documents bind each source field by the provider's own
--- identity, qualified by the occurrence that referenced it, so the refusal
--- says which reference lost its field rather than which column name did.
--- @expect_error=MV source field is missing for relation occurrence
+-- @skip_result_check=true
+SET SESSION enable_materialized_view_rewrite = false;
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 7
+SELECT id, region, amount FROM mv_${uuid0} ORDER BY id;
+
+-- query 8
+SELECT id, region, amount FROM base_${uuid0} ORDER BY id;
+
+-- query 9
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_${uuid0};

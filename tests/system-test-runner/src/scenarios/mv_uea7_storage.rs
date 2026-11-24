@@ -158,7 +158,9 @@ impl Scenario for MvStorageContract {
             "create document-managed Iceberg MV without publishing",
             "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, SUM(v2) AS total FROM orders GROUP BY k1",
         )?;
-        context.action("verify CREATE wrote table-level D/L/C and no snapshot or P to REST");
+        context.action(
+            "verify CREATE wrote table-level D/L/M/B and configuration without a snapshot or P",
+        );
         let created = load_graph(context, &rest_uri, 0)?;
 
         let first_commits_before = self.recorded_table_commits()?;
@@ -168,7 +170,7 @@ impl Scenario for MvStorageContract {
             "publish the first exact MV output",
             "REFRESH MATERIALIZED VIEW orders_mv",
         )?;
-        context.action("verify first P binds its exact snapshot and table-level D/L revisions");
+        context.action("verify the first P binds its exact snapshot and table-level D/L/M/B");
         let first = load_graph(context, &rest_uri, 2)?;
         assert_full_refresh_pair(&created, &first, 2)?;
         ensure!(
@@ -177,8 +179,10 @@ impl Scenario for MvStorageContract {
         );
         ensure!(
             first.definition == created.definition
-                && first.interpretation == created.interpretation,
-            "the first publication changed the CREATE D/L revisions"
+                && first.interpretation == created.interpretation
+                && first.mapping == created.mapping
+                && first.binding == created.binding,
+            "the first publication changed the CREATE D/L/M/B revisions"
         );
         assert_rows(
             context,
@@ -294,8 +298,11 @@ impl Scenario for MvStorageContract {
             "FULL dispatched more or less than one target REST commit"
         );
         ensure!(
-            second.definition == first.definition && second.interpretation == first.interpretation,
-            "FULL refresh changed the stable D/L revisions"
+            second.definition == first.definition
+                && second.interpretation == first.interpretation
+                && second.mapping == first.mapping
+                && second.binding == first.binding,
+            "FULL refresh changed the stable D/L/M/B revisions"
         );
         ensure!(
             second.publications[0] == first.publications[0]
@@ -424,6 +431,8 @@ fn require_rewrite(context: &mut ScenarioContext, conn: &mut SqlSession) -> Resu
 struct DocumentGraph {
     definition: Value,
     interpretation: Value,
+    mapping: String,
+    binding: String,
     publications: Vec<(i64, Value)>,
     snapshots: Vec<Value>,
     current: Option<i64>,
@@ -478,6 +487,8 @@ fn load_graph(context: &ScenarioContext, rest_uri: &str, expected: usize) -> Res
     Ok(DocumentGraph {
         definition: Value::String(graph.definition),
         interpretation: Value::String(graph.interpretation),
+        mapping: graph.mapping,
+        binding: graph.binding,
         publications,
         current: graph.current,
         next_row_id: metadata["next-row-id"]

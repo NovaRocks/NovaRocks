@@ -321,7 +321,7 @@ fn save_graph(context: &ScenarioContext, label: &str, metadata: &Value) -> Resul
     fs::write(
         dir.join("oracle.json"),
         serde_json::to_vec_pretty(
-            &json!({"definition":graph.definition,"interpretation":graph.interpretation,"binding":graph.binding,"current":graph.current,"private_bytes":graph.private_bytes,"record_bytes":graph.record_bytes,"diagnostics":graph.diagnostics}),
+            &json!({"definition":graph.definition,"interpretation":graph.interpretation,"mapping":graph.mapping,"binding":graph.binding,"current":graph.current,"private_bytes":graph.private_bytes,"record_bytes":graph.record_bytes,"diagnostics":graph.diagnostics}),
         )?,
     )?;
     Ok(graph)
@@ -605,6 +605,10 @@ fn publish_reordered_schema(
             Reference {
                 rel: "interpretation".into(),
                 id: new_l.id.clone(),
+            },
+            Reference {
+                rel: "mapping".into(),
+                id: graph.mapping.clone(),
             },
         ],
         &binding.bytes()?,
@@ -987,7 +991,7 @@ fn run_expiry(
     .collect();
     ensure!(
         after.versions.keys().cloned().collect::<BTreeSet<_>>() == expected,
-        "expiry did not collect exactly the old unreferenced D/L/B closure"
+        "expiry did not collect exactly the old unreferenced D/L/M/B closure"
     );
     exact_private_after_prune(&before, &after)?;
     let old = a2["current-snapshot-id"]
@@ -1023,7 +1027,7 @@ fn run_expiry(
             .cloned()
             .collect::<BTreeSet<_>>()
             == expected,
-        "orphan pass did not retain exactly the current D/L/B closure"
+        "orphan pass did not retain exactly the current D/L/M/B closure"
     );
     let a2_graph = Graph::from_metadata(&a2)?;
     ensure!(
@@ -1178,6 +1182,7 @@ fn run_expiry(
         format!("novarocks.doc.v2.rev.{}", graph.binding),
         format!("novarocks.doc.v2.rev.{}", graph.definition),
         format!("novarocks.doc.v2.rev.{}", graph.interpretation),
+        format!("novarocks.doc.v2.rev.{}", graph.mapping),
     ] {
         ensure!(
             c_after["properties"][&key] == c["properties"][&key],

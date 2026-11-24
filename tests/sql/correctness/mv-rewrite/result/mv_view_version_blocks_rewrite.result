@@ -1,0 +1,19 @@
+-- query 2
+-- types	bigint	bigint
+id	y
+11999	100
+
+-- query 4
+-- types	bigint	bigint
+id	y
+11999	100
+
+-- query 5
+-- types	bigint	bigint
+id	y
+11999	101
+
+-- query 7
+-- types	bigint	bigint
+id	y
+11999	101
