@@ -1052,7 +1052,8 @@ pub(crate) async fn probe_delete_filter(
         ConnectorReadRelationPreparationRequest as Request,
     };
 
-    let opening = prepare_read_opening(need, control, bindings, context)?;
+    let original_context = context.clone().with_original_table_preparation_reuse();
+    let opening = prepare_read_opening(need, control, bindings, &original_context)?;
     let Some(source) = original.source_read_facts() else {
         return Ok(Outcome::Refused {
             reason: "DELETE target has no original provider read facts".into(),
