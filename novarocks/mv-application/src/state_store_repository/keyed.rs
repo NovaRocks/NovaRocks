@@ -121,7 +121,7 @@ pub(super) async fn projection_inventory<T: ReadAccess + ?Sized>(
             }
             ProjectionRow::Retired { mv_id, source } => (
                 *mv_id,
-                source,
+                source.as_ref(),
                 Some(MvProjectionVersion::from_store(row.version)),
             ),
         };

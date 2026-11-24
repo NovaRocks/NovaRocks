@@ -898,7 +898,7 @@ impl ReadRepository<'_> {
             .map_err(corruption)?
             .value;
         let decoded = match row_facts {
-            codec::ProjectionRow::Current(value) => value,
+            codec::ProjectionRow::Current(value) => *value,
             codec::ProjectionRow::Retired { mv_id, source } => {
                 if mv_id != lookup.value.mv_id || source_target(&source) != *target {
                     return Err(corruption(
@@ -999,7 +999,7 @@ impl ReadRepository<'_> {
                 .map_err(corruption)?
                 .value
             {
-                codec::ProjectionRow::Current(value) => value,
+                codec::ProjectionRow::Current(value) => *value,
                 codec::ProjectionRow::Retired { mv_id, .. } => {
                     if row.key != projection_by_id_key(mv_id).map_err(corruption)? {
                         return Err(corruption(

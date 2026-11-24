@@ -503,10 +503,10 @@ pub fn encode_keyed_projection(
     encode_record(MvRecordKind::Projection, operation_id, &dto)
 }
 pub(super) enum ProjectionRow {
-    Current(crate::persistence::keyed_documents::StoredKeyedMvProjection),
+    Current(Box<crate::persistence::keyed_documents::StoredKeyedMvProjection>),
     Retired {
         mv_id: i64,
-        source: MvAcceleratorSourceRevision,
+        source: Box<MvAcceleratorSourceRevision>,
     },
 }
 
@@ -518,7 +518,7 @@ pub fn decode_keyed_projection(
     match decoded.value {
         ProjectionRow::Current(value) => Ok(DecodedMvRecord {
             operation_id: decoded.operation_id,
-            value,
+            value: *value,
         }),
         ProjectionRow::Retired { .. } => {
             Err("retired MV projection is available for DROP only".into())
@@ -561,7 +561,7 @@ pub(super) fn decode_projection_row(
             operation_id: decoded.operation_id,
             value: ProjectionRow::Retired {
                 mv_id: d.mv_id,
-                source,
+                source: Box::new(source),
             },
         });
     }
@@ -641,9 +641,9 @@ pub(super) fn decode_projection_row(
     }
     Ok(DecodedMvRecord {
         operation_id: decoded.operation_id,
-        value: ProjectionRow::Current(StoredKeyedMvProjection {
+        value: ProjectionRow::Current(Box::new(StoredKeyedMvProjection {
             mv_id: d.mv_id,
             facts,
-        }),
+        })),
     })
 }

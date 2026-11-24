@@ -383,7 +383,6 @@ fn encode_dependency(value: &BindingDependency) -> proto::BindingDependency {
             depth,
             exact_declaration,
             iceberg_version,
-            dialect: _,
             ..
         } => Kind::View(proto::ViewDependency {
             identity: Some(identity.to_vec()),
@@ -396,7 +395,6 @@ fn encode_dependency(value: &BindingDependency) -> proto::BindingDependency {
         BindingDependency::NestedMv {
             object_id,
             definition_revision,
-            dialect: _,
             ..
         } => Kind::NestedMv(proto::NestedMvDependency {
             object_id: Some(object_id.as_bytes().to_vec()),

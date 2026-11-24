@@ -238,7 +238,7 @@ pub(crate) fn build_mv_aggregate_create_bindings(
     if let Some(column) = retraction_columns.into_iter().next() {
         let aggregate_id = internal_retraction_count_aggregate_identity();
         let state_slot_ids =
-            bind_retraction_state(column, &targets, &mut state_slots, &mut target_fields)?;
+            bind_retraction_state(column, targets, &mut state_slots, &mut target_fields)?;
         aggregates.push(RuntimeAggregateFacts {
             aggregate_id,
             function_identity: "count".to_string(),
@@ -601,6 +601,34 @@ fn state_slot_identity(target_field_id: &FieldIdentity, role: StateRole) -> Stat
 
 fn digest(canonical: CanonicalFactWriter) -> [u8; 32] {
     Sha256::digest(canonical.finish()).into()
+}
+
+/// Check the aggregate contract attached to an actual publication before using
+/// its values for rewrite or consuming its state columns as a predecessor.
+pub fn validate_published_aggregate_contracts(
+    interpretation: &super::codec::InterpretationDocument,
+) -> Result<(), String> {
+    use novarocks_functions::builtin::catalogue::builtin_engine_function_catalog;
+    let catalogue = builtin_engine_function_catalog();
+    for aggregate in &interpretation.aggregates {
+        let function = aggregate.function_identity.as_str();
+        let Some(contract) = aggregate.semantic_contract.as_ref() else {
+            if aggregate.aggregate_id == internal_retraction_count_aggregate_identity() {
+                continue;
+            }
+            return Err(format!(
+                "MV aggregate {function} has no selected state binding"
+            ));
+        };
+        if !catalogue.admits_persistent_aggregate(contract) {
+            return Err(format!(
+                "MV aggregate {function} requires a full rebuild: publication overload {} carries state format {}, which are no longer admitted",
+                contract.overload.as_str(),
+                contract.state_format.as_str(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -982,32 +1010,4 @@ mod tests {
 
         validate_interpretation(&interpretation).expect("R2-valid interpretation");
     }
-}
-
-/// Check the aggregate contract attached to an actual publication before using
-/// its values for rewrite or consuming its state columns as a predecessor.
-pub fn validate_published_aggregate_contracts(
-    interpretation: &super::codec::InterpretationDocument,
-) -> Result<(), String> {
-    use novarocks_functions::builtin::catalogue::builtin_engine_function_catalog;
-    let catalogue = builtin_engine_function_catalog();
-    for aggregate in &interpretation.aggregates {
-        let function = aggregate.function_identity.as_str();
-        let Some(contract) = aggregate.semantic_contract.as_ref() else {
-            if aggregate.aggregate_id == internal_retraction_count_aggregate_identity() {
-                continue;
-            }
-            return Err(format!(
-                "MV aggregate {function} has no selected state binding"
-            ));
-        };
-        if !catalogue.admits_persistent_aggregate(contract) {
-            return Err(format!(
-                "MV aggregate {function} requires a full rebuild: publication overload {} carries state format {}, which are no longer admitted",
-                contract.overload.as_str(),
-                contract.state_format.as_str(),
-            ));
-        }
-    }
-    Ok(())
 }
