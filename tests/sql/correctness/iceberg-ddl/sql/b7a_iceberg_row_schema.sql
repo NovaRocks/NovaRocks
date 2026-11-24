@@ -56,15 +56,17 @@ WHERE table_schema = 'rows_${uuid0}'
 -- query 5
 -- @skip_result_check=true
 CREATE TABLE b7a_rows_${uuid0}.rows_${uuid0}.b7a_named_row (
-    payload ROW(id INTEGER)
+    payload ROW(id INTEGER, note VARCHAR)
 ) WITH (format_version = 3);
 
 -- query 6
 -- @skip_result_check=true
-INSERT INTO b7a_rows_${uuid0}.rows_${uuid0}.b7a_named_row VALUES ROW(ROW(7));
+INSERT INTO b7a_rows_${uuid0}.rows_${uuid0}.b7a_named_row VALUES
+    ROW(ROW(7, CAST('kept' AS VARCHAR))), ROW(ROW(8, NULL));
 
 -- query 7
-SELECT payload.id AS id_value FROM b7a_rows_${uuid0}.rows_${uuid0}.b7a_named_row;
+SELECT payload.id AS id_value, payload.note AS note
+FROM b7a_rows_${uuid0}.rows_${uuid0}.b7a_named_row ORDER BY id_value;
 
 -- query 8
 -- @cleanup=true

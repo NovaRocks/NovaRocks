@@ -238,6 +238,57 @@ fn trino_row_label_projection_preserves_ordinal_values_and_parent_nulls() {
 }
 
 #[test]
+fn trino_row_projection_lifts_unknown_children_to_typed_nulls() {
+    let unknown_item = Arc::new(Field::new_list_field(DataType::Null, true));
+    let numbers = Arc::new(ListArray::new(
+        Arc::clone(&unknown_item),
+        arrow_buffer::OffsetBuffer::from_lengths([1, 0, 2]),
+        new_null_array(&DataType::Null, 3),
+        None,
+    ));
+    let input = Arc::new(StructArray::new(
+        vec![
+            Arc::new(Field::new("", DataType::Null, true)),
+            Arc::new(Field::new("", numbers.data_type().clone(), false)),
+        ]
+        .into(),
+        vec![new_null_array(&DataType::Null, 3), numbers],
+        Some(arrow_buffer::NullBuffer::from(vec![true, false, true])),
+    )) as ArrayRef;
+    let source = FunctionValueType::new(input.data_type().clone(), true);
+    let target = FunctionValueType::new(
+        DataType::Struct(
+            vec![
+                Arc::new(Field::new("raw", DataType::Binary, true)),
+                Arc::new(Field::new(
+                    "numbers",
+                    DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true))),
+                    false,
+                )),
+            ]
+            .into(),
+        ),
+        true,
+    );
+    let prepared =
+        PreparedCastRecipe::try_new_trino(&source, &target, TrinoCastMode::Implicit, &Control)
+            .unwrap();
+    let rows = [1, 2];
+    let out = output(&prepared, &input, Selection::try_sparse(3, &rows).unwrap());
+    assert_eq!(out.values().data_type(), target.data_type());
+    assert!(out.errors().is_empty());
+    let row = out.values().as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(row.is_null(0));
+    assert!(!row.is_null(1));
+    assert!(row.column(0).is_null(1));
+    let numbers = row.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    let active = numbers.value(1);
+    assert_eq!(active.data_type(), &DataType::Int32);
+    assert_eq!(active.len(), 2);
+    assert_eq!(active.null_count(), 2);
+}
+
+#[test]
 fn renamed_struct_keeps_nested_fixed_bytes_without_generic_value_casting() {
     let fixed =
         Arc::new(FixedSizeBinaryArray::try_from_iter([b"abcd", b"wxyz"].into_iter()).unwrap())

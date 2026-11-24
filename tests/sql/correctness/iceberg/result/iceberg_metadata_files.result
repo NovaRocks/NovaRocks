@@ -9,7 +9,7 @@ total_records
 2
 
 -- query 7
--- legacy
+-- types	varchar	bigint
 part_region	records
 eu	1
 us	1

@@ -4,6 +4,7 @@ rejected_tables
 0
 
 -- query 7
--- types	integer
-id_value
-7
+-- types	integer	varchar
+id_value	note
+7	kept
+8	NULL
