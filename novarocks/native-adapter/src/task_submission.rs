@@ -20,17 +20,18 @@
 use crate::task_instance::task_sink_edge_ids_path;
 use novarocks_execution::runtime::endpoint::TaskDestination;
 use novarocks_execution::runtime::task::TaskSinkAssignment;
+use novarocks_execution_contract::ExchangeEdgeId;
 use novarocks_execution_contract::task_execution::descriptor::{
     DataStreamPartitionType, ExchangeEdge, ExchangeTopology,
 };
+use novarocks_physical_plan::EdgeId;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_types::UniqueId;
 use std::collections::BTreeSet;
 
-/// Binds a compiled program's static sink to the task's frozen outbound
-/// edges, with the exact frozen edge law: each
-/// branch's destination node and partitioning come from the compiled static
-/// sink, never from a legacy plan tree.
+/// Binds a compiled sink without package-owned multicast branches.
+///
+/// Native multicast requires the original package's ordered physical edges.
 pub fn compiled_task_sink_assignment(
     sink: &novarocks_local_program::StaticSinkProgram,
     summaries: &[novarocks_local_program::StaticSummaryBranch],
@@ -38,16 +39,62 @@ pub fn compiled_task_sink_assignment(
     source: UniqueId,
     topology: &ExchangeTopology,
 ) -> Result<TaskSinkAssignment, ProtocolError> {
+    compiled_task_sink_assignment_with_multicast_edges(
+        sink,
+        summaries,
+        &[],
+        sink_edge_ids,
+        source,
+        topology,
+    )
+}
+
+pub(crate) fn compiled_task_sink_assignment_with_multicast_edges(
+    sink: &novarocks_local_program::StaticSinkProgram,
+    summaries: &[novarocks_local_program::StaticSummaryBranch],
+    multicast_edges: &[EdgeId],
+    sink_edge_ids: &[u32],
+    source: UniqueId,
+    topology: &ExchangeTopology,
+) -> Result<TaskSinkAssignment, ProtocolError> {
     use novarocks_local_program::StaticSinkProgram;
     let path = FieldPath::root("fragment_package").field("sink");
-    if matches!(
-        sink,
-        StaticSinkProgram::MultiCastDataStream { .. } | StaticSinkProgram::SplitDataStream { .. }
-    ) {
+    if matches!(sink, StaticSinkProgram::SplitDataStream { .. }) {
         return Err(error(
             path,
             ProtocolErrorKind::InvalidValue,
-            "compiled multicast and split sinks are not executable yet",
+            "compiled split sinks are not executable yet",
+        ));
+    }
+    if let StaticSinkProgram::MultiCastDataStream { branches } = sink {
+        if multicast_edges.is_empty() || multicast_edges.len() != branches.len() {
+            return Err(error(
+                path,
+                ProtocolErrorKind::InconsistentFields,
+                "multicast sink branches differ from the frozen physical edges",
+            ));
+        }
+        for (index, edge) in multicast_edges.iter().enumerate() {
+            let expected = ExchangeEdgeId::from_physical_ordinal(edge.get()).ok_or_else(|| {
+                error(
+                    path.clone(),
+                    ProtocolErrorKind::InvalidValue,
+                    "multicast physical edge cannot be represented in the task topology",
+                )
+            })?;
+            if sink_edge_ids.get(index).copied() != Some(expected.get()) {
+                return Err(error(
+                    task_sink_edge_ids_path().index(index),
+                    ProtocolErrorKind::InconsistentFields,
+                    "assigned edge differs from the frozen multicast branch",
+                ));
+            }
+        }
+    } else if !multicast_edges.is_empty() {
+        return Err(error(
+            path,
+            ProtocolErrorKind::InconsistentFields,
+            "frozen physical multicast edges require a compiled multicast sink",
         ));
     }
     let expected = sink
@@ -178,7 +225,6 @@ mod tests {
     use novarocks_execution_contract::task_execution::descriptor::{
         ExchangeDestination, RuntimeEndpoint,
     };
-    use novarocks_execution_contract::task_execution::domain::ExchangeEdgeId;
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -556,6 +602,133 @@ mod tests {
                 .contains("partitioning disagrees with its assigned edge")
         );
     }
+
+    #[test]
+    fn multicast_projection_is_bound_to_its_own_destination_group() {
+        use novarocks_local_program::{
+            ProgramOutputRole, StaticSinkProgram, StaticStreamBranch, StaticStreamContract,
+            StaticStreamRouting,
+        };
+        use novarocks_types::SlotId;
+
+        let execution = execution();
+        let node = FragmentNodeId::new(9);
+        let partitioning = DataStreamPartitionType::Unpartitioned;
+        let destination = |stage, key| {
+            ExchangeDestination::new(
+                TaskIdentity::new(
+                    execution,
+                    StageId::new(stage).unwrap(),
+                    TaskId::new(1).unwrap(),
+                    BackendProcessId::new_v7(),
+                ),
+                UniqueId::new(key, 1),
+                RuntimeEndpoint::new("be.local", 8060).unwrap(),
+                node,
+            )
+        };
+        let left = destination(2, 51);
+        let right = destination(3, 79);
+        let edge = |id, destination, sender| {
+            ExchangeEdge::try_new(
+                ExchangeEdgeId::new(id).unwrap(),
+                node,
+                partitioning,
+                vec![destination],
+                sender,
+                NonZeroU32::new(3).unwrap(),
+            )
+            .unwrap()
+        };
+        let topology = ExchangeTopology::try_new(
+            vec![edge(3, right.clone(), 2), edge(10, left.clone(), 1)],
+            vec![],
+        )
+        .unwrap();
+        let branch = |slot| {
+            StaticStreamBranch::try_new(
+                node.get(),
+                partitioning,
+                vec![],
+                vec![SlotId::new(slot)],
+                None,
+                StaticStreamContract {
+                    role: ProgramOutputRole::Relational,
+                    delivery:
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                    routing: StaticStreamRouting::Ordinary,
+                },
+            )
+            .unwrap()
+        };
+        let sink = StaticSinkProgram::try_multicast(vec![branch(1), branch(0)], &[]).unwrap();
+        let edges = [9, 2].map(EdgeId::new);
+        let assignment = compiled_task_sink_assignment_with_multicast_edges(
+            &sink,
+            &[],
+            &edges,
+            &[10, 3],
+            SOURCE,
+            &topology,
+        )
+        .unwrap();
+        let TaskSinkAssignment::DestinationGroups { groups, .. } = assignment else {
+            panic!("one distinct destination group per multicast projection");
+        };
+        assert_eq!(groups.len(), 2);
+        for ((branch, group), (slot, destination, sender)) in sink
+            .branches()
+            .iter()
+            .zip(&groups)
+            .zip([(1, left, 1), (0, right, 2)])
+        {
+            assert_eq!(branch.output_columns(), &[SlotId::new(slot)]);
+            let [actual] = group.as_slice() else {
+                panic!("expected exactly one frozen destination");
+            };
+            assert_eq!(actual.task_identity(), Some(destination.task()));
+            assert_eq!(*actual.task_key(), destination.task_key());
+            assert_eq!(actual.source_task_key(), SOURCE);
+            assert_eq!(
+                (actual.sender_ordinal(), actual.sender_count()),
+                (sender, 3)
+            );
+        }
+        let extra = compiled_task_sink_assignment_with_multicast_edges(
+            &sink,
+            &[],
+            &edges,
+            &[10, 3, 7],
+            SOURCE,
+            &topology,
+        )
+        .expect_err("the existing binding still owns coverage after the multicast prefix");
+        assert!(extra.detail().contains("exactly once"));
+        let unproved = compiled_task_sink_assignment(&sink, &[], &[10, 3], SOURCE, &topology)
+            .expect_err("multicast requires its package-owned physical branch identities");
+        assert!(unproved.detail().contains("frozen physical edges"));
+    }
+
+    #[test]
+    fn split_remains_unavailable_through_native_sink_binding() {
+        let stream = compiled_stream(9, DataStreamPartitionType::Unpartitioned);
+        let split = novarocks_local_program::StaticSinkProgram::SplitDataStream {
+            branches: stream.branches().to_vec().into(),
+            split_exprs: [].into(),
+            fanout: false,
+        };
+        let err = compiled_task_sink_assignment(
+            &split,
+            &[],
+            &[3],
+            SOURCE,
+            &one_edge_topology(DataStreamPartitionType::Unpartitioned),
+        )
+        .expect_err("split keeps its named capability refusal");
+        assert_eq!(err.kind(), &ProtocolErrorKind::InvalidValue);
+        assert_eq!(err.detail(), "compiled split sinks are not executable yet");
+    }
+
     #[test]
     fn compiled_stream_requires_exactly_one_assigned_edge() {
         for ids in [vec![], vec![3, 3], vec![0], vec![7]] {
