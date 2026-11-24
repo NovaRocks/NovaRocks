@@ -42,10 +42,9 @@ CREATE TABLE ${case_db}.struct_test (
 
 -- query 3
 -- @skip_result_check=true
--- NovaRocks rejects the invalid insert with a field-count specific
--- diagnostic (4 row literals vs. a 2-field STRUCT column). The distributed
--- Iceberg sink validates this after inserting target CASTs into the write plan.
--- @expect_error=CAST STRUCT field count mismatch
+-- Assignment analysis rejects a four-field ROW for the two-field target.
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+-- @expect_error=[sql.analyze.type_mismatch] Cannot assign Struct
 INSERT INTO ${case_db}.struct_test (pk, s0) VALUES ROW(7, row(3, '', null, null));
 
 -- query 4

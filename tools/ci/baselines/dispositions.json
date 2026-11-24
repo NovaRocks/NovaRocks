@@ -1530,9 +1530,9 @@
     },
     {
       "unit": "sql-case:join/join_struct_type",
-      "reason": "The original negative oracle at statement3 is masked by the named selected-carrier refusal sql.analyze.unavailable_implementation for builtin.scalar/row/dynamic-v1. The expected-error assertion really fails. D0-6 does not authorize a known-failure match or reordering error precedence; retain this raw failure until the named family restores the capability.",
-      "owner": "UEA-5E B7",
-      "exit_condition": "UEA-5E B7 restores builtin.scalar/row/dynamic-v1; rerun this original complete native1FE+3BE case with all original result, expected-error, fault, lifecycle and cleanup assertions passing, then remove this quarantine.",
+      "reason": "D0-6 originally preserved the missing ROW constructor refusal at statement 3 and its masked wrong-field-count assertion. B7a restores construction. The same four-field input for the two-field target now returns TYPE_MISMATCH during assignment analysis, matching the Trino 484 reference. The original 1FE+3BE scenario then stops at statement 4 with sql.analyze.unsupported_expression for a non-NULL ROW child conversion from VARCHAR(2) to VARCHAR. Preserve all remaining result and error assertions and the raw earlier failures.",
+      "owner": "UEA-5E B7e",
+      "exit_condition": "B7e delivers the exact ROW child conversion and applicable ordinary composite predicates. Rerun the complete original native 1FE+3BE case with its wrong-field-count assertion, all remaining result and error assertions and actual lifecycle cleanup passing, then remove this quarantine.",
       "review_by": "2026-12-15"
     },
     {
