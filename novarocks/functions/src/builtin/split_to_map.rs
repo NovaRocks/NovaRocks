@@ -156,7 +156,9 @@ fn split_row<'a>(
     if pair_delimiter.is_empty() {
         return Ok(Err("keyValueDelimiter is empty"));
     }
-    if entry_delimiter == pair_delimiter {
+    if entry_delimiter.len() == pair_delimiter.len()
+        && split_once_observed(entry_delimiter, pair_delimiter, work)?.is_some()
+    {
         return Ok(Err(
             "entryDelimiter and keyValueDelimiter must not be the same",
         ));
@@ -164,12 +166,16 @@ fn split_row<'a>(
     let mut pairs = Vec::new();
     let mut keys = HashSet::new();
     let invalid_entry = "Key-value delimiter must appear exactly once in each entry";
-    for entry in input.split_terminator(entry_delimiter) {
+    let mut remaining = input;
+    while !remaining.is_empty() {
         work.step()?;
-        let Some((key, value)) = entry.split_once(pair_delimiter) else {
+        let (entry, tail) =
+            split_once_observed(remaining, entry_delimiter, work)?.unwrap_or((remaining, ""));
+        remaining = tail;
+        let Some((key, value)) = split_once_observed(entry, pair_delimiter, work)? else {
             return Ok(Err(invalid_entry));
         };
-        if value.contains(pair_delimiter) {
+        if split_once_observed(value, pair_delimiter, work)?.is_some() {
             return Ok(Err(invalid_entry));
         }
         keys.try_reserve(1)
@@ -183,6 +189,20 @@ fn split_row<'a>(
         pairs.push((key, value));
     }
     Ok(Ok(pairs))
+}
+
+fn split_once_observed<'a>(
+    text: &'a str,
+    delimiter: &str,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<Option<(&'a str, &'a str)>, KernelFailure> {
+    let found = crate::string_split_part_core::find_subslice_observed(
+        text.as_bytes(),
+        delimiter.as_bytes(),
+        || work.step(),
+    )?;
+    // A nonempty UTF-8 delimiter begins at a UTF-8 codepoint boundary.
+    Ok(found.map(|offset| (&text[..offset], &text[offset + delimiter.len()..])))
 }
 
 fn append_pair(
@@ -202,4 +222,51 @@ fn append_pair(
     keys.append_value(key);
     values.append_value(value);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ObserveScan {
+        cancel_at_quantum: bool,
+    }
+    impl KernelEvaluationControl for ObserveScan {
+        fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+            if self.cancel_at_quantum && units == crate::MAX_UNOBSERVED_KERNEL_WORK {
+                return Err(KernelFailure::Cancelled);
+            }
+            Ok(())
+        }
+
+        fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+            panic!("literal delimiter search does not wait");
+        }
+    }
+
+    #[test]
+    fn split_to_map_checks_control_while_scanning_one_long_entry() {
+        let text = "x".repeat(4096);
+        let mut work = EvaluationCheckpoints::new(&ObserveScan {
+            cancel_at_quantum: true,
+        });
+        assert!(matches!(
+            split_row(&text, ",", ":", &mut work),
+            Err(KernelFailure::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn split_to_map_preserves_text_slices_with_utf8_delimiters_and_trailing_entry_separator() {
+        let mut work = EvaluationCheckpoints::new(&ObserveScan {
+            cancel_at_quantum: false,
+        });
+        let text = "甲：α※乙：※";
+        let pairs = split_row(text, "※", "：", &mut work).unwrap().unwrap();
+        assert_eq!(pairs, vec![("甲", "α"), ("乙", "")]);
+        assert!(matches!(
+            split_row("甲：α※※", "※", "：", &mut work),
+            Ok(Err(_))
+        ));
+    }
 }

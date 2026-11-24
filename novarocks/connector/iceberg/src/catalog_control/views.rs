@@ -1635,12 +1635,10 @@ mod declaration_tests {
         };
         let context = request().context;
         let anonymous = prepare_definition(&declared(""), None, &[], &context)
-            .err()
-            .expect("anonymous ROW field is rejected");
+            .expect_err("anonymous ROW field is rejected");
         assert_eq!(anonymous.kind(), ConnectorErrorKind::Unsupported);
         let duplicate = prepare_definition(&declared("entry"), None, &[], &context)
-            .err()
-            .expect("duplicate ROW field is rejected");
+            .expect_err("duplicate ROW field is rejected");
         assert_eq!(
             duplicate.failure_fact(),
             FailureFact::new(
