@@ -3,19 +3,11 @@
 use super::{AstBox, AstVec, Expr, Fold, Ident, Query, SyntaxEq, Table, Visit};
 use crate::Span;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TrinoInsertMode {
-    Into,
-    Overwrite,
-    OverwritePartitions,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrinoInsert {
     pub table: Table,
     pub columns: Option<Vec<Ident>>,
     pub query: AstBox<Query>,
-    pub mode: TrinoInsertMode,
     pub span: Span,
 }
 
@@ -116,8 +108,7 @@ pub fn fold_trino_update_assignment<F: Fold + ?Sized>(
 
 impl SyntaxEq for TrinoInsert {
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.mode == other.mode
-            && self.table.syntax_eq(&other.table)
+        self.table.syntax_eq(&other.table)
             && self.query.syntax_eq(&other.query)
             && match (&self.columns, &other.columns) {
                 (None, None) => true,

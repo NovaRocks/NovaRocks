@@ -1372,7 +1372,7 @@ fn application_document_begin_request(
         catalog_session: Default::default(),
         table: Arc::from("db.t"),
         target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-        intent: novarocks_spi::connector::ConnectorWriteIntent::Overwrite,
+        intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
         purpose: novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
         input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
             fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(

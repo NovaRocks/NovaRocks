@@ -1,0 +1,36 @@
+-- query 5
+-- types	bigint	bigint
+id	value
+1	10
+2	20
+3	30
+4	40
+
+-- query 9
+-- types	bigint	bigint	bigint
+id	value	new_value
+1	10	NULL
+2	20	NULL
+3	30	NULL
+5	50	NULL
+
+-- query 13
+-- types	bigint	bigint
+id	value
+1	10
+2	20
+3	30
+
+-- query 17
+-- types	bigint	bigint
+id	value
+8	80
+
+-- query 21
+-- types	bigint	bigint
+id	value
+1	10
+2	20
+3	30
+5	50
+6	60

@@ -325,15 +325,12 @@ pub use semantic_revision::{
     MAX_CONNECTOR_SEMANTIC_FACT_FORMAT_BYTES, MAX_CONNECTOR_SEMANTIC_FACT_VALUE_BYTES,
 };
 pub use staged_create::{
-    CONNECTOR_CTAS_UNANCHORED_CLEANUP_CONTRACT_VERSION, CONNECTOR_STAGED_CREATE_CONTRACT_VERSION,
-    ConnectorCtasUnanchoredCleanupOutcome, ConnectorCtasUnanchoredCleanupRequest,
-    ConnectorCtasUnanchoredDiscoveryRequest, ConnectorCtasUnanchoredProvenance,
-    ConnectorPreparedCreateDocumentTarget, ConnectorPreparedCreateFieldBinding,
-    ConnectorStagedCreate, ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
-    ConnectorStagedCreateMode, ConnectorStagedCreateNeededCommitted,
-    ConnectorStagedCreateOperationId, ConnectorStagedCreatePrepareOutcome,
-    ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublication,
-    ConnectorStagedCreatePublicationAdjudicationOutcome,
+    CONNECTOR_STAGED_CREATE_CONTRACT_VERSION, ConnectorPreparedCreateDocumentTarget,
+    ConnectorPreparedCreateFieldBinding, ConnectorStagedCreate, ConnectorStagedCreateAbortOutcome,
+    ConnectorStagedCreateAbortRequest, ConnectorStagedCreateMode,
+    ConnectorStagedCreateNeededCommitted, ConnectorStagedCreateOperationId,
+    ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
+    ConnectorStagedCreatePublication, ConnectorStagedCreatePublicationAdjudicationOutcome,
     ConnectorStagedCreatePublicationAdjudicationRequest,
     ConnectorStagedCreatePublicationObservation, ConnectorStagedCreatePublicationPayload,
     ConnectorStagedCreatePublicationReceiving, ConnectorStagedCreatePublicationRecorder,
@@ -342,8 +339,7 @@ pub use staged_create::{
     ConnectorStagedCreateReceiptPhase, ConnectorStagedCreateSession, ConnectorStagedCtasProperties,
     ConnectorStagedMvStorageProperties, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
-    ConnectorStagedWriteProof, ConnectorUnanchoredCtasCleanup,
-    ConnectorUnanchoredCtasCleanupSession,
+    ConnectorStagedWriteProof,
 };
 pub use statistics::{
     AsyncStatisticsCollectionSession, AsyncStatisticsCollectionStart, ConnectorStatistics,

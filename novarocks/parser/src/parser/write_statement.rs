@@ -3,15 +3,14 @@
 use super::{GrammarError, Parser};
 use crate::Span;
 use crate::ast::{
-    AstBox, Expr, Table, TrinoDelete, TrinoInsert, TrinoInsertMode, TrinoUpdate,
-    TrinoUpdateAssignment,
+    AstBox, Expr, Table, TrinoDelete, TrinoInsert, TrinoUpdate, TrinoUpdateAssignment,
 };
-use crate::token::{Keyword, Symbol, TokenKind};
+use crate::token::{Keyword, Symbol};
 
 impl Parser<'_> {
     pub(super) fn parse_insert_statement(&mut self) -> Result<TrinoInsert, GrammarError> {
         let start = self.expect_keyword(Keyword::Insert)?;
-        let mode = self.parse_insert_mode()?;
+        self.expect_keyword(Keyword::Into)?;
         let table = self.parse_write_statement_target(start)?;
         // After the opening parenthesis, a column name is an identifier and a
         // root query starts with a reserved query keyword or another parenthesis.
@@ -26,7 +25,6 @@ impl Parser<'_> {
             columns,
             span: self.span_since(start),
             query,
-            mode,
         })
     }
 
@@ -57,32 +55,6 @@ impl Parser<'_> {
             predicate,
             span: self.span_since(start),
         })
-    }
-
-    fn parse_insert_mode(&mut self) -> Result<TrinoInsertMode, GrammarError> {
-        if self.eat_keyword(Keyword::Into).is_some() {
-            return Ok(TrinoInsertMode::Into);
-        }
-        // OVERWRITE is contextual to the two approved insert extensions.
-        let token = self.peek(0);
-        if token.kind != TokenKind::Identifier
-            || !self.source[token.span.start()..token.span.end()].eq_ignore_ascii_case("OVERWRITE")
-        {
-            return Err(self.error("INTO or OVERWRITE"));
-        }
-        self.bump();
-        // PARTITIONS is also a target identifier. The extension introducer
-        // requires INTO or a target name after it.
-        let mode = if self.at_keyword(Keyword::Partitions)
-            && (self.is_identifier(1) || self.peek(1).kind == TokenKind::Keyword(Keyword::Into))
-        {
-            self.bump();
-            TrinoInsertMode::OverwritePartitions
-        } else {
-            TrinoInsertMode::Overwrite
-        };
-        self.eat_keyword(Keyword::Into);
-        Ok(mode)
     }
 
     pub(super) fn parse_write_statement_target(

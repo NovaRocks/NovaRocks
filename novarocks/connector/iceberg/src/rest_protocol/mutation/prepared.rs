@@ -280,10 +280,15 @@ impl PreparedRestOutcome {
             RestEvidence::NotDispatched { kind, .. } => DispatchEvidence::NotDispatched {
                 failure: ConnectorMutationFailure::new(*kind, self.evidence.message()),
             },
-            RestEvidence::Rejected { kind, .. } => DispatchEvidence::Rejected {
-                failure: ConnectorMutationFailure::new(*kind, self.evidence.message()),
-                observation,
-            },
+            RestEvidence::Rejected { .. } | RestEvidence::RejectedStagedTableExists(_) => {
+                DispatchEvidence::Rejected {
+                    failure: self
+                        .evidence
+                        .failure()
+                        .expect("REST rejection carries a failure"),
+                    observation,
+                }
+            }
             RestEvidence::Unknown { diagnosis } => DispatchEvidence::Unknown {
                 failure: ConnectorMutationFailure::new(
                     if matches!(

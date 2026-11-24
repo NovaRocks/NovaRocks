@@ -1,5 +1,5 @@
 -- query 2
--- types	varchar	bigint	bigint
+-- types	varchar(6)	bigint	bigint
 ref_name	row_count	metric_sum
 backup	2	30
 main	3	60

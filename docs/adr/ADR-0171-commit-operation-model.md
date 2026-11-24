@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0262
+    scope: "Application of a writer schema assertion and old head dependency to ordinary INSERT; its writer prerequisite is the exact default partition spec."
+    link: "ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md"
   - id: ADR-0251
     scope: "RefUnchanged for OPTIMIZE and main-branch TRUNCATE, and the retired distributed DV rewrite commit path"
     link: "ADR-0251-iceberg-maintenance-commits-by-operation.md"

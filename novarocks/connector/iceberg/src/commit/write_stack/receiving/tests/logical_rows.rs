@@ -18,14 +18,14 @@
 //! Observes the sealed receiving mode and validates its logical row projection.
 
 use super::*;
-use crate::commit::write_stack::tests::{logical_final_delete, project_managed_rows_fixture};
+use crate::commit::write_stack::tests::{logical_final_delete, project_prepared_managed_rows};
 use novarocks_spi::connector::ConnectorManagedPublicationTechnique;
 use novarocks_spi::connector::write_stack::{
     ConnectorManagedPublicationShape, ConnectorWriteRowChange,
 };
 
 #[test]
-fn incremental_compact_rows_match_the_original_materialized_projection() {
+fn incremental_rows_preserve_inserted_and_newly_deleted_counts() {
     let target = |ordinal| WriteTargetOrdinal::try_new(ordinal).unwrap();
     let records = vec![
         (target(0), data_fragment("s3://b/new.parquet")),
@@ -39,18 +39,12 @@ fn incremental_compact_rows_match_the_original_materialized_projection() {
             logical_final_delete("s3://b/old-b.parquet", 4, 4, None).unwrap(),
         ),
     ];
-    let project = |use_full_inventory| {
-        project_managed_rows_fixture(
-            ConnectorManagedPublicationTechnique::Incremental,
-            ConnectorManagedPublicationShape::RowMutation,
-            records.clone(),
-            use_full_inventory,
-        )
-        .unwrap()
-    };
-    let (compact, rows) = project(false);
-    assert!(compact);
-    assert_eq!(rows, project(true).1);
+    let rows = project_prepared_managed_rows(
+        ConnectorManagedPublicationTechnique::Incremental,
+        ConnectorManagedPublicationShape::RowMutation,
+        records,
+    )
+    .unwrap();
     assert_eq!(
         rows,
         Some(ConnectorWriteRowChange::Delta {
@@ -61,17 +55,15 @@ fn incremental_compact_rows_match_the_original_materialized_projection() {
 }
 
 #[test]
-fn metadata_only_selects_compact_and_full_refresh_selects_whole_receiving() {
+fn metadata_only_and_full_refresh_use_compact_receiving() {
     let shape = ConnectorManagedPublicationShape::Data;
     let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
-    let (compact, rows) = project_managed_rows_fixture(
+    let rows = project_prepared_managed_rows(
         ConnectorManagedPublicationTechnique::MetadataOnly,
         shape,
         Vec::new(),
-        false,
     )
     .unwrap();
-    assert!(compact);
     assert_eq!(
         rows,
         Some(ConnectorWriteRowChange::Delta {
@@ -79,13 +71,11 @@ fn metadata_only_selects_compact_and_full_refresh_selects_whole_receiving() {
             deleted: 0
         })
     );
-    let (compact, rows) = project_managed_rows_fixture(
+    let rows = project_prepared_managed_rows(
         ConnectorManagedPublicationTechnique::Full,
         shape,
         vec![(ordinal, data_fragment("s3://b/replaced.parquet"))],
-        false,
     )
     .unwrap();
-    assert!(!compact);
     assert_eq!(rows, Some(ConnectorWriteRowChange::Replace(5)));
 }

@@ -176,8 +176,6 @@ pub struct DmlEnginePorts {
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     connector_runtime: tokio::runtime::Handle,
-    lake_publication_runtime_policy:
-        novarocks_query_application::publication::LakePublicationRuntimePolicy,
     state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
     write_runtime: Option<(
         crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
@@ -200,7 +198,6 @@ impl DmlEnginePorts {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         connector_runtime: tokio::runtime::Handle,
-        lake_publication_runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
         view_service: Arc<dyn ViewService>,
@@ -224,7 +221,6 @@ impl DmlEnginePorts {
             connector_runtime,
             write_runtime: None,
             state_store: None,
-            lake_publication_runtime_policy,
         }
     }
 
@@ -263,7 +259,6 @@ impl DmlEnginePorts {
             Arc::clone(&self.mv_storage_observation),
             Arc::clone(&self.mv_readiness),
         )
-        .with_lake_publication_runtime_policy(self.lake_publication_runtime_policy)
         .with_connector_runtime(self.connector_runtime.clone())
         .with_state_store_original(self.state_store.clone());
         match &self.write_runtime {

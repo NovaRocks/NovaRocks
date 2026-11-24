@@ -1,5 +1,5 @@
 -- query 3
--- types	varchar	bigint	bigint	bigint
+-- types	varchar(12)	bigint	bigint	bigint
 first_write	total_rows	assigned_rows	unique_rows
-empty-append	4	4	4
+empty-insert	4	0	0
 insert	5	5	5

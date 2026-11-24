@@ -43,10 +43,10 @@ pub(crate) mod model;
 pub mod mv_publication_fence;
 pub mod mv_refresh_ref;
 mod new_manifests;
+pub(crate) use new_manifests::PendingNewFiles;
 pub(crate) use new_manifests::{RegisteredFile, RegisteredNewFiles, RegisteredPaths};
 pub(crate) mod operation;
 pub(crate) mod overwrite;
-mod overwrite_partitions;
 pub(crate) mod partition_key;
 pub mod position_delete_writer;
 pub(crate) mod preparation;
@@ -103,12 +103,8 @@ pub use types::{CommitOpKind, WrittenFile};
 pub use validation::{
     ensure_column_id_not_regressed, ensure_default_sort_order_resolvable,
     ensure_equality_delete_single_partition_spec, ensure_iceberg_write_supported,
-    ensure_iceberg_write_supported_from_metadata, ensure_no_equality_deletes,
-    ensure_overwrite_single_partition_spec, ensure_partition_id_not_regressed,
+    ensure_iceberg_write_supported_from_metadata, ensure_partition_id_not_regressed,
     ensure_single_partition_spec, match_select_schema_to_table,
     row_mutation_strategy_from_metadata,
 };
 pub use write_control::IcebergWriteControl;
-
-pub(crate) use data_file::from_written_file as frozen_data_file_from_written;
-pub(crate) use fast_append::FastAppendPreparer;

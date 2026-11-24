@@ -6,6 +6,9 @@ status: active
 supersedes: [ADR-0032, ADR-0035, ADR-0036, ADR-0037, ADR-0046, ADR-0054, ADR-0064, ADR-0068, ADR-0070]
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0262
+    scope: "CTAS placement in an unanchored staging namespace, age-gated scans of that namespace, and the cross-statement lake publication deadline."
+    link: "ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md"
   - id: ADR-0246
     scope: "Repeating ADD FILES duplicate validation on every refreshed base"
     link: "ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md"

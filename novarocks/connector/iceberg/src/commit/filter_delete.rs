@@ -71,6 +71,7 @@ enum Selection {
 /// Selection is always derived from B. The operation intent owns the protocol label.
 pub(crate) struct FilterDeletePreparer {
     selection: Selection,
+    full_refresh: bool,
 }
 
 impl FilterDeletePreparer {
@@ -78,18 +79,21 @@ impl FilterDeletePreparer {
     fn new(filter: Predicate, judge: Arc<dyn RowFilterJudge>) -> Self {
         Self {
             selection: Selection::Scripted(filter, judge),
+            full_refresh: false,
         }
     }
 
     pub(crate) fn always_true() -> Self {
         Self {
             selection: Selection::AllRows,
+            full_refresh: false,
         }
     }
 
     pub(crate) fn for_condition(fact: Arc<IcebergDeleteConditionFact>) -> Self {
         Self {
             selection: Selection::Condition(fact),
+            full_refresh: false,
         }
     }
 
@@ -126,6 +130,13 @@ impl FilterDeletePreparer {
             Selection::Scripted(filter, _) => filter.to_string(),
         }
     }
+
+    pub(crate) fn for_full_refresh() -> Self {
+        Self {
+            full_refresh: true,
+            ..Self::always_true()
+        }
+    }
 }
 
 #[async_trait]
@@ -136,7 +147,9 @@ impl Preparer for FilterDeletePreparer {
         intent: &OperationIntent,
     ) -> Result<PreparedChange> {
         let metadata = view.metadata();
-        if !intent.changes().added.is_empty() || !intent.changes().removed.is_empty() {
+        if (!self.full_refresh && !intent.changes().added.is_empty())
+            || !intent.changes().removed.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 "Filtered delete cannot include explicit file changes",
@@ -245,6 +258,7 @@ impl Preparer for FilterDeletePreparer {
             snapshot_id,
             manifests,
             &removed,
+            self.full_refresh,
         )
         .await
     }

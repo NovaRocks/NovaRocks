@@ -622,7 +622,7 @@ fn require_absent_table(control: &mut SqlSession, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn staged_ctas_objects(fixture: &Fixture, start: usize) -> Vec<String> {
+fn ctas_parquet_puts(fixture: &Fixture, start: usize) -> Vec<String> {
     fixture.proxy.events()[start..]
         .iter()
         .filter(|event| {
@@ -1106,25 +1106,25 @@ fn native_writes(
         "failed CTAS did not reach the original root fault"
     );
     await_resource_convergence(context, &baseline, "failed managed CTAS")?;
-    let sealed = staged_ctas_objects(fixture, before_ctas)
+    let unconfirmed_writer_output = ctas_parquet_puts(fixture, before_ctas)
         .into_iter()
         .map(|path| -> Result<_> {
             let uri = object_uri(&path);
             let digest = object_digest(fixture, runtime, &uri)
-                .context("root-prefix failure must retain the sealed CTAS object")?;
+                .context("an unconfirmed Root prefix must retain the writer-sealed CTAS object")?;
             Ok((uri, digest))
         })
         .collect::<Result<Vec<_>>>()?;
     ensure!(
-        !sealed.is_empty(),
-        "faulted CTAS did not create an actual staged object"
+        !unconfirmed_writer_output.is_empty(),
+        "faulted CTAS did not create an actual Parquet object"
     );
     require_absent_table(&mut sql, "failed_ctas")?;
 
     let before_cancel = fixture.proxy.events().len();
     cancel_ctas(context, observations)?;
     await_resource_convergence(context, &baseline, "canceled managed CTAS")?;
-    let canceled_staged = staged_ctas_objects(fixture, before_cancel);
+    let canceled_staged = ctas_parquet_puts(fixture, before_cancel);
     for path in &canceled_staged {
         ensure!(
             !fixture.rest.object_exists(&object_uri(path))?,
@@ -1176,17 +1176,17 @@ fn native_writes(
         "native follow-up INSERT did not preserve prior committed rows"
     );
     await_resource_convergence(context, &baseline, "managed output native writes")?;
-    for (uri, expected) in &sealed {
+    for (uri, expected) in &unconfirmed_writer_output {
         ensure!(
             object_digest(fixture, runtime, uri)? == *expected,
-            "sealed CTAS bytes changed before original fixture cleanup"
+            "writer output from the unconfirmed CTAS prefix changed before fixture cleanup"
         );
     }
 
     std::fs::write(
         fixture.root.join("managed-output-native.json"),
         serde_json::to_vec_pretty(
-            &json!({"insert_lost_ack":{"sha256":digest,"http":insert_events},"ctas_sealed_objects":sealed,"canceled_ctas_cleaned_objects":canceled_staged,"dv_conditional_puts":dv_puts,"final_rows":[1,4,5]}),
+            &json!({"insert_lost_ack":{"sha256":digest,"http":insert_events},"ctas_sealed_objects":unconfirmed_writer_output,"canceled_ctas_cleaned_objects":canceled_staged,"dv_conditional_puts":dv_puts,"final_rows":[1,4,5]}),
         )?,
     )?;
     Ok(())

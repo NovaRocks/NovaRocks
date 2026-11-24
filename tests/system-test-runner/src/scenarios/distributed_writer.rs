@@ -86,7 +86,7 @@ const ROOT_PEAK: &str = "novarocks_backend_connector_write_root_prepared_set_pea
 const RESULT_TERMINALS: &str = "novarocks_backend_task_result_terminals_total";
 const WRITER_PARTIAL_TOTALS: &str = "novarocks_table_writer_partial_totals";
 
-/// `LakePublicationFamily::Write` — INSERT and INSERT OVERWRITE.
+/// `LakePublicationFamily::Write` — INSERT.
 const WRITE_FAMILY: &str = "write";
 /// `LakePublicationFamily::DataMutation` — DELETE, UPDATE and MERGE.
 const MUTATION_FAMILY: &str = "data_mutation";
@@ -128,7 +128,6 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(DistributedWriterDataflow),
         Box::new(DistributedWriterConcurrentProgress::default()),
         Box::new(DistributedStatisticsDataflow),
-        Box::new(DistributedWriterOverwrite),
         Box::new(DistributedWriterRowLevel::default()),
         Box::new(DistributedWriterRowLevel::small_slots()),
         Box::new(DistributedWriterFaults::default()),
@@ -2097,153 +2096,6 @@ fn assert_every_backend_accepted_task(
         );
     }
     Ok(delta)
-}
-
-/// The same dataflow claims for a full-table overwrite.
-///
-/// An overwrite is the statement most likely to be special-cased into "delete
-/// then append", so it gets its own end-to-end evidence that it distributes,
-/// aggregates on one root, and publishes one snapshot.
-struct DistributedWriterOverwrite;
-
-impl Scenario for DistributedWriterOverwrite {
-    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
-        crate::scenarios::declarations::for_module(
-            "distributed_writer",
-            self.name(),
-            self.is_explicit_stage(),
-            self.is_compatibility_stage(),
-        )
-    }
-
-    fn name(&self) -> &'static str {
-        "connector/distributed-writer-overwrite"
-    }
-
-    fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
-    }
-
-    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        require_three_backends(context)?;
-        let expected_dop = require_multi_driver_host()?;
-        let baseline = resource_baseline(context)?;
-        let user = context.sql_user().to_owned();
-        let port = context.trino_port();
-        context.remaining("connect distributed overwrite control session")?;
-        let mut control = SqlSession::new(&user, port, context.deadline())?;
-
-        const CATALOG: &str = "distributed_overwrite";
-        const DATABASE: &str = "distributed_overwrite_db";
-        const SOURCE: &str = "distributed_overwrite_source";
-        const TABLE: &str = "distributed_overwrite_data";
-        let target = format!("{CATALOG}.{DATABASE}.{TABLE}");
-
-        context.action("seed one committed source file per backend and a stale target");
-        seed_source_files(
-            context,
-            &mut control,
-            CATALOG,
-            DATABASE,
-            SOURCE,
-            "distributed-writer-overwrite",
-        )?;
-        control
-            .execute(format!(
-                "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT)"
-            ))
-            .context("create distributed overwrite table")?;
-        // The stale content the overwrite must replace. It is written at one
-        // driver so it, like the seeding writes, leaves a one-entry root peak.
-        control
-            .execute(format!(
-                "INSERT INTO {target} SELECT sequential_number FROM TABLE(sequence(1, 7))"
-            ))
-            .context("seed the distributed overwrite target with stale rows")?;
-
-        let before = all_write_counters(context)?;
-        let ceiling = peak_ceiling(&before);
-        let before_terminals = publication_terminals(context, WRITE_FAMILY)?;
-        let snapshots_before = snapshot_count(&mut control, &target)?;
-
-        context.action("replace the table through the distributed write dataflow");
-        control
-            .execute(format!(
-                "INSERT OVERWRITE {target} SELECT v FROM {CATALOG}.{DATABASE}.{SOURCE}"
-            ))
-            .context("distributed overwrite through the write dataflow")?;
-
-        let after = all_write_counters(context)?;
-        let after_terminals = publication_terminals(context, WRITE_FAMILY)?;
-        let delta = write_delta(&before, &after);
-
-        if delta.writing_backends.len() < 2 {
-            bail!(
-                "distributed overwrite opened writers on {} backend(s); before={before:?} \
-                 after={after:?}",
-                delta.writing_backends.len()
-            );
-        }
-        for &index in &delta.writing_backends {
-            let opens = delta.opens[index];
-            if (opens - expected_dop).abs() > f64::EPSILON {
-                bail!(
-                    "BE[{index}] opened {opens} overwrite writers for a plan running at DOP \
-                     {expected_dop}; opens={:?}",
-                    delta.opens
-                );
-            }
-        }
-        let root = identify_root(
-            &after,
-            ceiling,
-            delta.commit_fragments,
-            "distributed writer overwrite",
-        )?;
-        if !delta.writing_backends.iter().any(|&index| index != root) {
-            bail!(
-                "distributed overwrite aggregated on BE[{root}] and every writer ran there too; \
-                 writers={:?}",
-                delta.writing_backends
-            );
-        }
-        if (delta.rows - SEED_ROWS as f64).abs() > f64::EPSILON {
-            bail!(
-                "overwrite writers accepted {} rows; expected {SEED_ROWS}",
-                delta.rows
-            );
-        }
-
-        assert_committed_once(
-            before_terminals,
-            after_terminals,
-            "distributed writer overwrite",
-        )?;
-        let snapshots_after = snapshot_count(&mut control, &target)?;
-        if snapshots_after != snapshots_before + 1 {
-            bail!(
-                "distributed overwrite moved {target} from {snapshots_before} to \
-                 {snapshots_after} snapshots; one statement must publish exactly one"
-            );
-        }
-
-        // The stale rows are gone and only the overwritten relation remains.
-        let rows = row_count(&mut control, &target)?;
-        if rows != SEED_ROWS {
-            bail!("overwritten {target} has {rows} rows; expected {SEED_ROWS}");
-        }
-        let total = writer_optional_bigint(
-            &control
-                .execute(format!("SELECT SUM(v) FROM {target}"))
-                .context("read back the distributed overwrite")?,
-        )?;
-        if total != Some(SEED_SUM) {
-            bail!("distributed overwrite read back {total:?}; expected Some({SEED_SUM})");
-        }
-
-        await_resource_convergence(context, &baseline, "distributed writer overwrite")?;
-        Ok(())
-    }
 }
 
 /// Row-level mutations write more than one branch of one relation.

@@ -15,9 +15,7 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Test Point: Unsupported writes on evolved Iceberg partition specs fail fast
--- Method: evolve a partition spec, then verify INSERT OVERWRITE and ADD EQUALITY DELETE return clear unsupported errors
--- Scope: standalone Iceberg table DDL, unsupported write guards
+-- ADD EQUALITY DELETE refuses a table with an evolved partition spec.
 
 -- query 1
 -- @skip_result_check=true
@@ -32,14 +30,9 @@ ALTER TABLE ${case_db}.t_partition_evolution_unsupported SET PROPERTIES partitio
 ALTER TABLE ${case_db}.t_partition_evolution_unsupported SET PROPERTIES partitioning = ARRAY['bucket(user_id, 8)'];
 
 -- query 2
--- @expect_error=INSERT OVERWRITE on an evolved Iceberg table is not supported yet
-INSERT OVERWRITE ${case_db}.t_partition_evolution_unsupported
-SELECT * FROM ${case_db}.t_partition_evolution_unsupported;
-
--- query 3
 -- @expect_error=ADD EQUALITY DELETE on an evolved Iceberg table is not supported yet
 ALTER TABLE ${case_db}.t_partition_evolution_unsupported EXECUTE add_equality_delete(columns => ARRAY['id'], rows => ARRAY[ROW(1)]);
 
--- query 4
+-- query 3
 -- @skip_result_check=true
 DROP TABLE ${case_db}.t_partition_evolution_unsupported ;

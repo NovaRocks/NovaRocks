@@ -162,9 +162,9 @@ ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v2 EXECUTE drop_tag(name => 'kept_tag
 INSERT INTO ice_hms_${uuid0}.iru7_${uuid0}.v3 VALUES (4, 2, 'four');
 
 -- query 33
--- Overwrite
+-- Append from a query
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-INSERT OVERWRITE ice_hms_${uuid0}.iru7_${uuid0}.v3 SELECT * FROM ice_hms_${uuid0}.iru7_${uuid0}.v1;
+INSERT INTO ice_hms_${uuid0}.iru7_${uuid0}.v3 SELECT * FROM ice_hms_${uuid0}.iru7_${uuid0}.v1;
 
 -- query 34
 -- Position or vector row delta

@@ -615,6 +615,7 @@ impl IcebergReadBinding {
     /// binding is rebound to an admitted request. Callers use this only to
     /// defer optional startup capability probes; actual I/O must still call
     /// [`Self::resolve_access`] and therefore remains fail-closed.
+    #[cfg(test)]
     pub(crate) fn requires_request_storage_resolver(&self) -> bool {
         matches!(
             self.storage_access,

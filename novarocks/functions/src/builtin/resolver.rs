@@ -1499,8 +1499,41 @@ mod tests {
 
     #[test]
     fn resolve_now_returns_datetime_with_no_args() {
-        let r = resolve_scalar_function("now", &[]);
-        assert_eq!(r, Ok(DataType::Timestamp(TimeUnit::Microsecond, None)));
+        use crate::{FunctionBindingRequest, FunctionKind, FunctionResultType};
+        use novarocks_type_contract::{TemporalPrecision, TemporalType};
+
+        assert_eq!(
+            resolve_scalar_function("now", &[]),
+            Err(ResolveError::UnknownFunction)
+        );
+        let selected = super::super::catalogue::builtin_engine_function_catalog()
+            .resolve_bound_user(
+                "now",
+                FunctionKind::Scalar,
+                FunctionBindingRequest {
+                    arguments: &[],
+                    logical_argument_count: 0,
+                    expected_result_type: None,
+                },
+                crate::binding_test_control(),
+            )
+            .unwrap();
+        assert_eq!(selected.function_id.as_str(), "builtin.scalar/now/v1");
+        assert_eq!(
+            selected.selected.overload.as_str(),
+            "builtin.scalar/now/clock-v1"
+        );
+        assert!(selected.selected.argument_types.is_empty());
+        let FunctionResultType::Scalar(result) = selected.selected.result_type else {
+            panic!("now has a scalar result");
+        };
+        assert!(!result.nullable());
+        assert_eq!(
+            result.value_type().temporal(),
+            Some(TemporalType::TimestampWithTimeZone(
+                TemporalPrecision::DEFAULT
+            )),
+        );
     }
 
     #[test]

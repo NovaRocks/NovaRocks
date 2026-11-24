@@ -330,18 +330,18 @@ fn public_sql_map_lookup_rejects_a_probe_that_cannot_coerce_to_the_declared_key(
     use novarocks_sql::compiler::{SqlCompileError, SqlCompileProgressError};
 
     let probe = Arc::new(FoldProbe::default());
-    let error = compile_table_free(
-        "SELECT map_agg(CAST(1 AS INTEGER),'one')[1e0]",
-        session(Default::default(), true),
-        &probe.control(),
-    )
-    .unwrap_err();
+    let expression = "map_agg(CAST(1 AS INTEGER),'one')[1e0]";
+    let sql = format!("SELECT {expression}");
+    let error =
+        compile_table_free(&sql, session(Default::default(), true), &probe.control()).unwrap_err();
     let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = error else {
         panic!("expected a typed analysis error: {error}");
     };
     assert_eq!(error.kind(), AnalyzeErrorKind::UnknownFunction);
+    assert_eq!(error.code().as_str(), "sql.analyze.unknown_function");
     assert_eq!(error.message(), "no matching declared overload");
-    assert!(error.span().is_some());
+    let span = error.span().expect("the original MAP subscript has a span");
+    assert_eq!(&sql[span.start()..span.end()], expression);
 }
 
 #[test]

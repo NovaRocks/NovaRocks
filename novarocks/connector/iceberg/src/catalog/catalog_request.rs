@@ -390,6 +390,11 @@ impl CatalogPublicationRequest {
                     .entry("format-version".into())
                     .or_insert_with(|| (creation.format_version as u8).to_string());
                 let target = CatalogTableName::new(namespace.namespace, creation.name.clone());
+                let expectation = if stage_create {
+                    AttributionExpectation::stage_create(target.clone())
+                } else {
+                    AttributionExpectation::create_table()
+                };
                 let body = CreateTableRequest {
                     name: creation.name,
                     location: creation.location,
@@ -407,11 +412,7 @@ impl CatalogPublicationRequest {
                     }),
                     target.into(),
                     MutationRoute::CreateTable(ident),
-                    if stage_create {
-                        AttributionExpectation::stage_create()
-                    } else {
-                        AttributionExpectation::create_table()
-                    },
+                    expectation,
                     encode(&body)?,
                 )
             }

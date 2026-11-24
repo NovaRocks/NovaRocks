@@ -3300,7 +3300,6 @@ dependencies = [
  "novarocks-functions",
  "novarocks-proto-codec",
  "novarocks-proto-models",
- "novarocks-resource-contract",
  "novarocks-spi",
  "novarocks-test-support",
  "novarocks-type-contract",

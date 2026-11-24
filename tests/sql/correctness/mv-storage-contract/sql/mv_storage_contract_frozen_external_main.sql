@@ -63,7 +63,7 @@ print("MV_EXTERNAL_REQUEST_FROZEN", snapshot)
 
 -- query 4
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=2,slot-changes=0
+-- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=2,slot-changes=0,full-refreshes=2,full-refresh-last=true
 SET SESSION "mvfrozen_${uuid0}".incremental_refresh_enabled = false;
 REFRESH MATERIALIZED VIEW target_mv;
 RESET SESSION "mvfrozen_${uuid0}".incremental_refresh_enabled;
@@ -97,7 +97,7 @@ if actual == expected or f"expected id {expected} != {actual}" not in message:
     sys.exit(f"frozen main condition was not rejected: expected={expected}, actual={actual}, error={message}")
 if "uea7.frozen-external-main" in metadata["properties"]:
     sys.exit("stale external mutation changed target properties")
-if len(metadata["snapshots"]) != 2:
+if len(metadata["snapshots"]) != 4:
     sys.exit("stale external mutation changed target snapshot count")
 print("MV_FROZEN_EXTERNAL_REJECTED", expected, actual)
 ' \

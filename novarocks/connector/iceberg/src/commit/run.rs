@@ -413,6 +413,14 @@ mod keyed_publication_trace_tests {
     }
 
     async fn fixture_with_format(format_version: FormatVersion, row_lineage: bool) -> Fixture {
+        publication_fixture(format_version, row_lineage, false).await
+    }
+
+    async fn publication_fixture(
+        format_version: FormatVersion,
+        row_lineage: bool,
+        lose_reply: bool,
+    ) -> Fixture {
         let warehouse = tempfile::tempdir().expect("warehouse tempdir");
         let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
         let binding = {
@@ -476,12 +484,25 @@ mod keyed_publication_trace_tests {
         // admitted owner, independent of Hadoop's product document policy.
         let load_modes = Arc::new(Mutex::new(Vec::new()));
         let recording = catalog.clone();
-        let owner = crate::catalog::admission_test_support::all_admitted_recording_with_snapshot_trace_and_dispatch_fault(
-            owner,
-            Arc::new(move |requirements, updates| recording.record_frozen(requirements, updates)),
-            Arc::clone(&load_modes),
-            Arc::clone(&catalog.next_error),
+        let record = Arc::new(
+            move |requirements: &[TableRequirement], updates: &[TableUpdate]| {
+                recording.record_frozen(requirements, updates);
+            },
         );
+        use crate::catalog::admission_test_support::{
+            all_admitted_recording_with_lost_reply,
+            all_admitted_recording_with_snapshot_trace_and_dispatch_fault,
+        };
+        let owner = if lose_reply {
+            all_admitted_recording_with_lost_reply(owner, record)
+        } else {
+            all_admitted_recording_with_snapshot_trace_and_dispatch_fault(
+                owner,
+                record,
+                Arc::clone(&load_modes),
+                Arc::clone(&catalog.next_error),
+            )
+        };
         let runtime = Arc::new(
             crate::metadata_context::IcebergMetadataContext::with_catalog_for_test(
                 crate::catalog_control::IcebergCatalogControlState::new(configuration),
@@ -709,7 +730,7 @@ mod keyed_publication_trace_tests {
     }
 
     #[tokio::test]
-    async fn ordinary_zero_row_append_preserves_live_data_and_publishes_one_session_marker() {
+    async fn ordinary_zero_row_append_preserves_live_data_and_dispatches_no_commit() {
         let fixture = fixture().await;
         append_snapshot_for_test(
             fixture.provider.clone(),
@@ -767,27 +788,22 @@ mod keyed_publication_trace_tests {
             })
             .expect("finish zero-row ordinary append");
         let ExternalMutationOutcome::KnownCommitted {
-            cleanup: _,
-            effect: ExternalMutationEffect::Applied,
+            cleanup: ExternalMutationFinalization::Complete,
+            effect: ExternalMutationEffect::NoOp,
             receipt,
             finalization: ExternalMutationFinalization::Complete,
         } = outcome
         else {
-            panic!("ordinary append must publish its session marker: {outcome:?}");
+            panic!("zero-row ordinary append must settle as a no-op: {outcome:?}");
         };
         let snapshot_id = receipt
             .committed_version()
             .and_then(|version| version.snapshot_id())
             .expect("ordinary append receipt snapshot");
-        assert_ne!(Some(snapshot_id), base_snapshot_id);
+        assert_eq!(Some(snapshot_id), base_snapshot_id);
         assert_eq!(receipt.resulting_row_count(), None);
         assert_eq!(before_live.values().sum::<u64>(), 3);
-        assert_exact_target_mutation(
-            &fixture,
-            base_snapshot_id,
-            &["add-snapshot", "set-snapshot-ref"],
-            snapshot_id,
-        );
+        assert!(fixture.catalog.commits().is_empty());
         let after = fixture
             .catalog
             .load_table(fixture.table.identifier())
@@ -797,11 +813,12 @@ mod keyed_publication_trace_tests {
             .await
             .expect("observe resulting live files");
         assert_eq!(after_live, before_live);
-        assert_eq!(
+        assert_eq!(after.metadata().current_snapshot_id(), base_snapshot_id);
+        assert_ne!(
             after
                 .metadata()
                 .current_snapshot()
-                .expect("marker snapshot")
+                .unwrap()
                 .summary()
                 .additional_properties
                 .get(ICEBERG_WRITE_SESSION_MARKER_PROPERTY),

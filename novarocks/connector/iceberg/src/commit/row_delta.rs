@@ -22,16 +22,25 @@
 
 use std::collections::HashMap;
 
-use crate::iceberg::spec::{DataContentType, Operation};
+#[cfg(test)]
+use crate::iceberg::spec::DataContentType;
+use crate::iceberg::spec::{ManifestFile, Operation};
 use async_trait::async_trait;
+
+use super::manifest_sources::SnapshotSources;
+use super::model::OperationIntent;
+use super::operation::IcebergCommitOperation;
+use super::staging::{PreparedChange, StagedView};
 
 fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, s)
 }
 
 /// Position/equality-delete preparation consumes frozen additions once per attempt.
+#[cfg(test)]
 pub(crate) struct RowDeltaPreparer;
 
+#[cfg(test)]
 #[async_trait]
 impl crate::commit::staging::Preparer for RowDeltaPreparer {
     async fn prepare(
@@ -126,23 +135,74 @@ impl crate::commit::staging::Preparer for RowDeltaPreparer {
         let snapshot_id = view.stage_snapshot_id()?;
         let added =
             write_added_entry_groups(view, snapshot_id, intent.changes().added.clone()).await?;
-        let manifests = super::manifest_transform::ordinary_manifests(
+        prepare_delete_snapshot(view, intent, snapshot_id, sources.as_ref(), added, summary).await
+    }
+}
+
+pub(crate) struct CompactEqualityDeletePreparer {
+    pub(crate) operation: IcebergCommitOperation,
+    pub(crate) stage: usize,
+}
+
+#[async_trait]
+impl super::staging::Preparer for CompactEqualityDeletePreparer {
+    async fn prepare(
+        &self,
+        view: &StagedView<'_>,
+        intent: &OperationIntent,
+    ) -> crate::iceberg::Result<PreparedChange> {
+        let sources = view.target_sources().await?;
+        let snapshot_id = view.stage_snapshot_id()?;
+        let (added, counts) = super::new_manifests::prepare_added_manifests(
+            &self.operation,
             view,
+            self.stage,
             snapshot_id,
-            sources.as_ref(),
-            &[],
-            added,
+            None,
         )
         .await?;
-        crate::commit::overwrite::prepare_ordinary_snapshot_change(
-            view,
-            intent,
-            snapshot_id,
-            Operation::Delete,
-            manifests,
-            summary,
-            false,
-        )
-        .await
+        let equality = counts.equality_deletes;
+        if equality.files == 0
+            || counts.data.files != 0
+            || counts.position_deletes.files != 0
+            || counts.newly_deleted_rows != 0
+        {
+            return Err(to_iceberg_unexpected(
+                "Equality delete stage requires only equality delete files".into(),
+            ));
+        }
+        let summary = HashMap::from([
+            (
+                "added-equality-delete-files".into(),
+                equality.files.to_string(),
+            ),
+            ("added-equality-deletes".into(), equality.rows.to_string()),
+            ("added-delete-files".into(), equality.files.to_string()),
+            ("added-files-size".into(), equality.bytes.to_string()),
+        ]);
+        prepare_delete_snapshot(view, intent, snapshot_id, sources.as_ref(), added, summary).await
     }
+}
+
+async fn prepare_delete_snapshot(
+    view: &StagedView<'_>,
+    intent: &OperationIntent,
+    snapshot_id: i64,
+    sources: Option<&SnapshotSources<'_>>,
+    added: Vec<ManifestFile>,
+    summary: HashMap<String, String>,
+) -> crate::iceberg::Result<PreparedChange> {
+    let manifests =
+        super::manifest_transform::ordinary_manifests(view, snapshot_id, sources, &[], added)
+            .await?;
+    super::overwrite::prepare_ordinary_snapshot_change(
+        view,
+        intent,
+        snapshot_id,
+        Operation::Delete,
+        manifests,
+        summary,
+        false,
+    )
+    .await
 }

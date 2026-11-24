@@ -1,0 +1,13 @@
+-- query 9
+-- types	integer	integer
+id	v
+1	10
+2	20
+3	10
+
+-- query 10
+-- types	varchar	double	double	double	double	varchar	varchar
+column_name	data_size	distinct_values_count	nulls_fraction	row_count	low_value	high_value
+id	NULL	3.0	0.0	NULL	1	3
+v	NULL	2.0	0.0	NULL	10	20
+NULL	NULL	NULL	NULL	3.0	NULL	NULL

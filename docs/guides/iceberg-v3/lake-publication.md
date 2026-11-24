@@ -25,11 +25,14 @@ under the License.
 验证依赖、准备完整请求，然后派发一次。Catalog **确定拒绝**的并发冲突可以触发新的 attempt；
 新 attempt 会重新验证同一操作意图，不会把旧请求直接重发。
 
-纯追加可在新的目标 head 上重新准备，起始快照已过期或目标 ref 曾回滚也不要求遍历历史。
-[ADD FILES](dml.md#登记已有-parquet-文件) 在输入校验后核对候选路径是否在 `main` 存活。提交重试时同一快照可复用该证据，换快照须复核本批候选。依赖名称映射时还须同轮核对整版 metadata。DELETE、UPDATE、MERGE、动态分区覆盖、
-OPTIMIZE 和 TRUNCATE 当前要求目标 ref 自读取基线起未变；冲突后重新加载若发现 head 已变，就以
-确定未提交的冲突结束。需要重新执行语句来读取新事实，不能复用旧输出绕过检查。静态全表
-INSERT OVERWRITE 按提交时的目标状态覆盖。带基线绑定文档或分区演进的操作也要求 ref 未变。
+普通 INSERT 可以在同一目标表与目标 ref 的新 head 上重新准备。提交时原子核对写出所用的默认
+分区规范，规范变化时拒绝提交。单独变化的 schema ID 不阻断原写集提交。零行 INSERT 跳过提交。
+
+[ADD FILES](dml.md#登记已有-parquet-文件) 在输入校验后核对候选路径是否在 `main` 存活。提交重试时
+同一快照可复用该证据，换快照须复核本批候选。依赖名称映射时还须同轮核对整版 metadata。
+普通 DELETE、UPDATE、MERGE 按隔离级别验证准入观察与连续快照窗口。OPTIMIZE 和主分支 TRUNCATE
+按各自协议在本轮基准核对。MV 全量刷新和重分区仍要求目标 ref 与输出基线相同，一次提交先发布
+`delete` 快照，再发布 `append` 快照。标记与文档记录绑定在 `append` 快照上。
 
 操作提交循环使用以下 Iceberg 表属性；未设置时采用表中缺省值：
 
@@ -42,17 +45,23 @@ INSERT OVERWRITE 按提交时的目标状态覆盖。带基线绑定文档或分
 
 数值必须合法，重试次数非负，最小等待不得超过最大等待，总窗口必须大于零。
 退避和重新准备都响应取消；已经派发的请求等待实际结果，取消不会把它变成确定未提交。
-这些属性控制数据提交与统计的操作循环；现有 schema/ref/快照生命周期 DDL 的重试路径不因此统一。
+数据提交与统计沿各自的操作循环。普通写语句使用原查询或会话期限。原语句未提供 deadline 时，
+Connector 请求从现有查询选项获得有限期限，缺省为 300 秒。旧的统一发布期限与扫描年龄配置已退役。
 
-CTAS 冻结标准 REST staged-create 的初始化、数据和属性，使用目标不存在的条件派发一次，不重新准备。
-零输出 CTAS 创建无快照的空表。ANALYZE 只在准备时检查测得统计的快照存在，发布统计时不做目标 ref
-CAS；检查后快照被并发过期，统计仍可成功，留下的条目不参与不存在快照的读取。
+CTAS 按 [REST 建表位置规则](dml.md) 直接在最终位置暂存。初始化、数据及已启用的写时统计使用
+目标不存在的条件派发一次。零行 CTAS 发布一个空 append 快照。若同名表在分析后抢先创建，发布
+返回 `TABLE_ALREADY_EXISTS`，包括使用 `IF NOT EXISTS` 的语句。见
+[ADR-0262](../../adr/ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md)。
+
+ANALYZE 只在准备时检查测得统计的快照存在，发布统计时不做目标 ref CAS。检查后快照被并发过期，
+统计仍可成功，留下的条目不参与不存在快照的读取。
 
 ## 发布结果与清理结果
 
-Catalog 发布证据与后续清理分别报告。已知提交即使后续清理或运行时桥接失败，仍保持已知提交；
-finalization 失败不表示数据被回滚。确定未提交时只清理本操作实际拥有的产物，ADD FILES 的外部
-源文件不属于清理范围。已提交后，只能清理未被成功请求引用的 owned 残留。
+Catalog 发布证据与后续清理分别报告。已知提交的后续清理失败保留已知提交的事实。确定未提交时，
+原作者只清理账本中本操作拥有的产物。CTAS 封存后的清理由建表 operation 接管，同目录下其他
+操作的文件继续受到保护。ADD FILES 的外部源文件由原持有者管理。已提交后，operation 仅清理
+成功请求未引用且已获删除权的残留。
 
 | 清理结果 | 含义 |
 |---|---|
@@ -71,9 +80,10 @@ finalization 失败不表示数据被回滚。确定未提交时只清理本操�
 abort/cleanup、不要删除 staging ref 或对象。**
 
 对于带公开 publication marker 的数据快照写入和标准 REST staged CREATE，NovaRocks 将原
-`LakePublicationId` 写入 snapshot summary 或 CREATE 表属性。下面的人工 marker 核对配方仅适用于
-这些操作，不能用于推断所有 metadata-only 或 DDL 请求的结果。派发前保存的实际完整恢复事实及其
-decoded ledger 是证据，不授予删除权限。核对只做读操作；无快照 CREATE 使用表属性和精确目标身份。
+`LakePublicationId` 写入 snapshot summary 或 CREATE 表属性。CTAS 保留
+`novarocks.ctas.operation-id` 与原暂存表 UUID 和本次追加快照的归因检查。
+下列人工配方仅适用于这些操作，核对只做读操作。恢复事实与对象账本用于证实归属。
+无数据快照的文档管理建表使用表属性及精确目标身份。
 
 ANALYZE 只发布统计条目，不写新的 snapshot marker 或表属性 marker。其 Unknown 保留精确的统计
 发布证据，包括目标表身份、测得快照和版本、统计证据 revision、统计文件路径及完整发布事实，按
@@ -113,16 +123,15 @@ SHOW CREATE TABLE catalog_name.db_name.created_table;
 `loadTable` 读取同一 metadata JSON。关键是不改变判断标准：读取目标 UUID、snapshot marker 和
 ancestor chain，而不是匹配 NovaRocks 的错误字符串。
 
-对于 data-producing MV，额外读取 `$refs` 中的 `main` 与 NovaRocks-owned staging branch。历史 staging
-branch 只能由配置了安全年龄窗的 GC 退休；人工核对和应用进程不得抢先删除它。对于还未注册目标表的
-CTAS，只有其 deterministic warehouse-owned staging prefix 的 GC 可以在年龄窗后回收残留。
+对于全量刷新或重分区的 MV，核对 `main` 上带标记的 `append` 快照，同时检查该次发布的
+`delete` 父快照。CTAS 在 Catalog 无法给出正向归因时继续保持 Unknown，崩溃残留留在表位置。
 
 ## 如何结束 Unknown
 
 对 marker 配方适用的操作，将核对项的原始读结果、target identity、`LakePublicationId` 和 statement
 tag 交给平台运维或人工处理流程。ANALYZE 以及不带公开 marker 的 metadata/DDL 请求则保留其操作
-特定发布证据，不从 marker 缺失推断结果。若最终证明 Published，客户端可以按已提交处理；若仍
-Unknown，应保持 Unknown 并让 GC 在安全年龄窗后处理残留。不要以再次执行原 SQL 作为“恢复”。
+特定发布证据。若最终证明 Published，客户端按已提交处理。仍为 Unknown 时，继续保留原发布事实
+及其对象，等待能给出准确归属与发布结论的外部证据。
 
 ## 验收环境
 

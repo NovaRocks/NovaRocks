@@ -20,7 +20,7 @@ use novarocks_failure_contract::{
     FailureReason,
     connector_reason::{
         COMMIT_TRANSACTION_CONFLICT, ICEBERG_COMMIT_ERROR, ICEBERG_COMMIT_STATE_UNKNOWN,
-        ICEBERG_COMMIT_VALIDATION_CONFLICT,
+        ICEBERG_COMMIT_VALIDATION_CONFLICT, ICEBERG_TABLE_ALREADY_EXISTS,
     },
 };
 
@@ -30,6 +30,55 @@ fn commit_input(reason: FailureReason, detail: &str) -> ExecutionFailureInput {
         SafeDetail::truncating(detail),
         ExecutionFailureSite::Coordinator,
     )
+}
+
+#[test]
+fn staged_table_exists_projects_the_standard_code_and_exact_message() {
+    let detail = "Table lake.inner.orders already exists";
+    let input = ExecutionFailureInput::new(
+        FailureFact::new(FailureClass::Data, ICEBERG_TABLE_ALREADY_EXISTS),
+        SafeDetail::truncating(detail),
+        ExecutionFailureSite::Coordinator,
+    );
+    let execution = QueryExecutionError::from_execution(input.clone());
+    let service = QueryServiceError::from_execution_failure(input)
+        .attach_external_effect_disposition(StatementExternalEffectDisposition::KnownUncommitted);
+    let sql = "CREATE TABLE IF NOT EXISTS orders AS SELECT 1";
+    let from_execution = query_error(TrinoErrorSource::Execution {
+        error: &execution,
+        sql,
+    });
+    assert_eq!(
+        (
+            from_execution.error_code,
+            from_execution.error_name,
+            from_execution.error_type,
+            from_execution.message.as_str(),
+        ),
+        (50, "TABLE_ALREADY_EXISTS", "USER_ERROR", detail)
+    );
+    assert_eq!(
+        query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql,
+        }),
+        from_execution
+    );
+    let with_unknown = query_error_for_query_with_effect(
+        "query-id",
+        TrinoErrorSource::Service {
+            error: &service,
+            sql,
+        },
+        Some(StatementExternalEffectDisposition::CommitUnknown),
+    );
+    assert_eq!(with_unknown.error_code, 50);
+    assert!(with_unknown.message.starts_with(detail));
+    assert!(
+        with_unknown
+            .message
+            .contains("CommitUnknown do_not_retry=true")
+    );
 }
 
 #[test]

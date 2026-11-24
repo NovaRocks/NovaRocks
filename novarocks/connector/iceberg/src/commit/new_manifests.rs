@@ -45,7 +45,9 @@ use super::write_stack::control::publication::{
     rewrite_file_backing, written_file_with_historical_partition,
 };
 use super::write_stack::domain::IcebergCommitFragment;
-use super::write_stack::receiving::compact::{AddedCounters, CompactAddition, CompactEntry};
+use super::write_stack::receiving::compact::{
+    AddedCounters, AdditionKind, CompactAddition, CompactEntry,
+};
 use super::write_stack::receiving::{AdditionGroup, ReceivedCompactFiles};
 
 mod registered;
@@ -95,7 +97,7 @@ pub(super) fn commit_validation_error_for(
     message: impl Into<String>,
 ) -> Error {
     let message = message.into();
-    let failure = super::conflict::validation_conflict_for(operation, message.clone());
+    let failure = super::conflict::validation_conflict(operation, message.clone());
     Error::new(ErrorKind::DataInvalid, message).with_source(failure)
 }
 
@@ -208,11 +210,7 @@ pub(crate) async fn prepare_added_manifests(
             (upgrade_v1(view, snapshot_id, written).await?, true)
         }
         StageNewFiles::Written(written) => {
-            if written
-                .manifests
-                .iter()
-                .any(|manifest| manifest.content == ManifestContentType::Deletes)
-            {
+            if written.counts.position_deletes.files != 0 {
                 validate_position_format(written.version, version)?;
             }
             tracing::debug!(operation = ?operation.token(), stage, snapshot_id,
@@ -254,13 +252,14 @@ async fn write_pending(
         .data
         .files
         .checked_add(counts.position_deletes.files)
+        .and_then(|files| files.checked_add(counts.equality_deletes.files))
         .and_then(|files| usize::try_from(files).ok())
         .ok_or_else(|| invariant("Compact manifest entry count overflow"))?;
     let mut manifests = Vec::new();
     for (group, entries) in groups {
         let AdditionGroup::Additions {
             spec: spec_id,
-            deletes,
+            kind,
         } = group
         else {
             if historical.is_none() {
@@ -268,7 +267,7 @@ async fn write_pending(
             }
             continue;
         };
-        let partition_type = if deletes {
+        let partition_type = if kind == AdditionKind::PositionDelete {
             Some(
                 historical
                     .and_then(|partitions| partitions.get(&spec_id))
@@ -298,6 +297,7 @@ async fn write_pending(
             source: &pending.source,
             snapshot,
             spec,
+            content: kind.manifest_content(),
         };
         write_rolled(input, &output, target_bytes, &mut manifests).await?;
     }
@@ -332,6 +332,7 @@ async fn write_registered(
         source,
         snapshot,
         spec,
+        content: ManifestContentType::Data,
     };
     let mut manifests = Vec::new();
     // RegisteredNewFiles still holds the vector's capacity receipt. It
@@ -383,6 +384,7 @@ struct RollingOutput<'a, 'view> {
     source: &'a TableMetadata,
     snapshot: i64,
     spec: &'a PartitionSpec,
+    content: ManifestContentType,
 }
 
 impl RollingInput<'_> {
@@ -426,7 +428,7 @@ impl RollingInput<'_> {
                 let remaining = entries.split_off(count);
                 let batch = std::mem::replace(entries, remaining);
                 let mut descriptor = if let Some(sequence) = *rewrite_sequence {
-                    if partition_type.is_some() {
+                    if output.content != ManifestContentType::Data {
                         return Err(invariant(
                             "Iceberg rewrite output must use its frozen data partition",
                         ));
@@ -466,7 +468,9 @@ impl RollingInput<'_> {
                         )
                         .await?
                     } else {
-                        output.write_data(values.into_iter().map(Ok)).await?
+                        output
+                            .write_current_partition(values.into_iter().map(Ok))
+                            .await?
                     }
                 };
                 if rewrite_sequence.is_some()
@@ -489,7 +493,7 @@ impl RollingInput<'_> {
                     entries: entries.as_mut_slice()[..count].iter_mut(),
                     spec_id: output.spec.spec_id(),
                 };
-                let descriptor = output.write_data(batch).await?;
+                let descriptor = output.write_current_partition(batch).await?;
                 // The SDK consumed each moved file. Its receipt and any
                 // remaining unused slot are retired with the original prefix.
                 entries.by_ref().take(count).for_each(drop);
@@ -550,14 +554,14 @@ impl RollingOutput<'_, '_> {
             .then(|| reserve_rewrite_backing(author, partition_bytes))
             .transpose()?;
         let batch = PaidRewriteBatch(files.iter_mut());
-        let result = self.write_data(batch).await;
+        let result = self.write_current_partition(batch).await;
         // The iterator moves each DataFile into the SDK's writer. Its receipt
         // remains here until the writer completes or its future has exited.
         drop(files);
         result
     }
 
-    async fn write_data(
+    async fn write_current_partition(
         &self,
         entries: impl Iterator<Item = Result<ManifestEntryWrite>>,
     ) -> Result<ManifestFile> {
@@ -566,7 +570,7 @@ impl RollingOutput<'_, '_> {
             self.snapshot,
             self.source.current_schema().clone(),
             self.spec.clone(),
-            ManifestContentType::Data,
+            self.content,
         );
         write_manifest_with_sources(self.view.artifacts(), encoding, entries, &[]).await
     }

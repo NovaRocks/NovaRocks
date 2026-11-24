@@ -467,7 +467,7 @@ fn rewrite_preparation_retains_complete_input_declarations() {
         let preparation = rewrite_preparation(
             &owner,
             &request,
-            ConnectorWriteIntent::Overwrite,
+            ConnectorWriteIntent::RewriteDataFiles,
             &source,
             &execution,
             row_lineage,

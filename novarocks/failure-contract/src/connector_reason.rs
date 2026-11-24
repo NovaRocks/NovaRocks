@@ -67,3 +67,7 @@ pub const SOURCE_TYPE_MISMATCH: FailureReason =
 /// A required target field was absent or had NULL values.
 pub const NOT_NULL_VIOLATION: FailureReason =
     FailureReason::new(domain::CONNECTOR, NonZeroU16::new(61).unwrap());
+
+/// The REST catalog rejected a staged Iceberg create because the table exists.
+pub const ICEBERG_TABLE_ALREADY_EXISTS: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(62).unwrap());

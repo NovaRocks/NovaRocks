@@ -61,7 +61,7 @@ impl Scenario for MvStorageContract {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let (rest, launch) = ManagedMvRestFixture::start(scenario_root, CATALOG)?;
+        let (rest, launch) = ManagedMvRestFixture::start_recorded(scenario_root, CATALOG)?;
         let barrier_dir = scenario_root.join("mv-rewrite-final-barrier");
         fs::create_dir_all(&barrier_dir).context("create final MV rewrite barrier directory")?;
         let mut fixture = self
@@ -161,6 +161,7 @@ impl Scenario for MvStorageContract {
         context.action("verify CREATE wrote table-level D/L/C and no snapshot or P to REST");
         let created = load_graph(context, &rest_uri, 0)?;
 
+        let first_commits_before = self.recorded_table_commits()?;
         execute(
             context,
             &mut conn,
@@ -168,7 +169,12 @@ impl Scenario for MvStorageContract {
             "REFRESH MATERIALIZED VIEW orders_mv",
         )?;
         context.action("verify first P binds its exact snapshot and table-level D/L revisions");
-        let first = load_graph(context, &rest_uri, 1)?;
+        let first = load_graph(context, &rest_uri, 2)?;
+        assert_full_refresh_pair(&created, &first, 2)?;
+        ensure!(
+            self.recorded_table_commits()? == first_commits_before + 1,
+            "first FULL must publish both snapshots in one REST table commit"
+        );
         ensure!(
             first.definition == created.definition
                 && first.interpretation == created.interpretation,
@@ -224,7 +230,7 @@ impl Scenario for MvStorageContract {
             &[(1, 98_000), (2, 100_000)],
             "read the lake publication on the restarted FE",
         )?;
-        let after_restart = load_graph(context, &rest_uri, 1)?;
+        let after_restart = load_graph(context, &rest_uri, 2)?;
         ensure!(
             after_restart == first,
             "FE restart changed the exact D/L/P attachment graph"
@@ -266,6 +272,8 @@ impl Scenario for MvStorageContract {
             "insert source changes after management readmission",
             "INSERT INTO orders VALUES (1, 5), (2, 7)",
         )?;
+        let before_full = load_graph(context, &rest_uri, 3)?;
+        let commits_before = self.recorded_table_commits()?;
         full_refresh_orders(
             context,
             &mut conn,
@@ -278,8 +286,13 @@ impl Scenario for MvStorageContract {
             &[(1, 98_005), (2, 100_007)],
             "read the second publication directly",
         )?;
-        context.action("verify FULL produced a new exact P and an Iceberg overwrite");
-        let second = load_graph(context, &rest_uri, 3)?;
+        context.action("verify FULL added an exact delete and append in one REST commit");
+        let second = load_graph(context, &rest_uri, 5)?;
+        assert_full_refresh_pair(&before_full, &second, 2)?;
+        ensure!(
+            self.recorded_table_commits()? == commits_before + 1,
+            "FULL dispatched more or less than one target REST commit"
+        );
         ensure!(
             second.definition == first.definition && second.interpretation == first.interpretation,
             "FULL refresh changed the stable D/L revisions"
@@ -290,13 +303,8 @@ impl Scenario for MvStorageContract {
                     != first.publications.last().map(|(_, revision)| revision),
             "FULL refresh did not retain the original exact P and add a distinct P"
         );
-        ensure!(
-            second.last_operation.as_deref() == Some("overwrite"),
-            "FULL refresh did not publish an Iceberg overwrite: {:?}",
-            second.last_operation
-        );
         context.action(
-            "proved CREATE, exact publications, restart reads, readmission and FULL overwrite",
+            "proved CREATE, exact publications, restart reads, readmission and FULL refresh",
         );
         Ok(())
     }
@@ -311,6 +319,26 @@ impl Scenario for MvStorageContract {
             return Ok(());
         };
         fixture.shutdown()
+    }
+}
+
+impl MvStorageContract {
+    fn recorded_table_commits(&self) -> Result<usize> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        let requests = fixture
+            .as_ref()
+            .context("managed MV fixture is missing")?
+            .recorded_requests()?;
+        let target = format!("/v1/namespaces/{NAMESPACE}/tables/{VIEW}");
+        Ok(requests
+            .iter()
+            .filter(|r| {
+                r.method == "POST" && r.path_and_query.split('?').next() == Some(target.as_str())
+            })
+            .count())
     }
 }
 
@@ -397,7 +425,10 @@ struct DocumentGraph {
     definition: Value,
     interpretation: Value,
     publications: Vec<(i64, Value)>,
-    last_operation: Option<String>,
+    snapshots: Vec<Value>,
+    current: Option<i64>,
+    next_row_id: u64,
+    logical_rows: Option<u64>,
 }
 
 fn load_graph(context: &ScenarioContext, rest_uri: &str, expected: usize) -> Result<DocumentGraph> {
@@ -418,38 +449,113 @@ fn load_graph(context: &ScenarioContext, rest_uri: &str, expected: usize) -> Res
     let publications = graph
         .snapshots
         .iter()
-        .map(|(id, p)| {
-            let p = p
-                .as_ref()
-                .with_context(|| format!("snapshot {id} has no publication record"))?;
-            let revision: String = Sha256::digest(p.frame.as_bytes())
+        .filter_map(|(id, record)| record.as_ref().map(|record| (*id, record)))
+        .map(|(id, record)| {
+            let revision: String = Sha256::digest(record.frame.as_bytes())
                 .iter()
-                .map(|b| format!("{b:02x}"))
+                .map(|byte| format!("{byte:02x}"))
                 .collect();
-            Ok((*id, Value::String(revision)))
+            (id, Value::String(revision))
         })
-        .collect::<Result<Vec<_>>>()?;
-    if expected > 0 {
-        ensure!(
-            graph.current == publications.last().map(|(id, _)| *id),
-            "current snapshot does not carry the latest P record"
-        );
-    }
-    let last_operation = metadata["snapshots"]
+        .collect::<Vec<_>>();
+    ensure!(
+        graph.current == publications.last().map(|(id, _)| *id),
+        "current snapshot does not carry the latest P record"
+    );
+    let logical_rows = graph
+        .snapshots
+        .iter()
+        .find(|(id, _)| Some(*id) == graph.current)
+        .and_then(|(_, record)| record.as_ref())
+        .map(|record| graph.record_logical_rows(record))
+        .transpose()?
+        .flatten();
+    let mut snapshots = metadata["snapshots"]
         .as_array()
-        .and_then(|snapshots| {
-            snapshots
-                .iter()
-                .find(|s| s["snapshot-id"].as_i64() == graph.current)
-        })
-        .and_then(|s| s["summary"]["operation"].as_str())
-        .map(str::to_owned);
+        .context("managed MV metadata has no snapshots")?
+        .clone();
+    snapshots.sort_by_key(|snapshot| snapshot["sequence-number"].as_i64());
     Ok(DocumentGraph {
         definition: Value::String(graph.definition),
         interpretation: Value::String(graph.interpretation),
         publications,
-        last_operation,
+        current: graph.current,
+        next_row_id: metadata["next-row-id"]
+            .as_u64()
+            .context("row-lineage MV metadata has no next row ID")?,
+        logical_rows,
+        snapshots,
     })
+}
+
+fn assert_full_refresh_pair(
+    before: &DocumentGraph,
+    after: &DocumentGraph,
+    rows: u64,
+) -> Result<()> {
+    use super::mv_uea7_documents::wire::RECORD;
+    const SESSION_MARKER: &str = "novarocks.write.session.v1";
+
+    let retained = before.snapshots.len();
+    ensure!(
+        after.snapshots.len() == retained + 2 && after.snapshots.starts_with(&before.snapshots),
+        "FULL did not retain the original snapshots and add exactly two more"
+    );
+    let delete = &after.snapshots[retained];
+    let append = &after.snapshots[retained + 1];
+    ensure!(
+        delete["summary"]["operation"] == "delete"
+            && append["summary"]["operation"] == "append"
+            && delete["parent-snapshot-id"].as_i64() == before.current
+            && append["parent-snapshot-id"] == delete["snapshot-id"]
+            && append["snapshot-id"].as_i64() == after.current
+            && delete["sequence-number"]
+                .as_i64()
+                .and_then(|seq| seq.checked_add(1))
+                == append["sequence-number"].as_i64(),
+        "FULL did not publish consecutive delete and append snapshots rooted at its original main"
+    );
+    let delete_summary = delete["summary"]
+        .as_object()
+        .context("FULL delete summary missing")?;
+    ensure!(
+        ["total-records", "total-data-files", "total-delete-files"]
+            .iter()
+            .all(|key| delete["summary"][*key].as_str() == Some("0"))
+            && delete_summary
+                .keys()
+                .all(|key| !key.starts_with("novarocks.")),
+        "FULL delete must be empty and have only standard summary fields"
+    );
+    let append_summary = &append["summary"];
+    let session = append_summary[SESSION_MARKER]
+        .as_str()
+        .context("FULL append session missing")?;
+    ensure!(
+        !session.is_empty()
+            && after
+                .snapshots
+                .iter()
+                .filter(|s| s["summary"][SESSION_MARKER].as_str() == Some(session))
+                .count()
+                == 1
+            && append_summary[RECORD].as_str().is_some()
+            && before.publications.len() + 1 == after.publications.len()
+            && after.publications.starts_with(&before.publications),
+        "FULL did not add one exact document publication and one uniquely marked append"
+    );
+    ensure!(
+        append_summary["total-records"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            == Some(rows)
+            && after.logical_rows == Some(rows)
+            && append["first-row-id"].as_u64() == Some(before.next_row_id)
+            && append["added-rows"].as_u64() == Some(rows)
+            && before.next_row_id.checked_add(rows) == Some(after.next_row_id),
+        "FULL append did not project the exact logical and physical row totals and lineage"
+    );
+    Ok(())
 }
 
 fn connect(context: &mut ScenarioContext) -> Result<SqlSession> {

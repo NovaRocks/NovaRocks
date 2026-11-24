@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod append;
 mod rewrite_files;
 mod row_delta_window;
 mod truncate;
@@ -45,6 +46,7 @@ struct ControlledPublisher<'a> {
     fixture: &'a Fixture,
     metadata: Mutex<TableMetadata>,
     dispatch: Dispatch,
+    missing_target: bool,
     cancel_after_load: bool,
     load_delay: Duration,
     recovery_refused: bool,
@@ -61,6 +63,7 @@ impl<'a> ControlledPublisher<'a> {
             fixture,
             metadata: Mutex::new(metadata),
             dispatch,
+            missing_target: false,
             cancel_after_load: false,
             load_delay: Duration::ZERO,
             recovery_refused: false,
@@ -97,6 +100,12 @@ impl Publisher for ControlledPublisher<'_> {
     }
     async fn load_target(&self, _: &IcebergCommitAttempt) -> Result<StagingBase> {
         self.loads.fetch_add(1, Ordering::SeqCst);
+        if self.missing_target {
+            return Err(Error::new(
+                ErrorKind::TableNotFound,
+                "Table db.t does not exist",
+            ));
+        }
         if !self.load_delay.is_zero() {
             tokio::time::sleep(self.load_delay).await;
         }
@@ -351,10 +360,6 @@ async fn mor_frozen_before_another_branch_commit_inherits_actual_publication_seq
     )
     .await
     .unwrap();
-    fixture
-        .operation
-        .adopt_session_data(object.clone())
-        .unwrap();
     let dv = dv_data_file(
         &WrittenDvFile::from(written),
         &LiveFile {
@@ -380,24 +385,21 @@ async fn mor_frozen_before_another_branch_commit_inherits_actual_publication_seq
             snapshot_id: source_id,
             sequence_number: source_sequence,
         }),
-        changes: FileChanges {
-            added: vec![
-                AddedContent::new_logical_data(data(&updated_path, 1, Struct::empty()), 0).unwrap(),
-                AddedContent::new_logical_data(dv, 0).unwrap(),
-            ],
-            removed: vec![],
-        },
+        changes: FileChanges::default(),
         dependencies: vec![Dependency::RefUnchanged],
         protocol: crate::commit::model::CommitProtocol::Legacy,
         shape: RequestShape::SnapshotProducing,
         summary: Default::default(),
         token: fixture.operation.token(),
     })
+    .unwrap()
+    .with_compact_stage(0)
     .unwrap();
     let preparer = crate::commit::write_stack::control::observed_materialized_staging_fixture(
         std::sync::Arc::new(source.clone()),
-        &intent,
+        &fixture.operation,
         &writer,
+        vec![data(&updated_path, 1, Struct::empty()), dv],
     )
     .await
     .unwrap();

@@ -261,7 +261,7 @@ fn dedicated_extract_syntax_uses_its_catalogue_binding() {
     let result = constant(source, &context);
     assert_eq!(
         result.batch.values.to_data(),
-        Int32Array::from(vec![2025]).to_data()
+        Int64Array::from(vec![2025]).to_data()
     );
 }
 

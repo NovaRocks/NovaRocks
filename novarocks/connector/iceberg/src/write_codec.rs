@@ -25,101 +25,197 @@ use serde::{Deserialize, Serialize};
 
 use novarocks_spi::connector::{ConnectorCommittedVersion, ConnectorWriteReceipt};
 
-use crate::commit::WrittenFile;
 use crate::commit::report::{IcebergColumnStats, IcebergWriterReport};
 use crate::delete_file::IcebergFileContent;
 use crate::iceberg::spec::TableMetadata;
 use crate::write_descriptor::encode_partition_descriptor;
 
+#[cfg(test)]
+pub(crate) use crate::commit::write_stack::test_support::{
+    open_staged_files, seal_staged_files, seal_staged_files_with_statistics,
+};
+
 // Provider-owned bounded receipt facts and immutable staged files.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StagedSealFacts {
     version: u16,
     session_id: [u8; 16],
+    endpoint_digest: [u8; 32],
     file_count: u64,
+    row_count: u64,
     files_digest: [u8; 32],
 }
 
-struct StagedSealFiles {
-    session_id: [u8; 16],
-    files: std::sync::Arc<[WrittenFile]>,
+pub(crate) struct StagedSeal {
+    facts: StagedSealFacts,
+    inventory: std::sync::Mutex<Option<StagedWriteInventory>>,
+    pub(crate) statistics: std::sync::Arc<[novarocks_spi::connector::StatisticsArtifactDraft]>,
 }
 
-fn staged_files_digest(
-    files: &[WrittenFile],
-    metadata: &TableMetadata,
-) -> Result<[u8; 32], String> {
-    use sha2::{Digest, Sha256};
-    let reports = files
-        .iter()
-        .map(|file| crate::commit::report::writer_report_from_written_file(file, metadata))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Sha256::digest(encode_writer_reports(&reports, metadata)?).into())
+impl std::fmt::Debug for StagedSeal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StagedSeal")
+            .field("facts", &self.facts)
+            .finish_non_exhaustive()
+    }
 }
 
-pub(crate) fn seal_staged_files(
-    files: Vec<WrittenFile>,
+pub(crate) struct StagedWriteInventory {
+    pub(crate) files: crate::commit::write_stack::receiving::ReceivedCompactFiles,
+    pub(crate) codec: crate::commit::write_stack::codec::CompactFragmentCodec,
+}
+
+impl StagedSeal {
+    #[cfg(test)]
+    pub(crate) fn row_count_in_receipt(receipt: &ConnectorWriteReceipt) -> u64 {
+        serde_json::from_slice::<StagedSealFacts>(receipt.payload())
+            .map_or(0, |facts| facts.row_count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_inventory<R>(
+        &self,
+        use_inventory: impl FnOnce(
+            &StagedWriteInventory,
+        ) -> Result<R, novarocks_spi::connector::ConnectorError>,
+    ) -> Result<R, novarocks_spi::connector::ConnectorError> {
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        let inventory = self.inventory.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "Iceberg staged seal inventory poisoned",
+            )
+        })?;
+        use_inventory(inventory.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg staged seal inventory was already adopted",
+            )
+        })?)
+    }
+
+    pub(crate) fn adopt_inventory(
+        &self,
+        register_objects: impl FnOnce(
+            &StagedWriteInventory,
+        ) -> Result<(), novarocks_spi::connector::ConnectorError>,
+    ) -> Result<StagedWriteInventory, novarocks_spi::connector::ConnectorError> {
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        let mut inventory = self.inventory.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "Iceberg staged seal inventory poisoned",
+            )
+        })?;
+        let original = inventory.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg staged seal inventory was already adopted",
+            )
+        })?;
+        register_objects(original)?;
+        Ok(inventory.take().expect("registered staged inventory"))
+    }
+}
+
+pub(crate) fn seal_compact_staged_files(
+    received: &mut crate::commit::write_stack::receiving::IcebergReceiving,
+    statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
     metadata: &TableMetadata,
     session_id: [u8; 16],
+    row_count: u64,
+    codec: crate::commit::write_stack::codec::CompactFragmentCodec,
     owner: &novarocks_spi::connector::ConnectorProviderBindingKey,
 ) -> Result<ConnectorWriteReceipt, novarocks_spi::connector::ConnectorError> {
     use novarocks_spi::connector::{
         ConnectorError, ConnectorErrorKind, ConnectorProcessLocalPayload,
     };
-    let digest = staged_files_digest(&files, metadata)
-        .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
+    use sha2::{Digest, Sha256};
+
+    let corrupt = |message: &str| ConnectorError::new(ConnectorErrorKind::CorruptData, message);
+    let files = received.compact_files();
+    if files.has_delete_effects() || files.counts.data.rows != row_count {
+        return Err(corrupt(
+            "Iceberg staged seal does not match its finalized data rows",
+        ));
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"iceberg staged compact files v2");
+    for entry in files.entries() {
+        let addition = entry
+            .addition
+            .as_ref()
+            .ok_or_else(|| corrupt("Iceberg staged seal requires compact data additions"))?;
+        if addition.partition_spec_id != metadata.default_partition_spec_id() {
+            return Err(corrupt("Iceberg staged seal has a foreign partition spec"));
+        }
+        hash.update((addition.payload.len() as u64).to_be_bytes());
+        hash.update(addition.payload.as_ref());
+    }
     let facts = StagedSealFacts {
-        version: 1,
+        version: 2,
         session_id,
-        file_count: u64::try_from(files.len()).map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "Staged file count is not representable",
-            )
-        })?,
-        files_digest: digest,
+        endpoint_digest: crate::read_snapshot::metadata_identity_digest(metadata)
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?,
+        file_count: files.counts.data.files,
+        row_count,
+        files_digest: hash.finalize().into(),
     };
+    let sealed = std::sync::Arc::new(StagedSeal {
+        facts,
+        inventory: std::sync::Mutex::new(None),
+        statistics: if row_count == 0 {
+            Default::default()
+        } else {
+            statistics.into()
+        },
+    });
     let payload = canonical_json(&facts)
         .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
-    ConnectorWriteReceipt::try_new(payload)?.with_process_local_payload(
+    let receipt = ConnectorWriteReceipt::try_new(payload)?.with_process_local_payload(
         owner,
-        ConnectorProcessLocalPayload::new(
-            owner.clone(),
-            std::sync::Arc::new(StagedSealFiles {
-                session_id,
-                files: files.into(),
-            }),
-        ),
-    )
+        ConnectorProcessLocalPayload::new(owner.clone(), std::sync::Arc::clone(&sealed)),
+    )?;
+    *sealed
+        .inventory
+        .lock()
+        .expect("new Iceberg staged seal inventory") = Some(StagedWriteInventory {
+        files: received.take_compact_files(),
+        codec,
+    });
+    Ok(receipt)
 }
 
-pub(crate) fn open_staged_files(
+pub(crate) fn open_compact_staged_files(
     receipt: &ConnectorWriteReceipt,
     metadata: &TableMetadata,
+    row_count: u64,
     owner: &novarocks_spi::connector::ConnectorProviderBindingKey,
-) -> Result<std::sync::Arc<[WrittenFile]>, novarocks_spi::connector::ConnectorError> {
+) -> Result<std::sync::Arc<StagedSeal>, novarocks_spi::connector::ConnectorError> {
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
     let corrupt = |message: String| ConnectorError::new(ConnectorErrorKind::CorruptData, message);
     receipt.validate()?;
     let facts: StagedSealFacts = serde_json::from_slice(receipt.payload())
         .map_err(|error| corrupt(format!("Decode staged Iceberg seal: {error}")))?;
-    if facts.version != 1 {
+    if facts.version != 2 {
         return Err(corrupt("Unsupported staged Iceberg seal version".into()));
     }
     let payload = receipt.process_local_payload(owner)?.ok_or_else(|| {
-        corrupt("Staged Iceberg seal requires its original process-local file facts".into())
+        corrupt("Staged Iceberg seal requires its original process-local compact files".into())
     })?;
-    let sealed = payload.value::<StagedSealFiles>(owner.instance_id())?;
-    if sealed.session_id != facts.session_id
-        || u64::try_from(sealed.files.len()).ok() != Some(facts.file_count)
-        || staged_files_digest(&sealed.files, metadata).map_err(corrupt)? != facts.files_digest
+    let sealed = payload.value::<StagedSeal>(owner.instance_id())?;
+    if sealed.facts != facts
+        || facts.row_count != row_count
+        || facts.endpoint_digest
+            != crate::read_snapshot::metadata_identity_digest(metadata).map_err(corrupt)?
     {
         return Err(corrupt(
-            "Staged Iceberg seal file facts do not match its receipt".into(),
+            "Iceberg staged seal does not match its receipt and staged target".into(),
         ));
     }
-    Ok(sealed.files.clone())
+    Ok(sealed.clone())
 }
 
 pub const ICEBERG_WRITE_PAYLOAD_VERSION: u32 = 1;
@@ -450,47 +546,6 @@ impl From<IcebergWrittenOutputFactsV1> for IcebergWrittenOutputFacts {
             data_rows: value.data_rows,
         }
     }
-}
-
-pub(crate) fn written_output_facts(
-    files: &[WrittenFile],
-) -> Result<IcebergWrittenOutputFacts, String> {
-    let mut facts = IcebergWrittenOutputFacts::default();
-    for file in files {
-        match file.content {
-            crate::iceberg::spec::DataContentType::Data => {
-                facts.data_files = facts
-                    .data_files
-                    .checked_add(1)
-                    .ok_or_else(|| "Iceberg output data file count overflow".to_string())?;
-                facts.data_rows = facts
-                    .data_rows
-                    .checked_add(file.record_count)
-                    .ok_or_else(|| "Iceberg output data row count overflow".to_string())?;
-            }
-            crate::iceberg::spec::DataContentType::PositionDeletes
-                if file.content_offset.is_some() =>
-            {
-                facts.deletion_vectors = facts
-                    .deletion_vectors
-                    .checked_add(1)
-                    .ok_or_else(|| "Iceberg output deletion-vector count overflow".to_string())?;
-            }
-            crate::iceberg::spec::DataContentType::PositionDeletes => {
-                facts.position_delete_files =
-                    facts.position_delete_files.checked_add(1).ok_or_else(|| {
-                        "Iceberg output position-delete file count overflow".to_string()
-                    })?;
-            }
-            crate::iceberg::spec::DataContentType::EqualityDeletes => {
-                facts.equality_delete_files =
-                    facts.equality_delete_files.checked_add(1).ok_or_else(|| {
-                        "Iceberg output equality-delete file count overflow".to_string()
-                    })?;
-            }
-        }
-    }
-    Ok(facts)
 }
 
 pub fn encode_write_receipt(snapshot_id: i64) -> Result<Bytes, String> {

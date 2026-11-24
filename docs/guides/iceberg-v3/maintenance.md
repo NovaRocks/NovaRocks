@@ -179,9 +179,9 @@ S3 兼容存储递归列举，本地文件系统和 HDFS 逐层列举。后端�
 ## 旧 `CALL`、提交与其它清理
 
 Spark 风格旧 `CALL` 保留其各自的参数与结果形状，其中适用的旧入口继续接收 `older_than`。
-本页的 EXECUTE 参数和显式扫描授权只适用于对应的 ALTER TABLE 过程。
-自动入口和无表锚 CTAS 扫描仍按各自原有的删除授权，参见
-[ADR-0198](../../adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md)。
+本页的 EXECUTE 参数和显式扫描授权只适用于对应的 ALTER TABLE 过程。其它入口按各自的原删除授权工作。
+无表锚 CTAS 根扫描已退役，CTAS 改由原写会话和建表 operation 按准确对象清单清理。见
+[ADR-0262](../../adr/ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md)。
 
 ### 与提交、必要 finalize 和精确清理的关系
 
@@ -198,9 +198,8 @@ operation/journal 与访问能力仍由同一稳定 Call/残留保管；GC 的 P
 结果分开，不能为了返回成功而丢弃未退出的清理工作。相反，精确库存已经真正处置时，
 历史清理诊断也不能单独把该责任永久留住。CTAS seal 必要 finalize 失败时不得继续最终 CREATE。
 
-无表锚 CTAS 的旧根扫描是可选维护。禁用缺证扫描不阻止新 CTAS 走已安全准入的 staged
-publication，也不能把该扫描的 unsupported 错误投成新 CTAS 的 AppliedButUnusable。
-目前不承诺跨 FE/BE 崩溃可重建全部产物清单、自动回收或无孤儿；恢复这类能力需要独立协议与证明。
+CTAS 在已证明未提交时清理本次 operation 拥有的对象。原请求和清理沿各自期限与预算运行，
+超时后仍保留尚未确认的外部效果与对象。崩溃时产物留在表位置，当前路径不会在重启后重建清单。
 
 ### 发布、必要收尾与公开结果
 

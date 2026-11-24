@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::query_execution::dml::insert::{InsertOverwriteMode, InsertTargetName};
+use crate::query_execution::dml::insert::InsertTargetName;
 use novarocks_parser::{ast, printer};
 
 /// Frontend command retaining the parser's complete source and numeric text.
@@ -24,7 +24,6 @@ pub struct InsertCommand {
     pub target: InsertTargetName,
     pub columns: Vec<String>,
     pub source: Box<ast::Query>,
-    pub overwrite_mode: InsertOverwriteMode,
 }
 
 pub(super) fn validate_insert_source(
@@ -410,15 +409,5 @@ mod tests {
             ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap(),
             ast::Expr::FunctionCall(_)
         ));
-    }
-
-    #[test]
-    fn preserves_dynamic_overwrite_target() {
-        let command = convert("INSERT OVERWRITE PARTITIONS db.t VALUES (1)").unwrap();
-        assert_eq!(command.target.parts, ["db", "t"]);
-        assert_eq!(
-            command.overwrite_mode,
-            InsertOverwriteMode::DynamicPartitions
-        );
     }
 }

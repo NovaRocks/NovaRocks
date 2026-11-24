@@ -53,7 +53,7 @@ impl FrontendQuerySession {
             TrinoDescriptionKind::Input => StatementKind::DescribeInput,
             TrinoDescriptionKind::Output => StatementKind::DescribeOutput,
         };
-        let plan = CommandPlan::management(kind, StatementOutputShape::ResultSet, false);
+        let plan = CommandPlan::management(kind, StatementOutputShape::ResultSet);
         let result = match self
             .start_trino_command(
                 source.sql(),

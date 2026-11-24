@@ -239,12 +239,16 @@ impl RestEndpoints {
         mut request: CreateTableRequest,
     ) -> MutationOutcome {
         request.stage_create = Some(true);
+        let table = crate::catalog::CatalogTableName::new(
+            namespace.as_ref().join("."),
+            request.name.clone(),
+        );
         self.mutate(
             Method::POST,
             |binding| binding.tables_url(namespace),
             Some(&request),
             Some(VENDED_CREDENTIALS),
-            &AttributionExpectation::stage_create(),
+            &AttributionExpectation::stage_create(table),
             true,
         )
         .await
@@ -621,6 +625,7 @@ mod tests {
         match evidence {
             RestEvidence::NotDispatched { kind, .. } => Expected::NotDispatched(*kind),
             RestEvidence::Rejected { kind, .. } => Expected::Rejected(*kind),
+            RestEvidence::RejectedStagedTableExists(_) => Expected::Rejected(Kind::AlreadyExists),
             RestEvidence::Applied { .. } => Expected::Applied,
             RestEvidence::Unknown { .. } => Expected::Unknown,
         }
@@ -741,6 +746,7 @@ mod tests {
                     updates: vec![],
                 };
                 let expect = AttributionExpectation::ctas_final_commit(
+                    crate::catalog::CatalogTableName::from_identifier(&table()),
                     uuid(TABLE_UUID),
                     snapshot(),
                     vec![(MARKER.0.to_string(), MARKER.1.to_string())],
@@ -793,7 +799,9 @@ mod tests {
             .permits_cleanup();
         let proven_not_applied = matches!(
             outcome.evidence,
-            RestEvidence::NotDispatched { .. } | RestEvidence::Rejected { .. }
+            RestEvidence::NotDispatched { .. }
+                | RestEvidence::Rejected { .. }
+                | RestEvidence::RejectedStagedTableExists(_)
         );
         assert_eq!(permits, proven_not_applied, "{:?}", outcome.evidence);
     }

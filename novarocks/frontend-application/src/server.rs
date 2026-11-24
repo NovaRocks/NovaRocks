@@ -409,9 +409,6 @@ async fn build_frontend_role_products(
             crate::mv::MvRefreshRuntimeSettings {
                 optimizer_query_mem_limit_bytes: host.optimizer_query_mem_limit_bytes(),
                 statement_clock: host.statement_clock(),
-                attempt_timeout: host
-                    .lake_publication_runtime_policy()
-                    .max_attempt_duration(),
             },
             host.workload_root_admission(),
             host.mv_startup_isolation(),
@@ -709,7 +706,6 @@ fn build_frontend_query_session_factory_from_role_products(
             mv_storage_observation,
             Arc::clone(&mv_readiness),
             Handle::current(),
-            host.lake_publication_runtime_policy(),
             host.constant_policy(),
             host.static_plan_carrier(),
             view_service.clone(),
@@ -749,7 +745,6 @@ fn build_frontend_query_session_factory_from_role_products(
         host.query_blocking_executor(),
         host.optimizer_query_mem_limit_bytes(),
         host.statement_clock(),
-        host.lake_publication_runtime_policy(),
         host.serving_lifecycle().admission(),
     )
     .with_state_store_original(host.state_store_original_binding());

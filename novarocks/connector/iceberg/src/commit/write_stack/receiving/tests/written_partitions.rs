@@ -37,7 +37,7 @@ use crate::iceberg::spec::{
 use novarocks_spi::connector::ConnectorWriteAdmissionPurpose;
 
 fn register(metadata: &TableMetadata) -> IcebergReceiving {
-    let mut receiving = IcebergReceiving::with_compact_mode(true, None);
+    let mut receiving = IcebergReceiving::new(None);
     let original = binding(metadata);
     receiving
         .bind_rewritten_target(owner("unit", [1; 16]), original, metadata)

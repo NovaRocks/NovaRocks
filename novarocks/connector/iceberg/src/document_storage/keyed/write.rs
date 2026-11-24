@@ -22,7 +22,7 @@
 
 use super::{envelope, keys, limits, record, view};
 use crate::iceberg::TableUpdate;
-use crate::iceberg::spec::TableMetadata;
+use crate::iceberg::spec::{Snapshot, TableMetadata};
 use novarocks_spi::connector::{
     ConnectorDocumentVersion, ConnectorError, ConnectorErrorKind, DocumentIdentity, KeyedCreate,
     KeyedMarkerWrite, KeyedPublication,
@@ -129,11 +129,22 @@ pub(crate) fn publication_updates(
     metadata: &TableMetadata,
     documents: &KeyedPublication,
 ) -> Result<PublicationUpdates, ConnectorError> {
+    publication_updates_from_snapshot(
+        metadata,
+        metadata.current_snapshot().map(AsRef::as_ref),
+        documents,
+    )
+}
+
+pub(crate) fn publication_updates_from_snapshot(
+    metadata: &TableMetadata,
+    predecessor: Option<&Snapshot>,
+    documents: &KeyedPublication,
+) -> Result<PublicationUpdates, ConnectorError> {
     documents.validate()?;
     let parsed = view::parse_properties(metadata.properties())
         .map_err(super::super::observation::keyed_read_error)?;
-    let previous_records = metadata
-        .current_snapshot()
+    let previous_records = predecessor
         .map(|snapshot| {
             view::parse_snapshot_records(&snapshot.summary().additional_properties, true)
         })

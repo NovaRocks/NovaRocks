@@ -24,11 +24,12 @@ pub(crate) struct GraphExpectation<'a> {
     pub(crate) table_commits: Option<usize>,
     pub(crate) failed_table_commits: usize,
     pub(crate) slot_changes: usize,
+    full_refreshes: usize,
     logical_rows: Option<u64>,
     total_records: Option<u64>,
     delete_files_min: Option<u64>,
     metadata_only_last: bool,
-    full_overwrite_last: bool,
+    full_refresh_last: bool,
     append_last: bool,
     interpretation_changes: bool,
 }
@@ -62,7 +63,10 @@ pub(crate) fn assert_graph(suite: &str, directive: &str) -> Result<String> {
         .with_context(|| format!("REST did not return MV metadata at {url}"))?;
     let value: Value = response.json().context("decode MV REST metadata")?;
     let summary = verify_graph(&value, &expectation)?;
-    verify_no_document_files(&value["metadata"])?;
+    verify_no_staging_files(
+        &value["metadata"],
+        expectation.publications == 0 && expectation.slot_changes == 0,
+    )?;
     Ok(summary)
 }
 
@@ -73,19 +77,20 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
     let mut parameters = parameters.split(',');
     let count = parameters.next().context("missing publication count")?;
     let mut metadata_only_last = false;
-    let mut full_overwrite_last = false;
+    let mut full_refresh_last = false;
     let mut append_last = false;
     let mut interpretation_changes = false;
     let mut table_commits = None;
     let mut failed_table_commits = None;
     let mut slot_changes = None;
+    let mut full_refreshes = None;
     let mut logical_rows = None;
     let mut total_records = None;
     let mut delete_files_min = None;
     for parameter in parameters {
         match parameter {
             "metadata-only-last=true" if !metadata_only_last => metadata_only_last = true,
-            "full-overwrite-last=true" if !full_overwrite_last => full_overwrite_last = true,
+            "full-refresh-last=true" if !full_refresh_last => full_refresh_last = true,
             "append-last=true" if !append_last => append_last = true,
             "interpretation-changes=true" if !interpretation_changes => {
                 interpretation_changes = true
@@ -113,6 +118,13 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
                         .context("invalid slot-changes count")?,
                 );
             }
+            value if value.starts_with("full-refreshes=") && full_refreshes.is_none() => {
+                full_refreshes = Some(
+                    value["full-refreshes=".len()..]
+                        .parse::<usize>()
+                        .context("invalid full-refreshes count")?,
+                );
+            }
             value if value.starts_with("logical-rows=") && logical_rows.is_none() => {
                 logical_rows = Some(
                     value["logical-rows=".len()..]
@@ -138,6 +150,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         }
     }
     let slot_changes = slot_changes.unwrap_or_default();
+    let full_refreshes = full_refreshes.unwrap_or_default();
     let publications = count
         .parse::<usize>()
         .context("invalid publication count")?;
@@ -146,8 +159,8 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         "metadata-only-last requires at least two publications"
     );
     ensure!(
-        !full_overwrite_last || publications >= 2,
-        "full-overwrite-last requires at least two publications"
+        full_refreshes <= publications && (!full_refresh_last || full_refreshes > 0),
+        "full refresh count and last-publication shape must agree with the publication count"
     );
     ensure!(
         !append_last || publications >= 2,
@@ -158,9 +171,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         "interpretation-changes currently requires exactly two publications"
     );
     ensure!(
-        usize::from(metadata_only_last)
-            + usize::from(full_overwrite_last)
-            + usize::from(append_last)
+        usize::from(metadata_only_last) + usize::from(full_refresh_last) + usize::from(append_last)
             <= 1,
         "last publication can have only one expected physical write shape"
     );
@@ -185,11 +196,12 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         table_commits,
         failed_table_commits: failed_table_commits.unwrap_or_default(),
         slot_changes,
+        full_refreshes,
         logical_rows,
         total_records,
         delete_files_min,
         metadata_only_last,
-        full_overwrite_last,
+        full_refresh_last,
         append_last,
         interpretation_changes,
     })
@@ -312,11 +324,13 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         .as_array()
         .context("REST metadata lacks snapshots")?;
     ensure!(
-        snapshots.len() == expectation.publications + expectation.slot_changes,
-        "retained snapshots {} differ from publications {} + slot changes {}",
+        snapshots.len()
+            == expectation.publications + expectation.slot_changes + expectation.full_refreshes,
+        "retained snapshots {} differ from publications {} + slot changes {} + FULL deletes {}",
         snapshots.len(),
         expectation.publications,
-        expectation.slot_changes
+        expectation.slot_changes,
+        expectation.full_refreshes,
     );
     let mut by_id = BTreeMap::new();
     let mut by_sequence = BTreeMap::new();
@@ -347,6 +361,13 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
             "current and main ref differ"
         );
     }
+    let (full_deletes, full_appends) = full_refresh_pairs(&by_sequence)?;
+    ensure!(
+        full_appends.len() == expectation.full_refreshes,
+        "FULL pairs {}, expected {}",
+        full_appends.len(),
+        expectation.full_refreshes
+    );
     let mut publications = BTreeMap::<[u8; 16], String>::new();
     let mut slots = 0;
     let mut slot_ids = BTreeSet::new();
@@ -356,6 +377,9 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         let id = snapshot["snapshot-id"]
             .as_i64()
             .context("snapshot lacks ID")?;
+        if full_deletes.contains(&id) {
+            continue;
+        }
         let records = wire::records(&snapshot["summary"])?;
         for frame in records.values() {
             if let Some(root) = wire::record(frame)?.binding {
@@ -411,6 +435,20 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
             } else {
                 publications.insert(p.id, frame.clone());
                 is_publication = true;
+            }
+            if full_appends.contains(&id) {
+                let total = summary_number(&snapshot["summary"], "total-records")?;
+                ensure!(
+                    is_publication && p.rows == Some(total),
+                    "FULL append must carry a new P with exact physical and logical rows"
+                );
+                if total > 0 {
+                    ensure!(
+                        snapshot["first-row-id"].as_u64().is_some()
+                            && snapshot["added-rows"].as_u64() == Some(total),
+                        "FULL append must introduce lineage for every rebuilt row"
+                    );
+                }
             }
             if Some(id) == current {
                 if let Some(minimum) = expectation.delete_files_min {
@@ -546,15 +584,20 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
                 "metadata-only publication changed files/records"
             );
         }
-        if expectation.full_overwrite_last {
+        if expectation.full_refresh_last {
             ensure!(
-                summary["operation"] == "overwrite",
-                "FULL publication is not overwrite"
+                last["snapshot-id"]
+                    .as_i64()
+                    .is_some_and(|id| full_appends.contains(&id)),
+                "last publication is not a FULL delete/append pair"
             );
         }
         if expectation.append_last {
             ensure!(
                 summary["operation"] == "append"
+                    && last["snapshot-id"]
+                        .as_i64()
+                        .is_some_and(|id| !full_appends.contains(&id))
                     && summary_number(summary, "added-data-files")? > 0,
                 "incremental publication did not append data files"
             );
@@ -566,6 +609,65 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         properties.private_bytes
     ))
 }
+fn full_refresh_pairs(snapshots: &BTreeMap<u64, &Value>) -> Result<(BTreeSet<i64>, BTreeSet<i64>)> {
+    const MARKER: &str = "novarocks.write.session.v1";
+    let mut deletes = BTreeSet::new();
+    let mut appends = BTreeSet::new();
+    let mut previous_id = None;
+    for (&sequence, snapshot) in snapshots {
+        let id = snapshot["snapshot-id"]
+            .as_i64()
+            .context("snapshot lacks ID")?;
+        let summary = &snapshot["summary"];
+        if summary["operation"] == "delete" && summary[wire::PUBLICATION_KEY].is_null() {
+            ensure!(
+                previous_id == snapshot["parent-snapshot-id"].as_i64(),
+                "FULL delete did not extend the retained prior head"
+            );
+            ensure!(
+                summary.as_object().is_some_and(|summary| summary
+                    .keys()
+                    .all(|key| !key.starts_with("novarocks."))),
+                "FULL delete summary contains nonstandard fields"
+            );
+            for key in ["total-records", "total-data-files", "total-delete-files"] {
+                ensure!(
+                    summary_number(summary, key)? == 0,
+                    "FULL delete has nonzero {key}"
+                );
+            }
+            let append = sequence
+                .checked_add(1)
+                .and_then(|next| snapshots.get(&next))
+                .context("FULL delete lacks a consecutive append")?;
+            let append_summary = &append["summary"];
+            let marker = append_summary[MARKER]
+                .as_str()
+                .filter(|marker| !marker.is_empty())
+                .context("FULL append lacks a write session marker")?;
+            ensure!(
+                append["parent-snapshot-id"].as_i64() == Some(id)
+                    && append_summary["operation"] == "append"
+                    && append_summary[wire::PUBLICATION_KEY].is_string()
+                    && snapshots
+                        .values()
+                        .filter(|s| s["summary"][MARKER].as_str() == Some(marker))
+                        .count()
+                        == 1,
+                "FULL append did not extend its delete with one unique marked publication"
+            );
+            deletes.insert(id);
+            appends.insert(
+                append["snapshot-id"]
+                    .as_i64()
+                    .context("FULL append lacks ID")?,
+            );
+        }
+        previous_id = Some(id);
+    }
+    Ok((deletes, appends))
+}
+
 fn s3_bucket_and_key(location: &str) -> Result<(&str, &str)> {
     let path = location
         .strip_prefix("s3://")
@@ -610,7 +712,7 @@ fn document_prefixes<'a>(
         ),
     ])
 }
-fn verify_no_document_files(metadata: &Value) -> Result<()> {
+fn verify_no_staging_files(metadata: &Value, verify_managed_create: bool) -> Result<()> {
     let warehouse = std::env::var("NOVAROCKS_ICEBERG_REST_WAREHOUSE")
         .context("isolated warehouse URI unavailable")?;
     let endpoint = std::env::var("AWS_S3_ENDPOINT").context("MinIO endpoint unavailable")?;
@@ -620,7 +722,28 @@ fn verify_no_document_files(metadata: &Value) -> Result<()> {
         .enable_all()
         .build()?;
     let storage = FixtureObjectStore::new(endpoint, access, secret)?;
-    for (bucket, prefix) in document_prefixes(metadata, &warehouse)? {
+    let mut prefixes = document_prefixes(metadata, &warehouse)?.to_vec();
+    if verify_managed_create {
+        let location = metadata["location"]
+            .as_str()
+            .context("REST metadata lacks table location")?;
+        let (bucket, key) = s3_bucket_and_key(location)?;
+        let (warehouse_bucket, warehouse_key) = s3_bucket_and_key(&warehouse)?;
+        prefixes.extend([
+            (
+                bucket,
+                format!("{}/data/_staging/", key.trim_end_matches('/')),
+            ),
+            (
+                warehouse_bucket,
+                format!(
+                    "{}/_novarocks/ctas-staging/v1/",
+                    warehouse_key.trim_end_matches('/')
+                ),
+            ),
+        ]);
+    }
+    for (bucket, prefix) in prefixes {
         let location = format!("s3://{bucket}/{prefix}");
         let has_files = runtime
             .block_on(async {
@@ -628,10 +751,10 @@ fn verify_no_document_files(metadata: &Value) -> Result<()> {
                 let access = storage.resolve(&location, &cancellation).await?;
                 storage.has_files(&access, &location, &cancellation).await
             })
-            .with_context(|| format!("LIST document prefix s3://{bucket}/{prefix}"))?;
+            .with_context(|| format!("LIST staging prefix s3://{bucket}/{prefix}"))?;
         ensure!(
             !has_files,
-            "unexpected document object below s3://{bucket}/{prefix}"
+            "unexpected object below staging prefix s3://{bucket}/{prefix}"
         );
     }
     Ok(())

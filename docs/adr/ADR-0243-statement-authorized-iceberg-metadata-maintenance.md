@@ -5,6 +5,10 @@ domain: [table-maintenance, provider-spi, sql-language]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0262
+    scope: "Continued independent admission of the built-in unanchored CTAS scan."
+    link: "ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md"
 partially-supersedes:
   - id: ADR-0110
     scope: "Scan GC admission for explicit remove_orphan_files and cleanup of NovaRocks-owned refs. Target OCC, autocommit and crash-only publication remain active."

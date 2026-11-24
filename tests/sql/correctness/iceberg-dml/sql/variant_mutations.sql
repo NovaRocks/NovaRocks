@@ -51,7 +51,7 @@ ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id,v) VALUES (s.id,NULL);
 
 -- query 6
 -- @expect_error=Iceberg Variant writes are not supported
-INSERT OVERWRITE iru9_variant_mutations_${uuid0}.iru9_${uuid0}.t_v3_variant_mut VALUES ROW(20,parse_json('{"a":20}'));
+INSERT INTO iru9_variant_mutations_${uuid0}.iru9_${uuid0}.t_v3_variant_mut VALUES ROW(20,parse_json('{"a":20}'));
 
 -- query 7
 -- @skip_result_check=true
@@ -66,7 +66,7 @@ SELECT COUNT(*) AS remaining_rows FROM iru9_variant_mutations_${uuid0}.iru9_${uu
 ALTER TABLE iru9_variant_mutations_${uuid0}.iru9_${uuid0}.t_v3_variant_mut EXECUTE add_equality_delete(columns => ARRAY['v'], rows => ARRAY[ROW(NULL)]);
 
 -- query 10
--- @expect_error=Iceberg Variant writes are not supported
+-- @expect_error=SQL type variant is not supported
 CREATE TABLE ${case_db}.t_v3_variant_partition_bad (id BIGINT,v VARIANT) WITH (partitioning = ARRAY['v'], format_version = 3);
 
 -- query 11
@@ -85,7 +85,7 @@ grep -E '^IRU9_(EMPTY_REGION_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
 
 -- query 13
 -- @expect_error=Iceberg Variant writes are not supported
-INSERT OVERWRITE PARTITIONS iru9_variant_mutations_${uuid0}.iru9_${uuid0}.t_v3_variant_part_mut
+INSERT INTO iru9_variant_mutations_${uuid0}.iru9_${uuid0}.t_v3_variant_part_mut
 VALUES ROW(4,'us',parse_json('{"a":4}'));
 
 -- query 14

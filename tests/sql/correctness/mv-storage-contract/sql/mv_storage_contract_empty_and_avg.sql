@@ -62,7 +62,7 @@ CREATE MATERIALIZED VIEW readings_total WITH (refresh_policy = 'MANUAL') AS SELE
 
 -- query 7
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.readings_total,publications=1,slot-changes=0
+-- @mv_rest_document_graph=ns_${uuid0}.readings_total,publications=1,slot-changes=0,full-refreshes=1
 REFRESH MATERIALIZED VIEW readings_total;
 
 -- query 8
@@ -82,7 +82,7 @@ INSERT INTO mvsc_${uuid0}.ns_${uuid0}.readings VALUES ROW('a', 10), ROW('a', 20)
 
 -- query 11
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.readings_total,publications=2,slot-changes=0
+-- @mv_rest_document_graph=ns_${uuid0}.readings_total,publications=2,slot-changes=0,full-refreshes=1
 REFRESH MATERIALIZED VIEW readings_total;
 
 -- query 12
@@ -96,7 +96,7 @@ CREATE MATERIALIZED VIEW readings_avg WITH (refresh_policy = 'MANUAL') AS SELECT
 
 -- query 14
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.readings_avg,publications=1,slot-changes=0
+-- @mv_rest_document_graph=ns_${uuid0}.readings_avg,publications=1,slot-changes=0,full-refreshes=1
 REFRESH MATERIALIZED VIEW readings_avg;
 
 -- query 15
@@ -108,7 +108,7 @@ INSERT INTO mvsc_${uuid0}.ns_${uuid0}.readings VALUES ROW('a', 60), ROW('b', 3);
 
 -- query 17
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.readings_avg,publications=2,slot-changes=0
+-- @mv_rest_document_graph=ns_${uuid0}.readings_avg,publications=2,slot-changes=0,full-refreshes=1
 REFRESH MATERIALIZED VIEW readings_avg;
 
 -- query 18

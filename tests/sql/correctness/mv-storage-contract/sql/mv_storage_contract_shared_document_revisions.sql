@@ -35,7 +35,7 @@ CREATE MATERIALIZED VIEW mv_graph WITH (refresh_policy = 'MANUAL') AS SELECT k, 
 -- query 6
 -- @tags=mv,iceberg,rest,minio,storage-contract,document-retention
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=1,slot-changes=0
+-- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=1,slot-changes=0,full-refreshes=1
 REFRESH MATERIALIZED VIEW mv_graph;
 
 -- query 7
@@ -47,7 +47,7 @@ INSERT INTO mvgraph_${uuid0}.ns_${uuid0}.fact VALUES ROW('east', 20);
 REFRESH MATERIALIZED VIEW mv_graph;
 
 -- query 9
--- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=2,slot-changes=0
+-- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=2,slot-changes=0,full-refreshes=1
 -- @skip_result_check=true
 -- @result_contains=east
 -- @result_contains=10

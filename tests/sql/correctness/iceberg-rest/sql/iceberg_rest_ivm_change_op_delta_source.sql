@@ -21,7 +21,7 @@
 -- Test Point:
 --   Validate Iceberg-backed MV refresh over an Iceberg REST v3 row-lineage table
 --   uses tagged delta source semantics for both projection and signed aggregate
---   SUM overwrite changes, including full aggregate-group retraction.
+--   SUM changes after Spark overwrites, including full aggregate-group retraction.
 
 -- query 1
 -- @skip_result_check=true
@@ -58,9 +58,16 @@ FROM orders_sum_mv_${uuid0}
 ORDER BY customer;
 
 -- query 5
--- @skip_result_check=true
-INSERT OVERWRITE iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0}
-VALUES ROW(1, 'Alice', 80), ROW(2, 'Bob', 40);
+-- @result_contains=SPARK_BASE_OVERWRITE_OK
+shell: set -eu
+tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-ivm-overwrite-XXXXXX.sql")"
+trap 'rm -f "$tmp_sql"' EXIT
+cat > "$tmp_sql" <<'SPARK_SQL'
+INSERT OVERWRITE TABLE ice_rest.ivm_${uuid0}.orders_${uuid0}
+VALUES (1, 'Alice', 80), (2, 'Bob', 40);
+SPARK_SQL
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
+printf 'SPARK_BASE_OVERWRITE_OK\n'
 
 -- query 6
 SELECT id, customer, amount
@@ -83,9 +90,16 @@ FROM orders_sum_mv_${uuid0}
 ORDER BY customer;
 
 -- query 10
--- @skip_result_check=true
-INSERT OVERWRITE iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0}
-VALUES ROW(2, 'Bob', 40);
+-- @result_contains=SPARK_BASE_OVERWRITE_OK
+shell: set -eu
+tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-ivm-overwrite-XXXXXX.sql")"
+trap 'rm -f "$tmp_sql"' EXIT
+cat > "$tmp_sql" <<'SPARK_SQL'
+INSERT OVERWRITE TABLE ice_rest.ivm_${uuid0}.orders_${uuid0}
+VALUES (2, 'Bob', 40);
+SPARK_SQL
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
+printf 'SPARK_BASE_OVERWRITE_OK\n'
 
 -- query 11
 SELECT id, customer, amount

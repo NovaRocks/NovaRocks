@@ -942,9 +942,8 @@ fn run_expiry(
     let a1 = load_metadata(context, rest, NS, "a")?;
     repartition(context, conn, "a", 2)?;
     let a2 = load_metadata(context, rest, NS, "a")?;
-    // A second native repartition requires unsupported multi-spec overwrite.
-    // An external schema reorder preserves field identities and publishes a
-    // third distinct L/B closure without changing the writer's support contract.
+    // An external schema reorder preserves field identities and independently
+    // publishes a third distinct L/B closure for the expiry check.
     let a3 = publish_reordered_schema(context, rest, "a", &a2)?;
     assert_rows(
         context,
@@ -959,8 +958,18 @@ fn run_expiry(
     let pruned = load_metadata(context, rest, NS, "a")?;
     let after = save_graph(context, "a-after-expiry", &pruned)?;
     ensure!(
-        snapshot_ids(&pruned)?.len() == 2,
-        "expiry channel did not remove exactly the oldest snapshot"
+        snapshot_ids(&pruned)?
+            == [
+                a2["current-snapshot-id"]
+                    .as_i64()
+                    .context("repartition head missing")?,
+                a3["current-snapshot-id"]
+                    .as_i64()
+                    .context("external head missing")?,
+            ]
+            .into_iter()
+            .collect(),
+        "expiry did not retain precisely the two newest snapshots"
     );
     ensure!(
         !after.versions.contains_key(&first_graph.binding),
@@ -1074,7 +1083,7 @@ fn run_expiry(
         let middle_graph = Graph::from_metadata(&middle)?;
         let before_graph = Graph::from_metadata(&before)?;
         ensure!(
-            snapshot_ids(&before)?.len() == 3
+            snapshot_ids(&before)?.len() == 5
                 && head != middle_head
                 && carrier["parent-snapshot-id"].as_i64() == Some(middle_head)
                 && before_graph.versions == middle_graph.versions
@@ -1572,8 +1581,8 @@ impl Documents {
         let stable = load_metadata(context, rest, NS, "stable")?;
         let graph = save_graph(context, "continuous-refresh-300", &stable)?;
         ensure!(
-            graph.snapshots.len() == 300,
-            "300 ordinary refreshes did not produce 300 publication snapshots"
+            graph.snapshots.len() == 301,
+            "300 refreshes must retain their publications and the first full refresh delete"
         );
         let counted = conn.execute("SELECT COUNT(*) FROM stable")?;
         ensure!(
@@ -1599,16 +1608,28 @@ impl Documents {
             "ordinary refreshes grew private properties: first={first_private_bytes}, final={}",
             graph.private_bytes
         );
-        // Graph counts every private record. One MV record in each snapshot
-        // and the matching total exclude additional records in any snapshot.
+        let (initial_delete_id, record) = &graph.snapshots[0];
+        let initial_delete = stable["snapshots"]
+            .as_array()
+            .context("refresh snapshots missing")?
+            .iter()
+            .find(|s| s["snapshot-id"].as_i64() == Some(*initial_delete_id))
+            .context("initial full refresh delete missing")?;
         ensure!(
-            graph.record_bytes.len() == graph.snapshots.len()
-                && graph.snapshots.iter().all(|(_, record)| {
+            record.is_none()
+                && initial_delete["summary"]["operation"] == "delete"
+                && initial_delete["summary"]["total-records"] == "0",
+            "initial full refresh delete must contain no rows or publication"
+        );
+        // One original record per actual publication keeps the compact document bound.
+        ensure!(
+            graph.record_bytes.len() == 300
+                && graph.snapshots[1..].iter().all(|(_, record)| {
                     record.as_ref().is_some_and(|record| {
                         record.binding.as_deref() == Some(first_binding.as_str())
                     })
                 }),
-            "ordinary refresh snapshots must each carry one record of the first binding"
+            "ordinary refreshes must each carry one record of the first binding"
         );
         let start = self.audit()?.len();
         execute(

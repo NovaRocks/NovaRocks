@@ -45,7 +45,7 @@ use novarocks_spi::connector::{
     ConnectorDocumentPublicationDeclaration, ConnectorError, ConnectorErrorKind,
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteIntent, ExternalMutationFinalization,
+    ExternalMutationFinalization,
 };
 use parquet::basic::Compression;
 
@@ -135,16 +135,11 @@ impl IcebergWriteBranch {
 /// Every SQL-level write shape Iceberg supports, mapped onto one commit op.
 ///
 /// This enum is provider-private on purpose: the neutral write stack never
-/// learns that Iceberg distinguishes a dynamic partition overwrite from a
-/// static one, or a row mutation from a distributed rewrite.
+/// learns how Iceberg represents row mutations or distributed rewrites.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum IcebergWriteFlavor {
     /// `INSERT INTO`.
     Append,
-    /// `INSERT OVERWRITE` replacing the whole target.
-    Overwrite,
-    /// `INSERT OVERWRITE` replacing only the touched partitions.
-    PartitionOverwrite,
     /// Merge-on-read row mutation staging Parquet position deletes.
     RowMutationPositionDelete,
     /// Merge-on-read row mutation staging Puffin deletion vectors.
@@ -158,16 +153,6 @@ pub enum IcebergWriteFlavor {
     ManagedPublication,
     /// Distributed compaction / rewrite of a frozen data file set.
     DistributedRewrite,
-    /// Distributed repack of a frozen position-delete artifact set.
-    ///
-    /// It is a separate flavor from [`Self::DistributedRewrite`] rather than a
-    /// flag on it because the two seal different physical branches: this one
-    /// republishes deletion vectors and never writes a data file, and the other
-    /// republishes data files and never writes a delete artifact. Keeping them
-    /// apart is what lets `allowed_session_branches` refuse each one's branch on
-    /// the other.
-    /// Provider-owned maintenance such as `TRUNCATE`.
-    TableMaintenance,
 }
 
 impl IcebergWriteFlavor {
@@ -176,7 +161,6 @@ impl IcebergWriteFlavor {
         use crate::catalog::admission::CatalogOperation;
         match self {
             Self::Append => CatalogOperation::Append,
-            Self::Overwrite | Self::PartitionOverwrite => CatalogOperation::Overwrite,
             Self::RowMutationPositionDelete | Self::RowMutationDeletionVector => {
                 CatalogOperation::RowMutation
             }
@@ -186,7 +170,6 @@ impl IcebergWriteFlavor {
             ),
             Self::ManagedPublication => CatalogOperation::PublishDocuments,
             Self::DistributedRewrite => CatalogOperation::RewriteDataFiles,
-            Self::TableMaintenance => CatalogOperation::Truncate,
         }
     }
 
@@ -201,8 +184,6 @@ impl IcebergWriteFlavor {
             Self::Append | Self::StagedCreate | Self::ManagedPublication => {
                 CommitOpKind::FastAppend
             }
-            Self::Overwrite => CommitOpKind::Overwrite,
-            Self::PartitionOverwrite => CommitOpKind::OverwritePartitions,
             Self::RowMutationPositionDelete => CommitOpKind::RowDelta,
             Self::RowMutationDeletionVector => CommitOpKind::MaterializedRowDelta,
             // The same op a Parquet position-delete row mutation commits: the
@@ -213,7 +194,6 @@ impl IcebergWriteFlavor {
             // input set; what differs is which half of that set they replace,
             // and the commit reads that off the session's flavor.
             Self::DistributedRewrite => CommitOpKind::SelectedRewrite,
-            Self::TableMaintenance => CommitOpKind::Truncate,
         }
     }
 
@@ -237,12 +217,9 @@ impl IcebergWriteFlavor {
     pub fn branches(self) -> &'static [IcebergWriteBranch] {
         match self {
             Self::Append
-            | Self::Overwrite
-            | Self::PartitionOverwrite
             | Self::StagedCreate
             | Self::ManagedPublication
-            | Self::DistributedRewrite
-            | Self::TableMaintenance => &[IcebergWriteBranch::Data],
+            | Self::DistributedRewrite => &[IcebergWriteBranch::Data],
             Self::RowMutationPositionDelete => {
                 &[IcebergWriteBranch::Data, IcebergWriteBranch::PositionDelete]
             }
@@ -322,14 +299,6 @@ impl IcebergDocumentPublicationFacts {
         self.declaration.empty_input()
     }
 
-    pub const fn connector_intent(&self) -> ConnectorWriteIntent {
-        match self.technique() {
-            ConnectorManagedPublicationTechnique::Full => ConnectorWriteIntent::Overwrite,
-            ConnectorManagedPublicationTechnique::Incremental
-            | ConnectorManagedPublicationTechnique::MetadataOnly => ConnectorWriteIntent::Append,
-        }
-    }
-
     pub const fn commit_op_kind(&self, delete_branch: Option<IcebergWriteBranch>) -> CommitOpKind {
         publication_commit_op_kind(self.technique(), delete_branch)
     }
@@ -344,7 +313,7 @@ const fn publication_commit_op_kind(
         // `plan_document_publication_branches` refuses a full refresh with a
         // change-stream shape, because a commit that replaces every live
         // row has no prior row for a change event to supersede.
-        (ConnectorManagedPublicationTechnique::Full, _) => CommitOpKind::Overwrite,
+        (ConnectorManagedPublicationTechnique::Full, _) => CommitOpKind::FullRefresh,
         // A metadata-only publication writes no files and seals no delete
         // branch: it exists to move the watermark, and the rows it publishes
         // are the ones already there.
@@ -470,8 +439,7 @@ impl IcebergFrozenRewriteBranchInput {
 /// rewrite into a failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IcebergEmptyWriteDecision {
-    /// Publish the empty write as an ordinary snapshot. This is what a zero-row
-    /// `INSERT` has always done.
+    /// Publish the empty write as a snapshot.
     Commit,
     /// Terminate the session with no external commit at all. The target ref
     /// keeps the head the session was frozen against.
@@ -482,31 +450,12 @@ impl IcebergWriteFlavor {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Append => "append",
-            Self::Overwrite => "overwrite",
-            Self::PartitionOverwrite => "partition-overwrite",
             Self::RowMutationPositionDelete => "row-mutation-position-delete",
             Self::RowMutationDeletionVector => "row-mutation-deletion-vector",
             Self::StagedCreate => "staged-create",
             Self::ManagedPublication => "managed-publication",
             Self::DistributedRewrite => "distributed-rewrite",
-            Self::TableMaintenance => "table-maintenance",
             Self::EqualityDelete => "equality-delete",
-        }
-    }
-
-    /// The neutral write intent this flavor presents to admission.
-    pub const fn connector_intent(self) -> ConnectorWriteIntent {
-        match self {
-            Self::Append | Self::StagedCreate | Self::ManagedPublication => {
-                ConnectorWriteIntent::Append
-            }
-            Self::Overwrite | Self::DistributedRewrite | Self::TableMaintenance => {
-                ConnectorWriteIntent::Overwrite
-            }
-            Self::PartitionOverwrite => ConnectorWriteIntent::PartitionOverwrite,
-            Self::RowMutationPositionDelete
-            | Self::RowMutationDeletionVector
-            | Self::EqualityDelete => ConnectorWriteIntent::RowDelta,
         }
     }
 }
@@ -1555,10 +1504,10 @@ impl IcebergEqualityDeleteRecipe {
 /// number covers. That is also why it supersedes nothing and merges nothing.
 #[derive(Clone, Debug)]
 pub struct IcebergEqualityDeleteFileArtifact {
-    path: String,
-    partition: IcebergArtifactPartition,
-    metrics: IcebergArtifactMetrics,
-    equality_field_ids: Vec<i32>,
+    pub(super) path: String,
+    pub(super) partition: IcebergArtifactPartition,
+    pub(super) metrics: IcebergArtifactMetrics,
+    pub(super) equality_field_ids: Vec<i32>,
 }
 
 impl IcebergEqualityDeleteFileArtifact {
@@ -2456,12 +2405,15 @@ impl IcebergWriteCommitSession {
     }
 
     pub(crate) fn with_mutation_read(mut self, recipe: IcebergMutationReadRecipe) -> Self {
+        assert!(
+            self.progress
+                .get_mut()
+                .expect("new write session progress")
+                .receiving
+                .is_unstarted(),
+            "fixed mutation must be bound before receiving"
+        );
         self.mutation_read = Some(recipe);
-        self.progress
-            .get_mut()
-            .expect("new write session progress")
-            .receiving
-            .enable_fixed_mutation(self.flavor);
         self
     }
 
@@ -2605,25 +2557,19 @@ impl IcebergWriteCommitSession {
                 flavor.as_str()
             )));
         }
-        let compact_receiving = flavor == IcebergWriteFlavor::Append
-            || flavor.is_distributed_rewrite()
-            || (repartition.is_none()
-                && document_publication.as_ref().is_some_and(|publication| {
-                    matches!(
-                        publication.technique(),
-                        ConnectorManagedPublicationTechnique::MetadataOnly
-                            | ConnectorManagedPublicationTechnique::Incremental
-                    )
-                }));
         let rewrite_groups = flavor.is_distributed_rewrite().then_some(targets.len());
         Ok(Self {
             session_id,
             creation_scope: None,
             mutation_read: None,
-            commit_protocol: if flavor.is_distributed_rewrite() {
-                crate::commit::model::WriteSessionCommitProtocol::RewriteFiles
-            } else {
-                crate::commit::model::WriteSessionCommitProtocol::Legacy
+            commit_protocol: match flavor {
+                IcebergWriteFlavor::Append => {
+                    crate::commit::model::WriteSessionCommitProtocol::Append
+                }
+                flavor if flavor.is_distributed_rewrite() => {
+                    crate::commit::model::WriteSessionCommitProtocol::RewriteFiles
+                }
+                _ => crate::commit::model::WriteSessionCommitProtocol::Legacy,
             },
             table,
             flavor,
@@ -2649,7 +2595,7 @@ impl IcebergWriteCommitSession {
             empty_cleanup_disposed: std::sync::atomic::AtomicBool::new(false),
             progress: Mutex::new(IcebergWriteSessionProgress {
                 state: IcebergWriteSessionState::Active,
-                receiving: IcebergReceiving::with_compact_mode(compact_receiving, rewrite_groups),
+                receiving: IcebergReceiving::new(rewrite_groups),
             }),
         })
     }
@@ -2895,12 +2841,12 @@ impl IcebergWriteCommitSession {
 
     /// What an empty prepared write set means for this session.
     ///
-    /// Artifact-only row deltas and explicit managed aborts can finish without
+    /// Empty inserts, artifact-only row deltas and explicit managed aborts finish without
     /// publishing. A rewrite session already owns a nonempty removal set and
     /// settles it even when no rows survive. A plan with no groups starts no
     /// session.
     pub fn empty_write_decision(&self) -> IcebergEmptyWriteDecision {
-        if self.flavor.is_artifact_row_delta() {
+        if self.flavor == IcebergWriteFlavor::Append || self.flavor.is_artifact_row_delta() {
             return IcebergEmptyWriteDecision::SkipExternalCommit;
         }
         let disposition = self
@@ -3395,14 +3341,11 @@ mod tests {
     fn every_flavor_maps_to_one_commit_op_and_owns_its_branches() {
         for flavor in [
             IcebergWriteFlavor::Append,
-            IcebergWriteFlavor::Overwrite,
-            IcebergWriteFlavor::PartitionOverwrite,
             IcebergWriteFlavor::RowMutationPositionDelete,
             IcebergWriteFlavor::RowMutationDeletionVector,
             IcebergWriteFlavor::StagedCreate,
             IcebergWriteFlavor::ManagedPublication,
             IcebergWriteFlavor::DistributedRewrite,
-            IcebergWriteFlavor::TableMaintenance,
         ] {
             let branches = flavor.branches();
             assert!(!branches.is_empty(), "{} has no branch", flavor.as_str());
@@ -3415,7 +3358,6 @@ mod tests {
             // A commit op is a total function of the flavor; calling it must
             // never panic and must never be inferred from a fragment.
             let _ = flavor.commit_op_kind();
-            let _ = flavor.connector_intent();
             assert!(flavor.accepts_empty_prepared_set());
         }
         assert_eq!(
@@ -3427,7 +3369,6 @@ mod tests {
         let flavor = IcebergWriteFlavor::EqualityDelete;
         assert_eq!(flavor.branches(), &[IcebergWriteBranch::EqualityDelete]);
         let _ = flavor.commit_op_kind();
-        let _ = flavor.connector_intent();
         assert!(flavor.accepts_empty_prepared_set());
     }
 

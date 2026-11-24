@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0262
+    scope: "Treatment of the unanchored CTAS scan as a conditional participant in scan-based garbage collection."
+    link: "ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md"
   - id: ADR-0243
     scope: "The external-effect fencing prerequisite for explicit remove_orphan_files and the rules for cleanup of NovaRocks-owned refs. Original publication, cancellation, actual exit and unanchored CTAS rules remain active."
     link: "ADR-0243-statement-authorized-iceberg-metadata-maintenance.md"

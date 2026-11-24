@@ -174,8 +174,6 @@ pub struct DmlExecutionKernel {
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
     connector_runtime: Option<tokio::runtime::Handle>,
-    lake_publication_runtime_policy:
-        Option<novarocks_query_application::publication::LakePublicationRuntimePolicy>,
     write_runtime: Option<(
         crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
         crate::native::data_runtime::FrontendDataRuntime,
@@ -252,7 +250,6 @@ impl DmlExecutionKernel {
             connector_runtime: None,
             state_store: None,
             write_runtime: None,
-            lake_publication_runtime_policy: None,
         }
     }
 
@@ -376,14 +373,6 @@ impl DmlExecutionKernel {
         &self.typed_connector_control
     }
 
-    pub fn with_lake_publication_runtime_policy(
-        mut self,
-        policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
-    ) -> Self {
-        self.lake_publication_runtime_policy = Some(policy);
-        self
-    }
-
     pub(crate) fn catalog_service(&self) -> &Arc<QueryCatalogService> {
         &self.catalog_service
     }
@@ -406,12 +395,6 @@ impl DmlExecutionKernel {
 
     pub(crate) fn mv_readiness(&self) -> &Arc<MvReadinessPort> {
         &self.mv_readiness
-    }
-
-    pub(crate) fn lake_publication_runtime_policy(
-        &self,
-    ) -> Option<novarocks_query_application::publication::LakePublicationRuntimePolicy> {
-        self.lake_publication_runtime_policy
     }
 }
 
