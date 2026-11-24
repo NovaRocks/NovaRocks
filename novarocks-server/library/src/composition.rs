@@ -172,6 +172,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                     field.type_signature,
                     field.nullable,
                 )
+                .map(|binding| binding.with_source_type(field.source_type))
             })
             .collect::<Result<Vec<_>, _>>()?;
         MvSourceSchemaObservation::try_new(
@@ -205,6 +206,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                     field.type_signature,
                     field.nullable,
                 )
+                .with_source_type(field.source_type)
             })
             .collect();
         let partition = mv_partition_observation(observed.partition);
@@ -238,7 +240,8 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                         field.name,
                         field.type_signature,
                         field.nullable,
-                    )?,
+                    )?
+                    .with_source_type(field.source_type),
                 ))
             })
             .collect::<Result<Vec<_>, ConnectorError>>()?;

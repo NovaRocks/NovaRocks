@@ -57,6 +57,11 @@ mod row_mutation;
 mod scalar;
 mod scoped_begin;
 mod semantic_revision;
+mod source_type;
+pub use source_type::{
+    IcebergSourcePrimitive, IcebergSourceType, IcebergSourceTypeNode, ProviderSourceType,
+    ProviderSourceTypeShape,
+};
 mod staged_create;
 mod statistics;
 mod view_metadata;

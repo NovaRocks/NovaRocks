@@ -1477,7 +1477,10 @@ impl IcebergStagedCreateAdapter {
                 let payload = Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes());
                 let handle = if let Some(admission) = document_admission {
                     let managed_handle = (|| {
-                        let fields = prepared_document_field_bindings(staged.table.metadata())?;
+                        let fields = prepared_document_field_bindings(
+                            staged.table.metadata(),
+                            &finalization_context,
+                        )?;
                         let target = ConnectorPreparedCreateDocumentTarget::try_new(
                             self.owner(),
                             admission.catalog_handle().clone(),
@@ -2229,7 +2232,10 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 let payload = Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes());
                 let handle = if let Some(admission) = document_admission {
                     let managed_handle = (|| {
-                        let fields = prepared_document_field_bindings(staged.table.metadata())?;
+                        let fields = prepared_document_field_bindings(
+                            staged.table.metadata(),
+                            &finalization_context,
+                        )?;
                         let target = ConnectorPreparedCreateDocumentTarget::try_new(
                             self.owner(),
                             admission.catalog_handle().clone(),
@@ -3012,7 +3018,9 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 
 fn prepared_document_field_bindings(
     metadata: &crate::iceberg::spec::TableMetadata,
+    context: &ConnectorRequestContext,
 ) -> Result<Vec<ConnectorPreparedCreateFieldBinding>, ConnectorError> {
+    let mut type_bytes = 0;
     metadata
         .current_schema()
         .as_struct()
@@ -3022,6 +3030,10 @@ fn prepared_document_field_bindings(
         .map(|(ordinal, field)| {
             let ordinal = u32::try_from(ordinal)
                 .map_err(|_| invalid("Iceberg staged-create field ordinal exceeds u32"))?;
+            let source_type =
+                crate::source_type::project_source_type(&field.field_type, context, |bytes| {
+                    crate::storage_inspector::reserve_bytes(context, &mut type_bytes, bytes)
+                })?;
             ConnectorPreparedCreateFieldBinding::try_new(
                 ordinal,
                 Bytes::copy_from_slice(&field.id.to_be_bytes()),
@@ -3029,6 +3041,7 @@ fn prepared_document_field_bindings(
                 field.field_type.to_string(),
                 !field.required,
             )
+            .map(|binding| binding.with_source_type(source_type))
         })
         .collect()
 }

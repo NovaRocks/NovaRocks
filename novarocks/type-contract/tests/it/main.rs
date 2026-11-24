@@ -22,3 +22,5 @@ mod control_creation;
 mod temporal;
 
 mod result_render_type;
+
+mod canonical_fact;

@@ -59,12 +59,14 @@ mod function;
 mod largeint;
 mod logical;
 pub use depth_profile::{ArrowTypeDepth, ArrowTypeProfile, TypeTraversalFrame};
+mod canonical_fact;
 pub mod owned_resources;
 mod partition;
 mod schema;
 mod semantics;
 mod temporal_source;
 mod type_fingerprint;
+pub use canonical_fact::CanonicalFactWriter;
 mod value_type_identity;
 pub use value_type_identity::{
     write_value_layout_identity_observed, write_value_type_identity_observed,

@@ -31,7 +31,7 @@ use bytes::Bytes;
 use super::{
     ConnectorCommittedVersion, ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTableObjectId,
+    ConnectorTableObjectId, ProviderSourceType,
 };
 
 pub const MAX_MV_OBSERVATION_FIELDS: usize = 4_096;
@@ -54,6 +54,7 @@ pub struct MvObservedSourceField {
     provider_field_id: Bytes,
     name: String,
     type_signature: String,
+    source_type: Option<ProviderSourceType>,
     nullable: bool,
 }
 
@@ -138,6 +139,7 @@ impl MvObservedSourceField {
             provider_field_id,
             name,
             type_signature,
+            source_type: None,
             nullable,
         })
     }
@@ -152,6 +154,23 @@ impl MvObservedSourceField {
 
     pub fn type_signature(&self) -> &str {
         &self.type_signature
+    }
+
+    pub fn with_source_type(mut self, source_type: ProviderSourceType) -> Self {
+        self.source_type = Some(source_type);
+        self
+    }
+
+    pub fn source_type(&self) -> Option<&ProviderSourceType> {
+        self.source_type.as_ref()
+    }
+
+    fn retained_type_bytes(&self) -> usize {
+        self.type_signature.len().saturating_add(
+            self.source_type
+                .as_ref()
+                .map_or(0, ProviderSourceType::retained_bytes),
+        )
     }
 
     pub const fn nullable(&self) -> bool {
@@ -221,7 +240,7 @@ impl MvSourceSchemaObservation {
                 FIELD_FIXED_BYTES
                     .saturating_add(field.provider_field_id().len())
                     .saturating_add(field.name().len())
-                    .saturating_add(field.type_signature().len()),
+                    .saturating_add(field.retained_type_bytes()),
                 context,
                 "MV CREATE source",
             )?;
@@ -275,6 +294,7 @@ pub struct MvObservedField {
     field_id: i32,
     name: String,
     type_signature: String,
+    source_type: Option<ProviderSourceType>,
     nullable: bool,
 }
 
@@ -284,6 +304,7 @@ impl MvObservedField {
             field_id,
             name,
             type_signature,
+            source_type: None,
             nullable,
         }
     }
@@ -298,6 +319,23 @@ impl MvObservedField {
 
     pub fn type_signature(&self) -> &str {
         &self.type_signature
+    }
+
+    pub fn with_source_type(mut self, source_type: ProviderSourceType) -> Self {
+        self.source_type = Some(source_type);
+        self
+    }
+
+    pub fn source_type(&self) -> Option<&ProviderSourceType> {
+        self.source_type.as_ref()
+    }
+
+    fn retained_type_bytes(&self) -> usize {
+        self.type_signature.len().saturating_add(
+            self.source_type
+                .as_ref()
+                .map_or(0, ProviderSourceType::retained_bytes),
+        )
     }
 
     pub const fn nullable(&self) -> bool {
@@ -512,7 +550,7 @@ impl MvSchemaValidationObservation {
                 FIELD_FIXED_BYTES
                     .saturating_add(field.provider_field_id().len())
                     .saturating_add(field.name().len())
-                    .saturating_add(field.type_signature().len()),
+                    .saturating_add(field.retained_type_bytes()),
                 context,
                 "MV exact schema",
             )?;
@@ -999,7 +1037,9 @@ fn validate_fields_and_partition(
         }
         reserve(
             &mut used,
-            FIELD_FIXED_BYTES + field.name.len() + field.type_signature.len(),
+            FIELD_FIXED_BYTES
+                .saturating_add(field.name.len())
+                .saturating_add(field.retained_type_bytes()),
             context,
             subject,
         )?;
