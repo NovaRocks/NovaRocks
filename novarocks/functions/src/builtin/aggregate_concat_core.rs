@@ -149,7 +149,7 @@ fn sort_indices<A: ScalarStateAllocator>(
         indices.push(index);
     }
     work.flush()?;
-    if is_asc_order.len() == 0 {
+    if is_asc_order.is_empty() {
         return Ok(indices);
     }
 
