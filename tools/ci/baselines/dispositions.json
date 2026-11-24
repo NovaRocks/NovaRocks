@@ -1480,13 +1480,6 @@
       "review_by": "2026-12-15"
     },
     {
-      "unit": "system-scenario:task-execution/multicast-normal-close-keeps-sibling",
-      "reason": "Approved D0-5(a) named capability gap: Multicast sink/CTE cuts missing from LocalCompiler. Clean fffbffe8 actual native 1FE+3BE result remains FAIL (exit1), with complete formal and scene cleanup; business suffix remains unobserved. See independent evidence p30-system11-fff-independent-review-r1.json, ordinal 86.",
-      "owner": "B4",
-      "exit_condition": "B4 restores compiled Multicast/CTE sink and cut lowering, then the unchanged scenario observes Installed, A normal close, B sibling rows/EOS and producer/B actual exit with all original cleanup/resource assertions passing. A disappeared first refusal alone does not close this record.",
-      "review_by": "2026-12-15"
-    },
-    {
       "unit": "sql-case:decimal/decimal_error_policy_contract",
       "reason": "D0-6: B4a restores execution of the original mixed UNION ALL at statement 24. The scan branch SET_VAR is a block comment under TRC-5e and the original statement succeeds, so its required query.execution.numeric_out_of_range Execution oracle fails. An isolated root WITH SESSION sql_mode = ERROR_IF_OVERFLOW control passes that oracle while preserving the constant and scan branches. The original plain verify suffix is unexecuted. Separate diagnostic recordings show a different cast error at statement 27, a generic nested Decimal cast refusal at 28, and unsupported array cast source execution at 29 and 30 with result comparisons unexecuted. Evidence: p07-plain/decimal.jsonl and p07-cte-decimal-diagnostic/decimal/results.jsonl. Preserve the original SQL and all its oracles.",
       "owner": "TRC-5e SQL migration and Decimal cast owners",

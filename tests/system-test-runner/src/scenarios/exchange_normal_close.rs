@@ -18,22 +18,34 @@
 use std::path::Path;
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 #[cfg(test)]
 use arrow_array::{Array, Int64Array};
-use novarocks_cluster_harness::TestClusterOwner;
+use novarocks_cluster_harness::native_root_reply_fault::{
+    ExchangeFaultAction, ExchangeFaultCandidate, ExchangeFaultObservation, ExchangeFaultSelector,
+    RootReplyFaultBounds, RootReplyFaultControl,
+};
 use novarocks_cluster_harness::test_sessions::{
     ClusterTestSessionPlan, RoleLaunchReference, RoleSlot,
 };
+use novarocks_cluster_harness::{
+    CrossProcessNativeFaultProxyConfig, CrossProcessRootReplyFaultConfig, TestClusterOwner,
+};
+use novarocks_execution_contract::task_execution::domain::ExchangeEdgeId;
+use novarocks_failpoint::observation_marker::{EXCHANGE_SNAPSHOT, ObservationAction};
 use novarocks_failpoint::{session::DomainGrant, target_binding::RoleProcessReceipt};
 use novarocks_proto_models::{common, novarocks as proto};
-use novarocks_types::{BackendProcessId, FrontendProcessId};
+use novarocks_types::{BackendProcessId, FrontendProcessId, UniqueId};
 use prost::Message;
+use serde::Serialize;
 use serde_json::json;
 
+use super::exchange_flow::{
+    FlowSnapshot, Park, await_fault_exit, await_flow_idle, capture_healthy, flow_snapshots,
+    original_still_held, parked, scalar,
+};
 use super::native_compatibility::raw_operation_envelope;
 use super::native_creation::{
     RawBackendSession, RawCreate, RawSink, compiled_fragment, observe_task_terminal_and_stopped,
@@ -44,6 +56,28 @@ use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 
 const ROWS: [i64; 5] = [7, -11, 0, i64::MAX, i64::MIN];
 const POLL: Duration = Duration::from_millis(50);
+const PHYSICAL_EDGE_A: u32 = 1;
+const PHYSICAL_EDGE_B: u32 = 2;
+const NODE: i32 = 10;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CloseTiming {
+    BeforeOpen,
+    InFlight,
+}
+
+impl CloseTiming {
+    const fn artifact_directory(self) -> &'static str {
+        match self {
+            Self::BeforeOpen => "before-open",
+            Self::InFlight => "in-flight",
+        }
+    }
+}
+
+fn runtime_edge(physical: u32) -> Result<ExchangeEdgeId> {
+    ExchangeEdgeId::from_physical_ordinal(physical).context("raw physical edge is not projectable")
+}
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -65,9 +99,10 @@ struct SameProducerNormalClose {
 
 struct FrozenExchangeObservation {
     identity: (common::UniqueId, FrontendProcessId),
+    in_flight_identity: Option<(common::UniqueId, FrontendProcessId)>,
     references: Vec<RoleLaunchReference>,
     deadline: Instant,
-    selected: bool,
+    selected: Option<CloseTiming>,
 }
 #[derive(Default)]
 struct ExchangeObservationOwner(Mutex<Option<FrozenExchangeObservation>>);
@@ -77,6 +112,7 @@ impl ExchangeObservationOwner {
         cluster_size: usize,
         binary: &Path,
         deadline: Instant,
+        multicast: bool,
     ) -> Result<ClusterTestSessionPlan> {
         let mut owner = self
             .0
@@ -90,6 +126,7 @@ impl ExchangeObservationOwner {
         // This is the fixture producer's original request identity, allocated
         // once before launch and then used unchanged in all three contexts.
         let identity = RawBackendSession::declare_identity();
+        let in_flight_identity = multicast.then(RawBackendSession::declare_identity);
         let mut plan = ClusterTestSessionPlan::new(deadline)?;
         let root = plan.reserve_transport("exact-exchange-observations")?;
         let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
@@ -99,14 +136,22 @@ impl ExchangeObservationOwner {
             let reference = plan.reserve_launch(RoleSlot::Backend(index))?;
             plan.authorize_launch(
                 &reference,
-                vec![DomainGrant {
-                    domain: "native-observation".into(),
-                    grant_id: format!("exchange-q1-be{index}"),
-                    parameters: json!({"action":novarocks_failpoint::observation_marker::ObservationAction::ExchangeSnapshot.as_str(), "root":root,
-                    "backend_index":index, "target_session_id":reference.session_id,
-                    "max_events":16384, "query_execution":{
-                        "query_id_hi":identity.0.hi, "query_id_lo":identity.0.lo, "attempt_id":1}}),
-                }],
+                std::iter::once(identity)
+                    .chain(in_flight_identity)
+                    .enumerate()
+                    .map(|(ordinal, (query, _))| DomainGrant {
+                        domain: "native-observation".into(),
+                        grant_id: format!("exchange-q{ordinal}-be{index}"),
+                        parameters: json!({
+                            "action":ObservationAction::ExchangeSnapshot.as_str(),
+                            "root":root, "backend_index":index,
+                            "target_session_id":reference.session_id, "max_events":16384,
+                            "query_execution":{
+                                "query_id_hi":query.hi, "query_id_lo":query.lo, "attempt_id":1
+                            }
+                        }),
+                    })
+                    .collect(),
                 vec![
                     ("novarocks-server".into(), "test-controls".into()),
                     ("novarocks-native-adapter".into(), "test-controls".into()),
@@ -118,14 +163,19 @@ impl ExchangeObservationOwner {
         plan.validate_selected_intents(cluster_size)?;
         *owner = Some(FrozenExchangeObservation {
             identity,
+            in_flight_identity,
             references,
             deadline,
-            selected: false,
+            selected: None,
         });
         Ok(plan)
     }
 
-    fn take_identity(&self, deadline: Instant) -> Result<(common::UniqueId, FrontendProcessId)> {
+    fn take_identity(
+        &self,
+        deadline: Instant,
+        timing: CloseTiming,
+    ) -> Result<(common::UniqueId, FrontendProcessId)> {
         let mut owner = self
             .0
             .lock()
@@ -133,16 +183,22 @@ impl ExchangeObservationOwner {
         let frozen = owner
             .as_mut()
             .context("exchange observation was not frozen before launch")?;
-        ensure!(!frozen.selected, "exchange identity already selected");
         ensure!(
             frozen.deadline == deadline && Instant::now() < deadline,
             "exchange original deadline changed or expired"
         );
-        frozen.selected = true;
-        Ok(frozen.identity)
+        let identity = match (frozen.selected, timing) {
+            (None, CloseTiming::BeforeOpen) => frozen.identity,
+            (Some(CloseTiming::BeforeOpen), CloseTiming::InFlight) => frozen
+                .in_flight_identity
+                .context("in-flight observation was not authorized")?,
+            _ => bail!("exchange identity selected out of order or reused"),
+        };
+        frozen.selected = Some(timing);
+        Ok(identity)
     }
 
-    fn verify_backend(&self, index: usize, actual: BackendProcessId) -> Result<()> {
+    fn declared_backend(&self, index: usize) -> Result<BackendProcessId> {
         let owner = self
             .0
             .lock()
@@ -151,7 +207,7 @@ impl ExchangeObservationOwner {
             .as_ref()
             .context("exchange observation was not frozen")?;
         ensure!(
-            frozen.selected && Instant::now() < frozen.deadline,
+            frozen.selected.is_some() && Instant::now() < frozen.deadline,
             "exchange identity is not live and selected"
         );
         let reference = frozen
@@ -160,10 +216,10 @@ impl ExchangeObservationOwner {
             .context("exchange backend is outside the finite plan")?;
         let receipt = RoleProcessReceipt::read_private(&reference.process_receipt)?;
         ensure!(
-            receipt.session_id == reference.session_id && receipt.backend_process()? == actual,
-            "exchange observation differs from its declared backend session/process"
+            receipt.session_id == reference.session_id,
+            "exchange observation differs from its declared backend session"
         );
-        Ok(())
+        Ok(receipt.backend_process()?)
     }
 }
 
@@ -197,7 +253,32 @@ impl Scenario for SameProducerNormalClose {
             cluster_size,
             binary,
             deadline,
+            self.multicast,
         )?))
+    }
+
+    fn launch_config(&self, _: &Path) -> Result<ScenarioLaunchConfig> {
+        let mut launch = ScenarioLaunchConfig::default();
+        if self.multicast {
+            launch.config_overlay.be = Some(
+                concat!(
+                    "[runtime]\n",
+                    "exchange_instance_floor_slots = 1\n",
+                    "exchange_instance_max_slots = 1\n",
+                    "exchange_floating_slots = 0\n",
+                    "exchange_stream_window = 1\n",
+                )
+                .into(),
+            );
+            launch.native_fault_proxies = CrossProcessNativeFaultProxyConfig {
+                backend_retained_byte_limits: [(0, 1024 * 1024)].into(),
+            };
+            launch.native_root_reply_fault = Some(CrossProcessRootReplyFaultConfig {
+                backend_indices: [0].into(),
+                bounds: RootReplyFaultBounds::default(),
+            });
+        }
+        Ok(launch)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -205,26 +286,41 @@ impl Scenario for SameProducerNormalClose {
             context.handle().be_count() == 3,
             "exchange evidence requires native 1FE+3BE"
         );
+        let fault = if self.multicast {
+            // Bind the live roster to the original authenticated Data proxy
+            // before either sub-attempt can start a grant subscription.
+            Some(context.handle().native_exchange_fault(0)?)
+        } else {
+            None
+        };
+        self.run_attempt(context, CloseTiming::BeforeOpen, None)?;
+        if let Some(fault) = &fault {
+            self.run_attempt(context, CloseTiming::InFlight, Some(fault))?;
+        }
+        Ok(())
+    }
+}
+
+impl SameProducerNormalClose {
+    fn run_attempt(
+        &self,
+        context: &mut ScenarioContext,
+        timing: CloseTiming,
+        fault: Option<&RootReplyFaultControl>,
+    ) -> Result<()> {
+        let artifacts = context.scenario_root().join(timing.artifact_directory());
+        std::fs::create_dir(&artifacts)?;
         let baseline = resource_snapshot(context)?;
         let mut sessions = Vec::new();
         let result = (|| -> Result<()> {
-            let (query_id, frontend) = self.observation.take_identity(context.deadline())?;
-            sessions.push(RawBackendSession::establish_declared(
-                context, 0, query_id, frontend,
-            )?);
-            self.observation.verify_backend(0, sessions[0].backend)?;
-            sessions.push(RawBackendSession::establish_same_attempt(
-                context,
-                1,
-                &sessions[0],
-            )?);
-            sessions.push(RawBackendSession::establish_same_attempt(
-                context,
-                2,
-                &sessions[0],
-            )?);
-            self.observation.verify_backend(1, sessions[1].backend)?;
-            self.observation.verify_backend(2, sessions[2].backend)?;
+            let (query_id, frontend) =
+                self.observation.take_identity(context.deadline(), timing)?;
+            for index in 0..3 {
+                let backend = self.observation.declared_backend(index)?;
+                sessions.push(RawBackendSession::establish_on_installed_backend(
+                    context, index, query_id, frontend, backend,
+                )?);
+            }
             let a = &sessions[0];
             let b = &sessions[1];
             let p = &sessions[2];
@@ -275,69 +371,74 @@ impl Scenario for SameProducerNormalClose {
                 producer.accept_and_await_installed(context, p)?;
             }
             context.action(format!(
-                "froze attempt={:?} P={:?} task_key={producer_finst:?} A={:?} B={:?}; P Installed with edges Closed; multicast={}",
-                producer.identity.query_execution_id, producer.identity, receiver_a.identity, receiver_b.identity, self.multicast,
+                "{}: froze attempt={:?} P={:?} task_key={producer_finst:?} A={:?} B={:?}; P Installed with edges Closed; multicast={}",
+                timing.artifact_directory(), producer.identity.query_execution_id, producer.identity, receiver_a.identity, receiver_b.identity, self.multicast,
             ));
-            context.action(if self.multicast {
-                "frozen P edge 1 -> exact A; P edge 2 -> exact B; both edges use the same P source task_key and sender ordinal 0/count 1"
+            let native_edges = runtime_edges(self.multicast)?;
+            context.action(format!(
+                "frozen physical edges project to native {native_edges:?}; sender ordinal 0/count 1; same-edge siblings share one native edge"
+            ));
+            let live = if let Some(fault) = fault {
+                start_live_capture(context, fault, a, &receiver_a)?;
+                open_producer(p, &producer, native_edges)?;
+                let live = await_granted_data(context, fault, a, p, &receiver_a, &producer)?;
+                retain(&artifacts, "granted-data-before-withdrawal.json", &live)?;
+                let at_withdrawal = fault.exchange_observation();
+                ensure!(
+                    !at_withdrawal.released
+                        && at_withdrawal.active_target_streams > 0
+                        && original_still_held(&at_withdrawal),
+                    "the granted P-to-A Data Unit was no longer held before withdrawal"
+                );
+                withdraw_receiver(a, &receiver_a)?;
+                observe_task_terminal_and_stopped(
+                    context,
+                    a,
+                    &receiver_a.identity,
+                    proto::TaskState::Canceled,
+                )?;
+                fault.release_exchange();
+                Some(live)
             } else {
-                "frozen P edge 1 -> exact A and B; both destinations use the same P source task_key and sender ordinal 0/count 1"
-            });
-            let cancel = session_control(
-                a,
-                proto::task_control_operation::Control::CancelTask(proto::CancelTaskRequest {
-                    identity: Some(receiver_a.identity.clone()),
-                    reason: proto::TaskCancelReason::UpstreamNoLongerNeeded as i32,
-                }),
-            )?;
-            ensure!(
-                matches!(
-                    outcome(&cancel)?,
-                    proto::TaskOperationOutcome::Accepted | proto::TaskOperationOutcome::Idempotent
-                ),
-                "exact normal Cancel failed: {cancel:?}"
-            );
-            // RawApplication declares this Task no longer needs input. This
-            // is an explicit test authority, not a business unknown-A source.
-            observe_task_terminal_and_stopped(
-                context,
-                a,
-                &receiver_a.identity,
-                proto::TaskState::Canceled,
-            )?;
-            let edge_ids = if self.multicast { vec![1, 2] } else { vec![1] };
-            let open = p.apply(
-                proto::TaskOperation {
-                    envelope: Some(raw_operation_envelope(1_000)),
-                    operation: Some(proto::task_operation::Operation::UpdateTask(
-                        proto::UpdateTaskRequest {
-                            identity: Some(producer.identity.clone()),
-                            domains: vec![proto::TaskDomainUpdate {
-                                domain: Some(proto::task_domain_update::Domain::OpenExchangeEdges(
-                                    proto::OpenExchangeEdgesDomain {
-                                        version: 1,
-                                        edge_ids,
-                                    },
-                                )),
-                            }],
-                        },
-                    )),
-                },
-                "open the frozen producer after A actually stopped",
-            )?;
-            ensure!(
-                matches!(
-                    outcome(&open)?,
-                    proto::TaskOperationOutcome::Accepted | proto::TaskOperationOutcome::Idempotent
-                ),
-                "producer open failed: {open:?}"
-            );
-            let rows = fetch_rows(context, b, &receiver_b.identity)?;
+                withdraw_receiver(a, &receiver_a)?;
+                observe_task_terminal_and_stopped(
+                    context,
+                    a,
+                    &receiver_a.identity,
+                    proto::TaskState::Canceled,
+                )?;
+                open_producer(p, &producer, native_edges)?;
+                None
+            };
+            let rows = fetch_rows(context, b, &receiver_b.identity, &artifacts)?;
             ensure!(
                 rows == ROWS,
                 "B lost or changed rows after A closed: {rows:?}"
             );
-            await_normal_close_marker(context, p, &receiver_a, &producer)?;
+            let close = await_normal_close_marker(context, p, &receiver_a, &producer)?;
+            if let Some(live) = &live {
+                let sequence = live
+                    .candidate
+                    .target
+                    .sequence()
+                    .context("original held unit sequence")?
+                    .get();
+                ensure!(
+                    close.custody_through < sequence && sequence <= close.granted_through,
+                    "A did not withdraw an exact granted but unaccepted data Unit: {close:?}"
+                );
+                let fault = fault.context("in-flight close lost the original fault owner")?;
+                let exit = await_fault_exit(context, fault)?;
+                ensure!(
+                    exit.attempts.iter().any(|attempt| {
+                        attempt.candidate == live.candidate
+                            && attempt.stream_future_exited_at_millis.is_some()
+                    }),
+                    "the original in-flight data RPC did not actually exit"
+                );
+                retain(&artifacts, "original-data-rpc-exit.json", &exit)?;
+            }
+            retain(&artifacts, "validated-normal-withdrawal.json", &close)?;
             observe_task_terminal_and_stopped(
                 context,
                 b,
@@ -350,9 +451,12 @@ impl Scenario for SameProducerNormalClose {
                 &producer.identity,
                 proto::TaskState::Finished,
             )?;
-            context.action(format!("same frozen P received A's validated typed normal-close reply; B received exact BIGINT rows {rows:?} plus EOS; P and B Finished and actually stopped"));
+            context.action(format!("{}: frozen P received A's typed Withdrawn; B received exact BIGINT rows {rows:?} plus EOS; P and B Finished and actually stopped", timing.artifact_directory()));
             Ok(())
         })();
+        if let Some(fault) = fault {
+            fault.release_exchange();
+        }
         // A failed fixture may still own a Closed producer or waiting B.
         // Abort first drives those live Tasks down; Quiesce alone only fences
         // admission. Successful evidence keeps the normal Release path.
@@ -382,8 +486,194 @@ impl Scenario for SameProducerNormalClose {
             return Err(error);
         }
         await_resource_convergence(context, &baseline)?;
+        retain(
+            &artifacts,
+            "converged-exchange.json",
+            &await_flow_idle(context)?,
+        )?;
         Ok(())
     }
+}
+
+fn runtime_edges(multicast: bool) -> Result<Vec<u32>> {
+    let mut edges = vec![runtime_edge(PHYSICAL_EDGE_A)?.get()];
+    if multicast {
+        edges.push(runtime_edge(PHYSICAL_EDGE_B)?.get());
+    }
+    Ok(edges)
+}
+
+fn open_producer(
+    session: &RawBackendSession,
+    producer: &FrozenTask,
+    edge_ids: Vec<u32>,
+) -> Result<()> {
+    let receipt = session.apply(
+        proto::TaskOperation {
+            envelope: Some(raw_operation_envelope(1_000)),
+            operation: Some(proto::task_operation::Operation::UpdateTask(
+                proto::UpdateTaskRequest {
+                    identity: Some(producer.identity.clone()),
+                    domains: vec![proto::TaskDomainUpdate {
+                        domain: Some(proto::task_domain_update::Domain::OpenExchangeEdges(
+                            proto::OpenExchangeEdgesDomain {
+                                version: 1,
+                                edge_ids,
+                            },
+                        )),
+                    }],
+                },
+            )),
+        },
+        "open the frozen producer's exact native edges",
+    )?;
+    ensure!(
+        matches!(
+            outcome(&receipt)?,
+            proto::TaskOperationOutcome::Accepted | proto::TaskOperationOutcome::Idempotent
+        ),
+        "producer open failed: {receipt:?}"
+    );
+    Ok(())
+}
+
+fn withdraw_receiver(session: &RawBackendSession, receiver: &FrozenTask) -> Result<()> {
+    // RawApplication explicitly declares this Task no longer needs input.
+    let receipt = session_control(
+        session,
+        proto::task_control_operation::Control::CancelTask(proto::CancelTaskRequest {
+            identity: Some(receiver.identity.clone()),
+            reason: proto::TaskCancelReason::UpstreamNoLongerNeeded as i32,
+        }),
+    )?;
+    ensure!(
+        matches!(
+            outcome(&receipt)?,
+            proto::TaskOperationOutcome::Accepted | proto::TaskOperationOutcome::Idempotent
+        ),
+        "exact normal Cancel failed: {receipt:?}"
+    );
+    Ok(())
+}
+
+fn start_live_capture(
+    context: &ScenarioContext,
+    fault: &RootReplyFaultControl,
+    receiver_session: &RawBackendSession,
+    receiver: &FrozenTask,
+) -> Result<()> {
+    let execution = novarocks_task_codec::identity::decode_task_identity(
+        &receiver.identity,
+        novarocks_proto_codec::FieldPath::root("receiver"),
+    )?
+    .query_execution_id();
+    let bounds = RootReplyFaultBounds::default();
+    let deadline = (Instant::now() + Duration::from_millis(bounds.maximum_capture_millis))
+        .min(context.deadline());
+    fault.begin_exchange_capture_on(
+        ExchangeFaultAction::HoldDataBeforeForward,
+        ExchangeFaultSelector {
+            destination_node: Some(NODE),
+            backend_index: Some(receiver_session.index),
+            query_execution_id: Some(execution),
+        },
+        deadline,
+    )
+}
+
+#[derive(Serialize)]
+struct GrantedData {
+    candidate: ExchangeFaultCandidate,
+    held: ExchangeFaultObservation,
+    pressure: Vec<FlowSnapshot>,
+    receiver_park: Option<Park>,
+}
+
+fn await_granted_data(
+    context: &mut ScenarioContext,
+    fault: &RootReplyFaultControl,
+    receiver_session: &RawBackendSession,
+    producer_session: &RawBackendSession,
+    receiver: &FrozenTask,
+    producer: &FrozenTask,
+) -> Result<GrantedData> {
+    use novarocks_proto_codec::FieldPath;
+    use novarocks_task_codec::identity::decode_task_identity;
+
+    let a = decode_task_identity(&receiver.identity, FieldPath::root("receiver"))?;
+    let p = decode_task_identity(&producer.identity, FieldPath::root("producer"))?;
+    let a_key = UniqueId::new(receiver.task_key.hi, receiver.task_key.lo);
+    let p_key = UniqueId::new(producer.task_key.hi, producer.task_key.lo);
+    let candidate = loop {
+        context.remaining("observe the original granted P-to-A Data Unit")?;
+        capture_healthy(fault)?;
+        if let Some(candidate) = fault.exchange_candidate() {
+            let stream = candidate.target.stream();
+            ensure!(
+                candidate.backend_index == receiver_session.index
+                    && candidate.caller == producer_session.backend
+                    && stream.destination() == a
+                    && stream.destination_task_key() == a_key
+                    && stream.destination_node().get() == NODE
+                    && stream.source().task() == p
+                    && stream.source().task_key() == p_key
+                    && stream.source().sender_ordinal() == 0
+                    && candidate.target.sequence().is_some(),
+                "captured data is not the exact original P-to-A Unit: {candidate:?}"
+            );
+            fault.arm_exchange_exact(&candidate)?;
+            break candidate;
+        }
+        thread::sleep(
+            context
+                .remaining("bind the original signed Exchange Unit")?
+                .min(POLL),
+        );
+    };
+    loop {
+        context.remaining("observe granted P-to-A data in flight before withdrawal")?;
+        capture_healthy(fault)?;
+        let first = fault.exchange_observation();
+        if original_still_held(&first)
+            && let Some(pressure) = flow_snapshots(context)?
+        {
+            let receiver = &pressure[receiver_session.index];
+            let sender = &pressure[producer_session.index];
+            if receiver.stream_window == 1
+                && receiver.instance_floor == 1
+                && receiver.instance_max == 1
+                && receiver.floating == 0
+                && receiver.in_use > 0
+                && receiver.max_instance_in_use == receiver.instance_max
+                && sender.calls > 0
+            {
+                let receiver_park = parked(context, &candidate)?;
+                let held = fault.exchange_observation();
+                if held.active_target_streams > 0 && original_still_held(&held) {
+                    return Ok(GrantedData {
+                        candidate,
+                        held,
+                        pressure,
+                        receiver_park,
+                    });
+                }
+            }
+        }
+        thread::sleep(
+            context
+                .remaining("await actual grant and sender call custody")?
+                .min(POLL),
+        );
+    }
+}
+
+fn retain(root: &Path, name: &str, evidence: &impl Serialize) -> Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(root.join(name))?;
+    serde_json::to_writer_pretty(file, evidence)?;
+    Ok(())
 }
 
 struct FrozenTask {
@@ -482,7 +772,11 @@ fn receiver(
     base.exchange_input = true;
     let (_, mut metadata) = carriers(&base)?;
     let fragment_id = if multicast && result { 3 } else { 1 };
-    let edge = if multicast && result { 2 } else { 1 };
+    let edge = if multicast && result {
+        PHYSICAL_EDGE_B
+    } else {
+        PHYSICAL_EDGE_A
+    };
     let frozen = compiled_fragment(
         fragment_id,
         1,
@@ -534,42 +828,48 @@ fn producer(
     let descriptor = metadata.descriptor.as_mut().expect("fixture descriptor");
     descriptor.identity = Some(identity);
     descriptor.task_key = Some(task_key);
-    let mut destination = |task: &FrozenTask, index: usize| -> proto::TaskExchangeDestination {
-        proto::TaskExchangeDestination {
-            task: Some(task.identity.clone()),
-            task_key: Some(task.task_key),
-            destination_node_id: 10,
-            endpoint: Some(proto::QueryControlEndpoint {
-                host: "127.0.0.1".into(),
-                port: u32::from(context.handle().runtime().be[index].grpc),
-            }),
-        }
-    };
+    let mut destination =
+        |task: &FrozenTask, index: usize| -> Result<proto::TaskExchangeDestination> {
+            let endpoint = context.handle().native_be_endpoint(index)?;
+            Ok(proto::TaskExchangeDestination {
+                task: Some(task.identity.clone()),
+                task_key: Some(task.task_key),
+                destination_node_id: NODE,
+                endpoint: Some(proto::QueryControlEndpoint {
+                    host: endpoint.host().into(),
+                    port: u32::from(endpoint.port()),
+                }),
+            })
+        };
     let edge = |edge_id, destinations| proto::TaskExchangeEdge {
         edge_id,
-        destination_node_id: 10,
+        destination_node_id: NODE,
         partitioning: proto::ExchangePartitioning::Unpartitioned as i32,
         destinations,
         sender_ordinal: 0,
         sender_count: 1,
     };
+    let native_edges = runtime_edges(multicast)?;
     descriptor
         .topology
         .as_mut()
         .expect("fixture topology")
         .outbound = if multicast {
         vec![
-            edge(1, vec![destination(a, 0)]),
-            edge(2, vec![destination(b, 1)]),
+            edge(native_edges[0], vec![destination(a, 0)?]),
+            edge(native_edges[1], vec![destination(b, 1)?]),
         ]
     } else {
-        vec![edge(1, vec![destination(a, 0), destination(b, 1)])]
+        vec![edge(
+            native_edges[0],
+            vec![destination(a, 0)?, destination(b, 1)?],
+        )]
     };
     metadata
         .assignment
         .as_mut()
         .expect("fixture assignment")
-        .sink_edge_ids = if multicast { vec![1, 2] } else { vec![1] };
+        .sink_edge_ids = native_edges;
     Ok(freeze(frozen, metadata))
 }
 
@@ -577,6 +877,7 @@ fn fetch_rows(
     context: &mut ScenarioContext,
     session: &RawBackendSession,
     identity: &proto::TaskIdentity,
+    artifacts: &Path,
 ) -> Result<Vec<i64>> {
     use novarocks_execution_contract::root_result::RootReadOutcome;
     use novarocks_proto_models::result as result_proto;
@@ -702,7 +1003,7 @@ fn fetch_rows(
             && waited.accepted_consumed == end.sequence.get()
     );
     std::fs::write(
-        context.scenario_root().join("root-end-ack-data-wait.json"),
+        artifacts.join("root-end-ack-data-wait.json"),
         serde_json::to_vec_pretty(&observation)?,
     )?;
     ensure!(
@@ -732,7 +1033,7 @@ fn fetch_rows(
     let mut observations = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(context.scenario_root().join("root-end-ack-census.jsonl"))?;
+        .open(artifacts.join("root-end-ack-census.jsonl"))?;
     loop {
         use std::io::Write as _;
         let remaining = context.remaining("observe the original acknowledged Context Root")?;
@@ -775,12 +1076,19 @@ fn fetch_rows(
     Ok(rows)
 }
 
+#[derive(Debug, Serialize)]
+struct ValidatedClose {
+    custody_through: u64,
+    granted_through: u64,
+    line: String,
+}
+
 fn await_normal_close_marker(
     context: &mut ScenarioContext,
     session: &RawBackendSession,
     a: &FrozenTask,
     p: &FrozenTask,
-) -> Result<()> {
+) -> Result<ValidatedClose> {
     loop {
         let log = context.handle().be_log_contents(session.index)?;
         let destination = format!(
@@ -822,8 +1130,9 @@ fn await_normal_close_marker(
                 .expect("fixture execution")
                 .attempt_id
         );
-        if log.lines().any(|line| {
-            line.contains("event=normal_close_validated")
+        if let Some(line) = log.lines().find(|line| {
+            line.contains(EXCHANGE_SNAPSHOT)
+                && line.contains("event=normal_close_validated ")
                 && line.contains(&destination)
                 && line.contains(&source)
                 && line.contains(&task)
@@ -831,8 +1140,15 @@ fn await_normal_close_marker(
                 && line.contains("node_id=10 ")
                 && line.contains("sender_ordinal=0 ")
                 && line.contains("sender_count=1 ")
+                && line
+                    .split_whitespace()
+                    .any(|field| field == "close=Some(Withdrawn)")
         }) {
-            return Ok(());
+            return Ok(ValidatedClose {
+                custody_through: scalar(line, "custody_through")?,
+                granted_through: scalar(line, "granted_through")?,
+                line: line.to_owned(),
+            });
         }
         thread::sleep(
             context
@@ -851,17 +1167,47 @@ mod observation_authorization_tests {
         let owner = ExchangeObservationOwner::default();
         let deadline = Instant::now() + Duration::from_secs(10);
         let binary = std::env::current_exe().unwrap();
-        let plan = owner.freeze(3, &binary, deadline).unwrap();
+        let plan = owner.freeze(3, &binary, deadline, true).unwrap();
         plan.validate_selected_intents(3).unwrap();
-        let identity = owner.0.lock().unwrap().as_ref().unwrap().identity;
+        let (identity, in_flight_identity) = {
+            let guard = owner.0.lock().unwrap();
+            let frozen = guard.as_ref().unwrap();
+            (frozen.identity, frozen.in_flight_identity.unwrap())
+        };
+        assert_ne!(identity.0, in_flight_identity.0);
         assert!(
             owner
-                .take_identity(deadline + Duration::from_millis(1))
+                .take_identity(deadline + Duration::from_millis(1), CloseTiming::BeforeOpen)
                 .is_err()
         );
-        assert_eq!(owner.take_identity(deadline).unwrap(), identity);
-        assert!(owner.take_identity(deadline).is_err());
-        assert!(owner.freeze(3, &binary, deadline).is_err());
+        assert!(
+            owner
+                .take_identity(deadline, CloseTiming::InFlight)
+                .is_err()
+        );
+        assert_eq!(
+            owner
+                .take_identity(deadline, CloseTiming::BeforeOpen)
+                .unwrap(),
+            identity
+        );
+        assert!(
+            owner
+                .take_identity(deadline, CloseTiming::BeforeOpen)
+                .is_err()
+        );
+        assert_eq!(
+            owner
+                .take_identity(deadline, CloseTiming::InFlight)
+                .unwrap(),
+            in_flight_identity
+        );
+        assert!(
+            owner
+                .take_identity(deadline, CloseTiming::InFlight)
+                .is_err()
+        );
+        assert!(owner.freeze(3, &binary, deadline, true).is_err());
         let references = owner.0.lock().unwrap().as_ref().unwrap().references.clone();
         for (index, reference) in references.iter().enumerate() {
             let process = BackendProcessId::new_v7();
@@ -874,14 +1220,9 @@ mod observation_authorization_tests {
             }
             .write_private(&reference.process_receipt)
             .unwrap();
-            assert!(owner.verify_backend(index, process).is_ok());
-            assert!(
-                owner
-                    .verify_backend(index, BackendProcessId::new_v7())
-                    .is_err()
-            );
+            assert_eq!(owner.declared_backend(index).unwrap(), process);
         }
-        assert!(owner.verify_backend(3, BackendProcessId::new_v7()).is_err());
+        assert!(owner.declared_backend(3).is_err());
     }
 
     #[test]
@@ -936,6 +1277,12 @@ mod observation_authorization_tests {
             assert_eq!(fragment.values()[output].ty, ty);
             assert!(package.calls().entries().is_empty());
             assert_eq!(package.cuts().outbound.len(), if multicast { 2 } else { 1 });
+            let native_edges = runtime_edges(multicast).unwrap();
+            assert_eq!(native_edges, if multicast { vec![2, 3] } else { vec![2] });
+            for (cut, edge) in package.cuts().outbound.iter().zip(native_edges) {
+                assert_eq!(runtime_edge(cut.edge.get()).unwrap().get(), edge);
+                assert_ne!(cut.edge.get(), edge);
+            }
             let fields = wire.source_fields.as_ref().unwrap();
             assert!(fields.shape.is_some());
             assert_eq!(fields.field_facts.len(), 1);

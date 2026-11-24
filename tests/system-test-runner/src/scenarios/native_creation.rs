@@ -41,6 +41,7 @@ use novarocks_proto_models::{common, novarocks as proto};
 use novarocks_test_trino_client::{
     CancelHandle, PendingStatement, StatementFailure, StatementResult, TrinoError, TrinoValue,
 };
+use novarocks_types::NativeEndpoint;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
 
 use crate::actors::sql::SqlSession;
@@ -425,7 +426,7 @@ pub(super) struct RawBackendSession {
 
 impl RawBackendSession {
     pub(super) fn establish(context: &mut ScenarioContext, index: usize) -> Result<Self> {
-        Self::establish_with_identity(context, index, None)
+        Self::establish_with_identity(context, index, None, None)
     }
 
     /// Allocate the existing fixture identity once, before role launch when declared.
@@ -446,29 +447,36 @@ impl RawBackendSession {
         query_id: common::UniqueId,
         frontend: FrontendProcessId,
     ) -> Result<Self> {
-        Self::establish_with_identity(context, index, Some((query_id, frontend)))
+        Self::establish_with_identity(context, index, Some((query_id, frontend)), None)
     }
 
-    /// Establish another backend Context for the same frozen first attempt.
-    pub(super) fn establish_same_attempt(
+    /// Establish on the authenticated process's installed listeners. This
+    /// leaves an advertised Data fault proxy exclusive to product traffic.
+    pub(super) fn establish_on_installed_backend(
         context: &mut ScenarioContext,
         index: usize,
-        owner: &Self,
+        query_id: common::UniqueId,
+        frontend: FrontendProcessId,
+        backend: BackendProcessId,
     ) -> Result<Self> {
-        Self::establish_with_identity(context, index, Some((owner.query_id, owner.frontend)))
+        Self::establish_with_identity(context, index, Some((query_id, frontend)), Some(backend))
     }
 
     fn establish_with_identity(
         context: &mut ScenarioContext,
         index: usize,
         shared: Option<(common::UniqueId, FrontendProcessId)>,
+        expected_backend: Option<BackendProcessId>,
     ) -> Result<Self> {
-        let port = context.handle().runtime().be[index].grpc;
+        // FE topology uses the harness-advertised endpoint, which can be a
+        // proxy listener separate from the original installed Data endpoint.
+        let endpoint = context.handle().native_be_endpoint(index)?;
+        let port = endpoint.port();
         let rows = context.handle().frontend_backend_topology()?;
         let row = rows
             .iter()
             .find(|row| row.grpc_port == port)
-            .with_context(|| format!("backend topology omitted BE[{index}]"))?;
+            .with_context(|| format!("backend topology omitted BE[{index}] at {endpoint}"))?;
         ensure!(
             row.is_eligible_live(),
             "BE[{index}] must be eligible and live, row={row:?}"
@@ -477,11 +485,25 @@ impl RawBackendSession {
             .process_id
             .parse::<BackendProcessId>()
             .context("parse the target backend process identity")?;
+        ensure!(
+            expected_backend.is_none_or(|expected| expected == backend),
+            "BE[{index}] topology process {backend} differs from authenticated launch {expected_backend:?}"
+        );
         let compatibility = decode_hex_32(&row.native_compatibility_id)?;
-        let endpoint = context.handle().native_be_endpoint(index)?;
+        let control_endpoint = context.handle().native_be_control_endpoint(index)?;
+        let (endpoint, control_endpoint) = if expected_backend.is_some() {
+            let installed = &context.handle().runtime().be[index];
+            (
+                NativeEndpoint::from_host_port(endpoint.host(), installed.grpc)
+                    .map_err(anyhow::Error::msg)?,
+                NativeEndpoint::from_host_port(control_endpoint.host(), installed.control_grpc)
+                    .map_err(anyhow::Error::msg)?,
+            )
+        } else {
+            (endpoint, control_endpoint)
+        };
         let mode = context.handle().native_trust_mode();
         let connector = context.handle().native_probe_connector(endpoint, mode)?;
-        let control_endpoint = context.handle().native_be_control_endpoint(index)?;
         let control_connector = context
             .handle()
             .native_probe_connector(control_endpoint, mode)?;
