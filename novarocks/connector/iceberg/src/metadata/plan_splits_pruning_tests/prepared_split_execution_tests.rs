@@ -129,11 +129,11 @@ impl NovaRocksCatalog for ObservationCatalog {
     ) -> Result<Vec<String>, ConnectorError> {
         self.inner.list_views(name, bound).await
     }
-    async fn load_view(
+    async fn load_view_document(
         &self,
         name: CatalogTableName,
-    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
-        self.inner.load_view(name).await
+    ) -> Result<crate::rest_protocol::endpoints::LoadedViewDocument, ConnectorError> {
+        self.inner.load_view_document(name).await
     }
     async fn anchor_written_metadata(
         &self,

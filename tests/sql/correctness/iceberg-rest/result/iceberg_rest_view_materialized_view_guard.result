@@ -1,0 +1,63 @@
+-- query 2
+-- types	integer
+id
+11
+22
+
+-- query 4
+-- types	integer
+id
+99
+
+-- query 6
+-- types	integer
+id
+99
+
+-- query 8
+-- types	integer
+id
+99
+
+-- query 10
+-- types	integer
+id
+99
+
+-- query 12
+-- types	integer
+id
+99
+
+-- query 14
+-- types	integer
+id
+99
+
+-- query 16
+-- types	integer
+id
+11
+22
+
+-- query 17
+-- types	integer
+id
+99
+
+-- query 18
+-- types	varchar	varchar
+table_name	table_type
+mv	VIEW
+mv_base	BASE TABLE
+mv_storage	BASE TABLE
+
+-- query 21
+-- types	integer
+id
+99
+
+-- query 26
+-- types	integer
+id
+2

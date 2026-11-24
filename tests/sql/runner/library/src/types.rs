@@ -283,6 +283,39 @@ pub enum UpdateCountExpectation {
     NoCount,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IcebergViewFixtureEndpoint {
+    Rest,
+    RestMv,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IcebergViewFixtureSample {
+    TrinoMv,
+    SparkMv,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergViewFixtureTarget {
+    pub catalog: Option<String>,
+    pub namespace: String,
+    pub view: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergViewFixtureDirective {
+    pub endpoint: IcebergViewFixtureEndpoint,
+    pub target: IcebergViewFixtureTarget,
+    pub sample: IcebergViewFixtureSample,
+    pub storage_table: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IcebergViewFixtureAssertion {
+    InstalledOnStepOrOnlyFixture,
+    Named(IcebergViewFixtureTarget),
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct QueryMeta {
     pub order_sensitive: Option<bool>,
@@ -397,6 +430,10 @@ pub struct QueryMeta {
     /// After this step, assert that the fixture object for `iceberg_orphan_fixture`
     /// is absent. This keeps the object-store assertion outside SQL result text.
     pub iceberg_orphan_fixture_absent: bool,
+    /// Install an independent Iceberg REST view before executing the step.
+    pub iceberg_view_fixture: Option<IcebergViewFixtureDirective>,
+    /// Check the original view version and storage-table after the step.
+    pub iceberg_view_fixture_unchanged: Option<IcebergViewFixtureAssertion>,
     /// After the step SQL executes (verify mode), assert the named MV's
     /// incremental contents equal a full recompute derived by running the MV's
     /// persisted definition (from `system.metadata.materialized_views`) directly

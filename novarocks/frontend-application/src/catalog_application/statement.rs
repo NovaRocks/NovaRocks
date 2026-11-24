@@ -33,7 +33,7 @@ use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorColumnDefinition, ConnectorColumnPath,
     ConnectorColumnPosition, ConnectorDataType, ConnectorDefaultValue,
     ConnectorDropTableDataDisposition, ConnectorErrorKind, ConnectorInstanceId,
-    ConnectorNamespaceIdentity, ConnectorTableIdentity, ConnectorViewIdentity,
+    ConnectorNamespaceIdentity, ConnectorObjectKind, ConnectorTableIdentity, ConnectorViewIdentity,
     ConnectorViewRequest, CreatePolicy, DropPolicy,
 };
 use novarocks_sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
@@ -55,7 +55,6 @@ pub trait CatalogDropContext:
 {
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
     fn mv_readiness(&self) -> &crate::mv::domain::readiness::MvReadinessPort;
-    fn mv_storage_observation(&self) -> &dyn novarocks_spi::connector::MvStorageObservationPort;
 }
 
 // ---------------------------------------------------------------------------
@@ -457,16 +456,33 @@ fn enumerate_admitted_force_drop_children(
         .binding()
         .view_metadata()
         .ok_or_else(|| "view enumeration is not supported by this catalog".to_string())?;
-    let mut views = view_metadata
-        .list_views(novarocks_spi::connector::ConnectorListViewsRequest {
+    let classified_views = view_metadata
+        .list_classified_views(novarocks_spi::connector::ConnectorListViewsRequest {
             namespace: namespace_identity.clone(),
             page_size: novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
             context: connector_context.clone(),
         })
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .map(|identity| identity.view.to_string())
-        .collect::<Vec<_>>();
+        .map_err(|error| error.to_string())?;
+    let mut views = Vec::new();
+    let mut materialized_views = Vec::new();
+    for (identity, kind) in classified_views {
+        match kind {
+            ConnectorObjectKind::View => views.push(identity.view.to_string()),
+            ConnectorObjectKind::MaterializedView { .. } => {
+                materialized_views.push(identity.view.to_string());
+            }
+            ConnectorObjectKind::Table => return Err("Unexpected table in view listing".into()),
+        }
+    }
+    if !materialized_views.is_empty() {
+        materialized_views.sort();
+        return Err(format!(
+            "Cannot drop schema {}.{} with CASCADE: materialized views exist: {}",
+            namespace_identity.instance_id.as_str(),
+            namespace_identity.namespace,
+            materialized_views.join(", "),
+        ));
+    }
     views.sort();
     Ok(Some((tables, views)))
 }
@@ -496,35 +512,54 @@ pub(crate) fn execute_drop_table_statement(
         }
         Err(err) => return Err((err).into()),
     };
-    match crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
-        context.connector_control(),
-        context.mv_storage_observation(),
-        context.mv_readiness(),
-        &target,
-        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::DropTable,
-    ) {
-        Ok(()) => {}
-        Err(err)
-            if if_exists
-                && target.provider_id.as_str() == "iceberg"
-                && is_missing_table_guard_error(&err) =>
-        {
-            cleanup_iceberg_drop_table_registration_if_exists(context, &target)?;
-            return Ok(StatementResult::Ok);
-        }
-        Err(err) => return Err((err).into()),
-    }
     let exact_lease = crate::connector::acquire_metadata_planning_pin(
         context.connector_control(),
         &target.catalog,
     )?;
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_pin(
+    let missing_table = |error: CommandError| {
+        if target.provider_id.as_str() == "iceberg" {
+            let kind = external_view_kind(&exact_lease, &target, connector_context)?;
+            if let Some(hint) = drop_table_view_hint(&target, kind) {
+                return Err(hint.into());
+            }
+            if if_exists {
+                cleanup_iceberg_drop_table_registration_if_exists(context, &target)?;
+                return Ok(StatementResult::Ok);
+            }
+        } else if if_exists {
+            return Ok(StatementResult::Ok);
+        }
+        Err(error)
+    };
+    match crate::mv::domain::iceberg_guard::check_iceberg_mv_table_mutation(
+        &exact_lease,
+        context.mv_readiness(),
+        &target,
+        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::DropTable,
+        connector_context.clone(),
+    ) {
+        Ok(()) => {}
+        Err(error) if error.target_missing() => {
+            return missing_table(error.to_string().into());
+        }
+        Err(error) => return Err(error.to_string().into()),
+    }
+    let metadata = match crate::connector::metadata_load_connector_table_with_planning_pin_typed(
         &exact_lease,
         connector_context.clone(),
         &target.namespace,
         &target.table,
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-    )?;
+    ) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if target.provider_id.as_str() == "iceberg"
+                && error.kind() == ConnectorErrorKind::NotFound =>
+        {
+            return missing_table(error.to_string().into());
+        }
+        Err(error) => return Err(error.to_string().into()),
+    };
     let revision = exact_lease
         .binding()
         .metadata()
@@ -587,49 +622,8 @@ pub(crate) fn execute_drop_table_statement(
         }
         crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted {
             failure,
-            ref cleanup,
-        } if if_exists
-            && matches!(
-                cleanup,
-                novarocks_spi::connector::ExternalMutationFinalization::Complete
-            )
-            && failure.kind()
-                == novarocks_spi::connector::ConnectorMutationFailureKind::NotFound =>
-        {
-            if target.provider_id.as_str() == "iceberg" {
-                cleanup_iceberg_drop_table_registration_if_exists(context, &target)?;
-            }
-            Ok(StatementResult::Ok)
-        }
-        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted {
-            failure,
             cleanup,
-        } => {
-            let failure = novarocks_spi::connector::ConnectorMutationFailure::new(
-                failure.kind(),
-                crate::connector::mutation::known_uncommitted_message(&failure, &cleanup),
-            );
-            // A DROP TABLE aimed at a view must say so instead of "unknown
-            // table" — views and tables are separate REST resources.
-            drop_table_failure_with_view_check(failure, || {
-                if target.provider_id.as_str() == "iceberg"
-                    && external_view_exists(
-                        context,
-                        &target.catalog,
-                        &target.namespace,
-                        &target.table,
-                        connector_context,
-                    )?
-                {
-                    Ok(Some(format!(
-                        "{}.{}.{} is a view, use DROP VIEW",
-                        target.catalog, target.namespace, target.table
-                    )))
-                } else {
-                    Ok(None)
-                }
-            })
-        }
+        } => drop_table_failure_with_view_check(failure, &cleanup, missing_table),
         crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => Err(
             (novarocks_query_application::engine_error::EngineError::commit_unknown(
                 failure.to_string(),
@@ -645,30 +639,24 @@ pub(crate) fn execute_drop_table_statement(
 
 fn drop_table_failure_with_view_check(
     failure: novarocks_spi::connector::ConnectorMutationFailure,
-    view_error: impl FnOnce() -> Result<Option<String>, String>,
+    cleanup: &novarocks_spi::connector::ExternalMutationFinalization,
+    missing_table: impl FnOnce(CommandError) -> Result<StatementResult, CommandError>,
 ) -> Result<StatementResult, CommandError> {
-    if failure.kind() == novarocks_spi::connector::ConnectorMutationFailureKind::NotFound
-        && let Some(error) = view_error()?
-    {
-        return Err((error).into());
-    }
-    Err(
-        (novarocks_query_application::engine_error::EngineError::commit_known_uncommitted(
-            failure.to_string(),
+    let error: CommandError =
+        novarocks_query_application::engine_error::EngineError::commit_known_uncommitted(
+            crate::connector::mutation::known_uncommitted_message(&failure, cleanup),
         )
-        .to_string())
-        .into(),
-    )
-}
-
-fn is_missing_table_guard_error(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
-    lower.contains("unknown table:")
-        || lower.contains("table not found")
-        || lower.contains("no metadata files")
-        // Catalog backends normalize absence differently; the REST client
-        // reports that the table does not exist.
-        || lower.contains("does not exist")
+        .to_string()
+        .into();
+    if failure.kind() == novarocks_spi::connector::ConnectorMutationFailureKind::NotFound
+        && matches!(
+            cleanup,
+            novarocks_spi::connector::ExternalMutationFinalization::Complete
+        )
+    {
+        return missing_table(error);
+    }
+    Err(error)
 }
 
 fn cleanup_iceberg_drop_table_registration_if_exists(
@@ -726,41 +714,49 @@ fn ensure_no_external_iceberg_dependents(
     )
 }
 
-fn external_view_exists(
-    context: &impl CatalogDropContext,
-    catalog: &str,
-    namespace: &str,
-    view: &str,
+fn external_view_kind(
+    lease: &novarocks_spi::connector::ConnectorControlPlanningPin,
+    target: &crate::catalog_application::resolver::TargetBackend,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<bool, String> {
-    let lease =
-        crate::connector::acquire_metadata_planning_pin(context.connector_control(), catalog)?;
+) -> Result<Option<ConnectorObjectKind>, String> {
     let binding = lease.binding();
     let Some(view_metadata) = binding.view_metadata() else {
-        return Ok(false);
+        return Ok(None);
     };
     let instance_id = binding.descriptor().instance_id.clone();
-    match crate::connector::schema_creation::load_frontend_view(
-        view_metadata.as_ref(),
-        ConnectorViewRequest {
-            view: ConnectorViewIdentity {
-                instance_id,
-                namespace: Arc::from(namespace),
-                view: Arc::from(view),
-            },
-            context: connector_context.clone(),
+    match view_metadata.classify_view(ConnectorViewRequest {
+        view: ConnectorViewIdentity {
+            instance_id,
+            namespace: Arc::from(target.namespace.as_str()),
+            view: Arc::from(target.table.as_str()),
         },
-    ) {
-        Ok(_) => Ok(true),
+        context: crate::connector::context_for_planning_pin(lease, connector_context.clone())?,
+    }) {
         Err(error)
             if matches!(
                 error.kind(),
                 ConnectorErrorKind::NotFound | ConnectorErrorKind::Unsupported
             ) =>
         {
-            Ok(false)
+            Ok(None)
         }
         Err(error) => Err(error.to_string()),
+        Ok(kind) => Ok(kind),
+    }
+}
+
+fn drop_table_view_hint(
+    target: &crate::catalog_application::resolver::TargetBackend,
+    kind: Option<ConnectorObjectKind>,
+) -> Option<String> {
+    let kind = kind?;
+    let name = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
+    match kind {
+        ConnectorObjectKind::View => Some(format!("{name} is a view, use DROP VIEW")),
+        ConnectorObjectKind::MaterializedView { .. } => Some(format!(
+            "Table '{name}' does not exist, but a materialized view with that name exists. Did you mean DROP MATERIALIZED VIEW {name}?"
+        )),
+        ConnectorObjectKind::Table => None,
     }
 }
 
@@ -1263,6 +1259,7 @@ fn default_out_of_range(type_name: &str, value: i64) -> String {
 #[cfg(test)]
 mod force_drop_admission_tests {
     use super::*;
+    use novarocks_spi::connector::ConnectorObjectKind;
     use novarocks_spi::connector::*;
     use std::sync::Mutex;
 
@@ -1379,6 +1376,25 @@ mod force_drop_admission_tests {
         }
     }
     impl ConnectorViewMetadata for Capability {
+        fn classify_view(
+            &self,
+            _: ConnectorViewRequest,
+        ) -> Result<Option<ConnectorObjectKind>, ConnectorError> {
+            panic!("unexpected view classification")
+        }
+
+        fn list_classified_views(
+            &self,
+            request: ConnectorListViewsRequest,
+        ) -> Result<Vec<(ConnectorViewIdentity, ConnectorObjectKind)>, ConnectorError> {
+            self.list_views(request).map(|views| {
+                views
+                    .into_iter()
+                    .map(|view| (view, ConnectorObjectKind::View))
+                    .collect()
+            })
+        }
+
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
         }
@@ -1533,11 +1549,6 @@ mod drop_table_if_exists_tests {
         fn mv_readiness(&self) -> &crate::mv::domain::readiness::MvReadinessPort {
             panic!("virtual DROP must not enter MV readiness")
         }
-        fn mv_storage_observation(
-            &self,
-        ) -> &dyn novarocks_spi::connector::MvStorageObservationPort {
-            panic!("virtual DROP must not observe MV storage")
-        }
     }
     #[test]
     fn conditional_drop_cannot_hide_virtual_targets_in_the_local_fallback() {
@@ -1579,7 +1590,9 @@ mod drop_table_if_exists_tests {
 
     #[test]
     fn non_missing_mutation_failures_preserve_the_error_without_view_io() {
-        use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
+        use novarocks_spi::connector::{
+            ConnectorMutationFailure, ConnectorMutationFailureKind, ExternalMutationFinalization,
+        };
         for kind in [
             ConnectorMutationFailureKind::Unsupported,
             ConnectorMutationFailureKind::Unavailable,
@@ -1588,44 +1601,106 @@ mod drop_table_if_exists_tests {
             let message = "read-only compatibility entry";
             let result = super::drop_table_failure_with_view_check(
                 ConnectorMutationFailure::new(kind, message),
-                || panic!("non-NotFound failure must not query a view"),
+                &ExternalMutationFinalization::Complete,
+                |_| panic!("non-NotFound failure must not query a view"),
             );
             assert!(result.unwrap_err().to_string().contains(message));
         }
     }
 
     #[test]
-    fn missing_table_mutation_still_distinguishes_a_view() {
-        use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
-        let result = super::drop_table_failure_with_view_check(
+    fn missing_table_mutation_with_incomplete_cleanup_preserves_the_failure() {
+        use novarocks_spi::connector::{
+            ConnectorMutationFailure, ConnectorMutationFailureKind, ExternalMutationFinalization,
+        };
+        let error = super::drop_table_failure_with_view_check(
             ConnectorMutationFailure::new(ConnectorMutationFailureKind::NotFound, "table missing"),
-            || Ok(Some("target is a view, use DROP VIEW".into())),
-        );
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "target is a view, use DROP VIEW"
-        );
-        let result = super::drop_table_failure_with_view_check(
-            ConnectorMutationFailure::new(ConnectorMutationFailureKind::NotFound, "table missing"),
-            || Ok(None),
-        );
-        assert!(result.unwrap_err().to_string().contains("table missing"));
+            &ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::Unavailable,
+                "cleanup failed",
+            )),
+            |_| panic!("a hint must not mask the cleanup failure"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("table missing"));
+        assert!(error.contains("cleanup failed"));
     }
 
     #[test]
-    fn guard_missing_table_error_is_soft_drop_candidate_but_mv_error_is_not() {
-        assert!(super::is_missing_table_guard_error(
-            "unknown table: db.missing"
-        ));
-        assert!(super::is_missing_table_guard_error(
-            "load iceberg table db.missing: table not found: warehouse/db/missing"
-        ));
-        assert!(super::is_missing_table_guard_error(
-            "no metadata files for db.missing"
-        ));
-        assert!(!super::is_missing_table_guard_error(
-            "table ice.db.mv_orders is a materialized view; use DROP MATERIALIZED VIEW"
-        ));
+    fn missing_table_mutation_uses_classified_view_hints() {
+        use novarocks_spi::connector::{
+            ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorObjectKind,
+            ConnectorProviderId, ConnectorStorageTableIdentifier, ExternalMutationFinalization,
+        };
+        let target = crate::catalog_application::resolver::TargetBackend {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            catalog: "ice".into(),
+            namespace: "db".into(),
+            table: "v".into(),
+        };
+        let materialized = ConnectorObjectKind::MaterializedView {
+            storage_table: ConnectorStorageTableIdentifier {
+                namespace: vec!["db".into()].into(),
+                name: "storage".into(),
+                catalog: None,
+            },
+        };
+        for (kind, hint) in [
+            (
+                Some(ConnectorObjectKind::View),
+                Some("ice.db.v is a view, use DROP VIEW"),
+            ),
+            (
+                Some(materialized),
+                Some(
+                    "Table 'ice.db.v' does not exist, but a materialized view with that name exists. Did you mean DROP MATERIALIZED VIEW ice.db.v?",
+                ),
+            ),
+            (None, None),
+        ] {
+            let error = super::drop_table_failure_with_view_check(
+                ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::NotFound,
+                    "table missing",
+                ),
+                &ExternalMutationFinalization::Complete,
+                |original| {
+                    Err(super::drop_table_view_hint(&target, kind).map_or(original, Into::into))
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            if let Some(hint) = hint {
+                assert_eq!(error, hint);
+            } else {
+                assert!(error.contains("table missing"));
+            }
+        }
+    }
+
+    #[test]
+    fn only_exact_table_binding_absence_is_a_missing_drop_target() {
+        use crate::mv::domain::iceberg_guard::IcebergMvMutationGuardError;
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        assert!(
+            IcebergMvMutationGuardError::TableBinding(ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                "opaque connector detail",
+            ))
+            .target_missing()
+        );
+        assert!(
+            !IcebergMvMutationGuardError::TableBinding(ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "table not found",
+            ))
+            .target_missing()
+        );
+        assert!(
+            !IcebergMvMutationGuardError::Other("unknown table: db.missing".into())
+                .target_missing()
+        );
     }
 }
 
@@ -1879,6 +1954,7 @@ pub(crate) mod external_listing_tests {
         Tables,
         SecondNamespaceTables,
         Views,
+        MaterializedViews,
     }
 
     pub(crate) fn error_kinds() -> [ConnectorErrorKind; 3] {
@@ -2035,10 +2111,6 @@ pub(crate) mod external_listing_tests {
         fn mv_readiness(&self) -> &crate::mv::domain::readiness::MvReadinessPort {
             unreachable!("the non-Iceberg fixture does not consult MV readiness")
         }
-
-        fn mv_storage_observation(&self) -> &dyn MvStorageObservationPort {
-            unreachable!("the non-Iceberg fixture does not consult MV storage")
-        }
     }
 
     struct ListingProvider {
@@ -2179,6 +2251,47 @@ pub(crate) mod external_listing_tests {
     }
 
     impl ConnectorViewMetadata for ListingProvider {
+        fn classify_view(
+            &self,
+            _: ConnectorViewRequest,
+        ) -> Result<Option<ConnectorObjectKind>, ConnectorError> {
+            unreachable!("the FORCE preflight must fail before a successful view classification")
+        }
+
+        fn list_classified_views(
+            &self,
+            request: ConnectorListViewsRequest,
+        ) -> Result<Vec<(ConnectorViewIdentity, ConnectorObjectKind)>, ConnectorError> {
+            if self.failure == FailurePoint::MaterializedViews {
+                self.call("classified-views");
+                return Ok(["mv_z", "mv_a"]
+                    .into_iter()
+                    .map(|name| {
+                        (
+                            ConnectorViewIdentity {
+                                instance_id: self.descriptor.instance_id.clone(),
+                                namespace: request.namespace.namespace.clone(),
+                                view: name.into(),
+                            },
+                            ConnectorObjectKind::MaterializedView {
+                                storage_table: ConnectorStorageTableIdentifier {
+                                    namespace: vec!["db".into()].into(),
+                                    name: format!("{name}_storage").into(),
+                                    catalog: None,
+                                },
+                            },
+                        )
+                    })
+                    .collect());
+            }
+            self.list_views(request).map(|views| {
+                views
+                    .into_iter()
+                    .map(|view| (view, ConnectorObjectKind::View))
+                    .collect()
+            })
+        }
+
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
         }
@@ -2341,6 +2454,33 @@ pub(crate) mod external_listing_tests {
         {
             unreachable!("listing must not reconcile a mutation")
         }
+    }
+
+    #[test]
+    fn drop_database_force_lists_materialized_views_before_any_mutation() {
+        let fixture = ListingFixture::new(
+            FailurePoint::MaterializedViews,
+            ConnectorErrorKind::Internal,
+        );
+        let error = execute_drop_database_statement(
+            &fixture,
+            &novarocks_sql::semantic::ObjectName {
+                parts: vec!["catalog".into(), "db".into()],
+            },
+            None,
+            false,
+            true,
+            &crate::connector::test_request_context(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Cannot drop schema catalog.db with CASCADE: materialized views exist: mv_a, mv_z"
+        );
+        assert_eq!(
+            fixture.calls(),
+            ["admit", "namespace_exists", "tables:db", "classified-views"]
+        );
     }
 
     #[test]

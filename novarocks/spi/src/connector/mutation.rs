@@ -29,8 +29,8 @@ use uuid::Uuid;
 use super::{
     ConnectorCommittedPartitioning, ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorNamespaceIdentity,
-    ConnectorProcessLocalPayload, ConnectorProviderBindingKey, ConnectorRequestContext,
-    ConnectorTableIdentity, ProviderBindingEpoch,
+    ConnectorObjectKind, ConnectorProcessLocalPayload, ConnectorProviderBindingKey,
+    ConnectorRequestContext, ConnectorTableIdentity, ProviderBindingEpoch,
 };
 
 /// Largest provider-owned reconciliation payload accepted by the control plane.
@@ -174,6 +174,19 @@ pub enum ConnectorMutationFailureKind {
 pub struct ConnectorMutationFailure {
     kind: ConnectorMutationFailureKind,
     message: Arc<str>,
+    detail: Option<ConnectorMutationFailureDetail>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConnectorMutationFailureDetail {
+    Connector(ConnectorError),
+    // Only failures that carry an object identity need additional storage.
+    ExistingObject(Box<ExistingObjectFailure>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExistingObjectFailure {
+    kind: ConnectorObjectKind,
     source: Option<ConnectorError>,
 }
 
@@ -199,24 +212,50 @@ impl ConnectorMutationFailure {
         Self {
             kind: error.kind().into(),
             message: error.to_string().into(),
-            source: Some(error),
+            detail: Some(ConnectorMutationFailureDetail::Connector(error)),
         }
     }
     /// Attach the originating connector fact while preserving the mutation disposition.
     pub fn with_connector_source(mut self, source: ConnectorError) -> Self {
-        self.source = Some(source);
+        if let Some(ConnectorMutationFailureDetail::ExistingObject(object)) = &mut self.detail {
+            object.source = Some(source);
+        } else {
+            self.detail = Some(ConnectorMutationFailureDetail::Connector(source));
+        }
         self
     }
 
     pub fn connector_source(&self) -> Option<&ConnectorError> {
-        self.source.as_ref()
+        match self.detail.as_ref()? {
+            ConnectorMutationFailureDetail::Connector(source) => Some(source),
+            ConnectorMutationFailureDetail::ExistingObject(object) => object.source.as_ref(),
+        }
     }
 
     pub fn new(kind: ConnectorMutationFailureKind, message: impl Into<Arc<str>>) -> Self {
         Self {
             kind,
             message: message.into(),
-            source: None,
+            detail: None,
+        }
+    }
+
+    pub fn with_existing_object(mut self, kind: ConnectorObjectKind) -> Self {
+        let source = match self.detail.take() {
+            Some(ConnectorMutationFailureDetail::Connector(source)) => Some(source),
+            Some(ConnectorMutationFailureDetail::ExistingObject(object)) => object.source,
+            None => None,
+        };
+        self.detail = Some(ConnectorMutationFailureDetail::ExistingObject(Box::new(
+            ExistingObjectFailure { kind, source },
+        )));
+        self
+    }
+
+    pub fn existing_object(&self) -> Option<&ConnectorObjectKind> {
+        match self.detail.as_ref()? {
+            ConnectorMutationFailureDetail::ExistingObject(object) => Some(&object.kind),
+            ConnectorMutationFailureDetail::Connector(_) => None,
         }
     }
 
@@ -231,15 +270,14 @@ impl ConnectorMutationFailure {
 
 impl std::error::Error for ConnectorMutationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_ref()
+        self.connector_source()
             .map(|cause| cause as &dyn std::error::Error)
     }
 }
 impl novarocks_failure_contract::FailureProjection for ConnectorMutationFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use novarocks_failure_contract::{FailureClass as C, FailureFact, FailureReason, domain};
-        if let Some(source) = &self.source {
+        if let Some(source) = self.connector_source() {
             return source.failure_fact();
         }
         let (class, reason) = match self.kind {

@@ -16,3 +16,4 @@
 -- under the License.
 
 DROP CATALOG IF EXISTS "iceberg_rest_${suite_uuid0}";
+DROP CATALOG IF EXISTS "iceberg_rest_mv_${suite_uuid0}";

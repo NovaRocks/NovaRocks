@@ -890,7 +890,9 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.admit.not_in_transaction" => NotInTransaction,
         "sql.admit.schema_already_exists" => SchemaAlreadyExists,
         "sql.admit.table_already_exists" => TableAlreadyExists,
-        "sql.analyze.invalid_query_shape" | "query.execution.invalid_data" => GenericUser,
+        "sql.admit.materialized_view_target"
+        | "sql.analyze.invalid_query_shape"
+        | "query.execution.invalid_data" => GenericUser,
         "sql.parse.unsupported_statement"
         | "sql.admit.unsupported_statement"
         | "sql.analyze.unsupported_expression"

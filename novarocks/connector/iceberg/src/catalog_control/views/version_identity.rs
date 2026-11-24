@@ -18,9 +18,8 @@
 //! Bind one observed declaration, including when a catalog reuses version IDs
 //! after history expiry. This digest grants neither a lease nor lookup authority.
 
-use crate::iceberg::spec::{
-    NestedField, PrimitiveType, Schema, Type, ViewMetadata, ViewRepresentation, ViewVersion,
-};
+use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use crate::rest_protocol::view_metadata::{ViewMetadata, ViewRepresentation, ViewVersion};
 use novarocks_connector_contract::PureProviderCompileError;
 use novarocks_spi::connector::{ConnectorError, read_stack::ConnectorReadSchemaCreation};
 use sha2::{Digest, Sha256};
@@ -53,7 +52,7 @@ pub(super) fn observed(
         digest.update(bytes);
         Ok(())
     };
-    write(b"novarocks-iceberg-view-declaration-v1")?;
+    write(b"novarocks-iceberg-view-declaration-v2")?;
     write(metadata.uuid().as_bytes())?;
     write(&metadata.current_version_id().to_le_bytes())?;
     write(&version.schema_id().to_le_bytes())?;
@@ -69,11 +68,39 @@ pub(super) fn observed(
     for component in version.default_namespace().iter() {
         text(component, &mut write)?;
     }
-    write(&(version.representations().iter().count() as u64).to_le_bytes())?;
-    for representation in version.representations().iter() {
-        let ViewRepresentation::Sql(sql) = representation;
-        text(&sql.dialect, &mut write)?;
-        text(&sql.sql, &mut write)?;
+    match version.storage_table() {
+        Some(storage) => {
+            write(&[1])?;
+            write(&(storage.namespace.len() as u64).to_le_bytes())?;
+            for component in &storage.namespace {
+                text(component, &mut write)?;
+            }
+            text(&storage.name, &mut write)?;
+            match &storage.catalog {
+                Some(catalog) => {
+                    write(&[1])?;
+                    text(catalog, &mut write)?;
+                }
+                None => write(&[0])?,
+            }
+        }
+        None => write(&[0])?,
+    }
+    write(&(version.representations().len() as u64).to_le_bytes())?;
+    for representation in version.representations() {
+        match representation {
+            ViewRepresentation::Sql(sql) => {
+                write(&[0])?;
+                text(&sql.dialect, &mut write)?;
+                text(&sql.sql, &mut write)?;
+            }
+            ViewRepresentation::Unknown {
+                representation_type,
+            } => {
+                write(&[1])?;
+                text(representation_type, &mut write)?;
+            }
+        }
     }
     write(&(summary.len() as u64).to_le_bytes())?;
     for (key, value) in summary {

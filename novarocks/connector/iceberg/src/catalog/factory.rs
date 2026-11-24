@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(listed.kind(), ConnectorErrorKind::Unsupported);
 
         let loaded = catalog
-            .load_view(CatalogTableName::new("db", "v"))
+            .load_view_document(CatalogTableName::new("db", "v"))
             .await
             .expect_err("load_view must not answer not-found");
         assert_eq!(loaded.kind(), ConnectorErrorKind::Unsupported);

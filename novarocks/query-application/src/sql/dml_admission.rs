@@ -68,6 +68,12 @@ const TABLE_ALREADY_EXISTS: ErrorCodeDescriptor = ErrorCodeDescriptor {
     status: ErrorCodeStatus::Active,
 };
 
+const MATERIALIZED_VIEW_TARGET: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.materialized_view_target"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+
 const SCHEMA_ALREADY_EXISTS: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.admit.schema_already_exists"),
     phase: ErrorPhase::Admit,
@@ -84,6 +90,7 @@ pub const DML_ADMISSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     CREATE_TABLE_UNSUPPORTED_FORM,
     INVALID_DEFAULT_COLUMN_VALUE,
     TABLE_ALREADY_EXISTS,
+    MATERIALIZED_VIEW_TARGET,
     SCHEMA_ALREADY_EXISTS,
 ];
 
@@ -96,6 +103,7 @@ pub enum DmlAdmissionError {
     CreateTableUnsupportedForm,
     InvalidDefaultColumnValue,
     TableAlreadyExists,
+    MaterializedViewTarget,
     SchemaAlreadyExists,
 }
 
@@ -109,6 +117,7 @@ impl DmlAdmissionError {
             Self::CreateTableUnsupportedForm => CREATE_TABLE_UNSUPPORTED_FORM,
             Self::InvalidDefaultColumnValue => INVALID_DEFAULT_COLUMN_VALUE,
             Self::TableAlreadyExists => TABLE_ALREADY_EXISTS,
+            Self::MaterializedViewTarget => MATERIALIZED_VIEW_TARGET,
             Self::SchemaAlreadyExists => SCHEMA_ALREADY_EXISTS,
         }
     }
@@ -177,7 +186,7 @@ mod tests {
 
     #[test]
     fn manifest_contains_every_dml_statement_shape_code() {
-        assert_eq!(DML_ADMISSION_ERROR_CODE_DESCRIPTORS.len(), 9);
+        assert_eq!(DML_ADMISSION_ERROR_CODE_DESCRIPTORS.len(), 10);
         assert!(
             DML_ADMISSION_ERROR_CODE_DESCRIPTORS
                 .iter()

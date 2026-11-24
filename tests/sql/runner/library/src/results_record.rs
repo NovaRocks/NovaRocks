@@ -365,6 +365,12 @@ pub(crate) fn required(step: &SqlStep) -> Vec<&'static str> {
     if m.iceberg_orphan_fixture_absent {
         kinds.push("iceberg_orphan_absent");
     }
+    if m.iceberg_view_fixture.is_some() {
+        kinds.push("iceberg_view_fixture");
+    }
+    if m.iceberg_view_fixture_unchanged.is_some() {
+        kinds.push("iceberg_view_fixture_unchanged");
+    }
     kinds
 }
 

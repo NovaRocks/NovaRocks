@@ -363,8 +363,9 @@ pub use statistics::{
     TableStatisticsSummary,
 };
 pub use view_metadata::{
-    ConnectorListViewsRequest, ConnectorViewMetadata, ConnectorViewMetadataValue,
-    ConnectorViewPreparation, ConnectorViewPreparationFuture, ConnectorViewRequest,
+    ConnectorListViewsRequest, ConnectorObjectKind, ConnectorStorageTableIdentifier,
+    ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewPreparation,
+    ConnectorViewPreparationFuture, ConnectorViewRequest,
 };
 pub use write::{
     ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,

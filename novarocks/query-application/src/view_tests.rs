@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::api::QueryResult;
+use crate::api::{CommandError, QueryResult, StatementExternalEffectDisposition};
 use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::view::ViewCommand;
 use crate::view::{
@@ -29,7 +29,10 @@ use crate::view::{
 use crate::view_service::QueryViewService;
 use arrow::array::{Array, StringArray};
 use novarocks_parser::ast::{Query, SetExpr, ShowCreateKind, TrinoStatement};
-use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
+use novarocks_spi::connector::{
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorObjectKind,
+    ConnectorRequestContext, ConnectorStopOwner, ConnectorStorageTableIdentifier,
+};
 
 #[derive(Default)]
 struct FakeViewEngine {
@@ -38,6 +41,7 @@ struct FakeViewEngine {
     views: Mutex<HashMap<ViewTarget, ResolvedExternalView>>,
     created: Mutex<Vec<CreateExternalViewRequest>>,
     analyzed_count: Mutex<usize>,
+    mutation_error: Option<CommandError>,
 }
 
 impl FakeViewEngine {
@@ -66,6 +70,9 @@ impl ViewEngine for FakeViewEngine {
         request: CreateExternalViewRequest,
         _context: &ConnectorRequestContext,
     ) -> Result<(), crate::api::CommandError> {
+        if let Some(error) = &self.mutation_error {
+            return Err(error.clone());
+        }
         if self.tables.lock().unwrap().contains(&request.target) {
             return Err(format!(
                 "a table named {}.{}.{} already exists",
@@ -100,6 +107,9 @@ impl ViewEngine for FakeViewEngine {
         _context: &ConnectorRequestContext,
         policy: novarocks_spi::connector::DropPolicy,
     ) -> Result<(), crate::api::CommandError> {
+        if let Some(error) = &self.mutation_error {
+            return Err(error.clone());
+        }
         if self.views.lock().unwrap().remove(target).is_some()
             || policy == novarocks_spi::connector::DropPolicy::NoOpIfMissing
         {
@@ -235,16 +245,138 @@ fn view_command<'a>(
         TrinoStatement::CreateView(node) => {
             ViewCommand::trino_create(source, node).map_err(|error| error.to_string())?
         }
-        TrinoStatement::DropView(node) => ViewCommand::Drop {
-            name: &node.name,
-            if_exists: node.exists,
-        },
+        TrinoStatement::DropView(node) => ViewCommand::Drop { source, node },
         TrinoStatement::ShowCreate(node) if node.kind == ShowCreateKind::View => {
             ViewCommand::ShowCreate { name: &node.name }
         }
         _ => return Ok(None),
     };
     Ok(Some(command))
+}
+
+fn execute_refused_view_command(source: &str, error: CommandError) -> CommandError {
+    let statement = crate::sql::parse_single_statement(source).unwrap();
+    let command = view_command(source, &statement).unwrap().unwrap();
+    let engine = FakeViewEngine {
+        mutation_error: Some(error),
+        ..Default::default()
+    };
+    QueryViewService::new()
+        .execute_command(&engine, command, context(Some("ice"), "db"))
+        .unwrap_err()
+}
+
+#[derive(Debug)]
+struct ViewMutationRefusal(ConnectorMutationFailure);
+
+impl std::fmt::Display for ViewMutationRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl std::error::Error for ViewMutationRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl novarocks_failure_contract::FailureProjection for ViewMutationRefusal {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(&self.0)
+    }
+}
+
+#[test]
+fn external_view_mutations_author_kind_specific_sql_errors_at_the_statement() {
+    use ConnectorMutationFailureKind::{AlreadyExists, InvalidRequest};
+    use ConnectorObjectKind::{MaterializedView, Table, View};
+    use novarocks_failure_contract::SharedFailureCause;
+
+    let materialized = MaterializedView {
+        storage_table: ConnectorStorageTableIdentifier {
+            namespace: vec!["db".into()].into(),
+            name: "mv_storage".into(),
+            catalog: None,
+        },
+    };
+    for (sql, failure, kind, code, message) in [
+        (
+            "CREATE VIEW v AS SELECT 1",
+            AlreadyExists,
+            Table,
+            "sql.admit.table_already_exists",
+            "Table already exists: 'ice.db.v'",
+        ),
+        (
+            "CREATE VIEW v AS SELECT 1",
+            AlreadyExists,
+            View,
+            "sql.admit.table_already_exists",
+            "View already exists: 'ice.db.v'",
+        ),
+        (
+            "CREATE OR REPLACE VIEW v AS SELECT 1",
+            AlreadyExists,
+            materialized.clone(),
+            "sql.admit.table_already_exists",
+            "Materialized view already exists: 'ice.db.v'",
+        ),
+        (
+            "DROP VIEW IF EXISTS v",
+            InvalidRequest,
+            materialized,
+            "sql.admit.materialized_view_target",
+            "View 'ice.db.v' does not exist, but a materialized view with that name exists. Did you mean DROP MATERIALIZED VIEW ice.db.v?",
+        ),
+    ] {
+        let cause = SharedFailureCause::new(ViewMutationRefusal(
+            ConnectorMutationFailure::new(failure, "the provider's original failure")
+                .with_existing_object(kind),
+        ));
+        let disposition = Some(StatementExternalEffectDisposition::KnownUncommitted);
+        let original = CommandError::from_failure_cause(cause.clone())
+            .with_external_effect_disposition(disposition);
+        let source = format!("-- comment before the statement\n  {sql}");
+        let error = execute_refused_view_command(&source, original);
+        let user = error.user_error().unwrap();
+        assert_eq!(user.code().as_str(), code);
+        assert_eq!(user.message(), message);
+        let location = user.location().unwrap();
+        assert_eq!((location.line(), location.column()), (2, 3));
+        assert_eq!(error.failure_cause(), Some(&cause));
+        assert_eq!(error.external_effect_disposition(), disposition);
+    }
+}
+
+#[test]
+fn external_view_refusals_without_a_confirmed_object_collision_remain_original() {
+    use novarocks_failure_contract::SharedFailureCause;
+
+    for (failure, disposition) in [
+        (
+            ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::CorruptData,
+                "invalid storage-table",
+            ),
+            StatementExternalEffectDisposition::KnownUncommitted,
+        ),
+        (
+            ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::AlreadyExists,
+                "outcome unresolved",
+            )
+            .with_existing_object(ConnectorObjectKind::View),
+            StatementExternalEffectDisposition::CommitUnknown,
+        ),
+    ] {
+        let original = CommandError::from_failure_cause(SharedFailureCause::new(failure))
+            .with_external_effect_disposition(Some(disposition));
+        assert_eq!(
+            execute_refused_view_command("CREATE VIEW v AS SELECT 1", original.clone()),
+            original
+        );
+    }
 }
 
 fn parse_query(sql: &str) -> Query {

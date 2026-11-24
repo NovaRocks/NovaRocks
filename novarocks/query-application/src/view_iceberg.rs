@@ -15,17 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::error::Error;
+
+use crate::api::{CommandError, StatementExternalEffectDisposition};
 use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
+use crate::sql::dml_admission::DmlAdmissionError;
 use crate::view::{
     CreateExternalViewRequest, CreateViewCommand, ViewEngine, ViewRequestContext,
     ViewStatementResult, ViewTarget,
 };
 use novarocks_parser::{
-    ast::ObjectName,
+    Span,
+    ast::{ObjectName, TrinoDropView},
     build::{ident_from_catalog, object_name},
     printer::print_create_view_definition,
 };
-use novarocks_spi::connector::DropPolicy;
+use novarocks_spi::connector::{
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorObjectKind, DropPolicy,
+};
 use novarocks_types::naming::normalize_identifier;
 
 use crate::view_service::{DEFAULT_CATALOG, build_query_result};
@@ -112,39 +119,128 @@ pub(crate) fn create_external_view(
         },
         connector_context,
     )?;
-    engine.create_external_view(
-        CreateExternalViewRequest {
-            target,
-            columns,
-            definition,
-            comment: statement.comment.map(str::to_owned),
-            or_replace: statement.or_replace,
-            if_not_exists: statement.if_not_exists,
-            properties: Vec::new(),
-        },
-        connector_context,
-    )?;
+    let name = qualified_view_name(&target);
+    engine
+        .create_external_view(
+            CreateExternalViewRequest {
+                target,
+                columns,
+                definition,
+                comment: statement.comment.map(str::to_owned),
+                or_replace: statement.or_replace,
+                if_not_exists: statement.if_not_exists,
+                properties: Vec::new(),
+            },
+            connector_context,
+        )
+        .map_err(|error| {
+            present_view_mutation_error(
+                error,
+                ViewMutation::Create,
+                &name,
+                statement.source,
+                statement.span,
+            )
+        })?;
     Ok(ViewStatementResult::Ok)
 }
 
 pub(crate) fn drop_external_view(
     engine: &dyn ViewEngine,
     target: &ViewTarget,
-    if_exists: bool,
+    source: &str,
+    statement: &TrinoDropView,
     context: ViewRequestContext<'_>,
 ) -> Result<(), crate::api::CommandError> {
     let connector_context = context
         .connector_context
         .ok_or_else(|| "external view mutation requires connector request context".to_string())?;
-    engine.drop_external_view(
-        target,
-        connector_context,
-        if if_exists {
-            DropPolicy::NoOpIfMissing
-        } else {
-            DropPolicy::FailIfMissing
-        },
+    engine
+        .drop_external_view(
+            target,
+            connector_context,
+            if statement.exists {
+                DropPolicy::NoOpIfMissing
+            } else {
+                DropPolicy::FailIfMissing
+            },
+        )
+        .map_err(|error| {
+            present_view_mutation_error(
+                error,
+                ViewMutation::Drop,
+                &qualified_view_name(target),
+                source,
+                statement.span,
+            )
+        })
+}
+
+fn qualified_view_name(target: &ViewTarget) -> String {
+    format!("{}.{}.{}", target.catalog, target.database, target.view)
+}
+
+enum ViewMutation {
+    Create,
+    Drop,
+}
+
+fn present_view_mutation_error(
+    error: CommandError,
+    operation: ViewMutation,
+    name: &str,
+    source: &str,
+    span: Span,
+) -> CommandError {
+    let disposition = error.external_effect_disposition();
+    if disposition != Some(StatementExternalEffectDisposition::KnownUncommitted) {
+        return error;
+    }
+    let Some(cause) = error.failure_cause() else {
+        return error;
+    };
+    let mut source_error: &(dyn Error + 'static) = cause;
+    let (failure, kind) = loop {
+        if let Some(failure) = source_error.downcast_ref::<ConnectorMutationFailure>()
+            && let Some(kind) = failure.existing_object()
+        {
+            break (failure.kind(), kind);
+        }
+        let Some(next) = source_error.source() else {
+            return error;
+        };
+        source_error = next;
+    };
+    let (code, message) = match (operation, failure, kind) {
+        (ViewMutation::Create, ConnectorMutationFailureKind::AlreadyExists, kind) => {
+            let label = match kind {
+                ConnectorObjectKind::Table => "Table",
+                ConnectorObjectKind::View => "View",
+                ConnectorObjectKind::MaterializedView { .. } => "Materialized view",
+            };
+            (
+                DmlAdmissionError::TableAlreadyExists,
+                format!("{label} already exists: '{name}'"),
+            )
+        }
+        (
+            ViewMutation::Drop,
+            ConnectorMutationFailureKind::InvalidRequest,
+            ConnectorObjectKind::MaterializedView { .. },
+        ) => (
+            DmlAdmissionError::MaterializedViewTarget,
+            format!(
+                "View '{name}' does not exist, but a materialized view with that name exists. Did you mean DROP MATERIALIZED VIEW {name}?"
+            ),
+        ),
+        _ => return error,
+    };
+    CommandError::from_user_error_with_cause(
+        code.to_user_error(source, span, message),
+        cause.clone(),
     )
+    .with_compile_control(error.compile_control_error())
+    .with_external_effect_disposition(disposition)
 }
 
 pub(crate) fn show_create_view(

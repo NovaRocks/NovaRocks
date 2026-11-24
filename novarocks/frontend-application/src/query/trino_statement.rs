@@ -1286,8 +1286,8 @@ impl FrontendQuerySession {
                         ViewCommand::trino_create(&source, node).map_err(procedure_command_error)?
                     }
                     TrinoViewInput::Drop(node) => ViewCommand::Drop {
-                        name: &node.name,
-                        if_exists: node.exists,
+                        source: &source,
+                        node,
                     },
                     TrinoViewInput::ShowCreate(node) => {
                         ViewCommand::ShowCreate { name: &node.name }

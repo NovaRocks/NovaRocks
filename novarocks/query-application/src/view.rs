@@ -23,7 +23,8 @@
 
 use std::collections::HashMap;
 
-use novarocks_parser::ast::{ObjectName, Query, TrinoCreateView};
+use novarocks_parser::Span;
+use novarocks_parser::ast::{ObjectName, Query, TrinoCreateView, TrinoDropView};
 use novarocks_spi::connector::{ConnectorRequestContext, DropPolicy};
 
 use crate::api::QueryResult;
@@ -84,8 +85,8 @@ pub struct ResolvedExternalView {
 pub enum ViewCommand<'a> {
     Create(CreateViewCommand<'a>),
     Drop {
-        name: &'a ObjectName,
-        if_exists: bool,
+        source: &'a str,
+        node: &'a TrinoDropView,
     },
     ShowCreate {
         name: &'a ObjectName,
@@ -93,6 +94,8 @@ pub enum ViewCommand<'a> {
 }
 
 pub struct CreateViewCommand<'a> {
+    pub(crate) source: &'a str,
+    pub(crate) span: Span,
     pub(crate) name: &'a ObjectName,
     pub(crate) query: &'a Query,
     pub(crate) raw_query: &'a str,
@@ -131,6 +134,8 @@ impl<'a> ViewCommand<'a> {
                 )
             })?;
         Ok(Self::Create(CreateViewCommand {
+            source,
+            span: node.span,
             name: &node.name,
             query: &node.query,
             raw_query,

@@ -605,14 +605,14 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         self.view_exists(view).await
     }
 
-    async fn load_view_for_request(
+    async fn load_view_document_for_request(
         &self,
         view: CatalogTableName,
         context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+    ) -> Result<crate::rest_protocol::endpoints::LoadedViewDocument, ConnectorError> {
         use novarocks_spi::connector::ConnectorOperationControl;
         context.check_active()?;
-        self.load_view(view).await
+        self.load_view_document(view).await
     }
 
     async fn view_exists(&self, _view: CatalogTableName) -> Result<bool, ConnectorError> {
@@ -627,10 +627,10 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         Err(super::views_unsupported("list_views"))
     }
 
-    async fn load_view(
+    async fn load_view_document(
         &self,
         _view: CatalogTableName,
-    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+    ) -> Result<crate::rest_protocol::endpoints::LoadedViewDocument, ConnectorError> {
         Err(super::views_unsupported("load_view"))
     }
 

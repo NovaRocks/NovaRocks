@@ -48,6 +48,7 @@ sql.admit.kill_query_invalid_argument	Admit
 sql.admit.kill_query_permission_denied	Execution
 sql.admit.kill_query_target_not_found	Execution
 sql.admit.kill_query_target_not_running	Execution
+sql.admit.materialized_view_target	Admit
 sql.admit.merge_unsupported_form	Admit
 sql.admit.not_in_transaction	Admit
 sql.admit.persisted_definition_semantics_unsupported	Admit

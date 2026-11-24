@@ -34,6 +34,7 @@ mod hms_case_input;
 #[cfg(all(test, unix))]
 mod hms_selection_tests;
 mod iceberg_orphan_fixture;
+mod iceberg_view_fixture;
 mod mv_rest_document_graph;
 mod namespace_guard;
 mod parser;
@@ -3232,6 +3233,29 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
     outcome
 }
 
+fn cleanup_case_view_fixtures(
+    fixtures: &mut iceberg_view_fixture::CaseViewFixtures,
+    deadline: Instant,
+    evidence: &mut results_record::CaseEvidence,
+    log: &mut String,
+) -> bool {
+    let mut all_deleted = true;
+    for (target, result) in fixtures.cleanup(deadline) {
+        match result {
+            Ok(()) => {
+                let _ = writeln!(log, "    @iceberg_view_fixture cleanup PASS {target}");
+            }
+            Err(error) => {
+                all_deleted = false;
+                let reason = format!("Iceberg view fixture cleanup {target}: {error:#}");
+                evidence.record_case_cleanup_failure(None, reason.clone());
+                let _ = writeln!(log, "    ❌ {reason}");
+            }
+        }
+    }
+    all_deleted
+}
+
 fn run_case_observed(
     ctx: &SuiteRunContext,
     case: &SqlCase,
@@ -3571,6 +3595,7 @@ fn run_case_observed(
     // that skipped its own cleanup fails the ones after it.
     let mut cleanup_only = false;
     let fault_cleanup_errors = fault_injection::FaultStepCleanupErrors::default();
+    let mut view_fixtures = iceberg_view_fixture::CaseViewFixtures::default();
 
     let mut cleanup_transport = false;
     for step in &case.steps {
@@ -3609,6 +3634,10 @@ fn run_case_observed(
                 }
             }
         }
+        if step.meta.cleanup {
+            case_failed |=
+                !cleanup_case_view_fixtures(&mut view_fixtures, step_deadline, evidence, &mut log);
+        }
         if !step.meta.cleanup && Instant::now() >= step_deadline {
             case_failed = true;
             cleanup_only = true;
@@ -3642,6 +3671,61 @@ fn run_case_observed(
             "  step {} (order_sensitive={}, epsilon={:?})",
             step.query_number, order_sensitive, epsilon
         );
+
+        if let Some(directive) = &step.meta.iceberg_view_fixture {
+            let installed = target_session
+                .namespace_guard()
+                .context("Iceberg view fixture requires a scoped case session")
+                .and_then(|guard| {
+                    view_fixtures.install(
+                        directive,
+                        guard,
+                        |namespace| {
+                            case_dbs.iter().any(|name| name == namespace)
+                                || case
+                                    .namespace_rewrites
+                                    .values()
+                                    .any(|name| name == namespace)
+                        },
+                        step_deadline,
+                    )
+                });
+            evidence.record(
+                step,
+                "iceberg_view_fixture",
+                installed.is_ok(),
+                serde_json::json!({}),
+            );
+            match installed {
+                Ok(target) => {
+                    let _ = writeln!(log, "    @iceberg_view_fixture installed {target}");
+                }
+                Err(error) => {
+                    case_failed = true;
+                    cleanup_only = true;
+                    let reason = format!("install Iceberg view fixture: {error:#}");
+                    evidence.record_independent_failure(Some(step.query_number), reason.clone());
+                    let _ = writeln!(log, "    ❌ {reason}");
+                    preserve_case_failure_snapshot(
+                        ctx,
+                        &case.case_id,
+                        Some(step.query_number),
+                        &mut log,
+                    );
+                    if !retire_unissued_step_role_launches(
+                        ctx,
+                        case,
+                        step.query_number,
+                        abort,
+                        evidence,
+                        &mut log,
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
 
         let be_log_deadline =
             be_log_directive::step_evidence_deadline(&step.meta).map(|end| end.min(step_deadline));
@@ -5204,6 +5288,38 @@ fn run_case_observed(
             }
         }
 
+        if let Some(assertion) = &step.meta.iceberg_view_fixture_unchanged {
+            let result = target_session
+                .namespace_guard()
+                .context("Iceberg view fixture assertion requires a scoped case session")
+                .and_then(|guard| {
+                    view_fixtures.assert_unchanged(
+                        assertion,
+                        step.meta.iceberg_view_fixture.is_some(),
+                        guard,
+                        step_deadline,
+                    )
+                });
+            evidence.record(
+                step,
+                "iceberg_view_fixture_unchanged",
+                result.is_ok(),
+                serde_json::json!({}),
+            );
+            match result {
+                Ok(target) => {
+                    let _ = writeln!(log, "    @iceberg_view_fixture_unchanged PASS {target}");
+                }
+                Err(error) => {
+                    case_failed = true;
+                    conversion_infrastructure_failed = true;
+                    let reason = format!("Iceberg view fixture unchanged assertion: {error:#}");
+                    evidence.record_independent_failure(Some(step.query_number), reason.clone());
+                    let _ = writeln!(log, "    ❌ {reason}");
+                }
+            }
+        }
+
         if !step.meta.cleanup && Instant::now() >= step_deadline {
             case_failed = true;
             conversion_infrastructure_failed = true;
@@ -5277,6 +5393,13 @@ fn run_case_observed(
             let _ = writeln!(log, "    ❌ {role} Trino client cleanup: {error:#}");
         }
     }
+
+    case_failed |= !cleanup_case_view_fixtures(
+        &mut view_fixtures,
+        ctx.cleanup_deadline(),
+        evidence,
+        &mut log,
+    );
 
     for db_name in &case_dbs {
         if let Err(exc) = session::drop_case_database_until(
@@ -6993,6 +7116,12 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             for case in &cases {
                 for step in &case.steps {
                     parser::validate_test_capability_tags(&step.meta.tags)?;
+                    if let Some(directive) = &step.meta.iceberg_view_fixture {
+                        results_writer.track_file(&iceberg_view_fixture::sample_path(
+                            &base_dir,
+                            directive.sample,
+                        ))?;
+                    }
                     if step.meta.cleanup_fault.is_some()
                         || step.meta.kill_query_at_lifecycle_phase.is_some()
                         || step.meta.kill_be_at_lifecycle_phase.is_some()

@@ -25,16 +25,16 @@ use novarocks_spi::connector::{
     ConnectorDataMutationReconcileRequest, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorListTablesRequest, ConnectorListViewsRequest, ConnectorMetadata,
-    ConnectorNamespaceRequest, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
-    ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderId,
-    ConnectorReadNamedReference, ConnectorReadReferenceFacts, ConnectorReadReferenceKind,
-    ConnectorReadSnapshotLogEntry, ConnectorScalarType, ConnectorScalarValue, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
-    ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateId,
-    ConnectorStaticPredicateKind, ConnectorStatistics, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest, ConnectorViewIdentity,
-    ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewRequest,
+    ConnectorNamespaceRequest, ConnectorObjectKind, ConnectorPredicateDisposition,
+    ConnectorPredicateDispositionKind, ConnectorProviderBinding, ConnectorProviderBindingKey,
+    ConnectorProviderId, ConnectorReadNamedReference, ConnectorReadReferenceFacts,
+    ConnectorReadReferenceKind, ConnectorReadSnapshotLogEntry, ConnectorScalarType,
+    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateColumn,
+    ConnectorStaticPredicateId, ConnectorStaticPredicateKind, ConnectorStatistics,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    ConnectorViewIdentity, ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewRequest,
     ExternalMutationOutcome, ProviderBindingEpoch, StatisticsBasisRelation, StatisticsDataVersion,
     StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
     StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue, StatisticsNumericNature,
@@ -373,6 +373,20 @@ struct OwnerViewMetadata {
 }
 
 impl ConnectorViewMetadata for OwnerViewMetadata {
+    fn classify_view(
+        &self,
+        _: ConnectorViewRequest,
+    ) -> Result<Option<ConnectorObjectKind>, ConnectorError> {
+        unreachable!("control binding construction must not classify views")
+    }
+
+    fn list_classified_views(
+        &self,
+        _: ConnectorListViewsRequest,
+    ) -> Result<Vec<(ConnectorViewIdentity, ConnectorObjectKind)>, ConnectorError> {
+        unreachable!("control binding construction must not list classified views")
+    }
+
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }

@@ -1142,7 +1142,7 @@ pub(crate) struct IcebergPreparedTableFacts {
 
 struct IcebergPreparedViewFacts {
     request: novarocks_spi::connector::ConnectorViewRequest,
-    metadata: crate::iceberg::spec::ViewMetadata,
+    metadata: crate::rest_protocol::view_metadata::ViewMetadata,
     incarnation: ProviderBindingEpoch,
     generation_owner: Arc<GenerationOwner>,
 }
@@ -1150,7 +1150,7 @@ impl IcebergMetadata {
     pub(crate) fn prepared_view_facts(
         &self,
         request: novarocks_spi::connector::ConnectorViewRequest,
-        metadata: crate::iceberg::spec::ViewMetadata,
+        metadata: crate::rest_protocol::view_metadata::ViewMetadata,
     ) -> novarocks_spi::connector::ConnectorViewPreparation {
         novarocks_spi::connector::ConnectorViewPreparation::new(
             &self.descriptor,
@@ -5069,11 +5069,11 @@ mod plan_splits_pruning_tests {
         ) -> Result<Vec<String>, ConnectorError> {
             self.inner.list_views(name, bound).await
         }
-        async fn load_view(
+        async fn load_view_document(
             &self,
             name: crate::catalog::CatalogTableName,
-        ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
-            self.inner.load_view(name).await
+        ) -> Result<crate::rest_protocol::endpoints::LoadedViewDocument, ConnectorError> {
+            self.inner.load_view_document(name).await
         }
         async fn anchor_written_metadata(
             &self,

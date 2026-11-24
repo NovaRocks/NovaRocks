@@ -26,7 +26,7 @@ use crate::view::{
     CreateViewCommand, ViewCommand, ViewEngine, ViewRequestContext, ViewService,
     ViewStatementResult,
 };
-use novarocks_parser::ast::ObjectName;
+use novarocks_parser::ast::TrinoDropView;
 use novarocks_types::naming::normalize_identifier;
 
 pub(crate) const DEFAULT_CATALOG: &str = "default_catalog";
@@ -212,18 +212,18 @@ impl QueryViewService {
     fn handle_drop(
         &self,
         engine: &dyn ViewEngine,
-        name: &ObjectName,
-        if_exists: bool,
+        source: &str,
+        node: &TrinoDropView,
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, crate::api::CommandError> {
-        let parts = view_object_name_parts(name);
+        let parts = view_object_name_parts(&node.name);
         crate::view_iceberg::require_mutable_view_target(&parts, context)?;
         if let Some(target) =
             crate::view_iceberg::resolve_external_target_parts(engine, &parts, context)?
         {
-            crate::view_iceberg::drop_external_view(engine, &target, if_exists, context)?;
+            crate::view_iceberg::drop_external_view(engine, &target, source, node, context)?;
         } else {
-            self.drop_session_view(&session_view_key(name, context.current_database)?)?;
+            self.drop_session_view(&session_view_key(&node.name, context.current_database)?)?;
         }
         Ok(ViewStatementResult::Ok)
     }
@@ -251,9 +251,7 @@ impl ViewService for QueryViewService {
     ) -> Result<ViewStatementResult, crate::api::CommandError> {
         match command {
             ViewCommand::Create(create_view) => self.handle_create(engine, create_view, context),
-            ViewCommand::Drop { name, if_exists } => {
-                self.handle_drop(engine, name, if_exists, context)
-            }
+            ViewCommand::Drop { source, node } => self.handle_drop(engine, source, node, context),
             ViewCommand::ShowCreate { name } => {
                 crate::view_iceberg::show_create_view(engine, name, context)
             }
