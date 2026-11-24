@@ -1569,8 +1569,8 @@
       "unit": "sql-case:complex-type/schema_free_exchange_depth64_map",
       "owner": "UEA-7B3-A",
       "review_by": "2026-12-15",
-      "reason": "User ruling on 2026-11-03 permits exact blocked depth64 cases to be temporarily ignored without imposing new implementation limits. Original 1FE+3BE observations are retained in UEA-7B3-A attempts 20261103T111804Z-candidate-2381d00-dev-sql-f97868 and 20261103T112438Z-dev-sql-derived-inputs-distribution-7318c3; suite, server and fixture cleanup were OK. This is quarantine, not a known-error exemption, expected-error rewrite or PASS. The actual selected overload builtin.scalar/map/dynamic-v1 has no installed implementation; positive depth64 results and both distribution assertions remain unexecuted.",
-      "exit_condition": "Restore the named constructor capability and review the supported depth path; run the complete original positive logical64 case under native 1FE+3BE in both placements, verify all value/type and plan oracles and actual cleanup, then remove this exact quarantine."
+      "reason": "User ruling on 2026-11-03 permits exact blocked depth64 cases to be temporarily ignored without imposing new limits. The original 1FE+3BE attempts 20261103T111804Z-candidate-2381d00-dev-sql-f97868 and 20261103T112438Z-dev-sql-derived-inputs-distribution-7318c3 stopped at the missing MAP constructor. B7a installs that owner. Native query 2 now stops in FE compilation with query.execution.resource_exhausted. The isolated compiled-statement reproducer retains Flow(TooDeep) at the existing 96-position dependency depth, with both a MAP call and a value ARRAY call per level. The original partitioned and broadcast result and plan oracles remain outstanding.",
+      "exit_condition": "Review the expression control depth and subsequent supported value path. Run the complete original positive logical64 case under native 1FE+3BE in both placements, verify all value/type and plan oracles and actual cleanup, then remove this exact quarantine."
     },
     {
       "unit": "sql-case:complex-type/schema_free_exchange_depth64_list",
