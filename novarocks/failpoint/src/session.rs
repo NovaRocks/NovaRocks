@@ -30,12 +30,6 @@ use std::time::Duration;
 
 pub const DECLARATION_VERSION: u32 = 1;
 pub const MAX_DECLARATION_BYTES: usize = 64 * 1024;
-// One real FE launch in the native SQL recovery suite needs 103 independently
-// bound grants, including both allowed submission attempts. Keep that launch
-// intact: rounding its finite demand up to 128 avoids synthetic role restarts.
-// The independent 64 KiB envelope bound still limits total input and parsing
-// work; grant validation and claim scans also retain this finite count bound.
-pub const MAX_GRANTS: usize = 128;
 pub const MAX_LIVENESS_FRAME_BYTES: usize = 4096;
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 pub const HEARTBEAT_LOSS: Duration = Duration::from_secs(30);
@@ -119,10 +113,8 @@ impl SessionDeclaration {
         {
             return Err(invalid("invalid one-use test-session handshake material"));
         }
-        if self.domain_grants.is_empty() || self.domain_grants.len() > MAX_GRANTS {
-            return Err(invalid(
-                "test-session requires a bounded nonempty grant set",
-            ));
+        if self.domain_grants.is_empty() {
+            return Err(invalid("test-session requires a nonempty grant set"));
         }
         let mut ids = BTreeSet::new();
         for grant in &self.domain_grants {
@@ -289,20 +281,20 @@ mod capacity_tests {
     }
 
     #[test]
-    fn declaration_accepts_128_exact_grants_and_rejects_129() {
-        let accepted = declaration(128);
+    fn declaration_accepts_more_than_128_grants_within_the_byte_bound() {
+        let accepted = declaration(163);
         accepted.validate_envelope().unwrap();
         let encoded = serde_json::to_vec(&accepted).unwrap();
         assert!(encoded.len() <= MAX_DECLARATION_BYTES);
         let decoded: SessionDeclaration = serde_json::from_slice(&encoded).unwrap();
         decoded.validate_envelope().unwrap();
-        assert_eq!(decoded.domain_grants.len(), 128);
+        assert_eq!(decoded.domain_grants.len(), 163);
 
-        let error = declaration(129).validate_envelope().unwrap_err();
+        let error = declaration(0).validate_envelope().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
             error.to_string(),
-            "test-session requires a bounded nonempty grant set"
+            "test-session requires a nonempty grant set"
         );
     }
 

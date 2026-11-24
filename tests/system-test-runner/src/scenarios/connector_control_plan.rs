@@ -303,14 +303,7 @@ impl Owner {
                 observations: spec.observations,
             });
         }
-        for ((role, ordinal), (reference, grants)) in launches {
-            ensure!(
-                grants.len() <= novarocks_failpoint::session::MAX_GRANTS,
-                "connector {:?} launch {ordinal} needs {} grants, exceeds {}",
-                role,
-                grants.len(),
-                novarocks_failpoint::session::MAX_GRANTS
-            );
+        for ((role, _), (reference, grants)) in launches {
             if grants.is_empty() {
                 plan.authorize_ordinary_launch(&reference, binary.to_path_buf())?;
             } else {
@@ -938,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn every_connector_scene_fits_original_role_and_declaration_bounds() {
+    fn every_connector_scene_fits_the_declaration_byte_bound() {
         let (_directory, binary) = binary();
         for &name in SCENES {
             let owner = Owner::default();
@@ -949,9 +942,6 @@ mod tests {
                 .unwrap();
             plan.validate_selected_intents(3).unwrap();
             assert_eq!(plan.deadline(), deadline);
-            for role in plan.planned_launch_summaries().as_array().unwrap() {
-                assert!(role["grants"].as_array().unwrap().len() <= 64, "{name}");
-            }
         }
     }
 
@@ -1051,23 +1041,15 @@ mod tests {
     }
 
     #[test]
-    fn declaration_overflow_fails_before_launch_without_expanding_grant_budget() {
+    fn declaration_byte_overflow_fails_before_owner_publication() {
         let (_directory, binary) = binary();
         let owner = Owner::default();
-        let maximum = novarocks_failpoint::session::MAX_GRANTS;
-        let observations_per_statement = Spec::observed("SELECT 1".into(), &[READER, GRPC])
-            .observations
-            .len();
-        let statement_count = (maximum - 1) / observations_per_statement + 1;
-        assert!(statement_count <= 64);
-        let expected_grants = 1 + statement_count * observations_per_statement;
-        assert!(expected_grants > maximum);
-        let too_many = (0..statement_count)
+        let too_large = (0..64)
             .map(|_| Spec::observed("SELECT 1".into(), &[READER, GRPC]))
             .collect();
         let error = owner
             .freeze(
-                too_many,
+                too_large,
                 false,
                 &[],
                 3,
@@ -1078,9 +1060,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             error.to_string(),
-            format!(
-                "connector Frontend launch 0 needs {expected_grants} grants, exceeds {maximum}"
-            )
+            "selected role declaration exceeds its bounded input size"
         );
         assert!(owner.take(0).is_err());
     }

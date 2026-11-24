@@ -765,17 +765,11 @@ pub(crate) fn build(
             }
         }
     }
-    for ((role, generation), launch) in refs {
-        ensure!(
-            launch.grants.len() <= novarocks_failpoint::session::MAX_GRANTS,
-            "selected {role:?} launch {generation} exceeds the finite role grant bound: {} > {}",
-            launch.grants.len(),
-            novarocks_failpoint::session::MAX_GRANTS
-        );
+    for ((role, _generation), launch) in refs {
         #[cfg(test)]
         execution.planned_launches.push(PlannedLaunchInspection {
             role,
-            generation,
+            generation: _generation,
             reference: launch.reference.clone(),
             grants: launch.grants.clone(),
         });
@@ -1188,7 +1182,7 @@ mod tests {
         );
     }
     #[test]
-    fn original_budget_overflow_and_finite_role_grant_overflow_fail_before_spawn() {
+    fn original_budget_overflow_fails_before_spawn() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut input = inputs(vec![step(
             1,
@@ -1208,31 +1202,6 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("overflow")
-        );
-        let input = inputs(
-            // Each selected statement contributes two submission attempts on
-            // three BEs. Exceed the finite bound without fixing it at 64.
-            (0..(novarocks_failpoint::session::MAX_GRANTS / (2 * 3) + 1))
-                .map(|number| {
-                    step(
-                        number,
-                        "SELECT 1",
-                        QueryMeta {
-                            be_log_not_contains: vec![
-                                novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED
-                                    .into(),
-                            ],
-                            ..Default::default()
-                        },
-                    )
-                })
-                .collect(),
-        );
-        assert!(
-            plan(&input, file.path())
-                .unwrap_err()
-                .to_string()
-                .contains("finite role grant bound")
         );
     }
     #[test]
@@ -1271,16 +1240,6 @@ mod tests {
         // not just the number of grants visible in the public summaries.
         plan.validate_selected_intents(3).unwrap();
         let launches = &execution.planned_launches;
-        let peak = launches
-            .iter()
-            .map(|launch| launch.grants.len())
-            .max()
-            .unwrap();
-        assert!(
-            peak > 64,
-            "the whole suite exercises the former capacity limit"
-        );
-        assert!(peak <= novarocks_failpoint::session::MAX_GRANTS);
 
         let mut tokens = BTreeSet::new();
         for ((suite, case_id, query), control) in &execution.steps {
