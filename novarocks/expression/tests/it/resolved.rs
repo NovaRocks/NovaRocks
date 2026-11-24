@@ -19,13 +19,17 @@
 use super::*;
 use arrow::array::{BooleanArray, Int64Array};
 use novarocks_functions::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 const FUNCTION: &str = "fixture/local-resolved/function-v1";
 const TYPE_FUNCTION: &str = "fixture/local-resolved/type-function-v1";
 const HIGHER_FUNCTION: &str = "fixture/local-resolved/higher-function-v1";
 const CONTROL_FUNCTION: &str = "fixture/local-resolved/control-v1";
 const SCALAR: &str = "fixture/local-resolved/compare-v1";
 const STRICT: &str = "fixture/local-resolved/strict-compare-v1";
+const ORDERED: &str = "fixture/local-resolved/ordered-compare-v1";
 const TYPE_ONLY: &str = "fixture/local-resolved/type-v1";
 const HIGHER: &str = "fixture/local-resolved/higher-v1";
 const IF: &str = "fixture/local-resolved/if-v1";
@@ -48,9 +52,13 @@ fn input_type() -> FunctionValueType {
 fn effects(control: ArgumentControl) -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
-        own_row_error: FunctionIntrinsicRowError::NoRowError,
+        own_row_error: if control == ArgumentControl::OrderedNull {
+            FunctionIntrinsicRowError::MayRaise
+        } else {
+            FunctionIntrinsicRowError::NoRowError
+        },
         failure_behavior: FunctionFailureBehavior::Propagate,
-        null_behavior: if control == ArgumentControl::If {
+        null_behavior: if matches!(control, ArgumentControl::If | ArgumentControl::OrderedNull) {
             FunctionNullBehavior::ControlDefined
         } else {
             FunctionNullBehavior::CalledOnNull
@@ -66,7 +74,7 @@ fn argument_types(overload: &FunctionOverloadId) -> Vec<FunctionArgument> {
         value_type: input_type(),
         constant: None,
     };
-    if *overload == oid(STRICT) {
+    if *overload == oid(STRICT) || *overload == oid(ORDERED) {
         vec![
             FunctionArgument::Value {
                 value_type: input_type().with_nullable(true).unwrap(),
@@ -100,6 +108,7 @@ struct Owner {
     declaration: FunctionBindingDeclaration,
     implementations: Vec<PureImplementationDeclaration>,
     instances: Arc<AtomicUsize>,
+    ordered_rows: Arc<Mutex<Vec<Vec<usize>>>>,
     explicit_type_only: Option<[FunctionValueType; 2]>,
     expected_constraint: Option<FunctionValueType>,
     explicit_higher_parameters: Option<Box<[FunctionValueType]>>,
@@ -108,6 +117,11 @@ impl Owner {
     fn for_overload(overload: &str) -> Self {
         let (function, control, abi) = match overload {
             SCALAR | STRICT => (FUNCTION, ArgumentControl::Eager, PureKernelAbi::ScalarV1),
+            ORDERED => (
+                FUNCTION,
+                ArgumentControl::OrderedNull,
+                PureKernelAbi::ScalarV1,
+            ),
             TYPE_ONLY => (
                 TYPE_FUNCTION,
                 ArgumentControl::TypeOnly,
@@ -157,6 +171,7 @@ impl Owner {
                 })
                 .collect(),
             instances: Arc::new(AtomicUsize::new(0)),
+            ordered_rows: Arc::new(Mutex::new(Vec::new())),
             explicit_type_only: None,
             expected_constraint: None,
             explicit_higher_parameters: None,
@@ -251,6 +266,21 @@ impl FunctionBindingResolver for Owner {
         self.validate_selected(&selected, request, _control)?;
         Ok(selected)
     }
+    fn select_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        self.declaration.effect_declaration(overload)?;
+        let selected = self.resolve(request, control)?;
+        if &selected.overload != overload {
+            return Err(FunctionBindingError::InvalidBinding(
+                "fixture selected a different overload".into(),
+            ));
+        }
+        Ok(selected)
+    }
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
@@ -337,6 +367,7 @@ impl PureScalarImplementation for Owner {
         Ok(Arc::new(Scalar {
             contract,
             instances: self.instances.clone(),
+            ordered_rows: self.ordered_rows.clone(),
         }))
     }
 }
@@ -344,6 +375,7 @@ impl PureScalarImplementation for Owner {
 struct Scalar {
     contract: Arc<ScalarCallContract>,
     instances: Arc<AtomicUsize>,
+    ordered_rows: Arc<Mutex<Vec<Vec<usize>>>>,
 }
 impl PreparedScalarKernel for Scalar {
     fn contract(&self) -> &Arc<ScalarCallContract> {
@@ -354,10 +386,14 @@ impl PreparedScalarKernel for Scalar {
     }
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
         self.instances.fetch_add(1, Ordering::Relaxed);
-        Ok(Box::new(ScalarInstance))
+        Ok(Box::new(ScalarInstance {
+            ordered_rows: self.ordered_rows.clone(),
+        }))
     }
 }
-struct ScalarInstance;
+struct ScalarInstance {
+    ordered_rows: Arc<Mutex<Vec<Vec<usize>>>>,
+}
 impl ScalarKernelInstance for ScalarInstance {
     fn retained_bytes(&self) -> usize {
         0
@@ -367,11 +403,19 @@ impl ScalarKernelInstance for ScalarInstance {
         input: ScalarCallInput<'_, 'input>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'input>, KernelFailure> {
+        let ordered = input.contract().effects().argument_control == ArgumentControl::OrderedNull;
+        if ordered {
+            self.ordered_rows
+                .lock()
+                .unwrap()
+                .push(input.selection().iter().collect());
+        }
         let mut output = Vec::new();
+        let mut row_errors = Vec::new();
         for ordinal in 0..input.selection().len() {
             control.checkpoint(1)?;
             if input.contract().effects().argument_control == ArgumentControl::TypeOnly {
-                output.push(true);
+                output.push(Some(true));
                 continue;
             }
             let read = |argument: EvaluatedArgument<'_>| {
@@ -381,15 +425,38 @@ impl ScalarKernelInstance for ScalarInstance {
                     .downcast_ref::<Int64Array>()
                     .unwrap();
                 let row = input.selection().row(ordinal).unwrap();
-                array.value(argument.value_row(ordinal, row))
+                let physical_row = argument.value_row(ordinal, row);
+                if ordered {
+                    use arrow::array::Array;
+                    assert!(!array.is_null(physical_row));
+                }
+                array.value(physical_row)
             };
-            output.push(read(input.arguments()[0]) > read(input.arguments()[1]));
+            let left = read(input.arguments()[0]);
+            if ordered && left == 98 {
+                return Err(KernelFailure::Cancelled);
+            }
+            if ordered && left == 99 {
+                return Err(KernelFailure::ResourceExhausted);
+            }
+            if ordered && left == 97 {
+                row_errors.push(RowDataError::with_reason(
+                    ordinal,
+                    DataFailureReason::Domain(
+                        novarocks_failure_contract::kernel_reason::INVALID_FUNCTION_ARGUMENT,
+                    ),
+                    "fixture ordered leaf refused its value",
+                ));
+                output.push(None);
+            } else {
+                output.push(Some(left > read(input.arguments()[1])));
+            }
         }
         SelectedValues::try_new(
             input.selection(),
             &DataType::Boolean,
             Arc::new(BooleanArray::from(output)),
-            Box::default(),
+            row_errors.into_boxed_slice(),
         )
         .map_err(|_| KernelFailure::Internal(KernelDiagnostic::new("fixture output differs")))
     }
@@ -412,16 +479,41 @@ fn catalog(owner: Arc<Owner>) -> PureEngineFunctionCatalog {
     }
     .unwrap();
     builder.register(definition).unwrap();
-    builder
-        .seal_pure(owner.implementations.iter().cloned().map(|implementation| {
-            InstalledPureKernel {
-                function: owner.declaration.function_id().clone(),
-                kind: FunctionKind::Scalar,
-                implementation,
+    let mut installed = owner
+        .implementations
+        .iter()
+        .cloned()
+        .map(|implementation| InstalledPureKernel {
+            function: owner.declaration.function_id().clone(),
+            kind: FunctionKind::Scalar,
+            implementation,
+            aggregate_state_format: None,
+        })
+        .collect::<Vec<_>>();
+    if owner.implementations[0].overload == oid(ORDERED) {
+        let builtin = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
+        let metadata = builtin.metadata();
+        let try_definition = metadata.definition("try", FunctionKind::Scalar).unwrap();
+        let declaration = try_definition.binding_declaration().unwrap();
+        for overload in declaration.overloads() {
+            let prepared = metadata
+                .pure_overload_declaration_observed(
+                    declaration.function_id(),
+                    declaration.kind(),
+                    &overload.identity,
+                    &Control::good(),
+                )
+                .unwrap();
+            installed.push(InstalledPureKernel {
+                function: declaration.function_id().clone(),
+                kind: declaration.kind(),
+                implementation: prepared.implementation().clone(),
                 aggregate_state_format: None,
-            }
-        }))
-        .unwrap()
+            });
+        }
+        builder.register(try_definition.clone()).unwrap();
+    }
+    builder.seal_pure(installed).unwrap()
 }
 fn unit(owner: &Owner, control: ArgumentControl, hidden_call: bool) -> BoundExprSet {
     let mut builder = builder();
@@ -1355,5 +1447,168 @@ fn zero_port_strict_null_skips_kernel_creation() {
             Some(expected),
         );
         assert_eq!(owner.instances.load(Ordering::SeqCst), created);
+    }
+}
+
+#[test]
+fn ordered_null_demands_only_surviving_rows_and_keeps_original_error_scope() {
+    use arrow::{array::StringArray, datatypes::Schema, record_batch::RecordBatch};
+    use novarocks_expression::testkit::{
+        HarnessControl,
+        expression_text::{Consistency, TextColumn, TextContext, TextError, type_expression_text},
+    };
+    use novarocks_type_contract::{
+        SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
+    };
+
+    let owner = Arc::new(Owner::for_overload(ORDERED));
+    let functions = catalog(owner.clone());
+    let parameters = SemanticParameters::default();
+    let context = TextContext {
+        functions: &functions,
+        constant_policy: policy(),
+        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+        parameters: &parameters,
+        allow_throw_exception: SemanticParameterRef {
+            id: SemanticParameterId::new(0),
+            expected_key: SemanticParameterKey::AllowThrowException,
+        },
+    };
+    let columns = ["a", "b"].map(|name| TextColumn {
+        name: name.into(),
+        value: ValueId::new(if name == "a" { 1 } else { 2 }),
+        value_type: FunctionValueType::new(DataType::Utf8, true),
+    });
+    let schema = Arc::new(Schema::new(
+        columns
+            .iter()
+            .map(|column| column.value_type.try_to_field(&column.name).unwrap())
+            .collect::<Vec<_>>(),
+    ));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec![
+                None,
+                Some("bad-left"),
+                Some("5"),
+                Some("6"),
+                Some("1"),
+                Some("9"),
+                Some("97"),
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("bad-right"),
+                None,
+                Some("bad-right"),
+                Some("3"),
+                Some("3"),
+                None,
+                Some("3"),
+            ])),
+        ],
+    )
+    .unwrap();
+    let call = "unit_fixture(CAST(a AS BIGINT), CAST(b AS BIGINT))";
+    let expression = type_expression_text(call, &columns, &context, &HarnessControl).unwrap();
+    let flow = expression.unit().control_flow();
+    let first_use = &flow.uses()[&expression.unit().root_use_ids()[0]];
+    assert_eq!(first_use.control, ControlShape::OrderedNull);
+    assert_eq!(first_use.arguments.len(), 2);
+    let second = &flow.uses()[&first_use.arguments[1]];
+    assert_eq!(
+        flow.regions()[&second.context.region]
+            .guard
+            .as_ref()
+            .unwrap()
+            .kind,
+        GuardKind::OrderedNullAfterArgument { ordinal: 0 },
+    );
+    let checked = expression
+        .check_rows(&batch, &HarnessControl, &Runtime)
+        .unwrap();
+    assert!(matches!(checked.consistency, Consistency::Compared { .. }));
+    assert_eq!(
+        checked
+            .batch
+            .values
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap(),
+        &BooleanArray::from(vec![None, None, None, Some(true), Some(false), None, None]),
+    );
+    assert_eq!(
+        checked
+            .batch
+            .errors
+            .iter()
+            .map(|error| (error.selected_ordinal(), error.failure_fact().reason()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                1,
+                novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT
+            ),
+            (
+                2,
+                novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT
+            ),
+            (
+                6,
+                novarocks_failure_contract::kernel_reason::INVALID_FUNCTION_ARGUMENT
+            ),
+        ],
+    );
+    assert_eq!(
+        *owner.ordered_rows.lock().unwrap(),
+        [vec![3, 4, 6], vec![0], vec![0], vec![0]]
+    );
+
+    let expression =
+        type_expression_text(&format!("TRY({call})"), &columns, &context, &HarnessControl).unwrap();
+    let checked = expression
+        .check_rows(&batch, &HarnessControl, &Runtime)
+        .unwrap();
+    assert!(checked.batch.errors.is_empty());
+    assert_eq!(
+        checked
+            .batch
+            .values
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap(),
+        &BooleanArray::from(vec![None, None, None, Some(true), Some(false), None, None]),
+    );
+    for (left, failure) in [
+        ("98", KernelFailure::Cancelled),
+        ("99", KernelFailure::ResourceExhausted),
+    ] {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![left])),
+                Arc::new(StringArray::from(vec!["3"])),
+            ],
+        )
+        .unwrap();
+        let error = expression
+            .check_rows(&batch, &HarnessControl, &Runtime)
+            .unwrap_err();
+        let TextError::Evaluation(error) = error else {
+            panic!("expected original evaluation failure, got {error:?}");
+        };
+        match (*error, failure) {
+            (
+                novarocks_expression::ExprEvaluationFailure::Kernel(KernelFailure::Cancelled),
+                KernelFailure::Cancelled,
+            )
+            | (
+                novarocks_expression::ExprEvaluationFailure::Kernel(
+                    KernelFailure::ResourceExhausted,
+                ),
+                KernelFailure::ResourceExhausted,
+            ) => {}
+            (actual, expected) => panic!("actual {actual:?}, expected {expected:?}"),
+        }
     }
 }

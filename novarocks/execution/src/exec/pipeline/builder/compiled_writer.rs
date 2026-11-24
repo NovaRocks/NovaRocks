@@ -101,6 +101,14 @@ pub(super) fn build_table_writer(
                     ));
                 }
             }
+            CompiledExchangeRouting::Hash {
+                algorithm: PartitionHashAlgorithm::NativeExchangeV2,
+            } => {
+                return Err(program_failure(
+                    FragmentBindingErrorKind::LayoutMismatch,
+                    "canonical MAP exchange is not a writer route",
+                ));
+            }
             CompiledExchangeRouting::Hash { .. }
             | CompiledExchangeRouting::BucketShuffle { .. } => {
                 build = shuffle_compiled_group_input_slots(

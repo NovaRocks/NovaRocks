@@ -147,6 +147,30 @@ pub(crate) fn native_tuple_hashes_observed(
     owner: &dyn InputConstructionOwner,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<TupleHashBatch> {
+    tuple_hashes_observed::<false>(arrays, key_types, selected, conversions, owner, checkpoint)
+}
+
+/// Ordinary exchange V2 uses the same typed combination, with unordered MAP
+/// identity on the affected components. The callers apply ordinary modulo.
+pub(crate) fn native_exchange_v2_hashes_observed(
+    arrays: &[ArrayRef],
+    key_types: &[FunctionValueType],
+    selected: &ReachableRows<'_>,
+    conversions: &mut ValueConversionContext,
+    owner: &dyn InputConstructionOwner,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<TupleHashBatch> {
+    tuple_hashes_observed::<true>(arrays, key_types, selected, conversions, owner, checkpoint)
+}
+
+fn tuple_hashes_observed<const UNORDERED_MAP: bool>(
+    arrays: &[ArrayRef],
+    key_types: &[FunctionValueType],
+    selected: &ReachableRows<'_>,
+    conversions: &mut ValueConversionContext,
+    owner: &dyn InputConstructionOwner,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<TupleHashBatch> {
     checkpoint()?;
     if arrays.is_empty() || arrays.len() != key_types.len() {
         return Err(invariant(ValueViolation::Layout));
@@ -187,7 +211,7 @@ pub(crate) fn native_tuple_hashes_observed(
                 .iter()
                 .map(|&row| hashes[row])
                 .collect::<Vec<_>>();
-            append_native_column(
+            append_native_column::<UNORDERED_MAP>(
                 &normalized.array,
                 ty,
                 &ReachableRows::all(normalized.rows.len()),
@@ -200,7 +224,7 @@ pub(crate) fn native_tuple_hashes_observed(
                 hashes[row] = hash;
             }
         } else {
-            append_native_column(
+            append_native_column::<UNORDERED_MAP>(
                 array,
                 ty,
                 selected,
@@ -218,7 +242,7 @@ pub(crate) fn native_tuple_hashes_observed(
     })
 }
 
-fn append_native_column(
+fn append_native_column<const UNORDERED_MAP: bool>(
     array: &ArrayRef,
     ty: &FunctionValueType,
     selected: &ReachableRows<'_>,
@@ -313,6 +337,16 @@ fn append_native_column(
         hash_native_list(array, selected, hashes, conversions, owner, checkpoint)?;
     } else {
         let semantic = ty.value_type();
+        if UNORDERED_MAP && super::key_builder::contains_map(semantic) {
+            return super::key_builder::hash_map_identity_column_observed(
+                array,
+                semantic,
+                hashes,
+                &|layout| owner.request(layout).map_err(ExecutionFailure::from),
+                checkpoint,
+                |accumulator, leaf| combine(accumulator, combine(FNV_SEED, leaf.unwrap_or(0))),
+            );
+        }
         let temporal_children = semantic.contains_temporal();
         for (row, hash) in hashes.iter_mut().enumerate() {
             if row.is_multiple_of(256) {
@@ -1327,6 +1361,81 @@ mod tests {
         );
     }
     #[test]
+    fn ordinary_v2_map_identity_keeps_a_mixed_tuple_together_and_v1_routes_stay_frozen() {
+        let maps = super::super::key_builder::permuted_map_fixture();
+        let arrays = [Arc::new(Int32Array::from(vec![1; 4])) as ArrayRef, maps];
+        let types = [
+            FunctionValueType::new(DataType::Int32, false),
+            FunctionValueType::new(arrays[1].data_type().clone(), true),
+        ];
+        let owner = owner();
+        let selected = ReachableRows::all(4);
+        let mut conversions = ValueConversionContext::default();
+        let old = native_tuple_hashes_observed(
+            &arrays,
+            &types,
+            &selected,
+            &mut conversions,
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let new = native_exchange_v2_hashes_observed(
+            &arrays,
+            &types,
+            &selected,
+            &mut conversions,
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        // Derived independently from the framed entry bytes, two FNV
+        // combination steps, and the widened companion integer.
+        assert_eq!(
+            old.as_slice(),
+            &[
+                Some(0xa08b_6028_bcbe_1d06),
+                Some(0x02ba_b0f8_4c58_5bb2),
+                Some(0x626f_daf6_d7ea_bdd8),
+                Some(0xadc7_3216_f839_4b27),
+            ]
+        );
+        assert_eq!(
+            new.as_slice(),
+            &[
+                Some(0x02ba_b0f8_4c58_5bb2),
+                Some(0x02ba_b0f8_4c58_5bb2),
+                Some(0x626f_daf6_d7ea_bdd8),
+                Some(0xadc7_3216_f839_4b27),
+            ]
+        );
+        for count in [3, 8] {
+            assert_ne!(
+                old.as_slice()[0].unwrap() % count,
+                old.as_slice()[1].unwrap() % count
+            );
+            assert_eq!(
+                new.as_slice()[0].unwrap() % count,
+                new.as_slice()[1].unwrap() % count
+            );
+        }
+        let selected = ReachableRows::indices(4, &[1, 3]);
+        let sparse = native_exchange_v2_hashes_observed(
+            &arrays,
+            &types,
+            &selected,
+            &mut conversions,
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            sparse.as_slice(),
+            &[None, new.as_slice()[1], None, new.as_slice()[3]]
+        );
+    }
+
+    #[test]
     fn public_byte_equality_native_hash_and_tuple_identity_agree_across_carriers() {
         let values = vec![Some("alpha"), None, Some("beta")];
         let plain = Arc::new(StringArray::from(values.clone())) as ArrayRef;
@@ -1564,7 +1673,7 @@ mod tests {
         let mut hashes = vec![None; 4096];
         hashes[4095] = Some(FNV_SEED);
         let calls = Cell::new(0usize);
-        let error = append_native_column(
+        let error = append_native_column::<false>(
             &numeric,
             &FunctionValueType::new(DataType::Int32, false),
             &selected,
@@ -1585,7 +1694,7 @@ mod tests {
         assert!(error.same_occurrence(&original));
         assert_eq!(hashes[4095], Some(FNV_SEED));
         assert!(hashes[..4095].iter().all(Option::is_none));
-        append_native_column(
+        append_native_column::<false>(
             &numeric,
             &FunctionValueType::new(DataType::Int32, false),
             &selected,

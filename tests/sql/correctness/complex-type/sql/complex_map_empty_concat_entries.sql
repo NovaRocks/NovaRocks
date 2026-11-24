@@ -18,7 +18,7 @@
 -- Migrated from: dev/test/sql/test_map/T/test_map (case: testEmptyMap)
 -- Test Objective:
 -- 1. Validate map_concat with empty maps (map() literal as left/right operand).
--- 2. Cover FE errors for invalid map key types (MAP, ARRAY, and STRUCT as key).
+-- 2. Preserve MAP, ARRAY, and ROW keys when the other map is empty.
 -- 3. Validate map_entries on a table column and unnest(map_entries(...)).
 -- @order_sensitive=true
 
@@ -55,22 +55,42 @@ SELECT map_concat(c1, MAP(ARRAY[1], ARRAY[2]))
 FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
 
 -- query 6
--- @expect_error=Map key don't supported type: MAP
--- FE error: MAP type used as a map key
-SELECT map_concat(c1, MAP(ARRAY[map()], ARRAY[map()]))
-FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
+-- Verify the nested MAP key through the declared type.
+WITH merged AS (
+    SELECT map_concat(c1, MAP(ARRAY[map()], ARRAY[map()])) AS m
+    FROM (VALUES ROW(map())) AS t(c1)
+), entries AS (
+    SELECT cardinality(m) AS merged_entries, element_at(map_entries(m), 1) AS e
+    FROM merged
+)
+SELECT merged_entries, cardinality(e[1]) AS key_entries, cardinality(e[2]) AS value_entries
+FROM entries;
 
 -- query 7
--- @expect_error=Map key don't supported type: ARRAY
--- FE error: ARRAY type used as a map key
-SELECT map_concat(c1, MAP(ARRAY[[]], ARRAY[map()]))
-FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
+-- Verify the ARRAY key and MAP value through their declared types.
+WITH merged AS (
+    SELECT map_concat(c1, MAP(ARRAY[[]], ARRAY[map()])) AS m
+    FROM (VALUES ROW(map())) AS t(c1)
+), entries AS (
+    SELECT cardinality(m) AS merged_entries, element_at(map_entries(m), 1) AS e
+    FROM merged
+)
+SELECT merged_entries, cardinality(e[1]) AS key_entries, cardinality(e[2]) AS value_entries
+FROM entries;
 
 -- query 8
--- @expect_error=Map key don't supported type: struct
--- FE error: STRUCT type used as a map key
-SELECT map_concat(c1, MAP(ARRAY[CAST(ROW(2) AS ROW("1" INTEGER))], ARRAY[CAST(ROW(ARRAY[MAP()]) AS ROW("A" ARRAY(MAP(INTEGER, INTEGER))))]))
-FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
+-- Read the ROW key and the empty MAP nested in its ROW value by position.
+WITH merged AS (
+    SELECT map_concat(c1, MAP(ARRAY[ROW(2 AS "1")],
+                              ARRAY[ROW(ARRAY[CAST(MAP() AS MAP(INTEGER, INTEGER))] AS "A")])) AS m
+    FROM (VALUES ROW(map())) AS t(c1)
+), entries AS (
+    SELECT cardinality(m) AS merged_entries, element_at(map_entries(m), 1) AS e
+    FROM merged
+)
+SELECT merged_entries, e[1][1] AS key_value, cardinality(e[2][1]) AS value_array_entries,
+       cardinality(element_at(e[2][1], 1)) AS nested_map_entries
+FROM entries;
 
 -- query 9
 -- map_entries on a table column; order by pk for determinism
@@ -81,3 +101,8 @@ SELECT col_int, map_entries(col_map) FROM ${case_db}.test_map ORDER BY col_int;
 SELECT col_int, map_entries(col_map), "unnest"
 FROM ${case_db}.test_map, unnest(map_entries(col_map)) AS "unnest"("unnest")
 ORDER BY col_int;
+
+-- query 11
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- Changing a child type inside a ROW uses the separate recursive ROW conversion.
+SELECT CAST(ROW(ARRAY[MAP()]) AS ROW("A" ARRAY(MAP(INTEGER, INTEGER))));

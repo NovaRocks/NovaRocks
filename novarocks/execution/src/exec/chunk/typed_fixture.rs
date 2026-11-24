@@ -127,3 +127,41 @@ pub(crate) fn columns(
     )
     .expect("actual typed publication")
 }
+
+/// Distinct input rows 0 and 1 carry the same MAP with reversed entry order.
+pub(crate) fn reordered_map_keys() -> (Chunk, FunctionValueType) {
+    use arrow::array::{Array, Int64Array, MapArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType, Field, Fields};
+
+    let fields = Fields::from(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]);
+    let entries = StructArray::new(
+        fields.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 2, 1, 9])),
+            Arc::new(Int64Array::from(vec![10, 20, 20, 10, 90])),
+        ],
+        None,
+    );
+    let maps = Arc::new(MapArray::new(
+        Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+        OffsetBuffer::new(vec![0_i32, 2, 4, 5].into()),
+        entries,
+        None,
+        false,
+    ));
+    let ty = FunctionValueType::new(maps.data_type().clone(), false);
+    (
+        columns(
+            &["map", "row"],
+            &[SlotId::new(1), SlotId::new(2)],
+            &[ty.clone(), FunctionValueType::new(DataType::Int64, false)],
+            vec![maps, Arc::new(Int64Array::from(vec![0, 1, 2]))],
+            3,
+        ),
+        ty,
+    )
+}

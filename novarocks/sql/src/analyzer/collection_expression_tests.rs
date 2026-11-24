@@ -648,14 +648,15 @@ fn multi_column_in_decomposes_only_anonymous_row_fields() {
     let ast::Expr::Row(row) = &mut predicate.value else {
         panic!("positional row fixture");
     };
-    // A named field has no positional IN capability, even if all the other
-    // fields are anonymous. Its value must not be resolved as a scalar first.
+    // A mixed-name ROW is one value, so it cannot match two output columns.
     row.fields[0].name = Some(build::ident("First", true));
-    row.fields[0].expression = build::identifier(build::ident("missing", false));
     let ctx = context(&control);
     let error = ctx.analyze_query(&named).unwrap_err();
-    assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-    assert!(ctx.collected_subqueries.borrow().is_empty());
+    assert_eq!(error.kind(), AnalyzeErrorKind::InvalidQueryShape);
+    assert!(
+        error.message().contains("exactly one output column"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -687,7 +688,7 @@ fn unsupported_access_profiles_refuse_before_base_or_table_resolution() {
 }
 
 #[test]
-fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly() {
+fn row_syntax_preserves_original_arguments_and_declared_field_names() {
     use crate::analysis::ExprKind;
     use novarocks_parser::{ast, build};
     let control = SqlCompileControl::unbounded();
@@ -695,7 +696,7 @@ fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly()
     let scope = ctx.new_scope();
     for sql in [
         "SELECT ROW(7)",
-        "SELECT ROW(CAST(1.25 AS DECIMAL(5,2)), [1, NULL])",
+        r#"SELECT ROW(CAST(1.25 AS DECIMAL(5,2)) AS id, [1, NULL] AS "Values", 9)"#,
     ] {
         let parsed = query(sql);
         let ast::Expr::Row(row) = projection(&parsed) else {
@@ -806,11 +807,11 @@ fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly()
         panic!("row");
     };
     row.fields[0].name = Some(build::ident("Named", true));
-    row.fields[0].expression = build::identifier(build::ident("must_not_resolve", false));
+    row.fields[0].expression = build::identifier(build::ident("missing_value", false));
     let error = ctx.analyze_expr(projection(&parsed), &scope).unwrap_err();
     assert_eq!(
         error.kind(),
-        crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        crate::analyze_error::AnalyzeErrorKind::UnknownColumn
     );
 }
 
@@ -849,4 +850,116 @@ fn values_unknown_array_elements_use_the_exact_temporal_array_target() {
             &DataType::Null
         );
     }
+}
+
+#[test]
+fn row_access_uses_named_ordinals_and_typed_index_errors() {
+    use crate::analysis::{ExprKind, LiteralValue};
+    use crate::analyze_error::AnalyzeErrorKind;
+    let control = SqlCompileControl::unbounded();
+    let ctx = context(&control);
+    let scope = ctx.new_scope();
+    for (sql, ordinal, nullable) in [
+        ("SELECT (ROW(7 AS id, 9)).id", 0, false),
+        ("SELECT (ROW(7 AS x, 9 AS x))[2]", 1, false),
+        ("SELECT (CAST(NULL AS ROW(id INTEGER))).id", 0, true),
+    ] {
+        let actual = ctx.analyze_expr(projection(&query(sql)), &scope).unwrap();
+        let ExprKind::FunctionCall { args, binding, .. } = &actual.kind else {
+            panic!("expected ROW field call for {sql}");
+        };
+        assert_eq!(
+            binding.function_id.as_str(),
+            "builtin.scalar/__row_field/v1"
+        );
+        assert!(
+            matches!(args[1].kind, ExprKind::Literal(LiteralValue::Int(value)) if value == ordinal)
+        );
+        assert_eq!(actual.value_type.data_type(), &DataType::Int32);
+        assert_eq!(actual.value_type.nullable(), nullable);
+    }
+    for (sql, expected) in [
+        (
+            r#"SELECT (ROW(7 AS id, 9 AS "ID")).id"#,
+            AnalyzeErrorKind::AmbiguousName,
+        ),
+        (
+            "SELECT (ROW(7, 9)).missing",
+            AnalyzeErrorKind::UnknownColumn,
+        ),
+        (
+            "SELECT (CAST(NULL AS ROW(INTEGER))).f1",
+            AnalyzeErrorKind::UnknownColumn,
+        ),
+        (
+            "SELECT (ROW(7, 9))['1']",
+            AnalyzeErrorKind::ExpressionNotConstant,
+        ),
+        (
+            "SELECT (ROW(7, 9))[1+1]",
+            AnalyzeErrorKind::ExpressionNotConstant,
+        ),
+        (
+            "SELECT (ROW(7, 9))[2147483648]",
+            AnalyzeErrorKind::TypeMismatch,
+        ),
+        (
+            "SELECT (ROW(7, 9))[3]",
+            AnalyzeErrorKind::InvalidFunctionArgument,
+        ),
+        (
+            "SELECT (ROW(7, 9))[0]",
+            AnalyzeErrorKind::InvalidFunctionArgument,
+        ),
+    ] {
+        let error = ctx
+            .analyze_expr(projection(&query(sql)), &scope)
+            .unwrap_err();
+        assert_eq!(error.kind(), expected, "{sql}");
+        assert!(error.span().is_some(), "{sql}");
+    }
+}
+
+#[test]
+fn map_concat_selects_full_common_map_type_before_ordered_control() {
+    use crate::analysis::ExprKind;
+    use crate::analyze_error::AnalyzeErrorKind;
+    let control = SqlCompileControl::unbounded();
+    let ctx = context(&control);
+    let scope = ctx.new_scope();
+    let analyzed = ctx
+        .analyze_expr(
+            projection(&query(
+                "SELECT map_concat(map(ARRAY[1], ARRAY[10]), map(ARRAY[BIGINT '2'], ARRAY[20]))",
+            )),
+            &scope,
+        )
+        .unwrap();
+    assert_eq!(
+        analyzed.value_type.child_at(0).unwrap().data_type(),
+        &DataType::Int64
+    );
+    assert_eq!(
+        analyzed.value_type.child_at(1).unwrap().data_type(),
+        &DataType::Int32
+    );
+    let ExprKind::FunctionCall { args, binding, .. } = &analyzed.kind else {
+        panic!("frozen map_concat call");
+    };
+    assert_eq!(binding.function_id.as_str(), "builtin.scalar/map_concat/v1");
+    assert!(matches!(
+        args[0].kind,
+        ExprKind::Cast {
+            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
+            ..
+        }
+    ));
+    assert_eq!(args[0].value_type, args[1].value_type);
+    let error = ctx
+        .analyze_expr(
+            projection(&query("SELECT map_concat(map(ARRAY[1], ARRAY[10]))")),
+            &scope,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), AnalyzeErrorKind::InvalidFunctionArgument);
 }

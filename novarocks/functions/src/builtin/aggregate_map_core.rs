@@ -22,85 +22,106 @@ use crate::aggregate_scalar::{
     AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue,
     build_typed_scalar_array, tracked_scalar_from_typed_array, tracked_scalar_to_output,
 };
-use crate::aggregate_scalar_fingerprint::tracked_key_fingerprint_with_float_identity;
 use allocator_api2::vec::Vec as ScalarVec;
 use arrow_array::{Array, ArrayRef, MapArray, StructArray};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_cast::cast;
 use arrow_schema::{DataType, Field, Fields};
-use hashbrown::{HashSet, hash_map::DefaultHashBuilder};
+use hashbrown::{HashMap, hash_map::DefaultHashBuilder};
+#[cfg(test)]
+use novarocks_type_contract::FunctionValueType;
 use novarocks_type_contract::ValueTypeRef;
 use std::sync::Arc;
+
+mod key;
+pub(super) use key::KeyIdentity;
 
 #[derive(Debug)]
 pub struct MapAggState<A: ScalarStateAllocator> {
     pub allocator: A,
-    pub seen_keys: HashSet<ScalarVec<u8, A>, DefaultHashBuilder, A>,
-    pub entries: ScalarVec<(TrackedAggScalarValue<A>, Option<TrackedAggScalarValue<A>>), A>,
+    pub(super) key_heads: HashMap<u64, usize, DefaultHashBuilder, A>,
+    pub(super) entries: ScalarVec<MapEntry<A>, A>,
 }
+
+#[derive(Debug)]
+pub(super) struct MapEntry<A: ScalarStateAllocator> {
+    pub(super) key: TrackedAggScalarValue<A>,
+    pub(super) value: Option<TrackedAggScalarValue<A>>,
+    next_key: Option<usize>,
+}
+
 impl<A: ScalarStateAllocator> MapAggState<A> {
     pub fn new(allocator: A) -> Self {
         Self {
-            seen_keys: HashSet::with_hasher_in(DefaultHashBuilder::default(), allocator.clone()),
+            key_heads: HashMap::with_hasher_in(DefaultHashBuilder::default(), allocator.clone()),
             entries: ScalarVec::new_in(allocator.clone()),
             allocator,
         }
     }
 }
+
 /// The same first-wins computation used by both update and partial-state merge.
-pub fn append_entry<A: ScalarStateAllocator>(
+fn append_entry<A: ScalarStateAllocator>(
     state: &mut MapAggState<A>,
+    identity: &KeyIdentity,
     key: TrackedAggScalarValue<A>,
     value: Option<TrackedAggScalarValue<A>>,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<(), KernelFailure> {
-    append_entry_observed(state, key, value, work, &mut |_| Ok(()))
+    let hash = identity.hash(&key, work)?;
+    append_entry_with_hash(state, identity, key, value, hash, work)
 }
-pub fn append_entry_observed<A: ScalarStateAllocator>(
+
+fn append_entry_with_hash<A: ScalarStateAllocator>(
     state: &mut MapAggState<A>,
+    identity: &KeyIdentity,
     key: TrackedAggScalarValue<A>,
     value: Option<TrackedAggScalarValue<A>>,
+    hash: u64,
     work: &mut ScalarWork<'_, '_>,
-    inserted_key: &mut dyn FnMut(usize) -> Result<(), KernelFailure>,
 ) -> Result<(), KernelFailure> {
-    let key_fp = tracked_key_fingerprint_with_float_identity(
-        &key,
-        &state.allocator,
-        super::map_lookup_core::map_float_identity,
-        work,
-    )?;
-    work.flush()?;
-    let duplicate = state.seen_keys.contains(&key_fp);
-    work.flush()?;
-    if duplicate {
-        return Ok(());
+    let head = state.key_heads.get(&hash).copied();
+    let mut candidate = head;
+    while let Some(row) = candidate {
+        work.step()?;
+        let prior = &state.entries[row];
+        if identity.matches(&key, &prior.key, &state.allocator, work)? {
+            return Ok(());
+        }
+        candidate = prior.next_key;
     }
     work.flush()?;
-    state.seen_keys.try_reserve(1).map_err(|source| {
-        state
-            .allocator
-            .scalar_allocation_error("reserve map_agg key set", source)
-    })?;
-    work.flush()?;
+    if head.is_none() {
+        state.key_heads.try_reserve(1).map_err(|source| {
+            state
+                .allocator
+                .scalar_allocation_error("reserve map_agg key index", source)
+        })?;
+        work.flush()?;
+    }
     state.entries.try_reserve(1).map_err(|source| {
         state
             .allocator
             .scalar_allocation_error("reserve map_agg entries", source)
     })?;
     work.flush()?;
-    let key_capacity = key_fp.capacity();
-    let inserted = state.seen_keys.insert(key_fp);
-    debug_assert!(inserted);
-    state.entries.push((key, value));
-    inserted_key(key_capacity)?;
-    work.flush()?;
+    let row = state.entries.len();
+    state.entries.push(MapEntry {
+        key,
+        value,
+        next_key: head,
+    });
+    state.key_heads.insert(hash, row);
     Ok(())
 }
-/// The original packed-input shape check and child-array clone order.
+
+/// Original packed-input fixture, kept to verify which rows the body reads.
+#[cfg(test)]
 pub struct MapUpdateInput {
     pub keys: ArrayRef,
     pub values: ArrayRef,
 }
+#[cfg(test)]
 pub fn update_input(array: &ArrayRef) -> Result<MapUpdateInput, KernelFailure> {
     let struct_arr = array
         .as_any()
@@ -114,28 +135,38 @@ pub fn update_input(array: &ArrayRef) -> Result<MapUpdateInput, KernelFailure> {
         values: struct_arr.column(1).clone(),
     })
 }
-/// Parent StructArray NULLs are intentionally ignored, matching the original body.
+
+#[cfg(test)]
+fn physical_test_identity(carrier: &DataType) -> KeyIdentity {
+    KeyIdentity::prepare(&FunctionValueType::new(carrier.clone(), true), &mut |_| {
+        Ok::<_, std::convert::Infallible>(())
+    })
+    .unwrap()
+}
+
+#[cfg(test)]
 pub fn update_row<A: ScalarStateAllocator>(
     state: &mut MapAggState<A>,
     input: &MapUpdateInput,
     row: usize,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<(), KernelFailure> {
-    update_from_arrays_observed(
+    update_from_arrays(
         state,
+        &physical_test_identity(input.keys.data_type()),
         (&input.keys, row, None),
         (&input.values, row, None),
         work,
-        &mut |_| Ok(()),
     )
 }
+
 /// Distinct actual carrier addresses preserve Column, Selected and Constant inputs.
-pub fn update_from_arrays_observed<A: ScalarStateAllocator>(
+pub(super) fn update_from_arrays<A: ScalarStateAllocator>(
     state: &mut MapAggState<A>,
+    identity: &KeyIdentity,
     (keys, key_row, key_declaration): (&ArrayRef, usize, Option<&ValueTypeRef>),
     (values, value_row, value_declaration): (&ArrayRef, usize, Option<&ValueTypeRef>),
     work: &mut ScalarWork<'_, '_>,
-    inserted_key: &mut dyn FnMut(usize) -> Result<(), KernelFailure>,
 ) -> Result<(), KernelFailure> {
     work.step()?;
     let Some(key) =
@@ -143,6 +174,7 @@ pub fn update_from_arrays_observed<A: ScalarStateAllocator>(
     else {
         return Ok(());
     };
+    // Preserve the original failure order even for a duplicate key.
     let value = tracked_scalar_from_typed_array(
         values,
         value_row,
@@ -150,7 +182,7 @@ pub fn update_from_arrays_observed<A: ScalarStateAllocator>(
         &state.allocator,
         work,
     )?;
-    append_entry_observed(state, key, value, work, inserted_key)
+    append_entry(state, identity, key, value, work)
 }
 pub struct MapMergeInput<'a> {
     map: &'a MapArray,
@@ -168,21 +200,29 @@ pub fn merge_input(array: &ArrayRef) -> Result<MapMergeInput<'_>, KernelFailure>
         values: map.values().clone(),
     })
 }
+#[cfg(test)]
 pub fn merge_row<A: ScalarStateAllocator>(
     state: &mut MapAggState<A>,
     input: &MapMergeInput<'_>,
     row: usize,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<(), KernelFailure> {
-    merge_row_observed(state, input, row, None, work, &mut |_| Ok(()))
+    merge_row_typed(
+        state,
+        &physical_test_identity(input.keys.data_type()),
+        input,
+        row,
+        None,
+        work,
+    )
 }
-pub fn merge_row_observed<A: ScalarStateAllocator>(
+pub(super) fn merge_row_typed<A: ScalarStateAllocator>(
     state: &mut MapAggState<A>,
+    identity: &KeyIdentity,
     input: &MapMergeInput<'_>,
     row: usize,
     declaration: Option<&ValueTypeRef>,
     work: &mut ScalarWork<'_, '_>,
-    inserted_key: &mut dyn FnMut(usize) -> Result<(), KernelFailure>,
 ) -> Result<(), KernelFailure> {
     work.step()?;
     if input.map.is_null(row) {
@@ -195,24 +235,13 @@ pub fn merge_row_observed<A: ScalarStateAllocator>(
     let value_declaration = declaration.and_then(|value| value.child_type_at(1));
     for idx in start..end {
         work.step()?;
-        let Some(key) = tracked_scalar_from_typed_array(
-            &input.keys,
-            idx,
-            key_declaration,
-            &state.allocator,
-            work,
-        )?
-        else {
-            continue;
-        };
-        let value = tracked_scalar_from_typed_array(
-            &input.values,
-            idx,
-            value_declaration,
-            &state.allocator,
+        update_from_arrays(
+            state,
+            identity,
+            (&input.keys, idx, key_declaration),
+            (&input.values, idx, value_declaration),
             work,
         )?;
-        append_entry_observed(state, key, value, work, inserted_key)?;
     }
     Ok(())
 }
@@ -251,7 +280,7 @@ where
         work.step()?;
         validity.append(!state.entries.is_empty());
         let next = checked_map_output_offset(current, state.entries.len())?;
-        for (key, value) in &state.entries {
+        for MapEntry { key, value, .. } in &state.entries {
             work.step()?;
             key_values.push(Some(tracked_scalar_to_output(key, work)?));
             value_values.push(

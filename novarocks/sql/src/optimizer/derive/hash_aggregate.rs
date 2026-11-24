@@ -20,10 +20,23 @@
 
 use crate::column_id::ColumnId;
 use crate::optimizer::operator::{AggMode, PhysicalHashAggregateOp};
-use crate::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
+use novarocks_type_contract::PartitionHashAlgorithm;
+
+use crate::optimizer::property::{DistributionSpec, HashSource, OrderingSpec, PhysicalPropertySet};
 use crate::optimizer::scalar::ScalarArena;
 
 use super::{DeriveOutput, DeriveRequired, scalar_exprs_to_column_ids};
+
+fn grouping_distribution<'a>(
+    cols: Vec<ColumnId>,
+    types: impl IntoIterator<Item = &'a arrow::datatypes::DataType>,
+) -> DistributionSpec {
+    let source = match PartitionHashAlgorithm::for_grouping_keys(types) {
+        PartitionHashAlgorithm::NativeExchangeV2 => HashSource::MapGrouping,
+        _ => HashSource::ShuffleAgg,
+    };
+    DistributionSpec::hash_partitioned(cols, source)
+}
 
 impl DeriveOutput for PhysicalHashAggregateOp {
     fn derive_output(
@@ -55,7 +68,13 @@ impl DeriveOutput for PhysicalHashAggregateOp {
             PhysicalPropertySet::gather()
         } else {
             PhysicalPropertySet {
-                distribution: DistributionSpec::shuffle_agg(cols),
+                distribution: grouping_distribution(
+                    cols,
+                    self.output_layout
+                        .group_key_columns
+                        .iter()
+                        .map(|column| column.value_type.data_type()),
+                ),
                 ordering: OrderingSpec::Any,
             }
         }
@@ -80,7 +99,12 @@ impl DeriveRequired for PhysicalHashAggregateOp {
                     vec![PhysicalPropertySet::gather()]
                 } else {
                     vec![PhysicalPropertySet {
-                        distribution: DistributionSpec::shuffle_agg(cols),
+                        distribution: grouping_distribution(
+                            cols,
+                            self.group_by
+                                .iter()
+                                .map(|id| scalars.value_type(*id).data_type()),
+                        ),
                         ordering: OrderingSpec::Any,
                     }]
                 }
@@ -91,7 +115,12 @@ impl DeriveRequired for PhysicalHashAggregateOp {
                     vec![PhysicalPropertySet::gather()]
                 } else {
                     vec![PhysicalPropertySet {
-                        distribution: DistributionSpec::shuffle_agg(cols),
+                        distribution: grouping_distribution(
+                            cols,
+                            self.group_by
+                                .iter()
+                                .map(|id| scalars.value_type(*id).data_type()),
+                        ),
                         ordering: OrderingSpec::Any,
                     }]
                 }
@@ -107,7 +136,6 @@ mod tests {
     use crate::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::column_id::ColumnId;
     use crate::optimizer::operator::AggregateOutputLayout;
-    use crate::optimizer::property::HashSource;
     use crate::optimizer::scalar::ScalarId;
 
     use crate::planner::optimizer_bridge::scalar::intern_typed;

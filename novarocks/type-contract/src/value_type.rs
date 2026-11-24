@@ -424,6 +424,13 @@ impl ValueField {
     pub fn name(&self) -> &str {
         &self.0.name
     }
+
+    /// The declared name of a ROW member. The canonical empty-name encoding
+    /// denotes an anonymous member.
+    pub fn row_name(&self) -> Option<&str> {
+        let name = self.name();
+        (!name.is_empty()).then_some(name)
+    }
     pub fn value_type(&self) -> &ValueTypeRef {
         &self.0.value_type
     }

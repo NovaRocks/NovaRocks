@@ -538,6 +538,15 @@ fn function(
     args: &[TypedExpr],
     out: &mut DisplayOutput<'_, '_>,
 ) -> Result<(), SqlCompileError> {
+    if name == "__row_field"
+        && let [source, ordinal] = args
+        && let ExprKind::Literal(query_ir::LiteralValue::Int(ordinal)) = ordinal.kind
+    {
+        expression(source, false, out)?;
+        out.append("[")?;
+        out.append(&(ordinal + 1).to_string())?;
+        return out.append("]");
+    }
     match name {
         "__struct_subfield" | "__array_struct_subfield" if args.len() == 2 => {
             if let Some(field) = typed_string_literal(&args[1], out)? {

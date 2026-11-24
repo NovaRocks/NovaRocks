@@ -242,6 +242,9 @@ fn encode_hash(value: PartitionHashAlgorithm) -> i32 {
         PartitionHashAlgorithm::NativeExchangeV1 => {
             wire::PartitionHashAlgorithm::NativeExchangeV1 as i32
         }
+        PartitionHashAlgorithm::NativeExchangeV2 => {
+            wire::PartitionHashAlgorithm::NativeExchangeV2 as i32
+        }
         PartitionHashAlgorithm::NativeHierarchicalV1 => {
             wire::PartitionHashAlgorithm::NativeHierarchicalV1 as i32
         }
@@ -254,6 +257,9 @@ fn decode_hash(value: i32) -> Result<PartitionHashAlgorithm, Error> {
     match wire::PartitionHashAlgorithm::try_from(value) {
         Ok(wire::PartitionHashAlgorithm::NativeExchangeV1) => {
             Ok(PartitionHashAlgorithm::NativeExchangeV1)
+        }
+        Ok(wire::PartitionHashAlgorithm::NativeExchangeV2) => {
+            Ok(PartitionHashAlgorithm::NativeExchangeV2)
         }
         Ok(wire::PartitionHashAlgorithm::NativeHierarchicalV1) => {
             Ok(PartitionHashAlgorithm::NativeHierarchicalV1)

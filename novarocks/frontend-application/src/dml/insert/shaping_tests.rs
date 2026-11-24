@@ -108,32 +108,6 @@ fn baseline_default_values(default: ast::Expr, default_type_sql: &str) -> ast::Q
     query
 }
 
-fn assert_existing_default_rejection(
-    shaped: ast::Query,
-    baseline: ast::Query,
-    kind: AnalyzeErrorKind,
-    message: &str,
-) {
-    assert!(shaped.syntax_eq(&baseline));
-    let novarocks_sql::compiler::SqlCompileError::Analyze(original) =
-        analyze_shaped_query(baseline).expect_err("the original AST has this analysis boundary")
-    else {
-        panic!("baseline must retain its analysis error");
-    };
-    let novarocks_sql::compiler::SqlCompileError::Analyze(current) =
-        analyze_shaped_query(shaped).expect_err("the migrated AST keeps the original rejection")
-    else {
-        panic!("migrated AST must retain its analysis error");
-    };
-    assert_eq!(original.kind(), kind);
-    assert_eq!(original.message(), message);
-    assert_eq!(original.span(), Some(SYNTHETIC));
-    assert_eq!(current.kind(), original.kind());
-    assert_eq!(current.code(), original.code());
-    assert_eq!(current.message(), original.message());
-    assert_eq!(current.span(), original.span());
-}
-
 fn shape(sql: &str, columns: &[ColumnDef]) -> ast::Query {
     shape_insert_source(&parse_query(sql), &[], columns, columns)
         .expect("literal source should shape")
@@ -591,15 +565,8 @@ fn typed_single_field_struct_defaults_keep_their_values_row() {
             true
         ))]))
     );
-    // Both actual source forms now reach the original row overload. Its
-    // installed-implementation boundary still rejects the default; preserving
-    // literal values above does not imply successful compilation or execution.
-    assert_existing_default_rejection(
-        shaped,
-        baseline,
-        AnalyzeErrorKind::UnavailableImplementation,
-        "selected overload `builtin.scalar/row/dynamic-v1` has no installed implementation for the selected carrier",
-    );
+    analyze_shaped_query(baseline).expect("original VALUES default reaches typed ROW analysis");
+    analyze_shaped_query(shaped).expect("shaped singleton default reaches typed ROW analysis");
 }
 
 #[test]

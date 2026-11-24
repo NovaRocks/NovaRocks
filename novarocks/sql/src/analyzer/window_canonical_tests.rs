@@ -1015,12 +1015,9 @@ fn typeof_keeps_original_window_resolution() {
     for window in ["missing_window", "(missing_window)", "(GROUPS CURRENT ROW)"] {
         let direct = format!("SELECT CAST(row_number() OVER {window} AS INT)");
         let inspected = format!("SELECT typeof(CAST(row_number() OVER {window} AS INT))");
-        let direct = analyze(&direct, &source, &functions)
-            .err()
-            .expect("invalid window");
-        let inspected = analyze(&inspected, &source, &functions)
-            .err()
-            .expect("invalid inspected window");
+        let direct = analyze(&direct, &source, &functions).expect_err("invalid window");
+        let inspected =
+            analyze(&inspected, &source, &functions).expect_err("invalid inspected window");
         assert_eq!(inspected.kind(), direct.kind());
         assert_eq!(inspected.message(), direct.message());
     }

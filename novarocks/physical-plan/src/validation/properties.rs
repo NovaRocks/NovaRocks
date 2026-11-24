@@ -521,6 +521,7 @@ pub(crate) fn validate_distribution(
             if !matches!(
                 scheme.definition.algorithm,
                 novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
+                    | novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV2
                     | novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
             ) {
                 errors.push(ValidationError::new(
@@ -832,7 +833,8 @@ fn set_operation_output_distribution_from(
             .try_fold(None, |expected, (input, mapping)| {
                 match &input.distribution {
                     Distribution::Hash { keys, scheme }
-                        if mapping_keys_match(keys, mapping, &representative_ordinals) =>
+                        if mapping_keys_match(keys, mapping, &representative_ordinals)
+                            && supports_grouping_hash_identity(fragment, keys, scheme) =>
                     {
                         match expected {
                             None => Some(Some(scheme)),
@@ -1742,6 +1744,12 @@ fn derive_node_output_properties_from(
                         } else {
                             grouping_values.as_deref().is_some_and(|keys| {
                                 distribution_colocates_by(&input.distribution, keys)
+                                    && match &input.distribution {
+                                        Distribution::Hash { keys, scheme } => {
+                                            supports_grouping_hash_identity(fragment, keys, scheme)
+                                        }
+                                        _ => true,
+                                    }
                             })
                         }
                 });
@@ -2121,6 +2129,20 @@ pub(crate) fn derive_ordering(
     order_by: &[crate::SortExpr],
 ) -> Option<Vec<crate::OrderingKey>> {
     crate::ordering_keys(fragment, node, partition_by, order_by)
+}
+
+fn supports_grouping_hash_identity(
+    fragment: &Fragment,
+    keys: &[ValueId],
+    scheme: &crate::HashPartitionScheme,
+) -> bool {
+    use novarocks_type_contract::PartitionHashAlgorithm;
+    let expected = PartitionHashAlgorithm::for_grouping_keys(
+        keys.iter()
+            .filter_map(|key| fragment.values().get(key).map(|v| v.ty.data_type())),
+    );
+    expected != PartitionHashAlgorithm::NativeExchangeV2
+        || scheme.definition.algorithm == PartitionHashAlgorithm::NativeExchangeV2
 }
 
 pub(crate) fn distribution_colocates_by(distribution: &Distribution, keys: &[ValueId]) -> bool {

@@ -32,10 +32,10 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub(super) struct MapKernel {
     pub(super) contract: Arc<AggregateCallContract>,
+    key: core::KeyIdentity,
 }
 pub(super) struct MapState {
     core: core::MapAggState<HostAggregateAllocator>,
-    key_bytes: usize,
     heap_bytes: usize,
     failed: bool,
 }
@@ -43,7 +43,6 @@ impl MapState {
     fn latch(&mut self) {
         self.failed = true;
         self.core = core::MapAggState::new(self.core.allocator.clone());
-        self.key_bytes = 0;
         self.heap_bytes = 0;
     }
     fn account_new_values(
@@ -51,8 +50,8 @@ impl MapState {
         from: usize,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), KernelFailure> {
-        for (key, value) in &self.core.entries[from..] {
-            for scalar in std::iter::once(key).chain(value.iter()) {
+        for entry in &self.core.entries[from..] {
+            for scalar in std::iter::once(&entry.key).chain(entry.value.iter()) {
                 self.heap_bytes = self
                     .heap_bytes
                     .checked_add(scalar::tracked_scalar_heap_capacity(scalar, work)?)
@@ -207,6 +206,18 @@ fn mapped_domain(
     Ok((allocator, owned))
 }
 impl MapKernel {
+    pub(super) fn prepare(
+        contract: Arc<AggregateCallContract>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, KernelFailure> {
+        let declaration = contract
+            .logical_argument_types()
+            .next()
+            .ok_or_else(|| invalid("map_agg has no checked key declaration"))?;
+        let key =
+            core::KeyIdentity::prepare(declaration, &mut |_| work.step().map_err(compile_failure))?;
+        Ok(Self { contract, key })
+    }
     fn check_emit(
         &self,
         context: &AggregateEmissionContext<'_>,
@@ -244,7 +255,10 @@ impl PreparedAggregateKernel for MapKernel {
         work.step().map_err(compile_failure)?;
         validate_contract(&contract, &mut work)?;
         work.finish().map_err(compile_failure)?;
-        Ok(Arc::new(Self { contract }))
+        Ok(Arc::new(Self {
+            contract,
+            key: self.key.clone(),
+        }))
     }
     type State = MapState;
     type PreparedUpdateBatch<'a> = MapUpdate<'a>;
@@ -257,13 +271,9 @@ impl PreparedAggregateKernel for MapKernel {
     }
     fn retained_bytes(&self, state: &Self::State) -> usize {
         state.core.allocator.metadata_bytes()
-            + state.core.seen_keys.raw_table().allocation_info().1.size()
+            + state.core.key_heads.raw_table().allocation_info().1.size()
             + state.core.entries.capacity()
-                * std::mem::size_of::<(
-                    scalar::TrackedAggScalarValue<HostAggregateAllocator>,
-                    Option<scalar::TrackedAggScalarValue<HostAggregateAllocator>>,
-                )>()
-            + state.key_bytes
+                * std::mem::size_of::<core::MapEntry<HostAggregateAllocator>>()
             + state.heap_bytes
     }
     fn prepared_update_retained_bytes(&self, prepared: &Self::PreparedUpdateBatch<'_>) -> usize {
@@ -298,7 +308,6 @@ impl PreparedAggregateKernel for MapKernel {
         )?;
         Ok(MapState {
             core: core::MapAggState::new(host),
-            key_bytes: 0,
             heap_bytes: 0,
             failed: false,
         })
@@ -454,7 +463,6 @@ impl PreparedAggregateKernel for MapKernel {
             };
             let from = state.core.entries.len();
             let mut scalar_work = ScalarWork::new(Some(work));
-            let key_bytes = &mut state.key_bytes;
             let mut declarations = self.contract.logical_argument_types();
             let key_type = declarations
                 .next()
@@ -464,17 +472,12 @@ impl PreparedAggregateKernel for MapKernel {
                 .next()
                 .expect("checked MAP_AGG value")
                 .value_type();
-            core::update_from_arrays_observed(
+            core::update_from_arrays(
                 &mut state.core,
+                &self.key,
                 (keys.array(), kr, Some(key_type)),
                 (values.array(), vr, Some(value_type)),
                 &mut scalar_work,
-                &mut |capacity| {
-                    *key_bytes = key_bytes
-                        .checked_add(capacity)
-                        .ok_or(KernelFailure::ResourceExhausted)?;
-                    Ok(())
-                },
             )
             .map_err(|error| sink.scalar(error))?;
             state
@@ -522,19 +525,13 @@ impl PreparedAggregateKernel for MapKernel {
             let from = state.core.entries.len();
             let mut scalar_work = ScalarWork::new(Some(work));
             let merge = core::merge_input(argument.array()).map_err(|error| sink.scalar(error))?;
-            let key_bytes = &mut state.key_bytes;
-            core::merge_row_observed(
+            core::merge_row_typed(
                 &mut state.core,
+                &self.key,
                 &merge,
                 address,
                 Some(self.contract.intermediate_type().value_type()),
                 &mut scalar_work,
-                &mut |capacity| {
-                    *key_bytes = key_bytes
-                        .checked_add(capacity)
-                        .ok_or(KernelFailure::ResourceExhausted)?;
-                    Ok(())
-                },
             )
             .map_err(|error| sink.scalar(error))?;
             state

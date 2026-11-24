@@ -282,6 +282,7 @@ enum EncodeStep {
         path: Path,
         phase: u8,
         first: bool,
+        object_text: bool,
     },
     Struct {
         array: ArrayRef,
@@ -820,6 +821,7 @@ impl CellCursor {
                     path,
                     phase,
                     first,
+                    object_text,
                 } => {
                     if next < end {
                         let m = down::<MapArray>(&array)?;
@@ -835,9 +837,21 @@ impl CellCursor {
                             path,
                             phase: 1 - phase,
                             first: false,
+                            object_text,
                         })?;
                         let child = path.child(phase as usize)?;
-                        self.push(if phase == 0 {
+                        self.push(if object_text {
+                            EncodeStep::RawKey {
+                                array: a,
+                                row: next,
+                                path: child,
+                                mode: if phase == 0 {
+                                    ValueText::MapKey
+                                } else {
+                                    ValueText::MapKeyMember
+                                },
+                            }
+                        } else if phase == 0 {
                             EncodeStep::TrinoKey {
                                 array: a,
                                 row: next,
@@ -851,9 +865,9 @@ impl CellCursor {
                             }
                         })?;
                         if phase == 1 {
-                            self.literal(b":")?;
+                            self.literal(if object_text { b"=" } else { b":" })?;
                         } else if !first {
-                            self.literal(b",")?;
+                            self.literal(if object_text { b", " } else { b"," })?;
                         }
                     }
                 }

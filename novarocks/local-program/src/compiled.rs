@@ -667,6 +667,7 @@ fn validate_exchange_inputs(
                         && matches!(
                         algorithm,
                         novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
+                            | novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV2
                             | novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
                     )
                 }

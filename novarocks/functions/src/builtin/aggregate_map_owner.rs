@@ -359,7 +359,7 @@ impl MapOwner {
             }
             validate_contract(&contract, &mut work)?;
             work.flush().map_err(compile_failure)?;
-            let prepared = Arc::new(MapKernel { contract });
+            let prepared = Arc::new(MapKernel::prepare(contract, &mut work)?);
             work.flush().map_err(compile_failure)?;
             Ok(prepared)
         })();

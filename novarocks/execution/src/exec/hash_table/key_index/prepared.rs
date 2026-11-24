@@ -90,25 +90,33 @@ pub(crate) enum KeyStrategy {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum TemporalKeyMode {
+enum ComplexKeyMode {
     Physical,
     Temporal,
     Zoned,
+    UnorderedMap,
 }
 
-impl TemporalKeyMode {
+impl ComplexKeyMode {
     fn from_declaration(
         declaration: &novarocks_type_contract::ValueTypeRef,
+        unordered_maps: bool,
         checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<Self> {
         use novarocks_type_contract::{
-            TemporalType, ValueSemanticVisit, visit_value_type_observed,
+            TemporalType, ValueKind, ValueSemanticVisit, visit_value_type_observed,
         };
 
         let mut mode = Self::Physical;
         visit_value_type_observed(declaration, |event| {
             checkpoint()?;
             if let ValueSemanticVisit::Node(value) = event {
+                if unordered_maps && matches!(value.kind(), ValueKind::Map { .. }) {
+                    mode = Self::UnorderedMap;
+                }
+                if mode == Self::UnorderedMap {
+                    return Ok(());
+                }
                 mode = match value.temporal() {
                     Some(
                         TemporalType::TimeWithTimeZone(_) | TemporalType::TimestampWithTimeZone(_),
@@ -127,7 +135,7 @@ struct SpecData {
     types: Vec<FunctionValueType>,
     nulls: Vec<NullPolicy>,
     equalities: Vec<KeyEquality>,
-    temporal_modes: Vec<TemporalKeyMode>,
+    complex_modes: Vec<ComplexKeyMode>,
     #[cfg_attr(
         not(test),
         expect(
@@ -151,10 +159,29 @@ impl KeySpec {
             types,
             nulls.len(),
             |i| KeyEquality::SqlGrouping(nulls[i]),
+            false,
             owner,
             checkpoint,
         )
     }
+    /// The grouping and relational deduplication owners opt into unordered
+    /// MAP identity. Legacy join, assertion, TopN and content callers keep
+    /// their original relation.
+    pub(crate) fn for_grouping(
+        types: &[FunctionValueType],
+        owner: &dyn InputConstructionOwner,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<Self> {
+        Self::build(
+            types,
+            types.len(),
+            |_| KeyEquality::SqlGrouping(NullPolicy::Equal),
+            true,
+            owner,
+            checkpoint,
+        )
+    }
+
     pub(crate) fn with_equalities(
         types: &[FunctionValueType],
         equalities: &[KeyEquality],
@@ -165,6 +192,7 @@ impl KeySpec {
             types,
             equalities.len(),
             |i| equalities[i],
+            false,
             owner,
             checkpoint,
         )
@@ -173,6 +201,7 @@ impl KeySpec {
         types: &[FunctionValueType],
         count: usize,
         equality: impl Fn(usize) -> KeyEquality,
+        unordered_maps: bool,
         owner: &dyn InputConstructionOwner,
         checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<Self> {
@@ -183,7 +212,7 @@ impl KeySpec {
         let mut copied_types = vector(owner, types.len())?;
         let mut copied_nulls = vector(owner, count)?;
         let mut equalities = vector(owner, count)?;
-        let mut temporal_modes = vector(owner, count)?;
+        let mut complex_modes = vector(owner, count)?;
         let mut canonical = false;
         for (i, ty) in types.iter().enumerate() {
             checkpoint_at(i, checkpoint)?;
@@ -200,8 +229,9 @@ impl KeySpec {
             }
             copied_nulls.push(policy.null_policy());
             equalities.push(policy);
-            temporal_modes.push(TemporalKeyMode::from_declaration(
+            complex_modes.push(ComplexKeyMode::from_declaration(
                 ty.value_type(),
+                unordered_maps,
                 checkpoint,
             )?);
             canonical |=
@@ -222,7 +252,7 @@ impl KeySpec {
                 types: copied_types,
                 nulls: copied_nulls,
                 equalities,
-                temporal_modes,
+                complex_modes,
                 strategy,
                 _storage: owner.storage_lifetime(),
             },
@@ -547,31 +577,12 @@ pub(super) fn sort_by_key<T: Copy, K: Ord>(
         checkpoint_at(i, checkpoint)?;
         scratch.push(row);
     }
-    let mut width = 1usize;
-    while width < rows.len() {
-        checkpoint()?;
-        for start in (0..rows.len()).step_by(width.saturating_mul(2)) {
-            let middle = start.saturating_add(width).min(rows.len());
-            let end = middle.saturating_add(width).min(rows.len());
-            let (mut left, mut right) = (start, middle);
-            for (offset, slot) in scratch[start..end].iter_mut().enumerate() {
-                checkpoint_at(offset, checkpoint)?;
-                if left < middle && (right == end || key(rows[left]) <= key(rows[right])) {
-                    *slot = rows[left];
-                    left += 1;
-                } else {
-                    *slot = rows[right];
-                    right += 1;
-                }
-            }
-        }
-        for (i, (to, &from)) in rows.iter_mut().zip(&scratch).enumerate() {
-            checkpoint_at(i, checkpoint)?;
-            *to = from;
-        }
-        width = width.saturating_mul(2);
-    }
-    Ok(())
+    crate::exec::hash_table::key_builder::sort_key_references(
+        rows,
+        &mut scratch,
+        checkpoint,
+        |a, b| Ok(key(a).cmp(&key(b))),
+    )
 }
 
 pub(super) enum DomainFailure {
@@ -846,13 +857,43 @@ impl<'a> PreparedKeyBatch<'a> {
         row: usize,
         checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<crate::exec::hash_table::allocation::AggregateVec<u8>> {
-        let temporal_mode = self
-            .spec
-            .0
-            .temporal_modes
-            .get(column)
-            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
-        if *temporal_mode != TemporalKeyMode::Physical {
+        let mode = self.complex_mode(column)?;
+        if mode == ComplexKeyMode::UnorderedMap {
+            use crate::exec::hash_table::key_builder::{
+                append_map_identity_nullable, append_temporal_nullable_tracked_observed,
+                group_key_component_len,
+            };
+            if CONTENT {
+                return Err(invariant(ValueViolation::Layout));
+            }
+            let declaration = self.component_binding(column)?.value_type();
+            let (array, mapping) = self.tuples().physical_component(column)?;
+            let physical = super::pairs::physical_row(mapping, row)?;
+            let mut out =
+                crate::exec::hash_table::allocation::AggregateVec::new_in(self.allocator.clone());
+            let dual = REPRESENTATIVE && !array.is_null(physical);
+            if dual {
+                out.try_reserve_exact(5).map_err(|source| {
+                    self.allocator
+                        .allocation_error("reserve MAP representative frame", source)
+                })?;
+                out.extend_from_slice(&[2, 0, 0, 0, 0]);
+            }
+            append_map_identity_nullable(array, physical, declaration, &mut out, checkpoint)?;
+            if dual {
+                let length = group_key_component_len(out.len() - 5, "MAP comparison key")?;
+                out[1..5].copy_from_slice(&length.to_le_bytes());
+                append_temporal_nullable_tracked_observed::<true, true>(
+                    array,
+                    physical,
+                    declaration,
+                    &mut out,
+                    checkpoint,
+                )?;
+            }
+            return Ok(out);
+        }
+        if mode != ComplexKeyMode::Physical {
             use crate::exec::hash_table::key_builder::append_temporal_nullable_tracked_observed;
             let declaration = self.component_binding(column)?.value_type();
             let (array, mapping) = self.tuples().physical_component(column)?;
@@ -861,7 +902,7 @@ impl<'a> PreparedKeyBatch<'a> {
                 crate::exec::hash_table::allocation::AggregateVec::new_in(self.allocator.clone());
             if REPRESENTATIVE
                 && !CONTENT
-                && *temporal_mode == TemporalKeyMode::Zoned
+                && mode == ComplexKeyMode::Zoned
                 && !array.is_null(physical)
             {
                 // Retain both the comparison bytes and the actually admitted
@@ -911,6 +952,44 @@ impl<'a> PreparedKeyBatch<'a> {
         >(array, physical, &mut out, checkpoint)?;
         Ok(out)
     }
+    fn complex_mode(&self, column: usize) -> ExecutionResult<ComplexKeyMode> {
+        self.spec
+            .0
+            .complex_modes
+            .get(column)
+            .copied()
+            .ok_or_else(|| invariant(ValueViolation::Bounds))
+    }
+
+    pub(super) fn uses_unordered_map(&self, column: usize) -> ExecutionResult<bool> {
+        Ok(self.complex_mode(column)? == ComplexKeyMode::UnorderedMap)
+    }
+
+    pub(super) fn component_equals<const CONTENT: bool>(
+        &self,
+        column: usize,
+        row: usize,
+        expected: &[u8],
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<bool> {
+        use crate::exec::hash_table::key_builder::{
+            canonical_nullable_equals_with_policy_observed, identity_bytes_equal,
+        };
+        if self.complex_mode(column)? == ComplexKeyMode::UnorderedMap {
+            let actual = self.encode_component_row::<CONTENT, false>(column, row, checkpoint)?;
+            return identity_bytes_equal(&actual, expected, checkpoint);
+        }
+        let (array, mapping) = self.tuples().physical_component(column)?;
+        let row = super::pairs::physical_row(mapping, row)?;
+        canonical_nullable_equals_with_policy_observed::<CONTENT>(
+            array,
+            row,
+            Some(self.component_binding(column)?.value_type()),
+            expected,
+            checkpoint,
+        )
+    }
+
     pub(super) fn component_binding(&self, column: usize) -> ExecutionResult<&FunctionValueType> {
         let bindings = self
             .preparation

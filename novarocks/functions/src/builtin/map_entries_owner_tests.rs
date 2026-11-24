@@ -164,9 +164,10 @@ fn map_entries_owner_exact_original_order_duplicates_nulls_slices_empty_and_cano
             panic!("actual Struct");
         };
         assert_eq!(item.name(), "item");
-        assert_eq!(fields[0].name(), "key");
-        assert_eq!(fields[1].name(), "value");
-        assert!(fields[0].is_nullable());
+        assert_eq!(fields[0].name(), "");
+        assert_eq!(fields[1].name(), "");
+        assert!(!fields[0].is_nullable());
+        assert!(!item.is_nullable());
         assert!(out.errors().is_empty());
         let sliced = a.slice(1, 3);
         let args = [EvaluatedArgument::Column(&sliced)];

@@ -493,6 +493,48 @@ fn ordered_regexp_roundtrip_checks_predecessor_guards_and_value_demand() {
 }
 
 #[test]
+fn ordered_null_roundtrip_rejects_a_regexp_guard_and_foreign_predecessor() {
+    use wire::region_guard::Kind;
+
+    let control = Control::default();
+    let (definitions, flow) = branch_fixture(ControlShape::OrderedNull);
+    let encoded = encode_expression_control(&flow, &control).unwrap();
+    let guards = encoded
+        .regions
+        .iter()
+        .filter_map(|region| region.guard.as_ref())
+        .map(|guard| (guard.owner_use_id, guard.kind))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        guards,
+        vec![
+            (Some(0), Some(Kind::OrderedNullAfterArgumentOrdinal(0))),
+            (Some(0), Some(Kind::OrderedNullAfterArgumentOrdinal(1))),
+        ],
+    );
+    assert_eq!(
+        decode_expression_control(&definitions, &encoded, &control).unwrap(),
+        flow
+    );
+    for kind in [
+        Kind::OrderedRegexpAfterArgumentOrdinal(0),
+        Kind::OrderedNullAfterArgumentOrdinal(1),
+    ] {
+        let mut forged = encoded.clone();
+        forged
+            .regions
+            .iter_mut()
+            .find_map(|region| region.guard.as_mut())
+            .unwrap()
+            .kind = Some(kind);
+        assert_eq!(
+            decode_expression_control(&definitions, &forged, &control).unwrap_err(),
+            ControlCodecError::Flow(ExpressionControlFlowError::InvalidGuard)
+        );
+    }
+}
+
+#[test]
 fn every_control_and_guard_variant_roundtrips() {
     for shape in [
         ControlShape::Eager,
@@ -505,6 +547,7 @@ fn every_control_and_guard_variant_roundtrips() {
         ControlShape::Coalesce,
         ControlShape::Try,
         ControlShape::OrderedRegexp,
+        ControlShape::OrderedNull,
         ControlShape::Between { negated: false },
         ControlShape::Between { negated: true },
         ControlShape::Membership { negated: false },
@@ -548,6 +591,7 @@ fn every_control_and_guard_variant_roundtrips() {
             GuardKind::BetweenAfterSource { ordinal: u32::MAX },
             GuardKind::MembershipAfterSource { ordinal: u32::MAX },
             GuardKind::OrderedRegexpAfterArgument { ordinal: 0 },
+            GuardKind::OrderedNullAfterArgument { ordinal: u32::MAX },
             GuardKind::CoalesceAfterNull { ordinal: u32::MAX },
             GuardKind::CaseWhen { arm: 0 },
             GuardKind::CaseThen { arm: u32::MAX },

@@ -313,7 +313,7 @@ impl<'a> super::AnalyzerContext<'a> {
         if let Some(call) = novarocks_parser::canonical_call(expr)
             .map_err(|error| AnalyzeError::unsupported_expression(error.message, error.span))?
         {
-            return self.analyze_syntax_function(call.name, &call.arguments, call.span, scope);
+            return self.analyze_syntax_function(call, scope);
         }
 
         match expr {
@@ -587,6 +587,37 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
         span: Span,
     ) -> Result<TypedExpr, AnalyzeError> {
+        if let DataType::Struct(fields) = base.value_type.data_type() {
+            let ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::Long { parsed_value, .. },
+                ..
+            }) = index
+            else {
+                return Err(AnalyzeError::expression_not_constant(
+                    "Subscript expression on ROW requires a constant index",
+                    index.span(),
+                ));
+            };
+            let position = i32::try_from(*parsed_value).map_err(|_| {
+                AnalyzeError::type_mismatch(
+                    "Subscript expression on ROW requires an INTEGER index, found BIGINT",
+                    index.span(),
+                )
+            })?;
+            let ordinal = usize::try_from(i64::from(position) - 1)
+                .ok()
+                .filter(|ordinal| *ordinal < fields.len())
+                .ok_or_else(|| {
+                    AnalyzeError::invalid_function_argument(
+                        format!(
+                            "ROW subscript index {position} is outside 1..={}",
+                            fields.len()
+                        ),
+                        index.span(),
+                    )
+                })?;
+            return self.bind_row_field(base, ordinal, span);
+        }
         let index_typed = self.analyze_expr(index, scope)?;
         let output_type = match &base.value_type.data_type() {
             DataType::List(_) => {
@@ -623,37 +654,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
                 fields[1].data_type().clone()
             }
-            DataType::Struct(fields) => {
-                return match &index_typed.kind {
-                    ExprKind::Literal(LiteralValue::String(field_name)) => {
-                        self.analyze_struct_field_access(base, field_name.clone(), span)
-                    }
-                    // 1-based positional access: `struct_val[1]` →
-                    // first field of the STRUCT. Matches StarRocks /
-                    // Spark / Trino convention.
-                    ExprKind::Literal(LiteralValue::Int(pos)) => {
-                        if *pos < 1 || (*pos as usize) > fields.len() {
-                            return Err(AnalyzeError::invalid_argument(
-                                format!(
-                                    "struct subscript {} is out of range (1..{})",
-                                    pos,
-                                    fields.len()
-                                ),
-                                span,
-                            ));
-                        }
-                        let field_name = fields[(*pos as usize) - 1].name().clone();
-                        self.analyze_struct_field_access(base, field_name, span)
-                    }
-                    _ => Err(AnalyzeError::invalid_argument(
-                        format!(
-                            "struct subscript requires a string literal field name or 1-based integer index, got {:?}",
-                            index_typed.kind
-                        ),
-                        span,
-                    )),
-                };
-            }
+
             other => {
                 return Err(AnalyzeError::invalid_argument(
                     format!(
@@ -812,47 +813,57 @@ impl<'a> super::AnalyzerContext<'a> {
         field_name: String,
         span: Span,
     ) -> Result<TypedExpr, AnalyzeError> {
-        let DataType::Struct(fields) = &base.value_type.data_type() else {
-            return Err(AnalyzeError::invalid_argument(
-                format!(
-                    "field access expects STRUCT input, got {:?}",
-                    base.value_type.data_type()
-                ),
-                span,
-            ));
+        use novarocks_expression::typing::{RowFieldResolution, resolve_row_field_name};
+
+        let ordinal =
+            match resolve_row_field_name(&base.value_type, &field_name, || self.check_control())? {
+                RowFieldResolution::Found(ordinal) => ordinal,
+                RowFieldResolution::NotRow => {
+                    return Err(AnalyzeError::type_mismatch(
+                        "Field access requires a ROW value",
+                        span,
+                    ));
+                }
+                RowFieldResolution::Missing => {
+                    return Err(AnalyzeError::unknown_column(
+                        format!("Cannot resolve row field: {field_name}"),
+                        span,
+                    ));
+                }
+                RowFieldResolution::Ambiguous => {
+                    return Err(AnalyzeError::ambiguous_name(
+                        format!("Ambiguous row field reference: {field_name}"),
+                        span,
+                    ));
+                }
+            };
+        self.bind_row_field(base, ordinal, span)
+    }
+
+    fn bind_row_field(
+        &self,
+        base: TypedExpr,
+        ordinal: usize,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let ordinal = i32::try_from(ordinal)
+            .map_err(|_| AnalyzeError::internal("ROW field ordinal exceeds INTEGER"))?;
+        let ordinal = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(i64::from(ordinal))),
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         };
-        // Canonical spelling is presentation only. The same Functions author
-        // rejects case collisions before either SQL or binding can pick a field.
-        let mut field_work = novarocks_type_contract::CompileCheckpoints::try_new(
-            self.control,
-            novarocks_type_contract::CompilePhase::Validate,
-        )
-        .map_err(AnalyzeError::control)?;
-        let ordinal = novarocks_functions::builtin::struct_field_resolution::resolve_struct_field_ordinal_observed(
-            fields, &field_name, || field_work.step().map_err(novarocks_functions::FunctionBindingError::Control),
-        ).map_err(|source| match source {
-            novarocks_functions::FunctionBindingError::Control(source) => AnalyzeError::control(source),
-            source => AnalyzeError::invalid_argument(source.to_string(), span),
-        })?.ok_or_else(|| AnalyzeError::unknown_column(format!("struct field '{}' does not exist", field_name), span))?;
-        field_work.finish().map_err(AnalyzeError::control)?;
-        let field = &fields[ordinal];
-        let field_type = field.data_type().clone();
-        let canonical_field_name = field.name().clone();
-        let field_name_expr = TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::String(canonical_field_name)),
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
-        };
-        let result = resolved_scalar_call_at(
-            self.function_catalog,
-            "__struct_subfield",
-            vec![base, field_name_expr],
-            span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
-        )?;
-        debug_assert_eq!(result.value_type.data_type(), &field_type);
-        Ok(result)
+        let bound = self.type_scalar_call(NodeShape::RowField, vec![base, ordinal], span)?;
+        let value_type = bound.value_type().clone();
+        Ok(TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: "__row_field".into(),
+                args: bound.args.into(),
+                distinct: false,
+                volatility: bound.binding.semantics.volatility,
+                binding: bound.binding,
+            },
+            value_type,
+        })
     }
 
     fn analyze_array_literal(
@@ -2006,17 +2017,21 @@ impl<'a> super::AnalyzerContext<'a> {
     /// Borrow dedicated syntax children into the original function author.
     fn analyze_syntax_function(
         &self,
-        name: &str,
-        arguments: &[&ast::Expr],
-        span: Span,
+        call: novarocks_parser::CanonicalCall<'_>,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        if name == "row" {
+        let novarocks_parser::CanonicalCall {
+            name,
+            arguments,
+            row_fields,
+            span,
+        } = call;
+        if row_fields.is_some() {
             let args = arguments
                 .iter()
                 .map(|argument| self.analyze_expr(argument, scope))
                 .collect::<Result<Vec<_>, _>>()?;
-            let call = self.type_scalar_call(NodeShape::Row, args, span)?;
+            let call = self.type_scalar_call(NodeShape::Row { fields: row_fields }, args, span)?;
             let value_type = call.value_type().clone();
             let volatility = call.binding.semantics.volatility;
             return Ok(TypedExpr {
@@ -2040,7 +2055,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 null_treatment: None,
             },
             name.to_owned(),
-            arguments,
+            &arguments,
             scope,
         )
     }
@@ -2233,6 +2248,12 @@ impl<'a> super::AnalyzerContext<'a> {
         let mut name = analyzer_aggregate_alias(&original_name)
             .map(str::to_owned)
             .unwrap_or(original_name);
+        if name == "map_concat" && original_arguments.len() < 2 {
+            return Err(AnalyzeError::invalid_function_argument(
+                "There must be two or more concatenation arguments",
+                func.span,
+            ));
+        }
 
         // Reject a function-local ordering with no arguments.
         if original_arguments.is_empty() && func.order_by.is_some() {
@@ -9072,52 +9093,65 @@ mod tests {
     }
 
     #[test]
-    fn nested_decimal_cast_preserves_array_admission_and_map_row_capability_errors() {
-        for sql in [
-            "SELECT CAST(MAP(ARRAY[1], ARRAY[DECIMAL '123.5']) AS MAP(INTEGER, DECIMAL(3,0)))",
-            "SELECT CAST(ROW(DECIMAL '123.5') AS ROW(a DECIMAL(3,0)))",
-        ] {
-            let query = novarocks_parser::parser::parse_query(sql).unwrap();
-            let error = super::super::analyze_with_function_catalog_and_sql_semantics(
-                &query,
-                &EmptyCatalog,
-                "default",
-                crate::functions::builtin_sql_function_catalog(),
-                &crate::sql_mode::SqlSemanticSettings::default(),
-                crate::constant::test_constant_policy(),
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap_err();
-            assert_eq!(
-                error.kind(),
-                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
-            );
-            assert!(
-                error
-                    .message()
-                    .contains("cast requires an implemented exact Physical scalar domain"),
-                "{error}"
-            );
-            assert_eq!(
-                error.span(),
-                Some(novarocks_parser::Span::new(7, sql.len()))
-            );
-        }
+    fn nested_decimal_cast_admits_array_and_map_and_refuses_row_child_conversion() {
         use novarocks_type_contract::TrinoCastMode;
+
+        let sql = "SELECT CAST(ROW(DECIMAL '123.5') AS ROW(a DECIMAL(3,0)))";
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
+        let error = super::super::analyze_with_function_catalog_and_sql_semantics(
+            &query,
+            &EmptyCatalog,
+            "default",
+            crate::functions::builtin_sql_function_catalog(),
+            &crate::sql_mode::SqlSemanticSettings::default(),
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert!(
+            error
+                .message()
+                .contains("cast requires an implemented exact Physical scalar domain"),
+            "{error}"
+        );
+        assert_eq!(
+            error.span(),
+            Some(novarocks_parser::Span::new(7, sql.len()))
+        );
+
         for (name, mode) in [
             ("CAST", TrinoCastMode::Explicit),
             ("TRY_CAST", TrinoCastMode::Try),
         ] {
-            let sql = format!("SELECT {name}(ARRAY[DECIMAL '123.5'] AS ARRAY(DECIMAL(3,0)))");
-            let expression = analyze_projection_expr(&sql).unwrap();
-            assert!(
-                matches!(expression.kind, ExprKind::Cast { cast_mode: Some(actual), .. } if actual == mode)
-            );
-            assert_eq!(
-                expression.value_type.child_at(0).unwrap().data_type(),
-                &DataType::Decimal128(3, 0)
-            );
-            assert_eq!(expression.value_type.nullable(), mode == TrinoCastMode::Try);
+            for (source, target, child) in [
+                ("ARRAY[DECIMAL '123.5']", "ARRAY(DECIMAL(3,0))", 0),
+                (
+                    "MAP(ARRAY[1], ARRAY[DECIMAL '123.5'])",
+                    "MAP(INTEGER, DECIMAL(3,0))",
+                    1,
+                ),
+            ] {
+                let sql = format!("SELECT {name}({source} AS {target})");
+                let expression = analyze_projection_expr(&sql).unwrap();
+                assert!(
+                    matches!(expression.kind, ExprKind::Cast { cast_mode: Some(actual), .. } if actual == mode),
+                    "{sql}"
+                );
+                assert_eq!(
+                    expression.value_type.child_at(child).unwrap().data_type(),
+                    &DataType::Decimal128(3, 0),
+                    "{sql}"
+                );
+                assert_eq!(
+                    expression.value_type.nullable(),
+                    mode == TrinoCastMode::Try,
+                    "{sql}"
+                );
+            }
         }
     }
 

@@ -33,6 +33,23 @@ fn commit_input(reason: FailureReason, detail: &str) -> ExecutionFailureInput {
 }
 
 #[test]
+fn duplicate_iceberg_row_field_projects_duplicate_column_name() {
+    let error = QueryServiceError::from_execution_failure(ExecutionFailureInput::new(
+        FailureFact::new(FailureClass::Data, ICEBERG_DUPLICATE_ROW_FIELD_NAME),
+        SafeDetail::truncating("Iceberg schema contains duplicate ROW field names"),
+        ExecutionFailureSite::Coordinator,
+    ));
+    let mapped = query_error(TrinoErrorSource::Service {
+        error: &error,
+        sql: "CREATE TABLE lake.inner.t AS SELECT ROW(1 AS a, 2 AS a) AS payload",
+    });
+    assert_eq!(
+        (mapped.error_code, mapped.error_name),
+        (54, "DUPLICATE_COLUMN_NAME")
+    );
+}
+
+#[test]
 fn staged_table_exists_projects_the_standard_code_and_exact_message() {
     let detail = "Table lake.inner.orders already exists";
     let input = ExecutionFailureInput::new(

@@ -385,6 +385,9 @@ fn compiled_partition_keys(
     let program = std::sync::Arc::clone(program);
     Ok(Some(match branch.contract().routing {
         StaticStreamRouting::Ordinary => CompiledPartitionKeys::new(program, sites),
+        StaticStreamRouting::OrdinaryHash { algorithm } => {
+            CompiledPartitionKeys::ordinary_hash(program, sites, algorithm)
+        }
         StaticStreamRouting::HierarchicalHashV1 => {
             CompiledPartitionKeys::hierarchical(program, sites)
         }

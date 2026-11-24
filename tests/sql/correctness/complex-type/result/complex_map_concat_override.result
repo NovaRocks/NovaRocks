@@ -1,4 +1,4 @@
 -- query 1
--- legacy
+-- types	integer	integer	integer	bigint
 a_v	b_v	c_v	map_sz
 1	9	3	3

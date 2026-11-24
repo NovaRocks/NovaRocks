@@ -20,8 +20,8 @@ use novarocks_query_application::api::ExecutionFailurePresentation;
 
 use crate::diagnostics::{self, BoundedMessage};
 use novarocks_execution_contract::failure::connector_reason::{
-    ICEBERG_COMMIT_ERROR, ICEBERG_FILESYSTEM_ERROR, ICEBERG_INVALID_METADATA,
-    ICEBERG_TABLE_ALREADY_EXISTS,
+    ICEBERG_COMMIT_ERROR, ICEBERG_DUPLICATE_ROW_FIELD_NAME, ICEBERG_FILESYSTEM_ERROR,
+    ICEBERG_INVALID_METADATA, ICEBERG_TABLE_ALREADY_EXISTS,
 };
 use novarocks_execution_contract::failure::{
     FailureClass, FailureEvidence, FailureProjection, domain,
@@ -116,6 +116,7 @@ enum Code {
     NotFound,
     FunctionNotFound,
     AmbiguousFunctionCall,
+    AmbiguousName,
     InvalidFunctionArgument,
     ExceededFunctionMemoryLimit,
     DivisionByZero,
@@ -204,6 +205,7 @@ impl Code {
             NotFound => (5, "NOT_FOUND", "USER_ERROR"),
             FunctionNotFound => (6, "FUNCTION_NOT_FOUND", "USER_ERROR"),
             AmbiguousFunctionCall => (32, "AMBIGUOUS_FUNCTION_CALL", "USER_ERROR"),
+            AmbiguousName => (62, "AMBIGUOUS_NAME", "USER_ERROR"),
             InvalidFunctionArgument => (7, "INVALID_FUNCTION_ARGUMENT", "USER_ERROR"),
             ExceededFunctionMemoryLimit => (37, "EXCEEDED_FUNCTION_MEMORY_LIMIT", "USER_ERROR"),
             DivisionByZero => (8, "DIVISION_BY_ZERO", "USER_ERROR"),
@@ -758,6 +760,7 @@ fn execution_code(input: &ExecutionFailureInput) -> Code {
     }
     let fact = input.fact();
     match (fact.class(), fact.reason()) {
+        (FailureClass::Data, ICEBERG_DUPLICATE_ROW_FIELD_NAME) => return Code::DuplicateColumnName,
         (FailureClass::Data, ICEBERG_TABLE_ALREADY_EXISTS)
             if fact.evidence() == FailureEvidence::Originating
                 && matches!(input.site(), ExecutionFailureSite::Coordinator) =>
@@ -849,6 +852,7 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.analyze.unknown_column" => ColumnNotFound,
         "sql.analyze.unknown_function" => FunctionNotFound,
         "sql.analyze.ambiguous_function_call" => AmbiguousFunctionCall,
+        "sql.analyze.ambiguous_name" => AmbiguousName,
         "sql.analyze.missing_column_name" => MissingColumnName,
         "sql.analyze.duplicate_column_name" => DuplicateColumnName,
         "sql.analyze.mismatched_column_aliases" => MismatchedColumnAliases,

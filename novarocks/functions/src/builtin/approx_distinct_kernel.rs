@@ -315,7 +315,7 @@ impl PreparedAggregateKernel for ApproxDistinctKernel {
                 match (&state.value, self.profile) {
                     (State::Unknown, ApproxProfile::Unknown) => output.append_value(b"NU\x01")?,
                     (State::Boolean(bits), ApproxProfile::Boolean) => {
-                        output.append_value(&[b'N', b'B', 1, *bits])?
+                        output.append_value([b'N', b'B', 1, *bits])?
                     }
                     (State::Hash(sketch), ApproxProfile::Hash(profile)) => {
                         let bytes = sketch.encode(profile.transport_profile(), work)?;

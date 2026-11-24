@@ -1619,6 +1619,36 @@ mod declaration_tests {
                 .map_err(crate::metadata::metadata_creation_error)
         })
     }
+
+    #[test]
+    fn view_schema_preserves_the_typed_row_name_rejections() {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
+        let declared = |name: &str| {
+            let fields = ["Entry", name]
+                .into_iter()
+                .map(|name| Field::new(name, DataType::Int32, true))
+                .collect::<Vec<_>>();
+            definition(FunctionValueType::new(
+                DataType::Struct(fields.into()),
+                true,
+            ))
+        };
+        let context = request().context;
+        let anonymous = prepare_definition(&declared(""), None, &[], &context)
+            .expect_err("anonymous ROW field is rejected");
+        assert_eq!(anonymous.kind(), ConnectorErrorKind::Unsupported);
+        let duplicate = prepare_definition(&declared("entry"), None, &[], &context)
+            .expect_err("duplicate ROW field is rejected");
+        assert_eq!(
+            duplicate.failure_fact(),
+            FailureFact::new(
+                FailureClass::Data,
+                novarocks_failure_contract::connector_reason::ICEBERG_DUPLICATE_ROW_FIELD_NAME,
+            ),
+        );
+        assert!(prepare_definition(&declared("other"), None, &[], &context).is_ok());
+    }
+
     #[test]
     fn java_created_view_without_client_summary_keeps_named_sql_context_and_nullable_type() {
         let stored = prepared(FunctionValueType::new(DataType::Int32, true));

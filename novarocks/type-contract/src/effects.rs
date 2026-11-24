@@ -61,6 +61,8 @@ pub enum ArgumentControl {
     /// Demand each regexp argument only after the previous one succeeded and
     /// produced a non-NULL value. Compile the pattern at argument ordinal 1.
     OrderedRegexp,
+    /// Demand each argument only after all earlier arguments succeed non-NULL.
+    OrderedNull,
     /// The exact installed owner demands original emitted source occurrences.
     TemporalSource(crate::TemporalSourceKind),
     SimpleCase,
@@ -94,6 +96,7 @@ impl ArgumentControl {
             | (Self::NullIf, ControlShape::NullIf)
             | (Self::Try, ControlShape::Try)
             | (Self::OrderedRegexp, ControlShape::OrderedRegexp)
+            | (Self::OrderedNull, ControlShape::OrderedNull)
             | (Self::SimpleCase, ControlShape::Case { simple: true, .. })
             | (Self::SearchedCase, ControlShape::Case { simple: false, .. }) => true,
             (
@@ -216,6 +219,7 @@ impl FunctionEffectDeclaration {
                         | ArgumentControl::NullIf
                         | ArgumentControl::Try
                         | ArgumentControl::OrderedRegexp
+                        | ArgumentControl::OrderedNull
                         | ArgumentControl::TemporalSource(_)
                         | ArgumentControl::SimpleCase
                         | ArgumentControl::SearchedCase
@@ -248,6 +252,7 @@ impl FunctionEffectDeclaration {
                 | ArgumentControl::NullIf
                 | ArgumentControl::Try
                 | ArgumentControl::OrderedRegexp
+                | ArgumentControl::OrderedNull
                 | ArgumentControl::TemporalSource(_)
                 | ArgumentControl::SimpleCase
                 | ArgumentControl::SearchedCase
@@ -600,6 +605,7 @@ mod tests {
             ArgumentControl::NullIf,
             ArgumentControl::Try,
             ArgumentControl::OrderedRegexp,
+            ArgumentControl::OrderedNull,
             ArgumentControl::SimpleCase,
             ArgumentControl::SearchedCase,
             ArgumentControl::HigherOrder {
@@ -622,6 +628,7 @@ mod tests {
             ControlShape::NullIf,
             ControlShape::Try,
             ControlShape::OrderedRegexp,
+            ControlShape::OrderedNull,
             ControlShape::Case {
                 simple: true,
                 arms: 1,

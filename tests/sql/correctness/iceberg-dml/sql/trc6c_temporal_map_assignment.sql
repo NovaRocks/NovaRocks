@@ -37,7 +37,9 @@ SELECT ARRAY[MAP_AGG(instant, measure)] FROM (
 SELECT count(*) AS snapshots FROM ${case_db}."trc6c_map_output$snapshots";
 
 -- query 3
--- @expect_error=Data failure (reason 4:1)
+-- The MAP conversion rejects the colliding target keys before publication.
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+-- @expect_error=[query.execution.invalid_cast_argument] Data failure (reason 1:44)
 INSERT INTO ${case_db}.trc6c_map_output SELECT payload FROM ${case_db}.trc6c_map_input;
 
 -- query 4

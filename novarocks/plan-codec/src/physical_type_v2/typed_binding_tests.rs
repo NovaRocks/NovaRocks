@@ -143,6 +143,45 @@ fn typed_semantic_complete_recursive_binding_and_physical_only_map_wrapper_round
     assert!(decode_type_table_pure(&wrong, limits(), &Control).is_err());
 }
 #[test]
+fn typed_semantic_complete_mixed_row_names_and_nullability_round_trip() {
+    let expected = FunctionValueType::new(
+        DataType::Struct(
+            vec![
+                Field::new("ID", DataType::Int32, false),
+                Field::new("", DataType::Utf8, true),
+                Field::new("Note", DataType::Null, true),
+            ]
+            .into(),
+        ),
+        false,
+    );
+    let table = encode(&[(7, expected.clone())], &[]);
+    let decoded = decode_type_table_pure(&table, limits(), &Control).unwrap();
+    let result = decoded.value_type(7).unwrap();
+    assert_eq!(result, &expected);
+    let ValueKind::Struct(fields) = result.value_type().kind() else {
+        panic!("ROW declaration");
+    };
+    assert_eq!(
+        fields
+            .iter()
+            .map(|field| field.row_name())
+            .collect::<Vec<_>>(),
+        vec![Some("ID"), None, Some("Note")],
+    );
+    assert!(!fields[0].value_type().nullable());
+    assert!(fields[1].value_type().nullable());
+    let mut contradictory = table;
+    let anonymous = contradictory
+        .fields
+        .iter_mut()
+        .find(|field| field.name.is_empty())
+        .unwrap();
+    anonymous.name = "guessed_name".into();
+    assert!(decode_type_table_pure(&contradictory, limits(), &Control).is_err());
+}
+
+#[test]
 #[allow(deprecated)]
 fn typed_semantic_external_metadata_and_dictionary_descriptors_remain_independent_facts() {
     let source = Arc::new(

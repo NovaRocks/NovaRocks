@@ -120,7 +120,11 @@ pub use carrier_parameters::{CarrierParameterError, validate_arrow_carrier_param
 pub use coercion::{
     supports_boolean_negation_value_type, wider_type, wider_type_with_construction,
 };
-pub use comparison::{ComparisonOperator, JoinKeyMatch, OrderedComparisonAlgorithm};
+pub use comparison::{
+    ComparisonOperator, JoinKeyMatch, KeyComparison, KeyLeaf, KeyRelation,
+    OrderedComparisonAlgorithm, UnsupportedKeyType, canonical_f32_bits, canonical_f64_bits,
+    key_character_bytes_observed, key_domains_match_observed, key_leaf,
+};
 pub use comparison_coercion::{
     ComparisonCoercionFailure, comparison_common_type, comparison_common_value_type,
     decimal_compare_type, value_type_for_common_layout,

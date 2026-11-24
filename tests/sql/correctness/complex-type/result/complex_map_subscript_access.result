@@ -67,7 +67,7 @@ _col0
 7
 
 -- query 13
--- types	varchar
+-- types	varchar(1)
 _col0
 a
 b
@@ -76,6 +76,6 @@ NULL
 NULL
 
 -- query 15
--- types	varchar
+-- types	varchar(1)
 null_probe
 NULL

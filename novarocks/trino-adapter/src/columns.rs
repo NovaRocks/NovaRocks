@@ -52,7 +52,7 @@ enum ClientTypeArgument {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct NamedTypeSignature {
-    field_name: RowFieldName,
+    field_name: Option<RowFieldName>,
     type_signature: ClientTypeSignature,
 }
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -129,7 +129,9 @@ fn signature_backing(
             ClientTypeArgument::Long(_) => {}
             ClientTypeArgument::Type(child) => signature_backing(child, bytes)?,
             ClientTypeArgument::NamedType(child) => {
-                add_backing(bytes, child.field_name.name.capacity())?;
+                if let Some(name) = &child.field_name {
+                    add_backing(bytes, name.name.capacity())?;
+                }
                 signature_backing(&child.type_signature, bytes)?;
             }
         }
@@ -514,10 +516,15 @@ fn exact_signature(
         TypeInfo::Row(fields) => {
             let mut arguments = exact_vec(fields.len())?;
             for field in fields {
-                arguments.push(ClientTypeArgument::NamedType(NamedTypeSignature {
-                    field_name: RowFieldName {
+                let field_name = if field.name.is_empty() {
+                    None
+                } else {
+                    Some(RowFieldName {
                         name: exact_copy(&field.name)?,
-                    },
+                    })
+                };
+                arguments.push(ClientTypeArgument::NamedType(NamedTypeSignature {
+                    field_name,
                     type_signature: exact_signature(&field.field.native_type, facts)?,
                 }));
             }
@@ -646,8 +653,10 @@ fn write_type_name(
                 if index != 0 {
                     out.write_str(", ")?;
                 }
-                write_field_name(out, &field.name)?;
-                out.write_char(' ')?;
+                if !field.name.is_empty() {
+                    write_field_name(out, &field.name)?;
+                    out.write_char(' ')?;
+                }
                 write_type_name(out, &field.field.native_type, facts)?;
             }
             out.write_char(')')
@@ -957,6 +966,29 @@ mod tests {
         );
     }
     #[test]
+    fn anonymous_row_fields_keep_named_type_with_a_null_field_name() {
+        let ty = NativeRenderType::Struct(vec![
+            NamedRenderField {
+                name: String::new(),
+                field: field(NativeRenderType::Boolean),
+            },
+            NamedRenderField {
+                name: "Id".into(),
+                field: field(NativeRenderType::SignedInteger(64)),
+            },
+        ]);
+        let columns = columns(&schema(vec![ty], TrinoJsonFacts::default())).unwrap();
+        assert_eq!(columns[0].type_name, "row(boolean, Id bigint)");
+        let value = serde_json::to_value(&columns[0]).unwrap();
+        assert_eq!(
+            value["typeSignature"]["arguments"],
+            json!([
+                {"kind": "NAMED_TYPE", "value": {"fieldName": null, "typeSignature": {"rawType": "boolean", "arguments": []}}},
+                {"kind": "NAMED_TYPE", "value": {"fieldName": {"name": "Id"}, "typeSignature": {"rawType": "bigint", "arguments": []}}}
+            ])
+        );
+    }
+    #[test]
     fn temporal_units_have_exact_precision_or_no_precision() {
         for (unit, p) in [
             (RenderTimeUnit::Second, 0),
@@ -1008,7 +1040,7 @@ mod tests {
         let nested_capacity = nested_arguments.capacity();
         let mut arguments = Vec::with_capacity(7);
         arguments.push(ClientTypeArgument::NamedType(NamedTypeSignature {
-            field_name: RowFieldName { name: field_name },
+            field_name: Some(RowFieldName { name: field_name }),
             type_signature: signature("decimal", nested_arguments),
         }));
         let mut type_arguments = Vec::with_capacity(3);
@@ -1037,7 +1069,7 @@ mod tests {
             + column.name.capacity()
             + column.type_name.capacity()
             + arguments_capacity * std::mem::size_of::<ClientTypeArgument>()
-            + named.field_name.name.capacity()
+            + named.field_name.as_ref().unwrap().name.capacity()
             + nested_capacity * std::mem::size_of::<ClientTypeArgument>()
             + type_arguments_capacity * std::mem::size_of::<ClientTypeArgument>();
         assert_eq!(columns_backing_bytes(&projected).unwrap(), expected);

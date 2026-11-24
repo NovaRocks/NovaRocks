@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection, connector_reason};
 use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorDataType, ConnectorDefaultValue, ConnectorError,
     ConnectorErrorKind,
@@ -164,6 +165,18 @@ pub(crate) fn iceberg_type(
             )))
         }
         ConnectorDataType::Struct(fields) => {
+            // Design: ADR-0265 (docs/adr/ADR-0265-row-declarations-and-canonical-map-keys.md)
+            for (index, field) in fields.iter().enumerate() {
+                if field.name.is_empty() {
+                    return Err(anonymous_row_field());
+                }
+                if fields[..index]
+                    .iter()
+                    .any(|previous| equal_row_field_names(&previous.name, &field.name))
+                {
+                    return Err(duplicate_row_field_name());
+                }
+            }
             // New-table publication normalizes IDs with the pinned SDK: assign
             // all sibling IDs before descending into any sibling's children.
             let ids = fields
@@ -186,6 +199,45 @@ pub(crate) fn iceberg_type(
             Ok(Type::Struct(StructType::new(fields)))
         }
     }
+}
+
+pub(super) fn equal_row_field_names(left: &str, right: &str) -> bool {
+    left.chars()
+        .flat_map(char::to_lowercase)
+        .eq(right.chars().flat_map(char::to_lowercase))
+}
+
+pub(super) fn anonymous_row_field() -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        "Iceberg schema requires names for all ROW fields",
+    )
+    .with_public_failure_detail()
+}
+
+#[derive(Debug)]
+struct DuplicateRowFieldName;
+
+impl std::fmt::Display for DuplicateRowFieldName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Iceberg schema contains duplicate ROW field names")
+    }
+}
+
+impl std::error::Error for DuplicateRowFieldName {}
+
+impl FailureProjection for DuplicateRowFieldName {
+    fn failure_fact(&self) -> FailureFact {
+        FailureFact::new(
+            FailureClass::Data,
+            connector_reason::ICEBERG_DUPLICATE_ROW_FIELD_NAME,
+        )
+    }
+}
+
+pub(super) fn duplicate_row_field_name() -> ConnectorError {
+    ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, DuplicateRowFieldName)
+        .with_public_failure_detail()
 }
 
 fn invalid(message: impl Into<String>) -> ConnectorError {
@@ -359,6 +411,37 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::Unsupported,
         );
+    }
+
+    #[test]
+    fn nested_row_schema_requires_present_and_unique_sibling_names() {
+        let schema = |second: &str| {
+            let field = |name: &str| ConnectorStructField {
+                name: name.into(),
+                data_type: ConnectorDataType::Int,
+                nullable: true,
+            };
+            [ConnectorColumnDefinition {
+                name: "payload".into(),
+                data_type: ConnectorDataType::Array(Box::new(ConnectorDataType::Struct(vec![
+                    field("Item"),
+                    field(second),
+                ]))),
+                nullable: true,
+                default: None,
+            }]
+        };
+        let anonymous = schema_fields(&schema(""), FormatVersion::V3).unwrap_err();
+        assert_eq!(anonymous.kind(), ConnectorErrorKind::Unsupported);
+        let duplicate = schema_fields(&schema("item"), FormatVersion::V3).unwrap_err();
+        assert_eq!(
+            duplicate.failure_fact(),
+            FailureFact::new(
+                FailureClass::Data,
+                connector_reason::ICEBERG_DUPLICATE_ROW_FIELD_NAME,
+            ),
+        );
+        assert!(schema_fields(&schema("detail"), FormatVersion::V3).is_ok());
     }
 
     #[test]

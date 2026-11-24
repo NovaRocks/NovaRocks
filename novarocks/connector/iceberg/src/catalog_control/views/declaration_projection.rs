@@ -34,6 +34,10 @@ use novarocks_type_contract::{
 };
 use std::sync::Arc;
 
+use super::super::type_mapping::{
+    anonymous_row_field, duplicate_row_field_name, equal_row_field_names,
+};
+
 type Failure = PureProviderCompileError<ConnectorError>;
 fn unsupported_failure() -> Failure {
     ConnectorError::new(
@@ -224,9 +228,7 @@ fn write_type(
         ValueKind::Struct(children) => {
             let mut fields = creation.reserve::<Arc<NestedField>>(children.len())?;
             for (index, child) in children.iter().enumerate() {
-                if child.name().is_empty() {
-                    return unsupported();
-                }
+                let name = child.row_name().ok_or_else(anonymous_row_field)?;
                 for previous in children.iter().take(index) {
                     creation.work(
                         previous
@@ -235,18 +237,13 @@ fn write_type(
                             .checked_add(child.name().len())
                             .ok_or_else(resource)?,
                     )?;
-                    if previous
-                        .name()
-                        .chars()
-                        .flat_map(char::to_lowercase)
-                        .eq(child.name().chars().flat_map(char::to_lowercase))
-                    {
-                        return unsupported();
+                    if equal_row_field_names(previous.name(), name) {
+                        return Err(duplicate_row_field_name().into());
                     }
                 }
                 let id = next_id(next)?;
                 let ty = write_type(child.value_type(), next, depth + 1, nodes, creation)?;
-                let name = creation.text(child.name())?;
+                let name = creation.text(name)?;
                 fields.push(nested_field(id, name, ty, false, creation)?);
             }
             Type::Struct(StructType::new(fields))

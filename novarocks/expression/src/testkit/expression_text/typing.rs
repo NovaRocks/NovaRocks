@@ -109,7 +109,9 @@ impl<'a> TextTyping<'a> {
         }
         if let Some(call) = canonical_call(expr).map_err(TextError::UnsupportedSyntax)? {
             let shape = if call.name == "row" {
-                Some(NodeShape::Row)
+                Some(NodeShape::Row {
+                    fields: call.row_fields,
+                })
             } else if matches!(expr, ast::Expr::Coalesce(_)) {
                 Some(NodeShape::Coalesce)
             } else {
@@ -294,8 +296,68 @@ impl<'a> TextTyping<'a> {
                 .map_err(|cause| typing_error(cause, span))?;
                 Ok(TextNode::cast(input, conversion))
             }
+            ast::Expr::Dereference(dereference) => {
+                let base = self.lower(&dereference.base, work, next)?;
+                use crate::typing::{RowFieldResolution, resolve_row_field_name};
+                let field = dereference.field.as_ref().ok_or_else(|| {
+                    typing_error(
+                        TypingError::InvalidShape("ROW dereference requires a field name"),
+                        span,
+                    )
+                })?;
+                let ordinal =
+                    match resolve_row_field_name(&base.typing.value_type, &field.value, || {
+                        work.step()
+                    })? {
+                        RowFieldResolution::Found(ordinal) => ordinal,
+                        RowFieldResolution::NotRow => {
+                            return Err(typing_error(
+                                TypingError::InvalidShape("Field access requires a ROW value"),
+                                span,
+                            ));
+                        }
+                        RowFieldResolution::Missing => {
+                            return Err(typing_error(
+                                TypingError::InvalidShape("ROW field does not exist"),
+                                span,
+                            ));
+                        }
+                        RowFieldResolution::Ambiguous => {
+                            return Err(typing_error(
+                                TypingError::InvalidShape("Ambiguous row field reference"),
+                                span,
+                            ));
+                        }
+                    };
+                self.row_field(base, ordinal, span, work)
+            }
             ast::Expr::Subscript(subscript) => {
                 let base = self.lower(&subscript.base, work, next)?;
+                if let DataType::Struct(fields) = base.typing.value_type.data_type() {
+                    let ast::Expr::Literal(ast::Literal {
+                        kind: ast::LiteralKind::Long { parsed_value, .. },
+                        ..
+                    }) = &subscript.index
+                    else {
+                        return Err(typing_error(
+                            TypingError::InvalidShape(
+                                "Subscript expression on ROW requires a constant index",
+                            ),
+                            span,
+                        ));
+                    };
+                    let ordinal = i32::try_from(*parsed_value)
+                        .ok()
+                        .and_then(|index| usize::try_from(i64::from(index) - 1).ok())
+                        .filter(|&ordinal| ordinal < fields.len())
+                        .ok_or_else(|| {
+                            typing_error(
+                                TypingError::InvalidShape("Invalid ROW field subscript"),
+                                span,
+                            )
+                        })?;
+                    return self.row_field(base, ordinal, span, work);
+                }
                 let index = self.lower(&subscript.index, work, next)?;
                 self.type_call(
                     NodeShape::Operator(OperatorFunction::ArraySubscript),
@@ -538,6 +600,32 @@ impl<'a> TextTyping<'a> {
         Ok(TextNode::call(binding, Some(target), children))
     }
 
+    fn row_field(
+        &self,
+        base: TextNode,
+        ordinal: usize,
+        span: Span,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<TextNode, TextError> {
+        let value = i64::try_from(ordinal).map_err(|_| {
+            typing_error(
+                TypingError::InvalidShape("ROW field ordinal exceeds INTEGER"),
+                span,
+            )
+        })?;
+        let index = self.lower_literal(
+            &ast::Literal {
+                kind: ast::LiteralKind::Long {
+                    spelling: value.to_string(),
+                    parsed_value: value,
+                },
+                span,
+            },
+            work,
+        )?;
+        self.type_call(NodeShape::RowField, vec![base, index], span, work)
+    }
+
     fn type_call(
         &self,
         shape: NodeShape<'_>,
@@ -559,7 +647,11 @@ impl<'a> TextTyping<'a> {
             .collect::<Vec<_>>();
         let binding = finish_call(&self.context, &selected, &facts, work)
             .map_err(|cause| typing_error(cause, span))?;
-        Ok(TextNode::call(binding, None, children))
+        Ok(TextNode::call(
+            binding,
+            selected.expected_result().cloned(),
+            children,
+        ))
     }
 
     fn type_value(
@@ -820,18 +912,32 @@ impl TextNode {
                     .map(|child| child.emit(draft, constants, context, work))
                     .collect::<Result<Box<_>, _>>()?;
                 let mut changed = false;
+                let row_constructor = binding.function_id.as_str() == "builtin.scalar/row/v1";
                 let mut request_args = Vec::with_capacity(args.len());
                 for (&id, argument) in args.iter().zip(arguments) {
                     work.step()?;
                     let actual = emitted_type(draft, id);
-                    changed |= actual.nullable() != argument.typing.value_type.nullable();
+                    changed |= if row_constructor {
+                        actual != &argument.typing.value_type
+                    } else {
+                        actual.nullable() != argument.typing.value_type.nullable()
+                    };
                     request_args.push(FunctionArgument::Value {
                         value_type: actual.clone(),
                         constant: argument.typing.constant.clone(),
                     });
                 }
                 let widened_target;
-                let expected_result = if changed
+                let expected_result = if changed && row_constructor {
+                    let original = expected_result.as_ref().ok_or_else(|| typing_error(
+                        TypingError::InvalidShape("ROW constructor lost its original declaration"),
+                        novarocks_parser::SYNTHETIC,
+                    ))?;
+                    widened_target = Some(crate::typing::rebind_row_constructor_result(
+                        original, &request_args, work,
+                    ).map_err(|cause| typing_error(cause, novarocks_parser::SYNTHETIC))?);
+                    widened_target.as_ref()
+                } else if changed
                     && binding.selected.overload.as_str()
                         == novarocks_functions::builtin::value_conversion::OPERATOR_DECIMAL_FLOAT_COERCION
                 {

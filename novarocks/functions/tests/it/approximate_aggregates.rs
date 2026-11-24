@@ -75,7 +75,7 @@ fn approximate_aggregates_distinct_installed_and_declared_only_contracts() {
             "explicit-error-hll-v1",
         ),
     ] {
-        let bound = select("approx_distinct", &[input.clone()]);
+        let bound = select("approx_distinct", std::slice::from_ref(&input));
         assert_eq!(
             bound.selected.overload.as_str(),
             format!("builtin.aggregate/approx_distinct/{default}")
@@ -352,8 +352,10 @@ fn approximate_aggregates_percentile_array_has_no_4096_target_limit() {
     assert!(
         result
             .values()
-            .chunks_exact(2)
-            .all(|pair| pair == [2.0, 6.0])
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|pair| *pair == [2.0, 6.0])
     );
     assert_eq!(result.value(4096), 2.0);
 

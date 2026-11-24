@@ -182,7 +182,7 @@ mod tests {
                     vec![],
                     crate::functions::test_resolved_aggregate(
                         "approx_distinct",
-                        &[data_type.clone()],
+                        std::slice::from_ref(&data_type),
                         distinct,
                     ),
                 );

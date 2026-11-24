@@ -25,6 +25,12 @@ use crate::{
     reachability::SelectionSet,
 };
 use std::{alloc::Layout, convert::Infallible};
+mod key;
+pub use key::{
+    BoundKeyArray, KeyLookup, KeyPreparationFailure, KeyRows, PreparedKeyOperations,
+    RetainedKeyChild, RetainedKeyContents, RetainedKeyValue,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ByteHashAlgorithm {
     /// The seed is the initial state (the conventional offset basis is

@@ -204,9 +204,12 @@ fn kernel(
     let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
         panic!("aggregate handle")
     };
-    MapKernel {
-        contract: handle.contract().clone(),
-    }
+    let mut work = CompileCheckpoints::try_new(
+        &Compile,
+        novarocks_type_contract::CompilePhase::FunctionSpecialization,
+    )
+    .unwrap();
+    MapKernel::prepare(handle.contract().clone(), &mut work).unwrap()
 }
 
 fn update_selected(
@@ -388,7 +391,7 @@ fn map_owner_sparse_constant_keys_have_distinct_actual_addresses() {
             .unwrap();
     }
     assert!(matches!(
-        state.core.entries[0].1,
+        state.core.entries[0].value,
         Some(scalar::TrackedAggScalarValue::Int64(2))
     ));
     drop(prepared);
@@ -885,12 +888,12 @@ fn map_owner_actual_pool_ordinal_is_broadcast_without_consuming_other_values() {
             .update_row_evaluation(&mut state, &prepared, ordinal, &control)
             .unwrap();
     }
-    let scalar::TrackedAggScalarValue::Utf8(key) = &state.core.entries[0].0 else {
+    let scalar::TrackedAggScalarValue::Utf8(key) = &state.core.entries[0].key else {
         panic!("original key scalar")
     };
     assert_eq!(key.as_slice(), b"fixed");
     assert!(matches!(
-        state.core.entries[0].1,
+        state.core.entries[0].value,
         Some(scalar::TrackedAggScalarValue::Int64(2))
     ));
     drop(prepared);
@@ -1261,4 +1264,106 @@ fn map_whole_numeric_origin_survives_real_diagnostic_deadline_and_host_exit() {
     drop(host);
     assert!(weak.upgrade().is_none());
     assert_eq!(error.failure_fact(), expected.failure_fact());
+}
+
+#[test]
+fn map_agg_nested_map_keys_merge_real_partials_in_observed_order() {
+    use arrow_array::{
+        Float64Array, Int64Array, MapArray, StringArray,
+        builder::{Float64Builder, Int64Builder, MapBuilder},
+    };
+
+    let key_batch = |rows: Vec<Vec<(i64, Option<f64>)>>| -> ArrayRef {
+        let mut builder = MapBuilder::new(None, Int64Builder::new(), Float64Builder::new());
+        for row in rows {
+            for (key, value) in row {
+                builder.keys().append_value(key);
+                builder.values().append_option(value);
+            }
+            builder.append(true).unwrap();
+        }
+        Arc::new(builder.finish())
+    };
+    let old = key_batch(vec![
+        vec![(1, Some(-0.0)), (2, None)],
+        vec![(2, None), (1, Some(0.0))],
+    ]);
+    let new = key_batch(vec![
+        vec![(2, None), (1, Some(0.0))],
+        vec![(1, None), (2, Some(0.0))],
+    ]);
+    let a: ArrayRef = Arc::new(StringArray::from(vec![None, Some("same local key")]));
+    let b: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("same remote key"),
+        Some("different pair"),
+    ]));
+    let partial = make_kernel(&old, &a, AggregateKernelPhase::Partial);
+    let final_kernel = make_kernel(&old, &a, AggregateKernelPhase::Final);
+    let host = Arc::new(Host::default());
+    let control = Control::default();
+    let partial_from = |keys, values| {
+        let mut state = partial
+            .create_state_with_allocator(Some(host.clone()), &control)
+            .unwrap();
+        update_selected(
+            &partial,
+            &mut state,
+            host.clone(),
+            keys,
+            values,
+            Selection::all(2),
+            &[9, 9],
+            &control,
+        )
+        .unwrap();
+        emit(&partial, &state, host.clone(), &control).unwrap()
+    };
+    let p1 = partial_from(&old, &a);
+    let p2 = partial_from(&new, &b);
+    assert_eq!(
+        p1.data_type(),
+        partial.contract.intermediate_type().data_type()
+    );
+    assert_eq!(
+        p2.data_type(),
+        partial.contract.intermediate_type().data_type()
+    );
+    let mut output = final_kernel
+        .create_state_with_allocator(Some(host.clone()), &control)
+        .unwrap();
+    for partial in [&p1, &p2] {
+        merge_selected(&final_kernel, &mut output, host.clone(), partial, &control).unwrap();
+    }
+    let result = emit(&final_kernel, &output, host.clone(), &control).unwrap();
+    assert_eq!(
+        result.data_type(),
+        final_kernel.contract.final_type().data_type()
+    );
+    let result = result.as_any().downcast_ref::<MapArray>().unwrap();
+    assert_eq!(result.value_offsets(), &[0, 2]);
+
+    let keys = result.keys().as_any().downcast_ref::<MapArray>().unwrap();
+    assert_eq!(keys.value_offsets(), &[0, 2, 4]);
+    let key_entries = keys.keys().as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(key_entries.values(), &[1, 2, 1, 2]);
+    let value_entries = keys
+        .values()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(value_entries.value(0).to_bits(), (-0.0_f64).to_bits());
+    assert!(value_entries.is_null(1));
+    assert!(value_entries.is_null(2));
+    assert_eq!(value_entries.value(3).to_bits(), 0.0_f64.to_bits());
+    let values = result
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        values.iter().collect::<Vec<_>>(),
+        [None, Some("different pair")]
+    );
+    drop(output);
+    assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }

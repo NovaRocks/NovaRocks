@@ -180,6 +180,15 @@ fn find_subslice<'a, P: SplitProjection<'a>>(
     needle: &[u8],
     projection: &mut P,
 ) -> Result<Option<usize>, P::Error> {
+    find_subslice_observed(haystack, needle, || projection.step())
+}
+
+/// Search for an exact byte delimiter while observing the actual comparisons.
+pub(crate) fn find_subslice_observed<E>(
+    haystack: &[u8],
+    needle: &[u8],
+    mut step: impl FnMut() -> Result<(), E>,
+) -> Result<Option<usize>, E> {
     if needle.is_empty() {
         return Ok(Some(0));
     }
@@ -188,7 +197,7 @@ fn find_subslice<'a, P: SplitProjection<'a>>(
     }
     let mut failure = None;
     let found = haystack.windows(needle.len()).position(|window| {
-        match equal_window(window, needle, projection) {
+        match equal_window(window, needle, &mut step) {
             Ok(equal) => equal,
             Err(error) => {
                 failure = Some(error);
@@ -207,23 +216,23 @@ fn find_subslice<'a, P: SplitProjection<'a>>(
 /// with its primitive comparisons exposed to the selected observation policy.
 /// The old v1 library Eq implementation changes locally; search/order/storage
 /// remain original. No second comparison follows this result.
-fn equal_window<'a, P: SplitProjection<'a>>(
+fn equal_window<E>(
     window: &[u8],
     needle: &[u8],
-    projection: &mut P,
-) -> Result<bool, P::Error> {
+    step: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
     if window.len() != needle.len() {
         return Ok(false);
     }
     for (left, right) in window.iter().zip(needle) {
         let same = left == right;
-        projection.step()?;
+        step()?;
         if !same {
-            projection.step()?;
+            step()?;
             return Ok(false);
         }
     }
-    projection.step()?;
+    step()?;
     Ok(true)
 }
 struct OriginalProjection;

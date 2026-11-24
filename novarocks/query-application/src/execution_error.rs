@@ -180,6 +180,11 @@ impl ExecutionFailurePresentation for ExecutionFailureInput {
             K::InvalidFunctionArgument
         } else if self.fact().class() == FailureClass::Data
             && self.fact().reason()
+                == novarocks_failure_contract::kernel_reason::MAP_KEY_INDETERMINATE
+        {
+            K::Unsupported
+        } else if self.fact().class() == FailureClass::Data
+            && self.fact().reason()
                 == novarocks_function_contract::kernel_failure::EXCEEDED_FUNCTION_MEMORY_LIMIT
         {
             K::ExceededFunctionMemoryLimit
@@ -955,6 +960,23 @@ mod boundary_tests {
                 SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::Invariant,)
             );
         }
+    }
+
+    #[test]
+    fn map_key_indeterminacy_preserves_the_data_fact_and_projects_unsupported() {
+        use novarocks_failure_contract::kernel_reason::MAP_KEY_INDETERMINATE;
+        let fact = FailureFact::new(FailureClass::Data, MAP_KEY_INDETERMINATE);
+        let input = ExecutionFailureInput::new(
+            fact,
+            SafeDetail::truncating("Map key comparison is indeterminate"),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_eq!(input.fact(), fact);
+        assert_eq!(
+            input.descriptor(),
+            SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::Unsupported)
+        );
+        assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
     }
 
     #[test]

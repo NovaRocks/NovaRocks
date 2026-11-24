@@ -1,0 +1,10 @@
+-- query 3
+-- types	integer	bigint
+id	entry_count
+1	NULL
+2	2
+
+-- query 5
+-- types	integer
+absent_value
+NULL

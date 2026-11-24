@@ -32,7 +32,7 @@ use registry::{SessionCatalogPropertyPort, SessionPropertyInputs, SessionPropert
 
 /// The connection owns input values and the derived execution projection.
 /// Runtime settings never author an explicit property override.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SessionSqlState {
     principal: Option<Arc<str>>,
     current_catalog: Option<String>,
@@ -44,22 +44,6 @@ pub struct SessionSqlState {
     presentation: Option<ClientPresentationFamily>,
     time_zone: Option<SessionTimeZone>,
     time_zone_override: Option<SessionTimeZone>,
-}
-impl Default for SessionSqlState {
-    fn default() -> Self {
-        Self {
-            principal: None,
-            current_catalog: None,
-            current_schema: None,
-            execution_settings: SessionExecutionSettings::default(),
-            optimizer_settings: SessionOptimizerSettings::default(),
-            sql_semantics: SqlSemanticSettings::default(),
-            property_inputs: SessionPropertyInputs::default(),
-            presentation: None,
-            time_zone: None,
-            time_zone_override: None,
-        }
-    }
 }
 impl SessionSqlState {
     pub fn current_catalog(&self) -> Option<&str> {
@@ -289,7 +273,7 @@ impl ExplainDetail {
 ///
 /// This type deliberately contains no protocol DTO. MySQL and native role
 /// adapters project this state into their own validated wire contracts.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SessionExecutionSettings {
     explain_detail: ExplainDetail,
     query_timeout_secs: Option<u64>,
@@ -301,23 +285,6 @@ pub struct SessionExecutionSettings {
     enable_populate_datacache: bool,
     runtime_filter_scan_wait_time_ms: Option<i64>,
     runtime_filter_wait_timeout_ms: Option<i32>,
-}
-
-impl Default for SessionExecutionSettings {
-    fn default() -> Self {
-        Self {
-            explain_detail: ExplainDetail::default(),
-            query_timeout_secs: None,
-            query_mem_limit_bytes: None,
-
-            pipeline_dop: None,
-            enable_parquet_reader_page_index: false,
-            enable_scan_datacache: false,
-            enable_populate_datacache: false,
-            runtime_filter_scan_wait_time_ms: None,
-            runtime_filter_wait_timeout_ms: None,
-        }
-    }
 }
 
 impl SessionExecutionSettings {

@@ -39,6 +39,19 @@ pub(super) fn current_constraint(
             }
             Ok(None)
         }
+        SqlResultConstraintOrigin::RowConstructor => {
+            let target = binding
+                .result_constraint()
+                .ok_or_else(|| invalid("ROW constructor lost its original declaration"))?;
+            novarocks_expression::typing::rebind_row_constructor_result(target, arguments, work)
+                .map(Some)
+                .map_err(|error| match error {
+                    novarocks_expression::typing::TypingError::Control(error) => error.into(),
+                    error => ContractLoweringError::InvalidFunctionBinding {
+                        detail: error.to_string(),
+                    },
+                })
+        }
         SqlResultConstraintOrigin::ArrayCommonCoercion
         | SqlResultConstraintOrigin::OperatorDecimalFloatCoercion => {
             let [novarocks_functions::FunctionArgument::Value { value_type, .. }] = arguments
@@ -302,5 +315,79 @@ fn call_binding(kind: &ContractExprKind) -> Option<&BoundFunction> {
     match kind {
         ContractExprKind::FunctionCall { function, .. } => Some(function),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_functions::{
+        FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionValueType,
+    };
+    use novarocks_type_contract::{DecimalOverflowPolicy, ValueKind};
+
+    #[test]
+    fn row_constructor_constraint_rebinds_actual_nullability_in_original_positions() {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let catalogue =
+            novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
+                .unwrap();
+        let original = FunctionValueType::new(
+            DataType::Struct(
+                vec![
+                    Field::new("ID", DataType::Int32, false),
+                    Field::new("", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        let mut arguments = [
+            FunctionArgument::Value {
+                value_type: FunctionValueType::new(DataType::Int32, false),
+                constant: None,
+            },
+            FunctionArgument::Value {
+                value_type: FunctionValueType::new(DataType::Utf8, true),
+                constant: None,
+            },
+        ];
+        let selected = catalogue
+            .resolve_bound_trusted(
+                "row",
+                FunctionKind::Scalar,
+                FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: arguments.len(),
+                    expected_result_type: Some(&original),
+                },
+                &control,
+            )
+            .unwrap();
+        let binding = SqlFunctionBinding::new_with_row_constructor_constraint(
+            selected,
+            DecimalOverflowPolicy::OutputNull,
+            original.clone(),
+        );
+
+        arguments[0] = FunctionArgument::Value {
+            value_type: FunctionValueType::new(DataType::Int32, true),
+            constant: None,
+        };
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        let actual = current_constraint(&binding, &arguments, &mut work)
+            .unwrap()
+            .unwrap();
+        work.finish().unwrap();
+        assert_eq!(binding.result_constraint(), Some(&original));
+        assert!(!actual.nullable());
+        let ValueKind::Struct(fields) = actual.value_type().kind() else {
+            panic!("the revised constraint is a ROW");
+        };
+        assert_eq!(fields[0].row_name(), Some("ID"));
+        assert!(fields[0].value_type().nullable());
+        assert_eq!(fields[1].row_name(), None);
+        assert_eq!(actual.child_at(1), original.child_at(1));
     }
 }

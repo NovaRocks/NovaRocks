@@ -344,6 +344,7 @@ fn call_inapplicability(
             | ArgumentControl::Coalesce
             | ArgumentControl::Try
             | ArgumentControl::OrderedRegexp
+            | ArgumentControl::OrderedNull
             | ArgumentControl::NoArguments => None,
             _ => Some(CallInapplicability::ArgumentControl),
         });

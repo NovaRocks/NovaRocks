@@ -61,8 +61,9 @@ use novarocks_spi::connector::write_stack::{
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, OrderedComparisonAlgorithm,
-    PartitionCountParameterId, PartitionSpaceId, PureCompileControl, SemanticParameterId,
-    SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
+    PartitionCountParameterId, PartitionHashAlgorithm, PartitionSpaceId, PureCompileControl,
+    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
+    SemanticParameters,
 };
 use sha2::{Digest, Sha256};
 use {
@@ -3068,20 +3069,42 @@ impl<'a> ContractLoweringVisitor<'a> {
     /// being compared. Minting a space per exchange instead would have made
     /// that depend on the order the lowering happened to visit them in.
     fn allocate_hash_scheme(&mut self) -> Result<HashPartitionScheme, ContractLoweringError> {
+        self.allocate_exchange_hash_scheme(PartitionHashAlgorithm::NativeExchangeV1)
+    }
+
+    fn allocate_exchange_hash_scheme(
+        &mut self,
+        algorithm: PartitionHashAlgorithm,
+    ) -> Result<HashPartitionScheme, ContractLoweringError> {
         let destination = self.current_fragment;
         if let Some(scheme) = self.exchange_hash_schemes.get(&destination) {
+            if scheme.definition.algorithm != algorithm {
+                return Err(ContractLoweringError::InvalidPlanIdentity {
+                    detail: "redistributions into one fragment request different hash algorithms"
+                        .into(),
+                });
+            }
             return Ok(scheme.clone());
         }
+        let partition_class = match algorithm {
+            PartitionHashAlgorithm::NativeExchangeV1 => b"sql-exchange".as_slice(),
+            PartitionHashAlgorithm::NativeExchangeV2 => b"sql-exchange-v2".as_slice(),
+            _ => {
+                return Err(ContractLoweringError::InvalidPlanIdentity {
+                    detail: "ordinary hash space requires an ordinary exchange algorithm".into(),
+                });
+            }
+        };
         let destination_bytes = destination.get().to_be_bytes();
         let space_bytes = partition_identity_digest(
             b"novarocks.uea5.partition-space.v1",
             self.plan_version,
-            &[b"sql-exchange", &destination_bytes],
+            &[partition_class, &destination_bytes],
         );
         let count_bytes = partition_identity_digest(
             b"novarocks.uea5.partition-count.v1",
             self.plan_version,
-            &[b"sql-exchange", &destination_bytes],
+            &[partition_class, &destination_bytes],
         );
         let scheme = HashPartitionScheme {
             space: PartitionSpaceId::try_new(space_bytes).map_err(|error| {
@@ -3101,7 +3124,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     requires_power_of_two: self.dop_domain.requires_power_of_two,
                 },
             },
-            definition: HashDefinition::native_exchange(),
+            definition: HashDefinition { algorithm },
         };
         self.exchange_hash_schemes
             .insert(destination, scheme.clone());
@@ -5527,7 +5550,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 require_no_partition_expressions("Broadcast", &redistribute.partition_exprs)?;
                 ExchangeLayout::Broadcast
             }
-            RedistributeMode::Hash { cols, .. } => {
+            RedistributeMode::Hash { cols, source } => {
                 if cols.is_empty() {
                     return Err(ContractLoweringError::EmptyPartitionKeys {
                         node: "Redistribute",
@@ -5547,9 +5570,22 @@ impl<'a> ContractLoweringVisitor<'a> {
                         detail: "hash partition expressions are not the exact ordered key columns",
                     });
                 }
+                let algorithm = source.exchange_algorithm();
                 let scheme = match shared_hash_scheme {
-                    Some(scheme) => scheme,
-                    None => self.allocate_hash_scheme()?,
+                    Some(scheme)
+                        if (algorithm == PartitionHashAlgorithm::NativeExchangeV2)
+                            == (scheme.definition.algorithm
+                                == PartitionHashAlgorithm::NativeExchangeV2) =>
+                    {
+                        scheme
+                    }
+                    Some(_) => {
+                        return Err(ContractLoweringError::InvalidPartitionExpressions {
+                            node: "Redistribute",
+                            detail: "shared partition space uses an incompatible MAP key identity",
+                        });
+                    }
+                    None => self.allocate_exchange_hash_scheme(algorithm)?,
                 };
                 ExchangeLayout::Hash {
                     keys: cols.clone().into_boxed_slice(),
@@ -5903,6 +5939,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                 }
                 let lowered = self.lower_node(child)?;
                 if let Distribution::Hash { scheme, .. } = &lowered.properties.distribution {
+                    if scheme.definition.algorithm == PartitionHashAlgorithm::NativeExchangeV2 {
+                        return Err(ContractLoweringError::InvalidJoin {
+                            node: "HashJoin",
+                            detail: "canonical MAP exchange cannot place a hash join",
+                        });
+                    }
                     if shared_hash_scheme
                         .as_ref()
                         .is_some_and(|expected| expected != scheme)
@@ -6785,6 +6827,11 @@ impl<'a> ContractLoweringVisitor<'a> {
         // its space to the shuffles beside it as long as its keys need no cast.
         let mut inputs = Vec::with_capacity(plan.children.len());
         let mut shared_hash_scheme = None;
+        let algorithm = PartitionHashAlgorithm::for_grouping_keys(
+            plan.output_columns
+                .iter()
+                .map(|column| column.value_type.data_type()),
+        );
         for (child, columns) in plan.children.iter().zip(&set_op.child_output_columns) {
             let needs_cast = columns.iter().zip(&plan.output_columns).any(|(from, to)| {
                 let from = value_type(from);
@@ -6803,6 +6850,13 @@ impl<'a> ContractLoweringVisitor<'a> {
 
             let input = self.lower_node(child)?;
             if let Distribution::Hash { scheme, .. } = &input.properties.distribution {
+                if (algorithm == PartitionHashAlgorithm::NativeExchangeV2)
+                    != (scheme.definition.algorithm == PartitionHashAlgorithm::NativeExchangeV2)
+                {
+                    return Err(ContractLoweringError::InvalidSetOp {
+                        detail: "partitioned set input needs shuffle into its comparison key domain",
+                    });
+                }
                 if self.set_op_branch_needs_cast(&input, columns, &plan.output_columns)? {
                     return Err(ContractLoweringError::InvalidSetOp {
                         detail: "a partitioned input needs alignment before its hash exchange",
@@ -6832,7 +6886,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         }
         let scheme = match shared_hash_scheme {
             Some(scheme) => scheme,
-            None => self.allocate_hash_scheme()?,
+            None => self.allocate_exchange_hash_scheme(algorithm)?,
         };
         plan.children
             .iter()
@@ -7543,6 +7597,22 @@ impl<'a> ContractLoweringVisitor<'a> {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                if let Distribution::Hash { keys, scheme } = &child.properties.distribution {
+                    let types = keys
+                        .iter()
+                        .map(|key| self.value_declared_type_in(child.fragment, *key))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if PartitionHashAlgorithm::for_grouping_keys(
+                        types.iter().map(|ty| ty.data_type()),
+                    ) == PartitionHashAlgorithm::NativeExchangeV2
+                        && scheme.definition.algorithm != PartitionHashAlgorithm::NativeExchangeV2
+                    {
+                        return Err(ContractLoweringError::PropertyRequirementUnsatisfied {
+                            node: "HashAggregate",
+                            detail: "final MAP grouping keys lack canonical partitioning",
+                        });
+                    }
+                }
                 if !distribution_colocates(&child.properties.distribution, &keys) {
                     return Err(ContractLoweringError::PropertyRequirementUnsatisfied {
                         node: "HashAggregate",

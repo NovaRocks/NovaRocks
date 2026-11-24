@@ -38,7 +38,7 @@ fn recipe(
         source: source.clone(),
         result: result.clone(),
         body,
-        array_child: child,
+        children: child.map_or(CastChildren::None, CastChildren::Array),
         trino_mode: None,
         decimal_overflow_policy: policy,
         allow_throw_exception: allow,
@@ -454,6 +454,23 @@ pub(super) fn evaluate<'a>(
                 } else if recipe.body == CastBody::Identity {
                     work.flush()?;
                     argument.array().slice(row, 1)
+                } else if recipe.body == CastBody::ExplicitMap {
+                    match super::map_mode::evaluate_row(
+                        recipe,
+                        argument.array(),
+                        row,
+                        ordinal,
+                        control,
+                        &mut work,
+                    )? {
+                        Ok(value) => value,
+                        Err(error) => {
+                            if recipe.array_failure_mode != Some(ArrayCastFailureMode::OutputNull) {
+                                errors.push(error);
+                            }
+                            new_null_array(recipe.result.data_type(), 1)
+                        }
+                    }
                 } else {
                     let list = argument
                         .array()
@@ -468,10 +485,9 @@ pub(super) fn evaluate<'a>(
                     if start > end || end > list.values().len() {
                         return Err(invalid("array CAST offsets exceed its child"));
                     }
-                    let child = recipe
-                        .array_child
-                        .as_ref()
-                        .ok_or_else(|| internal("array CAST lost its prepared child"))?;
+                    let CastChildren::Array(child) = &recipe.children else {
+                        return Err(internal("array CAST lost its prepared child"));
+                    };
                     work.flush()?;
                     let values = list.values().slice(start, end - start);
                     let converted = child.evaluate_selected(

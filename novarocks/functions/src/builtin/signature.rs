@@ -1185,8 +1185,17 @@ pub(super) fn declared_list_with_construction<E>(
     creation: &mut ScalarConstruction<'_, E>,
 ) -> Result<FunctionValueType, ConstructionFailure<E>> {
     let item = creation.nullable(item, true)?;
+    declared_list_exact_with_construction(&item, nullable, creation)
+}
+
+pub(super) fn declared_list_exact_with_construction<E>(
+    item: &FunctionValueType,
+    nullable: bool,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<FunctionValueType, ConstructionFailure<E>> {
     let kind = novarocks_type_contract::ValueKind::List(item.value_type().clone());
-    let layout = DataType::List(creation.field("item", item.data_type().clone(), true)?);
+    let layout =
+        DataType::List(creation.field("item", item.data_type().clone(), item.nullable())?);
     declared_collection_with_construction(kind, layout, nullable, creation)
 }
 #[cfg(test)]
@@ -1212,8 +1221,17 @@ pub(super) fn declared_map_with_construction<E>(
     nullable: bool,
     creation: &mut ScalarConstruction<'_, E>,
 ) -> Result<FunctionValueType, ConstructionFailure<E>> {
-    let key = creation.nullable(key, false)?;
     let value = creation.nullable(value, true)?;
+    declared_map_exact_values_with_construction(key, &value, nullable, creation)
+}
+
+pub(super) fn declared_map_exact_values_with_construction<E>(
+    key: &FunctionValueType,
+    value: &FunctionValueType,
+    nullable: bool,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<FunctionValueType, ConstructionFailure<E>> {
+    let key = creation.nullable(key, false)?;
     let kind = novarocks_type_contract::ValueKind::Map {
         key: key.value_type().clone(),
         value: value.value_type().clone(),
@@ -1222,7 +1240,7 @@ pub(super) fn declared_map_with_construction<E>(
     creation.array::<u8>("key".len())?;
     let key_field = Field::new("key", key.data_type().clone(), false);
     creation.array::<u8>("value".len())?;
-    let value_field = Field::new("value", value.data_type().clone(), true);
+    let value_field = Field::new("value", value.data_type().clone(), value.nullable());
     let fields = vec![key_field, value_field];
     creation.fields_from_values(fields.len())?;
     let fields = DataType::Struct(fields.into());
@@ -1249,14 +1267,31 @@ pub(super) fn declared_struct_with_construction<E>(
     nullable: bool,
     creation: &mut ScalarConstruction<'_, E>,
 ) -> Result<FunctionValueType, ConstructionFailure<E>> {
+    declared_struct_fields_with_construction(fields, nullable, false, creation)
+}
+
+pub(super) fn declared_struct_fields_with_construction<E>(
+    fields: Vec<(String, FunctionValueType)>,
+    nullable: bool,
+    exact_children: bool,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<FunctionValueType, ConstructionFailure<E>> {
     creation.array::<novarocks_type_contract::ValueField>(fields.len())?;
     let mut semantics = Vec::with_capacity(fields.len());
     creation.array::<Field>(fields.len())?;
     let mut layouts = Vec::with_capacity(fields.len());
     for (name, field) in fields {
-        let field = creation.nullable(&field, true)?;
+        let field = if exact_children {
+            field
+        } else {
+            creation.nullable(&field, true)?
+        };
         creation.array::<u8>(name.len())?;
-        layouts.push(Field::new(&name, field.data_type().clone(), true));
+        layouts.push(Field::new(
+            &name,
+            field.data_type().clone(),
+            field.nullable(),
+        ));
         let storage = creation.storage();
         semantics.push(
             novarocks_type_contract::ValueField::from_string_with_construction(

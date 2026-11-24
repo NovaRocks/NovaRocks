@@ -167,7 +167,7 @@ fn resolve_parts(
         ast::TypeKind::Row(row) => {
             let mut values = Vec::with_capacity(row.fields.len());
             let mut fields = Vec::with_capacity(row.fields.len());
-            for (index, field) in row.fields.iter().enumerate() {
+            for field in row.fields.iter() {
                 let (value, layout) =
                     resolve_parts(&field.data_type, true, depth + 1, nodes, work)?;
                 let name = match &field.name {
@@ -178,7 +178,7 @@ fn resolve_parts(
                         }
                         name.value.clone()
                     }
-                    None => format!("f{}", index + 1),
+                    None => String::new(),
                 };
                 values.push(ValueField::new(name.as_str(), value, storage.clone()));
                 fields.push(Arc::new(Field::new(name, layout, true)));
