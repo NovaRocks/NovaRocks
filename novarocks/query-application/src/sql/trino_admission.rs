@@ -785,17 +785,18 @@ mod tests {
                 panic!("expected definition or replay preparation: {source}");
             };
             assert!(admit_persisted_definition_semantics(source, &preparation, &default).is_ok());
-            for (settings, feature) in [(&strict, "ERROR_IF_OVERFLOW")] {
-                let error = admit_persisted_definition_semantics(source, &preparation, settings)
-                    .unwrap_err();
-                let user = error.user_error().unwrap();
-                assert_eq!(
-                    user.code().as_str(),
-                    "sql.admit.persisted_definition_semantics_unsupported"
-                );
-                assert!(user.message().contains(feature), "{source}: {user}");
-                assert_eq!(user.location().unwrap().column(), 1);
-            }
+            let error =
+                admit_persisted_definition_semantics(source, &preparation, &strict).unwrap_err();
+            let user = error.user_error().unwrap();
+            assert_eq!(
+                user.code().as_str(),
+                "sql.admit.persisted_definition_semantics_unsupported"
+            );
+            assert!(
+                user.message().contains("ERROR_IF_OVERFLOW"),
+                "{source}: {user}"
+            );
+            assert_eq!(user.location().unwrap().column(), 1);
         }
         for source in [
             "CREATE VIEW v AS VALUES 1",
