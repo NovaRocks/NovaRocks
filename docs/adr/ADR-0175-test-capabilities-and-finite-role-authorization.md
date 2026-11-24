@@ -35,7 +35,7 @@ code-anchors:
 | owner 本地控制对象 | 在领域已有调用接缝校验参数、绑定真实工作并执行有限动作 | 通用机制不解释领域语义，不增加产品配置或公共管理路由 |
 | `ClusterTestSessionPlan` | 冻结每个真实角色的 binary 与授权，保留实际自报和生命周期证据 | 控制 helper join、工作退出、角色 reap 与资源收敛分别取证 |
 
-声明具有版本和大小/数量上界。每次角色启动拥有独立身份与私有材料，liveness 使用准确进程握手及有限心跳；runner 持有原绝对期限，握手只交付剩余预算，角色将其转换成本地时钟期限。EOF、失联、期限、主动结束均使控制失效。握手和心跳不续期。领域 payload 保持 owner 本地解释，共享 failpoint crate 只提供中立的有限授权与生命周期机械能力。
+声明具有版本，序列化大小上限为 64 KiB，授权条目数由该字节上限约束。每次角色启动拥有独立身份与私有材料，liveness 使用准确进程握手及有限心跳；runner 持有原绝对期限，握手只交付剩余预算，角色将其转换成本地时钟期限。EOF、失联、期限、主动结束均使控制失效。握手和心跳不续期。领域 payload 保持 owner 本地解释，共享 failpoint crate 只提供中立的有限授权与生命周期机械能力。
 
 MV 文档观察和整族 Accelerator 擦除具有不同授权。`wipe_accelerator_for_test` 复用产品已有 admission stop 与 background join，在真实后台退出且不存在活跃 publication 后才执行擦除；随后 runner 停止并 reap 原 FE，创建新 launch，并按剩余已冻结需求选择普通或受控产物及新会话，不继承旧 grant。擦除不定义新的启动期恢复语义，也不改变湖上文档、管理接续或查询结果判据。
 

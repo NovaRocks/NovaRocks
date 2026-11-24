@@ -682,19 +682,20 @@ mod tests {
         assert!(owner.take(0).is_err());
     }
     #[test]
-    fn oversized_role_intent_is_rejected_before_owner_publication() {
+    fn oversized_role_declaration_is_rejected_before_owner_publication() {
         let binary = std::env::current_exe().unwrap();
         let owner = SqlIntentOwner::default();
-        let maximum = novarocks_failpoint::session::MAX_GRANTS;
-        let statement_count = maximum.div_ceil(3);
-        assert!(statement_count <= 64);
-        // The FE owns one statement-observation grant plus these exact binds.
-        let statements = (0..statement_count)
-            .map(|at| {
+        use novarocks_failpoint::observation_marker::ObservationAction::{
+            TaskProtocol, WriterMarker,
+        };
+
+        let statements = (0..64)
+            .map(|_| {
                 let mut statement = spec("SELECT 1");
-                let observations = (maximum - at * 3).min(3);
-                statement.observations = (0..observations)
-                    .map(|index| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), None))
+                statement.observations = (0..3)
+                    .flat_map(|index| {
+                        [TaskProtocol, WriterMarker].map(|action| (index, action.as_str(), None))
+                    })
                     .collect();
                 statement
             })
@@ -705,7 +706,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             error.to_string(),
-            "test-session requires a bounded nonempty grant set"
+            "selected role declaration exceeds its bounded input size"
         );
         assert!(owner.take(0).is_err());
     }

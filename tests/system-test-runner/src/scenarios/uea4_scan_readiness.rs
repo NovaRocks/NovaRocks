@@ -1202,7 +1202,6 @@ mod tests {
             .unwrap();
         for launch in plan.planned_launch_summaries().as_array().unwrap() {
             let grants = launch["grants"].as_array().unwrap();
-            assert!(grants.len() <= novarocks_failpoint::session::MAX_GRANTS);
             if launch["role"] == "fe" {
                 assert_eq!(grants.len(), 43);
             } else {
