@@ -6407,12 +6407,14 @@ mod prepared_source_relation_tests {
             has_deletes: false,
             partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
         };
+        let snapshot_schema =
+            crate::change_planning::resolved_window_schema(&metadata, 42).unwrap();
         let relations = frozen_prepared_source_relations(
             &name,
             &metadata,
             request.selection(),
-            metadata.current_schema().clone(),
-            metadata.current_schema_id(),
+            snapshot_schema.clone(),
+            snapshot_schema.schema_id(),
             Some(&admission),
         )
         .unwrap();

@@ -1624,8 +1624,7 @@ mod tests {
             .await
             .load_table(&table("t"), false)
             .await
-            .err()
-            .expect("missing required next-row-id");
+            .expect_err("missing required next-row-id");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
         assert!(error.message().contains("next-row-id"));
     }

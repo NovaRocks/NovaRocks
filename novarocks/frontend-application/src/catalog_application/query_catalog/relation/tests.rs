@@ -446,6 +446,10 @@ fn fixture(
     }
 }
 fn need(sql: &str) -> CatalogRelationNeed {
+    need_for_table(sql, "orders")
+}
+
+fn need_for_table(sql: &str, table: &str) -> CatalogRelationNeed {
     let query = novarocks_parser::parser::parse_query(sql).unwrap();
     let source = novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
         query.clone(),
@@ -457,7 +461,7 @@ fn need(sql: &str) -> CatalogRelationNeed {
     source
         .needs()
         .iter()
-        .find(|need| need.relation().table == "orders")
+        .find(|need| need.relation().table == table)
         .unwrap()
         .clone()
 }
@@ -606,8 +610,8 @@ async fn names_for_the_same_object_keep_the_first_observation_through_sealing() 
 
     let resolver = fixture(None, None);
     let bindings = QueryTableBindingStore::try_new().unwrap();
-    let load = |sql, complete_first| {
-        let need = need(sql);
+    let load = |sql, table, complete_first| {
+        let need = need_for_table(sql, table);
         let bindings = &bindings;
         let resolver = &resolver;
         async move {
@@ -622,8 +626,10 @@ async fn names_for_the_same_object_keep_the_first_observation_through_sealing() 
             .await
         }
     };
-    load("SELECT x FROM ice.db.orders", true).await.unwrap();
-    load("SELECT x FROM ice.db.order_alias", false)
+    load("SELECT x FROM ice.db.orders", "orders", true)
+        .await
+        .unwrap();
+    load("SELECT x FROM ice.db.order_alias", "order_alias", false)
         .await
         .unwrap();
     bindings.seal_catalog_observations().await;
@@ -631,6 +637,7 @@ async fn names_for_the_same_object_keep_the_first_observation_through_sealing() 
         materialization, ..
     } = load(
         "SELECT x FROM ice.db.order_alias FOR VERSION AS OF 10",
+        "order_alias",
         false,
     )
     .await
@@ -650,7 +657,11 @@ async fn names_for_the_same_object_keep_the_first_observation_through_sealing() 
         materialization.read_schema.field(0).data_type(),
         &arrow::datatypes::DataType::Int32
     );
-    assert!(load("SELECT x FROM ice.db.unseen", false).await.is_err());
+    assert!(
+        load("SELECT x FROM ice.db.unseen", "unseen", false)
+            .await
+            .is_err()
+    );
     assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), 2);
     assert_eq!(resolver.counts.source_prepare.load(Ordering::Relaxed), 1);
     assert_eq!(resolver.counts.table_prepare.load(Ordering::Relaxed), 1);
