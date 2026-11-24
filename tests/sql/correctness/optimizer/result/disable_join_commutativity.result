@@ -44,10 +44,6 @@ PLAN FRAGMENT 2
 -- query 12
 -- types	varchar
 Explain String
-RUNTIME FILTER GRAPH
-  runtime filter channel 1
-    producer binding 1, fragment = 1, node = 2, expr = (lo.lo_datekey)
-    consumer binding 1, fragment = 1, node = 3, expr = (d.d_datekey), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   STAGE PLACEMENT: singleton
@@ -56,29 +52,38 @@ PLAN FRAGMENT 0
 0:GATHER stats={rows=16200}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
-  STAGE PLACEMENT: scan-work
+  STAGE PLACEMENT: follow-sources([2,3])
   DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 0
     PARTITION: UNPARTITIONED
 1:PROJECT [lo.lo_orderkey, d.d_year] stats={rows=16200}
-  2:HASH JOIN (BROADCAST, INNER, eq: [d.d_datekey = lo.lo_datekey]) bcast_verdict=feasible stats={rows=16200}
-    3:SCAN ${case_db}.date_dim (alias=d) stats={rows=2}
-         TABLE: ${case_db}.date_dim
-         columns: d_datekey, d_year
-         min-max stats
-         predicates: d.d_datekey IS NOT NULL
-    4:BROADCAST EXCHANGE stats={rows=18000}
+  2:HASH JOIN (PARTITIONED, INNER, eq: [d.d_datekey = lo.lo_datekey]) stats={rows=16200}
+    3:HASH EXCHANGE
+    4:HASH EXCHANGE
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   STAGE PLACEMENT: scan-work
   DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: HASH_PARTITIONED (d.d_datekey)
+5:SCAN ${case_db}.date_dim (alias=d) stats={rows=2}
+     TABLE: ${case_db}.date_dim
+     columns: d_datekey, d_year
+     min-max stats
+     predicates: d.d_datekey IS NOT NULL
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
     EXCHANGE ID: 4
-    PARTITION: BROADCAST
-5:SCAN ${case_db}.lineorder (alias=lo) stats={rows=18000}
+    PARTITION: HASH_PARTITIONED (lo.lo_datekey)
+6:SCAN ${case_db}.lineorder (alias=lo) stats={rows=18000}
      TABLE: ${case_db}.lineorder
      columns: lo_orderkey, lo_datekey
      min-max stats

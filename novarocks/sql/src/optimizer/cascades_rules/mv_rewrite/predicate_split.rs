@@ -21,11 +21,15 @@
 
 use std::collections::HashMap;
 
+use arrow::datatypes::DataType;
+
 use crate::column_id::ColumnId;
 use crate::common::{BinOp, LiteralValue};
 use crate::compiler::SqlCompileError;
 use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+use novarocks_type_contract::{
+    CharacterKind, CompileCheckpoints, CompilePhase, PureCompileControl, ValueKind,
+};
 
 use super::column_mapping::{NormExpr, norm_contains, normalize};
 
@@ -71,10 +75,10 @@ fn classify(
     let mut residuals = Vec::new();
     let mut residual_ids = Vec::new();
     for c in conjuncts {
-        // The range model consumes literals and the shared exact signed fact.
-        // Observe their opaque string/map operations at the same scope boundary.
+        // Observe the range model's opaque string and map operations at the
+        // same scope boundary as residual normalization.
         work.flush()?;
-        let range = as_range_conjunct(arena, *c, base_names);
+        let range = as_range_conjunct(arena, *c, base_names, work)?;
         work.step()?;
         work.flush()?;
         match range {
@@ -109,27 +113,78 @@ fn classify(
     }))
 }
 
+/// Read the selected VARCHAR value across a declaration-only cast to
+/// unbounded VARCHAR. Keep the expression and its casts for compensation.
+fn varchar_bound(
+    arena: &ScalarArena,
+    mut expr: ScalarId,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<LiteralValue>, SqlCompileError> {
+    loop {
+        work.step()?;
+        let ty = arena.value_type(expr);
+        let kind = ty.value_type().kind();
+        if ty.data_type() != &DataType::Utf8
+            || !matches!(kind, ValueKind::String)
+                && !matches!(kind, ValueKind::BoundedCharacter(c) if c.kind() == CharacterKind::Varchar)
+        {
+            return Ok(None);
+        }
+        match arena.node(expr) {
+            ScalarNode::Literal(HashableLiteral(value @ LiteralValue::String(_))) => {
+                return Ok(Some(value.clone()));
+            }
+            ScalarNode::Constant(value) if value.value_type() == ty => {
+                work.flush()?;
+                return Ok(value
+                    .utf8_observed(CompilePhase::LowerProgram, work.control())?
+                    .map(|text| LiteralValue::String(text.to_owned())));
+            }
+            ScalarNode::Cast {
+                child,
+                target: DataType::Utf8,
+                ..
+            } if matches!(kind, ValueKind::String) => {
+                expr = *child;
+            }
+            // CHAR, narrowing VARCHAR and other value-changing casts are
+            // outside this lexical range observation.
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn range_literal(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<LiteralValue>, SqlCompileError> {
+    if let ScalarNode::Literal(HashableLiteral(value)) = arena.node(expr)
+        && !matches!(value, LiteralValue::String(_))
+    {
+        return Ok(Some(value.clone()));
+    }
+    if let Some(value) = crate::optimizer::scalar_expr::signed_integer_literal(arena, expr) {
+        return Ok(Some(LiteralValue::Int(value)));
+    }
+    varchar_bound(arena, expr, work)
+}
+
+type RangeConjunct = (String, Option<Bound>, Option<Bound>);
+
 /// `col op literal` / `literal op col` / BETWEEN -> (column, low?, high?).
 /// op ∈ {<, <=, >, >=, =}. `!=`, IS NULL, IN, LIKE etc. are residuals.
 fn as_range_conjunct(
     arena: &ScalarArena,
     expr: ScalarId,
     base_names: &HashMap<ColumnId, String>,
-) -> Option<(String, Option<Bound>, Option<Bound>)> {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<RangeConjunct>, SqlCompileError> {
     let col_of = |x: ScalarId| -> Option<String> {
         let ScalarNode::ColumnRef(column_id) = arena.node(x) else {
             return None;
         };
         base_names.get(column_id).cloned()
-    };
-    let lit_of = |x: ScalarId| -> Option<LiteralValue> {
-        match arena.node(x) {
-            ScalarNode::Literal(HashableLiteral(value)) => Some(value.clone()),
-            // Observe the original exact signed value without evaluating or
-            // rewriting its CV/CAST source. Other CV domains remain residuals.
-            _ => crate::optimizer::scalar_expr::signed_integer_literal(arena, x)
-                .map(LiteralValue::Int),
-        }
     };
     if let Some((op, [left, right])) =
         crate::common::binary_operator::scalar_comparison(arena, expr)
@@ -137,93 +192,64 @@ fn as_range_conjunct(
             crate::common::binary_operator::permits_equality_substitution(arena.data_type(operand))
         })
     {
-        let (col, lit, op) = if let (Some(c), Some(l)) = (col_of(left), lit_of(right)) {
-            (c, l, op)
-        } else if let (Some(l), Some(c)) = (lit_of(left), col_of(right)) {
-            // literal op col  ==  col flipped-op literal
-            let flipped = match op {
-                BinOp::Lt => BinOp::Gt,
-                BinOp::Le => BinOp::Ge,
-                BinOp::Gt => BinOp::Lt,
-                BinOp::Ge => BinOp::Le,
-                BinOp::Eq => BinOp::Eq,
-                _ => return None,
-            };
-            (c, l, flipped)
-        } else {
-            return None;
+        let (col, operand, op) = match (col_of(left), col_of(right)) {
+            (Some(col), None) => (col, right, op),
+            (None, Some(col)) => {
+                let flipped = match op {
+                    BinOp::Lt => BinOp::Gt,
+                    BinOp::Le => BinOp::Ge,
+                    BinOp::Gt => BinOp::Lt,
+                    BinOp::Ge => BinOp::Le,
+                    BinOp::Eq => BinOp::Eq,
+                    _ => return Ok(None),
+                };
+                (col, left, flipped)
+            }
+            _ => return Ok(None),
         };
-        return match op {
-            BinOp::Eq => Some((
-                col,
-                Some(Bound {
-                    value: lit.clone(),
-                    inclusive: true,
-                }),
-                Some(Bound {
-                    value: lit,
-                    inclusive: true,
-                }),
-            )),
-            BinOp::Ge => Some((
-                col,
-                Some(Bound {
-                    value: lit,
-                    inclusive: true,
-                }),
-                None,
-            )),
-            BinOp::Gt => Some((
-                col,
-                Some(Bound {
-                    value: lit,
-                    inclusive: false,
-                }),
-                None,
-            )),
-            BinOp::Le => Some((
-                col,
-                None,
-                Some(Bound {
-                    value: lit,
-                    inclusive: true,
-                }),
-            )),
-            BinOp::Lt => Some((
-                col,
-                None,
-                Some(Bound {
-                    value: lit,
-                    inclusive: false,
-                }),
-            )),
+        let Some(value) = range_literal(arena, operand, work)? else {
+            return Ok(None);
+        };
+        let bound = Bound {
+            value,
+            inclusive: matches!(op, BinOp::Eq | BinOp::Ge | BinOp::Le),
+        };
+        return Ok(match op {
+            BinOp::Eq => Some((col, Some(bound.clone()), Some(bound))),
+            BinOp::Ge | BinOp::Gt => Some((col, Some(bound), None)),
+            BinOp::Le | BinOp::Lt => Some((col, None, Some(bound))),
             _ => None,
-        };
+        });
     }
-    match arena.node(expr) {
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated: false,
-        } => {
-            let col = col_of(*child)?;
-            let lo = lit_of(*low)?;
-            let hi = lit_of(*high)?;
-            Some((
-                col,
-                Some(Bound {
-                    value: lo,
-                    inclusive: true,
-                }),
-                Some(Bound {
-                    value: hi,
-                    inclusive: true,
-                }),
-            ))
-        }
-        _ => None,
-    }
+    let ScalarNode::Between {
+        child,
+        low,
+        high,
+        negated: false,
+    } = arena.node(expr)
+    else {
+        return Ok(None);
+    };
+    let Some(col) = col_of(*child) else {
+        return Ok(None);
+    };
+    let (Some(lo), Some(hi)) = (
+        range_literal(arena, *low, work)?,
+        range_literal(arena, *high, work)?,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        col,
+        Some(Bound {
+            value: lo,
+            inclusive: true,
+        }),
+        Some(Bound {
+            value: hi,
+            inclusive: true,
+        }),
+    )))
 }
 
 /// Compare two literals of compatible kinds. None = incomparable (fail closed).
@@ -345,8 +371,8 @@ pub(crate) fn check_containment(
                 }
             }
         }
-        // Other CV residuals keep exact selected-value/type identity. Signed
-        // range observations above preserve the original compensation order.
+        // Residuals keep exact selected-value/type identity. Use the
+        // original expressions when a proven range requires compensation.
         for mn in &m.residuals {
             work.flush()?;
             if !norm_contains(&q.residuals, mn, control)? {
@@ -597,6 +623,87 @@ mod tests {
         let r = check_containment(&[between_a(10, 20)], &[between_a(0, 100)], &n, &n)
             .expect("contained");
         assert_eq!(r.compensation.len(), 1); // the tighter BETWEEN re-applied
+    }
+
+    #[test]
+    fn varchar_ranges_match_folded_constants_and_declaration_only_casts() {
+        use novarocks_type_contract::{
+            CharacterType, FunctionValueType, TrinoCastMode, ValueLayout, ValueTypeRef,
+            ValueTypeStorageLifetime,
+        };
+
+        let unbounded = FunctionValueType::new(DataType::Utf8, false);
+        let mut column = a();
+        column.value_type = FunctionValueType::new(DataType::Utf8, true);
+        let storage = ValueTypeStorageLifetime::pure();
+        let bounded = FunctionValueType::try_from_value(
+            ValueTypeRef::try_new(
+                ValueKind::BoundedCharacter(
+                    CharacterType::new(CharacterKind::Varchar, 10).unwrap(),
+                ),
+                false,
+                storage.clone(),
+            )
+            .unwrap(),
+            ValueLayout::try_new(&DataType::Utf8, storage).unwrap(),
+        )
+        .unwrap();
+        let cast = |text: &str| TypedExpr {
+            kind: ExprKind::Cast {
+                cast_mode: Some(TrinoCastMode::Implicit),
+                expr: novarocks_parser::ast::AstBox::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::String(text.into())),
+                    value_type: bounded.clone(),
+                }),
+                target: DataType::Utf8,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            value_type: unbounded.clone(),
+        };
+        let folded = |text: &str| TypedExpr {
+            kind: ExprKind::Constant(
+                crate::constant::admit_syntax_constant(
+                    &LiteralValue::String(text.into()),
+                    &unbounded,
+                    crate::constant::test_constant_policy(),
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
+            ),
+            value_type: unbounded.clone(),
+        };
+        let mv = [
+            bin(col_ref(&column), BinOp::Ge, cast("2021-08-01")),
+            bin(col_ref(&column), BinOp::Lt, cast("2021-09-01")),
+        ];
+        let query = [
+            bin(col_ref(&column), BinOp::Ge, folded("2021-08-01")),
+            bin(col_ref(&column), BinOp::Lt, folded("2021-09-01")),
+        ];
+        let n = names();
+        assert!(
+            check_containment(&query, &mv, &n, &n)
+                .expect("equal VARCHAR ranges")
+                .compensation
+                .is_empty()
+        );
+        let between = |upper: &str| TypedExpr {
+            kind: ExprKind::Between {
+                expr: novarocks_parser::ast::AstBox::new(col_ref(&column)),
+                low: novarocks_parser::ast::AstBox::new(folded("2021-08-05")),
+                high: novarocks_parser::ast::AstBox::new(folded(upper)),
+                negated: false,
+            },
+            value_type: FunctionValueType::new(DataType::Boolean, true),
+        };
+        assert_eq!(
+            check_containment(&[between("2021-08-20")], &mv, &n, &n)
+                .expect("contained VARCHAR range")
+                .compensation
+                .len(),
+            1
+        );
+        assert!(check_containment(&[between("2021-09-01")], &mv, &n, &n).is_none());
     }
 
     #[test]

@@ -15,96 +15,82 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Test Objective:
--- Keep complete-group TopN results reachable independently of the unsupported
--- Global ordered-filter queries earlier in compressed_key.sql. Preserve that
--- case and its original results; this case does not qualify its skipped tail.
--- Inputs: the original 24-column table, 30002 rows, DOP 2, and concat limit.
--- Oracle: verbatim compressed_key.result blocks 137-140, with markers mapped
--- to 8-11. No expected value is recorded from this implementation.
--- Maintained by the aggregate/runtime-filter owners; run with the aggregate
--- suite when those owners change and before merging related changes. The SQL
--- runner owns case database isolation, suite cleanup, and cluster shutdown.
+-- @order_sensitive=true
+-- Check complete groups under ordered LIMIT with DOP 2. The expected keys
+-- and counts are calculated from the input sequence and the two inserted rows.
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
 
--- name: test_agg_compressed_key
 -- query 2
 -- @skip_result_check=true
-USE ${case_db};
-create table all_t0 (
-    c1 tinyint,
-    c2 smallint,
-    c3 int,
-    c4 bigint,
-    c5 largeint,
-    c6 date,
+CREATE TABLE ${case_db}.all_t0 (
+    c1 TINYINT,
+    c2 SMALLINT,
+    c3 INTEGER,
+    c6 DATE,
     c7 TIMESTAMP(6),
     c8 VARCHAR,
     c9 VARCHAR,
-    c10 char(100),
-    c11 REAL,
-    c12 double,
-    c13 tinyint NOT NULL,
-    c14 smallint NOT NULL,
-    c15 int NOT NULL,
-    c16 bigint NOT NULL,
-    c17 largeint NOT NULL,
-    c18 date NOT NULL,
-    c19 TIMESTAMP(6) NOT NULL,
-    c20 VARCHAR NOT NULL,
-    c21 VARCHAR NOT NULL,
-    c22 char(100) NOT NULL,
-    c23 REAL NOT NULL,
-    c24 double NOT NULL
+    c13 TINYINT NOT NULL,
+    c14 SMALLINT NOT NULL,
+    c15 INTEGER NOT NULL
 ) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
-USE ${case_db};
--- The compact calendar inputs in this range have midnight time parts.
-insert into all_t0 SELECT x%200, x%200, x%200, x%200, x%200, x, CAST(CAST(x AS DATE) AS TIMESTAMP(6)), x%200, x, x, x, x, x % 8, x % 8, x % 16, x %200, x%200, '2020-02-02', '2020-02-02', x%200, x, x, x, x FROM TABLE(sequence(1,  30000)) as g(x);
+INSERT INTO ${case_db}.all_t0
+SELECT CAST(x % 200 - 100 AS TINYINT),
+       CAST(x % 200 AS SMALLINT),
+       CAST(x % 200 AS INTEGER),
+       date_add('day', x % 200, DATE '2000-01-01'),
+       date_add('day', x % 200, TIMESTAMP '2000-01-01 00:00:00.000000'),
+       CAST(x % 200 AS VARCHAR),
+       CAST(x AS VARCHAR),
+       CAST(x % 8 AS TINYINT),
+       CAST(x % 8 AS SMALLINT),
+       CAST(x % 16 AS INTEGER)
+FROM TABLE(sequence(1, 30000)) AS g(x);
 
 -- query 4
 -- @skip_result_check=true
-USE ${case_db};
-insert into all_t0 values ROW(null, null, null, null, null, null, null, null, null, null, null, null, -1,-2,-3,-4,-5, '2000-01-28', '2000-01-28', 'literal', 'literal', 'literal', -1, -1);
+INSERT INTO ${case_db}.all_t0 VALUES ROW(NULL, NULL, NULL, NULL, NULL, NULL, NULL, -1, -2, -3);
 
 -- query 5
 -- @skip_result_check=true
-USE ${case_db};
-insert into all_t0 values ROW(-1, -2, -3, null, null, null, null, null, null, null, null, null, -1,-2,-3,-4,-5, '2000-01-28', '2000-01-28', 'literal', 'literal', 'literal', -1, -1);
+INSERT INTO ${case_db}.all_t0 VALUES ROW(-1, -2, -3, NULL, NULL, NULL, NULL, -1, -2, -3);
 
 -- query 6
 -- @skip_result_check=true
-USE ${case_db};
 SET SESSION pipeline_dop = 2;
 
 -- query 7
--- @skip_result_check=true
-USE ${case_db};
+SELECT COUNT(*) AS input_rows FROM ${case_db}.all_t0;
 
 -- query 8
-USE ${case_db};
-WITH result AS (
-    SELECT c1, c2, c3, COUNT() AS cnt FROM all_t0 GROUP BY c1, c2, c3 ORDER BY c1, c2, c3 LIMIT 100
-) SELECT 'Test Case 39' AS test_name, LOWER(TO_HEX(MD5(TO_UTF8(LISTAGG(CAST(CAST(CAST(c1 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c2 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c3 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS VARCHAR) AS BOOLEAN) AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(CAST(CAST(c1 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c2 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c3 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS VARCHAR) AS BOOLEAN) AS VARCHAR)))))) AS result_hash FROM result;
+SELECT c1, c2, c3, COUNT(*) AS cnt
+FROM ${case_db}.all_t0
+GROUP BY c1, c2, c3
+ORDER BY c1 NULLS FIRST, c2, c3
+LIMIT 100;
 
 -- query 9
-USE ${case_db};
-WITH result AS (
-    SELECT c6, c7, c8, COUNT() AS cnt FROM all_t0 GROUP BY c6, c7, c8 ORDER BY c6, c7, c8 LIMIT 100
-) SELECT 'Test Case 40' AS test_name, LOWER(TO_HEX(MD5(TO_UTF8(LISTAGG(CAST(CAST(CAST(c6 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c7 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(c8 AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS VARCHAR) AS BOOLEAN) AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(CAST(CAST(c6 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c7 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(c8 AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS VARCHAR) AS BOOLEAN) AS VARCHAR)))))) AS result_hash FROM result;
+SELECT c6, c7, c8, COUNT(*) AS cnt
+FROM ${case_db}.all_t0
+GROUP BY c6, c7, c8
+ORDER BY c6 NULLS FIRST, c7, c8
+LIMIT 100;
 
 -- query 10
-USE ${case_db};
-WITH result AS (
-    SELECT c13, c14, c15, COUNT() AS cnt FROM all_t0 GROUP BY c13, c14, c15 ORDER BY c13, c14, c15 LIMIT 100
-) SELECT 'Test Case 42' AS test_name, LOWER(TO_HEX(MD5(TO_UTF8(LISTAGG(CAST(CAST(CAST(c13 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c14 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c15 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS VARCHAR) AS BOOLEAN) AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(CAST(CAST(c13 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c14 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c15 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS VARCHAR) AS BOOLEAN) AS VARCHAR)))))) AS result_hash FROM result;
+SELECT c13, c14, c15, COUNT(*) AS cnt
+FROM ${case_db}.all_t0
+GROUP BY c13, c14, c15
+ORDER BY c13, c14, c15
+LIMIT 100;
 
 -- query 11
-USE ${case_db};
-WITH result AS (
-    SELECT c9, COUNT() AS cnt FROM all_t0 GROUP BY c9 ORDER BY c9 LIMIT 100
-) SELECT 'Test Case 51' AS test_name, LOWER(TO_HEX(MD5(TO_UTF8(LISTAGG(CAST(CAST(c9 AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS VARCHAR) AS BOOLEAN) AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(CAST(c9 AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS VARCHAR) AS BOOLEAN) AS VARCHAR)))))) AS result_hash FROM result;
+SELECT c9, COUNT(*) AS cnt
+FROM ${case_db}.all_t0
+GROUP BY c9
+ORDER BY c9 NULLS FIRST
+LIMIT 100;

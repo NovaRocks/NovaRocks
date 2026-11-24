@@ -13,3 +13,13 @@ _col0
 -- types	integer	varchar
 k1	v1
 10	z
+
+-- query 7
+-- types	bigint
+matching_tables
+1
+
+-- query 9
+-- types	bigint
+matching_tables
+0
