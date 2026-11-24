@@ -14,50 +14,35 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Original corpus source author and permanent complete-compiler expectation.
+//! SQL binding and complete local compilation for array struct field access.
 use arrow::datatypes::{DataType, Field};
 use novarocks_expression_contract::ExprKind;
 use novarocks_physical_plan::FunctionArgumentType;
 use novarocks_physical_plan::StaticFunctionArgument;
 
-const CORPUS: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/sql/correctness/aggregate/sql/agg_topk_extrema_misc_semantics.sql"
-));
-fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
-    let first = CORPUS
-        .split_once("WITH w1 AS (")
-        .unwrap()
-        .1
-        .split_once("-- query 2")
-        .unwrap()
-        .0;
-    let second = CORPUS
-        .split_once("-- query 2")
-        .unwrap()
-        .1
-        .split_once("-- query 3")
-        .unwrap()
-        .0;
-    [format!("WITH w1 AS ({first}"), second.to_owned()]
-        .into_iter()
-        .map(|sql| {
-            let fields = [
-                ("id", DataType::Int32),
-                ("grp", DataType::Int32),
-                ("v", DataType::Int32),
-                ("txt", DataType::Utf8),
-                ("flag", DataType::Boolean),
-                ("big_v", DataType::Int64),
-                ("w", DataType::Int64),
-            ]
-            .map(|(name, ty)| Field::new(name, ty, true));
-            super::sql_test_source::sql_source_with_declared_fields(
-                sql.replace("${case_db}", "fixture").trim(),
-                &fields,
-            )
-        })
-        .collect()
+fn sources() -> [novarocks_sql::compiler::SqlAuthoredPhysicalPlan; 2] {
+    use std::sync::Arc;
+
+    let item = DataType::Struct(
+        vec![
+            Field::new("item", DataType::Int32, true),
+            Field::new("count", DataType::Int64, false),
+        ]
+        .into(),
+    );
+    let fields = [
+        Field::new("grp", DataType::Int32, true),
+        Field::new(
+            "entries",
+            DataType::List(Arc::new(Field::new("item", item, true))),
+            true,
+        ),
+    ];
+    [
+        "SELECT __array_struct_subfield(entries, 'item') FROM fixture.source",
+        "SELECT grp, __array_struct_subfield(entries, 'item') FROM fixture.source ORDER BY grp",
+    ]
+    .map(|sql| super::sql_test_source::sql_source_with_declared_fields(sql, &fields))
 }
 #[test]
 fn array_struct_subfield_actual_required_sql_full_binding_source() {
@@ -132,7 +117,7 @@ fn array_struct_subfield_actual_required_sql_full_binding_source() {
         }
         assert!(
             seen > 0,
-            "actual SQL lambda lowering must publish its projection call"
+            "SQL field projection must publish its array struct subfield call"
         );
     }
 }
@@ -146,7 +131,7 @@ fn array_struct_subfield_actual_required_sql_compiler_closure() {
         assert!(!results.is_empty());
         for (fragment, program) in results {
             program.unwrap_or_else(|error| {
-                panic!("complete top-k required fragment {fragment:?}: {error:?}")
+                panic!("array struct field projection fragment {fragment:?}: {error:?}")
             });
         }
     }

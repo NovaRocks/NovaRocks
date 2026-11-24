@@ -1542,7 +1542,12 @@ impl<'a> AnalyzerContext<'a> {
             .collect::<Result<Vec<_>, AnalyzeError>>()?;
         for (ordinal, column) in output_cols.iter().enumerate() {
             let temporal = column.value_type.value_type().temporal().is_some();
-            if !temporal && self.factory.borrow().prepared_description.is_none() {
+            let temporal_array = matches!(
+                column.value_type.value_type().kind(),
+                novarocks_type_contract::ValueKind::List(item) if item.contains_temporal()
+            );
+            if !temporal && !temporal_array && self.factory.borrow().prepared_description.is_none()
+            {
                 continue;
             }
             for (row, source) in resolved_rows.iter_mut().zip(values.rows.iter()) {
@@ -1554,7 +1559,27 @@ impl<'a> AnalyzerContext<'a> {
                 if !matches!(source, ast::Expr::Row(_)) {
                     self.observe_implicit_type(cell, &column.value_type)?;
                 }
-                if temporal && !cell.value_type.same_value_domain(&column.value_type) {
+                if temporal_array
+                    && matches!(cell.value_type.data_type(), DataType::List(_))
+                    && !cell.value_type.same_value_domain(&column.value_type)
+                    && novarocks_type_contract::array_common_coercion_types_valid_observed(
+                        &cell.value_type,
+                        &column.value_type,
+                        || self.check_control(),
+                    )?
+                {
+                    // Freeze the exact conversion of UNKNOWN array elements before
+                    // lowering VALUES. A physical carrier cast cannot author a
+                    // nested temporal declaration.
+                    *cell = value_conversion::coerce_array_common_argument(
+                        self.function_catalog,
+                        cell.clone(),
+                        &column.value_type,
+                        self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                        self.constant_policy,
+                        self.control,
+                    )?;
+                } else if temporal && !cell.value_type.same_value_domain(&column.value_type) {
                     *cell = self.cast_to_value_type(
                         cell.clone(),
                         column.value_type.clone(),

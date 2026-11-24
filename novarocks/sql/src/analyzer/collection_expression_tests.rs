@@ -813,3 +813,40 @@ fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly()
         crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
     );
 }
+
+#[test]
+fn values_unknown_array_elements_use_the_exact_temporal_array_target() {
+    use crate::analysis::ExprKind;
+    use novarocks_functions::builtin::value_conversion::ARRAY_COMMON_COERCION;
+
+    let control = SqlCompileControl::unbounded();
+    let ctx = context(&control);
+    let query =
+        query("VALUES (ARRAY[TIMESTAMP '1970-01-01 00:00:00.000000']), (ARRAY[]), (ARRAY[NULL])");
+    let ast::SetExpr::Values(values) = query.body.as_ref() else {
+        panic!("VALUES fixture");
+    };
+    let (resolved, columns) = ctx.analyze_values(values).unwrap();
+    let target = &columns[0].value_type;
+    assert!(
+        target
+            .child_at(0)
+            .unwrap()
+            .value_type()
+            .temporal()
+            .is_some()
+    );
+
+    for row in &resolved.rows[1..] {
+        let cell = &row[0];
+        assert_eq!(&cell.value_type, target);
+        let ExprKind::FunctionCall { binding, args, .. } = &cell.kind else {
+            panic!("VALUES freezes its original array common conversion");
+        };
+        assert_eq!(binding.selected.overload.as_str(), ARRAY_COMMON_COERCION);
+        assert_eq!(
+            args[0].value_type.child_at(0).unwrap().data_type(),
+            &DataType::Null
+        );
+    }
+}

@@ -23,7 +23,9 @@ use crate::analysis::TypedExpr;
 use crate::analyze_error::AnalyzeError;
 use crate::compiler::{SqlCompileControl, SqlCompileError, SqlWriteAssignmentSite};
 use novarocks_parser::Span;
-use novarocks_type_contract::{CheckedWriteInputProjection, CompilePhase, PureCompileControl};
+use novarocks_type_contract::{
+    CheckedWriteInputProjection, CompilePhase, PureCompileControl, ValueKind,
+};
 
 impl super::AnalyzerContext<'_> {
     pub(super) fn bind_write_assignment_value(
@@ -74,6 +76,7 @@ pub(crate) fn bind_write_assignment_value(
     // Exact writer declarations cannot smuggle a byte-width conversion
     // through ordinary safe CAST, which would turn bad widths into NULL.
     let mut fixed_target = false;
+    let mut map_target = false;
     novarocks_type_contract::visit_value_type_observed(site.input().value_type(), |event| {
         control
             .checkpoint(CompilePhase::Validate, 1)
@@ -81,10 +84,9 @@ pub(crate) fn bind_write_assignment_value(
         if let novarocks_type_contract::ValueSemanticVisit::Node(value) = event {
             fixed_target |= matches!(
                 value.kind(),
-                novarocks_type_contract::ValueKind::Scalar(
-                    arrow::datatypes::DataType::FixedSizeBinary(_)
-                )
+                ValueKind::Scalar(arrow::datatypes::DataType::FixedSizeBinary(_))
             );
+            map_target |= matches!(value.kind(), ValueKind::Map { .. });
         }
         Ok::<_, AnalyzeError>(())
     })?;
@@ -123,7 +125,20 @@ pub(crate) fn bind_write_assignment_value(
     let target = super::declaration_widening::widen_declaration(site.input(), control)
         .map_err(original_analysis_error)?;
     use novarocks_functions::builtin::value_conversion::temporal_write_assignment_matches;
-    let converted = if temporal_write_assignment_matches(&source.value_type, &target, control)
+    let converted = if map_target
+        && source.value_type.data_type() == &arrow::datatypes::DataType::Null
+    {
+        // The strict NULL lift preserves the original source evaluation. Its
+        // typed result does not require a guarded interleave of MAP values.
+        super::value_conversion::convert_value_domain_with_catalog(
+            catalog,
+            source,
+            target,
+            settings.sql_mode().decimal_overflow_policy(),
+            constant_policy,
+            control,
+        )?
+    } else if temporal_write_assignment_matches(&source.value_type, &target, control)
         .map_err(AnalyzeError::function_binding)?
     {
         bind_nested_temporal_assignment(
