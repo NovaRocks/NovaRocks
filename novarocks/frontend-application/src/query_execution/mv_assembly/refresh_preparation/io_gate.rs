@@ -25,7 +25,7 @@ use novarocks_spi::connector::ConnectorOperationControl;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
@@ -258,6 +258,7 @@ pub(crate) struct MvRefreshPreparationIo {
     original: ConnectorOriginalResultScope,
     admission: Arc<MvPublicationAdmissionReceiving>,
     registration: Arc<CurrentProjectionRegistration>,
+    marker_registration: OnceLock<Arc<CurrentProjectionRegistration>>,
     metadata_result: Mutex<Option<Result<ConnectorTablePreparation, ConnectorError>>>,
     view_result:
         Mutex<Option<Result<novarocks_spi::connector::ConnectorViewPreparation, ConnectorError>>>,
@@ -305,6 +306,7 @@ impl MvRefreshPreparationIo {
             original,
             admission: Arc::new(MvPublicationAdmissionReceiving::new()),
             registration: Arc::new(CurrentProjectionRegistration::new()),
+            marker_registration: OnceLock::new(),
             metadata_result: Mutex::new(None),
             view_result: Mutex::new(None),
             source_result: Mutex::new(None),
@@ -503,6 +505,16 @@ impl MvRefreshPreparationIo {
                         .await;
                         let result = match result {
                             Ok(Some(marker)) => {
+                                // A metadata-only renewal may already have consumed the
+                                // initial Current. Marker settlement owns a new observation.
+                                let gate = original_gate
+                                    .upgrade()
+                                    .expect("original MV gate outlives marker settlement");
+                                let marker_registration =
+                                    Arc::clone(gate.marker_registration.get_or_init(|| {
+                                        Arc::new(CurrentProjectionRegistration::new())
+                                    }));
+                                drop(gate);
                                 let readiness = source
                                     .readiness()
                                     .in_requests(Arc::clone(&services.requests));
@@ -514,7 +526,7 @@ impl MvRefreshPreparationIo {
                                                 readiness: &readiness,
                                                 connector_control: source.connector_control(),
                                                 metadata_cpu: &current_metadata_cpu,
-                                                registration: &registration,
+                                                registration: &marker_registration,
                                             },
                                             catalog,
                                             expected,
@@ -1291,8 +1303,10 @@ impl MvRefreshPreparationIo {
     pub(crate) fn local_health_failure(
         &self,
     ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
-        if let Some(health) = self.registration.local_health_failure() {
-            return Some(health);
+        for registration in self.current_registrations() {
+            if let Some(health) = registration.local_health_failure() {
+                return Some(health);
+            }
         }
         let scan_cpu = self
             .source_result
@@ -1371,16 +1385,23 @@ impl MvRefreshPreparationIo {
             }
         }
         drop(retained);
-        let _ = self.registration.poll_progress(cx);
-        if self.registration.poll_registration_closed(cx).is_pending() {
-            return Poll::Pending;
-        }
-        if let Some(health) = self.registration.local_health_failure() {
-            return Poll::Ready(Err(health));
+        for registration in self.current_registrations() {
+            let _ = registration.poll_progress(cx);
+            if registration.poll_registration_closed(cx).is_pending() {
+                return Poll::Pending;
+            }
+            if let Some(health) = registration.local_health_failure() {
+                return Poll::Ready(Err(health));
+            }
         }
         // Original source owners remain here until the containing Action has
         // received this proof and actually disposes this Source outside locks.
         Poll::Ready(Ok(()))
+    }
+
+    fn current_registrations(&self) -> impl Iterator<Item = &CurrentProjectionRegistration> {
+        std::iter::once(self.registration.as_ref())
+            .chain(self.marker_registration.get().map(Arc::as_ref))
     }
 }
 
