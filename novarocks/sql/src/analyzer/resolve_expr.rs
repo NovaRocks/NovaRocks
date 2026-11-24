@@ -9093,52 +9093,65 @@ mod tests {
     }
 
     #[test]
-    fn nested_decimal_cast_preserves_array_admission_and_map_row_capability_errors() {
-        for sql in [
-            "SELECT CAST(MAP(ARRAY[1], ARRAY[DECIMAL '123.5']) AS MAP(INTEGER, DECIMAL(3,0)))",
-            "SELECT CAST(ROW(DECIMAL '123.5') AS ROW(a DECIMAL(3,0)))",
-        ] {
-            let query = novarocks_parser::parser::parse_query(sql).unwrap();
-            let error = super::super::analyze_with_function_catalog_and_sql_semantics(
-                &query,
-                &EmptyCatalog,
-                "default",
-                crate::functions::builtin_sql_function_catalog(),
-                &crate::sql_mode::SqlSemanticSettings::default(),
-                crate::constant::test_constant_policy(),
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap_err();
-            assert_eq!(
-                error.kind(),
-                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
-            );
-            assert!(
-                error
-                    .message()
-                    .contains("cast requires an implemented exact Physical scalar domain"),
-                "{error}"
-            );
-            assert_eq!(
-                error.span(),
-                Some(novarocks_parser::Span::new(7, sql.len()))
-            );
-        }
+    fn nested_decimal_cast_admits_array_and_map_and_refuses_row_child_conversion() {
         use novarocks_type_contract::TrinoCastMode;
+
+        let sql = "SELECT CAST(ROW(DECIMAL '123.5') AS ROW(a DECIMAL(3,0)))";
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
+        let error = super::super::analyze_with_function_catalog_and_sql_semantics(
+            &query,
+            &EmptyCatalog,
+            "default",
+            crate::functions::builtin_sql_function_catalog(),
+            &crate::sql_mode::SqlSemanticSettings::default(),
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert!(
+            error
+                .message()
+                .contains("cast requires an implemented exact Physical scalar domain"),
+            "{error}"
+        );
+        assert_eq!(
+            error.span(),
+            Some(novarocks_parser::Span::new(7, sql.len()))
+        );
+
         for (name, mode) in [
             ("CAST", TrinoCastMode::Explicit),
             ("TRY_CAST", TrinoCastMode::Try),
         ] {
-            let sql = format!("SELECT {name}(ARRAY[DECIMAL '123.5'] AS ARRAY(DECIMAL(3,0)))");
-            let expression = analyze_projection_expr(&sql).unwrap();
-            assert!(
-                matches!(expression.kind, ExprKind::Cast { cast_mode: Some(actual), .. } if actual == mode)
-            );
-            assert_eq!(
-                expression.value_type.child_at(0).unwrap().data_type(),
-                &DataType::Decimal128(3, 0)
-            );
-            assert_eq!(expression.value_type.nullable(), mode == TrinoCastMode::Try);
+            for (source, target, child) in [
+                ("ARRAY[DECIMAL '123.5']", "ARRAY(DECIMAL(3,0))", 0),
+                (
+                    "MAP(ARRAY[1], ARRAY[DECIMAL '123.5'])",
+                    "MAP(INTEGER, DECIMAL(3,0))",
+                    1,
+                ),
+            ] {
+                let sql = format!("SELECT {name}({source} AS {target})");
+                let expression = analyze_projection_expr(&sql).unwrap();
+                assert!(
+                    matches!(expression.kind, ExprKind::Cast { cast_mode: Some(actual), .. } if actual == mode),
+                    "{sql}"
+                );
+                assert_eq!(
+                    expression.value_type.child_at(child).unwrap().data_type(),
+                    &DataType::Decimal128(3, 0),
+                    "{sql}"
+                );
+                assert_eq!(
+                    expression.value_type.nullable(),
+                    mode == TrinoCastMode::Try,
+                    "{sql}"
+                );
+            }
         }
     }
 

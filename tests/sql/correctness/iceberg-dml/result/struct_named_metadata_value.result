@@ -1,6 +1,6 @@
 -- query 2
--- legacy
+-- types	integer	varchar	varchar	boolean
 id	metadata_hex	value_hex	whole_null
-1	0100	FF00	0
-2	NULL		0
-3	NULL	NULL	1
+1	0100	FF00	false
+2	NULL	""	false
+3	NULL	NULL	true

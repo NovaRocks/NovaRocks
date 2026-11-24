@@ -909,8 +909,7 @@ mod scalar_domain_tests {
             panic!("struct output")
         };
         assert_eq!(fields[0].data_type(), &DataType::Null);
-        assert_eq!(fields[0].name(), "col1");
-        assert_eq!(fields[1].name(), "col2");
+        assert!(fields.iter().all(|field| field.name().is_empty()));
         assert!(fields[1].metadata().as_arc().is_none());
         assert_eq!(
             domain_at(&expression, &[1]),
@@ -1386,7 +1385,7 @@ mod scalar_domain_tests {
             panic!("struct");
         };
         assert_eq!(fields[0].data_type(), &DataType::Null);
-        assert_eq!(fields[1].name(), "col2");
+        assert!(fields[1].name().is_empty());
         assert!(fields[1].metadata().as_arc().is_none());
         assert_eq!(
             domain_at(&adapted, &[1]),
@@ -1683,24 +1682,18 @@ mod scalar_domain_tests {
     #[test]
     fn m07_scalar_null_companion_retains_actual_null_and_independent_marker() {
         let expressions = output_expressions("select ROW(NULL,b),ROW(NULL,p) from t");
-        for (expression, marker, names) in [
-            (
-                &expressions[0],
-                novarocks_type_contract::ValueLogicalType::Bitmap,
-                ["col1", "col2"],
-            ),
-            (
-                &expressions[1],
-                novarocks_type_contract::ValueLogicalType::Percentile,
-                ["col1", "col2"],
-            ),
-        ] {
+        use novarocks_type_contract::ValueLogicalType;
+        assert_eq!(expressions.len(), 2);
+        for (expression, marker) in expressions
+            .iter()
+            .zip([ValueLogicalType::Bitmap, ValueLogicalType::Percentile])
+        {
             let DataType::Struct(fields) = &expression.value_type.data_type() else {
                 panic!("expected struct")
             };
             assert_eq!(fields[0].data_type(), &DataType::Null);
-            assert_eq!(fields[0].name(), names[0]);
-            assert_eq!(fields[1].name(), names[1]);
+            assert_eq!(fields.len(), 2);
+            assert!(fields.iter().all(|field| field.name().is_empty()));
             assert!(fields[1].metadata().as_arc().is_none());
             assert_eq!(domain_at(expression, &[1]), Some(marker));
         }
@@ -1771,7 +1764,7 @@ mod scalar_domain_tests {
             vec![
                 Some(SqlType::Array(Box::new(SqlType::Hll))),
                 Some(SqlType::Struct(vec![(
-                    "col1".into(),
+                    String::new(),
                     SqlType::Struct(vec![
                         ("json".into(), SqlType::Json),
                         ("bitmap".into(), SqlType::Bitmap)
@@ -2238,13 +2231,17 @@ mod scalar_domain_tests {
     }
     #[test]
     fn structure_projection_case_collisions_fail_at_analysis_and_unique_case_keeps_domain() {
-        for sql in [
-            r#"SELECT s.id FROM (SELECT CAST(ROW(1,2) AS ROW("ID" INTEGER,"id" INTEGER)) s) t"#,
-            r#"SELECT __array_struct_subfield(ARRAY[CAST(ROW(1,2) AS ROW("ID" INTEGER,"id" INTEGER))],'id')"#,
-        ] {
-            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
-            assert!(error.to_string().contains("ambiguous"), "{sql}: {error}");
-        }
+        let direct =
+            r#"SELECT s.id FROM (SELECT CAST(ROW(1,2) AS ROW("ID" INTEGER,"id" INTEGER)) s) t"#;
+        let error = super::super::analyze(&query(direct), &Catalog, "db").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::AmbiguousName
+        );
+
+        let mapped = r#"SELECT __array_struct_subfield(ARRAY[CAST(ROW(1,2) AS ROW("ID" INTEGER,"id" INTEGER))],'id')"#;
+        let error = super::super::analyze(&query(mapped), &Catalog, "db").unwrap_err();
+        assert!(error.message().contains("ambiguous"), "{mapped}: {error}");
         let expression =
             output_expressions("SELECT __array_struct_subfield(ARRAY[r],'bItMaP') FROM t")
                 .remove(0);

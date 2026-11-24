@@ -4193,8 +4193,8 @@ mod tests {
         // The original physical declaration author removes nested annotations;
         // provider raw facts and canonical function FVT remain separate checks.
         let expected_source = FunctionValueType::new(catalog.struct_type.clone(), false);
-        // The original Functions subfield owner declares its result nullable.
-        let expected_field = FunctionValueType::new(DataType::Int32, true);
+        // Both the provider's ROW and its selected field are required.
+        let expected_field = FunctionValueType::new(DataType::Int32, false);
         let expected_qualified = FunctionValueType::new(DataType::Utf8, true);
 
         for (sql, struct_access) in [
