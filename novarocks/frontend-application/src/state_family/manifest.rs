@@ -201,7 +201,7 @@ mod tests {
     use super::super::classification::WipeEntry;
     use super::*;
 
-    /// Five Frontend families: two in-process `Accelerator` and
+    /// Four Frontend families: one in-process `Accelerator` and
     /// three `ProcessRuntime`.
     ///
     /// Backend desired state is deliberately absent. It was registered while
@@ -213,8 +213,8 @@ mod tests {
     fn manifest_registers_exactly_the_spec_family_table() {
         assert_eq!(
             StateFamily::ALL.len(),
-            5,
-            "the manifest registers five frontend state families"
+            4,
+            "the manifest registers four frontend state families"
         );
 
         let mut process_runtime = 0;
@@ -228,7 +228,7 @@ mod tests {
             }
         }
 
-        assert_eq!(accelerator, 2, "schema cache, statistics artifact cache");
+        assert_eq!(accelerator, 1, "statistics artifact cache");
         assert_eq!(process_runtime, 3, "local views, DML, backend observations");
     }
 
