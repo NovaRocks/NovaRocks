@@ -26,10 +26,22 @@ use crate::common::OutputColumn;
 use crate::optimizer::operator::{ExceptOp, IntersectOp, UnionOp};
 use crate::optimizer::property::{DistributionSpec, HashSource, OrderingSpec, PhysicalPropertySet};
 use crate::optimizer::scalar::ScalarArena;
+use novarocks_type_contract::PartitionHashAlgorithm;
 
 use super::{DeriveOutput, DeriveRequired};
 
-fn columns_to_shuffle_join_property(columns: &[OutputColumn]) -> PhysicalPropertySet {
+fn set_hash_source(comparison_columns: &[OutputColumn]) -> HashSource {
+    match PartitionHashAlgorithm::for_grouping_keys(
+        comparison_columns
+            .iter()
+            .map(|column| column.value_type.data_type()),
+    ) {
+        PartitionHashAlgorithm::NativeExchangeV2 => HashSource::MapSet,
+        _ => HashSource::ShuffleJoin,
+    }
+}
+
+fn set_distribution(columns: &[OutputColumn], source: HashSource) -> PhysicalPropertySet {
     let mut ids = Vec::with_capacity(columns.len());
     for column in columns {
         if column.column_id == crate::column_id::ColumnId::UNSET {
@@ -41,10 +53,7 @@ fn columns_to_shuffle_join_property(columns: &[OutputColumn]) -> PhysicalPropert
         PhysicalPropertySet::gather()
     } else {
         PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned {
-                cols: ids,
-                source: HashSource::ShuffleJoin,
-            },
+            distribution: DistributionSpec::HashPartitioned { cols: ids, source },
             ordering: OrderingSpec::Any,
         }
     }
@@ -52,14 +61,16 @@ fn columns_to_shuffle_join_property(columns: &[OutputColumn]) -> PhysicalPropert
 
 fn set_op_required(
     child_output_columns: &[Vec<OutputColumn>],
+    comparison_columns: &[OutputColumn],
     n: usize,
 ) -> Vec<PhysicalPropertySet> {
     if child_output_columns.len() != n {
         return vec![PhysicalPropertySet::gather(); n];
     }
+    let source = set_hash_source(comparison_columns);
     child_output_columns
         .iter()
-        .map(|columns| columns_to_shuffle_join_property(columns))
+        .map(|columns| set_distribution(columns, source))
         .collect()
 }
 
@@ -72,7 +83,7 @@ impl DeriveOutput for UnionOp {
         if self.all {
             PhysicalPropertySet::any()
         } else {
-            columns_to_shuffle_join_property(&self.output_columns)
+            set_distribution(&self.output_columns, set_hash_source(&self.output_columns))
         }
     }
 }
@@ -87,7 +98,7 @@ impl DeriveRequired for UnionOp {
         if self.all {
             vec![PhysicalPropertySet::any(); n]
         } else {
-            set_op_required(&self.child_output_columns, n)
+            set_op_required(&self.child_output_columns, &self.output_columns, n)
         }
     }
 }
@@ -98,7 +109,7 @@ impl DeriveOutput for IntersectOp {
         _scalars: &ScalarArena,
         _children: &[&PhysicalPropertySet],
     ) -> PhysicalPropertySet {
-        columns_to_shuffle_join_property(&self.output_columns)
+        set_distribution(&self.output_columns, set_hash_source(&self.output_columns))
     }
 }
 
@@ -109,7 +120,7 @@ impl DeriveRequired for IntersectOp {
         _parent: &PhysicalPropertySet,
         n: usize,
     ) -> Vec<PhysicalPropertySet> {
-        set_op_required(&self.child_output_columns, n)
+        set_op_required(&self.child_output_columns, &self.output_columns, n)
     }
 }
 
@@ -119,7 +130,7 @@ impl DeriveOutput for ExceptOp {
         _scalars: &ScalarArena,
         _children: &[&PhysicalPropertySet],
     ) -> PhysicalPropertySet {
-        columns_to_shuffle_join_property(&self.output_columns)
+        set_distribution(&self.output_columns, set_hash_source(&self.output_columns))
     }
 }
 
@@ -130,7 +141,7 @@ impl DeriveRequired for ExceptOp {
         _parent: &PhysicalPropertySet,
         n: usize,
     ) -> Vec<PhysicalPropertySet> {
-        set_op_required(&self.child_output_columns, n)
+        set_op_required(&self.child_output_columns, &self.output_columns, n)
     }
 }
 
@@ -197,6 +208,45 @@ mod tests {
                 source: HashSource::ShuffleJoin,
             }
         );
+    }
+
+    #[test]
+    fn map_set_distribution_uses_the_aligned_key_domain_for_both_branches() {
+        use arrow::datatypes::Field;
+        use std::sync::Arc;
+
+        let mut comparison = col(10, "key");
+        comparison.value_type = novarocks_type_contract::FunctionValueType::new(
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Int64, false),
+                            Field::new("value", DataType::Int64, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        );
+        let mut unknown = col(20, "key");
+        unknown.value_type = novarocks_type_contract::FunctionValueType::new(DataType::Null, true);
+        let op = ExceptOp {
+            output_columns: vec![comparison.clone()],
+            child_output_columns: vec![vec![comparison], vec![unknown]],
+        };
+        let requirements = op.derive_required(&ScalarArena::new(), &PhysicalPropertySet::any(), 2);
+        for (index, requirement) in requirements.into_iter().enumerate() {
+            let id = ColumnId(if index == 0 { 10 } else { 20 });
+            assert_eq!(
+                requirement.distribution,
+                DistributionSpec::hash_partitioned([id], HashSource::MapSet)
+            );
+        }
     }
 
     #[test]

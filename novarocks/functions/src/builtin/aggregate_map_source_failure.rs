@@ -26,19 +26,23 @@ use std::{fmt, num::NonZeroU16};
 enum MapAggregateFailure {
     Contract(BoundedDetail),
     Constructor(ArrowError),
+    UnsupportedKey(novarocks_type_contract::UnsupportedKeyType),
 }
 impl fmt::Display for MapAggregateFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Contract(detail) => detail.fmt(f),
             Self::Constructor(source) => write!(f, "map_agg: {source}"),
+            Self::UnsupportedKey(cause) => {
+                write!(f, "map_agg key relation is unavailable for {cause:?}")
+            }
         }
     }
 }
 impl std::error::Error for MapAggregateFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Contract(_) => None,
+            Self::Contract(_) | Self::UnsupportedKey(_) => None,
             Self::Constructor(source) => Some(source),
         }
     }
@@ -49,6 +53,7 @@ impl FailureProjection for MapAggregateFailure {
             Self::Contract(_) => (FailureClass::Invariant, 343),
             Self::Constructor(ArrowError::MemoryError(_)) => (FailureClass::Resource, 345),
             Self::Constructor(_) => (FailureClass::Invariant, 344),
+            Self::UnsupportedKey(_) => (FailureClass::Unsupported, 853),
         };
         FailureFact::new(
             class,
@@ -64,6 +69,10 @@ pub(super) fn contract(detail: impl fmt::Display) -> KernelFailure {
 }
 pub(super) fn constructor(source: ArrowError) -> KernelFailure {
     KernelFailure::from_domain(MapAggregateFailure::Constructor(source))
+}
+
+pub(super) fn key_type(cause: novarocks_type_contract::UnsupportedKeyType) -> KernelFailure {
+    KernelFailure::from_domain(MapAggregateFailure::UnsupportedKey(cause))
 }
 
 /// Diagnostic construction is secondary to the already observed whole-value

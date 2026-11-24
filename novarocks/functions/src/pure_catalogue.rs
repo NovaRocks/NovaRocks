@@ -140,7 +140,9 @@ impl PureKernelAbi {
                 kind == FunctionKind::Scalar
                     && matches!(
                         base.argument_control,
-                        ArgumentControl::Eager | ArgumentControl::TypeOnly
+                        ArgumentControl::Eager
+                            | ArgumentControl::TypeOnly
+                            | ArgumentControl::OrderedNull
                     )
             }
             Self::ScalarInvocationV1 => {

@@ -66,6 +66,62 @@ impl Scenario for TypedLayout {
             "original ordered two-row query changed its rows: {result:?}"
         );
         context.action("verified original one-column ordered two-row typed result");
+        let raw = TrinoClient::new(
+            context.trino_port(),
+            context.sql_user(),
+            context.deadline(),
+            &context.scenario_root().join("row-map-http"),
+        )?;
+        let pages = raw.execute(
+            r#"SELECT ROW(7 AS "id", CAST(NULL AS INTEGER), 9) AS payload,
+                MAP(ARRAY[MAP(ARRAY[2, 1], ARRAY['a"b', 'x=y,{z}'])], ARRAY[7]) AS keyed"#,
+        )?;
+        let mut columns = None;
+        let mut rows = Vec::new();
+        for page in &pages {
+            let value = page.json()?;
+            ensure!(
+                page.status == 200 && value.get("error").is_none(),
+                "ROW/MAP result page failed: {value}"
+            );
+            if let Some(page_columns) = value.get("columns") {
+                if let Some(previous) = &columns {
+                    ensure!(
+                        previous == page_columns,
+                        "result metadata changed between pages"
+                    );
+                } else {
+                    columns = Some(page_columns.clone());
+                }
+            }
+            if let Some(data) = value.get("data").and_then(|data| data.as_array()) {
+                rows.extend(data.iter().cloned());
+            }
+        }
+        let columns = columns.context("ROW/MAP result omitted column metadata")?;
+        ensure!(
+            columns[0]["type"] == "row(id integer, integer, integer)"
+                && columns[0]["typeSignature"]["rawType"] == "row"
+                && columns[0]["typeSignature"]["arguments"][0]["value"]["fieldName"]["name"]
+                    == "id"
+                && columns[0]["typeSignature"]["arguments"][1]["kind"] == "NAMED_TYPE"
+                && columns[0]["typeSignature"]["arguments"][1]["value"].get("fieldName")
+                    == Some(&serde_json::Value::Null)
+                && columns[1]["typeSignature"]["rawType"] == "map",
+            "ROW field declarations changed: {columns}"
+        );
+        ensure!(
+            rows == [serde_json::json!([[7, null, 9], {"{2=a\"b, 1=x=y,{z}}": 7}])],
+            "ROW/MAP result changed its field positions or key text: {rows:?}"
+        );
+        let terminal = pages
+            .last()
+            .context("ROW/MAP result omitted its terminal page")?;
+        ensure!(
+            terminal.next_uri()?.is_none() && terminal.json()?["stats"]["state"] == "FINISHED",
+            "ROW/MAP result did not reach its original terminal page"
+        );
+        context.action("verified anonymous ROW declarations and MAP key text on raw Trino pages");
         let deadline = context.deadline();
         context
             .handle()

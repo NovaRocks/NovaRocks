@@ -1354,3 +1354,17 @@ fn cumulative_calls_and_environment_bounds_precede_output_allocation() {
 mod observed_resources_tests {
     include!("../owned_resources/tests.rs");
 }
+
+#[test]
+fn ordered_null_argument_effect_roundtrips_as_its_own_wire_variant() {
+    let encoded = encode_argument_control(ArgumentControl::OrderedNull);
+    assert_eq!(
+        decode_argument_control(&encoded).unwrap(),
+        ArgumentControl::OrderedNull
+    );
+    assert_ne!(
+        encoded,
+        encode_argument_control(ArgumentControl::OrderedRegexp)
+    );
+    assert_ne!(encoded, encode_argument_control(ArgumentControl::Eager));
+}

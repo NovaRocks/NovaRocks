@@ -385,7 +385,7 @@ mod scalar_domain_tests {
         let context = context(factory);
         let call = context
             .type_scalar_call(
-                novarocks_expression::typing::NodeShape::Row,
+                novarocks_expression::typing::NodeShape::Row { fields: None },
                 vec![value],
                 Span::new(0, 0),
             )

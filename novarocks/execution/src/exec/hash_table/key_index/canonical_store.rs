@@ -431,13 +431,20 @@ impl OwnedCanonicalColumn {
                 if stored.row >= encoded.len() {
                     return Err(invariant(ValueViolation::Bounds));
                 }
-                u8::from(canonical_nullable_equals_with_policy_observed::<CONTENT>(
-                    source,
-                    physical,
-                    Some(self.binding.value_type()),
-                    canonical_component_forms(encoded.value(stored.row))?.0,
-                    checkpoint,
-                )?)
+                let comparison = canonical_component_forms(encoded.value(stored.row))?.0;
+                if input.uses_unordered_map(column)? {
+                    u8::from(
+                        input.component_equals::<CONTENT>(column, row, comparison, checkpoint)?,
+                    )
+                } else {
+                    u8::from(canonical_nullable_equals_with_policy_observed::<CONTENT>(
+                        source,
+                        physical,
+                        Some(self.binding.value_type()),
+                        comparison,
+                        checkpoint,
+                    )?)
+                }
             };
         }
         checkpoint()

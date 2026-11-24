@@ -14,11 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! ONE original MAP_ENTRIES Map-to-List projection and original output cast.
+//! MAP_ENTRIES lends the original key and value arrays to the declared row shape.
 use super::array_literal_core::CollectionObservation;
 use super::collection_arrow::{ArrowSite, arrow_failure, contract};
 use crate::KernelFailure;
-use arrow_array::{Array, ArrayRef, ListArray, MapArray};
+use arrow_array::{Array, ArrayRef, ListArray, MapArray, StructArray};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 #[derive(Debug)]
@@ -39,22 +39,44 @@ pub fn project_observed<E>(
         )))
     })?;
     observer(CollectionObservation::OpaqueBoundary).map_err(MapEntriesFailure::Control)?;
-    let entries = Arc::new(map.entries().clone()) as ArrayRef;
+    let operation = |source| {
+        MapEntriesFailure::Operation(arrow_failure("map_entries", ArrowSite::Construct, source))
+    };
+    let (item, entries) = match output_type {
+        Some(DataType::List(item)) => {
+            let DataType::Struct(fields) = item.data_type() else {
+                return Err(MapEntriesFailure::Operation(contract(
+                    "map_entries result item is not ROW",
+                )));
+            };
+            let entries = StructArray::try_new_with_length(
+                fields.clone(),
+                map.entries().columns().to_vec(),
+                map.entries().nulls().cloned(),
+                map.entries().len(),
+            )
+            .map_err(operation)?;
+            (Arc::clone(item), entries)
+        }
+        None => (
+            Arc::new(Field::new("item", map.entries().data_type().clone(), true)),
+            map.entries().clone(),
+        ),
+        _ => {
+            return Err(MapEntriesFailure::Operation(contract(
+                "map_entries result is not ARRAY",
+            )));
+        }
+    };
     let list = ListArray::try_new(
-        Arc::new(Field::new("item", map.entries().data_type().clone(), true)),
+        item,
         map.offsets().clone(),
-        entries,
+        Arc::new(entries),
         map.nulls().cloned(),
     )
-    .map_err(|source| {
-        MapEntriesFailure::Operation(arrow_failure("map_entries", ArrowSite::Construct, source))
-    })?;
-    let out = Arc::new(list) as ArrayRef;
+    .map_err(operation)?;
     observer(CollectionObservation::OpaqueBoundary).map_err(MapEntriesFailure::Control)?;
-    let out = super::collection_arrow::cast_output(out, output_type, "map_entries")
-        .map_err(MapEntriesFailure::Operation)?;
-    observer(CollectionObservation::OpaqueBoundary).map_err(MapEntriesFailure::Control)?;
-    Ok(out)
+    Ok(Arc::new(list))
 }
 /// Raw wrapper uses the same core with no runtime authority or observation.
 pub fn project(

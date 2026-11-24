@@ -574,6 +574,30 @@ fn nested_rows_arrays_and_map_keys_use_their_distinct_projections() {
         vec![r#"[{"AP8=":1}]"#]
     );
 }
+#[test]
+fn map_keys_preserve_entry_positions_and_escape_the_whole_object_text() {
+    let (keys, mut key_field) = map(
+        Arc::new(Int32Array::from(vec![2, 1])),
+        Arc::new(StringArray::from(vec![Some("a\"b"), None])),
+        field(N::SignedInteger(32), false),
+        field(N::String, true),
+    );
+    key_field.nullable = false;
+    let (array, render_field) = map(
+        keys,
+        Arc::new(Int32Array::from(vec![7])),
+        key_field,
+        field(N::SignedInteger(32), false),
+    );
+    assert_eq!(
+        payloads(
+            encoder(vec![array], vec![render_field], TrinoJsonFacts::default()),
+            5,
+        ),
+        vec![r#"[{"{2=a\"b, 1=null}":7}]"#],
+    );
+}
+
 fn serialized(meta: &[u8], value: &[u8]) -> Vec<u8> {
     let mut out = ((meta.len() + value.len()) as u32).to_le_bytes().to_vec();
     out.extend(meta);

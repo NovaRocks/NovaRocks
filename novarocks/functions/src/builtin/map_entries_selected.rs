@@ -67,6 +67,14 @@ pub(super) fn validate_profile(
         .value_type()
         .child_type_at(0)
         .ok_or_else(|| invalid("map_entries has no semantic result item"))?;
+    let novarocks_type_contract::ValueKind::Struct(declared) = output_semantic.kind() else {
+        return Err(invalid("map_entries result item is not a semantic ROW"));
+    };
+    if item.is_nullable() || declared.iter().any(|field| field.row_name().is_some()) {
+        return Err(invalid(
+            "map_entries requires an anonymous, nonnull ROW item",
+        ));
+    }
     for (index, (source_field, target)) in fields.iter().zip(output.iter()).enumerate() {
         let a = source
             .value_type()

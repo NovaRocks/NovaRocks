@@ -69,6 +69,10 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
+        "__row_field",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
+    (
         "__struct_subfield",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
@@ -720,7 +724,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "split_to_map",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "sqrt",

@@ -24,9 +24,8 @@ use super::{
 };
 use crate::{
     exec::{
-        hash_table::{
-            hash::{canonical_f32_bits, canonical_f64_bits, content_f32_bits, content_f64_bits},
-            key_builder::canonical_nullable_equals_with_policy_observed,
+        hash_table::hash::{
+            canonical_f32_bits, canonical_f64_bits, content_f32_bits, content_f64_bits,
         },
         pipeline::operator::InputConstructionOwner,
     },
@@ -135,16 +134,9 @@ pub(super) fn compare_prepared_pairs(
                                     let expected = left.encode_component_row::<$content, false>(
                                         column, ar, checkpoint,
                                     )?;
-                                    *result =
-                                        u8::from(canonical_nullable_equals_with_policy_observed::<
-                                            $content,
-                                        >(
-                                            b,
-                                            bp,
-                                            Some(right.component_binding(column)?.value_type()),
-                                            &expected,
-                                            checkpoint,
-                                        )?);
+                                    *result = u8::from(right.component_equals::<$content>(
+                                        column, br, &expected, checkpoint,
+                                    )?);
                                 }
                             }
                         }};
@@ -294,15 +286,9 @@ pub(super) fn compare_value_pairs(
                                     let expected = left.encode_component_row::<$content, false>(
                                         column, ar, checkpoint,
                                     )?;
-                                    Some(
-                                        canonical_nullable_equals_with_policy_observed::<$content>(
-                                            b,
-                                            bp,
-                                            Some(right.component_binding(column)?.value_type()),
-                                            &expected,
-                                            checkpoint,
-                                        )?,
-                                    )
+                                    Some(right.component_equals::<$content>(
+                                        column, br, &expected, checkpoint,
+                                    )?)
                                 };
                             }
                         }};

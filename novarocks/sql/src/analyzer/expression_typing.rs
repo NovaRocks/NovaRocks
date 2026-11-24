@@ -606,10 +606,21 @@ fn type_scalar_call_with_environment(
             let binding = typing::finish_call(context, &selected, &converted, work)?;
             let dependencies = catalog.scalar_time_dependencies(&binding);
             enforce_mv_time_independence(forbid_time_dependencies, dependencies)?;
+            let binding = if matches!(shape, NodeShape::Row { .. }) {
+                let target = selected.expected_result().ok_or(TypingError::InvalidShape(
+                    "ROW constructor lost its original result declaration",
+                ))?;
+                SqlFunctionBinding::new_with_row_constructor_constraint(
+                    binding,
+                    context.decimal_overflow_policy,
+                    target.clone(),
+                )
+            } else {
+                SqlFunctionBinding::new(binding, context.decimal_overflow_policy)
+            };
             Ok(BoundScalarCall {
                 args,
-                binding: SqlFunctionBinding::new(binding, context.decimal_overflow_policy)
-                    .with_statement_time(statement_time, dependencies)?,
+                binding: binding.with_statement_time(statement_time, dependencies)?,
             })
         },
     )

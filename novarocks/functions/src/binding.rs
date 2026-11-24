@@ -219,6 +219,7 @@ impl FunctionSemantics {
             | ArgumentControl::NullIf
             | ArgumentControl::Try
             | ArgumentControl::OrderedRegexp
+            | ArgumentControl::OrderedNull
             | ArgumentControl::SimpleCase
             | ArgumentControl::SearchedCase => FunctionArgumentEvaluation::ShortCircuit,
             ArgumentControl::Eager

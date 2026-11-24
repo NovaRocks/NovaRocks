@@ -39,6 +39,14 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::exec::hash_table::allocation::AggregateAllocator;
 use crate::exec::hash_table::allocation::AggregateVec;
+
+mod map_identity;
+#[cfg(test)]
+pub(crate) use map_identity::permuted_map_fixture;
+pub(crate) use map_identity::{
+    append_map_identity_nullable, contains_map, hash_map_identity_column_observed,
+    identity_bytes_equal, sort_key_references,
+};
 use novarocks_types::largeint;
 
 use super::hash::{canonical_f32_bits, canonical_f64_bits, content_f32_bits, content_f64_bits};

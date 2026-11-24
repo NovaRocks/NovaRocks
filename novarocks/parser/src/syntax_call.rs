@@ -18,7 +18,7 @@
 use std::fmt;
 
 use crate::Span;
-use crate::ast::{Expr, ExtractField, Literal, LiteralKind, TrimSpecification};
+use crate::ast::{Expr, ExtractField, Literal, LiteralKind, RowField, TrimSpecification};
 
 // The absent IF branch has no syntax location. Its type is fixed with the
 // other branch during call typing, just as for an explicit NULL.
@@ -32,6 +32,7 @@ static IF_IMPLICIT_ELSE: Expr = Expr::Literal(Literal {
 pub struct CanonicalCall<'a> {
     pub name: &'static str,
     pub arguments: Vec<&'a Expr>,
+    pub row_fields: Option<&'a [RowField]>,
     pub span: Span,
 }
 
@@ -40,15 +41,6 @@ pub struct CanonicalCall<'a> {
 pub struct UnsupportedCallSyntax {
     pub message: String,
     pub span: Span,
-}
-
-impl UnsupportedCallSyntax {
-    fn new(message: impl Into<String>, span: Span) -> Self {
-        Self {
-            message: message.into(),
-            span,
-        }
-    }
 }
 
 impl fmt::Display for UnsupportedCallSyntax {
@@ -64,18 +56,10 @@ impl std::error::Error for UnsupportedCallSyntax {}
 pub fn canonical_call(expr: &Expr) -> Result<Option<CanonicalCall<'_>>, UnsupportedCallSyntax> {
     let span = expr.span();
     let (name, arguments) = match expr {
-        Expr::Row(row) => {
-            if row.fields.iter().any(|field| field.name.is_some()) {
-                return Err(UnsupportedCallSyntax::new(
-                    "named ROW fields are not supported",
-                    span,
-                ));
-            }
-            (
-                "row",
-                row.fields.iter().map(|field| &field.expression).collect(),
-            )
-        }
+        Expr::Row(row) => (
+            "row",
+            row.fields.iter().map(|field| &field.expression).collect(),
+        ),
         Expr::If(node) => {
             let false_value = node.false_value.as_ref().unwrap_or(&IF_IMPLICIT_ELSE);
             ("if", vec![&node.condition, &node.true_value, false_value])
@@ -110,6 +94,10 @@ pub fn canonical_call(expr: &Expr) -> Result<Option<CanonicalCall<'_>>, Unsuppor
     Ok(Some(CanonicalCall {
         name,
         arguments,
+        row_fields: match expr {
+            Expr::Row(row) => Some(row.fields.as_ref()),
+            _ => None,
+        },
         span,
     }))
 }

@@ -263,11 +263,36 @@ fn shuffle_compiled_group_input_slots(
         partitions: partition_count.max(1),
         hash_version: 0,
     };
-    shuffle_input_slots_with_distribution(
+    shuffle_local_partition(
         build,
         ctx,
         owner_node_id,
-        slots,
+        LocalExchangePartitionSpec::InputSlotIds(slots),
+        distribution,
+        partition_count,
+    )
+}
+
+fn shuffle_compiled_map_group_keys(
+    build: PipelineBuildResult,
+    ctx: &mut PipelineBuildContext,
+    owner_node_id: i32,
+    keys: Vec<(
+        novarocks_types::SlotId,
+        novarocks_type_contract::FunctionValueType,
+    )>,
+    partition_count: usize,
+) -> PipelineBuildResult {
+    let distribution = Distribution::HashInputSlots {
+        slots: keys.iter().map(|(slot, _)| *slot).collect(),
+        partitions: partition_count.max(1),
+        hash_version: 2,
+    };
+    shuffle_local_partition(
+        build,
+        ctx,
+        owner_node_id,
+        LocalExchangePartitionSpec::CanonicalMapInputSlots(keys),
         distribution,
         partition_count,
     )
@@ -333,11 +358,11 @@ fn shuffle_compiled_typed_keys(
     }
 }
 
-fn shuffle_input_slots_with_distribution(
+fn shuffle_local_partition(
     mut build: PipelineBuildResult,
     ctx: &mut PipelineBuildContext,
     owner_node_id: i32,
-    partition_slot_ids: Vec<novarocks_types::SlotId>,
+    partition: LocalExchangePartitionSpec,
     distribution: Distribution,
     partition_count: usize,
 ) -> PipelineBuildResult {
@@ -351,7 +376,7 @@ fn shuffle_input_slots_with_distribution(
     let exchanger = LocalExchanger::new_with_limits(
         partition_count,
         producer_count,
-        LocalExchangePartitionSpec::InputSlotIds(partition_slot_ids),
+        partition,
         ctx.local_exchange_buffer_mem_limit_per_driver,
         ctx.local_exchange_max_buffered_rows,
     );

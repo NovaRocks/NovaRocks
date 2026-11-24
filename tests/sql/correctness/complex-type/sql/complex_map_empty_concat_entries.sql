@@ -18,7 +18,7 @@
 -- Migrated from: dev/test/sql/test_map/T/test_map (case: testEmptyMap)
 -- Test Objective:
 -- 1. Validate map_concat with empty maps (map() literal as left/right operand).
--- 2. Cover FE errors for invalid map key types (MAP, ARRAY, and STRUCT as key).
+-- 2. Preserve MAP, ARRAY, and ROW keys when the other map is empty.
 -- 3. Validate map_entries on a table column and unnest(map_entries(...)).
 -- @order_sensitive=true
 
@@ -55,20 +55,17 @@ SELECT map_concat(c1, MAP(ARRAY[1], ARRAY[2]))
 FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
 
 -- query 6
--- @expect_error=Map key don't supported type: MAP
--- FE error: MAP type used as a map key
+-- MAP key
 SELECT map_concat(c1, MAP(ARRAY[map()], ARRAY[map()]))
 FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
 
 -- query 7
--- @expect_error=Map key don't supported type: ARRAY
--- FE error: ARRAY type used as a map key
+-- ARRAY key
 SELECT map_concat(c1, MAP(ARRAY[[]], ARRAY[map()]))
 FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
 
 -- query 8
--- @expect_error=Map key don't supported type: struct
--- FE error: STRUCT type used as a map key
+-- ROW key
 SELECT map_concat(c1, MAP(ARRAY[CAST(ROW(2) AS ROW("1" INTEGER))], ARRAY[CAST(ROW(ARRAY[MAP()]) AS ROW("A" ARRAY(MAP(INTEGER, INTEGER))))]))
 FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
 

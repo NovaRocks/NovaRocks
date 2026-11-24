@@ -106,6 +106,7 @@ pub(super) fn compiled_unit_can_fold(
             | ArgumentControl::Coalesce
             | ArgumentControl::NullIf
             | ArgumentControl::Try
+            | ArgumentControl::OrderedNull
             | ArgumentControl::NoArguments => {}
             ArgumentControl::TemporalSource(_) => return Ok(false),
             _ => return Err(invalid_program("unsupported frozen constant call control")),

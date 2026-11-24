@@ -24,7 +24,7 @@ use crate::{
         chunk::{ChunkConstructionFailure, ChunkSchema},
         hash_table::key_index::{
             BulkBuildGraph, BulkDomain, BulkInput, BulkWork, CaptureWork, CompleteInput,
-            IndexPurpose, KeySpec, NullPolicy, SealedCapture,
+            IndexPurpose, KeySpec, SealedCapture,
         },
         operators::local_exchanger::LocalExchanger,
         shared_stage::{
@@ -88,16 +88,14 @@ impl SetOpDeclaration {
             .get_or_init(|| {
                 let checkpoint = || work.control.checkpoint(0).map_err(ExecutionFailure::from);
                 let mut types = funded_vec(work.owner, schema.slots().len())?;
-                let mut nulls = funded_vec(work.owner, schema.slots().len())?;
                 for slot in schema.slots() {
                     let binding = slot.typed_binding().clone_observed(checkpoint)?;
                     types.push(
                         FunctionValueType::try_from_typed_binding(binding)
                             .map_err(ChunkConstructionFailure::from)?,
                     );
-                    nulls.push(NullPolicy::Equal);
                 }
-                let spec = KeySpec::new(&types, &nulls, work.owner, &checkpoint)?;
+                let spec = KeySpec::for_grouping(&types, work.owner, &checkpoint)?;
                 let domain = BulkDomain::new(&spec, work.owner, work.control)?;
                 let changed = funded_shared(work.owner, Observable::new())?;
                 let completion = StageCompletion::new(

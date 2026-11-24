@@ -58,6 +58,20 @@ pub enum JoinDistribution {
 pub enum HashSource {
     ShuffleAgg,
     ShuffleJoin,
+    MapGrouping,
+    MapSet,
+}
+
+impl HashSource {
+    pub(crate) const fn exchange_algorithm(
+        self,
+    ) -> novarocks_type_contract::PartitionHashAlgorithm {
+        use novarocks_type_contract::PartitionHashAlgorithm;
+        match self {
+            Self::ShuffleAgg | Self::ShuffleJoin => PartitionHashAlgorithm::NativeExchangeV1,
+            Self::MapGrouping | Self::MapSet => PartitionHashAlgorithm::NativeExchangeV2,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

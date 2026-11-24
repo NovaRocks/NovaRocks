@@ -46,6 +46,7 @@ pub(super) enum Operation {
     Uuid,
     Bar,
     Bucket,
+    SplitToMap,
     Vector(super::vector_distance_owner::Operation),
 }
 
@@ -56,6 +57,7 @@ pub(super) fn operation(name: &str) -> Option<Operation> {
         "uuid" => Operation::Uuid,
         "bar" => Operation::Bar,
         "width_bucket" => Operation::Bucket,
+        "split_to_map" => Operation::SplitToMap,
         name => Operation::Vector(super::vector_distance_owner::operation(name)?),
     })
 }
@@ -69,14 +71,15 @@ pub(super) fn effects(operation: Operation) -> FunctionEffectDeclaration {
             FunctionVolatility::Immutable
         },
         own_row_error: match operation {
-            Operation::AssertTrue | Operation::Bucket | Operation::Vector(_) => {
-                FunctionIntrinsicRowError::MayRaise
-            }
+            Operation::AssertTrue
+            | Operation::Bucket
+            | Operation::SplitToMap
+            | Operation::Vector(_) => FunctionIntrinsicRowError::MayRaise,
             _ => FunctionIntrinsicRowError::NoRowError,
         },
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: match operation {
-            Operation::Bar | Operation::Bucket | Operation::Vector(_) => {
+            Operation::Bar | Operation::Bucket | Operation::SplitToMap | Operation::Vector(_) => {
                 FunctionNullBehavior::Strict
             }
             _ => FunctionNullBehavior::CalledOnNull,
@@ -329,6 +332,7 @@ impl ScalarKernelInstance for ScalarRowsInstance {
             }
             Operation::Bar => TrinoSynopse::Bar.evaluate(input, control),
             Operation::Bucket => TrinoSynopse::WidthBucket.evaluate(input, control),
+            Operation::SplitToMap => super::split_to_map::evaluate(input, control),
             Operation::Uuid => Err(invalid("scalar row operation does not match its instance")),
         }
     }
@@ -412,6 +416,10 @@ impl ScalarRowsOwner {
                 Operation::TypeOf | Operation::Bar => DataType::Utf8,
                 Operation::Uuid => DataType::FixedSizeBinary(16),
                 Operation::Bucket => DataType::Int64,
+                Operation::SplitToMap => {
+                    super::split_to_map::result_fields(contract.result_type().data_type())?;
+                    contract.result_type().data_type().clone()
+                }
                 Operation::Vector(_) => DataType::Float64,
             };
             let result_domain = if self.operation == Operation::Uuid {

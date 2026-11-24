@@ -591,15 +591,8 @@ fn typed_single_field_struct_defaults_keep_their_values_row() {
             true
         ))]))
     );
-    // Both actual source forms now reach the original row overload. Its
-    // installed-implementation boundary still rejects the default; preserving
-    // literal values above does not imply successful compilation or execution.
-    assert_existing_default_rejection(
-        shaped,
-        baseline,
-        AnalyzeErrorKind::UnavailableImplementation,
-        "selected overload `builtin.scalar/row/dynamic-v1` has no installed implementation for the selected carrier",
-    );
+    analyze_shaped_query(baseline).expect("original VALUES default reaches typed ROW analysis");
+    analyze_shaped_query(shaped).expect("shaped singleton default reaches typed ROW analysis");
 }
 
 #[test]

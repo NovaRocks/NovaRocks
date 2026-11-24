@@ -25,14 +25,19 @@ use arrow_array::{
 };
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_schema::{DataType, FieldRef, Fields};
+use novarocks_failure_contract::{FailureReason, kernel_reason::INVALID_FUNCTION_ARGUMENT};
 use novarocks_type_contract::{
-    FunctionValueType, ValueKind, ValueLogicalType, arrow_data_types_exact_observed,
+    FunctionValueType, KeyComparison, KeyRelation, ValueLogicalType,
+    arrow_data_types_exact_observed,
+};
+use novarocks_value_arrays::{
+    ValueFailure,
+    hash_eq::{KeyPreparationFailure, KeyRows, PreparedKeyOperations},
 };
 
 use super::{
     collection_arrow::{ArrowSite, arrow_failure},
     collection_selected::{copy_error, reserve},
-    map_lookup_core::{MapKeyIdentity, MapKeyOperations},
 };
 use crate::{
     DataFailureReason, EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl,
@@ -42,10 +47,10 @@ use crate::{
     selected_copy::{CopyIndexView, preflight_original_take},
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 // Design: ADR-0255 (docs/adr/ADR-0255-collection-calls-and-relational-sequence.md)
 pub(super) struct Recipe {
-    keys: MapKeyOperations,
+    keys: PreparedKeyOperations,
 }
 
 impl Recipe {
@@ -56,17 +61,22 @@ impl Recipe {
         let target = contract.result_type();
         let (_, fields, _) = map_layout(target.data_type())?;
         let key = target
-            .value_type()
-            .child_type_at(0)
+            .child_at(0)
             .ok_or_else(|| invalid("map result lacks its frozen key declaration"))?;
-        let logical = match key.kind() {
-            ValueKind::Nominal(logical) => *logical,
-            _ => ValueLogicalType::Physical,
-        };
-        let recipe = Self {
-            keys: MapKeyOperations::prepare(fields[0].data_type(), logical)
-                .ok_or_else(|| invalid("map has no installed identity for its frozen key"))?,
-        };
+        let keys =
+            PreparedKeyOperations::prepare_observed(&key, KeyRelation::Identical, &mut |units| {
+                for _ in 0..units {
+                    observe()?;
+                }
+                Ok::<_, KernelFailure>(())
+            })
+            .map_err(|error| match error {
+                KeyPreparationFailure::Caller(error) => error,
+                KeyPreparationFailure::Unsupported(_) => {
+                    invalid("map has no installed identity for its frozen key")
+                }
+            })?;
+        let recipe = Self { keys };
         let arguments = &contract.selected().argument_types;
         if !matches!(arguments.len(), 0 | 2) {
             return Err(invalid("map requires zero or two frozen value arguments"));
@@ -125,7 +135,7 @@ impl Recipe {
     }
 
     pub(super) fn evaluate<'a>(
-        self,
+        &self,
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
@@ -158,13 +168,16 @@ impl Recipe {
                     let values = Source::from_argument(*values)?;
                     let mut key_indices = Vec::new();
                     let mut value_indices = Vec::new();
-                    let mut seen = hashbrown::HashSet::new();
+                    let mut seen = hashbrown::HashMap::new();
                     for (ordinal, row) in selection.iter().enumerate() {
                         work.borrow_mut().step()?;
                         match (keys.range(ordinal, row)?, values.range(ordinal, row)?) {
                             (Some(keys_range), Some(values_range)) => {
                                 let issue = if keys_range.len() != values_range.len() {
-                                    Some("Key and value arrays must be the same length")
+                                    Some((
+                                        INVALID_FUNCTION_ARGUMENT,
+                                        "Key and value arrays must be the same length",
+                                    ))
                                 } else {
                                     seen.clear();
                                     work.borrow_mut().flush()?;
@@ -177,12 +190,10 @@ impl Recipe {
                                         &work,
                                     )?
                                 };
-                                if let Some(issue) = issue {
+                                if let Some((reason, issue)) = issue {
                                     errors.push(RowDataError::with_reason(
                                         ordinal,
-                                        DataFailureReason::Domain(
-                                            novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
-                                        ),
+                                        DataFailureReason::Domain(reason),
                                         issue,
                                     ));
                                     nulls.append(false);
@@ -234,25 +245,79 @@ impl Recipe {
         work.into_inner().finish_result(result)
     }
 
-    fn invalid_keys<'a>(
+    fn invalid_keys(
         &self,
-        keys: &'a ArrayRef,
+        keys: &ArrayRef,
         positions: Range<usize>,
-        seen: &mut hashbrown::HashSet<MapKeyIdentity<'a>>,
+        seen: &mut hashbrown::HashMap<u64, Vec<usize>>,
         work: &RefCell<EvaluationCheckpoints<'_>>,
-    ) -> Result<Option<&'static str>, KernelFailure> {
+    ) -> Result<Option<(FailureReason, &'static str)>, KernelFailure> {
+        let mut observe = |steps| {
+            for _ in 0..steps {
+                work.borrow_mut().step()?;
+            }
+            Ok::<_, KernelFailure>(())
+        };
+        let array = self
+            .keys
+            .bind_observed(keys, KeyRows::Range(positions.clone()), &mut observe)
+            .map_err(key_failure)?;
         for position in positions {
             work.borrow_mut().step()?;
-            let Some(key) = self.keys.identity(keys.as_ref(), position)? else {
-                return Ok(Some("map key cannot be null"));
-            };
-            work.borrow_mut().flush()?;
-            if !seen.insert(key) {
-                return Ok(Some("Duplicate map keys are not allowed"));
+            if keys.data_type() == &DataType::Null || keys.is_null(position) {
+                return Ok(Some((INVALID_FUNCTION_ARGUMENT, "map key cannot be null")));
             }
-            work.borrow_mut().flush()?;
+            if !self
+                .keys
+                .determinate_observed(&array, position, &mut observe)
+                .map_err(key_failure)?
+            {
+                return Ok(Some((
+                    INVALID_FUNCTION_ARGUMENT,
+                    "map key cannot be indeterminate",
+                )));
+            }
+            let hash = self
+                .keys
+                .hash_observed(&array, position, &mut observe)
+                .map_err(key_failure)?;
+            let candidates = seen.entry(hash).or_default();
+            for &prior in candidates.iter() {
+                match self
+                    .keys
+                    .compare_observed(
+                        &array,
+                        prior,
+                        &array,
+                        position,
+                        &mut |_| Ok(()),
+                        &mut observe,
+                    )
+                    .map_err(key_failure)?
+                {
+                    KeyComparison::True => {
+                        return Ok(Some((
+                            INVALID_FUNCTION_ARGUMENT,
+                            "Duplicate map keys are not allowed",
+                        )));
+                    }
+                    KeyComparison::False => {}
+                    _ => return Err(invalid("map key identity must be total")),
+                }
+            }
+            candidates
+                .try_reserve(1)
+                .map_err(|_| KernelFailure::ResourceExhausted)?;
+            candidates.push(position);
         }
         Ok(None)
+    }
+}
+
+fn key_failure(error: ValueFailure<KernelFailure>) -> KernelFailure {
+    match error {
+        ValueFailure::Value(error) => KernelFailure::from_domain(error),
+        ValueFailure::Caller(error) => error,
     }
 }
 

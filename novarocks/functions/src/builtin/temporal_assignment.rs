@@ -21,7 +21,8 @@ use arrow_array::{Array, ArrayRef, ListArray, MapArray, StructArray, make_array}
 use arrow_buffer::NullBufferBuilder;
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
-    TemporalMicros, TemporalType, TemporalValue, TimeZoneKey, ValueKind, ValueTypeRef,
+    FunctionValueType, TemporalMicros, TemporalType, TemporalValue, TimeZoneKey, ValueKind,
+    ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
 };
 use novarocks_value_arrays::{
     ValueFailure, decode::PreparedTemporalArray, visit_reachable_child_rows_observed,
@@ -29,6 +30,7 @@ use novarocks_value_arrays::{
 
 use super::{extent, temporal::CastFailure};
 use crate::builtin::temporal_output::TemporalOutputBuilder;
+use crate::cast::map_mode::{converted_keys_have_duplicate, duplicate_map_key_error};
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::temporal_cast::Type;
@@ -144,6 +146,11 @@ fn entries(field: &Field) -> Option<&[arrow_schema::FieldRef]> {
     }
 }
 
+enum AssignmentRowFailure {
+    Precision(LiteralError),
+    DuplicateMapKey,
+}
+
 pub(super) fn convert(
     array: &ArrayRef,
     source: &novarocks_type_contract::FunctionValueType,
@@ -152,8 +159,12 @@ pub(super) fn convert(
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
     let size = array.len();
-    extent(size, std::mem::size_of::<Option<LiteralError>>())?;
-    let mut failures = vec![None; size];
+    extent(size, std::mem::size_of::<Option<AssignmentRowFailure>>())?;
+    let mut failures = Vec::new();
+    failures
+        .try_reserve_exact(size)
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    failures.resize_with(size, || None);
     let root = (0..size).map(|row| (row, row));
     let result = convert_at(
         array,
@@ -176,7 +187,12 @@ pub(super) fn convert(
             errors
                 .try_reserve(1)
                 .map_err(|_| KernelFailure::ResourceExhausted)?;
-            errors.push(RowDataError::from_domain(row, CastFailure(failure))?);
+            errors.push(match failure {
+                AssignmentRowFailure::Precision(cause) => {
+                    RowDataError::from_domain(row, CastFailure(cause))?
+                }
+                AssignmentRowFailure::DuplicateMapKey => duplicate_map_key_error(row),
+            });
         }
     }
     let data = result
@@ -195,7 +211,7 @@ fn convert_at(
     target: &ValueTypeRef,
     target_layout: &DataType,
     owners: impl Iterator<Item = (usize, usize)>,
-    failures: &mut [Option<LiteralError>],
+    failures: &mut [Option<AssignmentRowFailure>],
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
     work.step()?;
@@ -226,7 +242,7 @@ fn convert_at(
             match cast_precision(ParsedTemporal { ty: source, value }, target) {
                 Ok(converted) => output.temporal(target, converted.value)?,
                 Err(error) => {
-                    failures[owner].get_or_insert(error);
+                    failures[owner].get_or_insert(AssignmentRowFailure::Precision(error));
                     output.temporal(target, zero(target))?;
                 }
             }
@@ -313,6 +329,32 @@ fn convert_at(
                 };
             let keys = convert_child(map.keys(), sk, tk, &fields[0], failures, work)?;
             let values = convert_child(map.values(), sv, tv, &fields[1], failures, work)?;
+            if sk != tk {
+                work.flush()?;
+                let layout =
+                    ValueLayout::try_new(fields[0].data_type(), ValueTypeStorageLifetime::pure())
+                        .map_err(KernelFailure::from_domain)?;
+                let declaration = FunctionValueType::try_from_value(tk.clone(), layout)
+                    .map_err(crate::kernel_control::type_failure)?;
+                for (row, offsets) in map.value_offsets().windows(2).enumerate() {
+                    work.step()?;
+                    if map.is_null(row) || offsets[0] == offsets[1] {
+                        continue;
+                    }
+                    let start = usize::try_from(offsets[0])
+                        .map_err(|_| invalid("invalid temporal map offset"))?;
+                    let end = usize::try_from(offsets[1])
+                        .map_err(|_| invalid("invalid temporal map offset"))?;
+                    let Some(owner) = child.get(start).and_then(|owner| *owner) else {
+                        continue;
+                    };
+                    if failures[owner].is_none()
+                        && converted_keys_have_duplicate(&declaration, &keys, start..end, work)?
+                    {
+                        failures[owner] = Some(AssignmentRowFailure::DuplicateMapKey);
+                    }
+                }
+            }
             let entries = StructArray::try_new_with_length(
                 fields.to_vec().into(),
                 vec![keys, values],
@@ -498,9 +540,17 @@ mod tests {
         let map = result.as_any().downcast_ref::<MapArray>().unwrap();
         let keys = PreparedTemporalArray::bind(micros, map.keys().as_ref(), false).unwrap();
         assert_eq!(keys.value(0).unwrap(), keys.value(1).unwrap());
+        assert!(map.is_null(0));
         assert!(map.is_null(1));
         assert!(map.is_null(2));
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].selected_ordinal(), 2);
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].selected_ordinal(), 0);
+        assert_eq!(
+            errors[0].reason(),
+            crate::DataFailureReason::Domain(
+                novarocks_function_contract::kernel_failure::INVALID_CAST_ARGUMENT,
+            )
+        );
+        assert_eq!(errors[1].selected_ordinal(), 2);
     }
 }

@@ -67,7 +67,7 @@ use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances, 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::hash_table::allocation::AggregateAllocator;
 use crate::exec::hash_table::key_index::{
-    IndexPurpose, KeyIndex, KeyInput, KeyMatch, KeySpec, NullPolicy, PreparedKeyBatch, hash_batch,
+    IndexPurpose, KeyIndex, KeyInput, KeyMatch, KeySpec, PreparedKeyBatch, hash_batch,
 };
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputConstructionOwner, InputEncodingPolicy,
@@ -781,12 +781,7 @@ impl CompiledAggregateProcessor {
             let schema = Arc::clone(self.prepared_output()?);
             let owner = self.control.construction_owner(schema.as_ref())?;
             let checkpoint = || self.control.checkpoint_execution();
-            let mut nulls = aggregate_vector(owner.as_ref(), self.key_types.len())?;
-            for _ in &self.key_types {
-                checkpoint()?;
-                nulls.push(NullPolicy::Equal);
-            }
-            let spec = KeySpec::new(&self.key_types, &nulls, owner.as_ref(), &checkpoint)?;
+            let spec = KeySpec::for_grouping(&self.key_types, owner.as_ref(), &checkpoint)?;
             self.key_table = Some(KeyIndex::new(
                 spec,
                 IndexPurpose::KeyIds,
@@ -1743,6 +1738,46 @@ mod failure_latch_tests {
         assert!(keys.is_null(2));
         assert_eq!(keys.value(3), 1.5);
         assert_eq!(count.values().as_ref(), &[4, 4, 2, 2]);
+    }
+
+    #[test]
+    fn compiled_aggregate_k_groups_permuted_maps_and_emits_the_first_actual_key() {
+        use arrow::array::{Array, Float64Array, Int32Array, MapArray};
+        let maps = crate::exec::hash_table::key_builder::permuted_map_fixture();
+        let ty = FunctionValueType::new(maps.data_type().clone(), true);
+        let (mut processor, layout, _, _tracker) = processor_for_key_count(
+            false,
+            ty,
+            &[vec![
+                crate::exec::operators::family_fixture::constant_sources::null(),
+            ]],
+        );
+        let state = RuntimeState::default();
+        for maps in [maps.slice(0, 1), maps.slice(1, 3)] {
+            let batch = RecordBatch::try_new(layout.record_batch().schema(), vec![maps]).unwrap();
+            let chunk = Chunk::new_like(batch, &layout);
+            processor.apply_for_test(&state, chunk).unwrap();
+        }
+        let output = processor.finalize_for_test(&state).unwrap().output.unwrap();
+        let maps = output.columns()[0]
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        let counts = output.columns()[1]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(counts.values().as_ref(), &[2, 1, 1]);
+        assert!(maps.is_null(2));
+        let keys = maps.keys().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(keys.values().as_ref(), &[2, 1, 1, 2]);
+        let values = maps
+            .values()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(values.is_null(0));
+        assert_eq!(values.value(1).to_bits(), (-0.0_f64).to_bits());
     }
 
     fn with_context<T>(state: &RuntimeState, action: impl FnOnce(&mut DriverStep<'_>) -> T) -> T {

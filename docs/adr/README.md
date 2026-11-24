@@ -340,6 +340,7 @@ code-anchors:
 
 - [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — 聚合所选重载如何贯穿原行更新、状态交换和实际物化发布（active）
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 集合调用、关系区间、MAP 键与复合成员判断如何保留各自的定型和执行事实（active）
+- [ADR-0265](ADR-0265-row-declarations-and-canonical-map-keys.md) — ROW 字段如何随原类型约束冻结，MAP 规范身份如何贯穿分组和分区，有序调用如何按行短路（active）
 
 - [ADR-0254](ADR-0254-exact-temporal-values-and-frozen-statement-time.md) — 精确时态值如何保留逐值时区，语句环境与规则如何在折叠、执行、存储和结果呈现之间传递（active）
 
@@ -412,6 +413,7 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 领域哲学：Map 键域在构造时成立，不能由写出路径或运行时字段放宽来补救。非空且唯一是值语义；构造拒绝与具有明确优先级的合并分开，唯一性复用 GROUP BY 规范键等价。实施覆盖必须如实记录，局部入口的校验不代表所有生产者已经收敛。
 
 - [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — MAP 聚合空结果、所选状态以及已发布聚合语义的准入（active）
+- [ADR-0265](ADR-0265-row-declarations-and-canonical-map-keys.md) — MAP 键关系如何贯穿查找、规范身份、分组和分区（active）
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 构造、DDL 属性和聚合如何共用 MAP 键契约，查找如何沿普通等值（active；部分替代 ADR-0183 的作者及判重合同）
 - [ADR-0183](ADR-0183-map-keys-are-non-null-and-unique.md) — Map 键为何非空且唯一，构造拒绝为何与合并优先级分开（active；键域和合并规则保留，构造作者及判重合同见 ADR-0255）
 

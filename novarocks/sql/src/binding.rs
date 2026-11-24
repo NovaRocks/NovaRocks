@@ -60,6 +60,8 @@ pub enum SqlResultConstraintOrigin {
     Unconstrained,
     /// A common target authored from the original ARRAY element declarations.
     ArrayCommonCoercion,
+    /// The original field names and positions of an explicitly constructed ROW.
+    RowConstructor,
     TemporalSelected {
         own_nullable: bool,
     },
@@ -138,6 +140,18 @@ impl SqlFunctionBinding {
         facts.result_constraint = Some(result_constraint);
         facts.result_constraint_origin =
             SqlResultConstraintOrigin::TemporalSelected { own_nullable };
+        binding
+    }
+
+    pub(crate) fn new_with_row_constructor_constraint(
+        resolved: novarocks_functions::ResolvedFunctionBinding,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        result_constraint: novarocks_functions::FunctionValueType,
+    ) -> Self {
+        let mut binding = Self::new(resolved, decimal_overflow_policy);
+        let facts = Arc::make_mut(&mut binding.0);
+        facts.result_constraint = Some(result_constraint);
+        facts.result_constraint_origin = SqlResultConstraintOrigin::RowConstructor;
         binding
     }
 

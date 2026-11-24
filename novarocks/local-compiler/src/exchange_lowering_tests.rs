@@ -76,6 +76,7 @@ enum Shape {
     RoundRobin,
     /// Stream edge hashed on both produced columns; consumer is a Noop sink.
     Hash,
+    HashV2,
     /// Hash keys `[a, b]` with the received value `b` published twice.
     RepeatedHash,
     /// Stream edge without a partitioning contract; consumer is a Noop sink.
@@ -252,6 +253,18 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     let (source, destination) = match shape {
         Shape::Gather | Shape::WidenedGather => (Distribution::Singleton, Distribution::Singleton),
         Shape::Hash => (hash([b, a]), hash([ib, ia])),
+        Shape::HashV2 => {
+            let mut source = hash([b, a]);
+            let mut destination = hash([ib, ia]);
+            for distribution in [&mut source, &mut destination] {
+                let Distribution::Hash { scheme, .. } = distribution else {
+                    unreachable!("hash fixture")
+                };
+                scheme.definition.algorithm =
+                    novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV2;
+            }
+            (source, destination)
+        }
         Shape::RepeatedHash => (hash([a, b]), hash([ia, ib])),
         Shape::Hierarchical => {
             let hierarchical = |keys| {
@@ -299,6 +312,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         Shape::Gather
             | Shape::WidenedGather
             | Shape::RepeatedHash
+            | Shape::HashV2
             | Shape::Hierarchical
             | Shape::Conditional
             | Shape::RepeatedConditional
@@ -689,6 +703,36 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
         consumer.graph().sink(),
         Some(StaticSinkProgram::Result)
     ));
+}
+
+#[test]
+fn ordinary_exchange_freezes_the_same_algorithm_at_both_endpoints() {
+    use novarocks_local_program::{CompiledExchangeRouting, StaticStreamRouting};
+    use novarocks_type_contract::PartitionHashAlgorithm;
+
+    for (shape, algorithm) in [
+        (
+            Shape::RepeatedHash,
+            PartitionHashAlgorithm::NativeExchangeV1,
+        ),
+        (Shape::HashV2, PartitionHashAlgorithm::NativeExchangeV2),
+    ] {
+        let mut packages = packages(shape);
+        let producer = compile(packages.remove(&PRODUCER).unwrap(), None).unwrap();
+        let consumer = compile(packages.remove(&CONSUMER).unwrap(), Some(1)).unwrap();
+        let Some(StaticSinkProgram::DataStream { branch }) = producer.graph().sink() else {
+            panic!("ordinary exchange producer");
+        };
+        assert_eq!(
+            branch.contract().routing,
+            StaticStreamRouting::OrdinaryHash { algorithm }
+        );
+        let receiver = &consumer.exchange_inputs()[&ProgramNodeId::new(0)];
+        assert_eq!(
+            receiver.routing,
+            CompiledExchangeRouting::Hash { algorithm }
+        );
+    }
 }
 
 #[test]

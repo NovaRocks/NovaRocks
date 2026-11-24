@@ -71,6 +71,8 @@ pub enum ControlShape {
     /// Demand source and pattern in order, compile the non-NULL pattern at
     /// its original position, then demand the remaining arguments in order.
     OrderedRegexp,
+    /// Demand ordered arguments on surviving non-NULL rows and invoke a scalar leaf.
+    OrderedNull,
     /// Four ordered source occurrences and two intervening comparisons.
     Between {
         negated: bool,
@@ -124,6 +126,10 @@ pub enum GuardKind {
     /// The preceding regexp argument supplied a non-NULL value and completed
     /// its required conversion for this row.
     OrderedRegexpAfterArgument {
+        ordinal: u32,
+    },
+    /// The preceding argument succeeded and returned a non-NULL value.
+    OrderedNullAfterArgument {
         ordinal: u32,
     },
     /// Whole current invocation predicate, never a per-row NULL branch.
@@ -795,6 +801,7 @@ fn validate_arity(shape: ControlShape, count: usize) -> Result<(), ExpressionCon
         ControlShape::NullIf => count == 2,
         ControlShape::Try => count == 1,
         ControlShape::OrderedRegexp => (2..=4).contains(&count),
+        ControlShape::OrderedNull => count > 0,
         ControlShape::Between { .. } => count == 4,
         ControlShape::Membership { .. } => count > 0,
         ControlShape::TemporalSource(shape) => count == shape.source_count(),
@@ -839,6 +846,9 @@ fn control_argument_guard(shape: ControlShape, ordinal: usize) -> Option<GuardKi
                 ordinal: (ordinal - 1) as u32,
             })
         }
+        ControlShape::OrderedNull => (ordinal > 0).then(|| GuardKind::OrderedNullAfterArgument {
+            ordinal: (ordinal - 1) as u32,
+        }),
         ControlShape::Between { .. } => (ordinal > 0).then(|| GuardKind::BetweenAfterSource {
             ordinal: (ordinal - 1) as u32,
         }),
@@ -896,6 +906,7 @@ fn control_argument_demand(
         | ControlShape::NullIf
         | ControlShape::Try
         | ControlShape::OrderedRegexp
+        | ControlShape::OrderedNull
         | ControlShape::TemporalSource(_)
         | ControlShape::Between { .. }
         | ControlShape::Membership { .. } => Value,
@@ -1234,6 +1245,33 @@ mod tests {
                 Err(ExpressionControlFlowError::InvalidControlShape)
             );
         }
+    }
+
+    #[test]
+    fn ordered_null_guards_values_after_each_predecessor() {
+        for count in [1_usize, 2, 7] {
+            for ordinal in 0..count {
+                let guard =
+                    ordinal
+                        .checked_sub(1)
+                        .map(|predecessor| GuardKind::OrderedNullAfterArgument {
+                            ordinal: predecessor as u32,
+                        });
+                assert_eq!(
+                    control_argument_semantics(
+                        ControlShape::OrderedNull,
+                        count,
+                        ordinal,
+                        EvaluationDemand::TruthOnly,
+                    ),
+                    Ok((EvaluationDemand::Value, guard))
+                );
+            }
+        }
+        assert_eq!(
+            control_argument_semantics(ControlShape::OrderedNull, 0, 0, EvaluationDemand::Value,),
+            Err(ExpressionControlFlowError::InvalidControlShape)
+        );
     }
 
     #[path = "failure_tail_tests.rs"]

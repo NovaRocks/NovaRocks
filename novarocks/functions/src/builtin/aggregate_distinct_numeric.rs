@@ -22,6 +22,7 @@ use arrow_array::*;
 use arrow_buffer::i256;
 use arrow_schema::DataType;
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
+use novarocks_type_contract::{canonical_f32_bits, canonical_f64_bits};
 use std::sync::Arc;
 /// The numeric aggregate owns arithmetic and canonical-state failures. It
 /// preserves control and allocation causes supplied by their actual owners.
@@ -537,24 +538,6 @@ fn encode_le<const N: usize>(value: [u8; N]) -> NumericKey {
     let mut bytes = [0u8; 32];
     bytes[..N].copy_from_slice(&value);
     NumericKey { bytes, len: N }
-}
-fn canonical_f32_bits(v: f32) -> u32 {
-    if v.is_nan() {
-        f32::NAN.to_bits()
-    } else if v == 0.0 {
-        0.0f32.to_bits()
-    } else {
-        v.to_bits()
-    }
-}
-fn canonical_f64_bits(v: f64) -> u64 {
-    if v.is_nan() {
-        f64::NAN.to_bits()
-    } else if v == 0.0 {
-        0.0f64.to_bits()
-    } else {
-        v.to_bits()
-    }
 }
 pub fn encode_numeric_row(
     array: &dyn Array,

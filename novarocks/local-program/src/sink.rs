@@ -160,14 +160,18 @@ pub(crate) fn validate_summary_layout_core<E: From<StaticSinkError>>(
     Ok(())
 }
 
-/// Ordinary streams retain their frozen historic hash mapping. The two new
-/// variants use the versioned instance/driver domains at their respective
-/// boundaries; FALSE/NULL applicability uses a per-row round-robin cursor.
+/// Stream routing retains the exact ordinary hash algorithm and the separate
+/// hierarchical protocols. Conditional FALSE/NULL rows use round-robin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StaticStreamRouting {
     Ordinary,
+    OrdinaryHash {
+        algorithm: novarocks_type_contract::PartitionHashAlgorithm,
+    },
     HierarchicalHashV1,
-    ConditionalKeyV1 { applies: ProgramRootRef },
+    ConditionalKeyV1 {
+        applies: ProgramRootRef,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,6 +272,15 @@ impl StaticStreamBranch {
             return Err(StaticSinkError::TooManyColumns);
         }
         if !partition_type.requires_exprs() && !partition_exprs.is_empty() {
+            return Err(StaticSinkError::InvalidPartitionExpressions);
+        }
+        if let StaticStreamRouting::OrdinaryHash { algorithm } = contract.routing
+            && !matches!(
+                algorithm,
+                novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
+                    | novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV2
+            )
+        {
             return Err(StaticSinkError::InvalidPartitionExpressions);
         }
         if !matches!(contract.routing, StaticStreamRouting::Ordinary)
@@ -615,9 +628,17 @@ fn validate_branch_core<E: From<StaticSinkError>>(
             *id,
             novarocks_type_contract::EvaluationDemand::Value,
         ) && crate::unit_refs::root_type(units, *id).is_some_and(|node| {
-            matches!(branch.contract.routing, StaticStreamRouting::Ordinary)
-                || novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
-                    .supports_partition_value_type(node)
+            use novarocks_type_contract::PartitionHashAlgorithm;
+            match branch.contract.routing {
+                StaticStreamRouting::Ordinary => true,
+                StaticStreamRouting::OrdinaryHash { algorithm } => {
+                    algorithm.supports_partition_value_type(node)
+                }
+                StaticStreamRouting::HierarchicalHashV1
+                | StaticStreamRouting::ConditionalKeyV1 { .. } => {
+                    PartitionHashAlgorithm::NativeHierarchicalV1.supports_partition_value_type(node)
+                }
+            }
         });
         observe()?;
         if !valid {

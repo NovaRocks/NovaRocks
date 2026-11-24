@@ -1,0 +1,6 @@
+-- query 3
+-- types	integer	integer	boolean	integer
+outer_id	inner_value	parent_null	positional
+1	7	false	11
+2	NULL	false	12
+3	NULL	true	13

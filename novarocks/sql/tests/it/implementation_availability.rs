@@ -62,8 +62,20 @@ fn actual_map_key_keeps_original_exact_binding_and_names_uninstalled_key_domain(
     let output = source.original_public_result_declaration().unwrap();
     assert_eq!(output.fields()[0].ty.data_type(), &DataType::Int32);
 
-    let failure = try_sql_source_with_declared_fields(
+    let array_keys = try_sql_source_with_declared_fields(
         "SELECT map(ARRAY[ARRAY[k]], ARRAY[10]) AS candidate FROM t",
+        &fields,
+    )
+    .unwrap();
+    let schema = array_keys.original_public_result_declaration().unwrap();
+    let key = schema.fields()[0]
+        .ty
+        .child_at(0)
+        .expect("MAP key declaration");
+    assert_eq!(key.child_at(0).unwrap().data_type(), &DataType::Int64);
+
+    let failure = try_sql_source_with_declared_fields(
+        "SELECT map(ARRAY[ROW(k, JSON '{}')], ARRAY[10]) AS candidate FROM t",
         &fields,
     )
     .unwrap_err();

@@ -121,7 +121,9 @@ pub fn grouped_state_topn_key_supported(
 /// and reserves the retired regexp and Base64 source claim fields.
 /// Revision 41 reserves the retired string-aggregate semantic parameters.
 /// Revision 42 freezes NULLIF's guarded comparison and left-value selection.
-pub const PLAN_CONTRACT_REVISION: u32 = 42;
+/// Revision 43 freezes MAP-key exchange, ordered NULL argument demand and
+/// exact named and anonymous ROW calls.
+pub const PLAN_CONTRACT_REVISION: u32 = 43;
 
 #[cfg(test)]
 mod tests;

@@ -283,7 +283,9 @@ impl PreparedScalarKernel for PreparedArrayLiteral {
     }
 
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
-        Ok(Box::new(ArrayLiteralInstance { map: self.map }))
+        Ok(Box::new(ArrayLiteralInstance {
+            map: self.map.clone(),
+        }))
     }
 }
 
@@ -296,10 +298,11 @@ impl ScalarKernelInstance for ArrayLiteralInstance {
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        match self.map {
+        match &self.map {
             Some(recipe) => recipe.evaluate(input, control),
             None => super::collection_selected::evaluate(
                 super::collection_selected::Operation::ArrayLiteral,
+                None,
                 input,
                 control,
             ),

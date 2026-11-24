@@ -1414,13 +1414,25 @@ pub(crate) use data_stream_sink_hash_partition::{
     partition_chunk_by_hash_arrays_created, take_partition_rows_created,
 };
 
-/// The caller freezes the partition algorithm independently of the legacy
-/// carrier spelling. Ordinary keeps the pre-existing exchange mapping.
+/// The caller freezes the partition algorithm independently of the transport
+/// carrier. Bucket routing and legacy fixture routes keep their old mapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompiledPartitionRoute {
     Ordinary,
+    OrdinaryHash(novarocks_type_contract::PartitionHashAlgorithm),
     HierarchicalV1,
     ConditionalKeyV1,
+}
+
+impl CompiledPartitionRoute {
+    fn uses_typed_hash(self) -> bool {
+        matches!(
+            self,
+            Self::OrdinaryHash(novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV2)
+                | Self::HierarchicalV1
+                | Self::ConditionalKeyV1
+        )
+    }
 }
 
 /// The partition and optional applicability roots of one exact stream branch.
@@ -1438,6 +1450,19 @@ impl CompiledPartitionKeys {
             program,
             sites,
             route: CompiledPartitionRoute::Ordinary,
+            applies: None,
+        }
+    }
+
+    pub(crate) fn ordinary_hash(
+        program: Arc<LocalProgram>,
+        sites: Vec<ProgramRootRef>,
+        algorithm: novarocks_type_contract::PartitionHashAlgorithm,
+    ) -> Self {
+        Self {
+            program,
+            sites,
+            route: CompiledPartitionRoute::OrdinaryHash(algorithm),
             applies: None,
         }
     }
@@ -1534,17 +1559,19 @@ fn instance_partition_rows(
     ctx: &mut DriverStep<'_>,
 ) -> ExecutionResult<Vec<Vec<u32>>> {
     use crate::exec::hash_table::partition_keys::{
-        native_tuple_hashes_observed, require_non_null_keys,
+        native_exchange_v2_hashes_observed, native_tuple_hashes_observed, require_non_null_keys,
     };
-    use novarocks_type_contract::PartitionHashDomain;
+    use novarocks_type_contract::{PartitionHashAlgorithm, PartitionHashDomain};
     use novarocks_value_arrays::reachability::ReachableRows;
     ctx.checkpoint()?;
     check_partition_row_extent(input_rows)?;
-    if destinations == 0 || keys.route == CompiledPartitionRoute::Ordinary {
+    if destinations == 0 || !keys.route.uses_typed_hash() {
         return Err(stream_contract(
-            "hierarchical exchange requires destinations and an explicit route",
+            "typed exchange requires destinations and a typed route",
         ));
     }
+    let ordinary_v2 = keys.route
+        == CompiledPartitionRoute::OrdinaryHash(PartitionHashAlgorithm::NativeExchangeV2);
     let conditional = keys.route == CompiledPartitionRoute::ConditionalKeyV1;
     if conditional != keys.selected_rows.is_some() {
         return Err(stream_contract(
@@ -1584,7 +1611,12 @@ fn instance_partition_rows(
         if conditional {
             require_non_null_keys(&keys.arrays, &keys.types, &selected, &checkpoint)?;
         }
-        Some(native_tuple_hashes_observed(
+        let hash_row = if ordinary_v2 {
+            native_exchange_v2_hashes_observed
+        } else {
+            native_tuple_hashes_observed
+        };
+        Some(hash_row(
             &keys.arrays,
             &keys.types,
             &selected,
@@ -1617,7 +1649,12 @@ fn instance_partition_rows(
                 .as_ref()
                 .and_then(|batch| batch.as_slice()[selected])
                 .ok_or_else(|| stream_contract("selected exchange key has no canonical hash"))?;
-            (PartitionHashDomain::InstanceV1.mix(hash) % destinations as u64) as usize
+            let hash = if ordinary_v2 {
+                hash
+            } else {
+                PartitionHashDomain::InstanceV1.mix(hash)
+            };
+            (hash % destinations as u64) as usize
         } else {
             let destination = *bypass_cursor % destinations;
             *bypass_cursor = (destination + 1) % destinations;
@@ -2585,7 +2622,7 @@ impl DataStreamSinkOperator {
                 // Preserve the ordinary path's exact historical refusal.
                 // New routes use the signed logical type rather than guessing
                 // VARIANT from a plain binary carrier.
-                if (state.keys.route == CompiledPartitionRoute::Ordinary
+                if (!state.keys.route.uses_typed_hash()
                     && matches!(array.data_type(), DataType::LargeBinary))
                     || ty.logical_type() == novarocks_type_contract::ValueLogicalType::Variant
                 {
@@ -2625,7 +2662,7 @@ impl DataStreamSinkOperator {
 
         let n = dests.len();
         if let Some(keys) = compiled_keys
-            && keys.route != CompiledPartitionRoute::Ordinary
+            && keys.route.uses_typed_hash()
         {
             let rows =
                 instance_partition_rows(keys, chunk, chunk.len(), n, &mut self.random_next, ctx)?;
@@ -3268,7 +3305,7 @@ impl InputEncodingPolicy for DataStreamSinkOperator {
         if self
             .compiled_partition
             .as_ref()
-            .is_some_and(|state| state.keys.route != CompiledPartitionRoute::Ordinary)
+            .is_some_and(|state| state.keys.route.uses_typed_hash())
         {
             // The selected key evaluator and decoder own reachability. Eager
             // Transform hydration must not inspect excluded dictionary rows.

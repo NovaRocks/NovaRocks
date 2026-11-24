@@ -1351,6 +1351,7 @@ impl BuiltinScalarResolver {
         &self,
         argument_types: &mut Vec<FunctionValueType>,
         request: FunctionBindingRequest<'_>,
+        overload: &FunctionOverloadId,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), FunctionBindingError> {
         for _value in argument_types.iter() {
@@ -1359,6 +1360,18 @@ impl BuiltinScalarResolver {
         let carriers = ScalarCarriers::from_values(ScalarTypes::from_values(argument_types));
         validate_builtin_selected_domain(&self.canonical_name, carriers, work)?;
         let name = self.canonical_name.as_ref();
+        if matches!(name, "__map_element_at" | "__map_subscript" | "element_at")
+            && let Some(collection) = argument_types.first()
+            && let novarocks_type_contract::ValueKind::Map { key, .. } =
+                collection.value_type().kind()
+            && novarocks_type_contract::KeyRelation::Equal
+                .validate_type_observed(key, |_| work.step())?
+                .is_err()
+        {
+            return Err(FunctionBindingError::UnavailableImplementation(
+                overload.clone(),
+            ));
+        }
         match name {
             "contains_sequence" | "arrays_overlap" | "concat"
                 if name != "concat"
@@ -1507,7 +1520,12 @@ impl BuiltinScalarResolver {
                 self.overloads[index].clone(),
             ));
         }
-        self.apply_argument_rules(&mut resolved.argument_types, request, work)?;
+        self.apply_argument_rules(
+            &mut resolved.argument_types,
+            request,
+            &self.overloads[index],
+            work,
+        )?;
         resolved.return_type = self
             .result_decision(request, work)?
             .materialize(resolved.return_type)?;
@@ -1618,7 +1636,12 @@ impl BuiltinScalarResolver {
                 )
                 .map_err(binding_resolution_error)?,
             };
-            self.apply_argument_rules(&mut decision.argument_types, request, work)?;
+            self.apply_argument_rules(
+                &mut decision.argument_types,
+                request,
+                &self.overloads[index],
+                work,
+            )?;
             let result = self.result_decision(request, work)?;
             let mut argument_drift = None;
             let count_matches = decision.argument_types.len() == selected.argument_types.len();
@@ -1878,6 +1901,7 @@ impl FunctionBindingResolver for BuiltinUnnestResolver {
 const DYNAMIC_SCALAR_FUNCTIONS: &[&str] = &[
     "__array_literal",
     "__array_struct_subfield",
+    "__row_field",
     "__struct_subfield",
     "flatten",
     "array_intersect",
@@ -2282,6 +2306,45 @@ fn dynamic_struct<H>(
         super::signature::declared_struct_with_construction(fields, nullable, cx)
     })
 }
+pub(super) fn row_field_ordinal(
+    request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<usize, FunctionBindingError> {
+    let [
+        FunctionArgument::Value {
+            value_type: row, ..
+        },
+        FunctionArgument::Value {
+            value_type: index, ..
+        },
+    ] = request.arguments
+    else {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    };
+    let DataType::Struct(fields) = row.data_type() else {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    };
+    if index.data_type() != &DataType::Int32
+        || index.nullable()
+        || index.logical_type() != ValueLogicalType::Physical
+    {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    }
+    let index = constant_source(request.arguments.get(1), work)?
+        .ok_or(FunctionBindingError::NoMatchingOverload)?;
+    work.flush()?;
+    index
+        .signed_integer_observed(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            work.control(),
+        )?
+        .and_then(|index| usize::try_from(index).ok())
+        .filter(|&index| index < fields.len())
+        .ok_or_else(|| {
+            FunctionBindingError::InvalidBinding("invalid frozen ROW field ordinal".into())
+        })
+}
+
 fn bind_dynamic_scalar_result_with_creation<H>(
     function_id: &FunctionId,
     overload: &FunctionOverloadId,
@@ -2290,6 +2353,56 @@ fn bind_dynamic_scalar_result_with_creation<H>(
     work: &mut CompileCheckpoints<'_>,
     mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
 ) -> Result<FunctionValueType, FunctionBindingCreationFailure<H>> {
+    if name == "row" {
+        let result = request.expected_result_type.ok_or_else(|| {
+            FunctionBindingError::InvalidBinding(
+                "ROW constructor requires its declared result".into(),
+            )
+        })?;
+        let DataType::Struct(fields) = result.data_type() else {
+            return Err(FunctionBindingError::NoMatchingOverload.into());
+        };
+        if result.nullable() || request.arguments.len() != fields.len() {
+            return Err(FunctionBindingError::NoMatchingOverload.into());
+        }
+        binding_control::value_type(result, work)?;
+        for (ordinal, argument) in request.arguments.iter().enumerate() {
+            work.step()?;
+            let FunctionArgument::Value { value_type, .. } = argument else {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
+            };
+            let field = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.child(result, ordinal)
+            })?
+            .ok_or(FunctionBindingError::NoMatchingOverload)?;
+            if !binding_control::exact_type(&field, value_type, work)? {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "ROW field declaration differs from its value input".into(),
+                )
+                .into());
+            }
+        }
+        return Ok(result.clone());
+    }
+    if name == "__row_field" {
+        let ordinal = row_field_ordinal(request, work)?;
+        let FunctionArgument::Value {
+            value_type: row, ..
+        } = &request.arguments[0]
+        else {
+            unreachable!("ROW argument checked with its ordinal")
+        };
+        let field = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+            cx.child(row, ordinal)
+        })?
+        .ok_or(FunctionBindingError::NoMatchingOverload)?;
+        return dynamic_nullable(
+            &field,
+            row.nullable() || field.nullable(),
+            work,
+            borrow_creator(&mut creation),
+        );
+    }
     if name == "map" {
         let [keys, values] = match request.arguments {
             [] => {
@@ -2324,8 +2437,9 @@ fn bind_dynamic_scalar_result_with_creation<H>(
         ) {
             return Err(FunctionBindingError::NoMatchingOverload.into());
         }
-        if super::map_lookup_core::MapKeyOperations::prepare(key.data_type(), key.logical_type())
-            .is_none()
+        if novarocks_type_contract::KeyRelation::Identical
+            .validate_type_observed(key.value_type(), |_| work.step())?
+            .is_err()
         {
             return Err(FunctionBindingError::UnavailableImplementation(overload.clone()).into());
         }
@@ -2465,7 +2579,7 @@ fn bind_dynamic_scalar_result_with_creation<H>(
         }
     }
     let nullable = match name {
-        "named_struct" | "row" => false,
+        "named_struct" => false,
         "__struct_subfield" | "__array_struct_subfield" => true,
         _ => scalar_result_nullable(name, request, work)?,
     };
@@ -2551,58 +2665,23 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                 borrow_creator(&mut creation),
             )?;
         }
-        "map_concat" => {
-            let arguments =
-                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
-            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                cx.collected_vec::<(FunctionValueType, FunctionValueType)>(arguments.len())
-            })?;
-            let pairs = arguments
-                .into_iter()
-                .map(|value| {
-                    work.step()?;
-                    full_map_items_with_creation(value, work, borrow_creator(&mut creation))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if pairs.is_empty() {
-                return Err(FunctionBindingError::NoMatchingOverload.into());
-            }
-            full_result = dynamic_map(
-                &fold_value_types_with_creation(
-                    pairs.iter().map(|pair| &pair.0),
-                    work,
-                    borrow_creator(&mut creation),
-                )?,
-                &fold_value_types_with_creation(
-                    pairs.iter().map(|pair| &pair.1),
-                    work,
-                    borrow_creator(&mut creation),
-                )?,
-                full_result.nullable(),
-                work,
-                borrow_creator(&mut creation),
-            )?;
-        }
         "map_entries" => {
             let (key, value) =
                 full_map_items_with_creation(value(0)?, work, borrow_creator(&mut creation))?;
-            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+            full_result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
                 cx.array::<(String, FunctionValueType)>(2)?;
-                cx.array::<u8>("key".len())?;
-                cx.array::<u8>("value".len())
+                let entries = super::signature::declared_struct_fields_with_construction(
+                    vec![(String::new(), key), (String::new(), value)],
+                    false,
+                    true,
+                    cx,
+                )?;
+                super::signature::declared_list_exact_with_construction(
+                    &entries,
+                    full_result.nullable(),
+                    cx,
+                )
             })?;
-            let entries = dynamic_struct(
-                vec![("key".into(), key), ("value".into(), value)],
-                true,
-                work,
-                borrow_creator(&mut creation),
-            )?;
-            full_result = dynamic_list(
-                &entries,
-                full_result.nullable(),
-                work,
-                borrow_creator(&mut creation),
-            )?;
         }
         "transform_keys" | "transform_values" => {
             let _ = full_map_items_with_creation(value(1)?, work, borrow_creator(&mut creation))?;
@@ -2613,8 +2692,8 @@ fn bind_dynamic_scalar_result_with_creation<H>(
             let _ = full_map_items_with_creation(result_type, work, borrow_creator(&mut creation))?;
             full_result = result_type.clone();
         }
-        "named_struct" | "row" => {
-            let fields = if name == "named_struct" {
+        "named_struct" => {
+            let fields = {
                 with_binding_creation(borrow_creator(&mut creation), work, |cx| {
                     cx.collected_vec::<(String, FunctionValueType)>(request.arguments.len() / 2)
                 })?;
@@ -2634,25 +2713,6 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                             cx.array::<u8>(name.len())
                         })?;
                         Ok((name.to_string(), value_type.clone()))
-                    })
-                    .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?
-            } else {
-                let arguments =
-                    dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
-                with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                    cx.collected_vec::<(String, FunctionValueType)>(arguments.len())
-                })?;
-                arguments
-                    .iter()
-                    .enumerate()
-                    .map(|(index, ty)| {
-                        work.step()?;
-                        Ok((
-                            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                                cx.col_name(index)
-                            })?,
-                            (*ty).clone(),
-                        ))
                     })
                     .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?
             };
@@ -2781,6 +2841,70 @@ impl BuiltinDynamicScalarResolver {
             )?;
             let argument_types =
                 with_binding_creation(creation, work, |cx| cx.publish_arguments(arguments))?;
+            return Ok(FunctionBindingSelection {
+                overload: overload.clone(),
+                argument_types,
+                result_type: FunctionResultType::Scalar(result),
+                aggregate: None,
+            });
+        }
+        if self.canonical_name.as_ref() == "map_concat" {
+            let sources =
+                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
+            if sources.len() < 2
+                || sources.iter().any(|source| {
+                    !matches!(source.data_type(), DataType::Map(_, _) | DataType::Null)
+                })
+            {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
+            }
+            let mut result = sources[0].clone();
+            for source in &sources[1..] {
+                work.step()?;
+                result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                    cx.trino_common(&result, source)
+                })?
+                .ok_or(FunctionBindingError::NoMatchingOverload)?;
+            }
+            if result.data_type() == &DataType::Null {
+                result = dynamic_map(&result, &result, true, work, borrow_creator(&mut creation))?;
+            }
+            let (key, value) =
+                full_map_items_with_creation(&result, work, borrow_creator(&mut creation))?;
+            // The output merge does not retain any input's physical sorted
+            // flag or field labels. Its member declarations are the common K/V.
+            result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                super::signature::declared_map_exact_values_with_construction(
+                    &key,
+                    &value,
+                    result.nullable(),
+                    cx,
+                )
+            })?;
+            let admitted = novarocks_type_contract::KeyRelation::Identical
+                .validate_type_observed(key.value_type(), |_| work.step())?;
+            if admitted.is_err() {
+                return Err(
+                    FunctionBindingError::UnavailableImplementation(overload.clone()).into(),
+                );
+            }
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.array::<FunctionArgumentType>(sources.len())
+            })?;
+            let targets = sources
+                .iter()
+                .map(|source| {
+                    let target = dynamic_nullable(
+                        &result,
+                        source.nullable(),
+                        work,
+                        borrow_creator(&mut creation),
+                    )?;
+                    Ok(FunctionArgumentType::Value(target))
+                })
+                .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?;
+            let argument_types =
+                with_binding_creation(creation, work, |cx| cx.publish_arguments(targets))?;
             return Ok(FunctionBindingSelection {
                 overload: overload.clone(),
                 argument_types,
@@ -3257,8 +3381,10 @@ pub(super) fn dynamic_definition_parts(
         })?;
     let pure_effects = match name {
         "map" => Some(super::array_literal_owner::map_effects()),
+        "row" | "__row_field" => Some(super::row_owner::effects()),
         "__array_struct_subfield" => Some(super::array_struct_subfield_owner::effects()),
         "map_entries" => Some(super::map_entries_owner::effects()),
+        "map_concat" => Some(super::map_concat_owner::effects()),
         "__array_literal" => Some(super::array_literal_owner::effects()),
         "truncate" => Some(super::truncate_owner::effects()),
         "round" => Some(super::round_owner::effects()),
@@ -3273,6 +3399,7 @@ pub(super) fn dynamic_definition_parts(
         // T is the selected field of the input row, named by the constant VARCHAR.
         "__array_struct_subfield" => &[("array(row(...)), varchar", "array(T)")],
         "map_entries" => &[("map(K,V)", "array(row(K,V))")],
+        "map_concat" => &[("map(K,V), map(K,V), map(K,V)...", "map(K,V)")],
         "greatest" | "least" => &[("T...", "T")],
         "round" | "truncate" => super::rounding_binding::public_signatures(name),
         "nullif" => &[("T, T", "T")],
@@ -3412,6 +3539,8 @@ pub fn contribute_builtin_functions(
                 super::array_struct_subfield_owner::definition(name, declaration, resolver)?
             }
             "map_entries" => super::map_entries_owner::definition(name, declaration, resolver)?,
+            "map_concat" => super::map_concat_owner::definition(name, declaration, resolver)?,
+            "row" | "__row_field" => super::row_owner::definition(name, declaration, resolver)?,
             "__array_literal" | "map" => {
                 super::array_literal_owner::definition(name, declaration, resolver)?
             }
@@ -3423,7 +3552,7 @@ pub fn contribute_builtin_functions(
             }
             _ => FunctionDefinition::bound_with_owner(
                 name,
-                if matches!(*name, "named_struct" | "row") {
+                if *name == "named_struct" {
                     FunctionVisibility::Hidden
                 } else {
                     FunctionVisibility::Public

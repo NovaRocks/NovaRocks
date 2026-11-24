@@ -1,0 +1,25 @@
+-- query 6
+-- types	integer	bigint	boolean
+map_value	row_count	original_order
+11	2	true
+
+-- query 7
+-- types	bigint
+distinct_maps
+1
+
+-- query 8
+-- types	bigint
+row_count
+2
+
+-- query 9
+-- types	bigint	boolean
+map_count	original_order
+1	true
+
+-- query 13
+-- types	integer	integer
+id	first_key
+1	1
+2	2

@@ -192,7 +192,10 @@ pub enum NodeShape<'a> {
         name: &'a str,
         expected_result: Option<&'a FunctionValueType>,
     },
-    Row,
+    Row {
+        fields: Option<&'a [novarocks_parser::ast::RowField]>,
+    },
+    RowField,
     MapSubscript,
     Operator(OperatorFunction),
     Coalesce,
@@ -322,6 +325,12 @@ impl From<ValueTypeError> for TypingError {
     }
 }
 
+impl From<novarocks_type_contract::ExecutionValueTypeError> for TypingError {
+    fn from(error: novarocks_type_contract::ExecutionValueTypeError) -> Self {
+        Self::ValueType(error.into())
+    }
+}
+
 impl From<AssignmentCommonTypeError> for TypingError {
     fn from(error: AssignmentCommonTypeError) -> Self {
         match error {
@@ -417,6 +426,154 @@ pub fn negation_operator(operand: &FunctionValueType) -> OperatorFunction {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RowFieldResolution {
+    NotRow,
+    Missing,
+    Ambiguous,
+    Found(usize),
+}
+
+/// Resolve the SQL name against named fields of the semantic ROW declaration.
+pub fn resolve_row_field_name<E>(
+    source: &FunctionValueType,
+    requested: &str,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<RowFieldResolution, E> {
+    let novarocks_type_contract::ValueKind::Struct(fields) = source.value_type().kind() else {
+        return Ok(RowFieldResolution::NotRow);
+    };
+    let mut selected = None;
+    for (ordinal, field) in fields.iter().enumerate() {
+        observe()?;
+        if field
+            .row_name()
+            .is_some_and(|name| row_names_match(name, requested))
+            && selected.replace(ordinal).is_some()
+        {
+            return Ok(RowFieldResolution::Ambiguous);
+        }
+    }
+    Ok(selected.map_or(RowFieldResolution::Missing, RowFieldResolution::Found))
+}
+
+fn row_names_match(left: &str, right: &str) -> bool {
+    if left.is_ascii() && right.is_ascii() {
+        return left.eq_ignore_ascii_case(right);
+    }
+    fn simple_case(character: char) -> char {
+        let mut uppercase = character.to_uppercase();
+        let upper = uppercase.next().expect("a char has an uppercase mapping");
+        // ROW dereference compares individual characters. Multi-character
+        // display mappings (e.g. ß -> SS) do not merge two field names.
+        let simple_upper = if uppercase.next().is_none() {
+            upper
+        } else {
+            character
+        };
+        simple_upper
+            .to_lowercase()
+            .next()
+            .expect("a char has a lowercase mapping")
+    }
+    left.chars()
+        .map(simple_case)
+        .eq(right.chars().map(simple_case))
+}
+
+/// Construct a precise nonnull ROW from actual children and their declarations.
+pub fn row_constructor_result<'a>(
+    fields: impl ExactSizeIterator<Item = (Option<&'a str>, &'a FunctionValueType)>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FunctionValueType, TypingError> {
+    use novarocks_type_contract::{
+        ValueField, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+
+    let storage = ValueTypeStorageLifetime::pure();
+    let mut layout = Vec::with_capacity(fields.len());
+    let mut semantic = Vec::with_capacity(fields.len());
+    for (name, field) in fields {
+        work.step()?;
+        if name == Some("") {
+            return Err(TypingError::InvalidShape(
+                "a named ROW field requires a nonempty name",
+            ));
+        }
+        let name = name.unwrap_or_default();
+        layout.push(arrow::datatypes::Field::new(
+            name,
+            field.data_type().clone(),
+            field.nullable(),
+        ));
+        semantic.push(ValueField::new(
+            name,
+            field.value_type().clone(),
+            storage.clone(),
+        ));
+    }
+    work.flush()?;
+    let mut observe = |units| -> Result<(), TypingError> {
+        for _ in 0..units {
+            work.step()?;
+        }
+        Ok(())
+    };
+    let semantic = ValueTypeRef::try_new_observed(
+        ValueKind::Struct(semantic.into()),
+        false,
+        storage.clone(),
+        &mut observe,
+    )?;
+    let layout = ValueLayout::try_from_normalized_arrow_observed(
+        DataType::Struct(layout.into()),
+        storage,
+        &mut observe,
+    )?;
+    let binding = novarocks_type_contract::TypedValueBinding::try_new_observed(
+        semantic,
+        layout,
+        &mut observe,
+    )?;
+    Ok(FunctionValueType::try_from_typed_binding(binding)?)
+}
+
+pub fn rebind_row_constructor_result(
+    original: &FunctionValueType,
+    arguments: &[FunctionArgument],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FunctionValueType, TypingError> {
+    let novarocks_type_contract::ValueKind::Struct(fields) = original.value_type().kind() else {
+        return Err(TypingError::InvalidShape(
+            "ROW constructor lacks its original ROW declaration",
+        ));
+    };
+    if original.nullable() || fields.len() != arguments.len() {
+        return Err(TypingError::InvalidShape(
+            "ROW declaration does not match its value operands",
+        ));
+    }
+    let values = arguments
+        .iter()
+        .map(|argument| match argument {
+            FunctionArgument::Value { value_type, .. } => Ok(value_type),
+            _ => Err(TypingError::InvalidShape(
+                "ROW constructor requires value operands",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    row_constructor_result(
+        fields.iter().map(|field| field.row_name()).zip(values),
+        work,
+    )
+}
+
+impl SelectedCall {
+    pub fn expected_result(&self) -> Option<&FunctionValueType> {
+        self.expected_result.as_ref()
+    }
+}
+
 /// Select a node's result and its ordered child conversions. The caller
 /// applies the decisions and hands the actual converted facts to finish_call.
 pub fn type_node(
@@ -446,7 +603,33 @@ pub fn type_node(
                 })?;
             type_catalog_call(context, "coalesce", None, children, work)?
         }
-        NodeShape::Row => {
+        NodeShape::Row { fields } => {
+            if fields.is_some_and(|fields| fields.len() != children.len()) {
+                return Err(TypingError::InvalidShape(
+                    "ROW names do not match its value operands",
+                ));
+            }
+            let names = fields.map(|fields| {
+                fields
+                    .iter()
+                    .map(|field| {
+                        field.name.as_ref().map(|name| {
+                            if name.quoted {
+                                std::borrow::Cow::Borrowed(name.value.as_str())
+                            } else {
+                                std::borrow::Cow::Owned(name.value.to_ascii_uppercase())
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let result = row_constructor_result(
+                children.iter().enumerate().map(|(ordinal, child)| {
+                    let name = names.as_ref().and_then(|names| names[ordinal].as_deref());
+                    (name, &child.value_type)
+                }),
+                work,
+            )?;
             let function = FunctionId::try_new("builtin.scalar/row/v1")
                 .expect("valid ROW constructor function identity");
             let overload = FunctionOverloadId::try_new("builtin.scalar/row/dynamic-v1")
@@ -456,6 +639,18 @@ pub fn type_node(
             let binding = context.catalog.select_exact_scalar(
                 &function,
                 &overload,
+                request(&arguments, Some(&result)),
+                work.control(),
+            )?;
+            type_selected_call(context, binding, Some(&result), children, work)?
+        }
+        NodeShape::RowField => {
+            let arguments = arguments(children, work)?;
+            let function = FunctionId::try_new("builtin.scalar/__row_field/v1")
+                .expect("valid ROW field function identity");
+            work.flush()?;
+            let binding = context.catalog.select_trusted_scalar(
+                &function,
                 request(&arguments, None),
                 work.control(),
             )?;

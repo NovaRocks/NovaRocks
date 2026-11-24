@@ -84,8 +84,22 @@ fn invoke(name: &str, columns: &[ArrayRef], rows: usize) -> Result<Output, Kerne
     let bound = catalog
         .resolve_bound_user(name, FunctionKind::Scalar, request, &Control)
         .unwrap();
+    let evaluated = columns
+        .iter()
+        .map(EvaluatedArgument::Column)
+        .collect::<Vec<_>>();
+    invoke_bound(&catalog, bound, request, Selection::all(rows), &evaluated)
+}
+
+fn invoke_bound(
+    catalog: &novarocks_functions::EngineFunctionCatalog,
+    bound: novarocks_functions::ResolvedFunctionBinding,
+    request: FunctionBindingRequest<'_>,
+    selection: Selection<'_>,
+    evaluated: &[EvaluatedArgument<'_>],
+) -> Result<Output, KernelFailure> {
     let selected = Arc::new(bound.selected);
-    let uses = (1..=arguments.len() as u32)
+    let uses = (1..=request.arguments.len() as u32)
         .map(|index| Some(ExpressionUseId::new(index)))
         .collect::<Vec<_>>();
     let context = ExpressionEffectContext {
@@ -120,18 +134,73 @@ fn invoke(name: &str, columns: &[ArrayRef], rows: usize) -> Result<Output, Kerne
         panic!("expected scalar kernel");
     };
     let mut instance = ScalarEvaluationInstance::instantiate(prepared).unwrap();
-    let arguments = columns
-        .iter()
-        .map(EvaluatedArgument::Column)
-        .collect::<Vec<_>>();
     let (_, values, errors) = instance
-        .evaluate(Selection::all(rows), &arguments, &Control)?
+        .evaluate(selection, evaluated, &Control)?
         .into_parts();
     Ok(Output { values, errors })
 }
 
 fn evaluate(name: &str, columns: &[ArrayRef], rows: usize) -> Output {
     invoke(name, columns, rows).unwrap()
+}
+
+#[test]
+fn row_constructor_keeps_sparse_selection_broadcast_and_child_nulls() {
+    use arrow_array::StructArray;
+    use arrow_schema::Field;
+    let id: ArrayRef = Arc::new(Int32Array::from(vec![7]));
+    let nullable: ArrayRef = Arc::new(Int32Array::from(vec![Some(10), None, Some(30), Some(40)]));
+    let result_type = FunctionValueType::new(
+        DataType::Struct(
+            vec![
+                Field::new("ID", DataType::Int32, false),
+                Field::new("", DataType::Int32, true),
+            ]
+            .into(),
+        ),
+        false,
+    );
+    let arguments = [
+        FunctionArgument::Value {
+            value_type: FunctionValueType::new(DataType::Int32, false),
+            constant: None,
+        },
+        FunctionArgument::Value {
+            value_type: FunctionValueType::new(DataType::Int32, true),
+            constant: None,
+        },
+    ];
+    let request = FunctionBindingRequest {
+        arguments: &arguments,
+        logical_argument_count: arguments.len(),
+        expected_result_type: Some(&result_type),
+    };
+    let catalog = build_builtin_engine_function_catalog().unwrap();
+    let bound = catalog
+        .resolve_bound_trusted("row", FunctionKind::Scalar, request, &Control)
+        .unwrap();
+    let evaluated = [
+        EvaluatedArgument::Scalar(&id),
+        EvaluatedArgument::Column(&nullable),
+    ];
+    let selection = Selection::try_sparse(4, &[1, 3]).unwrap();
+    let output = invoke_bound(&catalog, bound, request, selection, &evaluated).unwrap();
+    assert!(output.errors().is_empty());
+    let row = output
+        .values()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert_eq!(row.null_count(), 0);
+    assert_eq!(row.data_type(), result_type.data_type());
+    assert_eq!(
+        row.column(0).to_data(),
+        Int32Array::from(vec![7, 7]).to_data()
+    );
+    assert_eq!(
+        row.column(1).to_data(),
+        Int32Array::from(vec![None, Some(40)]).to_data()
+    );
 }
 
 #[test]
@@ -310,4 +379,188 @@ fn element_at_is_one_based_and_keeps_array_and_map_overloads_distinct() {
         [Some(10), Some(20), None, None]
     );
     assert_eq!(result.errors().len(), 1);
+}
+
+#[test]
+fn map_entries_projects_anonymous_fields_and_concat_keeps_last_value() {
+    use arrow_array::StructArray;
+    use novarocks_type_contract::ValueKind;
+
+    let list = |items: Vec<Option<i32>>| -> ArrayRef {
+        Arc::new(ListArray::from_iter_primitive::<types::Int32Type, _, _>([
+            Some(items),
+        ]))
+    };
+    let a = evaluate(
+        "map",
+        &[list(vec![Some(1), Some(2)]), list(vec![Some(10), Some(20)])],
+        1,
+    );
+    let b = evaluate(
+        "map",
+        &[list(vec![Some(2), Some(3)]), list(vec![None, Some(30)])],
+        1,
+    );
+    let merged = evaluate("map_concat", &[a.values().clone(), b.values().clone()], 1);
+    let key: ArrayRef = Arc::new(Int32Array::from(vec![2]));
+    let found = evaluate("element_at", &[merged.values().clone(), key], 1);
+    assert_eq!(
+        found.values().to_data(),
+        Int32Array::from(vec![None]).to_data()
+    );
+
+    let output = evaluate("map_entries", &[merged.values().clone()], 1);
+    let list = output
+        .values()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let entries = list
+        .values()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let declared = FunctionValueType::new(list.data_type().clone(), true);
+    let item = declared.child_at(0).unwrap();
+    let ValueKind::Struct(fields) = item.value_type().kind() else {
+        panic!("ROW item")
+    };
+    assert_eq!(
+        fields
+            .iter()
+            .map(|field| field.row_name())
+            .collect::<Vec<_>>(),
+        vec![None, None]
+    );
+    assert!(!fields[0].value_type().nullable());
+    let merged = merged.values().as_any().downcast_ref::<MapArray>().unwrap();
+    assert_eq!(entries.column(0).to_data(), merged.keys().to_data());
+    assert_eq!(entries.column(1).to_data(), merged.values().to_data());
+    let keys = entries
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let values = entries
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let mut pairs: Vec<_> = keys.values().iter().copied().zip(values.iter()).collect();
+    pairs.sort_unstable_by_key(|pair| pair.0);
+    assert_eq!(pairs, vec![(1, Some(10)), (2, None), (3, Some(30))]);
+}
+
+#[test]
+fn split_to_map_accounts_for_bad_pairs_as_original_row_errors() {
+    use novarocks_failure_contract::{FailureProjection, kernel_reason::INVALID_FUNCTION_ARGUMENT};
+
+    let string: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("a:1|b:2|"),
+        Some("a:1|a:2"),
+        Some(""),
+        Some("x:1:2"),
+        None,
+    ]));
+    let delimiter: ArrayRef = Arc::new(StringArray::from(vec!["|"; 5]));
+    let pair: ArrayRef = Arc::new(StringArray::from(vec![":"; 5]));
+    let out = evaluate("split_to_map", &[string, delimiter, pair], 5);
+    let map = out.values().as_any().downcast_ref::<MapArray>().unwrap();
+    assert_eq!(map.value_offsets(), &[0, 2, 2, 2, 2, 2]);
+    assert!(map.is_null(1));
+    assert!(map.is_valid(2));
+    assert!(map.is_null(3));
+    assert!(map.is_null(4));
+    assert_eq!(
+        out.errors()
+            .iter()
+            .map(|error| (error.selected_ordinal(), error.failure_fact().reason()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, INVALID_FUNCTION_ARGUMENT),
+            (3, INVALID_FUNCTION_ARGUMENT)
+        ],
+    );
+}
+
+#[test]
+fn map_lookup_uses_actual_composite_comparisons_after_null_candidates() {
+    use arrow_array::StructArray;
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::Field;
+    use novarocks_failure_contract::{FailureProjection, kernel_reason::MAP_KEY_INDETERMINATE};
+
+    let key = |rows: Vec<Vec<Option<i32>>>| -> ArrayRef {
+        Arc::new(ListArray::from_iter_primitive::<types::Int32Type, _, _>(
+            rows.into_iter().map(Some),
+        ))
+    };
+    // This carrier models a valid map_agg output with one nested NULL key.
+    let keys = key(vec![
+        vec![Some(1), None],
+        vec![Some(1), Some(2)],
+        vec![Some(2), Some(9)],
+    ]);
+    let fields = vec![
+        Field::new("key", keys.data_type().clone(), false),
+        Field::new("value", DataType::Int32, true),
+    ]
+    .into();
+    let entries = StructArray::try_new(
+        fields,
+        vec![keys, Arc::new(Int32Array::from(vec![7, 8, 9]))],
+        None,
+    )
+    .unwrap();
+    let maps: ArrayRef = Arc::new(
+        MapArray::try_new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::new(vec![0, 2, 3, 3, 3].into()),
+            entries,
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let probes = key(vec![
+        vec![Some(1), Some(2)],
+        vec![None, Some(1)],
+        vec![Some(1), None],
+        vec![Some(1), Some(2)],
+    ]);
+    let output = evaluate("element_at", &[maps, probes], 4);
+    assert!(output.errors().is_empty());
+    assert_eq!(
+        output.values().to_data(),
+        Int32Array::from(vec![Some(8), None, None, None]).to_data()
+    );
+
+    let keys = key(vec![vec![Some(1), None]]);
+    let fields = vec![
+        Field::new("key", keys.data_type().clone(), false),
+        Field::new("value", DataType::Int32, true),
+    ]
+    .into();
+    let entries = StructArray::try_new(
+        fields,
+        vec![keys, Arc::new(Int32Array::from(vec![7]))],
+        None,
+    )
+    .unwrap();
+    let map: ArrayRef = Arc::new(
+        MapArray::try_new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::new(vec![0, 1].into()),
+            entries,
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let result = evaluate("element_at", &[map, key(vec![vec![Some(1), Some(2)]])], 1);
+    assert_eq!(result.errors().len(), 1);
+    assert_eq!(
+        result.errors()[0].failure_fact().reason(),
+        MAP_KEY_INDETERMINATE
+    );
 }

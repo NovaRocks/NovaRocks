@@ -79,6 +79,7 @@ struct LocalExchangerState {
 pub(crate) enum LocalExchangePartitionSpec {
     Single,
     InputSlotIds(Vec<SlotId>),
+    CanonicalMapInputSlots(Vec<(SlotId, novarocks_type_contract::FunctionValueType)>),
     HierarchicalInputSlotIds(Vec<(SlotId, novarocks_type_contract::FunctionValueType)>),
     /// Equal typed file occurrences on distinct contribution receivers have
     /// the same ordinal but different fragment-local slot identities.
@@ -280,7 +281,8 @@ impl LocalExchanger {
     pub(crate) fn retains_encoded_partition_input(&self) -> bool {
         matches!(
             &self.partition_spec,
-            LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
+            LocalExchangePartitionSpec::CanonicalMapInputSlots(_)
+                | LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
                 | LocalExchangePartitionSpec::HierarchicalFileInput(_)
                 | LocalExchangePartitionSpec::ConditionalKey { .. }
         )
@@ -597,8 +599,9 @@ impl LocalExchanger {
                     &|| control.checkpoint(),
                 )?
             }
-            LocalExchangePartitionSpec::HierarchicalInputSlotIds(slots) => {
-                return self.partition_hierarchical(
+            LocalExchangePartitionSpec::CanonicalMapInputSlots(slots)
+            | LocalExchangePartitionSpec::HierarchicalInputSlotIds(slots) => {
+                return self.partition_typed_keys(
                     chunk,
                     slots,
                     None,
@@ -616,7 +619,7 @@ impl LocalExchanger {
                         crate::runtime::task::ExecutionFailure::from_domain(LocalPartitionContract)
                     })?
                     .slot_id();
-                return self.partition_hierarchical(
+                return self.partition_typed_keys(
                     chunk,
                     &[(slot, ty.clone())],
                     None,
@@ -626,7 +629,7 @@ impl LocalExchanger {
                 );
             }
             LocalExchangePartitionSpec::ConditionalKey { applies, keys } => {
-                return self.partition_hierarchical(
+                return self.partition_typed_keys(
                     chunk,
                     keys,
                     Some(*applies),
@@ -644,7 +647,7 @@ impl LocalExchanger {
         Ok(partitioned.into_iter().enumerate().collect())
     }
 
-    fn partition_hierarchical(
+    fn partition_typed_keys(
         &self,
         chunk: &Chunk,
         slots: &[(SlotId, novarocks_type_contract::FunctionValueType)],
@@ -654,7 +657,8 @@ impl LocalExchanger {
         ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
     ) -> crate::runtime::task::ExecutionResult<Vec<(usize, Chunk)>> {
         use crate::exec::hash_table::partition_keys::{
-            native_tuple_hashes_observed, require_non_null_keys, source_key_owner,
+            native_exchange_v2_hashes_observed, native_tuple_hashes_observed,
+            require_non_null_keys, source_key_owner,
         };
         use crate::exec::pipeline::operator::ConstructionFailure;
         use crate::runtime::task::ExecutionFailure;
@@ -688,6 +692,10 @@ impl LocalExchanger {
                     .ok_or_else(|| ExecutionFailure::from_domain(LocalPartitionContract))
             })
             .transpose()?;
+        let canonical_map = matches!(
+            &self.partition_spec,
+            LocalExchangePartitionSpec::CanonicalMapInputSlots(_)
+        );
         let position_file = matches!(
             &self.partition_spec,
             LocalExchangePartitionSpec::HierarchicalFileInput(_)
@@ -742,7 +750,12 @@ impl LocalExchanger {
             if applies.is_some() {
                 require_non_null_keys(&arrays, &types, &rows, &checkpoint)?;
             }
-            Some(native_tuple_hashes_observed(
+            let hash_row = if canonical_map {
+                native_exchange_v2_hashes_observed
+            } else {
+                native_tuple_hashes_observed
+            };
+            Some(hash_row(
                 &arrays,
                 &types,
                 &rows,
@@ -762,7 +775,14 @@ impl LocalExchanger {
             }
             let hash = hashes.as_ref().and_then(|batch| batch.as_slice()[row]);
             let partition = if let Some(hash) = hash {
-                (PartitionHashDomain::DriverV1.mix(hash) % self.partition_count as u64) as usize
+                let hash = if canonical_map {
+                    hash
+                } else {
+                    PartitionHashDomain::DriverV1.mix(hash)
+                };
+                (hash % self.partition_count as u64) as usize
+            } else if canonical_map {
+                return Err(ExecutionFailure::from_domain(LocalPartitionContract));
             } else {
                 let partition = *bypass_cursor;
                 *bypass_cursor = (*bypass_cursor + 1) % self.partition_count;
@@ -816,6 +836,7 @@ impl LocalExchanger {
                 partition_chunk_by_hash_arrays(chunk, &arrays, self.partition_count, false)?
             }
             LocalExchangePartitionSpec::Single
+            | LocalExchangePartitionSpec::CanonicalMapInputSlots(_)
             | LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
             | LocalExchangePartitionSpec::HierarchicalFileInput(_)
             | LocalExchangePartitionSpec::ConditionalKey { .. } => {
@@ -1107,6 +1128,49 @@ mod hierarchical_tests {
             rows,
         )
     }
+    #[test]
+    fn ordinary_v2_driver_shuffle_keeps_reordered_map_rows_together() {
+        use arrow::array::Int64Array;
+
+        let (source, ty) = crate::exec::chunk::typed_fixture::reordered_map_keys();
+        let rt = RuntimeState::default();
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            MemTracker::new_root("MAP driver partition fixture"),
+            rt.error_state(),
+        ).unwrap();
+        let exchanger = LocalExchanger::new_with_limits(
+            127,
+            3,
+            LocalExchangePartitionSpec::CanonicalMapInputSlots(vec![(SlotId::new(1), ty)]),
+            1 << 30,
+            -1,
+        );
+        let mut bypass = 0;
+        let rows = with_test_step(&rt, |ctx| {
+            exchanger.partition_chunk_created(&source, factory.as_ref(), ctx, &mut bypass)
+        })
+        .unwrap();
+        assert_eq!(bypass, 0);
+        let groups = rows
+            .iter()
+            .filter_map(|(_, chunk)| {
+                (!chunk.is_empty()).then(|| {
+                    chunk.columns()[1]
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(groups.iter().any(|group| group.starts_with(&[0, 1])));
+        assert_eq!(
+            groups.iter().map(|group| group.len()).sum::<usize>(),
+            source.len()
+        );
+    }
+
     #[test]
     fn instance_and_driver_levels_keep_one_author_and_use_multiple_drivers() {
         let rt = RuntimeState::default();

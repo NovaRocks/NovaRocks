@@ -29,6 +29,8 @@ pub const INVALID_CAST_ARGUMENT: FailureReason =
 
 pub const INVALID_FUNCTION_ARGUMENT: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(45).unwrap());
+pub const MAP_KEY_INDETERMINATE: FailureReason =
+    FailureReason::new(domain::KERNEL, NonZeroU16::new(56).unwrap());
 
 pub const INVALID_JSON_LITERAL: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(46).unwrap());

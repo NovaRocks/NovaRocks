@@ -244,10 +244,13 @@ impl PureScalarImplementation for MapElementAtOwner {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum LookupMode {
     TrinoArray,
-    Map(super::collection_selected::Operation),
+    Map(
+        super::collection_selected::Operation,
+        Arc<novarocks_value_arrays::hash_eq::PreparedKeyOperations>,
+    ),
 }
 
 #[derive(Debug)]
@@ -265,7 +268,7 @@ impl PreparedScalarKernel for PreparedMapElementAt {
     }
 
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
-        Ok(Box::new(MapElementAtInstance(self.mode)))
+        Ok(Box::new(MapElementAtInstance(self.mode.clone())))
     }
 }
 
@@ -276,12 +279,12 @@ impl ScalarKernelInstance for MapElementAtInstance {
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        match self.0 {
+        match &self.0 {
             LookupMode::TrinoArray => {
                 super::array_access_selected::evaluate_element_at(input, control)
             }
-            LookupMode::Map(operation) => {
-                super::collection_selected::evaluate(operation, input, control)
+            LookupMode::Map(operation, key) => {
+                super::collection_selected::evaluate(*operation, Some(key), input, control)
             }
         }
     }
@@ -385,7 +388,26 @@ impl MapElementAtOwner {
                 super::collection_selected::validate_profile(operation, &contract, || {
                     work.step().map_err(compile_failure)
                 })?;
-                LookupMode::Map(operation)
+                let key = collection
+                    .child_at(0)
+                    .ok_or_else(|| invalid("MAP lookup lacks its frozen key declaration"))?;
+                let key = novarocks_value_arrays::hash_eq::PreparedKeyOperations::prepare_observed(
+                    &key,
+                    novarocks_type_contract::KeyRelation::Equal,
+                    &mut |steps| {
+                        for _ in 0..steps {
+                            work.step().map_err(compile_failure)?;
+                        }
+                        Ok::<_, KernelFailure>(())
+                    },
+                )
+                .map_err(|error| match error {
+                    novarocks_value_arrays::hash_eq::KeyPreparationFailure::Caller(error) => error,
+                    novarocks_value_arrays::hash_eq::KeyPreparationFailure::Unsupported(_) => {
+                        invalid("MAP lookup has no prepared comparison for its key")
+                    }
+                })?;
+                LookupMode::Map(operation, Arc::new(key))
             };
             work.step().map_err(compile_failure)?;
             // The prepared object retains the same canonical contract. Its body is

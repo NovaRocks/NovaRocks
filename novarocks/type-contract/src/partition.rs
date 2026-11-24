@@ -61,6 +61,8 @@ pub const fn avalanche_hash_u64(mut value: u64) -> u64 {
 pub enum PartitionHashAlgorithm {
     /// Native exchange FNV-based row combination followed by unsigned modulo.
     NativeExchangeV1,
+    /// Ordinary exchange over canonical MAP identity, followed by unsigned modulo.
+    NativeExchangeV2,
     /// The same canonical row encoding and combination as NativeExchangeV1,
     /// followed by InstanceV1 or DriverV1 full-width domain mixing before
     /// unsigned modulo at that level. Source and Task identities never enter.
@@ -73,6 +75,7 @@ impl PartitionHashAlgorithm {
     pub const fn stable_name(self) -> &'static str {
         match self {
             Self::NativeExchangeV1 => "novarocks.native-exchange.v1",
+            Self::NativeExchangeV2 => "novarocks.native-exchange.v2",
             Self::NativeHierarchicalV1 => "novarocks.native-hierarchical.v1",
             Self::NativeBucketCrc32V1 => "novarocks.native-bucket-crc32.v1",
         }
@@ -80,15 +83,26 @@ impl PartitionHashAlgorithm {
 
     pub const fn nulls_equal(self) -> bool {
         match self {
-            Self::NativeExchangeV1 | Self::NativeHierarchicalV1 | Self::NativeBucketCrc32V1 => true,
+            Self::NativeExchangeV1
+            | Self::NativeExchangeV2
+            | Self::NativeHierarchicalV1
+            | Self::NativeBucketCrc32V1 => true,
         }
     }
 
-    /// Reports the exact Arrow key domain for which revision 1 hashing is
-    /// total and consistent with SQL equality.
+    /// Ordinary grouped and set keys containing a MAP need its unordered identity.
+    pub fn for_grouping_keys<'a>(types: impl IntoIterator<Item = &'a DataType>) -> Self {
+        if types.into_iter().any(contains_map) {
+            Self::NativeExchangeV2
+        } else {
+            Self::NativeExchangeV1
+        }
+    }
+
+    /// Reports the exact Arrow key domain of the frozen algorithm.
     ///
-    /// Both revisions reduce a key to the one canonical row encoding grouping
-    /// uses, so a partitioned key lands where its group does. Floating-point
+    /// Ordinary V1 and hierarchical V1 retain positional MAP encoding.
+    /// Ordinary V2 hashes MAP entries by their canonical unordered identity. Floating-point
     /// keys belong to the native exchange, whose encoding folds signed zero
     /// and NaN payloads. They do not belong to the bucket algorithm: Iceberg's
     /// bucket transform is undefined for `float` and `double`, and this is its
@@ -109,13 +123,15 @@ impl PartitionHashAlgorithm {
         data_type: &DataType,
     ) -> bool {
         self.supports_partition_key(data_type)
-            || matches!(self, Self::NativeExchangeV1 | Self::NativeHierarchicalV1)
-                && canonical_temporal_key(semantic, data_type)
+            || matches!(
+                self,
+                Self::NativeExchangeV1 | Self::NativeExchangeV2 | Self::NativeHierarchicalV1
+            ) && canonical_temporal_key(semantic, data_type)
     }
 
     pub fn supports_partition_key(self, data_type: &DataType) -> bool {
         match self {
-            Self::NativeExchangeV1 | Self::NativeHierarchicalV1 => {
+            Self::NativeExchangeV1 | Self::NativeExchangeV2 | Self::NativeHierarchicalV1 => {
                 canonical_key_leaf(data_type)
                     || matches!(
                         data_type,
@@ -133,6 +149,15 @@ impl PartitionHashAlgorithm {
                     )
             }
         }
+    }
+}
+
+fn contains_map(ty: &DataType) -> bool {
+    match ty {
+        DataType::Map(..) => true,
+        DataType::List(field) => contains_map(field.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|field| contains_map(field.data_type())),
+        _ => false,
     }
 }
 
@@ -312,6 +337,39 @@ mod tests {
         BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,
         PartitionHashAlgorithm, PartitionSpaceId, PartitionSpaceIdentityError,
     };
+
+    #[test]
+    fn grouping_hash_only_switches_for_a_map_reachable_in_the_key_type() {
+        let entries = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Int64, false),
+                    Field::new("value", DataType::Int64, true),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        let map = DataType::Map(entries, false);
+        let nested = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(vec![Field::new("map", map.clone(), true)].into()),
+            true,
+        )));
+        assert_eq!(
+            PartitionHashAlgorithm::for_grouping_keys([&DataType::Int64]),
+            PartitionHashAlgorithm::NativeExchangeV1,
+        );
+        assert_eq!(
+            PartitionHashAlgorithm::for_grouping_keys([&DataType::Int64, &map]),
+            PartitionHashAlgorithm::NativeExchangeV2,
+        );
+        assert_eq!(
+            PartitionHashAlgorithm::for_grouping_keys([&nested]),
+            PartitionHashAlgorithm::NativeExchangeV2,
+        );
+    }
 
     #[test]
     fn native_exchange_hash_identity_includes_revision_and_null_semantics() {

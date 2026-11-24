@@ -812,7 +812,7 @@ fn dereference_borrows_its_original_interior_constant_before_name_resolution() {
     let crate::analysis::ExprKind::FunctionCall { name, args, .. } = &expression.kind else {
         panic!("original struct subfield binding");
     };
-    assert_eq!(name, "__struct_subfield");
+    assert_eq!(name, "__row_field");
     assert_eq!(expression.value_type.data_type(), &DataType::Int32);
     let crate::analysis::ExprKind::Constant(actual) = &args[0].kind else {
         panic!("original interior constant");

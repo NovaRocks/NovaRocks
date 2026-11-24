@@ -18,6 +18,21 @@ _col0
 _col0
 {1:2}
 
+-- query 6
+-- types	map(map(unknown, unknown), map(unknown, unknown))
+_col0
+{"{}":{}}
+
+-- query 7
+-- types	map(array(unknown), map(unknown, unknown))
+_col0
+{"[]":{}}
+
+-- query 8
+-- types	map(row("1" integer), row(A array(map(integer, integer))))
+_col0
+{"[2]":[[{}]]}
+
 -- query 9
 -- legacy
 col_int	_col1
