@@ -1,5 +1,5 @@
 ---
-id: ADR-0260
+id: ADR-0263
 title: "Trino scalar values and MV publication eligibility"
 domain: [sql-compiler, map-semantics]
 status: active
