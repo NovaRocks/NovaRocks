@@ -14,7 +14,7 @@ trailing_null_key
 [10,20,30]
 
 -- query 4
--- legacy
+-- types	array(unknown)	unknown	unknown
 sorted	smallest	largest
 [null,null,null]	NULL	NULL
 
@@ -22,3 +22,8 @@ sorted	smallest	largest
 -- types	array(integer)
 null_value_moves
 [8,7,null]
+
+-- query 6
+-- types	tinyint	smallint
+narrow_min	narrow_max
+1	2

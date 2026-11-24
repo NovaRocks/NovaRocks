@@ -29,8 +29,7 @@ SELECT row_number() OVER () AS row_number_value;
 SELECT -CAST(1 AS SMALLINT) AS negated, typeof(CAST(1 AS TINYINT)) AS narrow_type;
 
 -- query 5
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT reverse(ARRAY[1]) WHERE FALSE;
+SELECT reverse(ARRAY[1]) AS reversed_array WHERE FALSE;
 
 -- query 6
 -- Invalid arity must be rejected even when the row predicate is false.
@@ -51,16 +50,13 @@ FROM (VALUES (1, ARRAY[2], NULL), (2, ARRAY[1], NULL))
     AS input_rows(ordinal, payload_value, k1);
 
 -- query 10
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT array_sort(ARRAY[]);
+SELECT array_sort(ARRAY[]) AS result;
 
 -- query 11
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT array_min(ARRAY[NULL]);
+SELECT array_min(ARRAY[NULL]) AS result;
 
 -- query 12
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT array_max(ARRAY[NULL]);
+SELECT array_max(ARRAY[NULL]) AS result;
 
 -- query 13
 -- A NULL left value skips the right expression on that row.

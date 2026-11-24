@@ -73,3 +73,45 @@ SELECT sequence(DATE '2025-10-01',DATE '2025-10-02',INTERVAL '2147483647' MONTH)
 -- @skip_result_check=true
 USE ${case_db};
 DROP TABLE temporal_range;
+
+-- query 16
+WITH endpoints(early, late) AS (
+    VALUES (TIMESTAMP '2024-01-01 00:00:00.0000001', TIMESTAMP '2024-01-01 00:00:00.0000002')
+)
+SELECT sequence(early, late, INTERVAL '1' MONTH) AS forward,
+       sequence(late, early, INTERVAL '-1' MONTH) AS reverse,
+       sequence(late, late, INTERVAL '-1' MONTH) AS same_endpoint
+FROM endpoints;
+
+-- query 17
+-- The endpoints share a microsecond. Direction uses their full precision.
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT sequence(TIMESTAMP '2024-01-01 00:00:00.0000001',
+                TIMESTAMP '2024-01-01 00:00:00.0000002', INTERVAL '-1' MONTH);
+
+-- query 18
+SELECT TRY(cardinality(sequence(TIMESTAMP '2024-01-01 00:00:00.0000002',
+                                TIMESTAMP '2024-01-01 00:00:00.0000001', INTERVAL '1' MONTH)))
+           AS wrong_reverse;
+
+-- query 19
+SELECT sequence(CAST(TIMESTAMP '1969-12-31 23:59:59' AS TIMESTAMP(0)),
+                CAST(TIMESTAMP '1970-01-01 00:00:01' AS TIMESTAMP(0)),
+                INTERVAL '0.999999999999' SECOND(2,12)) AS picosecond_step;
+
+-- query 20
+SELECT cardinality(sequence(1, 10000)) AS sequence_limit,
+       TRY(cardinality(sequence(1, 10001))) AS sequence_over_limit,
+       cardinality(repeat(1, 100000)) AS repeat_limit,
+       TRY(cardinality(repeat(1, 100001))) AS repeat_over_limit;
+
+-- query 21
+WITH input(low_precision, high_precision) AS (
+    VALUES (TIMESTAMP '1969-12-31 23:59:59.999999', TIMESTAMP '1969-12-31 23:59:59.9999990'),
+           (TIMESTAMP '1970-01-01 00:00:00.000001', TIMESTAMP '1970-01-01 00:00:00.0000011')
+)
+SELECT contains(ARRAY[low_precision], high_precision) AS hit,
+       contains_sequence(ARRAY[ARRAY[low_precision]], ARRAY[ARRAY[high_precision]]) AS nested_hit,
+       array_intersect(ARRAY[low_precision], ARRAY[high_precision]) AS intersection
+FROM input
+ORDER BY low_precision;

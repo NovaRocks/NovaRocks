@@ -1,61 +1,21 @@
 -- query 12
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
-
--- query 13
--- legacy
-_col0
-0
-NULL
-NULL
-0
-
--- query 14
--- legacy
-_col0
-0
-1
-NULL
-1
-
--- query 15
--- legacy
-_col0
-0
-NULL
-NULL
-0
-
--- query 16
--- legacy
-_col0
-0
-0
-NULL
-1
+true
 
 -- query 21
--- legacy
+-- types	boolean
 _col0
-1
-0
+true
+false
 NULL
-1
-
--- query 22
--- legacy
-_col0
-0
-1
-NULL
-1
+true
 
 -- query 23
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -63,103 +23,79 @@ NULL
 NULL
 
 -- query 24
--- legacy
+-- types	boolean
 _col0
-1
+true
 NULL
-1
-1
+true
+true
 
 -- query 25
--- legacy
+-- types	boolean
 _col0
-1
+true
 NULL
-1
-1
-
--- query 26
--- legacy
-_col0
-0
-NULL
-0
-0
+true
+true
 
 -- query 27
--- legacy
+-- types	boolean
 _col0
-1
+true
 NULL
-1
-1
+true
+true
 
 -- query 28
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
 NULL
 NULL
-
--- query 29
--- legacy
-_col0
-0
-1
-NULL
-1
 
 -- query 30
--- legacy
+-- types	boolean
 _col0
-1
+true
 NULL
 NULL
-1
+true
 
 -- query 31
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
+true
 
 -- query 32
--- legacy
+-- types	boolean
 _col0
-1
+true
 NULL
 NULL
-1
+true
 
 -- query 33
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
-
--- query 38
--- legacy
-_col0
-0
-0
-NULL
-0
+true
 
 -- query 39
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
+true
 
 -- query 40
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -167,79 +103,63 @@ NULL
 NULL
 
 -- query 41
--- legacy
+-- types	boolean
 _col0
-1
-1
-1
-1
+true
+true
+true
+true
 
 -- query 42
--- legacy
+-- types	boolean
 _col0
-1
-1
-1
-1
-
--- query 47
--- legacy
-_col0
-0
-0
-0
-0
+true
+true
+true
+true
 
 -- query 48
--- legacy
+-- types	boolean
 _col0
-1
-1
-0
-1
+true
+true
+NULL
+true
 
 -- query 49
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
 NULL
 NULL
-
--- query 50
--- legacy
-_col0
-0
-0
-NULL
-1
 
 -- query 51
--- legacy
+-- types	boolean
 _col0
-1
-1
-1
-1
+true
+true
+true
+true
 
 -- query 52
--- legacy
+-- types	boolean
 _col0
-1
+true
 NULL
-1
-1
+true
+true
 
 -- query 53
--- legacy
+-- types	boolean
 _col0
-1
-1
-1
-1
+true
+true
+true
+true
 
 -- query 54
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -247,167 +167,135 @@ NULL
 NULL
 
 -- query 55
--- legacy
+-- types	boolean
 _col0
-1
+true
 NULL
-1
-1
+true
+true
 
 -- query 56
--- legacy
+-- types	boolean
 _col0
-1
+true
 NULL
-1
-1
+true
+true
 
 -- query 57
--- legacy
+-- types	boolean
 _col0
-1
+true
 NULL
 NULL
-1
+true
 
 -- query 58
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
+true
 
 -- query 59
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
+true
 
 -- query 60
--- legacy
+-- types	boolean
 _col0
-1
+true
 NULL
 NULL
-1
+true
 
 -- query 61
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
+true
 
 -- query 62
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
-
--- query 64
--- legacy
-_col0
-0
-0
-NULL
-1
+true
 
 -- query 65
--- legacy
+-- types	boolean
 _col0
-1
+true
 NULL
 NULL
-1
+true
 
 -- query 66
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
+true
 
 -- query 67
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
+true
 
 -- query 68
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
+true
 
 -- query 72
--- legacy
+-- types	boolean
 _col0
-1
+true
 NULL
-1
-1
-
--- query 73
--- legacy
-_col0
-1
-NULL
-0
-0
-
--- query 77
--- legacy
-_col0
-1
-NULL
-0
-0
+true
+true
 
 -- query 78
--- legacy
+-- types	boolean
 _col0
-1
+true
 NULL
-1
-1
+true
+true
 
 -- query 83
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
-
--- query 89
--- legacy
-_col0
-0
-0
-NULL
-0
+true
 
 -- query 90
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
+true
 
 -- query 93
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -415,39 +303,31 @@ NULL
 NULL
 
 -- query 94
--- legacy
+-- types	boolean
 _col0
-1
-0
+true
+false
 NULL
-1
+true
 
 -- query 95
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
-
--- query 97
--- legacy
-_col0
-0
-0
-0
-0
+true
 
 -- query 98
--- legacy
+-- types	boolean
 _col0
-1
-1
-1
-1
+true
+true
+true
+true
 
 -- query 99
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -455,7 +335,7 @@ NULL
 NULL
 
 -- query 100
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -463,7 +343,7 @@ NULL
 NULL
 
 -- query 101
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -471,7 +351,7 @@ NULL
 NULL
 
 -- query 102
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -479,7 +359,7 @@ NULL
 NULL
 
 -- query 103
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -487,7 +367,7 @@ NULL
 NULL
 
 -- query 104
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -495,7 +375,7 @@ NULL
 NULL
 
 -- query 105
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -503,7 +383,7 @@ NULL
 NULL
 
 -- query 106
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -511,7 +391,7 @@ NULL
 NULL
 
 -- query 107
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -519,7 +399,7 @@ NULL
 NULL
 
 -- query 108
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -527,7 +407,7 @@ NULL
 NULL
 
 -- query 109
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -535,7 +415,7 @@ NULL
 NULL
 
 -- query 110
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL

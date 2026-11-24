@@ -1,4 +1,9 @@
 -- query 1
--- legacy
+-- types	array(integer)	varchar
 sorted_arr	joined_arr
-[null,1,2,3]	a,b
+[1,2,3,null]	a,b
+
+-- query 3
+-- types	varchar	varchar
+element_error	replaced_null
+NULL	missing,one

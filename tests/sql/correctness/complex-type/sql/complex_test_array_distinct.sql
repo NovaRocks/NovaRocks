@@ -52,3 +52,14 @@ insert into t2 select 1, array_agg(c2) from t1;
 -- query 6
 USE ${case_db};
 select cardinality(array_distinct(c2)) from t2;
+
+-- query 7
+-- The four distinct values fit the host budget. Trino 484 exceeds its 4 MiB output check.
+SELECT cardinality(array_distinct(a)) AS distinct_count
+FROM (
+    SELECT array_agg(rpad(CAST(x AS VARCHAR), 1048572, 'x') ORDER BY x) AS a
+    FROM TABLE(sequence(1, 4)) AS input(x)
+) AS t;
+
+-- query 8
+SELECT array_distinct(ARRAY[CAST('-0.0' AS DOUBLE), NULL, CAST('NaN' AS DOUBLE), 0e0, CAST('NaN' AS DOUBLE), NULL]) AS first_representatives;

@@ -47,8 +47,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_generate/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
+      "reason": "The original 2,000,000-element grouping workload uses relational sequence and a typed oracle whose legacy rendering equals the original result. Native 1FE+3BE verifies step 3 and first refuses transform/lambda-v1 at step 5. Preserve the remaining SQL and the legacy step 7 oracle for the next owner. Evidence: B7b p07-convert-v2 and p07-matrix-v3/aggregate. Exit after the complete case and cleanup pass.",
+      "owner": "UEA-5E B7c",
       "expires": "2026-12-15"
     },
     {
@@ -68,16 +68,6 @@
         "code": "sql.analyze.unavailable_implementation"
       },
       "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:analytic/analytic_lead_lag_array_type",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_join/(list<any<T>>,utf8...)->utf8;strict;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
       "owner": "B7, B8, I1, I5",
       "expires": "2026-12-15"
     },
@@ -122,43 +112,13 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:complex-type/array_generate_temporal_domain",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unsupported_expression"
-      },
-      "reason": "Statement 2 reaches the explicit Trino timestamp sequence inputs and refuses the INTERVAL DAY literal before scalar binding. The prior array_generate/dynamic-v1 failure is retained in baseline evidence. TRC-6c owns interval representation and B7b owns scalar sequence installation. Verify the complete date and timestamp case and native cleanup before removal.",
-      "owner": "TRC-6c, UEA-5E B7b",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/array_null_elements",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Statement 1 selects builtin.scalar/contains/(list<any<T>>,any<T>)->bool;widen;legacy, which has no installed pure implementation. The former array_contains raw failure is preserved in the base evidence. Restore this exact selected domain and verify the complete original NULL-element oracles and native cleanup before removal.",
-      "owner": "UEA-5E B7b",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/array_ordered_logical_null",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_sort/(list<any<T>>)->list<any<T>>;strict;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:complex-type/array_varchar_common_coercion",
       "failure": {
         "class": "error_code",
-        "code": "query.execution.unsupported"
+        "code": "sql.analyze.type_mismatch"
       },
-      "reason": "Unsupported compiled cast from: List(Field { data_type: Null, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification Native b722 and TST-G9b1 c30 both refuse unchanged step 3; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "B7, B8, I1, I5",
+      "reason": "The unchanged native 1FE+3BE case verifies its first result at step 4. Its first refusal at step 5 is the explicit recursive CAST from ARRAY(TIMESTAMP(6)) to ARRAY(VARCHAR); the recursive element conversion belongs to B7e. Keep all subsequent original oracles. Evidence: B7b p07-matrix-v3/complex-type. Exit after the full original case and cleanup pass.",
+      "owner": "UEA-5E B7e",
       "expires": "2026-12-15"
     },
     {
@@ -168,36 +128,6 @@
         "code": "sql.analyze.unavailable_implementation"
       },
       "reason": "Missing installed pure implementation for builtin.scalar/row/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_array_slice_concat_distinct",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_slice/(list<any<T>>,i64,i64)->list<any<T>>;strict;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_array_slice_zero_offset_semantics",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_slice/(list<any<T>>,i64,i64)->list<any<T>>;strict;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_array_sort_join",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_sort/(list<any<T>>)->list<any<T>>;strict;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
       "owner": "B7, B8, I1, I5",
       "expires": "2026-12-15"
     },
@@ -282,23 +212,13 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:complex-type/complex_test_array_distinct",
-      "failure": {
-        "class": "error_code",
-        "code": "query.execution.unsupported"
-      },
-      "reason": "Unsupported compiled cast from: List(Field { data_type: Null, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification Native b722 and TST-G9b1 c30 both refuse unchanged step 4; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:complex-type/complex_test_array_map_2",
       "failure": {
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_repeat/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
+      "reason": "The Trino-compatible fixture uses DECIMAL(38,0) for the original signed values beyond BIGINT. Native 1FE+3BE first refuses builtin.scalar/transform/lambda-v1 at step 4. Preserve the remaining original result and error oracles. Evidence: B7b p07-matrix-v3/complex-type. Exit after the complete case and cleanup pass.",
+      "owner": "UEA-5E B7c",
       "expires": "2026-12-15"
     },
     {
@@ -367,18 +287,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_repeat/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:function/concat_array_family",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_concat/(list<any<T>>...)->list<any<T>>;strict;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
+      "reason": "Native 1FE+3BE verifies the repeat-backed result at steps 1–3 after equivalent legacy conversion. Step 4 first refuses builtin.scalar/transform/lambda-v1 inside array_max. Preserve all later input, result and error oracles. Evidence: B7b p07-matrix-v3/filter and p07-convert-v2. Exit after complete native verification and cleanup.",
+      "owner": "UEA-5E B7c",
       "expires": "2026-12-15"
     },
     {
@@ -1302,16 +1212,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:complex-type/complex_test_array_intersect",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original case reaches statement 4 and the frozen selected overload builtin.scalar/array_intersect/dynamic-v1 is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B7",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:complex-type/complex_test_array_map",
       "failure": {
         "class": "error_code",
@@ -1322,33 +1222,13 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:complex-type/complex_test_array_min_max",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original case reaches statement 4 and the frozen selected overload builtin.scalar/array_min/(list<any<T>>)->any<T>;strict;legacy is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B7",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_test_array_remove",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original case reaches statement 4 and the frozen selected overload builtin.scalar/array_remove/(list<any<T>>,any<T>)->list<any<T>>;widen;legacy is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B7",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:complex-type/complex_test_arrays_overlap",
       "failure": {
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "The original case reaches statement 12 and the frozen selected overload builtin.scalar/arrays_overlap/(list<any<T>>,list<any<U>>)->bool;strict;legacy is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B7",
+      "reason": "The Trino 484 typed oracles through step 110 are independently replayed and the native 1FE+3BE case verifies that prefix. Step 111 first refuses builtin.scalar/arrays_overlap/(list<any<T>>,list<any<T>>)->bool;widen;legacy on ARRAY(JSON) because the original JSON leaf key relation is absent. Trino 484 executes the same JSON comparison. F7 owns the missing JSON leaf operation and consumes F6. Preserve step 111 and the remaining original oracles. Evidence: B7b p07-matrix-v3-replay/complex-type and p07-overlap-typed-oracle. Exit after the complete case and cleanup pass.",
+      "owner": "7B3F F7",
       "expires": "2026-12-15"
     },
     {
@@ -1415,10 +1295,10 @@
       "unit": "sql-case:complex-type/complex_test_cast_array",
       "failure": {
         "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
+        "code": "sql.analyze.unsupported_expression"
       },
-      "reason": "The case remains FAIL: its original step-4 expected Representation error now actually matches, and result steps 5/6/8/9 pass; the new first failure is positive result statement 10, selected overload builtin.scalar/array_length/(list<any<T>>)->i32;strict;legacy, with actual sql.analyze.unavailable_implementation. B7 owns this exact missing array scalar implementation. Installed cardinality does not install the distinct array_length declaration, as the current owner predicate and independent owner test explicitly state. No independent failed oracle or cleanup violation accompanies this refusal. Deliver that exact pure array_length profile, then pass the entire unchanged current frozen native case including its step-4 negative oracle and later array results before removal; unreached statements 11-13 are not PASS.",
-      "owner": "UEA-5E B7",
+      "reason": "Native 1FE+3BE verifies through step 9 after equivalent legacy conversion. Step 10 first refuses CAST of an exact JSON literal to ARRAY(ARRAY(INTEGER)). Two Trino 484 attempts reject the old VARCHAR source and confirm the JSON-source step 10 and 11 results on the original repeated values. Preserve step 11 and table cleanup. Evidence: B7b p07-cast-array-migration. Exit after complete native verification and cleanup.",
+      "owner": "UEA-5E B7e",
       "expires": "2026-12-15"
     },
     {

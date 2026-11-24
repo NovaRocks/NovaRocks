@@ -1,26 +1,31 @@
 -- query 1
--- legacy
+-- types	boolean	bigint	boolean	bigint	boolean	bigint
 empty_contains	empty_position	singleton_contains	singleton_position	repeated_contains	repeated_position
-0	0	1	1	1	1
+NULL	NULL	NULL	NULL	NULL	NULL
 
 -- query 2
--- legacy
+-- types	array(unknown)	array(unknown)	array(unknown)	array(unknown)	boolean	boolean	boolean
 removed	deduplicated	intersected	empty_intersection	shared_null	empty_overlap	contains_null_seq
-[]	[null]	[null]	[]	1	0	1
+NULL	[null]	[null]	[]	NULL	false	true
 
 -- query 3
--- legacy
+-- types	boolean	bigint	array(integer)	array(integer)	array(integer)	boolean
 null_contains	null_position	null_removed	null_distinct	null_intersection	null_overlap
 NULL	NULL	NULL	NULL	NULL	NULL
 
 -- query 4
--- legacy
+-- types	integer	boolean	bigint	array(unknown)	array(unknown)
 id	contains_null	null_position	removed	deduplicated
-1	0	0	[]	[]
-2	1	1	[]	[null]
-3	1	1	[]	[null]
+1	NULL	NULL	NULL	[]
+2	NULL	NULL	NULL	[null]
+3	NULL	NULL	NULL	[null]
 
 -- query 5
--- legacy
+-- types	boolean	bigint	array(integer)	array(array(unknown))	array(array(unknown))
 typed_contains	typed_position	typed_removed	nested_distinct	nested_intersection
-1	2	[1,2]	[[null]]	[[null]]
+NULL	NULL	NULL	[[null]]	[[null]]
+
+-- query 6
+-- types	boolean	bigint
+early_contains	early_position
+true	1

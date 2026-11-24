@@ -131,3 +131,17 @@ SELECT id, array_intersect(array_datetime, [TIMESTAMP '2025-01-01 12:00:00.00000
 -- the namespace holds none. Drop the tables explicitly instead.
 USE ${case_db};
 DROP TABLE IF EXISTS test_array_intersect;
+
+-- query 20
+-- Trino 484 exceeds its 4 MiB output check. All four values fit the host budget.
+SELECT cardinality(array_intersect(a, a)) AS intersect_count
+FROM (
+    SELECT array_agg(rpad(CAST(x AS VARCHAR), 1048572, 'x') ORDER BY x) AS a
+    FROM TABLE(sequence(1, 4)) AS input(x)
+) AS t;
+
+-- query 21
+SELECT array_intersect(ARRAY[2, 1, NULL], ARRAY[NULL, 1, 2]) AS tied_left_order,
+       array_intersect(ARRAY[2, NULL], ARRAY[NULL, 2, 2, 1]) AS longer_right_order,
+       array_intersect(ARRAY[CAST('-0.0' AS DOUBLE), CAST('NaN' AS DOUBLE), 0e0],
+                       ARRAY[0e0, CAST('NaN' AS DOUBLE)]) AS float_representatives;

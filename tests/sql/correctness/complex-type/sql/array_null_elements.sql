@@ -61,3 +61,11 @@ SELECT contains([1, NULL, 2], NULL) AS typed_contains,
        array_remove([1, NULL, 2], NULL) AS typed_removed,
        array_distinct([[NULL], [NULL]]) AS nested_distinct,
        array_intersect([[NULL], [NULL]], [[NULL]]) AS nested_intersection;
+
+-- query 6
+SELECT contains(ARRAY[ARRAY[7], ARRAY[CAST(NULL AS BIGINT)]], ARRAY[BIGINT '7']) AS early_contains,
+       array_position(ARRAY[ARRAY[7], ARRAY[CAST(NULL AS BIGINT)]], ARRAY[BIGINT '7']) AS early_position;
+
+-- query 7
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT contains(ARRAY[ARRAY[CAST(NULL AS BIGINT)], ARRAY[7]], ARRAY[BIGINT '7']);
