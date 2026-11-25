@@ -1622,8 +1622,9 @@ fn publication_unknown_handoff_keeps_exact_passive_evidence_and_the_original_bar
     use novarocks_spi::connector::{
         CommitConclusion, CommitProof, ConnectorInstanceDescriptor, ConnectorMutationOperationId,
         ConnectorProcessLocalPayload, ConnectorProviderBindingKey, ConnectorProviderId,
-        ExternalMutationEvidence, KeyedDispatchRecord, KeyedSnapshotDispatch, KeyedWriteObservation,
-        LakePublicationId, ProviderBindingEpoch, UnknownCommitEvidence, UnknownCommitIdentity,
+        ExternalMutationEvidence, KeyedDispatchRecord, KeyedSnapshotDispatch,
+        KeyedWriteObservation, LakePublicationId, ProviderBindingEpoch, UnknownCommitEvidence,
+        UnknownCommitIdentity,
     };
 
     for conclusion in [
