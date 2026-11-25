@@ -19,7 +19,7 @@ use super::*;
 use crate::optimizer::memo::LogicalProperties;
 use crate::optimizer::operator::ValuesOp;
 use arrow::array::{
-    ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float32Array, Int64Array, StringArray,
+    ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float32Array, Int64Array, LargeBinaryArray,
     UInt64Array,
 };
 use novarocks_functions::{ConstantPool, ConstantValue};
@@ -211,7 +211,7 @@ fn values_constants_read_actual_signedness_float_width_scale_and_largeint_domain
         (raw_largeint.clone(), ValueLogicalType::Physical),
         (raw_largeint, ValueLogicalType::Uuid),
         (
-            Arc::new(StringArray::from(vec!["7"])) as ArrayRef,
+            Arc::new(LargeBinaryArray::from(vec![b"\x01\x46\x07".as_slice()])) as ArrayRef,
             ValueLogicalType::Json,
         ),
     ] {

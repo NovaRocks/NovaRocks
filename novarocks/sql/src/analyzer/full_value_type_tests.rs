@@ -972,7 +972,7 @@ fn internal_value_conversion_preserves_the_supplied_catalog_boundary() {
 
 #[test]
 fn scalar_text_arguments_require_explicit_json_conversion() {
-    for name in ["parse_json", "length"] {
+    for name in ["json_parse", "length"] {
         let query = novarocks_parser::parser::parse_query(&format!("SELECT {name}(j) FROM source"))
             .unwrap();
         let error = super::analyze(&query, &SourceCatalog, "default").unwrap_err();

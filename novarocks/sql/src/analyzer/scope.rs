@@ -821,14 +821,14 @@ mod tests {
         use novarocks_types::schema::SqlType;
         let factory = test_factory();
         let mut scope = AnalyzerScope::new(factory.clone());
-        for (name, logical, expected) in [("j", SqlType::Json, true), ("s", SqlType::String, false)]
-        {
+        for (name, carrier, logical, expected) in [
+            ("j", DataType::LargeBinary, SqlType::Json, true),
+            ("s", DataType::Utf8, SqlType::String, false),
+        ] {
             let column = ColumnDef {
                 name: name.into(),
                 data_type: DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    DataType::Utf8,
-                    true,
+                    "item", carrier, true,
                 ))),
                 nullable: true,
                 write_default: None,

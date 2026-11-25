@@ -168,7 +168,7 @@ fn explicit_json_text_casts_keep_their_target_and_original_scalar_sources() {
                                 );
                             };
                             let item = value_type.child_at(0).unwrap();
-                            assert_eq!(item.data_type(), &DataType::Utf8);
+                            assert_eq!(item.data_type(), &DataType::LargeBinary);
                             assert_eq!(item.logical_type(), ValueLogicalType::Json);
                         }
                         assert_loan_prefixes(&owner, fragment, unit_node, source);
@@ -191,7 +191,7 @@ fn explicit_json_text_casts_keep_their_target_and_original_scalar_sources() {
                 let DataType::List(item) = source.ty.data_type() else {
                     panic!("original array source");
                 };
-                assert_eq!(item.data_type(), &DataType::Utf8);
+                assert_eq!(item.data_type(), &DataType::LargeBinary);
                 assert_eq!(
                     source.ty.child_at(0).unwrap().logical_type(),
                     ValueLogicalType::Json
@@ -235,7 +235,7 @@ fn explicit_json_text_casts_keep_their_target_and_original_scalar_sources() {
                     };
                     assert_eq!(
                         function.function_id.as_str(),
-                        "builtin.scalar/json_object/v1"
+                        "builtin.scalar/__json_object_null/v1"
                     );
                     assert_eq!(function.result_type, original.ty);
                     let receipt =

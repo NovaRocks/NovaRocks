@@ -863,7 +863,7 @@ mod tests {
 
     #[test]
     fn literal_identity_compares_selected_cv_and_complete_source_without_pool_or_scalar_id_keys() {
-        use arrow::array::{Int64Array, StringArray};
+        use arrow::array::{Int64Array, LargeBinaryArray};
         use novarocks_type_contract::ValueLogicalType;
         use std::sync::Arc;
         let (left, l, lv) = cv_node(
@@ -961,24 +961,14 @@ mod tests {
                 expected_equal
             );
         }
-        let (text, text_id, _) = cv_node(
-            Arc::new(StringArray::from(vec!["\"same\""])),
-            0,
-            ValueLogicalType::Physical,
-            false,
-            "same",
-        );
-        let (json, json_id, _) = cv_node(
-            Arc::new(StringArray::from(vec!["\"same\""])),
-            0,
-            ValueLogicalType::Json,
-            false,
-            "same",
-        );
+        let bytes = Arc::new(LargeBinaryArray::from(vec![b"\x01\x44\x04same".as_slice()]));
+        let (binary, binary_id, _) =
+            cv_node(bytes.clone(), 0, ValueLogicalType::Physical, false, "same");
+        let (json, json_id, _) = cv_node(bytes, 0, ValueLogicalType::Json, false, "same");
         assert!(
             !literal_equal_observed(
-                &text,
-                text_id,
+                &binary,
+                binary_id,
                 &json,
                 json_id,
                 crate::optimizer::test_optimizer_control()

@@ -1146,14 +1146,18 @@ fn aggregate_occurrences_missing_foreign_source_scope_environment_and_proof_keep
     );
 }
 #[test]
-fn aggregate_occurrences_state_format_drift_and_nominal_utf8_keep_selected_owner_gate() {
-    for name in ["min", "max"] {
-        let t = FunctionValueType::try_with_logical_type(
-            DataType::Utf8,
-            true,
-            novarocks_type_contract::ValueLogicalType::Json,
-        )
-        .unwrap();
+fn aggregate_occurrences_state_format_drift_and_nominal_json_keep_selected_owner_gate() {
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        novarocks_type_contract::ValueLogicalType::Json,
+    )
+    .unwrap();
+    for (name, t) in [
+        ("min", ty(DataType::Utf8, true)),
+        ("max", ty(DataType::Utf8, true)),
+        ("any_value", json),
+    ] {
         let f = Fixture::new(
             name,
             t.clone(),

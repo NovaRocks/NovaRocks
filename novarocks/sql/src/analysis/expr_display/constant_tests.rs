@@ -187,7 +187,7 @@ fn selected_field_path_and_aggregate_labels_preserve_existing_source_spelling() 
 
 #[test]
 fn selected_display_rejects_foreign_full_type_and_preserves_ordinary_failure_tail() {
-    let pool = source(DataType::Utf8, "chosen");
+    let pool = binary_source(DataType::LargeBinary);
     let mut bad = constant(pool.value(2).unwrap());
     bad.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
         bad.value_type.data_type().clone(),

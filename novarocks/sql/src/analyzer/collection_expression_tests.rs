@@ -154,7 +154,7 @@ fn null_child_arrays_cast_to_the_complete_json_list_declaration() {
         );
         let item = actual.value_type.child_at(0).unwrap();
         assert_eq!(item.logical_type(), ValueLogicalType::Json);
-        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(item.data_type(), &DataType::LargeBinary);
         assert!(item.nullable());
         assert!(!actual.value_type.nullable());
         let ExprKind::Cast { expr, target, .. } = &actual.kind else {

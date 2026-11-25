@@ -568,13 +568,19 @@ mod tests {
             (
                 "full output domain mismatch",
                 Box::new(|p| {
-                    aggregate_mut(p).output_layout.group_key_columns[0].value_type =
-                        novarocks_type_contract::FunctionValueType::try_with_logical_type(
-                            DataType::Utf8,
-                            true,
-                            novarocks_type_contract::ValueLogicalType::Json,
-                        )
-                        .unwrap();
+                    use novarocks_type_contract::{CharacterKind, CharacterType};
+                    let key = &mut aggregate_mut(p).output_layout.group_key_columns[0];
+                    key.value_type = ColumnDef {
+                        name: key.name.clone(),
+                        data_type: DataType::Utf8,
+                        nullable: true,
+                        write_default: None,
+                        logical_type: Some(novarocks_types::schema::SqlType::BoundedCharacter(
+                            CharacterType::new(CharacterKind::Varchar, 10).unwrap(),
+                        )),
+                    }
+                    .declared_value_type()
+                    .unwrap();
                 }),
             ),
             (

@@ -97,17 +97,12 @@ mod tests {
         values: Vec<&str>,
         key: i32,
     ) -> (Arc<online_unit::ExchangeRecipe>, Vec<u8>) {
-        dictionary_unit(expected, factory, Arc::new(StringArray::from(values)), key)
-    }
-
-    fn dictionary_unit(
-        expected: &ChunkSchemaRef,
-        factory: &dyn InputConstructionFactory,
-        values: ArrayRef,
-        key: i32,
-    ) -> (Arc<online_unit::ExchangeRecipe>, Vec<u8>) {
         let array: ArrayRef = Arc::new(
-            DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![key]), values).unwrap(),
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![key]),
+                Arc::new(StringArray::from(values)),
+            )
+            .unwrap(),
         );
         // Source names, IDs and metadata never author the receiver's domain.
         #[expect(
@@ -146,17 +141,20 @@ mod tests {
         (recipe, bytes)
     }
     #[test]
-    fn reader_source_attributes_never_author_json_and_last_schema_keeps_finite_header_only() {
-        let tracker = MemTracker::new_root("reader finite prepared schema");
+    fn reader_source_attributes_never_author_json_and_exact_carrier_reuses_prepared_schema() {
+        let tracker = MemTracker::new_root("reader exact JSON prepared schema");
         let (factory, error_weak) = factory(tracker.clone());
         let factory_weak = Arc::downgrade(&factory);
         let expected = declaration(ValueLogicalType::Json);
         let null_document = b"\x01\x20".as_slice();
-        let (recipe, source) = dictionary_unit(
+        let wire_field = Field::new("wire", DataType::LargeBinary, false).with_metadata(
+            HashMap::from([("novarocks.logical_type".to_owned(), "bitmap".to_owned())]),
+        );
+        let (recipe, source) = make_unit(
             &expected,
             factory.as_ref(),
+            wire_field.clone(),
             Arc::new(LargeBinaryArray::from(vec![null_document])),
-            0,
         );
         let (old_recipe, old_bytes) = unit(
             &declaration(ValueLogicalType::Physical),
@@ -167,11 +165,11 @@ mod tests {
         assert_ne!(recipe.value.digest(), old_recipe.value.digest());
         assert!(online_unit::decode(&recipe, &old_bytes, &expected, factory.as_ref()).is_err());
         drop(old_recipe);
-        let (_, bad_bytes) = dictionary_unit(
+        let (_, bad_bytes) = make_unit(
             &expected,
             factory.as_ref(),
+            wire_field,
             Arc::new(LargeBinaryArray::from(vec![b"null".as_slice()])),
-            0,
         );
         let wrong_value =
             online_unit::decode(&recipe, &bad_bytes, &expected, factory.as_ref()).unwrap_err();
@@ -193,6 +191,8 @@ mod tests {
         assert!(!slot.typed_binding().nullable());
         assert!(slot.field().metadata().as_arc().is_none());
         let schema = chunks[0].chunk_schema_ref();
+        assert!(Arc::ptr_eq(&schema, &expected));
+        assert!(tracker.current() > 0);
         drop(chunks);
         drop(recipe);
         drop(source);
@@ -200,7 +200,7 @@ mod tests {
         drop(factory);
         assert!(factory_weak.upgrade().is_none());
         assert!(error_weak.upgrade().is_none());
-        assert!(tracker.current() > 0);
+        assert_eq!(tracker.current(), 0);
         assert!(matches!(
             schema.slots()[0].typed_binding().value_type().kind(),
             ValueKind::Nominal(ValueLogicalType::Json)
@@ -372,6 +372,7 @@ mod tests {
             "{}"
         );
         drop(projection);
+        // The decoded dictionary schema retains its finite paid header.
         assert!(tracker.current() > 0);
         assert!(
             tracker.current() < array_and_schema,

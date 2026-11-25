@@ -16,7 +16,7 @@
 // under the License.
 
 use arrow::{
-    array::{Array, ArrayRef, Date32Array, Int32Array, Int64Array, StringArray},
+    array::{Array, ArrayRef, Int32Array, Int64Array, LargeBinaryArray, StringArray},
     datatypes::Schema,
     record_batch::RecordBatch,
 };
@@ -34,9 +34,9 @@ use novarocks_expression_contract::{
     BoundExprSetBuilder, ExprKind, ExprPort, RootOrdinal, RootScope, UnitLimits, ValueId,
 };
 use novarocks_functions::{
-    AggregateStateAllocator, EvaluatedArgument, FunctionArgument,
-    InvocationScalarEvaluationInstance, KernelFailure, PreparedPureKernel,
-    ScalarInvocationActivation, ScalarInvocationScope, Selection,
+    AggregateStateAllocator, DataFailureReason, EvaluatedArgument, FunctionArgument, KernelFailure,
+    PreparedPureKernel, ScalarInvocationActivation, ScalarInvocationScope, Selection,
+    json_value::{Kind, Node},
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, EvaluationDemand, FunctionValueType, SemanticParameters,
@@ -47,13 +47,11 @@ use std::{collections::BTreeMap, convert::Infallible, sync::Arc};
 enum Event {
     Begin,
     Admit(ScalarCallPhase, ScalarCallRequestFacts),
-    Callback,
 }
 
 #[derive(Default)]
 struct RecordingHost {
     events: Vec<Event>,
-    callback: ScalarCallRequestFacts,
 }
 
 impl ScalarCallHost for RecordingHost {
@@ -77,8 +75,7 @@ impl ScalarCallHost for RecordingHost {
         &mut self,
         _: Option<&Arc<dyn AggregateStateAllocator>>,
     ) -> Result<ScalarCallRequestFacts, ScalarCallFailure<Self::Refusal>> {
-        self.events.push(Event::Callback);
-        Ok(self.callback)
+        panic!("these installed scalar owners have no invocation callback")
     }
 }
 
@@ -237,53 +234,21 @@ fn profiled_scalar_admits_the_body_with_the_original_requests() {
 }
 
 #[test]
-fn whole_invocation_admits_prefix_then_callback_and_body() {
+fn native_json_scalar_keeps_its_result_grant_after_the_call_frame_exits() {
     let (program, root, batch) = fixture(
-        "json_object",
-        vec![
-            Arc::new(StringArray::from(vec!["key"])),
-            Arc::new(StringArray::from(vec!["value"])),
-        ],
+        "json_parse",
+        vec![Arc::new(StringArray::from(vec!["null"]))],
     );
-    let allocator: Arc<dyn AggregateStateAllocator> = Arc::new(CountingAllocator::new(usize::MAX));
-    let use_id = program.root(root).unwrap().use_id;
-    let PreparedPureKernel::ScalarInvocation(prepared) = program.calls()[&use_id].prepared() else {
-        panic!("expected the actual invocation owner");
-    };
-    let instance = InvocationScalarEvaluationInstance::instantiate_with_allocator(
-        prepared.clone(),
-        Some(allocator.clone()),
-    )
-    .unwrap();
-    let profile = instance.invocation_resource_profile().unwrap();
-    let prefix = profile.preparation_prefix();
-    let arguments: Vec<_> = batch
-        .columns()
-        .iter()
-        .map(EvaluatedArgument::Column)
-        .collect();
-    let body = profile
-        .requests_for(
-            &instance,
-            Selection::all(1),
-            &arguments,
-            ScalarInvocationActivation::Activated,
-            &HarnessControl,
-        )
-        .unwrap();
-    assert!(body.requires_host_callback());
-    let mut host = RecordingHost {
-        callback: ScalarCallRequestFacts::new(32, 2),
-        ..RecordingHost::default()
-    };
+    let allocator = Arc::new(CountingAllocator::new(usize::MAX));
+    let mut host = RecordingHost::default();
     let mut frame = CompiledExpressionInstance::try_new_with_allocator(
         program,
         root,
         &HarnessControl,
-        Some(allocator),
+        Some(allocator.clone()),
     )
     .unwrap();
-    let out = frame
+    let output = frame
         .evaluate(
             input(&batch),
             complete_batch(&batch),
@@ -292,29 +257,22 @@ fn whole_invocation_admits_prefix_then_callback_and_body() {
             &mut host,
         )
         .unwrap();
-    assert_eq!(
-        out.values()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .value(0),
-        r#"{"key": "value"}"#
-    );
-    assert_eq!(
-        host.events,
-        vec![
-            Event::Begin,
-            Event::Admit(
-                ScalarCallPhase::Preparation,
-                ScalarCallRequestFacts::new(prefix.bytes(), prefix.requests())
-            ),
-            Event::Callback,
-            Event::Admit(
-                ScalarCallPhase::Body,
-                ScalarCallRequestFacts::new(body.bytes() + 32, body.requests() + 2)
-            ),
-        ]
-    );
+    let json = output
+        .values()
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .unwrap();
+    assert!(matches!(
+        Node::from_root(json.value(0)).unwrap().kind().unwrap(),
+        Kind::Null
+    ));
+    assert_eq!(host.events, vec![Event::Begin]);
+    let alias = json.values().clone();
+    drop(output);
+    drop(frame);
+    assert!(allocator.outstanding() > 0);
+    drop(alias);
+    assert_eq!(allocator.outstanding(), 0);
 }
 
 #[test]
@@ -341,13 +299,10 @@ fn unprofiled_scalar_only_observes_the_call_start() {
 }
 
 #[test]
-fn invocation_data_keeps_its_original_domain_and_failed_reentry() {
+fn selected_json_data_keeps_its_original_domain_and_allows_successful_reentry() {
     let (program, root, batch) = fixture(
-        "json_object",
-        vec![
-            Arc::new(StringArray::from(vec!["key"])),
-            Arc::new(Date32Array::from(vec![-1000000000])),
-        ],
+        "json_parse",
+        vec![Arc::new(StringArray::from(vec!["{]", "{]", "{]", "null"]))],
     );
     let mut frame = CompiledExpressionInstance::try_new_with_allocator(
         program,
@@ -357,24 +312,73 @@ fn invocation_data_keeps_its_original_domain_and_failed_reentry() {
     )
     .unwrap();
     let mut host = RecordingHost::default();
-    let original = frame
+    let actual = Selection::all(4);
+    let selected = Selection::try_sparse(4, &[1, 3]).unwrap();
+    let output = frame
         .evaluate(
             input(&batch),
-            complete_batch(&batch),
+            ScalarInvocationScope::new(actual, selected),
+            ScalarInvocationActivation::Activated,
+            &HarnessControl,
+            &mut host,
+        )
+        .unwrap();
+    let [error] = output.errors() else {
+        panic!("only the malformed selected row returns a row error");
+    };
+    assert_eq!(output.selection().row(error.selected_ordinal()), Some(1));
+    assert_eq!(
+        error.reason(),
+        DataFailureReason::Domain(
+            novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT
+        )
+    );
+    assert_eq!(error.message(), "Invalid JSON input");
+    assert!(output.values().is_null(0));
+    assert!(output.values().is_valid(1));
+
+    let selected = Selection::try_sparse(4, &[3]).unwrap();
+    let output = frame
+        .evaluate(
+            input(&batch),
+            ScalarInvocationScope::new(actual, selected),
+            ScalarInvocationActivation::Activated,
+            &HarnessControl,
+            &mut host,
+        )
+        .unwrap();
+    assert!(output.errors().is_empty());
+    assert!(output.values().is_valid(0));
+    assert_eq!(host.events, vec![Event::Begin, Event::Begin]);
+}
+
+#[test]
+fn a_profiled_scalar_rejects_demand_outside_the_actual_domain_before_admission() {
+    let (program, root, batch) = fixture(
+        "bitwise_left_shift",
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![2, 1])),
+        ],
+    );
+    let mut frame = CompiledExpressionInstance::try_new(program, root, &HarnessControl).unwrap();
+    let actual = Selection::try_sparse(2, &[0]).unwrap();
+    let outside = Selection::try_sparse(2, &[1]).unwrap();
+    let mut host = RecordingHost::default();
+    let failure = frame
+        .evaluate(
+            input(&batch),
+            ScalarInvocationScope::new(actual, outside),
             ScalarInvocationActivation::Activated,
             &HarnessControl,
             &mut host,
         )
         .unwrap_err();
-    let ExprEvaluationFailure::Data(data) = original else {
-        panic!("original typed Data")
-    };
-    assert_eq!(
-        data.message(),
-        "json_object invalid date32 day value: -1000000000"
-    );
-    assert_eq!((data.batch_rows(), data.source_row(0)), (1, Some(0)));
-    host.events.clear();
+    assert!(matches!(
+        failure,
+        ExprEvaluationFailure::Kernel(KernelFailure::InvalidProgram(_))
+    ));
+    assert!(host.events.is_empty());
     assert_eq!(
         frame
             .evaluate(
@@ -382,58 +386,10 @@ fn invocation_data_keeps_its_original_domain_and_failed_reentry() {
                 complete_batch(&batch),
                 ScalarInvocationActivation::Activated,
                 &HarnessControl,
-                &mut host
+                &mut host,
             )
             .unwrap_err(),
         ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
     );
     assert!(host.events.is_empty());
-}
-
-#[test]
-fn a_profiled_owner_refuses_the_explicit_actual_domain_before_admission() {
-    use novarocks_expression::testkit::call_scoped_invocation;
-    use novarocks_functions::{EvaluatedSourceLoan, KernelDiagnostic, ScalarInvocationSource};
-    let (program, root, batch) = fixture(
-        "json_object",
-        vec![
-            Arc::new(StringArray::from(vec!["key"])),
-            Arc::new(StringArray::from(vec!["value"])),
-        ],
-    );
-    let use_id = program.root(root).unwrap().use_id;
-    let PreparedPureKernel::ScalarInvocation(prepared) = program.calls()[&use_id].prepared() else {
-        panic!("expected the actual invocation owner");
-    };
-    let mut instance = InvocationScalarEvaluationInstance::instantiate_with_allocator(
-        prepared.clone(),
-        Some(Arc::new(CountingAllocator::new(usize::MAX))),
-    )
-    .unwrap();
-    assert!(instance.invocation_resource_profile().is_some());
-    let sources: Vec<_> = batch
-        .columns()
-        .iter()
-        .map(|value| {
-            ScalarInvocationSource::Array(EvaluatedSourceLoan::new(value, Selection::all(1)))
-        })
-        .collect();
-    let mut host = RecordingHost::default();
-    let cause = call_scoped_invocation(
-        &mut host,
-        &mut instance,
-        complete_batch(&batch),
-        &sources,
-        ScalarInvocationActivation::Activated,
-        &HarnessControl,
-    )
-    .unwrap_err();
-    assert_eq!(
-        cause,
-        ScalarCallFailure::Kernel(KernelFailure::InvalidProgram(KernelDiagnostic::new(
-            "scoped invocation has no installed measurement source transport"
-        ),))
-    );
-    assert_eq!(host.events, vec![Event::Begin]);
-    assert!(!instance.is_failed());
 }

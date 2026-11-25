@@ -23,7 +23,7 @@ use crate::optimizer::stats_input::{
     StatsRef,
 };
 use arrow::array::{
-    ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float32Array, Int64Array, StringArray,
+    ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float32Array, Int64Array, LargeBinaryArray,
     StructArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field};
@@ -351,7 +351,10 @@ fn selected_cv_numeric_width_scale_and_nominal_domain_share_values_reader() {
             None,
         ),
         (
-            Arc::new(StringArray::from(vec!["100", "7"])),
+            Arc::new(LargeBinaryArray::from(vec![
+                b"\x01\x46\x64".as_slice(),
+                b"\x01\x46\x07".as_slice(),
+            ])),
             ValueLogicalType::Json,
             None,
         ),

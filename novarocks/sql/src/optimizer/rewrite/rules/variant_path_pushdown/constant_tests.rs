@@ -23,7 +23,9 @@ use crate::optimizer::options::SessionOptimizerSettings;
 use crate::planner::table::{
     SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
 };
-use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray, StringViewArray};
+use arrow::array::{
+    Array, ArrayRef, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+};
 use novarocks_functions::{ConstantPolicy, ConstantPool, ConstantValue};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType,
@@ -99,6 +101,20 @@ fn text(
         logical,
     )
     .unwrap();
+    constant(array, ty, ordinal)
+}
+
+fn json_text(encoded: &[u8]) -> ConstantValue {
+    let ty = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    constant(Arc::new(LargeBinaryArray::from(vec![encoded])), ty, 0)
+}
+
+fn constant(array: ArrayRef, ty: FunctionValueType, ordinal: u32) -> ConstantValue {
     let field = Arc::new(
         ty.try_to_field("source-path")
             .unwrap()
@@ -387,24 +403,8 @@ fn selected_null_nominal_json_and_unparseable_paths_remain_nonmatches_without_pu
                 ValueLogicalType::Physical,
             ),
         ),
-        (
-            text(
-                DataType::Utf8,
-                &[Some("\"$.a\"")],
-                0,
-                ValueLogicalType::Json,
-            ),
-            valid_target.clone(),
-        ),
-        (
-            valid_path.clone(),
-            text(
-                DataType::Utf8,
-                &[Some("\"bigint\"")],
-                0,
-                ValueLogicalType::Json,
-            ),
-        ),
+        (json_text(b"\x01\x44\x03$.a"), valid_target.clone()),
+        (valid_path.clone(), json_text(b"\x01\x44\x06bigint")),
         (
             text(
                 DataType::Utf8,

@@ -307,19 +307,32 @@ fn folds_values_rows_join_condition_and_sort_keys() {
 }
 
 #[test]
-fn collapsing_nested_literal_preserves_the_authored_value_domain() {
+fn collapsing_nested_constant_preserves_the_authored_json_domain() {
+    use arrow::array::{Array, LargeBinaryArray};
+    use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueLogicalType};
+    use std::sync::Arc;
+
     let mut fixture = Fixture::new();
-    let value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+    let value_type = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
         false,
-        novarocks_type_contract::ValueLogicalType::Json,
+        ValueLogicalType::Json,
     )
     .unwrap();
-    let literal = fixture.intern(
-        ScalarNode::Literal(HashableLiteral(LiteralValue::String("{\"k\":1}".into()))),
+    let pool = novarocks_functions::ConstantPool::try_new(
+        Arc::new(value_type.try_to_field("original_json").unwrap()),
+        value_type.clone(),
+        LargeBinaryArray::from(vec![b"\x01\x44\x01x".as_slice()]).to_data(),
+        crate::constant::test_constant_policy(),
+        CompilePhase::Validate,
+        crate::optimizer::test_optimizer_control(),
+    )
+    .unwrap();
+    let constant = fixture.intern(
+        ScalarNode::Constant(pool.value(0).unwrap()),
         value_type.clone(),
     );
-    let nested = fixture.intern(ScalarNode::Nested(literal), value_type.clone());
+    let nested = fixture.intern(ScalarNode::Nested(constant), value_type.clone());
     let folded = project_expr(&changed(fixture.apply(project(nested))));
     assert_eq!(fixture.arena.borrow().value_type(folded), &value_type);
     assert_eq!(fixture.calls(), 0);

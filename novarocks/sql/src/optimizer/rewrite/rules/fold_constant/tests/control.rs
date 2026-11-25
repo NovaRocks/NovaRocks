@@ -315,7 +315,7 @@ fn actual_metadata_decline_and_successful_output_pool_keep_all_callback_prefixes
     )
     .unwrap();
     let list = ValueTypeRef::try_new(ValueKind::List(json), true, storage.clone()).unwrap();
-    let field = Field::new("item", DataType::Utf8, true).with_metadata([
+    let field = Field::new("item", DataType::LargeBinary, true).with_metadata([
         (novarocks_type_contract::NR_LOGICAL_TYPE_KEY, "json"),
         ("provider.fact", "positive source metadata"),
     ]);

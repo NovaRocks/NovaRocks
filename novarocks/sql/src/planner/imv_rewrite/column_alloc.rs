@@ -216,7 +216,7 @@ mod tests {
         }
         let json = ColumnDef {
             name: "visible".into(),
-            data_type: DataType::Utf8,
+            data_type: DataType::LargeBinary,
             nullable: true,
             write_default: None,
             logical_type: Some(SqlType::Json),

@@ -1073,19 +1073,19 @@ mod tests {
     fn json_output_domain_uses_bound_result_not_shadowed_function_spelling() {
         let builtin = build_builtin_engine_function_catalog().unwrap();
         let args = [value_argument(DataType::Utf8, false, None)];
-        let bound = resolve_exact_scalar(&builtin, "json_object", &args);
+        let bound = resolve_exact_scalar(&builtin, "json_parse", &args);
         assert_eq!(
             scalar_output_logical_type(&bound),
             Some(novarocks_types::schema::SqlType::Json)
         );
 
-        let overload = FunctionOverloadId::try_new("test.shadow.json_object/0/v1").unwrap();
+        let overload = FunctionOverloadId::try_new("test.shadow.json_parse/0/v1").unwrap();
         let mut selection = bound.selected.clone();
         selection.overload = overload.clone();
         selection.result_type =
             FunctionResultType::Scalar(FunctionValueType::new(DataType::Utf8, false));
         let declaration = FunctionBindingDeclaration::try_new(
-            FunctionId::try_new("test.shadow/json_object/v1").unwrap(),
+            FunctionId::try_new("test.shadow/json_parse/v1").unwrap(),
             FunctionKind::Scalar,
             [FunctionOverloadDeclaration {
                 effects: None,
@@ -1101,7 +1101,7 @@ mod tests {
         builder
             .register(
                 FunctionDefinition::try_new_bound(
-                    "json_object",
+                    "json_parse",
                     FunctionVisibility::Public,
                     declaration,
                     Arc::new(ShadowBindingResolver(selection)),
@@ -1110,7 +1110,7 @@ mod tests {
             )
             .unwrap();
         let shadow = builder.seal().unwrap();
-        let bound = resolve_exact_scalar(&shadow, "json_object", &args);
+        let bound = resolve_exact_scalar(&shadow, "json_parse", &args);
         assert_eq!(scalar_result(&bound).data_type().clone(), DataType::Utf8);
         assert_eq!(scalar_output_logical_type(&bound), None);
     }
@@ -1250,7 +1250,7 @@ mod tests {
     fn json_output_domain_uses_bound_identity_not_shadowed_function_spelling() {
         let builtin = build_builtin_engine_function_catalog().unwrap();
         let args = [value_argument(DataType::Utf8, false, None)];
-        let bound = resolve_exact_scalar(&builtin, "json_object", &args);
+        let bound = resolve_exact_scalar(&builtin, "json_parse", &args);
         assert_eq!(
             scalar_output_logical_type(&bound),
             Some(novarocks_types::schema::SqlType::Json)
@@ -1258,12 +1258,12 @@ mod tests {
 
         let signatures = novarocks_functions::builtin::registry::builtin_scalar_declarations()
             .into_iter()
-            .find(|(name, _)| name == "json_object")
+            .find(|(name, _)| name == "json_parse")
             .unwrap()
             .1;
         let overloads = (0..signatures.len())
             .map(|index| {
-                FunctionOverloadId::try_new(format!("test.shadow.json_object/{index}/v1")).unwrap()
+                FunctionOverloadId::try_new(format!("test.shadow.json_parse/{index}/v1")).unwrap()
             })
             .collect::<Vec<_>>();
         let mut selection = bound.selected.clone();
@@ -1271,7 +1271,7 @@ mod tests {
         selection.result_type =
             FunctionResultType::Scalar(FunctionValueType::new(DataType::Utf8, false));
         let declaration = FunctionBindingDeclaration::try_new(
-            FunctionId::try_new("test.shadow/json_object/v1").unwrap(),
+            FunctionId::try_new("test.shadow/json_parse/v1").unwrap(),
             FunctionKind::Scalar,
             overloads
                 .iter()
@@ -1291,7 +1291,7 @@ mod tests {
         builder
             .register(
                 FunctionDefinition::try_new_bound(
-                    "json_object",
+                    "json_parse",
                     FunctionVisibility::Public,
                     declaration,
                     Arc::new(ShadowBindingResolver(selection)),
@@ -1300,7 +1300,7 @@ mod tests {
             )
             .unwrap();
         let shadow = builder.seal().unwrap();
-        let bound = resolve_exact_scalar(&shadow, "json_object", &args);
+        let bound = resolve_exact_scalar(&shadow, "json_parse", &args);
         assert_eq!(scalar_result(&bound).data_type().clone(), DataType::Utf8);
         assert_eq!(scalar_output_logical_type(&bound), None);
     }
@@ -1697,9 +1697,9 @@ mod tests {
                 Own::NoRowError,
             ),
             (
-                "parse_json",
+                "json_parse",
                 vec![value_argument(DataType::Utf8, true, None)],
-                Own::NoRowError,
+                Own::MayRaise,
             ),
             (
                 "assert_true",
