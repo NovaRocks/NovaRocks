@@ -47,6 +47,10 @@ impl ComparisonAllocator {
     pub fn try_new(host: Arc<dyn AggregateStateAllocator>) -> Result<Self, KernelFailure> {
         Ok(Self(HostAggregateAllocator::try_new(host)?))
     }
+
+    pub(crate) const fn retained_bytes() -> usize {
+        HostAggregateAllocator::metadata_allocation_bytes()
+    }
 }
 
 /// Final outcome of one demanded composite predicate. Key indeterminacy remains

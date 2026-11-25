@@ -49,6 +49,33 @@ pub(crate) enum PreparedNodeComparison {
     Composite(PreparedCompositeComparisonRecipe),
 }
 
+pub(crate) fn case_own_effects<'a, E: From<CompileControlError>>(
+    operand: Option<&FunctionValueType>,
+    labels: impl Iterator<Item = Result<&'a FunctionValueType, E>>,
+    context: novarocks_type_contract::ExpressionEffectContext,
+    work: &mut CompileCheckpoints<'_>,
+    comparison_error: impl Fn(ComparisonPrepareError) -> E,
+) -> Result<novarocks_functions::ScopedExpressionEffects, E> {
+    let mut effects = novarocks_type_contract::ExpressionEffects::PURE_VALUE;
+    if let Some(operand) = operand.filter(|ty| PreparedCompositeComparisonRecipe::is_composite(ty))
+    {
+        for label in labels {
+            work.step()?;
+            let recipe = PreparedCompositeComparisonRecipe::try_new(
+                novarocks_type_contract::KeyRelation::Equal,
+                operand,
+                label?,
+                work.control(),
+            )
+            .map_err(&comparison_error)?;
+            effects.may_raise_row_error |= recipe.may_raise_row_error();
+        }
+    }
+    Ok(novarocks_functions::ScopedExpressionEffects::primitive(
+        context, effects,
+    ))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProgramPrimitiveError {
     Control(CompileControlError),

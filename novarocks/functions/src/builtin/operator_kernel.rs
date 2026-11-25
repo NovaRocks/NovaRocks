@@ -257,6 +257,11 @@ impl PreparedScalarKernel for BinaryOperatorKernel {
 
     fn instance_retained_upper_bound(&self) -> usize {
         std::mem::size_of::<Instance>()
+            + if self.instance_inline_allocation_bytes() != 0 {
+                ComparisonAllocator::retained_bytes()
+            } else {
+                0
+            }
     }
 
     fn instance_inline_allocation_bytes(&self) -> usize {
@@ -458,6 +463,11 @@ impl ScalarKernelInstance for Instance {
 
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            + if self.1.is_some() {
+                ComparisonAllocator::retained_bytes()
+            } else {
+                0
+            }
     }
 }
 
