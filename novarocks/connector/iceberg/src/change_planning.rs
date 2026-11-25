@@ -17,6 +17,8 @@
 
 //! Provider-owned Iceberg change-window facts and manifest planning.
 
+// Design: ADR-0271 (docs/adr/ADR-0271-iceberg-change-window-facts-and-complete-enumeration.md)
+
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;

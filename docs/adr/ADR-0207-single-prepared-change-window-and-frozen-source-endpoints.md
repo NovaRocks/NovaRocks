@@ -5,6 +5,7 @@ domain: [provider-spi, frontend-mv]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0271]
 date: 2026-10-29
 provenance:
   - "discussion: 2026-10-29 typed window preparation, frozen source endpoints and execution observations"

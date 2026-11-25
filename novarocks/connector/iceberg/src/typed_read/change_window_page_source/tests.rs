@@ -237,6 +237,7 @@ struct Fixture {
     data_path: PathBuf,
     data_file_size: u64,
     record_count: i64,
+    first_row_id: Option<i64>,
 }
 
 impl Fixture {
@@ -279,6 +280,7 @@ impl Fixture {
             data_path,
             data_file_size,
             record_count: ids.len() as i64,
+            first_row_id: None,
         }
     }
 
@@ -326,7 +328,7 @@ impl Fixture {
             deletes: deletes.into(),
             file_statistics_domain: TupleDomain::all(),
             data_sequence_number: Some(DATA_SEQUENCE_NUMBER),
-            file_first_row_id: None,
+            file_first_row_id: self.first_row_id,
             decryption_data: None,
             split_weight: SplitWeight::STANDARD,
             affinity_key: None,
@@ -413,24 +415,6 @@ fn drain(source: &mut DrivenStream<'_>) -> Vec<(i64, i32)> {
     rows
 }
 
-fn drain_stream(
-    fixture: &Fixture,
-    stream: &mut OwnedConnectorPageStream,
-    budget: &ConnectorPollBudget,
-) -> Vec<(i64, i32)> {
-    use futures::StreamExt;
-    fixture._runtime.block_on(async {
-        let mut rows = Vec::new();
-        loop {
-            budget.refill(1024);
-            match stream.next().await {
-                Some(page) => rows.extend(signed_rows(page.expect("page"))),
-                None => return rows,
-            }
-        }
-    })
-}
-
 /// One page's `(id, __change_op)` pairs.
 fn signed_rows(page: novarocks_spi::connector::read_stack::SourcePage) -> Vec<(i64, i32)> {
     let (count, columns) = page.into_columns().expect("materialize");
@@ -460,17 +444,40 @@ fn read_streamed(
     split: &IcebergChangeSplit,
     schema: &Schema,
 ) -> Vec<(i64, i32)> {
-    let columns = id_and_change_op(schema);
+    read_streamed_with(
+        fixture,
+        handle,
+        split,
+        &id_and_change_op(schema),
+        signed_rows,
+    )
+}
+
+fn read_streamed_with<T>(
+    fixture: &Fixture,
+    handle: &IcebergChangeWindowHandle,
+    split: &IcebergChangeSplit,
+    columns: &[IcebergColumnHandle],
+    rows_from_page: impl Fn(novarocks_spi::connector::read_stack::SourcePage) -> Vec<T>,
+) -> Vec<T> {
+    use futures::StreamExt;
+
     let budget = ConnectorPollBudget::new();
     let mut stream = fixture
-        .page_stream(handle, split, &columns, &budget)
+        .page_stream(handle, split, columns, &budget)
         .expect("page stream");
-    let streamed = drain_stream(fixture, &mut stream, &budget);
-    fixture
-        ._runtime
-        .block_on(stream.close())
-        .expect("close a drained stream");
-    streamed
+    fixture._runtime.block_on(async {
+        let mut rows = Vec::new();
+        loop {
+            budget.refill(1024);
+            let Some(page) = stream.next().await else {
+                break;
+            };
+            rows.extend(rows_from_page(page.expect("page")));
+        }
+        stream.close().await.expect("close a drained stream");
+        rows
+    })
 }
 
 #[test]
@@ -600,6 +607,55 @@ fn removed_files_exclude_the_complete_from_closure() {
         read_streamed(&fixture, &handle, &removed(&fixture, vec![]), &schema),
         vec![(20, -1), (21, -1), (22, -1)]
     );
+}
+
+#[test]
+fn removing_a_file_and_deleting_its_remaining_rows_retract_the_same_row_ids() {
+    use crate::row_lineage_synth::{ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL};
+
+    let mut fixture = Fixture::new(&[10, 20, 20, 30]);
+    fixture.first_row_id = Some(1_000);
+    let schema = iceberg_schema();
+    let handle = change_window_handle(&schema);
+    let mut columns = id_and_change_op(&schema);
+    columns.push(
+        IcebergColumnHandle::base_column(&NestedField::optional(
+            ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+            ICEBERG_ROW_ID_COL,
+            Type::Primitive(PrimitiveType::Long),
+        ))
+        .expect("row id handle"),
+    );
+    let old_position = fixture.path("old-position.parquet");
+    let old_equality = fixture.path("old-equality.parquet");
+    let new_position = fixture.path("new-position.parquet");
+    write_position_delete(&old_position, &fixture.data_file(), &[0]);
+    write_equality_delete(&old_equality, &[10]);
+    write_position_delete(&new_position, &fixture.data_file(), &[1, 2, 3]);
+
+    let expected = [(20, -1, 1_001), (20, -1, 1_002), (30, -1, 1_003)];
+    for from in [
+        position_delete_descriptor(&old_position, 4),
+        equality_delete_descriptor(&old_equality, 4),
+    ] {
+        let to = vec![from.clone(), position_delete_descriptor(&new_position, 5)];
+        for split in [
+            difference(&fixture, vec![from.clone()], to),
+            removed(&fixture, vec![from]),
+        ] {
+            let rows = read_streamed_with(&fixture, &handle, &split, &columns, |page| {
+                let (count, arrays) = page.into_columns().expect("materialize");
+                let ids = arrays[0].as_any().downcast_ref::<Int64Array>().unwrap();
+                let signs = arrays[1].as_any().downcast_ref::<Int32Array>().unwrap();
+                let row_ids = arrays[2].as_any().downcast_ref::<Int64Array>().unwrap();
+                assert_eq!(row_ids.null_count(), 0);
+                (0..count)
+                    .map(|row| (ids.value(row), signs.value(row), row_ids.value(row)))
+                    .collect()
+            });
+            assert_eq!(rows, expected);
+        }
+    }
 }
 #[test]
 fn replacement_closure_emits_only_the_endpoint_row_bag_difference() {
