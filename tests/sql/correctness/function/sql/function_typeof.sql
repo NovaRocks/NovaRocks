@@ -138,6 +138,7 @@ select typeof(c1)
   ,typeof(c17)
   ,typeof(c18)
   ,typeof(c19)
+  ,typeof(c20)
   ,typeof(json_parse(c20))
   from t1;
 
