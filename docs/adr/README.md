@@ -337,7 +337,6 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
-- [ADR-0269](ADR-0269-cte-multicast-freezes-exact-branches.md) — 共享 CTE 的相邻 exchange 如何融合，物理边和 Task 运行边为何沿同一受检投影绑定（active）
 - [ADR-0263](ADR-0263-trino-scalar-values-and-publication-eligibility.md) — Trino 标量定型、UUID 呈现与受影响 MV 的发布资格（active）
 - [ADR-0256](ADR-0256-temporal-calls-freeze-overloads-and-selected-row-effects.md) — 时态调用如何冻结重载、环境和选中行错误，并以实际发布验值完成 MV 切换（active）
 
@@ -357,6 +356,7 @@ code-anchors:
 - [ADR-0245](ADR-0245-scalar-typing-finalizes-the-original-overload.md) — 表达式层为何在转换后以原重载定稿，语句准入、实际端口和两套入口如何交接（active）
 - [ADR-0244](ADR-0244-operators-are-identified-catalogue-functions.md) — 隐藏目录函数为何按身份表示运算符，如何沿普通调用迁移、渲染和折叠（active；部分替代 ADR-0242 的取负范围）
 
+- [ADR-0269](ADR-0269-cte-multicast-freezes-exact-branches.md) — 共享 CTE 的相邻 exchange 如何融合，物理边和 Task 运行边为何沿同一受检投影绑定（active）
 - [ADR-0243](ADR-0243-set-operation-shared-stages-and-exactly-once-placement.md) — 集合运算为何先转换再分区，无 split 分支为何由 Singleton source 和单副本 exchange 建立行放置（active）
 - [ADR-0242](ADR-0242-constant-folding-compiles-expression-units.md) — 常量折叠为何逐节点使用同一表达式单元、缓存结果并在规划期保留原失败语义，标量调用事实为何归表达式层（active；部分替代 ADR-0100、折叠 ADR-0191 与 ADR-0238，承接求值器 ADR-0239 的单节点入口退役条件；取负按 ADR-0244 进入普通调用折叠范围）
 - [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排；单节点折叠的退役条件由 ADR-0242 承接）
