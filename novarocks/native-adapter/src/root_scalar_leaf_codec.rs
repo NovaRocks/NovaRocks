@@ -598,17 +598,19 @@ pub(crate) fn borrow_leaf_at<'a>(
         return match (&expected.value_type, values.data_type()) {
             (S::String, DataType::Utf8) => {
                 let values = exact::<StringArray>(values.as_ref())?;
-                Ok(values
-                    .is_valid(key)
-                    .then(|| V::String(values.value(key)))
-                    .unwrap_or(V::Null))
+                Ok(if values.is_valid(key) {
+                    V::String(values.value(key))
+                } else {
+                    V::Null
+                })
             }
             (S::String, DataType::LargeUtf8) => {
                 let values = exact::<LargeStringArray>(values.as_ref())?;
-                Ok(values
-                    .is_valid(key)
-                    .then(|| V::String(values.value(key)))
-                    .unwrap_or(V::Null))
+                Ok(if values.is_valid(key) {
+                    V::String(values.value(key))
+                } else {
+                    V::Null
+                })
             }
             (S::Json, DataType::LargeBinary) => borrow_leaf_at(expected, values.as_ref(), key),
             _ => Err(NativeScalarLeafError::Type),

@@ -1218,9 +1218,9 @@ pub(super) fn type_only_fixture(
     (unit, catalog(owner))
 }
 
-fn type_only_hidden_native_fixture(
-    kind: &str,
-) -> Result<(BoundExprSet, Arc<Owner>, Vec<(ValueId, ValueType)>), UnitError> {
+type HiddenNativeFixture = (BoundExprSet, Arc<Owner>, Vec<(ValueId, ValueType)>);
+
+fn type_only_hidden_native_fixture(kind: &str) -> Result<HiddenNativeFixture, UnitError> {
     let mut b = builder();
     let input_type = match kind {
         "in_float" => FunctionValueType::new(DataType::Float64, false),

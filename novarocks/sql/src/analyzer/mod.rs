@@ -5914,7 +5914,7 @@ mod tests {
                         coefficient: 123456789012345678901234567890,
                     }),
                 ) => {}
-                ("1E308", Kind::Scalar(Scalar::Double(value))) if value == 1e308 => {}
+                ("1E308", Kind::Scalar(Scalar::Double(1e308))) => {}
                 (_, actual) => panic!("unexpected numeric class for {text}: {actual:?}"),
             }
         }
