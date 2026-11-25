@@ -55,6 +55,7 @@ pub use array_json::validate_trino_json_literal;
 mod array_mode;
 mod array_text;
 pub(crate) mod map_mode;
+mod row_mode;
 #[path = "cast/selected.rs"]
 mod selected;
 mod trino;
@@ -428,6 +429,9 @@ pub(crate) fn varchar_row_temporary_extent(
 enum CastBody {
     ExplicitArray,
     ExplicitMap,
+    ExplicitRow {
+        may_raise: bool,
+    },
     ArrayNull,
     ArrayLeaf(trino_array_leaf::Leaf),
     ArrayText,
@@ -473,6 +477,7 @@ enum CastBody {
         source: Source,
     },
     TemporalWiden(crate::builtin::LosslessTemporalWiden),
+    TemporalText(crate::builtin::TemporalTextCast),
     Text {
         source: Source,
     },
@@ -510,6 +515,7 @@ enum CastChildren {
     None,
     Array(Box<PreparedCastRecipe>),
     Map(Box<[PreparedCastRecipe; 2]>),
+    Row(Box<[PreparedCastRecipe]>),
 }
 impl PreparedCastRecipe {
     /// Prepare the strict conversion authored by an ARRAY common-type binding.
@@ -554,6 +560,7 @@ impl PreparedCastRecipe {
             CastChildren::None => return Ok(0),
             CastChildren::Array(child) => std::slice::from_ref(child.as_ref()),
             CastChildren::Map(children) => children.as_slice(),
+            CastChildren::Row(children) => children.as_ref(),
         };
         let mut bytes = 0_usize;
         for (index, child) in children.iter().enumerate() {
@@ -1234,6 +1241,7 @@ impl PreparedCastRecipe {
                 | CastBody::SelectedArray(_)
                 | CastBody::ExplicitArray
                 | CastBody::ExplicitMap
+                | CastBody::ExplicitRow { .. }
                 | CastBody::ArrayNull
                 | CastBody::TemporalWiden(_)
         )
@@ -1248,6 +1256,7 @@ impl PreparedCastRecipe {
         match self.body {
             CastBody::ExplicitArray
             | CastBody::ExplicitMap
+            | CastBody::ExplicitRow { .. }
             | CastBody::ArrayNull
             | CastBody::TemporalWiden(_) => {
                 array_mode::evaluate(self, argument, selection, inherited, control)
@@ -1303,6 +1312,7 @@ impl PreparedCastRecipe {
                     && matches!(&self.children, CastChildren::Array(child) if child.conversion_may_raise())
             }
             CastBody::ExplicitMap => true,
+            CastBody::ExplicitRow { may_raise } => may_raise,
             CastBody::ArrayNull => false,
             CastBody::ArrayLeaf(leaf) => leaf.may_fail(),
             CastBody::ArrayJson(array_json::Operation::VarcharToJson)
@@ -1379,6 +1389,7 @@ impl PreparedCastRecipe {
             | CastBody::BinaryText
             | CastBody::LargeIntText
             | CastBody::TemporalWiden(_)
+            | CastBody::TemporalText(_)
             | CastBody::Identity
             | CastBody::Text { .. } => false,
             CastBody::Carrier { source, target } => {
@@ -1434,6 +1445,22 @@ impl PreparedCastRecipe {
                     logical_row,
                     &mut work,
                 );
+            }
+            if let CastBody::TemporalText(cast) = self.body {
+                let row = self.checked_row_with_shape(
+                    argument,
+                    ordinal,
+                    logical_row,
+                    &mut work,
+                    |array| array.as_any().is::<TimestampMicrosecondArray>(),
+                )?;
+                let text = cast.evaluate(
+                    argument.array().as_ref(),
+                    row,
+                    self.source.nullable(),
+                    &mut work,
+                )?;
+                return Ok(text.map_or(CastRowResult::Null, CastRowResult::Text));
             }
             if let CastBody::Trino(body) = self.body {
                 return trino::evaluate_scalar(

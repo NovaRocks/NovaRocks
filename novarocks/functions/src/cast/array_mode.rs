@@ -325,7 +325,10 @@ fn prepare_element(
     ))
 }
 
-fn reserve<T>(len: usize, work: &mut EvaluationCheckpoints<'_>) -> Result<Vec<T>, KernelFailure> {
+pub(super) fn reserve<T>(
+    len: usize,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<Vec<T>, KernelFailure> {
     Layout::array::<T>(len).map_err(|_| KernelFailure::ResourceExhausted)?;
     work.flush()?;
     let mut values = Vec::new();
@@ -475,15 +478,17 @@ pub(super) fn evaluate<'a>(
                 } else if recipe.body == CastBody::Identity {
                     work.flush()?;
                     argument.array().slice(row, 1)
-                } else if recipe.body == CastBody::ExplicitMap {
-                    match super::map_mode::evaluate_row(
-                        recipe,
-                        argument.array(),
-                        row,
-                        ordinal,
-                        control,
-                        &mut work,
-                    )? {
+                } else if matches!(
+                    recipe.body,
+                    CastBody::ExplicitMap | CastBody::ExplicitRow { .. }
+                ) {
+                    let evaluate_row = if recipe.body == CastBody::ExplicitMap {
+                        super::map_mode::evaluate_row
+                    } else {
+                        super::row_mode::evaluate_row
+                    };
+                    match evaluate_row(recipe, argument.array(), row, ordinal, control, &mut work)?
+                    {
                         Ok(value) => value,
                         Err(error) => {
                             if recipe.array_failure_mode != Some(ArrayCastFailureMode::OutputNull) {
