@@ -158,7 +158,7 @@ fn native_json_pages(context: &mut ScenarioContext) -> Result<()> {
                           WHEN 1 THEN CAST(NULL AS JSON)
                           WHEN 2 THEN JSON 'null'
                           WHEN 3 THEN json_parse(concat(rpad('', 1024, '['), CAST(n AS VARCHAR), rpad('', 1024, ']')))
-                          WHEN 8 THEN json_parse(concat('"', rpad('', {wide}, 'q'), CAST(n AS VARCHAR), '"'))
+                          WHEN 8 THEN CAST(rpad(CAST(n AS VARCHAR), {wide}, 'q') AS JSON)
                           ELSE json_parse(concat('{{"b":', CAST(n AS VARCHAR), ',"a":1,"a":2}}'))
                       END AS doc
                FROM input_rows
@@ -190,7 +190,7 @@ fn native_json_pages(context: &mut ScenarioContext) -> Result<()> {
     );
     let object = |n| format!(r#"{{"b":{n},"a":1,"a":2}}"#);
     let depth = format!("{}3{}", "[".repeat(1024), "]".repeat(1024));
-    let large_document = format!("\"{}8\"", "q".repeat(wide));
+    let large_document = format!("\"8{}\"", "q".repeat(wide - 1));
     let expected = [
         json!([0, depth, [depth, object(6), object(9)]]),
         json!([1, null, [null, object(4), object(7)]]),

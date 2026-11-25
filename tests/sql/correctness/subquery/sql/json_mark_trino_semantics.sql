@@ -90,5 +90,7 @@ SELECT JSON 'not JSON' IN (JSON 'not JSON') AS included;
 SELECT JSON '"\ud800"' IN (SELECT JSON '"\uD800"') AS included;
 -- @expect_trino_error=INVALID_LITERAL,USER_ERROR
 SELECT JSON '1e9999' IN (JSON '1') AS included;
--- @expect_error=[sql.analyze.unsupported_query_shape]
+-- Variant CAST admission precedes the JSON mark's operand check.
+-- @expect_sql_code=sql.analyze.unsupported_expression
+-- @expect_error=SQL type variant is not supported
 SELECT JSON '1' IN (SELECT CAST(NULL AS VARIANT)) AS included;
