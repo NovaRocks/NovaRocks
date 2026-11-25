@@ -18,8 +18,7 @@
 //! Conversion of an original typed JSON value to a frozen SQL structure.
 
 use super::{
-    LeafError, Reader, Scalar, consume_value, decode_string, number_facts, number_text, numeric,
-    validate,
+    LeafError, Reader, Scalar, consume_value, decode_string, number_text, numeric, validate,
 };
 use crate::cast::{
     CastPrepareError, CastRowResult, PreparedCastRecipe, SignedWidth, map_mode, trino,
