@@ -411,7 +411,7 @@ pub(crate) fn require_arrow_model() -> Result<(), ScalarResourceError> {
     // The locked source and pinned compiler fix the private enum layout
     // algorithm. Public actual types also reject an unreviewed target/pool
     // profile; dependency features cannot be read from this crate's cfg.
-    if env!("NOVAROCKS_SCALAR_ARROW_SOURCE") != "60.1.0"
+    if env!("NOVAROCKS_SCALAR_ARROW_SOURCE") != "60.2.0"
         || !cfg!(any(
             all(target_arch = "aarch64", target_os = "macos"),
             all(

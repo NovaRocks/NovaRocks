@@ -19,11 +19,11 @@
 //! This receipt fixes source identity, not dependency feature resolution.
 
 const SOURCES: [(&[u8], &[u8]); 6] = [
-    (b"\nname = \"arrow-array\"\n", b"\nname = \"arrow-array\"\nversion = \"60.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"0f3d22a41d3df78b71df0b685af219ae3a94188ab98d6fb29c958eb55c3247f4\"\n"),
-    (b"\nname = \"arrow-buffer\"\n", b"\nname = \"arrow-buffer\"\nversion = \"60.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"7bd46a530bc1a8e763102fc36c1dc0f51f3ffa150c78e7f5658ccb54b1458ade\"\n"),
-    (b"\nname = \"arrow-data\"\n", b"\nname = \"arrow-data\"\nversion = \"60.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"415b7fbc4cf56b080bb5677a4ae74211b5c79e571ed37a1d547633ec07f3b43b\"\n"),
-    (b"\nname = \"arrow-schema\"\n", b"\nname = \"arrow-schema\"\nversion = \"60.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"de2c8e714b466404cdc1189e89f892426efea614d938e16c15518c340cd43ba3\"\n"),
-    (b"\nname = \"arrow-cast\"\n", b"\nname = \"arrow-cast\"\nversion = \"60.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"baa83a0752814a1922d5ee75032524ca9bbfb7f60ee35a67ed4ab8b275260aaf\"\n"),
+    (b"\nname = \"arrow-array\"\n", b"\nname = \"arrow-array\"\nversion = \"60.2.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"a7a75080e8066219ed2d1e3b8fd2eb0b1a4b35d03b6fa87fb1035e93bd8dac95\"\n"),
+    (b"\nname = \"arrow-buffer\"\n", b"\nname = \"arrow-buffer\"\nversion = \"60.2.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"6c6bf2edf52662586214410c6030204215453eb86b8715037e8951326e173b19\"\n"),
+    (b"\nname = \"arrow-data\"\n", b"\nname = \"arrow-data\"\nversion = \"60.2.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"d0a7becabdb9bf3fa058b55845c52e0f792bedc88fd0e28d6580c9730a902b60\"\n"),
+    (b"\nname = \"arrow-schema\"\n", b"\nname = \"arrow-schema\"\nversion = \"60.2.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"3e7574c4175cc731e0d26a8384bc25d455c5e220250988a772c1af843592444b\"\n"),
+    (b"\nname = \"arrow-cast\"\n", b"\nname = \"arrow-cast\"\nversion = \"60.2.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"fcad6713dda348c245cd6ef36a578b4362c143c3a9dd829aa19e89f407c3e48b\"\n"),
     (b"\nname = \"num-traits\"\n", b"\nname = \"num-traits\"\nversion = \"0.2.19\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841\"\n"),
 ];
 
