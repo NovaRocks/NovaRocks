@@ -352,7 +352,7 @@ fn shared_text_scanner_preserves_unicode_markers_numbers_and_strict_errors() {
     assert_eq!(java_double_decimal(1e23), Some((1, -23)));
     assert_eq!(java_double_decimal(f64::from_bits(1)), Some((49, 325)));
     assert_eq!(
-        java_double_decimal(80_241_618_952_346.125),
+        java_double_decimal(80_241_618_952_346.0 + 0.125),
         Some((8_024_161_895_234_612, 2))
     );
 }

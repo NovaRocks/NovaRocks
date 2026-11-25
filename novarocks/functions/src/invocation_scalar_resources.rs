@@ -714,14 +714,13 @@ mod tests {
         let PreparedPureKernel::Scalar(prepared) = prepared else {
             panic!("installed UPPER must provide a selected scalar contract");
         };
-        let fixture = Arc::new_cyclic(|owner: &std::sync::Weak<ProfileFixture>| ProfileFixture {
+        Arc::new_cyclic(|owner: &std::sync::Weak<ProfileFixture>| ProfileFixture {
             prepared,
             profile: WholeInvocationResourceProfile {
                 source: WholeInvocationSource::JsonObject,
                 prepared: owner.clone(),
             },
-        });
-        fixture
+        })
     }
 
     #[test]
