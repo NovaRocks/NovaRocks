@@ -16,10 +16,12 @@
 // under the License.
 
 use super::*;
-use arrow::array::{ArrayRef, DictionaryArray, Float32Array, Int64Array, StringArray};
+use arrow::array::{
+    ArrayRef, DictionaryArray, Float32Array, Int64Array, LargeBinaryArray, StringArray,
+};
 use arrow::datatypes::{Field, Int8Type};
 use novarocks_functions::{ConstantPolicy, ConstantPool};
-use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+use novarocks_type_contract::ValueLogicalType;
 use std::sync::{Arc, Mutex};
 
 struct Control {
@@ -194,21 +196,21 @@ fn float32_nan_payload_and_signed_zero_are_exact_materialized_values() {
 fn root_source_metadata_is_independent_and_authored_logical_domains_remain_identity() {
     let mut arena = ScalarArena::with_constant_policy(policy());
     let value = |logical, metadata: &str| {
-        let ty =
-            FunctionValueType::try_from_legacy_declared_projection(DataType::Utf8, false, logical)
-                .expect("valid temporary legacy value projection");
-        let field = Arc::new(
-            ty.try_to_field("literal").unwrap().with_metadata(
-                [("provider.fact".into(), metadata.into())]
-                    .into_iter()
-                    .chain(
-                        (logical == ValueLogicalType::Json)
-                            .then(|| (NR_LOGICAL_TYPE_KEY.into(), "json".into())),
-                    )
-                    .collect::<std::collections::HashMap<String, String>>(),
-            ),
-        );
-        cv(Arc::new(StringArray::from(vec!["x"])), ty, field, 0)
+        let ty = FunctionValueType::try_from_legacy_declared_projection(
+            DataType::LargeBinary,
+            false,
+            logical,
+        )
+        .expect("valid temporary legacy value projection");
+        let field = Arc::new(ty.try_to_field("literal").unwrap().with_metadata(
+            std::collections::HashMap::from([("provider.fact".into(), metadata.into())]),
+        ));
+        cv(
+            Arc::new(LargeBinaryArray::from(vec![b"\x01\x44\x01x".as_slice()])),
+            ty,
+            field,
+            0,
+        )
     };
     let first = insert(
         &mut arena,

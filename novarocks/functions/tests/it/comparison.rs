@@ -556,12 +556,8 @@ fn byte_profiles_and_nonzero_constant_compact_slice_addresses_are_independent() 
 fn unsupported_domains_and_bad_selected_addresses_refuse_before_null_short_circuit() {
     let physical = ty(DataType::Utf8, true);
     for logical in [ValueLogicalType::Json, ValueLogicalType::Variant] {
-        let data_type = if logical == ValueLogicalType::Json {
-            DataType::Utf8
-        } else {
-            DataType::LargeBinary
-        };
-        let value = FunctionValueType::try_with_logical_type(data_type, true, logical).unwrap();
+        let value =
+            FunctionValueType::try_with_logical_type(DataType::LargeBinary, true, logical).unwrap();
         assert_eq!(
             PreparedComparisonRecipe::try_new(
                 ComparisonOperator::Eq,

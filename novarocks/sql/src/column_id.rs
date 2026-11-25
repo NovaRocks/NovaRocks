@@ -421,13 +421,17 @@ mod tests {
     fn same_value_provenance_preserves_nested_domains_and_root_nullability_rules() {
         let mut factory = ColumnRefFactory::new();
         let json = crate::test_value_types::string_structure(&[("payload", true, true)], false);
-        let text = crate::test_value_types::string_structure(&[("payload", true, false)], false);
-        assert_eq!(json.data_type(), text.data_type());
+        let binary =
+            novarocks_type_contract::FunctionValueType::new(json.data_type().clone(), false);
+        assert_eq!(json.data_type(), binary.data_type());
         let source = factory.create(None, "source".into(), json.clone());
         let widened = factory.create(None, "widened".into(), json.with_nullable(true).unwrap());
-        let changed = factory.create(None, "changed".into(), text);
+        let changed = factory.create(None, "changed".into(), binary);
         assert!(factory.transfer_value_provenance(source, widened).is_ok());
-        assert!(factory.transfer_value_provenance(source, changed).is_err());
+        assert_eq!(
+            factory.transfer_value_provenance(source, changed),
+            Err("same-value column rewrite changed its complete declared type")
+        );
         assert!(factory.transfer_value_provenance(widened, source).is_err());
     }
 }

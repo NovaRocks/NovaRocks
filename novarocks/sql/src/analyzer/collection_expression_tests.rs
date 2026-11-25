@@ -95,8 +95,8 @@ fn json_list_target() -> novarocks_type_contract::FunctionValueType {
     let layout = ValueLayout::try_from_normalized_arrow(
         DataType::List(std::sync::Arc::new(Field::new(
             "item",
-            DataType::Utf8,
-            true,
+            item.data_type().clone(),
+            item.nullable(),
         ))),
         ValueTypeStorageLifetime::pure(),
     )

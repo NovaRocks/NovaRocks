@@ -427,12 +427,14 @@ fn typed_null_identity_logical_domain_and_empty_partition_are_truthful() {
     let r = recipe(&json, &target);
     assert_eq!(r.source_type().logical_type(), ValueLogicalType::Json);
     let source: ArrayRef = Arc::new(crate::json_value::test_array(&[Some("{}"), Some("[1]")]));
-    assert_eq!(
-        r.evaluate_complete(EvaluatedArgument::Column(&source), 2, &Control::default())
-            .unwrap()
-            .to_data(),
-        source.to_data()
-    );
+    let prepared = r
+        .prepare_partition(EvaluatedArgument::Column(&source), 2, &Control::default())
+        .unwrap()
+        .unwrap();
+    assert!(matches!(prepared, super::PartitionDefault::Borrowed(_)));
+    assert!(Arc::ptr_eq(prepared.argument().array(), &source));
+    assert_eq!(prepared.retained_bytes(), 0);
+    assert_eq!(r.retained_upper_bound(2).unwrap(), 0);
     let empty: ArrayRef = Arc::new(Int64Array::from(Vec::<i64>::new()));
     let r = recipe(&ty(DataType::Int64, false), &ty(DataType::Utf8, true));
     let out = r

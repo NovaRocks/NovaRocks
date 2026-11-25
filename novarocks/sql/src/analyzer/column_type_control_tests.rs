@@ -139,7 +139,7 @@ fn column_type_source_domains_and_scope_keep_complete_authored_fields() {
         }
     }
 
-    let item = Field::new("provider_item", DataType::Utf8, false).with_metadata(
+    let item = Field::new("provider_item", DataType::LargeBinary, false).with_metadata(
         std::collections::HashMap::<String, String>::from([(
             "provider".into(),
             "kept-exactly".into(),

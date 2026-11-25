@@ -958,16 +958,39 @@ impl crate::compiler::SqlFunctionCatalog for MissingConversionPort {
 #[test]
 fn internal_value_conversion_preserves_the_supplied_catalog_boundary() {
     let control = crate::compiler::SqlCompileControl::unbounded();
-    let error = super::value_conversion::convert_value_domain_with_catalog(
-        &MissingConversionPort,
-        projection("SELECT j FROM source"),
-        FunctionValueType::new(DataType::Utf8, false),
-        novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-        crate::constant::test_constant_policy(),
-        &control,
-    )
-    .unwrap_err();
+    let convert = |catalog: &dyn crate::compiler::SqlFunctionCatalog, source: &str| {
+        super::value_conversion::convert_value_domain_with_catalog(
+            catalog,
+            projection(source),
+            FunctionValueType::new(DataType::Utf8, false),
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            crate::constant::test_constant_policy(),
+            &control,
+        )
+    };
+    let builtin = crate::functions::builtin_sql_function_catalog();
+    let converted = convert(builtin, "SELECT i FROM source").unwrap();
+    let ExprKind::FunctionCall { binding, args, .. } = &converted.kind else {
+        panic!("expected the installed value-domain conversion");
+    };
+    assert_eq!(
+        binding.function_id.as_str(),
+        "builtin.scalar/value_domain_conversion/v1"
+    );
+    assert_eq!(
+        args[0].value_type.logical_type(),
+        ValueLogicalType::LargeInt
+    );
+    assert_eq!(
+        converted.value_type,
+        FunctionValueType::new(DataType::Utf8, false)
+    );
+
+    let error = convert(&MissingConversionPort, "SELECT i FROM source").unwrap_err();
     assert!(error.to_string().contains("binding declaration"), "{error}");
+
+    let error = convert(builtin, "SELECT j FROM source").unwrap_err();
+    assert_eq!(error.message(), "no matching declared overload");
 }
 
 #[test]

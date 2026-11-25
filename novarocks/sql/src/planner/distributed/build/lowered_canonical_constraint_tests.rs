@@ -334,7 +334,7 @@ fn typed_empty_array_retains_independent_unknown_owner_and_outer_json_cast() {
                     panic!("outer JSON list target");
                 };
                 assert_eq!(item.name(), "item");
-                assert_eq!(item.data_type(), &DataType::Utf8);
+                assert_eq!(item.data_type(), &DataType::LargeBinary);
                 assert!(item.is_nullable());
                 assert!(item.metadata().is_empty());
                 assert_eq!(

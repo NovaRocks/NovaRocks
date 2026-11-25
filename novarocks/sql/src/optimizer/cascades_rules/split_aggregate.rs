@@ -720,6 +720,7 @@ mod tests {
         let sources = [
             ("count", FunctionValueType::new(DataType::Int64, false)),
             ("count", FunctionValueType::new(DataType::Int64, true)),
+            ("min", FunctionValueType::new(DataType::Utf8, false)),
             (
                 "any_value",
                 FunctionValueType::try_with_logical_type(
@@ -776,6 +777,10 @@ mod tests {
                 .clone();
             if name == "count" {
                 assert_eq!(state, FunctionValueType::new(DataType::Int64, false));
+            } else if name == "any_value" {
+                let nullable_source = source.with_nullable(true).unwrap();
+                assert_eq!(result, nullable_source);
+                assert_eq!(state, nullable_source);
             }
             let input = OutputColumn {
                 column_id: ColumnId(2),
@@ -842,6 +847,10 @@ mod tests {
                     &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
+            if name == "any_value" {
+                assert!(alternative.is_empty());
+                continue;
+            }
             assert_eq!(
                 alternative.len(),
                 1,

@@ -397,7 +397,7 @@ mod tests {
             vec![
                 Field::new(
                     "documents",
-                    DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, true))),
+                    DataType::LargeList(Arc::new(Field::new("item", DataType::LargeBinary, true))),
                     true,
                 ),
                 Field::new(
