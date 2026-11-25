@@ -1061,13 +1061,11 @@ impl<'a> super::AnalyzerContext<'a> {
             }
         }
         for item in &list_typed {
-            if !PreparedCompositeComparisonRecipe::is_composite(&expr_typed.value_type)
-                && !PreparedCompositeComparisonRecipe::is_composite(&item.value_type)
-                && incompatible_complex_compare(
-                    expr_typed.value_type.data_type(),
-                    item.value_type.data_type(),
-                )
-                .is_some()
+            if incompatible_complex_compare(
+                expr_typed.value_type.data_type(),
+                item.value_type.data_type(),
+            )
+            .is_some()
             {
                 return Err(AnalyzeError::type_mismatch(
                     in_predicate_type_error(
@@ -1482,6 +1480,24 @@ impl<'a> super::AnalyzerContext<'a> {
                     ));
                 }
             }
+            // Reject comparisons between complex types whose element /
+            // entry / field layouts are fundamentally incompatible.
+            // Cases like `array<int> = [map{...}, null]` would otherwise
+            // fall through to a runtime CAST that produces a confusing
+            // error; surface a clear analyzer-level message instead.
+            if !has_temporal
+                && let Some(reason) = incompatible_complex_compare(
+                    left_typed.value_type.data_type(),
+                    right_typed.value_type.data_type(),
+                )
+            {
+                return Err(AnalyzeError::type_mismatch(
+                    format!(
+                        "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                    ),
+                    left.span(),
+                ));
+            }
             let ordinary_composite_equality =
                 matches!(
                     operator,
@@ -1503,24 +1519,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 );
             }
 
-            // Reject comparisons between complex types whose element /
-            // entry / field layouts are fundamentally incompatible.
-            // Cases like `array<int> = [map{...}, null]` would otherwise
-            // fall through to a runtime CAST that produces a confusing
-            // error; surface a clear analyzer-level message instead.
-            if !has_temporal
-                && let Some(reason) = incompatible_complex_compare(
-                    left_typed.value_type.data_type(),
-                    right_typed.value_type.data_type(),
-                )
-            {
-                return Err(AnalyzeError::type_mismatch(
-                    format!(
-                        "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
-                    ),
-                    left.span(),
-                ));
-            }
             let integer_array_equality =
                 matches!(
                     operator,
