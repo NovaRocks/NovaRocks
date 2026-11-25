@@ -91,6 +91,7 @@ impl ComparisonFacts {
     }
 }
 
+// Design: ADR-0270 (docs/adr/ADR-0270-recursive-casts-and-composite-sql-predicates.md)
 /// Exact SQL composite relation after the original type author has frozen any
 /// needed coercions. Each operand retains its own layout and NULL declarations.
 #[derive(Clone, Debug)]

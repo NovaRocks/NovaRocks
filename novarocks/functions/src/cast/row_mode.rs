@@ -22,6 +22,7 @@ use crate::Selection;
 use arrow_array::{ArrayRef, StructArray};
 use std::sync::Arc;
 
+// Design: ADR-0270 (docs/adr/ADR-0270-recursive-casts-and-composite-sql-predicates.md)
 pub(super) fn evaluate_row(
     recipe: &PreparedCastRecipe,
     input: &ArrayRef,

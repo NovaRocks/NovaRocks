@@ -342,6 +342,7 @@ code-anchors:
 - [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — 聚合所选重载如何贯穿原行更新、状态交换和实际物化发布（active）
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 集合调用、关系区间、MAP 键与复合成员判断如何保留各自的定型和执行事实（active）
 - [ADR-0265](ADR-0265-row-declarations-and-canonical-map-keys.md) — ROW 字段如何随原类型约束冻结，MAP 规范身份如何贯穿分组和分区，有序调用如何按行短路（active）
+- [ADR-0270](ADR-0270-recursive-casts-and-composite-sql-predicates.md) — 嵌套转换和普通复合谓词如何保留完整类型、选行、行错误及关系需求（active）
 
 - [ADR-0254](ADR-0254-exact-temporal-values-and-frozen-statement-time.md) — 精确时态值如何保留逐值时区，语句环境与规则如何在折叠、执行、存储和结果呈现之间传递（active）
 
