@@ -4861,7 +4861,7 @@ mod tests {
                 data_type: column.data_type,
                 nullable: column.nullable,
                 write_default: None,
-                logical_type: None,
+                logical_type: column.logical_type,
             })
             .collect()
     }

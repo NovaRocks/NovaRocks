@@ -345,9 +345,12 @@ fn boolean_decimal_and_decimal256_truth_value_are_independent_of_scale() {
 }
 #[test]
 fn extended_recipes_do_not_authorize_nominal_domain_changes() {
-    let source =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let source = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let target = FunctionValueType::new(DataType::Decimal128(8, 1), true);
     assert_eq!(
         PreparedCastRecipe::try_new(

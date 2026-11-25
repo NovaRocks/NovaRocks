@@ -3943,7 +3943,7 @@ mod tests {
         use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
         let mut arena = ScalarArena::new();
         let source_type = FunctionValueType::try_from_legacy_declared_projection(
-            DataType::Utf8,
+            DataType::LargeBinary,
             true,
             ValueLogicalType::Json,
         )

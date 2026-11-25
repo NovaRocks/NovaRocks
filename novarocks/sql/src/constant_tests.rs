@@ -281,9 +281,9 @@ fn syntax_text_binary_nominal_and_typed_null_have_one_complete_source_type() {
     }
     for (carrier, logical, syntax) in [
         (
-            DataType::Utf8,
+            DataType::LargeBinary,
             ValueLogicalType::Json,
-            LiteralValue::String("{\"x\":1}".into()),
+            LiteralValue::Binary(b"\x01\x80\x01\x00".to_vec()),
         ),
         (
             DataType::LargeBinary,
@@ -673,8 +673,8 @@ fn pure_nominal_constant_author_keeps_semantics_out_of_field_metadata() {
     let control = Control::new(None);
     for (literal, carrier, domain) in [
         (
-            crate::common::LiteralValue::String("{}".into()),
-            arrow::datatypes::DataType::Utf8,
+            crate::common::LiteralValue::Binary(b"\x01\x80\x01\x00".to_vec()),
+            arrow::datatypes::DataType::LargeBinary,
             ValueLogicalType::Json,
         ),
         (

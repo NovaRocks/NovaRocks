@@ -1684,9 +1684,9 @@ mod tests {
             ("count", FunctionValueType::new(DataType::Int64, false)),
             ("count", FunctionValueType::new(DataType::Int64, true)),
             (
-                "min",
+                "any_value",
                 FunctionValueType::try_with_logical_type(
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     false,
                     ValueLogicalType::Json,
                 )

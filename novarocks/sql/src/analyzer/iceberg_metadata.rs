@@ -65,18 +65,11 @@ impl MetadataColumn {
         }
     }
 
-    /// Trino `JSON`. NovaRocks has no Arrow type for JSON: it carries the
-    /// value as `Utf8` and records the intent out of band — as
-    /// `ColumnDef::logical_type = SqlType::Json` at the catalog level
-    /// (`novarocks/types/src/schema.rs`) and as the `nr_logical_type` field
-    /// metadata key at the Arrow level (`novarocks/types/src/logical.rs`).
-    /// The logical type is therefore the only thing separating this column
-    /// from a plain VARCHAR; a caller that drops it silently degrades JSON to
-    /// a string. See [`metadata_column_supports_expressions`].
+    /// Trino `JSON` retains its nominal declaration over native JSON bytes.
     fn json(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            data_type: DataType::Utf8,
+            data_type: DataType::LargeBinary,
             nullable: true,
             logical_type: Some(SqlType::Json),
         }
@@ -562,7 +555,7 @@ mod tests {
             ("split_offsets", array_of(bigint())),
             ("equality_ids", array_of(integer())),
             ("sort_order_id", integer()),
-            ("readable_metrics", varchar()),
+            ("readable_metrics", DataType::LargeBinary),
             ("added_snapshot_id", bigint()),
             ("file_sequence_number", bigint()),
             ("data_sequence_number", bigint()),
@@ -622,14 +615,14 @@ mod tests {
     }
 
     #[test]
-    fn files_readable_metrics_is_json_not_plain_varchar() {
-        let columns = metadata_table_schema_with(SqlMetadataTableKind::Files, &full_derivation());
-        let metrics = column(&columns, "readable_metrics");
-        // The JSON tag is what keeps this column distinguishable from the
-        // Utf8 that carries it; the analyzer scope propagates the tag, so
-        // expression resolution sees JSON rather than text.
-        assert_eq!(metrics.logical_type, Some(SqlType::Json));
-        assert_eq!(metrics.data_type, varchar());
+    fn readable_metrics_has_the_exact_nominal_json_carrier() {
+        for kind in [SqlMetadataTableKind::Files, SqlMetadataTableKind::Entries] {
+            let columns = metadata_table_schema_with(kind, &full_derivation());
+            let metrics = column(&columns, "readable_metrics");
+            assert_eq!(metrics.logical_type, Some(SqlType::Json));
+            assert_eq!(metrics.data_type, DataType::LargeBinary);
+            assert!(metrics.nullable);
+        }
     }
 
     #[test]

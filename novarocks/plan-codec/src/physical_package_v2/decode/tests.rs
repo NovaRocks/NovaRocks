@@ -18,7 +18,7 @@
 use super::*;
 use crate::physical_package_v2::definition_sources::tests::{
     change_stream_packages, cv_package, repeated_change_stream_packages, rich_package,
-    values_package, writer_constant_package, writer_finish_package,
+    values_package, values_package_with_pool, writer_constant_package, writer_finish_package,
 };
 use crate::physical_package_v2::encode::{PackageEncodeError, encode_fragment_package};
 use crate::physical_package_v2::provider_sources::tests::checked_read;
@@ -125,6 +125,127 @@ fn json_constants_validate_only_reachable_nominal_cells() {
             ));
         } else {
             result.unwrap();
+        }
+    }
+}
+
+#[test]
+fn package_wire_validates_reachable_json_in_nullable_row_array_map() {
+    use arrow::array::{Array, LargeBinaryArray, ListArray, MapArray, StringArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_functions::json_value::JsonValueError;
+    use novarocks_type_contract::{
+        FunctionValueType, ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+    use std::sync::Arc;
+
+    let json_null = b"\x01\x20".as_slice();
+    // The item has the full boolean extent, but value 2 is outside its domain.
+    let damaged = b"\x01\x42\x02".as_slice();
+    let docs = Arc::new(LargeBinaryArray::from(vec![json_null, damaged, json_null]));
+    let keys = Arc::new(StringArray::from(vec!["k"; docs.len()]));
+    let entries = StructArray::new(
+        vec![
+            Arc::new(Field::new("key", DataType::Utf8, false)),
+            Arc::new(Field::new("value", DataType::LargeBinary, true)),
+        ]
+        .into(),
+        vec![keys, docs],
+        None,
+    );
+    let entries_field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
+    let storage = ValueTypeStorageLifetime::pure();
+    let value = |kind, nullable| ValueTypeRef::try_new(kind, nullable, storage.clone()).unwrap();
+    let json = value(ValueKind::Nominal(ValueLogicalType::Json), true);
+    let map = value(
+        ValueKind::Map {
+            key: value(ValueKind::String, false),
+            value: json,
+        },
+        true,
+    );
+    let list = value(ValueKind::List(map), true);
+    let row = value(
+        ValueKind::Struct(Box::from([ValueField::new("docs", list, storage.clone())])),
+        true,
+    );
+
+    let validity = |valid| Some(vec![true, valid, true].into());
+    let model = model();
+    let control = Control::default();
+    for (row_valid, list_valid, map_valid) in [
+        (false, true, true),
+        (true, false, true),
+        (true, true, false),
+        (true, true, true),
+    ] {
+        let maps = MapArray::new(
+            entries_field.clone(),
+            OffsetBuffer::from_lengths([1, 1, 1]),
+            entries.clone(),
+            validity(map_valid),
+            false,
+        );
+        let lists = ListArray::new(
+            Arc::new(Field::new("item", maps.data_type().clone(), true)),
+            OffsetBuffer::from_lengths([1, 1, 1]),
+            Arc::new(maps),
+            validity(list_valid),
+        );
+        let rows = StructArray::new(
+            vec![Arc::new(Field::new(
+                "docs",
+                lists.data_type().clone(),
+                true,
+            ))]
+            .into(),
+            vec![Arc::new(lists)],
+            validity(row_valid),
+        );
+        let layout = ValueLayout::try_new(rows.data_type(), storage.clone()).unwrap();
+        let ty = FunctionValueType::try_from_value(row.clone(), layout).unwrap();
+        let root = Arc::new(Field::new("cells", rows.data_type().clone(), true));
+        let pool = p::ConstantPool::try_new(
+            root,
+            ty.clone(),
+            rows.to_data(),
+            decode_limits().constant_policy,
+            CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let package = values_package_with_pool(rows.len(), 1, pool);
+        let bytes = encode(&package).unwrap();
+        let result = decode_fragment_package(&bytes, &model, &decode_limits(), &control);
+        if row_valid && list_valid && map_valid {
+            assert!(matches!(
+                result,
+                Err(PackageDecodeError::Constant(
+                    PhysicalConstantCodecError::JsonValue(JsonValueError::Scalar)
+                ))
+            ));
+        } else {
+            let decoded = result.unwrap();
+            let pool = &decoded.constants().entries()[&p::ConstantPoolId::new(0)];
+            assert_eq!(pool.value_type(), &ty);
+            let rows = pool.array().as_any().downcast_ref::<StructArray>().unwrap();
+            let lists = rows.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+            let maps = lists.values().as_any().downcast_ref::<MapArray>().unwrap();
+            let docs = maps
+                .values()
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            assert_eq!(
+                (rows.is_valid(1), lists.is_valid(1), maps.is_valid(1)),
+                (row_valid, list_valid, map_valid)
+            );
+            assert_eq!(
+                [docs.value(0), docs.value(1), docs.value(2)],
+                [json_null, damaged, json_null]
+            );
         }
     }
 }

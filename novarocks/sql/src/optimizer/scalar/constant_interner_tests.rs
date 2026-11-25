@@ -252,13 +252,15 @@ fn forged_carrier_logical_and_nullable_sources_refuse_before_publication() {
         assert!(arena.intern.is_empty());
     }
     let ty = FunctionValueType::try_from_legacy_declared_projection(
-        DataType::Utf8,
+        DataType::LargeBinary,
         false,
         ValueLogicalType::Json,
     )
     .expect("valid temporary legacy value projection");
     let value = cv(
-        Arc::new(StringArray::from(vec!["x"])),
+        Arc::new(arrow::array::LargeBinaryArray::from(vec![
+            b"\x01\x44\x01x".as_slice(),
+        ])),
         ty.clone(),
         Arc::new(ty.try_to_field("literal").unwrap()),
         0,
@@ -268,7 +270,7 @@ fn forged_carrier_logical_and_nullable_sources_refuse_before_publication() {
         arena
             .intern_observed(
                 ScalarNode::Constant(value),
-                FunctionValueType::new(DataType::Utf8, false),
+                FunctionValueType::new(DataType::LargeBinary, false),
                 &Control::good()
             )
             .is_err()

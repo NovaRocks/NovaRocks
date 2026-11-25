@@ -1496,73 +1496,10 @@ fn partition_struct_array(
     ))
 }
 
-/// The `readable_metrics` JSON of one file row.
-///
-/// Keys are column names in a stable order, and each value reports the metrics
-/// Iceberg recorded for that column. A metric Iceberg did not record is `null`,
-/// never a zero.
-fn readable_metrics_json(row: &FileRow, schema: &Schema) -> Result<String, ConnectorError> {
-    let mut object = serde_json::Map::new();
-    for (field_id, _) in schema
-        .field_id_to_fields()
-        .iter()
-        .filter(|(_, field)| matches!(field.field_type.as_ref(), Type::Primitive(_)))
-        .collect::<BTreeMap<_, _>>()
-    {
-        let mut metrics = serde_json::Map::new();
-        let number = |value: Option<i64>| {
-            value.map_or(serde_json::Value::Null, |value| {
-                serde_json::Value::Number(value.into())
-            })
-        };
-        let bound = |value: Option<&Datum>| {
-            value.map_or(serde_json::Value::Null, |datum| {
-                serde_json::Value::String(datum.to_human_string())
-            })
-        };
-        metrics.insert(
-            "column_size".to_string(),
-            number(row.column_sizes.get(field_id).copied()),
-        );
-        metrics.insert(
-            "value_count".to_string(),
-            number(row.value_counts.get(field_id).copied()),
-        );
-        metrics.insert(
-            "null_value_count".to_string(),
-            number(row.null_value_counts.get(field_id).copied()),
-        );
-        metrics.insert(
-            "nan_value_count".to_string(),
-            number(row.nan_value_counts.get(field_id).copied()),
-        );
-        metrics.insert(
-            "lower_bound".to_string(),
-            bound(row.lower_bounds.get(field_id)),
-        );
-        metrics.insert(
-            "upper_bound".to_string(),
-            bound(row.upper_bounds.get(field_id)),
-        );
-        // The schema's own name index is the key, not the leaf field name:
-        // two structs may each hold a field called `x`, and a JSON object
-        // would silently keep only one of them.
-        let name = schema.name_by_field_id(*field_id).ok_or_else(|| {
-            corrupt(format!(
-                "iceberg field id {field_id} has no name in its own schema"
-            ))
-        })?;
-        object.insert(name.to_string(), serde_json::Value::Object(metrics));
-    }
-    serde_json::to_string(&serde_json::Value::Object(object))
-        .map_err(|error| internal(format!("render iceberg readable metrics: {error}")))
-}
-
-/// Materialize the `$files` columns of one already-frozen relation schema.
-fn files_columns(
+/// Materialize the columns of one frozen `$files` or `$entries` relation.
+fn manifest_file_columns(
     schema: &SchemaRef,
     rows: &[FileRow],
-    table_schema: &Schema,
 ) -> Result<Vec<ArrayRef>, ConnectorError> {
     let partitions = rows.iter().map(|row| &row.partition).collect::<Vec<_>>();
 
@@ -1621,13 +1558,6 @@ fn files_columns(
             "sort_order_id" => Arc::new(Int32Array::from(
                 rows.iter().map(|row| row.sort_order_id).collect::<Vec<_>>(),
             )),
-            "readable_metrics" => {
-                let mut rendered = Vec::with_capacity(rows.len());
-                for row in rows {
-                    rendered.push(Some(readable_metrics_json(row, table_schema)?));
-                }
-                Arc::new(StringArray::from(rendered))
-            }
             "added_snapshot_id" => Arc::new(Int64Array::from(
                 rows.iter()
                     .map(|row| row.entry.snapshot_id)
@@ -1678,15 +1608,6 @@ fn files_columns(
         columns.push(array);
     }
     Ok(columns)
-}
-
-/// Materialize `$entries`: the entry columns plus the nested `data_file` ROW.
-fn entries_columns(
-    schema: &SchemaRef,
-    rows: &[FileRow],
-    table_schema: &Schema,
-) -> Result<Vec<ArrayRef>, ConnectorError> {
-    files_columns(schema, rows, table_schema)
 }
 
 // ---------------------------------------------------------------------------
@@ -2479,7 +2400,6 @@ struct FilesSplitRelation {
     spec: PartitionSpec,
     schema: SchemaRef,
     projection: Vec<usize>,
-    table_schema: Schema,
 }
 
 impl FilesSplitRelation {
@@ -2541,7 +2461,6 @@ impl FilesSplitRelation {
             spec,
             schema,
             projection,
-            table_schema,
         })
     }
 
@@ -2567,19 +2486,7 @@ impl FilesSplitRelation {
             },
             &self.unified,
         )?;
-        let relation_columns = match self.kind {
-            IcebergSystemTableType::Files => {
-                files_columns(&self.schema, &rows, &self.table_schema)?
-            }
-            IcebergSystemTableType::Entries => {
-                entries_columns(&self.schema, &rows, &self.table_schema)?
-            }
-            _ => {
-                return Err(invalid(
-                    "iceberg manifest work unit requires files or entries",
-                ));
-            }
-        };
+        let relation_columns = manifest_file_columns(&self.schema, &rows)?;
         IcebergSystemPageSource::new(
             &self.schema,
             relation_columns,

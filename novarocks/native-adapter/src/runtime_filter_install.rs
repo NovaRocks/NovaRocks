@@ -2489,7 +2489,7 @@ mod typed_domain_creation_tests {
     fn independently_decoded_runtime_filter_domain_retains_actual_creator_until_last_binding_reference()
      {
         let source = FunctionValueType::try_with_logical_type(
-            arrow::datatypes::DataType::Utf8,
+            arrow::datatypes::DataType::LargeBinary,
             true,
             ValueLogicalType::Json,
         )

@@ -631,7 +631,7 @@ mod tests {
         for (carrier, logical) in [
             (DataType::Int32, ValueLogicalType::Physical),
             (DataType::Utf8, ValueLogicalType::Physical),
-            (DataType::Utf8, ValueLogicalType::Json),
+            (DataType::LargeBinary, ValueLogicalType::Json),
             (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
             (DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
         ] {

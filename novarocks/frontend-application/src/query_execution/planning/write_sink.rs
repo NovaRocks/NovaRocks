@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn source_attributes_cannot_replace_the_complete_writer_declaration() {
         let value = novarocks_type_contract::FunctionValueType::try_with_logical_type(
-            DataType::Utf8,
+            DataType::LargeBinary,
             true,
             ValueLogicalType::Json,
         )
@@ -352,7 +352,7 @@ mod tests {
         let input = ConnectorWriteInputShape::Data {
             fields: vec![signed(
                 0,
-                annotated("v", DataType::Utf8, "unknown-source-label"),
+                annotated("v", DataType::LargeBinary, "unknown-source-label"),
                 value.clone(),
             )],
         };
@@ -362,6 +362,6 @@ mod tests {
             input.fields()[0].field().metadata()[NR_LOGICAL_TYPE_KEY],
             "unknown-source-label"
         );
-        assert_eq!(value.data_type(), &DataType::Utf8);
+        assert_eq!(value.data_type(), &DataType::LargeBinary);
     }
 }

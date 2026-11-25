@@ -207,6 +207,135 @@ mod tests {
         assert_eq!(tracker.current(), 0);
     }
     #[test]
+    fn reader_checks_reachable_json_roots_in_nullable_row_array_map() {
+        use arrow::array::{Array, ListArray, MapArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        use novarocks_functions::json_value::JsonValueError;
+        use novarocks_type_contract::ValueField;
+        use std::error::Error as _;
+
+        let tracker = MemTracker::new_root("reader nested JSON");
+        let (factory, _) = factory(tracker);
+        let json_null = b"\x01\x20".as_slice();
+        let damaged = b"\x01\x42".as_slice();
+        let docs = Arc::new(LargeBinaryArray::from(vec![json_null, damaged, json_null]));
+        let keys = Arc::new(StringArray::from(vec!["k"; docs.len()]));
+        let entries = StructArray::new(
+            vec![
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(Field::new("value", DataType::LargeBinary, true)),
+            ]
+            .into(),
+            vec![keys, docs],
+            None,
+        );
+        let entries_field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
+        let storage = ValueTypeStorageLifetime::pure();
+        let value =
+            |kind, nullable| ValueTypeRef::try_new(kind, nullable, storage.clone()).unwrap();
+        let json = value(ValueKind::Nominal(ValueLogicalType::Json), true);
+        let map = value(
+            ValueKind::Map {
+                key: value(ValueKind::String, false),
+                value: json,
+            },
+            true,
+        );
+        let list = value(ValueKind::List(map), true);
+        let row = value(
+            ValueKind::Struct(Box::from([ValueField::new("docs", list, storage.clone())])),
+            true,
+        );
+
+        let validity = |valid| Some(vec![true, valid, true].into());
+        for (row_valid, list_valid, map_valid) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let maps = MapArray::new(
+                entries_field.clone(),
+                OffsetBuffer::from_lengths([1, 1, 1]),
+                entries.clone(),
+                validity(map_valid),
+                false,
+            );
+            let lists = ListArray::new(
+                Arc::new(Field::new("item", maps.data_type().clone(), true)),
+                OffsetBuffer::from_lengths([1, 1, 1]),
+                Arc::new(maps),
+                validity(list_valid),
+            );
+            let rows = StructArray::new(
+                vec![Arc::new(Field::new(
+                    "docs",
+                    lists.data_type().clone(),
+                    true,
+                ))]
+                .into(),
+                vec![Arc::new(lists)],
+                validity(row_valid),
+            );
+            let carrier = rows.data_type();
+            let layout = ValueLayout::try_new(carrier, storage.clone()).unwrap();
+            let binding = TypedValueBinding::try_new(row.clone(), layout).unwrap();
+            let slot = crate::exec::chunk::ChunkSlotSchema::try_new_typed(
+                SlotId::new(9),
+                Arc::new(Field::new("document", carrier.clone(), true)),
+                binding,
+                None,
+                storage.clone(),
+            )
+            .unwrap();
+            let expected = Arc::new(
+                crate::exec::chunk::ChunkSchema::try_new_typed(vec![slot], storage.clone())
+                    .unwrap(),
+            );
+            let wire = Field::new("wire", carrier.clone(), true);
+            let (recipe, bytes) = make_unit(&expected, factory.as_ref(), wire, Arc::new(rows));
+            let result = online_unit::decode(&recipe, &bytes, &expected, factory.as_ref());
+            if row_valid && list_valid && map_valid {
+                let error = result.unwrap_err();
+                assert!(matches!(error, ExchangeFailure::Source(_)));
+                let cause = std::iter::successors(error.source(), |cause| (*cause).source())
+                    .find_map(|cause| cause.downcast_ref::<JsonValueError>());
+                assert_eq!(cause, Some(&JsonValueError::Extent));
+            } else {
+                let chunks = result.unwrap();
+                let [chunk] = chunks.as_slice() else {
+                    panic!("expected one decoded exchange chunk");
+                };
+                assert_eq!(
+                    chunk.chunk_schema().slots()[0].typed_binding().value_type(),
+                    &row
+                );
+                let rows = chunk
+                    .record_batch()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                let lists = rows.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+                let maps = lists.values().as_any().downcast_ref::<MapArray>().unwrap();
+                let docs = maps
+                    .values()
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .unwrap();
+                assert_eq!(
+                    (rows.is_valid(1), lists.is_valid(1), maps.is_valid(1)),
+                    (row_valid, list_valid, map_valid)
+                );
+                assert_eq!(
+                    [docs.value(0), docs.value(1), docs.value(2)],
+                    [json_null, damaged, json_null]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn reader_array_projection_keeps_dictionary_body_without_pinning_array_group_in_schema() {
         let tracker = MemTracker::new_root("reader per-unit array header");
         let (factory, error_weak) = factory(tracker.clone());

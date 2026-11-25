@@ -1796,7 +1796,7 @@ mod tests {
             column_id: ColumnId(77),
             name: "json_source".to_string(),
             value_type: FunctionValueType::try_from_legacy_declared_projection(
-                DataType::Utf8,
+                DataType::LargeBinary,
                 true,
                 ValueLogicalType::Json,
             )
