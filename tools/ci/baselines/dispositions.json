@@ -192,16 +192,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:filter/test_scan_predicate_expr_reuse",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unsupported_expression"
-      },
-      "reason": "Native 1FE+3BE verifies steps 1–8, including the original transform predicate at step 4. Statement 9 first refuses the nested ROW cast changing the child array from INTEGER to BIGINT. All later SQL and value oracles remain in the case. Evidence: B7c equivalent-verify/filter. Exit after the complete case and cleanup pass.",
-      "owner": "UEA-5E B7e",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:function/function_conditional",
       "failure": {
         "class": "error_code",
@@ -1035,10 +1025,10 @@
       "unit": "sql-case:complex-type/complex_test_array_map",
       "failure": {
         "class": "error_code",
-        "code": "sql.analyze.unsupported_expression"
+        "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Native 1FE+3BE verifies the prefix through statement 12, including the original transform results. Statement 13 first refuses the JSON-to-ARRAY(JSON) cast. Preserve the remaining SQL and value oracles. Evidence: B7c equivalent-verify/complex-type. Exit after the complete case and cleanup pass.",
-      "owner": "UEA-5E B7e",
+      "reason": "Native 1FE+3BE verifies the prefix through step 12. Step 13 admits the JSON-to-ARRAY(JSON) cast after B7e and first refuses the legacy get_json_string overload inside transform. Preserve the original SQL and remaining value oracles until the scalar SQL/JSON accessor migration reaches the complete case and actual cleanup passes.",
+      "owner": "7B3F F11",
       "expires": "2026-12-15"
     },
     {
