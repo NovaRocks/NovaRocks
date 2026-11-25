@@ -16,6 +16,7 @@
 // under the License.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
@@ -23,17 +24,13 @@ use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
+use super::read_stack::ConnectorReadSourceProjection;
 use super::{
     ConnectorError, ConnectorErrorKind, ConnectorPredicateDisposition, ConnectorProviderBindingKey,
     ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit, ConnectorStaticPredicate,
     SharedConnectorReadSession,
 };
 
-const MAX_CONNECTOR_CHANGE_PARTITIONS: usize = 16_384;
-const MAX_CONNECTOR_CHANGE_PARTITION_FIELDS: usize = 256;
-const MAX_CONNECTOR_CHANGE_PARTITION_TOTAL_FIELDS: usize = 65_536;
-const MAX_CONNECTOR_CHANGE_ID_BYTES: usize = 1024;
-const CHANGE_ADMISSION_BYTES: usize = 16;
 const CHANGE_PARTITION_IMPACT_BYTES: usize = 16;
 const CHANGE_PARTITION_BYTES: usize = 16;
 const CHANGE_PARTITION_FIELD_BYTES: usize = 24;
@@ -181,64 +178,201 @@ pub enum ConnectorScanAdmission {
     Snapshot,
 }
 
+/// Provider facts about one exact source window, frozen before projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ConnectorChangeWindowAdmission {
-    MetadataOnly,
-    Incremental {
-        has_inserts: bool,
-        has_deletes: bool,
+pub enum ConnectorChangeWindowFacts {
+    NotIncremental(ConnectorChangeWindowNotIncrementalReason),
+    NetZero(ConnectorChangeWindowNetZeroBasis),
+    Difference {
+        negative_weight: ConnectorChangeWindowNegativeWeight,
         partition_impact: ConnectorChangeWindowPartitionImpact,
-    },
-    FullRebuild(ConnectorChangeWindowFullRebuildReason),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorChangeWindowFullRebuildReason {
-    LineageBroken {
-        from_snapshot_id: i64,
-    },
-    UnprovenReplace {
-        snapshot_id: i64,
-        failure: ConnectorChangeWindowReplaceFailure,
+        volume: ConnectorChangeWindowVolume,
     },
 }
 
+impl ConnectorChangeWindowFacts {
+    pub const fn permits(&self, projection: ConnectorReadSourceProjection) -> bool {
+        match projection {
+            ConnectorReadSourceProjection::To => true,
+            ConnectorReadSourceProjection::From => matches!(self, Self::Difference { .. }),
+            ConnectorReadSourceProjection::Delta => {
+                matches!(self, Self::NetZero(_) | Self::Difference { .. })
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorChangeWindowReplaceFailure {
-    MissingParent,
-    RecordCountChanged,
-    MissingOrInvalidSummary,
-    InvalidDataFileCounts,
-    SchemaChanged,
+pub enum ConnectorChangeWindowNotIncrementalReason {
+    SnapshotAncestryBroken { from_snapshot_id: i64 },
+    SchemaChanged { snapshot_id: i64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorChangeWindowNetZeroBasis {
+    SameSnapshot,
+    ReplaceOnly,
+    EqualEndpoints,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorChangeWindowNegativeWeight {
+    Absent,
+    Possible,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorChangeWindowVolume {
+    /// Upper bound under the format contract, before positive and negative events cancel.
+    pub source_event_rows_upper_bound: u128,
+    /// Physical size of the source data files selected by the difference, once per variant.
+    pub source_data_file_bytes: u128,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorChangeWindowPartitionImpact {
     Unavailable,
     Unpartitioned,
-    Exact {
-        has_row_deletes: bool,
-        added: Vec<ConnectorChangePartition>,
-        removed: Vec<ConnectorChangePartition>,
-    },
+    Exact(Arc<ConnectorChangeWindowExactPartitionImpact>),
 }
 
-impl ConnectorChangeWindowPartitionImpact {
-    pub fn try_exact(
-        has_row_deletes: bool,
-        mut added: Vec<ConnectorChangePartition>,
-        mut removed: Vec<ConnectorChangePartition>,
-        context: &ConnectorRequestContext,
-    ) -> Result<Self, ConnectorError> {
-        canonicalize_partitions(&mut added);
-        canonicalize_partitions(&mut removed);
-        let impact = Self::Exact {
+#[derive(Debug, Eq, PartialEq)]
+pub struct ConnectorChangeWindowExactPartitionImpact {
+    has_row_deletes: bool,
+    added: Vec<ConnectorChangePartition>,
+    removed: Vec<ConnectorChangePartition>,
+}
+
+impl ConnectorChangeWindowExactPartitionImpact {
+    pub const fn has_row_deletes(&self) -> bool {
+        self.has_row_deletes
+    }
+
+    pub fn added(&self) -> &[ConnectorChangePartition] {
+        &self.added
+    }
+
+    pub fn removed(&self) -> &[ConnectorChangePartition] {
+        &self.removed
+    }
+}
+
+/// Retains only the canonical entries that fit the request's optional impact budget.
+pub struct ConnectorChangeWindowPartitionImpactBuilder {
+    has_row_deletes: bool,
+    max_bytes: usize,
+    partitions: Option<RetainedChangePartitions>,
+}
+
+struct RetainedChangePartitions {
+    bytes: usize,
+    added: BTreeSet<SemanticChangePartition>,
+    removed: BTreeSet<SemanticChangePartition>,
+}
+
+impl ConnectorChangeWindowPartitionImpactBuilder {
+    pub fn new(has_row_deletes: bool, context: &ConnectorRequestContext) -> Self {
+        let max_bytes = context.max_total_payload_bytes();
+        Self {
             has_row_deletes,
-            added,
-            removed,
+            max_bytes,
+            partitions: (CHANGE_PARTITION_IMPACT_BYTES <= max_bytes).then(|| {
+                RetainedChangePartitions {
+                    bytes: CHANGE_PARTITION_IMPACT_BYTES,
+                    added: BTreeSet::new(),
+                    removed: BTreeSet::new(),
+                }
+            }),
+        }
+    }
+
+    pub const fn is_available(&self) -> bool {
+        self.partitions.is_some()
+    }
+
+    pub fn mark_row_deletes(&mut self) {
+        self.has_row_deletes = true;
+    }
+
+    pub fn add(&mut self, partition: ConnectorChangePartition) {
+        self.retain(partition, |partitions| &mut partitions.added);
+    }
+
+    pub fn remove(&mut self, partition: ConnectorChangePartition) {
+        self.retain(partition, |partitions| &mut partitions.removed);
+    }
+
+    fn retain(
+        &mut self,
+        partition: ConnectorChangePartition,
+        side: impl FnOnce(&mut RetainedChangePartitions) -> &mut BTreeSet<SemanticChangePartition>,
+    ) {
+        let Some(partitions) = &mut self.partitions else {
+            return;
         };
-        validate_partition_impact(&impact, context)?;
-        Ok(impact)
+        let candidate = SemanticChangePartition(partition);
+        let bytes = partitions.bytes;
+        let side = side(partitions);
+        let previous_bytes = if let Some(existing) = side.get(&candidate) {
+            if canonical_partition_cmp(&candidate.0, &existing.0) != Ordering::Less {
+                return;
+            }
+            existing
+                .0
+                .payload_bytes()
+                .expect("retained partition was charged")
+        } else {
+            0
+        };
+        let new_bytes = candidate
+            .0
+            .payload_bytes()
+            .and_then(|candidate_bytes| (bytes - previous_bytes).checked_add(candidate_bytes));
+        if let Some(new_bytes) = new_bytes.filter(|bytes| *bytes <= self.max_bytes) {
+            side.replace(candidate);
+            partitions.bytes = new_bytes;
+        } else {
+            self.partitions = None;
+        }
+    }
+
+    pub fn finish(self) -> ConnectorChangeWindowPartitionImpact {
+        let Some(partitions) = self.partitions else {
+            return ConnectorChangeWindowPartitionImpact::Unavailable;
+        };
+        ConnectorChangeWindowPartitionImpact::Exact(Arc::new(
+            ConnectorChangeWindowExactPartitionImpact {
+                has_row_deletes: self.has_row_deletes,
+                added: partitions.added.into_iter().map(|entry| entry.0).collect(),
+                removed: partitions
+                    .removed
+                    .into_iter()
+                    .map(|entry| entry.0)
+                    .collect(),
+            },
+        ))
+    }
+}
+
+struct SemanticChangePartition(ConnectorChangePartition);
+
+impl PartialEq for SemanticChangePartition {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for SemanticChangePartition {}
+
+impl PartialOrd for SemanticChangePartition {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SemanticChangePartition {
+    fn cmp(&self, other: &Self) -> Ordering {
+        semantic_partition_cmp(&self.0, &other.0)
     }
 }
 
@@ -253,14 +387,12 @@ impl ConnectorChangePartition {
         partition_spec_identity: Bytes,
         mut fields: Vec<ConnectorChangePartitionField>,
     ) -> Result<Self, ConnectorError> {
-        if partition_spec_identity.is_empty()
-            || partition_spec_identity.len() > MAX_CONNECTOR_CHANGE_ID_BYTES
-        {
+        if partition_spec_identity.is_empty() {
             return Err(invalid(
                 "connector change partition has an invalid partition spec identity",
             ));
         }
-        if fields.is_empty() || fields.len() > MAX_CONNECTOR_CHANGE_PARTITION_FIELDS {
+        if fields.is_empty() {
             return Err(invalid(
                 "connector change partition has an invalid field count",
             ));
@@ -304,9 +436,7 @@ impl ConnectorChangePartitionField {
         value: ConnectorChangePartitionValue,
     ) -> Result<Self, ConnectorError> {
         let source_column = source_column.into();
-        if source_field_identity.is_empty()
-            || source_field_identity.len() > MAX_CONNECTOR_CHANGE_ID_BYTES
-        {
+        if source_field_identity.is_empty() {
             return Err(invalid(
                 "connector change partition source field identity is invalid",
             ));
@@ -358,175 +488,23 @@ pub enum ConnectorChangePartitionValue {
     String(Arc<str>),
 }
 
-fn canonicalize_partitions(partitions: &mut Vec<ConnectorChangePartition>) {
-    partitions.sort_by(canonical_partition_cmp);
-    partitions.dedup_by(|right, left| semantic_partition_cmp(left, right) == Ordering::Equal);
-}
-
-impl ConnectorChangeWindowAdmission {
-    /// Validate the original lineage/impact facts and request payload bounds.
-    pub fn validate(&self, context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-        let bytes = match self {
-            ConnectorChangeWindowAdmission::MetadataOnly => CHANGE_ADMISSION_BYTES,
-            ConnectorChangeWindowAdmission::Incremental {
-                has_inserts,
-                has_deletes,
-                partition_impact,
-            } => {
-                if !has_inserts && !has_deletes {
-                    return Err(invalid(
-                        "connector incremental change-window admission has no row changes",
-                    ));
-                }
-                CHANGE_ADMISSION_BYTES
-                    .saturating_add(validate_partition_impact(partition_impact, context)?)
-            }
-            ConnectorChangeWindowAdmission::FullRebuild(_) => {
-                CHANGE_ADMISSION_BYTES.saturating_add(2 * std::mem::size_of::<i64>())
-            }
-        };
-        validate_admission_bytes(bytes, context)
+impl ConnectorChangePartition {
+    fn payload_bytes(&self) -> Option<usize> {
+        self.fields.iter().try_fold(
+            CHANGE_PARTITION_BYTES.checked_add(self.partition_spec_identity.len())?,
+            |bytes, field| {
+                let value_bytes = match &field.value {
+                    ConnectorChangePartitionValue::Null => 0,
+                    ConnectorChangePartitionValue::String(value) => value.len(),
+                };
+                bytes
+                    .checked_add(CHANGE_PARTITION_FIELD_BYTES)?
+                    .checked_add(field.source_field_identity.len())?
+                    .checked_add(field.source_column.len())?
+                    .checked_add(value_bytes)
+            },
+        )
     }
-}
-
-fn validate_partition_impact(
-    impact: &ConnectorChangeWindowPartitionImpact,
-    context: &ConnectorRequestContext,
-) -> Result<usize, ConnectorError> {
-    let ConnectorChangeWindowPartitionImpact::Exact { added, removed, .. } = impact else {
-        validate_admission_bytes(CHANGE_PARTITION_IMPACT_BYTES, context)?;
-        return Ok(CHANGE_PARTITION_IMPACT_BYTES);
-    };
-
-    for partition in added.iter().chain(removed) {
-        validate_partition(partition)?;
-    }
-    validate_canonical_partitions(added, "added")?;
-    validate_canonical_partitions(removed, "removed")?;
-
-    if unique_partition_count(added, removed) > MAX_CONNECTOR_CHANGE_PARTITIONS {
-        return Err(resource_exhausted(
-            "connector change-window partition impact exceeds the unique partition limit",
-        ));
-    }
-    let total_fields = added
-        .iter()
-        .chain(removed)
-        .fold(0_usize, |total, partition| {
-            total.saturating_add(partition.fields.len())
-        });
-    if total_fields > MAX_CONNECTOR_CHANGE_PARTITION_TOTAL_FIELDS {
-        return Err(resource_exhausted(
-            "connector change-window partition impact exceeds the total field limit",
-        ));
-    }
-
-    let bytes =
-        added
-            .iter()
-            .chain(removed)
-            .fold(CHANGE_PARTITION_IMPACT_BYTES, |total, partition| {
-                partition.fields.iter().fold(
-                    total
-                        .saturating_add(CHANGE_PARTITION_BYTES)
-                        .saturating_add(partition.partition_spec_identity.len()),
-                    |total, field| {
-                        total
-                            .saturating_add(CHANGE_PARTITION_FIELD_BYTES)
-                            .saturating_add(field.source_field_identity.len())
-                            .saturating_add(field.source_column.len())
-                            .saturating_add(match &field.value {
-                                ConnectorChangePartitionValue::Null => 0,
-                                ConnectorChangePartitionValue::String(value) => value.len(),
-                            })
-                    },
-                )
-            });
-    validate_admission_bytes(bytes, context)?;
-    Ok(bytes)
-}
-
-fn validate_partition(partition: &ConnectorChangePartition) -> Result<(), ConnectorError> {
-    if partition.partition_spec_identity.is_empty()
-        || partition.partition_spec_identity.len() > MAX_CONNECTOR_CHANGE_ID_BYTES
-    {
-        return Err(corrupt(
-            "connector change-window partition has an invalid partition spec identity",
-        ));
-    }
-    if partition.fields.is_empty() || partition.fields.len() > MAX_CONNECTOR_CHANGE_PARTITION_FIELDS
-    {
-        return Err(corrupt(
-            "connector change-window partition has an invalid field count",
-        ));
-    }
-    if partition.fields.iter().any(|field| {
-        field.source_field_identity.is_empty()
-            || field.source_field_identity.len() > MAX_CONNECTOR_CHANGE_ID_BYTES
-            || field.source_column.trim().is_empty()
-    }) {
-        return Err(corrupt(
-            "connector change-window partition has an invalid source field",
-        ));
-    }
-    if partition
-        .fields
-        .windows(2)
-        .any(|pair| canonical_field_key_cmp(&pair[0], &pair[1]) != Ordering::Less)
-    {
-        return Err(corrupt(
-            "connector change-window partition fields are not canonical",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_canonical_partitions(
-    partitions: &[ConnectorChangePartition],
-    side: &str,
-) -> Result<(), ConnectorError> {
-    if partitions
-        .windows(2)
-        .any(|pair| semantic_partition_cmp(&pair[0], &pair[1]) != Ordering::Less)
-    {
-        return Err(corrupt(format!(
-            "connector change-window {side} partitions are not canonical"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_admission_bytes(
-    bytes: usize,
-    context: &ConnectorRequestContext,
-) -> Result<(), ConnectorError> {
-    if bytes > context.max_total_payload_bytes() {
-        return Err(resource_exhausted(
-            "connector change-window admission exceeds the request total payload budget",
-        ));
-    }
-    Ok(())
-}
-
-fn unique_partition_count(
-    added: &[ConnectorChangePartition],
-    removed: &[ConnectorChangePartition],
-) -> usize {
-    let (mut added_index, mut removed_index, mut count) = (0_usize, 0_usize, 0_usize);
-    while added_index < added.len() && removed_index < removed.len() {
-        count = count.saturating_add(1);
-        match semantic_partition_cmp(&added[added_index], &removed[removed_index]) {
-            Ordering::Less => added_index += 1,
-            Ordering::Greater => removed_index += 1,
-            Ordering::Equal => {
-                added_index += 1;
-                removed_index += 1;
-            }
-        }
-    }
-    count
-        .saturating_add(added.len().saturating_sub(added_index))
-        .saturating_add(removed.len().saturating_sub(removed_index))
 }
 
 fn canonical_field_key_cmp(
@@ -638,10 +616,6 @@ fn corrupt(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::CorruptData, message)
 }
 
-fn resource_exhausted(message: impl Into<String>) -> ConnectorError {
-    ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message)
-}
-
 /// SQL-owned intent for a provider-neutral read. Providers may use this to
 /// reject read handles that are valid for ordinary scans but unsafe for a
 /// specialized consumer, without exposing provider payloads to Core.
@@ -724,23 +698,11 @@ impl ConnectorSplitPlanningResult {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
-
     use arrow::datatypes::Schema;
     use bytes::Bytes;
 
     use super::*;
     use crate::connector::{ConnectorInstanceId, ProviderBindingEpoch};
-
-    fn context(max_handle_bytes: usize, max_total_bytes: usize) -> ConnectorRequestContext {
-        ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(30),
-            crate::connector::ConnectorStopOwner::new().view(),
-            max_handle_bytes,
-            max_total_bytes,
-        )
-        .expect("valid connector request context")
-    }
 
     fn owner() -> ConnectorProviderBindingKey {
         ConnectorProviderBindingKey {
@@ -752,32 +714,6 @@ mod tests {
     fn handle(owner: &ConnectorProviderBindingKey, payload: &'static [u8]) -> ConnectorScanHandle {
         ConnectorScanHandle::try_new(owner.instance_id.clone(), Bytes::from_static(payload))
             .expect("scan handle")
-    }
-
-    fn field(
-        source: &str,
-        transform: ConnectorChangePartitionTransform,
-        value: &str,
-    ) -> ConnectorChangePartitionField {
-        ConnectorChangePartitionField::try_new(
-            Bytes::from(source.to_ascii_lowercase()),
-            source,
-            transform,
-            ConnectorChangePartitionValue::String(Arc::from(value)),
-        )
-        .expect("partition field")
-    }
-
-    fn partition(source: &str, value: &str) -> ConnectorChangePartition {
-        ConnectorChangePartition::try_new(
-            Bytes::from_static(b"spec-1"),
-            vec![field(
-                source,
-                ConnectorChangePartitionTransform::Identity,
-                value,
-            )],
-        )
-        .expect("partition")
     }
 
     #[test]
@@ -817,181 +753,5 @@ mod tests {
             .kind(),
             ConnectorErrorKind::CorruptData
         );
-    }
-
-    #[test]
-    fn metadata_only_and_full_rebuild_keep_the_original_payload_validation() {
-        ConnectorChangeWindowAdmission::MetadataOnly
-            .validate(&context(16, 16))
-            .unwrap();
-        let full = ConnectorChangeWindowAdmission::FullRebuild(
-            ConnectorChangeWindowFullRebuildReason::LineageBroken {
-                from_snapshot_id: 9,
-            },
-        );
-        full.validate(&context(1024, 4096)).unwrap();
-        assert_eq!(
-            full.validate(&context(16, 16)).unwrap_err().kind(),
-            ConnectorErrorKind::ResourceExhausted
-        );
-    }
-
-    #[test]
-    fn exact_partition_impact_is_canonical_and_validated() {
-        let request_context = context(1024, 16 * 1024);
-        let partition_a = ConnectorChangePartition::try_new(
-            Bytes::from_static(b"spec-1"),
-            vec![
-                field("Zed", ConnectorChangePartitionTransform::Year, "2026"),
-                field("account", ConnectorChangePartitionTransform::Identity, "7"),
-            ],
-        )
-        .expect("canonical fields");
-        assert_eq!(partition_a.fields()[0].source_column(), "account");
-        let partition_b = partition("account", "8");
-        let impact = ConnectorChangeWindowPartitionImpact::try_exact(
-            true,
-            vec![partition_b.clone(), partition_a.clone(), partition_b],
-            vec![partition_a],
-            &request_context,
-        )
-        .expect("canonical exact impact");
-        let admission = ConnectorChangeWindowAdmission::Incremental {
-            has_inserts: true,
-            has_deletes: true,
-            partition_impact: impact,
-        };
-        admission
-            .validate(&request_context)
-            .expect("valid exact admission");
-        let ConnectorChangeWindowAdmission::Incremental {
-            partition_impact: ConnectorChangeWindowPartitionImpact::Exact { added, removed, .. },
-            ..
-        } = &admission
-        else {
-            panic!("expected exact change-window admission")
-        };
-        assert_eq!(added.len(), 2);
-        assert_eq!(removed.len(), 1);
-    }
-
-    #[test]
-    fn exact_partition_impact_keeps_distinct_provider_identities() {
-        let make_partition = |spec: &'static [u8], source: &'static [u8]| {
-            ConnectorChangePartition::try_new(
-                Bytes::from_static(spec),
-                vec![
-                    ConnectorChangePartitionField::try_new(
-                        Bytes::from_static(source),
-                        "region",
-                        ConnectorChangePartitionTransform::Identity,
-                        ConnectorChangePartitionValue::String(Arc::from("us")),
-                    )
-                    .expect("field"),
-                ],
-            )
-            .expect("partition")
-        };
-        let impact = ConnectorChangeWindowPartitionImpact::try_exact(
-            false,
-            vec![
-                make_partition(b"spec-1", b"field-1"),
-                make_partition(b"spec-2", b"field-1"),
-                make_partition(b"spec-1", b"field-2"),
-            ],
-            Vec::new(),
-            &context(1024, 4096),
-        )
-        .expect("distinct exact partitions");
-        let ConnectorChangeWindowPartitionImpact::Exact { added, .. } = impact else {
-            panic!("expected exact partition impact")
-        };
-        assert_eq!(added.len(), 3);
-    }
-
-    #[test]
-    fn incremental_without_row_changes_is_rejected() {
-        let error = ConnectorChangeWindowAdmission::Incremental {
-            has_inserts: false,
-            has_deletes: false,
-            partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
-        }
-        .validate(&context(1024, 4096))
-        .expect_err("empty incremental admission must fail");
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-    }
-
-    #[test]
-    fn duplicate_partition_source_identity_and_transform_is_rejected() {
-        let error = ConnectorChangePartition::try_new(
-            Bytes::from_static(b"spec-1"),
-            vec![
-                ConnectorChangePartitionField::try_new(
-                    Bytes::from_static(b"field-1"),
-                    "OldName",
-                    ConnectorChangePartitionTransform::Identity,
-                    ConnectorChangePartitionValue::String(Arc::from("7")),
-                )
-                .expect("first field"),
-                ConnectorChangePartitionField::try_new(
-                    Bytes::from_static(b"field-1"),
-                    "NewName",
-                    ConnectorChangePartitionTransform::Identity,
-                    ConnectorChangePartitionValue::String(Arc::from("8")),
-                )
-                .expect("second field"),
-            ],
-        )
-        .expect_err("duplicate provider source identity must fail");
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-    }
-
-    #[test]
-    fn noncanonical_direct_partition_impact_is_rejected() {
-        let later = partition("account", "9");
-        let earlier = partition("account", "1");
-        let error = ConnectorChangeWindowAdmission::Incremental {
-            has_inserts: true,
-            has_deletes: false,
-            partition_impact: ConnectorChangeWindowPartitionImpact::Exact {
-                has_row_deletes: false,
-                added: vec![later, earlier],
-                removed: Vec::new(),
-            },
-        }
-        .validate(&context(1024, 4096))
-        .expect_err("noncanonical direct exact impact must fail");
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-    }
-
-    #[test]
-    fn partition_impact_is_charged_to_request_payload_budget() {
-        let source = "a".repeat(128);
-        let oversized = ConnectorChangeWindowPartitionImpact::try_exact(
-            false,
-            vec![partition(&source, "value")],
-            Vec::new(),
-            &context(32, 64),
-        )
-        .expect_err("partition facts over the request budget must fail");
-        assert_eq!(oversized.kind(), ConnectorErrorKind::ResourceExhausted);
-    }
-
-    #[test]
-    fn partition_impact_enforces_unique_partition_limit() {
-        let added = (0..=MAX_CONNECTOR_CHANGE_PARTITIONS)
-            .map(|value| partition("account", &value.to_string()))
-            .collect();
-        let error = ConnectorChangeWindowPartitionImpact::try_exact(
-            false,
-            added,
-            Vec::new(),
-            &context(
-                crate::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-                crate::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-            ),
-        )
-        .expect_err("unique partition bound must be enforced");
-        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
     }
 }

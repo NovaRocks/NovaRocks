@@ -40,9 +40,8 @@ use crate::read_model::IcebergReadFile;
 use crate::read_model::{IcebergReadDeleteFile, IcebergReadDeleteFormat, IcebergReadDeleteKind};
 
 use super::change_window::{
-    IcebergAddedRows, IcebergChangeSplit, IcebergChangeWindowHandle, IcebergChangeWindowPlan,
-    IcebergChangeWindowPlanOutcome, IcebergDeletedDataFileRows, IcebergEndpointVisibility,
-    IcebergVisibilityDifferenceRows,
+    ChangeVariant, IcebergAddedRows, IcebergChangeSplit, IcebergChangeWindowHandle,
+    IcebergChangeWindowPlan, IcebergDeletedDataFileRows, IcebergVisibilityDifferenceRows,
 };
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, unsupported};
 use super::split::{
@@ -395,9 +394,9 @@ fn admit_readable_data_file(file: &IcebergPlannedDataFile) -> Result<(), Connect
 ///
 /// The manifest's own `split_offsets` win when they are usable, because they
 /// name the writer's row-group boundaries; otherwise the file is cut into
-/// contiguous target-sized ranges. Either way the ranges cover `[0, file_size)`
-/// with no gap and no overlap, which is what lets a change window prove that
-/// its splits neither drop nor double a row.
+/// contiguous target-sized ranges. The first valid offset can follow the
+/// file header. The resulting ranges tile the scan region from that offset,
+/// or zero, to the file size.
 fn data_file_byte_ranges(
     split_offsets: &[i64],
     file_size: i64,
@@ -682,20 +681,7 @@ pub fn plan_change_window_splits(
         context.push_deleted_data_file_rows(from_file, &mut splits)?;
     }
 
-    match IcebergChangeWindowPlan::try_plan(
-        handle.clone(),
-        IcebergEndpointVisibility::Proven,
-        splits,
-    )? {
-        IcebergChangeWindowPlanOutcome::Incremental(plan) => Ok(plan),
-        // Admission already proved both endpoints, so a rebuild verdict here
-        // would mean the proof and the plan disagree about the same window.
-        // The arm exists because the outcome is a closed enum, and quietly
-        // returning no splits would be indistinguishable from an empty window.
-        IcebergChangeWindowPlanOutcome::FullRebuild(reason) => Err(corrupt(format!(
-            "iceberg change window was admitted as proven but planning reported a full rebuild: {reason:?}"
-        ))),
-    }
+    IcebergChangeWindowPlan::try_plan(handle.clone(), splits)
 }
 
 /// One endpoint's visible files, keyed by data file path.
@@ -739,28 +725,21 @@ impl ChangeWindowContext<'_> {
         file: &IcebergPlannedDataFile,
         splits: &mut Vec<IcebergChangeSplit>,
     ) -> Result<(), ConnectorError> {
-        let facts = self.file_facts(file)?;
-        for split in self.data_splits(file, &facts)? {
-            splits.push(IcebergChangeSplit::AddedRows(IcebergAddedRows::try_new(
-                split,
-                Vec::new(),
-            )?));
-        }
-        Ok(())
+        self.push_file_group(file, ChangeVariant::AddedRows, splits, |split| {
+            IcebergAddedRows::try_new(split, Vec::new()).map(IcebergChangeSplit::AddedRows)
+        })
     }
+
     fn push_deleted_data_file_rows(
         &self,
         file: &IcebergPlannedDataFile,
         splits: &mut Vec<IcebergChangeSplit>,
     ) -> Result<(), ConnectorError> {
-        let facts = self.file_facts(file)?;
-        for split in self.data_splits(file, &facts)? {
-            splits.push(IcebergChangeSplit::DeletedDataFileRows(
-                IcebergDeletedDataFileRows::try_new(split)?,
-            ));
-        }
-        Ok(())
+        self.push_file_group(file, ChangeVariant::DeletedDataFileRows, splits, |split| {
+            IcebergDeletedDataFileRows::try_new(split).map(IcebergChangeSplit::DeletedDataFileRows)
+        })
     }
+
     fn push_surviving_file(
         &self,
         from_file: &IcebergPlannedDataFile,
@@ -780,11 +759,7 @@ impl ChangeWindowContext<'_> {
                 to.path
             )));
         }
-        let from_set = from.logical_delete_set();
-        let to_set = to.logical_delete_set();
-        // An address-only match loses interpretation changes; a load-view match
-        // makes optional statistics part of correctness. Compare logical facts.
-        if from_set.same_addresses(to_set) && from_set.same_applications(to_set) {
+        if !crate::change_planning::delete_closure_changed(from, to) {
             return Ok(());
         }
         let from_deletes: std::sync::Arc<[IcebergDeleteFile]> =
@@ -795,15 +770,49 @@ impl ChangeWindowContext<'_> {
             IcebergSplitDeletes::Planned(to.deletes.clone())
                 .to_vec()?
                 .into();
-        let facts = self.file_facts(to_file)?;
-        for split in self.data_splits(to_file, &facts)? {
-            splits.push(IcebergChangeSplit::VisibilityDifference(
+        self.push_file_group(
+            to_file,
+            ChangeVariant::VisibilityDifference,
+            splits,
+            |split| {
                 IcebergVisibilityDifferenceRows::try_new_shared(
                     split,
                     from_deletes.clone(),
                     to_deletes.clone(),
-                )?,
-            ));
+                )
+                .map(IcebergChangeSplit::VisibilityDifference)
+            },
+        )
+    }
+
+    fn push_file_group(
+        &self,
+        file: &IcebergPlannedDataFile,
+        variant: ChangeVariant,
+        splits: &mut Vec<IcebergChangeSplit>,
+        mut wrap: impl FnMut(IcebergSplit) -> Result<IcebergChangeSplit, ConnectorError>,
+    ) -> Result<(), ConnectorError> {
+        let facts = self.file_facts(file)?;
+        let start = splits.len();
+        for split in self.data_splits(file, &facts)? {
+            splits.push(wrap(split)?);
+        }
+        let emitted = &splits[start..];
+        let read_file = &file.read_file;
+        // Compare with the original range author, including the true scan
+        // start, which cannot be inferred from the first emitted split.
+        if emitted.len() != facts.ranges.len()
+            || !emitted.iter().zip(&facts.ranges).all(|(split, range)| {
+                split.variant() == variant
+                    && split.data().path() == read_file.path.as_str()
+                    && split.data().read_domain() == read_file.read_domain()
+                    && (split.data().start(), split.data().length()) == *range
+            })
+        {
+            return Err(corrupt(format!(
+                "iceberg change-window splits do not cover the expected range of {}",
+                read_file.path
+            )));
         }
         Ok(())
     }
@@ -886,8 +895,6 @@ impl ChangeWindowContext<'_> {
 pub struct IcebergChangeWindowSplitSource {
     pending: VecDeque<IcebergChangeSplit>,
     closed: bool,
-    /// Set when a runtime predicate proved the scan reads nothing.
-    exhausted: bool,
 }
 
 impl IcebergChangeWindowSplitSource {
@@ -900,7 +907,6 @@ impl IcebergChangeWindowSplitSource {
         Self {
             pending: VecDeque::from(plan.into_splits()),
             closed: false,
-            exhausted: false,
         }
     }
 }
@@ -912,24 +918,16 @@ impl ConnectorSplitSource for IcebergChangeWindowSplitSource {
     fn next_batch(
         &mut self,
         max_size: usize,
-        dynamic_filter: &DynamicFilterSnapshot<Self::Column>,
+        _dynamic_filter: &DynamicFilterSnapshot<Self::Column>,
     ) -> Result<ConnectorSplitBatch<Self::Split>, ConnectorError> {
         if max_size == 0 {
             return Err(invalid("connector split batch size must be positive"));
         }
-        if self.closed || self.exhausted {
+        if self.closed {
             return Ok(ConnectorSplitBatch::finished());
         }
-        // A change window is a proven set difference, so a runtime predicate
-        // must not narrow it split by split: dropping one would lose rows the
-        // difference owns. An unsatisfiable predicate is the single exception,
-        // because it proves the scan reads nothing at all.
-        if dynamic_filter.current_predicate().is_none() {
-            self.exhausted = true;
-            self.pending.clear();
-            return Ok(ConnectorSplitBatch::finished());
-        }
-
+        // A change window owns every split of the frozen difference. The
+        // relationship consuming it may prove a zero contribution separately.
         let max_size = max_size.min(MAX_SPLITS_PER_ASSIGNMENT);
         let mut produced = Vec::with_capacity(max_size.min(self.pending.len()));
         while produced.len() < max_size {
@@ -942,7 +940,7 @@ impl ConnectorSplitSource for IcebergChangeWindowSplitSource {
     }
 
     fn is_finished(&self) -> bool {
-        self.closed || self.exhausted || self.pending.is_empty()
+        self.closed || self.pending.is_empty()
     }
 
     /// Idempotent, exactly like the data enumerator: a batch already returned
@@ -2335,11 +2333,14 @@ mod tests {
     fn an_unsatisfiable_predicate_ends_change_window_enumeration_without_narrowing_it() {
         let plan = window_plan(Vec::new(), vec![endpoint_file("added.parquet", Vec::new())])
             .expect("plan");
-        let mut source = IcebergChangeWindowSplitSource::new(plan);
-        let unsatisfiable = DynamicFilterSnapshot::new(TupleDomain::none(), true);
-        let batch = source.next_batch(4, &unsatisfiable).expect("batch");
-        assert!(batch.no_more_splits());
-        assert!(batch.into_splits().is_empty());
-        assert!(source.is_finished());
+        for predicate in [TupleDomain::all(), TupleDomain::none()] {
+            let mut source = IcebergChangeWindowSplitSource::new(plan.clone());
+            let filter = DynamicFilterSnapshot::new(predicate, true);
+            let batch = source.next_batch(4, &filter).expect("batch");
+            assert!(batch.no_more_splits());
+            assert_eq!(batch.splits().len(), 1);
+            assert_eq!(batch.splits()[0].data().path(), "added.parquet");
+            assert!(source.is_finished());
+        }
     }
 }

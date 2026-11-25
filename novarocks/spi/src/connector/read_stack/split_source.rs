@@ -90,7 +90,13 @@ pub trait ConnectorSplitSource: Send {
     /// Produce up to `max_size` splits.
     ///
     /// The caller keeps at most one outstanding request. An empty batch means
-    /// "nothing right now", never "finished".
+    /// "nothing right now" unless it is marked final.
+    ///
+    /// An explicit change-window read and a prepared delta both enumerate the
+    /// complete frozen difference regardless of the dynamic filter. Successful
+    /// enumeration is the active attempt's consumption of all batches through
+    /// the natural final batch. A proven zero contribution remains a separate
+    /// preparation fact.
     fn next_batch(
         &mut self,
         max_size: usize,
@@ -100,7 +106,8 @@ pub trait ConnectorSplitSource: Send {
     fn is_finished(&self) -> bool;
 
     /// Idempotent. A normal batch that completed before the close may still be
-    /// delivered to the caller that requested it.
+    /// delivered to the caller that requested it. Closing or canceling an attempt
+    /// provides no evidence that the enumeration was consumed.
     fn close(&mut self) -> Result<(), ConnectorError>;
 }
 

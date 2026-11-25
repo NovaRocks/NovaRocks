@@ -27,7 +27,7 @@ use novarocks_spi::connector::read_stack::{
     adapter::ProviderPreparedSourceRead,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorChangeWindowAdmission, ConnectorExactSemanticRevision,
+    CatalogHandle, ConnectorChangeWindowFacts, ConnectorExactSemanticRevision,
     ConnectorOriginalResultScope, ConnectorProcessLocalPayload, ConnectorProviderBindingKey,
     ConnectorRequestContext, ConnectorRowMutationCurrent, ConnectorTableMetadata,
     ConnectorTableObjectId, ProviderMetadataCpuPort,
@@ -116,7 +116,7 @@ pub struct IcebergPreparedSourceRead {
     pub(crate) request: ConnectorReadSourcePreparationRequest,
     pub(crate) access: Arc<IcebergAttemptTableAccess>,
     pub(crate) relations: PreparedRelations,
-    pub(crate) admission: Option<ConnectorChangeWindowAdmission>,
+    pub(crate) window_facts: Option<ConnectorChangeWindowFacts>,
     pub(crate) to_metadata: Arc<ConnectorTableMetadata>,
 }
 impl std::fmt::Debug for IcebergPreparedSourceRead {
@@ -178,7 +178,7 @@ impl Work {
             }
             Phase::Finish => {
                 let physical = self.physical.as_ref().expect("frozen source physical view");
-                let admission = crate::change_planning::finish_change_window(
+                let window_facts = crate::change_planning::finish_change_window(
                     physical.table.metadata(),
                     &self.endpoints[0]
                         .as_ref()
@@ -190,7 +190,7 @@ impl Work {
                         .files,
                     &self.context,
                 )?;
-                self.finish(Some(admission))
+                self.finish(Some(window_facts))
             }
         }
     }
@@ -336,7 +336,7 @@ impl Work {
                     window.to_snapshot_id(),
                     &self.context,
                 )? {
-                    ChangeWindowPlan::Resolved(admission) => self.finish(Some(admission)),
+                    ChangeWindowPlan::Resolved(window_facts) => self.finish(Some(window_facts)),
                     ChangeWindowPlan::Endpoints { schema } => {
                         if self.schema.as_ref() != Some(&schema) {
                             return Err(corrupt(
@@ -351,7 +351,7 @@ impl Work {
     }
     fn finish(
         &mut self,
-        admission: Option<ConnectorChangeWindowAdmission>,
+        window_facts: Option<ConnectorChangeWindowFacts>,
     ) -> Result<(), ConnectorError> {
         let physical = self.physical.as_ref().expect("same frozen source view");
         let selection = self.request.selection();
@@ -393,16 +393,13 @@ impl Work {
             )
             .map_err(crate::metadata::metadata_creation_error)
         })?;
-        if let Some(admission) = &admission {
-            admission.validate(&self.context)?;
-        }
         let relations = crate::typed_boundary::frozen_prepared_source_relations(
             self.request.name(),
             physical.table.metadata(),
             self.request.selection(),
             self.schema.as_ref().expect("frozen To schema").clone(),
             self.pin_schema_id.expect("original schema fallback"),
-            admission.as_ref(),
+            window_facts.as_ref(),
         )?;
         self.result = Some(Ok(Arc::new(IcebergPreparedSourceRead {
             owner: ConnectorProviderBindingKey {
@@ -413,7 +410,7 @@ impl Work {
             request: self.request.clone(),
             access: Arc::clone(self.access.as_ref().expect("original source frame")),
             relations,
-            admission,
+            window_facts,
             to_metadata: Arc::new(to_metadata),
         })));
         Ok(())
@@ -715,10 +712,10 @@ impl IcebergMetadataCpuOriginal {
             .result
             .take()
             .ok_or_else(|| invalid("prepared source is not ready"))??;
-        Ok(match source.admission.clone() {
-            Some(admission) => ProviderPreparedSourceRead::change_window(
+        Ok(match source.window_facts.clone() {
+            Some(window_facts) => ProviderPreparedSourceRead::change_window(
                 Arc::clone(&source),
-                admission,
+                window_facts,
                 Arc::clone(&source.to_metadata),
             ),
             None => ProviderPreparedSourceRead::snapshot(
@@ -1024,10 +1021,10 @@ mod tests {
                 _ => assert!(prepared.relations.delta.is_none()),
             }
             assert_eq!(prepared.to_metadata.schema().field(0).name(), "id");
-            assert_eq!(prepared.admission, match from {
+            assert_eq!(prepared.window_facts, match from {
                 None => None,
-                Some(42) => Some(ConnectorChangeWindowAdmission::MetadataOnly),
-                Some(from) => Some(ConnectorChangeWindowAdmission::FullRebuild(novarocks_spi::connector::ConnectorChangeWindowFullRebuildReason::LineageBroken { from_snapshot_id: from })),
+                Some(42) => Some(ConnectorChangeWindowFacts::NetZero(novarocks_spi::connector::ConnectorChangeWindowNetZeroBasis::SameSnapshot)),
+                Some(from) => Some(ConnectorChangeWindowFacts::NotIncremental(novarocks_spi::connector::ConnectorChangeWindowNotIncrementalReason::SnapshotAncestryBroken { from_snapshot_id: from })),
             });
             assert_eq!(
                 concrete.calls.load(Ordering::SeqCst),

@@ -30,8 +30,8 @@ use novarocks_spi::connector::{
 use crate::mv::domain::model::AffectedTargetPartitions;
 use novarocks_spi::connector::read_stack::ConnectorPreparedSourceRead;
 use novarocks_spi::connector::{
-    ConnectorChangeWindowAdmission, ConnectorChangeWindowPartitionImpact,
-    ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
+    ConnectorChangeWindowFacts, ConnectorChangeWindowPartitionImpact, ConnectorControlPlanningPin,
+    ConnectorError, ConnectorErrorKind,
 };
 
 #[derive(Debug)]
@@ -114,19 +114,21 @@ pub(crate) fn plan_prepared_source_partitions(
             "partition impact does not belong to the original D source occurrence",
         ));
     }
-    if target_partition.fields.is_empty() && prepared.admission().is_some() {
-        return Ok(AffectedTargetPartitions::Unpartitioned);
-    }
-    match prepared.admission() {
-        Some(ConnectorChangeWindowAdmission::MetadataOnly) => {
+    match prepared.window_facts() {
+        Some(ConnectorChangeWindowFacts::NetZero(_)) => {
             Ok(AffectedTargetPartitions::known(std::iter::empty()))
         }
-        Some(ConnectorChangeWindowAdmission::FullRebuild(_)) => {
+        Some(ConnectorChangeWindowFacts::NotIncremental(_)) => {
             Ok(AffectedTargetPartitions::not_derived(
-                "connector change-window admission requires a full rebuild",
+                "connector change window requires a full rebuild",
             ))
         }
-        Some(ConnectorChangeWindowAdmission::Incremental {
+        Some(ConnectorChangeWindowFacts::Difference { .. })
+            if target_partition.fields.is_empty() =>
+        {
+            Ok(AffectedTargetPartitions::Unpartitioned)
+        }
+        Some(ConnectorChangeWindowFacts::Difference {
             partition_impact, ..
         }) => derive_prepared_partition_impact(
             projection,
@@ -165,16 +167,14 @@ fn derive_prepared_partition_impact(
                 )
             }
         }
-        ConnectorChangeWindowPartitionImpact::Exact {
-            has_row_deletes,
-            added,
-            removed,
-        } => {
-            if *has_row_deletes {
+        ConnectorChangeWindowPartitionImpact::Exact(partitions) => {
+            if partitions.has_row_deletes() {
                 return Ok(AffectedTargetPartitions::not_derived(
                     "row-level delete affected partitions require row-evaluation fallback",
                 ));
             }
+            let added = partitions.added();
+            let removed = partitions.removed();
             let mut partitions = Vec::with_capacity(added.len() + removed.len());
             for partition in added.iter().chain(removed) {
                 match map_partition_fields(
@@ -602,11 +602,11 @@ mod tests {
             target_spec_id: 0,
             fields: vec![],
         };
-        let impact = ConnectorChangeWindowPartitionImpact::Exact {
-            has_row_deletes: true,
-            added: vec![],
-            removed: vec![],
-        };
+        let impact = novarocks_spi::connector::ConnectorChangeWindowPartitionImpactBuilder::new(
+            true,
+            &context(),
+        )
+        .finish();
         let result = derive_prepared_partition_impact(
             &projection,
             7,

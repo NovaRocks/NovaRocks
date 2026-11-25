@@ -25,7 +25,8 @@ use novarocks_spi::connector::{
     MvExactPartitionField, MvExactPartitionTransform,
     read_stack::{
         ConnectorMvPartitionValue, ConnectorMvTargetPartitionSelection,
-        MAX_MV_TARGET_PARTITION_KEYS, MAX_MV_TARGET_PARTITION_VALUE_BYTES,
+        ConnectorReadSourceProjection as Projection, MAX_MV_TARGET_PARTITION_KEYS,
+        MAX_MV_TARGET_PARTITION_VALUE_BYTES,
     },
 };
 use novarocks_types::naming::TableIdentity;
@@ -305,16 +306,12 @@ pub(crate) async fn freeze_imv_base_query_local_overlays_from_captured_inputs_or
         let materialization = crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
             metadata, source.planning_pin.clone())?;
         validate_source_revisions_original(&materialization, current.iter())?;
-        // Historical From is an execution dependency only for a Delta-capable receipt.
-        // FullRebuild/MetadataOnly cannot manufacture an executable From relation.
+        // Validate the original revision only when the receipt authorizes a From read.
         for old in previous.values() {
             if let Some(receipt) = source.receipt(Some(&old.semantic_revision))
-                && matches!(
-                    receipt.admission(),
-                    Some(
-                        novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. }
-                    )
-                )
+                && receipt
+                    .window_facts()
+                    .is_some_and(|facts| facts.permits(Projection::From))
             {
                 validate_source_revisions_original(&materialization, std::iter::once(old))?;
             }
@@ -331,7 +328,6 @@ pub(crate) fn freeze_captured_source_overlays(
     Vec<QueryLocalTableOverlay>,
     crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
 > {
-    use novarocks_spi::connector::read_stack::ConnectorReadSourceProjection as Projection;
     let mut overlays = Vec::new();
     for (base, captured) in sources.bindings() {
         let metadata = if captured.snapshot.is_some() {
@@ -378,33 +374,16 @@ pub(crate) fn freeze_captured_source_overlays(
                     )?;
                 }
                 for receipt in &receipts {
-                    match receipt.admission() {
-                        Some(
-                            novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental {
-                                ..
-                            },
-                        ) => {
-                            result.install_prepared_source_read(
-                                receipt.clone(),
-                                Projection::From,
-                                materialization.planning_pin.clone(),
-                            )?;
-                            result.install_prepared_source_read(
-                                receipt.clone(),
-                                Projection::Delta,
-                                materialization.planning_pin.clone(),
-                            )?;
+                    if let Some(facts) = receipt.window_facts() {
+                        for projection in [Projection::From, Projection::Delta] {
+                            if facts.permits(projection) {
+                                result.install_prepared_source_read(
+                                    receipt.clone(),
+                                    projection,
+                                    materialization.planning_pin.clone(),
+                                )?;
+                            }
                         }
-                        Some(
-                            novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
-                        ) => {
-                            result.install_prepared_source_read(
-                                receipt.clone(),
-                                Projection::Delta,
-                                materialization.planning_pin.clone(),
-                            )?;
-                        }
-                        _ => {}
                     }
                 }
                 Ok(result)

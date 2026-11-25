@@ -517,9 +517,10 @@ pub enum ConnectorManagedPublicationShape {
     /// two produce different plans: one is compiled as an ordinary write, the
     /// other through the change-stream router.
     ///
-    /// Note what this does NOT do: an effect no branch accepts is dropped by the
-    /// router, not refused, so declaring only Insert does not make "no deletes
-    /// can appear" an enforced invariant. It remains the caller's precondition.
+    /// A refresh chooses this shape when its prepared window facts prove
+    /// [absent negative weight](crate::connector::ConnectorChangeWindowNegativeWeight::Absent).
+    /// If a delete event reaches the router, there is no accepting branch and
+    /// the router rejects the batch with a contract error.
     InsertOnlyChangeStream,
     /// The publication applies a change stream that supersedes rows; SQL routes
     /// change events to the branches the provider seals, and the session freezes

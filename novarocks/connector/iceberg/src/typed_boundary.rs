@@ -2708,26 +2708,17 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
         )?;
         if receipt.projection == ConnectorReadSourceProjection::Delta
             && matches!(
-                receipt.source.admission,
-                Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly)
+                receipt.source.window_facts,
+                Some(novarocks_spi::connector::ConnectorChangeWindowFacts::NetZero(_))
             )
         {
             let crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) =
                 request.table.as_ref()
             else {
-                return Err(invalid("MetadataOnly Delta lost its exact typed window"));
+                return Err(invalid("net-zero Delta lost its exact typed window"));
             };
-            let outcome = crate::typed_read::IcebergChangeWindowPlan::try_plan(
-                handle.clone(),
-                crate::typed_read::IcebergEndpointVisibility::Proven,
-                Vec::new(),
-            )?;
-            let crate::typed_read::IcebergChangeWindowPlanOutcome::Incremental(plan) = outcome
-            else {
-                return Err(invalid(
-                    "proven MetadataOnly Delta did not form an empty plan",
-                ));
-            };
+            let plan =
+                crate::typed_read::IcebergChangeWindowPlan::try_plan(handle.clone(), Vec::new())?;
             // Exact original receipt is the proof of zero contribution. No
             // fresh loader, CPU job, Source owner or retention guard is created.
             return Ok(Box::pin(async move {
@@ -3674,6 +3665,19 @@ fn pinned_change_window_handle_with_fallback(
         )));
     }
 
+    let to_schema = compatible_change_window_endpoint_schema(metadata, window, fallback_schema_id)?;
+    change_window_handle_with_frozen_schema(name, metadata, window, to_schema).map(Some)
+}
+
+/// Preserve the endpoint schema and nominal-domain checks for an executable
+/// difference. Prepared windows already proved their exact parent history.
+fn compatible_change_window_endpoint_schema(
+    metadata: &TableMetadata,
+    window: ConnectorReadChangeWindow,
+    fallback_schema_id: i32,
+) -> Result<SchemaRef, ConnectorError> {
+    let from = window.from_snapshot_id();
+    let to = window.to_snapshot_id();
     let from_schema = crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::frozen_snapshot_schema(metadata, from, fallback_schema_id)?;
     let to_schema = crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::frozen_snapshot_schema(metadata, to, fallback_schema_id)?;
     if !struct_types_share_field_identities(from_schema.as_struct(), to_schema.as_struct()) {
@@ -3695,11 +3699,11 @@ fn pinned_change_window_handle_with_fallback(
             "Iceberg change-window endpoints have different declared scalar integer domains",
         ));
     }
-    change_window_handle_with_frozen_schema(name, metadata, window, to_schema).map(Some)
+    Ok(to_schema)
 }
 
 /// Static endpoint identities from the original frozen metadata, not evidence
-/// of a physical read. MetadataOnly has no executable From projection and its
+/// of a physical read. Net zero has no executable From projection and its
 /// empty Delta never starts endpoint discovery.
 fn change_window_handle_with_frozen_schema(
     name: &SchemaTableName,
@@ -3769,86 +3773,70 @@ pub(crate) fn frozen_prepared_source_relations(
     selection: ConnectorReadSourceSelection,
     to_schema: SchemaRef,
     fallback_schema_id: i32,
-    admission: Option<&novarocks_spi::connector::ConnectorChangeWindowAdmission>,
+    window_facts: Option<&novarocks_spi::connector::ConnectorChangeWindowFacts>,
 ) -> Result<PreparedRelations, ConnectorError> {
     let to = selection.to_snapshot_id();
-    if matches!(
-        admission,
-        Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. })
-    ) {
-        let ConnectorReadSourceSelection::ChangeWindow(window) = selection else {
-            return Err(invalid(
-                "snapshot source cannot have an incremental decision",
-            ));
-        };
-        let delta =
-            pinned_change_window_handle_with_fallback(name, metadata, window, fallback_schema_id)?
-                .ok_or_else(|| unsupported("incremental decision has no typed Delta relation"))?;
-        let to = pinned_table_handle_with_schema_and_domain(
-            name,
-            metadata,
-            Some(to),
-            to_schema.clone(),
-            None,
-            || Ok(Some(Arc::clone(delta.to_read_domain()))),
-        )?;
-        let from = pinned_table_handle_with_schema_and_domain(
+    let Some(facts) =
+        window_facts.filter(|facts| facts.permits(ConnectorReadSourceProjection::Delta))
+    else {
+        return Ok(PreparedRelations {
+            to: pinned_table_handle_with_schema(name, metadata, Some(to), to_schema, None)?,
+            from: None,
+            delta: None,
+        });
+    };
+    let ConnectorReadSourceSelection::ChangeWindow(window) = selection else {
+        return Err(invalid(
+            "snapshot source cannot carry executable change-window facts",
+        ));
+    };
+    // The preparation already proved the history of these exact endpoints.
+    // The frozen handle still needs both domain identities for an empty Delta.
+    if !matches!(
+        metadata.format_version(),
+        FormatVersion::V2 | FormatVersion::V3
+    ) || metadata.snapshot_by_id(window.from_snapshot_id()).is_none()
+        || metadata.snapshot_by_id(to).is_none()
+    {
+        return Err(invalid(
+            "change-window source has no exact endpoint metadata",
+        ));
+    }
+    let permits_from = facts.permits(ConnectorReadSourceProjection::From);
+    if permits_from
+        && compatible_change_window_endpoint_schema(metadata, window, fallback_schema_id)?
+            != to_schema
+    {
+        return Err(corrupt(
+            "change-window endpoint schema differs from its frozen To observation",
+        ));
+    }
+    let delta = change_window_handle_with_frozen_schema(name, metadata, window, to_schema.clone())?;
+    let to = pinned_table_handle_with_schema_and_domain(
+        name,
+        metadata,
+        Some(to),
+        to_schema.clone(),
+        None,
+        || Ok(Some(Arc::clone(delta.to_read_domain()))),
+    )?;
+    let from = if permits_from {
+        Some(pinned_table_handle_with_schema_and_domain(
             name,
             metadata,
             Some(window.from_snapshot_id()),
             to_schema,
             None,
             || Ok(Some(Arc::clone(delta.from_read_domain()))),
-        )?;
-        Ok(PreparedRelations {
-            to,
-            from: Some(from),
-            delta: Some(delta),
-        })
-    } else if matches!(
-        admission,
-        Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly)
-    ) {
-        let ConnectorReadSourceSelection::ChangeWindow(window) = selection else {
-            return Err(invalid(
-                "snapshot source cannot have a MetadataOnly window decision",
-            ));
-        };
-        // A real MetadataOnly preparation proved this exact original lineage.
-        // Reject contradictory private facts rather than inventing a From pin.
-        if !matches!(
-            metadata.format_version(),
-            FormatVersion::V2 | FormatVersion::V3
-        ) || metadata.snapshot_by_id(window.from_snapshot_id()).is_none()
-            || metadata.snapshot_by_id(to).is_none()
-            || !snapshot_descends_from(metadata, to, window.from_snapshot_id())
-        {
-            return Err(invalid(
-                "MetadataOnly source has no exact original endpoint lineage",
-            ));
-        }
-        let delta =
-            change_window_handle_with_frozen_schema(name, metadata, window, to_schema.clone())?;
-        let to = pinned_table_handle_with_schema_and_domain(
-            name,
-            metadata,
-            Some(to),
-            to_schema,
-            None,
-            || Ok(Some(Arc::clone(delta.to_read_domain()))),
-        )?;
-        Ok(PreparedRelations {
-            to,
-            from: None,
-            delta: Some(delta),
-        })
+        )?)
     } else {
-        Ok(PreparedRelations {
-            to: pinned_table_handle_with_schema(name, metadata, Some(to), to_schema, None)?,
-            from: None,
-            delta: None,
-        })
-    }
+        None
+    };
+    Ok(PreparedRelations {
+        to,
+        from,
+        delta: Some(delta),
+    })
 }
 
 /// Whether `descendant` reaches `ancestor` by following parent pointers.
@@ -3856,17 +3844,14 @@ pub(crate) fn frozen_prepared_source_relations(
 /// The walk is bounded by the number of snapshots the metadata carries, so a
 /// corrupted parent cycle ends the search instead of hanging the coordinator.
 fn snapshot_descends_from(metadata: &TableMetadata, descendant: i64, ancestor: i64) -> bool {
-    let mut cursor = Some(descendant);
+    let mut history = crate::snapshot_history::SnapshotHistory::new(metadata, descendant);
     for _ in 0..=metadata.snapshots().len() {
-        let Some(snapshot_id) = cursor else {
-            return false;
-        };
-        if snapshot_id == ancestor {
+        if history.next_id() == Some(ancestor) {
             return true;
         }
-        cursor = metadata
-            .snapshot_by_id(snapshot_id)
-            .and_then(|snapshot| snapshot.parent_snapshot_id());
+        if history.next().is_none() {
+            return false;
+        }
     }
     false
 }
@@ -6231,8 +6216,9 @@ mod prepared_source_relation_tests {
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::{CatalogHandle, ConnectorExactSemanticRevision};
     use novarocks_spi::connector::{
-        ConnectorChangeWindowAdmission, ConnectorChangeWindowFullRebuildReason,
-        ConnectorChangeWindowPartitionImpact,
+        ConnectorChangeWindowFacts, ConnectorChangeWindowNegativeWeight,
+        ConnectorChangeWindowNetZeroBasis, ConnectorChangeWindowNotIncrementalReason,
+        ConnectorChangeWindowPartitionImpact, ConnectorChangeWindowVolume,
     };
 
     fn metadata() -> TableMetadata {
@@ -6399,11 +6385,7 @@ mod prepared_source_relation_tests {
             revision(41),
             revision(42),
         );
-        let admission = ConnectorChangeWindowAdmission::Incremental {
-            has_inserts: true,
-            has_deletes: false,
-            partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
-        };
+        let window_facts = append_window_facts();
         let snapshot_schema =
             crate::change_planning::resolved_window_schema(&metadata, 42).unwrap();
         let relations = frozen_prepared_source_relations(
@@ -6412,7 +6394,7 @@ mod prepared_source_relation_tests {
             request.selection(),
             snapshot_schema.clone(),
             snapshot_schema.schema_id(),
-            Some(&admission),
+            Some(&window_facts),
         )
         .unwrap();
         let source = Arc::new(IcebergPreparedSourceRead {
@@ -6424,7 +6406,7 @@ mod prepared_source_relation_tests {
             request,
             access: Arc::new(IcebergAttemptTableAccess::freeze(physical)),
             relations,
-            admission: Some(admission),
+            window_facts: Some(window_facts),
             to_metadata: Arc::new(observed),
         });
         let boundary = Arc::new(
@@ -6810,6 +6792,17 @@ mod prepared_source_relation_tests {
         );
         assert!(boundary.prepared_source_access(&other).unwrap().is_none());
     }
+    fn append_window_facts() -> ConnectorChangeWindowFacts {
+        ConnectorChangeWindowFacts::Difference {
+            negative_weight: ConnectorChangeWindowNegativeWeight::Absent,
+            partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
+            volume: ConnectorChangeWindowVolume {
+                source_event_rows_upper_bound: 1,
+                source_data_file_bytes: 128,
+            },
+        }
+    }
+
     #[test]
     fn prepared_incremental_relations_share_the_original_endpoint_domains() {
         let metadata = metadata();
@@ -6819,11 +6812,7 @@ mod prepared_source_relation_tests {
             ConnectorReadSourceSelection::ChangeWindow(ConnectorReadChangeWindow::new(41, 42)),
             metadata.current_schema().clone(),
             metadata.current_schema_id(),
-            Some(&ConnectorChangeWindowAdmission::Incremental {
-                has_inserts: true,
-                has_deletes: false,
-                partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
-            }),
+            Some(&append_window_facts()),
         )
         .unwrap();
         let delta = relations.delta.unwrap();
@@ -6845,8 +6834,8 @@ mod prepared_source_relation_tests {
         let metadata = metadata();
         for admission in [
             None,
-            Some(ConnectorChangeWindowAdmission::FullRebuild(
-                ConnectorChangeWindowFullRebuildReason::LineageBroken {
+            Some(ConnectorChangeWindowFacts::NotIncremental(
+                ConnectorChangeWindowNotIncrementalReason::SnapshotAncestryBroken {
                     from_snapshot_id: 999,
                 },
             )),
@@ -6874,7 +6863,10 @@ mod prepared_source_relation_tests {
     #[test]
     fn prepared_metadata_only_has_exact_empty_delta_without_executable_from() {
         let metadata = metadata();
-        for from in [41, 42] {
+        for (from, basis) in [
+            (41, ConnectorChangeWindowNetZeroBasis::EqualEndpoints),
+            (42, ConnectorChangeWindowNetZeroBasis::SameSnapshot),
+        ] {
             let relations = frozen_prepared_source_relations(
                 &SchemaTableName::try_new("db", "t").unwrap(),
                 &metadata,
@@ -6883,7 +6875,7 @@ mod prepared_source_relation_tests {
                 )),
                 metadata.current_schema().clone(),
                 metadata.current_schema_id(),
-                Some(&ConnectorChangeWindowAdmission::MetadataOnly),
+                Some(&ConnectorChangeWindowFacts::NetZero(basis)),
             )
             .unwrap();
             assert!(relations.from.is_none());
@@ -6895,16 +6887,8 @@ mod prepared_source_relation_tests {
                 IcebergChangeWindowHandle::from_proto(&delta.to_proto()).unwrap(),
                 delta
             );
-            let outcome = crate::typed_read::IcebergChangeWindowPlan::try_plan(
-                delta,
-                crate::typed_read::IcebergEndpointVisibility::Proven,
-                Vec::new(),
-            )
-            .unwrap();
-            let crate::typed_read::IcebergChangeWindowPlanOutcome::Incremental(plan) = outcome
-            else {
-                panic!("closed zero contribution")
-            };
+            let plan =
+                crate::typed_read::IcebergChangeWindowPlan::try_plan(delta, Vec::new()).unwrap();
             assert!(plan.into_splits().is_empty());
         }
         assert!(
@@ -6914,7 +6898,9 @@ mod prepared_source_relation_tests {
                 ConnectorReadSourceSelection::ChangeWindow(ConnectorReadChangeWindow::new(999, 42)),
                 metadata.current_schema().clone(),
                 metadata.current_schema_id(),
-                Some(&ConnectorChangeWindowAdmission::MetadataOnly),
+                Some(&ConnectorChangeWindowFacts::NetZero(
+                    ConnectorChangeWindowNetZeroBasis::EqualEndpoints
+                )),
             )
             .is_err()
         );
@@ -6933,12 +6919,16 @@ mod prepared_source_relation_tests {
             source.request.selection(),
             metadata.current_schema().clone(),
             metadata.current_schema_id(),
-            Some(&ConnectorChangeWindowAdmission::MetadataOnly),
+            Some(&ConnectorChangeWindowFacts::NetZero(
+                ConnectorChangeWindowNetZeroBasis::EqualEndpoints,
+            )),
         )
         .unwrap();
         let original = Arc::get_mut(&mut source).unwrap();
         original.relations = relations;
-        original.admission = Some(ConnectorChangeWindowAdmission::MetadataOnly);
+        original.window_facts = Some(ConnectorChangeWindowFacts::NetZero(
+            ConnectorChangeWindowNetZeroBasis::EqualEndpoints,
+        ));
         install_inventory(&boundary, &source);
         let mut foreign = source.relations.delta.as_ref().unwrap().to_proto();
         foreign.from_snapshot_id_exclusive = foreign.to_snapshot_id_inclusive;

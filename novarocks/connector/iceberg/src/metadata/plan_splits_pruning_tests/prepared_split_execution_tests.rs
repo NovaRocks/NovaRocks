@@ -32,9 +32,9 @@ use novarocks_spi::connector::read_stack::{
     ConnectorReadSplitSource, ConnectorSession, TupleDomain,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogVersion, ConnectorOriginalResultScope, ConnectorProcessLocalPayload,
-    ConnectorTableObjectBindingFailure, ProviderMetadataCpuInput, ProviderMetadataCpuPort,
-    ProviderMetadataCpuSource,
+    CatalogHandle, CatalogVersion, ConnectorChangeWindowFacts, ConnectorChangeWindowNetZeroBasis,
+    ConnectorOriginalResultScope, ConnectorProcessLocalPayload, ConnectorTableObjectBindingFailure,
+    ProviderMetadataCpuInput, ProviderMetadataCpuPort, ProviderMetadataCpuSource,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -185,6 +185,15 @@ async fn source_fixture_selection(
     snapshot_only: bool,
     metadata_only: Option<EmptyWindow>,
 ) -> Fixture {
+    source_fixture_with_history(original, snapshot_only, metadata_only, false).await
+}
+
+async fn source_fixture_with_history(
+    original: &IcebergMetadata,
+    snapshot_only: bool,
+    metadata_only: Option<EmptyWindow>,
+    coverage_window: bool,
+) -> Fixture {
     assert!(!(snapshot_only && metadata_only.is_some()));
     for request in [
         CatalogPublicationRequest::CreateNamespace {
@@ -263,14 +272,16 @@ async fn source_fixture_selection(
         .await
         .unwrap()
         .into_parts();
-    let setup_io = materialization
-        .into_static_table()
-        .unwrap()
-        .file_io()
-        .clone();
+    let table = materialization.into_static_table().unwrap();
+    let setup_io = table.file_io().clone();
+    let replacement = if coverage_window {
+        Some(write_coverage_history(&table, snapshots[0], snapshots[1]).await)
+    } else {
+        None
+    };
     let catalog = Arc::new(ObservationCatalog {
         inner: original.runtime.novarocks_catalog().clone(),
-        replacement: Mutex::new(None),
+        replacement: Mutex::new(replacement),
         reads: Mutex::new(Vec::new()),
         runtime: original
             .runtime
@@ -362,17 +373,21 @@ async fn source_fixture_selection(
         .await
         .unwrap();
     if snapshot_only {
-        assert!(prepared.admission().is_none());
+        assert!(prepared.window_facts().is_none());
         assert!(prepared.request().from_revision().is_none());
-    } else if metadata_only.is_some() {
-        assert!(matches!(
-            prepared.admission(),
-            Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly)
-        ));
+    } else if let Some(selection) = metadata_only {
+        let basis = match selection {
+            EmptyWindow::SameSnapshot => ConnectorChangeWindowNetZeroBasis::SameSnapshot,
+            EmptyWindow::DistinctSnapshots => ConnectorChangeWindowNetZeroBasis::EqualEndpoints,
+        };
+        assert_eq!(
+            prepared.window_facts(),
+            Some(&ConnectorChangeWindowFacts::NetZero(basis))
+        );
     } else {
         assert!(matches!(
-            prepared.admission(),
-            Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. })
+            prepared.window_facts(),
+            Some(ConnectorChangeWindowFacts::Difference { .. })
         ));
     }
     std::future::poll_fn(|cx| cpu.poll_closed(cx))
@@ -400,6 +415,106 @@ async fn source_fixture_selection(
         to: snapshots[1],
     }
 }
+/// Write two independent endpoint inventories. The upper snapshot adds a file,
+/// retires a whole file and applies an equality delete to the surviving file.
+async fn write_coverage_history(
+    table: &crate::iceberg::table::Table,
+    from: i64,
+    to: i64,
+) -> crate::iceberg::spec::TableMetadataRef {
+    use crate::iceberg::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, ManifestListWriter,
+        ManifestWriterBuilder, Struct,
+    };
+
+    let metadata = table.metadata();
+    let io = table.file_io();
+    let from_sequence = metadata.snapshot_by_id(from).unwrap().sequence_number();
+    let to_sequence = metadata.snapshot_by_id(to).unwrap().sequence_number();
+    let file = |name, offsets| {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(format!("{}/data/{name}.parquet", metadata.location()))
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .record_count(3)
+            .file_size_in_bytes(128)
+            .split_offsets(Some(offsets))
+            .build()
+            .unwrap()
+    };
+    let removed = file("removed", vec![7, 55]);
+    let surviving = file("surviving", vec![8, 48, 96]);
+    let added = file("added", vec![4, 70]);
+    let delete = DataFileBuilder::default()
+        .content(DataContentType::EqualityDeletes)
+        .file_path(format!(
+            "{}/data/coverage-delete.parquet",
+            metadata.location()
+        ))
+        .file_format(DataFileFormat::Parquet)
+        .partition(Struct::empty())
+        .record_count(1)
+        .file_size_in_bytes(64)
+        .equality_ids(Some(vec![1]))
+        .build()
+        .unwrap();
+    let manifest = |name, id| {
+        ManifestWriterBuilder::new(
+            io.new_output(format!(
+                "{}/metadata/coverage-{name}.avro",
+                metadata.location()
+            ))
+            .unwrap(),
+            Some(id),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().as_ref().clone(),
+        )
+    };
+    let mut from_data = manifest("from-data", from).build_v2_data();
+    from_data.add_file(removed.clone(), from_sequence).unwrap();
+    from_data
+        .add_file(surviving.clone(), from_sequence)
+        .unwrap();
+    let mut to_data = manifest("to-data", to).build_v2_data();
+    to_data
+        .add_existing_file(surviving, from, from_sequence, Some(from_sequence))
+        .unwrap();
+    to_data
+        .add_delete_file(removed, from_sequence, Some(from_sequence))
+        .unwrap();
+    to_data.add_file(added, to_sequence).unwrap();
+    let mut to_deletes = manifest("to-deletes", to).build_v2_deletes();
+    to_deletes.add_file(delete, to_sequence).unwrap();
+    let mut value = serde_json::to_value(metadata).unwrap();
+    for (id, parent, sequence, manifests) in [
+        (
+            from,
+            None,
+            from_sequence,
+            vec![from_data.write_manifest_file().await.unwrap()],
+        ),
+        (
+            to,
+            Some(from),
+            to_sequence,
+            vec![
+                to_data.write_manifest_file().await.unwrap(),
+                to_deletes.write_manifest_file().await.unwrap(),
+            ],
+        ),
+    ] {
+        let path = format!("{}/metadata/coverage-list-{id}.avro", metadata.location());
+        let writer = io.new_output(&path).unwrap().writer().await.unwrap();
+        let mut list = ManifestListWriter::v2(writer, id, parent, sequence);
+        list.add_manifests(manifests.into_iter()).unwrap();
+        list.close().await.unwrap();
+        snapshot_mut(&mut value, id)["manifest-list"] = serde_json::json!(path);
+    }
+    snapshot_mut(&mut value, to)["summary"]["operation"] = serde_json::json!("overwrite");
+    Arc::new(serde_json::from_value(value).unwrap())
+}
+
 impl Fixture {
     fn observe(&self, edit: impl FnOnce(&mut serde_json::Value)) {
         let mut value = serde_json::to_value(self.physical.table.metadata()).unwrap();
@@ -531,6 +646,166 @@ fn snapshot_mut(value: &mut serde_json::Value, id: i64) -> &mut serde_json::Valu
         .iter_mut()
         .find(|snapshot| snapshot["snapshot-id"].as_i64() == Some(id))
         .unwrap()
+}
+
+#[test]
+fn change_window_entries_emit_every_expected_range_through_the_natural_final_batch() {
+    use novarocks_spi::connector::read_stack::{
+        ConnectorReadChangeWindow, ConnectorReadRelationPreparationKind,
+        ConnectorReadRelationPreparationRequest, SchemaTableName,
+    };
+
+    let (executor, _warehouse, provider) = provider();
+    executor.block_on(async {
+        let fixture = source_fixture_with_history(&provider, false, None, true).await;
+        let explicit = ConnectorReadRelationPreparationRequest::new(
+            SchemaTableName::try_new("prepared_execution", "t").unwrap(),
+            ConnectorReadRelationPreparationKind::Delta {
+                window: ConnectorReadChangeWindow::new(fixture.from, fixture.to),
+            },
+        );
+        // An explicit read owns its own request. The prepared scope already
+        // binds this base table to its immutable occurrence inventory.
+        let explicit_read = prepared_source_fixture_control(&fixture.provider, &context());
+        let metadata = explicit_read.metadata();
+        let explicit = metadata
+            .prepare_relation(&fixture.session, &explicit)
+            .await
+            .unwrap()
+            .unwrap();
+        let (explicit, _) = metadata
+            .create_prepared_relation(explicit)
+            .unwrap()
+            .unwrap()
+            .into_parts();
+        let prepared = fixture.table(ConnectorReadSourceProjection::Delta);
+        let adapter = fixture.adapter();
+        let expected = [
+            ("add", "added.parquet", fixture.to, 4, 66),
+            ("add", "added.parquet", fixture.to, 70, 58),
+            ("visibility", "surviving.parquet", fixture.to, 8, 40),
+            ("visibility", "surviving.parquet", fixture.to, 48, 48),
+            ("visibility", "surviving.parquet", fixture.to, 96, 32),
+            ("remove", "removed.parquet", fixture.from, 7, 48),
+            ("remove", "removed.parquet", fixture.from, 55, 73),
+        ]
+        .map(|(variant, path, snapshot, start, length)| {
+            (variant, path.to_owned(), snapshot, start, length)
+        });
+        for (use_prepared, table) in [(true, &prepared), (false, &explicit)] {
+            let crate::typed_read::IcebergRuntimeRelation::ChangeWindow(window) =
+                adapter.table(table).unwrap()
+            else {
+                panic!("both entries must freeze an exact change window");
+            };
+            assert_eq!(window.from_read_domain().endpoint().snapshot_id(), fixture.from);
+            assert_eq!(window.to_read_domain().endpoint().snapshot_id(), fixture.to);
+            let describe = |split| {
+                let crate::typed_read::IcebergReadSplit::ChangeWindow(split) =
+                    adapter.split(&split).unwrap()
+                else {
+                    panic!("change-window source must emit a change-window split");
+                };
+                let (variant, domain) = match &split {
+                    crate::typed_read::IcebergChangeSplit::AddedRows(_) => {
+                        ("add", window.to_read_domain())
+                    }
+                    crate::typed_read::IcebergChangeSplit::DeletedDataFileRows(_) => {
+                        ("remove", window.from_read_domain())
+                    }
+                    crate::typed_read::IcebergChangeSplit::VisibilityDifference(_) => {
+                        ("visibility", window.to_read_domain())
+                    }
+                };
+                let data = split.data();
+                assert_eq!(data.read_domain(), domain, "{variant} endpoint domain");
+                (
+                    variant,
+                    data.path().rsplit('/').next().unwrap().to_owned(),
+                    data.read_domain().endpoint().snapshot_id(),
+                    data.start(),
+                    data.length(),
+                )
+            };
+            for (closed_early, predicate) in [
+                (false, TupleDomain::all()),
+                (false, TupleDomain::none()),
+                (true, TupleDomain::none()),
+            ] {
+                let filter = ConnectorReadDynamicFilterSnapshot::new(predicate, true);
+                let mut owner = None;
+                let mut source = if use_prepared {
+                    fixture
+                        .opening(
+                            ConnectorReadSourceProjection::Delta,
+                            fixture.cpu.clone(),
+                            &mut owner,
+                        )
+                        .await
+                        .unwrap()
+                } else {
+                    use novarocks_spi::connector::read_stack::ConnectorReadConstraint;
+                    explicit_read
+                        .splits()
+                        .get_splits(
+                            ConnectorReadSplitOpenRequest::new(
+                                fixture.session.clone(),
+                                table.clone(),
+                                Vec::new(),
+                                std::collections::BTreeSet::new(),
+                                ConnectorReadConstraint::of_summary(TupleDomain::all()),
+                            ),
+                            &mut owner,
+                        )
+                        .await
+                        .unwrap()
+                };
+                assert_eq!(owner.is_some(), use_prepared);
+                assert!(!source.is_finished());
+                let mut observed = Vec::new();
+                let mut batches = Vec::new();
+                loop {
+                    let batch = source.next_batch(2, &filter).unwrap();
+                    let final_batch = batch.no_more_splits();
+                    let splits = batch.into_splits();
+                    batches.push((splits.len(), final_batch));
+                    observed.extend(splits.into_iter().map(describe));
+                    if closed_early || final_batch {
+                        break;
+                    }
+                    assert!(!source.is_finished());
+                }
+                let predicate = if filter.current_predicate().is_none() {
+                    "none"
+                } else {
+                    "all"
+                };
+                let entry = if use_prepared { "prepared" } else { "explicit" };
+                println!(
+                    "{entry}, filter={predicate}, closed_early={closed_early}, batches={batches:?}, ranges={observed:?}"
+                );
+                if closed_early {
+                    assert_eq!(observed, expected[..2]);
+                    assert_eq!(batches, [(2, false)]);
+                    assert!(!source.is_finished());
+                    source.close().unwrap();
+                    assert!(source.is_finished());
+                    let terminal = source.next_batch(2, &filter).unwrap();
+                    assert!(terminal.no_more_splits());
+                    assert!(terminal.into_splits().is_empty());
+                } else {
+                    assert_eq!(observed, expected);
+                    assert_eq!(batches, [(2, false), (2, false), (2, false), (1, true)]);
+                    assert!(source.is_finished());
+                }
+                if use_prepared {
+                    fixture.close_source(source, owner, &fixture.cpu).await;
+                } else {
+                    source.close().unwrap();
+                }
+            }
+        }
+    });
 }
 
 #[test]
@@ -1220,7 +1495,7 @@ fn vended_prepared_source_fresh_refusal(expire_selected_endpoint: bool) {
             .await
             .unwrap();
         assert!(
-            prepared.admission().is_none(),
+            prepared.window_facts().is_none(),
             "a first/full To source must not pretend to be Delta"
         );
         let selected = prepared

@@ -102,6 +102,7 @@ pub(crate) mod scalar_integer_domain;
 pub mod scan_model;
 pub mod schema_facts;
 pub mod schema_mapping;
+mod snapshot_history;
 mod source_type;
 pub mod statistics_ancestry;
 pub mod statistics_basis;
