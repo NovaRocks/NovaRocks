@@ -459,20 +459,22 @@ fn checked_filter_contracts_keep_complete_installed_types_and_owned_canonical_st
     };
     use novarocks_local_program::{FilterMembershipSchema, FilterMembershipSchemaError};
 
-    // JSON and text share the same artifact bytes, but the original declared
-    // domain and root NULL guarantee survive checked static adoption and thaw.
+    // UUID and physical fixed binary share the same artifact bytes. The
+    // declared domain and root NULL guarantee survive static adoption and thaw.
     for nullable in [false, true] {
         let declared = FunctionValueType::try_with_logical_type(
-            DataType::Utf8,
+            DataType::FixedSizeBinary(16),
             nullable,
-            novarocks_type_contract::ValueLogicalType::Json,
+            novarocks_type_contract::ValueLogicalType::Uuid,
         )
         .unwrap();
         let source = crate::exec::chunk::typed_fixture::columns(
             &["key"],
             &[SlotId::new(1)],
             std::slice::from_ref(&declared),
-            vec![Arc::new(arrow::array::StringArray::from(vec!["{}"]))],
+            vec![Arc::new(
+                arrow::array::FixedSizeBinaryArray::try_from_iter([[0u8; 16]].into_iter()).unwrap(),
+            )],
             1,
         );
         let tracker =
@@ -556,10 +558,10 @@ fn checked_filter_contracts_keep_complete_installed_types_and_owned_canonical_st
         assert_ne!(
             runtime.contract(),
             &declared_membership_contract(
-                FunctionValueType::new(DataType::Utf8, nullable),
+                FunctionValueType::new(DataType::FixedSizeBinary(16), nullable),
                 execution::RuntimeFilterNullSemantics::NeverMatches,
             ),
-            "physical artifact equality cannot erase JSON",
+            "physical artifact equality cannot erase UUID",
         );
         drop((installed, frozen, owner, source, factory, state, declared));
         assert!(factory_weak.upgrade().is_none());

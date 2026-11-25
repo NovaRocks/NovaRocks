@@ -1150,7 +1150,7 @@ mod runtime_projection_tests {
     use crate::exec::pipeline::operator::ConstructionFailure;
     use crate::runtime::task::ExecutionFailure;
     use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState};
-    use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
+    use arrow::array::{Array, ArrayRef, BooleanArray, LargeBinaryArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
     use std::sync::Arc;
@@ -1170,7 +1170,7 @@ mod runtime_projection_tests {
         .unwrap();
         let provider_schema = Arc::new(Schema::new(vec![Field::new(
             "document",
-            DataType::Utf8,
+            DataType::LargeBinary,
             false,
         )]));
         let (frozen, projection, input_layout) =
@@ -1191,7 +1191,10 @@ mod runtime_projection_tests {
             .unwrap();
         let input = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
             source_schema.clone(),
-            vec![Arc::new(StringArray::from(vec!["{}", "[]"])) as ArrayRef],
+            vec![Arc::new(LargeBinaryArray::from(vec![
+                b"\x01\x80\x01\x00".as_slice(),
+                b"\x01\x60\x01\x00".as_slice(),
+            ])) as ArrayRef],
             2,
             owner.storage_lifetime(),
             |step| owner.observe(0, &[], step),
@@ -1213,10 +1216,10 @@ mod runtime_projection_tests {
         assert_eq!(
             output.columns()[0]
                 .as_any()
-                .downcast_ref::<StringArray>()
+                .downcast_ref::<LargeBinaryArray>()
                 .unwrap()
                 .value(1),
-            "[]"
+            b"\x01\x60\x01\x00"
         );
         let weak = Arc::downgrade(&factory);
         let output = output.into_batch_projection();

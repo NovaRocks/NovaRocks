@@ -327,7 +327,10 @@ where
 mod typed_tests {
     use super::*;
     use crate::exec::chunk::ChunkSlotSchema;
-    use arrow::array::{Array, ArrayRef, DictionaryArray, Int32Array, StringArray, StructArray};
+    use crate::exec::chunk::typed_fixture::json_array;
+    use arrow::array::{
+        Array, ArrayRef, DictionaryArray, Int32Array, LargeBinaryArray, StringArray, StructArray,
+    };
     use arrow::datatypes::{Field, Int32Type};
     use novarocks_type_contract::{
         TypedValueBinding, ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
@@ -364,14 +367,16 @@ mod typed_tests {
                 .collect::<DictionaryArray<Int32Type>>(),
         );
         let sibling: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let documents: ArrayRef = Arc::new(json_array(&[Some("{}"), None, Some("[]")]));
         let fields = vec![
             Arc::new(Field::new("payload", dictionary.data_type().clone(), true)),
             Arc::new(Field::new("row", DataType::Int32, false)),
+            Arc::new(Field::new("document", DataType::LargeBinary, true)),
         ];
         let array: ArrayRef = Arc::new(
             StructArray::try_new(
                 fields.clone().into(),
-                vec![dictionary.clone(), sibling.clone()],
+                vec![dictionary.clone(), sibling.clone(), documents.clone()],
                 None,
             )
             .unwrap(),
@@ -387,8 +392,13 @@ mod typed_tests {
         let value = ValueTypeRef::try_new(
             ValueKind::Struct(
                 vec![
-                    ValueField::new("payload", json, storage.clone()),
+                    ValueField::new(
+                        "payload",
+                        ValueTypeRef::try_new(ValueKind::String, true, storage.clone()).unwrap(),
+                        storage.clone(),
+                    ),
                     ValueField::new("row", row, storage.clone()),
+                    ValueField::new("document", json, storage.clone()),
                 ]
                 .into_boxed_slice(),
             ),
@@ -444,12 +454,26 @@ mod typed_tests {
             .downcast_ref::<StructArray>()
             .unwrap();
         assert!(Arc::ptr_eq(&sibling, &flat_array.columns()[1]));
-        let json = flat_array.columns()[0]
+        let text = flat_array.columns()[0]
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert_eq!(json.value(0), "{}");
-        assert!(json.is_null(1));
+        assert_eq!(text.value(0), "{}");
+        assert!(text.is_null(1));
+        let json = flat_array.columns()[2]
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(json.to_data(), documents.to_data());
+        assert_eq!(
+            flat.chunk_schema().slots()[0]
+                .typed_binding()
+                .value_type()
+                .child_type_at(2)
+                .unwrap()
+                .domain(),
+            Some(ValueLogicalType::Json),
+        );
         assert!(
             source
                 .columns()
@@ -528,14 +552,11 @@ mod typed_tests {
                 .into_iter()
                 .collect::<DictionaryArray<Int32Type>>(),
         );
-        let value = ValueTypeRef::try_new(
-            ValueKind::Nominal(ValueLogicalType::Json),
-            true,
-            ValueTypeStorageLifetime::pure(),
-        )
-        .unwrap();
+        let value =
+            ValueTypeRef::try_new(ValueKind::String, true, ValueTypeStorageLifetime::pure())
+                .unwrap();
         let mut source = typed_chunk(
-            Field::new("json", array.data_type().clone(), true),
+            Field::new("text", array.data_type().clone(), true),
             value,
             array,
         );

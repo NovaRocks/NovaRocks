@@ -165,3 +165,33 @@ pub(crate) fn reordered_map_keys() -> (Chunk, FunctionValueType) {
         ty,
     )
 }
+
+/// Encode selected fixture documents with the production native JSON value author.
+pub(crate) fn json_array(documents: &[Option<&str>]) -> arrow::array::LargeBinaryArray {
+    use novarocks_functions::{
+        KernelFailure,
+        json_value::{JsonWork, parse},
+    };
+
+    struct Work;
+    impl JsonWork for Work {
+        type Reservation = ();
+
+        fn step(&mut self) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+
+        fn reserve(&mut self, _: usize) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+
+        fn reserve_output(&mut self, _: usize) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+    }
+
+    documents
+        .iter()
+        .map(|value| value.map(|text| parse(text, &mut Work).unwrap()))
+        .collect()
+}

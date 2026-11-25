@@ -773,7 +773,7 @@ fn explicit_json_text_public_recipes_preserve_required_child_contracts() {
     let layout = ValueLayout::try_new(
         &DataType::List(Arc::new(arrow_schema::Field::new(
             "json",
-            DataType::Utf8,
+            DataType::LargeBinary,
             false,
         ))),
         storage,

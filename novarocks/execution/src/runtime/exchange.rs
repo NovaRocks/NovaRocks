@@ -2262,7 +2262,7 @@ mod tests;
 mod typed_receiver_header_tests {
     use super::*;
     use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFactory};
-    use arrow::array::{DictionaryArray, Int32Array, StringArray};
+    use arrow::array::{DictionaryArray, Int32Array, LargeBinaryArray, StringArray};
     use arrow::datatypes::{Field, Int32Type};
     use novarocks_type_contract::{
         TypedValueBinding, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
@@ -2273,29 +2273,37 @@ mod typed_receiver_header_tests {
         // The fixture is a genuine pure frozen author. Its JSON declaration is
         // independent of the IPC field and of any arbitrary source attributes.
         let storage = ValueTypeStorageLifetime::pure();
-        let value = ValueTypeRef::try_new(
-            ValueKind::Nominal(ValueLogicalType::Json),
-            false,
-            storage.clone(),
-        )
-        .unwrap();
-        let binding = TypedValueBinding::try_new(
-            value,
-            ValueLayout::try_new(&DataType::Utf8, storage.clone()).unwrap(),
-        )
-        .unwrap();
-        let slot = crate::exec::chunk::ChunkSlotSchema::try_new_typed(
-            SlotId::new(9),
-            Arc::new(Field::new("payload", DataType::Utf8, false)),
-            binding,
-            None,
-            storage.clone(),
-        )
-        .unwrap();
+        let slots = [
+            (9, "payload", ValueKind::String, DataType::Utf8),
+            (
+                10,
+                "document",
+                ValueKind::Nominal(ValueLogicalType::Json),
+                DataType::LargeBinary,
+            ),
+        ]
+        .into_iter()
+        .map(|(slot, name, kind, carrier)| {
+            let value = ValueTypeRef::try_new(kind, false, storage.clone()).unwrap();
+            let binding = TypedValueBinding::try_new(
+                value,
+                ValueLayout::try_new(&carrier, storage.clone()).unwrap(),
+            )
+            .unwrap();
+            crate::exec::chunk::ChunkSlotSchema::try_new_typed(
+                SlotId::new(slot),
+                Arc::new(Field::new(name, carrier, false)),
+                binding,
+                None,
+                storage.clone(),
+            )
+            .unwrap()
+        })
+        .collect();
         Arc::new(
             crate::exec::chunk::ChunkSchema::try_new_typed_observed::<
                 crate::runtime::task::ExecutionFailure,
-            >(vec![slot], storage, |_| Ok(()), |_| Ok(()))
+            >(slots, storage, |_| Ok(()), |_| Ok(()))
             .unwrap(),
         )
     }
@@ -2310,19 +2318,23 @@ mod typed_receiver_header_tests {
         .unwrap()
     }
     fn dictionary_batch() -> RecordBatch {
-        // Only key 0 is selected; the unused NULL dictionary value is legal for
-        // this required JSON source. The descriptor belongs to the real IPC
-        // occurrence, not to JSON value identity.
-        let array: ArrayRef = Arc::new(
+        // Only dictionary key 0 is selected. The unused NULL belongs to
+        // the ordinary text encoding; native JSON is a separate column.
+        let text: ArrayRef = Arc::new(
             DictionaryArray::<Int32Type>::try_new(
                 Int32Array::from(vec![0]),
                 Arc::new(StringArray::from(vec![Some("{}"), None])),
             )
             .unwrap(),
         );
+        let json: ArrayRef = Arc::new(LargeBinaryArray::from(vec![&[1, 0x80, 1, 0][..]]));
         #[allow(deprecated)]
-        let field = Field::new_dict("wire_payload", array.data_type().clone(), false, 271, false);
-        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap()
+        let field = Field::new_dict("wire_payload", text.data_type().clone(), false, 271, false);
+        let schema = Schema::new(vec![
+            field,
+            Field::new("wire_document", DataType::LargeBinary, false),
+        ]);
+        RecordBatch::try_new(Arc::new(schema), vec![text, json]).unwrap()
     }
     fn key() -> ExchangeKey {
         ExchangeKey {
@@ -2368,7 +2380,7 @@ mod typed_receiver_header_tests {
         let batch = dictionary_batch();
         let original_array = batch.column(0).clone();
         let wire = ExchangeWireMeta {
-            slot_ids_by_index: vec![SlotId::new(33)],
+            slot_ids_by_index: vec![SlotId::new(33), SlotId::new(34)],
         };
         let refusal = materialize_chunk_for_wire_meta(
             &expected,
@@ -2398,7 +2410,7 @@ mod typed_receiver_header_tests {
         let batch = dictionary_batch();
         let source_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
             batch.schema().as_ref(),
-            &[SlotId::new(33)],
+            &[SlotId::new(33), SlotId::new(34)],
         )
         .unwrap();
         let source = Chunk::new_with_chunk_schema(batch, source_schema);
@@ -2430,7 +2442,7 @@ mod typed_receiver_header_tests {
         let chunk = chunks.remove(0);
         let schema = chunk.chunk_schema_ref();
         assert_eq!(
-            schema.slots()[0].typed_binding().value_type().domain(),
+            schema.slots()[1].typed_binding().value_type().domain(),
             Some(ValueLogicalType::Json)
         );
         assert!(!schema.slots()[0].nullable());
@@ -2442,6 +2454,14 @@ mod typed_receiver_header_tests {
             assert_eq!(schema.slots()[0].field().dict_id(), Some(ipc_id));
             assert_eq!(schema.slots()[0].field().dict_is_ordered(), Some(ipc_order));
         }
+        assert_eq!(
+            chunk.columns()[1]
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap()
+                .value(0),
+            &[1, 0x80, 1, 0]
+        );
         registry.remove_exchange_key(key());
         drop(registry);
         drop(factory);
@@ -2501,9 +2521,9 @@ mod bounded_root_header_tests {
     }
     #[test]
     fn bounded_root_sole_typed_writer_preserves_plain_nested_dictionary_and_count_only() {
-        use arrow::array::{DictionaryArray, Int32Array, ListArray, StringArray};
+        use arrow::array::{DictionaryArray, Int32Array, LargeBinaryArray, ListArray, StringArray};
         use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-        use arrow::datatypes::Int32Type;
+        use arrow::datatypes::{Field, Int32Type};
         let pure = ValueTypeStorageLifetime::pure();
         let plain = source(
             Arc::new(Int32Array::from(vec![7, 9])),
@@ -2531,6 +2551,30 @@ mod bounded_root_header_tests {
                     item,
                     OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2])),
                     dict,
+                    None,
+                )
+                .unwrap(),
+            ),
+            ValueTypeRef::try_new(
+                ValueKind::List(
+                    ValueTypeRef::try_new(ValueKind::String, true, pure.clone()).unwrap(),
+                ),
+                false,
+                pure.clone(),
+            )
+            .unwrap(),
+            2,
+        );
+        let json = Arc::new(LargeBinaryArray::from(vec![
+            &[1, 0x80, 1, 0][..],
+            &[1, 0x60, 1, 0][..],
+        ]));
+        let json = source(
+            Arc::new(
+                ListArray::try_new(
+                    Arc::new(Field::new("item", DataType::LargeBinary, true)),
+                    OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2])),
+                    json,
                     None,
                 )
                 .unwrap(),
@@ -2565,7 +2609,7 @@ mod bounded_root_header_tests {
             crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), tracker.clone(), Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         ).unwrap();
         let baseline = tracker.current();
-        for input in [&plain, &nested, &count] {
+        for input in [&plain, &nested, &json, &count] {
             let encoded = encode_chunks_bounded_with_creation(
                 std::slice::from_ref(input),
                 true,

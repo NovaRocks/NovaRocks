@@ -682,7 +682,7 @@ fn actual_public_compiler_functions_keep_primary_h_and_real_bounded_scope_exit()
 fn nonempty_original_request() -> novarocks_expression_contract::PhysicalCallRequest {
     use novarocks_physical_plan::StaticFunctionArgument as A;
     let json = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         true,
         novarocks_type_contract::ValueLogicalType::Json,
     )

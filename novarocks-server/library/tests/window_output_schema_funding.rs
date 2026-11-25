@@ -146,9 +146,12 @@ fn bigint() -> FunctionValueType {
 }
 fn nested() -> FunctionValueType {
     let storage = ValueTypeStorageLifetime::pure();
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let fields = vec![ValueField::new(
         "child_".repeat(100),
         json.value_type().clone(),
@@ -156,8 +159,8 @@ fn nested() -> FunctionValueType {
     )];
     let physical = vec![Arc::new(Field::new(
         "child_".repeat(100),
-        DataType::Utf8,
-        true,
+        json.data_type().clone(),
+        json.nullable(),
     ))];
     let value = ValueTypeRef::try_new(
         ValueKind::Struct(fields.into_boxed_slice()),

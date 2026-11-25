@@ -680,10 +680,10 @@ fn structure_signature_correspondence_ignores_only_legacy_effects_and_keeps_full
         );
     }
     let mut nominal = original.clone();
-    nominal.result_type = ValueType::new(DataType::Utf8, true);
+    nominal.result_type = ValueType::new(DataType::LargeBinary, true);
     let mut json = nominal.clone();
     json.result_type = ValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         true,
         novarocks_type_contract::ValueLogicalType::Json,
     )

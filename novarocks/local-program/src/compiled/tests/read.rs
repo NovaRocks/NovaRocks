@@ -153,7 +153,7 @@ fn draft() -> ConnectorReadRelationRecipeDraft {
 fn schema() -> Schema {
     Schema::new_with_metadata(
         vec![
-            Field::new("json_source", DataType::Utf8, true).with_metadata(HashMap::from([
+            Field::new("json_source", DataType::LargeBinary, true).with_metadata(HashMap::from([
                 ("provider.field-id".into(), "17".into()),
                 ("provider.note".into(), "retained".into()),
             ])),
@@ -166,7 +166,7 @@ fn frozen() -> FrozenConnectorRead {
         draft(),
         vec![StaticScanAssignment::new(
             Arc::from("json_source"),
-            ConnectorValueType::Varchar,
+            ConnectorValueType::NonComparable,
         )],
         TupleDomain::all(),
         TupleDomain::all(),
@@ -202,7 +202,7 @@ fn legacy() -> StaticConnectorScan {
         recipe,
         vec![StaticScanAssignment::new(
             Arc::from("json_source"),
-            ConnectorValueType::Varchar,
+            ConnectorValueType::NonComparable,
         )],
         TupleDomain::all(),
         TupleDomain::all(),

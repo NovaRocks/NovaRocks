@@ -220,11 +220,11 @@ mod tests {
         FunctionOverloadId, FunctionValueType, ValueLogicalType, ValueTypeError,
     };
     fn selected(logical: ValueLogicalType) -> FunctionBindingSelection {
-        let input =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, logical).unwrap();
+        let input = FunctionValueType::try_with_logical_type(DataType::LargeBinary, false, logical)
+            .unwrap();
         let state = FunctionValueType::new(DataType::Int64, false);
         FunctionBindingSelection {
-            overload: FunctionOverloadId::try_new("test/aggregate/utf8/v1").unwrap(),
+            overload: FunctionOverloadId::try_new("test/aggregate/large-binary/v1").unwrap(),
             argument_types: FunctionArgumentTypes::from_pure_boxed(
                 vec![FunctionArgumentType::Value(input.clone())].into_boxed_slice(),
             ),

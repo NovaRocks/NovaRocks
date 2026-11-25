@@ -111,8 +111,12 @@ fn assert_real_null_list_cast(
     let expected = columns
         .iter()
         .map(|(name, domain, len)| {
-            let item =
-                FunctionValueType::try_with_logical_type(DataType::Utf8, true, *domain).unwrap();
+            let carrier = if *domain == novarocks_type_contract::ValueLogicalType::Json {
+                DataType::LargeBinary
+            } else {
+                DataType::Utf8
+            };
+            let item = FunctionValueType::try_with_logical_type(carrier, true, *domain).unwrap();
             let value_type = FunctionValueType::try_from_value(
                 ValueTypeRef::try_new(
                     ValueKind::List(item.value_type().clone()),
@@ -121,7 +125,11 @@ fn assert_real_null_list_cast(
                 )
                 .unwrap(),
                 ValueLayout::try_from_normalized_arrow(
-                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                    DataType::List(Arc::new(Field::new(
+                        "item",
+                        item.data_type().clone(),
+                        item.nullable(),
+                    ))),
                     ValueTypeStorageLifetime::pure(),
                 )
                 .unwrap(),

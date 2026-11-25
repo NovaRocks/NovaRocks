@@ -902,7 +902,11 @@ mod tests {
             ValueTypeRef::try_new(ValueKind::Nominal(L::Json), true, storage.clone()).unwrap();
         let value = ValueTypeRef::try_new(ValueKind::List(child), false, storage.clone()).unwrap();
         let layout = ValueLayout::try_new(
-            &DataType::LargeList(Arc::new(Field::new("anonymous", DataType::Utf8, true))),
+            &DataType::LargeList(Arc::new(Field::new(
+                "anonymous",
+                DataType::LargeBinary,
+                true,
+            ))),
             storage.clone(),
         )
         .unwrap();

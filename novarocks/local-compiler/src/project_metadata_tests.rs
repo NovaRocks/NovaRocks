@@ -447,12 +447,13 @@ fn recipe(
 fn project_metadata_recipe_counts_typed_occurrences_without_external_metadata_or_dictionary_boxes()
 {
     let physical = FunctionValueType::new(DataType::Utf8, true);
+    let physical_binary = FunctionValueType::new(DataType::LargeBinary, true);
     let dictionary = FunctionValueType::new(
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
         true,
     );
     let json = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         true,
         novarocks_type_contract::ValueLogicalType::Json,
     )
@@ -483,7 +484,7 @@ fn project_metadata_recipe_counts_typed_occurrences_without_external_metadata_or
         );
         assert_eq!(
             recipe(&json, count),
-            physical,
+            recipe(&physical_binary, count),
             "complete nominal binding is shared without an execution metadata map"
         );
         assert_eq!(

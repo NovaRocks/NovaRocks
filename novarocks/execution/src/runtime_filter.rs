@@ -1645,9 +1645,9 @@ mod typed_channel_identity_tests {
     use novarocks_functions::FunctionValueType;
     #[test]
     fn membership_channel_keeps_complete_semantics_separate_from_physical_artifact_digest() {
-        let text = FunctionValueType::new(DataType::Utf8, true);
+        let binary = FunctionValueType::new(DataType::LargeBinary, true);
         let json = FunctionValueType::try_with_logical_type(
-            DataType::Utf8,
+            DataType::LargeBinary,
             true,
             novarocks_type_contract::ValueLogicalType::Json,
         )
@@ -1661,12 +1661,12 @@ mod typed_channel_identity_tests {
             )
             .unwrap()
         };
-        let text = construct(text);
+        let binary = construct(binary);
         let json = construct(json);
-        assert_eq!(text.canonical_bytes(), json.canonical_bytes());
-        assert_eq!(text.digest(), json.digest());
+        assert_eq!(binary.canonical_bytes(), json.canonical_bytes());
+        assert_eq!(binary.digest(), json.digest());
         assert_ne!(
-            RuntimeFilterExecutionContract::Membership(text.clone()),
+            RuntimeFilterExecutionContract::Membership(binary.clone()),
             RuntimeFilterExecutionContract::Membership(json.clone())
         );
         assert_eq!(
@@ -1674,8 +1674,8 @@ mod typed_channel_identity_tests {
             novarocks_type_contract::ValueLogicalType::Json
         );
         assert_eq!(
-            construct(FunctionValueType::new(DataType::Utf8, true)),
-            text
+            construct(FunctionValueType::new(DataType::LargeBinary, true)),
+            binary
         );
     }
 }

@@ -54,7 +54,11 @@ fn parts(
         ValueLogicalType::Json,
     )
     .unwrap();
-    let carrier = DataType::LargeList(Arc::new(Field::new("source-element", DataType::Utf8, true)));
+    let carrier = DataType::LargeList(Arc::new(Field::new(
+        "source-element",
+        DataType::LargeBinary,
+        true,
+    )));
     let ty = FunctionValueType::try_from_value(
         ValueTypeRef::try_new(ValueKind::List(child.value_type().clone()), false, pure()).unwrap(),
         ValueLayout::try_new(&carrier, pure()).unwrap(),

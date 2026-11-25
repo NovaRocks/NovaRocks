@@ -1847,7 +1847,7 @@ fn join_nested_fixture_slot(
         if json {
             ValueKind::Nominal(ValueLogicalType::Json)
         } else {
-            ValueKind::String
+            ValueKind::Binary
         },
         child_nullable,
         storage.clone(),
@@ -1855,7 +1855,11 @@ fn join_nested_fixture_slot(
     .unwrap();
     let semantic =
         ValueTypeRef::try_new(ValueKind::List(child), root_nullable, storage.clone()).unwrap();
-    let dtype = DataType::List(Arc::new(Field::new("item", DataType::Utf8, child_nullable)));
+    let dtype = DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::LargeBinary,
+        child_nullable,
+    )));
     let binding = TypedValueBinding::try_new(
         semantic,
         ValueLayout::try_new(&dtype, storage.clone()).unwrap(),
@@ -1872,7 +1876,7 @@ fn join_nested_fixture_slot(
 }
 
 fn join_nested_fixture_source(id: u32, json: bool) -> crate::exec::chunk::Chunk {
-    use arrow::array::{ArrayRef, ListArray, StringArray};
+    use arrow::array::{ArrayRef, LargeBinaryArray, ListArray};
     use arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use arrow::datatypes::Field;
     use novarocks_type_contract::ValueTypeStorageLifetime;
@@ -1884,9 +1888,12 @@ fn join_nested_fixture_source(id: u32, json: bool) -> crate::exec::chunk::Chunk 
         .unwrap(),
     );
     let array: ArrayRef = Arc::new(ListArray::new(
-        Arc::new(Field::new("item", DataType::Utf8, true)),
+        Arc::new(Field::new("item", DataType::LargeBinary, true)),
         OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
-        Arc::new(StringArray::from(vec![Some("1"), None])),
+        Arc::new(LargeBinaryArray::from(vec![
+            Some(b"\x01\x4a\x01\x00\x00\x00".as_slice()),
+            None,
+        ])),
         None,
     ));
     let batch =

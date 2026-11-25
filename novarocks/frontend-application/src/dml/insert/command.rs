@@ -68,7 +68,7 @@ pub(crate) fn is_literal_expr(expr: &ast::Expr) -> bool {
                     printer::print_object_name(&function.name)
                         .to_ascii_lowercase()
                         .as_str(),
-                    "array" | "map" | "row" | "named_struct" | "parse_json"
+                    "array" | "map" | "row" | "named_struct" | "json_parse"
                 )
                 && function
                     .arguments
@@ -196,7 +196,7 @@ fn admission_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
             .then_some(Other),
         ast::Expr::FunctionCall(function) if plain_function(function) => {
             let name = printer::print_object_name(&function.name).to_ascii_lowercase();
-            if name == "parse_json" {
+            if name == "json_parse" {
                 return (function.arguments.len() == 1
                     && admission_literal_shape(&function.arguments[0].value) == Some(String))
                 .then_some(String);
@@ -409,5 +409,21 @@ mod tests {
             ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap(),
             ast::Expr::FunctionCall(_)
         ));
+    }
+
+    #[test]
+    fn current_json_parser_uses_the_original_literal_select_admission() {
+        for text in ["42", "{"] {
+            let command = convert(&format!("INSERT INTO t SELECT json_parse('{text}')")).unwrap();
+            assert!(literal_query(&command.source));
+            assert!(admission_literal_query(&command.source));
+        }
+        let error = convert("INSERT INTO t SELECT json_parse('42') UNION SELECT json_parse('43')")
+            .unwrap_err();
+        assert!(error.contains("requires UNION ALL"), "{error}");
+
+        let old = convert("INSERT INTO t SELECT parse_json('42')").unwrap();
+        assert!(!literal_query(&old.source));
+        assert!(!admission_literal_query(&old.source));
     }
 }

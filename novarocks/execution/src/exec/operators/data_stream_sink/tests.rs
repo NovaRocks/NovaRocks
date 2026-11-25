@@ -1649,7 +1649,7 @@ mod typed_sender_header_tests {
     };
     use crate::runtime::mem_tracker::MemTracker;
     use crate::runtime::task::ExecutionFailureCause;
-    use arrow::array::ListArray;
+    use arrow::array::{LargeBinaryArray, ListArray};
     use arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use novarocks_type_contract::{
         TypedValueBinding, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
@@ -1741,13 +1741,8 @@ mod typed_sender_header_tests {
             .unwrap(),
         );
         let pure = ValueTypeStorageLifetime::pure();
-        let json = ValueTypeRef::try_new(
-            ValueKind::Nominal(ValueLogicalType::Json),
-            true,
-            pure.clone(),
-        )
-        .unwrap();
-        let value = ValueTypeRef::try_new(ValueKind::List(json), false, pure).unwrap();
+        let text = ValueTypeRef::try_new(ValueKind::String, true, pure.clone()).unwrap();
+        let value = ValueTypeRef::try_new(ValueKind::List(text), false, pure).unwrap();
         source(list, value, 4, factory)
     }
     fn install_and_prepare(
@@ -1799,7 +1794,7 @@ mod typed_sender_header_tests {
         assert_eq!(tracker.current(), 0);
     }
     #[test]
-    fn oversized_typed_nested_dictionary_keeps_json_null_and_encoding_contract() {
+    fn oversized_typed_nested_dictionary_keeps_nullable_utf8_and_encoding_contract() {
         let fixture = Fixture::new();
         let tracker = MemTracker::new_root("sender typed nested dictionary slice");
         let factory = actual_factory(tracker.clone());
@@ -1820,10 +1815,7 @@ mod typed_sender_header_tests {
             let ValueKind::List(item) = value.kind() else {
                 panic!("complete List declaration")
             };
-            assert!(matches!(
-                item.kind(),
-                ValueKind::Nominal(ValueLogicalType::Json)
-            ));
+            assert!(matches!(item.kind(), ValueKind::String));
             assert!(
                 item.nullable(),
                 "the genuine Arrow child declaration permits the retained dictionary NULL"
@@ -1865,6 +1857,60 @@ mod typed_sender_header_tests {
         drop(source);
         drop(sink);
         drop(factory);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn oversized_typed_nested_json_preserves_sql_null_and_original_bytes() {
+        let fixture = Fixture::new();
+        let tracker = MemTracker::new_root("sender typed native JSON slice");
+        let factory = actual_factory(tracker.clone());
+        let pure = ValueTypeStorageLifetime::pure();
+        let item = ValueTypeRef::try_new(
+            ValueKind::Nominal(ValueLogicalType::Json),
+            true,
+            pure.clone(),
+        )
+        .unwrap();
+        let binding = ValueTypeRef::try_new(ValueKind::List(item), false, pure).unwrap();
+        let documents = [
+            Some(b"\x01\x80\x01\x00".as_slice()),
+            None,
+            Some(b"\x01\x60\x01\x00".as_slice()),
+            Some(b"\x01\x20".as_slice()),
+        ];
+        let list = ListArray::try_new(
+            Arc::new(Field::new("item", DataType::LargeBinary, true)),
+            OffsetBuffer::from_lengths([1; 4]),
+            Arc::new(LargeBinaryArray::from(documents.to_vec())),
+            None,
+        )
+        .unwrap();
+        let source = source(Arc::new(list), binding.clone(), 4, factory.as_ref());
+        let sink = install_and_prepare(&fixture, factory.clone());
+        let out = split_oversized_chunks_with_creation(
+            vec![source.clone()],
+            1,
+            None,
+            sink.construction_factory.as_ref().unwrap().as_ref(),
+        )
+        .unwrap();
+        assert_eq!(out.chunks.len(), documents.len());
+        for (piece, document) in out.chunks.iter().zip(documents) {
+            assert_eq!(piece.len(), 1);
+            assert_eq!(
+                piece.chunk_schema().slots()[0].typed_binding().value_type(),
+                &binding
+            );
+            let list = piece.columns()[0]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let array = list.value(0);
+            let value = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            assert_eq!(value.is_valid(0).then(|| value.value(0)), document);
+        }
+        drop((out, source, sink, factory));
         assert_eq!(tracker.current(), 0);
     }
 

@@ -2294,7 +2294,7 @@ fn actual_writer_compilation_keeps_source_types_and_checks_only_null_differences
             if json {
                 ValueKind::Nominal(ValueLogicalType::Json)
             } else {
-                ValueKind::String
+                ValueKind::Binary
             },
             child_nullable,
             storage.clone(),
@@ -2311,7 +2311,9 @@ fn actual_writer_compilation_keeps_source_types_and_checks_only_null_differences
         )
         .unwrap();
         let layout = ValueLayout::try_new(
-            &DataType::Struct(vec![Field::new("payload", DataType::Utf8, child_nullable)].into()),
+            &DataType::Struct(
+                vec![Field::new("payload", DataType::LargeBinary, child_nullable)].into(),
+            ),
             storage,
         )
         .unwrap();

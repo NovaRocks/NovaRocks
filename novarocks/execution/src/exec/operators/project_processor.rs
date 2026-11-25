@@ -1076,12 +1076,7 @@ mod tests {
     #[test]
     fn final_identity_keeps_supported_dictionary_carriers() {
         use novarocks_type_contract::FunctionValueType;
-        let declaration = FunctionValueType::try_with_logical_type(
-            DataType::LargeBinary,
-            true,
-            ValueLogicalType::Json,
-        )
-        .unwrap();
+        let declaration = FunctionValueType::new(DataType::Utf8, true);
         let array: ArrayRef = Arc::new(
             vec![Some("{}"), None, Some("[]"), Some("null")]
                 .into_iter()
@@ -1102,7 +1097,7 @@ mod tests {
                 .typed_binding()
                 .value_type()
                 .domain(),
-            Some(ValueLogicalType::Json)
+            None
         );
         assert!(output.schema().field(0).metadata().is_empty());
     }
@@ -1438,14 +1433,12 @@ mod tests {
             ValueLogicalType::Json,
         )
         .unwrap();
-        let source_format_field =
-            Field::new("payload", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
-                String,
-                String,
-            >::from([(
+        let source_format_field = Field::new("payload", DataType::LargeBinary, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
                 "nr_logical_type".into(),
                 "unknown format attribute".into(),
-            )]));
+            )]),
+        );
         let source_slot = ChunkSlotSchema::try_new_typed(
             SlotId::new(1),
             Arc::new(source_format_field.clone()),
@@ -1470,7 +1463,7 @@ mod tests {
         let target = |slot: ChunkSlotSchema| {
             ChunkSlotSchema::try_new_typed(
                 slot.slot_id(),
-                Arc::new(Field::new(slot.name(), DataType::Utf8, true)),
+                Arc::new(Field::new(slot.name(), DataType::LargeBinary, true)),
                 slot.typed_binding().clone(),
                 slot.unique_id(),
                 ValueTypeStorageLifetime::pure(),
@@ -1484,8 +1477,8 @@ mod tests {
             )
             .unwrap(),
         );
-        for values in [vec![Some("{}")], Vec::new()] {
-            let array: ArrayRef = Arc::new(StringArray::from(values));
+        for values in [vec![Some(b"\x01\x80\x01\x00".as_slice())], Vec::new()] {
+            let array: ArrayRef = Arc::new(arrow::array::LargeBinaryArray::from(values));
             let rows = array.len();
             let input = Chunk::try_new_typed_with_columns_owned_observed::<
                 crate::runtime::task::ExecutionFailure,
@@ -1824,9 +1817,10 @@ mod owned_project_tests {
             storage.clone(),
         )
         .unwrap();
-        let text = ValueTypeRef::try_new(ValueKind::String, true, storage.clone()).unwrap();
-        let layout =
-            DataType::Struct(vec![Arc::new(Field::new("member", DataType::Utf8, true))].into());
+        let binary = ValueTypeRef::try_new(ValueKind::Binary, true, storage.clone()).unwrap();
+        let layout = DataType::Struct(
+            vec![Arc::new(Field::new("member", DataType::LargeBinary, true))].into(),
+        );
         let author = |member| {
             FunctionValueType::try_from_value(
                 ValueTypeRef::try_new(
@@ -1842,13 +1836,15 @@ mod owned_project_tests {
             .unwrap()
         };
         let source = author(json);
-        let target = author(text);
+        let target = author(binary);
         let column: ArrayRef = Arc::new(arrow::array::StructArray::new(
             match &layout {
                 DataType::Struct(fields) => fields.clone(),
                 _ => unreachable!(),
             },
-            vec![Arc::new(StringArray::from(vec!["[]"]))],
+            vec![Arc::new(arrow::array::LargeBinaryArray::from(vec![
+                b"\x01\x60\x01\x00".as_slice(),
+            ]))],
             None,
         ));
         let owner = owner(storage.clone(), false);

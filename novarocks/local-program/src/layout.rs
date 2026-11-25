@@ -1295,7 +1295,11 @@ mod tests {
         fn list(kind: ValueKind, child_nullable: bool, nullable: bool) -> TypedValueBinding {
             complete(
                 value(ValueKind::List(value(kind, child_nullable)), nullable),
-                &DataType::List(Arc::new(Field::new("item", DataType::Utf8, child_nullable))),
+                &DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::LargeBinary,
+                    child_nullable,
+                ))),
             )
         }
         fn declared(
@@ -1345,7 +1349,7 @@ mod tests {
         assert!(provider.writer_projection_matches(&execution).unwrap());
         for wrong in [
             declared(
-                list(ValueKind::String, false, false),
+                list(ValueKind::Binary, false, false),
                 "document",
                 1,
                 Some(9),
@@ -1566,7 +1570,11 @@ mod tests {
 
     #[test]
     fn exact_slot_semantics_change_identity_without_arrow_schema_change() {
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::LargeBinary,
+            true,
+        )]));
         let slots: Arc<[SlotId]> = Arc::from([SlotId::new(7)]);
         let unspecified = StaticLayout::try_new(schema.clone(), slots.clone()).unwrap();
         let control = OriginalControl::default();
@@ -1574,7 +1582,7 @@ mod tests {
             schema.clone(),
             slots.clone(),
             vec![(
-                complete(value(ValueKind::String, true), &DataType::Utf8),
+                complete(value(ValueKind::Binary, true), &DataType::LargeBinary),
                 None,
             )],
             &control,
@@ -1586,7 +1594,7 @@ mod tests {
             vec![(
                 complete(
                     value(ValueKind::Nominal(ValueLogicalType::Json), true),
-                    &DataType::Utf8,
+                    &DataType::LargeBinary,
                 ),
                 None,
             )],
@@ -1597,7 +1605,7 @@ mod tests {
             schema.clone(),
             slots.clone(),
             vec![(
-                complete(value(ValueKind::String, true), &DataType::Utf8),
+                complete(value(ValueKind::Binary, true), &DataType::LargeBinary),
                 Some(3),
             )],
             &control,
@@ -1766,7 +1774,7 @@ mod tests {
             ValueKind::List(value(ValueKind::Nominal(ValueLogicalType::Json), true)),
             true,
         );
-        let carrier = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let carrier = DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true)));
         let facts = vec![
             (
                 complete(value(ValueKind::String, true), &DataType::Utf8),

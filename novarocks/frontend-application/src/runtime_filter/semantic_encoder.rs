@@ -631,7 +631,6 @@ mod tests {
         for (carrier, logical) in [
             (DataType::Int32, ValueLogicalType::Physical),
             (DataType::Utf8, ValueLogicalType::Physical),
-            (DataType::LargeBinary, ValueLogicalType::Json),
             (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
             (DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
         ] {
@@ -646,6 +645,31 @@ mod tests {
                 .expect("the original scalar RF carrier is supported");
                 assert_complete_domain(&encoded, std::slice::from_ref(&source));
             }
+        }
+    }
+
+    #[test]
+    fn native_json_is_rejected_as_a_runtime_filter_membership_carrier() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        for nullable in [false, true] {
+            let json = FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                nullable,
+                ValueLogicalType::Json,
+            )
+            .unwrap();
+            let Err(error) = encode_logical_domain(RuntimeFilterLogicalDomainFacts::Membership {
+                value_type: json,
+                null_semantics: RuntimeFilterNullSemantics::NeverMatches,
+            }) else {
+                panic!("JSON is not an admitted native runtime filter carrier");
+            };
+            assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+            assert!(
+                error
+                    .to_string()
+                    .contains("runtime filter native type does not support LargeBinary")
+            );
         }
     }
 

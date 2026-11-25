@@ -2382,7 +2382,7 @@ mod tests {
             },
         )
         .unwrap()
-        .into_field(format!("v{id}"), DataType::Utf8, false);
+        .into_field(format!("v{id}"), DataType::LargeBinary, false);
         ChunkSlotSchema::try_new_with_metadata_origins(
             SlotId::new(id),
             Arc::clone(owner.field()),
@@ -2397,7 +2397,7 @@ mod tests {
     fn owned_slot_derivation_preserves_identity_only_for_unchanged_field() {
         let source = owned_slot(7);
         let unchanged = source
-            .with_type_and_nullable(DataType::Utf8, false)
+            .with_type_and_nullable(DataType::LargeBinary, false)
             .unwrap();
         assert!(Arc::ptr_eq(source.field_ref(), unchanged.field_ref()));
         let renamed_slot = source.with_slot_id(SlotId::new(9)).unwrap();
@@ -2441,7 +2441,7 @@ mod tests {
             construction_bytes: 4096,
         };
         let item =
-            ArrowMetadataOwner::try_new(vec![("nr_logical_type".into(), "json".into())], limits)
+            ArrowMetadataOwner::try_new(vec![("provider.field-id".into(), "17".into())], limits)
                 .unwrap()
                 .into_field("item".into(), DataType::Utf8, false);
         let list = ArrowMetadataOwner::try_new(vec![], limits)
@@ -2469,6 +2469,7 @@ mod tests {
                 None,
             )
             .unwrap(),
+            owned_slot(2),
         ])
         .unwrap();
         let actual_item = Arc::new(Field::new(
@@ -2483,12 +2484,14 @@ mod tests {
         ));
         let actual_type = DataType::Struct(vec![actual_list].into());
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "root",
-                actual_type.clone(),
-                true,
-            )])),
-            vec![arrow::array::new_empty_array(&actual_type)],
+            Arc::new(Schema::new(vec![
+                Field::new("root", actual_type.clone(), true),
+                Field::new("v2", DataType::LargeBinary, false),
+            ])),
+            vec![
+                arrow::array::new_empty_array(&actual_type),
+                arrow::array::new_empty_array(&DataType::LargeBinary),
+            ],
         )
         .unwrap();
         let aligned = super::align_chunk_schema_to_batch(&batch, &source).unwrap();
@@ -2504,7 +2507,12 @@ mod tests {
         };
         assert!(!Arc::ptr_eq(&old_item, item));
         assert!(!Arc::ptr_eq(&old_list, &fields[0]));
-        assert_eq!(logical_type_of_field(item), Some(LogicalType::Json));
+        assert_eq!(item.metadata()["provider.field-id"], "17");
+        assert_eq!(logical_type_of_field(item), None);
+        let json = &aligned.slots()[1];
+        assert_eq!(json.data_type(), &DataType::LargeBinary);
+        assert_eq!(logical_type_of_field(json.field()), Some(LogicalType::Json));
+        assert!(Arc::ptr_eq(json.field_ref(), source.slots()[1].field_ref()));
         assert!(item.is_nullable());
         assert!(origins.metadata_bytes_for(item).is_some());
         assert!(origins.metadata_bytes_for(&fields[0]).is_some());
@@ -2532,7 +2540,7 @@ mod tests {
         let child =
             ArrowMetadataOwner::try_new(vec![("nr_logical_type".into(), "json".into())], limits)
                 .unwrap()
-                .into_field("item".into(), DataType::Utf8, true);
+                .into_field("item".into(), DataType::LargeBinary, true);
         let exact_child = Arc::clone(child.field());
         let root = ArrowMetadataOwner::try_new(vec![], limits)
             .unwrap()
@@ -2554,10 +2562,12 @@ mod tests {
             ])
             .unwrap(),
         );
-        let foreign = Arc::new(Field::new("item", DataType::Utf8, true));
+        let foreign = Arc::new(Field::new("item", DataType::LargeBinary, true));
         let values = Arc::new(StructArray::new(
             vec![Arc::clone(&foreign)].into(),
-            vec![Arc::new(StringArray::from(vec![Some("{}")]))],
+            vec![Arc::new(crate::exec::chunk::typed_fixture::json_array(&[
+                Some("{}"),
+            ]))],
             None,
         )) as ArrayRef;
         let chunk = Chunk::try_new_with_columns(schema, vec![values]).unwrap();
@@ -2687,7 +2697,7 @@ mod tests {
         let slots = original_source.slot_ids();
         let schema = Arc::new(Schema::new(
             (0..257)
-                .map(|id| Field::new(format!("v{id}"), DataType::Utf8, false))
+                .map(|id| Field::new(format!("v{id}"), DataType::LargeBinary, false))
                 .collect::<Vec<_>>(),
         ));
         let declared = crate::exec::chunk::typed_fixture::layout(schema.clone(), slots, &types);
@@ -2926,7 +2936,8 @@ mod tests {
             storage.clone(),
         )
         .unwrap();
-        let carrier = DataType::Struct(vec![Field::new("payload", DataType::Utf8, true)].into());
+        let carrier =
+            DataType::Struct(vec![Field::new("payload", DataType::LargeBinary, true)].into());
         let field = Arc::new(Field::new("output", carrier.clone(), false));
         let binding = TypedValueBinding::try_new(
             value,
@@ -3091,17 +3102,21 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "payload",
-                DataType::Utf8,
+                DataType::LargeBinary,
                 true,
             )])),
-            vec![Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#)])) as ArrayRef],
+            vec![
+                Arc::new(crate::exec::chunk::typed_fixture::json_array(&[Some(
+                    r#"{"a":1}"#,
+                )])) as ArrayRef,
+            ],
         )
         .expect("record batch");
         let contract = Arc::new(
             ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                 SlotId::new(9),
                 field_with_logical_type(
-                    Field::new("payload", DataType::Utf8, false),
+                    Field::new("payload", DataType::LargeBinary, false),
                     LogicalType::Json,
                 ),
                 None,

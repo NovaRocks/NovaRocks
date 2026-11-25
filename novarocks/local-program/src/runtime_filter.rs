@@ -1063,22 +1063,23 @@ mod tests {
     fn complete_domain_and_original_canonical_are_paired_without_semantic_inference() {
         use novarocks_type_contract::{FunctionValueType as V, ValueLogicalType};
         let canonical = FilterMembershipSchema::try_new(
-            &DataType::LargeBinary,
+            &DataType::FixedSizeBinary(16),
             FilterNullSemantics::NeverMatches,
         )
         .unwrap();
         let bytes = StaticFilterContract::membership_from_canonical(
             canonical.clone(),
-            V::new(DataType::LargeBinary, false),
+            V::new(DataType::FixedSizeBinary(16), false),
         )
         .unwrap();
-        let json = StaticFilterContract::membership_from_canonical(
+        let uuid = StaticFilterContract::membership_from_canonical(
             canonical.clone(),
-            V::try_with_logical_type(DataType::LargeBinary, false, ValueLogicalType::Json).unwrap(),
+            V::try_with_logical_type(DataType::FixedSizeBinary(16), false, ValueLogicalType::Uuid)
+                .unwrap(),
         )
         .unwrap();
         assert_ne!(
-            bytes, json,
+            bytes, uuid,
             "equal artifact bytes do not author complete execution domains"
         );
         assert!(matches!(
@@ -1369,7 +1370,7 @@ mod aggregate_topn_key_tests {
                     .unwrap()
             ));
             assert!(!is_aggregate_topn_key_type(
-                &V::try_with_logical_type(DataType::Utf8, nullable, L::Json).unwrap()
+                &V::try_with_logical_type(DataType::LargeBinary, nullable, L::Json).unwrap()
             ));
         }
     }

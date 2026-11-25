@@ -384,8 +384,11 @@ fn runtime_json_object_ordered_filter_suppresses_and_maps_selected_errors() {
     }
     let (predicates, schema) = selected.expect("SQL produced an ordered two-predicate Filter/Scan");
     for demanded in [false, true] {
-        let tracker = demanded.then(|| MemTracker::new_root("native-json-filter"));
-        let control = runtime_control(tracker);
+        let memory = demanded.then(super::bound);
+        let mut control = super::control(memory.as_ref(), Arc::default());
+        if demanded {
+            control.bind_mem_tracker(MemTracker::new_root("native-json-filter"));
+        }
         let columns = schema
             .fields()
             .iter()

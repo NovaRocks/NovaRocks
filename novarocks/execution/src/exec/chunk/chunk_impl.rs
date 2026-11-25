@@ -1782,35 +1782,43 @@ mod shared_batch_projection_tests {
 
     #[test]
     fn strict_nested_dictionary_slice_reuses_ingress_proof_and_keeps_actual_creation_holds() {
+        use crate::exec::chunk::typed_fixture::json_array;
         use crate::exec::pipeline::operator::input_construction::{
             ConstructionFailure, try_runtime_input_construction_factory,
         };
         use crate::runtime::runtime_state::RuntimeErrorState;
-        use arrow::array::StringArray;
+        use arrow::array::{LargeBinaryArray, StringArray};
         use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
         use novarocks_type_contract::{ValueField, ValueLogicalType};
 
         let pure = ValueTypeStorageLifetime::pure();
+        let texts = Arc::new(StringArray::from(vec![
+            r#""first""#,
+            r#""second""#,
+            r#""third""#,
+        ]));
         let dictionary: ArrayRef = Arc::new(
             DictionaryArray::<Int32Type>::try_new(
                 Int32Array::from(vec![Some(0), None, Some(1), Some(2), Some(0)]),
-                Arc::new(StringArray::from(vec![
-                    r#""first""#,
-                    r#""second""#,
-                    r#""third""#,
-                ])),
+                texts.clone(),
             )
             .unwrap(),
         );
+        let documents = Arc::new(json_array(&[
+            Some(r#""first""#),
+            None,
+            Some(r#""second""#),
+            Some(r#""third""#),
+            Some(r#""first""#),
+        ]));
         let item = Arc::new(
             StructArray::try_new(
-                vec![Arc::new(Field::new(
-                    "payload",
-                    dictionary.data_type().clone(),
-                    true,
-                ))]
+                vec![
+                    Arc::new(Field::new("payload", dictionary.data_type().clone(), true)),
+                    Arc::new(Field::new("document", DataType::LargeBinary, true)),
+                ]
                 .into(),
-                vec![dictionary],
+                vec![dictionary, documents.clone()],
                 None,
             )
             .unwrap(),
@@ -1832,7 +1840,15 @@ mod shared_batch_projection_tests {
         .unwrap();
         let item = ValueTypeRef::try_new(
             ValueKind::Struct(
-                vec![ValueField::new("payload", json, pure.clone())].into_boxed_slice(),
+                vec![
+                    ValueField::new(
+                        "payload",
+                        ValueTypeRef::try_new(ValueKind::String, true, pure.clone()).unwrap(),
+                        pure.clone(),
+                    ),
+                    ValueField::new("document", json, pure.clone()),
+                ]
+                .into_boxed_slice(),
             ),
             true,
             pure.clone(),
@@ -1945,7 +1961,7 @@ mod shared_batch_projection_tests {
                 .value_type()
                 .child_type_at(0)
                 .unwrap()
-                .child_type_at(0)
+                .child_type_at(1)
                 .unwrap()
                 .domain(),
             Some(ValueLogicalType::Json),
@@ -1974,16 +1990,24 @@ mod shared_batch_projection_tests {
             .unwrap();
         assert_eq!(
             values.value(dictionary.keys().value(2) as usize),
-            r#""second""#
+            texts.value(1)
         );
         assert_eq!(
             values.value(dictionary.keys().value(3) as usize),
-            r#""third""#
+            texts.value(2)
         );
         assert_eq!(
             values.value(dictionary.keys().value(4) as usize),
-            r#""first""#
+            texts.value(0)
         );
+        let json = item
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        for row in [2, 3, 4] {
+            assert_eq!(json.value(row), documents.value(row));
+        }
         let projection = output.into_batch_projection();
         drop(owner);
         drop(source);

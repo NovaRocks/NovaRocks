@@ -1500,7 +1500,7 @@ mod tests {
         )
         .unwrap();
         let layout = novarocks_type_contract::ValueLayout::try_new(
-            &DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, false))),
+            &DataType::LargeList(Arc::new(Field::new("item", DataType::LargeBinary, false))),
             novarocks_type_contract::ValueTypeStorageLifetime::pure(),
         )
         .unwrap();
@@ -1523,7 +1523,7 @@ mod tests {
             .collect::<Vec<_>>();
         altered[4] = Arc::new(Field::new(
             "exact_state",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, false))),
             true,
         ));
         assert!(

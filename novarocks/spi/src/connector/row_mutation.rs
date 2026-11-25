@@ -1727,10 +1727,14 @@ mod typed_execution_fields_tests {
     fn mutation_field_keeps_explicit_nested_json_and_opaque_source_attributes() {
         let item = value(
             ValueKind::Nominal(ValueLogicalType::Json),
-            DataType::Utf8,
+            DataType::LargeBinary,
             false,
         );
-        let carrier = DataType::List(Arc::new(Field::new("item", DataType::Utf8, false)));
+        let carrier = DataType::List(Arc::new(Field::new(
+            "item",
+            item.data_type().clone(),
+            item.nullable(),
+        )));
         let declared = value(
             ValueKind::List(item.value_type().clone()),
             carrier.clone(),
@@ -1766,17 +1770,25 @@ mod typed_execution_fields_tests {
         let token = ConnectorWriteFieldToken::from_bytes([3; 32]);
         let child = value(
             ValueKind::Nominal(ValueLogicalType::Json),
-            DataType::Utf8,
+            DataType::LargeBinary,
             false,
         );
         let declared = value(
             ValueKind::List(child.value_type().clone()),
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            DataType::List(Arc::new(Field::new(
+                "item",
+                child.data_type().clone(),
+                child.nullable(),
+            ))),
             true,
         );
         let widened = Field::new(
             "document",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            DataType::List(Arc::new(Field::new(
+                "item",
+                child.data_type().clone(),
+                true,
+            ))),
             true,
         );
         assert_eq!(
@@ -1910,20 +1922,23 @@ mod typed_match_digest_tests {
     fn text() -> FunctionValueType {
         value(ValueKind::String, DataType::Utf8, false)
     }
+    fn binary() -> FunctionValueType {
+        value(ValueKind::Binary, DataType::LargeBinary, false)
+    }
     fn json() -> FunctionValueType {
         value(
             ValueKind::Nominal(ValueLogicalType::Json),
-            DataType::Utf8,
+            DataType::LargeBinary,
             false,
         )
     }
     #[test]
     fn match_identity_covers_same_carrier_domain_in_each_declared_role() {
-        let baseline = contract(text(), text(), text(), HashMap::new());
+        let baseline = contract(binary(), binary(), binary(), HashMap::new());
         for changed in [
-            contract(json(), text(), text(), HashMap::new()),
-            contract(text(), json(), text(), HashMap::new()),
-            contract(text(), text(), json(), HashMap::new()),
+            contract(json(), binary(), binary(), HashMap::new()),
+            contract(binary(), json(), binary(), HashMap::new()),
+            contract(binary(), binary(), json(), HashMap::new()),
         ] {
             // Arrow names, NULL promises, attrs and carriers are identical.
             assert_eq!(
@@ -1986,13 +2001,13 @@ mod typed_match_digest_tests {
         assert!(!Arc::ptr_eq(first_item, second_item));
         let first = contract(text(), text(), first_type, HashMap::new());
         let independently_equal = contract(text(), text(), second_type, HashMap::new());
-        let text_child = contract(text(), text(), nested(text()), HashMap::new());
+        let binary_child = contract(text(), text(), nested(binary()), HashMap::new());
         assert_eq!(
             first.after_fields()[0].field(),
-            text_child.after_fields()[0].field()
+            binary_child.after_fields()[0].field()
         );
         assert_eq!(first.digest(), independently_equal.digest());
-        assert_ne!(first.digest(), text_child.digest());
+        assert_ne!(first.digest(), binary_child.digest());
     }
     #[test]
     fn match_source_attributes_and_schema_identity_stay_separate() {
@@ -2013,7 +2028,7 @@ mod typed_match_digest_tests {
             second.after_fields()[0].execution_type()
         );
         assert_ne!(first.digest(), second.digest());
-        let schema = Schema::new(vec![Field::new("after", DataType::Utf8, false)]);
+        let schema = Schema::new(vec![Field::new("after", DataType::LargeBinary, false)]);
         assert_eq!(
             canonical_schema_digest(&schema).unwrap(),
             canonical_schema_digest(&Schema::new(vec![

@@ -1153,9 +1153,13 @@ mod tests {
         };
         let storage = ValueTypeStorageLifetime::pure();
         let child =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, child_nullable, domain)
+            FunctionValueType::try_with_logical_type(DataType::LargeBinary, child_nullable, domain)
                 .unwrap();
-        let item = Arc::new(Field::new("item", DataType::Utf8, child_nullable));
+        let item = Arc::new(Field::new(
+            "item",
+            child.data_type().clone(),
+            child.nullable(),
+        ));
         let layout = if large {
             DataType::LargeList(item)
         } else {

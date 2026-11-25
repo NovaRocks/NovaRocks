@@ -333,7 +333,11 @@ fn explicit_execution_binding_keeps_nested_nominal_null_and_offset_contracts() {
     .unwrap();
     let logical =
         ValueTypeRef::try_new(ValueKind::List(child.value_type().clone()), false, pure()).unwrap();
-    let carrier = DataType::LargeList(Arc::new(Field::new("source-role", DataType::Utf8, true)));
+    let carrier = DataType::LargeList(Arc::new(Field::new(
+        "source-role",
+        DataType::LargeBinary,
+        true,
+    )));
     let binding =
         FunctionValueType::try_from_value(logical, ValueLayout::try_new(&carrier, pure()).unwrap())
             .unwrap();
@@ -358,12 +362,12 @@ fn explicit_execution_binding_keeps_nested_nominal_null_and_offset_contracts() {
         Schema::new(vec![Field::new("value", binding.data_type().clone(), true)]),
         Schema::new(vec![Field::new(
             "value",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true))),
             false,
         )]),
         Schema::new(vec![Field::new(
             "value",
-            DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, false))),
+            DataType::LargeList(Arc::new(Field::new("item", DataType::LargeBinary, false))),
             false,
         )]),
     ] {
