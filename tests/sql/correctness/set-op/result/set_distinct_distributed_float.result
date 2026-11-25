@@ -2,8 +2,8 @@
 -- types	double
 common_key
 NULL
-0.0
 NaN
+0.0
 
 -- query 8
 -- types	integer

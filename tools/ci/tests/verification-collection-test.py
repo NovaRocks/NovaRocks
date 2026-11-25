@@ -121,6 +121,23 @@ class Collection(unittest.TestCase):
         records[2]["oracle"]["executed"] = [{"step": 1, "kind": "expected_error", "outcome": "fail"}]
         self.assertTrue(check("sql", value.sql_file(records), 1)["safe_to_continue"])
 
+    def test_sql_iceberg_view_oracles_allow_continuation_after_another_case_fails(self):
+        value = self.fixture()
+        records = value.sql()
+        required = [{"step": 1, "kind": "iceberg_view_fixture"},
+                    {"step": 2, "kind": "iceberg_view_fixture_unchanged"}]
+        oracle = {"required": required,
+                  "executed": [dict(assertion, outcome="pass", policy={}) for assertion in required]}
+        records[2]["oracle"] = oracle
+        records[3].update(status="fail", failure={"class": "error_code", "error_code": "unregistered"})
+        records[-1]["exit_code"] = 1
+        result = check("sql", value.sql_file(records), 1)
+        self.assertTrue(result["safe_to_continue"], result)
+
+        oracle["executed"].pop()
+        result = check("sql", value.sql_file(records), 1)
+        self.assertFalse(result["safe_to_continue"], result)
+
     def test_sql_parent_invocation_identity_and_exact_material_are_required(self):
         value = self.fixture()
         sql = value.sql_file(value.sql())
