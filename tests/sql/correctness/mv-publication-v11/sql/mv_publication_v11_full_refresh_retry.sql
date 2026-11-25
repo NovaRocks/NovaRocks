@@ -90,36 +90,39 @@ SPARK_SCALA
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala"
 
 -- query 9
+-- An unpublished MV with the first slot snapshot still requires a full build.
+-- @skip_result_check=true
+CREATE MATERIALIZED VIEW refusal_mv WITH (refresh_policy = 'MANUAL') AS SELECT k, v FROM fact;
+ALTER MATERIALIZED VIEW refusal_mv SET PROPERTIES refresh_paused = false;
+
+-- query 10
 -- @result_contains=MV_RETRY_LIMIT_SET
 shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-mv-retry-limit-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
-printf '%s\n' "ALTER TABLE ice_rest.ns_${uuid0}.target_mv SET TBLPROPERTIES ('commit.retry.num-retries'='0');" > "$tmp_sql"
+printf '%s\n' "ALTER TABLE ice_rest.ns_${uuid0}.refusal_mv SET TBLPROPERTIES ('commit.retry.num-retries'='0');" > "$tmp_sql"
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 printf '%s\n' MV_RETRY_LIMIT_SET
 
--- query 10
+-- query 11
 -- @result_contains=MV_OCC_BASELINE
 shell: set -eu
-curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}/tables/target_mv' \
+curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}/tables/refusal_mv' \
   | python3 -c 'import json, sys; json.dump(json.load(sys.stdin)["metadata"], open(sys.argv[1], "w")); print("MV_OCC_BASELINE")' "${TMPDIR:-/tmp}/novarocks-mv-no-retry-${uuid0}.json"
 
--- query 11
--- @publication_service_hold=ns_${uuid0}.target_mv
--- @publication_catalog_concurrent_shell=set -eu; tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-mv-occ-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "DELETE FROM ice_rest.ns_${uuid0}.target_mv WHERE k = 'west';" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
+-- query 12
+-- @publication_service_hold=ns_${uuid0}.refusal_mv
+-- @publication_catalog_concurrent_shell=set -eu; tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-mv-occ-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "INSERT INTO ice_rest.ns_${uuid0}.refusal_mv VALUES ('external', -1);" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 -- @expect_trino_error=TRANSACTION_CONFLICT,USER_ERROR
 -- @expect_error=Failed to commit the transaction during refresh materialized view:
-USE mvretry_${uuid0}.ns_${uuid0};
-SET SESSION "mvretry_${uuid0}".incremental_refresh_enabled = false;
-INSERT INTO fact VALUES ROW('south', 30);
-REFRESH MATERIALIZED VIEW target_mv;
+REFRESH MATERIALIZED VIEW mvretry_${uuid0}.ns_${uuid0}.refusal_mv;
 
--- query 12
+-- query 13
 -- @result_contains=MV_OCC_FIXED
 shell: set -eu
 baseline="${TMPDIR:-/tmp}/novarocks-mv-no-retry-${uuid0}.json"
 trap 'rm -f "$baseline"' EXIT
-curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}/tables/target_mv' \
+curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}/tables/refusal_mv' \
   | python3 -c '
 import json
 import sys
@@ -143,26 +146,25 @@ assert {k: v for k, v in before["properties"].items() if k.startswith("novarocks
 print("MV_OCC_FIXED")
 ' "$baseline"
 
--- query 13
+-- query 14
 -- @skip_result_check=true
 CREATE MATERIALIZED VIEW repartition_mv WITH (refresh_policy = 'MANUAL') AS SELECT k, v FROM fact;
 REFRESH MATERIALIZED VIEW repartition_mv;
 
--- query 14
+-- query 15
 -- @result_contains=MV_OCC_BASELINE
 shell: set -eu
 curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}/tables/repartition_mv' \
   | python3 -c 'import json, sys; json.dump(json.load(sys.stdin)["metadata"], open(sys.argv[1], "w")); print("MV_OCC_BASELINE")' "${TMPDIR:-/tmp}/novarocks-mv-repartition-${uuid0}.json"
 
--- query 15
+-- query 16
 -- @publication_service_hold=ns_${uuid0}.repartition_mv
 -- @publication_catalog_concurrent_shell=set -eu; tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-mv-occ-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "DELETE FROM ice_rest.ns_${uuid0}.repartition_mv WHERE k = 'east';" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 -- @expect_trino_error=ICEBERG_COMMIT_ERROR,EXTERNAL
 -- @expect_error=Failed to commit the transaction during refresh materialized view: Materialized view storage table changed during repartition
-USE mvretry_${uuid0}.ns_${uuid0};
-ALTER MATERIALIZED VIEW repartition_mv SET PROPERTIES partitioning = ARRAY['truncate(k, 2)'];
+ALTER MATERIALIZED VIEW mvretry_${uuid0}.ns_${uuid0}.repartition_mv SET PROPERTIES partitioning = ARRAY['truncate(k, 2)'];
 
--- query 16
+-- query 17
 -- @result_contains=MV_OCC_FIXED
 shell: set -eu
 baseline="${TMPDIR:-/tmp}/novarocks-mv-repartition-${uuid0}.json"
@@ -191,17 +193,18 @@ assert {k: v for k, v in before["properties"].items() if k.startswith("novarocks
 print("MV_OCC_FIXED")
 ' "$baseline"
 
--- query 17
+-- query 18
 -- @cleanup=true
 -- @skip_result_check=true
 shell: rm -f "${TMPDIR:-/tmp}/novarocks-mv-no-retry-${uuid0}.json" "${TMPDIR:-/tmp}/novarocks-mv-repartition-${uuid0}.json"
 
--- query 18
+-- query 19
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS mvretry_${uuid0}.ns_${uuid0}.repartition_mv;
+DROP MATERIALIZED VIEW IF EXISTS mvretry_${uuid0}.ns_${uuid0}.refusal_mv;
 
--- query 19
+-- query 20
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS mvretry_${uuid0}.ns_${uuid0}.target_mv;

@@ -238,8 +238,14 @@ impl Hold {
         let updated = held[2]["updated_metadata"]
             .as_str()
             .context("hold updated metadata missing")?;
+        let commit = held[2]["commit_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("held commit identity missing")?;
         ensure!(
             held.iter().all(|event| event["table"] == self.table)
+                && held[4]["commit_id"] == commit
+                && held[5]["commit_id"] == commit
                 && held[4]["base_metadata"] == base
                 && held[4]["updated_metadata"] == updated
                 && held[5]["base_metadata"] == base
@@ -281,11 +287,12 @@ impl Hold {
             }),
             "REST service did not refresh after the JDBC conflict"
         );
+        // A service worker can handle a fresh request after the conflict.
         ensure!(
             !events.iter().any(|event| {
                 event["event"] == "delegate-commit-start"
                     && event["table"] == self.table
-                    && event["thread"] == thread
+                    && (event["commit_id"] == commit || event["base_metadata"] == base)
                     && event["sequence"]
                         .as_u64()
                         .is_some_and(|n| n > conflict_sequence)
