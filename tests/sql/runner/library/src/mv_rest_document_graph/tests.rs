@@ -486,7 +486,7 @@ fn retirement_wire_binds_the_exact_original_operation() {
     payload.extend_from_slice(&[26, 16]);
     payload.extend_from_slice(&[4; 16]);
     payload.extend_from_slice(&[32, 11, 40, 9, 48, 1]);
-    let frame = |payload| format!("2.-.{}", URL_SAFE_NO_PAD.encode(payload));
+    let frame = |payload: &[u8]| format!("2.-.{}", URL_SAFE_NO_PAD.encode(payload));
     let first = wire::retirement(&frame(&payload)).unwrap();
     assert_eq!(first.retired, [3; 16]);
     assert_eq!(first.operation, [4; 16]);
