@@ -49,6 +49,19 @@ pub(crate) struct RowWork<'a, 'c> {
     output: Option<OpaqueReservation>,
 }
 
+impl<'a, 'c> RowWork<'a, 'c> {
+    pub(crate) fn new(
+        work: &'a mut EvaluationCheckpoints<'c>,
+        charge: &'a OpaqueRetainedCharge,
+    ) -> Self {
+        Self {
+            work,
+            charge,
+            output: None,
+        }
+    }
+}
+
 impl JsonWork for RowWork<'_, '_> {
     type Reservation = OpaqueReservation;
 
@@ -160,11 +173,7 @@ pub(crate) fn assemble_bytes<'a, O: OffsetSizeTrait>(
 
     let mut inherited = inherited.iter().peekable();
     for (ordinal, batch_row) in selection.iter().enumerate() {
-        let mut row = RowWork {
-            work,
-            charge: &charge,
-            output: None,
-        };
+        let mut row = RowWork::new(work, &charge);
         row.step()?;
         let inherited_error = if inherited
             .peek()

@@ -1431,6 +1431,27 @@ impl PreparedCastRecipe {
             }
         }
     }
+    /// Write one prepared JSON-to-VARCHAR row directly into the caller's
+    /// already admitted output. JSON null and row errors remain distinct.
+    pub(crate) fn with_json_varchar_row<T>(
+        &self,
+        argument: EvaluatedArgument<'_>,
+        ordinal: usize,
+        logical_row: usize,
+        work: &mut crate::builtin::json_sql_selected::RowWork<'_, '_>,
+        emit: impl FnOnce(
+            &str,
+            &mut crate::builtin::json_sql_selected::RowWork<'_, '_>,
+        ) -> Result<T, KernelFailure>,
+    ) -> Result<Option<T>, crate::builtin::json_sql_selected::RowFailure> {
+        let CastBody::NativeJson(json_mode::Operation::From(json_mode::Target::Varchar(max))) =
+            self.body
+        else {
+            return Err(invalid("JSON VARCHAR row requires its prepared CAST body").into());
+        };
+        json_mode::with_varchar_row(self, argument, ordinal, logical_row, max, work, emit)
+    }
+
     /// The host excludes inherited errors before this selected-row operation.
     /// Both the actual address and concrete scalar carrier are checked before NULL.
     pub fn evaluate_row(

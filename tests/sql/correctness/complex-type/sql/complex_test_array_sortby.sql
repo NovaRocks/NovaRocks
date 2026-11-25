@@ -505,7 +505,7 @@ CREATE TABLE test_array_sortby (
     array_varchar ARRAY<VARCHAR(100)>,
     array_datetime ARRAY<TIMESTAMP(6)>,
     array_date ARRAY<DATE>,
-    -- Iceberg persists JSON as STRING; readback has the STRING domain.
+    -- Persist JSON source text as VARCHAR for parsing after the Iceberg scan.
     array_json ARRAY<VARCHAR>
 ) WITH (format_version = 3);
 

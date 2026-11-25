@@ -21,9 +21,12 @@ use allocator_api2::vec::Vec as HostVec;
 use arrow_array::{Array, ListArray, StringArray};
 use arrow_buffer::{Buffer, NullBufferBuilder, OffsetBuffer};
 use arrow_schema::DataType;
-use novarocks_type_contract::{FunctionValueType, PureCompileControl, TrinoCastMode};
+use novarocks_type_contract::{
+    FunctionValueType, PureCompileControl, TrinoCastMode, ValueLogicalType,
+};
 
 use super::array_scalar_output::scratch;
+use super::json_sql_selected::{RowFailure, RowWork};
 use super::value_conversion_temporal::TemporalTextCast;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::cast::{CastPrepareError, CastRowResult, PreparedCastRecipe};
@@ -33,14 +36,15 @@ use crate::opaque_memory::OpaqueRetainedCharge;
 use crate::scalar_output_operation::with_scalar_output_peak;
 use crate::selected_copy::checked_utf8_output_offset;
 use crate::{
-    AggregateStateAllocator, EvaluatedArgument, KernelEvaluationControl, KernelFailure,
-    RowDataError, ScalarCallContract, ScalarCallInput, SelectedValues,
+    AggregateStateAllocator, DataFailureReason, EvaluatedArgument, KernelEvaluationControl,
+    KernelFailure, RowDataError, ScalarCallContract, ScalarCallInput, SelectedValues,
 };
 
 #[derive(Debug)]
 pub(super) enum ElementCast {
     Varchar,
     Standard(PreparedCastRecipe),
+    JsonVarchar(PreparedCastRecipe),
     Temporal {
         cast: TemporalTextCast,
         nullable: bool,
@@ -73,6 +77,8 @@ impl ElementCast {
         Ok(
             if prepared.is_identity() && element.data_type() == &DataType::Utf8 {
                 Self::Varchar
+            } else if element.logical_type() == ValueLogicalType::Json {
+                Self::JsonVarchar(prepared)
             } else {
                 Self::Standard(prepared)
             },
@@ -131,6 +137,21 @@ fn append(
     Ok(())
 }
 
+fn append_part(
+    output: &mut HostVec<u8, HostAggregateAllocator>,
+    separator: &str,
+    part: &str,
+    emitted: &mut bool,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<(), KernelFailure> {
+    if *emitted {
+        append(output, separator, work)?;
+    }
+    append(output, part, work)?;
+    *emitted = true;
+    Ok(())
+}
+
 pub(super) fn evaluate<'a>(
     input: ScalarCallInput<'_, 'a>,
     control: &dyn KernelEvaluationControl,
@@ -165,7 +186,8 @@ pub(super) fn evaluate<'a>(
         let mut offsets = scratch(count, allocator)?;
         let mut valid = scratch(selection.len(), allocator)?;
         let mut row_errors = scratch(selection.len(), allocator)?;
-        let cast_charge = OpaqueRetainedCharge::try_new(Arc::clone(host))?;
+        let mut cast_charge = OpaqueRetainedCharge::try_new(Arc::clone(host))?;
+        let mut diagnostic_bytes = 0usize;
         let child = source.values();
         let utf8 = child.as_any().downcast_ref::<StringArray>();
         offsets.push(0i32);
@@ -202,6 +224,42 @@ pub(super) fn evaluate<'a>(
                             })?
                             .value(item),
                         ),
+                        ElementCast::JsonVarchar(recipe) => {
+                            let result = recipe.with_json_varchar_row(
+                                EvaluatedArgument::Column(child),
+                                ordinal,
+                                item,
+                                &mut RowWork::new(&mut work, &cast_charge),
+                                |part, row| {
+                                    append_part(&mut payload, sep, part, &mut emitted, row.work)
+                                },
+                            );
+                            match result {
+                                Ok(Some(())) => continue,
+                                Ok(None) => fallback,
+                                Err(RowFailure::Outer(cause)) => return Err(cause),
+                                Err(RowFailure::Data { reason, message }) => {
+                                    let bytes =
+                                        message.len().min(crate::MAX_ROW_ERROR_MESSAGE_BYTES);
+                                    work.flush()?;
+                                    let mut grant = cast_charge.reserve_operation(bytes)?;
+                                    row_errors.push(RowDataError::with_reason(
+                                        ordinal,
+                                        DataFailureReason::Domain(reason),
+                                        message,
+                                    ));
+                                    diagnostic_bytes = diagnostic_bytes
+                                        .checked_add(bytes)
+                                        .ok_or(KernelFailure::ResourceExhausted)?;
+                                    cast_charge.reconcile_under_reservation(
+                                        diagnostic_bytes,
+                                        &mut grant,
+                                    )?;
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                        }
                         ElementCast::Standard(recipe) => {
                             // A single original CAST may materialize text while
                             // the growing join payload is still live.
@@ -243,11 +301,7 @@ pub(super) fn evaluate<'a>(
                     }
                 };
                 if let Some(part) = part {
-                    if emitted {
-                        append(&mut payload, sep, &mut work)?;
-                    }
-                    append(&mut payload, part, &mut work)?;
-                    emitted = true;
+                    append_part(&mut payload, sep, part, &mut emitted, &mut work)?;
                 }
             }
             if failed {

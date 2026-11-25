@@ -176,60 +176,96 @@ fn variable_row(
     logical_row: usize,
     work: &mut RowWork<'_, '_>,
 ) -> Result<Option<Vec<u8>>, RowFailure> {
-    let row = recipe.checked_row_with_shape(argument, ordinal, logical_row, work.work, |_| true)?;
-    let input = argument.array().as_ref();
-    if logical_is_null(input, row, 1, work.work)? {
-        return if recipe.source.nullable() {
-            Ok(None)
-        } else {
-            Err(invalid("non-null JSON CAST input contains an SQL NULL").into())
-        };
-    }
     match operation {
-        Operation::To => super::json_input::encode_selected(input, &recipe.source, row, work)
-            .map(Some)
-            .map_err(encode_failure),
-        Operation::From(Target::Varchar(max)) => {
-            let value = match checked_json(input, row, work.work)? {
-                Kind::Null => return Ok(None),
-                Kind::Scalar(value) => value,
-                _ => return Err(failed_cast()),
+        Operation::To => {
+            let Some(row) = checked_variable_row(recipe, argument, ordinal, logical_row, work)?
+            else {
+                return Ok(None);
             };
-            let mut scratch = json_value::FixedText::<256>::new();
-            let text = if let Scalar::String(text) = value {
-                text
-            } else {
-                // The installed SQL floating CAST author uses a bounded rendering workspace.
-                let _scratch_reservation = if matches!(value, Scalar::Real(_) | Scalar::Double(_)) {
-                    Some(work.reserve(super::varchar_row_temporary_extent(argument.array(), row)?)?)
-                } else {
-                    None
-                };
-                json_value::write_scalar_cast(&mut scratch, value, work.work)
-                    .map_err(encode_failure)?;
-                scratch.as_str()
-            };
-            if let Some(limit) = max {
-                for (ordinal, _) in text.chars().enumerate() {
-                    work.step()?;
-                    if ordinal >= limit as usize {
-                        return Err(failed_cast());
-                    }
-                }
-            }
-            work.reserve_output(text.len())?;
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(text.len())
-                .map_err(|_| KernelFailure::ResourceExhausted)?;
-            for chunk in text.as_bytes().chunks(256) {
-                work.step()?;
-                bytes.extend_from_slice(chunk);
-            }
-            Ok(Some(bytes))
+            super::json_input::encode_selected(argument.array().as_ref(), &recipe.source, row, work)
+                .map(Some)
+                .map_err(encode_failure)
         }
+        Operation::From(Target::Varchar(max)) => with_varchar_row(
+            recipe,
+            argument,
+            ordinal,
+            logical_row,
+            max,
+            work,
+            |text, work| {
+                work.reserve_output(text.len())?;
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(text.len())
+                    .map_err(|_| KernelFailure::ResourceExhausted)?;
+                for chunk in text.as_bytes().chunks(256) {
+                    work.step()?;
+                    bytes.extend_from_slice(chunk);
+                }
+                Ok(bytes)
+            },
+        ),
         _ => Err(internal("JSON CAST lost its variable result recipe").into()),
     }
+}
+
+fn checked_variable_row(
+    recipe: &PreparedCastRecipe,
+    argument: EvaluatedArgument<'_>,
+    ordinal: usize,
+    logical_row: usize,
+    work: &mut RowWork<'_, '_>,
+) -> Result<Option<usize>, RowFailure> {
+    let row = recipe.checked_row_with_shape(argument, ordinal, logical_row, work.work, |_| true)?;
+    if !logical_is_null(argument.array().as_ref(), row, 1, work.work)? {
+        return Ok(Some(row));
+    }
+    if recipe.source.nullable() {
+        return Ok(None);
+    }
+    Err(invalid("non-null JSON CAST input contains an SQL NULL").into())
+}
+
+pub(super) fn with_varchar_row<T>(
+    recipe: &PreparedCastRecipe,
+    argument: EvaluatedArgument<'_>,
+    ordinal: usize,
+    logical_row: usize,
+    max: Option<u32>,
+    work: &mut RowWork<'_, '_>,
+    emit: impl FnOnce(&str, &mut RowWork<'_, '_>) -> Result<T, KernelFailure>,
+) -> Result<Option<T>, RowFailure> {
+    let Some(row) = checked_variable_row(recipe, argument, ordinal, logical_row, work)? else {
+        return Ok(None);
+    };
+    let value = match checked_json(argument.array().as_ref(), row, work.work)? {
+        Kind::Null => return Ok(None),
+        Kind::Scalar(value) => value,
+        _ => return Err(failed_cast()),
+    };
+    let mut scratch = json_value::FixedText::<256>::new();
+    let text = if let Scalar::String(text) = value {
+        text
+    } else {
+        // The installed SQL floating CAST author uses a bounded rendering workspace.
+        let _scratch_reservation = if matches!(value, Scalar::Real(_) | Scalar::Double(_)) {
+            Some(work.reserve(super::varchar_row_temporary_extent(argument.array(), row)?)?)
+        } else {
+            None
+        };
+        json_value::write_scalar_cast(&mut scratch, value, work.work).map_err(encode_failure)?;
+        scratch.as_str()
+    };
+    if let Some(limit) = max {
+        for (ordinal, _) in text.chars().enumerate() {
+            work.step()?;
+            if ordinal >= limit as usize {
+                return Err(failed_cast());
+            }
+        }
+    }
+    Ok(Some(emit(text, work)?))
 }
 
 pub(super) fn evaluate_fixed(
