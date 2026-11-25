@@ -75,27 +75,22 @@ impl Groups {
             return Ok(None);
         }
 
+        let parent_at = |ordinal| -> Result<_, KernelFailure> {
+            parent(
+                selection
+                    .row(ordinal)
+                    .ok_or_else(|| internal("selected leaf row is absent"))?,
+            )
+        };
         let argument_bytes = mapped::bytes::<usize>(children.len())?;
         let _argument_hold = mapped::reserve(allocator, argument_bytes)?;
         let mut arguments = mapped::buffer(children.len())?;
         for (ordinal, child) in children.iter().enumerate() {
             if kernel.supports_scalar_broadcast(ordinal)
                 && let Value::Mapped(value) = child.uncontinued()
+                && repeats_wide_source(value, active, &parent_at, allocator, work)?
             {
-                let mut wide = false;
-                for &row in active {
-                    if let Some((array, row)) = value.value(row)
-                        && selected_payload(array, row)
-                            > size_of::<Group>() + size_of::<(usize, usize)>()
-                    {
-                        wide = true;
-                        break;
-                    }
-                    work.step()?;
-                }
-                if wide {
-                    arguments.push(ordinal);
-                }
+                arguments.push(ordinal);
             }
             work.step()?;
         }
@@ -110,13 +105,6 @@ impl Groups {
         let mut group_of = mapped::buffer(active.len())?;
         let mut groups: Vec<Group> = mapped::buffer(active.len())?;
         let mut hashes = mapped::ScopedMap::<u64, usize>::new();
-        let parent_at = |ordinal| -> Result<_, KernelFailure> {
-            parent(
-                selection
-                    .row(ordinal)
-                    .ok_or_else(|| internal("selected leaf row is absent"))?,
-            )
-        };
         let address = |argument: usize, ordinal: usize| {
             let Value::Mapped(value) = children[argument].uncontinued() else {
                 unreachable!("only mapped arguments are qualified for grouping")
@@ -328,56 +316,97 @@ impl Operand<'_> {
     }
 }
 
-// Only compares repeated source payload with actual grouping metadata. The
-// selected-copy author still computes the exact operation extent.
-fn selected_payload(array: &ArrayRef, row: usize) -> usize {
+fn repeats_wide_source(
+    value: &mapped::MappedValues,
+    active: &[usize],
+    parent_at: &dyn Fn(usize) -> Result<usize, KernelFailure>,
+    allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<bool, KernelFailure> {
+    let mut seen = mapped::ScopedMap::<(usize, usize, usize), ()>::new();
+    let grouping_bytes = size_of::<Group>() + size_of::<(usize, usize)>();
+    for &ordinal in active {
+        if let Some((slot, row)) = value.address(ordinal)
+            && selected_payload(&value.sources()[slot], row)
+                .is_none_or(|bytes| bytes > grouping_bytes)
+        {
+            let address = (parent_at(ordinal)?, slot, row);
+            if seen.get(&address).is_some() {
+                return Ok(true);
+            }
+            seen.insert(address, (), allocator, work)?;
+        }
+        work.step()?;
+    }
+    Ok(false)
+}
+
+// This heuristic only claims bytes it can derive cheaply from one actual
+// selected source row. A repeated non-fixed row with unknown payload is a
+// candidate for borrowing. The copy author still computes the actual extent.
+fn selected_payload(array: &ArrayRef, row: usize) -> Option<usize> {
+    let collection_bytes = |length: usize, item_width: Option<usize>| {
+        if length == 0 {
+            Some(0)
+        } else {
+            item_width.and_then(|width| length.checked_mul(width))
+        }
+    };
     match array.data_type() {
-        DataType::List(field) => array
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .map_or(0, |array| {
-                (array.value_length(row) as usize).saturating_mul(
-                    field
-                        .data_type()
-                        .primitive_width()
-                        .unwrap_or(size_of::<i32>()),
-                )
-            }),
+        DataType::List(field) => {
+            let array = array.as_any().downcast_ref::<ListArray>()?;
+            collection_bytes(
+                usize::try_from(array.value_length(row)).ok()?,
+                field.data_type().primitive_width(),
+            )
+        }
         DataType::LargeList(field) => {
+            let array = array.as_any().downcast_ref::<LargeListArray>()?;
+            collection_bytes(
+                usize::try_from(array.value_length(row)).ok()?,
+                field.data_type().primitive_width(),
+            )
+        }
+        DataType::Map(..) => {
+            let array = array.as_any().downcast_ref::<MapArray>()?;
+            let width = array
+                .keys()
+                .data_type()
+                .primitive_width()
+                .zip(array.values().data_type().primitive_width())
+                .and_then(|(key, value)| key.checked_add(value));
+            collection_bytes(usize::try_from(array.value_length(row)).ok()?, width)
+        }
+        DataType::Utf8 => usize::try_from(
             array
                 .as_any()
-                .downcast_ref::<LargeListArray>()
-                .map_or(0, |array| {
-                    (array.value_length(row) as usize).saturating_mul(
-                        field
-                            .data_type()
-                            .primitive_width()
-                            .unwrap_or(size_of::<i64>()),
-                    )
-                })
-        }
-        DataType::Map(..) => array
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .map_or(0, |array| {
-                (array.value_length(row) as usize).saturating_mul(size_of::<i32>())
-            }),
-        DataType::Utf8 => array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .map_or(0, |array| array.value_length(row) as usize),
-        DataType::LargeUtf8 => array
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .map_or(0, |array| array.value_length(row) as usize),
-        DataType::Binary => array
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .map_or(0, |array| array.value_length(row) as usize),
-        DataType::LargeBinary => array
-            .as_any()
-            .downcast_ref::<LargeBinaryArray>()
-            .map_or(0, |array| array.value_length(row) as usize),
-        _ => 0,
+                .downcast_ref::<StringArray>()?
+                .value_length(row),
+        )
+        .ok(),
+        DataType::LargeUtf8 => usize::try_from(
+            array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()?
+                .value_length(row),
+        )
+        .ok(),
+        DataType::Binary => usize::try_from(
+            array
+                .as_any()
+                .downcast_ref::<BinaryArray>()?
+                .value_length(row),
+        )
+        .ok(),
+        DataType::LargeBinary => usize::try_from(
+            array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()?
+                .value_length(row),
+        )
+        .ok(),
+        DataType::Null => Some(0),
+        DataType::Boolean => Some(1),
+        ty => ty.primitive_width(),
     }
 }

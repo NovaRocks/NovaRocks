@@ -254,6 +254,84 @@ fn scalar_call_protocol_borrows_wide_guarded_captures_in_the_original_body_batch
 }
 
 #[test]
+fn scalar_call_protocol_borrows_repeated_variable_width_capture() {
+    use arrow::array::{ListBuilder, StringBuilder};
+
+    let needles = 64;
+    let payload = "a".repeat(32 * 1024);
+    let mut left = ListBuilder::new(StringBuilder::new());
+    for ordinal in 0..needles {
+        left.values().append_value(format!(
+            "a distinct needle wider than the grouping metadata threshold {ordinal}"
+        ));
+    }
+    left.append(true);
+    let mut right = ListBuilder::new(StringBuilder::new());
+    right.values().append_value(&payload);
+    right.append(true);
+    let inputs = [
+        ("a", Arc::new(left.finish()) as ArrayRef, false),
+        ("b", Arc::new(right.finish()) as ArrayRef, false),
+    ];
+    let (compiled, batch) = program("filter(a, x -> contains(b, x))", &inputs);
+    let allocator = Arc::new(CountingAllocator::new(usize::MAX));
+    let mut evaluator = CompiledExpressionInstance::try_new_with_allocator(
+        compiled,
+        RootOrdinal::new(0),
+        &HarnessControl,
+        Some(allocator.clone()),
+    )
+    .unwrap();
+    let selection = Selection::all(1);
+    let (output, events) = observe(|| {
+        evaluator
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                novarocks_functions::ScalarInvocationActivation::Activated,
+                &HarnessControl,
+                &mut PassThroughCallHost,
+            )
+            .unwrap()
+    });
+    assert!(output.errors().is_empty());
+    let values = output
+        .values()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert!(!values.is_null(0));
+    assert_eq!(values.value_length(0), 0);
+
+    let mut leaf_rows = 0;
+    let mut capture_copy = 0;
+    for event in events {
+        match event {
+            Event::ScalarLeaf { rows, broadcast } => {
+                assert_eq!(broadcast, [0], "only the repeated source is broadcast");
+                leaf_rows += rows;
+            }
+            Event::Gather {
+                is_collection: true,
+                new_stock,
+            } => capture_copy += new_stock,
+            _ => {}
+        }
+    }
+    assert_eq!(leaf_rows, needles);
+    assert!(
+        capture_copy <= payload.len(),
+        "capture copy was {capture_copy} bytes"
+    );
+    drop(output);
+    drop(evaluator);
+    assert_eq!(allocator.outstanding(), 0);
+}
+
+#[test]
 fn array_invocation_frames_reuse_actual_ancestor_rows_across_intermediate_calls() {
     let inputs = [
         (

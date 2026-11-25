@@ -24,8 +24,8 @@ use super::*;
 use crate::primitives::PreparedNodeComparison;
 use arrow::array::{Array, BooleanArray};
 use novarocks_functions::{
-    ComparisonAllocator, CompositeComparisonResult, PreparedCompositeComparisonRecipe,
-    PreparedNullIfEquality,
+    AggregateStateAllocator, ComparisonAllocator, CompositeComparisonResult,
+    PreparedCompositeComparisonRecipe, PreparedNullIfEquality, opaque_memory::OpaqueReservation,
 };
 use novarocks_type_contract::EvaluationDemand;
 use std::{cell::RefCell, rc::Rc};
@@ -337,7 +337,30 @@ struct Child {
     // Compact parent positions, distinct from original batch rows.
     ordinals: Vec<usize>,
     value: OwnedValue,
+    ordinal_storage: Option<OpaqueReservation>,
 }
+struct BodyFrameMemory {
+    host: Arc<dyn AggregateStateAllocator>,
+    _input_rows: Option<OpaqueReservation>,
+    parent_ordinals: Option<OpaqueReservation>,
+    _control: Option<OpaqueReservation>,
+}
+
+impl BodyFrameMemory {
+    fn new(
+        host: &Arc<dyn AggregateStateAllocator>,
+        input_rows: Option<OpaqueReservation>,
+        parent_ordinals: Option<OpaqueReservation>,
+    ) -> Self {
+        Self {
+            host: Arc::clone(host),
+            _input_rows: input_rows,
+            parent_ordinals,
+            _control: None,
+        }
+    }
+}
+
 pub(super) struct Frame<K = ExpressionUseId> {
     occurrence: K,
     activation: novarocks_functions::ScalarInvocationActivation,
@@ -356,6 +379,7 @@ pub(super) struct Frame<K = ExpressionUseId> {
     boolean: Option<BooleanRows>,
     temporal: Option<TemporalValues>,
     membership: Option<novarocks_functions::native_inlist::InRows>,
+    _body_memory: Option<BodyFrameMemory>,
 }
 impl<K> Frame<K> {
     fn new(
@@ -367,25 +391,14 @@ impl<K> Frame<K> {
         needs_original_domain: bool,
         activation: novarocks_functions::ScalarInvocationActivation,
         parent_ordinals: Vec<usize>,
+        mut body_memory: Option<BodyFrameMemory>,
         work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<Self, KernelFailure> {
-        let output_rows = rows.clone();
         // IF's original author evaluates its condition on its actual parent
         // Chunk, then filters mixed branches. Output projection is independent.
-        if shape == ControlShape::If
+        let expands_if = shape == ControlShape::If
             && needs_original_domain
-            && activation == novarocks_functions::ScalarInvocationActivation::Activated
-        {
-            rows = domain.rows().to_vec();
-        }
-        // A demand-zero invocation does not construct or interleave a result
-        // before its original arity Data. Retain the actual domain storage,
-        // but do not invent an output-copy admission for nonexistent values.
-        if shape != ControlShape::NoArguments && supports_result(result_type) {
-            novarocks_functions::selected_copy::guarded_result_extent(result_type, rows.len())
-                .map_err(|_| KernelFailure::ResourceExhausted)?;
-            work.step()?;
-        }
+            && activation == novarocks_functions::ScalarInvocationActivation::Activated;
         let tracks_remaining = matches!(
             shape,
             ControlShape::Coalesce
@@ -402,13 +415,71 @@ impl<K> Frame<K> {
                 | ControlShape::NullIf
                 | ControlShape::Case { .. }
         );
+        if let Some(memory) = &mut body_memory {
+            let actual = if expands_if {
+                domain.rows().len()
+            } else {
+                rows.len()
+            };
+            let choice_rows = if tracks_choices { actual } else { 0 };
+            let remaining_rows = if tracks_remaining { actual } else { 0 };
+            let route_rows = if shape == ControlShape::If { actual } else { 0 };
+            let boolean_rows = if matches!(
+                shape,
+                ControlShape::Conjunction
+                    | ControlShape::Disjunction
+                    | ControlShape::Between { .. }
+            ) {
+                actual
+            } else {
+                0
+            };
+            let matched_rows = if matches!(shape, ControlShape::NullIf | ControlShape::Case { .. })
+            {
+                actual
+            } else {
+                0
+            };
+            let widened_rows = if expands_if { actual } else { 0 };
+            let requests = [
+                super::mapped::bytes::<usize>(rows.len())?,
+                super::mapped::bytes::<usize>(widened_rows)?,
+                super::mapped::bytes::<usize>(remaining_rows)?,
+                super::mapped::bytes::<usize>(matched_rows)?,
+                super::mapped::bytes::<Option<(usize, usize)>>(choice_rows)?,
+                super::mapped::bytes::<Option<bool>>(route_rows)?,
+                super::mapped::bytes::<Option<bool>>(boolean_rows)?,
+                super::mapped::bytes::<bool>(boolean_rows)?,
+            ];
+            let bytes = requests.into_iter().try_fold(0usize, |sum, amount| {
+                sum.checked_add(amount)
+                    .ok_or(KernelFailure::ResourceExhausted)
+            })?;
+            memory._control = super::mapped::reserve(Some(&memory.host), bytes)?;
+        }
+        let output_rows = rows.clone();
+        if expands_if {
+            rows = domain.rows().to_vec();
+        }
+        // A demand-zero invocation does not construct or interleave a result
+        // before its original arity Data. Retain the actual domain storage,
+        // but do not invent an output-copy admission for nonexistent values.
+        if shape != ControlShape::NoArguments && supports_result(result_type) {
+            novarocks_functions::selected_copy::guarded_result_extent(result_type, rows.len())
+                .map_err(|_| KernelFailure::ResourceExhausted)?;
+            work.step()?;
+        }
         let mut remaining = Vec::new();
         let mut choices = Vec::new();
         if tracks_remaining {
-            remaining.reserve(rows.len());
+            remaining
+                .try_reserve_exact(rows.len())
+                .map_err(|_| KernelFailure::ResourceExhausted)?;
         }
         if tracks_choices {
-            choices.reserve(rows.len());
+            choices
+                .try_reserve_exact(rows.len())
+                .map_err(|_| KernelFailure::ResourceExhausted)?;
         }
         if tracks_remaining || tracks_choices {
             for ordinal in 0..rows.len() {
@@ -449,6 +520,7 @@ impl<K> Frame<K> {
             boolean,
             temporal,
             membership: None,
+            _body_memory: body_memory,
         })
     }
     fn next_ordinals(
@@ -489,7 +561,11 @@ impl<K> Frame<K> {
         {
             return Ok(None);
         }
-        let mut ordinals = Vec::new();
+        let mut ordinals = if self._body_memory.is_some() {
+            super::mapped::buffer(self.rows.len())?
+        } else {
+            Vec::new()
+        };
         match shape {
             ControlShape::OrderedRegexp if self.next > 0 => {
                 if self.next > regexp::PATTERN_ORDINAL {
@@ -707,6 +783,7 @@ impl<K> Frame<K> {
         }
         self.children.push(Child {
             ordinals: child.ordinals,
+            ordinal_storage: child.ordinal_storage,
             value: OwnedValue::from_materialized(output),
         });
         if ordinal.is_multiple_of(2) {
@@ -842,6 +919,7 @@ impl<K> Frame<K> {
             ))?);
             self.children.push(Child {
                 ordinals: child.ordinals,
+                ordinal_storage: child.ordinal_storage,
                 value: OwnedValue::from_materialized(output),
             });
             return Ok(());
@@ -851,6 +929,7 @@ impl<K> Frame<K> {
         }
         let right = Child {
             ordinals: child.ordinals,
+            ordinal_storage: child.ordinal_storage,
             value: OwnedValue::from_materialized(output),
         };
         let mut parents = Vec::with_capacity(right.ordinals.len());
@@ -979,6 +1058,7 @@ impl<K> Frame<K> {
             }
             self.children.push(Child {
                 ordinals: child.ordinals,
+                ordinal_storage: child.ordinal_storage,
                 value: OwnedValue::from_materialized(materialized),
             });
             return Ok(());
@@ -1098,6 +1178,21 @@ impl<K> Frame<K> {
             return Ok(());
         }
         let child_index = self.children.len();
+        let _guard_scratch = if let Some(memory) = &self._body_memory {
+            let values = if matches!(shape, ControlShape::If) {
+                1
+            } else {
+                2
+            };
+            let rows = child
+                .ordinals
+                .len()
+                .checked_mul(values)
+                .ok_or(KernelFailure::ResourceExhausted)?;
+            super::mapped::reserve(Some(&memory.host), super::mapped::bytes::<usize>(rows)?)?
+        } else {
+            None
+        };
         let mut rows = Vec::with_capacity(child.ordinals.len());
         for &ordinal in &child.ordinals {
             rows.push(self.rows[ordinal]);
@@ -1123,7 +1218,9 @@ impl<K> Frame<K> {
             }
             if shape == ControlShape::If && child_index == 0 {
                 let mut errors = value.errors().iter().peekable();
-                self.routes.reserve(self.rows.len());
+                self.routes
+                    .try_reserve_exact(self.rows.len())
+                    .map_err(|_| KernelFailure::ResourceExhausted)?;
                 for ordinal in 0..rows.len() {
                     let route = if let Some(error) =
                         errors.next_if(|error| error.selected_ordinal() == ordinal)
@@ -1148,7 +1245,7 @@ impl<K> Frame<K> {
                 || case_result
             {
                 let mut errors = value.errors().iter().peekable();
-                let mut remaining = Vec::new();
+                let mut remaining = Vec::with_capacity(child.ordinals.len());
                 for (local, &parent) in child.ordinals.iter().enumerate() {
                     if errors
                         .peek()
@@ -1354,6 +1451,7 @@ impl<K> Frame<K> {
             }
             self.children.push(Child {
                 ordinals: child.ordinals,
+                ordinal_storage: child.ordinal_storage,
                 value: OwnedValue::from_materialized(output),
             });
             return Ok(());
@@ -1380,14 +1478,16 @@ impl<K> Frame<K> {
             return Ok(());
         }
         let mut child_errors = output.errors().iter().peekable();
-        let mut remaining = Vec::new();
+        let mut remaining = Vec::with_capacity(child.ordinals.len());
         if shape == ControlShape::If && child_index == 0 {
             let booleans = output
                 .values()
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| invalid("actual IF condition is not its frozen Boolean carrier"))?;
-            self.routes.reserve(self.rows.len());
+            self.routes
+                .try_reserve_exact(self.rows.len())
+                .map_err(|_| KernelFailure::ResourceExhausted)?;
             for (ordinal, _) in rows.iter().enumerate() {
                 let route = if child_errors
                     .peek()
@@ -1436,6 +1536,7 @@ impl<K> Frame<K> {
         }
         self.children.push(Child {
             ordinals: child.ordinals,
+            ordinal_storage: child.ordinal_storage,
             value: OwnedValue::from_materialized(output),
         });
         Ok(())
@@ -1947,6 +2048,7 @@ pub(super) fn evaluate_tree<'a, R>(
         needs_original.contains(&root_use),
         activation,
         Vec::new(),
+        None,
         work,
     )?;
     let mut driver = TreeDriver {
@@ -2132,6 +2234,15 @@ impl TreeDriver<'_, '_> {
                 rows: missing.clone(),
             });
             let invocation = &self.program.control_flow().uses()[&use_id];
+            let body_memory = allocator
+                .map(|host| {
+                    let rows = super::mapped::reserve(
+                        Some(host),
+                        super::mapped::bytes::<usize>(missing.len())?,
+                    )?;
+                    Ok::<_, KernelFailure>(BodyFrameMemory::new(host, rows, None))
+                })
+                .transpose()?;
             let first = Frame::new(
                 use_id,
                 invocation.control,
@@ -2141,6 +2252,7 @@ impl TreeDriver<'_, '_> {
                 false,
                 novarocks_functions::ScalarInvocationActivation::Activated,
                 Vec::new(),
+                body_memory,
                 work,
             )?;
             let selection = Selection::try_sparse_observed(batch_rows, &missing, || work.step())?;
@@ -2219,6 +2331,9 @@ impl TreeDriver<'_, '_> {
         let allocator = self.allocator.ok_or_else(|| {
             invalid("higher-order evaluation requires its original allocation host")
         })?;
+        if let Some(host) = work.scalar_host.as_deref() {
+            host.validate_frame_allocator(Some(allocator))?;
+        }
         let children = std::mem::take(&mut frame.children);
         let mut values = Vec::with_capacity(children.len());
         let mut inherited = BTreeMap::new();
@@ -2241,20 +2356,23 @@ impl TreeDriver<'_, '_> {
                 super::mapped::bytes::<[usize; 2]>(selection.len())?,
             )?
         };
-        let mut active_rows = Vec::new();
-        let mut active_ordinals = Vec::new();
+        let active_rows;
+        let active_ordinals;
         let call_selection = if inherited.is_empty() {
+            active_ordinals = Vec::new();
             selection
         } else {
-            active_rows = super::mapped::buffer(selection.len())?;
-            active_ordinals = super::mapped::buffer(selection.len())?;
+            let mut rows = super::mapped::buffer(selection.len())?;
+            let mut ordinals = super::mapped::buffer(selection.len())?;
             for (ordinal, row) in selection.iter().enumerate() {
                 if !inherited.contains_key(&ordinal) {
-                    active_rows.push(row);
-                    active_ordinals.push(ordinal);
+                    rows.push(row);
+                    ordinals.push(ordinal);
                 }
                 work.step()?;
             }
+            active_rows = rows;
+            active_ordinals = ordinals;
             Selection::try_sparse_observed(selection.batch_rows(), &active_rows, || work.step())?
         };
         let mut compact = Vec::with_capacity(values.len());
@@ -2336,9 +2454,9 @@ impl TreeDriver<'_, '_> {
                             let body_use = &program.control_flow().uses()[&body.body_use];
                             let result_type = body.contract.result_type().data_type();
                             let row_count = rows.element_rows();
-                            let _row_storage = super::mapped::reserve(
+                            let row_storage = super::mapped::reserve(
                                 Some(allocator),
-                                super::mapped::bytes::<[usize; 2]>(row_count)?,
+                                super::mapped::bytes::<usize>(row_count)?,
                             )?;
                             let mut selected = super::mapped::buffer(row_count)?;
                             for row in 0..row_count {
@@ -2366,16 +2484,21 @@ impl TreeDriver<'_, '_> {
                                 self.needs_original.contains(&body.body_use),
                                 novarocks_functions::ScalarInvocationActivation::Activated,
                                 Vec::new(),
+                                Some(BodyFrameMemory::new(allocator, row_storage, None)),
                                 work,
                             )?;
                             let selection = rows.all_elements();
                             let value = self.drive(first, Some(&lambda), None, instances, work)?;
                             let value = value.into_value_mapped(selection, work)?;
                             let output = value.materialize(selection, result_type, work)?;
+                            let output = constant_projection::rebuild_lambda_body_output(
+                                output.value,
+                                body.contract.result_type(),
+                                allocator,
+                                work,
+                            )?;
                             work.flush()?;
-                            demand
-                                .complete(&body.contract, output.value)
-                                .map_err(Into::into)
+                            demand.complete(&body.contract, output).map_err(Into::into)
                         })?;
                     }
                 }
@@ -2473,6 +2596,7 @@ impl TreeDriver<'_, '_> {
             }
             // ValidateOnly with no demanded rows enters no children or leaf.
             // Activated empty invocations retain their original arity behavior.
+            let mut ordinals_storage = None;
             let next = if reuse.is_some()
                 || frame.rows.is_empty()
                     && frame.activation
@@ -2494,6 +2618,14 @@ impl TreeDriver<'_, '_> {
                     })
                     .transpose()?
                     .unwrap_or(true);
+                if frame.next < invocation.arguments.len()
+                    && let Some(memory) = &frame._body_memory
+                {
+                    ordinals_storage = super::mapped::reserve(
+                        Some(&memory.host),
+                        super::mapped::bytes::<usize>(frame.rows.len())?,
+                    )?;
+                }
                 frame.next_ordinals(
                     invocation.control,
                     invocation.arguments.len(),
@@ -2505,6 +2637,20 @@ impl TreeDriver<'_, '_> {
             if let Some(ordinals) = next {
                 let child_use = invocation.arguments[frame.next];
                 frame.next += 1;
+                let child_memory = if let Some(memory) = &frame._body_memory {
+                    let selection_count = if original_domain {
+                        frame.domain.rows().len()
+                    } else {
+                        ordinals.len()
+                    };
+                    let rows = super::mapped::reserve(
+                        Some(&memory.host),
+                        super::mapped::bytes::<usize>(selection_count)?,
+                    )?;
+                    Some(BodyFrameMemory::new(&memory.host, rows, ordinals_storage))
+                } else {
+                    None
+                };
                 let (rows, child_domain, child_activation) =
                     child_context(&frame, invocation.control, &ordinals, original_domain, work)?;
                 let child_domain = if matches!(
@@ -2528,6 +2674,7 @@ impl TreeDriver<'_, '_> {
                     self.needs_original.contains(&child_use),
                     child_activation,
                     ordinals,
+                    child_memory,
                     work,
                 )?;
                 frames.push(frame);
@@ -2762,6 +2909,10 @@ impl TreeDriver<'_, '_> {
                     Child {
                         ordinals: frame.parent_ordinals,
                         value,
+                        ordinal_storage: frame
+                            ._body_memory
+                            .as_mut()
+                            .and_then(|memory| memory.parent_ordinals.take()),
                     },
                     &UnitNodeRecipes {
                         unit: program,
@@ -3771,7 +3922,11 @@ fn duplicate_child(
     }
     .with_continuation(continuation);
     work.step()?;
-    Ok(Child { ordinals, value })
+    Ok(Child {
+        ordinals,
+        value,
+        ordinal_storage: None,
+    })
 }
 
 /// RowDataError placeholders are results, not error-free kernel arguments.

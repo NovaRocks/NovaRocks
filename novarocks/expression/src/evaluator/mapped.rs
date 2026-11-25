@@ -20,6 +20,7 @@
 use super::{Work, gather, internal};
 use arrow::{
     array::{Array, ArrayRef, BooleanArray, UInt64Array, new_empty_array, new_null_array},
+    buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer},
     compute::concat,
     datatypes::DataType,
 };
@@ -475,13 +476,11 @@ pub(super) fn take_rows(
     work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<ArrayRef, KernelFailure> {
     let len = rows.len();
-    let index_width = bytes::<u64>(len)?
-        .checked_add(len.div_ceil(8))
-        .ok_or(KernelFailure::ResourceExhausted)?;
-    let indices_charge = reserve(allocator, index_width)?;
-    let _projection_charge = reserve(allocator, bytes::<Option<u64>>(len)?)?;
+    let projection_charge = reserve(allocator, bytes::<Option<u64>>(len)?)?;
     let mut indices = buffer(len)?;
+    let mut has_nulls = false;
     for row in rows {
+        has_nulls |= row.is_none();
         indices.push(
             row.map(u64::try_from)
                 .transpose()
@@ -489,30 +488,84 @@ pub(super) fn take_rows(
         );
         work.step()?;
     }
-    match allocator {
-        Some(host) => {
-            work.flush()?;
-            let indices = CopyIndices::UInt64(Arc::new(UInt64Array::from_iter(indices)));
-            let copied = take_copy_in(
-                Arc::clone(array),
-                indices,
-                indices_charge,
-                Arc::clone(host),
-                work.control,
-            )
-            .map_err(copy_failure)?;
-            #[cfg(test)]
-            super::lambda_observation::record(|| super::lambda_observation::Event::Gather {
-                is_collection: matches!(
-                    array.data_type(),
-                    DataType::List(_) | DataType::LargeList(_) | DataType::Map(..)
-                ),
-                new_stock: copied.new_buffer_stock(),
-            });
-            Ok(copied.into_values())
+    let Some(host) = allocator else {
+        return gather(array, &indices, work);
+    };
+
+    // Adopt two explicitly sized buffers. The original one-node author
+    // supplies the Buffer owners and Array Arc geometry for this index.
+    let bitmap_bytes = if has_nulls { len.div_ceil(8) } else { 0 };
+    let structural = std::cell::Cell::new(0usize);
+    let record = |size| {
+        structural.set(
+            structural
+                .get()
+                .checked_add(size)
+                .ok_or(KernelFailure::ResourceExhausted)?,
+        );
+        Ok(())
+    };
+    let mut layout = |layout: Layout| record(layout.size());
+    let mut opaque = record;
+    let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut layout,
+        &mut opaque,
+    );
+    use novarocks_functions::selected_copy::{
+        CopyConstructionError, preflight_arrow_node_structure_construction,
+    };
+    preflight_arrow_node_structure_construction(
+        &DataType::UInt64,
+        has_nulls,
+        &mut creation,
+        &mut |boundary| if boundary { work.flush() } else { work.step() },
+    )
+    .map_err(|error| match error {
+        CopyConstructionError::Copy(error) => error.into_kernel(),
+        CopyConstructionError::Creator(error) => error,
+        CopyConstructionError::Resource(error) => KernelFailure::from_domain(error),
+    })?;
+    let index_width = bytes::<u64>(len)?
+        .checked_add(bitmap_bytes)
+        .and_then(|size| size.checked_add(structural.get()))
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    let index_charge = reserve(allocator, index_width)?;
+    let mut values = buffer(len)?;
+    let mut validity = buffer(bitmap_bytes)?;
+    validity.resize(bitmap_bytes, 0u8);
+    for (ordinal, value) in indices.into_iter().enumerate() {
+        if has_nulls && value.is_some() {
+            validity[ordinal / 8] |= 1 << (ordinal % 8);
         }
-        None => gather(array, &indices, work),
+        values.push(value.unwrap_or(0));
+        work.step()?;
     }
+    drop(projection_charge);
+    work.flush()?;
+    let nulls =
+        has_nulls.then(|| NullBuffer::new(BooleanBuffer::new(Buffer::from_vec(validity), 0, len)));
+    let indices = CopyIndices::UInt64(Arc::new(UInt64Array::new(
+        ScalarBuffer::from(values),
+        nulls,
+    )));
+    let copied = take_copy_in(
+        Arc::clone(array),
+        indices,
+        index_charge,
+        Arc::clone(host),
+        work.control,
+    )
+    .map_err(copy_failure)?;
+    #[cfg(test)]
+    super::lambda_observation::record(|| super::lambda_observation::Event::Gather {
+        is_collection: matches!(
+            array.data_type(),
+            DataType::List(_) | DataType::LargeList(_) | DataType::Map(..)
+        ),
+        new_stock: copied.new_buffer_stock(),
+    });
+    Ok(copied.into_values())
 }
 
 fn copy_failure(error: CopyOperationError) -> KernelFailure {

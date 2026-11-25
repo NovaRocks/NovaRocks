@@ -1168,27 +1168,6 @@
       "exit_condition": "Owner B7 installs the corresponding declared pure implementation and this exact unchanged test passes with the original complete result/key/lambda assertions; then remove this quarantine."
     },
     {
-      "unit": "rust-test:novarocks-sql::planner::distributed::build::contract_lowering::lowered_scalar_source_tests::lowered_operational_lambda_tests::operational_lambda_projector_preserves_every_actual_small_control_prefix",
-      "owner": "B7",
-      "review_by": "2026-12-15",
-      "reason": "D0-5(a), K12: the first observed failure is the typed sql.analyze.unavailable_implementation refusal for builtin.scalar/array_map/dynamic-v1. This exact test protects an unavailable container/scalar/lambda declaration rather than an incidental fixture; preserve all its assertions.",
-      "exit_condition": "Owner B7 installs the corresponding declared pure implementation and this exact unchanged test passes with the original complete result/key/lambda assertions; then remove this quarantine."
-    },
-    {
-      "unit": "rust-test:novarocks-sql::planner::distributed::build::contract_lowering::lowered_scalar_source_tests::lowered_operational_lambda_tests::operational_lambda_analyzed_source_loans_original_parameters_and_actual_body_scope",
-      "owner": "B7",
-      "review_by": "2026-12-15",
-      "reason": "D0-5(a), K12: the first observed failure is the typed sql.analyze.unavailable_implementation refusal for builtin.scalar/array_map/dynamic-v1. This exact test protects an unavailable container/scalar/lambda declaration rather than an incidental fixture; preserve all its assertions.",
-      "exit_condition": "Owner B7 installs the corresponding declared pure implementation and this exact unchanged test passes with the original complete result/key/lambda assertions; then remove this quarantine."
-    },
-    {
-      "unit": "rust-test:novarocks-sql::planner::distributed::build::contract_lowering::neutral_requests::tests::neutral_sql_lambda_window_order_and_left_table_keep_distinct_original_channels",
-      "owner": "B7",
-      "review_by": "2026-12-15",
-      "reason": "D0-5(a), K12: the first observed failure is the typed sql.analyze.unavailable_implementation refusal for builtin.scalar/array_map/dynamic-v1. This exact test protects an unavailable container/scalar/lambda declaration rather than an incidental fixture; preserve all its assertions.",
-      "exit_condition": "Owner B7 installs the corresponding declared pure implementation and this exact unchanged test passes with the original complete result/key/lambda assertions; then remove this quarantine."
-    },
-    {
       "unit": "rust-test:novarocks-server-application::json_object_invocation_runtime_funding::json_object_actual_runtime_whole_groups_keep_query_facts_until_cross_thread_last_alias",
       "owner": "I3",
       "review_by": "2026-12-15",

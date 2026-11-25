@@ -819,9 +819,17 @@ fn transform_keeps_the_installed_lambda_and_arity_refusals_distinct() {
         binding.selected.overload.as_str(),
         "builtin.scalar/transform/lambda-v1"
     );
+    let installed = catalog
+        .pure_overload_declaration_observed(
+            &binding.function_id,
+            FunctionKind::Scalar,
+            &binding.selected.overload,
+            control,
+        )
+        .unwrap();
     assert_eq!(
-        binding.admitted_execution_abi,
-        Some(crate::PureKernelAbi::HigherOrderV1)
+        installed.implementation().abi,
+        crate::PureKernelAbi::HigherOrderV1
     );
     assert!(matches!(
         catalog.resolve_bound_user(

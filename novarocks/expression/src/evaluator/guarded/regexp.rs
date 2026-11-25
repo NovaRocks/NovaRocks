@@ -107,7 +107,11 @@ pub(super) fn pattern_ordinals<K>(
         .children
         .first()
         .ok_or_else(|| internal("missing ordered regexp source"))?;
-    let mut active = Vec::new();
+    let mut active = if frame._body_memory.is_some() {
+        super::super::mapped::buffer(frame.rows.len())?
+    } else {
+        Vec::new()
+    };
     for (ordinal, &row) in frame.rows.iter().enumerate() {
         work.step()?;
         if matches!(source.value.regexp_cell(ordinal, row)?, Cell::Value(..)) {
@@ -252,6 +256,14 @@ impl TreeDriver<'_, '_> {
         };
         // Only these re-entries nest; the compiled use graph already bounds
         // call depth. The same driver holds the exact input and instance state.
+        let body_memory = parent
+            ._body_memory
+            .as_ref()
+            .map(|memory| {
+                let input = super::super::mapped::reserve(Some(&memory.host), size_of::<usize>())?;
+                Ok::<_, KernelFailure>(BodyFrameMemory::new(&memory.host, input, None))
+            })
+            .transpose()?;
         let frame = Frame::new(
             child,
             invocation.control,
@@ -261,6 +273,7 @@ impl TreeDriver<'_, '_> {
             original,
             ScalarInvocationActivation::Activated,
             Vec::new(),
+            body_memory,
             work,
         )?;
         self.drive(frame, lambda, None, instances, work)

@@ -63,6 +63,7 @@ impl<K> Frame<K> {
         )?;
         self.children.push(Child {
             ordinals: child.ordinals,
+            ordinal_storage: child.ordinal_storage,
             value: retain_argument(value),
         });
         Ok(())

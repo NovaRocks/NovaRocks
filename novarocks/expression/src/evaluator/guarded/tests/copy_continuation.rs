@@ -151,6 +151,7 @@ fn copy_chain(all_true: bool, finite: bool) {
     };
     let children = [
         Child {
+            ordinal_storage: None,
             ordinals: vec![0, 1, 2],
             value: OwnedValue::Selected(
                 Arc::new(BooleanArray::from(vec![all_true; 3])),
@@ -158,10 +159,12 @@ fn copy_chain(all_true: bool, finite: bool) {
             ),
         },
         Child {
+            ordinal_storage: None,
             ordinals: vec![0, 1, 2],
             value: yes,
         },
         Child {
+            ordinal_storage: None,
             ordinals: vec![0, 1, 2],
             value: no,
         },
