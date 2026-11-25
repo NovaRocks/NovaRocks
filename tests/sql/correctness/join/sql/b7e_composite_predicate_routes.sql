@@ -63,19 +63,20 @@ ORDER BY probe_id, candidate_id;
 -- @explain_contains=HASH JOIN
 -- @explain_contains=other:
 WITH probes AS (
-    SELECT id, ROW(id, IF(id = 1, CAST(NULL AS BIGINT), BIGINT '7')) AS left_value
-    FROM TABLE(sequence(1, 3)) AS s(id)
+    SELECT id, CAST(ROW(id, IF(id = 1, CAST(NULL AS BIGINT), BIGINT '7')) AS ROW(key_value BIGINT, label_value BIGINT)) AS left_value
+    FROM TABLE(sequence(1, 256)) AS s(id)
 ), right_rows AS (
     SELECT rid,
            CASE
                WHEN rid <= 2 THEN BIGINT '1'
                WHEN rid <= 4 THEN BIGINT '2'
-               ELSE BIGINT '3'
+               WHEN rid <= 6 THEN BIGINT '3'
+               ELSE rid
            END AS group_id
-    FROM TABLE(sequence(1, 6)) AS s(rid)
+    FROM TABLE(sequence(1, 512)) AS s(rid)
 ), candidates AS (
     SELECT rid, group_id,
-           ROW(group_id, IF(rid % 2 = 0, IF(group_id = 1, CAST(NULL AS BIGINT), BIGINT '7'), BIGINT '99')) AS right_value
+           CAST(ROW(group_id, IF(rid <= 6 AND rid % 2 = 0, IF(group_id = 1, CAST(NULL AS BIGINT), BIGINT '7'), BIGINT '99')) AS ROW(key_value BIGINT, label_value BIGINT)) AS right_value
     FROM right_rows
 )
 SELECT p.id AS probe_id, c.rid AS candidate_id

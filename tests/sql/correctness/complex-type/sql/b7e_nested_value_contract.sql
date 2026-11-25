@@ -131,3 +131,11 @@ WITH grouped AS (
 )
 SELECT exact_value IN (exact_value, uncertain)
 FROM pairs;
+
+-- query 12
+-- The installed contains_sequence coercion profile requires matching nested MAP key declarations.
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT contains_sequence(
+    ARRAY[MAP(ARRAY['c', 'd'], ARRAY[3, 4])],
+    CAST(ARRAY[MAP(ARRAY['c', 'd'], ARRAY[3, 4])] AS ARRAY(MAP(VARCHAR, INTEGER)))
+);
