@@ -105,7 +105,9 @@ pub(crate) fn admit_multicast_cut(
         Distribution::Hash { keys, scheme }
             if !keys.is_empty()
                 && matches!(scheme.definition.algorithm,
-                    PartitionHashAlgorithm::NativeExchangeV1 | PartitionHashAlgorithm::NativeHierarchicalV1)
+                    PartitionHashAlgorithm::NativeExchangeV1
+                        | PartitionHashAlgorithm::NativeExchangeV2
+                        | PartitionHashAlgorithm::NativeHierarchicalV1)
     );
     if kind != EdgeKind::CteMulticast
         || delivery != DeliveryRequirement::DemandDriven

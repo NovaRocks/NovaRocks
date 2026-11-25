@@ -61,6 +61,8 @@ code-anchors:
 
 1. **以原 enforcer 为消费边的分布作者。** Contract lowering 融合直接相邻的 Gather、Broadcast 或 Hash Redistribute。Hash 保留原 scheme，
    发送键经 `producer_column_ids` 回到生产值，接收键按原 import occurrence 绑定。比较前的类型转换留在 shuffle 前的 fragment。
+   需要 canonical MAP key identity 时，发送和接收沿 [ADR-0265](ADR-0265-row-declarations-and-canonical-map-keys.md) 使用冻结的
+   `NativeExchangeV2`，每个分支交给原流发送算子处理。
    Filter、Project 等真实工作保留，因此其前方未融合的 CTE 边使用 RoundRobin。生产根与发送侧为 SingleCopy。Gather 汇入一个实例，
    RoundRobin 将每行交给一个目标实例，Hash 交给键对应实例，Broadcast 在现有准入的复制区给每个目标一份。
    只有 CTE RoundRobin 边新增 `FollowSources` 依据，宽度取有效来源的最大值。结果、Gather、ScanWork 及显式放置照其优先级处理。
@@ -82,7 +84,7 @@ code-anchors:
 5. **原 backing 随最后一个实际别名归还。** Fanout 分发前固定现有批次 backing 的 charge，分支持有同一原 Arrow backing、creator 和来源凭据。
    原 charge 保留在原 owner，普通分支队列不更新它的归属。新增分区数据、布局规范化及 IPC 等独立分配由其原作者按各自生命周期计量。
    同一 backing 的共享计费与独立副本的占用分别成立。
-6. **按计划契约修订切分 Native 兼容岛。** 修订 43 冻结上述物理边到运行边的绑定语义。现有 package、Task assignment 和 descriptor 字段
+6. **按计划契约修订切分 Native 兼容岛。** 修订 44 冻结上述物理边到运行边的绑定语义。现有 package、Task assignment 和 descriptor 字段
    继续承载各自的身份及顺序。按 [ADR-0124](ADR-0124-native-compatibility-islands-and-ingress-admission.md)，
    兼容身份参与 membership、调度准入与 Init。部署和回滚以整岛为单位。
 

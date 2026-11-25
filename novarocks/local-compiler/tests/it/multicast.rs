@@ -17,12 +17,12 @@
 
 use std::sync::Arc;
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use novarocks_expression::testkit::HarnessControl;
 use novarocks_local_compiler::FragmentCompileError;
 use novarocks_local_program::{
     BindingRequirement, CompiledExchangeRouting, DataStreamPartitionType, ProgramNodeKind,
-    StaticSinkProgram,
+    StaticSinkProgram, StaticStreamRouting,
 };
 use novarocks_physical_plan::{
     CutImport, CutValue, DeliveryRequirement, Distribution, EdgeId, EdgeKind, EdgePartitioning,
@@ -64,7 +64,7 @@ fn package_input(
     }
 }
 
-fn hash(keys: Box<[ValueId]>) -> Distribution {
+fn hash(keys: Box<[ValueId]>, algorithm: PartitionHashAlgorithm) -> Distribution {
     Distribution::Hash {
         keys,
         scheme: HashPartitionScheme {
@@ -77,14 +77,23 @@ fn hash(keys: Box<[ValueId]>) -> Distribution {
                     requires_power_of_two: false,
                 },
             },
-            definition: HashDefinition::native_exchange(),
+            definition: HashDefinition { algorithm },
         },
     }
 }
 
 fn producer_input() -> FragmentPackageInput {
+    producer_input_with_hash(
+        ValueType::new(DataType::Int64, false),
+        PartitionHashAlgorithm::NativeExchangeV1,
+    )
+}
+
+fn producer_input_with_hash(
+    a_type: ValueType,
+    algorithm: PartitionHashAlgorithm,
+) -> FragmentPackageInput {
     let mut builder = FragmentBuilder::new(PRODUCER);
-    let a_type = ValueType::new(DataType::Int64, false);
     let b_type = ValueType::new(DataType::Boolean, false);
     let (root, values) = empty_values(&mut builder, &[a_type.clone(), b_type.clone()]);
     let [a, b] = values[..] else {
@@ -135,8 +144,8 @@ fn producer_input() -> FragmentPackageInput {
             2,
             2,
             &[&b, &a],
-            hash(Box::from([a.value])),
-            hash(Box::from([ValueId::new(11)])),
+            hash(Box::from([a.value]), algorithm),
+            hash(Box::from([ValueId::new(11)]), algorithm),
             RowMultiplicity::SingleCopy,
         ),
         branch(
@@ -382,6 +391,52 @@ fn multicast_receivers_lower_to_exact_exchange_channels() {
             assert_ne!(layout.slots()[0], layout.slots()[2]);
         }
     }
+}
+
+#[test]
+fn multicast_preserves_the_frozen_map_hash_on_both_ends() {
+    let map = DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Int64, false),
+                    Field::new("value", DataType::Int64, false),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    );
+    let algorithm = PartitionHashAlgorithm::NativeExchangeV2;
+    let input = producer_input_with_hash(ValueType::new(map.clone(), false), algorithm);
+    let consumer = consumer_input(&input.cuts.outbound[0]);
+    let functions = numeric_catalogue();
+    let producer_package = FragmentPackage::try_new(input, ADMISSION, &HarnessControl).unwrap();
+    let producer = compile(&functions, Arc::new(producer_package), &HarnessControl).unwrap();
+    let Some(StaticSinkProgram::MultiCastDataStream { branches }) = producer.graph().sink() else {
+        panic!("expected multicast sink");
+    };
+    assert_eq!(
+        branches[1].contract().routing,
+        StaticStreamRouting::OrdinaryHash { algorithm }
+    );
+    assert_eq!(branches[1].partition_exprs().len(), 1);
+
+    let consumer_package = FragmentPackage::try_new(consumer, ADMISSION, &HarnessControl).unwrap();
+    let consumer = compile(&functions, Arc::new(consumer_package), &HarnessControl).unwrap();
+    let root = consumer.graph().root();
+    let receiver = &consumer.exchange_inputs()[&root];
+    assert_eq!(
+        receiver.routing,
+        CompiledExchangeRouting::Hash { algorithm }
+    );
+    assert_eq!(
+        receiver.hash_partition_slots.as_ref(),
+        &[receiver.wire_layout.slots()[1]]
+    );
+    assert_eq!(receiver.wire_layout.schema().field(1).data_type(), &map);
 }
 
 #[test]
