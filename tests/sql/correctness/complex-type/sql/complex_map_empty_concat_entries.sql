@@ -103,6 +103,5 @@ FROM ${case_db}.test_map, unnest(map_entries(col_map)) AS "unnest"("unnest")
 ORDER BY col_int;
 
 -- query 11
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
--- Changing a child type inside a ROW uses the separate recursive ROW conversion.
+-- Convert the reachable ARRAY member from an empty untyped MAP to its declared type.
 SELECT CAST(ROW(ARRAY[MAP()]) AS ROW("A" ARRAY(MAP(INTEGER, INTEGER))));
