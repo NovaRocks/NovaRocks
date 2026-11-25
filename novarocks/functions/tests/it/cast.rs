@@ -953,8 +953,22 @@ mod standard_conversion {
             ))),
             true,
         );
+        assert!(
+            PreparedCastRecipe::try_new_trino(&json, &array, TrinoCastMode::Explicit, &control)
+                .is_ok()
+        );
+        let mixed_row = physical(
+            DataType::Struct(
+                vec![
+                    arrow_schema::Field::new("a", DataType::Int32, true),
+                    arrow_schema::Field::new("", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
         assert!(matches!(
-            PreparedCastRecipe::try_new_trino(&json, &array, TrinoCastMode::Explicit, &control),
+            PreparedCastRecipe::try_new_trino(&json, &mixed_row, TrinoCastMode::Explicit, &control),
             Err(CastPrepareError::Unsupported),
         ));
     }

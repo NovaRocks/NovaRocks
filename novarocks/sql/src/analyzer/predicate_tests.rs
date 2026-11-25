@@ -17,7 +17,7 @@
 
 //! Independent syntax migration oracles through the real analyzer and catalog.
 use super::AnalyzerContext;
-use crate::analysis::{BinOp, ExprKind, TypedExpr, UnOp};
+use crate::analysis::{ExprKind, TypedExpr};
 use crate::analyze_error::AnalyzeErrorKind;
 use crate::catalog::{PlannerTableProvider, ResolvedAnalyzerTable};
 use crate::compiler::SqlCompileControl;
@@ -90,7 +90,14 @@ fn distinct_from_retains_null_safe_operands_and_exact_operator_identities() {
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let scope = ctx.new_scope();
-    for (left, right) in [("NULL", "NULL"), ("NULL", "1"), ("1", "NULL"), ("1", "1")] {
+    for (left, right) in [
+        ("NULL", "NULL"),
+        ("NULL", "1"),
+        ("1", "NULL"),
+        ("1", "1"),
+        ("[1,NULL]", "[1,NULL]"),
+        ("ROW(1, NULL)", "ROW(1, 2)"),
+    ] {
         let equal = query(&format!("SELECT {left} IS NOT DISTINCT FROM {right}"));
         let unequal = query(&format!("SELECT {left} IS DISTINCT FROM {right}"));
         let actual_equal = ctx.analyze_expr(projection(&equal), &scope).unwrap();
@@ -110,23 +117,6 @@ fn distinct_from_retains_null_safe_operands_and_exact_operator_identities() {
             same_typed(actual, expected, &control);
         }
     }
-    let legacy = query("SELECT [1,NULL] IS DISTINCT FROM [1,NULL]");
-    let actual = ctx.analyze_expr(projection(&legacy), &scope).unwrap();
-    assert!(!actual.value_type.nullable());
-    let ExprKind::UnaryOp {
-        op: UnOp::Not,
-        expr,
-    } = actual.kind
-    else {
-        panic!("legacy collection comparison still uses NOT over its original equality");
-    };
-    assert!(matches!(
-        expr.kind,
-        ExprKind::BinaryOp {
-            op: BinOp::EqForNull,
-            ..
-        }
-    ));
 }
 
 #[test]

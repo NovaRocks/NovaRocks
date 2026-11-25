@@ -1,59 +1,49 @@
 -- query 1
--- legacy
+-- types	row(col1 integer, col2 integer, col3 integer)
 _col0
-{"col1":1,"col2":2,"col3":3}
-
--- query 2
--- legacy
-_col0
-{"col1":1,"col2":2}
-
--- query 3
--- legacy
-_col0
-{"col1":1,"col2":2,"col3":3,"col4":null}
-
--- query 4
--- legacy
-_col0
-{"col1":1,"col2":2,"col3":3,"col4":null}
+[1,2,3]
 
 -- query 5
--- legacy
+-- types	row(col1 double, col2 double, col3 double)
 _col0
-{"col1":1.1,"col2":2.2,"col3":3.3}
+[1.1,2.2,3.3]
 
 -- query 6
--- legacy
+-- types	row(col1 double, col2 double, col3 integer)
 _col0
-{"col1":1.1,"col2":2.2,"col3":3}
+[1.1,2.2,3]
 
 -- query 7
--- legacy
+-- types	row(number integer, star varchar)
 _col0
-{"number":1,"star":"rocks"}
+[1,"rocks"]
 
 -- query 8
--- legacy
+-- types	row(number integer, not_found varchar)
 _col0
-{"number":1,"not_found":null}
+[1,null]
 
 -- query 9
--- legacy
+-- types	row(number array(integer), not_found varchar)
 _col0
-{"number":[1,2,3],"not_found":null}
+[[1,2,3],null]
 
 -- query 10
--- legacy
+-- types	row(col1 integer, col2 array(json))
 _col0
-{"col1":1,"col2":['{"star": "rocks"}','{"star": "rocks"}']}
+[1,["{\"star\": \"rocks\"}","{\"star\": \"rocks\"}"]]
 
 -- query 11
--- legacy
+-- types	row(star varchar(10), length integer, numbers array(integer), nest row(col1 integer, col2 integer, col3 integer))
 _col0
-{"star":"rocks","length":5,"numbers":[1,4,7],"nest":{"col1":1,"col2":2,"col3":3}}
+["rocks",5,[1,4,7],[1,2,3]]
 
 -- query 12
--- legacy
+-- types	array(row(star varchar(10), length integer, numbers array(integer), nest row(col1 integer, col2 integer, col3 integer)))
 _col0
-[{"star":"rocks","length":5,"numbers":[1,4,7],"nest":{"col1":1,"col2":2,"col3":3}},{"star":"rockses","length":33,"numbers":[2,5,9],"nest":{"col1":3,"col2":6,"col3":9}}]
+[["rocks",5,[1,4,7],[1,2,3]],["rockses",33,[2,5,9],[3,6,9]]]
+
+-- query 13
+-- types	row(col1 integer, col2 integer, col3 integer, col4 integer)
+_col0
+NULL

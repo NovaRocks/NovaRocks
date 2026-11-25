@@ -212,7 +212,7 @@ fn in_admission_checks_the_comparison_domain_and_exact_operand_carriers() {
         FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
             .unwrap();
     let unsupported_list = FunctionValueType::new(
-        DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+        DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
         true,
     );
     let boolean = FunctionValueType::new(DataType::Boolean, true);

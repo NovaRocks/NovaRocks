@@ -1,202 +1,204 @@
 -- query 2
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-3	NULL	[{33:null},{303:301}]	[{"a":31,"b":32},{"a":null,"b":33}]	{34:43,36:13,32:null}	{303:null}	{303:{"c":31,"b":32}}	NULL
+3	NULL	[{"33":null},{"303":301}]	[[31,32],[null,33]]	{"32":null,"34":43,"36":13}	{"303":null}	{"303":[31,32]}	NULL
 
 -- query 3
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 4
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-5	[15,25,35,45]	[{999:550},{505:501}]	[{"a":51,"b":52},{"a":null,"b":53}]	{54:45,56:15,999:null}	{999:null}	{505:{"c":null,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":null,"s4":{"e":null,"f":550}}
-5	[15,25,35,45]	[{3:550},{505:501}]	[{"a":51,"b":52},{"a":3,"b":53}]	{54:45,56:15,3:3}	{3:[2,20,3,23]}	{505:{"c":3,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":{4:555},"s4":{"e":3,"f":550}}
+5	[15,25,35,45]	[{"999":550},{"505":501}]	[[51,52],[null,53]]	{"54":45,"56":15,"999":null}	{"999":null}	{"505":[null,52]}	[5,[5,50,51],null,[null,550]]
+5	[15,25,35,45]	[{"3":550},{"505":501}]	[[51,52],[3,53]]	{"3":3,"54":45,"56":15}	{"3":[2,20,3,23]}	{"505":[3,52]}	[5,[5,50,51],{"4":555},[3,550]]
 
 -- query 7
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 8
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 9
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-5	[15,25,35,45]	[{999:550},{505:501}]	[{"a":51,"b":52},{"a":null,"b":53}]	{54:45,56:15,999:null}	{999:null}	{505:{"c":null,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":null,"s4":{"e":null,"f":550}}
+5	[15,25,35,45]	[{"999":550},{"505":501}]	[[51,52],[null,53]]	{"54":45,"56":15,"999":null}	{"999":null}	{"505":[null,52]}	[5,[5,50,51],null,[null,550]]
 
 -- query 10
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-4	[14,24,null,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{999:[4,null,41,23]}	{404:{"c":41,"b":42}}	{"s1":null,"s2":[4,null,41],"s3":{999:444},"s4":null}
-4	[14,24,3,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{3:[4,3,41,23]}	{404:{"c":41,"b":42}}	{"s1":3,"s2":[4,3,41],"s3":{3:444},"s4":{"e":110,"f":330}}
+4	[14,24,null,44]	[{"44":440},{"404":401}]	[[41,42],[42,43]]	{"42":34,"44":44,"46":14}	{"999":[4,null,41,23]}	{"404":[41,42]}	[null,[4,null,41],{"999":444},null]
+4	[14,24,3,44]	[{"44":440},{"404":401}]	[[41,42],[42,43]]	{"42":34,"44":44,"46":14}	{"3":[4,3,41,23]}	{"404":[41,42]}	[3,[4,3,41],{"3":444},[110,330]]
 
 -- query 11
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 12
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-1	[11,null,31,41]	[{11:110},{101:101}]	[{"a":11,"b":12},{"a":12,"b":13}]	{14:41,999:11,12:31}	{101:[1,10,11,23]}	{101:{"c":null,"b":12}}	{"s1":1,"s2":[1,10,11],"s3":{101:111,999:null},"s4":{"e":111,"f":110}}
+1	[11,null,31,41]	[{"11":110},{"101":101}]	[[11,12],[12,13]]	{"12":31,"14":41,"999":11}	{"101":[1,10,11,23]}	{"101":[null,12]}	[1,[1,10,11],{"101":111,"999":null},[111,110]]
 
 -- query 13
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-4	[14,24,null,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{999:[4,null,41,23]}	{404:{"c":41,"b":42}}	{"s1":null,"s2":[4,null,41],"s3":{999:444},"s4":null}
-4	[14,24,3,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{3:[4,3,41,23]}	{404:{"c":41,"b":42}}	{"s1":3,"s2":[4,3,41],"s3":{3:444},"s4":{"e":110,"f":330}}
+4	[14,24,null,44]	[{"44":440},{"404":401}]	[[41,42],[42,43]]	{"42":34,"44":44,"46":14}	{"999":[4,null,41,23]}	{"404":[41,42]}	[null,[4,null,41],{"999":444},null]
+4	[14,24,3,44]	[{"44":440},{"404":401}]	[[41,42],[42,43]]	{"42":34,"44":44,"46":14}	{"3":[4,3,41,23]}	{"404":[41,42]}	[3,[4,3,41],{"3":444},[110,330]]
 
 -- query 14
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 15
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 16
--- legacy
+-- types	row(a integer, b array(integer))
 _col0
-{"a":1,"b":null}
+[1,null]
 
 -- query 17
--- legacy
+-- types	map(integer, array(integer))
 _col0
-{1:null}
+{"1":null}
 
 -- query 19
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 20
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 21
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-1	[11,null,31,41]	[{11:110},{101:101}]	[{"a":11,"b":12},{"a":12,"b":13}]	{14:41,999:11,12:31}	{101:[1,10,11,23]}	{101:{"c":null,"b":12}}	{"s1":1,"s2":[1,10,11],"s3":{101:111,999:null},"s4":{"e":111,"f":110}}
-1	[11,3,31,41]	[{11:110},{101:101}]	[{"a":11,"b":12},{"a":12,"b":13}]	{14:41,3:11,12:31}	{101:[1,10,11,23]}	{101:{"c":3,"b":12}}	{"s1":1,"s2":[1,10,11],"s3":{101:111,3:3},"s4":{"e":111,"f":110}}
+1	[11,null,31,41]	[{"11":110},{"101":101}]	[[11,12],[12,13]]	{"12":31,"14":41,"999":11}	{"101":[1,10,11,23]}	{"101":[null,12]}	[1,[1,10,11],{"101":111,"999":null},[111,110]]
+1	[11,3,31,41]	[{"11":110},{"101":101}]	[[11,12],[12,13]]	{"12":31,"14":41,"3":11}	{"101":[1,10,11,23]}	{"101":[3,12]}	[1,[1,10,11],{"101":111,"3":3},[111,110]]
 
 -- query 22
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
+4	[14,24,null,44]	[{"44":440},{"404":401}]	[[41,42],[42,43]]	{"42":34,"44":44,"46":14}	{"999":[4,null,41,23]}	{"404":[41,42]}	[null,[4,null,41],{"999":444},null]
+4	[14,24,3,44]	[{"44":440},{"404":401}]	[[41,42],[42,43]]	{"42":34,"44":44,"46":14}	{"3":[4,3,41,23]}	{"404":[41,42]}	[3,[4,3,41],{"3":444},[110,330]]
 
 -- query 23
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 24
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 25
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 26
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 27
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 28
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 29
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 30
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
-0
-0
+false
+false
 NULL
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
 
 -- query 31
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
+false
+false
+false
+false
 NULL
-0
-0
-0
-1
-1
+false
+false
+false
+true
+true
 
 -- query 32
--- legacy
+-- types	boolean
 _col0
-0
-0
+false
+false
 NULL
 NULL
-0
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
+false
 
 -- query 33
--- legacy
+-- types	boolean
 _col0
-0
-0
+false
+false
 NULL
 NULL
-0
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
+false
 
 -- query 34
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-0
-0
-1
-0
+false
+false
+false
+false
+false
+false
+false
+false
+true
+false
 
 -- query 35
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-1
-1
-0
-0
+false
+false
+false
+false
+false
+false
+true
+true
+false
+false
 
 -- query 36
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -210,189 +212,189 @@ NULL
 NULL
 
 -- query 37
--- legacy
+-- types	boolean
 _col0
-1
-0
+true
+false
 NULL
-0
-0
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
+false
+false
 
 -- query 38
--- legacy
+-- types	boolean
 _col0
-0
-0
+false
+false
 NULL
-0
-0
-0
-1
-1
-0
-0
+false
+false
+false
+true
+true
+false
+false
 
 -- query 39
--- legacy
+-- types	boolean
 _col0
-0
-0
+false
+false
 NULL
 NULL
 NULL
 NULL
-0
-0
-0
-0
+false
+false
+false
+false
 
 -- query 40
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
+false
+false
+false
+false
+false
 
 -- query 41
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
+false
 NULL
-0
+false
 NULL
-0
+false
 
 -- query 42
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
+false
 NULL
-0
+false
 NULL
-0
+false
 
 -- query 43
--- legacy
+-- types	boolean
 _col0
-1
-1
-0
-0
-0
-0
-0
-0
-0
-0
+true
+true
+false
+false
+false
+false
+false
+false
+false
+false
 
 -- query 44
--- legacy
+-- types	boolean
 _col0
-0
-0
+false
+false
 NULL
-0
-0
-0
-0
-0
-0
-0
+false
+false
+false
+true
+true
+false
+false
 
 -- query 45
--- legacy
+-- types	boolean
 _col0
-0
-0
+false
+false
 NULL
-0
-0
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
+false
+false
 
 -- query 46
--- legacy
+-- types	boolean
 _col0
-0
-0
+false
+false
 NULL
-0
-0
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
+NULL
+false
 
 -- query 47
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
+false
+false
+false
 NULL
 NULL
 
 -- query 48
--- legacy
+-- types	boolean
 _col0
-0
-0
+false
+false
 NULL
 NULL
 NULL
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
 
 -- query 49
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
+false
+false
+false
+false
 NULL
-0
-0
-0
+false
+false
+false
 NULL
 NULL
 
 -- query 50
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -406,7 +408,7 @@ NULL
 NULL
 
 -- query 51
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -420,474 +422,476 @@ NULL
 NULL
 
 -- query 52
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-1	[11,3,31,41]	[{11:110},{101:101}]	[{"a":11,"b":12},{"a":12,"b":13}]	{14:41,3:11,12:31}	{101:[1,10,11,23]}	{101:{"c":3,"b":12}}	{"s1":1,"s2":[1,10,11],"s3":{101:111,3:3},"s4":{"e":111,"f":110}}
+1	[11,3,31,41]	[{"11":110},{"101":101}]	[[11,12],[12,13]]	{"12":31,"14":41,"3":11}	{"101":[1,10,11,23]}	{"101":[3,12]}	[1,[1,10,11],{"101":111,"3":3},[111,110]]
 
 -- query 53
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-5	[15,25,35,45]	[{999:550},{505:501}]	[{"a":51,"b":52},{"a":null,"b":53}]	{54:45,56:15,999:null}	{999:null}	{505:{"c":null,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":null,"s4":{"e":null,"f":550}}
-5	[15,25,35,45]	[{3:550},{505:501}]	[{"a":51,"b":52},{"a":3,"b":53}]	{54:45,56:15,3:3}	{3:[2,20,3,23]}	{505:{"c":3,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":{4:555},"s4":{"e":3,"f":550}}
+5	[15,25,35,45]	[{"999":550},{"505":501}]	[[51,52],[null,53]]	{"54":45,"56":15,"999":null}	{"999":null}	{"505":[null,52]}	[5,[5,50,51],null,[null,550]]
+5	[15,25,35,45]	[{"3":550},{"505":501}]	[[51,52],[3,53]]	{"3":3,"54":45,"56":15}	{"3":[2,20,3,23]}	{"505":[3,52]}	[5,[5,50,51],{"4":555},[3,550]]
 
 -- query 54
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-2	[12,22,32,42]	[{22:220},{3:201}]	[{"a":21,"b":22},{"a":12,"b":13}]	{34:43,36:13,32:3}	{202:[2,20,3,23]}	{202:{"c":21,"b":22}}	{"s1":2,"s2":[2,3,4],"s3":{202:3},"s4":{"e":222,"f":220}}
+2	[12,22,32,42]	[{"22":220},{"3":201}]	[[21,22],[12,13]]	{"32":3,"34":43,"36":13}	{"202":[2,20,3,23]}	{"202":[21,22]}	[2,[2,3,4],{"202":3},[222,220]]
 
 -- query 55
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 56
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-5	[15,25,35,45]	[{3:550},{505:501}]	[{"a":51,"b":52},{"a":3,"b":53}]	{54:45,56:15,3:3}	{3:[2,20,3,23]}	{505:{"c":3,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":{4:555},"s4":{"e":3,"f":550}}
+5	[15,25,35,45]	[{"3":550},{"505":501}]	[[51,52],[3,53]]	{"3":3,"54":45,"56":15}	{"3":[2,20,3,23]}	{"505":[3,52]}	[5,[5,50,51],{"4":555},[3,550]]
 
 -- query 57
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-4	[14,24,null,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{999:[4,null,41,23]}	{404:{"c":41,"b":42}}	{"s1":null,"s2":[4,null,41],"s3":{999:444},"s4":null}
-4	[14,24,3,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{3:[4,3,41,23]}	{404:{"c":41,"b":42}}	{"s1":3,"s2":[4,3,41],"s3":{3:444},"s4":{"e":110,"f":330}}
+4	[14,24,null,44]	[{"44":440},{"404":401}]	[[41,42],[42,43]]	{"42":34,"44":44,"46":14}	{"999":[4,null,41,23]}	{"404":[41,42]}	[null,[4,null,41],{"999":444},null]
+4	[14,24,3,44]	[{"44":440},{"404":401}]	[[41,42],[42,43]]	{"42":34,"44":44,"46":14}	{"3":[4,3,41,23]}	{"404":[41,42]}	[3,[4,3,41],{"3":444},[110,330]]
 
 -- query 58
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-1	[11,3,31,41]	[{11:110},{101:101}]	[{"a":11,"b":12},{"a":12,"b":13}]	{14:41,3:11,12:31}	{101:[1,10,11,23]}	{101:{"c":3,"b":12}}	{"s1":1,"s2":[1,10,11],"s3":{101:111,3:3},"s4":{"e":111,"f":110}}
+1	[11,3,31,41]	[{"11":110},{"101":101}]	[[11,12],[12,13]]	{"12":31,"14":41,"3":11}	{"101":[1,10,11,23]}	{"101":[3,12]}	[1,[1,10,11],{"101":111,"3":3},[111,110]]
 
 -- query 59
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-4	[14,24,null,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{999:[4,null,41,23]}	{404:{"c":41,"b":42}}	{"s1":null,"s2":[4,null,41],"s3":{999:444},"s4":null}
-4	[14,24,3,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{3:[4,3,41,23]}	{404:{"c":41,"b":42}}	{"s1":3,"s2":[4,3,41],"s3":{3:444},"s4":{"e":110,"f":330}}
+4	[14,24,null,44]	[{"44":440},{"404":401}]	[[41,42],[42,43]]	{"42":34,"44":44,"46":14}	{"999":[4,null,41,23]}	{"404":[41,42]}	[null,[4,null,41],{"999":444},null]
+4	[14,24,3,44]	[{"44":440},{"404":401}]	[[41,42],[42,43]]	{"42":34,"44":44,"46":14}	{"3":[4,3,41,23]}	{"404":[41,42]}	[3,[4,3,41],{"3":444},[110,330]]
 
 -- query 60
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-2	[12,22,32,42]	[{22:220},{3:201}]	[{"a":21,"b":22},{"a":12,"b":13}]	{34:43,36:13,32:3}	{202:[2,20,3,23]}	{202:{"c":21,"b":22}}	{"s1":2,"s2":[2,3,4],"s3":{202:3},"s4":{"e":222,"f":220}}
-3	[12,22,32,42]	[{33:3},{303:301}]	[{"a":31,"b":32},{"a":3,"b":33}]	{34:43,36:13,32:3}	{303:[4,3,41,23]}	{303:{"c":31,"b":32}}	{"s1":2,"s2":[2,3,4],"s3":{201:3},"s4":{"e":222,"f":220}}
+2	[12,22,32,42]	[{"22":220},{"3":201}]	[[21,22],[12,13]]	{"32":3,"34":43,"36":13}	{"202":[2,20,3,23]}	{"202":[21,22]}	[2,[2,3,4],{"202":3},[222,220]]
+3	[12,22,32,42]	[{"33":3},{"303":301}]	[[31,32],[3,33]]	{"32":3,"34":43,"36":13}	{"303":[4,3,41,23]}	{"303":[31,32]}	[2,[2,3,4],{"201":3},[222,220]]
 
 -- query 61
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 62
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-4	[14,24,3,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{3:[4,3,41,23]}	{404:{"c":41,"b":42}}	{"s1":3,"s2":[4,3,41],"s3":{3:444},"s4":{"e":110,"f":330}}
+4	[14,24,3,44]	[{"44":440},{"404":401}]	[[41,42],[42,43]]	{"42":34,"44":44,"46":14}	{"3":[4,3,41,23]}	{"404":[41,42]}	[3,[4,3,41],{"3":444},[110,330]]
 
 -- query 63
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 64
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
+4	[14,24,null,44]	[{"44":440},{"404":401}]	[[41,42],[42,43]]	{"42":34,"44":44,"46":14}	{"999":[4,null,41,23]}	{"404":[41,42]}	[null,[4,null,41],{"999":444},null]
+4	[14,24,3,44]	[{"44":440},{"404":401}]	[[41,42],[42,43]]	{"42":34,"44":44,"46":14}	{"3":[4,3,41,23]}	{"404":[41,42]}	[3,[4,3,41],{"3":444},[110,330]]
 
 -- query 65
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-5	[15,25,35,45]	[{3:550},{505:501}]	[{"a":51,"b":52},{"a":3,"b":53}]	{54:45,56:15,3:3}	{3:[2,20,3,23]}	{505:{"c":3,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":{4:555},"s4":{"e":3,"f":550}}
+5	[15,25,35,45]	[{"3":550},{"505":501}]	[[51,52],[3,53]]	{"3":3,"54":45,"56":15}	{"3":[2,20,3,23]}	{"505":[3,52]}	[5,[5,50,51],{"4":555},[3,550]]
 
 -- query 66
--- legacy
+-- types	bigint	array(integer)	array(map(integer, integer))	array(row(a integer, b integer))	map(integer, integer)	map(integer, array(integer))	map(integer, row(c integer, b integer))	row(s1 integer, s2 array(integer), s3 map(integer, integer), s4 row(e integer, f integer))
 v1	array1	array2	array3	map1	map2	map3	st1
-2	[12,22,32,42]	[{22:220},{3:201}]	[{"a":21,"b":22},{"a":12,"b":13}]	{34:43,36:13,32:3}	{202:[2,20,3,23]}	{202:{"c":21,"b":22}}	{"s1":2,"s2":[2,3,4],"s3":{202:3},"s4":{"e":222,"f":220}}
+2	[12,22,32,42]	[{"22":220},{"3":201}]	[[21,22],[12,13]]	{"32":3,"34":43,"36":13}	{"202":[2,20,3,23]}	{"202":[21,22]}	[2,[2,3,4],{"202":3},[222,220]]
 
 -- query 68
--- legacy
+-- types	boolean
 _col0
-1
-0
-0
-0
-0
-0
-0
-0
-0
-0
+true
+false
+false
+false
+false
+false
+false
+false
+false
+false
 
 -- query 69
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-0
-0
-1
-1
+false
+false
+false
+false
+false
+false
+false
+false
+true
+true
 
 -- query 70
--- legacy
+-- types	boolean
 _col0
-0
-0
-1
-0
-0
-0
-0
-0
-0
-0
+false
+false
+true
+false
+false
+false
+false
+false
+false
+false
 
 -- query 71
--- legacy
+-- types	boolean
 _col0
-0
-0
-1
-0
-0
-0
-0
-0
-0
-0
+false
+false
+true
+false
+false
+false
+false
+false
+false
+false
 
 -- query 72
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-0
-0
-1
-0
+false
+false
+false
+false
+false
+false
+false
+false
+true
+false
 
 -- query 73
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-1
-1
-0
-0
+false
+false
+false
+false
+false
+false
+true
+true
+false
+false
 
 -- query 74
--- legacy
+-- types	boolean
 _col0
-0
-0
-1
-0
-0
-0
-0
-0
-0
-0
+false
+false
+true
+false
+false
+false
+false
+false
+false
+false
 
 -- query 75
--- legacy
+-- types	boolean
 _col0
-1
-0
-0
-0
-0
-0
-0
-0
-0
-0
+true
+false
+false
+false
+false
+false
+false
+false
+false
+false
 
 -- query 76
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-1
-1
-0
-0
+false
+false
+false
+false
+false
+false
+true
+true
+false
+false
 
 -- query 77
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-1
-0
-0
-0
-0
-0
+false
+false
+false
+false
+true
+false
+false
+false
+false
+false
 
 -- query 78
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
+false
+false
+false
+false
+false
 
 -- query 79
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-0
-0
-1
-0
+false
+false
+false
+false
+false
+false
+false
+false
+true
+false
 
 -- query 80
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-1
-0
-0
-0
+false
+false
+false
+false
+false
+false
+true
+false
+false
+false
 
 -- query 81
--- legacy
+-- types	boolean
 _col0
-1
-1
-0
-0
-0
-0
-0
-0
-0
-0
+true
+true
+false
+false
+false
+false
+false
+false
+false
+false
 
 -- query 82
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
+false
+true
+true
+false
+false
 
 -- query 83
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
+false
+false
+false
+false
+false
 
 -- query 84
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-0
-0
-0
-0
+false
+false
+false
+false
+false
+false
+false
+false
+true
+false
 
 -- query 85
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-0
-0
-1
-0
+false
+false
+false
+false
+false
+false
+false
+false
+true
+false
 
 -- query 86
--- legacy
+-- types	boolean
 _col0
-0
-0
-1
-0
-0
-0
-0
-0
-0
-0
+false
+false
+true
+false
+false
+false
+false
+false
+false
+false
 
 -- query 87
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-0
-0
-0
-0
-1
-0
+false
+false
+false
+false
+false
+false
+false
+false
+true
+false
 
 -- query 88
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-1
-0
-0
-0
-0
-0
+false
+false
+false
+false
+true
+false
+false
+false
+false
+false
 
 -- query 89
--- legacy
+-- types	boolean
 _col0
-0
-0
-0
-0
-1
-0
-0
-0
-0
-0
+false
+false
+false
+false
+true
+false
+false
+false
+false
+false
 
 -- query 90
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
-1
-1
+true
+true
 NULL
-1
-1
-1
-1
-1
+true
+true
+true
+true
+true
 
 -- query 91
--- legacy
+-- types	boolean
 _col0
-1
-1
-1
-1
+true
+true
+true
+true
 NULL
-1
-1
-1
-0
-0
+true
+true
+true
+false
+false
 
 -- query 92
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
 NULL
-1
-1
-1
-1
-1
-1
+true
+true
+true
+true
+true
+true
 
 -- query 93
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
 NULL
-1
-1
-1
-1
-1
-1
+true
+true
+true
+true
+true
+true
 
 -- query 94
--- legacy
+-- types	boolean
 _col0
-1
-1
-1
-1
-1
-1
-1
-1
-0
-1
+true
+true
+true
+true
+true
+true
+true
+true
+false
+true
 
 -- query 95
--- legacy
+-- types	boolean
 _col0
-1
-1
-1
-1
-1
-1
-0
-0
-1
-1
+true
+true
+true
+true
+true
+true
+false
+false
+true
+true
 
 -- query 96
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -901,189 +905,189 @@ NULL
 NULL
 
 -- query 97
--- legacy
+-- types	boolean
 _col0
-0
-1
+false
+true
 NULL
-1
-1
-1
-1
-1
-1
-1
+true
+true
+true
+true
+true
+true
+true
 
 -- query 98
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
-1
-1
-0
-0
-1
-1
+true
+true
+true
+false
+false
+true
+true
 
 -- query 99
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
 NULL
 NULL
 NULL
-1
-1
-1
-1
+true
+true
+true
+true
 
 -- query 100
--- legacy
+-- types	boolean
 _col0
-1
-1
-1
-1
-1
-1
-1
-1
-1
-1
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
 
 -- query 101
--- legacy
+-- types	boolean
 _col0
-1
-1
-1
-1
-1
-1
+true
+true
+true
+true
+true
+true
 NULL
-1
+true
 NULL
-1
+true
 
 -- query 102
--- legacy
+-- types	boolean
 _col0
-1
-1
-1
-1
-1
-1
+true
+true
+true
+true
+true
+true
 NULL
-1
+true
 NULL
-1
+true
 
 -- query 103
--- legacy
+-- types	boolean
 _col0
-0
-0
-1
-1
-1
-1
-1
-1
-1
-1
+false
+false
+true
+true
+true
+true
+true
+true
+true
+true
 
 -- query 104
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
-1
-1
-1
-1
-1
-1
+true
+true
+true
+false
+false
+true
+true
 
 -- query 105
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
-1
-1
-1
-1
-1
-1
+true
+true
+true
+true
+true
+true
+true
 
 -- query 106
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
-1
-1
-1
-1
-1
-1
-1
+true
+true
+true
+true
+true
+NULL
+true
 
 -- query 107
--- legacy
+-- types	boolean
 _col0
-1
-1
-1
-1
-1
-1
-1
-1
+true
+true
+true
+true
+true
+true
+true
+true
 NULL
 NULL
 
 -- query 108
--- legacy
+-- types	boolean
 _col0
-1
-1
+true
+true
 NULL
 NULL
 NULL
-1
-1
-1
-1
-1
+true
+true
+true
+true
+true
 
 -- query 109
--- legacy
+-- types	boolean
 _col0
-1
-1
-1
-1
+true
+true
+true
+true
 NULL
-1
-1
-1
+true
+true
+true
 NULL
 NULL
 
 -- query 110
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -1097,7 +1101,7 @@ NULL
 NULL
 
 -- query 111
--- legacy
+-- types	boolean
 _col0
 NULL
 NULL
@@ -1111,40 +1115,40 @@ NULL
 NULL
 
 -- query 114
--- legacy
+-- types	boolean
 _col0
-1
+true
 
 -- query 115
--- legacy
+-- types	boolean
 _col0
-0
+false
 
 -- query 116
--- legacy
+-- types	boolean
 _col0
-0
+false
 
 -- query 117
--- legacy
+-- types	boolean
 _col0
-1
+true
 
 -- query 118
--- legacy
+-- types	boolean	boolean	boolean	boolean	boolean	boolean	boolean
 struct_eq	struct_ne	map_eq	map_ne	struct_unknown	struct_safe	map_safe
-0	1	0	1	NULL	1	1
+false	true	false	true	NULL	true	true
 
 -- query 119
--- legacy
+-- types	bigint	boolean	boolean	boolean
 v1	eq	ne	safe
-1	NULL	NULL	1
-1	1	0	1
-2	1	0	1
-2	1	0	1
-3	NULL	NULL	1
-3	1	0	1
-4	NULL	NULL	1
-4	1	0	1
-5	1	0	1
-5	1	0	1
+1	NULL	NULL	true
+1	true	false	true
+2	true	false	true
+2	true	false	true
+3	NULL	NULL	true
+3	true	false	true
+4	NULL	NULL	true
+4	true	false	true
+5	true	false	true
+5	true	false	true
