@@ -800,6 +800,13 @@ mv_refresh_scheduler_max_concurrent = 1
                     "before-background-configuration-write",
                     &scenario_root.join("mv-recovery-faults"),
                 )?,
+                control_plan::scheduler_outcome(
+                    "background-configuration-outcome",
+                    "system_mv_config_interleaving",
+                    "ns",
+                    "background_mv",
+                    &scenario_root.join("background-configuration-outcome"),
+                ),
             ])],
         )
         .map(Some)
@@ -1053,17 +1060,36 @@ fn background_configuration_writer_conflict(
         "external pause and same-value resume did not publish distinct configuration writer snapshots"
     );
     prepared.remove()?;
-    loop {
-        if context.handle().fe_log_contents()?.lines().any(|line| {
-            line.contains("frontend MV scheduler refresh did not complete")
-                && line.contains("background_mv")
-                && line.contains("Materialized view slot value or writer changed since admission")
-        }) {
-            break;
+    let outcome = context
+        .scenario_root()
+        .join("background-configuration-outcome");
+    let scope = context.handle().mv_scheduler_outcome_binding(
+        "background-configuration-outcome",
+        "system_mv_config_interleaving",
+        "ns",
+        "background_mv",
+        &outcome,
+    )?;
+    let blocked = loop {
+        if let Some(blocked) = read_scheduler_outcome(
+            &outcome,
+            "background-configuration-outcome",
+            "system_mv_config_interleaving",
+            "background_mv",
+            &scope,
+        )? {
+            break blocked;
         }
         context.remaining("observe rejection of the originally admitted background writer")?;
         thread::sleep(POLL_INTERVAL);
-    }
+    };
+    use novarocks_execution_contract::failure::{FailureClass, domain};
+    ensure!(
+        blocked.fact.class() == FailureClass::Dependency
+            && blocked.fact.reason().domain() == domain::CONNECTOR.get()
+            && blocked.fact.reason().code() == 52,
+        "expected the original provider validation conflict, got {blocked}"
+    );
     let after = load_metadata(context, rest_uri, "ns", "background_mv")?;
     ensure!(
         after["snapshots"] == resumed["snapshots"],
@@ -3284,6 +3310,24 @@ fn check_scheduler_outcome(
     mv: &str,
     expected: &novarocks_failpoint::target_binding::RoleProcessReceipt,
 ) -> Result<()> {
+    if let Some(blocked) =
+        read_scheduler_outcome(directory, grant_id, "system_mv_scheduler", mv, expected)?
+    {
+        return Err(anyhow::Error::new(blocked).context(format!(
+            "actual Blocked scheduler request recorded at {}",
+            directory.join("scheduler-outcome.json").display()
+        )));
+    }
+    Ok(())
+}
+
+fn read_scheduler_outcome(
+    directory: &Path,
+    grant_id: &str,
+    catalog: &str,
+    mv: &str,
+    expected: &novarocks_failpoint::target_binding::RoleProcessReceipt,
+) -> Result<Option<SchedulerRequestBlocked>> {
     use prost::Message;
     use std::io::Read;
     expected
@@ -3303,7 +3347,7 @@ fn check_scheduler_outcome(
     const MAX_BYTES: usize = 64 * 1024;
     let file = match fs::File::open(&path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("open finite scheduler outcome {}", path.display()));
@@ -3324,7 +3368,7 @@ fn check_scheduler_outcome(
             && record["semantic_scope"] == "scheduler-request-outcome"
             && record["decision"] == "Blocked"
             && record["grant_id"] == grant_id
-            && record["target"]["catalog"] == "system_mv_scheduler"
+            && record["target"]["catalog"] == catalog
             && record["target"]["namespace"] == "ns"
             && record["target"]["mv"] == mv,
         "finite scheduler outcome has a foreign target/grant or invalid shape; outcome UNKNOWN"
@@ -3447,14 +3491,10 @@ fn check_scheduler_outcome(
         record["public_message"] == public_message,
         "scheduler outcome message disagrees with its decoded domain fact; outcome UNKNOWN"
     );
-    Err(anyhow::Error::new(SchedulerRequestBlocked {
+    Ok(Some(SchedulerRequestBlocked {
         fact,
         public_message,
-    })
-    .context(format!(
-        "actual Blocked scheduler request recorded at {}",
-        path.display()
-    )))
+    }))
 }
 
 struct SchedulerOutcomeTarget {
