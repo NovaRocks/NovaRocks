@@ -31,8 +31,12 @@ SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal)
 FROM (VALUES (1, 30, 3, NULL), (2, 10, 1, NULL), (3, 20, 2, NULL)) AS input_rows(ordinal, payload_value, k1, k2);
 
 -- query 4
-SELECT array_sort([NULL,NULL,NULL]) AS sorted, array_min([NULL,NULL,NULL]) AS smallest, array_max([NULL,NULL,NULL]) AS largest;
+SELECT array_sort(ARRAY[NULL,NULL,NULL]) AS sorted, array_min(ARRAY[NULL,NULL,NULL]) AS smallest, array_max(ARRAY[NULL,NULL,NULL]) AS largest;
 
 -- query 5
 SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal) AS null_value_moves
 FROM (VALUES (1, NULL, NULL, 3), (2, 8, NULL, 1), (3, 7, NULL, 2)) AS input_rows(ordinal, payload_value, k1, k2);
+
+-- query 6
+SELECT array_min(ARRAY[TINYINT '2', TINYINT '1']) AS narrow_min,
+       array_max(ARRAY[SMALLINT '2', SMALLINT '1']) AS narrow_max;

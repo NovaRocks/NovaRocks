@@ -1,4 +1,9 @@
 -- query 1
--- legacy
+-- types	array(integer)	array(integer)	array(integer)
 sliced	concated	deduped
 [2,3]	[1,2,3,null]	[1,2,null]
+
+-- query 2
+-- types	bigint
+repeat_count
+4096

@@ -28,3 +28,8 @@ SELECT
     slice([1, 2, 3, 4], 2, 2) AS sliced,
     concat([1, 2], [3, NULL]) AS concated,
     ARRAY_DISTINCT([1, 2, 2, NULL, 1, NULL]) AS deduped;
+
+-- query 2
+-- This result fits the query host. Trino 484 charges its object representation.
+SELECT cardinality(repeat(rpad(CAST(x AS VARCHAR), 1020, 'x'), 4096)) AS repeat_count
+FROM TABLE(sequence(1, 1)) AS input(x);

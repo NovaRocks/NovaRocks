@@ -38,6 +38,7 @@ pub(super) fn test_product() -> (RequiredConstantInterpreter, Arc<EngineFunction
     for name in [
         "lower",
         "concat",
+        "slice",
         "if",
         "coalesce",
         "rand",

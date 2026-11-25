@@ -129,6 +129,28 @@ pub enum HydrateProjection {
     /// STRING or BINARY domain. Names and NULL declarations remain exact;
     /// dictionary values retain their original D(L)/explicit-override policy.
     ExactByteLayouts,
+    /// Accept nullable physical child flags on an already signed value layout.
+    /// Required values are still checked in every reachable row. The caller
+    /// may also request its existing exact plain-byte layout projection.
+    PermissivePhysicalNullability {
+        project_byte_layouts: bool,
+    },
+}
+
+impl HydrateProjection {
+    fn projects_byte_layouts(self) -> bool {
+        matches!(
+            self,
+            Self::ExactByteLayouts
+                | Self::PermissivePhysicalNullability {
+                    project_byte_layouts: true
+                }
+        )
+    }
+
+    fn permits_physical_nullability(self) -> bool {
+        matches!(self, Self::PermissivePhysicalNullability { .. })
+    }
 }
 
 /// Primitive storage parameter for exercising a future dictionary-value

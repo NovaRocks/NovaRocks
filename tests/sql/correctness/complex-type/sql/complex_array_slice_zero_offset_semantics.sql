@@ -17,15 +17,17 @@
 
 -- @order_sensitive=true
 -- @tags=complex,array
--- Test Objective:
--- 1. Validate ARRAY_SLICE offset=0 semantics match StarRocks (empty result).
--- 2. Prevent regressions where offset=0 is treated as start-from-first-element.
--- Test Flow:
--- 1. Build deterministic array literals.
--- 2. Evaluate ARRAY_SLICE with zero, positive, and negative offsets.
--- 3. Assert projected arrays.
-SELECT
-    slice([1, 2, 3], 0, 2) AS sliced_zero_with_len,
-    slice([1, 2, 3], 0) AS sliced_zero_no_len,
-    slice([1, 2, 3], -2, 2) AS sliced_negative,
-    slice([1, 2, 3], 1, 2) AS sliced_positive;
+-- Valid starts use Trino indexing. Slice length is clamped to the remaining items.
+
+-- query 1
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT slice(ARRAY[1, 2, 3], 0, 2);
+
+-- query 2
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT slice(ARRAY[1, 2, 3], 0);
+
+-- query 3
+SELECT slice(ARRAY[1, 2, 3], -2, 2) AS sliced_negative,
+       slice(ARRAY[1, 2, 3], 1, 2) AS sliced_positive,
+       slice(ARRAY[1, 2, 3], 2, BIGINT '9223372036854775807') AS clipped_length;

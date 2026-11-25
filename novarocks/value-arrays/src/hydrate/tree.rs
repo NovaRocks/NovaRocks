@@ -16,8 +16,8 @@
 // under the License.
 
 use super::{
-    HydrateEvent, HydrateObserver, HydrateOptions, HydratePathStep, HydrateProjection,
-    HydrateRequirements, child, invalid, reserve,
+    HydrateEvent, HydrateObserver, HydrateOptions, HydratePathStep, HydrateRequirements, child,
+    invalid, reserve,
 };
 use crate::{
     ByteLayout, ValueError, ValueFailure, ValueViolation,
@@ -88,17 +88,14 @@ impl Node {
             _ => None,
         };
         let keep = dictionary && keep_encoded(&path[..depth], source.data_type());
-        let source_layout =
-            if options.projection == HydrateProjection::ExactByteLayouts && !dictionary {
-                ByteLayout::from_data_type(source.data_type())
-            } else {
-                layout
-            };
+        let project_byte_layout = options.projection.projects_byte_layouts() && !dictionary;
+        let source_layout = if project_byte_layout {
+            ByteLayout::from_data_type(source.data_type())
+        } else {
+            layout
+        };
         let byte_projection = fixed_binary_source_width.is_some()
-            || options.projection == HydrateProjection::ExactByteLayouts
-                && !dictionary
-                && layout.is_some()
-                && layout != source_layout;
+            || project_byte_layout && layout.is_some() && layout != source_layout;
         let required_inactive_nulls = !binding.value_type().nullable() && source.null_count() != 0;
         let convert = dictionary && !keep
             || !dictionary && layout.is_some() && required_inactive_nulls

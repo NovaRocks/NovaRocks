@@ -19,7 +19,7 @@
 
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_scalar::ScalarWork;
-use crate::arrow_result_custody::retain_result_backing;
+use crate::arrow_result_custody::{RetainedArrowResult, retain_result_backing};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::OpaqueRetainedCharge;
 use crate::scalar_output_resources::ScalarOutputResources;
@@ -43,18 +43,30 @@ pub(crate) fn with_scalar_output_operation(
     compute: impl FnOnce(&mut ScalarWork<'_, '_>) -> Result<ArrayRef, KernelFailure>,
 ) -> Result<RetainedScalarOutput, KernelFailure> {
     let bytes = resources.operation_upper_bound()?;
-    let charge = OpaqueRetainedCharge::try_new(host)?;
-    work.flush()?;
-    // Actual host refusal precedes the original copy/builder; all seven typed
-    // causes return unchanged. Layout/stock facts alone never mint a grant.
-    let mut reservation = charge.reserve_operation(bytes)?;
-    work.flush()?;
-    let values = compute(&mut ScalarWork::new(Some(work)))?;
-    let values = retain_result_backing(values, charge, &mut reservation, allocator.clone(), work)?;
+    let values = with_scalar_output_peak(bytes, host, allocator, work, |work| {
+        compute(&mut ScalarWork::new(Some(work)))
+    })?;
     Ok(RetainedScalarOutput {
         values: values.values,
         resources,
         original_carrier_stock: values.original_carrier_stock,
         retained_envelope: values.retained_envelope,
     })
+}
+
+/// Preserve the shared build and settlement path for a caller with Arrow's
+/// actual output geometry. The caller's geometry supplies no capacity grant.
+pub(crate) fn with_scalar_output_peak(
+    bytes: usize,
+    host: Arc<dyn AggregateStateAllocator>,
+    allocator: &HostAggregateAllocator,
+    work: &mut EvaluationCheckpoints<'_>,
+    compute: impl FnOnce(&mut EvaluationCheckpoints<'_>) -> Result<ArrayRef, KernelFailure>,
+) -> Result<RetainedArrowResult, KernelFailure> {
+    let charge = OpaqueRetainedCharge::try_new(host)?;
+    work.flush()?;
+    let mut reservation = charge.reserve_operation(bytes)?;
+    work.flush()?;
+    let values = compute(work)?;
+    retain_result_backing(values, charge, &mut reservation, allocator.clone(), work)
 }

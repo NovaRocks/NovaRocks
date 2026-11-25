@@ -152,6 +152,26 @@ impl PreparedKeyOperations {
         .compare(left, right)
     }
 
+    /// Compare two selected Arrow values with the caller's actual allocator.
+    /// Recursive MAP scratch is released at the end of each original index.
+    pub fn compare_in_observed<A: Allocator + Clone, E>(
+        &self,
+        left: &BoundKeyArray<'_>,
+        right: &BoundKeyArray<'_>,
+        rows: (usize, usize),
+        allocator: &A,
+        work: &mut Work<'_, E>,
+    ) -> Result<KeyComparison, ValueFailure<E>> {
+        self.check_pair(left, right, work)?;
+        ComparisonWork {
+            relation: self.relation,
+            growth: &mut |_| Ok(()),
+            work,
+            allocator,
+        }
+        .compare(left.position(rows.0)?, right.position(rows.1)?)
+    }
+
     /// Results stay in the supplied pair order, including repeated coordinates.
     pub fn compare_pairs_observed<E>(
         &self,

@@ -583,7 +583,9 @@ fn string_reverse_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
             owner.binding_declaration().function_id().as_str(),
             "builtin.scalar/reverse/v1"
         );
-        assert_eq!(owner.implementation_declarations().len(), 2);
+        assert!(owner.implementation_declarations().iter().any(|entry| {
+            entry.implementation.as_str() == "builtin.scalar/reverse/array-selected-v1"
+        }));
         assert_eq!(
             owner.implementation_declarations()[0]
                 .implementation
@@ -642,17 +644,20 @@ fn string_reverse_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
                 .prepare_scalar(stale, canonical, crate::binding_test_control())
                 .is_err()
         );
+        let array = FunctionValueType::from_legacy_declared_projection(
+            DataType::List(Arc::new(arrow_schema::Field::new(
+                "item",
+                DataType::Int64,
+                true,
+            ))),
+            true,
+        );
+        let prepared =
+            prepared_for_test_with_policy(name, &array, DecimalOverflowPolicy::OutputNull).unwrap();
+        assert_eq!(prepared.contract().result_type(), &array);
         for source in [
             FunctionValueType::new(DataType::LargeUtf8, true),
             FunctionValueType::new(DataType::Int64, true),
-            FunctionValueType::from_legacy_declared_projection(
-                DataType::List(Arc::new(arrow_schema::Field::new(
-                    "item",
-                    DataType::Int64,
-                    true,
-                ))),
-                true,
-            ),
             FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
                 .unwrap(),
         ] {

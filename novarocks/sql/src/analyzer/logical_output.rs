@@ -1908,8 +1908,8 @@ mod scalar_domain_tests {
         assert_eq!(
             output_domains("select zip([b],[parse_json('{}')]) from t"),
             vec![Some(SqlType::Array(Box::new(SqlType::Struct(vec![
-                ("col1".to_owned(), SqlType::Bitmap),
-                ("col2".to_owned(), SqlType::Json),
+                (String::new(), SqlType::Bitmap),
+                (String::new(), SqlType::Json),
             ]))))]
         );
         let sql = "select zip([row(null,b)],null) from t";
@@ -1928,16 +1928,19 @@ mod scalar_domain_tests {
         else {
             panic!("List");
         };
+        assert!(expression.value_type.nullable());
+        assert!(selected.nullable());
         assert_eq!(item.name(), selected_item.name());
-        assert_eq!(item.is_nullable(), selected_item.is_nullable());
+        assert!(!item.is_nullable());
+        assert!(!selected_item.is_nullable());
         let (DataType::Struct(fields), DataType::Struct(selected_fields)) =
             (item.data_type(), selected_item.data_type())
         else {
             panic!("Struct");
         };
         assert_eq!(fields.len(), 2);
-        for (i, (field, selected)) in fields.iter().zip(selected_fields).enumerate() {
-            assert_eq!(field.name(), &format!("col{}", i + 1));
+        for (field, selected) in fields.iter().zip(selected_fields) {
+            assert!(field.name().is_empty());
             assert_eq!(field.name(), selected.name());
             assert_eq!(field.is_nullable(), selected.is_nullable());
             assert!(field.is_nullable());

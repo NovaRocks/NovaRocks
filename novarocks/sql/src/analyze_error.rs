@@ -50,6 +50,11 @@ const UNKNOWN_FUNCTION: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const OPERATOR_NOT_FOUND: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.operator_not_found"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const UNKNOWN_TYPE: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.unknown_type"),
     phase: ErrorPhase::Analyze,
@@ -204,6 +209,7 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     UNKNOWN_SCHEMA,
     UNKNOWN_COLUMN,
     UNKNOWN_FUNCTION,
+    OPERATOR_NOT_FOUND,
     UNKNOWN_TYPE,
     AMBIGUOUS_FUNCTION_CALL,
     AMBIGUOUS_NAME,
@@ -243,6 +249,7 @@ pub enum AnalyzeErrorKind {
     UnknownSchema,
     UnknownColumn,
     UnknownFunction,
+    OperatorNotFound,
     UnknownType,
     AmbiguousFunctionCall,
     AmbiguousName,
@@ -284,6 +291,7 @@ impl AnalyzeErrorKind {
             Self::UnknownSchema => UNKNOWN_SCHEMA,
             Self::UnknownColumn => UNKNOWN_COLUMN,
             Self::UnknownFunction => UNKNOWN_FUNCTION,
+            Self::OperatorNotFound => OPERATOR_NOT_FOUND,
             Self::UnknownType => UNKNOWN_TYPE,
             Self::AmbiguousFunctionCall => AMBIGUOUS_FUNCTION_CALL,
             Self::AmbiguousName => AMBIGUOUS_NAME,
@@ -830,6 +838,15 @@ impl AnalyzeError {
                     view_cause: None,
                 }
             }
+            error @ novarocks_functions::FunctionBindingError::OperatorNotFound => Self {
+                kind: AnalyzeErrorKind::OperatorNotFound,
+                message: error.to_string(),
+                span: None,
+                source_sql: None,
+                control: None,
+                source: None,
+                view_cause: None,
+            },
             error @ (novarocks_functions::FunctionBindingError::UnknownFunction
             | novarocks_functions::FunctionBindingError::HiddenFunction
             | novarocks_functions::FunctionBindingError::NoMatchingOverload
@@ -870,6 +887,7 @@ impl AnalyzeError {
             AnalyzeErrorKind::UnavailableImplementation
                 | AnalyzeErrorKind::UnsupportedExpression
                 | AnalyzeErrorKind::UnknownFunction
+                | AnalyzeErrorKind::OperatorNotFound
                 | AnalyzeErrorKind::UnknownType
                 | AnalyzeErrorKind::AmbiguousFunctionCall
         ) {
@@ -1064,6 +1082,7 @@ mod tests {
                 "sql.analyze.unknown_schema",
                 "sql.analyze.unknown_column",
                 "sql.analyze.unknown_function",
+                "sql.analyze.operator_not_found",
                 "sql.analyze.unknown_type",
                 "sql.analyze.ambiguous_function_call",
                 "sql.analyze.ambiguous_name",

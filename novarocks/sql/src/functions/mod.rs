@@ -1739,74 +1739,101 @@ mod tests {
 
     #[test]
     fn array_ordering_binding_closes_comparator_domain() {
+        use arrow::datatypes::Field;
+        use novarocks_type_contract::{
+            TemporalPrecision, TemporalType, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+        };
+
         let catalog = build_builtin_engine_function_catalog().unwrap();
-        let list = |ty| DataType::List(Arc::new(arrow::datatypes::Field::new("item", ty, true)));
-        for ty in [
-            list(DataType::Int64),
-            DataType::Map(
-                Arc::new(arrow::datatypes::Field::new(
-                    "entries",
-                    DataType::Struct(
-                        vec![
-                            Arc::new(arrow::datatypes::Field::new("key", DataType::Int64, false)),
-                            Arc::new(arrow::datatypes::Field::new("value", DataType::Int64, true)),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
+        let control = &crate::compiler::SqlCompileControl::unbounded();
+        let list = |ty| DataType::List(Arc::new(Field::new_list_field(ty, true)));
+        let row = |ty| DataType::Struct(vec![Field::new("x", ty, true)].into());
+        let map = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Int64, false),
+                        Field::new("value", DataType::Int64, true),
+                    ]
+                    .into(),
+                ),
                 false,
-            ),
-            DataType::Struct(
-                vec![Arc::new(arrow::datatypes::Field::new(
-                    "x",
-                    DataType::Int64,
-                    true,
-                ))]
-                .into(),
-            ),
-            DataType::Decimal256(60, 2),
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
-        ] {
+            )),
+            false,
+        );
+        for item in [map.clone(), row(list(map))] {
+            let arguments = [value_argument(list(item), true, None)];
+            let request = FunctionBindingRequest {
+                expected_result_type: None,
+                arguments: &arguments,
+                logical_argument_count: 1,
+            };
             for name in ["array_sort", "array_min", "array_max"] {
-                let arguments = vec![value_argument(list(ty.clone()), true, None)];
                 assert!(
-                    catalog
-                        .resolve_bound_user(
-                            name,
-                            FunctionKind::Scalar,
-                            FunctionBindingRequest {
-                                expected_result_type: None,
-                                arguments: &arguments,
-                                logical_argument_count: arguments.len()
-                            },
-                            &crate::compiler::SqlCompileControl::unbounded(),
-                        )
-                        .is_err(),
+                    matches!(
+                        catalog.resolve_bound_user(name, FunctionKind::Scalar, request, control),
+                        Err(FunctionBindingError::NoMatchingOverload)
+                    ),
                     "{name}"
                 );
             }
         }
-        for ty in [
+
+        let mut admitted = [
             DataType::Null,
             DataType::Int8,
             DataType::Date32,
             DataType::Decimal128(38, 2),
+            DataType::Decimal256(60, 2),
             DataType::FixedSizeBinary(16),
-        ] {
-            let arguments = [value_argument(list(ty), true, None)];
-            let bound = resolve_exact_scalar(&catalog, "array_sort", &arguments);
-            catalog
-                .validate_bound(
-                    &bound,
-                    FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &arguments,
-                        logical_argument_count: 1,
-                    },
-                    &crate::compiler::SqlCompileControl::unbounded(),
+            list(row(DataType::Int64)),
+            row(list(DataType::Int64)),
+        ]
+        .map(|item| FunctionValueType::from_legacy_declared_projection(item, true))
+        .to_vec();
+        let temporal = TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS);
+        let storage = ValueTypeStorageLifetime::pure();
+        admitted.push(
+            FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(ValueKind::Temporal(temporal), true, storage.clone())
+                    .unwrap(),
+                ValueLayout::try_new(&temporal.carrier(), storage).unwrap(),
+            )
+            .unwrap(),
+        );
+        for item in admitted {
+            let storage = ValueTypeStorageLifetime::pure();
+            let array = FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(
+                    ValueKind::List(item.value_type().clone()),
+                    true,
+                    storage.clone(),
                 )
-                .unwrap();
+                .unwrap(),
+                ValueLayout::try_new(&list(item.data_type().clone()), storage).unwrap(),
+            )
+            .unwrap();
+            let arguments = [FunctionArgument::Value {
+                value_type: array.clone(),
+                constant: None,
+            }];
+            for name in ["array_sort", "array_min", "array_max"] {
+                let bound = resolve_exact_scalar(&catalog, name, &arguments);
+                catalog
+                    .validate_bound(
+                        &bound,
+                        FunctionBindingRequest {
+                            expected_result_type: None,
+                            arguments: &arguments,
+                            logical_argument_count: 1,
+                        },
+                        control,
+                    )
+                    .unwrap();
+                let expected = if name == "array_sort" { &array } else { &item };
+                assert_eq!(scalar_result(&bound), expected, "{name}");
+            }
         }
     }
 
@@ -1828,21 +1855,18 @@ mod tests {
             if name != "array_distinct" {
                 arguments.push(value_argument(DataType::Decimal256(60, 2), true, None));
             }
-            assert!(
-                catalog
-                    .resolve_bound_user(
-                        name,
-                        FunctionKind::Scalar,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: arguments.len()
-                        },
-                        &crate::compiler::SqlCompileControl::unbounded(),
-                    )
-                    .is_err(),
-                "{name}"
-            );
+            let bound = resolve_exact_scalar(&catalog, name, &arguments);
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        expected_result_type: None,
+                        arguments: &arguments,
+                        logical_argument_count: arguments.len(),
+                    },
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
         }
         for name in ["contains", "array_position", "array_remove"] {
             let item = list(DataType::FixedSizeBinary(16));
@@ -1897,7 +1921,7 @@ mod tests {
         let bound = resolve_exact_scalar(&catalog, "arrays_overlap", &arguments);
         assert_eq!(
             bound.semantics.intrinsic_row_error,
-            novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
+            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
         );
     }
 

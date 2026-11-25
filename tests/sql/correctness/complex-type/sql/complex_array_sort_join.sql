@@ -17,13 +17,19 @@
 
 -- @order_sensitive=true
 -- @tags=complex,array
--- Test Objective:
--- 1. Validate ARRAY_SORT and ARRAY_JOIN outputs.
--- 2. Prevent regressions in array ordering/stringification helpers.
--- Test Flow:
--- 1. Build deterministic array literals.
--- 2. Apply sort and join helpers.
--- 3. Assert scalar output.
-SELECT
-    ARRAY_SORT([3, 1, 2, NULL]) AS sorted_arr,
-    ARRAY_JOIN(['a', 'b', NULL], ',') AS joined_arr;
+
+-- query 1
+SELECT array_sort(ARRAY[3, 1, 2, NULL]) AS sorted_arr,
+       array_join(ARRAY['a', 'b', NULL], ',') AS joined_arr;
+
+-- query 2
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT array_join(ARRAY[JSON '[1]'], ',');
+
+-- query 3
+SELECT TRY(array_join(ARRAY[JSON '[1]'], ',')) AS element_error,
+       array_join(ARRAY[JSON 'null', JSON '"one"'], ',', 'missing') AS replaced_null;
+
+-- query 4
+-- @expect_trino_error=OPERATOR_NOT_FOUND,USER_ERROR
+SELECT array_join(ARRAY[ARRAY[1]], ',');

@@ -29,13 +29,13 @@ USE ${case_db};
 CREATE TABLE "array_map_test" (
   "id" TINYINT NOT NULL,
   "arr_str" array<VARCHAR>,
-  "arr_largeint" array<largeint>
+  "arr_largeint" ARRAY(DECIMAL(38, 0))
 ) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into array_map_test values ROW(1, repeat('abcdefghasdasdasirnqwrq', 20000), repeat(CAST(100 AS LARGEINT), 20000));
+insert into array_map_test values ROW(1, repeat('abcdefghasdasdasirnqwrq', 20000), repeat(CAST(100 AS DECIMAL(38, 0)), 20000));
 
 -- query 4
 USE ${case_db};
@@ -187,13 +187,13 @@ USE ${case_db};
 CREATE TABLE "array_map_x" (
   "id" TINYINT NOT NULL,
   "arr_str" array<varchar(65533)>,
-  "arr_largeint" array<largeint(40)>
+  "arr_largeint" ARRAY(DECIMAL(38, 0))
 ) WITH (format_version = 3);
 
 -- query 37
 -- @skip_result_check=true
 USE ${case_db};
-insert into array_map_x values ROW(1, repeat('abcdefghasdasdasirnqwrq', 2), repeat(CAST(100 AS LARGEINT), 2));
+insert into array_map_x values ROW(1, repeat('abcdefghasdasdasirnqwrq', 2), repeat(CAST(100 AS DECIMAL(38, 0)), 2));
 
 -- query 38
 USE ${case_db};

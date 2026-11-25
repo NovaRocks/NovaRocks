@@ -206,13 +206,9 @@ mod fold_frontiers {
         }
     }
     #[test]
-    fn reverse_keeps_installed_string_and_uninstalled_array_overloads_distinct() {
+    fn reverse_keeps_installed_string_and_array_overloads_distinct() {
         let probe = Arc::new(FoldProbe::default());
-        analyze("SELECT reverse('abc')", &probe).unwrap();
-        unavailable(
-            analyze("SELECT reverse(ARRAY[1,2])", &probe).unwrap_err(),
-            "builtin.scalar/reverse/(list",
-        );
+        analyze("SELECT reverse('abc'), reverse(ARRAY[1,2])", &probe).unwrap();
     }
 
     #[test]

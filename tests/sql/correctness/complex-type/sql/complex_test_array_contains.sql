@@ -42,7 +42,7 @@ insert into t select generate_series, concat('array-key-', CAST(generate_series 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into t values ROW(1000, concat('array-key-', CAST(1000 AS varchar)), concat(sequence(1, 128), null), concat(repeat(concat('array-key-', CAST(1000 AS varchar)),16), null),concat(sequence(1, 128),null));
+insert into t values ROW(1000, concat('array-key-', CAST(1000 AS varchar)), concat(sequence(1, 128), [CAST(NULL AS BIGINT)]), concat(repeat(concat('array-key-', CAST(1000 AS varchar)),16), [CAST(NULL AS VARCHAR)]),concat(sequence(1, 128), [CAST(NULL AS BIGINT)]));
 
 -- query 5
 USE ${case_db};
@@ -78,11 +78,11 @@ select array_position(null, null) from t order by pk limit 10;
 
 -- query 13
 USE ${case_db};
-select sum(contains((sequence(1, 1000)), pk)) from t;
+select SUM(CAST(contains((sequence(1, 1000)), pk) AS BIGINT)) from t;
 
 -- query 14
 USE ${case_db};
-select sum(contains((sequence(1, 1000)), 100)) from t;
+select SUM(CAST(contains((sequence(1, 1000)), 100) AS BIGINT)) from t;
 
 -- query 15
 USE ${case_db};
@@ -94,15 +94,15 @@ select sum(array_position((sequence(1, 1000)), 100)) from t;
 
 -- query 17
 USE ${case_db};
-select sum(contains(concat((sequence(1, 1000)), null), pk)) from t;
+select SUM(CAST(contains(concat((sequence(1, 1000)), [CAST(NULL AS BIGINT)]), pk) AS BIGINT)) from t;
 
 -- query 18
 USE ${case_db};
-select sum(contains(concat((sequence(1, 1000)), null), null)) from t;
+select SUM(CAST(contains(concat((sequence(1, 1000)), [CAST(NULL AS BIGINT)]), null) AS BIGINT)) from t;
 
 -- query 19
 USE ${case_db};
-select sum(contains(arr_bigint, 100)) from t;
+select SUM(CAST(contains(arr_bigint, 100) AS BIGINT)) from t;
 
 -- query 20
 USE ${case_db};
@@ -110,7 +110,7 @@ select sum(array_position(arr_bigint, 100)) from t;
 
 -- query 21
 USE ${case_db};
-select sum(contains(arr_str, concat('array-key-', CAST(100 AS varchar)))) from t;
+select SUM(CAST(contains(arr_str, concat('array-key-', CAST(100 AS varchar))) AS BIGINT)) from t;
 
 -- query 22
 USE ${case_db};
@@ -118,7 +118,7 @@ select sum(array_position(arr_str, concat('array-key-', CAST(100 AS varchar)))) 
 
 -- query 23
 USE ${case_db};
-select sum(contains(arr_decimal, pk)) from t;
+select SUM(CAST(contains(arr_decimal, pk) AS BIGINT)) from t;
 
 -- query 24
 USE ${case_db};
@@ -126,7 +126,7 @@ select sum(array_position(arr_decimal, pk)) from t;
 
 -- query 25
 USE ${case_db};
-select sum(contains(arr_decimal, 100)) from t;
+select SUM(CAST(contains(arr_decimal, 100) AS BIGINT)) from t;
 
 -- query 26
 USE ${case_db};
@@ -134,11 +134,11 @@ select sum(array_position(arr_decimal, 100)) from t;
 
 -- query 27
 USE ${case_db};
-select sum(contains((repeat('abcdefg', 10000)), 'abcdefg')) from t;
+select SUM(CAST(contains((repeat('abcdefg', 10000)), 'abcdefg') AS BIGINT)) from t;
 
 -- query 28
 USE ${case_db};
-select sum(contains((repeat('abcdefg', 10000)), str)) from t;
+select SUM(CAST(contains((repeat('abcdefg', 10000)), str) AS BIGINT)) from t;
 
 -- name: test_array_contains_with_decimal
 -- query 29
@@ -320,12 +320,12 @@ USE ${case_db};
 select contains_sequence((concat(repeat(1, 1000), 2)), (concat(repeat(1, 500), 2)));
 
 -- query 67
--- @expect_error=2-th input of array_contains_seq should be an array, rather than varchar
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select contains_sequence(['abc'],'a');
 
 -- query 68
--- @expect_error=1-th input of array_contains_seq should be an array, rather than varchar
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select contains_sequence('abc',['a']);
 
@@ -356,46 +356,46 @@ CREATE TABLE test_array_contains (
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO test_array_contains VALUES
-ROW(1, [true, false, NULL], [1, 2, NULL], [100, 200, NULL], [10, 20, NULL], [1000, 2000, NULL], [1234567890123456789, NULL, NULL],
+ROW(1, [true, false, NULL], CAST([1, 2, NULL] AS ARRAY<TINYINT>), CAST([100, 200, NULL] AS ARRAY<SMALLINT>), [10, 20, NULL], [1000, 2000, NULL], [1234567890123456789, NULL, NULL],
  [12345.67, 89012.34, NULL], [123.45, 678.90, NULL], [12345678.90, 9876543.21, NULL], [1234567890.1234567890, NULL, NULL], 
  [1.23, 4.56, NULL], [123.456, 789.012, NULL], ['hello', NULL, 'starrocks'], 
- ['2025-01-01', '2025-01-02', NULL], ['2025-01-01 12:00:00', NULL, '2025-01-02 14:00:00']),
-ROW(2, NULL, [5, NULL, 3], [500, 400, NULL], [50, 40, NULL], [5000, NULL, 3000], [987654321987654321, NULL, NULL],
+ [DATE '2025-01-01', DATE '2025-01-02', NULL], [TIMESTAMP '2025-01-01 12:00:00', NULL, TIMESTAMP '2025-01-02 14:00:00']),
+ROW(2, NULL, CAST([5, NULL, 3] AS ARRAY<TINYINT>), CAST([500, 400, NULL] AS ARRAY<SMALLINT>), [50, 40, NULL], [5000, NULL, 3000], [987654321987654321, NULL, NULL],
  [56789.01, NULL, 45678.12], [345.67, NULL, 234.56], [56789012.34, NULL, 34567890.12], [2345678901.2345678901, NULL, NULL], 
  [2.34, NULL, 1.23], [234.567, NULL, 123.456], [NULL, 'array', 'test'], 
- [NULL, '2024-12-31', '2024-12-30'], ['2024-12-31 23:59:59', '2024-12-30 12:00:00', NULL]),
-ROW(3, [true, NULL, false], [1, 6, NULL], [150, NULL, 250], [15, NULL, 35], [1100, NULL, 2200], [2345678901234567890, NULL, NULL],
+ [NULL, DATE '2024-12-31', DATE '2024-12-30'], [TIMESTAMP '2024-12-31 23:59:59', TIMESTAMP '2024-12-30 12:00:00', NULL]),
+ROW(3, [true, NULL, false], CAST([1, 6, NULL] AS ARRAY<TINYINT>), CAST([150, NULL, 250] AS ARRAY<SMALLINT>), [15, NULL, 35], [1100, NULL, 2200], [2345678901234567890, NULL, NULL],
  [67890.12, NULL, 56789.01], [456.78, NULL, 345.67], [67890123.45, NULL, 56789012.34], [3456789012.3456789012, NULL, NULL],
  [1.11, NULL, 3.33], [222.333, NULL, 333.444], ['foo', 'bar', NULL], 
- ['2025-01-03', NULL, '2025-01-04'], ['2025-01-03 16:00:00', '2025-01-04 18:00:00', NULL]),
-ROW(4, [NULL, true, false], [NULL, 20, 10], [110, 220, NULL], [NULL, 12, 24], [1200, NULL, 2400], [3456789012345678901, NULL, NULL],
+ [DATE '2025-01-03', NULL, DATE '2025-01-04'], [TIMESTAMP '2025-01-03 16:00:00', TIMESTAMP '2025-01-04 18:00:00', NULL]),
+ROW(4, [NULL, true, false], CAST([NULL, 20, 10] AS ARRAY<TINYINT>), CAST([110, 220, NULL] AS ARRAY<SMALLINT>), [NULL, 12, 24], [1200, NULL, 2400], [3456789012345678901, NULL, NULL],
  [78901.23, 67890.12, NULL], [567.89, 456.78, NULL], [78901234.56, 67890123.45, NULL], [4567890123.4567890123, NULL, NULL],
  [NULL, 5.55, 4.44], [NULL, 777.888, 666.777], ['NULL', 'banana', 'apple'], 
- [NULL, '2025-01-05', '2025-01-06'], [NULL, '2025-01-06 20:00:00', '2025-01-05 18:00:00']),
-ROW(5, [false, NULL, true], [10, NULL, 30], [300, 400, NULL], [70, NULL, 90], [4000, NULL, 6000], [987654321234567890, NULL, NULL],
+ [NULL, DATE '2025-01-05', DATE '2025-01-06'], [NULL, TIMESTAMP '2025-01-06 20:00:00', TIMESTAMP '2025-01-05 18:00:00']),
+ROW(5, [false, NULL, true], CAST([10, NULL, 30] AS ARRAY<TINYINT>), CAST([300, 400, NULL] AS ARRAY<SMALLINT>), [70, NULL, 90], [4000, NULL, 6000], [987654321234567890, NULL, NULL],
  [123456.78, NULL, 876543.21], [678.90, NULL, 789.01], [9876543.21, NULL, 1234567.89], [5678901234.5678901234, NULL, NULL],
  [3.21, 4.32, NULL], [111.222, NULL, 333.444], ['dog', 'cat', NULL], 
- ['2025-01-07', '2025-01-08', NULL], ['2025-01-07 10:00:00', NULL, '2025-01-08 15:00:00']),
-ROW(6, [NULL, true, true], [NULL, 40, 50], [450, 500, NULL], [80, 100, NULL], [1500, NULL, 2500], [765432198765432109, NULL, NULL],
+ [DATE '2025-01-07', DATE '2025-01-08', NULL], [TIMESTAMP '2025-01-07 10:00:00', NULL, TIMESTAMP '2025-01-08 15:00:00']),
+ROW(6, [NULL, true, true], CAST([NULL, 40, 50] AS ARRAY<TINYINT>), CAST([450, 500, NULL] AS ARRAY<SMALLINT>), [80, 100, NULL], [1500, NULL, 2500], [765432198765432109, NULL, NULL],
  [34567.89, NULL, 12345.67], [123.45, NULL, 678.90], [54321.12, NULL, 12345.67], [7654321098.7654321098, NULL, NULL],
  [NULL, 6.54, 7.65], [555.666, NULL, 444.333], [NULL, 'bird', 'fish'], 
- ['2025-01-09', '2025-01-10', NULL], ['2025-01-09 12:00:00', NULL, '2025-01-10 18:00:00']),
-ROW(7, [false, false, NULL], [70, NULL, 90], [650, NULL, 750], [120, 140, NULL], [8000, NULL, 9000], [543210987654321098, NULL, NULL],
+ [DATE '2025-01-09', DATE '2025-01-10', NULL], [TIMESTAMP '2025-01-09 12:00:00', NULL, TIMESTAMP '2025-01-10 18:00:00']),
+ROW(7, [false, false, NULL], CAST([70, NULL, 90] AS ARRAY<TINYINT>), CAST([650, NULL, 750] AS ARRAY<SMALLINT>), [120, 140, NULL], [8000, NULL, 9000], [543210987654321098, NULL, NULL],
  [45678.12, NULL, 23456.78], [234.56, NULL, 456.78], [67890123.45, NULL, 34567890.12], [4321098765.4321098765, NULL, NULL],
  [7.89, 8.90, NULL], [333.222, NULL, 111.000], ['lion', NULL, 'tiger'], 
- ['2025-01-11', '2025-01-12', NULL], ['2025-01-11 20:00:00', NULL, '2025-01-12 22:00:00']),
-ROW(8, [true, NULL, false], [5, 15, NULL], [50, NULL, 150], [25, NULL, 75], [4500, NULL, 5500], [321098765432109876, NULL, NULL],
+ [DATE '2025-01-11', DATE '2025-01-12', NULL], [TIMESTAMP '2025-01-11 20:00:00', NULL, TIMESTAMP '2025-01-12 22:00:00']),
+ROW(8, [true, NULL, false], CAST([5, 15, NULL] AS ARRAY<TINYINT>), CAST([50, NULL, 150] AS ARRAY<SMALLINT>), [25, NULL, 75], [4500, NULL, 5500], [321098765432109876, NULL, NULL],
  [23456.78, NULL, 12345.67], [345.67, NULL, 456.78], [8901234.56, NULL, 7890123.45], [2109876543.2109876543, NULL, NULL],
  [5.67, NULL, 4.56], [666.555, NULL, 222.111], [NULL, 'grape', 'pear'], 
- ['2025-01-13', NULL, '2025-01-14'], ['2025-01-13 23:59:59', '2025-01-14 12:00:00', NULL]),
-ROW(9, [false, true, NULL], [25, 35, NULL], [350, NULL, 450], [100, 200, NULL], [6000, NULL, 7000], [654321098765432109, NULL, NULL],
+ [DATE '2025-01-13', NULL, DATE '2025-01-14'], [TIMESTAMP '2025-01-13 23:59:59', TIMESTAMP '2025-01-14 12:00:00', NULL]),
+ROW(9, [false, true, NULL], CAST([25, 35, NULL] AS ARRAY<TINYINT>), CAST([350, NULL, 450] AS ARRAY<SMALLINT>), [100, 200, NULL], [6000, NULL, 7000], [654321098765432109, NULL, NULL],
  [67890.12, NULL, 34567.89], [456.78, NULL, 234.56], [34567890.12, NULL, 23456789.01], [8765432109.8765432109, NULL, NULL],
  [9.87, NULL, 8.76], [444.333, NULL, 555.222], ['watermelon', NULL, 'kiwi'], 
- [NULL, '2025-01-15', '2025-01-16'], ['2025-01-15 12:00:00', NULL, '2025-01-16 18:00:00']),
-ROW(10, [true, true, NULL], [50, 70, NULL], [750, 850, NULL], [300, 400, NULL], [10000, NULL, 12000], [789012345678901234, NULL, NULL],
+ [NULL, DATE '2025-01-15', DATE '2025-01-16'], [TIMESTAMP '2025-01-15 12:00:00', NULL, TIMESTAMP '2025-01-16 18:00:00']),
+ROW(10, [true, true, NULL], CAST([50, 70, NULL] AS ARRAY<TINYINT>), CAST([750, 850, NULL] AS ARRAY<SMALLINT>), [300, 400, NULL], [10000, NULL, 12000], [789012345678901234, NULL, NULL],
  [78901.23, NULL, 67890.12], [567.89, NULL, 456.78], [12345678.90, NULL, 9876543.21], [1234567890.1234567890, NULL, NULL],
  [NULL, 1.11, 2.22], [777.888, 999.000, NULL], ['blueberry', 'cherry', NULL], 
- ['2025-01-17', '2025-01-18', NULL], [NULL, '2025-01-17 10:00:00', '2025-01-18 20:00:00']);
+ [DATE '2025-01-17', DATE '2025-01-18', NULL], [NULL, TIMESTAMP '2025-01-17 10:00:00', TIMESTAMP '2025-01-18 20:00:00']);
 
 -- query 71
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2
@@ -559,7 +559,7 @@ SELECT id FROM test_array_contains WHERE contains(array_varchar, 'starrocks') OR
 
 -- query 110
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE contains(array_date, '2025-01-01') ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_date, DATE '2025-01-01') ORDER BY id;
 
 -- query 111
 USE ${case_db};
@@ -567,11 +567,11 @@ SELECT id FROM test_array_contains WHERE contains(array_date, NULL) ORDER BY id;
 
 -- query 112
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE contains(array_date, '2025-01-13') ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_date, DATE '2025-01-13') ORDER BY id;
 
 -- query 113
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE contains(array_datetime, '2025-01-01 12:00:00') ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_datetime, TIMESTAMP '2025-01-01 12:00:00') ORDER BY id;
 
 -- query 114
 USE ${case_db};
@@ -579,7 +579,7 @@ SELECT id FROM test_array_contains WHERE contains(array_datetime, NULL) ORDER BY
 
 -- query 115
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE contains(array_datetime, '2025-01-17 10:00:00') ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_datetime, TIMESTAMP '2025-01-17 10:00:00') ORDER BY id;
 
 -- query 116
 USE ${case_db};
@@ -739,7 +739,7 @@ SELECT id, array_position(array_varchar, 'starrocks') AS position FROM test_arra
 
 -- query 155
 USE ${case_db};
-SELECT id, array_position(array_date, '2025-01-01') AS position FROM test_array_contains ORDER BY id;
+SELECT id, array_position(array_date, DATE '2025-01-01') AS position FROM test_array_contains ORDER BY id;
 
 -- query 156
 USE ${case_db};
@@ -747,11 +747,11 @@ SELECT id, array_position(array_date, NULL) AS position FROM test_array_contains
 
 -- query 157
 USE ${case_db};
-SELECT id, array_position(array_date, '2025-01-13') AS position FROM test_array_contains ORDER BY id;
+SELECT id, array_position(array_date, DATE '2025-01-13') AS position FROM test_array_contains ORDER BY id;
 
 -- query 158
 USE ${case_db};
-SELECT id, array_position(array_datetime, '2025-01-01 12:00:00') AS position FROM test_array_contains ORDER BY id;
+SELECT id, array_position(array_datetime, TIMESTAMP '2025-01-01 12:00:00') AS position FROM test_array_contains ORDER BY id;
 
 -- query 159
 USE ${case_db};
@@ -759,7 +759,7 @@ SELECT id, array_position(array_datetime, NULL) AS position FROM test_array_cont
 
 -- query 160
 USE ${case_db};
-SELECT id, array_position(array_datetime, '2025-01-17 10:00:00') AS position FROM test_array_contains ORDER BY id;
+SELECT id, array_position(array_datetime, TIMESTAMP '2025-01-17 10:00:00') AS position FROM test_array_contains ORDER BY id;
 
 -- query 161
 USE ${case_db};
@@ -826,12 +826,12 @@ SELECT id FROM test_array_contains WHERE contains_sequence(array_varchar, ['hell
 -- query 174
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE contains_sequence(array_date, ['2025-01-01', '2025-01-13']) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_date, [DATE '2025-01-01', DATE '2025-01-13']) ORDER BY id;
 
 -- query 175
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE contains_sequence(array_datetime, ['2025-01-01 12:00:00', '2025-01-17 10:00:00']) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_datetime, [TIMESTAMP '2025-01-01 12:00:00', TIMESTAMP '2025-01-17 10:00:00']) ORDER BY id;
 
 -- query 176
 -- @skip_result_check=true
@@ -901,12 +901,12 @@ SELECT id FROM test_array_contains WHERE contains_sequence(['hello', 'world'], a
 -- query 189
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE contains_sequence(['2025-01-01', '2025-01-13'], array_date) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([DATE '2025-01-01', DATE '2025-01-13'], array_date) ORDER BY id;
 
 -- query 190
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE contains_sequence(['2025-01-01 12:00:00', '2025-01-17 10:00:00'], array_datetime) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([TIMESTAMP '2025-01-01 12:00:00', TIMESTAMP '2025-01-17 10:00:00'], array_datetime) ORDER BY id;
 
 -- query 191
 USE ${case_db};
@@ -947,8 +947,8 @@ CREATE TABLE test_array_contains_complex_type (
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO test_array_contains_complex_type VALUES
-ROW(1, [MAP(ARRAY['a', 'b'], ARRAY[1, 2]), MAP(ARRAY['c', 'd'], ARRAY[3, 4])], ['{"key1": 100, "key2": 200}', '{"key3": 300}'], [row(10, 'hello'), row(20, 'world')]),
-ROW(2, [MAP(ARRAY['x', 'y'], ARRAY[5, 6])], ['{"key4": 400}', '{"key5": 500, "key6": 600}'], [row(30,'starrocks'), row(40, 'database')]),
+ROW(1, [MAP(ARRAY['a', 'b'], ARRAY[1, 2]), MAP(ARRAY['c', 'd'], ARRAY[3, 4])], [JSON '{"key1": 100, "key2": 200}', JSON '{"key3": 300}'], [row(10, 'hello'), row(20, 'world')]),
+ROW(2, [MAP(ARRAY['x', 'y'], ARRAY[5, 6])], [JSON '{"key4": 400}', JSON '{"key5": 500, "key6": 600}'], [row(30,'starrocks'), row(40, 'database')]),
 ROW(3, NULL, NULL, NULL),
 ROW(4, [], [], []);
 
@@ -961,6 +961,7 @@ USE ${case_db};
 SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([], array_map) ORDER BY id;
 
 -- query 200
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 SELECT id FROM test_array_contains_complex_type WHERE contains_sequence(['{"key3": 300}'], array_json) ORDER BY id;
 
@@ -977,6 +978,7 @@ USE ${case_db};
 SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([NULL], array_struct) ORDER BY id;
 
 -- query 204
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 SELECT id FROM test_array_contains_complex_type WHERE contains_sequence(array_json, ['{"key3": 300}']) ORDER BY id;
 
@@ -1007,14 +1009,17 @@ USE ${case_db};
 SELECT id FROM test_array_contains_complex_type WHERE contains(array_map, map()) ORDER BY id;
 
 -- query 211
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, '{"key1": 100, "key2": 200}') ORDER BY id;
 
 -- query 212
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, '{"key3": 300}') ORDER BY id;
 
 -- query 213
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, '{"key5": 500, "key6": 600}') ORDER BY id;
 
@@ -1024,7 +1029,7 @@ USE ${case_db};
 SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, NULL) ORDER BY id;
 
 -- query 215
--- @skip_result_check=true
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, '{}') ORDER BY id;
 
@@ -1066,14 +1071,17 @@ USE ${case_db};
 SELECT id, array_position(array_map, map()) FROM test_array_contains_complex_type ORDER BY id;
 
 -- query 225
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 SELECT id, array_position(array_json, '{"key1": 100, "key2": 200}') FROM test_array_contains_complex_type ORDER BY id;
 
 -- query 226
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 SELECT id, array_position(array_json, '{"key3": 300}') FROM test_array_contains_complex_type ORDER BY id;
 
 -- query 227
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 SELECT id, array_position(array_json, '{"key5": 500, "key6": 600}') FROM test_array_contains_complex_type ORDER BY id;
 
@@ -1082,6 +1090,7 @@ USE ${case_db};
 SELECT id, array_position(array_json, NULL) FROM test_array_contains_complex_type ORDER BY id;
 
 -- query 229
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 SELECT id, array_position(array_json, '{}') FROM test_array_contains_complex_type ORDER BY id;
 

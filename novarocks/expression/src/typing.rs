@@ -852,7 +852,17 @@ fn type_selected_call(
     check_shape(&binding, children.len())?;
     let arithmetic = OperatorFunction::from_function_id(&binding.function_id)
         .is_some_and(|operator| operator.arithmetic().is_some());
-    let array_concat = binding.function_id.as_str() == "builtin.scalar/concat/v1"
+    let array_common = matches!(
+        binding.function_id.as_str(),
+        "builtin.scalar/contains/v1"
+            | "builtin.scalar/contains_sequence/v1"
+            | "builtin.scalar/arrays_overlap/v1"
+            | "builtin.scalar/array_position/v1"
+            | "builtin.scalar/array_remove/v1"
+            | "builtin.scalar/array_intersect/v1"
+            | "builtin.scalar/flatten/v1"
+            | "builtin.scalar/zip/v1"
+    ) || binding.function_id.as_str() == "builtin.scalar/concat/v1"
         && matches!(&binding.selected.result_type, FunctionResultType::Scalar(result)
             if matches!(result.data_type(), DataType::List(_)));
     let conversions = binding
@@ -866,7 +876,7 @@ fn type_selected_call(
                     "selected scalar expects a lambda argument",
                 ));
             };
-            if array_concat && matches!(target.data_type(), DataType::List(_)) {
+            if array_common && matches!(target.data_type(), DataType::List(_)) {
                 return conversion::array_common(context, child, target, work);
             }
             if arithmetic

@@ -25,50 +25,51 @@ USE ${case_db};
 -- name: test_arrays_zip @mac
 -- query 2
 USE ${case_db};
-SELECT zip([1, 2], ['1b', '2b']) AS result;
+SELECT zip(ARRAY[1, 2], ARRAY['1b', '2b']) AS result;
 
 -- query 3
 USE ${case_db};
-SELECT zip([1, 2], ['1b', null, '3b']) AS result;
+SELECT zip(ARRAY[1, 2], ARRAY['1b', NULL, '3b']) AS result;
 
 -- query 4
 USE ${case_db};
-SELECT zip([1, 2, 3], ['a', 'b', 'c'], [10, 20, 30]) AS result;
+SELECT zip(ARRAY[1, 2, 3], ARRAY['a', 'b', 'c'], ARRAY[10, 20, 30]) AS result;
 
 -- query 5
 USE ${case_db};
-SELECT zip([], []) AS result;
+SELECT zip(ARRAY[], ARRAY[]) AS result;
 
 -- query 6
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
-SELECT zip([1, 2, 3]) AS result;
+SELECT zip(ARRAY[1, 2, 3]) AS result;
 
 -- query 7
 USE ${case_db};
-SELECT zip(null, [1, 2]) AS result;
+SELECT zip(NULL, ARRAY[1, 2]) AS result;
 
 -- query 8
 USE ${case_db};
-SELECT zip([1, null, 3], ['a', 'b', null]) AS result;
+SELECT zip(ARRAY[1, NULL, 3], ARRAY['a', 'b', NULL]) AS result;
 
 -- query 9
 USE ${case_db};
-SELECT * FROM (SELECT 1 AS id) a WHERE a.id = 1 AND zip([1], ['a']) IS NOT NULL;
+SELECT * FROM (SELECT 1 AS id) a WHERE a.id = 1 AND zip(ARRAY[1], ARRAY['a']) IS NOT NULL;
 
 -- query 10
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE arrays_zip_test (
   pk bigint not null,
-  int_array Array<BigInt>,
-  str_array Array<VARCHAR>,
-  double_array Array<Double>,
-  null_array Array<VARCHAR>,
-  mixed_null_array Array<BigInt>,
-  empty_array Array<VARCHAR>,
-  single_element_array Array<BigInt>,
-  large_array Array<VARCHAR>,
-  decimal_array Array<DECIMAL(10, 2)>
+  int_array ARRAY(BIGINT),
+  str_array ARRAY(VARCHAR),
+  double_array ARRAY(DOUBLE),
+  null_array ARRAY(VARCHAR),
+  mixed_null_array ARRAY(BIGINT),
+  empty_array ARRAY(VARCHAR),
+  single_element_array ARRAY(BIGINT),
+  large_array ARRAY(VARCHAR),
+  decimal_array ARRAY(DECIMAL(10, 2))
 ) WITH (format_version = 3);
 
 -- query 11
@@ -109,6 +110,7 @@ USE ${case_db};
 SELECT pk, zip(int_array, str_array, double_array, decimal_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 20
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 SELECT pk, zip(int_array) FROM arrays_zip_test ORDER BY pk;
 
@@ -122,11 +124,11 @@ SELECT pk FROM arrays_zip_test WHERE zip(null_array, str_array) IS NULL ORDER BY
 
 -- query 23
 USE ${case_db};
-SELECT pk, zip(int_array, ['const1', 'const2', 'const3']) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(int_array, ARRAY['const1', 'const2', 'const3']) FROM arrays_zip_test ORDER BY pk;
 
 -- query 24
 USE ${case_db};
-SELECT pk, zip(['const_a', 'const_b', 'const_c'], str_array) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(ARRAY['const_a', 'const_b', 'const_c'], str_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 25
 USE ${case_db};
@@ -154,6 +156,7 @@ WHERE pk IN (1, 6, 7, 12)
 ORDER BY pk;
 
 -- query 29
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR,2
 USE ${case_db};
 SELECT pk, 
   CASE 
@@ -184,13 +187,13 @@ ORDER BY pk;
 
 -- query 33
 USE ${case_db};
-SELECT DISTINCT zip([1, 2], ['a', 'b']) FROM arrays_zip_test LIMIT 5;
+SELECT DISTINCT zip(ARRAY[1, 2], ARRAY['a', 'b']) FROM arrays_zip_test LIMIT 5;
 
 -- query 34
 USE ${case_db};
-SELECT COUNT(*) AS cnt, zip([1], ['test'])
+SELECT COUNT(*) AS cnt, zip(ARRAY[1], ARRAY['test'])
 FROM arrays_zip_test 
-GROUP BY zip([1], ['test']);
+GROUP BY zip(ARRAY[1], ARRAY['test']);
 
 -- query 35
 -- @skip_result_check=true
