@@ -31,12 +31,16 @@ use serde::Deserialize;
 use novarocks_spi::connector::{
     ConnectorCommittedVersion, ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
     ConnectorRequestContext, ConnectorTableMetadata, ConnectorTableObjectId, LakePublicationId,
-    MvExactPartitionField, MvExactPartitionTransform,
+    MvExactPartitionField, MvExactPartitionTransform, ProviderSourceType,
 };
 
 use crate::commit::MV_PUBLICATION_ID_PROP;
 use crate::iceberg::spec::{FormatVersion, TableMetadata, Transform};
 use crate::scan_model::IcebergTableInfo;
+use crate::source_type::project_source_type;
+
+mod binding;
+pub(crate) mod storage_mapping;
 
 pub(crate) const MV_DESCRIPTOR_PACKAGE_ID_PROP: &str = "novarocks.mv.descriptor.package-id";
 const MAX_TARGET_FIELDS: usize = 4_096;
@@ -77,7 +81,7 @@ pub struct IcebergStorageTargetObservation {
 pub struct IcebergStorageTargetField {
     pub field_id: i32,
     pub name: String,
-    pub type_signature: String,
+    pub source_type: ProviderSourceType,
     pub nullable: bool,
 }
 
@@ -98,7 +102,7 @@ pub struct IcebergStorageSourceSchemaObservation {
 pub struct IcebergStorageSourceField {
     pub provider_field_id: Bytes,
     pub name: String,
-    pub type_signature: String,
+    pub source_type: ProviderSourceType,
     pub nullable: bool,
 }
 
@@ -543,12 +547,13 @@ fn target_observation(
         .iter()
         .map(|field| {
             reserve(context, &mut budget, &field.name)?;
-            let type_signature = field.field_type.to_string();
-            reserve(context, &mut budget, &type_signature)?;
+            let source_type = project_source_type(&field.field_type, context, |bytes| {
+                reserve_bytes(context, &mut budget, bytes)
+            })?;
             Ok(IcebergStorageTargetField {
                 field_id: field.id,
                 name: field.name.clone(),
-                type_signature,
+                source_type,
                 nullable: !field.required,
             })
         })
@@ -605,7 +610,7 @@ fn create_source_observation(
         .map(|field| IcebergStorageSourceField {
             provider_field_id: Bytes::copy_from_slice(&field.field_id.to_be_bytes()),
             name: field.name,
-            type_signature: field.type_signature,
+            source_type: field.source_type,
             nullable: field.nullable,
         })
         .collect();
@@ -631,7 +636,7 @@ pub(crate) fn source_schema_observation(
     context: &ConnectorRequestContext,
 ) -> Result<IcebergStorageSourceSchemaObservation, ConnectorError> {
     use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::{
-        IcebergObservedSourceReadFacts, frozen_snapshot_schema,
+        IcebergObservedSourceReadFacts, frozen_current_source_schema, frozen_snapshot_schema,
     };
     use crate::metadata::TableMetadataProjection;
     validate_context(context)?;
@@ -666,6 +671,10 @@ pub(crate) fn source_schema_observation(
         TableMetadataProjection::Current => return create_source_observation(table, context),
         TableMetadataProjection::SnapshotTo(snapshot) => {
             let schema = frozen_snapshot_schema(table, snapshot, table.current_schema_id())?;
+            selected_source_schema_observation(table, &schema, snapshot, admitted, context)?
+        }
+        TableMetadataProjection::CurrentSnapshotTo(snapshot) => {
+            let schema = frozen_current_source_schema(table, snapshot)?;
             selected_source_schema_observation(table, &schema, snapshot, admitted, context)?
         }
     };
@@ -732,14 +741,13 @@ fn selected_source_schema_observation(
             ));
         }
         reserve(context, &mut budget, &field.name)?;
-        let type_signature = field.field_type.to_string();
-        reserve(context, &mut budget, &type_signature)?;
-        // Preserve the existing Source signature vocabulary and provider-owned
-        // field identity. Do not encode a new SQL/nominal signature policy.
+        let source_type = project_source_type(&field.field_type, context, |bytes| {
+            reserve_bytes(context, &mut budget, bytes)
+        })?;
         fields.push(IcebergStorageSourceField {
             provider_field_id: Bytes::copy_from_slice(&field.id.to_be_bytes()),
             name: field.name.clone(),
-            type_signature,
+            source_type,
             nullable: !field.required,
         });
     }
@@ -801,14 +809,14 @@ fn exact_schema_observation(
             reserve_bytes(context, &mut budget, 32)?;
             reserve_bytes(context, &mut budget, provider_field_id.len())?;
             reserve(context, &mut budget, &field.name)?;
-            reserve(context, &mut budget, &field.type_signature)?;
+            reserve_bytes(context, &mut budget, field.source_type.retained_bytes())?;
             Ok((
                 u32::try_from(ordinal)
                     .map_err(|_| exhausted("MV physical field ordinal exceeds u32"))?,
                 IcebergStorageSourceField {
                     provider_field_id,
                     name: field.name,
-                    type_signature: field.type_signature,
+                    source_type: field.source_type,
                     nullable: field.nullable,
                 },
             ))
@@ -994,7 +1002,7 @@ fn reserve(
     reserve_bytes(context, budget, value.len())
 }
 
-fn reserve_bytes(
+pub(crate) fn reserve_bytes(
     context: &ConnectorRequestContext,
     budget: &mut usize,
     additional: usize,
@@ -1090,6 +1098,14 @@ mod tests {
         assert_eq!(observed.fields.len(), 2);
         assert_eq!(observed.fields[0].field_id, 1);
         assert_eq!(observed.fields[0].name, "id");
+        use novarocks_spi::connector::{IcebergSourcePrimitive, IcebergSourceTypeNode};
+        let ProviderSourceType::Iceberg(source_type) = &observed.fields[0].source_type;
+        assert_eq!(
+            source_type.nodes(),
+            &[IcebergSourceTypeNode::Primitive(
+                IcebergSourcePrimitive::Long
+            )],
+        );
         assert!(!observed.fields[0].nullable);
         assert_eq!(observed.fields[1].name, "name");
         assert!(observed.fields[1].nullable);

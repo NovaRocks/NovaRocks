@@ -24,7 +24,8 @@ use crate::mv::domain::refresh::planning::{RefreshStateBaseline, RefreshStateBas
 use crate::mv::domain::refresh::target_binding::MvTargetBinding;
 use crate::mv::domain::rewrite::analysis::{MvRewriteAnalysisInput, freeze_rewrite_analysis_facts};
 use crate::mv::domain::rewrite::context::{
-    IcebergMvRewriteContext, MvRewriteAnalysisFacts, MvRewriteSourceSnapshot,
+    IcebergMvRewriteContext, MvRewriteAnalysisFacts, MvRewriteRebuildLayout,
+    MvRewriteSourceSnapshot,
 };
 use crate::mv::domain::storage_observation::{
     MvSchemaValidationObservation, MvSourceSchemaObservation,
@@ -70,8 +71,9 @@ pub fn admitted_change_facts(
 /// Assemble the one canonical rewrite value from already frozen D/L/P/C and
 /// provider facts. Runtime handles and a second Current observation are not
 /// accepted at this boundary.
-pub fn build_neutral_refresh_rewrite_context(
+pub(crate) fn build_neutral_refresh_rewrite_context(
     projection: Arc<StoredKeyedMvProjection>,
+    rebuild_layout: Option<Arc<MvRewriteRebuildLayout>>,
     current: Vec<MvRewriteSourceSnapshot>,
     previous: Vec<MvRewriteSourceSnapshot>,
     target_table_uuid: String,
@@ -82,6 +84,7 @@ pub fn build_neutral_refresh_rewrite_context(
 ) -> Result<Arc<IcebergMvRewriteContext>, String> {
     IcebergMvRewriteContext::from_parts(
         projection,
+        rebuild_layout,
         current,
         previous,
         target_table_uuid,
@@ -100,6 +103,7 @@ pub(crate) struct RefreshRewriteInputs<'a> {
     pub connector_control: &'a dyn ConnectorControlRegistry,
     pub connector_context: &'a ConnectorRequestContext,
     pub projection: Arc<StoredKeyedMvProjection>,
+    pub rebuild_layout: Option<Arc<MvRewriteRebuildLayout>>,
     pub pin: &'a RefreshSnapshotPin,
     pub state_baseline: &'a RefreshStateBaseline,
     pub target_binding: &'a MvTargetBinding,
@@ -157,15 +161,33 @@ pub(crate) async fn freeze_refresh_rewrite_context_original(
             "MV refresh target binding and schema observation name different tables".into(),
         );
     }
+    let facts = &inputs.projection.facts;
+    let (binding, interpretation) = inputs.rebuild_layout.as_deref().map_or_else(
+        || (facts.binding(), facts.interpretation()),
+        |layout| (&layout.binding, &layout.interpretation),
+    );
     let analysis = freeze_rewrite_analysis_facts(MvRewriteAnalysisInput {
-        projection: inputs.projection.as_ref(),
+        definition_revision: facts.source_revision().definition_revision,
+        binding,
+        interpretation,
         runtime_bindings: inputs.runtime_bindings,
         observed_target_partition: inputs.target_binding.partition(),
         join_analysis: inputs.join_analysis.clone(),
         aggregate: inputs.aggregate,
+        source_fields: io
+            .captured_sources()
+            .analyzed_fields()
+            .cloned()
+            .ok_or("MV rewrite lacks the original analyzed source fields")?,
+        direct_output_sources: io
+            .captured_sources()
+            .direct_output_sources()
+            .cloned()
+            .ok_or("MV rewrite lacks the original analyzed output lineage")?,
     })?;
     build_neutral_refresh_rewrite_context(
         Arc::clone(&inputs.projection),
+        inputs.rebuild_layout,
         rewrite_current_sources(inputs.pin),
         rewrite_history_sources_original(
             io,

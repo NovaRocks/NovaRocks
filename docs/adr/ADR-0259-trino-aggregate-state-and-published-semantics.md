@@ -5,6 +5,10 @@ domain: [sql-compiler, map-semantics]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0267
+    scope: "Items 4 and 5 on published result semantics, legacy interpretation layouts and contract rebinding after an engine change."
+    link: "ADR-0267-mv-publishes-bound-source-and-storage-facts.md"
 date: 2026-11-23
 provenance:
   - "TRC-6d4 Spec v5 and Plan v2, approved Obsidian snapshot 98286ab2126bd4cc819c167e78ef4969cd4c3be1"

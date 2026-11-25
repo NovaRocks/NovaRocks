@@ -336,6 +336,7 @@ impl StatisticsNeed {
 pub struct MaterializedViewNeed {
     id: CompileNeedId,
     referenced_relations: Box<[TableIdentity]>,
+    relation_needs: Box<[CatalogRelationNeed]>,
 }
 
 impl MaterializedViewNeed {
@@ -362,7 +363,13 @@ impl MaterializedViewNeed {
         Ok(Self {
             id,
             referenced_relations,
+            relation_needs: Box::default(),
         })
+    }
+
+    pub(super) fn with_relation_needs(mut self, needs: &[CatalogRelationNeed]) -> Self {
+        self.relation_needs = needs.into();
+        self
     }
 
     pub const fn id(&self) -> CompileNeedId {
@@ -371,6 +378,10 @@ impl MaterializedViewNeed {
 
     pub fn referenced_relations(&self) -> &[TableIdentity] {
         &self.referenced_relations
+    }
+
+    pub fn relation_needs(&self) -> &[CatalogRelationNeed] {
+        &self.relation_needs
     }
 }
 
@@ -1189,13 +1200,7 @@ impl SqlNeedBatch {
             ),
             Self::CatalogRelations(needs) => checked_sum([
                 checked_mul(needs.len(), std::mem::size_of::<CatalogRelationNeed>()),
-                checked_sum(needs.iter().map(|need| {
-                    checked_sum([
-                        table_identity_bytes(&need.relation),
-                        catalog_selection_bytes(need.selection.as_deref()),
-                        quoted_metadata_binding_bytes(need.quoted_metadata_binding()),
-                    ])
-                })),
+                checked_sum(needs.iter().map(catalog_relation_need_bytes)),
             ]),
             Self::Statistics(needs) => checked_sum([
                 checked_mul(needs.len(), std::mem::size_of::<StatisticsNeed>()),
@@ -1215,6 +1220,11 @@ impl SqlNeedBatch {
                             std::mem::size_of::<TableIdentity>(),
                         ),
                         checked_sum(need.referenced_relations.iter().map(table_identity_bytes)),
+                        checked_mul(
+                            need.relation_needs.len(),
+                            std::mem::size_of::<CatalogRelationNeed>(),
+                        ),
+                        checked_sum(need.relation_needs.iter().map(catalog_relation_need_bytes)),
                     ])
                 })),
             ]),
@@ -1363,6 +1373,7 @@ impl CatalogRelationFact {
                 binding.selection(),
                 binding.relation_fqn(),
                 binding.snapshot_id(),
+                binding.read_selection(),
             )),
         )
     }
@@ -1381,13 +1392,27 @@ impl CatalogRelationFact {
                 reason: "captured snapshot cannot resolve a named reference or timestamp",
             });
         };
-        Self::resolved_with_selection(need, table, Some((key, &need.relation.fqn(), *snapshot)))
+        Self::resolved_with_selection(
+            need,
+            table,
+            Some((
+                key,
+                &need.relation.fqn(),
+                *snapshot,
+                crate::planner::table::SqlMvReadSelection::Snapshot,
+            )),
+        )
     }
 
     fn resolved_with_selection(
         need: &CatalogRelationNeed,
-        table: ResolvedAnalyzerTable,
-        binding: Option<(&crate::planning::catalog::SqlTimeTravelSelection, &str, i64)>,
+        mut table: ResolvedAnalyzerTable,
+        binding: Option<(
+            &crate::planning::catalog::SqlTimeTravelSelection,
+            &str,
+            i64,
+            crate::planner::table::SqlMvReadSelection,
+        )>,
     ) -> Result<Self, CompletionProtocolError> {
         if table.catalog.identity != need.relation {
             return Err(CompletionProtocolError::CatalogRelationMismatch {
@@ -1401,10 +1426,10 @@ impl CatalogRelationFact {
         }
         let selected_snapshot = match (need.selection_key(), binding) {
             (None, None) => None,
-            (Some(request), Some((selection, relation, selected_snapshot)))
+            (Some(request), Some((selection, relation, selected_snapshot, read_selection)))
                 if request == selection && need.relation.fqn() == relation =>
             {
-                let crate::planner::table::ScanSource::Sql(source) = &table.planner.source;
+                let crate::planner::table::ScanSource::Sql(source) = &mut table.planner.source;
                 if !matches!(&source.kind,
                     crate::planner::table::SqlScanKind::Data {
                         version: crate::planner::table::SqlTableVersionSelector::Snapshot(snapshot), ..
@@ -1416,6 +1441,7 @@ impl CatalogRelationFact {
                         id: need.id,
                     });
                 }
+                source.set_mv_read_selection(read_selection);
                 Some(selected_snapshot)
             }
             _ => return Err(CompletionProtocolError::CatalogLookupTargetMismatch { id: need.id }),
@@ -3618,6 +3644,14 @@ fn provider_payload_matches_binding(
     payload.header().provider_id() == &binding.descriptor().provider_id
         && payload.header().catalog() == binding.catalog_handle()
         && payload.header().category() == category
+}
+
+fn catalog_relation_need_bytes(need: &CatalogRelationNeed) -> Result<u64, CompletionProtocolError> {
+    checked_sum([
+        table_identity_bytes(&need.relation),
+        catalog_selection_bytes(need.selection.as_deref()),
+        quoted_metadata_binding_bytes(need.quoted_metadata_binding()),
+    ])
 }
 
 fn table_identity_bytes(identity: &TableIdentity) -> Result<u64, CompletionProtocolError> {

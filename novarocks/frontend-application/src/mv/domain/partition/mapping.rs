@@ -16,8 +16,9 @@
 // under the License.
 
 use crate::mv::domain::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
+use crate::mv::domain::persistence::source_bindings::MvDirectOutputSources;
 use crate::mv::domain::storage_observation::MvSourceSchemaObservation;
-use novarocks_mv_application::persistence::codec::{ExpressionKind, TargetPartitionTransform};
+use novarocks_mv_application::persistence::codec::TargetPartitionTransform;
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::persistence::schema::{
     MvPartitionContract, MvPartitionTransformContract,
@@ -71,6 +72,7 @@ pub(crate) fn plan_prepared_source_partitions(
     planning: &ConnectorControlPlanningPin,
     prepared: &ConnectorPreparedSourceRead,
     target_partition: &MvPartitionContract,
+    direct: Option<&MvDirectOutputSources>,
 ) -> Result<AffectedTargetPartitions, ConnectorError> {
     prepared.request().observed_source_facts().validate_owner(
         &novarocks_spi::connector::ConnectorProviderBindingKey {
@@ -91,8 +93,8 @@ pub(crate) fn plan_prepared_source_partitions(
     }
     let occurrence = projection
         .facts
-        .definition()
-        .relation_occurrences
+        .binding()
+        .occurrences
         .iter()
         .find(|value| value.occurrence_id == source_occurrence_id)
         .ok_or_else(|| {
@@ -132,6 +134,7 @@ pub(crate) fn plan_prepared_source_partitions(
             source,
             target_partition,
             partition_impact,
+            direct,
         ),
         None => Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
@@ -147,6 +150,7 @@ fn derive_prepared_partition_impact(
     source: &MvSourceSchemaObservation,
     target_partition: &MvPartitionContract,
     impact: &ConnectorChangeWindowPartitionImpact,
+    direct: Option<&MvDirectOutputSources>,
 ) -> Result<AffectedTargetPartitions, ConnectorError> {
     Ok(match impact {
         ConnectorChangeWindowPartitionImpact::Unavailable => AffectedTargetPartitions::not_derived(
@@ -179,6 +183,7 @@ fn derive_prepared_partition_impact(
                     source,
                     target_partition,
                     partition,
+                    direct,
                 ) {
                     Ok(Some(key)) => partitions.push(key),
                     Ok(None) => return Ok(AffectedTargetPartitions::Unpartitioned),
@@ -202,11 +207,12 @@ fn map_partition_fields(
     source_observation: &MvSourceSchemaObservation,
     target_partition: &MvPartitionContract,
     connector_partition: &ConnectorChangePartition,
+    direct: Option<&MvDirectOutputSources>,
 ) -> Result<Option<MvPartitionKey>, PartitionMappingFailure> {
     let occurrence = projection
         .facts
-        .definition()
-        .relation_occurrences
+        .binding()
+        .occurrences
         .iter()
         .find(|occurrence| occurrence.occurrence_id == source_occurrence_id)
         .ok_or("connector partition impact names no D source occurrence")?;
@@ -233,7 +239,6 @@ fn map_partition_fields(
             ).into());
         }
     }
-    let definition = projection.facts.definition();
     let interpretation = projection.facts.interpretation();
     let canonical = &interpretation.target.partition_fields;
     if canonical.len() != target_partition.fields.len() || canonical.is_empty() {
@@ -249,28 +254,19 @@ fn map_partition_fields(
             .iter()
             .find(|output| output.target_field_id == binding.source_target_field_id)
             .ok_or("target partition source has no output binding in canonical L")?;
-        let output = definition
-            .outputs
-            .iter()
-            .find(|output| output.output_id == output_binding.output_id)
-            .ok_or("target partition source has no output in canonical D")?;
-        if output.expression.kind != ExpressionKind::Field
-            || output.expression.source_fields.len() != 1
-            || output.expression.source_fields[0].occurrence_id != source_occurrence_id
-        {
-            return Err(PartitionMappingFailure::NotDerived(
-                "target partition output is not one direct source field",
-            ));
-        }
-        let source_id = &output.expression.source_fields[0].field_id;
+        let source = direct
+            .and_then(|sources| sources.get(&output_binding.output_id))
+            .filter(|source| source.occurrence_id == source_occurrence_id)
+            .ok_or(PartitionMappingFailure::NotDerived(
+                "target partition output has no analyzed direct source field",
+            ))?;
+        let source_id = &source.field_id;
         let source_field = source_observation
             .fields()
             .iter()
             .find(|field| field.field_id == *source_id)
             .ok_or("direct target partition source is absent from the exact observation")?;
-        if source_field.type_signature != output.type_signature
-            || output_binding.type_signature != output.type_signature
-        {
+        if source_field.source_type != output_binding.source_type {
             return Err("direct target partition source changes its value type".into());
         }
         let impact = connector_partition
@@ -352,12 +348,13 @@ mod tests {
     use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use bytes::Bytes;
     use novarocks_mv_application::persistence::codec::{
-        ApplyKeyKind, ExpressionShape, PhysicalFieldLogicalIdentity, SourceFieldReference,
+        ApplyKeyKind, PhysicalFieldLogicalIdentity, SourceFieldReference,
         TargetPartitionFieldBinding,
     };
     use novarocks_mv_application::persistence::identity::FieldIdentity;
     use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
     use novarocks_mv_application::persistence::schema::MvPartitionFieldContract;
+    use novarocks_mv_application::persistence::test_support::{fixture_mapping, fixture_type};
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::{
         ConnectorChangePartition, ConnectorChangePartitionField, ConnectorChangePartitionTransform,
@@ -406,7 +403,7 @@ mod tests {
                     MvObservedSourceField::try_new(
                         Bytes::from_static(&[1]),
                         "order_id".to_string(),
-                        "bigint".to_string(),
+                        fixture_type("bigint"),
                         false,
                     )
                     .unwrap(),
@@ -438,19 +435,14 @@ mod tests {
     fn partitioned_projection() -> StoredKeyedMvProjection {
         let mut fixture =
             ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), None);
-        fixture.definition.relation_occurrences.truncate(1);
-        fixture.definition.outputs[0].name = "order_id".into();
-        fixture.definition.outputs[0].type_signature = "bigint".into();
-        fixture.definition.outputs[0].nullable = false;
-        fixture.definition.outputs[0].expression = ExpressionShape {
-            kind: ExpressionKind::Field,
-            function_identity: None,
-            source_fields: vec![SourceFieldReference {
-                occurrence_id: 7,
-                field_id: FieldIdentity::try_new(vec![1]).unwrap(),
-            }],
-        };
-        fixture.interpretation.outputs[0].type_signature = "bigint".into();
+        fixture.binding.occurrences.truncate(1);
+        let output = &mut fixture.binding.outputs[0];
+        output.name = "order_id".into();
+        output.source_fields = vec![SourceFieldReference {
+            occurrence_id: 7,
+            field_id: FieldIdentity::try_new(vec![1]).unwrap(),
+        }];
+        fixture.interpretation.outputs[0].source_type = fixture_type("bigint");
         fixture.interpretation.outputs[0].nullable = false;
         fixture.interpretation.aggregates.clear();
         fixture.interpretation.state_slots.clear();
@@ -462,13 +454,14 @@ mod tests {
                 PhysicalFieldLogicalIdentity::Output(_) | PhysicalFieldLogicalIdentity::ApplyKey(_)
             )
         });
-        fixture.interpretation.target.fields[0].type_signature = "bigint".into();
+        fixture.interpretation.target.fields[0].source_type = fixture_type("bigint");
         fixture.interpretation.target.fields[0].nullable = false;
         fixture.interpretation.target.partition_fields = vec![TargetPartitionFieldBinding {
             partition_field_id: FieldIdentity::try_new(vec![90]).unwrap(),
             source_target_field_id: fixture.interpretation.outputs[0].target_field_id.clone(),
             transform: TargetPartitionTransform::Identity,
         }];
+        fixture.mapping = fixture_mapping(&fixture.binding, &fixture.interpretation);
         StoredKeyedMvProjection {
             mv_id: 1,
             facts: fixture.build().unwrap(),
@@ -488,6 +481,11 @@ mod tests {
         }
     }
 
+    fn direct_source(projection: &StoredKeyedMvProjection) -> MvDirectOutputSources {
+        let output = &projection.facts.binding().outputs[0];
+        [(output.identity(), output.source_fields[0].clone())].into()
+    }
+
     #[test]
     fn exact_partition_impact_derives_direct_bound_target_key() {
         let projection = partitioned_projection();
@@ -498,6 +496,7 @@ mod tests {
                 &observation(&[11]),
                 &target_partition(),
                 &partition(),
+                Some(&direct_source(&projection)),
             )
             .unwrap(),
             Some(MvPartitionKey::new(
@@ -525,6 +524,7 @@ mod tests {
             &observation(&[11]),
             &target_partition(),
             &partition(),
+            Some(&direct_source(&projection)),
         )
         .unwrap();
         let changed = map_partition_fields(
@@ -533,6 +533,7 @@ mod tests {
             &observation(&[11]),
             &target_partition(),
             &changed_spec,
+            Some(&direct_source(&projection)),
         )
         .unwrap();
         assert_eq!(
@@ -554,6 +555,7 @@ mod tests {
             &observation(&[11]),
             &target_partition,
             &partition(),
+            Some(&direct_source(&projection)),
         )
         .unwrap_err();
         assert!(error.to_string().contains("canonical L"), "{error}");
@@ -564,6 +566,7 @@ mod tests {
             &observation(&[12]),
             &target_partition,
             &partition(),
+            Some(&direct_source(&projection)),
         )
         .unwrap_err();
         assert!(
@@ -584,7 +587,8 @@ mod tests {
                 7,
                 &observation(&[11]),
                 &target,
-                &ConnectorChangeWindowPartitionImpact::Unpartitioned
+                &ConnectorChangeWindowPartitionImpact::Unpartitioned,
+                None,
             )
             .unwrap(),
             AffectedTargetPartitions::Unpartitioned
@@ -603,9 +607,15 @@ mod tests {
             added: vec![],
             removed: vec![],
         };
-        let result =
-            derive_prepared_partition_impact(&projection, 7, &observation(&[11]), &target, &impact)
-                .unwrap();
+        let result = derive_prepared_partition_impact(
+            &projection,
+            7,
+            &observation(&[11]),
+            &target,
+            &impact,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             result.not_derived_reason(),
             Some("row-level delete affected partitions require row-evaluation fallback")

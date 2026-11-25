@@ -31,7 +31,19 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorReadSourceSelection {
     Snapshot(i64),
+    /// The data snapshot of the original Current observation, projected
+    /// through that observation's declared schema.
+    CurrentAtSnapshot(i64),
     ChangeWindow(ConnectorReadChangeWindow),
+}
+
+impl ConnectorReadSourceSelection {
+    pub const fn to_snapshot_id(self) -> i64 {
+        match self {
+            Self::Snapshot(snapshot) | Self::CurrentAtSnapshot(snapshot) => snapshot,
+            Self::ChangeWindow(window) => window.to_snapshot_id(),
+        }
+    }
 }
 
 /// The original object's pin and exact revisions. A snapshot selection has no
@@ -85,6 +97,27 @@ impl ConnectorReadSourcePreparationRequest {
             selection: ConnectorReadSourceSelection::ChangeWindow(window),
             from_revision: Some(from_revision),
             to_revision,
+        }
+    }
+
+    pub fn current_at_snapshot(
+        name: SchemaTableName,
+        observed_table: ConnectorTableHandle,
+        observed_source_facts: ConnectorProcessLocalPayload,
+        object_id: ConnectorTableObjectId,
+        snapshot_id: i64,
+        revision: ConnectorExactSemanticRevision,
+    ) -> Self {
+        Self {
+            selection: ConnectorReadSourceSelection::CurrentAtSnapshot(snapshot_id),
+            ..Self::snapshot(
+                name,
+                observed_table,
+                observed_source_facts,
+                object_id,
+                snapshot_id,
+                revision,
+            )
         }
     }
 

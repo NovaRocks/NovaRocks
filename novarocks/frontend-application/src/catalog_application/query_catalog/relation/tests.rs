@@ -304,6 +304,10 @@ impl ObservedView {
                 .into(),
             },
             version,
+            Some(novarocks_spi::connector::ConnectorIcebergViewVersion {
+                uuid: [7; 16],
+                version_id: 8,
+            }),
             None,
             vec![],
             &request.context,
@@ -507,6 +511,17 @@ fn only_actual_table_absence_enters_the_same_generation_view_capability() {
         panic!("view")
     };
     assert_eq!(view.definition.version.as_ref(), "observed-v1");
+    assert_eq!(
+        view.definition.origin,
+        novarocks_sql::planning::catalog::SqlViewOrigin::Iceberg {
+            uuid: [7; 16],
+            version_id: 8,
+        },
+    );
+    assert_eq!(
+        view.definition.dialect,
+        novarocks_sql::planning::catalog::SqlViewDialect::Trino,
+    );
     assert_eq!(
         view.planning_pin.control_runtime_id(),
         resolver.binding.control_runtime_id()

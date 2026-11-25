@@ -3,3 +3,17 @@
 id	amount	label
 1	100	old-a
 2	200	old-b
+
+-- query 8
+-- types	integer	bigint	varchar
+id	amount	label
+1	100	old-a
+2	200	old-b
+3	300	old-b
+
+-- query 9
+-- types	integer	bigint	varchar
+id	amount	label
+1	100	old-a
+2	200	old-b
+3	300	old-b

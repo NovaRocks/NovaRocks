@@ -900,6 +900,7 @@ impl Body {
             .clone();
         self.cpu(CreatePublicationInput::Publication {
             plan: self.input.plan.clone(),
+            storage_observation: self.input.ports.storage_observation_port(),
             seed: self.input.seed.clone(),
             staged: self.staged_session.clone(),
             handle: handle.clone(),
@@ -1645,7 +1646,12 @@ mod original_stage_tests {
         let shape =
             prepare_mv_create_shape(statement.storage.target.clone(), query, analysis, &control)
                 .unwrap();
-        let (property, persistence) = prepare_mv_create_properties(&shape, &control).unwrap();
+        let property = prepare_mv_create_properties(&shape, &control).unwrap();
+        let persistence = shape
+            .analysis
+            .refresh_input
+            .create_persistence_facts()
+            .unwrap();
         let object_id =
             ConnectorTableObjectId::try_new(Bytes::from_static(b"orders-object")).unwrap();
         let exact = novarocks_spi::connector::ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
@@ -1679,7 +1685,7 @@ mod original_stage_tests {
                     MvObservedSourceField::try_new(
                         Bytes::from_static(b"id-1"),
                         "id".into(),
-                        "long".into(),
+                        novarocks_mv_application::persistence::test_support::fixture_type("long"),
                         true,
                     )
                     .unwrap(),
@@ -1690,23 +1696,65 @@ mod original_stage_tests {
             context,
         )
         .unwrap();
+        use novarocks_mv_application::persistence::codec::{
+            BindingDocument, BoundSourceNode, BoundSourcePath, SourceNodeKind,
+        };
+        use novarocks_mv_application::persistence::identity::FieldIdentity;
+        let mut occurrence =
+            novarocks_mv_application::persistence::test_support::relation(0, 1, "orders");
+        occurrence.catalog_at_binding = current_catalog.to_string();
+        occurrence.namespace_at_binding = current_database.to_string();
+        occurrence.facts.object = Bytes::copy_from_slice(persisted_object.as_bytes());
+        occurrence.object_id = persisted_object.clone();
+        occurrence.data_version = data_format;
+        occurrence.paths = vec![BoundSourcePath {
+            nodes: vec![BoundSourceNode {
+                field_id: FieldIdentity::try_new(b"id-1".to_vec()).unwrap(),
+                name_at_binding: "id".into(),
+                required: false,
+                kind: SourceNodeKind::Scalar,
+            }],
+            leaf_type: novarocks_mv_application::persistence::test_support::fixture_type("long"),
+            whole_subtree: false,
+        }];
+        let source_fields = vec![
+            novarocks_mv_application::persistence::aggregate_bindings::MvCreateRelationObservation {
+                occurrence_id: 0,
+                provider_object_id: Bytes::copy_from_slice(persisted_object.as_bytes()),
+                fields: vec![novarocks_mv_application::persistence::aggregate_bindings::MvCreateSourceFieldObservation {
+                    field_ordinal: 0,
+                    field_name: "id".into(),
+                    provider_field_id: Bytes::from_static(b"id-1"),
+                    source_type: novarocks_mv_application::persistence::test_support::fixture_type("long"),
+                    nullable: true,
+                }],
+            },
+        ];
+        let binding = BindingDocument {
+            occurrences: vec![occurrence],
+            outputs:
+                novarocks_mv_application::persistence::create_documents::build_binding_outputs(
+                    &persistence,
+                    &source_fields,
+                )
+                .unwrap(),
+            dependencies: Vec::new(),
+        };
         // Pure captured facts use the same CREATE authors as the active reader.
         // These values grant neither Provider permission nor a management admission.
         let plan = finish_mv_create_preparation(
-            shape, statement, property, persistence,
-            vec![novarocks_mv_application::persistence::aggregate_bindings::MvCreateRelationObservation {
-                occurrence_id: 0, provider_object_id: Bytes::copy_from_slice(persisted_object.as_bytes()),
-                provider_schema_version: Bytes::from_static(b"schema-1"),
-                fields: vec![novarocks_mv_application::persistence::aggregate_bindings::MvCreateSourceFieldObservation {
-                    field_ordinal: 0, field_name: "id".into(), provider_field_id: Bytes::from_static(b"id-1"),
-                    type_signature: "long".into(), nullable: true,
-                }],
-            }],
-            novarocks_mv_application::persistence::codec::keyed::BindingDocument {
-                data_versions: vec![data_format],
-            },
-            BTreeMap::from([(format!("{current_catalog}.{current_database}.orders"), observation)]),
-        ).unwrap();
+            shape,
+            statement,
+            property,
+            persistence,
+            source_fields,
+            binding,
+            BTreeMap::from([(
+                format!("{current_catalog}.{current_database}.orders"),
+                observation,
+            )]),
+        )
+        .unwrap();
         let seed = Arc::new(
             plan.projection_seed(statement, Some(current_catalog), current_database)
                 .unwrap(),
@@ -1868,7 +1916,9 @@ mod original_stage_tests {
                         ordinal.try_into().unwrap(),
                         Bytes::from(format!("created-field-{ordinal}")),
                         column.name.clone(),
-                        signature.into(),
+                        novarocks_mv_application::persistence::test_support::fixture_type(
+                            signature,
+                        ),
                         column.nullable,
                     )
                 })
@@ -1942,6 +1992,11 @@ mod original_stage_tests {
         fixture.definition = reloaded.clone();
         fixture.interpretation = documents.interpretation.clone();
         fixture.configuration = documents.configuration.clone();
+        fixture.binding = plan.binding_document.clone();
+        fixture.mapping = novarocks_mv_application::persistence::test_support::fixture_mapping(
+            &fixture.binding,
+            &fixture.interpretation,
+        );
         let projection =
             novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection {
                 mv_id: 1,

@@ -277,6 +277,14 @@ SQL client
   旧同步 runner、协调器及其第二身份来源已退役；未触及的 CALL/Host 辅助入口不能据此称为全域
   异步完成。ADR-0198 所述架构已实施；既有基线失败、能力限制与正式准入资格仍须独立核对。
 
+- `novarocks/type-contract/src/canonical_fact.rs` 提供版本化事实的规范编码；
+  `novarocks/spi/src/connector/source_type.rs` 保留 Provider 的结构化源类型。
+  `novarocks/frontend-application/src/mv/domain/persistence/source_bindings.rs` 汇合原语句的
+  SQL occurrence、视图依赖和 Provider 观察；Iceberg 在 `storage_inspector/storage_mapping.rs`
+  沿实际读写作者签发目标映射。 `novarocks/mv-application/src/persistence/keyed_documents.rs`
+  核对 B 对 D/L/M 的完整引用，历史 P 使用自己的 B 解码源水位。见
+  [ADR-0267](docs/adr/ADR-0267-mv-publishes-bound-source-and-storage-facts.md)。
+
 - `novarocks/frontend-application/src/catalog_application/statement.rs`
   Catalog, database and table DDL against the projected catalog.
 

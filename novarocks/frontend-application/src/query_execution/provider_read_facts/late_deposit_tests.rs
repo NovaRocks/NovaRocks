@@ -166,7 +166,8 @@ impl ProviderReadMetadata for LateProvider {
                 .observed_source_facts()
                 .value::<ConnectorTableObjectId>(source.owner.instance_id.as_str())?;
             let supported = match request.selection() {
-                ConnectorReadSourceSelection::Snapshot(41) => true,
+                ConnectorReadSourceSelection::Snapshot(41)
+                | ConnectorReadSourceSelection::CurrentAtSnapshot(41) => true,
                 ConnectorReadSourceSelection::ChangeWindow(window) => {
                     window == ConnectorReadChangeWindow::new(40, 41)
                 }
@@ -198,7 +199,7 @@ impl ProviderReadMetadata for LateProvider {
             let facts = (request.selection(), source.object.clone());
             let metadata = Arc::clone(&source.metadata);
             Ok(match request.selection() {
-                ConnectorReadSourceSelection::Snapshot(_) => novarocks_spi::connector::read_stack::adapter::ProviderPreparedSourceRead::snapshot(facts, metadata),
+                ConnectorReadSourceSelection::Snapshot(_) | ConnectorReadSourceSelection::CurrentAtSnapshot(_) => novarocks_spi::connector::read_stack::adapter::ProviderPreparedSourceRead::snapshot(facts, metadata),
                 ConnectorReadSourceSelection::ChangeWindow(_) => novarocks_spi::connector::read_stack::adapter::ProviderPreparedSourceRead::change_window(facts, ConnectorChangeWindowAdmission::Incremental { has_inserts: true, has_deletes: false, partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned }, metadata),
             })
         })

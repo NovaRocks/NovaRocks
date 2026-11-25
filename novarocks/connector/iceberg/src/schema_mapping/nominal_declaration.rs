@@ -308,7 +308,7 @@ pub(crate) fn retired_largeint_field<'a, E>(
         return Ok(None);
     }
     work()?;
-    if declarations.get(&field.id) == Some(&NominalSourceDomain::LargeInt) {
+    if is_retired_read_field(field.id, declarations) {
         return Ok(Some(field));
     }
     match field.field_type.as_ref() {
@@ -331,6 +331,14 @@ pub(crate) fn retired_largeint_field<'a, E>(
     Ok(None)
 }
 
+/// The declaration that makes one Iceberg field unreadable as a SQL value.
+pub(crate) fn is_retired_read_field(
+    field_id: i32,
+    declarations: &NominalSourceDeclarations,
+) -> bool {
+    declarations.get(&field_id) == Some(&NominalSourceDomain::LargeInt)
+}
+
 pub(crate) fn visit_retired_read_fields<'a, E>(
     field: &'a crate::iceberg::spec::NestedField,
     declarations: &NominalSourceDeclarations,
@@ -340,7 +348,7 @@ pub(crate) fn visit_retired_read_fields<'a, E>(
 ) -> Result<(), E> {
     work()?;
     path.push(field.name.as_str());
-    if declarations.get(&field.id) == Some(&NominalSourceDomain::LargeInt) {
+    if is_retired_read_field(field.id, declarations) {
         visit(path, field);
     }
     match field.field_type.as_ref() {

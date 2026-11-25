@@ -28,7 +28,7 @@ use novarocks_types::naming::TableIdentity;
 
 /// Pure/domain failures keep their original category. Provider and repository
 /// failures retain the actual typed cause through the same preparation result.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PreparationError(pub(crate) MvApplicationError);
 impl PreparationError {
     pub(crate) fn with_context(self, context: impl std::fmt::Display) -> Self {
@@ -111,7 +111,7 @@ pub(crate) fn require_source_snapshot(
 }
 
 pub(crate) fn validate_source_snapshot(
-    occurrence: &novarocks_mv_application::persistence::codec::RelationOccurrence,
+    occurrence: &novarocks_mv_application::persistence::codec::BindingOccurrence,
     observed_object: &novarocks_mv_application::persistence::identity::ObjectIdentity,
     planned_snapshot: i64,
     observed_snapshot: Option<i64>,
@@ -308,17 +308,82 @@ impl MvRefreshPreparationIo {
             )),
         }
     }
+    /// Attach the scan authors from the same analysis used to build B.
+    /// Metadata preparation later borrows these values by their settled locator.
+    pub(crate) fn install_analyzed_refresh_sources(
+        &self,
+        source: &IcebergMvCorePorts,
+        sql: &novarocks_sql::planning::mv::SqlMvCreatePersistenceFacts,
+        bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
+        observed: &crate::mv::domain::persistence::source_bindings::MvObservedBinding,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), PreparationError> {
+        let inventory = self.captured_sources();
+        for relation in sql.relation_occurrences() {
+            let binding = bindings.binding(relation.binding())?;
+            let metadata = binding
+                .source_metadata
+                .as_ref()
+                .ok_or("MV analyzed source has no retained metadata")?;
+            let table = TableIdentity {
+                catalog: metadata.identity.instance_id.as_str().to_owned(),
+                namespace: metadata.identity.namespace.to_string(),
+                table: metadata.identity.table.to_string(),
+            };
+            let exact = observed
+                .revisions
+                .get(&relation.occurrence_id().get())
+                .ok_or("MV analyzed occurrence has no exact data revision")?;
+            if let Some(previous) = inventory.by_table(&table) {
+                if &previous.revision != exact {
+                    return Err(
+                        "MV occurrences of one table observed different original revisions".into(),
+                    );
+                }
+                continue;
+            }
+            let lease = binding.admission.exact_planning_pin()?;
+            let facts = crate::mv::domain::refresh_io::observe_loaded_refresh_base(
+                source.storage_observation(),
+                &lease,
+                metadata,
+                &table,
+                context,
+            )?;
+            if exact.object_identity().value() != facts.object_id().as_bytes()
+                || exact.canonical_read_point()
+                    != Some(ConnectorCanonicalReadPoint::Snapshot(
+                        facts.current_snapshot_id(),
+                    ))
+            {
+                return Err(
+                    "MV source planning and data observations identify different objects".into(),
+                );
+            }
+            inventory.install(super::captured_sources::CapturedRefreshSource::new(
+                table,
+                lease,
+                metadata.clone(),
+                facts.clone(),
+                facts.current_snapshot_id(),
+                exact.clone(),
+            ))?;
+        }
+        inventory.set_direct_output_sources(observed.direct_output_sources.clone())?;
+        inventory.set_analyzed_fields(observed)?;
+        Ok(())
+    }
+
     /// Pin each object once before source schema or query analysis can observe it.
     /// Only completed facts enter the stock; physical CPU/IO custody stays in this gate.
     pub(crate) async fn capture_refresh_sources(
         &self,
         source: &IcebergMvCorePorts,
-        projection: &novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
+        binding: &novarocks_mv_application::persistence::codec::BindingDocument,
         baseline: &crate::mv::domain::refresh::planning::RefreshStateBaseline,
         full: bool,
         context: &ConnectorRequestContext,
     ) -> Result<(), PreparationError> {
-        use super::captured_sources::CapturedRefreshSource;
         use crate::mv::domain::refresh::planning::RefreshStateBaseline;
         use novarocks_spi::connector::read_stack::{
             ConnectorReadChangeWindow, ConnectorReadSourcePreparationRequest, SchemaTableName,
@@ -326,84 +391,14 @@ impl MvRefreshPreparationIo {
         let RefreshStateBaseline::SnapshotBacked {
             previous_sources, ..
         } = baseline;
-        for relation in &projection.facts.definition().relation_occurrences {
+        for relation in &binding.occurrences {
             context.original_operation_control().check_active()?;
             let table = TableIdentity {
                 catalog: relation.catalog_at_binding.clone(),
                 namespace: relation.namespace_at_binding.clone(),
                 table: relation.relation_at_binding.clone(),
             };
-            let inventory = self.captured_sources();
-            let captured = match inventory
-                .by_table(&table)
-                .or(inventory.by_definition_object(&relation.object_id, &table.catalog)?)
-            {
-                Some(captured) => {
-                    inventory.bind_alias(table.clone(), captured.clone())?;
-                    captured
-                }
-                None => {
-                    let lease = crate::connector::metadata_binding_typed(
-                        source.connector_control(),
-                        &table.catalog,
-                    )?;
-                    let metadata = self
-                        .source_table_metadata(
-                            &lease,
-                            context.clone(),
-                            &table.namespace,
-                            &table.table,
-                        )
-                        .await?;
-                    let observed = crate::mv::domain::refresh_io::observe_loaded_refresh_base(
-                        source.storage_observation(),
-                        &lease,
-                        &metadata,
-                        &table,
-                        context,
-                    )?;
-                    let revision = lease
-                        .binding()
-                        .metadata()
-                        .exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)?;
-                    if let Some(snapshot) = observed.current_snapshot_id() {
-                        let selector = lease
-                            .binding()
-                            .metadata()
-                            .read_selector_from_exact_revision(&metadata.table, &revision)?;
-                        if selector != ConnectorReadSelector::SnapshotId(snapshot) {
-                            return Err(ConnectorError::new(
-                                ConnectorErrorKind::CorruptData,
-                                "MV initial source observation and exact revision disagree",
-                            )
-                            .into());
-                        }
-                    }
-                    if revision.object_identity().value().as_ref()
-                        != observed.object_id().as_bytes().as_ref()
-                    {
-                        return Err(ConnectorError::new(
-                            ConnectorErrorKind::CorruptData,
-                            "MV initial source observation and exact revision disagree",
-                        )
-                        .into());
-                    }
-                    let captured = CapturedRefreshSource::new(
-                        table.clone(),
-                        lease,
-                        metadata,
-                        observed.clone(),
-                        observed.current_snapshot_id(),
-                        revision,
-                    );
-                    inventory.install(captured)?
-                }
-            };
-            let definition_schema = self.definition_schema(source, &table, context)?;
-            crate::mv::domain::refresh::schema_contract::validate_relation_occurrence_schema(
-                relation,
-                &definition_schema,
-            )?;
+            let captured = self.captured_sources().require(&table)?;
             let Some(to) = captured.snapshot else {
                 continue;
             };
@@ -454,7 +449,7 @@ impl MvRefreshPreparationIo {
                         captured.revision.clone(),
                     )
                 }
-                None => ConnectorReadSourcePreparationRequest::snapshot(
+                None => ConnectorReadSourcePreparationRequest::current_at_snapshot(
                     name,
                     captured.observed.table.clone(),
                     observed_facts,
@@ -506,7 +501,7 @@ impl MvRefreshPreparationIo {
             }
         };
         schema_contract::validate_projection_target(projection, target_observation)?;
-        let occurrences = &projection.facts.definition().relation_occurrences;
+        let occurrences = &projection.facts.binding().occurrences;
         if occurrences.len() != refs.len() {
             return Err(PreparationError::user(
                 "MV refresh source references do not retain every D occurrence",
@@ -532,9 +527,8 @@ impl MvRefreshPreparationIo {
         projection:&novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
         context: &ConnectorRequestContext,
     ) -> Result<crate::mv::domain::refresh::pin::RefreshSnapshotPin, PreparationError> {
-        let mut occurrences =
-            Vec::with_capacity(projection.facts.definition().relation_occurrences.len());
-        for relation in &projection.facts.definition().relation_occurrences {
+        let mut occurrences = Vec::with_capacity(projection.facts.binding().occurrences.len());
+        for relation in &projection.facts.binding().occurrences {
             let table = TableIdentity {
                 catalog: relation.catalog_at_binding.clone(),
                 namespace: relation.namespace_at_binding.clone(),
@@ -569,7 +563,7 @@ mod source_snapshot_tests {
             MvTarget::from_parts(Some("ice"), "sales", "mv"),
             Some(1),
         );
-        let occurrence = &projection.definition().relation_occurrences[0];
+        let occurrence = &projection.binding().occurrences[0];
         for what in ["MV first-refresh", "MV incremental refresh"] {
             let snapshot = require_source_snapshot(Some(10), what, "ice.sales.orders")
                 .expect("original planned snapshot");

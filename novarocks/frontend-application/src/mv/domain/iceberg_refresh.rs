@@ -23,8 +23,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::datatypes::DataType;
-
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::mv::domain::analysis::refresh_property::{
     RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
@@ -80,7 +78,7 @@ use crate::mv::domain::storage_observation::{
     MvSchemaValidationObservation, MvSourceSchemaObservation,
 };
 use novarocks_catalog_application::CatalogApplicationPort;
-use novarocks_mv_application::persistence::codec::{ApplyKeyKind, RelationOccurrence};
+use novarocks_mv_application::persistence::codec::{ApplyKeyKind, BindingOccurrence};
 use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest;
 use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
 use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
@@ -109,9 +107,8 @@ use novarocks_sql::planning::mv::UnionBranchKind;
 use novarocks_sql::planning::mv::{
     MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
     MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
-    MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvAggregateCalls,
-    SqlMvAggregateLayoutScope, SqlMvApplyKeySourceFacts, extract_join_aliases,
-    mv_apply_key_source_from_column_name,
+    MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvAggregateLayoutScope,
+    SqlMvApplyKeySourceFacts, extract_join_aliases, mv_apply_key_source_from_column_name,
 };
 use novarocks_sql::semantic::TableColumnDef;
 use novarocks_types::naming::TableIdentity;
@@ -228,6 +225,10 @@ impl IcebergMvCorePorts {
 
     pub(crate) fn storage_observation(&self) -> &dyn MvStorageObservationPort {
         self.storage_observation.as_ref()
+    }
+
+    pub(crate) fn storage_observation_port(&self) -> Arc<dyn MvStorageObservationPort> {
+        self.storage_observation.clone()
     }
 
     pub(crate) fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
@@ -356,17 +357,8 @@ pub(crate) fn prepare_mv_create_shape(
 pub(crate) fn prepare_mv_create_properties(
     shape: &MvCreateShape,
     control: &novarocks_sql::compiler::SqlCompileControl,
-) -> Result<
-    (
-        RefreshFragmentProperty,
-        novarocks_sql::planning::mv::SqlMvCreatePersistenceFacts,
-    ),
-    novarocks_sql::compiler::SqlCompileError,
-> {
-    Ok((
-        derive_fragment_property(&shape.analysis, control)?,
-        shape.analysis.refresh_input.create_persistence_facts()?,
-    ))
+) -> Result<RefreshFragmentProperty, novarocks_sql::compiler::SqlCompileError> {
+    derive_fragment_property(&shape.analysis, control)
 }
 
 pub(crate) fn finish_mv_create_preparation(
@@ -468,16 +460,7 @@ pub(crate) fn finish_mv_create_preparation(
     let aggregate_runtime_layout =
         representative_aggregate_layout(&property, &canonical_select_query, &analysis)?
             .map(|layout| layout.runtime_layout().clone())
-            .unwrap_or_else(|| {
-                novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout::try_new(
-                    "__row_id__".to_string(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )
-                .expect("empty aggregate layout is a valid stateless CREATE carrier")
-            });
+            .unwrap_or_else(stateless_mv_runtime_layout);
     let mut application_properties = vec![
         (
             APPLY_KEY_COLUMN_PROPERTY.to_string(),
@@ -523,6 +506,18 @@ pub(crate) fn finish_mv_create_preparation(
         application_properties,
         created_at_ms,
     }))
+}
+
+pub(crate) fn stateless_mv_runtime_layout()
+-> novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout {
+    novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout::try_new(
+        "__row_id__".to_string(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("empty aggregate layout is a valid stateless MV carrier")
 }
 
 fn create_declaration_error(message: String) -> MvApplicationError {
@@ -661,25 +656,10 @@ fn base_table_descriptor_from_observation(
             .iter()
             .map(|field| BaseColumnDescriptor {
                 name: field.name.clone(),
-                data_type: DataType::Null,
-                sql_type: observed_iceberg_type_sql_head(&field.type_signature),
+                source_type: field.source_type.clone(),
                 nullable: field.nullable,
             })
             .collect(),
-    }
-}
-
-fn observed_iceberg_type_sql_head(type_signature: &str) -> String {
-    let lower = type_signature.trim().to_ascii_lowercase();
-    let head = lower.split(['(', '<']).next().unwrap_or("").trim();
-    match head {
-        "long" => "BIGINT".to_string(),
-        "int" => "INT".to_string(),
-        "string" => "STRING".to_string(),
-        "decimal" => "DECIMAL".to_string(),
-        "date" => "DATE".to_string(),
-        "timestamp" | "timestamptz" => "DATETIME".to_string(),
-        other => other.to_ascii_uppercase(),
     }
 }
 
@@ -733,7 +713,7 @@ fn validate_union_projection_schema_contract_for_base(
     iceberg_target: &IcebergMvTarget,
     projection: &StoredKeyedMvProjection,
     branch_count: usize,
-    occurrence: &RelationOccurrence,
+    occurrence: &BindingOccurrence,
     base_observation: &MvSourceSchemaObservation,
     target_observation: &MvSchemaValidationObservation,
 ) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
@@ -1328,8 +1308,8 @@ mod tests {
             None,
         );
         for (occurrence, (table, qualifier)) in fixture
-            .definition
-            .relation_occurrences
+            .binding
+            .occurrences
             .iter_mut()
             .zip([(left, left_qualifier), (right, right_qualifier)])
         {
@@ -1546,52 +1526,6 @@ mod tests {
     }
 }
 
-// A-family aggregate-union execution is orchestrated by the shared fan-in
-// refresh path below. It pins every base, builds one refresh context, and
-// drives the aggregate merge with one canonical change per base.
-
-/// The per-shape payload distinguishing the two `AllBasesRequired` aggregate
-/// refresh variants that share the wrapper [`refresh_fan_in_aggregate_iceberg_mv`].
-///
-/// This enum is the *identity gate* the folded wrapper dispatches on: the
-/// `BranchUnion` variant corresponds to a `BranchScoped` row identity (UNION
-/// ALL of aggregate branches), while `FanIn` corresponds to a plain
-/// `GroupRowId` aggregate fanning in over a UNION ALL of scans. Both produce an
-/// `AllBasesRequired` snapshot policy and an aggregate state contract; only the
-/// branch-contract validation and the first-refresh strategy differ.
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-enum AllBasesAggregateRefresh<'a> {
-    /// Aggregate-over-UNION-ALL fan-in: one aggregate above a union of scans.
-    /// The aggregate-call surface is sourced from the focused extractor
-    /// (`extract_aggregate_sql_calls`), not the legacy classifier.
-    FanIn {
-        schema_contract: &'a mv_schema::MvSchemaContract,
-        aggregate_calls: &'a SqlMvAggregateCalls,
-    },
-    /// Aggregate over a composed multi-base relation, such as a nested join or
-    /// a zero-key CROSS JOIN. The change stream still uses the aggregate
-    /// rewrite-merge path; the apply-key evidence decides whether join-delta
-    /// proof is required.
-    ComposedAggregate {
-        schema_contract: &'a mv_schema::MvSchemaContract,
-        aggregate_calls: &'a SqlMvAggregateCalls,
-    },
-    /// UNION ALL of aggregate branches (`BranchScoped` identity): the union sits
-    /// above per-branch aggregates and the first refresh injects `__branch_id__`.
-    /// The per-branch aggregate-call model is sourced from the focused extractor
-    /// (not the legacy classifier), so a composed branch (`Agg(a JOIN b)` /
-    /// `Agg(fan-in)`) is supported. `branch_count` is the persisted branch count;
-    /// `first_branch_calls` is the first branch's aggregate-call surface, which is
-    /// representative of every branch under the CREATE-time homogeneity gate.
-    BranchUnion {
-        branch_count: usize,
-        first_branch_calls: &'a SqlMvAggregateCalls,
-    },
-}
-
 #[allow(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
@@ -1718,17 +1652,17 @@ pub(crate) fn build_refresh_state_baseline(
     mv_definition: &StoredKeyedMvProjection,
     target: &crate::mv::domain::refresh::target_binding::MvTargetBinding,
 ) -> Result<RefreshStateBaseline, String> {
-    let definition = mv_definition.facts.definition();
+    let definition = mv_definition.facts.binding();
     let previous_sources = match mv_definition.facts.publication() {
         None => Vec::new(),
         Some(publication) => {
-            if publication.inputs.len() != definition.relation_occurrences.len() {
+            if publication.inputs.len() != definition.occurrences.len() {
                 return Err(
                     "MV publication inputs do not cover every D relation occurrence".into(),
                 );
             }
             definition
-                .relation_occurrences
+                .occurrences
                 .iter()
                 .zip(&publication.inputs)
                 .map(|(occurrence, input)| {
@@ -1771,12 +1705,14 @@ pub(crate) fn build_refresh_state_baseline(
         previous_sources,
         target_snapshot_id: target.current_snapshot_id(),
         target_table_uuid: target.table_uuid().to_string(),
-        definition_fingerprint: mv_definition_fingerprint(&definition.query.effective_sql),
+        definition_fingerprint: mv_definition_fingerprint(
+            &mv_definition.facts.definition().query.effective_sql,
+        ),
     })
 }
 
 /// D's binding-time locator for one relation occurrence.
-fn occurrence_table(occurrence: &RelationOccurrence) -> TableIdentity {
+fn occurrence_table(occurrence: &BindingOccurrence) -> TableIdentity {
     TableIdentity {
         catalog: occurrence.catalog_at_binding.clone(),
         namespace: occurrence.namespace_at_binding.clone(),
@@ -1794,8 +1730,8 @@ fn definition_base_refs(
 ) -> Result<Vec<TableIdentity>, String> {
     Ok(projection
         .facts
-        .definition()
-        .relation_occurrences
+        .binding()
+        .occurrences
         .iter()
         .map(occurrence_table)
         .collect())
@@ -1812,8 +1748,8 @@ fn definition_has_join(query: &ast::Query) -> bool {
 fn definition_occurrences_for_base_refs<'a>(
     projection: &'a StoredKeyedMvProjection,
     base_refs: &[TableIdentity],
-) -> Result<Vec<&'a RelationOccurrence>, String> {
-    let occurrences = &projection.facts.definition().relation_occurrences;
+) -> Result<Vec<&'a BindingOccurrence>, String> {
+    let occurrences = &projection.facts.binding().occurrences;
     if occurrences.len() != base_refs.len() {
         return Err("MV refresh base references do not retain every D occurrence".to_string());
     }
@@ -2095,7 +2031,7 @@ pub fn join_base_refs_for_definition<'a>(
     ),
     String,
 > {
-    let occurrences = &projection.facts.definition().relation_occurrences;
+    let occurrences = &projection.facts.binding().occurrences;
     if occurrences.len() != 2 || base_refs.len() != 2 {
         return Err("join MV refresh requires exactly two D relation occurrences".to_string());
     }

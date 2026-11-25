@@ -25,10 +25,8 @@ use arrow::{
 };
 use async_trait::async_trait;
 use novarocks_mv_application::freshness::{MvSourceObservation, MvSourceState};
-use novarocks_mv_application::persistence::codec::{PublicationInput, RelationOccurrence};
-use novarocks_mv_application::persistence::identity::{
-    NativeDataVersion, ObjectIdentity, SchemaVersion,
-};
+use novarocks_mv_application::persistence::codec::{BindingOccurrence, PublicationInput};
+use novarocks_mv_application::persistence::identity::{NativeDataVersion, ObjectIdentity};
 use novarocks_query_application::{
     system_tables::{
         SystemTableError, SystemTableLookup, SystemTableProvider, SystemTableRegistry,
@@ -201,7 +199,7 @@ impl StatementSystemTableSource for Source {
     }
     async fn current_sources(
         &self,
-        _occurrences: &[RelationOccurrence],
+        _occurrences: &[BindingOccurrence],
         _context: &ConnectorRequestContext,
     ) -> Result<Vec<MvSourceObservation>, SystemTableError> {
         self.call("observe");
@@ -584,17 +582,12 @@ async fn system_catalog_uses_registry_and_large_zero_column_snapshots_keep_cardi
     assert!(!result.storage.is_pure());
     assert_eq!(*source.batch_sizes.lock().unwrap().last().unwrap(), 1);
 }
-fn occurrence() -> RelationOccurrence {
-    RelationOccurrence {
-        occurrence_id: 1,
-        catalog_at_binding: "ice".into(),
-        namespace_at_binding: "db".into(),
-        relation_at_binding: "base".into(),
-        qualifier_at_binding: "b".into(),
-        object_id: ObjectIdentity::try_new(vec![1]).unwrap(),
-        schema_version: SchemaVersion::try_new(vec![1]).unwrap(),
-        fields: vec![],
-    }
+fn occurrence() -> BindingOccurrence {
+    let mut source = novarocks_mv_application::persistence::test_support::relation(1, 1, "b");
+    source.namespace_at_binding = "db".into();
+    source.relation_at_binding = "base".into();
+    source.object_id = ObjectIdentity::try_new(vec![1]).unwrap();
+    source
 }
 fn input() -> PublicationInput {
     PublicationInput {
@@ -613,6 +606,7 @@ fn mv(unavailable: bool) -> MaterializedViewFacts {
         occurrences: vec![occurrence()],
         publication: Some(vec![input()]),
         state: None,
+        retired: None,
     }
 }
 #[tokio::test]

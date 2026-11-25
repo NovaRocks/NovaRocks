@@ -1,0 +1,16 @@
+-- query 6
+-- types	bigint	bigint
+id	v
+1	10
+
+-- query 12
+-- types	bigint	bigint
+id	v
+1	10
+2	20
+
+-- query 13
+-- types	bigint	bigint
+id	v
+1	10
+2	20

@@ -18,12 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,a11,base_drop,referenced,error
--- Test Objective:
--- Validate that dropping a base column referenced by the MV triggers a
--- BaseFieldDropped error. The error message must mention the column name
--- and suggest REFRESH FULL or recreating the MV.
---
--- The MV selects `id`, `region`, `amount`. Spark drops `region` (referenced).
+-- An invalid original definition is reported as stale on refresh.
 
 -- query 1
 -- @skip_result_check=true
@@ -64,11 +59,7 @@ SPARK_SQL
 printf 'SPARK_SQL_OK\n'
 
 -- query 6
--- Refresh must fail: BaseFieldDropped for `region`.
--- The canonical documents bind each source field by the provider's own
--- identity, qualified by the occurrence that referenced it, so the refusal
--- says which reference lost its field rather than which column name did.
--- @expect_error=MV source field is missing for relation occurrence
+-- @expect_trino_error=VIEW_IS_STALE,USER_ERROR
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 7

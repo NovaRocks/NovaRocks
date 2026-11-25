@@ -27,14 +27,14 @@ use crate::mv::domain::refresh::schema_contract::{
 use crate::mv::domain::storage_observation::{
     MvSchemaValidationObservation, MvSourceSchemaObservation,
 };
-use novarocks_mv_application::persistence::codec::RelationOccurrence;
+use novarocks_mv_application::persistence::codec::BindingOccurrence;
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_sql::compiler::SqlCompileError;
 
 /// Validate one D source occurrence and the exact target generation.
 pub(crate) fn validate_schema_contract(
     projection: &StoredKeyedMvProjection,
-    occurrence: &RelationOccurrence,
+    occurrence: &BindingOccurrence,
     current_base: &MvSourceSchemaObservation,
     current_target: &MvSchemaValidationObservation,
 ) -> Result<Vec<MvOccurrenceFieldRebind>, SqlCompileError> {
@@ -49,10 +49,10 @@ pub(crate) fn validate_schema_contract(
 /// Repeated physical objects remain separate occurrences.
 pub(crate) fn validate_join_schema_contract(
     projection: &StoredKeyedMvProjection,
-    bases: &[(&RelationOccurrence, &MvSourceSchemaObservation)],
+    bases: &[(&BindingOccurrence, &MvSourceSchemaObservation)],
     current_target: &MvSchemaValidationObservation,
 ) -> Result<Vec<MvOccurrenceFieldRebind>, SqlCompileError> {
-    let occurrences = &projection.facts.definition().relation_occurrences;
+    let occurrences = &projection.facts.binding().occurrences;
     if occurrences.len() != bases.len() {
         return Err(format!(
             "MV source observation count {} does not match D occurrence count {}",
@@ -103,12 +103,12 @@ pub(crate) fn validate_branch_id_field(
 
 fn require_projection_occurrence(
     projection: &StoredKeyedMvProjection,
-    occurrence: &RelationOccurrence,
+    occurrence: &BindingOccurrence,
 ) -> Result<(), String> {
     if projection
         .facts
-        .definition()
-        .relation_occurrences
+        .binding()
+        .occurrences
         .iter()
         .any(|stored| stored == occurrence)
     {
@@ -182,22 +182,25 @@ mod tests {
     }
 
     fn source_observation(
-        occurrence: &RelationOccurrence,
+        occurrence: &BindingOccurrence,
         rename_amount: bool,
     ) -> MvSourceSchemaObservation {
         source_observation_with_lineage(occurrence, rename_amount, true, true)
     }
     fn source_observation_with_lineage(
-        occurrence: &RelationOccurrence,
+        occurrence: &BindingOccurrence,
         rename_amount: bool,
         format_v3: bool,
         selected_snapshot_has_row_range: bool,
     ) -> MvSourceSchemaObservation {
         let context = context();
         let fields = occurrence
-            .fields
+            .paths
             .iter()
-            .map(|field| {
+            .map(|path| {
+                let [field] = path.nodes.as_slice() else {
+                    panic!("fixture has a nested field");
+                };
                 MvObservedSourceField::try_new(
                     Bytes::copy_from_slice(field.field_id.as_bytes()),
                     if rename_amount && field.name_at_binding == "amount" {
@@ -205,8 +208,8 @@ mod tests {
                     } else {
                         field.name_at_binding.clone()
                     },
-                    field.type_signature.clone(),
-                    field.nullable,
+                    path.leaf_type.clone(),
+                    !field.required,
                 )
                 .unwrap()
             })
@@ -223,7 +226,7 @@ mod tests {
                     &occurrence.object_id,
                 )
                 .unwrap(),
-                Bytes::copy_from_slice(occurrence.schema_version.as_bytes()),
+                Bytes::from_static(b"fixture-schema"),
                 format_v3,
                 Some(1),
                 selected_snapshot_has_row_range,
@@ -262,7 +265,7 @@ mod tests {
                     MvObservedSourceField::try_new(
                         Bytes::copy_from_slice(field.target_field_id.as_bytes()),
                         format!("{prefix}_{ordinal}"),
-                        field.type_signature.clone(),
+                        field.source_type.clone(),
                         field.nullable,
                     )
                     .unwrap(),
@@ -298,7 +301,7 @@ mod tests {
     #[test]
     fn occurrence_validation_preserves_opaque_identity_and_reports_rename() {
         let projection = projection();
-        let occurrence = &projection.facts.definition().relation_occurrences[0];
+        let occurrence = &projection.facts.binding().occurrences[0];
         let renames = validate_schema_contract(
             &projection,
             occurrence,
@@ -314,7 +317,7 @@ mod tests {
     #[test]
     fn exact_target_generation_drift_is_rejected() {
         let projection = projection();
-        let occurrence = &projection.facts.definition().relation_occurrences[0];
+        let occurrence = &projection.facts.binding().occurrences[0];
         let target = target_observation_with_metadata(
             &projection,
             ConnectorCommittedVersion::try_new(Bytes::from_static(b"other-generation"), Some(12))
@@ -335,7 +338,7 @@ mod tests {
     #[test]
     fn source_projection_requires_v3_and_selected_snapshot_row_range() {
         let projection = projection();
-        let occurrence = &projection.facts.definition().relation_occurrences[0];
+        let occurrence = &projection.facts.binding().occurrences[0];
         let target = target_observation(&projection);
         for (format, lineage, expected) in [
             (false, false, "Iceberg format-version=3"),

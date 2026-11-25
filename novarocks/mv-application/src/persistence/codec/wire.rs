@@ -29,13 +29,8 @@ use crate::persistence::codec::PersistenceCodecError;
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Schema {
     DefinitionDocument,
-    ScalarPublicationContract,
     QuerySource,
     ResolutionContext,
-    RelationOccurrence,
-    SourceFieldBinding,
-    OutputDefinition,
-    ExpressionShape,
     SourceFieldReference,
     InterpretationDocument,
     OutputBinding,
@@ -51,6 +46,25 @@ pub(super) enum Schema {
     ConfigurationDocument,
     BindingDocument,
     DataVersionFormat,
+    BindingOccurrence,
+    BoundSourcePath,
+    BoundSourceNode,
+    BoundOutput,
+    BindingDependency,
+    ViewDependency,
+    NestedMvDependency,
+    BindingDigests,
+    StorageMappingDocument,
+    StorageColumnMapping,
+    MarkerDocument,
+    PendingMarker,
+    SourceVersionWindow,
+    PendingReleasedMarker,
+    NeedsRebuildMarker,
+    BindingChange,
+    InvalidDefinitionMarker,
+    InvalidMarker,
+    RetirementRecord,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,50 +192,13 @@ const fn repeated_set_message(number: u32, nested: Schema, key: CanonicalKey) ->
     }
 }
 
-const DEFINITION: &[Field] = &[
-    scalar(1),
-    message(2, Schema::QuerySource),
-    repeated_message(3, Schema::RelationOccurrence),
-    repeated_message(4, Schema::OutputDefinition),
-    bytes(5),
-    scalar(6),
-    repeated_message(7, Schema::ScalarPublicationContract),
-];
-const SCALAR_PUBLICATION_CONTRACT: &[Field] = &[bytes(1), bytes(2), scalar(3)];
+const DEFINITION: &[Field] = &[scalar(1), message(2, Schema::QuerySource), scalar(6)];
 const QUERY: &[Field] = &[bytes(1), scalar(2), message(3, Schema::ResolutionContext)];
 const RESOLUTION: &[Field] = &[bytes(1), bytes(2)];
-const RELATION: &[Field] = &[
-    scalar(1),
-    bytes(2),
-    bytes(3),
-    bytes(4),
-    bytes(5),
-    bytes(6),
-    bytes(7),
-    repeated_set_message(8, Schema::SourceFieldBinding, CanonicalKey::Bytes(1)),
-];
-const SOURCE_FIELD: &[Field] = &[bytes(1), bytes(2), bytes(3), boolean(4)];
-const OUTPUT_DEFINITION: &[Field] = &[
-    bytes(1),
-    bytes(2),
-    bytes(3),
-    boolean(4),
-    message(5, Schema::ExpressionShape),
-];
-const EXPRESSION: &[Field] = &[
-    scalar(1),
-    bytes(2),
-    repeated_set_message(
-        3,
-        Schema::SourceFieldReference,
-        CanonicalKey::UnsignedThenBytes(1, 2),
-    ),
-];
 const SOURCE_FIELD_REFERENCE: &[Field] = &[scalar(1), bytes(2)];
 const INTERPRETATION: &[Field] = &[
     scalar(1),
     bytes(2),
-    bytes(3),
     repeated_set_message(4, Schema::OutputBinding, CanonicalKey::Bytes(1)),
     repeated_set_message(5, Schema::StateSlot, CanonicalKey::Bytes(1)),
     message(6, Schema::ApplyKey),
@@ -251,9 +228,10 @@ const AGGREGATE: &[Field] = &[
     repeated_bytes(4),
     bytes(5),
     message(6, Schema::PersistentAggregateContract),
+    bytes(7),
 ];
 // Repeated uint32 is encoded packed and therefore length-delimited.
-const PERSISTENT_AGGREGATE: &[Field] = &[bytes(1), bytes(2), bytes(3), bytes(4)];
+const PERSISTENT_AGGREGATE: &[Field] = &[bytes(1), bytes(2), bytes(4)];
 const BRANCH: &[Field] = &[bytes(1), packed_varints(2), repeated_bytes(3)];
 const TARGET: &[Field] = &[
     bytes(1),
@@ -270,20 +248,117 @@ const TARGET_PARTITION_FIELD: &[Field] = &[bytes(1), bytes(2), scalar(3), scalar
 const PHYSICAL_FIELD: &[Field] = &[scalar(1), bytes(2), bytes(3), bytes(4), boolean(5)];
 const CONFIGURATION: &[Field] = &[scalar(1), scalar(2), boolean(3), scalar(4), scalar(5)];
 
-const BINDING: &[Field] = &[scalar(1), repeated_message(2, Schema::DataVersionFormat)];
+const BINDING: &[Field] = &[
+    scalar(1),
+    repeated_message(3, Schema::BindingOccurrence),
+    repeated_message(4, Schema::BoundOutput),
+    repeated_message(5, Schema::BindingDependency),
+    message(6, Schema::BindingDigests),
+];
+const BINDING_OCCURRENCE: &[Field] = &[
+    scalar(1),
+    bytes(2),
+    bytes(3),
+    bytes(4),
+    bytes(5),
+    bytes(6),
+    scalar(7),
+    message(8, Schema::DataVersionFormat),
+    bytes(9),
+    bytes(10),
+    bytes(11),
+    bytes(12),
+    repeated_message(13, Schema::BoundSourcePath),
+    bytes(14),
+];
+const BOUND_SOURCE_PATH: &[Field] = &[
+    repeated_message(1, Schema::BoundSourceNode),
+    bytes(2),
+    boolean(3),
+];
+const BOUND_SOURCE_NODE: &[Field] = &[bytes(1), boolean(2), scalar(3), bytes(4)];
+const BOUND_OUTPUT: &[Field] = &[
+    scalar(1),
+    bytes(2),
+    bytes(3),
+    repeated_set_message(
+        4,
+        Schema::SourceFieldReference,
+        CanonicalKey::UnsignedThenBytes(1, 2),
+    ),
+];
+const BINDING_DEPENDENCY: &[Field] = &[
+    message(1, Schema::ViewDependency),
+    message(2, Schema::NestedMvDependency),
+    bytes(3),
+];
+const VIEW_DEPENDENCY: &[Field] = &[
+    bytes(1),
+    scalar(2),
+    bytes(3),
+    bytes(4),
+    scalar(5),
+    scalar(6),
+];
+const NESTED_MV_DEPENDENCY: &[Field] = &[bytes(1), bytes(2), scalar(3)];
+const BINDING_DIGESTS: &[Field] = &[bytes(1), bytes(2), bytes(3)];
+const STORAGE_MAPPING: &[Field] = &[scalar(1), repeated_message(2, Schema::StorageColumnMapping)];
+const STORAGE_COLUMN: &[Field] = &[
+    scalar(1),
+    bytes(2),
+    bytes(3),
+    bytes(4),
+    bytes(5),
+    bytes(6),
+    bytes(7),
+    scalar(8),
+    boolean(9),
+    bytes(10),
+    scalar(11),
+];
+const MARKER: &[Field] = &[
+    scalar(1),
+    bytes(2),
+    bytes(3),
+    message(4, Schema::PendingMarker),
+    message(5, Schema::PendingReleasedMarker),
+    message(6, Schema::NeedsRebuildMarker),
+    message(7, Schema::InvalidDefinitionMarker),
+    message(8, Schema::InvalidMarker),
+];
+const PENDING_MARKER: &[Field] = &[
+    bytes(1),
+    bytes(2),
+    repeated_message(3, Schema::SourceVersionWindow),
+    bytes(4),
+    scalar(5),
+    bytes(6),
+    bytes(7),
+];
+const SOURCE_VERSION_WINDOW: &[Field] = &[scalar(1), bytes(2), bytes(3)];
+const PENDING_RELEASED: &[Field] = &[bytes(1)];
+const NEEDS_REBUILD: &[Field] = &[repeated_message(1, Schema::BindingChange)];
+const BINDING_CHANGE: &[Field] = &[scalar(1), bytes(2), bytes(3)];
+const INVALID_DEFINITION: &[Field] = &[scalar(1), bytes(2)];
+const INVALID_MARKER: &[Field] = &[bytes(1)];
+const RETIREMENT_RECORD: &[Field] = &[
+    scalar(1),
+    bytes(2),
+    bytes(3),
+    scalar(4),
+    scalar(5),
+    scalar(6),
+    bytes(7),
+];
+
 const DATA_VERSION_FORMAT: &[Field] = &[bytes(1), bytes(2), scalar(3), scalar(4)];
 
 impl Schema {
     fn fields(self) -> &'static [Field] {
         match self {
             Self::DefinitionDocument => DEFINITION,
-            Self::ScalarPublicationContract => SCALAR_PUBLICATION_CONTRACT,
             Self::QuerySource => QUERY,
             Self::ResolutionContext => RESOLUTION,
-            Self::RelationOccurrence => RELATION,
-            Self::SourceFieldBinding => SOURCE_FIELD,
-            Self::OutputDefinition => OUTPUT_DEFINITION,
-            Self::ExpressionShape => EXPRESSION,
             Self::SourceFieldReference => SOURCE_FIELD_REFERENCE,
             Self::InterpretationDocument => INTERPRETATION,
             Self::OutputBinding => OUTPUT_BINDING,
@@ -299,6 +374,25 @@ impl Schema {
             Self::ConfigurationDocument => CONFIGURATION,
             Self::BindingDocument => BINDING,
             Self::DataVersionFormat => DATA_VERSION_FORMAT,
+            Self::BindingOccurrence => BINDING_OCCURRENCE,
+            Self::BoundSourcePath => BOUND_SOURCE_PATH,
+            Self::BoundSourceNode => BOUND_SOURCE_NODE,
+            Self::BoundOutput => BOUND_OUTPUT,
+            Self::BindingDependency => BINDING_DEPENDENCY,
+            Self::ViewDependency => VIEW_DEPENDENCY,
+            Self::NestedMvDependency => NESTED_MV_DEPENDENCY,
+            Self::BindingDigests => BINDING_DIGESTS,
+            Self::StorageMappingDocument => STORAGE_MAPPING,
+            Self::StorageColumnMapping => STORAGE_COLUMN,
+            Self::MarkerDocument => MARKER,
+            Self::PendingMarker => PENDING_MARKER,
+            Self::SourceVersionWindow => SOURCE_VERSION_WINDOW,
+            Self::PendingReleasedMarker => PENDING_RELEASED,
+            Self::NeedsRebuildMarker => NEEDS_REBUILD,
+            Self::BindingChange => BINDING_CHANGE,
+            Self::InvalidDefinitionMarker => INVALID_DEFINITION,
+            Self::InvalidMarker => INVALID_MARKER,
+            Self::RetirementRecord => RETIREMENT_RECORD,
         }
     }
 }

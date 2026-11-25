@@ -348,6 +348,7 @@ pub(crate) fn execute_drop_database_statement(
                     // mutation retains the statement-level IF EXISTS contract.
                     policy: DropPolicy::NoOpIfMissing,
                     data_disposition: ConnectorDropTableDataDisposition::Purge,
+                    managed: None,
                 },
                 connector_context.clone(),
             )?;
@@ -597,6 +598,7 @@ pub(crate) fn execute_drop_table_statement(
                 DropPolicy::FailIfMissing
             },
             data_disposition: ConnectorDropTableDataDisposition::Purge,
+            managed: None,
         },
         connector_context.clone(),
     ) {

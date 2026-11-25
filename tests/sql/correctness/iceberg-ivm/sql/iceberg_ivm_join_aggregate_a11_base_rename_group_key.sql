@@ -18,9 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,a11,join,aggregate,base_rename
--- Test Point: Iceberg join aggregate MV refresh rebinds a renamed dim-side GROUP BY key.
--- Method: Rename dim.region -> area through Spark, insert new fact rows through NovaRocks, refresh, and compare the MV with the rewritten base query.
--- Scope: Iceberg target MV, join aggregate, schema evolution, field-id rebind.
+-- A referenced rename makes the original definition stale and preserves the published bag.
 
 -- query 1
 -- @skip_result_check=true
@@ -65,19 +63,22 @@ printf 'SPARK_SQL_OK\n'
 -- @skip_result_check=true
 INSERT INTO dim VALUES ROW(30, 'north');
 INSERT INTO fact VALUES ROW(4, 30, 7);
-REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0};
 
 -- query 6
-SELECT region, c, s FROM join_agg_mv_${uuid0} ORDER BY region;
+-- @expect_trino_error=VIEW_IS_STALE,USER_ERROR
+REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0};
 
 -- query 7
+SELECT region, c, s FROM join_agg_mv_${uuid0} ORDER BY region;
+
+-- query 8
 SELECT d.area AS region, COUNT(*) AS c, SUM(f.amount) AS s
 FROM fact AS f
 JOIN dim AS d ON f.dim_id = d.id
 GROUP BY d.area
 ORDER BY d.area;
 
--- query 8
+-- query 9
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW join_agg_mv_${uuid0};

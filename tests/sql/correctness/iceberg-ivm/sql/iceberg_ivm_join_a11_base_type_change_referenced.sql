@@ -18,7 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,row_lineage,join,a11,base_type_change,referenced,error
--- Test Point: Join IMV blocks refresh when a referenced column on either base changes type.
+-- Test Point: Join IMV rebuilds after a referenced input widens with a stable output.
 -- Method: Create a two-base join MV, widen a left-base projected column through Spark, then refresh.
 -- Scope: Multi-base A11 schema contract, current Iceberg schema validation, metadata-only evolution.
 
@@ -45,7 +45,8 @@ INSERT INTO ice_ivm_join_a11_type_${uuid0}.ns_${uuid0}.join_right_${uuid0} VALUE
 -- query 2
 -- @skip_result_check=true
 USE ice_ivm_join_a11_type_${uuid0}.ns_${uuid0};
-CREATE MATERIALIZED VIEW join_mv_${uuid0} AS SELECT l.id, l.amount, r.label
+SET SESSION enable_materialized_view_rewrite = false;
+CREATE MATERIALIZED VIEW join_mv_${uuid0} AS SELECT l.id, CAST(l.amount AS BIGINT) AS amount, r.label
 FROM join_left_${uuid0} AS l
 JOIN join_right_${uuid0} AS r ON l.rid = r.rid;
 
@@ -75,12 +76,18 @@ INSERT INTO ice_ivm_join_a11_type_${uuid0}.ns_${uuid0}.join_left_${uuid0} VALUES
   ROW(3, 20, 300);
 
 -- query 7
--- The refusal names the occurrence whose reference changed shape, which
--- is what tells the two sides of a join apart.
--- @expect_error=MV source field type or nullability changed for relation occurrence
+-- @skip_result_check=true
 REFRESH MATERIALIZED VIEW join_mv_${uuid0};
 
 -- query 8
+SELECT id, amount, label FROM join_mv_${uuid0} ORDER BY id, label;
+
+-- query 9
+SELECT l.id, CAST(l.amount AS BIGINT) AS amount, r.label
+FROM join_left_${uuid0} AS l JOIN join_right_${uuid0} AS r ON l.rid = r.rid
+ORDER BY l.id, r.label;
+
+-- query 10
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW join_mv_${uuid0};

@@ -349,14 +349,8 @@ fn approximate_aggregates_percentile_array_has_no_4096_target_limit() {
         .value(0);
     let result = result.as_any().downcast_ref::<Float64Array>().unwrap();
     assert_eq!(result.len(), 4097);
-    assert!(
-        result
-            .values()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .all(|pair| *pair == [2.0, 6.0])
-    );
+    let (pairs, _) = result.values().as_chunks::<2>();
+    assert!(pairs.iter().all(|pair| *pair == [2.0, 6.0]));
     assert_eq!(result.value(4096), 2.0);
 
     let invalid = evaluate(

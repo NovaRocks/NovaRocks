@@ -27,11 +27,12 @@
 use std::collections::{BTreeMap, HashSet};
 
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorCommittedVersion, ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTableObjectId,
+    ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTableObjectId, ProviderSourceType,
 };
 
 pub const MAX_MV_OBSERVATION_FIELDS: usize = 4_096;
@@ -46,6 +47,93 @@ const REF_FIXED_BYTES: usize = 16;
 const MARKER_FIXED_BYTES: usize = 24;
 const MAX_MV_SOURCE_FIELD_ID_BYTES: usize = 1024;
 
+/// One coordinate in the analyzed source schema. The name verifies that the
+/// original ordinal still selects the same field. Neither enters fact bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSourceFieldCoordinate {
+    pub ordinal: u32,
+    pub name: String,
+}
+
+/// A field or a whole subtree consumed by one analyzed relation occurrence.
+/// Paths descend through structs. Lists/maps used as values are requested as a
+/// whole subtree, including when SQL indexes or applies a lambda to them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSourceFieldPath {
+    pub fields: Vec<MvSourceFieldCoordinate>,
+    pub whole_subtree: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvSourceObjectKind {
+    Table,
+    MaterializedView,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvSourceFieldKind {
+    Scalar,
+    Struct,
+    List,
+    Map,
+}
+
+/// Only the selected path is described here. A struct header carries no child
+/// count. Exact leaf parameters and any consumed subtree are in `leaf_type`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSourceFieldBinding {
+    pub provider_field_id: Bytes,
+    pub required: bool,
+    pub kind: MvSourceFieldKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSourcePathBinding {
+    pub fields: Vec<MvSourceFieldBinding>,
+    pub leaf_type: ProviderSourceType,
+    pub whole_subtree: bool,
+}
+
+/// The original Provider authors the domain, version and bytes. The digest
+/// always describes these exact bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSourceBindingFact {
+    bytes: Bytes,
+    digest: [u8; 32],
+}
+
+impl MvSourceBindingFact {
+    pub fn from_canonical_bytes(bytes: Vec<u8>) -> Self {
+        let digest = Sha256::digest(&bytes).into();
+        Self {
+            bytes: Bytes::from(bytes),
+            digest,
+        }
+    }
+
+    pub fn canonical_bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    pub const fn sub_digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+/// A1–A4 for one source occurrence. Response paths correspond exactly to the
+/// request order. The Provider separately canonicalizes the unordered set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvSourceBindingObservation {
+    pub catalog_instance: ConnectorInstanceId,
+    pub object_id: ConnectorTableObjectId,
+    pub object_kind: MvSourceObjectKind,
+    pub paths: Vec<MvSourcePathBinding>,
+    pub object_fact: MvSourceBindingFact,
+    pub path_fact: MvSourceBindingFact,
+    pub type_fact: MvSourceBindingFact,
+    pub read_declarations_fact: MvSourceBindingFact,
+}
+
 /// One source-schema field whose provider-owned identity is safe to persist
 /// only through a consumer-owned document. The field's position in the
 /// enclosing observation is a CREATE-time join coordinate, never an identity.
@@ -53,7 +141,7 @@ const MAX_MV_SOURCE_FIELD_ID_BYTES: usize = 1024;
 pub struct MvObservedSourceField {
     provider_field_id: Bytes,
     name: String,
-    type_signature: String,
+    source_type: ProviderSourceType,
     nullable: bool,
 }
 
@@ -122,13 +210,12 @@ impl MvObservedSourceField {
     pub fn try_new(
         provider_field_id: Bytes,
         name: String,
-        type_signature: String,
+        source_type: ProviderSourceType,
         nullable: bool,
     ) -> Result<Self, ConnectorError> {
         if provider_field_id.is_empty()
             || provider_field_id.len() > MAX_MV_SOURCE_FIELD_ID_BYTES
             || name.trim().is_empty()
-            || type_signature.trim().is_empty()
         {
             return corrupt(
                 "MV source field observation has an empty or oversized identity or schema fact",
@@ -137,7 +224,7 @@ impl MvObservedSourceField {
         Ok(Self {
             provider_field_id,
             name,
-            type_signature,
+            source_type,
             nullable,
         })
     }
@@ -150,8 +237,12 @@ impl MvObservedSourceField {
         &self.name
     }
 
-    pub fn type_signature(&self) -> &str {
-        &self.type_signature
+    pub fn source_type(&self) -> &ProviderSourceType {
+        &self.source_type
+    }
+
+    fn retained_type_bytes(&self) -> usize {
+        self.source_type.retained_bytes()
     }
 
     pub const fn nullable(&self) -> bool {
@@ -221,7 +312,7 @@ impl MvSourceSchemaObservation {
                 FIELD_FIXED_BYTES
                     .saturating_add(field.provider_field_id().len())
                     .saturating_add(field.name().len())
-                    .saturating_add(field.type_signature().len()),
+                    .saturating_add(field.retained_type_bytes()),
                 context,
                 "MV CREATE source",
             )?;
@@ -274,16 +365,21 @@ impl MvSourceSchemaObservation {
 pub struct MvObservedField {
     field_id: i32,
     name: String,
-    type_signature: String,
+    source_type: ProviderSourceType,
     nullable: bool,
 }
 
 impl MvObservedField {
-    pub fn new(field_id: i32, name: String, type_signature: String, nullable: bool) -> Self {
+    pub fn new(
+        field_id: i32,
+        name: String,
+        source_type: ProviderSourceType,
+        nullable: bool,
+    ) -> Self {
         Self {
             field_id,
             name,
-            type_signature,
+            source_type,
             nullable,
         }
     }
@@ -296,8 +392,12 @@ impl MvObservedField {
         &self.name
     }
 
-    pub fn type_signature(&self) -> &str {
-        &self.type_signature
+    pub fn source_type(&self) -> &ProviderSourceType {
+        &self.source_type
+    }
+
+    fn retained_type_bytes(&self) -> usize {
+        self.source_type.retained_bytes()
     }
 
     pub const fn nullable(&self) -> bool {
@@ -512,7 +612,7 @@ impl MvSchemaValidationObservation {
                 FIELD_FIXED_BYTES
                     .saturating_add(field.provider_field_id().len())
                     .saturating_add(field.name().len())
-                    .saturating_add(field.type_signature().len()),
+                    .saturating_add(field.retained_type_bytes()),
                 context,
                 "MV exact schema",
             )?;
@@ -845,6 +945,37 @@ impl MvMaintenanceMetadataObservation {
 /// answer from the supplied exact lease and sealed metadata only.
 // Design: ADR-0086 (docs/adr/ADR-0086-frontend-mv-storage-observation-spi-relocation.md)
 pub trait MvStorageObservationPort: Send + Sync {
+    fn map_prepared_storage(
+        &self,
+        _target: &super::ConnectorPreparedCreateDocumentTarget,
+        _columns: &[super::MvStorageColumnRequest],
+        _context: ConnectorRequestContext,
+    ) -> Result<Vec<super::MvObservedStorageMapping>, ConnectorError> {
+        Err(unavailable())
+    }
+
+    fn observe_current_storage_mapping(
+        &self,
+        _exact_lease: &ConnectorControlPlanningPin,
+        _metadata: &ConnectorTableMetadata,
+        _columns: &[super::MvStorageColumnRequest],
+        _context: ConnectorRequestContext,
+    ) -> Result<super::MvCurrentStorageMapping, ConnectorError> {
+        Err(unavailable())
+    }
+
+    /// Projects A1–A4 from the original observed table generation, without
+    /// resolving another table or acquiring any I/O capability.
+    fn observe_source_binding(
+        &self,
+        _exact_lease: &ConnectorControlPlanningPin,
+        _metadata: &ConnectorTableMetadata,
+        _paths: &[MvSourceFieldPath],
+        _context: ConnectorRequestContext,
+    ) -> Result<MvSourceBindingObservation, ConnectorError> {
+        Err(unavailable())
+    }
+
     /// Projects opaque source identities from the same retained generation as
     /// `metadata`. A caller must reject this observation if its table or schema
     /// version does not exactly match that admitted metadata.
@@ -993,13 +1124,14 @@ fn validate_fields_and_partition(
     let mut names = HashSet::with_capacity(fields.len());
     for field in fields {
         require_non_empty(&field.name, "MV observed field name")?;
-        require_non_empty(&field.type_signature, "MV observed field type signature")?;
         if !ids.insert(field.field_id) || !names.insert(field.name.to_ascii_lowercase()) {
             return corrupt(format!("{subject} observation has duplicate schema fields"));
         }
         reserve(
             &mut used,
-            FIELD_FIXED_BYTES + field.name.len() + field.type_signature.len(),
+            FIELD_FIXED_BYTES
+                .saturating_add(field.name.len())
+                .saturating_add(field.retained_type_bytes()),
             context,
             subject,
         )?;
@@ -1083,6 +1215,16 @@ fn corrupt<T>(message: impl Into<String>) -> Result<T, ConnectorError> {
 
 #[cfg(test)]
 mod tests {
+    fn long_source_type() -> ProviderSourceType {
+        use crate::connector::{IcebergSourcePrimitive, IcebergSourceType, IcebergSourceTypeNode};
+        ProviderSourceType::Iceberg(
+            IcebergSourceType::try_new(vec![IcebergSourceTypeNode::Primitive(
+                IcebergSourcePrimitive::Long,
+            )])
+            .unwrap(),
+        )
+    }
+
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -1112,7 +1254,12 @@ mod tests {
             .expect("bounded target object ID")
     }
     fn fields() -> Vec<MvObservedField> {
-        vec![MvObservedField::new(1, "id".into(), "bigint".into(), false)]
+        vec![MvObservedField::new(
+            1,
+            "id".into(),
+            long_source_type(),
+            false,
+        )]
     }
     fn partition() -> MvObservedPartitionSpec {
         MvObservedPartitionSpec::new(
@@ -1181,7 +1328,7 @@ mod tests {
         let field = MvObservedSourceField::try_new(
             Bytes::from_static(b"provider-field"),
             "id".into(),
-            "bigint".into(),
+            long_source_type(),
             false,
         )
         .expect("source field");
@@ -1204,7 +1351,7 @@ mod tests {
         let field = MvObservedSourceField::try_new(
             Bytes::from_static(b"id"),
             "id".into(),
-            "long".into(),
+            long_source_type(),
             false,
         )
         .unwrap();
@@ -1228,7 +1375,7 @@ mod tests {
             MvObservedSourceField::try_new(
                 Bytes::from(vec![id]),
                 name.to_owned(),
-                "long".into(),
+                long_source_type(),
                 false,
             )
             .unwrap()
@@ -1265,7 +1412,7 @@ mod tests {
         let field = MvObservedSourceField::try_new(
             Bytes::from_static(b"source-field"),
             "id".into(),
-            "long".into(),
+            long_source_type(),
             false,
         )
         .unwrap();

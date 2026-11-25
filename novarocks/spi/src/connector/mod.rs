@@ -41,6 +41,7 @@ mod metadata;
 mod metadata_discovery;
 mod metadata_maintenance;
 mod mutation;
+mod mv_storage_mapping;
 mod mv_storage_observation;
 mod original_result_scope;
 mod payload_retention;
@@ -57,6 +58,11 @@ mod row_mutation;
 mod scalar;
 mod scoped_begin;
 mod semantic_revision;
+mod source_type;
+pub use source_type::{
+    IcebergSourcePrimitive, IcebergSourceType, IcebergSourceTypeNode, ProviderSourceType,
+    ProviderSourceTypeShape,
+};
 mod staged_create;
 mod statistics;
 mod view_metadata;
@@ -239,15 +245,16 @@ pub use mutation::{
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
     ConnectorCatalogMutationResolver, ConnectorCatalogMutationSession, ConnectorColumnDefinition,
     ConnectorColumnPath, ConnectorColumnPosition, ConnectorCommittedVersion, ConnectorDataType,
-    ConnectorDefaultValue, ConnectorDropTableDataDisposition, ConnectorMutationFailure,
-    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorPartitionTransform,
-    ConnectorPropertyAuthority, ConnectorPropertyChange, ConnectorRefAction, ConnectorRefKind,
-    ConnectorRefreshPublicationGuard, ConnectorSchemaChange, ConnectorStructField,
-    ConnectorViewColumn, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
-    CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
+    ConnectorDefaultValue, ConnectorDropTableDataDisposition, ConnectorManagedDropFence,
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
+    ConnectorPartitionTransform, ConnectorPropertyAuthority, ConnectorPropertyChange,
+    ConnectorRefAction, ConnectorRefKind, ConnectorRefreshPublicationGuard, ConnectorSchemaChange,
+    ConnectorStructField, ConnectorViewColumn, ConnectorViewDefinition, ConnectorViewDialect,
+    ConnectorViewIdentity, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
     MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
+pub use mv_storage_mapping::*;
 pub use mv_storage_observation::{
     MAX_MV_OBSERVATION_FIELDS, MAX_MV_OBSERVATION_PARTITION_FIELDS, MAX_MV_OBSERVATION_REFS,
     MAX_MV_OBSERVATION_SNAPSHOTS, MvCreatedTargetObservation, MvExactPartitionField,
@@ -255,7 +262,9 @@ pub use mv_storage_observation::{
     MvObservedMaintenancePolicy, MvObservedPartitionField, MvObservedPartitionSpec,
     MvObservedPartitionTransform, MvObservedRefreshMarker, MvObservedSnapshot,
     MvObservedSourceField, MvRefreshBaseObservation, MvRefreshTargetObservation,
-    MvSchemaValidationObservation, MvSourceSchemaObservation, MvStorageObservationPort,
+    MvSchemaValidationObservation, MvSourceBindingFact, MvSourceBindingObservation,
+    MvSourceFieldBinding, MvSourceFieldCoordinate, MvSourceFieldKind, MvSourceFieldPath,
+    MvSourceObjectKind, MvSourcePathBinding, MvSourceSchemaObservation, MvStorageObservationPort,
     UnavailableMvStorageObservationPort,
 };
 pub use original_result_scope::{
@@ -363,9 +372,9 @@ pub use statistics::{
     TableStatisticsSummary,
 };
 pub use view_metadata::{
-    ConnectorListViewsRequest, ConnectorObjectKind, ConnectorStorageTableIdentifier,
-    ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewPreparation,
-    ConnectorViewPreparationFuture, ConnectorViewRequest,
+    ConnectorIcebergViewVersion, ConnectorListViewsRequest, ConnectorObjectKind,
+    ConnectorStorageTableIdentifier, ConnectorViewMetadata, ConnectorViewMetadataValue,
+    ConnectorViewPreparation, ConnectorViewPreparationFuture, ConnectorViewRequest,
 };
 pub use write::{
     ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,

@@ -144,6 +144,15 @@ pub struct IcebergRefBinding {
 }
 
 impl IcebergRefBinding {
+    pub(crate) const fn read_selection(&self) -> crate::planner::table::SqlMvReadSelection {
+        use crate::planner::table::SqlMvReadSelection;
+        match self.ref_kind {
+            Some(IcebergRefKind::Branch) => SqlMvReadSelection::Branch,
+            Some(IcebergRefKind::Tag) => SqlMvReadSelection::Tag,
+            None => SqlMvReadSelection::Snapshot,
+        }
+    }
+
     pub fn ref_repr(&self) -> String {
         match (&self.ref_name, &self.ref_kind) {
             (Some(name), Some(IcebergRefKind::Branch)) => format!("branch '{name}'"),

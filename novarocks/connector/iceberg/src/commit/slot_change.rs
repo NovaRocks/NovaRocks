@@ -118,6 +118,7 @@ pub(crate) fn carry_records_and_closure(metadata: &TableMetadata) -> Result<Reco
 
 /// Immutable snapshot summary key authored by an admitted combined catalog mutation.
 pub(crate) const SLOT_STORAGE_EFFECT_SUMMARY_KEY: &str = "novarocks.mv.slot-storage-effect.v1";
+pub(crate) const SLOT_CHANGE_SNAPSHOT_SUMMARY_KEY: &str = "novarocks.document.slot-change.v1";
 
 pub(crate) struct SlotChangePreparer {
     pub change: KeyedSlotChange,
@@ -164,7 +165,7 @@ impl Preparer for SlotChangePreparer {
             vec![]
         };
         let snapshot_id = view.stage_snapshot_id()?;
-        let carry = carry_records_and_closure(metadata)?;
+        let mut carry = carry_records_and_closure(metadata)?;
         let mut rewrites = carry.properties;
         for (name, value) in &self.change.slots {
             rewrites.insert(
@@ -188,6 +189,10 @@ impl Preparer for SlotChangePreparer {
             .iter()
             .map(|(key, value)| key.len() + value.len())
             .sum();
+        carry.summary.insert(
+            SLOT_CHANGE_SNAPSHOT_SUMMARY_KEY.to_owned(),
+            "true".to_owned(),
+        );
         let mut change = super::overwrite::prepare_snapshot_change(
             view,
             intent,

@@ -17,7 +17,7 @@
 
 //! Stateful materialized-view analysis adapter.
 
-use arrow::datatypes::DataType;
+use novarocks_spi::connector::{IcebergSourcePrimitive, IcebergSourceTypeNode, ProviderSourceType};
 
 use crate::mv::domain::analysis::{MvAnalysis, prepare_mv_select_for_catalog_provider};
 /// Lightweight projection of the iceberg base table that
@@ -27,10 +27,7 @@ use crate::mv::domain::analysis::{MvAnalysis, prepare_mv_select_for_catalog_prov
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BaseColumnDescriptor {
     pub name: String,
-    pub data_type: DataType,
-    /// Uppercased SQL type as the analyzer/iceberg-schema mapper produced
-    /// it (e.g. `BIGINT`, `STRING`, `DECIMAL(18,2)`, `ARRAY<STRING>`).
-    pub sql_type: String,
+    pub source_type: ProviderSourceType,
     pub nullable: bool,
 }
 
@@ -78,10 +75,10 @@ pub(crate) fn validate_ivm_primary_key(
                 col.name
             ));
         }
-        if !is_hashable_pk_type(&col.sql_type) {
+        if !is_hashable_pk_type(&col.source_type) {
             return Err(format!(
-                "PRIMARY KEY column `{}` has unsupported type `{}`; only hashable scalar types are allowed",
-                col.name, col.sql_type
+                "PRIMARY KEY column `{}` has unsupported type `{:?}`; only hashable scalar types are allowed",
+                col.name, col.source_type
             ));
         }
     }
@@ -92,23 +89,22 @@ pub(crate) fn validate_ivm_primary_key(
 /// Accepts: BIGINT, INT, SMALLINT, TINYINT, STRING, VARCHAR, DATE,
 /// DATETIME, DECIMAL (with or without precision/scale).
 /// Rejects: BOOLEAN, FLOAT, DOUBLE, ARRAY, MAP, STRUCT, JSON.
-fn is_hashable_pk_type(sql_type: &str) -> bool {
-    let upper = sql_type.to_ascii_uppercase();
-    let head = upper.split(['(', '<']).next().unwrap_or("").trim();
+fn is_hashable_pk_type(source_type: &ProviderSourceType) -> bool {
+    let ProviderSourceType::Iceberg(source_type) = source_type;
+    use IcebergSourcePrimitive as Primitive;
     matches!(
-        head,
-        "BIGINT"
-            | "INT"
-            | "INTEGER"
-            | "SMALLINT"
-            | "TINYINT"
-            | "STRING"
-            | "VARCHAR"
-            | "CHAR"
-            | "DATE"
-            | "DATETIME"
-            | "TIMESTAMP"
-            | "DECIMAL"
+        source_type.nodes(),
+        [IcebergSourceTypeNode::Primitive(
+            Primitive::Int
+                | Primitive::Long
+                | Primitive::String
+                | Primitive::Date
+                | Primitive::Timestamp
+                | Primitive::Timestamptz
+                | Primitive::TimestampNs
+                | Primitive::TimestamptzNs
+                | Primitive::Decimal { .. }
+        )]
     )
 }
 

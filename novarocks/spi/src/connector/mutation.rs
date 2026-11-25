@@ -640,6 +640,7 @@ pub enum ConnectorCatalogMutationOperation {
         table: ConnectorTableIdentity,
         policy: DropPolicy,
         data_disposition: ConnectorDropTableDataDisposition,
+        managed: Option<ConnectorManagedDropFence>,
     },
     CreateView {
         view: ConnectorViewIdentity,
@@ -684,6 +685,36 @@ pub enum ConnectorCatalogMutationOperation {
         table: ConnectorTableIdentity,
         action: ConnectorRefAction,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorManagedDropFence {
+    pub admission: super::ConnectorDocumentManagementAdmission,
+    pub expected_metadata: ConnectorCommittedVersion,
+}
+
+impl ConnectorManagedDropFence {
+    pub fn validate_for(
+        &self,
+        owner: &ConnectorProviderBindingKey,
+        operation: ConnectorMutationOperationId,
+        target: &ConnectorTableIdentity,
+    ) -> Result<(), ConnectorError> {
+        self.admission.validate()?;
+        self.expected_metadata.validate()?;
+        if self.admission.owner() != owner
+            || self.admission.operation_id() != operation
+            || self.admission.target() != target
+            || self.admission.operation() != super::ConnectorDocumentManagementOperation::Drop
+            || self.admission.expected_object_id().is_none()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "managed DROP differs from its exact document admission",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl ConnectorCatalogMutationOperation {

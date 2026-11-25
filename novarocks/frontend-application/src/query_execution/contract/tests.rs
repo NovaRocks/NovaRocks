@@ -203,6 +203,13 @@ fn synthetic_options_preserve_admitted_root_hints_and_absent_options_defaults() 
         ));
         let options = super::synthetic_statement_query_options(context.execution());
         assert_eq!(options.as_proto().allow_throw_exception, expected_allow);
+        let mv = super::synthetic_mv_query_options(context.execution());
+        assert_eq!(
+            mv.as_proto().allow_throw_exception,
+            SqlSemanticSettings::default()
+                .sql_mode()
+                .allow_throw_exception(),
+        );
         let reconstructed = reconstruct_runtime_query_options(&options);
         let mut expected = novarocks_execution::runtime::query_options::QueryOptions::default();
         expected.set_allow_throw_exception(expected_allow);

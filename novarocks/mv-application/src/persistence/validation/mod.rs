@@ -21,15 +21,18 @@ pub mod runtime;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use novarocks_spi::connector::ProviderSourceType;
+
+use crate::persistence::codec::binding_model::BindingDocument;
+use crate::persistence::codec::mapping_codec::StorageMappingDocument;
+
 use crate::persistence::codec::{
-    ApplyKeyKind, ConfigurationDocument, DefinitionDocument, ExpressionKind,
+    ApplyKeyKind, ConfigurationDocument, DefinitionDocument,
     INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY, InterpretationDocument,
     PhysicalFieldLogicalIdentity, RefreshPolicy, StateRole, TargetPartitionTransform,
     internal_retraction_count_aggregate_identity,
 };
-use crate::persistence::identity::{
-    ComputationIdentity, DocumentRevision, FieldIdentity, ObjectIdentity,
-};
+use crate::persistence::identity::{DocumentRevision, FieldIdentity};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationError {
@@ -70,16 +73,6 @@ fn validate_timestamp(value: u64, path: &str) -> Result<(), ValidationError> {
 
 pub fn validate_definition(document: &DefinitionDocument) -> Result<(), ValidationError> {
     validate_timestamp(document.created_at_ms, "definition.created_at_ms")?;
-    if document
-        .scalar_contracts
-        .windows(2)
-        .any(|pair| pair[0] >= pair[1])
-    {
-        return Err(ValidationError::new(
-            "definition.scalar_contracts",
-            "scalar contracts must be unique and in canonical order",
-        ));
-    }
     nonempty_text(
         "definition.query.effective_sql",
         &document.query.effective_sql,
@@ -92,141 +85,6 @@ pub fn validate_definition(document: &DefinitionDocument) -> Result<(), Validati
         "definition.query.resolution.default_namespace",
         &document.query.resolution.default_namespace,
     )?;
-    if document.relation_occurrences.is_empty() {
-        return Err(ValidationError::new(
-            "definition.relation_occurrences",
-            "at least one relation occurrence is required",
-        ));
-    }
-    if document.outputs.is_empty() {
-        return Err(ValidationError::new(
-            "definition.outputs",
-            "at least one output is required",
-        ));
-    }
-
-    let mut occurrences = BTreeMap::new();
-    for relation in &document.relation_occurrences {
-        if occurrences
-            .insert(relation.occurrence_id, relation)
-            .is_some()
-        {
-            return Err(ValidationError::new(
-                "definition.relation_occurrences",
-                format!("duplicate occurrence id {}", relation.occurrence_id),
-            ));
-        }
-        for (field, value) in [
-            ("catalog_at_binding", relation.catalog_at_binding.as_str()),
-            (
-                "namespace_at_binding",
-                relation.namespace_at_binding.as_str(),
-            ),
-            ("relation_at_binding", relation.relation_at_binding.as_str()),
-            (
-                "qualifier_at_binding",
-                relation.qualifier_at_binding.as_str(),
-            ),
-        ] {
-            nonempty_text(
-                format!(
-                    "definition.relation_occurrences[{}].{field}",
-                    relation.occurrence_id
-                ),
-                value,
-            )?;
-        }
-        if relation.fields.is_empty() {
-            return Err(ValidationError::new(
-                format!(
-                    "definition.relation_occurrences[{}].fields",
-                    relation.occurrence_id
-                ),
-                "at least one stable field binding is required",
-            ));
-        }
-        let mut fields = BTreeSet::new();
-        for field in &relation.fields {
-            if !fields.insert(&field.field_id) {
-                return Err(ValidationError::new(
-                    format!(
-                        "definition.relation_occurrences[{}].fields",
-                        relation.occurrence_id
-                    ),
-                    "duplicate stable field identity",
-                ));
-            }
-            nonempty_text(
-                "definition.relation.field.name_at_binding",
-                &field.name_at_binding,
-            )?;
-            nonempty_text(
-                "definition.relation.field.type_signature",
-                &field.type_signature,
-            )?;
-        }
-    }
-
-    let mut output_ids = BTreeSet::new();
-    for output in &document.outputs {
-        if !output_ids.insert(&output.output_id) {
-            return Err(ValidationError::new(
-                "definition.outputs",
-                "duplicate output identity",
-            ));
-        }
-        nonempty_text("definition.output.name", &output.name)?;
-        nonempty_text("definition.output.type_signature", &output.type_signature)?;
-        match output.expression.kind {
-            ExpressionKind::Function | ExpressionKind::Mixed
-                if output
-                    .expression
-                    .function_identity
-                    .as_deref()
-                    .is_none_or(str::is_empty) =>
-            {
-                return Err(ValidationError::new(
-                    "definition.output.expression.function_identity",
-                    "function and mixed expressions require a function identity",
-                ));
-            }
-            ExpressionKind::Literal if !output.expression.source_fields.is_empty() => {
-                return Err(ValidationError::new(
-                    "definition.output.expression.source_fields",
-                    "literal expressions cannot reference source fields",
-                ));
-            }
-            _ => {}
-        }
-        let mut refs = BTreeSet::new();
-        for reference in &output.expression.source_fields {
-            if !refs.insert((reference.occurrence_id, &reference.field_id)) {
-                return Err(ValidationError::new(
-                    "definition.output.expression.source_fields",
-                    "duplicate stable source-field reference",
-                ));
-            }
-            let Some(relation) = occurrences.get(&reference.occurrence_id) else {
-                return Err(ValidationError::new(
-                    "definition.output.expression.source_fields",
-                    format!("unknown relation occurrence {}", reference.occurrence_id),
-                ));
-            };
-            if !relation
-                .fields
-                .iter()
-                .any(|field| field.field_id == reference.field_id)
-            {
-                return Err(ValidationError::new(
-                    "definition.output.expression.source_fields",
-                    format!(
-                        "field is not bound by relation occurrence {}",
-                        reference.occurrence_id
-                    ),
-                ));
-            }
-        }
-    }
     Ok(())
 }
 
@@ -239,10 +97,6 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
     }
     let mut outputs = BTreeMap::new();
     for output in &document.outputs {
-        nonempty_text(
-            "interpretation.output.type_signature",
-            &output.type_signature,
-        )?;
         if outputs.insert(&output.output_id, output).is_some() {
             return Err(ValidationError::new(
                 "interpretation.outputs",
@@ -253,10 +107,6 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
 
     let mut slots = BTreeMap::new();
     for slot in &document.state_slots {
-        nonempty_text(
-            "interpretation.state_slot.type_signature",
-            &slot.type_signature,
-        )?;
         if slots.insert(&slot.slot_id, slot).is_some() {
             return Err(ValidationError::new(
                 "interpretation.state_slots",
@@ -344,6 +194,25 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             }
             _ => {}
         }
+        let internal = aggregate.aggregate_id == internal_retraction_count_aggregate_identity();
+        if internal {
+            if aggregate.semantic_contract.is_some() || aggregate.binding_signature.is_some() {
+                return Err(ValidationError::new(
+                    "interpretation.aggregate.binding_signature",
+                    "internal retraction count cannot claim a SQL binding",
+                ));
+            }
+        } else if aggregate.semantic_contract.is_none()
+            || aggregate
+                .binding_signature
+                .as_ref()
+                .is_none_or(|bytes| bytes.is_empty())
+        {
+            return Err(ValidationError::new(
+                "interpretation.aggregate.binding_signature",
+                "SQL aggregate lacks its complete selected binding",
+            ));
+        }
         let mut source_fields = BTreeSet::new();
         for reference in &aggregate.source_fields {
             if !source_fields.insert((reference.occurrence_id, &reference.field_id)) {
@@ -376,7 +245,11 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             .iter()
             .filter_map(|id| slots.get(id).map(|slot| slot.role))
             .collect::<Vec<_>>();
-        if aggregate.function_identity == "avg" {
+        let is_avg = aggregate
+            .semantic_contract
+            .as_ref()
+            .is_some_and(|contract| contract.function.as_str() == "builtin.aggregate/avg/v1");
+        if is_avg {
             if referenced_roles.as_slice() != [StateRole::AvgSum, StateRole::AvgCount] {
                 return Err(ValidationError::new(
                     "interpretation.aggregate.state_slot_ids",
@@ -461,10 +334,6 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
 
     let mut physical = BTreeSet::new();
     for field in &document.target.fields {
-        nonempty_text(
-            "interpretation.target.field.type_signature",
-            &field.type_signature,
-        )?;
         if !physical.insert(&field.logical_identity) {
             return Err(ValidationError::new(
                 "interpretation.target.fields",
@@ -541,7 +410,7 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             &document.target.fields,
             &logical_identity,
             &output.target_field_id,
-            &output.type_signature,
+            &output.source_type,
             output.nullable,
         )?;
     }
@@ -551,7 +420,7 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             &document.target.fields,
             &logical_identity,
             &slot.target_field_id,
-            &slot.type_signature,
+            &slot.source_type,
             slot.nullable,
         )?;
     }
@@ -665,13 +534,14 @@ pub fn validate_configuration(document: &ConfigurationDocument) -> Result<(), Va
     Ok(())
 }
 
-/// Validates D/L even before the first publication exists.
-pub fn validate_definition_interpretation(
-    definition: &DefinitionDocument,
+/// Check the exact D/L/M references and resolve L's output and source addresses
+/// against the B document that accompanies the publication or unpublished root.
+pub fn validate_binding_interpretation(
+    binding: &BindingDocument,
     definition_revision: DocumentRevision,
     interpretation: &InterpretationDocument,
+    mapping: &StorageMappingDocument,
 ) -> Result<(), ValidationError> {
-    validate_definition(definition)?;
     validate_interpretation(interpretation)?;
     if interpretation.definition_revision != definition_revision {
         return Err(ValidationError::new(
@@ -679,133 +549,66 @@ pub fn validate_definition_interpretation(
             "does not reference the supplied definition document",
         ));
     }
-    if interpretation.computation_identity != definition.computation_identity {
+    if binding.outputs.len() != interpretation.outputs.len()
+        || binding.outputs.len() != mapping.columns.len()
+    {
         return Err(ValidationError::new(
-            "interpretation.computation_identity",
-            "does not match the supplied definition semantics",
+            "binding.outputs",
+            "binding, interpretation, and mapping must cover the same output declarations",
         ));
     }
-    let definition_occurrences = definition
-        .relation_occurrences
-        .iter()
-        .map(|value| (value.occurrence_id, value))
-        .collect::<BTreeMap<_, _>>();
-    let definition_outputs = definition
+    let interpretation_by_output = interpretation
         .outputs
         .iter()
         .map(|value| (&value.output_id, value))
         .collect::<BTreeMap<_, _>>();
-    if definition_outputs.len() != interpretation.outputs.len() {
-        return Err(ValidationError::new(
-            "interpretation.outputs",
-            "does not bind every and only definition output",
-        ));
-    }
-    for output in &interpretation.outputs {
-        let Some(defined) = definition_outputs.get(&output.output_id) else {
-            return Err(ValidationError::new(
+    for (logical, physical) in binding.outputs.iter().zip(&mapping.columns) {
+        let output_id = logical.identity();
+        let exact = interpretation_by_output.get(&output_id).ok_or_else(|| {
+            ValidationError::new(
                 "interpretation.outputs",
-                "binds an output absent from the referenced definition",
-            ));
-        };
-        if defined.type_signature != output.type_signature || defined.nullable != output.nullable {
+                "missing exact binding output identity",
+            )
+        })?;
+        if logical.ordinal != physical.output_ordinal
+            || logical.logical_type_identity != physical.logical_type_identity
+            || exact.target_field_id != physical.storage_field_id
+            || exact.source_type != physical.storage_type
+            || exact.nullable != physical.storage_nullable
+        {
             return Err(ValidationError::new(
-                "interpretation.outputs",
-                "changes a definition output type or nullability",
+                "mapping.columns",
+                "physical column does not implement its exact interpreted output",
             ));
         }
     }
+    let occurrences = binding
+        .occurrences
+        .iter()
+        .map(|value| (value.occurrence_id, value))
+        .collect::<BTreeMap<_, _>>();
     for aggregate in &interpretation.aggregates {
         for reference in &aggregate.source_fields {
-            validate_definition_field_reference(&definition_occurrences, reference)?;
-        }
-    }
-    for branch in &interpretation.branches {
-        for occurrence_id in &branch.relation_occurrence_ids {
-            if !definition_occurrences.contains_key(occurrence_id) {
+            if !occurrences
+                .get(&reference.occurrence_id)
+                .is_some_and(|occurrence| occurrence.contains_field(&reference.field_id))
+            {
                 return Err(ValidationError::new(
-                    "interpretation.branches.relation_occurrence_ids",
-                    "branch references an occurrence absent from the definition",
+                    "interpretation.aggregate.source_fields",
+                    "aggregate references a field absent from its binding occurrence",
                 ));
             }
         }
     }
-    Ok(())
-}
-
-fn validate_definition_field_reference(
-    occurrences: &BTreeMap<u32, &crate::persistence::codec::RelationOccurrence>,
-    reference: &crate::persistence::codec::SourceFieldReference,
-) -> Result<(), ValidationError> {
-    let Some(relation) = occurrences.get(&reference.occurrence_id) else {
-        return Err(ValidationError::new(
-            "interpretation.aggregate.source_fields",
-            "aggregate references an occurrence absent from the definition",
-        ));
-    };
-    if !relation
-        .fields
-        .iter()
-        .any(|field| field.field_id == reference.field_id)
-    {
-        return Err(ValidationError::new(
-            "interpretation.aggregate.source_fields",
-            "aggregate references a field absent from its definition occurrence",
-        ));
-    }
-    Ok(())
-}
-
-/// Validates one live source rebinding. Names and field order are diagnostic;
-/// stable object/field identities plus type/nullability decide compatibility.
-pub fn validate_live_relation_binding(
-    expected: &crate::persistence::codec::RelationOccurrence,
-    actual_object_id: &ObjectIdentity,
-    actual_fields: &[crate::persistence::codec::SourceFieldBinding],
-) -> Result<(), ValidationError> {
-    if &expected.object_id != actual_object_id {
-        return Err(ValidationError::new(
-            "live_relation.object_id",
-            "same-name relation was rebuilt with a different object identity",
-        ));
-    }
-    let mut actual = BTreeMap::new();
-    for field in actual_fields {
-        if actual.insert(&field.field_id, field).is_some() {
-            return Err(ValidationError::new(
-                "live_relation.fields",
-                "live schema contains a duplicate stable field identity",
-            ));
+    for branch in &interpretation.branches {
+        for occurrence_id in &branch.relation_occurrence_ids {
+            if !occurrences.contains_key(occurrence_id) {
+                return Err(ValidationError::new(
+                    "interpretation.branches.relation_occurrence_ids",
+                    "branch references an occurrence absent from the binding",
+                ));
+            }
         }
-    }
-    for expected_field in &expected.fields {
-        let Some(actual_field) = actual.get(&expected_field.field_id) else {
-            return Err(ValidationError::new(
-                "live_relation.fields",
-                "a bound stable field no longer exists",
-            ));
-        };
-        if expected_field.type_signature != actual_field.type_signature
-            || expected_field.nullable != actual_field.nullable
-        {
-            return Err(ValidationError::new(
-                "live_relation.fields",
-                "a bound field has an incompatible type or nullability",
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn verify_computation_identity(
-    stored: ComputationIdentity,
-    actual: ComputationIdentity,
-) -> Result<(), ValidationError> {
-    if stored != actual {
-        return Err(ValidationError::new(
-            "definition.computation_identity",
-            "does not match canonical definition semantics",
-        ));
     }
     Ok(())
 }
@@ -814,7 +617,7 @@ fn require_physical_binding(
     fields: &[crate::persistence::codec::PhysicalFieldBinding],
     logical_identity: &PhysicalFieldLogicalIdentity,
     target_field_id: &FieldIdentity,
-    type_signature: &str,
+    source_type: &ProviderSourceType,
     nullable: bool,
 ) -> Result<(), ValidationError> {
     let Some(binding) = fields
@@ -827,7 +630,7 @@ fn require_physical_binding(
         ));
     };
     if &binding.target_field_id != target_field_id
-        || binding.type_signature != type_signature
+        || &binding.source_type != source_type
         || binding.nullable != nullable
     {
         return Err(ValidationError::new(

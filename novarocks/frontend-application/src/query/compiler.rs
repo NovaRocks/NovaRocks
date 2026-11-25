@@ -74,7 +74,7 @@ impl FrontendQueryCompilerError {
             SqlCompileError::ResourceExhausted => {
                 Self::Control(novarocks_type_contract::CompileControlError::ResourceExhausted)
             }
-            SqlCompileError::CompilationSource(source) => Self::Source(source),
+            SqlCompileError::CompilationSource(source) => Self::from_source(source),
             error => Self::Engine(error.to_string()),
         }
     }
@@ -98,13 +98,28 @@ impl FrontendQueryCompilerError {
             E::ResourceExhausted => {
                 Self::Control(novarocks_type_contract::CompileControlError::ResourceExhausted)
             }
-            E::Source { source } => Self::Source(source.clone()),
+            E::Source { source } => Self::from_source(source.clone()),
             E::Analyze { error } => match error.control_error() {
                 Some(control) => Self::Control(control),
                 None => Self::Analyze(error.clone()),
             },
             error => Self::Engine(error.to_string()),
         }
+    }
+
+    fn from_source(source: novarocks_failure_contract::SharedFailureCause) -> Self {
+        use novarocks_spi::connector::KeyedDocumentReadError;
+        if matches!(
+            source.downcast_ref::<KeyedDocumentReadError>(),
+            Some(KeyedDocumentReadError::LegacyFormat { .. })
+        ) {
+            return Self::Application(
+                novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+                    source,
+                ),
+            );
+        }
+        Self::Source(source)
     }
 }
 
@@ -461,6 +476,37 @@ mod compile_control_tests {
             assert_eq!(actual.execution_failure().unwrap().fact(), expected);
             assert!(actual.compile_control_error().is_none());
         }
+    }
+
+    #[test]
+    fn retired_mv_catalog_failure_keeps_the_exact_document_reason_and_detail() {
+        use novarocks_spi::connector::{
+            ConnectorError, ConnectorErrorKind, KeyedDocumentReadError,
+        };
+        let legacy = KeyedDocumentReadError::LegacyFormat {
+            key: "novarocks.doc.v2.root.novarocks.mv".into(),
+        };
+        let connector = ConnectorError::from_domain_static(
+            ConnectorErrorKind::Unsupported,
+            legacy.clone(),
+            "Retired MV persistence format supports DROP only",
+        );
+        let compile =
+            crate::catalog_application::query_catalog::CatalogResolutionError::from_connector(
+                connector,
+            )
+            .into_compile();
+        let error = service(FrontendQueryCompilerError::from_compile(compile));
+        let cause = error.failure_cause().unwrap();
+        assert_eq!(
+            cause.downcast_ref::<KeyedDocumentReadError>(),
+            Some(&legacy)
+        );
+        assert!(
+            error
+                .message()
+                .contains("Retired MV persistence format supports DROP only"),
+        );
     }
 
     #[test]

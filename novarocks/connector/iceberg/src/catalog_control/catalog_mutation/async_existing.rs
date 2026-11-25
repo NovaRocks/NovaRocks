@@ -404,6 +404,7 @@ async fn drop_table(
         table,
         policy,
         data_disposition,
+        managed,
     } = &request.operation
     else {
         unreachable!()
@@ -451,6 +452,7 @@ async fn drop_table(
                 // leak objects; it never grants collection of an unidentified target.
                 let captured = match loaded {
                     Ok(loaded) => {
+                        validate_managed_drop_current(managed.as_ref(), &loaded)?;
                         let OriginalTable::Catalog(loaded) =
                             original.retain_table(OriginalTable::Catalog(loaded))
                         else {
@@ -463,6 +465,7 @@ async fn drop_table(
                             last_updated_ms: loaded.metadata().last_updated_ms(),
                         }
                     }
+                    Err(error) if managed.is_some() => return Err(error.into()),
                     Err(_) => crate::catalog::CatalogDropTableReceipt {
                         table_uuid: None,
                         table_location: None,

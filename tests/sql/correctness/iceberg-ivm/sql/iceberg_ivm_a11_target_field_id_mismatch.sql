@@ -19,13 +19,9 @@
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,a11,target,field_id_mismatch,error
 -- Test Objective:
--- Validate that externally dropping a visible column from the target MV table
--- fails exact target-generation binding, blocking further incremental refresh.
--- This simulates the spec scenario "target schema externally rewritten".
---
--- The MV has visible columns: id, region, amount.
--- Spark drops `amount` from the target MV Iceberg table directly.
--- The canonical target check must reject the changed metadata generation.
+-- Dropping a visible target column makes the current storage mapping
+-- incompatible with the original output declaration.
+-- Refresh must report a typed refusal after blocking the current publication.
 
 -- query 1
 -- @skip_result_check=true
@@ -76,10 +72,9 @@ printf 'SPARK_SQL_OK\n'
 INSERT INTO ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES ROW(4, 'US', 400);
 
 -- query 8
--- DROP COLUMN changes the target schema version while canonical L is unchanged.
--- Renewing the Current metadata read generation must not rebind L's schema.
--- Reject that exact schema-version mismatch before physical field binding.
--- @expect_error=MV runtime target schema version is not from the exact document generation
+-- The current target cannot represent the original amount column.
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_error=[query.execution.unsupported] Unsupported: prepared target lacks required physical field amount
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 9

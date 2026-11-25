@@ -17,7 +17,7 @@
 
 //! Immutable declaration read from one exact stored-view version.
 
-use novarocks_type_contract::FunctionValueType;
+use novarocks_type_contract::{CanonicalFactWriter, FunctionValueType};
 use novarocks_types::naming::TableIdentity;
 use std::sync::Arc;
 
@@ -27,10 +27,104 @@ pub struct SqlViewColumn {
     pub value_type: FunctionValueType,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlViewOrigin {
+    Session,
+    Iceberg { uuid: [u8; 16], version_id: i32 },
+    External,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlViewDialect {
+    Trino,
+}
+
+impl SqlViewDialect {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trino => "trino",
+        }
+    }
+}
+
+/// One view encountered during analysis of a materialized view definition.
+/// The stored version token remains distinct from an Iceberg version number.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlMvViewDependency {
+    identity: TableIdentity,
+    origin: SqlViewOrigin,
+    depth: u32,
+    dialect: SqlViewDialect,
+    version: Arc<str>,
+    canonical: Arc<[u8]>,
+}
+
+impl SqlMvViewDependency {
+    pub fn try_from_definition(view: &SqlViewDefinition, depth: u32) -> Result<Self, &'static str> {
+        let mut writer = CanonicalFactWriter::new("novarocks.mv-view-dependency", 1);
+        writer.text(&view.identity.catalog);
+        match view.origin {
+            SqlViewOrigin::Session => {
+                writer.u32(1);
+                writer.text(&view.identity.namespace);
+                writer.text(&view.identity.table);
+            }
+            SqlViewOrigin::Iceberg { uuid, version_id } => {
+                writer.u32(2);
+                writer.bytes(&uuid);
+                writer.i32(version_id);
+            }
+            SqlViewOrigin::External => {
+                return Err("Materialized view source has no exact Provider view identity");
+            }
+        }
+        writer.u32(depth);
+        writer.text(view.dialect.as_str());
+        writer.text(&view.version);
+        Ok(Self {
+            identity: view.identity.clone(),
+            origin: view.origin,
+            depth,
+            dialect: view.dialect,
+            version: view.version.clone(),
+            canonical: writer.finish().into(),
+        })
+    }
+
+    pub fn identity(&self) -> &TableIdentity {
+        &self.identity
+    }
+
+    pub const fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub const fn iceberg_version(&self) -> Option<([u8; 16], i32)> {
+        match self.origin {
+            SqlViewOrigin::Iceberg { uuid, version_id } => Some((uuid, version_id)),
+            SqlViewOrigin::Session | SqlViewOrigin::External => None,
+        }
+    }
+
+    pub const fn dialect(&self) -> &'static str {
+        self.dialect.as_str()
+    }
+
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical
+    }
+}
+
 /// Pure facts only: this value carries no catalog lease or I/O capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlViewDefinition {
     pub identity: TableIdentity,
+    pub origin: SqlViewOrigin,
+    pub dialect: SqlViewDialect,
     pub version: Arc<str>,
     pub raw_sql: Arc<str>,
     pub default_catalog: Arc<str>,

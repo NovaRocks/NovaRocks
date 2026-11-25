@@ -459,6 +459,9 @@ pub struct KeyedDocumentView {
     pub metadata_version: ConnectorCommittedVersion,
     pub current_snapshot: Option<i64>,
     pub current_snapshot_file_totals: SnapshotFileTotals,
+    /// Provider proof that the object has no data publication in its history.
+    /// An empty current snapshot alone cannot establish this fact.
+    pub before_first_data_publication: bool,
     pub slots: BTreeMap<ConnectorSlotName, ConnectorObservedSlot>,
     pub markers: BTreeMap<ConnectorMarkerKey, ConnectorMarkerValue>,
     pub versions: BTreeMap<DocumentIdentity, ConnectorDocumentVersion>,

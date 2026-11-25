@@ -1354,7 +1354,6 @@ fn application_document_publication_for(
     let keyed =
         novarocks_mv_application::persistence::keyed_documents::keyed_publication_document_set(
             &observed.versions,
-            &observed.definition,
             &p,
         )
         .unwrap();

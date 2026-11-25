@@ -735,8 +735,34 @@ pub(crate) enum SqlImvAggregateStateRoleContract {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvAggregateStateColumnContract {
     pub(crate) column_name: String,
-    pub(crate) type_signature: String,
+    pub(crate) source_type: novarocks_spi::connector::ProviderSourceType,
     pub(crate) role: SqlImvAggregateStateRoleContract,
+}
+
+impl SqlImvAggregateStateColumnContract {
+    pub(crate) fn iceberg_primitive(
+        &self,
+    ) -> Option<novarocks_spi::connector::IcebergSourcePrimitive> {
+        use novarocks_spi::connector::{IcebergSourceTypeNode, ProviderSourceType};
+
+        match &self.source_type {
+            ProviderSourceType::Iceberg(source) => match source.nodes() {
+                [IcebergSourceTypeNode::Primitive(primitive)] => Some(*primitive),
+                _ => None,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_iceberg_source_primitive(
+    primitive: novarocks_spi::connector::IcebergSourcePrimitive,
+) -> novarocks_spi::connector::ProviderSourceType {
+    use novarocks_spi::connector::{IcebergSourceType, IcebergSourceTypeNode, ProviderSourceType};
+    ProviderSourceType::Iceberg(
+        IcebergSourceType::try_new(vec![IcebergSourceTypeNode::Primitive(primitive)])
+            .expect("a primitive is a complete Iceberg source type"),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1057,16 +1083,16 @@ pub struct SqlImvAggregateStateColumnFacts {
 impl SqlImvAggregateStateColumnFacts {
     pub fn try_new(
         column_name: String,
-        type_signature: String,
+        source_type: novarocks_spi::connector::ProviderSourceType,
         role: SqlImvAggregateStateRoleFacts,
     ) -> Result<Self, String> {
-        if column_name.trim().is_empty() || type_signature.trim().is_empty() {
+        if column_name.trim().is_empty() {
             return Err("IMV aggregate state column facts are invalid".to_string());
         }
         Ok(Self {
             inner: SqlImvAggregateStateColumnContract {
                 column_name,
-                type_signature,
+                source_type,
                 role: match role {
                     SqlImvAggregateStateRoleFacts::Single => {
                         SqlImvAggregateStateRoleContract::Single
@@ -1922,7 +1948,9 @@ pub(crate) fn test_aggregate_snapshot(
                 .map(|(index, column)| SqlImvAggregateStateColumn {
                     name: column.column_name.clone(),
                     value_type: novarocks_type_contract::FunctionValueType::new(
-                        if column.type_signature == "long" {
+                        if column.iceberg_primitive()
+                            == Some(novarocks_spi::connector::IcebergSourcePrimitive::Long)
+                        {
                             arrow::datatypes::DataType::Int64
                         } else {
                             arrow::datatypes::DataType::Binary
@@ -1989,7 +2017,9 @@ pub(crate) fn test_aggregate_snapshot(
             .iter()
             .map(|column| novarocks_types::schema::ColumnDef {
                 name: column.column_name.clone(),
-                data_type: if column.type_signature == "long" {
+                data_type: if column.iceberg_primitive()
+                    == Some(novarocks_spi::connector::IcebergSourcePrimitive::Long)
+                {
                     arrow::datatypes::DataType::Int64
                 } else {
                     arrow::datatypes::DataType::Binary
@@ -2049,12 +2079,16 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
     let state_columns = vec![
         SqlImvAggregateStateColumnContract {
             column_name: "__agg_state_s".to_string(),
-            type_signature: "binary".to_string(),
+            source_type: test_iceberg_source_primitive(
+                novarocks_spi::connector::IcebergSourcePrimitive::Binary,
+            ),
             role: SqlImvAggregateStateRoleContract::Single,
         },
         SqlImvAggregateStateColumnContract {
             column_name: "__agg_state___ivm_row_count".to_string(),
-            type_signature: "long".to_string(),
+            source_type: test_iceberg_source_primitive(
+                novarocks_spi::connector::IcebergSourcePrimitive::Long,
+            ),
             role: SqlImvAggregateStateRoleContract::RetractionCount,
         },
     ];
@@ -2142,7 +2176,9 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
                 .map(|(aggregate_index, column)| SqlImvAggregateStateColumn {
                     name: column.column_name.clone(),
                     value_type: novarocks_type_contract::FunctionValueType::new(
-                        if column.type_signature == "long" {
+                        if column.iceberg_primitive()
+                            == Some(novarocks_spi::connector::IcebergSourcePrimitive::Long)
+                        {
                             arrow::datatypes::DataType::Int64
                         } else {
                             arrow::datatypes::DataType::Binary
@@ -2216,7 +2252,9 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
             .iter()
             .map(|column| novarocks_types::schema::ColumnDef {
                 name: column.column_name.clone(),
-                data_type: if column.type_signature == "long" {
+                data_type: if column.iceberg_primitive()
+                    == Some(novarocks_spi::connector::IcebergSourcePrimitive::Long)
+                {
                     arrow::datatypes::DataType::Int64
                 } else {
                     arrow::datatypes::DataType::Binary
@@ -2277,12 +2315,16 @@ pub(crate) fn test_branch_union_snapshot() -> Arc<SqlImvRewriteSnapshot> {
         vec![
             SqlImvAggregateStateColumnContract {
                 column_name: "__agg_state_s".to_string(),
-                type_signature: "binary".to_string(),
+                source_type: test_iceberg_source_primitive(
+                    novarocks_spi::connector::IcebergSourcePrimitive::Binary,
+                ),
                 role: SqlImvAggregateStateRoleContract::Single,
             },
             SqlImvAggregateStateColumnContract {
                 column_name: "__agg_state___ivm_row_count".to_string(),
-                type_signature: "long".to_string(),
+                source_type: test_iceberg_source_primitive(
+                    novarocks_spi::connector::IcebergSourcePrimitive::Long,
+                ),
                 role: SqlImvAggregateStateRoleContract::RetractionCount,
             },
         ],
@@ -2536,7 +2578,6 @@ pub struct SqlMvRewriteDefinitionFacts {
     sources: Vec<SqlMvRewriteSourceOccurrenceFacts>,
     selection: Option<SqlMvRewriteSelectionFacts>,
     selection_unavailable: Option<String>,
-    scalar_contracts: Box<[novarocks_functions::PersistentScalarContract]>,
 }
 
 impl SqlMvRewriteDefinitionFacts {
@@ -2580,16 +2621,7 @@ impl SqlMvRewriteDefinitionFacts {
             sources,
             selection: None,
             selection_unavailable: None,
-            scalar_contracts: Box::new([]),
         })
-    }
-
-    pub fn with_scalar_contracts(
-        mut self,
-        contracts: Box<[novarocks_functions::PersistentScalarContract]>,
-    ) -> Self {
-        self.scalar_contracts = contracts;
-        self
     }
 
     pub fn with_selection_facts(
@@ -3484,7 +3516,7 @@ pub(crate) fn analyze_candidates(
     optimizer_settings: &crate::optimizer::options::SessionOptimizerSettings,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
-    consumer_requires_semantic_snapshot: bool,
+    consumer_has_non_default_computation_semantics: bool,
 ) -> Result<SqlMvRewriteAnalysis, crate::compiler::SqlCompileError> {
     if !optimizer_settings.mv_rewrite_enabled() {
         return Ok(SqlMvRewriteAnalysis::empty(constant_policy));
@@ -3521,12 +3553,12 @@ pub(crate) fn analyze_candidates(
             entries.push(SqlMvRewriteAnalysisEntry::Ignored);
             continue;
         }
-        // An optional candidate without a captured semantic contract is
-        // ineligible before any analyzer replay; the base query remains valid.
-        if consumer_requires_semantic_snapshot {
+        // The definition was computed under the default semantics. Check
+        // the consumer before analyzing any optional candidate.
+        if consumer_has_non_default_computation_semantics {
             entries.push(SqlMvRewriteAnalysisEntry::Diagnostic(SqlMvRewriteDiagnostic {
                 mv_id: Some(definition.mv_id),
-                message: "mv rewrite: persisted definition is ineligible under ERROR_IF_OVERFLOW or ERROR_IF_OVERFLOW because its semantic settings are not captured".to_string(),
+                message: "mv rewrite: persisted definition is ineligible with non-default computation semantics".to_string(),
             }));
             continue;
         }
@@ -3654,7 +3686,7 @@ fn build_candidate(
         inner: analyzer_catalog,
         default_catalog: &definition.resolution.default_catalog,
     };
-    let (resolved, ctes, returned) = crate::analyzer::analyze_mv_definition_with_factory(
+    let (resolved, ctes, returned, _) = crate::analyzer::analyze_mv_definition_with_factory(
         &definition.select_query,
         &catalog,
         &definition.resolution.default_namespace,
@@ -3664,13 +3696,6 @@ fn build_candidate(
         control,
     )
     .map_err(SqlCompileError::from)?;
-    let scalar_contracts =
-        crate::planning::mv_persistence::collect_scalar_contracts(&resolved, control)?;
-    novarocks_functions::validate_published_scalar_contracts(
-        &definition.scalar_contracts,
-        &scalar_contracts,
-    )
-    .map_err(SqlCompileError::Compilation)?;
     let mut returned = returned;
     let output_names = crate::analysis::schema::validate_definition_column_names(
         &resolved.output_columns,
@@ -3977,7 +4002,7 @@ mod tests {
                 .iter()
                 .all(|entry| !matches!(entry, SqlMvRewriteAnalysisEntry::Candidate(_)))
         );
-        assert!(analysis.entries.iter().any(|entry| matches!(entry, SqlMvRewriteAnalysisEntry::Diagnostic(d) if d.message.contains("ERROR_IF_OVERFLOW"))));
+        assert!(analysis.entries.iter().any(|entry| matches!(entry, SqlMvRewriteAnalysisEntry::Diagnostic(d) if d.message.contains("non-default computation semantics"))));
         assert_eq!(
             catalog.resolutions.load(Ordering::Acquire),
             resolutions_before,

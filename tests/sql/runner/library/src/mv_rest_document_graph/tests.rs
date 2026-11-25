@@ -8,7 +8,7 @@ use serde_json::json;
 
 const GOLDEN_ID: &str = "b4e51690c34c67348567bf924b8bb5d41ed7f2dc43621d985e352facb425b17e";
 const GOLDEN_VERSION: &str = r#"{"v":2,"owner":"novarocks.mv","name":"definition","format":{"owner":"novarocks.mv","name":"definition","version":1},"refs":[],"content":"YWJj","id":"b4e51690c34c67348567bf924b8bb5d41ed7f2dc43621d985e352facb425b17e"}"#;
-const B_HEX: &str = "080112240a07696365626572671215636f6e6e6563746f722d736e617073686f742d69641801200912240a07696365626572671215636f6e6e6563746f722d736e617073686f742d696418012009";
+const B_HEX: &str = "08021a920108011207636174616c6f671a026e732204626173652a046c65667432066f626a656374380142240a07696365626572671215636f6e6e6563746f722d736e617073686f742d6964180120094a0b6f626a6563742d666163745209706174682d666163745a09747970652d6661637462116465636c61726174696f6e732d66616374720f6f6363757272656e63652d666163741a930108021207636174616c6f671a026e732204626173652a05726967687432066f626a656374380142240a07696365626572671215636f6e6e6563746f722d736e617073686f742d6964180120094a0b6f626a6563742d666163745209706174682d666163745a09747970652d6661637462116465636c61726174696f6e732d66616374720f6f6363757272656e63652d6661637422120800120576616c75651a07696e746567657232660a207272727272727272727272727272727272727272727272727272727272727272122064646464646464646464646464646464646464646464646464646464646464641a206f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f";
 const P_HEX: &str = "0111111111111111111111111111111111000000000000002a010000000000000007000200090100000000000000110009010000000000000011";
 fn bytes(s: &str) -> Vec<u8> {
     (0..s.len())
@@ -85,7 +85,8 @@ fn manual_version_identity_and_changed_rejections() {
 }
 #[test]
 fn manual_binding_and_compact_publication() {
-    let b = wire::binding(&bytes(B_HEX)).unwrap();
+    let raw = bytes(B_HEX);
+    let b = wire::binding(&raw).unwrap().formats;
     assert_eq!(b.len(), 2);
     assert_eq!(b[0], b[1]);
     assert_eq!(b[0].provider, "iceberg");
@@ -144,7 +145,7 @@ fn large_inline_version_and_private_properties_keep_their_exact_content() {
 
 #[test]
 fn large_publication_keeps_the_binding_count_and_declared_value_bounds() {
-    let formats = vec![wire::binding(&bytes(B_HEX)).unwrap()[0].clone(); 370];
+    let formats = vec![wire::binding(&bytes(B_HEX)).unwrap().formats[0].clone(); 370];
     let mut payload = bytes(P_HEX)[..34].to_vec();
     payload.extend_from_slice(&370u16.to_be_bytes());
     for _ in &formats {
@@ -425,4 +426,28 @@ fn zero_file_publication_is_append_and_metadata_only_cannot_add_dv() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn invalid_definition_marker_requires_the_exact_unpublished_binding_scope() {
+    let mut r = response(Vec::new());
+    let fixture = fixture();
+    let marker = &fixture["invalid_definition_marker"];
+    r["metadata"]["properties"][marker["key"].as_str().unwrap()] = marker["envelope"].clone();
+    let valid =
+        parse_expectation("ns.mv,publications=0,markers=invalid-definition-binding").unwrap();
+    assert!(verify_graph(&r, &valid).is_ok());
+    for directive in [
+        "ns.mv,publications=0,markers=invalid-definition-publication",
+        "ns.mv,publications=0,markers=clear",
+    ] {
+        assert!(verify_graph(&r, &parse_expectation(directive).unwrap()).is_err());
+    }
+    r["metadata"]["properties"][marker["key"].as_str().unwrap()] = json!(
+        marker["envelope"]
+            .as_str()
+            .unwrap()
+            .replace("invalid-definition", "needs-rebuild")
+    );
+    assert!(verify_graph(&r, &valid).is_err());
 }

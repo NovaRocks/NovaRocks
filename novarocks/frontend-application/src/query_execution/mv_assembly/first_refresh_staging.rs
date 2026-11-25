@@ -37,9 +37,10 @@ pub(crate) fn frozen_logical_context_from_rewrite(
     // contract before the logical artifact can outlive this preparation step.
     // The richer source revisions remain in the application artifact because
     // activation must reconstruct the canonical context without decoding IDs.
-    let _sql_pin = sql_snapshot_pin(&rewrite.mv_definition, &pin)?;
+    let _sql_pin = sql_snapshot_pin(rewrite.binding(), &pin)?;
     Ok(MvFirstRefreshLogicalContext {
         mv_definition: (*rewrite.mv_definition).clone(),
+        rebuild_layout: rewrite.rebuild_layout.clone(),
         base_refs: rewrite
             .base_refs
             .iter()
@@ -57,11 +58,7 @@ pub(crate) fn frozen_logical_context_from_rewrite(
 fn ordered_current_sources(
     rewrite: &crate::mv::domain::rewrite::context::IcebergMvRewriteContext,
 ) -> Result<Vec<crate::mv::domain::rewrite::context::MvRewriteSourceSnapshot>, String> {
-    let occurrences = &rewrite
-        .mv_definition
-        .facts
-        .definition()
-        .relation_occurrences;
+    let occurrences = &rewrite.binding().occurrences;
     if occurrences.len() != rewrite.pin.len() {
         return Err("MV first-refresh source pins do not cover every D occurrence".to_string());
     }
@@ -85,6 +82,9 @@ fn ordered_current_sources(
 fn ordered_previous_sources(
     rewrite: &crate::mv::domain::rewrite::context::IcebergMvRewriteContext,
 ) -> Result<Vec<crate::mv::domain::rewrite::context::MvRewriteSourceSnapshot>, String> {
+    if rewrite.rebuild_layout.is_some() {
+        return Ok(Vec::new());
+    }
     match rewrite.mv_definition.facts.publication() {
         None if rewrite.previous.is_empty() => Ok(Vec::new()),
         None => Err("never-published MV first-refresh artifact has source history".to_string()),
@@ -109,10 +109,10 @@ fn ordered_previous_sources(
 }
 
 fn sql_snapshot_pin(
-    projection: &novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
+    binding: &novarocks_mv_application::persistence::codec::BindingDocument,
     sources: &[crate::mv::domain::rewrite::context::MvRewriteSourceSnapshot],
 ) -> Result<SqlMvSnapshotPin, String> {
-    let occurrences = &projection.facts.definition().relation_occurrences;
+    let occurrences = &binding.occurrences;
     if occurrences.len() != sources.len() {
         return Err("MV first-refresh SQL pin does not cover every D occurrence".to_string());
     }
@@ -231,6 +231,7 @@ pub(crate) fn finish_frozen_mv_rewrite_context_original(
     }
     crate::mv::domain::refresh::rewrite_context::build_neutral_refresh_rewrite_context(
         Arc::new(facts.mv_definition.clone()),
+        facts.rebuild_layout.clone(),
         facts.pin.clone(),
         facts.previous.clone(),
         facts.target_table_uuid.clone(),
@@ -252,7 +253,14 @@ fn validate_frozen_join_base_facts(facts: &MvFirstRefreshLogicalContext) -> Resu
             "MV first-refresh logical artifact has incomplete base snapshot pins".to_string(),
         );
     }
-    let occurrences = &facts.mv_definition.facts.definition().relation_occurrences;
+    let occurrences = &facts
+        .rebuild_layout
+        .as_deref()
+        .map_or_else(
+            || facts.mv_definition.facts.binding(),
+            |layout| &layout.binding,
+        )
+        .occurrences;
     if occurrences.len() != facts.pin.len()
         || occurrences
             .iter()
@@ -318,9 +326,9 @@ mod tests {
     #[test]
     fn sql_pin_preserves_sparse_definition_occurrence_order() {
         let projection = projection();
-        let pin = sql_snapshot_pin(&projection, &[source(7), source(8)]).unwrap();
+        let pin = sql_snapshot_pin(projection.facts.binding(), &[source(7), source(8)]).unwrap();
         assert_eq!(pin.occurrences()[0].occurrence_id().get(), 7);
         assert_eq!(pin.occurrences()[1].occurrence_id().get(), 8);
-        assert!(sql_snapshot_pin(&projection, &[source(8), source(7)]).is_err());
+        assert!(sql_snapshot_pin(projection.facts.binding(), &[source(8), source(7)]).is_err());
     }
 }

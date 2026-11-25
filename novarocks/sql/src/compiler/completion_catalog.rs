@@ -490,7 +490,9 @@ fn same_view_version(
     use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
     work.flush()?;
-    if left.raw_sql != right.raw_sql
+    if left.origin != right.origin
+        || left.dialect != right.dialect
+        || left.raw_sql != right.raw_sql
         || left.default_catalog != right.default_catalog
         || left.default_database != right.default_database
         || left.columns.len() != right.columns.len()

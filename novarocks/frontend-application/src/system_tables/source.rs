@@ -19,7 +19,7 @@
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use novarocks_mv_application::freshness::MvSourceObservation;
-use novarocks_mv_application::persistence::codec::{PublicationInput, RelationOccurrence};
+use novarocks_mv_application::persistence::codec::{BindingOccurrence, PublicationInput};
 use novarocks_mv_application::readiness::{MvKeyedProjectionInventory, MvListedManageability};
 use novarocks_query_application::system_tables::{SystemTableError, SystemTableSnapshot};
 use novarocks_query_application::view::LocalViewSnapshot;
@@ -91,9 +91,10 @@ pub(crate) struct MaterializedViewFacts {
     pub name: String,
     pub definition: String,
     pub unavailable: bool,
-    pub occurrences: Vec<RelationOccurrence>,
+    pub occurrences: Vec<BindingOccurrence>,
     pub publication: Option<Vec<PublicationInput>>,
     pub state: Option<MaterializedViewStateFacts>,
+    pub retired: Option<novarocks_mv_application::persistence::codec::ConfigurationDocument>,
 }
 #[derive(Clone)]
 pub(crate) struct MaterializedViewStateFacts {
@@ -113,6 +114,8 @@ pub(crate) struct ListableMaterializedViews {
     include_freshness: bool,
     include_definition: bool,
     management: Option<Arc<novarocks_mv_application::management::ManagementEntrance>>,
+    retired:
+        std::vec::IntoIter<novarocks_mv_application::persistence::keyed_documents::RetiredMvStatus>,
 }
 impl ListableMaterializedViews {
     pub(crate) fn new(
@@ -125,7 +128,15 @@ impl ListableMaterializedViews {
             include_freshness,
             include_definition,
             management: None,
+            retired: Vec::new().into_iter(),
         }
+    }
+    pub(crate) fn with_retired(
+        mut self,
+        retired: Vec<novarocks_mv_application::persistence::keyed_documents::RetiredMvStatus>,
+    ) -> Self {
+        self.retired = retired.into_iter();
+        self
     }
     pub(crate) fn with_state_facts(
         mut self,
@@ -144,7 +155,20 @@ impl MaterializedViewInventory for ListableMaterializedViews {
             .await
             .map_err(repository_error)?;
         let Some(listed) = listed else {
-            return Ok(None);
+            return Ok(self.retired.next().map(|retired| {
+                let table = retired.target.table();
+                MaterializedViewFacts {
+                    catalog: table.instance_id.as_str().to_owned(),
+                    schema: table.namespace.to_string(),
+                    name: table.table.to_string(),
+                    definition: String::new(),
+                    unavailable: true,
+                    occurrences: Vec::new(),
+                    publication: None,
+                    state: None,
+                    retired: Some(retired.configuration),
+                }
+            }));
         };
         let facts = &listed.loaded.projection.facts;
         let target = &facts.source_revision().target;
@@ -164,11 +188,12 @@ impl MaterializedViewInventory for ListableMaterializedViews {
             },
             unavailable,
             occurrences: if self.include_freshness && !unavailable {
-                facts.definition().relation_occurrences.clone()
+                facts.binding().occurrences.clone()
             } else {
                 vec![]
             },
             state: None,
+            retired: None,
             publication: if self.include_freshness && !unavailable {
                 facts.publication().map(|p| p.inputs.clone())
             } else {
@@ -357,7 +382,7 @@ pub(crate) trait StatementSystemTableSource: Send + Sync {
     ) -> Result<Vec<String>, SystemTableError>;
     async fn current_sources(
         &self,
-        occurrences: &[RelationOccurrence],
+        occurrences: &[BindingOccurrence],
         context: &ConnectorRequestContext,
     ) -> Result<Vec<MvSourceObservation>, SystemTableError>;
     /// Begin one snapshot in the original stable CPU body; no payload is copied here.

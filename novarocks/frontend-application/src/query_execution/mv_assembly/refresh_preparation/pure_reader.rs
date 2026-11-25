@@ -182,6 +182,7 @@ async fn prepare_refresh_inner(
                     base_table_object_ids: &base_table_object_ids,
                     repartition_transition: repartition_transition.as_ref(),
                     retained_repartition_target: retained_repartition_target.as_ref(),
+                    rebuild: refresh.rebuild.as_ref(),
                 },
                 &request.attempt,
                 observed_binding.clone(),
@@ -332,7 +333,33 @@ pub(crate) async fn analyze_visible_refresh_query(
     visible_query: &novarocks_parser::ast::Query,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::mv::domain::analysis::MvAnalysis, PreparationError> {
-    let captured_catalog = capture_catalog(
+    let (analysis, _) = capture_visible_refresh_analysis(
+        io,
+        ports,
+        current_catalog,
+        current_database,
+        visible_query,
+        connector_context,
+    )
+    .await?;
+    Ok(analysis)
+}
+
+pub(crate) async fn capture_visible_refresh_analysis(
+    io: &MvRefreshPreparationIo,
+    ports: &IcebergMvCorePorts,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    visible_query: &novarocks_parser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<
+    (
+        crate::mv::domain::analysis::MvAnalysis,
+        Arc<QueryTableBindingStore>,
+    ),
+    PreparationError,
+> {
+    let captured_catalog = super::async_original::capture_catalog_with_source_history(
         MvCatalogCaptureInput {
             query: MvCatalogCaptureQuery::Query(Box::new(visible_query.clone())),
             ports: ports.clone(),
@@ -348,9 +375,10 @@ pub(crate) async fn analyze_visible_refresh_query(
             )?,
         },
         io,
+        true,
     )
     .await?;
-    crate::mv::domain::analysis_adapter::analyze_mv_select_with_provider(
+    let analysis = crate::mv::domain::analysis_adapter::analyze_mv_select_with_provider(
         current_catalog,
         captured_catalog.catalog.provider(),
         current_database,
@@ -361,7 +389,8 @@ pub(crate) async fn analyze_visible_refresh_query(
             connector_context,
         ),
     )
-    .map_err(PreparationError::from)
+    .map_err(PreparationError::from)?;
+    Ok((analysis, captured_catalog.bindings))
 }
 
 async fn retain_exact_repartition_target(
@@ -437,12 +466,12 @@ async fn prepare_managed_repartition_transition(
     select_repartition_shape(&RefreshCapabilities::from_canonical_facts(
         interpretation,
         &bindings,
-        projection.facts.definition().relation_occurrences.len(),
+        projection.facts.binding().occurrences.len(),
         definition_has_join(&query),
     )?)?;
     validate_projection_target(&projection, &retained_target.schema_validation)?;
     let base_tables = contract_base_tables(contract);
-    let occurrences = &projection.facts.definition().relation_occurrences;
+    let occurrences = &projection.facts.binding().occurrences;
     if occurrences.len() != base_tables.len() {
         return Err(PreparationError::user(
             "MV repartition source references do not retain every D occurrence",
@@ -668,11 +697,14 @@ fn bind_property_repartition_fields(
     Ok(result)
 }
 
-struct FirstRefreshTargetFacts<'contract, 'objects, 'transition, 'retained> {
+struct FirstRefreshTargetFacts<'contract, 'objects, 'transition, 'retained, 'rebuild> {
     contract: &'contract RefreshPlanContract,
     base_table_object_ids: &'objects BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
     repartition_transition: Option<&'transition PreparedManagedRepartitionTransition>,
     retained_repartition_target: Option<&'retained RetainedRepartitionTarget>,
+    rebuild: Option<
+        &'rebuild crate::mv::domain::iceberg_refresh::async_preparation::RefreshRebuildBinding,
+    >,
 }
 
 async fn prepare_frontend_first_refresh_write(
@@ -681,7 +713,7 @@ async fn prepare_frontend_first_refresh_write(
     source: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     current_database: &str,
-    target_facts: FirstRefreshTargetFacts<'_, '_, '_, '_>,
+    target_facts: FirstRefreshTargetFacts<'_, '_, '_, '_, '_>,
     attempt: &MvRefreshAttemptIdentity,
     observed_binding: ConnectorProviderBindingKey,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -691,6 +723,7 @@ async fn prepare_frontend_first_refresh_write(
         base_table_object_ids,
         repartition_transition,
         retained_repartition_target,
+        rebuild,
     } = target_facts;
     captured.rewrite = None;
     let target = IcebergMvTarget {
@@ -720,16 +753,17 @@ async fn prepare_frontend_first_refresh_write(
         );
     }
     let projection = io.definition(source, &target).await?;
-    let (projection, refresh_query_source) = io
-        .rebind_definition(
-            source,
-            &projection,
-            &contract_base_tables(contract),
-            &target,
-            retained_repartition_target.map(|retained| &retained.schema_validation),
-            &connector_context,
-        )
-        .await?;
+    let refresh_query_source = projection.facts.definition().query.effective_sql.clone();
+    let (effective_binding, effective_interpretation) = match rebuild {
+        Some(rebuild) => (
+            &rebuild.candidate.observed.document,
+            &rebuild.candidate.interpretation,
+        ),
+        None => (
+            projection.facts.binding(),
+            projection.facts.interpretation(),
+        ),
+    };
     let mut admitted_publication = io
         .admit(
             source,
@@ -740,6 +774,13 @@ async fn prepare_frontend_first_refresh_write(
             &connector_context,
         )
         .await?;
+    if let Some(rebuild) = rebuild {
+        admitted_publication.replace_refresh_layout(
+            rebuild.candidate.versions.clone(),
+            rebuild.candidate.interpretation.clone(),
+            rebuild.markers_remove.clone(),
+        )?;
+    }
     if let Some(transition) = repartition_transition {
         admitted_publication.set_repartition_partitioning(&transition.preview)?;
     }
@@ -806,12 +847,27 @@ async fn prepare_frontend_first_refresh_write(
         }
     };
     captured.target = Some(target_binding.clone());
-    let query = canonical_mv_select_query_from_source(&projection, &refresh_query_source)?;
-    let runtime_bindings = validate_projection_target(&projection, target_schema_validation)?;
+    let query = match rebuild {
+        Some(rebuild) => rebuild.candidate.query.clone(),
+        None => canonical_mv_select_query_from_source(&projection, &refresh_query_source)?,
+    };
+    let runtime_bindings = match rebuild {
+        Some(_) => {
+            let exact = target_schema_validation.exact_schema();
+            novarocks_mv_application::persistence::runtime_bindings::reconstruct_runtime_bindings(
+                effective_binding,
+                effective_interpretation,
+                &projection.facts.source_revision().target_object_id,
+                &exact.metadata_version,
+                exact,
+            )?
+        }
+        None => validate_projection_target(&projection, target_schema_validation)?,
+    };
     let capabilities = RefreshCapabilities::from_canonical_facts(
-        projection.facts.interpretation(),
+        effective_interpretation,
         &runtime_bindings,
-        projection.facts.definition().relation_occurrences.len(),
+        effective_binding.occurrences.len(),
         definition_has_join(&query),
     )?;
     let target_arrow_schema = target_binding.physical_write_schema()?.as_ref().clone();
@@ -832,7 +888,7 @@ async fn prepare_frontend_first_refresh_write(
         io,
         source,
         contract,
-        &projection,
+        effective_binding,
         base_table_object_ids,
         &connector_context,
         "MV first-refresh",
@@ -847,18 +903,6 @@ async fn prepare_frontend_first_refresh_write(
     let resolution = &projection.facts.definition().query.resolution;
     let source_catalog = Some(resolution.default_catalog.clone());
     let source_database = resolution.default_namespace.clone();
-    if capabilities.has_agg_state
-        && novarocks_mv_application::persistence::aggregate_bindings::validate_published_aggregate_contracts(
-            projection.facts.interpretation(),
-        ).is_err()
-    {
-        let analyzed = analyze_visible_refresh_query(
-            io, source, source_catalog.as_deref(), &source_database, &query, &connector_context,
-        ).await?;
-        admitted_publication.rebind_aggregate_contracts(
-            &analyzed.refresh_input.create_persistence_facts()?,
-        )?;
-    }
     let admitted_publication = AdmittedMvDataPublication::try_new(
         admitted_publication,
         &pin.exact_revisions_by_occurrence(),
@@ -876,6 +920,14 @@ async fn prepare_frontend_first_refresh_write(
                     connector_control: source.connector_control(),
                     connector_context: &connector_context,
                     projection: Arc::new(projection.clone()),
+                    rebuild_layout: rebuild.map(|rebuild| {
+                        Arc::new(
+                            crate::mv::domain::rewrite::context::MvRewriteRebuildLayout {
+                                binding: rebuild.candidate.observed.document.clone(),
+                                interpretation: rebuild.candidate.interpretation.clone(),
+                            },
+                        )
+                    }),
                     pin: &pin,
                     state_baseline: &contract.state_baseline,
                     target_binding,
@@ -940,10 +992,20 @@ async fn prepare_frontend_first_refresh_write(
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         )?;
+    let sql_pin = if effective_binding.dependencies.iter().any(|dependency| {
+        matches!(
+            dependency,
+            novarocks_mv_application::persistence::codec::BindingDependency::View { .. }
+        )
+    }) {
+        sql_pin.with_captured_sources()
+    } else {
+        sql_pin
+    };
     // L owns the branch and relation shape; the count of UNION branches is the
     // number of branch interpretations, not a separately persisted number.
-    let branch_count = projection.facts.interpretation().branches.len();
-    let multi_relation = projection.facts.definition().relation_occurrences.len() > 1;
+    let branch_count = effective_interpretation.branches.len();
+    let multi_relation = effective_binding.occurrences.len() > 1;
     let shape = if capabilities.has_agg_state {
         // A branch UNION ALL has no top-level GROUP BY. Its aggregate-state
         // layout is defined by the first branch and CREATE-time validation
@@ -1071,12 +1133,12 @@ async fn pin_contract_bases(
     io: &MvRefreshPreparationIo,
     source: &IcebergMvCorePorts,
     contract: &RefreshPlanContract,
-    projection: &novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
+    binding: &novarocks_mv_application::persistence::codec::BindingDocument,
     base_table_object_ids: &BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     what: &str,
 ) -> Result<RefreshSnapshotPin, PreparationError> {
-    let definition_occurrences = &projection.facts.definition().relation_occurrences;
+    let definition_occurrences = &binding.occurrences;
     if definition_occurrences.len() != contract.base_refs.len() {
         return Err(format!("{what} base facts do not retain every D occurrence").into());
     }
@@ -1200,7 +1262,7 @@ async fn prepare_metadata_only_publication(
         io,
         source,
         contract,
-        &projection,
+        projection.facts.binding(),
         base_table_object_ids,
         connector_context,
         "MV metadata-only refresh",
@@ -1340,7 +1402,7 @@ async fn prepare_frontend_incremental_write(
         definition_fingerprint,
         ..
     } = &contract.state_baseline;
-    let definition_occurrences = &projection.facts.definition().relation_occurrences;
+    let definition_occurrences = &projection.facts.binding().occurrences;
     if definition_occurrences.len() != contract.base_refs.len() {
         return Err(
             "MV incremental refresh base facts do not retain every D occurrence"
@@ -1434,6 +1496,7 @@ async fn prepare_frontend_incremental_write(
         crate::mv::domain::refresh::rewrite_context::freeze_refresh_rewrite_context_original(
             io,
             RefreshRewriteInputs {
+                rebuild_layout: None,
                 connector_control: source.connector_control(),
                 connector_context: &connector_context,
                 projection: Arc::new(projection),
@@ -1498,6 +1561,7 @@ async fn prepare_frontend_incremental_write(
                     base_table_object_ids: &rewrite.pinned_objects_by_occurrence()?,
                     repartition_transition: None,
                     retained_repartition_target: None,
+                    rebuild: None,
                 },
                 attempt,
                 observed_binding,
@@ -1684,6 +1748,7 @@ async fn prepare_frontend_incremental_write(
                     base_table_object_ids: &rewrite.pinned_objects_by_occurrence()?,
                     repartition_transition: None,
                     retained_repartition_target: None,
+                    rebuild: None,
                 },
                 attempt,
                 observed_binding,

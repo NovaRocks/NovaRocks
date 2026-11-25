@@ -53,6 +53,14 @@ pub enum ConnectorObjectKind {
     },
 }
 
+/// The original Iceberg view object and numeric version. Its declaration
+/// version token is retained separately because Iceberg can reuse a version ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorIcebergViewVersion {
+    pub uuid: [u8; 16],
+    pub version_id: i32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 // Design: ADR-0218 (docs/adr/ADR-0218-sql-output-declarations-and-stored-view-analysis.md)
 pub struct ConnectorViewMetadataValue {
@@ -60,6 +68,7 @@ pub struct ConnectorViewMetadataValue {
     pub definition: ConnectorViewDefinition,
     /// Immutable provider identity for the same observed definition/schema.
     pub version: Arc<str>,
+    pub iceberg_version: Option<ConnectorIcebergViewVersion>,
     pub comment: Option<Arc<str>>,
     pub properties: Vec<(Arc<str>, Arc<str>)>,
 }
@@ -69,6 +78,7 @@ impl ConnectorViewMetadataValue {
         identity: ConnectorViewIdentity,
         definition: ConnectorViewDefinition,
         version: Arc<str>,
+        iceberg_version: Option<ConnectorIcebergViewVersion>,
         comment: Option<Arc<str>>,
         mut properties: Vec<(Arc<str>, Arc<str>)>,
         context: &ConnectorRequestContext,
@@ -103,6 +113,7 @@ impl ConnectorViewMetadataValue {
             identity.namespace.len(),
             identity.view.len(),
             version.len(),
+            iceberg_version.as_ref().map_or(0, std::mem::size_of_val),
             definition.raw_sql.len(),
             definition
                 .default_catalog
@@ -139,6 +150,7 @@ impl ConnectorViewMetadataValue {
             identity,
             definition,
             version,
+            iceberg_version,
             comment,
             properties,
         })
@@ -418,6 +430,7 @@ mod tests {
             identity(),
             definition(),
             "same-observed-version".into(),
+            None,
             Some(Arc::from("comment")),
             vec![
                 (Arc::from("z"), Arc::from("2")),
@@ -438,6 +451,7 @@ mod tests {
             definition(),
             "same-observed-version".into(),
             None,
+            None,
             vec![
                 (Arc::from("a"), Arc::from("1")),
                 (Arc::from("a"), Arc::from("2")),
@@ -457,6 +471,7 @@ mod tests {
             identity(),
             definition,
             "same-observed-version".into(),
+            None,
             None,
             Vec::new(),
             &context(),
@@ -551,6 +566,7 @@ mod declaration_tests {
             super::tests::identity(),
             definition,
             version.into(),
+            None,
             None,
             Vec::new(),
             &super::tests::context(),

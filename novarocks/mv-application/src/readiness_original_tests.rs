@@ -537,13 +537,7 @@ async fn keyed_replace_and_delete_use_root_owned_point_reads_when_ranges_require
         .unwrap();
     let first = view.load_ready(&target()).await.unwrap().unwrap();
     assert!(
-        first
-            .projection
-            .facts
-            .definition()
-            .relation_occurrences
-            .len()
-            >= 2,
+        first.projection.facts.binding().occurrences.len() >= 2,
         "the real fixture must require continuation with its original page size one"
     );
     view.observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(2))
@@ -561,12 +555,7 @@ async fn keyed_replace_and_delete_use_root_owned_point_reads_when_ranges_require
         .unwrap();
     assert_eq!(
         dependencies.len(),
-        second
-            .projection
-            .facts
-            .definition()
-            .relation_occurrences
-            .len()
+        second.projection.facts.binding().occurrences.len()
     );
     let guard = view.reserve_projection_delete(target()).await.unwrap();
     assert!(matches!(

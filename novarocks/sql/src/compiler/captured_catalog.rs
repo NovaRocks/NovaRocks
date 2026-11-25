@@ -298,6 +298,7 @@ impl SqlCapturedCatalogPreparation {
                 None,
                 None,
                 Some(&table_sequence),
+                false,
             )
             .map_err(SqlCompileError::from)?;
         let names = crate::analysis::schema::validate_definition_column_names(

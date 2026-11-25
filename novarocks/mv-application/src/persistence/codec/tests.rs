@@ -16,303 +16,50 @@
 // under the License.
 
 use super::*;
-use crate::persistence::identity::{
-    AggregateIdentity, ApplyKeyIdentity, BranchIdentity, DocumentRevision, FieldIdentity,
-    ObjectIdentity, OutputIdentity, PartitionSpecVersion, SchemaVersion, StateSlotIdentity,
+use crate::persistence::test_support::{
+    MvDocumentFixture, aggregate_contract, fixture_type, physical, sample_definition,
 };
-use crate::persistence::validation::runtime::{RuntimeDefinitionFacts, RuntimeInterpretationFacts};
-use crate::persistence::validation::validate_live_relation_binding;
+use crate::persistence::validation::runtime::RuntimeInterpretationFacts;
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
 
-macro_rules! identity_fixture {
-    ($name:ident, $kind:ty) => {
-        fn $name(value: u8) -> $kind {
-            <$kind>::try_new(vec![value]).expect("valid fixture identity")
-        }
-    };
+fn field_id(value: u8) -> FieldIdentity {
+    FieldIdentity::try_new(vec![value]).unwrap()
 }
 
-identity_fixture!(object_id, ObjectIdentity);
-identity_fixture!(field_id, FieldIdentity);
-identity_fixture!(schema_version, SchemaVersion);
-identity_fixture!(partition_spec_version, PartitionSpecVersion);
-identity_fixture!(output_id, OutputIdentity);
-identity_fixture!(state_slot_id, StateSlotIdentity);
-identity_fixture!(aggregate_id, AggregateIdentity);
-identity_fixture!(branch_id, BranchIdentity);
-identity_fixture!(apply_key_id, ApplyKeyIdentity);
-
-fn field(id: u8, name: &str, type_signature: &str, nullable: bool) -> SourceFieldBinding {
-    SourceFieldBinding {
-        field_id: field_id(id),
-        name_at_binding: name.to_string(),
-        type_signature: type_signature.to_string(),
-        nullable,
-    }
+fn branch_id(value: u8) -> BranchIdentity {
+    BranchIdentity::try_new(vec![value]).unwrap()
 }
 
-fn relation(occurrence_id: u32, object_value: u8, qualifier: &str) -> RelationOccurrence {
-    RelationOccurrence {
-        occurrence_id,
-        catalog_at_binding: "ice".to_string(),
-        namespace_at_binding: "sales".to_string(),
-        relation_at_binding: "orders".to_string(),
-        qualifier_at_binding: qualifier.to_string(),
-        object_id: object_id(object_value),
-        schema_version: schema_version(1),
-        fields: vec![
-            field(2, "amount", "decimal(18,2)", true),
-            field(1, "order_id", "bigint", false),
-        ],
-    }
+fn state_slot_id(value: u8) -> StateSlotIdentity {
+    StateSlotIdentity::try_new(vec![value]).unwrap()
 }
 
-fn sample_definition() -> DefinitionDocument {
-    build_definition(
-        1_700_000_000_000,
-        QuerySource {
-            effective_sql: "SELECT AVG(o.amount) AS average_amount FROM ice.sales.orders o UNION ALL SELECT AVG(o2.amount) AS average_amount FROM ice.sales.orders o2".to_string(),
-            dialect: QueryDialect::Trino,
-            resolution: ResolutionContext {
-                default_catalog: "ice".to_string(),
-                default_namespace: "sales".to_string(),
-            },
-        },
-        vec![relation(7, 11, "o"), relation(8, 11, "o2")],
-        vec![OutputDefinition {
-            output_id: output_id(21),
-            name: "average_amount".to_string(),
-            type_signature: "decimal(18,2)".to_string(),
-            nullable: true,
-            expression: ExpressionShape {
-                kind: ExpressionKind::Function,
-                function_identity: Some("avg".to_string()),
-                source_fields: vec![
-                    SourceFieldReference {
-                        occurrence_id: 7,
-                        field_id: field_id(2),
-                    },
-                    SourceFieldReference {
-                        occurrence_id: 8,
-                        field_id: field_id(2),
-                    },
-                ],
-            },
-        }],
-    )
-    .expect("definition")
+fn aggregate_id(value: u8) -> AggregateIdentity {
+    AggregateIdentity::try_new(vec![value]).unwrap()
 }
 
-fn physical(
-    logical_identity: PhysicalFieldLogicalIdentity,
-    target_field_value: u8,
-    type_signature: &str,
-    nullable: bool,
-) -> PhysicalFieldBinding {
-    PhysicalFieldBinding {
-        logical_identity,
-        target_field_id: field_id(target_field_value),
-        type_signature: type_signature.to_string(),
-        nullable,
-    }
+fn apply_key_id(value: u8) -> ApplyKeyIdentity {
+    ApplyKeyIdentity::try_new(vec![value]).unwrap()
 }
 
 fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument {
-    InterpretationDocument {
-        definition_revision: definition.revision(),
-        computation_identity: sample_definition().computation_identity,
-        outputs: vec![OutputBinding {
-            output_id: output_id(21),
-            target_field_id: field_id(31),
-            type_signature: "decimal(18,2)".to_string(),
-            nullable: true,
-        }],
-        state_slots: vec![
-            StateSlot {
-                slot_id: state_slot_id(41),
-                target_field_id: field_id(33),
-                type_signature: "bigint".to_string(),
-                nullable: false,
-                role: StateRole::AvgCount,
-                encoding: StateEncoding::NativeColumnV1,
-            },
-            StateSlot {
-                slot_id: state_slot_id(42),
-                target_field_id: field_id(32),
-                type_signature: "decimal(38,2)".to_string(),
-                nullable: true,
-                role: StateRole::AvgSum,
-                encoding: StateEncoding::NativeColumnV1,
-            },
-        ],
-        apply_key: ApplyKey {
-            kind: ApplyKeyKind::GroupRowId,
-            components: vec![ApplyKeyComponent {
-                logical_id: apply_key_id(44),
-                target_field_id: field_id(34),
-            }],
-        },
-        aggregates: vec![AggregateInterpretation {
-            aggregate_id: aggregate_id(51),
-            function_identity: "avg".to_string(),
-            semantic_contract: None,
-            source_fields: vec![SourceFieldReference {
-                occurrence_id: 7,
-                field_id: field_id(2),
-            }],
-            state_slot_ids: vec![state_slot_id(42), state_slot_id(41)],
-            branch_id: Some(branch_id(61)),
-        }],
-        branches: vec![
-            BranchInterpretation {
-                branch_id: branch_id(61),
-                relation_occurrence_ids: vec![7],
-                output_ids: vec![output_id(21)],
-            },
-            BranchInterpretation {
-                branch_id: branch_id(62),
-                relation_occurrence_ids: vec![8],
-                output_ids: vec![output_id(21)],
-            },
-        ],
-        target: TargetBinding {
-            object_id: object_id(71),
-            schema_version: schema_version(3),
-            partition_spec_version: partition_spec_version(4),
-            fields: vec![
-                physical(
-                    PhysicalFieldLogicalIdentity::Output(output_id(21)),
-                    31,
-                    "decimal(18,2)",
-                    true,
-                ),
-                physical(
-                    PhysicalFieldLogicalIdentity::State(state_slot_id(41)),
-                    33,
-                    "bigint",
-                    false,
-                ),
-                physical(
-                    PhysicalFieldLogicalIdentity::State(state_slot_id(42)),
-                    32,
-                    "decimal(38,2)",
-                    true,
-                ),
-                physical(
-                    PhysicalFieldLogicalIdentity::ApplyKey(apply_key_id(44)),
-                    34,
-                    "binary",
-                    false,
-                ),
-                physical(
-                    PhysicalFieldLogicalIdentity::Branch(branch_id(61)),
-                    35,
-                    "integer",
-                    false,
-                ),
-                physical(
-                    PhysicalFieldLogicalIdentity::Branch(branch_id(62)),
-                    35,
-                    "integer",
-                    false,
-                ),
-            ],
-            partition_fields: Vec::new(),
-        },
-    }
+    let mut interpretation = MvDocumentFixture::new().interpretation;
+    interpretation.definition_revision = definition.revision();
+    interpretation
 }
 
 fn retraction_count_interpretation(definition: &EncodedDocument) -> InterpretationDocument {
-    let mut interpretation = sample_interpretation(definition);
-    interpretation.state_slots = vec![
-        StateSlot {
-            slot_id: state_slot_id(41),
-            target_field_id: field_id(32),
-            type_signature: "binary".to_string(),
-            nullable: false,
-            role: StateRole::Single,
-            encoding: StateEncoding::NativeColumnV1,
-        },
-        StateSlot {
-            slot_id: state_slot_id(42),
-            target_field_id: field_id(33),
-            type_signature: "bigint".to_string(),
-            nullable: false,
-            role: StateRole::RetractionCount,
-            encoding: StateEncoding::NativeColumnV1,
-        },
-    ];
-    interpretation.aggregates = vec![
-        AggregateInterpretation {
-            aggregate_id: aggregate_id(51),
-            function_identity: "sum".to_string(),
-            semantic_contract: None,
-            source_fields: vec![SourceFieldReference {
-                occurrence_id: 7,
-                field_id: field_id(2),
-            }],
-            state_slot_ids: vec![state_slot_id(41)],
-            branch_id: Some(branch_id(61)),
-        },
-        AggregateInterpretation {
-            aggregate_id: internal_retraction_count_aggregate_identity(),
-            function_identity: INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY.to_string(),
-            semantic_contract: None,
-            source_fields: Vec::new(),
-            state_slot_ids: vec![state_slot_id(42)],
-            branch_id: None,
-        },
-    ];
-    interpretation.target.fields = vec![
-        physical(
-            PhysicalFieldLogicalIdentity::Output(output_id(21)),
-            31,
-            "decimal(18,2)",
-            true,
-        ),
-        physical(
-            PhysicalFieldLogicalIdentity::State(state_slot_id(41)),
-            32,
-            "binary",
-            false,
-        ),
-        physical(
-            PhysicalFieldLogicalIdentity::State(state_slot_id(42)),
-            33,
-            "bigint",
-            false,
-        ),
-        physical(
-            PhysicalFieldLogicalIdentity::ApplyKey(apply_key_id(44)),
-            34,
-            "binary",
-            false,
-        ),
-        physical(
-            PhysicalFieldLogicalIdentity::Branch(branch_id(61)),
-            35,
-            "integer",
-            false,
-        ),
-        physical(
-            PhysicalFieldLogicalIdentity::Branch(branch_id(62)),
-            35,
-            "integer",
-            false,
-        ),
-    ];
+    let mut interpretation = MvDocumentFixture::new()
+        .with_retraction_count()
+        .interpretation;
+    interpretation.definition_revision = definition.revision();
     interpretation
 }
 
 fn sample_configuration() -> ConfigurationDocument {
-    ConfigurationDocument {
-        refresh_policy: RefreshPolicy::AsyncInterval,
-        paused: false,
-        refresh_interval_ms: Some(60_000),
-        max_staleness_ms: Some(120_000),
-    }
+    MvDocumentFixture::new().configuration
 }
 
 #[test]
@@ -333,17 +80,8 @@ fn current_query_runtime_maps_purely_without_reprinting_sql() {
 }
 
 #[test]
-fn neutral_runtime_facts_exhaustively_rebuild_definition_and_interpretation() {
-    let definition = sample_definition();
-    assert!(definition.query.effective_sql.contains(" UNION ALL "));
-    let runtime_definition =
-        RuntimeDefinitionFacts::try_from(&definition).expect("runtime definition facts");
-    let rebuilt_definition =
-        DefinitionDocument::try_from(runtime_definition).expect("rebuilt definition");
-    assert_eq!(rebuilt_definition, definition);
-
-    let encoded_definition = encode_definition(&definition).expect("definition revision");
-    let interpretation = sample_interpretation(&encoded_definition);
+fn neutral_runtime_facts_exhaustively_rebuild_interpretation() {
+    let interpretation = MvDocumentFixture::new().interpretation;
     let runtime_interpretation = RuntimeInterpretationFacts::from(&interpretation);
     let rebuilt_interpretation =
         InterpretationDocument::try_from(runtime_interpretation).expect("rebuilt interpretation");
@@ -381,17 +119,6 @@ fn target_partition_fields_roundtrip_in_provider_order_and_validate_arguments() 
 }
 
 #[test]
-fn runtime_interpretation_rejects_a_missing_union_branch_from_definition_input() {
-    let encoded_definition = encode_definition(&sample_definition()).expect("definition revision");
-    let interpretation = sample_interpretation(&encoded_definition);
-    let mut runtime = RuntimeInterpretationFacts::from(&interpretation);
-    runtime.branches.pop();
-    let error = InterpretationDocument::try_from(runtime)
-        .expect_err("dropping a definition branch must fail the D-to-L mapping");
-    assert!(error.contains("complete ordered definition branch identity set"));
-}
-
-#[test]
 fn definition_interpretation_configuration_round_trip_with_exact_references() {
     let definition = sample_definition();
     let encoded_definition = encode_definition(&definition).expect("encode definition");
@@ -415,87 +142,14 @@ fn definition_interpretation_configuration_round_trip_with_exact_references() {
         configuration
     );
 
-    crate::persistence::validation::validate_definition_interpretation(
-        &definition,
+    let fixture = MvDocumentFixture::new();
+    crate::persistence::validation::validate_binding_interpretation(
+        &fixture.binding,
         encoded_definition.revision(),
         &interpretation,
+        &fixture.mapping,
     )
     .expect("interpretation references the exact definition");
-}
-
-#[test]
-fn configuration_and_external_owner_do_not_change_computation_identity() {
-    let definition = sample_definition();
-    let identity = definition.computation_identity;
-    let mut configuration = sample_configuration();
-    configuration.paused = true;
-    configuration.max_staleness_ms = Some(240_000);
-    encode_configuration(&configuration).expect("changed configuration");
-    let owner_a = "deployment-a";
-    let owner_b = "deployment-b";
-    assert_ne!(owner_a, owner_b);
-    assert_eq!(sample_definition().computation_identity, identity);
-}
-
-#[test]
-fn set_order_is_canonical_but_occurrence_and_branch_order_remain_semantic() {
-    let definition = sample_definition();
-    let encoded = encode_definition(&definition).expect("definition");
-    let mut field_reordered = definition.clone();
-    field_reordered.relation_occurrences[0].fields.reverse();
-    assert_eq!(
-        encode_definition(&field_reordered).expect("reordered fields"),
-        encoded
-    );
-
-    let mut reordered_occurrences = definition.relation_occurrences.clone();
-    reordered_occurrences.reverse();
-    let occurrence_reordered = build_definition(
-        1_700_000_000_000,
-        definition.query.clone(),
-        reordered_occurrences,
-        definition.outputs.clone(),
-    )
-    .expect("rebuild reordered definition identity");
-    assert_ne!(
-        occurrence_reordered.computation_identity,
-        definition.computation_identity
-    );
-    assert_ne!(
-        encode_definition(&occurrence_reordered)
-            .expect("reordered occurrences")
-            .revision(),
-        encoded.revision()
-    );
-
-    let mut interpretation = sample_interpretation(&encoded);
-    let original = encode_interpretation(&interpretation).expect("interpretation");
-    interpretation.branches.reverse();
-    assert_ne!(
-        encode_interpretation(&interpretation)
-            .expect("reordered branches")
-            .revision(),
-        original.revision()
-    );
-}
-
-#[test]
-fn decode_rejects_noncanonical_set_order_instead_of_minting_a_second_revision() {
-    let definition = sample_definition();
-    let mut dto = definition_to_proto(&definition);
-    dto.relation_occurrences[0].fields.reverse();
-    let error = decode_definition(&dto.encode_to_vec())
-        .expect_err("noncanonical set order must fail in wire preflight");
-    assert!(error.to_string().contains("noncanonical set order"));
-
-    let mut duplicate = definition_to_proto(&definition);
-    let duplicate_field = duplicate.relation_occurrences[0].fields[1].clone();
-    duplicate.relation_occurrences[0]
-        .fields
-        .push(duplicate_field);
-    let error = decode_definition(&duplicate.encode_to_vec())
-        .expect_err("duplicate canonical set key must fail in wire preflight");
-    assert!(error.to_string().contains("duplicate or noncanonical"));
 }
 
 #[test]
@@ -522,39 +176,6 @@ fn wire_preflight_rejects_tag_order_nonminimal_varints_and_illegal_bool() {
     let error = decode_configuration(&illegal_bool)
         .expect_err("boolean values outside zero and one must fail before prost decode");
     assert!(error.to_string().contains("illegal value 2"));
-}
-
-#[test]
-fn stable_binding_allows_rename_and_reorder_but_rejects_rebuild_or_schema_drift() {
-    let expected = relation(7, 11, "o");
-    let renamed_reordered = vec![
-        field(1, "renamed_order_id", "bigint", false),
-        field(2, "renamed_amount", "decimal(18,2)", true),
-    ];
-    validate_live_relation_binding(&expected, &object_id(11), &renamed_reordered)
-        .expect("stable identities survive rename and reorder");
-    assert!(validate_live_relation_binding(&expected, &object_id(12), &renamed_reordered).is_err());
-    assert!(
-        validate_live_relation_binding(&expected, &object_id(11), &renamed_reordered[..1]).is_err()
-    );
-    let incompatible = vec![
-        field(1, "order_id", "bigint", false),
-        field(2, "amount", "double", true),
-    ];
-    assert!(validate_live_relation_binding(&expected, &object_id(11), &incompatible).is_err());
-
-    let duplicate_live_identity = vec![
-        field(1, "order_id", "bigint", false),
-        field(1, "duplicate_order_id", "bigint", false),
-        field(2, "amount", "decimal(18,2)", true),
-    ];
-    let error = validate_live_relation_binding(&expected, &object_id(11), &duplicate_live_identity)
-        .expect_err("duplicate live field identity must fail closed");
-    assert!(
-        error
-            .to_string()
-            .contains("duplicate stable field identity")
-    );
 }
 
 #[test]
@@ -640,6 +261,7 @@ fn aggregate_state_roles_are_exhaustive_for_avg_and_forbidden_elsewhere() {
 
     let mut non_avg = sample_interpretation(&definition);
     non_avg.aggregates[0].function_identity = "sum".to_string();
+    non_avg.aggregates[0].semantic_contract = Some(aggregate_contract("sum"));
     let error =
         encode_interpretation(&non_avg).expect_err("non-AVG aggregate cannot consume AVG roles");
     assert!(error.to_string().contains("non-AVG"));
@@ -723,7 +345,7 @@ fn automatic_retraction_count_state_requires_its_canonical_internal_owner() {
     multiple_automatic_states.state_slots.push(StateSlot {
         slot_id: state_slot_id(43),
         target_field_id: field_id(36),
-        type_signature: "bigint".to_string(),
+        source_type: fixture_type("bigint"),
         nullable: false,
         role: StateRole::RetractionCount,
         encoding: StateEncoding::NativeColumnV1,
@@ -773,7 +395,7 @@ fn user_count_without_automatic_retraction_state_remains_normal() {
     interpretation.state_slots = vec![StateSlot {
         slot_id: state_slot_id(41),
         target_field_id: field_id(32),
-        type_signature: "binary".to_string(),
+        source_type: fixture_type("binary"),
         nullable: false,
         role: StateRole::Single,
         encoding: StateEncoding::NativeColumnV1,
@@ -781,10 +403,11 @@ fn user_count_without_automatic_retraction_state_remains_normal() {
     interpretation.aggregates = vec![AggregateInterpretation {
         aggregate_id: aggregate_id(51),
         function_identity: "count".to_string(),
-        semantic_contract: None,
+        semantic_contract: Some(aggregate_contract("count")),
+        binding_signature: Some(Bytes::from_static(b"fixture-count")),
         source_fields: Vec::new(),
         state_slot_ids: vec![state_slot_id(41)],
-        branch_id: None,
+        branch_id: Some(branch_id(61)),
     }];
     interpretation.target.fields.retain(|field| {
         !matches!(
@@ -804,7 +427,7 @@ fn user_count_without_automatic_retraction_state_remains_normal() {
         })
         .expect("normal count state binding");
     state.target_field_id = field_id(32);
-    state.type_signature = "binary".to_string();
+    state.source_type = fixture_type("binary");
     state.nullable = false;
 
     encode_interpretation(&interpretation)
@@ -910,21 +533,21 @@ fn strict_wire_rejects_unknown_duplicate_missing_and_unknown_enum() {
 
 #[test]
 fn stale_definition_revision_is_rejected_by_the_interpretation_graph() {
-    let definition = sample_definition();
-    let encoded = encode_definition(&definition).unwrap();
-    let interpretation = sample_interpretation(&encoded);
+    let fixture = MvDocumentFixture::new();
+    let interpretation = fixture.interpretation;
     assert!(
-        crate::persistence::validation::validate_definition_interpretation(
-            &definition,
+        crate::persistence::validation::validate_binding_interpretation(
+            &fixture.binding,
             DocumentRevision::from_canonical_bytes(b"stale"),
             &interpretation,
+            &fixture.mapping,
         )
         .is_err()
     );
 }
 
 #[test]
-fn created_time_changes_document_revision_but_not_computation_identity() {
+fn created_time_changes_document_revision_and_preserves_query() {
     let original = sample_definition();
     let mut later = original.clone();
     later.created_at_ms += 1;
@@ -932,7 +555,7 @@ fn created_time_changes_document_revision_but_not_computation_identity() {
     let second = encode_definition(&later).unwrap();
     assert_ne!(first.revision(), second.revision());
     let decoded = decode_definition(second.as_bytes()).unwrap();
-    assert_eq!(decoded.computation_identity, original.computation_identity);
+    assert_eq!(decoded.query, original.query);
     assert_eq!(decoded.created_at_ms, later.created_at_ms);
 }
 
@@ -980,13 +603,8 @@ fn large_definition_roundtrips_exact_utf8_sql_without_a_byte_quota() {
         .push_str(&format!(" /*{}*/", "容量".repeat(12_000)));
     let expected_source = fixture.definition.query.effective_sql.clone();
     assert!(expected_source.len() > 65_536);
-    let definition = build_definition(
-        fixture.definition.created_at_ms,
-        fixture.definition.query,
-        fixture.definition.relation_occurrences,
-        fixture.definition.outputs,
-    )
-    .unwrap();
+    let definition =
+        build_definition(fixture.definition.created_at_ms, fixture.definition.query).unwrap();
     let bytes = encode_definition(&definition).unwrap();
     assert!(bytes.as_bytes().len() > 65_536);
     let decoded = decode_definition(bytes.as_bytes()).unwrap();
@@ -1002,7 +620,7 @@ fn large_definition_roundtrips_exact_utf8_sql_without_a_byte_quota() {
 }
 
 #[test]
-fn valid_definition_with_many_outputs_and_source_fields_roundtrips() {
+fn valid_binding_with_many_outputs_and_source_fields_roundtrips() {
     let fixture = crate::persistence::test_support::union_all_keyed_projection_fixture(
         crate::product::MvTarget::from_parts(Some("ice"), "sales", "wide_definition"),
         Some(17),
@@ -1010,18 +628,18 @@ fn valid_definition_with_many_outputs_and_source_fields_roundtrips() {
         4_100,
         1,
     );
-    assert!(fixture.definition.outputs.len() > 4_096);
-    let bytes = encode_definition(&fixture.definition).unwrap();
-    let decoded = decode_definition(bytes.as_bytes()).unwrap();
-    assert_eq!(decoded, fixture.definition);
+    assert!(fixture.binding.outputs.len() > 4_096);
+    let bytes = keyed::encode_binding(&fixture.binding).unwrap();
+    let decoded = keyed::decode_binding(bytes.as_bytes()).unwrap();
+    assert_eq!(decoded, fixture.binding);
     assert_eq!(
-        encode_definition(&decoded).unwrap().as_bytes(),
+        keyed::encode_binding(&decoded).unwrap().as_bytes(),
         bytes.as_bytes()
     );
 }
 
 #[test]
-fn keyed_same_layout_aggregate_publication_requires_current_semantics() {
+fn keyed_aggregate_publication_checks_state_format() {
     use crate::persistence::aggregate_bindings::validate_published_aggregate_contracts;
     use arrow_schema::DataType;
     use novarocks_functions::{
@@ -1040,12 +658,9 @@ fn keyed_same_layout_aggregate_publication_requires_current_semantics() {
     let definition = encode_definition(&sample_definition()).unwrap();
     let mut legacy = retraction_count_interpretation(&definition);
     legacy.aggregates[0].function_identity = "max".to_owned();
-    let bytes = keyed::encode_keyed_interpretation(&legacy).unwrap();
-    let decoded = keyed::decode_keyed_interpretation(bytes.as_bytes()).unwrap();
-    assert_eq!(decoded.state_slots, legacy.state_slots);
-    assert_eq!(decoded.target, legacy.target);
-    let refusal = validate_published_aggregate_contracts(&decoded).unwrap_err();
-    assert!(refusal.contains("no selected aggregate semantic contract"));
+    let mut missing_signature = legacy.clone();
+    missing_signature.aggregates[0].binding_signature = None;
+    assert!(keyed::encode_keyed_interpretation(&missing_signature).is_err());
 
     let args = [FunctionArgument::Value {
         value_type: FunctionValueType::new(DataType::Float64, true),
@@ -1065,56 +680,28 @@ fn keyed_same_layout_aggregate_publication_requires_current_semantics() {
         .unwrap();
     let selected = PersistentAggregateContract::from_binding(&bound).unwrap();
     let mut previous = selected.clone();
-    previous.result_semantics = "legacy-total-order-v1".into();
+    previous.state_format =
+        novarocks_functions::AggregateStateFormatIdentity::try_new("legacy-state-v1").unwrap();
     legacy.aggregates[0].semantic_contract = Some(previous);
     let bytes = keyed::encode_keyed_interpretation(&legacy).unwrap();
     let decoded = keyed::decode_keyed_interpretation(bytes.as_bytes()).unwrap();
     assert_eq!(decoded.state_slots, legacy.state_slots);
     let refusal = validate_published_aggregate_contracts(&decoded).unwrap_err();
-    assert!(refusal.contains("legacy-total-order-v1"));
+    assert!(refusal.contains("legacy-state-v1"));
+
+    let mut previous_overload = selected.clone();
+    previous_overload.overload =
+        novarocks_functions::FunctionOverloadId::try_new("builtin.aggregate/max/unsupported")
+            .unwrap();
+    legacy.aggregates[0].semantic_contract = Some(previous_overload);
+    let bytes = keyed::encode_keyed_interpretation(&legacy).unwrap();
+    let decoded = keyed::decode_keyed_interpretation(bytes.as_bytes()).unwrap();
+    let refusal = validate_published_aggregate_contracts(&decoded).unwrap_err();
+    assert!(refusal.contains("no longer admitted"));
 
     legacy.aggregates[0].semantic_contract = Some(selected);
     let bytes = keyed::encode_keyed_interpretation(&legacy).unwrap();
     let decoded = keyed::decode_keyed_interpretation(bytes.as_bytes()).unwrap();
     assert_eq!(decoded, legacy);
     validate_published_aggregate_contracts(&decoded).unwrap();
-}
-
-#[test]
-fn scalar_publication_contracts_preserve_legacy_decode_and_change_computation_identity() {
-    use novarocks_functions::{
-        FunctionId, FunctionOverloadId, PersistentScalarContract,
-        validate_published_scalar_contracts,
-    };
-
-    let original = sample_definition();
-    let encoded = encode_definition(&original).unwrap();
-    let legacy = decode_definition(encoded.as_bytes()).unwrap();
-    assert!(legacy.scalar_contracts.is_empty());
-    assert_eq!(legacy.computation_identity, original.computation_identity);
-    validate_published_scalar_contracts(&legacy.scalar_contracts, &[]).unwrap();
-
-    let greatest = PersistentScalarContract::new(
-        FunctionId::try_new("builtin.scalar/greatest/v1").unwrap(),
-        FunctionOverloadId::try_new("builtin.scalar/greatest/dynamic-v2").unwrap(),
-        std::num::NonZeroU32::MIN,
-    );
-    let contracts = vec![greatest];
-    let reason =
-        validate_published_scalar_contracts(&legacy.scalar_contracts, &contracts).unwrap_err();
-    assert!(reason.contains("builtin.scalar/greatest/v1 requires a full rebuild"));
-
-    let rebuilt = build_definition_with_scalar_contracts(
-        legacy.created_at_ms,
-        legacy.query,
-        legacy.relation_occurrences,
-        legacy.outputs,
-        contracts.clone(),
-    )
-    .unwrap();
-    assert_ne!(rebuilt.computation_identity, legacy.computation_identity);
-    let encoded = encode_definition(&rebuilt).unwrap();
-    let decoded = decode_definition(encoded.as_bytes()).unwrap();
-    validate_published_scalar_contracts(&decoded.scalar_contracts, &contracts).unwrap();
-    assert_eq!(decoded, rebuilt);
 }

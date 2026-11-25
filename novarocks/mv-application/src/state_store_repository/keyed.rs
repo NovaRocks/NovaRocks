@@ -4,7 +4,13 @@
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 
 //! Keyed projections on the single Accelerator owner and canonical indexes.
-use super::codec::decode_keyed_projection;
+use super::codec::{ProjectionRow, decode_projection_row};
+
+#[derive(Clone)]
+pub(crate) struct LoadedRetiredMvProjection {
+    pub(crate) entry: MvProjectionInventoryEntry,
+    pub(crate) dependencies: Vec<StoredMvDependency>,
+}
 use super::*;
 use crate::persistence::keyed_documents::{MvKeyedDocumentProjection, StoredKeyedMvProjection};
 use crate::repository::MvProjectionVersion;
@@ -41,8 +47,8 @@ pub(super) fn keyed_dependencies(
 ) -> Vec<StoredMvDependency> {
     use crate::dependency::{MvDependencyObjectType, MvDependencyStorageEngine};
     facts
-        .definition()
-        .relation_occurrences
+        .binding()
+        .occurrences
         .iter()
         .map(|r| StoredMvDependency {
             downstream_mv_id: id,
@@ -83,6 +89,22 @@ impl StateStoreMvRepository {
             .delete_keyed_projection(operation_id, expected)
             .await
     }
+
+    pub(crate) async fn find_retired_projection(
+        &self,
+        target: &MvTarget,
+    ) -> Result<Option<LoadedRetiredMvProjection>, MvRepositoryError> {
+        self.read_repository().find_retired_projection(target).await
+    }
+
+    pub(crate) async fn delete_retired_projection(
+        &self,
+        expected: LoadedRetiredMvProjection,
+    ) -> Result<bool, MvRepositoryError> {
+        self.write_repository()
+            .delete_retired_projection(expected)
+            .await
+    }
 }
 pub(super) async fn projection_inventory<T: ReadAccess + ?Sized>(
     tx: &mut T,
@@ -90,17 +112,28 @@ pub(super) async fn projection_inventory<T: ReadAccess + ?Sized>(
     let mut inventory = MvProjectionInventoryBuilder::new()?;
     let mut range = BoundedRecordRange::new(projection_prefix().map_err(corruption)?)?;
     while let Some(row) = range.next(tx).await? {
-        let projection = decode_keyed_projection(&row.key, &row.value)
+        let row_facts = decode_projection_row(&row.key, &row.value)
             .map_err(corruption)?
             .value;
-        if row.key != projection_by_id_key(projection.mv_id).map_err(corruption)? {
+        let (mv_id, source, retired_version) = match &row_facts {
+            ProjectionRow::Current(projection) => {
+                (projection.mv_id, projection.facts.source_revision(), None)
+            }
+            ProjectionRow::Retired { mv_id, source } => (
+                *mv_id,
+                source.as_ref(),
+                Some(MvProjectionVersion::from_store(row.version)),
+            ),
+        };
+        if row.key != projection_by_id_key(mv_id).map_err(corruption)? {
             return Err(corruption("keyed inventory key differs from projection"));
         }
-        inventory.push_facts(
-            projection.mv_id,
-            &projection.facts.target(),
-            &projection.facts.source_revision().target_object_id,
-        )?;
+        let target = MvTarget::from_parts(
+            Some(source.target.instance_id.as_str()),
+            &source.target.namespace,
+            &source.target.table,
+        );
+        inventory.push_facts(mv_id, &target, &source.target_object_id, retired_version)?;
     }
     Ok(inventory.finish())
 }

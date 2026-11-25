@@ -69,7 +69,6 @@ impl MvTargetCreationObservation {
         let mut field_names = HashSet::with_capacity(fields.len());
         for field in &fields {
             require_non_empty(&field.name, "created MV target field name")?;
-            require_non_empty(&field.type_signature, "created MV target field type")?;
             if !field_ids.insert(field.field_id) {
                 return corrupt(format!(
                     "created MV target observation has duplicate field ID {}",
@@ -168,7 +167,7 @@ pub(crate) fn source_schema_from_spi(
                         "source schema ordinal exceeds u32",
                     )
                 })?,
-                type_signature: field.type_signature().to_owned(),
+                source_type: field.source_type().clone(),
                 nullable: field.nullable(),
             })
         })
@@ -219,7 +218,7 @@ impl MvSchemaValidationObservation {
 pub(crate) struct MvObservedTargetField {
     pub field_id: i32,
     pub name: String,
-    pub type_signature: String,
+    pub source_type: novarocks_spi::connector::ProviderSourceType,
     pub nullable: bool,
 }
 
@@ -671,7 +670,7 @@ pub(crate) fn schema_validation_from_spi(
                 )?,
                 name: field.name().to_owned(),
                 ordinal: *ordinal,
-                type_signature: field.type_signature().to_owned(),
+                source_type: field.source_type().clone(),
                 nullable: field.nullable(),
             })
         })
@@ -795,7 +794,7 @@ fn observed_fields_from_spi(
         .map(|field| MvObservedTargetField {
             field_id: field.field_id(),
             name: field.name().to_string(),
-            type_signature: field.type_signature().to_string(),
+            source_type: field.source_type().clone(),
             nullable: field.nullable(),
         })
         .collect()
@@ -964,6 +963,7 @@ fn corrupt<T>(message: impl Into<String>) -> Result<T, ConnectorError> {
 
 #[cfg(test)]
 mod tests {
+    use novarocks_mv_application::persistence::test_support::fixture_type;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -1002,7 +1002,7 @@ mod tests {
         vec![MvObservedTargetField {
             field_id: 1,
             name: "c1".to_string(),
-            type_signature: "int".to_string(),
+            source_type: fixture_type("int"),
             nullable: false,
         }]
     }
@@ -1024,7 +1024,7 @@ mod tests {
             let field = novarocks_spi::connector::MvObservedSourceField::try_new(
                 Bytes::from_static(b"field-id"),
                 "value".into(),
-                "bigint".into(),
+                fixture_type("bigint"),
                 true,
             )
             .unwrap();
@@ -1053,7 +1053,7 @@ mod tests {
         duplicated.push(MvObservedTargetField {
             field_id: 1,
             name: "c2".to_string(),
-            type_signature: "bigint".to_string(),
+            source_type: fixture_type("bigint"),
             nullable: true,
         });
         let err = MvTargetCreationObservation::try_new(
@@ -1104,7 +1104,7 @@ mod tests {
         let field = MvObservedSourceField::try_new(
             Bytes::from_static(&[0xff, 7]),
             "physical_name".into(),
-            "int".into(),
+            fixture_type("int"),
             false,
         )
         .unwrap();
@@ -1176,7 +1176,7 @@ mod tests {
             vec![SpiObservedField::new(
                 1,
                 "c1".to_string(),
-                "int".to_string(),
+                fixture_type("int"),
                 false,
             )],
             partition,

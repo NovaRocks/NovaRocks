@@ -17,7 +17,7 @@
 
 //! Pure publication freshness. Observation does not grant scheduling legality.
 
-use crate::persistence::codec::{PublicationInput, RelationOccurrence};
+use crate::persistence::codec::{BindingOccurrence, PublicationInput};
 use crate::persistence::identity::{NativeDataVersion, ObjectIdentity};
 use novarocks_failure_contract::SharedFailureCause;
 use std::collections::{BTreeMap, BTreeSet};
@@ -78,7 +78,7 @@ pub fn exact_inputs_match(published: &[PublicationInput], current: &[Publication
 
 pub fn mv_publication_freshness(
     publication: Option<&[PublicationInput]>,
-    occurrences: &[RelationOccurrence],
+    occurrences: &[BindingOccurrence],
     observed: &[MvSourceObservation],
 ) -> Result<MvPublicationFreshness, MvObservationCoverageError> {
     let expected = occurrences
@@ -120,19 +120,12 @@ pub fn mv_publication_freshness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::identity::SchemaVersion;
+    use crate::persistence::test_support::relation;
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-    fn occurrence(id: u32) -> RelationOccurrence {
-        RelationOccurrence {
-            occurrence_id: id,
-            catalog_at_binding: "ice".into(),
-            namespace_at_binding: "db".into(),
-            relation_at_binding: "t".into(),
-            qualifier_at_binding: "t".into(),
-            object_id: ObjectIdentity::try_new(vec![1]).unwrap(),
-            schema_version: SchemaVersion::try_new(vec![1]).unwrap(),
-            fields: vec![],
-        }
+    fn occurrence(id: u32) -> BindingOccurrence {
+        let mut occurrence = relation(id, 1, "t");
+        occurrence.object_id = ObjectIdentity::try_new(vec![1]).unwrap();
+        occurrence
     }
     fn input(object: u8, version: u8) -> PublicationInput {
         PublicationInput {

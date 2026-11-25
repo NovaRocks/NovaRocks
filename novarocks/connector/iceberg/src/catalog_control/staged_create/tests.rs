@@ -195,7 +195,8 @@ fn prepared_operation_at(runtime: &IcebergMetadataContext, location: &str) -> Pr
 fn document_managed_create_freezes_actual_iceberg_field_ids_in_request_order() {
     let runtime = hadoop_runtime();
     let prepared = prepared_operation(&runtime);
-    let fields = prepared_document_field_bindings(prepared.staged.table.metadata()).unwrap();
+    let fields =
+        prepared_document_field_bindings(prepared.staged.table.metadata(), &context()).unwrap();
     assert_eq!(fields.len(), 1);
     assert_eq!(fields[0].request_ordinal(), 0);
     assert_eq!(fields[0].provider_field_id().as_ref(), 1_i32.to_be_bytes());
@@ -341,7 +342,7 @@ fn document_managed_target_cannot_publish_without_application_documents() {
         crate::storage_inspector::exact_partition_spec_version(
             prepared.staged.table.metadata().default_partition_spec_id(),
         ),
-        prepared_document_field_bindings(prepared.staged.table.metadata()).unwrap(),
+        prepared_document_field_bindings(prepared.staged.table.metadata(), &context()).unwrap(),
         crate::storage_inspector::prepared_create_partition_fields(
             prepared.staged.table.metadata(),
             &context(),

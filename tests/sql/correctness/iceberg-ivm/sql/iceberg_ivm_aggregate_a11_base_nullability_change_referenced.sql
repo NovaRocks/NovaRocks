@@ -18,8 +18,8 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,a11,aggregate,nullability,error
--- Test Point: Iceberg aggregate MV refresh rejects referenced base nullability drift.
--- Method: Create an aggregate MV over a required group key, relax the field to optional through Spark, and verify refresh fails fast.
+-- Test Point: An aggregate MV rebuilds after a referenced input becomes nullable.
+-- Method: Relax a required filter input through Spark and verify the rebuilt count excludes NULL.
 -- Scope: Iceberg target MV, single-base aggregate, schema contract.
 
 -- query 1
@@ -28,12 +28,14 @@ CREATE CATALOG ice_ivm_agg_a11_null_${uuid0} USING iceberg WITH ("iceberg.catalo
 CREATE SCHEMA ice_ivm_agg_a11_null_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_agg_a11_null_${uuid0}.ns_${uuid0}.orders (
   region VARCHAR NOT NULL,
-  amount BIGINT
+  amount BIGINT NOT NULL
 ) WITH (format_version = 3);
 INSERT INTO ice_ivm_agg_a11_null_${uuid0}.ns_${uuid0}.orders VALUES ROW('east', 10), ROW('west', 5);
 USE ice_ivm_agg_a11_null_${uuid0}.ns_${uuid0};
+SET SESSION enable_materialized_view_rewrite = false;
 CREATE MATERIALIZED VIEW agg_mv_${uuid0} AS SELECT region, COUNT(*) AS c
 FROM orders
+WHERE amount IS NOT NULL
 GROUP BY region;
 
 -- query 2
@@ -46,16 +48,23 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-a11-agg-null-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-ALTER TABLE ice_rest.ns_${uuid0}.orders ALTER COLUMN region DROP NOT NULL;
+ALTER TABLE ice_rest.ns_${uuid0}.orders ALTER COLUMN amount DROP NOT NULL;
 SPARK_SQL
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 printf 'SPARK_SQL_OK\n'
 
 -- query 4
--- @expect_error=MV source field type or nullability changed for relation occurrence
+-- @skip_result_check=true
+INSERT INTO orders VALUES ROW('east', NULL), ROW('west', 7);
 REFRESH MATERIALIZED VIEW agg_mv_${uuid0};
 
 -- query 5
+SELECT region, c FROM agg_mv_${uuid0} ORDER BY region;
+
+-- query 6
+SELECT region, COUNT(*) AS c FROM orders WHERE amount IS NOT NULL GROUP BY region ORDER BY region;
+
+-- query 7
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW agg_mv_${uuid0};

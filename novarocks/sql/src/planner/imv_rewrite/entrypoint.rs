@@ -1540,12 +1540,16 @@ pub(crate) mod tests {
             vec![
                 crate::compiler::mv_rewrite::SqlImvAggregateStateColumnContract {
                     column_name: "__agg_state_s".to_string(),
-                    type_signature: "binary".to_string(),
+                    source_type: crate::compiler::mv_rewrite::test_iceberg_source_primitive(
+                        novarocks_spi::connector::IcebergSourcePrimitive::Binary,
+                    ),
                     role: crate::compiler::mv_rewrite::SqlImvAggregateStateRoleContract::Single,
                 },
                 crate::compiler::mv_rewrite::SqlImvAggregateStateColumnContract {
                     column_name: "__agg_state___ivm_row_count".to_string(),
-                    type_signature: "long".to_string(),
+                    source_type: crate::compiler::mv_rewrite::test_iceberg_source_primitive(
+                        novarocks_spi::connector::IcebergSourcePrimitive::Long,
+                    ),
                     role: crate::compiler::mv_rewrite::SqlImvAggregateStateRoleContract::RetractionCount,
                 },
             ],

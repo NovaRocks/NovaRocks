@@ -3771,10 +3771,7 @@ pub(crate) fn frozen_prepared_source_relations(
     fallback_schema_id: i32,
     admission: Option<&novarocks_spi::connector::ConnectorChangeWindowAdmission>,
 ) -> Result<PreparedRelations, ConnectorError> {
-    let to = match selection {
-        ConnectorReadSourceSelection::Snapshot(to) => to,
-        ConnectorReadSourceSelection::ChangeWindow(window) => window.to_snapshot_id(),
-    };
+    let to = selection.to_snapshot_id();
     if matches!(
         admission,
         Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. })

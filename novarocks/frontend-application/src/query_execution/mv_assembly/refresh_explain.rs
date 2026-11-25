@@ -80,7 +80,16 @@ async fn explain_original_inner(
     use super::refresh_preparation::async_original::{
         MvCatalogCaptureInput, MvCatalogCaptureQuery, capture_catalog,
     };
+    use crate::mv::domain::iceberg_refresh::async_preparation::{
+        RefreshBindingObservation, definition_analysis_failure, prepare_refresh_binding_candidate,
+    };
     use crate::mv::domain::refresh::rewrite_context::RefreshRewriteInputs;
+    use novarocks_mv_application::persistence::{
+        codec::Marker,
+        rebuild_classification::{
+            RebuildEvidence, RefreshBindingClassification, classify_refresh_observation,
+        },
+    };
     let ports = &input.ports;
     let context = &input.context;
     let target = resolve_refresh_target(
@@ -96,36 +105,72 @@ async fn explain_original_inner(
         binding.metadata(),
         context.clone(),
     )?;
+    let documents = binding.planning_pin().derive_document_storage_lease()?;
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents,
+        binding.identity().clone(),
+        schema.table_object_id().clone(),
+        context.clone(),
+    );
+    let current = io.observe_current(ports, &documents, request).await?;
+    if current.view.metadata_version != schema.exact_schema().metadata_version
+        || current.versions.binding.identity() != projection.facts.versions().binding.identity()
+        || current.publication_revision != projection.facts.source_revision().publication_revision
+    {
+        return Err("EXPLAIN REFRESH observed a different MV generation".into());
+    }
+    let analyzed =
+        prepare_refresh_binding_candidate(io, ports, &projection, &binding, &schema, context).await;
+    let markers = current
+        .decoded_markers()
+        .map_err(|error| error.to_string())?;
+    let root = current.root_binding_revision();
+    match classify_refresh_observation(
+        RebuildEvidence::from(&current.versions),
+        analyzed
+            .as_ref()
+            .map(RefreshBindingObservation::evidence)
+            .map_err(definition_analysis_failure),
+        current.publication_evidence(&root),
+        &markers,
+    )? {
+        RefreshBindingClassification::Unchanged => {}
+        RefreshBindingClassification::NeedsRebuild(_) => {
+            return Ok(vec![
+                "MV refresh: NeedsRebuild".into(),
+                "Data write: full overwrite with the newly analyzed sources".into(),
+            ]);
+        }
+        RefreshBindingClassification::InvalidDefinition {
+            marker: Marker::InvalidDefinition { diagnostic, .. },
+            ..
+        } => return Ok(vec!["MV refresh: InvalidDefinition".into(), diagnostic]),
+        RefreshBindingClassification::IncompatibleStorage { cause, .. } => {
+            return Ok(vec!["MV refresh: NeedsRebuild".into(), cause.to_string()]);
+        }
+        RefreshBindingClassification::Blocked
+        | RefreshBindingClassification::InvalidDefinition { .. } => {
+            return Err("EXPLAIN REFRESH has no reusable MV generation".into());
+        }
+    }
+    let RefreshBindingObservation::Complete(candidate) = analyzed? else {
+        return Err("EXPLAIN REFRESH has no admitted current binding".into());
+    };
     let runtime_bindings = crate::mv::domain::refresh::schema_contract::validate_projection_target(
         &projection,
         &schema,
     )?;
     let baseline =
         crate::mv::domain::iceberg_refresh::build_refresh_state_baseline(&projection, &binding)?;
-    io.capture_refresh_sources(ports, &projection, &baseline, input.statement.full, context)
-        .await?;
-    let base_refs = projection
-        .facts
-        .definition()
-        .relation_occurrences
-        .iter()
-        .map(|base| novarocks_types::naming::TableIdentity {
-            catalog: base.catalog_at_binding.clone(),
-            namespace: base.namespace_at_binding.clone(),
-            table: base.relation_at_binding.clone(),
-        })
-        .collect::<Vec<_>>();
-    let (projection, _) = io
-        .rebind_definition(
-            ports,
-            &projection,
-            &base_refs,
-            &target,
-            Some(&schema),
-            context,
-        )
-        .await?;
-    let query = super::refresh_preparation::canonical_mv_select_query(&projection)?;
+    io.capture_refresh_sources(
+        ports,
+        &candidate.observed.document,
+        &baseline,
+        input.statement.full,
+        context,
+    )
+    .await?;
+    let query = candidate.query;
     let decision =
         crate::mv::domain::iceberg_refresh::async_preparation::captured_refresh_decision_original(
             io,
@@ -155,6 +200,7 @@ async fn explain_original_inner(
         crate::mv::domain::refresh::rewrite_context::freeze_refresh_rewrite_context_original(
             io,
             RefreshRewriteInputs {
+                rebuild_layout: None,
                 connector_control: ports.connector_control(),
                 connector_context: context,
                 projection: Arc::new(projection),

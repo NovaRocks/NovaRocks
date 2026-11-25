@@ -31,12 +31,14 @@ use novarocks_type_contract::{
 };
 
 pub use super::mv_persistence::{
-    SqlMvCreatePersistenceFacts, SqlMvPersistenceAggregateFacts, SqlMvPersistenceExpressionFacts,
-    SqlMvPersistenceExpressionKind, SqlMvPersistenceOutputFacts,
+    SqlMvCreatePersistenceFacts, SqlMvFieldCoordinate, SqlMvFieldPath,
+    SqlMvPersistenceAggregateFacts, SqlMvPersistenceOutputFacts,
     SqlMvPersistenceRelationOccurrenceFacts, SqlMvPersistenceSourceFieldFacts,
     SqlMvPersistenceSourceFieldReference, SqlMvPersistenceUnionBranchFacts,
 };
 pub use crate::compiler::SqlMvRelationOccurrenceId;
+pub use crate::planner::table::SqlMvReadSelection;
+pub use crate::planning::catalog::SqlMvViewDependency;
 
 /// Refuse private result domains before a persistence facade discards their
 /// query-local identities or converts their physical storage into SQL DDL.
@@ -1142,7 +1144,7 @@ pub trait SqlResolvedMvRefreshInputSource: resolved_mv_refresh_input_private::Se
 pub struct SqlResolvedMvRefreshInput(
     crate::analysis::ResolvedQuery,
     Box<[String]>,
-    Box<[novarocks_functions::PersistentScalarContract]>,
+    Box<[SqlMvViewDependency]>,
 );
 
 impl SqlResolvedMvRefreshInput {
@@ -1155,9 +1157,13 @@ impl SqlResolvedMvRefreshInput {
     pub(crate) fn from_validated_analysis(
         resolved: crate::analysis::ResolvedQuery,
         names: Vec<String>,
-        scalar_contracts: Box<[novarocks_functions::PersistentScalarContract]>,
+        view_dependencies: Vec<SqlMvViewDependency>,
     ) -> Self {
-        Self(resolved, names.into_boxed_slice(), scalar_contracts)
+        Self(
+            resolved,
+            names.into_boxed_slice(),
+            view_dependencies.into_boxed_slice(),
+        )
     }
 
     fn checked(
@@ -1167,16 +1173,7 @@ impl SqlResolvedMvRefreshInput {
             &resolved.output_columns,
             None,
         )?;
-        let scalar_contracts = super::mv_persistence::collect_scalar_contracts(
-            &resolved,
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .map_err(|error| crate::analyze_error::AnalyzeError::internal(error.to_string()))?;
-        Ok(Self::from_validated_analysis(
-            resolved,
-            names,
-            scalar_contracts,
-        ))
+        Ok(Self::from_validated_analysis(resolved, names, Vec::new()))
     }
 
     pub fn refresh_property(
@@ -1265,11 +1262,11 @@ impl SqlResolvedMvRefreshInput {
     /// query used for refresh planning. It is deliberately not an AST or plan:
     /// provider object, schema, and field identities remain application-owned
     /// observations that are joined to these occurrence-qualified SQL facts.
-    pub fn create_persistence_facts(&self) -> Result<SqlMvCreatePersistenceFacts, String> {
-        super::mv_persistence::project_create_persistence_facts(&self.0, &self.1, self.2.clone())
+    pub fn create_persistence_facts(&self) -> Result<SqlMvCreatePersistenceFacts, AnalyzeError> {
+        super::mv_persistence::project_create_persistence_facts(&self.0, &self.1, &self.2)
     }
 
-    pub fn scalar_contracts(&self) -> &[novarocks_functions::PersistentScalarContract] {
+    pub fn view_dependencies(&self) -> &[SqlMvViewDependency] {
         &self.2
     }
 
@@ -5826,15 +5823,18 @@ fn group_row_id_names(identity: &TargetIdentity) -> &[String] {
     }
 }
 
+pub(super) fn validate_mv_union_all(set_op: &ResolvedSetOp) -> Result<(), &'static str> {
+    if set_op.kind != SetOpKind::Union || !set_op.all {
+        return Err("Iceberg IMV refresh contract only supports UNION ALL set operations");
+    }
+    Ok(())
+}
+
 fn collect_union_all_branches<'a>(
     set_op: &'a ResolvedSetOp,
     out: &mut Vec<&'a ResolvedQuery>,
 ) -> Result<(), String> {
-    if set_op.kind != SetOpKind::Union || !set_op.all {
-        return Err(
-            "Iceberg IMV refresh contract only supports UNION ALL set operations".to_string(),
-        );
-    }
+    validate_mv_union_all(set_op)?;
     collect_union_all_query(&set_op.left, out)?;
     collect_union_all_query(&set_op.right, out)
 }

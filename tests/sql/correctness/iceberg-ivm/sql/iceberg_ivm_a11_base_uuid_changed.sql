@@ -18,13 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,a11,base_uuid,identity,error
--- Test Objective:
--- Validate that replacing the base table (DROP + CREATE with same name) triggers
--- BaseTableIdentityChanged error, because the new table has a different UUID.
--- The A11 identity guard must fire before any field-level checks.
---
--- Setup: create table, create MV, refresh. Then Spark drops and re-creates the
--- base table at the same three-part name. NovaRocks refresh must fail.
+-- A same-name replacement with the same output declaration is rebuilt from the new table.
 
 -- query 1
 -- @skip_result_check=true
@@ -71,14 +65,17 @@ SPARK_SQL
 printf 'SPARK_SQL_OK\n'
 
 -- query 6
--- Refresh must fail: BaseTableIdentityChanged (UUID mismatch).
--- The canonical documents name each base by its provider object identity,
--- qualified by the occurrence that references it, so the refusal says which
--- reference stopped resolving rather than which table name did.
--- @expect_error=MV source object changed for relation occurrence
+-- @skip_result_check=true
+SET SESSION enable_materialized_view_rewrite = false;
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 7
+SELECT id, amount FROM mv_${uuid0} ORDER BY id;
+
+-- query 8
+SELECT id, amount FROM base_${uuid0} ORDER BY id;
+
+-- query 9
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_${uuid0};

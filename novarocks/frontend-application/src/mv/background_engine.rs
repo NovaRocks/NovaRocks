@@ -23,7 +23,7 @@ use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use novarocks_mv_application::maintenance::{
     MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts,
 };
-use novarocks_mv_application::persistence::codec::{PublicationInput, RelationOccurrence};
+use novarocks_mv_application::persistence::codec::{BindingOccurrence, PublicationInput};
 use novarocks_spi::connector::ConnectorRequestContext;
 
 pub(crate) fn maintenance_facts_from_stats(
@@ -54,7 +54,7 @@ pub(crate) fn maintenance_facts_from_stats(
 /// one management pass and the selected Provider's original CPU capture.
 pub(crate) async fn current_source_inputs_in(
     ports: &IcebergMvCorePorts,
-    occurrences: &[RelationOccurrence],
+    occurrences: &[BindingOccurrence],
     context: &ConnectorRequestContext,
     factory: &crate::mv::domain::staged_create::CurrentProjectionMetadataCpu,
     capture: &Arc<crate::mv::domain::staged_create::CurrentMetadataCapture>,
@@ -119,7 +119,7 @@ impl crate::mv::domain::freshness::CurrentSourceCapture for BackgroundCapture<'_
 }
 
 pub(crate) fn scheduler_inputs(
-    occurrences: &[RelationOccurrence],
+    occurrences: &[BindingOccurrence],
     observations: Vec<novarocks_mv_application::freshness::MvSourceObservation>,
 ) -> Result<Vec<PublicationInput>, MvBackgroundEngineError> {
     use novarocks_mv_application::freshness::MvSourceState;
@@ -173,20 +173,16 @@ mod freshness_tests {
     use super::*;
     use novarocks_failure_contract::SharedFailureCause;
     use novarocks_mv_application::freshness::{MvSourceObservation, MvSourceState};
-    use novarocks_mv_application::persistence::identity::{
-        NativeDataVersion, ObjectIdentity, SchemaVersion,
-    };
+    use novarocks_mv_application::persistence::identity::{NativeDataVersion, ObjectIdentity};
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-    fn occurrence() -> RelationOccurrence {
-        RelationOccurrence {
-            occurrence_id: 1,
-            catalog_at_binding: "ice".into(),
-            namespace_at_binding: "db".into(),
-            relation_at_binding: "t".into(),
-            qualifier_at_binding: "t".into(),
-            object_id: ObjectIdentity::try_new(vec![1]).unwrap(),
-            schema_version: SchemaVersion::try_new(vec![1]).unwrap(),
-            fields: vec![],
+    fn occurrence() -> BindingOccurrence {
+        {
+            let mut occurrence =
+                novarocks_mv_application::persistence::test_support::relation(1, 1, "t");
+            occurrence.namespace_at_binding = "db".into();
+            occurrence.relation_at_binding = "t".into();
+            occurrence.object_id = ObjectIdentity::try_new(vec![1]).unwrap();
+            occurrence
         }
     }
     #[test]

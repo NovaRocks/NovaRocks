@@ -11,7 +11,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(in crate::scenarios) const ROOT: &str = "novarocks.doc.v2.root.novarocks.mv";
 pub(in crate::scenarios) const CONFIG: &str = "novarocks.doc.v2.slot.novarocks.mv~configuration";
@@ -324,6 +324,7 @@ pub(in crate::scenarios) struct Graph {
     pub record_bytes: Vec<usize>,
     pub definition: String,
     pub interpretation: String,
+    pub mapping: String,
     pub binding: String,
 }
 impl Graph {
@@ -342,6 +343,7 @@ impl Graph {
             record_bytes: Vec::new(),
             definition: String::new(),
             interpretation: String::new(),
+            mapping: String::new(),
             binding: String::new(),
         };
         for (key, value) in metadata["properties"]
@@ -443,10 +445,11 @@ impl Graph {
             .and_then(|r| r.binding.clone())
             .or_else(|| graph.roots.get(ROOT).cloned())
             .context("missing MV root/binding")?;
-        let (d, l) = graph.closure(&binding)?;
+        let (d, l, m) = graph.closure(&binding)?;
         graph.binding = binding;
         graph.definition = d;
         graph.interpretation = l;
+        graph.mapping = m;
         if let Some(p) = active {
             let _ = graph.record_logical_rows(p)?;
         } else if let Some(id) = graph.current {
@@ -481,7 +484,7 @@ impl Graph {
         management(&graph.slots[MANAGEMENT])?;
         Ok(graph)
     }
-    pub fn closure(&self, b: &str) -> Result<(String, String)> {
+    pub fn closure(&self, b: &str) -> Result<(String, String, String)> {
         let b = self
             .versions
             .get(b)
@@ -493,11 +496,11 @@ impl Graph {
                     == Format {
                         owner: "novarocks.mv".into(),
                         name: "binding".into(),
-                        version: 1
+                        version: 2
                     },
             "invalid B format"
         );
-        ensure!(b.refs.len() == 2, "B must reference D and L");
+        ensure!(b.refs.len() == 3, "B must reference D, L and M");
         let find = |name: &str| -> Result<String> {
             Ok(b.refs
                 .iter()
@@ -508,6 +511,7 @@ impl Graph {
         };
         let d = find("definition")?;
         let l = find("interpretation")?;
+        let m = find("mapping")?;
         let dv = self
             .versions
             .get(&d)
@@ -524,7 +528,7 @@ impl Graph {
                     == Format {
                         owner: "novarocks.mv".into(),
                         name: "definition".into(),
-                        version: 1
+                        version: 2
                     },
             "invalid D"
         );
@@ -535,7 +539,7 @@ impl Graph {
                     == Format {
                         owner: "novarocks.mv".into(),
                         name: "interpretation".into(),
-                        version: 2
+                        version: 3
                     }
                 && lv.refs
                     == vec![Reference {
@@ -550,7 +554,6 @@ impl Graph {
             &[
                 (1, 0, false),
                 (2, 2, false),
-                (3, 2, false),
                 (4, 2, true),
                 (5, 2, true),
                 (6, 2, false),
@@ -558,7 +561,7 @@ impl Graph {
                 (8, 2, true),
                 (9, 2, false),
             ],
-            &[1, 2, 3, 4, 9],
+            &[1, 2, 4, 9],
         )?;
         let fields = proto_fields(&lbytes)?;
         ensure!(
@@ -566,8 +569,8 @@ impl Graph {
                 .iter()
                 .find(|(n, _)| *n == 1)
                 .map(|(_, b)| b.as_slice())
-                == Some(&[2][..]),
-            "L content is not format2"
+                == Some(&[3][..]),
+            "L content is not format3"
         );
         ensure!(
             fields
@@ -577,21 +580,37 @@ impl Graph {
                 == Some(unhex(&d)?.as_slice()),
             "L does not embed D semantic identity"
         );
+        validate_definition(&dv.bytes()?)?;
+        let mv = self
+            .versions
+            .get(&m)
+            .with_context(|| format!("novarocks.doc.v2.rev.{m}: missing M"))?;
         ensure!(
-            binding_bounds(&b.bytes()?)?.len() == occurrence_count(&dv.bytes()?)?,
-            "B/D occurrence mismatch"
+            mv.owner == "novarocks.mv"
+                && mv.name == "mapping"
+                && mv.refs.is_empty()
+                && mv.format
+                    == Format {
+                        owner: "novarocks.mv".into(),
+                        name: "mapping".into(),
+                        version: 1,
+                    },
+            "invalid M"
         );
-        Ok((d, l))
+        let bytes = b.bytes()?;
+        binding_bounds(&bytes)?;
+        validate_mapping(&mv.bytes()?, &bytes)?;
+        Ok((d, l, m))
     }
     /// Independent decoding of the original publication inputs for Native
     /// window tests; this never imports the product document/revision codec.
     pub fn record_snapshot_watermarks(&self, p: &Record) -> Result<Vec<Option<i64>>> {
         let binding = p.binding.as_ref().context("MV publication missing B")?;
-        let (definition, _) = self.closure(binding)?;
+        self.closure(binding)?;
         let bytes = self.versions[binding].bytes()?;
         let bounds = binding_bounds(&bytes)?;
-        let descriptors = proto_fields(&bytes)?;
-        for (_, descriptor) in descriptors.iter().skip(1) {
+        let descriptors = binding_descriptors(&bytes)?;
+        for descriptor in &descriptors {
             let fields = proto_fields(descriptor)?;
             ensure!(
                 fields.len() == 4
@@ -602,25 +621,45 @@ impl Graph {
                 "Native window oracle requires the exact Iceberg snapshot format declaration"
             );
         }
-        let (_, values) = publication_payload_parts(
-            &p.payload,
-            occurrence_count(&self.versions[&definition].bytes()?)?,
-            &bounds,
-        )?;
+        let (_, values) = publication_payload_parts(&p.payload, bounds.len(), &bounds)?;
         values
             .iter()
             .map(|value| decode_snapshot_watermark(value))
             .collect()
     }
 
+    pub fn record_iceberg_source_uuids(&self, p: &Record) -> Result<Vec<String>> {
+        let binding = p.binding.as_ref().context("MV publication missing B")?;
+        self.closure(binding)?;
+        let mut prefix = b"NRMVFCT1".to_vec();
+        for part in ["iceberg", "connector-table-object-id"] {
+            prefix.extend_from_slice(&u16::try_from(part.len())?.to_be_bytes());
+            prefix.extend_from_slice(part.as_bytes());
+        }
+        prefix.extend_from_slice(&1u16.to_be_bytes());
+        prefix.extend_from_slice(&36u16.to_be_bytes());
+        proto_fields(&self.versions[binding].bytes()?)?
+            .into_iter()
+            .filter(|(tag, _)| *tag == 3)
+            .map(|(_, occurrence)| {
+                let (_, object) = proto_fields(&occurrence)?
+                    .into_iter()
+                    .find(|(tag, _)| *tag == 6)
+                    .context("B occurrence is missing its exact object fact")?;
+                let uuid = object
+                    .strip_prefix(prefix.as_slice())
+                    .context("not an exact Iceberg table UUID fact")?;
+                ensure!(uuid.len() == 36, "invalid Iceberg table UUID length");
+                Ok(std::str::from_utf8(uuid)?.to_owned())
+            })
+            .collect()
+    }
+
     pub fn record_logical_rows(&self, p: &Record) -> Result<Option<u64>> {
         let b = p.binding.as_ref().context("MV publication missing B")?;
-        let (d, _) = self.closure(b)?;
-        validate_payload(
-            &p.payload,
-            occurrence_count(&self.versions[&d].bytes()?)?,
-            &binding_bounds(&self.versions[b].bytes()?)?,
-        )
+        self.closure(b)?;
+        let bounds = binding_bounds(&self.versions[b].bytes()?)?;
+        validate_payload(&p.payload, bounds.len(), &bounds)
     }
 }
 /// Parse just protobuf wire fields, retaining scalar's canonical varint bytes.
@@ -708,39 +747,153 @@ fn scalar(bytes: &[u8]) -> u64 {
         .enumerate()
         .fold(0, |n, (i, b)| n | (u64::from(b & 127) << (i * 7)))
 }
-fn occurrence_count(d: &[u8]) -> Result<usize> {
+fn validate_definition(d: &[u8]) -> Result<()> {
     idl_shape(
         d,
-        &[
-            (1, 0, false),
-            (2, 2, false),
-            (3, 2, true),
-            (4, 2, true),
-            (5, 2, false),
-            (6, 0, false),
-        ],
-        &[1, 2, 4, 5, 6],
+        &[(1, 0, false), (2, 2, false), (6, 0, false)],
+        &[1, 2, 6],
     )?;
     let fields = proto_fields(d)?;
+    ensure!(fields.first() == Some(&(1, vec![2])), "D is not format2");
+    let query = &fields[1].1;
+    idl_shape(
+        query,
+        &[(1, 2, false), (2, 0, false), (3, 2, false)],
+        &[1, 2, 3],
+    )?;
+    let fields = proto_fields(query)?;
     ensure!(
-        fields
+        !std::str::from_utf8(&fields[0].1)?.is_empty() && fields[1].1 == [2],
+        "D does not carry a Trino query"
+    );
+    let context = &fields[2].1;
+    idl_shape(context, &[(1, 2, false), (2, 2, false)], &[1, 2])?;
+    ensure!(
+        proto_fields(context)?
             .iter()
-            .find(|(n, _)| *n == 1)
-            .map(|(_, v)| v.as_slice())
-            == Some(&[1][..]),
-        "D is not format1"
+            .all(|(_, value)| !value.is_empty()),
+        "D lacks a resolution context"
     );
-    Ok(fields.iter().filter(|(n, _)| *n == 3).count())
+    Ok(())
 }
-pub(in crate::scenarios) fn binding_bounds(bytes: &[u8]) -> Result<Vec<usize>> {
-    idl_shape(bytes, &[(1, 0, false), (2, 2, true)], &[1])?;
+
+fn binding_descriptors(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    idl_shape(
+        bytes,
+        &[
+            (1, 0, false),
+            (3, 2, true),
+            (4, 2, true),
+            (5, 2, true),
+            (6, 2, false),
+        ],
+        &[1, 3, 4, 6],
+    )?;
     let fields = proto_fields(bytes)?;
+    ensure!(fields.first() == Some(&(1, vec![2])), "B is not format2");
+    fields
+        .into_iter()
+        .filter(|(n, _)| *n == 3)
+        .map(|(_, occurrence)| {
+            idl_shape(
+                &occurrence,
+                &[
+                    (1, 0, false),
+                    (2, 2, false),
+                    (3, 2, false),
+                    (4, 2, false),
+                    (5, 2, false),
+                    (6, 2, false),
+                    (7, 0, false),
+                    (8, 2, false),
+                    (9, 2, false),
+                    (10, 2, false),
+                    (11, 2, false),
+                    (12, 2, false),
+                    (13, 2, true),
+                    (14, 2, false),
+                ],
+                &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14],
+            )?;
+            let mut fields = proto_fields(&occurrence)?.into_iter();
+            ensure!(
+                fields
+                    .nth(6)
+                    .is_some_and(|(n, value)| n == 7 && value == [1]),
+                "B occurrence must be a current read"
+            );
+            fields
+                .next()
+                .filter(|(n, _)| *n == 8)
+                .map(|(_, value)| value)
+                .context("B occurrence lacks a data-version descriptor")
+        })
+        .collect()
+}
+
+fn validate_mapping(bytes: &[u8], binding: &[u8]) -> Result<()> {
+    idl_shape(bytes, &[(1, 0, false), (2, 2, true)], &[1, 2])?;
+    let columns = proto_fields(bytes)?;
+    ensure!(columns.first() == Some(&(1, vec![1])), "M is not format1");
+    let outputs = proto_fields(binding)?
+        .into_iter()
+        .filter_map(|(n, bytes)| (n == 4).then_some(bytes))
+        .collect::<Vec<_>>();
     ensure!(
-        fields.first() == Some(&(1, vec![1])) && fields.iter().skip(1).all(|(n, _)| *n == 2),
-        "noncanonical B fields"
+        columns.len() == outputs.len() + 1,
+        "M/B output count differs"
     );
+    let mut storage_ids = BTreeSet::new();
+    for (ordinal, ((_, column), output)) in columns[1..].iter().zip(outputs).enumerate() {
+        idl_shape(
+            column,
+            &[
+                (1, 0, false),
+                (2, 2, false),
+                (3, 2, false),
+                (4, 2, false),
+                (5, 2, false),
+                (6, 2, false),
+                (7, 2, false),
+                (8, 0, false),
+                (9, 0, false),
+                (10, 2, false),
+                (11, 0, false),
+            ],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        )?;
+        idl_shape(
+            &output,
+            &[(1, 0, false), (2, 2, false), (3, 2, false), (4, 2, true)],
+            &[1, 2, 3],
+        )?;
+        let fields = proto_fields(column)?;
+        let bound = proto_fields(&output)?;
+        ensure!(
+            scalar(&fields[0].1) == ordinal as u64
+                && fields[0].1 == bound[0].1
+                && !fields[2].1.is_empty()
+                && fields[2].1 == bound[2].1,
+            "M column disagrees with the B output"
+        );
+        ensure!(
+            [1, 3, 4, 5, 6, 9]
+                .into_iter()
+                .all(|i| !fields[i].1.is_empty())
+                && storage_ids.insert(fields[1].1.clone())
+                && (1..=3).contains(&scalar(&fields[7].1))
+                && scalar(&fields[8].1) <= 1
+                && scalar(&fields[10].1) > 0,
+            "M column has incomplete or invalid storage facts"
+        );
+    }
+    Ok(())
+}
+
+pub(in crate::scenarios) fn binding_bounds(bytes: &[u8]) -> Result<Vec<usize>> {
+    let descriptors = binding_descriptors(bytes)?;
     let mut out = Vec::new();
-    for (_, descriptor) in fields.iter().skip(1) {
+    for descriptor in &descriptors {
         idl_shape(
             descriptor,
             &[(1, 2, false), (2, 2, false), (3, 0, false), (4, 0, false)],
@@ -928,9 +1081,17 @@ mod tests {
     }
     #[test]
     fn independent_b_and_p_match_frozen_manual_vectors() {
-        let b = bytes(
-            "080112240a07696365626572671215636f6e6e6563746f722d736e617073686f742d69641801200912240a07696365626572671215636f6e6e6563746f722d736e617073686f742d696418012009",
-        );
+        let b = bytes(concat!(
+            "08021a920108011207636174616c6f671a026e732204626173652a046c65667432066f626a656374380142240a076963",
+            "65626572671215636f6e6e6563746f722d736e617073686f742d6964180120094a0b6f626a6563742d66616374520970",
+            "6174682d666163745a09747970652d6661637462116465636c61726174696f6e732d66616374720f6f6363757272656e",
+            "63652d666163741a930108021207636174616c6f671a026e732204626173652a05726967687432066f626a6563743801",
+            "42240a07696365626572671215636f6e6e6563746f722d736e617073686f742d6964180120094a0b6f626a6563742d66",
+            "6163745209706174682d666163745a09747970652d6661637462116465636c61726174696f6e732d66616374720f6f63",
+            "63757272656e63652d6661637422120800120576616c75651a07696e746567657232660a207272727272727272727272",
+            "727272727272727272727272727272727272727272122064646464646464646464646464646464646464646464646464",
+            "646464646464641a206f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f",
+        ));
         let p = bytes(
             "0111111111111111111111111111111111000000000000002a010000000000000007000200090100000000000000110009010000000000000011",
         );
@@ -1011,26 +1172,23 @@ mod tests {
             name: name.into(),
             version,
         };
-        let mut d = vec![8, 1, 18, 0, 26, 0, 34, 0, 42, 32];
-        d.extend([7; 32]);
-        d.extend([48, 0]);
         let d = Version::new(
             "novarocks.mv",
             "definition",
-            format("definition", 1),
+            format("definition", 2),
             vec![],
-            &d,
+            &bytes(
+                "080212290a1653454c4543542076616c75652046524f4d206261736510021a0d0a07636174616c6f6712026e73302a",
+            ),
         )
         .unwrap();
-        let mut l = vec![8, 2, 18, 32];
+        let mut l = vec![8, 3, 18, 32];
         l.extend(unhex(&d.id).unwrap());
-        l.extend([26, 32]);
-        l.extend([7; 32]);
         l.extend([34, 0, 74, 3, 10, 1, 1]);
         let l = Version::new(
             "novarocks.mv",
             "interpretation",
-            format("interpretation", 2),
+            format("interpretation", 3),
             vec![Reference {
                 rel: "definition".into(),
                 id: d.id.clone(),
@@ -1038,10 +1196,21 @@ mod tests {
             &l,
         )
         .unwrap();
+        let m = Version::new(
+            "novarocks.mv",
+            "mapping",
+            format("mapping", 1),
+            vec![],
+            &bytes(concat!(
+                "0801124e080012056669656c641a07696e7465676572220c73746f726167652d747970652a07656e636f646572320764",
+                "65636f6465723a07636f6e74656e7440014800520b6465636c61726174696f6e5803",
+            )),
+        )
+        .unwrap();
         let b = Version::new(
             "novarocks.mv",
             "binding",
-            format("binding", 1),
+            format("binding", 2),
             vec![
                 Reference {
                     rel: "definition".into(),
@@ -1051,10 +1220,19 @@ mod tests {
                     rel: "interpretation".into(),
                     id: l.id.clone(),
                 },
+                Reference {
+                    rel: "mapping".into(),
+                    id: m.id.clone(),
+                },
             ],
-            &bytes(
-                "080112240a07696365626572671215636f6e6e6563746f722d736e617073686f742d696418012009",
-            ),
+            &bytes(concat!(
+                "08021a940108011207636174616c6f671a026e732204626173652a06736f7572636532066f626a656374380142240a07",
+                "696365626572671215636f6e6e6563746f722d736e617073686f742d6964180120094a0b6f626a6563742d6661637452",
+                "09706174682d666163745a09747970652d6661637462116465636c61726174696f6e732d66616374720f6f6363757272",
+                "656e63652d6661637422120800120576616c75651a07696e746567657232660a20727272727272727272727272727272",
+                "727272727272727272727272727272727212206464646464646464646464646464646464646464646464646464646464",
+                "6464641a206f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f",
+            )),
         )
         .unwrap();
         let mut c = Slot {
@@ -1081,7 +1259,7 @@ mod tests {
             .unwrap();
         let p =
             bytes("0111111111111111111111111111111111000000000000002a0000010009010000000000000011");
-        serde_json::json!({"properties":{(d.key()):d.encoded().unwrap(),(l.key()):l.encoded().unwrap(),(b.key()):b.encoded().unwrap(),(ROOT):b.id,(CONFIG):c.encoded().unwrap(),(MANAGEMENT):management_slot.encoded().unwrap()},"current-snapshot-id":1,"snapshots":[{"snapshot-id":1,"summary":{"operation":"append","total-data-files":"1","total-delete-files":"0",(RECORD):record_frame(&b.id,&p)}}]})
+        serde_json::json!({"properties":{(d.key()):d.encoded().unwrap(),(l.key()):l.encoded().unwrap(),(m.key()):m.encoded().unwrap(),(b.key()):b.encoded().unwrap(),(ROOT):b.id,(CONFIG):c.encoded().unwrap(),(MANAGEMENT):management_slot.encoded().unwrap()},"current-snapshot-id":1,"snapshots":[{"snapshot-id":1,"summary":{"operation":"append","total-data-files":"1","total-delete-files":"0",(RECORD):record_frame(&b.id,&p)}}]})
     }
     #[test]
     fn current_corruption_names_the_key_and_history_is_only_diagnostic() {
@@ -1111,6 +1289,10 @@ mod tests {
                 Reference {
                     rel: "interpretation".into(),
                     id: new_l.id.clone(),
+                },
+                Reference {
+                    rel: "mapping".into(),
+                    id: first.mapping.clone(),
                 },
             ],
             &old_b.bytes().unwrap(),

@@ -195,7 +195,8 @@ impl<A: ScalarStateAllocator> Sketch<A> {
                 && payload.len().is_multiple_of(size_of::<u32>()) =>
             {
                 let mut previous = None;
-                for word in payload.as_chunks::<{ size_of::<u32>() }>().0 {
+                let (words, _) = payload.as_chunks::<{ size_of::<u32>() }>();
+                for word in words {
                     work.step()?;
                     let entry = u32::from_le_bytes(*word);
                     let bucket = entry >> SPARSE_RANK_BITS;

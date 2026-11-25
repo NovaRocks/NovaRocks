@@ -479,11 +479,18 @@ impl StatisticsFactPort for FrontendStatisticsFacts {
 pub(crate) struct FrontendMaterializedViewFacts {
     owners: CompletionFactOwners,
     scope: StatementFactScope,
+    catalog: Arc<FrontendCatalogFacts>,
 }
 
 impl FrontendMaterializedViewFacts {
-    pub(crate) const fn new(owners: CompletionFactOwners, scope: StatementFactScope) -> Self {
-        Self { owners, scope }
+    #[cfg(test)]
+    pub(crate) fn new(owners: CompletionFactOwners, scope: StatementFactScope) -> Self {
+        let catalog = Arc::new(FrontendCatalogFacts::new(owners.clone(), scope.clone()));
+        Self {
+            owners,
+            scope,
+            catalog,
+        }
     }
 }
 
@@ -518,12 +525,21 @@ impl MaterializedViewFactPort for FrontendMaterializedViewFacts {
         };
         let mut facts = Vec::with_capacity(needs.len());
         for need in needs {
+            // MV discovery may be the first completion question. Resolve the
+            // original relation needs on the catalog fact owner's same memo.
+            // Optional discovery cannot change the error outcome of base SQL.
+            if let Err(error) = self.catalog.resolve_relations(need.relation_needs()).await {
+                tracing::debug!(%error, "skip MV rewrite without original catalog observations");
+                facts.push(MaterializedViewFact::observed(need, Vec::new()));
+                continue;
+            }
             facts.push(
                 freeze_materialized_view_fact_with_ports_async(
                     need,
                     &candidate,
                     self.owners.connector_control.as_ref(),
-                    self.owners.mv_storage_observation.as_ref(),
+                    &self.scope.bindings,
+                    Some(self.catalog.as_ref()),
                     &self.scope.connector_context,
                 )
                 .await,
@@ -638,10 +654,15 @@ pub(crate) fn statement_fact_source<A>(
         interpreter: Arc::clone(&owners.required_constants),
         scope: scope.clone(),
     });
+    let catalog = Arc::new(FrontendCatalogFacts::new(owners.clone(), scope.clone()));
     QueryCompletionFactSource::new(
-        Arc::new(FrontendCatalogFacts::new(owners.clone(), scope.clone())),
+        catalog.clone(),
         Arc::new(FrontendStatisticsFacts::new(owners.clone(), scope.clone())),
-        Arc::new(FrontendMaterializedViewFacts::new(owners, scope)),
+        Arc::new(FrontendMaterializedViewFacts {
+            owners,
+            scope,
+            catalog,
+        }),
         provider_reads,
         system_tables,
     )

@@ -11,7 +11,9 @@ use super::mv_uea7::{
     mv_text_lines,
 };
 use crate::actors::sql::{SqlSession, StatementFailure, StatementResult, TrinoValue};
-use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
+use crate::scenario::{
+    Scenario, ScenarioBinary, ScenarioBinaryLayout, ScenarioContext, ScenarioLaunchConfig,
+};
 use anyhow::{Context, Result, bail, ensure};
 use control_plan::FeLaunchIntent;
 use novarocks_cluster_harness::TestClusterOwner;
@@ -1693,6 +1695,7 @@ impl Scenario for MvCurrentDependencyRecheck {
 #[derive(Default)]
 struct MvLegacyInterpretationRebuild {
     fixture: Mutex<Option<ManagedMvRestFixture>>,
+    old_launch: Mutex<Option<ScenarioLaunchConfig>>,
 }
 
 impl Scenario for MvLegacyInterpretationRebuild {
@@ -1709,38 +1712,55 @@ impl Scenario for MvLegacyInterpretationRebuild {
         "mv/legacy-interpretation-rebuild"
     }
 
-    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let (fixture, launch) =
-            ManagedMvRestFixture::start(scenario_root, "system_mv_legacy_interpretation")?;
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn binary_requirements(&self) -> &'static [ScenarioBinary] {
+        &[ScenarioBinary::Primary, ScenarioBinary::Compatible]
+    }
+
+    fn launch_config_with_fixture_run(
+        &self,
+        scenario_root: &Path,
+        budget: &novarocks_cluster_harness::fixture_run::RunBudget,
+    ) -> Result<ScenarioLaunchConfig> {
+        let (fixture, mut launch) = ManagedMvRestFixture::start_private_with_budget(
+            scenario_root,
+            "system_mv_legacy_interpretation",
+            budget,
+        )?;
+        let deployment = format!(
+            "rwm10b-legacy-{}",
+            novarocks_types::BackendProcessId::new_v7()
+        );
+        launch.native_trust_fixture = launch
+            .native_trust_fixture
+            .with_deployment_id(&deployment)?;
+        let mut old = launch.clone();
+        old.binary_layout = ScenarioBinaryLayout {
+            frontend: ScenarioBinary::Compatible,
+            backends: vec![ScenarioBinary::Compatible; 3],
+        };
         let mut slot = self
             .fixture
             .lock()
             .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
-        if slot.is_some() {
-            bail!("managed MV fixture was initialized more than once");
-        }
+        ensure!(
+            slot.is_none(),
+            "managed MV fixture was initialized more than once"
+        );
         *slot = Some(fixture);
+        *self
+            .old_launch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("old MV launch lock poisoned"))? = Some(old);
         Ok(launch)
     }
 
-    fn test_session_plan(
-        &self,
-        _launch: &ScenarioLaunchConfig,
-        _scenario_root: &Path,
-        cluster_size: usize,
-        binary: &Path,
-        original_deadline: Instant,
-    ) -> Result<Option<ClusterTestSessionPlan>> {
-        control_plan::plan(
-            cluster_size,
-            binary,
-            original_deadline,
-            vec![FeLaunchIntent::Ordinary, FeLaunchIntent::Ordinary],
-        )
-        .map(Some)
-    }
-
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        use super::mv_uea7_documents::{load_metadata, wire::Graph};
+
         require_three_backends(context)?;
         let catalog = "system_mv_legacy_interpretation";
         let (create_catalog_sql, rest_uri) = {
@@ -1756,84 +1776,160 @@ impl Scenario for MvLegacyInterpretationRebuild {
                 fixture.rest_uri().to_owned(),
             )
         };
-        let mut conn = connect(context)?;
-        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
+        let old_launch = self
+            .old_launch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("old MV launch lock poisoned"))?
+            .take()
+            .context("old MV producer launch was not prepared")?;
         let create = "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders";
-        execute(context, &mut conn, "create an unpublished MV", create)?;
-        externally_persist_old_endian_interpretation(context, &rest_uri, "ns", "orders_mv")?;
-        drop(conn);
+        context.action("launch the exact old producer on the private REST lake");
+        let mut old = context.launch_peer_cluster("legacy-producer", old_launch)?;
+        old.retain_runtime_artifacts();
+        let produced = (|| -> Result<_> {
+            let mut conn = SqlSession::new(
+                old.sql_user(),
+                old.runtime().fe_trino_port,
+                context.deadline(),
+            )?;
+            setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
+            execute(
+                context,
+                &mut conn,
+                "create the MV with the original producer",
+                create,
+            )?;
+            refresh(context, &mut conn, "orders_mv")?;
+            assert_rows(
+                context,
+                &mut conn,
+                "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+                &[(1, 10), (2, 20)],
+                "read the original producer's materialized rows",
+            )?;
+            let metadata = load_metadata(context, &rest_uri, "ns", "orders_mv")?;
+            assert_legacy_mv_generation(&metadata)?;
+            fs::write(
+                context.scenario_root().join("old-mv-metadata.json"),
+                serde_json::to_vec_pretty(&metadata)?,
+            )?;
+            Ok(metadata)
+        })();
+        let old_exit = old
+            .shutdown()
+            .context("stop the original FE and all three BEs");
+        let metadata = match (produced, old_exit) {
+            (Ok(metadata), Ok(())) => metadata,
+            (Err(e), Ok(())) | (Ok(_), Err(e)) => return Err(e),
+            (Err(production), Err(cleanup)) => {
+                bail!("{production:#}; old producer cleanup: {cleanup:#}")
+            }
+        };
 
-        restart_frontend(context, "restart FE over an old nonzero big-endian L")?;
+        let mut conn = connect(context)?;
+        execute(
+            context,
+            &mut conn,
+            "attach only the old REST catalog to the fresh candidate StateStore",
+            &create_catalog_sql,
+        )?;
+        drop(conn);
+        restart_frontend(
+            context,
+            "cold start the candidate with only lake discovery for the old MV",
+        )?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
-        let closed = wait_for_status_phase(
+        let states = materialized_view_states(&mut conn)?;
+        ensure!(
+            mv_state_text(&states, "orders_mv", "manageability")? == "RETIRED",
+            "runtime MV inventory did not identify the retired target"
+        );
+        let inventory = query(
             context,
             &mut conn,
-            catalog,
-            "orders_mv",
-            "AWAITING_EFFECT_SETTLEMENT",
-            "wait for recovered old-format MV management barrier",
+            &format!(
+                "SELECT name, comment, definition FROM system.metadata.materialized_views WHERE catalog_name = '{catalog}' AND schema_name = 'ns' AND name = 'orders_mv'"
+            ),
+            "discover the old MV without a local Accelerator",
         )?;
-        let challenge = property(&closed, "Challenge")?;
-        let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
-        context.action("settle the old FE before testing the old L binding");
-        let resumed: Vec<(String, Option<String>)> = mv_properties(&conn.execute(format!(
-            "CALL novarocks_mv_resume_management('{catalog}', 'ns', 'orders_mv', \
-             '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
-             'the system scenario replaced the old FE before rebuilding an old-format MV')"
-        ))?)?;
-        if property(&resumed, "SettledEffects")? != "1" {
-            bail!("old-format MV did not settle the old FE incarnation");
+        ensure!(
+            matches!(inventory.rows.as_slice(), [row] if matches!(row.as_slice(),
+                [TrinoValue::Text(name), TrinoValue::Text(comment), TrinoValue::Null]
+                if name == "orders_mv" && comment.contains("DROP only"))),
+            "old MV metadata inventory omitted or misclassified the target"
+        );
+        for sql in [
+            "SELECT * FROM orders_mv",
+            "REFRESH MATERIALIZED VIEW orders_mv",
+        ] {
+            context.action(format!("reject retired MV command {sql}"));
+            let error = conn
+                .execute(sql)
+                .expect_err("retired MV command must fail closed");
+            let public = mv_public_error(&error)?;
+            ensure!(
+                public.message.contains("LegacyFormat") || public.message.contains("DROP only"),
+                "retired MV command returned another error: {}",
+                public.message
+            );
         }
-        let management_metadata = capture_empty_management_snapshot(
-            context,
-            &rest_uri,
-            "ns",
-            "orders_mv",
-            "before-rejected-refresh",
-        )?;
-        context.action("old L must reject a refresh without a data publication");
-        let failure = conn
-            .execute("REFRESH MATERIALIZED VIEW orders_mv")
-            .expect_err("old nonzero big-endian L must fail closed");
-        let error = mv_public_error(&failure)?.message.clone();
-        if !error
-            .contains("MV runtime target schema version is not from the exact document generation")
-        {
-            bail!("old L refresh failed for another reason: {error}");
-        }
-        let after_rejection = capture_empty_management_snapshot(
-            context,
-            &rest_uri,
-            "ns",
-            "orders_mv",
-            "after-rejected-refresh",
-        )?;
-        assert_rest_snapshot_state_unchanged(&management_metadata, &after_rejection)
-            .context("old-L rejection changed the management snapshot facts")?;
+        let after_refusal = load_metadata(context, &rest_uri, "ns", "orders_mv")?;
+        ensure!(
+            after_refusal == metadata,
+            "retired MV reads or refresh mutated exact lake metadata"
+        );
 
         execute(
             context,
             &mut conn,
-            "drop the old-format MV",
-            "DROP MATERIALIZED VIEW orders_mv",
+            "drop the retired object through its original managed target",
+            "DROP MATERIALIZED VIEW IF EXISTS orders_mv",
+        )?;
+        let status = Client::builder()
+            .no_proxy()
+            .timeout(context.remaining("confirm exact lake target removal")?)
+            .build()?
+            .get(format!(
+                "{}/v1/namespaces/ns/tables/orders_mv",
+                rest_uri.trim_end_matches('/')
+            ))
+            .send()?
+            .status();
+        ensure!(
+            status == reqwest::StatusCode::NOT_FOUND,
+            "REST still sees retired target: {status}"
+        );
+        execute(
+            context,
+            &mut conn,
+            "repeat IF EXISTS against the absent target",
+            "DROP MATERIALIZED VIEW IF EXISTS orders_mv",
         )?;
         execute(
             context,
             &mut conn,
-            "recreate the MV using current L format",
+            "recreate the MV in the current format",
             create,
         )?;
         refresh(context, &mut conn, "orders_mv")?;
-        assert_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 2)?;
+        let rebuilt = load_metadata(context, &rest_uri, "ns", "orders_mv")?;
+        let graph = Graph::from_metadata(&rebuilt)?;
+        ensure!(
+            rebuilt["table-uuid"] != metadata["table-uuid"]
+                && graph
+                    .snapshots
+                    .iter()
+                    .any(|(id, p)| Some(*id) == graph.current && p.is_some()),
+            "recreated MV did not publish a new table identity and current binding"
+        );
         assert_rows(
             context,
             &mut conn,
             "SELECT k1, v2 FROM orders_mv ORDER BY k1",
             &[(1, 10), (2, 20)],
-            "read the rebuilt MV",
-        )?;
-        Ok(())
+            "read the recreated and refreshed current-format MV",
+        )
     }
 
     fn teardown(&self) -> Result<()> {
@@ -2347,23 +2443,74 @@ impl Scenario for MvBaseIdentityReplacement {
             "read publication before replacing its base table",
         )?;
 
+        use super::mv_uea7_documents::{load_metadata, wire::Graph};
+        let old_source = load_metadata(context, &rest_uri, "ns", "orders")?;
+        let old_target =
+            Graph::from_metadata(&load_metadata(context, &rest_uri, "ns", "orders_mv")?)?;
         drop(conn);
-        externally_drop_rest_table(context, &rest_uri, "ns", "orders")?;
-        let mut conn = connect(context)?;
-        select_catalog_and_database(context, &mut conn, catalog)?;
+
+        let replace = |context: &mut ScenarioContext, rows: &str| -> Result<SqlSession> {
+            externally_drop_rest_table(context, &rest_uri, "ns", "orders")?;
+            let mut conn = connect(context)?;
+            select_catalog_and_database(context, &mut conn, catalog)?;
+            execute(
+                context,
+                &mut conn,
+                "recreate base table under the same logical name",
+                "CREATE TABLE orders (k1 INT, v2 BIGINT) WITH (format_version = 3)",
+            )?;
+            execute(context, &mut conn, "seed replacement base table", rows)?;
+            Ok(conn)
+        };
+        let mut conn = replace(context, "INSERT INTO orders VALUES (9, 90)")?;
         execute(
             context,
             &mut conn,
-            "recreate base table under the same logical name",
-            "CREATE TABLE orders (k1 INT, v2 BIGINT) WITH (format_version = 3)",
+            "use the unrewritten source query as the replacement oracle",
+            "SET SESSION enable_materialized_view_rewrite = false",
         )?;
-        execute(
-            context,
-            &mut conn,
-            "seed replacement base table incarnation",
-            "INSERT INTO orders VALUES (9, 90)",
-        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        for sql in [
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            "SELECT k1, v2 FROM orders ORDER BY k1",
+        ] {
+            assert_rows(
+                context,
+                &mut conn,
+                sql,
+                &[(9, 90)],
+                "validate the replacement bag",
+            )?;
+        }
+        let source = load_metadata(context, &rest_uri, "ns", "orders")?;
+        let target = Graph::from_metadata(&load_metadata(context, &rest_uri, "ns", "orders_mv")?)?;
+        let record = target
+            .snapshots
+            .iter()
+            .find_map(|(id, record)| {
+                (Some(*id) == target.current)
+                    .then_some(record.as_ref())
+                    .flatten()
+            })
+            .context("replacement refresh has no Current publication")?;
+        let snapshot = source["current-snapshot-id"]
+            .as_i64()
+            .context("replacement lacks Current")?;
+        let source_uuid = source["table-uuid"]
+            .as_str()
+            .context("replacement source lacks its table UUID")?;
+        ensure!(
+            source["table-uuid"] != old_source["table-uuid"]
+                && target.record_iceberg_source_uuids(record)? == [source_uuid]
+                && target.definition == old_target.definition
+                && target.binding != old_target.binding
+                && target.record_snapshot_watermarks(record)? == [Some(snapshot)],
+            "replacement P does not retain the new binding and its exact source watermark"
+        );
         drop(conn);
+        // Preserve the separate restart case. An owner change before a fresh
+        // publication still exercises the original incarnation readmission.
+        drop(replace(context, "INSERT INTO orders VALUES (10, 100)")?);
 
         restart_frontend(context, "restart FE after same-name base replacement")?;
         let mut conn = connect(context)?;
@@ -2660,137 +2807,64 @@ fn externally_drop_rest_table(
 /// writer first advances the physical Iceberg schema ID, then writes that
 /// exact nonzero ID into L in the former big-endian order. No P exists yet,
 /// so no historical publication reference is rewritten by this fixture.
-fn externally_persist_old_endian_interpretation(
-    context: &mut ScenarioContext,
-    rest_uri: &str,
-    namespace: &str,
-    table: &str,
-) -> Result<()> {
-    let url = format!(
-        "{}/v1/namespaces/{namespace}/tables/{table}",
-        rest_uri.trim_end_matches('/')
-    );
-    let client = Client::builder()
-        .no_proxy()
-        .timeout(context.remaining("construct old-format L in private REST")?)
-        .build()?;
-    let loaded: serde_json::Value = client.get(&url).send()?.error_for_status()?.json()?;
-    let metadata = loaded
-        .get("metadata")
-        .context("REST table load has no metadata")?;
-    if metadata["snapshots"]
-        .as_array()
-        .is_some_and(|snapshots| !snapshots.is_empty())
-    {
-        bail!("old-format L fixture requires an unpublished MV target");
-    }
-    let table_uuid = metadata["table-uuid"]
+fn assert_legacy_mv_generation(metadata: &serde_json::Value) -> Result<()> {
+    use super::mv_uea7_documents::wire::{RECORD, ROOT, Version, record};
+
+    let properties = &metadata["properties"];
+    let root = properties[ROOT]
         .as_str()
-        .context("REST MV metadata has no table UUID")?;
-    let current_schema_id = metadata["current-schema-id"]
-        .as_i64()
-        .context("REST MV metadata has no current schema ID")?;
-    let next_schema_id = current_schema_id
-        .checked_add(1)
-        .context("REST MV schema ID overflow")?;
-    if next_schema_id <= 0 {
-        bail!("old-format L fixture requires a positive physical schema ID");
-    }
-    let last_column_id = metadata["last-column-id"]
-        .as_i64()
-        .context("REST MV metadata has no last column ID")?;
-    let mut new_schema = metadata["schemas"]
-        .as_array()
-        .context("REST MV metadata has no schemas")?
-        .iter()
-        .find(|schema| schema["schema-id"].as_i64() == Some(current_schema_id))
-        .cloned()
-        .context("REST MV metadata has no current schema")?;
-    new_schema["schema-id"] = serde_json::json!(next_schema_id);
-    let fields = new_schema["fields"]
-        .as_array_mut()
-        .context("REST MV schema has no fields")?;
-    if fields.len() < 2 {
-        bail!("old-format L fixture requires two target fields to reorder");
-    }
-    fields.reverse();
-    use super::mv_uea7_documents::wire::{Graph, ROOT, Reference, Version};
-    let graph = Graph::from_metadata(metadata)?;
-    let interpretation = graph
-        .versions
-        .get(&graph.interpretation)
-        .context("MV lacks current L")?;
-    let mut content = interpretation.bytes()?;
-    let target = protobuf_bytes_field(&content, 9)?;
-    let schema = protobuf_bytes_field(&content[target.clone()], 2)?;
-    if schema.len() != 4 {
-        bail!("old-format L fixture expected a four-byte schema version");
-    }
-    let schema = target.start + schema.start..target.start + schema.end;
-    let original_id = i32::from_le_bytes(content[schema.clone()].try_into()?);
-    if i64::from(original_id) != current_schema_id || next_schema_id > i64::from(i32::MAX) {
-        bail!("old-format L fixture schema version does not match the exact physical target");
-    }
-    content[schema].copy_from_slice(&(next_schema_id as i32).to_be_bytes());
-    let new_l = Version::new(
-        &interpretation.owner,
-        &interpretation.name,
-        interpretation.format.clone(),
-        interpretation.refs.clone(),
-        &content,
-    )?;
-    let binding = &graph.versions[&graph.binding];
-    let new_b = Version::new(
-        &binding.owner,
-        &binding.name,
-        binding.format.clone(),
-        vec![
-            Reference {
-                rel: "definition".into(),
-                id: graph.definition.clone(),
-            },
-            Reference {
-                rel: "interpretation".into(),
-                id: new_l.id.clone(),
-            },
-        ],
-        &binding.bytes()?,
-    )?;
-    context
-        .action("persist an exact nonzero physical schema with the former big-endian L encoding");
-    let update = serde_json::json!({
-        "requirements": [
-            {"type": "assert-table-uuid", "uuid": table_uuid},
-            {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": null},
-            {"type": "assert-current-schema-id", "current-schema-id": current_schema_id},
-            {"type": "assert-last-assigned-field-id", "last-assigned-field-id": last_column_id}
-        ],
-        "updates": [
-            {"action": "add-schema", "schema": new_schema, "last-column-id": last_column_id},
-            {"action": "set-current-schema", "schema-id": -1},
-            {"action": "set-properties", "updates": {(new_l.key()):new_l.encoded()?,(new_b.key()):new_b.encoded()?,(ROOT):new_b.id}}
-        ]
-    });
-    let response = client.post(&url).json(&update).send()?;
-    if !response.status().is_success() {
-        bail!(
-            "old-format L REST mutation failed: {} {}",
-            response.status(),
-            response.text()?
+        .context("old MV has no keyed root")?;
+    let read_version = |identity: &str, name: &str, format: u32| -> Result<Version> {
+        let key = format!("novarocks.doc.v2.rev.{identity}");
+        let raw = properties[&key]
+            .as_str()
+            .with_context(|| format!("missing {key}"))?;
+        let version: Version = serde_json::from_str(raw)?;
+        ensure!(
+            version.encoded()? == raw
+                && version.identity()? == identity
+                && version.id == identity
+                && version.owner == "novarocks.mv"
+                && version.name == name
+                && version.format.owner == "novarocks.mv"
+                && version.format.name == name
+                && version.format.version == format,
+            "old producer did not persist the expected {name} generation"
         );
-    }
-    let observed: serde_json::Value = client.get(&url).send()?.error_for_status()?.json()?;
-    if observed["metadata"]["current-schema-id"].as_i64() != Some(next_schema_id) {
-        bail!("old-format L REST mutation did not advance the physical schema ID");
-    }
-    let persisted_graph = Graph::from_metadata(&observed["metadata"])?;
-    let persisted_content = persisted_graph.versions[&persisted_graph.interpretation].bytes()?;
-    let target = protobuf_bytes_field(&persisted_content, 9)?;
-    let schema = protobuf_bytes_field(&persisted_content[target.clone()], 2)?;
-    let persisted_schema = target.start + schema.start..target.start + schema.end;
-    if persisted_content[persisted_schema] != (next_schema_id as i32).to_be_bytes() {
-        bail!("old-format L REST mutation did not retain the big-endian schema version");
-    }
+        Ok(version)
+    };
+    let binding = read_version(root, "binding", 1)?;
+    ensure!(
+        binding
+            .refs
+            .iter()
+            .map(|r| r.rel.as_str())
+            .eq(["definition", "interpretation"]),
+        "old B1 relationships changed"
+    );
+    let definition = read_version(&binding.refs[0].id, "definition", 1)?;
+    let interpretation = read_version(&binding.refs[1].id, "interpretation", 2)?;
+    ensure!(
+        definition.refs.is_empty()
+            && interpretation.refs.len() == 1
+            && interpretation.refs[0].rel == "definition"
+            && interpretation.refs[0].id == definition.id,
+        "old L2 does not reference its D1"
+    );
+    let current = metadata["current-snapshot-id"]
+        .as_i64()
+        .context("old MV lacks Current")?;
+    let publication = metadata["snapshots"]
+        .as_array()
+        .context("old MV lacks snapshots")?
+        .iter()
+        .find(|s| s["snapshot-id"].as_i64() == Some(current))
+        .and_then(|s| s["summary"][RECORD].as_str())
+        .context("old MV lacks a publication on Current")?;
+    ensure!(
+        record(publication)?.binding.as_deref() == Some(root),
+        "old producer publication is not bound to B1"
+    );
     Ok(())
 }
 
@@ -2837,84 +2911,6 @@ fn protobuf_varint(input: &[u8], offset: &mut usize) -> Result<u64> {
         }
     }
     bail!("L protobuf varint exceeds 64 bits")
-}
-
-// Capture the real registration snapshot, never a guessed publication count.
-fn capture_empty_management_snapshot(
-    context: &mut ScenarioContext,
-    rest_uri: &str,
-    namespace: &str,
-    table: &str,
-    phase: &str,
-) -> Result<serde_json::Value> {
-    use super::mv_uea7_documents::wire::Graph;
-
-    let metadata = super::mv_uea7_documents::load_metadata(context, rest_uri, namespace, table)?;
-    fs::write(
-        context
-            .scenario_root()
-            .join(format!("old-l-{phase}-metadata.json")),
-        serde_json::to_vec_pretty(&metadata)?,
-    )?;
-    let graph = Graph::from_metadata(&metadata)?;
-    ensure!(
-        graph.snapshots.len() == 1,
-        "empty management target must have exactly its registration snapshot"
-    );
-    let (snapshot_id, publication) = &graph.snapshots[0];
-    ensure!(
-        graph.current == Some(*snapshot_id)
-            && metadata["refs"]["main"]["snapshot-id"].as_i64() == Some(*snapshot_id)
-            && publication.is_none(),
-        "empty management snapshot is not exact Current/main without P"
-    );
-    let snapshot = metadata["snapshots"]
-        .as_array()
-        .and_then(|snapshots| snapshots.first())
-        .context("empty management target has no raw snapshot")?;
-    let summary = snapshot["summary"]
-        .as_object()
-        .context("empty management snapshot has no summary")?;
-    ensure!(
-        summary.get("operation").and_then(serde_json::Value::as_str) == Some("append"),
-        "first management snapshot must be an empty append"
-    );
-    for key in ["total-data-files", "total-delete-files", "total-records"] {
-        ensure!(
-            summary.get(key).and_then(serde_json::Value::as_str) == Some("0"),
-            "empty management snapshot {key} is not exactly zero"
-        );
-    }
-    Ok(metadata)
-}
-
-fn assert_rest_snapshot_count(
-    context: &mut ScenarioContext,
-    rest_uri: &str,
-    namespace: &str,
-    table: &str,
-    expected: usize,
-) -> Result<()> {
-    let url = format!(
-        "{}/v1/namespaces/{namespace}/tables/{table}",
-        rest_uri.trim_end_matches('/')
-    );
-    let loaded: serde_json::Value = Client::builder()
-        .no_proxy()
-        .timeout(context.remaining("read old-format MV snapshot count")?)
-        .build()?
-        .get(&url)
-        .send()?
-        .error_for_status()?
-        .json()?;
-    let count = loaded["metadata"]["snapshots"]
-        .as_array()
-        .context("REST MV metadata has no snapshots")?
-        .len();
-    if count != expected {
-        bail!("old-format MV has {count} snapshots, expected {expected}");
-    }
-    Ok(())
 }
 
 fn assert_rest_snapshot_state_unchanged(

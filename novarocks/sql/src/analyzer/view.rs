@@ -24,14 +24,62 @@ use crate::analysis::{
 };
 use crate::analyze_error::{AnalyzeError, AnalyzeErrorKind};
 use crate::catalog::{
-    PlannerTableProvider, QuotedMetadataTable, ResolvedAnalyzerTable, SqlViewDefinition,
+    PlannerTableProvider, QuotedMetadataTable, ResolvedAnalyzerTable, SqlMvViewDependency,
+    SqlViewDefinition,
 };
 use novarocks_parser::{Span, ast};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueKind as K, ValueTypeRef};
 
-pub(super) type ViewAnalysisStack = std::rc::Rc<
-    std::cell::RefCell<Vec<(novarocks_types::naming::TableIdentity, std::sync::Arc<str>)>>,
->;
+#[derive(Clone, Default)]
+pub(super) struct ViewAnalysisStack(std::rc::Rc<std::cell::RefCell<ActiveViews>>);
+
+#[derive(Default)]
+struct ActiveViews {
+    stack: Vec<(novarocks_types::naming::TableIdentity, std::sync::Arc<str>)>,
+    dependencies: Option<Vec<SqlMvViewDependency>>,
+}
+
+impl ViewAnalysisStack {
+    pub(super) fn recording() -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(ActiveViews {
+            stack: Vec::new(),
+            dependencies: Some(Vec::new()),
+        })))
+    }
+
+    pub(super) fn take_dependencies(&self) -> Vec<SqlMvViewDependency> {
+        self.0.borrow_mut().dependencies.take().unwrap_or_default()
+    }
+
+    fn contains(&self, view: &SqlViewDefinition) -> bool {
+        self.0
+            .borrow()
+            .stack
+            .iter()
+            .any(|(identity, version)| identity == &view.identity && version == &view.version)
+    }
+
+    fn push(&self, view: &SqlViewDefinition, span: Span) -> Result<(), AnalyzeError> {
+        let mut active = self.0.borrow_mut();
+        let depth = active.stack.len() + 1;
+        if let Some(dependencies) = &mut active.dependencies {
+            let depth = u32::try_from(depth).map_err(|_| {
+                AnalyzeError::internal("View dependency depth is not representable")
+            })?;
+            let dependency = SqlMvViewDependency::try_from_definition(view, depth)
+                .map_err(|message| AnalyzeError::unsupported_expression(message, span))?;
+            dependencies.push(dependency);
+        }
+        active
+            .stack
+            .push((view.identity.clone(), view.version.clone()));
+        Ok(())
+    }
+
+    fn pop(&self) {
+        self.0.borrow_mut().stack.pop();
+    }
+}
 
 impl AnalyzerContext<'_> {
     pub(super) fn analyze_view_relation(
@@ -44,11 +92,7 @@ impl AnalyzerContext<'_> {
         self.check_control()?;
         view.validate().map_err(AnalyzeError::internal)?;
         if self.catalog.view_definition_target() == Some(&view.identity)
-            || self
-                .view_stack
-                .borrow()
-                .iter()
-                .any(|key| key.0 == view.identity && key.1 == view.version)
+            || self.view_stack.contains(view)
         {
             return Err(AnalyzeError::view_is_recursive(
                 format!("View '{}' is recursive", view.identity.fqn()),
@@ -65,8 +109,12 @@ impl AnalyzerContext<'_> {
         })?;
         crate::sql_mode::validate_persisted_query_semantics_typed(&query, &self.sql_semantics)
             .map_err(|error| stored_body_error(view, error, span))?;
-        let query = super::query_prepass::preanalyze(query)
+        let mut query = super::query_prepass::preanalyze(query)
             .map_err(|error| stored_body_error(view, error, span))?;
+        let retain_row_id = self.purpose == super::QueryAnalysisPurpose::FirstRefreshViewRowLineage;
+        if retain_row_id {
+            append_refresh_row_id(&mut query, view, span)?;
+        }
         let catalog = SavedViewCatalog {
             inner: self.catalog,
             catalog: &view.default_catalog,
@@ -94,15 +142,27 @@ impl AnalyzerContext<'_> {
             collected_subqueries: Default::default(),
             cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
         };
-        self.view_stack
-            .borrow_mut()
-            .push((view.identity.clone(), view.version.clone()));
+        self.view_stack.push(view, span)?;
         let result = child.analyze_query(&query);
-        self.view_stack.borrow_mut().pop();
+        self.view_stack.pop();
         // CTE identities and counters remain globally unique, while neither
         // caller CTE visibility nor correlation enters the stored body.
         self.absorb_semantic_scope(&child);
         let mut resolved = result.map_err(|error| stored_body_error(view, error, span))?;
+        let row_id = if retain_row_id {
+            let field = resolved
+                .output_columns
+                .last_mut()
+                .filter(|field| {
+                    field.field_name.as_deref() == Some(crate::common::ICEBERG_ROW_ID_COL)
+                        && field.value_type.data_type() == &arrow::datatypes::DataType::Int64
+                })
+                .ok_or_else(|| AnalyzeError::internal("MV view lost its original row identity"))?;
+            field.is_internal = true;
+            Some(field.clone())
+        } else {
+            None
+        };
         let source = resolved
             .output_columns
             .iter()
@@ -251,6 +311,22 @@ impl AnalyzerContext<'_> {
                     is_internal: false,
                 });
             }
+            if let Some(row_id) = &row_id {
+                projection.push(AnalyzedProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: row_id.column_id,
+                            qualifier: Some(inner_alias.clone()),
+                            column: row_id.name.clone(),
+                        },
+                        value_type: row_id.value_type.clone(),
+                    },
+                    output_name: row_id.name.clone(),
+                    field_name: row_id.field_name.clone(),
+                    output_column_id: row_id.column_id,
+                });
+                output_columns.push(row_id.clone());
+            }
             resolved = ResolvedQuery {
                 body: QueryBody::Select(ResolvedSelect {
                     from: Some(Relation::Subquery {
@@ -288,7 +364,14 @@ impl AnalyzerContext<'_> {
         }
         let mut scope = self.new_scope();
         for field in &fields {
-            scope.add_field(Some(&qualifier), field);
+            if row_id
+                .as_ref()
+                .is_some_and(|row_id| field.is_internal && field.column_id == row_id.column_id)
+            {
+                scope.add_hidden_field(&qualifier, field);
+            } else {
+                scope.add_field(Some(&qualifier), field);
+            }
         }
         Ok((
             Relation::Subquery {
@@ -299,6 +382,45 @@ impl AnalyzerContext<'_> {
             scope,
         ))
     }
+}
+
+fn append_refresh_row_id(
+    query: &mut ast::Query,
+    view: &SqlViewDefinition,
+    span: Span,
+) -> Result<(), AnalyzeError> {
+    let row_id = crate::common::ICEBERG_ROW_ID_COL;
+    let unsupported = || {
+        AnalyzeError::unsupported_query_shape(
+            format!(
+                "View '{}' cannot carry MV source row identity",
+                view.identity.fqn()
+            ),
+            span,
+        )
+    };
+    if view
+        .columns
+        .iter()
+        .any(|column| column.name.eq_ignore_ascii_case(row_id))
+    {
+        return Err(unsupported());
+    }
+    let mut body = query.body.as_mut();
+    while let ast::SetExpr::Query(nested) = body {
+        body = nested.query.body.as_mut();
+    }
+    let ast::SetExpr::Select(select) = body else {
+        return Err(unsupported());
+    };
+    if select.distinct || select.group_by.is_some() || select.having.is_some() {
+        return Err(unsupported());
+    }
+    select.projection.push(novarocks_parser::build::item(
+        novarocks_parser::build::identifier(novarocks_parser::build::ident(row_id, false)),
+        Some(novarocks_parser::build::ident(row_id, false)),
+    ));
+    Ok(())
 }
 
 fn same_public_name(
@@ -607,6 +729,8 @@ mod tests {
     fn declaration(sql: &str, published: &str, ty: FunctionValueType) -> SqlViewDefinition {
         SqlViewDefinition {
             identity: TableIdentity::new("caller", "db", "v"),
+            origin: crate::catalog::SqlViewOrigin::Session,
+            dialect: crate::catalog::SqlViewDialect::Trino,
             version: "version-1".into(),
             raw_sql: sql.into(),
             default_catalog: "caller".into(),
@@ -685,6 +809,82 @@ mod tests {
                 &[("ice".into(), "saved".into(), "t$files".into())],
             );
         }
+    }
+
+    fn visible_mv_view_dependencies(
+        catalog: &Catalog,
+    ) -> Result<Vec<SqlMvViewDependency>, AnalyzeError> {
+        let query = novarocks_parser::parser::parse_query("SELECT x FROM v").unwrap();
+        let (_, _, _, views) = crate::analyzer::analyze_mv_definition(
+            &query,
+            catalog,
+            "db",
+            crate::functions::builtin_sql_function_catalog(),
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )?;
+        Ok(views)
+    }
+
+    #[test]
+    fn mv_analysis_preserves_nested_view_identity_and_exact_declaration_version() {
+        use crate::catalog::SqlViewOrigin;
+
+        let build = |declaration_token: &str| {
+            let outer = declaration(
+                "SELECT x FROM inner_view",
+                "x",
+                FunctionValueType::new(D::Int32, false),
+            );
+            let mut inner_view = declaration(
+                "SELECT 1 AS x",
+                "x",
+                FunctionValueType::new(D::Int32, false),
+            );
+            inner_view.identity.table = "inner_view".into();
+            inner_view.origin = SqlViewOrigin::Iceberg {
+                uuid: [9; 16],
+                version_id: 17,
+            };
+            inner_view.version = declaration_token.into();
+            let mut catalog = catalog(outer);
+            catalog.views.insert(inner_view.identity.fqn(), inner_view);
+            catalog
+        };
+        let original = visible_mv_view_dependencies(&build("iceberg-view:original-declaration"))
+            .expect("original views");
+        let replaced = visible_mv_view_dependencies(&build("iceberg-view:changed-declaration"))
+            .expect("reused version number");
+
+        assert_eq!(original.len(), 2);
+        assert_eq!(original[0].identity().fqn(), "caller.db.v");
+        assert_eq!(original[0].version(), "version-1");
+        assert_eq!(original[0].depth(), 1);
+        assert_eq!(original[0].iceberg_version(), None);
+        assert_eq!(original[0].dialect(), "trino");
+        assert_eq!(original[1].identity().fqn(), "caller.db.inner_view");
+        assert_eq!(original[1].depth(), 2);
+        assert_eq!(original[1].iceberg_version(), Some(([9; 16], 17)));
+        assert_eq!(original[1].dialect(), "trino");
+        assert_eq!(original[1].iceberg_version(), replaced[1].iceberg_version());
+        assert_eq!(original[0].canonical_bytes(), replaced[0].canonical_bytes());
+        assert_ne!(original[1].canonical_bytes(), replaced[1].canonical_bytes());
+    }
+
+    #[test]
+    fn mv_analysis_refuses_a_view_without_exact_external_identity() {
+        let mut view = declaration(
+            "SELECT 1 AS x",
+            "x",
+            FunctionValueType::new(D::Int32, false),
+        );
+        view.origin = crate::catalog::SqlViewOrigin::External;
+        let catalog = catalog(view);
+        assert!(analyze("SELECT x FROM v", &catalog).is_ok());
+        let error =
+            visible_mv_view_dependencies(&catalog).expect_err("exact MV dependency required");
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+        assert!(error.message().contains("no exact Provider view identity"));
     }
 
     #[test]

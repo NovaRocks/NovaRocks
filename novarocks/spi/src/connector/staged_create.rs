@@ -38,7 +38,8 @@ use super::{
     ConnectorWriteReceipt, CreatePolicy, DdlPropertyDeclaration, DdlPropertyValue,
     ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
     LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MvExactPartitionField,
-    MvExactPartitionTransform, ProviderBindingEpoch,
+    MvExactPartitionTransform, MvStorageColumnDeclaration, ProviderBindingEpoch,
+    ProviderSourceType,
 };
 
 pub const CONNECTOR_STAGED_CREATE_CONTRACT_VERSION: u32 = 1;
@@ -60,7 +61,8 @@ pub struct ConnectorPreparedCreateFieldBinding {
     request_ordinal: u32,
     provider_field_id: Bytes,
     name: String,
-    type_signature: String,
+    source_type: ProviderSourceType,
+    storage_declaration: Option<MvStorageColumnDeclaration>,
     nullable: bool,
 }
 
@@ -71,7 +73,7 @@ impl std::fmt::Debug for ConnectorPreparedCreateFieldBinding {
             .field("request_ordinal", &self.request_ordinal)
             .field("provider_field_id_bytes", &self.provider_field_id.len())
             .field("name", &self.name)
-            .field("type_signature", &self.type_signature)
+            .field("source_type", &self.source_type)
             .field("nullable", &self.nullable)
             .finish()
     }
@@ -82,13 +84,12 @@ impl ConnectorPreparedCreateFieldBinding {
         request_ordinal: u32,
         provider_field_id: Bytes,
         name: String,
-        type_signature: String,
+        source_type: ProviderSourceType,
         nullable: bool,
     ) -> Result<Self, ConnectorError> {
         if provider_field_id.is_empty()
             || provider_field_id.len() > MAX_PREPARED_CREATE_FIELD_ID_BYTES
             || name.trim().is_empty()
-            || type_signature.trim().is_empty()
         {
             return Err(invalid(
                 "prepared create field binding is empty or exceeds its byte limit",
@@ -98,7 +99,8 @@ impl ConnectorPreparedCreateFieldBinding {
             request_ordinal,
             provider_field_id,
             name,
-            type_signature,
+            source_type,
+            storage_declaration: None,
             nullable,
         })
     }
@@ -115,8 +117,25 @@ impl ConnectorPreparedCreateFieldBinding {
         &self.name
     }
 
-    pub fn type_signature(&self) -> &str {
-        &self.type_signature
+    pub fn source_type(&self) -> &ProviderSourceType {
+        &self.source_type
+    }
+
+    pub fn with_storage_declaration(mut self, declaration: MvStorageColumnDeclaration) -> Self {
+        self.storage_declaration = Some(declaration);
+        self
+    }
+
+    pub fn storage_declaration(&self) -> Option<&MvStorageColumnDeclaration> {
+        self.storage_declaration.as_ref()
+    }
+
+    fn retained_type_bytes(&self) -> usize {
+        self.source_type.retained_bytes().saturating_add(
+            self.storage_declaration
+                .as_ref()
+                .map_or(0, MvStorageColumnDeclaration::retained_identity_bytes),
+        )
     }
 
     pub const fn nullable(&self) -> bool {
@@ -203,7 +222,7 @@ impl ConnectorPreparedCreateDocumentTarget {
                         .checked_add(std::mem::size_of::<u32>())
                         .and_then(|bytes| bytes.checked_add(field.provider_field_id().len()))
                         .and_then(|bytes| bytes.checked_add(field.name().len()))
-                        .and_then(|bytes| bytes.checked_add(field.type_signature().len()))
+                        .and_then(|bytes| bytes.checked_add(field.retained_type_bytes()))
                 })
             })
             .and_then(|bytes| {
@@ -311,7 +330,21 @@ impl ConnectorPreparedCreateDocumentTarget {
             hasher.update(field.request_ordinal.to_be_bytes());
             digest_bytes(hasher, &field.provider_field_id);
             digest_bytes(hasher, field.name().as_bytes());
-            digest_bytes(hasher, field.type_signature().as_bytes());
+            digest_bytes(hasher, &field.source_type().canonical_bytes());
+            if let Some(mapping) = field.storage_declaration() {
+                hasher.update([1]);
+                hasher.update(mapping.storage_format_version.to_be_bytes());
+                for identity in [
+                    &mapping.provider_declaration,
+                    &mapping.encode_identity,
+                    &mapping.decode_identity,
+                    &mapping.content_contract,
+                ] {
+                    digest_bytes(hasher, identity);
+                }
+            } else {
+                hasher.update([0]);
+            }
             hasher.update([u8::from(field.nullable())]);
         }
         hasher.update((self.partition_fields.len() as u64).to_be_bytes());
@@ -3001,6 +3034,16 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
+    fn int_source_type() -> ProviderSourceType {
+        use crate::connector::{IcebergSourcePrimitive, IcebergSourceType, IcebergSourceTypeNode};
+        ProviderSourceType::Iceberg(
+            IcebergSourceType::try_new(vec![IcebergSourceTypeNode::Primitive(
+                IcebergSourcePrimitive::Int,
+            )])
+            .unwrap(),
+        )
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -3402,7 +3445,7 @@ mod tests {
                     1,
                     Bytes::from_static(b"field-id"),
                     "field".to_string(),
-                    "int".to_string(),
+                    int_source_type(),
                     false,
                 )
                 .unwrap(),
@@ -3438,7 +3481,7 @@ mod tests {
                     0,
                     Bytes::from_static(b"field-id"),
                     "field".to_string(),
-                    "int".to_string(),
+                    int_source_type(),
                     false,
                 )
                 .unwrap(),
@@ -3474,7 +3517,7 @@ mod tests {
                     0,
                     Bytes::from_static(b"field-id"),
                     "field".to_string(),
-                    "int".to_string(),
+                    int_source_type(),
                     false,
                 )
                 .unwrap(),
@@ -3513,7 +3556,7 @@ mod tests {
                             0,
                             Bytes::from_static(b"field-id"),
                             "field".to_string(),
-                            "int".to_string(),
+                            int_source_type(),
                             false,
                         )
                         .unwrap(),
@@ -3562,6 +3605,28 @@ mod tests {
         assert_ne!(baseline.digest(), schema_changed.digest());
         assert_ne!(baseline.digest(), spec_changed.digest());
         assert_ne!(baseline.digest(), transform_changed.digest());
+
+        let handle_with_source = |primitive| {
+            use crate::connector::{IcebergSourceType, IcebergSourceTypeNode};
+            let mut target =
+                make_target(b"schema-a", b"spec-a", MvExactPartitionTransform::Identity);
+            target.fields[0].source_type = ProviderSourceType::Iceberg(
+                IcebergSourceType::try_new(vec![IcebergSourceTypeNode::Primitive(primitive)])
+                    .unwrap(),
+            );
+            ConnectorStagedTableHandle::try_new_document_managed(
+                owner.clone(),
+                operation_id,
+                Bytes::from_static(b"handle"),
+                target,
+            )
+            .unwrap()
+        };
+        use crate::connector::IcebergSourcePrimitive;
+        assert_ne!(
+            handle_with_source(IcebergSourcePrimitive::Int).digest(),
+            handle_with_source(IcebergSourcePrimitive::Long).digest(),
+        );
     }
 
     struct FakeCapability {

@@ -10,8 +10,9 @@ use crate::persistence::exact_revision::{decode_fact, encode_fact_parts};
 use crate::persistence::identity::{NativeDataVersion, PublicationIdentity};
 use novarocks_spi::connector::{ConnectorProviderId, ConnectorSemanticFact};
 
-pub const KEYED_INTERPRETATION_FORMAT_VERSION: u32 = 2;
-pub const BINDING_FORMAT_VERSION: u32 = 1;
+pub const KEYED_INTERPRETATION_FORMAT_VERSION: u32 = 3;
+pub use super::binding_codec::{BINDING_FORMAT_VERSION, decode_binding, encode_binding};
+pub use super::binding_model::BindingDocument;
 pub const MAX_DATA_VERSION_BYTES: u16 = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,7 +52,36 @@ impl DataVersionFormat {
         })?;
         Self::from_fact(fact, maximum)
     }
-    fn validate(&self) -> Result<(), PersistenceCodecError> {
+    pub(super) fn to_proto(&self) -> proto::DataVersionFormat {
+        proto::DataVersionFormat {
+            provider: Some(self.provider.clone()),
+            name: Some(self.name.clone()),
+            version: Some(u32::from(self.version)),
+            max_value_bytes: Some(u32::from(self.max_value_bytes)),
+        }
+    }
+
+    pub(super) fn from_proto(
+        value: proto::DataVersionFormat,
+    ) -> Result<Self, PersistenceCodecError> {
+        let to_u16 = |wire, field| {
+            u16::try_from(required(wire, field)?)
+                .map_err(|_| PersistenceCodecError::MalformedWire(format!("{field} exceeds u16")))
+        };
+        let format = Self {
+            provider: required(value.provider, "binding.data_version.provider")?,
+            name: required(value.name, "binding.data_version.name")?,
+            version: to_u16(value.version, "binding.data_version.version")?,
+            max_value_bytes: to_u16(
+                value.max_value_bytes,
+                "binding.data_version.max_value_bytes",
+            )?,
+        };
+        format.validate()?;
+        Ok(format)
+    }
+
+    pub(super) fn validate(&self) -> Result<(), PersistenceCodecError> {
         if self.max_value_bytes == 0 || self.max_value_bytes > MAX_DATA_VERSION_BYTES {
             return malformed("binding data-version maximum must be between 1 and 256");
         }
@@ -67,12 +97,6 @@ impl DataVersionFormat {
         let _ = provider;
         Ok(())
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BindingDocument {
-    /// Same order and multiplicity as D, including repeated physical objects.
-    pub data_versions: Vec<DataVersionFormat>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,9 +119,7 @@ pub fn encode_keyed_interpretation(
     let mut canonical = value.clone();
     canonicalize_interpretation(&mut canonical);
     validate_interpretation(&canonical)?;
-    let mut dto = interpretation_to_proto(&canonical);
-    dto.format_version = Some(KEYED_INTERPRETATION_FORMAT_VERSION);
-    encode_message(dto)
+    encode_message(interpretation_to_proto(&canonical))
 }
 pub fn decode_keyed_interpretation(
     bytes: &[u8],
@@ -106,7 +128,10 @@ pub fn decode_keyed_interpretation(
     let dto = proto::InterpretationDocument::decode(bytes)
         .map_err(PersistenceCodecError::ProtobufDecode)?;
     if dto.format_version != Some(KEYED_INTERPRETATION_FORMAT_VERSION) {
-        return malformed("keyed interpretation requires format version 2");
+        return Err(PersistenceCodecError::UnknownFormatVersion {
+            document: "interpretation",
+            version: required(dto.format_version, "interpretation.format_version")?,
+        });
     }
     let value = interpretation_from_proto(dto)?;
     if encode_keyed_interpretation(&value)?.as_bytes() != bytes {
@@ -115,77 +140,15 @@ pub fn decode_keyed_interpretation(
     Ok(value)
 }
 
-pub fn encode_binding(value: &BindingDocument) -> Result<EncodedDocument, PersistenceCodecError> {
-    if value.data_versions.len() > u16::MAX as usize {
-        return malformed("binding has too many relation occurrences");
-    }
-    for format in &value.data_versions {
-        format.validate()?;
-    }
-    let dto = proto::BindingDocument {
-        format_version: Some(BINDING_FORMAT_VERSION),
-        data_versions: value
-            .data_versions
-            .iter()
-            .map(|f| proto::DataVersionFormat {
-                provider: Some(f.provider.clone()),
-                name: Some(f.name.clone()),
-                version: Some(u32::from(f.version)),
-                max_value_bytes: Some(u32::from(f.max_value_bytes)),
-            })
-            .collect(),
-    };
-    encode_message(dto)
-}
-pub fn decode_binding(bytes: &[u8]) -> Result<BindingDocument, PersistenceCodecError> {
-    wire::preflight(bytes, wire::Schema::BindingDocument)?;
-    let dto =
-        proto::BindingDocument::decode(bytes).map_err(PersistenceCodecError::ProtobufDecode)?;
-    if dto.format_version != Some(BINDING_FORMAT_VERSION) {
-        return malformed("unsupported binding format version");
-    }
-    let value = BindingDocument {
-        data_versions: dto
-            .data_versions
-            .into_iter()
-            .map(|f| {
-                Ok(DataVersionFormat {
-                    provider: required(f.provider, "binding.provider")?,
-                    name: required(f.name, "binding.name")?,
-                    version: u16::try_from(required(f.version, "binding.version")?).map_err(
-                        |_| {
-                            PersistenceCodecError::MalformedWire(
-                                "binding format version exceeds u16".into(),
-                            )
-                        },
-                    )?,
-                    max_value_bytes: u16::try_from(required(
-                        f.max_value_bytes,
-                        "binding.max_value_bytes",
-                    )?)
-                    .map_err(|_| {
-                        PersistenceCodecError::MalformedWire(
-                            "binding format maximum exceeds u16".into(),
-                        )
-                    })?,
-                })
-            })
-            .collect::<Result<_, PersistenceCodecError>>()?,
-    };
-    if encode_binding(&value)?.as_bytes() != bytes {
-        return malformed("non-canonical binding document");
-    }
-    Ok(value)
-}
-
 pub fn maximum_publication_payload_bytes(
     binding: &BindingDocument,
 ) -> Result<usize, PersistenceCodecError> {
     let mut bytes = 1usize + 16 + 8 + 1 + 8 + 2;
-    if binding.data_versions.len() > u16::MAX as usize {
+    if binding.occurrences.len() > u16::MAX as usize {
         return malformed("too many publication occurrences");
     }
-    for format in &binding.data_versions {
+    for occurrence in &binding.occurrences {
+        let format = &occurrence.data_version;
         format.validate()?;
         bytes = bytes
             .checked_add(2 + usize::from(format.max_value_bytes))
@@ -198,7 +161,6 @@ pub fn maximum_publication_payload_bytes(
 
 pub fn encode_publication_payload(
     value: &KeyedPublicationDocument,
-    definition: &DefinitionDocument,
     binding: &BindingDocument,
 ) -> Result<Vec<u8>, PersistenceCodecError> {
     if value.publication_id.as_bytes().len() != 16
@@ -206,10 +168,8 @@ pub fn encode_publication_payload(
     {
         return malformed("publication identity or frozen timestamp is invalid");
     }
-    if value.inputs.len() != definition.relation_occurrences.len()
-        || binding.data_versions.len() != value.inputs.len()
-    {
-        return malformed("publication occurrence count differs from definition or binding");
+    if value.inputs.len() != binding.occurrences.len() {
+        return malformed("publication occurrence count differs from its binding");
     }
     let mut out = Vec::with_capacity(maximum_publication_payload_bytes(binding)?);
     out.push(1);
@@ -220,16 +180,12 @@ pub fn encode_publication_payload(
         out.extend_from_slice(&rows.to_be_bytes());
     }
     out.extend_from_slice(&(value.inputs.len() as u16).to_be_bytes());
-    for ((input, occurrence), format) in value
-        .inputs
-        .iter()
-        .zip(&definition.relation_occurrences)
-        .zip(&binding.data_versions)
-    {
+    for (input, occurrence) in value.inputs.iter().zip(&binding.occurrences) {
+        let format = &occurrence.data_version;
         if input.relation_occurrence_id != occurrence.occurrence_id
             || input.object_id != occurrence.object_id
         {
-            return malformed("publication input differs from its exact definition occurrence");
+            return malformed("publication input differs from its exact binding occurrence");
         }
         let fact = decode_fact(input.native_data_version.as_bytes())
             .map_err(|e| PersistenceCodecError::MalformedWire(e.to_string()))?;
@@ -249,7 +205,6 @@ pub fn encode_publication_payload(
 
 pub fn decode_publication_payload(
     bytes: &[u8],
-    definition: &DefinitionDocument,
     definition_revision: DocumentRevision,
     interpretation_revision: DocumentRevision,
     binding: &BindingDocument,
@@ -269,15 +224,12 @@ pub fn decode_publication_payload(
         _ => return malformed("invalid publication row-presence byte"),
     };
     let count = usize::from(u16::from_be_bytes(cursor.take(2)?.try_into().unwrap()));
-    if count != definition.relation_occurrences.len() || count != binding.data_versions.len() {
-        return malformed("publication occurrence count differs from definition or binding");
+    if count != binding.occurrences.len() {
+        return malformed("publication occurrence count differs from its binding");
     }
     let mut inputs = Vec::with_capacity(count);
-    for (occurrence, format) in definition
-        .relation_occurrences
-        .iter()
-        .zip(&binding.data_versions)
-    {
+    for occurrence in &binding.occurrences {
+        let format = &occurrence.data_version;
         format.validate()?;
         let len = usize::from(u16::from_be_bytes(cursor.take(2)?.try_into().unwrap()));
         if len == 0 || len > usize::from(format.max_value_bytes) || len > 256 {
@@ -325,17 +277,19 @@ impl<'a> Cursor<'a> {
 
 /// Check each protobuf document's canonical structure before DTO conversion.
 /// Compact publication structure is checked by `decode_publication_payload`,
-/// which also needs the decoded definition and binding facts.
+/// which also needs the decoded binding facts.
 pub fn preflight_keyed_document_set(
     d: &[u8],
     l: &[u8],
     b: &[u8],
+    m: &[u8],
     c: &[u8],
 ) -> Result<(), PersistenceCodecError> {
     for (content, schema) in [
         (d, wire::Schema::DefinitionDocument),
         (l, wire::Schema::InterpretationDocument),
         (b, wire::Schema::BindingDocument),
+        (m, wire::Schema::StorageMappingDocument),
         (c, wire::Schema::ConfigurationDocument),
     ] {
         wire::preflight(content, schema)?;
@@ -348,15 +302,10 @@ mod tests {
     use super::*;
     use crate::persistence::test_support::MvDocumentFixture;
     use novarocks_spi::connector::ConnectorExactSemanticRevision;
-    fn fixture() -> (
-        DefinitionDocument,
-        BindingDocument,
-        KeyedPublicationDocument,
-    ) {
+    fn fixture() -> (BindingDocument, KeyedPublicationDocument) {
         let f = MvDocumentFixture::new();
         let mut inputs = Vec::new();
-        let mut formats = Vec::new();
-        for d in &f.definition.relation_occurrences {
+        for d in &f.binding.occurrences {
             let data = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
                 ConnectorProviderId::parse("iceberg").unwrap(),
                 &crate::persistence::exact_revision::restore_persisted_object(&d.object_id)
@@ -364,7 +313,6 @@ mod tests {
                 Some(17),
             )
             .unwrap();
-            formats.push(DataVersionFormat::from_issued_fact(data.data_version()).unwrap());
             let (_, v) =
                 crate::persistence::exact_revision::persist_exact_connector_revision(&data)
                     .unwrap();
@@ -375,10 +323,7 @@ mod tests {
             });
         }
         (
-            f.definition,
-            BindingDocument {
-                data_versions: formats,
-            },
+            f.binding,
             KeyedPublicationDocument {
                 publication_prepared_at_ms: 42,
                 publication_id: PublicationIdentity::try_new(vec![0x11; 16]).unwrap(),
@@ -391,14 +336,10 @@ mod tests {
     }
     #[test]
     fn binding_and_compact_publication_roundtrip_with_exact_fact_identities() {
-        let (d, b, p) = fixture();
+        let (b, p) = fixture();
         let encoded = encode_binding(&b).unwrap();
-        assert_eq!(
-            hex::encode(encoded.as_bytes()),
-            "080112240a07696365626572671215636f6e6e6563746f722d736e617073686f742d69641801200912240a07696365626572671215636f6e6e6563746f722d736e617073686f742d696418012009"
-        );
         assert_eq!(decode_binding(encoded.as_bytes()).unwrap(), b);
-        let bytes = encode_publication_payload(&p, &d, &b).unwrap();
+        let bytes = encode_publication_payload(&p, &b).unwrap();
         assert_eq!(
             hex::encode(&bytes),
             "0111111111111111111111111111111111000000000000002a010000000000000007000200090100000000000000110009010000000000000011"
@@ -408,7 +349,6 @@ mod tests {
         assert_eq!(
             decode_publication_payload(
                 &bytes,
-                &d,
                 p.definition_revision,
                 p.interpretation_revision,
                 &b
@@ -419,13 +359,12 @@ mod tests {
     }
     #[test]
     fn compact_publication_rejects_truncation_trailing_presence_and_occurrence_mismatch() {
-        let (d, b, p) = fixture();
-        let bytes = encode_publication_payload(&p, &d, &b).unwrap();
+        let (b, p) = fixture();
+        let bytes = encode_publication_payload(&p, &b).unwrap();
         for end in 0..bytes.len() {
             assert!(
                 decode_publication_payload(
                     &bytes[..end],
-                    &d,
                     p.definition_revision,
                     p.interpretation_revision,
                     &b
@@ -436,46 +375,28 @@ mod tests {
         let mut bad = bytes.clone();
         bad.push(0);
         assert!(
-            decode_publication_payload(
-                &bad,
-                &d,
-                p.definition_revision,
-                p.interpretation_revision,
-                &b
-            )
-            .is_err()
+            decode_publication_payload(&bad, p.definition_revision, p.interpretation_revision, &b)
+                .is_err()
         );
         let mut bad = bytes.clone();
         bad[25] = 2;
         assert!(
-            decode_publication_payload(
-                &bad,
-                &d,
-                p.definition_revision,
-                p.interpretation_revision,
-                &b
-            )
-            .is_err()
+            decode_publication_payload(&bad, p.definition_revision, p.interpretation_revision, &b)
+                .is_err()
         );
         let mut bad = bytes;
         bad[34..36].copy_from_slice(&0u16.to_be_bytes());
         assert!(
-            decode_publication_payload(
-                &bad,
-                &d,
-                p.definition_revision,
-                p.interpretation_revision,
-                &b
-            )
-            .is_err()
+            decode_publication_payload(&bad, p.definition_revision, p.interpretation_revision, &b)
+                .is_err()
         );
     }
     #[test]
     fn binding_rejects_unknown_duplicate_and_oversized_format_fields() {
-        let (_, mut b, _) = fixture();
-        b.data_versions[0].max_value_bytes = 257;
+        let (mut b, _) = fixture();
+        b.occurrences[0].data_version.max_value_bytes = 257;
         assert!(encode_binding(&b).is_err());
-        let (_, b, _) = fixture();
+        let (b, _) = fixture();
         let mut bytes = encode_binding(&b).unwrap().into_bytes();
         bytes.extend_from_slice(&[8, 1]);
         assert!(decode_binding(&bytes).is_err());

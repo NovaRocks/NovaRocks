@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::persistence::codec::binding_model::output_identity;
 use crate::persistence::codec::{
     PhysicalFieldLogicalIdentity, StateEncoding, StateRole,
     internal_retraction_count_aggregate_identity,
@@ -37,17 +38,17 @@ use crate::persistence::validation::runtime::{
     RuntimeSourceFieldReference, RuntimeStateSlotFacts,
 };
 use bytes::Bytes;
-use novarocks_spi::connector::ConnectorPreparedCreateDocumentTarget;
+use novarocks_spi::connector::{ConnectorPreparedCreateDocumentTarget, ProviderSourceType};
 use novarocks_sql::planning::mv::{
     SqlMvCreatePersistenceFacts, SqlMvPersistenceSourceFieldReference,
 };
+use novarocks_type_contract::{CanonicalFactWriter, FunctionId};
 use novarocks_types::mv_aggregate_layout::{MvAggregateRuntimeLayout, MvAggregateStateRole};
 use sha2::{Digest, Sha256};
 
-const AGGREGATE_IDENTITY_DOMAIN: &[u8] = b"novarocks.mv.aggregate.v1";
-const BRANCH_IDENTITY_DOMAIN: &[u8] = b"novarocks.mv.branch.v1";
-const OUTPUT_IDENTITY_DOMAIN: &[u8] = b"novarocks.mv.output.v1";
-const STATE_SLOT_IDENTITY_DOMAIN: &[u8] = b"novarocks.mv.state-slot.v1";
+const AGGREGATE_IDENTITY_DOMAIN: &str = "novarocks.mv.aggregate";
+const BRANCH_IDENTITY_DOMAIN: &str = "novarocks.mv.branch";
+const STATE_SLOT_IDENTITY_DOMAIN: &str = "novarocks.mv.state-slot";
 
 /// One exact source field observed under the same provider generation used to
 /// analyze CREATE. `field_ordinal` is deliberately retained only for the
@@ -57,7 +58,7 @@ pub struct MvCreateSourceFieldObservation {
     pub field_ordinal: u32,
     pub field_name: String,
     pub provider_field_id: Bytes,
-    pub type_signature: String,
+    pub source_type: ProviderSourceType,
     pub nullable: bool,
 }
 
@@ -67,7 +68,6 @@ pub struct MvCreateSourceFieldObservation {
 pub struct MvCreateRelationObservation {
     pub occurrence_id: u32,
     pub provider_object_id: Bytes,
-    pub provider_schema_version: Bytes,
     pub fields: Vec<MvCreateSourceFieldObservation>,
 }
 
@@ -79,7 +79,7 @@ pub(crate) struct MvCreateTargetFieldObservation {
     pub request_ordinal: u32,
     pub physical_name: String,
     pub provider_field_id: Bytes,
-    pub type_signature: String,
+    pub source_type: ProviderSourceType,
     pub nullable: bool,
 }
 
@@ -88,8 +88,7 @@ pub(crate) struct MvAggregateCreateBindingInput<'a> {
     pub sql_facts: &'a SqlMvCreatePersistenceFacts,
     pub runtime_layout: &'a MvAggregateRuntimeLayout,
     pub source_observations: &'a [MvCreateRelationObservation],
-    pub target_observations: &'a [MvCreateTargetFieldObservation],
-    pub prepared_target: &'a ConnectorPreparedCreateDocumentTarget,
+    pub targets: &'a BTreeMap<&'a str, &'a MvCreateTargetFieldObservation>,
 }
 
 /// The aggregate-owned portions of an interpretation's durable facts.
@@ -102,7 +101,6 @@ pub(crate) struct MvAggregateCreateBindings {
     /// Shared semantic identities used by both D and L. The document builder
     /// must consume these values rather than recomputing output or branch
     /// hashes from an adjacent representation.
-    pub source_fields: BTreeMap<(u32, u32), FieldIdentity>,
     pub output_identities: BTreeMap<u32, OutputIdentity>,
     pub branch_identities: BTreeMap<u32, BranchIdentity>,
     pub aggregate_layout: RuntimeAggregateLayoutFacts,
@@ -116,9 +114,9 @@ pub(crate) fn build_mv_aggregate_create_bindings(
     input: MvAggregateCreateBindingInput<'_>,
 ) -> Result<MvAggregateCreateBindings, String> {
     let source_fields = source_field_map(input.sql_facts, input.source_observations)?;
-    let output_identities = output_identities(input.sql_facts, &source_fields)?;
+    let output_identities = output_identities(input.sql_facts)?;
     let branches = branch_identities(input.sql_facts, &output_identities)?;
-    let targets = target_field_map(input.target_observations, input.prepared_target)?;
+    let targets = input.targets;
 
     // A durable aggregate is one per (branch, output position). Two branches
     // computing the same output are two aggregates, and they share the one
@@ -209,15 +207,16 @@ pub(crate) fn build_mv_aggregate_create_bindings(
                 );
             }
             let aggregate_id = normal_aggregate_identity(
-                aggregate.function_identity(),
+                aggregate.canonical_bytes(),
+                aggregate.aggregate_ordinal(),
                 branch,
                 output,
                 &source_fields,
             );
             let state_slot_ids = bind_aggregate_states(
-                aggregate.function_identity(),
+                aggregate.function_id(),
                 &columns,
-                &targets,
+                targets,
                 &mut state_slots,
                 &mut target_fields,
             )?;
@@ -225,6 +224,7 @@ pub(crate) fn build_mv_aggregate_create_bindings(
                 aggregate_id,
                 function_identity: aggregate.function_identity().to_string(),
                 semantic_contract: Some(aggregate.semantic_contract().clone()),
+                binding_signature: Some(Bytes::copy_from_slice(aggregate.canonical_bytes())),
                 source_fields,
                 state_slot_ids,
                 branch_id: branch.cloned(),
@@ -238,11 +238,12 @@ pub(crate) fn build_mv_aggregate_create_bindings(
     if let Some(column) = retraction_columns.into_iter().next() {
         let aggregate_id = internal_retraction_count_aggregate_identity();
         let state_slot_ids =
-            bind_retraction_state(column, &targets, &mut state_slots, &mut target_fields)?;
+            bind_retraction_state(column, targets, &mut state_slots, &mut target_fields)?;
         aggregates.push(RuntimeAggregateFacts {
             aggregate_id,
             function_identity: "count".to_string(),
             semantic_contract: None,
+            binding_signature: None,
             source_fields: Vec::new(),
             state_slot_ids,
             // The retraction count is the view's own bookkeeping, not any
@@ -252,7 +253,6 @@ pub(crate) fn build_mv_aggregate_create_bindings(
     }
 
     Ok(MvAggregateCreateBindings {
-        source_fields,
         output_identities,
         branch_identities: branches,
         aggregate_layout: RuntimeAggregateLayoutFacts {
@@ -263,7 +263,7 @@ pub(crate) fn build_mv_aggregate_create_bindings(
     })
 }
 
-fn source_field_map(
+pub(crate) fn source_field_map(
     facts: &SqlMvCreatePersistenceFacts,
     observations: &[MvCreateRelationObservation],
 ) -> Result<BTreeMap<(u32, u32), FieldIdentity>, String> {
@@ -324,25 +324,12 @@ fn source_field_map(
 
 fn output_identities(
     facts: &SqlMvCreatePersistenceFacts,
-    source_fields: &BTreeMap<(u32, u32), FieldIdentity>,
 ) -> Result<BTreeMap<u32, OutputIdentity>, String> {
     let mut outputs = BTreeMap::new();
     for output in facts.outputs() {
-        let references =
-            aggregate_source_fields(output.expression().source_fields(), source_fields)?;
-        let mut canonical = CanonicalBytes::new(OUTPUT_IDENTITY_DOMAIN);
-        canonical.text(output.name());
-        canonical.text(&format!("{:?}", output.data_type()));
-        canonical.bool(output.nullable());
-        canonical.text(&format!("{:?}", output.expression().kind()));
-        canonical.optional_text(output.expression().function_identity());
-        canonical.references(&references);
+        let ordinal = output.output_ordinal();
         if outputs
-            .insert(
-                output.output_ordinal(),
-                OutputIdentity::try_new(digest(canonical).to_vec())
-                    .expect("SHA-256 identity is nonempty"),
-            )
+            .insert(ordinal, output_identity(ordinal, output.canonical_bytes()))
             .is_some()
         {
             return Err("SQL output facts contain a duplicate construction ordinal".to_string());
@@ -357,14 +344,11 @@ fn branch_identities(
 ) -> Result<BTreeMap<u32, BranchIdentity>, String> {
     let mut branches = BTreeMap::new();
     for branch in facts.union_branches() {
-        let mut canonical = CanonicalBytes::new(BRANCH_IDENTITY_DOMAIN);
-        canonical.u32s(
-            &branch
-                .relation_occurrence_ids()
-                .iter()
-                .map(|id| id.get())
-                .collect::<Vec<_>>(),
-        );
+        let mut canonical = CanonicalFactWriter::new(BRANCH_IDENTITY_DOMAIN, 1);
+        canonical.sequence(branch.relation_occurrence_ids().len());
+        for id in branch.relation_occurrence_ids() {
+            canonical.u32(id.get());
+        }
         let output_ids = branch
             .output_ordinals()
             .iter()
@@ -374,7 +358,10 @@ fn branch_identities(
                     .ok_or_else(|| "UNION branch references an unknown output ordinal".to_string())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        canonical.output_identities(&output_ids);
+        canonical.sequence(output_ids.len());
+        for id in output_ids {
+            canonical.bytes(id.as_bytes());
+        }
         if branches
             .insert(
                 branch.branch_ordinal(),
@@ -412,7 +399,7 @@ fn aggregate_source_fields(
         .collect()
 }
 
-fn target_field_map<'a>(
+pub(crate) fn target_field_map<'a>(
     observations: &'a [MvCreateTargetFieldObservation],
     target: &ConnectorPreparedCreateDocumentTarget,
 ) -> Result<BTreeMap<&'a str, &'a MvCreateTargetFieldObservation>, String> {
@@ -424,8 +411,8 @@ fn target_field_map<'a>(
     let mut by_name = BTreeMap::new();
     let mut ordinals = BTreeSet::new();
     for observation in observations {
-        if observation.physical_name.is_empty() || observation.type_signature.trim().is_empty() {
-            return Err("CREATE target observation has an empty physical name or type".to_string());
+        if observation.physical_name.is_empty() {
+            return Err("CREATE target observation has an empty physical name".to_string());
         }
         let prepared = target
             .fields()
@@ -438,6 +425,8 @@ fn target_field_map<'a>(
             })?;
         if prepared.request_ordinal() != observation.request_ordinal
             || prepared.provider_field_id().as_ref() != observation.provider_field_id.as_ref()
+            || prepared.source_type() != &observation.source_type
+            || prepared.nullable() != observation.nullable
         {
             return Err(
                 "CREATE target observation disagrees with prepared provider field binding"
@@ -465,31 +454,41 @@ fn target_field_map<'a>(
 }
 
 fn normal_aggregate_identity(
-    function_identity: &str,
+    binding_signature: &[u8],
+    call_ordinal: u32,
     branch: Option<&BranchIdentity>,
     output: &OutputIdentity,
     source_fields: &[RuntimeSourceFieldReference],
 ) -> AggregateIdentity {
-    let mut canonical = CanonicalBytes::new(AGGREGATE_IDENTITY_DOMAIN);
-    canonical.text(function_identity);
-    canonical.optional_branch_identity(branch);
-    canonical.identity(output.as_bytes());
-    canonical.references(source_fields);
+    let mut canonical = CanonicalFactWriter::new(AGGREGATE_IDENTITY_DOMAIN, 1);
+    canonical.bytes(binding_signature);
+    canonical.u32(call_ordinal);
+    canonical.boolean(branch.is_some());
+    if let Some(branch) = branch {
+        canonical.bytes(branch.as_bytes());
+    }
+    canonical.bytes(output.as_bytes());
+    canonical.sequence(source_fields.len());
+    for source in source_fields {
+        canonical.u32(source.occurrence_id);
+        canonical.bytes(source.field_id.as_bytes());
+    }
     AggregateIdentity::try_new(digest(canonical).to_vec()).expect("SHA-256 identity is nonempty")
 }
 
 fn bind_aggregate_states(
-    function_identity: &str,
+    function_identity: &FunctionId,
     columns: &[&novarocks_types::mv_aggregate_layout::MvAggregateStateColumn],
     targets: &BTreeMap<&str, &MvCreateTargetFieldObservation>,
     state_slots: &mut Vec<RuntimeStateSlotFacts>,
     target_fields: &mut Vec<RuntimePhysicalFieldFacts>,
 ) -> Result<Vec<StateSlotIdentity>, String> {
-    let expected_roles: &[MvAggregateStateRole] = if function_identity == "avg" {
-        &[MvAggregateStateRole::AvgSum, MvAggregateStateRole::AvgCount]
-    } else {
-        &[MvAggregateStateRole::Single]
-    };
+    let expected_roles: &[MvAggregateStateRole] =
+        if function_identity.as_str() == "builtin.aggregate/avg/v1" {
+            &[MvAggregateStateRole::AvgSum, MvAggregateStateRole::AvgCount]
+        } else {
+            &[MvAggregateStateRole::Single]
+        };
     if columns
         .iter()
         .map(|column| column.state_role())
@@ -551,7 +550,7 @@ fn bind_state(
     let slot_id = state_slot_identity(&target_field_id, role);
     if let Some(existing) = state_slots.iter().find(|slot| slot.slot_id == slot_id) {
         if existing.target_field_id != target_field_id
-            || existing.type_signature != target.type_signature
+            || existing.source_type != target.source_type
             || existing.nullable != target.nullable
             || existing.role != role
         {
@@ -565,7 +564,7 @@ fn bind_state(
     state_slots.push(RuntimeStateSlotFacts {
         slot_id: slot_id.clone(),
         target_field_id: target_field_id.clone(),
-        type_signature: target.type_signature.clone(),
+        source_type: target.source_type.clone(),
         nullable: target.nullable,
         role,
         encoding: StateEncoding::NativeColumnV1,
@@ -573,7 +572,7 @@ fn bind_state(
     target_fields.push(RuntimePhysicalFieldFacts {
         logical_identity: PhysicalFieldLogicalIdentity::State(slot_id.clone()),
         target_field_id,
-        type_signature: target.type_signature.clone(),
+        source_type: target.source_type.clone(),
         nullable: target.nullable,
     });
     Ok(slot_id)
@@ -589,8 +588,8 @@ fn state_role(role: MvAggregateStateRole) -> Result<StateRole, String> {
 }
 
 fn state_slot_identity(target_field_id: &FieldIdentity, role: StateRole) -> StateSlotIdentity {
-    let mut canonical = CanonicalBytes::new(STATE_SLOT_IDENTITY_DOMAIN);
-    canonical.identity(target_field_id.as_bytes());
+    let mut canonical = CanonicalFactWriter::new(STATE_SLOT_IDENTITY_DOMAIN, 1);
+    canonical.bytes(target_field_id.as_bytes());
     canonical.text(match role {
         StateRole::Single => "single",
         StateRole::AvgSum => "avg-sum",
@@ -600,86 +599,8 @@ fn state_slot_identity(target_field_id: &FieldIdentity, role: StateRole) -> Stat
     StateSlotIdentity::try_new(digest(canonical).to_vec()).expect("SHA-256 identity is nonempty")
 }
 
-fn digest(canonical: CanonicalBytes) -> [u8; 32] {
-    Sha256::digest(canonical.into_bytes()).into()
-}
-
-struct CanonicalBytes(Vec<u8>);
-
-impl CanonicalBytes {
-    fn new(domain: &[u8]) -> Self {
-        let mut value = Self(Vec::new());
-        value.bytes(domain);
-        value
-    }
-
-    fn into_bytes(self) -> Vec<u8> {
-        self.0
-    }
-
-    fn bytes(&mut self, value: &[u8]) {
-        self.0
-            .extend_from_slice(&(value.len() as u64).to_be_bytes());
-        self.0.extend_from_slice(value);
-    }
-
-    fn text(&mut self, value: &str) {
-        self.bytes(value.as_bytes());
-    }
-
-    fn optional_text(&mut self, value: Option<&str>) {
-        match value {
-            Some(value) => {
-                self.0.push(1);
-                self.text(value);
-            }
-            None => self.0.push(0),
-        }
-    }
-
-    fn bool(&mut self, value: bool) {
-        self.0.push(u8::from(value));
-    }
-
-    fn identity(&mut self, identity: &[u8]) {
-        self.bytes(identity);
-    }
-
-    fn optional_branch_identity(&mut self, identity: Option<&BranchIdentity>) {
-        match identity {
-            Some(identity) => {
-                self.0.push(1);
-                self.identity(identity.as_bytes());
-            }
-            None => self.0.push(0),
-        }
-    }
-
-    fn output_identities(&mut self, identities: &[&OutputIdentity]) {
-        self.0
-            .extend_from_slice(&(identities.len() as u64).to_be_bytes());
-        for identity in identities {
-            self.identity(identity.as_bytes());
-        }
-    }
-
-    fn references(&mut self, references: &[RuntimeSourceFieldReference]) {
-        self.0
-            .extend_from_slice(&(references.len() as u64).to_be_bytes());
-        for reference in references {
-            self.0
-                .extend_from_slice(&reference.occurrence_id.to_be_bytes());
-            self.identity(reference.field_id.as_bytes());
-        }
-    }
-
-    fn u32s(&mut self, values: &[u32]) {
-        self.0
-            .extend_from_slice(&(values.len() as u64).to_be_bytes());
-        for value in values {
-            self.0.extend_from_slice(&value.to_be_bytes());
-        }
-    }
+fn digest(canonical: CanonicalFactWriter) -> [u8; 32] {
+    Sha256::digest(canonical.finish()).into()
 }
 
 /// Check the aggregate contract attached to an actual publication before using
@@ -691,129 +612,23 @@ pub fn validate_published_aggregate_contracts(
     let catalogue = builtin_engine_function_catalog();
     for aggregate in &interpretation.aggregates {
         let function = aggregate.function_identity.as_str();
-        match &aggregate.semantic_contract {
-            Some(contract) if catalogue.admits_persistent_aggregate(contract) => {}
-            Some(contract) => {
-                return Err(format!(
-                    "MV aggregate {function} requires a full rebuild: publication overload {} carries result contract {} and state format {}, which are no longer admitted",
-                    contract.overload.as_str(),
-                    contract.result_semantics,
-                    contract.state_format.as_str(),
-                ));
+        let Some(contract) = aggregate.semantic_contract.as_ref() else {
+            if aggregate.aggregate_id == internal_retraction_count_aggregate_identity() {
+                continue;
             }
-            None if matches!(
-                function,
-                "min"
-                    | "max"
-                    | "min_by"
-                    | "max_by"
-                    | "min_n"
-                    | "max_n"
-                    | "bool_and"
-                    | "bool_or"
-                    | "booland_agg"
-                    | "boolor_agg"
-                    | "map_agg"
-                    | "array_agg"
-                    | "array_agg_distinct"
-                    | "variance"
-                    | "stddev"
-                    | "ndv"
-                    | "approx_distinct"
-                    | "approx_count_distinct"
-                    | "approx_most_frequent"
-                    | "approx_top_k"
-                    | "approx_percentile"
-                    | "percentile_approx"
-                    | "percentile_approx_weighted"
-                    | "group_concat"
-                    | "string_agg"
-                    | "listagg"
-            ) =>
-            {
-                return Err(format!(
-                    "MV aggregate {function} requires a full rebuild: publication has no selected aggregate semantic contract"
-                ));
-            }
-            None => {}
+            return Err(format!(
+                "MV aggregate {function} has no selected state binding"
+            ));
+        };
+        if !catalogue.admits_persistent_aggregate(contract) {
+            return Err(format!(
+                "MV aggregate {function} requires a full rebuild: publication overload {} carries state format {}, which are no longer admitted",
+                contract.overload.as_str(),
+                contract.state_format.as_str(),
+            ));
         }
     }
     Ok(())
-}
-
-/// Author a replacement interpretation from the original definition's freshly
-/// analyzed calls. A full rebuild retains the same logical aggregate and state
-/// column identities. Only the publication author may install this revision
-/// with the successfully rebuilt rows.
-pub fn rebind_aggregate_semantic_contracts(
-    definition: &super::codec::DefinitionDocument,
-    interpretation: &super::codec::InterpretationDocument,
-    current: &novarocks_sql::planning::mv::SqlMvCreatePersistenceFacts,
-) -> Result<super::codec::InterpretationDocument, String> {
-    use super::codec::internal_retraction_count_aggregate_identity;
-
-    let mut rebound = interpretation.clone();
-    let mut seen = BTreeSet::new();
-    for call in current.aggregates() {
-        let output = call
-            .output_ordinal()
-            .and_then(|ordinal| definition.outputs.get(ordinal as usize))
-            .ok_or("MV rebuild aggregate does not bind a retained output")?;
-        let branch = call
-            .branch_ordinal()
-            .map(|ordinal| {
-                interpretation
-                    .branches
-                    .get(ordinal as usize)
-                    .map(|branch| &branch.branch_id)
-                    .ok_or("MV rebuild aggregate does not bind a retained branch")
-            })
-            .transpose()?;
-        let source_fields = call
-            .source_fields()
-            .iter()
-            .map(|source| {
-                let occurrence_id = source.occurrence_id().get();
-                let occurrence = definition
-                    .relation_occurrences
-                    .iter()
-                    .find(|occurrence| occurrence.occurrence_id == occurrence_id)
-                    .ok_or("MV rebuild aggregate does not bind a retained source occurrence")?;
-                let field = occurrence
-                    .fields
-                    .iter()
-                    .find(|field| field.name_at_binding == source.field_name())
-                    .ok_or("MV rebuild aggregate does not bind a retained source field")?;
-                Ok(RuntimeSourceFieldReference {
-                    occurrence_id,
-                    field_id: field.field_id.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, &'static str>>()?;
-        let identity = normal_aggregate_identity(
-            call.function_identity(),
-            branch,
-            &output.output_id,
-            &source_fields,
-        );
-        let aggregate = rebound
-            .aggregates
-            .iter_mut()
-            .find(|aggregate| aggregate.aggregate_id == identity)
-            .ok_or("MV rebuild aggregate differs from its retained source and output contract")?;
-        if !seen.insert(identity) {
-            return Err("MV rebuild aggregate repeats a retained aggregate identity".into());
-        }
-        aggregate.semantic_contract = Some(call.semantic_contract().clone());
-    }
-    let internal = internal_retraction_count_aggregate_identity();
-    if rebound.aggregates.iter().any(|aggregate| {
-        aggregate.aggregate_id != internal && !seen.contains(&aggregate.aggregate_id)
-    }) {
-        return Err("MV rebuild does not cover every retained aggregate".into());
-    }
-    validate_published_aggregate_contracts(&rebound)?;
-    Ok(rebound)
 }
 
 #[cfg(test)]
@@ -825,9 +640,9 @@ mod tests {
         ApplyKeyKind, InterpretationDocument, internal_retraction_count_aggregate_identity,
     };
     use crate::persistence::identity::{
-        ApplyKeyIdentity, ComputationIdentity, DocumentRevision, ObjectIdentity,
-        PartitionSpecVersion, SchemaVersion,
+        ApplyKeyIdentity, DocumentRevision, ObjectIdentity, PartitionSpecVersion, SchemaVersion,
     };
+    use crate::persistence::test_support::{aggregate_contract, fixture_type};
     use crate::persistence::validation::{
         runtime::{
             RuntimeApplyKeyComponentFacts, RuntimeApplyKeyFacts, RuntimeInterpretationFacts,
@@ -855,7 +670,7 @@ mod tests {
             request_ordinal: ordinal,
             physical_name: name.to_string(),
             provider_field_id: Bytes::from(vec![field_id]),
-            type_signature: "varbinary".to_string(),
+            source_type: fixture_type("varbinary"),
             nullable: false,
         }
     }
@@ -887,7 +702,7 @@ mod tests {
                         u32::try_from(ordinal).expect("small fixture ordinal"),
                         Bytes::from(vec![*field_id]),
                         format!("field_{ordinal}"),
-                        "varbinary".to_string(),
+                        fixture_type("varbinary"),
                         false,
                     )
                 })
@@ -937,7 +752,7 @@ mod tests {
         let mut physical = Vec::new();
 
         let ids = bind_aggregate_states(
-            "avg",
+            &aggregate_contract("avg").function,
             &[&columns[0], &columns[1]],
             &targets,
             &mut slots,
@@ -976,8 +791,14 @@ mod tests {
         let mut slots = Vec::new();
         let mut physical = Vec::new();
 
-        let ids = bind_aggregate_states("count", &[&column], &targets, &mut slots, &mut physical)
-            .expect("user COUNT bindings");
+        let ids = bind_aggregate_states(
+            &aggregate_contract("count").function,
+            &[&column],
+            &targets,
+            &mut slots,
+            &mut physical,
+        )
+        .expect("user COUNT bindings");
 
         assert_ne!(user_count, internal_retraction_count_aggregate_identity());
         assert_eq!(slots[0].role, StateRole::Single);
@@ -1106,7 +927,7 @@ mod tests {
         let mut slots = Vec::new();
         let mut state_target_fields = Vec::new();
         let avg_slot_ids = bind_aggregate_states(
-            "avg",
+            &aggregate_contract("avg").function,
             &[&avg_columns[0], &avg_columns[1]],
             &targets,
             &mut slots,
@@ -1126,23 +947,22 @@ mod tests {
             RuntimePhysicalFieldFacts {
                 logical_identity: PhysicalFieldLogicalIdentity::Output(output_id.clone()),
                 target_field_id: output_field.clone(),
-                type_signature: "double".to_string(),
+                source_type: fixture_type("double"),
                 nullable: true,
             },
             RuntimePhysicalFieldFacts {
                 logical_identity: PhysicalFieldLogicalIdentity::ApplyKey(apply_id.clone()),
                 target_field_id: apply_field.clone(),
-                type_signature: "binary".to_string(),
+                source_type: fixture_type("binary"),
                 nullable: false,
             },
         ]);
         let interpretation = InterpretationDocument::try_from(RuntimeInterpretationFacts {
             definition_revision: DocumentRevision::from_canonical_bytes(b"definition"),
-            computation_identity: ComputationIdentity::from_canonical_bytes(b"definition"),
             output_bindings: vec![RuntimeOutputBindingFacts {
                 output_id,
                 target_field_id: output_field,
-                type_signature: "double".to_string(),
+                source_type: fixture_type("double"),
                 nullable: true,
             }],
             aggregate_layout: RuntimeAggregateLayoutFacts {
@@ -1151,7 +971,8 @@ mod tests {
                     RuntimeAggregateFacts {
                         aggregate_id: avg_id,
                         function_identity: "avg".to_string(),
-                        semantic_contract: None,
+                        semantic_contract: Some(aggregate_contract("avg")),
+                        binding_signature: Some(Bytes::from_static(b"fixture-avg")),
                         source_fields: Vec::new(),
                         state_slot_ids: avg_slot_ids,
                         branch_id: None,
@@ -1160,6 +981,7 @@ mod tests {
                         aggregate_id: internal_id,
                         function_identity: "count".to_string(),
                         semantic_contract: None,
+                        binding_signature: None,
                         source_fields: Vec::new(),
                         state_slot_ids: retraction_slot_ids,
                         branch_id: None,

@@ -1097,6 +1097,7 @@ impl novarocks_type_contract::PureCompileControl for SqlCompileControl {
 /// exist until this phase has completed.
 pub struct SqlAnalyzeRequest<'a> {
     pub(crate) write_assignments: Option<Arc<SqlWriteAssignments>>,
+    first_refresh_view_row_lineage: bool,
     pub(crate) statement: SqlStatementInput,
     pub(crate) intent: SqlCompileIntent,
     pub(crate) session: SqlSessionContext,
@@ -1114,6 +1115,11 @@ pub struct SqlAnalyzeRequest<'a> {
 }
 
 impl<'a> SqlAnalyzeRequest<'a> {
+    pub(crate) fn with_first_refresh_view_row_lineage(mut self, enabled: bool) -> Self {
+        self.first_refresh_view_row_lineage = enabled;
+        self
+    }
+
     pub fn with_write_assignments(
         mut self,
         assignments: Arc<SqlWriteAssignments>,
@@ -1150,6 +1156,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
     ) -> Self {
         Self {
             write_assignments: None,
+            first_refresh_view_row_lineage: false,
             statement,
             intent,
             session,
@@ -1188,6 +1195,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
     ) -> Self {
         Self {
             write_assignments: None,
+            first_refresh_view_row_lineage: false,
             statement: SqlStatementInput::logical_plan(plan, factory, root_semantics),
             intent,
             session,
@@ -1466,7 +1474,7 @@ pub fn analyze_mv_refresh_input(
     .map_err(SqlCompileError::Compilation)?;
     let scoped_functions = functions.snapshot_for_scalar_presence();
     let functions = scoped_functions.as_ref();
-    let (resolved, _, factory) = crate::analyzer::analyze_mv_definition(
+    let (resolved, _, factory, view_dependencies) = crate::analyzer::analyze_mv_definition(
         &query,
         catalog.planner_table_provider(),
         &current_database,
@@ -1481,13 +1489,11 @@ pub fn analyze_mv_refresh_input(
     )?;
     crate::planning::mv::validate_persistable_output(&resolved, &factory)
         .map_err(SqlCompileError::Compilation)?;
-    let scalar_contracts =
-        crate::planning::mv_persistence::collect_scalar_contracts(&resolved, &control)?;
     Ok(
         crate::planning::mv::SqlResolvedMvRefreshInput::from_validated_analysis(
             resolved,
             names,
-            scalar_contracts,
+            view_dependencies,
         ),
     )
 }
@@ -1839,7 +1845,10 @@ impl SqlCompiler {
                 factory.clone(),
                 root_semantics.clone(),
                 true,
-                (request.session.sql_semantics.sql_mode().error_if_overflow()),
+                !request
+                    .session
+                    .sql_semantics
+                    .has_default_computation_semantics(),
                 request
                     .session
                     .sql_semantics
@@ -1891,6 +1900,7 @@ impl SqlCompiler {
                         },
                         request.statement.prepared_parameters.as_deref(),
                         request.table_sequence,
+                        request.first_refresh_view_row_lineage,
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;
@@ -1922,7 +1932,7 @@ impl SqlCompiler {
                     &query_semantics
                 };
                 let consumer_requires_semantic_snapshot =
-                    crate::sql_mode::query_requires_semantic_snapshot(effective, &query);
+                    !effective.has_default_computation_semantics();
                 (
                     logical_plan,
                     factory,

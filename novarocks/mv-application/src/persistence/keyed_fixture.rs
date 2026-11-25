@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_spi::connector::{
-    ConnectorInstanceId, ConnectorProviderId, ConnectorTableIdentity, ConnectorTableObjectId,
+    ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableObjectId,
 };
 use std::sync::Arc;
 /// Mutable keyed projection inputs for application tests; every build decodes an actual keyed Current view.
@@ -24,6 +24,8 @@ pub struct KeyedProjectionFixture {
     pub target: crate::product::MvTarget,
     pub object_id: ConnectorTableObjectId,
     pub definition: crate::persistence::codec::DefinitionDocument,
+    pub binding: crate::persistence::codec::BindingDocument,
+    pub mapping: crate::persistence::codec::StorageMappingDocument,
     pub interpretation: crate::persistence::codec::InterpretationDocument,
     pub configuration: crate::persistence::codec::ConfigurationDocument,
     pub publication: Option<crate::persistence::codec::keyed::KeyedPublicationDocument>,
@@ -42,6 +44,8 @@ impl KeyedProjectionFixture {
             target,
             object_id: f.object_id,
             definition: f.definition,
+            binding: f.binding,
+            mapping: f.mapping,
             interpretation: f.interpretation,
             configuration: f.configuration,
             file_totals: observed.view.current_snapshot_file_totals,
@@ -62,33 +66,20 @@ impl KeyedProjectionFixture {
     pub fn build(
         mut self,
     ) -> Result<crate::persistence::keyed_documents::MvKeyedDocumentProjection, String> {
-        use crate::persistence::{
-            codec::keyed::{BindingDocument, DataVersionFormat},
-            identity::ObjectIdentity,
-            keyed_documents::*,
-        };
+        use crate::persistence::{identity::ObjectIdentity, keyed_documents::*};
         self.definition = crate::persistence::codec::build_definition(
             self.definition.created_at_ms,
             self.definition.query.clone(),
-            self.definition.relation_occurrences.clone(),
-            self.definition.outputs.clone(),
         )
         .map_err(|e| e.to_string())?;
-        self.interpretation.computation_identity = self.definition.computation_identity;
         self.interpretation.target.object_id =
             ObjectIdentity::try_new(self.object_id.as_bytes().to_vec())
                 .map_err(|e| e.to_string())?;
-        let formats=self.definition.relation_occurrences.iter().map(|o|{
-            let object=crate::persistence::exact_revision::restore_persisted_object(&o.object_id).map_err(|e|e.to_string())?;
-            let fact=novarocks_spi::connector::ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(ConnectorProviderId::parse("iceberg").unwrap(),&object,Some(17)).map_err(|e|e.to_string())?;
-            DataVersionFormat::from_issued_fact(fact.data_version()).map_err(|e|e.to_string())
-        }).collect::<Result<Vec<_>,String>>()?;
         let versions = build_keyed_versions(
             &self.definition,
             &self.interpretation,
-            BindingDocument {
-                data_versions: formats,
-            },
+            self.binding,
+            self.mapping,
         )
         .map_err(|e| e.to_string())?;
         let snapshot = self.metadata_version.snapshot_id();
@@ -137,7 +128,7 @@ impl KeyedProjectionFixture {
         if let Some(p) = self.publication.as_mut() {
             p.definition_revision = versions.definition_revision();
             p.interpretation_revision = versions.interpretation_revision();
-            view.current_records = keyed_publication_document_set(&versions, &self.definition, p)
+            view.current_records = keyed_publication_document_set(&versions, p)
                 .map_err(|e| e.to_string())?
                 .records;
         }
@@ -192,7 +183,7 @@ pub fn observed_current_keyed(
     view.current_records = facts
         .publication()
         .map(|p| {
-            keyed_publication_document_set(facts.versions(), facts.definition(), p)
+            keyed_publication_document_set(facts.versions(), p)
                 .unwrap()
                 .records
         })

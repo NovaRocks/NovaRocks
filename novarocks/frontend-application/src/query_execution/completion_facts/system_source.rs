@@ -36,7 +36,7 @@ use crate::system_tables::{
 use crate::wake::NotifyWake;
 use novarocks_mv_application::{
     freshness::{MvSourceObservation, MvSourceState},
-    persistence::codec::RelationOccurrence,
+    persistence::codec::BindingOccurrence,
 };
 use novarocks_query_application::{
     api::StatementNativeHealthFailure,
@@ -225,7 +225,8 @@ impl FrontendSystemTableFacts {
                             inventory,
                             include_freshness,
                             include_definition,
-                        );
+                        )
+                        .with_retired(readiness.retired_mv_statuses());
                         Box::new(if states {
                             inventory.with_state_facts(management)
                         } else {
@@ -1013,7 +1014,7 @@ impl StatementSystemTableSource for FrontendSystemTableFacts {
     }
     async fn current_sources(
         &self,
-        occurrences: &[RelationOccurrence],
+        occurrences: &[BindingOccurrence],
         _: &ConnectorRequestContext,
     ) -> Result<Vec<MvSourceObservation>, SystemTableError> {
         let mut pins = BTreeMap::new();

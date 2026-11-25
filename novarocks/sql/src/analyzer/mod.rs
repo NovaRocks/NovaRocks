@@ -198,6 +198,13 @@ pub(crate) fn analyze_with_function_catalog(
     )
 }
 
+pub(crate) type MvDefinitionAnalysis = (
+    ResolvedQuery,
+    crate::analysis::cte::CTERegistry,
+    crate::column_id::ColumnRefFactory,
+    Vec<crate::catalog::SqlMvViewDependency>,
+);
+
 /// Analyze the defining query of a materialized view with its binding diagnostics.
 pub(crate) fn analyze_mv_definition(
     query: &ast::Query,
@@ -206,14 +213,7 @@ pub(crate) fn analyze_mv_definition(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
-) -> Result<
-    (
-        ResolvedQuery,
-        crate::analysis::cte::CTERegistry,
-        crate::column_id::ColumnRefFactory,
-    ),
-    AnalyzeError,
-> {
+) -> Result<MvDefinitionAnalysis, AnalyzeError> {
     analyze_mv_definition_with_factory(
         query,
         catalog,
@@ -233,31 +233,28 @@ pub(crate) fn analyze_mv_definition_with_factory(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
-) -> Result<
-    (
-        ResolvedQuery,
-        crate::analysis::cte::CTERegistry,
-        crate::column_id::ColumnRefFactory,
-    ),
-    AnalyzeError,
-> {
-    analyze_with_factory_and_function_catalog_and_assignments_inner(
-        query,
-        catalog,
-        current_database,
-        factory,
-        function_catalog,
-        &crate::sql_mode::SqlSemanticSettings::default(),
-        constant_policy,
-        control,
-        None,
-        None,
-        false,
-        None,
-        None,
-        QueryAnalysisPurpose::MaterializedViewDefinition,
-        None,
-    )
+) -> Result<MvDefinitionAnalysis, AnalyzeError> {
+    let views = view::ViewAnalysisStack::recording();
+    let (query, registry, factory) =
+        analyze_with_factory_and_function_catalog_and_assignments_inner(
+            query,
+            catalog,
+            current_database,
+            factory,
+            function_catalog,
+            &crate::sql_mode::SqlSemanticSettings::default(),
+            constant_policy,
+            control,
+            None,
+            None,
+            false,
+            None,
+            None,
+            QueryAnalysisPurpose::MaterializedViewDefinition,
+            None,
+            views.clone(),
+        )?;
+    Ok((query, registry, factory, views.take_dependencies()))
 }
 
 /// Analyze using the semantic setting frozen by the SQL compiler.
@@ -339,6 +336,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     statement_relation: Option<&crate::compiler::StatementSystemRelationSource>,
     prepared_parameters: Option<&crate::compiler::SqlPreparedParameters>,
     table_sequence: Option<&crate::compiler::table_sequence::TableSequencePass>,
+    first_refresh_view_row_lineage: bool,
 ) -> Result<
     (
         ResolvedQuery,
@@ -361,8 +359,13 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
         root_session_admitted,
         statement_relation,
         prepared_parameters,
-        QueryAnalysisPurpose::Ordinary,
+        if first_refresh_view_row_lineage {
+            QueryAnalysisPurpose::FirstRefreshViewRowLineage
+        } else {
+            QueryAnalysisPurpose::Ordinary
+        },
         table_sequence,
+        view::ViewAnalysisStack::default(),
     )
 }
 
@@ -419,6 +422,7 @@ pub(crate) fn describe_prepared_query(
             Some(parameters),
             QueryAnalysisPurpose::Ordinary,
             None,
+            view::ViewAnalysisStack::default(),
         )?;
     if ctas_source {
         crate::analysis::schema::validate_definition_column_names(
@@ -535,6 +539,7 @@ fn analyze_with_factory_and_function_catalog_inner(
         None,
         QueryAnalysisPurpose::Ordinary,
         None,
+        view::ViewAnalysisStack::default(),
     )
 }
 
@@ -558,6 +563,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     prepared_parameters: Option<&crate::compiler::SqlPreparedParameters>,
     purpose: QueryAnalysisPurpose,
     table_sequence: Option<&crate::compiler::table_sequence::TableSequencePass>,
+    view_stack: view::ViewAnalysisStack,
 ) -> Result<
     (
         ResolvedQuery,
@@ -618,7 +624,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
         control,
         sql_semantics: sql_semantics.clone(),
         factory: factory.clone(),
-        view_stack: Default::default(),
+        view_stack,
         ctes: std::collections::HashMap::new(),
         pending_ctes: std::collections::HashSet::new(),
         next_subquery_id: std::cell::Cell::new(0),
@@ -740,6 +746,7 @@ impl GroupingSyntax {
 enum QueryAnalysisPurpose {
     Ordinary,
     MaterializedViewDefinition,
+    FirstRefreshViewRowLineage,
 }
 
 pub(super) struct AnalyzerContext<'a> {

@@ -391,6 +391,13 @@ fn validate_request(
                 ),
             )?;
         }
+        ConnectorCatalogMutationOperation::DropTable {
+            table,
+            managed: Some(fence),
+            ..
+        } => {
+            fence.validate_for(&request.target, request.operation_id, table)?;
+        }
         ConnectorCatalogMutationOperation::AlterSchema { table, changes } => {
             ensure_owner(provider, &table.instance_id)?;
             for change in changes {
@@ -1201,6 +1208,7 @@ fn execute_drop_table(
         table,
         policy,
         data_disposition,
+        managed,
     } = &request.operation
     else {
         return Ok(known_uncommitted(internal(
@@ -1260,12 +1268,16 @@ fn execute_drop_table(
                     .map_err(unavailable)?;
                 request.context.check_active()?;
                 let captured = match loaded {
-                    Ok(loaded) => crate::catalog::CatalogDropTableReceipt {
-                        table_uuid: Some(Arc::from(loaded.metadata().uuid().to_string())),
-                        table_location: Some(Arc::from(loaded.metadata().location())),
-                        metadata_location: loaded.metadata_location().map(Arc::from),
-                        last_updated_ms: loaded.metadata().last_updated_ms(),
-                    },
+                    Ok(loaded) => {
+                        validate_managed_drop_current(managed.as_ref(), &loaded)?;
+                        crate::catalog::CatalogDropTableReceipt {
+                            table_uuid: Some(Arc::from(loaded.metadata().uuid().to_string())),
+                            table_location: Some(Arc::from(loaded.metadata().location())),
+                            metadata_location: loaded.metadata_location().map(Arc::from),
+                            last_updated_ms: loaded.metadata().last_updated_ms(),
+                        }
+                    }
+                    Err(error) if managed.is_some() => return Err(error.into()),
                     Err(_) => crate::catalog::CatalogDropTableReceipt {
                         table_uuid: None,
                         table_location: None,
@@ -1343,6 +1355,27 @@ fn execute_drop_table(
     Ok(outcome)
 }
 
+fn validate_managed_drop_current(
+    fence: Option<&novarocks_spi::connector::ConnectorManagedDropFence>,
+    table: &crate::loaded_table::IcebergLoadedTable,
+) -> Result<(), ConnectorError> {
+    let Some(fence) = fence else {
+        return Ok(());
+    };
+    let metadata = table.metadata();
+    let object = novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::from(
+        metadata.uuid().to_string(),
+    ))?;
+    let version = crate::document_storage::observation::committed_version_from_metadata(
+        metadata,
+        table.metadata_location(),
+    )?;
+    if fence.admission.expected_object_id() != Some(&object) || fence.expected_metadata != version {
+        return Err(invalid("Managed table changed after exact DROP admission"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn drop_table(
     provider: &IcebergMetadata,
@@ -1361,6 +1394,7 @@ fn drop_table(
             table: table.clone(),
             policy,
             data_disposition,
+            managed: None,
         },
         context: context.clone(),
     };
@@ -4326,6 +4360,7 @@ mod tests {
                     table: table.clone(),
                     policy: DropPolicy::FailIfMissing,
                     data_disposition: ConnectorDropTableDataDisposition::Purge,
+                    managed: None,
                 },
                 CatalogOperation::DropTable,
             ),
@@ -6594,6 +6629,7 @@ mod tests {
             } else {
                 ConnectorDropTableDataDisposition::Retain
             },
+            managed: None,
         };
         request
     }
@@ -11277,6 +11313,7 @@ mod tests {
                             table: table.clone(),
                             policy,
                             data_disposition: ConnectorDropTableDataDisposition::Retain,
+                            managed: None,
                         },
                     },
                     &receiving,

@@ -1813,6 +1813,17 @@ pub type ConnectorTableObjectSnapshotFuture<'a> = std::pin::Pin<
 >;
 
 pub trait ConnectorMetadata: Send + Sync {
+    /// Project managed document envelopes from the retained original Current
+    /// metadata. Ordinary tables have no keyed management documents.
+    fn project_current_keyed_documents(
+        &self,
+        _table: &ConnectorTableMetadata,
+        _planning: &super::ConnectorControlPlanningPin,
+        _context: &ConnectorRequestContext,
+    ) -> Result<Option<super::KeyedDocumentView>, ConnectorError> {
+        Ok(None)
+    }
+
     /// Project visible DDL properties from the same table observation as its schema.
     /// No second table lookup or access to the raw property map is implied.
     fn table_definition_properties(

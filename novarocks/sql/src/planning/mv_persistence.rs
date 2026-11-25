@@ -25,16 +25,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use arrow::datatypes::DataType;
+use novarocks_functions::{
+    AggregateBindingSelection, FunctionResultType, PersistentAggregateContract,
+};
+use novarocks_type_contract::{
+    AggregateStateArgumentContract, CanonicalFactWriter, FunctionArgumentType, FunctionValueType,
+    ValueTypeRef,
+};
 
 use crate::analysis::{
-    ExprKind, QueryBody, Relation, ResolvedQuery, SetOpKind, SortItem, TypedExpr,
+    ExprKind, LiteralValue, QueryBody, Relation, ResolvedQuery, SortItem, TypedExpr,
 };
+use crate::analyze_error::AnalyzeError;
+use crate::binding::SqlTableBindingId;
 use crate::column_id::ColumnId;
-use crate::common::{BinOp, UnOp};
 use crate::compiler::SqlMvRelationOccurrenceId;
-use crate::planner::table::ScanSource;
-use novarocks_functions::PersistentScalarContract;
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+use crate::planner::table::{ScanSource, SqlMvReadSelection};
+use crate::planning::catalog::SqlMvViewDependency;
+use crate::planning::mv::validate_mv_union_all;
 
 /// Complete SQL-owned input for CREATE-time MV persistence mapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,7 +51,7 @@ pub struct SqlMvCreatePersistenceFacts {
     outputs: Vec<SqlMvPersistenceOutputFacts>,
     aggregates: Vec<SqlMvPersistenceAggregateFacts>,
     union_branches: Vec<SqlMvPersistenceUnionBranchFacts>,
-    scalar_contracts: Box<[PersistentScalarContract]>,
+    view_dependencies: Vec<SqlMvViewDependency>,
 }
 
 impl SqlMvCreatePersistenceFacts {
@@ -59,8 +67,8 @@ impl SqlMvCreatePersistenceFacts {
         &self.aggregates
     }
 
-    pub fn scalar_contracts(&self) -> &[PersistentScalarContract] {
-        &self.scalar_contracts
+    pub fn view_dependencies(&self) -> &[SqlMvViewDependency] {
+        &self.view_dependencies
     }
 
     /// Ordered UNION ALL leaves. A non-UNION query has no branch records.
@@ -77,6 +85,9 @@ pub struct SqlMvPersistenceRelationOccurrenceFacts {
     namespace: String,
     relation: String,
     qualifier: String,
+    binding: SqlTableBindingId,
+    read_selection: SqlMvReadSelection,
+    field_paths: Vec<SqlMvFieldPath>,
     referenced_fields: Vec<SqlMvPersistenceSourceFieldFacts>,
 }
 
@@ -101,9 +112,70 @@ impl SqlMvPersistenceRelationOccurrenceFacts {
         &self.qualifier
     }
 
-    /// Referenced fields only, in source-schema order.
+    /// The original statement-local binding used by this analyzed scan.
+    pub fn binding(&self) -> SqlTableBindingId {
+        self.binding
+    }
+
+    pub fn read_selection(&self) -> SqlMvReadSelection {
+        self.read_selection
+    }
+
+    /// Stable SQL occurrence identity. The provider authors the object identity.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut writer = CanonicalFactWriter::new("novarocks.sql.mv-occurrence", 1);
+        writer.u32(self.occurrence_id.get());
+        writer.u32(match self.read_selection {
+            SqlMvReadSelection::Current => 1,
+            SqlMvReadSelection::Snapshot => 2,
+            SqlMvReadSelection::Branch => 3,
+            SqlMvReadSelection::Tag => 4,
+        });
+        writer.finish()
+    }
+
+    pub fn field_paths(&self) -> &[SqlMvFieldPath] {
+        &self.field_paths
+    }
+
+    /// Top-level referenced fields in source-schema order.
     pub fn referenced_fields(&self) -> &[SqlMvPersistenceSourceFieldFacts] {
         &self.referenced_fields
+    }
+}
+
+/// A coordinate in the exact schema used to analyze a field access.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SqlMvFieldCoordinate {
+    ordinal: u32,
+    name: String,
+}
+
+impl SqlMvFieldCoordinate {
+    pub fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// A provider projection request in one analyzed scan's exact schema.
+/// Only the provider's field IDs and type facts carry durable identity.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SqlMvFieldPath {
+    fields: Vec<SqlMvFieldCoordinate>,
+    whole_subtree: bool,
+}
+
+impl SqlMvFieldPath {
+    pub fn fields(&self) -> &[SqlMvFieldCoordinate] {
+        &self.fields
+    }
+
+    pub fn whole_subtree(&self) -> bool {
+        self.whole_subtree
     }
 }
 
@@ -154,9 +226,10 @@ impl SqlMvPersistenceSourceFieldReference {
 pub struct SqlMvPersistenceOutputFacts {
     output_ordinal: u32,
     name: String,
-    data_type: DataType,
-    nullable: bool,
-    expression: SqlMvPersistenceExpressionFacts,
+    value_type: FunctionValueType,
+    source_fields: Vec<SqlMvPersistenceSourceFieldReference>,
+    direct_source: Option<SqlMvPersistenceSourceFieldReference>,
+    canonical_bytes: Vec<u8>,
 }
 
 impl SqlMvPersistenceOutputFacts {
@@ -169,49 +242,28 @@ impl SqlMvPersistenceOutputFacts {
     }
 
     pub fn data_type(&self) -> &DataType {
-        &self.data_type
+        self.value_type.data_type()
     }
 
     pub fn nullable(&self) -> bool {
-        self.nullable
+        self.value_type.nullable()
     }
 
-    pub fn expression(&self) -> &SqlMvPersistenceExpressionFacts {
-        &self.expression
-    }
-}
-
-/// Persistence-relevant shape of an output expression.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SqlMvPersistenceExpressionFacts {
-    kind: SqlMvPersistenceExpressionKind,
-    function_identity: Option<String>,
-    source_fields: Vec<SqlMvPersistenceSourceFieldReference>,
-}
-
-impl SqlMvPersistenceExpressionFacts {
-    pub fn kind(&self) -> SqlMvPersistenceExpressionKind {
-        self.kind
+    pub fn value_type(&self) -> &ValueTypeRef {
+        self.value_type.value_type()
     }
 
-    /// Stable SQL function/operator family spelling for Function and Mixed.
-    pub fn function_identity(&self) -> Option<&str> {
-        self.function_identity.as_deref()
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
     }
 
-    /// Set-semantics references, sorted by occurrence then source ordinal.
+    pub fn direct_source(&self) -> Option<&SqlMvPersistenceSourceFieldReference> {
+        self.direct_source.as_ref()
+    }
+
     pub fn source_fields(&self) -> &[SqlMvPersistenceSourceFieldReference] {
         &self.source_fields
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SqlMvPersistenceExpressionKind {
-    Field,
-    Literal,
-    Cast,
-    Function,
-    Mixed,
 }
 
 /// One analyzed aggregate call in branch/output traversal order.
@@ -221,7 +273,12 @@ pub struct SqlMvPersistenceAggregateFacts {
     branch_ordinal: Option<u32>,
     output_ordinal: Option<u32>,
     function_identity: String,
-    semantic_contract: novarocks_functions::PersistentAggregateContract,
+    semantic_contract: PersistentAggregateContract,
+    signature: novarocks_type_contract::FunctionArgumentTypes,
+    logical_argument_count: usize,
+    result_type: FunctionValueType,
+    selection: AggregateBindingSelection,
+    canonical_bytes: Vec<u8>,
     source_fields: Vec<SqlMvPersistenceSourceFieldReference>,
 }
 
@@ -242,8 +299,33 @@ impl SqlMvPersistenceAggregateFacts {
         &self.function_identity
     }
 
-    pub fn semantic_contract(&self) -> &novarocks_functions::PersistentAggregateContract {
+    pub fn semantic_contract(&self) -> &PersistentAggregateContract {
         &self.semantic_contract
+    }
+
+    pub fn function_id(&self) -> &novarocks_type_contract::FunctionId {
+        &self.semantic_contract.function
+    }
+
+    pub fn overload_id(&self) -> &novarocks_type_contract::FunctionOverloadId {
+        &self.semantic_contract.overload
+    }
+
+    pub fn argument_types(&self) -> &[FunctionArgumentType] {
+        &self.signature[..self.logical_argument_count]
+    }
+
+    pub fn result_type(&self) -> &FunctionValueType {
+        &self.result_type
+    }
+
+    pub fn selection(&self) -> &AggregateBindingSelection {
+        &self.selection
+    }
+
+    /// Exact selected binding, independent of the call's position and source.
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
     }
 
     pub fn source_fields(&self) -> &[SqlMvPersistenceSourceFieldReference] {
@@ -273,18 +355,34 @@ impl SqlMvPersistenceUnionBranchFacts {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FieldUse {
+    occurrence_id: SqlMvRelationOccurrenceId,
+    path: SqlMvFieldPath,
+}
+
+type FieldUses = BTreeSet<FieldUse>;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ColumnLineage {
+    fields: FieldUses,
+    passthrough: bool,
+}
+
 struct ProjectionBuilder {
     occurrences: Vec<SqlMvPersistenceRelationOccurrenceFacts>,
-    source_fields_by_column_id: BTreeMap<ColumnId, BTreeSet<SqlMvPersistenceSourceFieldReference>>,
-    referenced_fields: BTreeSet<SqlMvPersistenceSourceFieldReference>,
+    source_fields_by_column_id: BTreeMap<ColumnId, ColumnLineage>,
+    referenced_fields: FieldUses,
     aggregates: Vec<SqlMvPersistenceAggregateFacts>,
+    // The keys are only compared within this borrowed tree and never dereferenced.
+    scan_occurrences: BTreeMap<*const crate::analysis::ScanRelation, SqlMvRelationOccurrenceId>,
 }
 
 pub(super) fn project_create_persistence_facts(
     query: &ResolvedQuery,
     names: &[String],
-    scalar_contracts: Box<[PersistentScalarContract]>,
-) -> Result<SqlMvCreatePersistenceFacts, String> {
+    view_dependencies: &[SqlMvViewDependency],
+) -> Result<SqlMvCreatePersistenceFacts, AnalyzeError> {
     let mut output_leaves = Vec::new();
     let is_root_union = collect_union_leaves(query, &mut output_leaves)?;
     let mut builder = ProjectionBuilder {
@@ -292,8 +390,9 @@ pub(super) fn project_create_persistence_facts(
         source_fields_by_column_id: BTreeMap::new(),
         referenced_fields: BTreeSet::new(),
         aggregates: Vec::new(),
+        scan_occurrences: BTreeMap::new(),
     };
-    register_query(query, &mut builder)?;
+    let output_lineages = register_query(query, &mut builder)?;
 
     // Branches are the leaves whose rows reach the target, which is the root
     // UNION and nothing else. A UNION under an aggregate is an input to one
@@ -306,59 +405,78 @@ pub(super) fn project_create_persistence_facts(
         output_leaves
             .iter()
             .map(|leaf| query_relation_occurrence_ids(leaf, &builder))
-            .collect::<Result<Vec<_>, String>>()?
+            .collect::<Result<Vec<_>, AnalyzeError>>()?
     } else {
         Vec::new()
     };
 
-    let leaf_expressions = output_leaves
+    collect_query_semantics(query, &branch_occurrences, true, &mut builder)?;
+    let output_columns = query
+        .output_columns
         .iter()
-        .map(|leaf| project_leaf_expressions(leaf, &mut builder))
-        .collect::<Result<Vec<_>, String>>()?;
-    collect_query_semantics(query, &branch_occurrences, &mut builder)?;
-
-    let output_columns = output_columns(query);
-    if names.len() != output_columns.len() {
-        return Err("MV persistence output declaration width differs from analyzed output".into());
-    }
-    if leaf_expressions
-        .iter()
-        .any(|expressions| expressions.len() != output_columns.len())
-    {
-        return Err("MV CREATE persistence output arity does not match UNION branches".to_string());
+        .filter(|column| !column.is_internal);
+    let visible_count = output_columns.clone().count();
+    if names.len() != visible_count || output_lineages.len() != visible_count {
+        return Err(AnalyzeError::internal(
+            "MV persistence output declaration width differs from analyzed output",
+        ));
     }
     let outputs = output_columns
-        .into_iter()
+        .zip(output_lineages)
+        .zip(names)
         .enumerate()
-        .map(|(output_index, (_label, data_type, nullable))| {
-            let expressions = leaf_expressions
-                .iter()
-                .map(|branch| branch[output_index].clone())
-                .collect::<Vec<_>>();
+        .map(|(output_index, ((field, lineage), name))| {
+            builder
+                .referenced_fields
+                .extend(lineage.fields.iter().cloned());
+            let mut writer = CanonicalFactWriter::new("novarocks.sql.mv-output-type", 1);
+            writer.value_type(field.value_type.value_type());
+            let source_fields = root_source_fields(&lineage.fields);
+            let direct_source = match source_fields.as_slice() {
+                [field]
+                    if lineage.passthrough
+                        && lineage
+                            .fields
+                            .iter()
+                            .all(|used| used.path.fields.len() == 1) =>
+                {
+                    Some(field.clone())
+                }
+                _ => None,
+            };
             Ok(SqlMvPersistenceOutputFacts {
                 output_ordinal: u32_from_usize("MV output ordinal", output_index)?,
-                name: names[output_index].clone(),
-                data_type,
-                nullable,
-                expression: merge_branch_expression_facts(expressions),
+                name: name.clone(),
+                value_type: field.value_type.clone(),
+                source_fields,
+                direct_source,
+                canonical_bytes: writer.finish(),
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, AnalyzeError>>()?;
 
     for reference in &builder.referenced_fields {
         let occurrence = builder
             .occurrences
-            .iter_mut()
-            .find(|occurrence| occurrence.occurrence_id == reference.occurrence_id)
+            .get_mut(reference.occurrence_id.get() as usize)
             .ok_or_else(|| {
-                "MV CREATE persistence field references unknown occurrence".to_string()
+                AnalyzeError::internal("MV persistence field references unknown occurrence")
             })?;
-        occurrence
-            .referenced_fields
-            .push(SqlMvPersistenceSourceFieldFacts {
-                field_ordinal: reference.field_ordinal,
-                name: reference.field_name.clone(),
-            });
+        occurrence.field_paths.push(reference.path.clone());
+    }
+    for occurrence in &mut builder.occurrences {
+        normalize_paths(&mut occurrence.field_paths);
+        let mut roots = BTreeSet::new();
+        for path in &occurrence.field_paths {
+            roots.insert(&path.fields[0]);
+        }
+        occurrence.referenced_fields = roots
+            .into_iter()
+            .map(|field| SqlMvPersistenceSourceFieldFacts {
+                field_ordinal: field.ordinal,
+                name: field.name.clone(),
+            })
+            .collect();
     }
 
     let union_branches = if !branch_occurrences.is_empty() {
@@ -371,12 +489,14 @@ pub(super) fn project_create_persistence_facts(
                     relation_occurrence_ids,
                     output_ordinals: (0..outputs.len())
                         .map(|index| u32_from_usize("UNION output ordinal", index))
-                        .collect::<Result<Vec<_>, String>>()?,
+                        .collect::<Result<Vec<_>, AnalyzeError>>()?,
                 })
             })
-            .collect::<Result<Vec<_>, String>>()?
+            .collect::<Result<Vec<_>, AnalyzeError>>()?
     } else if is_root_union {
-        return Err("MV CREATE persistence UNION ALL has no branches".to_string());
+        return Err(AnalyzeError::internal(
+            "MV CREATE persistence UNION ALL has no branches",
+        ));
     } else {
         Vec::new()
     };
@@ -386,7 +506,7 @@ pub(super) fn project_create_persistence_facts(
         outputs,
         aggregates: builder.aggregates,
         union_branches,
-        scalar_contracts,
+        view_dependencies: view_dependencies.to_vec(),
     })
 }
 
@@ -394,14 +514,11 @@ pub(super) fn project_create_persistence_facts(
 fn collect_union_leaves<'a>(
     query: &'a ResolvedQuery,
     leaves: &mut Vec<&'a ResolvedQuery>,
-) -> Result<bool, String> {
+) -> Result<bool, AnalyzeError> {
     match &query.body {
         QueryBody::SetOperation(set_op) => {
-            if set_op.kind != SetOpKind::Union || !set_op.all {
-                return Err(
-                    "MV CREATE persistence facts require UNION ALL set operations".to_string(),
-                );
-            }
+            validate_mv_union_all(set_op)
+                .map_err(AnalyzeError::unsupported_expression_without_span)?;
             collect_union_leaves(&set_op.left, leaves)?;
             collect_union_leaves(&set_op.right, leaves)?;
             Ok(true)
@@ -410,62 +527,55 @@ fn collect_union_leaves<'a>(
             leaves.push(query);
             Ok(false)
         }
-        QueryBody::Values(_) => {
-            Err("MV CREATE persistence facts do not support VALUES".to_string())
-        }
+        QueryBody::Values(_) => Err(AnalyzeError::unsupported_expression_without_span(
+            "MV persistence facts do not support VALUES",
+        )),
     }
 }
 
 fn query_relation_occurrence_ids(
     query: &ResolvedQuery,
     builder: &ProjectionBuilder,
-) -> Result<Vec<SqlMvRelationOccurrenceId>, String> {
+) -> Result<Vec<SqlMvRelationOccurrenceId>, AnalyzeError> {
     match &query.body {
         QueryBody::Select(select) => {
-            let relation = select
-                .from
-                .as_ref()
-                .ok_or_else(|| "MV CREATE persistence facts require a FROM relation".to_string())?;
-            relation_occurrence_ids(relation, builder)
+            let mut ids = match &select.from {
+                Some(relation) => relation_occurrence_ids(relation, builder)?,
+                None => Vec::new(),
+            };
+            for inner in select
+                .apply_specs
+                .iter()
+                .map(|spec| &spec.inner)
+                .chain(select.predicate_apply_specs.iter().map(|spec| &spec.inner))
+            {
+                ids.extend(query_relation_occurrence_ids(inner, builder)?);
+            }
+            Ok(ids)
         }
         QueryBody::SetOperation(set_op) => {
             let mut ids = query_relation_occurrence_ids(&set_op.left, builder)?;
             ids.extend(query_relation_occurrence_ids(&set_op.right, builder)?);
             Ok(ids)
         }
-        QueryBody::Values(_) => {
-            Err("MV CREATE persistence facts do not support VALUES".to_string())
-        }
+        QueryBody::Values(_) => Err(AnalyzeError::unsupported_expression_without_span(
+            "MV persistence facts do not support VALUES",
+        )),
     }
 }
 
 fn relation_occurrence_ids(
     relation: &Relation,
     builder: &ProjectionBuilder,
-) -> Result<Vec<SqlMvRelationOccurrenceId>, String> {
+) -> Result<Vec<SqlMvRelationOccurrenceId>, AnalyzeError> {
     match relation {
         Relation::Scan(scan) => {
-            let column_id = scan.column_ids.first().ok_or_else(|| {
-                "MV CREATE persistence scan has no columns for occurrence binding".to_string()
-            })?;
-            let lineages = builder
-                .source_fields_by_column_id
-                .get(column_id)
-                .ok_or_else(|| {
-                    "MV CREATE persistence scan is missing occurrence lineage".to_string()
-                })?;
-            let mut occurrences = lineages
-                .iter()
-                .map(SqlMvPersistenceSourceFieldReference::occurrence_id)
-                .collect::<Vec<_>>();
-            occurrences.sort_unstable();
-            occurrences.dedup();
-            if occurrences.len() != 1 {
-                return Err(
-                    "MV CREATE persistence base scan resolved to multiple occurrences".to_string(),
-                );
-            }
-            Ok(occurrences)
+            let occurrence = builder
+                .scan_occurrences
+                .get(&std::ptr::from_ref(scan))
+                .copied()
+                .ok_or_else(|| AnalyzeError::internal("MV persistence scan has no occurrence"))?;
+            Ok(vec![occurrence])
         }
         Relation::Subquery { query, .. } => query_relation_occurrence_ids(query, builder),
         Relation::Join(join) => {
@@ -478,48 +588,155 @@ fn relation_occurrence_ids(
         | Relation::IcebergDeltaScan(_)
         | Relation::GenerateSeries(_)
         | Relation::Unnest(_)
-        | Relation::CTEConsume { .. } => {
-            Err("MV CREATE persistence facts require base-table scans and joins".to_string())
-        }
+        | Relation::CTEConsume { .. } => Err(AnalyzeError::unsupported_expression_without_span(
+            "MV persistence facts require base-table scans and joins",
+        )),
     }
 }
 
 fn register_query(
     query: &ResolvedQuery,
     builder: &mut ProjectionBuilder,
-) -> Result<Vec<BTreeSet<SqlMvPersistenceSourceFieldReference>>, String> {
+) -> Result<Vec<ColumnLineage>, AnalyzeError> {
     let lineages = match &query.body {
         QueryBody::Select(select) => {
-            let relation = select
-                .from
-                .as_ref()
-                .ok_or_else(|| "MV CREATE persistence facts require a FROM relation".to_string())?;
-            register_relation(relation, builder)?;
+            if let Some(relation) = &select.from {
+                register_relation(relation, builder)?;
+            }
+            register_applies(select, builder)?;
+            register_grouping_masks(select, builder)?;
             select
                 .projection
                 .iter()
-                .map(|item| expression_source_field_set(&item.expr, builder))
-                .collect::<Result<Vec<_>, String>>()?
+                .map(|item| expression_lineage(&item.expr, builder))
+                .collect::<Result<Vec<_>, AnalyzeError>>()?
         }
         QueryBody::SetOperation(set_op) => {
-            if set_op.kind != SetOpKind::Union || !set_op.all {
-                return Err(
-                    "MV CREATE persistence facts require UNION ALL set operations".to_string(),
-                );
-            }
+            validate_mv_union_all(set_op)
+                .map_err(AnalyzeError::unsupported_expression_without_span)?;
             let left = register_query(&set_op.left, builder)?;
             let right = register_query(&set_op.right, builder)?;
             merge_output_lineages(left, right)?
         }
         QueryBody::Values(_) => {
-            return Err("MV CREATE persistence facts do not support VALUES".to_string());
+            return Err(AnalyzeError::unsupported_expression_without_span(
+                "MV persistence facts do not support VALUES",
+            ));
         }
     };
     bind_output_lineages(&query.output_columns, &lineages, builder)?;
     Ok(lineages)
 }
 
-fn register_relation(relation: &Relation, builder: &mut ProjectionBuilder) -> Result<(), String> {
+fn register_grouping_masks(
+    select: &crate::analysis::ResolvedSelect,
+    builder: &mut ProjectionBuilder,
+) -> Result<(), AnalyzeError> {
+    let Some(repeat) = &select.repeat else {
+        return Ok(());
+    };
+    // Analysis appends the mask references after the original grouping keys.
+    // Repeat key ColumnIds are only filled by logical planning, after this
+    // projection. Use the analyzer's shared key tokens to join to its typed keys.
+    let (keys, masks) = select
+        .group_by
+        .split_at_checked(repeat.all_rollup_columns.len())
+        .ok_or_else(|| AnalyzeError::internal("MV grouping keys do not match Repeat analysis"))?;
+    if masks.len() != repeat.grouping_fn_ids.len() || masks.len() != repeat.grouping_fn_args.len() {
+        return Err(AnalyzeError::internal(
+            "MV grouping masks do not match Repeat analysis",
+        ));
+    }
+    let key_indices = repeat
+        .all_rollup_columns
+        .iter()
+        .zip(keys)
+        .collect::<BTreeMap<_, _>>();
+    for ((name, id), (argument_name, arguments)) in
+        repeat.grouping_fn_ids.iter().zip(&repeat.grouping_fn_args)
+    {
+        if name != argument_name {
+            return Err(AnalyzeError::internal(
+                "MV grouping mask arguments do not match their analyzed output",
+            ));
+        }
+        let mut fields = FieldUses::new();
+        for argument in arguments {
+            let key = key_indices.get(argument).ok_or_else(|| {
+                AnalyzeError::internal("MV grouping mask argument is not an analyzed grouping key")
+            })?;
+            fields.extend(expression_source_field_set(key, builder)?);
+        }
+        bind_column_lineage(
+            *id,
+            ColumnLineage {
+                fields,
+                passthrough: false,
+            },
+            builder,
+        )?;
+    }
+    Ok(())
+}
+
+fn register_applies(
+    select: &crate::analysis::ResolvedSelect,
+    builder: &mut ProjectionBuilder,
+) -> Result<(), AnalyzeError> {
+    for spec in &select.apply_specs {
+        let lineages = register_query(&spec.inner, builder)?;
+        let mut fields = lineages
+            .into_iter()
+            .flat_map(|lineage| lineage.fields)
+            .collect::<FieldUses>();
+        if let Some(probe) = &spec.mark_probe {
+            let lineage = expression_lineage(probe, builder)?;
+            fields.extend(lineage.fields.iter().cloned());
+            if let Some(mark) = &spec.relation_mark {
+                bind_column_lineage(mark.probe_column.column_id, lineage, builder)?;
+            }
+        }
+        if let Some(mark) = &spec.relation_mark {
+            for item in &mark.demand_projections {
+                let lineage = expression_lineage(&item.expr, builder)?;
+                bind_column_lineage(item.output_column_id, lineage, builder)?;
+            }
+            fields.extend(expression_source_field_set(&mark.predicate, builder)?);
+        }
+        bind_column_lineage(
+            spec.output_column.column_id,
+            ColumnLineage {
+                fields,
+                passthrough: false,
+            },
+            builder,
+        )?;
+    }
+    for spec in &select.predicate_apply_specs {
+        let mut fields = register_query(&spec.inner, builder)?
+            .into_iter()
+            .flat_map(|lineage| lineage.fields)
+            .collect::<FieldUses>();
+        if let Some(probe) = &spec.in_lhs {
+            fields.extend(expression_source_field_set(probe, builder)?);
+        }
+        builder.referenced_fields.extend(fields.iter().cloned());
+        bind_column_lineage(
+            spec.output_column.column_id,
+            ColumnLineage {
+                fields,
+                passthrough: false,
+            },
+            builder,
+        )?;
+    }
+    Ok(())
+}
+
+fn register_relation(
+    relation: &Relation,
+    builder: &mut ProjectionBuilder,
+) -> Result<(), AnalyzeError> {
     match relation {
         Relation::Scan(scan) => {
             let occurrence_id = SqlMvRelationOccurrenceId::new(u32_from_usize(
@@ -534,25 +751,40 @@ fn register_relation(relation: &Relation, builder: &mut ProjectionBuilder) -> Re
                 .chain(scan.table.iceberg_row_lineage_metadata_columns.iter())
                 .collect::<Vec<_>>();
             if fields.len() != scan.column_ids.len() {
-                return Err(format!(
-                    "MV CREATE persistence scan field count mismatch for {}.{}.{}: fields={}, column_ids={}",
+                return Err(AnalyzeError::internal(format!(
+                    "MV persistence scan field count mismatch for {}.{}.{}: fields={}, column_ids={}",
                     source.table.catalog,
                     source.table.namespace,
                     source.table.table,
                     fields.len(),
                     scan.column_ids.len()
-                ));
+                )));
             }
             for (field_ordinal, (column_id, field)) in
                 scan.column_ids.iter().zip(fields).enumerate()
             {
-                let reference = SqlMvPersistenceSourceFieldReference {
+                let reference = FieldUse {
                     occurrence_id,
-                    field_ordinal: u32_from_usize("MV source field ordinal", field_ordinal)?,
-                    field_name: field.name.clone(),
+                    path: SqlMvFieldPath {
+                        fields: vec![SqlMvFieldCoordinate {
+                            ordinal: u32_from_usize("MV source field ordinal", field_ordinal)?,
+                            name: field.name.clone(),
+                        }],
+                        whole_subtree: is_container(&field.data_type),
+                    },
                 };
-                bind_column_lineage(*column_id, BTreeSet::from([reference]), builder)?;
+                bind_column_lineage(
+                    *column_id,
+                    ColumnLineage {
+                        fields: BTreeSet::from([reference]),
+                        passthrough: true,
+                    },
+                    builder,
+                )?;
             }
+            builder
+                .scan_occurrences
+                .insert(std::ptr::from_ref(scan), occurrence_id);
             builder
                 .occurrences
                 .push(SqlMvPersistenceRelationOccurrenceFacts {
@@ -564,6 +796,9 @@ fn register_relation(relation: &Relation, builder: &mut ProjectionBuilder) -> Re
                         .alias
                         .clone()
                         .unwrap_or_else(|| source.table.table.clone()),
+                    binding: source.binding,
+                    read_selection: source.mv_read_selection(),
+                    field_paths: Vec::new(),
                     referenced_fields: Vec::new(),
                 });
             Ok(())
@@ -585,24 +820,27 @@ fn register_relation(relation: &Relation, builder: &mut ProjectionBuilder) -> Re
         | Relation::IcebergDeltaScan(_)
         | Relation::GenerateSeries(_)
         | Relation::Unnest(_)
-        | Relation::CTEConsume { .. } => {
-            Err("MV CREATE persistence facts require base-table scans and joins".to_string())
-        }
+        | Relation::CTEConsume { .. } => Err(AnalyzeError::unsupported_expression_without_span(
+            "MV persistence facts require base-table scans and joins",
+        )),
     }
 }
 
 fn merge_output_lineages(
-    left: Vec<BTreeSet<SqlMvPersistenceSourceFieldReference>>,
-    right: Vec<BTreeSet<SqlMvPersistenceSourceFieldReference>>,
-) -> Result<Vec<BTreeSet<SqlMvPersistenceSourceFieldReference>>, String> {
+    left: Vec<ColumnLineage>,
+    right: Vec<ColumnLineage>,
+) -> Result<Vec<ColumnLineage>, AnalyzeError> {
     if left.len() != right.len() {
-        return Err("MV CREATE persistence UNION output lineage arity mismatch".to_string());
+        return Err(AnalyzeError::internal(
+            "MV persistence UNION output lineage arity mismatch",
+        ));
     }
     Ok(left
         .into_iter()
         .zip(right)
         .map(|(mut left, right)| {
-            left.extend(right);
+            left.fields.extend(right.fields);
+            left.passthrough &= right.passthrough;
             left
         })
         .collect())
@@ -610,17 +848,16 @@ fn merge_output_lineages(
 
 fn bind_output_lineages(
     outputs: &[crate::analysis::AnalyzedOutputField],
-    lineages: &[BTreeSet<SqlMvPersistenceSourceFieldReference>],
+    lineages: &[ColumnLineage],
     builder: &mut ProjectionBuilder,
-) -> Result<(), String> {
-    if outputs.len() != lineages.len() {
-        return Err(format!(
-            "MV CREATE persistence analyzed output lineage mismatch: outputs={}, lineages={}",
-            outputs.len(),
-            lineages.len()
+) -> Result<(), AnalyzeError> {
+    let visible = outputs.iter().filter(|output| !output.is_internal);
+    if visible.clone().count() != lineages.len() {
+        return Err(AnalyzeError::internal(
+            "MV persistence analyzed output lineage arity mismatch",
         ));
     }
-    for (output, lineage) in outputs.iter().zip(lineages) {
+    for (output, lineage) in visible.zip(lineages) {
         bind_column_lineage(output.column_id, lineage.clone(), builder)?;
     }
     Ok(())
@@ -628,13 +865,13 @@ fn bind_output_lineages(
 
 fn bind_column_lineage(
     column_id: ColumnId,
-    lineage: BTreeSet<SqlMvPersistenceSourceFieldReference>,
+    lineage: ColumnLineage,
     builder: &mut ProjectionBuilder,
-) -> Result<(), String> {
+) -> Result<(), AnalyzeError> {
     match builder.source_fields_by_column_id.get(&column_id) {
-        Some(existing) if existing != &lineage => Err(format!(
-            "MV CREATE persistence analysis reused column identity {column_id} with different source lineage"
-        )),
+        Some(existing) if existing != &lineage => Err(AnalyzeError::internal(format!(
+            "MV persistence analysis reused column identity {column_id} with different source lineage"
+        ))),
         Some(_) => Ok(()),
         None => {
             builder
@@ -645,38 +882,39 @@ fn bind_column_lineage(
     }
 }
 
-fn project_leaf_expressions(
-    query: &ResolvedQuery,
-    builder: &mut ProjectionBuilder,
-) -> Result<Vec<SqlMvPersistenceExpressionFacts>, String> {
-    let QueryBody::Select(select) = &query.body else {
-        return Err("MV CREATE persistence leaf must be SELECT".to_string());
-    };
-    let mut expressions = Vec::with_capacity(select.projection.len());
-    for item in &select.projection {
-        expressions.push(expression_facts(&item.expr, builder)?);
-    }
-    Ok(expressions)
+fn column_lineage(
+    column_id: ColumnId,
+    builder: &ProjectionBuilder,
+) -> Result<&ColumnLineage, AnalyzeError> {
+    builder
+        .source_fields_by_column_id
+        .get(&column_id)
+        .ok_or_else(|| {
+            AnalyzeError::internal(format!(
+                "MV persistence column {column_id} has no base occurrence lineage"
+            ))
+        })
 }
 
 fn collect_query_semantics(
     query: &ResolvedQuery,
     branch_occurrences: &[Vec<SqlMvRelationOccurrenceId>],
+    target_projection: bool,
     builder: &mut ProjectionBuilder,
-) -> Result<(), String> {
+) -> Result<(), AnalyzeError> {
     match &query.body {
         QueryBody::Select(select) => {
             let query_occurrences = query_relation_occurrence_ids(query, builder)?;
             let branch_ordinal =
                 branch_ordinal_for_occurrences(&query_occurrences, branch_occurrences)?;
             for (output_index, item) in select.projection.iter().enumerate() {
-                collect_expression_references(&item.expr, builder)?;
-                collect_aggregates(
-                    &item.expr,
-                    branch_ordinal,
-                    Some(u32_from_usize("MV aggregate output ordinal", output_index)?),
-                    builder,
-                )?;
+                if select.distinct {
+                    collect_expression_references(&item.expr, builder)?;
+                }
+                let output_ordinal = target_projection
+                    .then(|| u32_from_usize("MV aggregate output ordinal", output_index))
+                    .transpose()?;
+                collect_aggregates(&item.expr, branch_ordinal, output_ordinal, builder)?;
             }
             for expression in select
                 .filter
@@ -687,17 +925,32 @@ fn collect_query_semantics(
                 collect_expression_references(expression, builder)?;
                 collect_aggregates(expression, branch_ordinal, None, builder)?;
             }
+            for inner in select
+                .apply_specs
+                .iter()
+                .map(|spec| &spec.inner)
+                .chain(select.predicate_apply_specs.iter().map(|spec| &spec.inner))
+            {
+                collect_query_semantics(inner, branch_occurrences, false, builder)?;
+            }
             if let Some(relation) = &select.from {
                 collect_relation_semantics(relation, branch_occurrences, builder)?;
                 collect_relation_expression_references(relation, branch_ordinal, builder)?;
             }
         }
         QueryBody::SetOperation(set_op) => {
-            collect_query_semantics(&set_op.left, branch_occurrences, builder)?;
-            collect_query_semantics(&set_op.right, branch_occurrences, builder)?;
+            collect_query_semantics(&set_op.left, branch_occurrences, target_projection, builder)?;
+            collect_query_semantics(
+                &set_op.right,
+                branch_occurrences,
+                target_projection,
+                builder,
+            )?;
         }
         QueryBody::Values(_) => {
-            return Err("MV CREATE persistence facts do not support VALUES".to_string());
+            return Err(AnalyzeError::unsupported_expression_without_span(
+                "MV persistence facts do not support VALUES",
+            ));
         }
     }
     for item in &query.order_by {
@@ -713,10 +966,10 @@ fn collect_relation_semantics(
     relation: &Relation,
     branch_occurrences: &[Vec<SqlMvRelationOccurrenceId>],
     builder: &mut ProjectionBuilder,
-) -> Result<(), String> {
+) -> Result<(), AnalyzeError> {
     match relation {
         Relation::Subquery { query, .. } => {
-            collect_query_semantics(query, branch_occurrences, builder)
+            collect_query_semantics(query, branch_occurrences, false, builder)
         }
         Relation::Join(join) => {
             collect_relation_semantics(&join.left, branch_occurrences, builder)?;
@@ -735,7 +988,10 @@ fn collect_relation_semantics(
 fn branch_ordinal_for_occurrences(
     query_occurrences: &[SqlMvRelationOccurrenceId],
     branch_occurrences: &[Vec<SqlMvRelationOccurrenceId>],
-) -> Result<Option<u32>, String> {
+) -> Result<Option<u32>, AnalyzeError> {
+    if query_occurrences.is_empty() {
+        return Ok(None);
+    }
     let matches = branch_occurrences
         .iter()
         .enumerate()
@@ -749,7 +1005,9 @@ fn branch_ordinal_for_occurrences(
     match matches.as_slice() {
         [] => Ok(None),
         [index] => Ok(Some(u32_from_usize("UNION branch ordinal", *index)?)),
-        _ => Err("MV CREATE persistence query belongs to multiple UNION branches".to_string()),
+        _ => Err(AnalyzeError::internal(
+            "MV persistence query belongs to multiple UNION branches",
+        )),
     }
 }
 
@@ -757,7 +1015,7 @@ fn collect_relation_expression_references(
     relation: &Relation,
     branch_ordinal: Option<u32>,
     builder: &mut ProjectionBuilder,
-) -> Result<(), String> {
+) -> Result<(), AnalyzeError> {
     if let Relation::Join(join) = relation {
         collect_relation_expression_references(&join.left, branch_ordinal, builder)?;
         collect_relation_expression_references(&join.right, branch_ordinal, builder)?;
@@ -773,172 +1031,113 @@ fn collect_sort_item_references(
     item: &SortItem,
     branch_ordinal: Option<u32>,
     builder: &mut ProjectionBuilder,
-) -> Result<(), String> {
+) -> Result<(), AnalyzeError> {
     collect_expression_references(&item.expr, builder)?;
     collect_aggregates(&item.expr, branch_ordinal, None, builder)
 }
 
-fn expression_facts(
+/// A projection can carry a source path without consuming the surrounding
+/// struct. A computation keeps the paths it reads but cannot propagate a
+/// later field coordinate back through its result.
+fn expression_lineage(
     expression: &TypedExpr,
-    builder: &mut ProjectionBuilder,
-) -> Result<SqlMvPersistenceExpressionFacts, String> {
-    let expression = unwrap_nested(expression);
-    let (kind, function_identity) = match &expression.kind {
-        ExprKind::ColumnRef { .. } => (SqlMvPersistenceExpressionKind::Field, None),
-        ExprKind::Literal(_) | ExprKind::Constant(_) => {
-            (SqlMvPersistenceExpressionKind::Literal, None)
-        }
-        ExprKind::Cast { .. } => (SqlMvPersistenceExpressionKind::Cast, None),
-        ExprKind::FunctionCall { name, binding, .. } => {
-            use novarocks_type_contract::{ArithmeticOperator, OperatorFunction};
-
-            let operator = OperatorFunction::from_function_id(&binding.function_id);
-            if let Some(arithmetic) = operator.and_then(OperatorFunction::arithmetic) {
-                let op = match arithmetic {
-                    ArithmeticOperator::Add => BinOp::Add,
-                    ArithmeticOperator::Subtract => BinOp::Sub,
-                    ArithmeticOperator::Multiply => BinOp::Mul,
-                    ArithmeticOperator::Divide => BinOp::Div,
-                    ArithmeticOperator::Modulo => BinOp::Mod,
-                };
-                (
-                    SqlMvPersistenceExpressionKind::Mixed,
-                    Some(binary_operator_identity(op).to_owned()),
-                )
-            } else {
-                let identity = if operator.is_some() {
-                    binding.function_id.as_str().to_owned()
-                } else {
-                    name.to_ascii_lowercase()
-                };
-                (SqlMvPersistenceExpressionKind::Function, Some(identity))
-            }
-        }
-        ExprKind::AggregateCall { name, .. } | ExprKind::WindowCall { name, .. } => (
-            SqlMvPersistenceExpressionKind::Function,
-            Some(name.to_ascii_lowercase()),
-        ),
-        ExprKind::BinaryOp { op, .. } => (
-            SqlMvPersistenceExpressionKind::Mixed,
-            Some(binary_operator_identity(*op).to_string()),
-        ),
-        ExprKind::UnaryOp { op, .. } => (
-            SqlMvPersistenceExpressionKind::Mixed,
-            Some(unary_operator_identity(*op).to_string()),
-        ),
-        ExprKind::LambdaFunction { .. } | ExprKind::Lambda { .. } => (
-            SqlMvPersistenceExpressionKind::Mixed,
-            Some("expression/lambda".to_string()),
-        ),
-        ExprKind::IsNull { negated, .. } => (
-            SqlMvPersistenceExpressionKind::Mixed,
-            Some(
-                if *negated {
-                    "predicate/is-not-null"
-                } else {
-                    "predicate/is-null"
-                }
-                .to_string(),
-            ),
-        ),
-        ExprKind::InList { negated, .. } => (
-            SqlMvPersistenceExpressionKind::Mixed,
-            Some(
-                if *negated {
-                    "predicate/not-in-list"
-                } else {
-                    "predicate/in-list"
-                }
-                .to_string(),
-            ),
-        ),
-        ExprKind::Between { negated, .. } => (
-            SqlMvPersistenceExpressionKind::Mixed,
-            Some(
-                if *negated {
-                    "predicate/not-between"
-                } else {
-                    "predicate/between"
-                }
-                .to_string(),
-            ),
-        ),
-        ExprKind::Like { negated, .. } => (
-            SqlMvPersistenceExpressionKind::Mixed,
-            Some(
-                if *negated {
-                    "predicate/not-like"
-                } else {
-                    "predicate/like"
-                }
-                .to_string(),
-            ),
-        ),
-        ExprKind::Case { .. } => (
-            SqlMvPersistenceExpressionKind::Mixed,
-            Some("expression/case".to_string()),
-        ),
-        ExprKind::IsTruthValue { value, negated, .. } => (
-            SqlMvPersistenceExpressionKind::Mixed,
-            Some(
-                match (*value, *negated) {
-                    (true, false) => "predicate/is-true",
-                    (true, true) => "predicate/is-not-true",
-                    (false, false) => "predicate/is-false",
-                    (false, true) => "predicate/is-not-false",
-                }
-                .to_string(),
-            ),
-        ),
-        ExprKind::LambdaParamRef { .. } => (
-            SqlMvPersistenceExpressionKind::Mixed,
-            Some("expression/lambda-parameter".to_string()),
-        ),
-        ExprKind::SubqueryPlaceholder { .. } => {
-            return Err(
-                "MV CREATE persistence facts cannot contain subquery placeholders".to_string(),
-            );
-        }
-        ExprKind::Nested(_) => unreachable!("nested expressions were unwrapped"),
-    };
-    let source_fields = expression_source_fields(expression, builder)?;
-    Ok(SqlMvPersistenceExpressionFacts {
-        kind,
-        function_identity,
-        source_fields,
+    builder: &ProjectionBuilder,
+) -> Result<ColumnLineage, AnalyzeError> {
+    if let Some(lineage) = path_lineage(expression, builder)? {
+        return Ok(lineage);
+    }
+    Ok(ColumnLineage {
+        fields: expression_source_field_set(expression, builder)?,
+        passthrough: false,
     })
 }
 
-fn expression_source_fields(
+fn path_lineage(
     expression: &TypedExpr,
-    builder: &mut ProjectionBuilder,
-) -> Result<Vec<SqlMvPersistenceSourceFieldReference>, String> {
-    let references = expression_source_field_set(expression, builder)?;
-    builder.referenced_fields.extend(references.iter().cloned());
-    Ok(references.into_iter().collect())
+    builder: &ProjectionBuilder,
+) -> Result<Option<ColumnLineage>, AnalyzeError> {
+    let expression = unwrap_nested(expression);
+    match &expression.kind {
+        ExprKind::ColumnRef { column_id, .. } => {
+            Ok(Some(column_lineage(*column_id, builder)?.clone()))
+        }
+        ExprKind::FunctionCall { args, binding, .. }
+            if binding.function_id.as_str() == "builtin.scalar/__struct_subfield/v1" =>
+        {
+            let [base, name] = args.as_slice() else {
+                return Err(AnalyzeError::internal(
+                    "bound struct field access has invalid arity",
+                ));
+            };
+            let ExprKind::Literal(LiteralValue::String(name)) = &name.kind else {
+                return Ok(None);
+            };
+            let Some(mut lineage) = path_lineage(base, builder)? else {
+                return Ok(None);
+            };
+            if !lineage.passthrough {
+                return Ok(Some(lineage));
+            }
+            let DataType::Struct(fields) = base.value_type.data_type() else {
+                return Err(AnalyzeError::internal(
+                    "bound struct field access has no struct layout",
+                ));
+            };
+            let Some((ordinal, field)) = fields
+                .iter()
+                .enumerate()
+                .find(|(_, field)| field.name() == name)
+            else {
+                return Err(AnalyzeError::internal(
+                    "bound struct field access is absent from the original layout",
+                ));
+            };
+            let coordinate = SqlMvFieldCoordinate {
+                ordinal: u32_from_usize("MV nested source field ordinal", ordinal)?,
+                name: field.name().clone(),
+            };
+            lineage.fields = lineage
+                .fields
+                .into_iter()
+                .map(|mut use_| {
+                    use_.path.fields.push(coordinate.clone());
+                    use_.path.whole_subtree = is_container(field.data_type());
+                    use_
+                })
+                .collect();
+            Ok(Some(lineage))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn is_container(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Struct(_)
+            | DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+            | DataType::Map(_, _)
+    )
 }
 
 fn expression_source_field_set(
     expression: &TypedExpr,
     builder: &ProjectionBuilder,
-) -> Result<BTreeSet<SqlMvPersistenceSourceFieldReference>, String> {
-    let mut references = BTreeSet::new();
-    walk_expression(expression, &mut |node| -> Result<(), String> {
-        if let ExprKind::ColumnRef {
-            column_id, column, ..
-        } = &node.kind
-        {
-            let bound = builder
-                .source_fields_by_column_id
-                .get(column_id)
-                .ok_or_else(|| {
-                    format!(
-                        "MV CREATE persistence column `{column}` has no base occurrence lineage"
-                    )
-                })?;
-            references.extend(bound.iter().cloned());
+) -> Result<FieldUses, AnalyzeError> {
+    let mut references = FieldUses::new();
+    walk_expression(expression, &mut |node| match path_lineage(node, builder)? {
+        Some(lineage) => {
+            references.extend(lineage.fields);
+            Ok(false)
         }
-        Ok(())
+        None if matches!(&node.kind, ExprKind::SubqueryPlaceholder { .. }) => Err(
+            AnalyzeError::internal("MV persistence has an unresolved subquery placeholder"),
+        ),
+        None => Ok(true),
     })?;
     Ok(references)
 }
@@ -946,8 +1145,43 @@ fn expression_source_field_set(
 fn collect_expression_references(
     expression: &TypedExpr,
     builder: &mut ProjectionBuilder,
-) -> Result<(), String> {
-    expression_source_fields(expression, builder).map(|_| ())
+) -> Result<(), AnalyzeError> {
+    let references = expression_source_field_set(expression, builder)?;
+    builder.referenced_fields.extend(references);
+    Ok(())
+}
+
+fn root_source_fields(references: &FieldUses) -> Vec<SqlMvPersistenceSourceFieldReference> {
+    references
+        .iter()
+        .map(|reference| {
+            let root = &reference.path.fields[0];
+            SqlMvPersistenceSourceFieldReference {
+                occurrence_id: reference.occurrence_id,
+                field_ordinal: root.ordinal,
+                field_name: root.name.clone(),
+            }
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn normalize_paths(paths: &mut Vec<SqlMvFieldPath>) {
+    paths.sort_unstable();
+    let mut normalized: Vec<SqlMvFieldPath> = Vec::with_capacity(paths.len());
+    for path in paths.drain(..) {
+        // In lexicographic path order all descendants of a consumed subtree are
+        // contiguous, so the most recent retained path is sufficient.
+        if normalized.last().is_some_and(|previous| {
+            previous == &path
+                || (previous.whole_subtree && path.fields.starts_with(&previous.fields))
+        }) {
+            continue;
+        }
+        normalized.push(path);
+    }
+    *paths = normalized;
 }
 
 fn collect_aggregates(
@@ -955,111 +1189,89 @@ fn collect_aggregates(
     branch_ordinal: Option<u32>,
     output_ordinal: Option<u32>,
     builder: &mut ProjectionBuilder,
-) -> Result<(), String> {
-    let mut calls = Vec::new();
-    walk_expression(expression, &mut |node| -> Result<(), String> {
-        if let ExprKind::AggregateCall { name, resolved, .. } = &node.kind {
-            calls.push((name.to_ascii_lowercase(), resolved, node));
-        }
-        Ok(())
-    })?;
-    for (function_identity, resolved, call) in calls {
+) -> Result<(), AnalyzeError> {
+    walk_expression(expression, &mut |node| {
+        let ExprKind::AggregateCall { name, resolved, .. } = &node.kind else {
+            return Ok(true);
+        };
+        let binding = resolved.resolved();
         let semantic_contract =
-            novarocks_functions::PersistentAggregateContract::from_binding(resolved.resolved())
-                .ok_or("MV aggregate lacks its selected state contract")?;
+            PersistentAggregateContract::from_binding(binding).ok_or_else(|| {
+                AnalyzeError::internal("MV aggregate lacks its selected state contract")
+            })?;
+        let Some(selection) = binding.selected.aggregate.as_ref() else {
+            return Err(AnalyzeError::internal(
+                "MV aggregate has no selected intermediate state",
+            ));
+        };
+        let FunctionResultType::Scalar(result_type) = &binding.selected.result_type else {
+            return Err(AnalyzeError::internal(
+                "MV aggregate has no selected scalar result",
+            ));
+        };
+        let logical_arguments = binding
+            .selected
+            .argument_types
+            .get(..binding.logical_argument_count)
+            .ok_or_else(|| {
+                AnalyzeError::internal("MV aggregate logical argument count is invalid")
+            })?;
+        let mut writer = CanonicalFactWriter::new("novarocks.sql.mv-aggregate-binding", 1);
+        writer.text(binding.function_id.as_str());
+        writer.text(binding.selected.overload.as_str());
+        writer.sequence(logical_arguments.len());
+        for argument in logical_arguments {
+            match argument {
+                FunctionArgumentType::Value(value) => {
+                    writer.u32(1);
+                    writer.value_type(value.value_type());
+                }
+                FunctionArgumentType::Lambda {
+                    parameter_types,
+                    result_type,
+                } => {
+                    writer.u32(2);
+                    writer.sequence(parameter_types.len());
+                    for parameter in parameter_types.iter() {
+                        writer.value_type(parameter.value_type());
+                    }
+                    writer.value_type(result_type.value_type());
+                }
+            }
+        }
+        writer.value_type(result_type.value_type());
+        writer.u32(match selection.state_argument_contract {
+            AggregateStateArgumentContract::ExactSignature => 1,
+            AggregateStateArgumentContract::ValueRootNullabilityIndependent => 2,
+        });
+        writer.value_type(selection.intermediate_type.value_type());
+        writer.text(selection.state_format.as_str());
         let aggregate_ordinal = u32_from_usize("MV aggregate ordinal", builder.aggregates.len())?;
-        let source_fields = expression_source_fields(call, builder)?;
+        let source_fields = root_source_fields(&expression_source_field_set(node, builder)?);
         builder.aggregates.push(SqlMvPersistenceAggregateFacts {
             aggregate_ordinal,
             branch_ordinal,
             output_ordinal,
-            function_identity,
+            function_identity: name.to_ascii_lowercase(),
             semantic_contract,
+            signature: binding.selected.argument_types.clone(),
+            logical_argument_count: binding.logical_argument_count,
+            result_type: result_type.clone(),
+            selection: selection.clone(),
+            canonical_bytes: writer.finish(),
             source_fields,
         });
-    }
-    Ok(())
-}
-
-pub(crate) fn collect_scalar_contracts(
-    query: &ResolvedQuery,
-    control: &dyn PureCompileControl,
-) -> Result<Box<[PersistentScalarContract]>, crate::compiler::SqlCompileError> {
-    let mut contracts = BTreeSet::new();
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-    collect_scalar_query(query, &mut |node| {
-        work.step()?;
-        if let ExprKind::FunctionCall { binding, .. } = &node.kind
-            && let Some(contract) = PersistentScalarContract::from_binding(binding.resolved())
-        {
-            contracts.insert(contract);
-        }
-        Ok::<_, novarocks_type_contract::CompileControlError>(())
-    })?;
-    work.finish()?;
-    Ok(contracts.into_iter().collect())
-}
-
-#[recursive::recursive]
-fn collect_scalar_query<E>(
-    query: &ResolvedQuery,
-    visitor: &mut impl FnMut(&TypedExpr) -> Result<(), E>,
-) -> Result<(), E> {
-    match &query.body {
-        QueryBody::Select(select) => {
-            for expr in select
-                .projection
-                .iter()
-                .map(|item| &item.expr)
-                .chain(select.filter.iter())
-                .chain(select.group_by.iter())
-                .chain(select.having.iter())
-            {
-                walk_expression(expr, visitor)?;
-            }
-            if let Some(relation) = &select.from {
-                collect_scalar_relation(relation, visitor)?;
-            }
-        }
-        QueryBody::SetOperation(set) => {
-            collect_scalar_query(&set.left, visitor)?;
-            collect_scalar_query(&set.right, visitor)?;
-        }
-        // The MV persistence profile requires a SELECT over observed sources.
-        QueryBody::Values(_) => {}
-    }
-    walk_sort_items(&query.order_by, visitor)
-}
-
-#[recursive::recursive]
-fn collect_scalar_relation<E>(
-    relation: &Relation,
-    visitor: &mut impl FnMut(&TypedExpr) -> Result<(), E>,
-) -> Result<(), E> {
-    match relation {
-        Relation::Subquery { query, .. } => collect_scalar_query(query, visitor),
-        Relation::Join(join) => {
-            if let Some(condition) = &join.condition {
-                walk_expression(condition, visitor)?;
-            }
-            collect_scalar_relation(&join.left, visitor)?;
-            collect_scalar_relation(&join.right, visitor)
-        }
-        Relation::Unnest(unnest) => walk_expressions(&unnest.args, visitor),
-        Relation::Scan(_)
-        | Relation::SystemTable { .. }
-        | Relation::IcebergMetadataScan(_)
-        | Relation::IcebergDeltaScan(_)
-        | Relation::GenerateSeries(_)
-        | Relation::CTEConsume { .. } => Ok(()),
-    }
+        Ok(true)
+    })
 }
 
 fn walk_expression<'a, E>(
     expression: &'a TypedExpr,
-    visitor: &mut impl FnMut(&'a TypedExpr) -> Result<(), E>,
+    visitor: &mut impl FnMut(&'a TypedExpr) -> Result<bool, E>,
 ) -> Result<(), E> {
-    visitor(expression)?;
+    if !visitor(expression)? {
+        return Ok(());
+    }
     match &expression.kind {
         ExprKind::BinaryOp { left, right, .. } => {
             walk_expression(left, visitor)?;
@@ -1140,7 +1352,7 @@ fn walk_expression<'a, E>(
 
 fn walk_expressions<'a, E>(
     expressions: &'a [TypedExpr],
-    visitor: &mut impl FnMut(&'a TypedExpr) -> Result<(), E>,
+    visitor: &mut impl FnMut(&'a TypedExpr) -> Result<bool, E>,
 ) -> Result<(), E> {
     for expression in expressions {
         walk_expression(expression, visitor)?;
@@ -1150,7 +1362,7 @@ fn walk_expressions<'a, E>(
 
 fn walk_sort_items<'a, E>(
     items: &'a [SortItem],
-    visitor: &mut impl FnMut(&'a TypedExpr) -> Result<(), E>,
+    visitor: &mut impl FnMut(&'a TypedExpr) -> Result<bool, E>,
 ) -> Result<(), E> {
     for item in items {
         walk_expression(&item.expr, visitor)?;
@@ -1165,94 +1377,8 @@ fn unwrap_nested(mut expression: &TypedExpr) -> &TypedExpr {
     expression
 }
 
-fn output_columns(query: &ResolvedQuery) -> Vec<(String, DataType, bool)> {
-    if query.output_columns.is_empty() {
-        match &query.body {
-            QueryBody::Select(select) => select
-                .projection
-                .iter()
-                .map(|item| {
-                    (
-                        item.output_name.clone(),
-                        item.expr.value_type.data_type().clone(),
-                        item.expr.value_type.nullable(),
-                    )
-                })
-                .collect(),
-            QueryBody::SetOperation(_) | QueryBody::Values(_) => Vec::new(),
-        }
-    } else {
-        query
-            .output_columns
-            .iter()
-            .map(|column| {
-                (
-                    column.name.clone(),
-                    column.value_type.data_type().clone(),
-                    column.value_type.nullable(),
-                )
-            })
-            .collect()
-    }
-}
-
-fn merge_branch_expression_facts(
-    expressions: Vec<SqlMvPersistenceExpressionFacts>,
-) -> SqlMvPersistenceExpressionFacts {
-    let first = expressions
-        .first()
-        .expect("analyzed MV output has at least one branch");
-    let same_shape = expressions.iter().all(|expression| {
-        expression.kind == first.kind && expression.function_identity == first.function_identity
-    });
-    let first_kind = first.kind;
-    let first_function_identity = first.function_identity.clone();
-    let mut source_fields = BTreeSet::new();
-    for expression in expressions {
-        source_fields.extend(expression.source_fields);
-    }
-    SqlMvPersistenceExpressionFacts {
-        kind: if same_shape {
-            first_kind
-        } else {
-            SqlMvPersistenceExpressionKind::Mixed
-        },
-        function_identity: if same_shape {
-            first_function_identity
-        } else {
-            Some("set-operation/union-all".to_string())
-        },
-        source_fields: source_fields.into_iter().collect(),
-    }
-}
-
-fn binary_operator_identity(operator: BinOp) -> &'static str {
-    match operator {
-        BinOp::Add => "operator/add",
-        BinOp::Sub => "operator/subtract",
-        BinOp::Mul => "operator/multiply",
-        BinOp::Div => "operator/divide",
-        BinOp::Mod => "operator/modulo",
-        BinOp::Eq => "operator/equal",
-        BinOp::Ne => "operator/not-equal",
-        BinOp::Lt => "operator/less-than",
-        BinOp::Le => "operator/less-than-or-equal",
-        BinOp::Gt => "operator/greater-than",
-        BinOp::Ge => "operator/greater-than-or-equal",
-        BinOp::EqForNull => "operator/null-safe-equal",
-        BinOp::And => "operator/and",
-        BinOp::Or => "operator/or",
-    }
-}
-
-fn unary_operator_identity(operator: UnOp) -> &'static str {
-    match operator {
-        UnOp::Not => "operator/not",
-    }
-}
-
-fn u32_from_usize(label: &str, value: usize) -> Result<u32, String> {
-    u32::try_from(value).map_err(|_| format!("{label} exceeds u32"))
+fn u32_from_usize(label: &str, value: usize) -> Result<u32, AnalyzeError> {
+    u32::try_from(value).map_err(|_| AnalyzeError::internal(format!("{label} exceeds u32")))
 }
 
 #[cfg(test)]
@@ -1280,6 +1406,24 @@ mod tests {
                     column("id", DataType::Int64, false),
                     column("region", DataType::Utf8, true),
                     column("amount", DataType::Int64, true),
+                    column(
+                        "attrs",
+                        DataType::Struct(
+                            vec![
+                                arrow::datatypes::Field::new("id", DataType::Int64, false),
+                                arrow::datatypes::Field::new("name", DataType::Utf8, true),
+                                arrow::datatypes::Field::new(
+                                    "tags",
+                                    DataType::List(std::sync::Arc::new(
+                                        arrow::datatypes::Field::new("item", DataType::Int64, true),
+                                    )),
+                                    true,
+                                ),
+                            ]
+                            .into(),
+                        ),
+                        true,
+                    ),
                 ],
                 iceberg_row_lineage_metadata_columns: Vec::new(),
                 source: ScanSource::Sql(SqlScanSource::new(
@@ -1323,8 +1467,8 @@ mod tests {
             .expect("persistence facts")
     }
 
-    fn refs(expression: &SqlMvPersistenceExpressionFacts) -> Vec<(u32, u32, &str)> {
-        expression
+    fn refs(output: &SqlMvPersistenceOutputFacts) -> Vec<(u32, u32, &str)> {
+        output
             .source_fields()
             .iter()
             .map(|field| {
@@ -1338,56 +1482,20 @@ mod tests {
     }
 
     #[test]
-    fn scalar_publication_contracts_include_actual_filter_and_projection_calls() {
-        let input = facts("SELECT greatest(id, 1) AS top FROM base WHERE least(id, 0) < 1");
-        let selected = input
-            .scalar_contracts()
-            .iter()
-            .map(|contract| (contract.function().as_str(), contract.overload().as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            selected,
-            [
-                (
-                    "builtin.scalar/greatest/v1",
-                    "builtin.scalar/greatest/dynamic-v2"
-                ),
-                ("builtin.scalar/least/v1", "builtin.scalar/least/dynamic-v2"),
-            ]
-        );
-        assert!(
-            facts("SELECT id AS top FROM base WHERE id < 1")
-                .scalar_contracts()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn projection_preserves_output_order_shapes_and_filter_fields() {
+    fn projection_preserves_output_order_type_and_filter_fields() {
         let facts = facts(
             "SELECT id AS order_id, amount + 1 AS adjusted FROM orders WHERE region IS NOT NULL",
         );
-
         assert_eq!(facts.relation_occurrences().len(), 1);
         assert_eq!(facts.outputs()[0].name(), "order_id");
-        assert_eq!(
-            facts.outputs()[0].expression().kind(),
-            SqlMvPersistenceExpressionKind::Field
-        );
-        assert_eq!(refs(facts.outputs()[0].expression()), vec![(0, 0, "id")]);
+        assert_eq!(facts.outputs()[0].output_ordinal(), 0);
+        assert_eq!(facts.outputs()[0].data_type(), &DataType::Int64);
+        let mut expected = CanonicalFactWriter::new("novarocks.sql.mv-output-type", 1);
+        expected.value_type(FunctionValueType::new(DataType::Int64, false).value_type());
+        assert_eq!(facts.outputs()[0].canonical_bytes(), expected.finish());
+        assert_eq!(refs(&facts.outputs()[0]), vec![(0, 0, "id")]);
         assert_eq!(facts.outputs()[1].name(), "adjusted");
-        assert_eq!(
-            facts.outputs()[1].expression().kind(),
-            SqlMvPersistenceExpressionKind::Mixed
-        );
-        assert_eq!(
-            facts.outputs()[1].expression().function_identity(),
-            Some("operator/add")
-        );
-        assert_eq!(
-            refs(facts.outputs()[1].expression()),
-            vec![(0, 2, "amount")]
-        );
+        assert_eq!(refs(&facts.outputs()[1]), vec![(0, 2, "amount")]);
         assert_eq!(
             facts.relation_occurrences()[0]
                 .referenced_fields()
@@ -1407,14 +1515,8 @@ mod tests {
         assert_eq!(facts.relation_occurrences()[0].qualifier(), "l");
         assert_eq!(facts.relation_occurrences()[1].occurrence_id().get(), 1);
         assert_eq!(facts.relation_occurrences()[1].qualifier(), "r");
-        assert_eq!(
-            refs(facts.outputs()[0].expression()),
-            vec![(0, 1, "region")]
-        );
-        assert_eq!(
-            refs(facts.outputs()[1].expression()),
-            vec![(1, 2, "amount")]
-        );
+        assert_eq!(refs(&facts.outputs()[0]), vec![(0, 1, "region")]);
+        assert_eq!(refs(&facts.outputs()[1]), vec![(1, 2, "amount")]);
         assert_eq!(
             facts.relation_occurrences()[0]
                 .referenced_fields()
@@ -1454,10 +1556,12 @@ mod tests {
         assert_eq!(facts.aggregates()[1].output_ordinal(), Some(2));
         assert_eq!(facts.aggregates()[1].function_identity(), "count");
         assert!(facts.aggregates()[1].source_fields().is_empty());
+        assert_eq!(facts.aggregates()[0].argument_types().len(), 1);
         assert_eq!(
-            facts.outputs()[1].expression().function_identity(),
-            Some("sum")
+            facts.aggregates()[0].function_id().as_str(),
+            "builtin.aggregate/sum/v1"
         );
+        assert!(!facts.aggregates()[0].canonical_bytes().is_empty());
     }
 
     #[test]
@@ -1490,7 +1594,7 @@ mod tests {
         );
         assert_eq!(facts.union_branches()[2].output_ordinals(), &[0, 1]);
         assert_eq!(
-            refs(facts.outputs()[0].expression()),
+            refs(&facts.outputs()[0]),
             vec![(0, 0, "id"), (1, 0, "id"), (2, 0, "id")]
         );
     }
@@ -1535,12 +1639,9 @@ mod tests {
         // discriminator to hold. Both leaves are still separate occurrences,
         // which is what the lineage below is resolved against.
         assert!(facts.union_branches().is_empty());
+        assert_eq!(refs(&facts.outputs()[0]), vec![(0, 0, "id"), (1, 0, "id")]);
         assert_eq!(
-            refs(facts.outputs()[0].expression()),
-            vec![(0, 0, "id"), (1, 0, "id")]
-        );
-        assert_eq!(
-            refs(facts.outputs()[1].expression()),
+            refs(&facts.outputs()[1]),
             vec![(0, 2, "amount"), (1, 2, "amount")]
         );
         assert_eq!(facts.aggregates().len(), 1);
@@ -1575,9 +1676,114 @@ mod tests {
         // and by the output lineage below.
         assert!(facts.union_branches().is_empty());
         assert_eq!(
-            refs(facts.outputs()[1].expression()),
+            refs(&facts.outputs()[1]),
             vec![(0, 2, "amount"), (1, 2, "amount"), (2, 2, "amount")]
         );
+    }
+
+    fn paths(occurrence: &SqlMvPersistenceRelationOccurrenceFacts) -> Vec<(Vec<&str>, bool)> {
+        occurrence
+            .field_paths()
+            .iter()
+            .map(|path| {
+                (
+                    path.fields()
+                        .iter()
+                        .map(SqlMvFieldCoordinate::name)
+                        .collect(),
+                    path.whole_subtree(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn struct_paths_keep_the_original_layout_across_passthroughs() {
+        let direct = facts("SELECT attrs.id AS a FROM orders");
+        let aliased =
+            facts("SELECT payload.id AS a FROM (SELECT attrs AS payload, amount FROM orders) q");
+        let occurrence = &aliased.relation_occurrences()[0];
+        assert_eq!(paths(occurrence), vec![(vec!["attrs", "id"], false)]);
+        let fields = occurrence.field_paths()[0].fields();
+        assert_eq!((fields[0].ordinal(), fields[1].ordinal()), (3, 0));
+        assert_eq!(occurrence.read_selection(), SqlMvReadSelection::Current);
+        assert_eq!(
+            occurrence.binding(),
+            crate::compiler::mv_rewrite::test_target_binding()
+        );
+        assert_eq!(
+            occurrence.canonical_bytes(),
+            direct.relation_occurrences()[0].canonical_bytes()
+        );
+        assert_eq!(
+            aliased.outputs()[0].canonical_bytes(),
+            direct.outputs()[0].canonical_bytes()
+        );
+    }
+
+    #[test]
+    fn collections_and_whole_structs_cover_their_complete_consumed_subtree() {
+        let indexed = facts("SELECT attrs.tags[id] AS item FROM orders");
+        assert_eq!(
+            paths(&indexed.relation_occurrences()[0]),
+            vec![(vec!["id"], false), (vec!["attrs", "tags"], true)]
+        );
+        let whole_struct = facts("SELECT attrs AS payload, attrs.id AS subfield FROM orders");
+        assert_eq!(
+            paths(&whole_struct.relation_occurrences()[0]),
+            vec![(vec!["attrs"], true)]
+        );
+    }
+
+    #[test]
+    fn grouping_sets_and_scalar_subqueries_contribute_source_paths() {
+        let grouped = facts(
+            "SELECT region, sum(amount) AS total FROM orders GROUP BY GROUPING SETS ((region, id), (region))",
+        );
+        assert_eq!(
+            paths(&grouped.relation_occurrences()[0]),
+            vec![
+                (vec!["id"], false),
+                (vec!["region"], false),
+                (vec!["amount"], false)
+            ]
+        );
+        let scalar = facts("SELECT id, (SELECT max(amount) FROM east) AS maximum FROM orders");
+        assert_eq!(scalar.relation_occurrences().len(), 2);
+        assert_eq!(
+            paths(&scalar.relation_occurrences()[0]),
+            vec![(vec!["id"], false)]
+        );
+        assert_eq!(
+            paths(&scalar.relation_occurrences()[1]),
+            vec![(vec!["amount"], false)]
+        );
+        assert_eq!(scalar.aggregates()[0].output_ordinal(), None);
+    }
+
+    #[test]
+    fn aggregate_binding_excludes_filter_and_retains_distinct_call_addresses() {
+        let calls = facts(
+            "SELECT sum(id) AS a, sum(amount) FILTER (WHERE region IS NOT NULL) AS b FROM orders WHERE amount IS NOT NULL",
+        );
+        assert_eq!(calls.aggregates()[0].output_ordinal(), Some(0));
+        assert_eq!(calls.aggregates()[1].output_ordinal(), Some(1));
+        assert_eq!(
+            calls.aggregates()[0].overload_id(),
+            calls.aggregates()[1].overload_id()
+        );
+        assert_eq!(calls.aggregates()[0].argument_types().len(), 1);
+        assert_eq!(calls.aggregates()[1].argument_types().len(), 1);
+        assert_eq!(
+            calls.aggregates()[0].selection().state_format,
+            calls.aggregates()[1].selection().state_format
+        );
+        let without_filter = facts("SELECT sum(amount) AS a FROM orders");
+        assert_eq!(
+            calls.aggregates()[1].canonical_bytes(),
+            without_filter.aggregates()[0].canonical_bytes()
+        );
+        assert!(paths(&calls.relation_occurrences()[0]).contains(&(vec!["region"], false)));
     }
 
     /// The refresh contract names each base relation by the occurrence id the
@@ -1645,9 +1851,6 @@ mod tests {
         assert_eq!(first.qualifier(), "orders");
         assert_eq!(second.qualifier(), "orders");
         assert_ne!(first.occurrence_id().get(), second.occurrence_id().get());
-        assert_eq!(
-            refs(facts.outputs()[0].expression()),
-            vec![(0, 0, "id"), (1, 0, "id")]
-        );
+        assert_eq!(refs(&facts.outputs()[0]), vec![(0, 0, "id"), (1, 0, "id")]);
     }
 }

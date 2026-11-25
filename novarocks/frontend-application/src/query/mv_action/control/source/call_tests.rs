@@ -76,6 +76,7 @@ impl Fixture {
                 },
                 policy: DropPolicy::FailIfMissing,
                 data_disposition: ConnectorDropTableDataDisposition::Purge,
+                managed: None,
             },
             self.context.clone(),
         );

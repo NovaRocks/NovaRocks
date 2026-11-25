@@ -93,8 +93,8 @@ pub(crate) fn downstream_floor(
             .collect::<BTreeMap<_, _>>();
         for occurrence in projection
             .facts
-            .definition()
-            .relation_occurrences
+            .binding()
+            .occurrences
             .iter()
             .filter(|occurrence| {
                 occurrence.catalog_at_binding == catalog
@@ -384,16 +384,12 @@ mod tests {
             MvTarget::from_parts(Some("ice"), "analytics", &target_name),
             Some(11),
         );
-        for (index, occurrence) in fixture
-            .definition
-            .relation_occurrences
-            .iter_mut()
-            .enumerate()
-        {
+        for (index, occurrence) in fixture.binding.occurrences.iter_mut().enumerate() {
             occurrence.relation_at_binding = relation.to_string();
             let revision = exact(object, snapshots[index]);
             let (object_id, data_version) = persist_exact_connector_revision(&revision).unwrap();
             occurrence.object_id = object_id.clone();
+            occurrence.facts.object = Bytes::copy_from_slice(object_id.as_bytes());
             let input = fixture
                 .publication
                 .as_mut()

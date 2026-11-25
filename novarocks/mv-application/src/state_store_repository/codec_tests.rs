@@ -195,7 +195,7 @@ fn schema_catalog_contains_exactly_four_current_accelerator_subjects() {
         assert_eq!(
             catalog.latest(subject).unwrap().id(),
             if subject == "mv.accelerator_projection" {
-                4
+                5
             } else {
                 3
             }
@@ -205,7 +205,7 @@ fn schema_catalog_contains_exactly_four_current_accelerator_subjects() {
         catalog.entry("mv.accelerator_projection", 3).unwrap().id(),
         3
     );
-    for version in [3, 4] {
+    for version in [3, 4, 5] {
         let entry = catalog.entry("mv.accelerator_projection", version).unwrap();
         let json: serde_json::Value = serde_json::from_str(entry.raw_schema()).unwrap();
         let fields = json["fields"].as_array().unwrap();
@@ -263,7 +263,7 @@ fn projection_preflight_refuses_a_huge_avro_byte_declaration_before_owned_decode
 #[test]
 fn dependency_decode_preflights_avro_lengths() {
     let root = projection();
-    let relation = &root.facts.definition().relation_occurrences[0];
+    let relation = &root.facts.binding().occurrences[0];
     let dependency = crate::persistence::dependency::StoredMvDependency {
         downstream_mv_id: root.mv_id,
         occurrence_id: relation.occurrence_id,

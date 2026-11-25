@@ -630,7 +630,6 @@ mod tests;
 pub struct PersistentAggregateContract {
     pub function: crate::FunctionId,
     pub overload: crate::FunctionOverloadId,
-    pub result_semantics: String,
     pub state_format: AggregateStateFormatIdentity,
 }
 
@@ -639,11 +638,9 @@ impl PersistentAggregateContract {
         let state = binding.selected.aggregate.as_ref()?;
         let function = binding.function_id.clone();
         let overload = binding.selected.overload.clone();
-        let result_semantics = aggregate_result_semantics(&function, &overload).to_owned();
         Some(Self {
             function,
             overload,
-            result_semantics,
             state_format: state.state_format.clone(),
         })
     }
@@ -665,45 +662,5 @@ impl crate::EngineFunctionCatalog {
                         .as_ref()
                         .is_some_and(|state| state.state_format == contract.state_format)
             })
-            && contract.result_semantics
-                == aggregate_result_semantics(&contract.function, &contract.overload)
-    }
-}
-
-fn aggregate_result_semantics(
-    function: &crate::FunctionId,
-    overload: &crate::FunctionOverloadId,
-) -> &'static str {
-    match (function.as_str(), overload.as_str()) {
-        ("builtin.aggregate/min/v1", "builtin.aggregate/min/derived-v1")
-        | ("builtin.aggregate/max/v1", "builtin.aggregate/max/derived-v1")
-        | ("builtin.aggregate/min/v1", "builtin.aggregate/min/top-n-v1")
-        | ("builtin.aggregate/max/v1", "builtin.aggregate/max/top-n-v1")
-        | ("builtin.aggregate/min_by/v1", _)
-        | ("builtin.aggregate/max_by/v1", _) => "trino-directional-extrema-v1",
-        ("builtin.aggregate/map_agg/v1", _) => "trino-map-null-empty-v1",
-        ("builtin.aggregate/array_agg/v1", _) => "trino-array-null-empty-v1",
-        ("builtin.aggregate/variance/v1", _) | ("builtin.aggregate/stddev/v1", _) => {
-            "trino-sample-moment-v1"
-        }
-        ("builtin.aggregate/bool_and/v1", _) | ("builtin.aggregate/bool_or/v1", _) => {
-            "trino-boolean-aggregate-v1"
-        }
-        (
-            "builtin.aggregate/approx_distinct/v1",
-            "builtin.aggregate/approx_distinct/default-hll-v1",
-        ) => "trino-hll-xxhash64-p11-v1",
-        (
-            "builtin.aggregate/approx_distinct/v1",
-            "builtin.aggregate/approx_distinct/boolean-v1",
-        ) => "trino-boolean-occurrences-v1",
-        (
-            "builtin.aggregate/approx_distinct/v1",
-            "builtin.aggregate/approx_distinct/unknown-v1",
-        ) => "trino-empty-distinct-v1",
-        ("builtin.aggregate/approx_percentile/v1", _) => "trino-tdigest-double-weight-v1",
-        ("builtin.aggregate/approx_most_frequent/v1", _) => "trino-space-saving-v1",
-        ("builtin.aggregate/listagg/v1", _) => "trino-listagg-overflow-v1",
-        _ => "selected-aggregate-v1",
     }
 }

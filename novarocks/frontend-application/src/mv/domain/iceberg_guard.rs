@@ -504,8 +504,11 @@ pub(crate) fn reject_drop_column_mv_dependencies_with_readiness(
         .map_err(|error| format!("load materialized view metadata failed: {error}"))?
     {
         let definition = projection.projection.facts.definition();
-        let matching_occurrences = definition
-            .relation_occurrences
+        let matching_occurrences = projection
+            .projection
+            .facts
+            .binding()
+            .occurrences
             .iter()
             .filter(|occurrence| {
                 occurrence
@@ -539,8 +542,9 @@ pub(crate) fn reject_drop_column_mv_dependencies_with_readiness(
         })?;
         let references_column = matching_occurrences.iter().any(|occurrence| {
             occurrence
-                .fields
+                .paths
                 .iter()
+                .flat_map(|path| &path.nodes)
                 .any(|field| field.name_at_binding.eq_ignore_ascii_case(&leaf))
         });
         if references_column || query_projects_target_wildcard(&query, &target) {

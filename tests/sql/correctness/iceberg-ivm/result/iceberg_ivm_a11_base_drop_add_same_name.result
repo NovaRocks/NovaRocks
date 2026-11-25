@@ -3,3 +3,15 @@
 id	region	amount
 1	US	100
 2	EU	50
+
+-- query 7
+-- types	integer	varchar	bigint
+id	region	amount
+1	NULL	100
+2	NULL	50
+
+-- query 8
+-- types	integer	varchar	bigint
+id	region	amount
+1	NULL	100
+2	NULL	50

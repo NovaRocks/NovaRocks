@@ -14,6 +14,8 @@ const PROTO_FILES: &[&str] = &[
     "persistence/definition.proto",
     "persistence/interpretation.proto",
     "persistence/configuration.proto",
+    "persistence/binding.proto",
+    "persistence/marker.proto",
 ];
 
 fn main() {

@@ -25,9 +25,9 @@
 //! `MvSchemaContract`, and never degrades silently into wrong pruning.
 
 use novarocks_mv_application::persistence::codec::{
-    TargetPartitionFieldBinding, TargetPartitionTransform,
+    BindingDocument, InterpretationDocument, TargetPartitionFieldBinding, TargetPartitionTransform,
 };
-use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
+use novarocks_mv_application::persistence::identity::DocumentRevision;
 use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
 use novarocks_mv_application::persistence::schema::MvPartitionContract;
 use novarocks_sql::planning::mv::{
@@ -48,7 +48,9 @@ use crate::mv::domain::rewrite::context::{
 
 /// Everything one refresh attempt already froze before analysis is derived.
 pub(crate) struct MvRewriteAnalysisInput<'a> {
-    pub projection: &'a StoredKeyedMvProjection,
+    pub definition_revision: DocumentRevision,
+    pub binding: &'a BindingDocument,
+    pub interpretation: &'a InterpretationDocument,
     /// Reconstructed against the exact target observation for this attempt.
     pub runtime_bindings: &'a MvRuntimeBindings,
     /// The provider's partition names and numeric scan-key spec from the same
@@ -58,14 +60,19 @@ pub(crate) struct MvRewriteAnalysisInput<'a> {
     pub join_analysis: SqlMvRefreshJoinAnalysis,
     /// SQL aggregate calls and the physical layout derived from D's query.
     pub aggregate: Option<(SqlMvAggregateCalls, SqlMvAggregatePhysicalLayout)>,
+    pub source_fields: std::collections::BTreeMap<
+        u32,
+        Vec<novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts>,
+    >,
+    pub direct_output_sources:
+        crate::mv::domain::persistence::source_bindings::MvDirectOutputSources,
 }
 
 pub(crate) fn freeze_rewrite_analysis_facts(
     input: MvRewriteAnalysisInput<'_>,
 ) -> Result<MvRewriteAnalysisFacts, String> {
-    let facts = &input.projection.facts;
-    let definition = facts.definition();
-    let interpretation = facts.interpretation();
+    let definition = input.binding;
+    let interpretation = input.interpretation;
 
     // A join rewrite needs each equality predicate expressed as a D occurrence
     // plus that occurrence's opaque source-field identity. Neither comes from
@@ -137,11 +144,13 @@ pub(crate) fn freeze_rewrite_analysis_facts(
     };
 
     Ok(MvRewriteAnalysisFacts {
-        definition_revision: facts.source_revision().definition_revision,
+        definition_revision: input.definition_revision,
         partition_spec_version: interpretation.target.partition_spec_version.clone(),
         join,
         partition,
         aggregate,
+        source_fields: input.source_fields,
+        direct_output_sources: input.direct_output_sources,
     })
 }
 
@@ -153,7 +162,7 @@ pub(crate) fn freeze_rewrite_analysis_facts(
 /// the column is matched against the name that occurrence's field was bound
 /// under, which is what D recorded beside the field's opaque identity.
 fn join_contract_facts(
-    definition: &novarocks_mv_application::persistence::codec::DefinitionDocument,
+    definition: &novarocks_mv_application::persistence::codec::BindingDocument,
     predicates: &[SqlMvJoinPredicateColumns],
 ) -> Result<SqlImvJoinContractFacts, String> {
     let resolved = predicates
@@ -169,11 +178,11 @@ fn join_contract_facts(
 }
 
 fn join_predicate_side(
-    definition: &novarocks_mv_application::persistence::codec::DefinitionDocument,
+    definition: &novarocks_mv_application::persistence::codec::BindingDocument,
     column: &novarocks_sql::planning::mv::SqlMvJoinColumnRef,
 ) -> Result<SqlImvQualifiedFieldFacts, String> {
     let mut matched = definition
-        .relation_occurrences
+        .occurrences
         .iter()
         .filter(|occurrence| occurrence.qualifier_at_binding == column.qualifier);
     let occurrence = matched.next().ok_or_else(|| {
@@ -189,8 +198,9 @@ fn join_predicate_side(
         ));
     }
     let field = occurrence
-        .fields
+        .paths
         .iter()
+        .filter_map(|path| path.nodes.first())
         .find(|field| field.name_at_binding == column.column)
         .ok_or_else(|| {
             format!(

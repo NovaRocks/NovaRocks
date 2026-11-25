@@ -18,9 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,a11,aggregate,base_rename
--- Test Point: Iceberg aggregate MV refresh rebinds a renamed referenced GROUP BY key.
--- Method: Rename base column region -> area through Spark, insert new rows through NovaRocks, refresh, and compare the MV with the rewritten base aggregate.
--- Scope: Iceberg target MV, single-base aggregate, schema evolution, field-id rebind.
+-- A referenced rename makes the original definition stale and preserves the published bag.
 
 -- query 1
 -- @skip_result_check=true
@@ -60,18 +58,21 @@ printf 'SPARK_SQL_OK\n'
 -- query 5
 -- @skip_result_check=true
 INSERT INTO ice_ivm_agg_a11_group_${uuid0}.ns_${uuid0}.orders VALUES ROW('east', 30), ROW('north', 7);
-REFRESH MATERIALIZED VIEW agg_mv_${uuid0};
 
 -- query 6
-SELECT region, c, s FROM agg_mv_${uuid0} ORDER BY region;
+-- @expect_trino_error=VIEW_IS_STALE,USER_ERROR
+REFRESH MATERIALIZED VIEW agg_mv_${uuid0};
 
 -- query 7
+SELECT region, c, s FROM agg_mv_${uuid0} ORDER BY region;
+
+-- query 8
 SELECT area AS region, COUNT(*) AS c, SUM(amount) AS s
 FROM orders
 GROUP BY area
 ORDER BY area;
 
--- query 8
+-- query 9
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW agg_mv_${uuid0};

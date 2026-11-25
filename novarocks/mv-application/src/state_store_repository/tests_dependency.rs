@@ -28,7 +28,7 @@ async fn dependency_indexes_are_replaced_only_with_the_root_projection_cas() {
         )
         .await
         .unwrap();
-    let upstream = created.projection.facts.definition().relation_occurrences[0]
+    let upstream = created.projection.facts.binding().occurrences[0]
         .relation_at_binding
         .clone();
     assert_eq!(
@@ -61,7 +61,7 @@ async fn dependency_indexes_are_replaced_only_with_the_root_projection_cas() {
     assert_eq!(dependencies.len(), 2);
     assert_eq!(dependencies[0].upstream.name, "customers");
     assert_ne!(
-        replaced.projection.facts.definition().relation_occurrences[0].relation_at_binding,
+        replaced.projection.facts.binding().occurrences[0].relation_at_binding,
         upstream
     );
     repository

@@ -52,13 +52,14 @@ use novarocks_query_application::coordination::{
 };
 use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExecutorConfig};
 use novarocks_spi::connector::{
-    ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableMetadata, MvCreatedTargetObservation, MvMaintenanceMetadataObservation,
+    ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
+    ConnectorPreparedCreateDocumentTarget, ConnectorRequestContext, ConnectorTableMetadata,
+    MvCreatedTargetObservation, MvCurrentStorageMapping, MvMaintenanceMetadataObservation,
     MvObservedField, MvObservedMaintenancePolicy, MvObservedPartitionField,
     MvObservedPartitionSpec, MvObservedPartitionTransform, MvObservedRefreshMarker,
-    MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
-    MvRefreshTargetObservation, MvSchemaValidationObservation, MvSourceSchemaObservation,
-    MvStorageObservationPort,
+    MvObservedSnapshot, MvObservedSourceField, MvObservedStorageMapping, MvRefreshBaseObservation,
+    MvRefreshTargetObservation, MvSchemaValidationObservation, MvSourceBindingObservation,
+    MvSourceFieldPath, MvSourceSchemaObservation, MvStorageColumnRequest, MvStorageObservationPort,
 };
 
 use novarocks_state_store_runtime::{
@@ -147,6 +148,38 @@ fn mv_partition_observation(
 }
 
 impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
+    fn map_prepared_storage(
+        &self,
+        target: &ConnectorPreparedCreateDocumentTarget,
+        columns: &[MvStorageColumnRequest],
+        context: ConnectorRequestContext,
+    ) -> Result<Vec<MvObservedStorageMapping>, ConnectorError> {
+        self.inspector
+            .map_prepared_storage(target, columns, context)
+    }
+
+    fn observe_current_storage_mapping(
+        &self,
+        exact_lease: &ConnectorControlPlanningPin,
+        metadata: &ConnectorTableMetadata,
+        columns: &[MvStorageColumnRequest],
+        context: ConnectorRequestContext,
+    ) -> Result<MvCurrentStorageMapping, ConnectorError> {
+        self.inspector
+            .observe_current_storage_mapping(exact_lease, metadata, columns, context)
+    }
+
+    fn observe_source_binding(
+        &self,
+        exact_lease: &ConnectorControlPlanningPin,
+        metadata: &ConnectorTableMetadata,
+        paths: &[MvSourceFieldPath],
+        context: ConnectorRequestContext,
+    ) -> Result<MvSourceBindingObservation, ConnectorError> {
+        self.inspector
+            .observe_source_binding(exact_lease, metadata, paths, context)
+    }
+
     fn observe_source_schema(
         &self,
         exact_lease: &ConnectorControlPlanningPin,
@@ -169,7 +202,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                 MvObservedSourceField::try_new(
                     field.provider_field_id,
                     field.name,
-                    field.type_signature,
+                    field.source_type,
                     field.nullable,
                 )
             })
@@ -202,7 +235,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                 MvObservedField::new(
                     field.field_id,
                     field.name,
-                    field.type_signature,
+                    field.source_type,
                     field.nullable,
                 )
             })
@@ -236,7 +269,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                     MvObservedSourceField::try_new(
                         field.provider_field_id,
                         field.name,
-                        field.type_signature,
+                        field.source_type,
                         field.nullable,
                     )?,
                 ))

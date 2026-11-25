@@ -274,12 +274,13 @@ impl Work {
             ));
         }
         self.pin_schema_id = Some(info.schema_id);
-        let to = match self.request.selection() {
-            ConnectorReadSourceSelection::Snapshot(to) => {
+        let selection = self.request.selection();
+        match selection {
+            ConnectorReadSourceSelection::Snapshot(_)
+            | ConnectorReadSourceSelection::CurrentAtSnapshot(_) => {
                 if self.request.from_revision().is_some() {
                     return Err(invalid("snapshot source has a From revision"));
                 }
-                to
             }
             ConnectorReadSourceSelection::ChangeWindow(window) => {
                 check_revision(
@@ -290,13 +291,27 @@ impl Work {
                         .from_revision()
                         .ok_or_else(|| invalid("window source has no From revision"))?,
                 )?;
-                window.to_snapshot_id()
             }
-        };
+        }
+        let to = selection.to_snapshot_id();
         check_revision(&self.descriptor, &object, to, self.request.to_revision())?;
-        // A missing schema_id is resolved only against this ORIGINAL pin's
-        // schema id, never a later Current/catalog view.
-        let schema = frozen_snapshot_schema(&metadata, to, info.schema_id)?;
+        let schema = if matches!(
+            selection,
+            ConnectorReadSourceSelection::CurrentAtSnapshot(_)
+        ) {
+            if !matches!(
+                observed.projection,
+                crate::metadata::TableMetadataProjection::Current
+            ) {
+                return Err(invalid(
+                    "Current source preparation requires an original Current observation",
+                ));
+            }
+            frozen_current_source_schema(&metadata, to)?
+        } else {
+            // Historical snapshots may fall back only to the original observation's schema ID.
+            frozen_snapshot_schema(&metadata, to, info.schema_id)?
+        };
         let physical = access.reacquired_request_scoped(
             self.runtime
                 .resources()
@@ -312,7 +327,8 @@ impl Work {
         self.physical = Some(physical);
         self.schema = Some(schema);
         match self.request.selection() {
-            ConnectorReadSourceSelection::Snapshot(_) => self.finish(None),
+            ConnectorReadSourceSelection::Snapshot(_)
+            | ConnectorReadSourceSelection::CurrentAtSnapshot(_) => self.finish(None),
             ConnectorReadSourceSelection::ChangeWindow(window) => {
                 match crate::change_planning::prepare_change_window(
                     &metadata,
@@ -338,9 +354,13 @@ impl Work {
         admission: Option<ConnectorChangeWindowAdmission>,
     ) -> Result<(), ConnectorError> {
         let physical = self.physical.as_ref().expect("same frozen source view");
-        let to = match self.request.selection() {
-            ConnectorReadSourceSelection::Snapshot(to) => to,
-            ConnectorReadSourceSelection::ChangeWindow(window) => window.to_snapshot_id(),
+        let selection = self.request.selection();
+        let to = selection.to_snapshot_id();
+        let projection = match selection {
+            ConnectorReadSourceSelection::CurrentAtSnapshot(_) => {
+                crate::metadata::TableMetadataProjection::CurrentSnapshotTo(to)
+            }
+            _ => crate::metadata::TableMetadataProjection::SnapshotTo(to),
         };
         let request = novarocks_spi::connector::ConnectorTableRequest {
             table: novarocks_spi::connector::ConnectorTableIdentity {
@@ -367,7 +387,7 @@ impl Work {
                             self.descriptor.instance_id.as_str(),
                         )?
                         .snapshots,
-                    projection: crate::metadata::TableMetadataProjection::SnapshotTo(to),
+                    projection,
                 },
                 creation,
             )
@@ -398,6 +418,18 @@ impl Work {
         })));
         Ok(())
     }
+}
+
+pub(crate) fn frozen_current_source_schema(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    snapshot: i64,
+) -> Result<SchemaRef, ConnectorError> {
+    if metadata.current_snapshot_id() != Some(snapshot) {
+        return Err(invalid(
+            "Current source snapshot differs from its original observation",
+        ));
+    }
+    Ok(metadata.current_schema().clone())
 }
 
 pub(crate) fn frozen_snapshot_schema(

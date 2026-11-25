@@ -91,11 +91,28 @@ pub struct MvDropManagementObservation {
     dependencies: ManagementDependencySet,
     root_binding: novarocks_spi::connector::DocumentIdentity,
     configuration_revision: crate::persistence::identity::DocumentRevision,
+    slots: DropSlotFence,
+    retired: bool,
+    metadata_version: ConnectorCommittedVersion,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DropSlotFence {
+    management: novarocks_spi::connector::DocumentIdentity,
+    configuration: novarocks_spi::connector::DocumentIdentity,
 }
 
 impl MvDropManagementObservation {
     pub fn target(&self) -> &ManagedMvTarget {
         &self.target
+    }
+
+    pub fn is_retired(&self) -> bool {
+        self.retired
+    }
+
+    pub fn metadata_version(&self) -> &ConnectorCommittedVersion {
+        &self.metadata_version
     }
 
     pub fn request(&self) -> ManagementRequest {
@@ -117,6 +134,9 @@ impl MvDropManagementObservation {
             && self.dependencies == other.dependencies
             && self.root_binding == other.root_binding
             && self.configuration_revision == other.configuration_revision
+            && self.slots == other.slots
+            && self.retired == other.retired
+            && self.metadata_version == other.metadata_version
     }
 }
 
@@ -342,6 +362,7 @@ struct TargetAdmissionState {
     pending_continuation: Option<ManagementContinuation>,
     pending_observation: Option<ManagementObservationAuthorization>,
     installed_observation: Option<ManagementObservationLiveness>,
+    retired_drop_slots: Option<DropSlotFence>,
     ready: bool,
     incarnation_mismatch: bool,
     owner_mismatch: bool,
@@ -618,6 +639,87 @@ impl ManagementEntrance {
         self.finish_keyed_drop_observation(lease, &request, documents, convergence)
     }
 
+    /// A retired envelope may be dropped without a Ready projection. It leaves
+    /// the management entrance closed to all operations other than exact DROP.
+    pub async fn observe_retired_keyed_drop_async(
+        &self,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<MvDropManagementObservation, crate::persistence::documents::MvDocumentError> {
+        use crate::persistence::{
+            documents::MvDocumentError,
+            keyed_documents::{MV_DOCUMENT_OWNER, decode_keyed_drop_documents},
+        };
+        let error = |message: &str| MvDocumentError::Contract(message.into());
+        let view = lease.observe_keyed_documents_async(request.clone()).await?;
+        let documents = decode_keyed_drop_documents(&view, request.catalog_handle.clone())?;
+        if !documents.retired || documents.owner != self.inner.owner {
+            return Err(error(
+                "MV DROP requires an exact retired binding of this deployment",
+            ));
+        }
+        if view
+            .markers
+            .keys()
+            .any(|key| key.owner == MV_DOCUMENT_OWNER)
+        {
+            return Err(error(
+                "MV DROP retired binding has unresolved document markers",
+            ));
+        }
+        let unbound = lock(&self.inner.unbound_create);
+        if unbound.contains_key(&view.table) {
+            return Err(error("MV DROP target has an unsettled CREATE"));
+        }
+        let mut state = lock(&self.inner.state);
+        let slots = DropSlotFence {
+            management: documents.management_slot_digest,
+            configuration: documents.configuration_slot_digest,
+        };
+        let dependencies = ManagementDependencySet::new(
+            *documents.definition_revision.as_bytes(),
+            *documents.interpretation_revision.as_bytes(),
+            None,
+            lease.control_runtime_id(),
+        );
+        let current = state
+            .entry(view.table.clone())
+            .or_insert_with(|| TargetAdmissionState {
+                target: documents.target.clone(),
+                dependencies: dependencies.clone(),
+                unsettled: HashMap::new(),
+                pending_slot_changes: HashMap::new(),
+                latest_slot_change_conclusion: None,
+                pending_committed_effect: None,
+                pending_continuation: None,
+                pending_observation: None,
+                installed_observation: Some(ManagementObservationLiveness::new()),
+                retired_drop_slots: Some(slots.clone()),
+                ready: true,
+                incarnation_mismatch: false,
+                owner_mismatch: false,
+            });
+        self.validate_keyed_drop_state(current, lease, &request)?;
+        if current.retired_drop_slots.as_ref() != Some(&slots)
+            || current.dependencies != dependencies
+            || !current.pending_slot_changes.is_empty()
+            || current.pending_continuation.is_some()
+        {
+            return Err(error(
+                "MV DROP retired target observation or retained obligations changed",
+            ));
+        }
+        Ok(MvDropManagementObservation {
+            target: documents.target,
+            dependencies,
+            root_binding: documents.root_binding,
+            configuration_revision: documents.configuration_revision,
+            slots,
+            retired: true,
+            metadata_version: documents.metadata_version,
+        })
+    }
+
     fn validate_keyed_drop_state(
         &self,
         current: &TargetAdmissionState,
@@ -697,10 +799,9 @@ impl ManagementEntrance {
                 "MV DROP Current management slot names another owner or incarnation",
             ));
         }
-        if current.dependencies.definition_revision
-            != *documents.versions.definition_revision().as_bytes()
+        if current.dependencies.definition_revision != *documents.definition_revision.as_bytes()
             || current.dependencies.interpretation_revision
-                != *documents.versions.interpretation_revision().as_bytes()
+                != *documents.interpretation_revision.as_bytes()
         {
             return Err(error(
                 "MV DROP current root definition or interpretation changed",
@@ -713,8 +814,14 @@ impl ManagementEntrance {
             MvDropManagementObservation {
                 target: documents.target,
                 dependencies: current.dependencies.clone(),
-                root_binding: documents.versions.binding.identity(),
+                root_binding: documents.root_binding,
                 configuration_revision: documents.configuration_revision,
+                slots: DropSlotFence {
+                    management: documents.management_slot_digest,
+                    configuration: documents.configuration_slot_digest,
+                },
+                retired: documents.retired,
+                metadata_version: documents.metadata_version,
             },
             convergence,
         ))
@@ -959,6 +1066,7 @@ impl ManagementEntrance {
                 pending_continuation: None,
                 pending_observation: None,
                 installed_observation: Some(observation.liveness().clone()),
+                retired_drop_slots: None,
                 ready: true,
                 incarnation_mismatch: false,
                 owner_mismatch: false,
@@ -1095,6 +1203,7 @@ impl ManagementEntrance {
                 pending_continuation: Some(continuation.clone()),
                 pending_observation: Some(authorization.clone()),
                 installed_observation: None,
+                retired_drop_slots: None,
                 ready: false,
                 incarnation_mismatch: false,
                 owner_mismatch: false,
@@ -1272,6 +1381,9 @@ impl ManagementEntrance {
         }
         if !current.ready {
             return MvManagementPhase::AwaitingObservation;
+        }
+        if current.retired_drop_slots.is_some() {
+            return MvManagementPhase::NotObserved;
         }
         if activity.active {
             return MvManagementPhase::Managing;
@@ -1628,6 +1740,8 @@ impl ManagementEntranceObligation {
                     current.installed_observation = None;
                 }
                 if !current.ready
+                    || (current.retired_drop_slots.is_some()
+                        && self.request.operation != ConnectorDocumentManagementOperation::Drop)
                     || !current.unsettled.is_empty()
                     || current.pending_committed_effect.is_some()
                     || current.pending_observation.is_some()
@@ -1930,6 +2044,7 @@ fn record_committed(
         pending_continuation: None,
         pending_observation: None,
         installed_observation: None,
+        retired_drop_slots: None,
         ready: false,
         incarnation_mismatch: false,
         owner_mismatch: false,
@@ -2062,6 +2177,11 @@ fn validate_request_against_state(
                     ManagementAdmissionError::EffectUnsettled
                 });
             }
+            if current.retired_drop_slots.is_some()
+                && request.operation != ConnectorDocumentManagementOperation::Drop
+            {
+                return Err(ManagementAdmissionError::ReadmissionIncomplete);
+            }
             if current.target.catalog() != &request.catalog
                 || request.expected_object_id.as_ref() != Some(current.target.object_id())
             {
@@ -2118,6 +2238,7 @@ fn record_unsettled(
         pending_continuation: None,
         pending_observation: None,
         installed_observation: None,
+        retired_drop_slots: None,
         ready: false,
         incarnation_mismatch: false,
         owner_mismatch: false,

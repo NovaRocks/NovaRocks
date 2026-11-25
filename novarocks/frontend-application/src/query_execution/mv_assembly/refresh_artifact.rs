@@ -50,6 +50,8 @@ pub(crate) enum MvStagedRefreshWriteMode {
 pub(crate) struct MvFirstRefreshLogicalContext {
     pub(crate) mv_definition:
         novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
+    pub(crate) rebuild_layout:
+        Option<Arc<crate::mv::domain::rewrite::context::MvRewriteRebuildLayout>>,
     pub(crate) base_refs: Vec<novarocks_types::naming::TableIdentity>,
     pub(crate) pin: Vec<MvRewriteSourceSnapshot>,
     pub(crate) previous: Vec<MvRewriteSourceSnapshot>,

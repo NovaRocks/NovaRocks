@@ -88,11 +88,9 @@ impl CatalogServiceMaterializer<'_> {
         } else if let Some(fact) = self.completed_current_table(need) {
             fact.map_err(CatalogResolutionError::from)
         } else {
-            self.bindings
-                .require_catalog_observation_allowed()
-                .map_err(
-                crate::query_execution::mv_assembly::refresh_preparation::io_gate::contract_error,
-            )?;
+            // The shared observation owner can project a retained view even
+            // after capture is sealed. It checks the seal before starting I/O
+            // for a missing name.
             let observed = projection::load_statement_relation(
                 &self.bindings,
                 controls,
@@ -326,6 +324,16 @@ impl CatalogServiceMaterializer<'_> {
         let Some(Ok(binding)) = self.bindings.resolved_lookup(&key) else {
             return None;
         };
+        if let Some((_, context)) = self.loader.connector_read_context()
+            && let Ok(held) = self.bindings.binding(binding)
+            && let Some(metadata) = held.source_metadata.as_ref()
+            && let Ok(planning) = held.admission.exact_planning_pin()
+            && let Err(error) = super::super::query_catalog::relation::validate_current_mv_format(
+                metadata, &planning, context,
+            )
+        {
+            return Some(Err(error.into_compile()));
+        }
         Some(self.memoized_relation_fact(
             need,
             MemoizedQueryRelation::Table {

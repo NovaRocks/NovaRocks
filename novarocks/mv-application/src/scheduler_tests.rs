@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use crate::persistence::identity::{NativeDataVersion, ObjectIdentity, SchemaVersion};
+use crate::persistence::identity::{NativeDataVersion, ObjectIdentity};
 use crate::persistence::test_support::KeyedProjectionFixture;
 
 fn stored(mv_id: i64, fixture: KeyedProjectionFixture) -> StoredKeyedMvProjection {
@@ -58,17 +58,10 @@ fn input(id: u32, object: &[u8], version: &[u8]) -> PublicationInput {
 fn publication(inputs: Vec<PublicationInput>) -> (u64, Vec<PublicationInput>) {
     (1_000, inputs)
 }
-fn occurrence(id: u32) -> RelationOccurrence {
-    RelationOccurrence {
-        occurrence_id: id,
-        catalog_at_binding: "iceberg".to_string(),
-        namespace_at_binding: "db".to_string(),
-        relation_at_binding: "base".to_string(),
-        qualifier_at_binding: "base".to_string(),
-        object_id: ObjectIdentity::try_new(b"source".to_vec()).unwrap(),
-        schema_version: SchemaVersion::try_new(vec![1]).unwrap(),
-        fields: Vec::new(),
-    }
+fn occurrence(id: u32) -> BindingOccurrence {
+    let mut occurrence = crate::persistence::test_support::relation(id, 1, "base");
+    occurrence.object_id = ObjectIdentity::try_new(b"source".to_vec()).unwrap();
+    occurrence
 }
 
 #[test]

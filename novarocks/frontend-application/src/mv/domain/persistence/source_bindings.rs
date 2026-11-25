@@ -23,66 +23,296 @@
 //! identities from that same metadata generation.
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
+use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
+use crate::mv::domain::storage_observation as storage;
+use bytes::Bytes;
+use novarocks_mv_application::persistence::{
+    aggregate_bindings::{MvCreateRelationObservation, MvCreateSourceFieldObservation},
+    codec::{
+        BindingDependency, BindingDocument, BindingOccurrence, BoundSourceNode, BoundSourcePath,
+        QueryDialect, ReadSelection, SourceBindingFacts, SourceNodeKind, keyed::DataVersionFormat,
+    },
+    create_documents::build_binding_outputs,
+    exact_revision::persist_exact_connector_revision,
+    identity::{FieldIdentity, ObjectIdentity},
+};
+use novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection;
 use novarocks_spi::connector::{
-    ConnectorReadSelector, ConnectorRequestContext, MvSourceSchemaObservation,
-    MvStorageObservationPort,
+    ConnectorExactSemanticRevision, ConnectorReadSelector, ConnectorRequestContext,
+    MvSourceFieldCoordinate, MvSourceFieldKind, MvSourceFieldPath, MvSourceObjectKind,
+    MvSourceSchemaObservation, MvStorageObservationPort,
 };
 use novarocks_sql::planning::mv::{
-    SqlMvCreatePersistenceFacts, SqlMvPersistenceRelationOccurrenceFacts,
+    SqlMvCreatePersistenceFacts, SqlMvPersistenceRelationOccurrenceFacts, SqlMvReadSelection,
 };
+use novarocks_type_contract::CanonicalFactWriter;
+use std::collections::BTreeMap;
 
-use novarocks_mv_application::persistence::aggregate_bindings::{
-    MvCreateRelationObservation, MvCreateSourceFieldObservation,
-};
+pub(crate) type MvDirectOutputSources = BTreeMap<
+    novarocks_mv_application::persistence::identity::OutputIdentity,
+    novarocks_mv_application::persistence::codec::SourceFieldReference,
+>;
 
-/// Freeze the exact provider source-field identities that a CREATE analysis
-/// already used. Repeated SQL references to one relation produce distinct
-/// occurrence records, even though they deliberately reuse one request-local
-/// source metadata binding.
-pub(crate) fn observe_mv_create_source_bindings_original(
+pub(crate) struct MvObservedBinding {
+    pub(crate) relations: Vec<MvCreateRelationObservation>,
+    pub(crate) document: BindingDocument,
+    pub(crate) revisions: BTreeMap<u32, ConnectorExactSemanticRevision>,
+    pub(crate) direct_output_sources: MvDirectOutputSources,
+    pub(crate) schemas: BTreeMap<String, storage::MvSourceSchemaObservation>,
+}
+
+/// Resolve each occurrence through the original SQL binding ID. A repeated
+/// object may share immutable metadata while preserving the address of each scan.
+pub(crate) fn view_binding_dependency(
+    view: &novarocks_sql::planning::catalog::SqlMvViewDependency,
+) -> BindingDependency {
+    let mut identity = CanonicalFactWriter::new("novarocks.mv.observed-view", 1);
+    identity.text(&view.identity().catalog);
+    if let Some((uuid, _)) = view.iceberg_version() {
+        identity.bytes(&uuid);
+    } else {
+        identity.text(&view.identity().namespace);
+        identity.text(&view.identity().table);
+    }
+    BindingDependency::View {
+        identity: identity.finish().into(),
+        depth: view.depth(),
+        exact_declaration: Bytes::copy_from_slice(view.version().as_bytes()),
+        iceberg_version: view.iceberg_version(),
+        dialect: QueryDialect::Trino,
+        canonical: Bytes::copy_from_slice(view.canonical_bytes()),
+    }
+}
+
+pub(crate) fn observe_mv_binding(
     observer: &dyn MvStorageObservationPort,
     sql_facts: &SqlMvCreatePersistenceFacts,
     bindings: &QueryTableBindingStore,
+    upstream: &[LoadedKeyedMvProjection],
     context: ConnectorRequestContext,
-) -> Result<
-    (
-        Vec<MvCreateRelationObservation>,
-        novarocks_mv_application::persistence::codec::keyed::BindingDocument,
-    ),
-    crate::mv::domain::application::MvApplicationError,
-> {
-    let mut formats = Vec::new();
-    let observations = sql_facts.relation_occurrences().iter().map(|relation| {
-        let binding = bindings.strict_base_binding(relation.catalog(), relation.namespace(), relation.relation())
-            .ok_or_else(|| invalid(format!("CREATE source occurrence {} has no admitted connector binding", relation.occurrence_id().get())))?;
-        let metadata = binding.source_metadata.as_ref().ok_or_else(|| invalid(format!(
-            "CREATE source occurrence {} was not admitted from exact provider metadata", relation.occurrence_id().get())))?;
-        let lease = binding.admission.exact_planning_pin().map_err(invalid)?;
-        let observed = observer.observe_source_schema(&lease, metadata, context.clone())
-            .map_err(|error| provider(error, format!("observe CREATE source fields for {}.{}.{}",
-                relation.catalog(), relation.namespace(), relation.relation())))?;
-        validate_same_generation(metadata, &observed).map_err(invalid)?;
-        let revision = lease.binding().metadata().exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)
-            .map_err(|error| provider(error, format!("observe exact CREATE source revision for {}.{}.{}",
-                relation.catalog(), relation.namespace(), relation.relation())))?;
-        if revision.object_identity().value().as_ref() != observed.object_id().as_bytes().as_ref() {
-            return Err(invalid("CREATE source field observation and exact revision identify different objects"));
+) -> Result<MvObservedBinding, MvApplicationError> {
+    let mut dependencies = sql_facts
+        .view_dependencies()
+        .iter()
+        .map(view_binding_dependency)
+        .collect::<Vec<_>>();
+    let mut relations = Vec::new();
+    let mut occurrences = Vec::new();
+    let mut revisions = BTreeMap::new();
+    let mut schemas = BTreeMap::new();
+    for relation in sql_facts.relation_occurrences() {
+        let occurrence_id = relation.occurrence_id().get();
+        if relation.read_selection() != SqlMvReadSelection::Current {
+            return Err(MvApplicationError::from_compile(
+                novarocks_sql::compiler::SqlCompileError::Analyze(
+                    novarocks_sql::analyze_error::AnalyzeError::unsupported_query_shape(
+                        "Materialized view source scans must read Current",
+                        novarocks_parser::Span::new(0, 0),
+                    ),
+                ),
+            ));
         }
-        formats.push(novarocks_mv_application::persistence::codec::keyed::DataVersionFormat::from_issued_fact(revision.data_version())
-            .map_err(codec_failure)?);
-        let (object_id, _data_version) = persist_exact_connector_revision(&revision)
-            .map_err(|error| provider(error, "persist exact CREATE source revision"))?;
-        bind_relation_fields(relation, &observed, bytes::Bytes::copy_from_slice(object_id.as_bytes()))
-            .map_err(invalid)
-    }).collect::<Result<Vec<_>, _>>()?;
-    Ok((
-        observations,
-        novarocks_mv_application::persistence::codec::keyed::BindingDocument {
-            data_versions: formats,
+        let binding = bindings.binding(relation.binding()).map_err(invalid)?;
+        let metadata = binding.source_metadata.as_ref().ok_or_else(|| {
+            invalid(format!(
+                "MV source occurrence {occurrence_id} has no original provider metadata"
+            ))
+        })?;
+        let lease = binding.admission.exact_planning_pin().map_err(invalid)?;
+        let request = relation
+            .field_paths()
+            .iter()
+            .map(|path| MvSourceFieldPath {
+                fields: path
+                    .fields()
+                    .iter()
+                    .map(|field| MvSourceFieldCoordinate {
+                        ordinal: field.ordinal(),
+                        name: field.name().to_owned(),
+                    })
+                    .collect(),
+                whole_subtree: path.whole_subtree(),
+            })
+            .collect::<Vec<_>>();
+        let fact = observer
+            .observe_source_binding(&lease, metadata, &request, context.clone())
+            .map_err(|error| provider(error, "observe exact MV source binding"))?;
+        let schema = observer
+            .observe_source_schema(&lease, metadata, context.clone())
+            .map_err(|error| provider(error, "observe exact MV source schema"))?;
+        validate_same_generation(metadata, &schema).map_err(invalid)?;
+        let revision = lease
+            .binding()
+            .metadata()
+            .exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)
+            .map_err(|error| provider(error, "freeze MV source data version"))?;
+        if fact.catalog_instance != metadata.identity.instance_id
+            || fact.object_id != *schema.object_id()
+            || revision.object_identity().value() != fact.object_id.as_bytes()
+            || fact.paths.len() != request.len()
+        {
+            return Err(invalid(
+                "MV source facts differ from the original query binding",
+            ));
+        }
+        let format =
+            DataVersionFormat::from_issued_fact(revision.data_version()).map_err(codec_failure)?;
+        let (object_id, _) = persist_exact_connector_revision(&revision)
+            .map_err(|error| provider(error, "persist exact MV source revision"))?;
+        relations.push(
+            bind_relation_fields(
+                relation,
+                &schema,
+                Bytes::copy_from_slice(object_id.as_bytes()),
+            )
+            .map_err(invalid)?,
+        );
+        if fact.object_kind == MvSourceObjectKind::MaterializedView {
+            dependencies.push(nested_dependency(upstream, &fact, &schema, &object_id)?);
+        }
+        let mut paths = fact
+            .paths
+            .into_iter()
+            .zip(request)
+            .map(|(path, sql_path)| {
+                if path.fields.len() != sql_path.fields.len() {
+                    return Err(invalid(
+                        "MV provider paths do not cover the analyzed field coordinates",
+                    ));
+                }
+                let nodes = path
+                    .fields
+                    .into_iter()
+                    .zip(sql_path.fields)
+                    .map(|(node, sql_field)| {
+                        Ok(BoundSourceNode {
+                            field_id: FieldIdentity::try_new(node.provider_field_id.to_vec())
+                                .map_err(|e| invalid(e.to_string()))?,
+                            name_at_binding: sql_field.name,
+                            required: node.required,
+                            kind: match node.kind {
+                                MvSourceFieldKind::Scalar => SourceNodeKind::Scalar,
+                                MvSourceFieldKind::Struct => SourceNodeKind::Struct,
+                                MvSourceFieldKind::List => SourceNodeKind::List,
+                                MvSourceFieldKind::Map => SourceNodeKind::Map,
+                            },
+                        })
+                    })
+                    .collect::<Result<_, MvApplicationError>>()?;
+                Ok(BoundSourcePath {
+                    nodes,
+                    leaf_type: path.leaf_type,
+                    whole_subtree: path.whole_subtree,
+                })
+            })
+            .collect::<Result<Vec<_>, MvApplicationError>>()?;
+        paths.sort_by(|left, right| {
+            left.nodes
+                .iter()
+                .map(|node| &node.field_id)
+                .cmp(right.nodes.iter().map(|node| &node.field_id))
+        });
+        occurrences.push(BindingOccurrence {
+            occurrence_id,
+            catalog_at_binding: metadata.identity.instance_id.as_str().to_owned(),
+            namespace_at_binding: metadata.identity.namespace.to_string(),
+            relation_at_binding: metadata.identity.table.to_string(),
+            qualifier_at_binding: relation.qualifier().to_owned(),
+            selection: ReadSelection::Current,
+            object_id,
+            data_version: format,
+            facts: SourceBindingFacts {
+                occurrence: relation.canonical_bytes().into(),
+                object: fact.object_fact.canonical_bytes().clone(),
+                field_paths: fact.path_fact.canonical_bytes().clone(),
+                field_types: fact.type_fact.canonical_bytes().clone(),
+                read_declarations: fact.read_declarations_fact.canonical_bytes().clone(),
+            },
+            paths,
+        });
+        let identity = format!(
+            "{}.{}.{}",
+            metadata.identity.instance_id.as_str(),
+            metadata.identity.namespace,
+            metadata.identity.table
+        );
+        if let std::collections::btree_map::Entry::Vacant(entry) = schemas.entry(identity) {
+            entry.insert(
+                storage::source_schema_from_spi(schema, &context)
+                    .map_err(|error| provider(error, "project MV base schema"))?,
+            );
+        }
+        if revisions.insert(occurrence_id, revision).is_some() {
+            return Err(invalid("MV analysis repeats a source occurrence identity"));
+        }
+    }
+    dependencies.sort_by(|left, right| left.canonical_bytes().cmp(right.canonical_bytes()));
+    dependencies.dedup_by(|left, right| left.canonical_bytes() == right.canonical_bytes());
+    let outputs = build_binding_outputs(sql_facts, &relations).map_err(invalid)?;
+    let mut direct_output_sources = BTreeMap::new();
+    for (sql, output) in sql_facts.outputs().iter().zip(&outputs) {
+        if let (Some(direct), [provider]) = (sql.direct_source(), output.source_fields.as_slice()) {
+            if direct.occurrence_id().get() != provider.occurrence_id {
+                return Err(invalid(
+                    "MV direct field belongs to another source occurrence",
+                ));
+            }
+            direct_output_sources.insert(output.identity(), provider.clone());
+        }
+    }
+    Ok(MvObservedBinding {
+        relations,
+        document: BindingDocument {
+            occurrences,
+            outputs,
+            dependencies,
         },
-    ))
+        revisions,
+        direct_output_sources,
+        schemas,
+    })
 }
+
+fn nested_dependency(
+    candidates: &[LoadedKeyedMvProjection],
+    fact: &novarocks_spi::connector::MvSourceBindingObservation,
+    schema: &MvSourceSchemaObservation,
+    object_id: &ObjectIdentity,
+) -> Result<BindingDependency, MvApplicationError> {
+    let matches = candidates
+        .iter()
+        .filter(|candidate| {
+            let source = candidate.projection.facts.source_revision();
+            source.target.instance_id == fact.catalog_instance
+                && source.target_object_id == fact.object_id
+                && candidate.projection.facts.metadata_version().snapshot_id()
+                    == schema.selected_snapshot_id()
+        })
+        .collect::<Vec<_>>();
+    let [upstream] = matches.as_slice() else {
+        return Err(MvApplicationError::new(
+            MvApplicationErrorKind::Unavailable,
+            "An observed upstream materialized view has no unambiguous current definition",
+        ));
+    };
+    let definition_revision = upstream
+        .projection
+        .facts
+        .source_revision()
+        .definition_revision;
+    let mut canonical = CanonicalFactWriter::new("novarocks.mv.nested-mv-binding", 1);
+    canonical.text(fact.catalog_instance.as_str());
+    canonical.bytes(object_id.as_bytes());
+    canonical.bytes(definition_revision.as_bytes());
+    canonical.text("trino");
+    Ok(BindingDependency::NestedMv {
+        object_id: object_id.clone(),
+        definition_revision,
+        dialect: QueryDialect::Trino,
+        canonical: canonical.finish().into(),
+    })
+}
+
 fn invalid(message: impl Into<String>) -> crate::mv::domain::application::MvApplicationError {
     crate::mv::domain::application::MvApplicationError::new(
         crate::mv::domain::application::MvApplicationErrorKind::InvalidRequest,
@@ -146,7 +376,7 @@ fn bind_relation_fields(
                 field_ordinal: reference.field_ordinal(),
                 field_name: field.name().to_string(),
                 provider_field_id: field.provider_field_id().clone(),
-                type_signature: field.type_signature().to_string(),
+                source_type: field.source_type().clone(),
                 nullable: field.nullable(),
             })
         })
@@ -154,7 +384,6 @@ fn bind_relation_fields(
     Ok(MvCreateRelationObservation {
         occurrence_id: relation.occurrence_id().get(),
         provider_object_id,
-        provider_schema_version: observed.schema_version().clone(),
         fields,
     })
 }
@@ -284,7 +513,7 @@ mod tests {
                 MvObservedSourceField::try_new(
                     Bytes::from_static(b"field-1"),
                     "id".to_string(),
-                    "long".to_string(),
+                    novarocks_mv_application::persistence::test_support::fixture_type("long"),
                     false,
                 )
                 .expect("field"),

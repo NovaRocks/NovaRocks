@@ -765,6 +765,7 @@ pub enum TargetReadiness {
     /// `Unavailable`, where the projection itself is in doubt.
     ReadOnly(String),
     Unavailable(String),
+    Retired(crate::persistence::keyed_documents::RetiredMvStatus),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -916,6 +917,33 @@ where
             .entry(target)
             .or_default()
             .readiness = TargetReadiness::Unavailable(reason);
+    }
+
+    pub(crate) fn set_retired(
+        &self,
+        target: T,
+        status: crate::persistence::keyed_documents::RetiredMvStatus,
+    ) {
+        self.inner
+            .lock()
+            .expect("MV application runtime lock poisoned")
+            .entry(target)
+            .or_default()
+            .readiness = TargetReadiness::Retired(status);
+    }
+
+    pub(crate) fn retired_mv_statuses(
+        &self,
+    ) -> Vec<crate::persistence::keyed_documents::RetiredMvStatus> {
+        self.inner
+            .lock()
+            .expect("MV application runtime lock poisoned")
+            .values()
+            .filter_map(|entry| match &entry.readiness {
+                TargetReadiness::Retired(status) => Some(status.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(crate) fn set_read_only(&self, target: T, reason: String) {

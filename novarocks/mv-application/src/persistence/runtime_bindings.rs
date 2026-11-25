@@ -24,7 +24,9 @@ use super::identity::{
     AggregateIdentity, BranchIdentity, FieldIdentity, OutputIdentity, PartitionSpecVersion,
     SchemaVersion, StateSlotIdentity,
 };
-use novarocks_spi::connector::{ConnectorCommittedVersion, ConnectorTableObjectId};
+use novarocks_spi::connector::{
+    ConnectorCommittedVersion, ConnectorTableObjectId, ProviderSourceType,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,7 +45,7 @@ pub struct MvPhysicalFieldFacts {
     pub field_id: FieldIdentity,
     pub name: String,
     pub ordinal: u32,
-    pub type_signature: String,
+    pub source_type: ProviderSourceType,
     pub nullable: bool,
 }
 
@@ -77,8 +79,8 @@ pub fn reconstruct_keyed_runtime_bindings(
     projection: &super::keyed_documents::MvKeyedDocumentProjection,
     schema: &MvExactTargetSchemaFacts,
 ) -> Result<MvRuntimeBindings, String> {
-    reconstruct_from_documents(
-        projection.definition(),
+    reconstruct_runtime_bindings(
+        projection.binding(),
         projection.interpretation(),
         &projection.source_revision().target_object_id,
         projection.metadata_version(),
@@ -86,14 +88,16 @@ pub fn reconstruct_keyed_runtime_bindings(
     )
 }
 
-fn reconstruct_from_documents(
-    definition: &super::codec::DefinitionDocument,
+pub fn reconstruct_runtime_bindings(
+    binding: &super::codec::BindingDocument,
     interpretation: &super::codec::InterpretationDocument,
     object_id: &ConnectorTableObjectId,
     metadata_version: &ConnectorCommittedVersion,
     schema: &MvExactTargetSchemaFacts,
 ) -> Result<MvRuntimeBindings, String> {
-    if schema.object_id != *object_id {
+    if schema.object_id != *object_id
+        || interpretation.target.object_id.as_bytes() != object_id.as_bytes().as_ref()
+    {
         return Err("MV runtime target object is not from the exact document generation".into());
     }
     if &schema.metadata_version != metadata_version {
@@ -119,7 +123,6 @@ fn reconstruct_from_documents(
     let mut names = BTreeSet::new();
     for field in &schema.fields {
         if field.name.is_empty()
-            || field.type_signature.is_empty()
             || !ordinals.insert(field.ordinal)
             || !names.insert(&field.name)
             || by_id.insert(&field.field_id, field).is_some()
@@ -134,7 +137,7 @@ fn reconstruct_from_documents(
         let field = by_id
             .get(&binding.target_field_id)
             .ok_or("MV runtime target schema is missing a bound physical field")?;
-        if field.type_signature != binding.type_signature || field.nullable != binding.nullable {
+        if field.source_type != binding.source_type || field.nullable != binding.nullable {
             return Err("MV runtime target field type or nullability changed".into());
         }
         logical.insert(&binding.logical_identity, (*field).clone());
@@ -144,15 +147,13 @@ fn reconstruct_from_documents(
             "MV interpretation has no physical binding for a logical identity".to_string()
         })
     };
-    let outputs = definition
+    let outputs = binding
         .outputs
         .iter()
         .map(|output| {
             Ok((
-                output.output_id.clone(),
-                lookup(PhysicalFieldLogicalIdentity::Output(
-                    output.output_id.clone(),
-                ))?,
+                output.identity(),
+                lookup(PhysicalFieldLogicalIdentity::Output(output.identity()))?,
             ))
         })
         .collect::<Result<_, String>>()?;
@@ -253,7 +254,7 @@ mod tests {
                 field_id: field.target_field_id.clone(),
                 name: format!("physical_{ordinal}"),
                 ordinal: ordinal as u32,
-                type_signature: field.type_signature.clone(),
+                source_type: field.source_type.clone(),
                 nullable: field.nullable,
             })
             .collect();

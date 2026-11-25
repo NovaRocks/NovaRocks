@@ -27,7 +27,7 @@ import "persistence/definition.proto";
 message InterpretationDocument {
   optional uint32 format_version = 1;
   optional bytes definition_revision = 2;
-  optional bytes computation_identity = 3;
+  reserved 3;
   repeated OutputBinding outputs = 4;
   repeated StateSlot state_slots = 5;
   optional ApplyKey apply_key = 6;
@@ -39,14 +39,14 @@ message InterpretationDocument {
 message OutputBinding {
   optional bytes output_id = 1;
   optional bytes target_field_id = 2;
-  optional string type_signature = 3;
+  optional bytes source_type = 3;
   optional bool nullable = 4;
 }
 
 message StateSlot {
   optional bytes slot_id = 1;
   optional bytes target_field_id = 2;
-  optional string type_signature = 3;
+  optional bytes source_type = 3;
   optional bool nullable = 4;
   optional StateRole role = 5;
   optional StateEncoding encoding = 6;
@@ -97,12 +97,14 @@ message AggregateInterpretation {
   optional bytes branch_id = 5;
   // Absent in interpretation documents authored before selected aggregate contracts.
   PersistentAggregateContract semantic_contract = 6;
+  // Complete B6 identity. Only the internal retraction count has no SQL call.
+  optional bytes binding_signature = 7;
 }
 
 message PersistentAggregateContract {
   optional string function_identity = 1;
   optional string overload_identity = 2;
-  optional string result_semantics = 3;
+  reserved 3;
   optional string state_format = 4;
 }
 
@@ -145,7 +147,7 @@ message PhysicalFieldBinding {
   optional PhysicalFieldKind kind = 1;
   optional bytes logical_id = 2;
   optional bytes target_field_id = 3;
-  optional string type_signature = 4;
+  optional bytes source_type = 4;
   optional bool nullable = 5;
 }
 
@@ -155,17 +157,4 @@ enum PhysicalFieldKind {
   PHYSICAL_FIELD_KIND_STATE = 2;
   PHYSICAL_FIELD_KIND_APPLY_KEY = 3;
   PHYSICAL_FIELD_KIND_BRANCH = 4;
-}
-
-// Keyed storage binding facts follow DefinitionDocument occurrence order.
-// Format descriptors are stable; each publication stores only the raw values.
-message BindingDocument {
-  optional uint32 format_version = 1;
-  repeated DataVersionFormat data_versions = 2;
-}
-message DataVersionFormat {
-  optional string provider = 1;
-  optional string name = 2;
-  optional uint32 version = 3;
-  optional uint32 max_value_bytes = 4;
 }

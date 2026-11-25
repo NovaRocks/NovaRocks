@@ -260,6 +260,12 @@ fn rediscover_one_target(
                 }
             }
             Err(error) => {
+                if let Ok(Some(retired)) =
+                    observe_discovered_retired_mv(ctx.connector_control, discovered, context)
+                {
+                    ctx.readiness.remember_retired_mv(retired);
+                    return Ok(());
+                }
                 ctx.readiness
                     .quarantine(
                         target.clone(),
@@ -393,6 +399,42 @@ enum ManagedMvDiscovery {
 struct DiscoveredManagedMvTarget {
     catalog: CatalogHandle,
     target: ConnectorTableIdentity,
+    object_id: novarocks_spi::connector::ConnectorTableObjectId,
+    metadata_version: novarocks_spi::connector::ConnectorCommittedVersion,
+}
+
+fn observe_discovered_retired_mv(
+    controls: &dyn ConnectorControlResolver,
+    discovered: &DiscoveredManagedMvTarget,
+    context: &ConnectorRequestContext,
+) -> Result<Option<novarocks_mv_application::persistence::keyed_documents::RetiredMvStatus>, String>
+{
+    let planning = controls
+        .acquire_current(&discovered.target.instance_id)
+        .map_err(|e| e.to_string())?;
+    let documents = planning
+        .derive_document_storage_lease()
+        .map_err(|e| e.to_string())?;
+    if documents.catalog_handle() != &discovered.catalog {
+        return Ok(None);
+    }
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents,
+        discovered.target.clone(),
+        discovered.object_id.clone(),
+        context.clone(),
+    );
+    let view = documents
+        .observe_keyed_documents(request)
+        .map_err(|e| e.to_string())?;
+    if view.metadata_version != discovered.metadata_version {
+        return Ok(None);
+    }
+    novarocks_mv_application::persistence::keyed_documents::project_retired_mv_status(
+        &view,
+        discovered.catalog.clone(),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Discover a catalog's managed MVs one namespace at a time.
@@ -471,6 +513,8 @@ fn discover_managed_mv_targets_in_namespace(
                 .map(|item| DiscoveredManagedMvTarget {
                     catalog: documents.catalog_handle().clone(),
                     target: item.target().clone(),
+                    object_id: item.object_id().clone(),
+                    metadata_version: item.metadata_version().clone(),
                 }),
         );
         let completeness = page.completeness();
@@ -594,7 +638,7 @@ fn verify_published_base_identities(
     if projection.facts.publication().is_none() {
         return Ok(());
     }
-    for occurrence in &projection.facts.definition().relation_occurrences {
+    for occurrence in &projection.facts.binding().occurrences {
         let instance_id = ConnectorInstanceId::parse(&occurrence.catalog_at_binding)
             .map_err(|error| error.to_string())?;
         let lease = ctx
@@ -658,8 +702,8 @@ fn projection_catalogs_are_admitted(
     catalogs.extend(
         projection
             .facts
-            .definition()
-            .relation_occurrences
+            .binding()
+            .occurrences
             .iter()
             .map(|occurrence| occurrence.catalog_at_binding.clone()),
     );
@@ -869,7 +913,7 @@ mod tests {
     #[test]
     fn canonical_projection_retains_duplicate_relation_occurrences() {
         let projection = stored_projection();
-        let dependencies = &projection.facts.definition().relation_occurrences;
+        let dependencies = &projection.facts.binding().occurrences;
         assert_eq!(dependencies.len(), 2);
         assert_eq!(
             dependencies[0].relation_at_binding,

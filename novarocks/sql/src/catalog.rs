@@ -23,7 +23,9 @@ use novarocks_types::schema::CatalogTable;
 
 pub(crate) mod memory;
 mod view;
-pub use view::{SqlViewColumn, SqlViewDefinition};
+pub use view::{
+    SqlMvViewDependency, SqlViewColumn, SqlViewDefinition, SqlViewDialect, SqlViewOrigin,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TableLookupMode {

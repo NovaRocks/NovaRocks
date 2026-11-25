@@ -20,20 +20,14 @@
 //! Root, metadata runtime, result window or provider creator is installed.
 use super::*;
 use crate::mv::domain::staged_create::admitted_current_tests::CurrentCaptureFixture;
-use novarocks_mv_application::persistence::identity::{ObjectIdentity, SchemaVersion};
 
-fn occurrence(provider: &CurrentCaptureFixture) -> [RelationOccurrence; 1] {
+fn occurrence(provider: &CurrentCaptureFixture) -> [BindingOccurrence; 1] {
     let table = provider.table();
-    [RelationOccurrence {
-        occurrence_id: 1,
-        catalog_at_binding: table.instance_id.as_str().into(),
-        namespace_at_binding: table.namespace.to_string(),
-        relation_at_binding: table.table.to_string(),
-        qualifier_at_binding: "source".into(),
-        object_id: ObjectIdentity::try_new(vec![1]).unwrap(),
-        schema_version: SchemaVersion::try_new(vec![1]).unwrap(),
-        fields: vec![],
-    }]
+    let mut source = novarocks_mv_application::persistence::test_support::relation(1, 1, "source");
+    source.catalog_at_binding = table.instance_id.as_str().into();
+    source.namespace_at_binding = table.namespace.to_string();
+    source.relation_at_binding = table.table.to_string();
+    [source]
 }
 async fn fixture(provider: &CurrentCaptureFixture, class: ResultWindowClass) -> Fixture {
     Fixture::new_with_pin(

@@ -25,7 +25,8 @@ use novarocks_sql::compiler::{
     CatalogRelationFact, CatalogRelationNeed, CatalogTimeTravelResolution,
 };
 use novarocks_sql::planning::catalog::{
-    SqlTimeTravelSnapshotBindingFacts, SqlViewColumn, SqlViewDefinition,
+    SqlTimeTravelSnapshotBindingFacts, SqlViewColumn, SqlViewDefinition, SqlViewDialect,
+    SqlViewOrigin,
 };
 use std::sync::Arc;
 
@@ -71,12 +72,52 @@ pub(in crate::catalog_application) struct StatementRelationObservations {
 }
 
 impl StatementRelationObservations {
+    pub(crate) fn frozen_views(
+        &self,
+    ) -> Vec<(
+        super::super::query_bindings::QueryTableBindingKey,
+        ConnectorQueryViewMaterialization,
+    )> {
+        self.names
+            .iter()
+            .filter_map(|(key, observed)| match observed {
+                Ok(StatementRelationObservation::View(view)) => Some((key.clone(), view.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn retain_frozen_views(
+        &mut self,
+        views: &[(
+            super::super::query_bindings::QueryTableBindingKey,
+            ConnectorQueryViewMaterialization,
+        )],
+    ) {
+        for (key, view) in views {
+            self.names
+                .entry(key.clone())
+                .or_insert_with(|| Ok(StatementRelationObservation::View(view.clone())));
+        }
+    }
+
+    pub(crate) fn view_definitions(&self) -> Vec<Arc<SqlViewDefinition>> {
+        self.names
+            .values()
+            .filter_map(|observation| match observation {
+                Ok(StatementRelationObservation::View(view)) => Some(view.definition.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn remember_table(
         &mut self,
         original: ConnectorTableMetadata,
         planning_pin: ConnectorControlPlanningPin,
         context: ConnectorRequestContext,
     ) -> CatalogResolutionResult<StatementRelationObservation> {
+        validate_current_mv_format(&original, &planning_pin, &context)?;
         let control = planning_pin.binding();
         let identity = match control
             .metadata()
@@ -380,6 +421,38 @@ impl HeldTableObservation {
     }
 }
 
+pub(in crate::catalog_application) fn validate_current_mv_format(
+    metadata: &ConnectorTableMetadata,
+    planning_pin: &ConnectorControlPlanningPin,
+    context: &ConnectorRequestContext,
+) -> CatalogResolutionResult<()> {
+    let binding = planning_pin.binding();
+    let documents = binding
+        .metadata()
+        .project_current_keyed_documents(metadata, planning_pin, context)
+        .map_err(CatalogResolutionError::from_connector)?;
+    if let Some(view) = documents {
+        novarocks_mv_application::persistence::keyed_documents::require_readable_keyed_format(
+            &view,
+        )
+        .map_err(|error| {
+            use novarocks_mv_application::persistence::documents::MvDocumentError;
+            let failure = match error {
+                MvDocumentError::KeyedStorage(
+                    legacy @ KeyedDocumentReadError::LegacyFormat { .. },
+                ) => ConnectorError::from_domain_static(
+                    ConnectorErrorKind::Unsupported,
+                    legacy,
+                    "Retired MV persistence format supports DROP only",
+                ),
+                error => ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string()),
+            };
+            CatalogResolutionError::from_connector(failure)
+        })?;
+    }
+    Ok(())
+}
+
 fn create_prepared_table(
     metadata: &dyn ConnectorMetadata,
     prepared: ConnectorTablePreparation,
@@ -442,9 +515,9 @@ pub(crate) fn project_view(
     planning_pin: ConnectorControlPlanningPin,
     expected: &ConnectorTableIdentity,
 ) -> CatalogResolutionResult<ConnectorQueryViewMaterialization> {
-    match value.definition.dialect {
-        ConnectorViewDialect::Trino => {}
-    }
+    let dialect = match value.definition.dialect {
+        ConnectorViewDialect::Trino => SqlViewDialect::Trino,
+    };
     if value.identity.instance_id != expected.instance_id
         || value.identity.namespace != expected.namespace
         || value.identity.view != expected.table
@@ -466,6 +539,13 @@ pub(crate) fn project_view(
             expected.namespace.as_ref(),
             expected.table.as_ref(),
         ),
+        origin: value
+            .iceberg_version
+            .map_or(SqlViewOrigin::External, |original| SqlViewOrigin::Iceberg {
+                uuid: original.uuid,
+                version_id: original.version_id,
+            }),
+        dialect,
         version: value.version,
         raw_sql: value.definition.raw_sql,
         default_catalog,

@@ -50,8 +50,8 @@ struct SourceGroup {
 fn group_sources_by_locator(
     rewrite: &IcebergMvRewriteContext,
 ) -> Result<BTreeMap<String, SourceGroup>, String> {
-    let definition = rewrite.mv_definition.facts.definition();
-    if definition.relation_occurrences.len() != rewrite.pin.len() {
+    let definition = rewrite.binding();
+    if definition.occurrences.len() != rewrite.pin.len() {
         return Err("MV query bindings do not cover every D occurrence".to_string());
     }
     let previous = rewrite
@@ -61,7 +61,7 @@ fn group_sources_by_locator(
         .collect::<BTreeMap<_, _>>();
     let mut matched_previous = BTreeSet::new();
     let mut groups = BTreeMap::new();
-    for occurrence in &definition.relation_occurrences {
+    for occurrence in &definition.occurrences {
         let occurrence_id =
             novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(occurrence.occurrence_id);
         let source = rewrite.pin.get(&occurrence_id).ok_or_else(|| {
@@ -132,7 +132,7 @@ pub(crate) fn bind_imv_target_query_table_from_metadata(
         })
         .zip(frozen_snapshot_id)
         .map(|(partitions, snapshot_id)| {
-            let target = &rewrite.mv_definition.facts.interpretation().target;
+            let target = &rewrite.interpretation().target;
             let fields = target.partition_fields.iter().map(|field| {
                 let transform = match field.transform {
                     TargetPartitionTransform::Identity => MvExactPartitionTransform::Identity,

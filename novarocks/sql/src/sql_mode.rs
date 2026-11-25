@@ -27,6 +27,7 @@ const ONLY_FULL_GROUP_BY: u64 = 1 << 5;
 const ALLOW_THROW_EXCEPTION: u64 = 1 << 9;
 const ERROR_IF_OVERFLOW: u64 = 1 << 35;
 const CONSUMED_MASK: u64 = ONLY_FULL_GROUP_BY | ALLOW_THROW_EXCEPTION | ERROR_IF_OVERFLOW;
+const DEFAULT_SQL_MODE_BITS: u64 = ONLY_FULL_GROUP_BY;
 
 /// One complete connection or statement setting. Successive assignments
 /// replace this value; comma-separated items within an assignment combine.
@@ -38,7 +39,10 @@ pub struct SqlMode {
 
 impl Default for SqlMode {
     fn default() -> Self {
-        Self::from_assignment("32")
+        Self {
+            assignment: DEFAULT_SQL_MODE_BITS.to_string(),
+            consumed_bits: DEFAULT_SQL_MODE_BITS,
+        }
     }
 }
 
@@ -144,13 +148,44 @@ impl StatementSessionEnvironment {
 /// Each field keeps its SQL owner; assigning one setting preserves the rest.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SqlSemanticSettings {
+    // Computation semantics.
     sql_mode: SqlMode,
     recursive_cte_max_depth: Option<i32>,
+    // Statement environment.
     statement_time: Option<novarocks_type_contract::StatementTimeEnvironment>,
     statement_session: Option<Arc<StatementSessionEnvironment>>,
 }
 
 impl SqlSemanticSettings {
+    /// Test the effective computation semantics of an admitted query.
+    pub fn has_default_computation_semantics(&self) -> bool {
+        let Self {
+            sql_mode,
+            recursive_cte_max_depth,
+            statement_time: _,
+            statement_session: _,
+        } = self;
+        sql_mode.consumed_bits == DEFAULT_SQL_MODE_BITS
+            && recursive_cte_max_depth.unwrap_or(DEFAULT_RECURSIVE_CTE_MAX_DEPTH)
+                == DEFAULT_RECURSIVE_CTE_MAX_DEPTH
+    }
+
+    /// Use the computation fixed for an MV while retaining the statement's
+    /// time and caller environment.
+    pub fn with_default_computation_semantics(self) -> Self {
+        let Self {
+            sql_mode: _,
+            recursive_cte_max_depth: _,
+            statement_time,
+            statement_session,
+        } = self;
+        Self {
+            statement_time,
+            statement_session,
+            ..Self::default()
+        }
+    }
+
     pub fn statement_session(&self) -> Option<&StatementSessionEnvironment> {
         self.statement_session.as_deref()
     }
@@ -249,13 +284,6 @@ fn query_has_select(query: &ast::Query) -> bool {
     let mut detector = Detector { has_select: false };
     detector.visit_query(query);
     detector.has_select
-}
-
-pub(crate) fn query_requires_semantic_snapshot(
-    settings: &SqlSemanticSettings,
-    query: &ast::Query,
-) -> bool {
-    settings.sql_mode().error_if_overflow() && query_has_select(query)
 }
 
 /// Detect uncaptured strict overflow policy under the root query setting.
@@ -381,6 +409,60 @@ mod tests {
                 .error_if_overflow()
             );
         }
+    }
+
+    #[test]
+    fn mv_computation_eligibility_uses_consumed_modes_and_effective_depth() {
+        for assignment in [
+            "32",
+            "ONLY_FULL_GROUP_BY",
+            "32,UNCONSUMED_MODE",
+            "ONLY_FULL_GROUP_BY,68719476736",
+        ] {
+            assert!(semantics(assignment).has_default_computation_semantics());
+        }
+        for assignment in ["0", "32,ALLOW_THROW_EXCEPTION", "32,ERROR_IF_OVERFLOW"] {
+            assert!(!semantics(assignment).has_default_computation_semantics());
+        }
+
+        let defaults = SqlSemanticSettings::default();
+        assert!(defaults.has_default_computation_semantics());
+        assert!(
+            defaults
+                .clone()
+                .with_recursive_cte_max_depth(DEFAULT_RECURSIVE_CTE_MAX_DEPTH)
+                .has_default_computation_semantics()
+        );
+        assert!(
+            !defaults
+                .with_recursive_cte_max_depth(DEFAULT_RECURSIVE_CTE_MAX_DEPTH + 1)
+                .has_default_computation_semantics()
+        );
+    }
+
+    #[test]
+    fn mv_default_computation_preserves_admitted_statement_environment() {
+        use novarocks_type_contract::{StatementStartUtc, StatementTimeEnvironment, TimeZoneKey};
+
+        let session = StatementSessionEnvironment::new(
+            Arc::from("mv-reader"),
+            Some("ice".into()),
+            Some("analytics".into()),
+        );
+        let time = StatementTimeEnvironment {
+            start: StatementStartUtc::try_new(1_700_000_000, 0).unwrap(),
+            zone: TimeZoneKey::UTC,
+        };
+        let settings = semantics("32,ALLOW_THROW_EXCEPTION")
+            .with_recursive_cte_max_depth(2)
+            .with_statement_session(Some(session.clone()))
+            .with_statement_time(time)
+            .with_default_computation_semantics();
+
+        assert!(settings.has_default_computation_semantics());
+        assert_eq!(settings.recursive_cte_max_depth(), None);
+        assert_eq!(settings.statement_session(), Some(&session));
+        assert_eq!(settings.statement_time(), Some(time));
     }
 
     #[test]

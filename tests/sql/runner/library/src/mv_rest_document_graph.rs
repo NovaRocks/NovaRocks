@@ -32,11 +32,21 @@ pub(crate) struct GraphExpectation<'a> {
     full_refresh_last: bool,
     append_last: bool,
     interpretation_changes: bool,
+    binding_changes: Option<usize>,
+    marker: Option<MarkerExpectation>,
+    source: Option<&'a str>,
+    decimal_mapping: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+enum MarkerExpectation {
+    Clear,
+    InvalidDefinition(wire::MarkerScope),
 }
 
 /// Read the product's own REST metadata while the runner-owned isolated
 /// catalog and native cluster are still alive. SQL result rows alone cannot
-/// prove the retained P -> B -> D/L graph or the absence of document files.
+/// prove the retained P -> B -> D/L/M graph or the absence of document files.
 pub(crate) fn assert_graph(suite: &str, directive: &str) -> Result<String> {
     ensure!(
         matches!(
@@ -53,9 +63,10 @@ pub(crate) fn assert_graph(suite: &str, directive: &str) -> Result<String> {
         "{}/v1/namespaces/{namespace}/tables/{table}",
         rest.trim_end_matches('/')
     );
-    let response = reqwest::blocking::Client::builder()
+    let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
-        .build()?
+        .build()?;
+    let response = client
         .get(&url)
         .send()
         .with_context(|| format!("read exact MV REST metadata at {url}"))?
@@ -63,6 +74,19 @@ pub(crate) fn assert_graph(suite: &str, directive: &str) -> Result<String> {
         .with_context(|| format!("REST did not return MV metadata at {url}"))?;
     let value: Value = response.json().context("decode MV REST metadata")?;
     let summary = verify_graph(&value, &expectation)?;
+    if let Some(source) = expectation.source {
+        let source_url = format!(
+            "{}/v1/namespaces/{namespace}/tables/{source}",
+            rest.trim_end_matches('/')
+        );
+        let source_metadata: Value = client.get(source_url).send()?.error_for_status()?.json()?;
+        verify_exact_source(
+            &value["metadata"],
+            namespace,
+            source,
+            &source_metadata["metadata"],
+        )?;
+    }
     verify_no_staging_files(
         &value["metadata"],
         expectation.publications == 0 && expectation.slot_changes == 0,
@@ -80,6 +104,10 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
     let mut full_refresh_last = false;
     let mut append_last = false;
     let mut interpretation_changes = false;
+    let mut binding_changes = None;
+    let mut marker = None;
+    let mut source = None;
+    let mut decimal_mapping = None;
     let mut table_commits = None;
     let mut failed_table_commits = None;
     let mut slot_changes = None;
@@ -94,6 +122,30 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
             "append-last=true" if !append_last => append_last = true,
             "interpretation-changes=true" if !interpretation_changes => {
                 interpretation_changes = true
+            }
+            "markers=clear" if marker.is_none() => marker = Some(MarkerExpectation::Clear),
+            "markers=invalid-definition-binding" if marker.is_none() => {
+                marker = Some(MarkerExpectation::InvalidDefinition(
+                    wire::MarkerScope::Binding,
+                ))
+            }
+            "markers=invalid-definition-publication" if marker.is_none() => {
+                marker = Some(MarkerExpectation::InvalidDefinition(
+                    wire::MarkerScope::Publication,
+                ))
+            }
+            value if value.starts_with("source=") && source.is_none() => {
+                source = Some(rest_identifier(&value["source=".len()..])?);
+            }
+            value if value.starts_with("decimal-mapping=") && decimal_mapping.is_none() => {
+                decimal_mapping = Some(rest_identifier(&value["decimal-mapping=".len()..])?);
+            }
+            value if value.starts_with("binding-changes=") && binding_changes.is_none() => {
+                binding_changes = Some(
+                    value["binding-changes=".len()..]
+                        .parse::<usize>()
+                        .context("invalid binding-changes count")?,
+                );
             }
             value if value.starts_with("table-commits=") && table_commits.is_none() => {
                 table_commits = Some(
@@ -167,6 +219,10 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         "append-last requires at least two publications"
     );
     ensure!(
+        binding_changes.is_none_or(|changes| changes > 0 && changes < publications),
+        "binding changes must be supported by consecutive retained publications"
+    );
+    ensure!(
         !interpretation_changes || publications == 2,
         "interpretation-changes currently requires exactly two publications"
     );
@@ -204,7 +260,80 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         full_refresh_last,
         append_last,
         interpretation_changes,
+        binding_changes,
+        marker,
+        source,
+        decimal_mapping,
     })
+}
+
+fn rest_identifier(input: &str) -> Result<&str> {
+    ensure!(
+        !input.is_empty()
+            && input
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_'),
+        "invalid REST identifier {input}"
+    );
+    Ok(input)
+}
+
+fn verify_exact_source(
+    metadata: &Value,
+    namespace: &str,
+    name: &str,
+    source: &Value,
+) -> Result<()> {
+    let current = metadata["current-snapshot-id"]
+        .as_i64()
+        .context("MV has no Current P")?;
+    let snapshot = metadata["snapshots"]
+        .as_array()
+        .context("MV lacks snapshot list")?
+        .iter()
+        .find(|snapshot| snapshot["snapshot-id"].as_i64() == Some(current))
+        .context("Current snapshot missing from history")?;
+    let frame = snapshot["summary"][wire::PUBLICATION_KEY]
+        .as_str()
+        .context("Current lacks P")?;
+    let record = wire::record(frame)?;
+    let binding_id = record.binding.context("P lacks B")?;
+    let properties = wire::properties(&metadata["properties"])?;
+    let binding = mv_document(&properties, &binding_id, "binding", 2)?;
+    let captured = wire::binding(&binding.content)?;
+    let [occurrence] = captured.occurrences.as_slice() else {
+        anyhow::bail!("source assertion requires one actual B occurrence");
+    };
+    let [format] = captured.formats.as_slice() else {
+        anyhow::bail!("source assertion requires one declared watermark");
+    };
+    ensure!(
+        occurrence.namespace == namespace
+            && occurrence.table == name
+            && format.provider == "iceberg"
+            && format.name == "connector-snapshot-id"
+            && format.version == 1
+            && format.maximum == 9,
+        "P/B points at a different source locator or format"
+    );
+    let uuid = source["table-uuid"]
+        .as_str()
+        .context("source REST table has no UUID")?;
+    ensure!(
+        wire::iceberg_object_identity(occurrence.object)? == uuid.as_bytes(),
+        "P/B points at another Iceberg source object"
+    );
+    let snapshot = source["current-snapshot-id"]
+        .as_i64()
+        .filter(|id| *id != -1)
+        .context("source REST table has no Current snapshot")?;
+    let mut expected = vec![1];
+    expected.extend_from_slice(&snapshot.to_be_bytes());
+    ensure!(
+        wire::publication(&record.payload, &captured.formats)?.watermarks == [expected],
+        "P does not hold the actual Current source snapshot"
+    );
+    Ok(())
 }
 
 fn mv_document<'a>(
@@ -237,8 +366,8 @@ struct BindingFacts {
 }
 fn binding_facts(properties: &wire::Properties, id: &str) -> Result<BindingFacts> {
     wire::closure(properties, id)?;
-    let binding = mv_document(properties, id, "binding", 1)?;
-    ensure!(binding.refs.len() == 2, "B must reference exactly D/L");
+    let binding = mv_document(properties, id, "binding", 2)?;
+    ensure!(binding.refs.len() == 3, "B must reference exactly D/L/M");
     let definition = binding
         .refs
         .get("definition")
@@ -247,9 +376,9 @@ fn binding_facts(properties: &wire::Properties, id: &str) -> Result<BindingFacts
         .refs
         .get("interpretation")
         .context("B lacks interpretation relationship")?;
-    let d = mv_document(properties, definition, "definition", 1)?;
+    let d = mv_document(properties, definition, "definition", 2)?;
     ensure!(d.refs.is_empty(), "D has unexpected relationships");
-    let l = mv_document(properties, interpretation, "interpretation", 2)?;
+    let l = mv_document(properties, interpretation, "interpretation", 3)?;
     ensure!(
         l.refs.len() == 1 && l.refs.get("definition") == Some(definition),
         "L has inconsistent definition relationship"
@@ -258,17 +387,59 @@ fn binding_facts(properties: &wire::Properties, id: &str) -> Result<BindingFacts
         wire::interpretation_definition(&l.content)? == *definition,
         "L embeds another definition identity"
     );
-    let formats = wire::binding(&binding.content)?;
-    ensure!(
-        formats.len() == wire::definition_occurrences(&d.content)?,
-        "B/D occurrence count differs"
-    );
+    let mapping = binding
+        .refs
+        .get("mapping")
+        .context("B lacks mapping relationship")?;
+    let m = mv_document(properties, mapping, "mapping", 1)?;
+    ensure!(m.refs.is_empty(), "M has unexpected relationships");
+    wire::definition(&d.content)?;
+    let binding = wire::binding(&binding.content)?;
+    wire::mapping(&m.content, &binding.outputs)?;
     Ok(BindingFacts {
         definition: definition.clone(),
         interpretation: interpretation.clone(),
-        formats,
+        formats: binding.formats,
     })
 }
+fn verify_decimal_mapping(
+    metadata: &Value,
+    properties: &wire::Properties,
+    root: &str,
+    name: &str,
+) -> Result<()> {
+    let binding = mv_document(properties, root, "binding", 2)?;
+    let mapping = mv_document(properties, &binding.refs["mapping"], "mapping", 1)?;
+    let binding = wire::binding(&binding.content)?;
+    let columns = wire::mapping(&mapping.content, &binding.outputs)?;
+    let (output, column) = binding
+        .outputs
+        .iter()
+        .zip(&columns)
+        .find(|(output, _)| output.name == name)
+        .context("B/M has no requested decimal output")?;
+    let schema = metadata["schemas"]
+        .as_array()
+        .context("REST metadata has no schemas")?
+        .iter()
+        .find(|schema| schema["schema-id"] == metadata["current-schema-id"])
+        .context("REST metadata has no current schema")?;
+    let field = schema["fields"]
+        .as_array()
+        .context("REST schema has no fields")?
+        .iter()
+        .find(|field| field["name"].as_str() == Some(name))
+        .context("REST schema has no requested decimal field")?;
+    wire::assert_decimal_mapping(
+        column,
+        output,
+        field,
+        metadata["format-version"]
+            .as_u64()
+            .context("REST metadata lacks storage format version")?,
+    )
+}
+
 fn summary_number(summary: &Value, key: &str) -> Result<u64> {
     summary[key]
         .as_str()
@@ -286,6 +457,9 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         .get("novarocks.mv")
         .context("MV has no binding root")?;
     let current_binding = binding_facts(&properties, root)?;
+    if let Some(name) = expectation.decimal_mapping {
+        verify_decimal_mapping(metadata, &properties, root, name)?;
+    }
     for id in properties.roots.values() {
         wire::closure(&properties, id)?;
     }
@@ -372,6 +546,9 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
     let mut slots = 0;
     let mut slot_ids = BTreeSet::new();
     let mut interpretations = BTreeSet::new();
+    let markers = wire::markers(&properties)?;
+    let mut active_publication = None;
+    let mut ordered_bindings = Vec::new();
     let mut last_publication = None;
     for snapshot in by_sequence.values() {
         let id = snapshot["snapshot-id"]
@@ -421,10 +598,10 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
                 "historical P changed D unexpectedly"
             );
             interpretations.insert(facts.interpretation);
-            if !expectation.interpretation_changes {
+            if !expectation.interpretation_changes && expectation.binding_changes.is_none() {
                 ensure!(
                     binding == *root,
-                    "ordinary publications do not share one B/D/L"
+                    "ordinary publications do not share one B/D/L/M"
                 );
             }
             if let Some(previous) = publications.get(&p.id) {
@@ -434,6 +611,7 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
                 );
             } else {
                 publications.insert(p.id, frame.clone());
+                ordered_bindings.push(binding.clone());
                 is_publication = true;
             }
             if full_appends.contains(&id) {
@@ -451,6 +629,7 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
                 }
             }
             if Some(id) == current {
+                active_publication = Some(p.id);
                 if let Some(minimum) = expectation.delete_files_min {
                     ensure!(
                         summary_number(&snapshot["summary"], "total-delete-files")? >= minimum,
@@ -532,6 +711,40 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         publications.len(),
         expectation.publications
     );
+    if let Some(changes) = expectation.binding_changes {
+        let actual = ordered_bindings
+            .windows(2)
+            .filter(|pair| pair[0] != pair[1])
+            .count();
+        ensure!(
+            actual == changes,
+            "binding changed {actual} times, expected {changes}"
+        );
+    }
+    if let Some(expected) = expectation.marker {
+        match expected {
+            MarkerExpectation::Clear => ensure!(markers.is_empty(), "MV retains marker properties"),
+            MarkerExpectation::InvalidDefinition(scope) => {
+                let expected_identity = match scope {
+                    wire::MarkerScope::Publication => active_publication
+                        .context("publication-scoped marker requires Current P")?
+                        .to_vec(),
+                    wire::MarkerScope::Binding => {
+                        ensure!(
+                            active_publication.is_none(),
+                            "B-scoped marker requires an unpublished target"
+                        );
+                        wire::decode_identity(root)?
+                    }
+                };
+                ensure!(
+                    matches!(markers.as_slice(), [marker] if marker.name == "invalid-definition"
+                        && marker.scope == scope && marker.identity == expected_identity),
+                    "MV lacks the single expected invalid-definition marker with its exact scope"
+                );
+            }
+        }
+    }
     if expectation.slot_changes > 0 {
         ensure!(
             [configuration, management]
@@ -604,7 +817,7 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         }
     }
     Ok(format!(
-        "{} publications, {slots} slot snapshots resolve current B/D/L; private-bytes={}; current={current:?}; no document files",
+        "{} publications, {slots} slot snapshots resolve current B/D/L/M; private-bytes={}; current={current:?}; no document files",
         publications.len(),
         properties.private_bytes
     ))

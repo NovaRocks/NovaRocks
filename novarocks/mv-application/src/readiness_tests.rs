@@ -603,7 +603,7 @@ async fn cancellation_during_repository_commit_leaves_cache_but_never_ready() {
 async fn dependency_guard_uses_catalog_and_exact_object_not_locator_name() {
     let (_, service) = service().await;
     let facts = sample_keyed_projection(target(), Some(1));
-    let occurrence = facts.definition().relation_occurrences[0].clone();
+    let occurrence = facts.binding().occurrences[0].clone();
     service
         .seed_projection(Uuid::now_v7(), facts)
         .await

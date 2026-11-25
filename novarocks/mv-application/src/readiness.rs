@@ -230,6 +230,27 @@ struct ReadinessRepository {
     execution: ReadinessExecution,
 }
 impl MvKeyedReadinessService {
+    pub fn remember_retired_mv(
+        &self,
+        status: crate::persistence::keyed_documents::RetiredMvStatus,
+    ) {
+        let identity = status.target.table();
+        let target = MvTarget::from_parts(
+            Some(identity.instance_id.as_str()),
+            &identity.namespace,
+            &identity.table,
+        );
+        self.runtime.set_retired(target, status);
+    }
+
+    pub fn retired_mv_statuses(&self) -> Vec<crate::persistence::keyed_documents::RetiredMvStatus> {
+        self.runtime.retired_mv_statuses()
+    }
+
+    pub fn is_retired_mv(&self, target: &MvTarget) -> bool {
+        self.runtime
+            .with_readiness(target, |state| matches!(state, TargetReadiness::Retired(_)))
+    }
     pub fn new(
         repository: Arc<crate::state_store_repository::StateStoreMvRepository>,
         runtime: Arc<ProcessRuntime<MvTarget, LakePublicationId>>,
@@ -619,7 +640,7 @@ impl MvKeyedProjectionInventory {
                     TargetReadiness::Unavailable(reason) => {
                         Some(MvListedManageability::Unavailable(reason.clone()))
                     }
-                    TargetReadiness::Unobserved => None,
+                    TargetReadiness::Unobserved | TargetReadiness::Retired(_) => None,
                 });
             let Some(manageability) = state else {
                 continue;
@@ -652,11 +673,13 @@ pub struct MvKeyedProjectionDeleteGuard {
     target: MvTarget,
     generation: u64,
     expected: Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+    retired: Option<crate::state_store_repository::keyed::LoadedRetiredMvProjection>,
+    retired_object: Option<novarocks_spi::connector::ConnectorTableObjectId>,
     order: Arc<tokio::sync::Mutex<ProjectionOrder>>,
 }
 impl MvKeyedProjectionDeleteGuard {
     pub fn has_projection(&self) -> bool {
-        self.expected.is_some()
+        self.expected.is_some() || self.retired.is_some()
     }
     pub fn expected_target_object_id(
         &self,
@@ -664,6 +687,7 @@ impl MvKeyedProjectionDeleteGuard {
         self.expected
             .as_ref()
             .map(|e| &e.projection.facts.source_revision().target_object_id)
+            .or(self.retired_object.as_ref())
     }
 }
 pub type MvKeyedDropReadiness = MvDropReadiness<MvKeyedProjectionDeleteGuard>;
@@ -738,6 +762,12 @@ impl MvKeyedReadinessExecution {
         &self,
         target: &MvTarget,
     ) -> Result<MvQueryAdmission, MvRepositoryError> {
+        let readiness = self.runtime.readiness(target);
+        if matches!(readiness, TargetReadiness::Retired(_)) {
+            return Ok(MvQueryAdmission::Quarantined(
+                "Retired MV persistence format supports DROP only".into(),
+            ));
+        }
         if self
             .repository
             .find_keyed_by_target(target)
@@ -746,12 +776,14 @@ impl MvKeyedReadinessExecution {
         {
             return Ok(MvQueryAdmission::NotAnMv);
         }
-        Ok(match self.runtime.readiness(target) {
+        Ok(match readiness {
             TargetReadiness::Ready | TargetReadiness::ReadOnly(_) => MvQueryAdmission::Admitted,
             TargetReadiness::Unavailable(r) => MvQueryAdmission::Quarantined(r),
-            TargetReadiness::Unobserved => MvQueryAdmission::Quarantined(
-                "MV target has not been observed in this process".into(),
-            ),
+            TargetReadiness::Unobserved | TargetReadiness::Retired(_) => {
+                MvQueryAdmission::Quarantined(
+                    "MV target has not been observed in this process".into(),
+                )
+            }
         })
     }
     pub async fn load_ready_settled(
@@ -812,7 +844,7 @@ impl MvKeyedReadinessExecution {
         upstream: &MvDependencyObjectIdentity,
     ) -> Result<(), MvRepositoryError> {
         for loaded in self.list_ready_projections().await? {
-            for r in &loaded.projection.facts.definition().relation_occurrences {
+            for r in &loaded.projection.facts.binding().occurrences {
                 if r.catalog_at_binding == upstream.catalog_instance.as_str()
                     && crate::persistence::exact_revision::persisted_object_names(
                         &r.object_id,
@@ -855,8 +887,67 @@ impl MvKeyedReadinessExecution {
             target,
             generation,
             expected,
+            retired: None,
+            retired_object: None,
             order,
         })
+    }
+
+    pub async fn prepare_retired_drop(
+        &self,
+        target: &MvTarget,
+        observation: &crate::management::MvDropManagementObservation,
+    ) -> Result<MvKeyedDropReadiness, MvProjectionError> {
+        let physical = observation.target();
+        let object = physical.object_id();
+        let identity = physical.table();
+        if !observation.is_retired()
+            || target.catalog() != Some(identity.instance_id.as_str())
+            || target.namespace() != identity.namespace.as_ref()
+            || target.name() != identity.table.as_ref()
+        {
+            return Err(MvProjectionError::new(
+                MvProjectionErrorKind::SourceConflict,
+                "MV DROP observation differs from the requested retired target",
+            ));
+        }
+        self.ensure_no_ready_downstream_dependencies(&MvDependencyObjectIdentity::new(
+            identity.instance_id.as_str(),
+            object.clone(),
+        ))
+        .await?;
+        let order = self.runtime.projection_order(target.clone());
+        let mut cell = order.lock().await;
+        let retired = self.repository.find_retired_projection(target).await?;
+        if retired
+            .as_ref()
+            .is_some_and(|projection| &projection.entry.object_id != object)
+            || self
+                .repository
+                .find_keyed_by_target(target)
+                .await?
+                .is_some()
+        {
+            return Err(MvProjectionError::new(
+                MvProjectionErrorKind::SourceConflict,
+                "MV DROP retired target conflicts with the Accelerator object",
+            ));
+        }
+        let generation = cell.advance()?;
+        cell.installed = None;
+        cell.pending = Some(generation);
+        drop(cell);
+        Ok(MvKeyedDropReadiness::ReadyToDrop(
+            MvKeyedProjectionDeleteGuard {
+                request: self.clone(),
+                target: target.clone(),
+                generation,
+                expected: None,
+                retired,
+                retired_object: Some(object.clone()),
+                order,
+            },
+        ))
     }
     pub async fn delete_after_provider_drop(
         &self,
@@ -875,6 +966,33 @@ impl MvKeyedReadinessExecution {
             .repository
             .find_keyed_by_target(&guard.target)
             .await?;
+        if guard.retired_object.is_some() {
+            request
+                .runtime
+                .set_unavailable(guard.target.clone(), "Retired MV target was removed".into());
+            if current.is_some() {
+                return Ok(MvKeyedProjectionInstallOutcome::Superseded);
+            }
+            let current_retired = request
+                .repository
+                .find_retired_projection(&guard.target)
+                .await?;
+            match (guard.retired, current_retired) {
+                (_, None) => return Ok(MvKeyedProjectionInstallOutcome::AlreadyAbsent),
+                (Some(expected), Some(current)) if expected.entry == current.entry => {
+                    let removed = request
+                        .repository
+                        .delete_retired_projection(expected)
+                        .await?;
+                    return Ok(if removed {
+                        MvKeyedProjectionInstallOutcome::Removed
+                    } else {
+                        MvKeyedProjectionInstallOutcome::AlreadyAbsent
+                    });
+                }
+                _ => return Ok(MvKeyedProjectionInstallOutcome::Superseded),
+            }
+        }
         if current.as_ref().map(|v| &v.version) != guard.expected.as_ref().map(|v| &v.version) {
             return Ok(MvKeyedProjectionInstallOutcome::Superseded);
         }
@@ -1354,6 +1472,37 @@ impl ReadinessRepository {
                 self.repository
                     .in_requests(execution.as_ref())
                     .delete_keyed_projection(operation_id, expected)
+                    .await
+            }
+        }
+    }
+    async fn find_retired_projection(
+        &self,
+        target: &MvTarget,
+    ) -> Result<
+        Option<crate::state_store_repository::keyed::LoadedRetiredMvProjection>,
+        MvRepositoryError,
+    > {
+        match &self.execution {
+            ReadinessExecution::Legacy => self.repository.find_retired_projection(target).await,
+            ReadinessExecution::Original(execution) => {
+                self.repository
+                    .in_requests(execution.as_ref())
+                    .find_retired_projection(target)
+                    .await
+            }
+        }
+    }
+    async fn delete_retired_projection(
+        &self,
+        expected: crate::state_store_repository::keyed::LoadedRetiredMvProjection,
+    ) -> Result<bool, MvRepositoryError> {
+        match &self.execution {
+            ReadinessExecution::Legacy => self.repository.delete_retired_projection(expected).await,
+            ReadinessExecution::Original(execution) => {
+                self.repository
+                    .in_requests(execution.as_ref())
+                    .delete_retired_projection(expected)
                     .await
             }
         }

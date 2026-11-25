@@ -53,7 +53,7 @@ struct SlotEnvelope {
     content: String,
     digest: String,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MarkerEnvelope {
     v: u8,
@@ -81,6 +81,7 @@ pub(super) struct Slot {
 }
 #[derive(Debug, Default)]
 pub(super) struct Properties {
+    markers: Vec<MarkerEnvelope>,
     pub versions: BTreeMap<String, Document>,
     pub slots: BTreeMap<String, Slot>,
     pub roots: BTreeMap<String, String>,
@@ -112,7 +113,7 @@ fn token(value: &str) -> Result<()> {
 pub(super) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|v| format!("{v:02x}")).collect()
 }
-fn unhex(value: &str) -> Result<Vec<u8>> {
+pub(super) fn decode_identity(value: &str) -> Result<Vec<u8>> {
     ensure!(
         value.len() == 64
             && value
@@ -239,7 +240,7 @@ pub(super) fn properties(value: &Value) -> Result<Properties> {
                     );
                     previous = Some(&reference.rel);
                     lp32(&mut middle, reference.rel.as_bytes());
-                    middle.extend_from_slice(&unhex(&reference.id)?);
+                    middle.extend_from_slice(&decode_identity(&reference.id)?);
                     refs.insert(reference.rel.clone(), reference.id.clone());
                 }
                 let expected = content_hash(
@@ -315,10 +316,11 @@ pub(super) fn properties(value: &Value) -> Result<Properties> {
                         ),
                     "marker integrity mismatch"
                 );
+                parsed.markers.push(v);
             }
             "root" => {
                 token(suffix)?;
-                unhex(raw)?;
+                decode_identity(raw)?;
                 parsed.roots.insert(suffix.into(), raw.into());
             }
             _ => bail!("unknown or misplaced document key {key}"),
@@ -367,7 +369,7 @@ pub(super) fn record(text: &str) -> Result<Record> {
     let binding = if fields[1] == "-" {
         None
     } else {
-        unhex(fields[1])?;
+        decode_identity(fields[1])?;
         Some(fields[1].into())
     };
     Ok(Record {
@@ -494,58 +496,276 @@ pub(super) struct DataVersionFormat {
     pub version: u16,
     pub maximum: u16,
 }
-pub(super) fn binding(raw: &[u8]) -> Result<Vec<DataVersionFormat>> {
-    let fields = proto(raw, &[(1, 0), (2, 2)], &[2])?;
+pub(super) struct Binding<'a> {
+    pub formats: Vec<DataVersionFormat>,
+    pub occurrences: Vec<Occurrence<'a>>,
+    pub outputs: Vec<BoundOutput<'a>>,
+}
+
+pub(super) struct Occurrence<'a> {
+    pub namespace: &'a str,
+    pub table: &'a str,
+    pub object: &'a [u8],
+}
+
+pub(super) struct BoundOutput<'a> {
+    pub name: &'a str,
+    pub logical_type: &'a [u8],
+}
+
+fn version(fields: &[(u32, Field<'_>)], expected: u64, document: &str) -> Result<()> {
     ensure!(
         fields
             .first()
-            .is_some_and(|(n, v)| *n == 1 && v.int().ok() == Some(1)),
-        "binding format must be 1"
+            .is_some_and(|(n, v)| *n == 1 && v.int().ok() == Some(expected)),
+        "{document} format must be {expected}"
     );
-    let mut result = Vec::new();
-    for (_, value) in fields.iter().skip(1) {
-        let descriptor = proto(value.bytes()?, &[(1, 2), (2, 2), (3, 0), (4, 0)], &[])?;
+    Ok(())
+}
+
+fn required<'a>(fields: &[(u32, Field<'a>)], number: u32) -> Result<&'a [u8]> {
+    fields
+        .iter()
+        .find(|(n, _)| *n == number)
+        .with_context(|| format!("missing protobuf field {number}"))?
+        .1
+        .bytes()
+}
+
+pub(super) fn binding(raw: &[u8]) -> Result<Binding<'_>> {
+    let fields = proto(raw, &[(1, 0), (3, 2), (4, 2), (5, 2), (6, 2)], &[3, 4, 5])?;
+    version(&fields, 2, "binding")?;
+    let mut formats = Vec::new();
+    let mut occurrence_ids = BTreeSet::new();
+    let mut occurrences = Vec::new();
+    let mut outputs = Vec::new();
+    for (number, value) in &fields[1..] {
+        match number {
+            3 => {
+                let occurrence = proto(
+                    value.bytes()?,
+                    &[
+                        (1, 0),
+                        (2, 2),
+                        (3, 2),
+                        (4, 2),
+                        (5, 2),
+                        (6, 2),
+                        (7, 0),
+                        (8, 2),
+                        (9, 2),
+                        (10, 2),
+                        (11, 2),
+                        (12, 2),
+                        (13, 2),
+                        (14, 2),
+                    ],
+                    &[13],
+                )?;
+                let id = occurrence
+                    .first()
+                    .filter(|(n, _)| *n == 1)
+                    .context("binding occurrence lacks ID")?
+                    .1
+                    .int()?;
+                ensure!(
+                    id <= u64::from(u32::MAX) && occurrence_ids.insert(id),
+                    "invalid or duplicate binding occurrence ID"
+                );
+                for n in [2, 3, 4, 5] {
+                    ensure!(
+                        !std::str::from_utf8(required(&occurrence, n)?)?.is_empty(),
+                        "empty binding occurrence locator"
+                    );
+                }
+                for n in [6, 9, 10, 11, 12, 14] {
+                    ensure!(
+                        !required(&occurrence, n)?.is_empty(),
+                        "empty binding occurrence fact"
+                    );
+                }
+                ensure!(
+                    occurrence
+                        .iter()
+                        .any(|(n, value)| *n == 7 && value.int().ok() == Some(1)),
+                    "binding occurrence must be a current read"
+                );
+                formats.push(data_version_format(required(&occurrence, 8)?)?);
+                occurrences.push(Occurrence {
+                    namespace: std::str::from_utf8(required(&occurrence, 3)?)?,
+                    table: std::str::from_utf8(required(&occurrence, 4)?)?,
+                    object: required(&occurrence, 6)?,
+                });
+            }
+            4 => {
+                let output = proto(value.bytes()?, &[(1, 0), (2, 2), (3, 2), (4, 2)], &[4])?;
+                ensure!(
+                    output.first().is_some_and(|(n, v)| *n == 1 && v.int().ok() == Some(outputs.len() as u64)),
+                    "binding output ordinal is missing or out of order"
+                );
+                let name = std::str::from_utf8(required(&output, 2)?)?;
+                let logical_type = required(&output, 3)?;
+                ensure!(
+                    !name.is_empty() && !logical_type.is_empty(),
+                    "empty binding output fact"
+                );
+                outputs.push(BoundOutput { name, logical_type });
+            }
+            _ => {}
+        }
+    }
+    let digests = proto(required(&fields, 6)?, &[(1, 2), (2, 2), (3, 2)], &[])?;
+    for n in 1..=3 {
         ensure!(
-            descriptor.len() == 4,
-            "binding descriptor missing required field"
+            required(&digests, n)?.len() == 32,
+            "invalid binding fact digest"
         );
-        let provider = std::str::from_utf8(descriptor[0].1.bytes()?)?.to_string();
-        token(&provider)?;
-        let name = std::str::from_utf8(descriptor[1].1.bytes()?)?.to_string();
+    }
+    ensure!(
+        (1..=usize::from(u16::MAX)).contains(&formats.len()),
+        "invalid occurrence count"
+    );
+    ensure!(!outputs.is_empty(), "binding lacks outputs");
+    Ok(Binding {
+        formats,
+        occurrences,
+        outputs,
+    })
+}
+
+fn data_version_format(raw: &[u8]) -> Result<DataVersionFormat> {
+    let descriptor = proto(raw, &[(1, 2), (2, 2), (3, 0), (4, 0)], &[])?;
+    ensure!(
+        descriptor.len() == 4,
+        "binding descriptor missing required field"
+    );
+    let provider = std::str::from_utf8(descriptor[0].1.bytes()?)?.to_string();
+    token(&provider)?;
+    let name = std::str::from_utf8(descriptor[1].1.bytes()?)?.to_string();
+    ensure!(
+        !name.is_empty() && name.len() <= 128 && name.is_ascii(),
+        "invalid data-version format name"
+    );
+    let version = u16::try_from(descriptor[2].1.int()?)?;
+    ensure!(version > 0, "zero data-version format version");
+    let maximum = u16::try_from(descriptor[3].1.int()?)?;
+    ensure!(
+        (1..=256).contains(&maximum),
+        "invalid declared data-version bound"
+    );
+    Ok(DataVersionFormat {
+        provider,
+        name,
+        version,
+        maximum,
+    })
+}
+
+pub(super) fn definition(raw: &[u8]) -> Result<()> {
+    let fields = proto(raw, &[(1, 0), (2, 2), (6, 0)], &[])?;
+    version(&fields, 2, "definition")?;
+    ensure!(fields.len() == 3, "definition fields are incomplete");
+    let query = proto(required(&fields, 2)?, &[(1, 2), (2, 0), (3, 2)], &[])?;
+    let sql = std::str::from_utf8(required(&query, 1)?)?;
+    ensure!(!sql.is_empty(), "definition lacks SQL");
+    ensure!(
+        query
+            .get(1)
+            .is_some_and(|(n, v)| *n == 2 && v.int().ok() == Some(2)),
+        "definition dialect must be Trino"
+    );
+    let context = proto(required(&query, 3)?, &[(1, 2), (2, 2)], &[])?;
+    for n in 1..=2 {
         ensure!(
-            !name.is_empty() && name.len() <= 128 && name.is_ascii(),
-            "invalid data-version format name"
+            !std::str::from_utf8(required(&context, n)?)?.is_empty(),
+            "definition lacks resolution context"
         );
-        let version = u16::try_from(descriptor[2].1.int()?)?;
-        ensure!(version > 0, "zero data-version format version");
-        let maximum = u16::try_from(descriptor[3].1.int()?)?;
+    }
+    Ok(())
+}
+
+pub(super) struct MappingColumn<'a> {
+    pub storage_field: &'a [u8],
+    pub storage_type: &'a [u8],
+    pub storage_nullable: bool,
+    pub declaration: &'a [u8],
+    pub encode_identity: &'a [u8],
+    pub decode_identity: &'a [u8],
+    pub content_contract: &'a [u8],
+    pub storage_format: u64,
+}
+
+pub(super) fn mapping<'a>(
+    raw: &'a [u8],
+    outputs: &[BoundOutput<'_>],
+) -> Result<Vec<MappingColumn<'a>>> {
+    let fields = proto(raw, &[(1, 0), (2, 2)], &[2])?;
+    version(&fields, 1, "mapping")?;
+    ensure!(
+        fields.len() == outputs.len() + 1,
+        "M/B output count differs"
+    );
+    let mut field_ids = BTreeSet::new();
+    let mut columns = Vec::new();
+    for (ordinal, ((_, value), output)) in fields[1..].iter().zip(outputs).enumerate() {
+        let column = proto(
+            value.bytes()?,
+            &[
+                (1, 0),
+                (2, 2),
+                (3, 2),
+                (4, 2),
+                (5, 2),
+                (6, 2),
+                (7, 2),
+                (8, 0),
+                (9, 0),
+                (10, 2),
+                (11, 0),
+            ],
+            &[],
+        )?;
+        ensure!(column.len() == 11, "M column fields are incomplete");
         ensure!(
-            (1..=256).contains(&maximum),
-            "invalid declared data-version bound"
+            column[0].1.int()? == ordinal as u64,
+            "M output ordinal is out of order"
         );
-        result.push(DataVersionFormat {
-            provider,
-            name,
-            version,
-            maximum,
+        for n in [2, 3, 4, 5, 6, 7, 10] {
+            ensure!(
+                !required(&column, n)?.is_empty(),
+                "M column identity is empty"
+            );
+        }
+        ensure!(
+            required(&column, 3)? == output.logical_type,
+            "M disagrees with B logical type for {}",
+            output.name
+        );
+        let storage_field = required(&column, 2)?;
+        ensure!(
+            field_ids.insert(storage_field),
+            "M repeats a physical field"
+        );
+        ensure!(
+            (1..=3).contains(&column[7].1.int()?),
+            "unknown M pushdown class"
+        );
+        let nullable = column[8].1.int()?;
+        ensure!(nullable <= 1, "invalid M nullability");
+        let storage_format = column[10].1.int()?;
+        ensure!(storage_format > 0, "missing M storage format version");
+        columns.push(MappingColumn {
+            storage_field,
+            storage_type: required(&column, 4)?,
+            storage_nullable: nullable == 1,
+            declaration: required(&column, 10)?,
+            encode_identity: required(&column, 5)?,
+            decode_identity: required(&column, 6)?,
+            content_contract: required(&column, 7)?,
+            storage_format,
         });
     }
-    ensure!(result.len() <= 65535, "too many binding occurrences");
-    Ok(result)
-}
-pub(super) fn definition_occurrences(raw: &[u8]) -> Result<usize> {
-    let fields = proto(
-        raw,
-        &[(1, 0), (2, 2), (3, 2), (4, 2), (5, 2), (6, 0)],
-        &[3, 4],
-    )?;
-    ensure!(
-        fields
-            .first()
-            .is_some_and(|(n, v)| *n == 1 && v.int().ok() == Some(1)),
-        "definition format must be 1"
-    );
-    Ok(fields.iter().filter(|(n, _)| *n == 3).count())
+    Ok(columns)
 }
 pub(super) fn interpretation_definition(raw: &[u8]) -> Result<String> {
     let fields = proto(
@@ -553,7 +773,6 @@ pub(super) fn interpretation_definition(raw: &[u8]) -> Result<String> {
         &[
             (1, 0),
             (2, 2),
-            (3, 2),
             (4, 2),
             (5, 2),
             (6, 2),
@@ -563,12 +782,7 @@ pub(super) fn interpretation_definition(raw: &[u8]) -> Result<String> {
         ],
         &[4, 5, 7, 8],
     )?;
-    ensure!(
-        fields
-            .first()
-            .is_some_and(|(n, v)| *n == 1 && v.int().ok() == Some(2)),
-        "interpretation format must be 2"
-    );
+    version(&fields, 3, "interpretation")?;
     let revision = fields
         .iter()
         .find(|(n, _)| *n == 2)
@@ -581,6 +795,232 @@ pub(super) fn interpretation_definition(raw: &[u8]) -> Result<String> {
     );
     Ok(hex(revision))
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MarkerScope {
+    Publication,
+    Binding,
+}
+
+#[derive(Debug)]
+pub(super) struct Marker {
+    pub name: String,
+    pub scope: MarkerScope,
+    pub identity: Vec<u8>,
+}
+
+fn frame64(bytes: &mut Vec<u8>, value: &[u8]) {
+    bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(value);
+}
+
+pub(super) fn markers(properties: &Properties) -> Result<Vec<Marker>> {
+    properties
+        .markers
+        .iter()
+        .filter(|item| item.owner == "novarocks.mv")
+        .map(|item| {
+            let raw = decode_base64url(&item.content)?;
+            let fields = proto(
+                &raw,
+                &[
+                    (1, 0),
+                    (2, 2),
+                    (3, 2),
+                    (4, 2),
+                    (5, 2),
+                    (6, 2),
+                    (7, 2),
+                    (8, 2),
+                ],
+                &[],
+            )?;
+            version(&fields, 1, "marker")?;
+            ensure!(fields.len() == 3, "marker must carry a scope and one body");
+            let identity = fields[1].1.bytes()?;
+            let (scope, tag) = match fields[1].0 {
+                2 if identity.len() == 16 => (MarkerScope::Publication, 1u32),
+                3 if identity.len() == 32 => (MarkerScope::Binding, 2u32),
+                _ => bail!("invalid MV marker scope"),
+            };
+            let body = fields[2].1.bytes()?;
+            let mut attempt = None;
+            let name = match fields[2].0 {
+                4 | 5 => {
+                    ensure!(
+                        scope == MarkerScope::Publication,
+                        "attempt marker must scope to P"
+                    );
+                    let shape = if fields[2].0 == 4 {
+                        &[(1, 2), (2, 2), (3, 2), (4, 2), (5, 0), (6, 2), (7, 2)][..]
+                    } else {
+                        &[(1, 2)]
+                    };
+                    let attempt_fields = proto(body, shape, &[3])?;
+                    let id = required(&attempt_fields, 1)?;
+                    ensure!(id.len() == 16, "invalid marker attempt identity");
+                    attempt = Some(id);
+                    if fields[2].0 == 4 {
+                        "pending"
+                    } else {
+                        "pending-released"
+                    }
+                }
+                6 => {
+                    let changes = proto(body, &[(1, 2)], &[1])?;
+                    ensure!(
+                        !changes.is_empty(),
+                        "needs-rebuild marker lost its change evidence"
+                    );
+                    let mut prior = 0;
+                    for (_, change) in changes {
+                        let fields = proto(change.bytes()?, &[(1, 0), (2, 2), (3, 2)], &[])?;
+                        ensure!(fields.len() == 3, "incomplete binding change evidence");
+                        let kind = fields[0].1.int()?;
+                        ensure!(
+                            kind > prior && kind <= 5,
+                            "invalid rebuild change kind order"
+                        );
+                        prior = kind;
+                        ensure!(
+                            required(&fields, 2)?.len() == 32 && required(&fields, 3)?.len() == 32,
+                            "rebuild marker revision is not an exact identity"
+                        );
+                    }
+                    "needs-rebuild"
+                }
+                7 => {
+                    let invalid = proto(body, &[(1, 0), (2, 2)], &[])?;
+                    ensure!(
+                        invalid
+                            .first()
+                            .is_some_and(|(n, v)| *n == 1 && matches!(v.int(), Ok(1 | 2)))
+                            && !std::str::from_utf8(required(&invalid, 2)?)?
+                                .trim()
+                                .is_empty(),
+                        "invalid-definition marker lacks its typed diagnostic"
+                    );
+                    "invalid-definition"
+                }
+                8 => {
+                    let invalid = proto(body, &[(1, 2)], &[])?;
+                    ensure!(
+                        scope == MarkerScope::Publication && required(&invalid, 1)?.len() == 32,
+                        "invalid marker lacks publication or retirement identity"
+                    );
+                    "invalid"
+                }
+                _ => bail!("missing MV marker body"),
+            };
+            ensure!(
+                item.name == name
+                    && item.format.owner == item.owner
+                    && item.format.name == name
+                    && item.format.version == 1,
+                "MV marker key does not match its typed body"
+            );
+            let mut binding = Vec::new();
+            frame64(&mut binding, b"novarocks.mv.marker-binding");
+            binding.extend_from_slice(&1u32.to_be_bytes());
+            binding.extend_from_slice(&tag.to_be_bytes());
+            frame64(&mut binding, identity);
+            if let Some(attempt) = attempt {
+                frame64(&mut binding, attempt);
+            }
+            ensure!(
+                hex(&Sha256::digest(binding)) == item.binding,
+                "MV marker key does not match its exact scope"
+            );
+            Ok(Marker {
+                name: name.to_string(),
+                scope,
+                identity: identity.to_vec(),
+            })
+        })
+        .collect()
+}
+
+pub(super) fn iceberg_object_identity(raw: &[u8]) -> Result<&[u8]> {
+    let mut c = Cursor::new(raw);
+    ensure!(c.take(8)? == b"NRMVFCT1", "unknown object fact envelope");
+    let len = usize::from(c.u16()?);
+    ensure!(c.take(len)? == b"iceberg", "unexpected object provider");
+    let len = usize::from(c.u16()?);
+    ensure!(
+        c.take(len)? == b"connector-table-object-id",
+        "unexpected object declaration"
+    );
+    ensure!(
+        c.u16()? == 1 && c.u16()? == 36,
+        "expected canonical Iceberg table UUID text"
+    );
+    let object = c.take(36)?;
+    c.done()?;
+    Ok(object)
+}
+
+pub(super) fn assert_decimal_mapping(
+    column: &MappingColumn<'_>,
+    output: &BoundOutput<'_>,
+    field: &Value,
+    format_version: u64,
+) -> Result<()> {
+    let field_id = i32::try_from(field["id"].as_i64().context("REST field lacks ID")?)?;
+    let required = field["required"]
+        .as_bool()
+        .context("REST field lacks required")?;
+    let decimal = field["type"]
+        .as_str()
+        .and_then(|value| value.strip_prefix("decimal(")?.strip_suffix(')'))
+        .context("REST output storage is not decimal")?;
+    let (precision, scale) = decimal
+        .split_once(',')
+        .context("invalid REST decimal type")?;
+    let precision = precision.trim().parse::<u32>()?;
+    let scale = scale.trim().parse::<u32>()?;
+    let mut ty = Vec::new();
+    frame64(&mut ty, b"novarocks.iceberg.source-type");
+    ty.extend_from_slice(&1u32.to_be_bytes());
+    ty.extend_from_slice(&1u64.to_be_bytes());
+    for value in [1u32, 6, precision, scale] {
+        ty.extend_from_slice(&value.to_be_bytes());
+    }
+    ensure!(
+        column.storage_field == field_id.to_be_bytes()
+            && column.storage_type == ty
+            && column.storage_nullable != required
+            && column.storage_format == format_version,
+        "M named a different Iceberg field, decimal storage type, or table format"
+    );
+    ensure!(
+        column.encode_identity == b"novarocks.iceberg.ordinary-value-write/v1"
+            && column.decode_identity == b"novarocks.iceberg.ordinary-value-read/v1"
+            && column.content_contract == b"novarocks.iceberg.mv.observable-value-content/v1",
+        "M does not describe the ordinary observable value path"
+    );
+    let mut declaration = Vec::new();
+    frame64(&mut declaration, b"novarocks.iceberg.mv.storage-column");
+    declaration.extend_from_slice(&1u32.to_be_bytes());
+    frame64(&mut declaration, &ty);
+    declaration.push(u8::from(required));
+    let mut logical = Cursor::new(output.logical_type);
+    let domain_len = usize::try_from(u64::from_be_bytes(logical.take(8)?.try_into()?))?;
+    ensure!(
+        logical.take(domain_len)? == b"novarocks.sql.mv-output-type"
+            && logical.take(4)? == 1u32.to_be_bytes(),
+        "B5 has an unexpected output type format"
+    );
+    let value_len = usize::try_from(u64::from_be_bytes(logical.take(8)?.try_into()?))?;
+    let value_type = logical.take(value_len)?;
+    logical.done()?;
+    frame64(&mut declaration, value_type);
+    frame64(&mut declaration, value_type);
+    ensure!(
+        column.declaration == declaration,
+        "M disagrees with the ordinary decimal declaration"
+    );
+    Ok(())
+}
+
 pub(super) fn management(raw: &[u8]) -> Result<[String; 3]> {
     let mut c = Cursor::new(raw);
     let mut result = Vec::new();
@@ -601,6 +1041,7 @@ pub(super) fn management(raw: &[u8]) -> Result<[String; 3]> {
 pub(super) struct Publication {
     pub id: [u8; 16],
     pub rows: Option<u64>,
+    pub watermarks: Vec<Vec<u8>>,
 }
 pub(super) fn publication(raw: &[u8], formats: &[DataVersionFormat]) -> Result<Publication> {
     let mut c = Cursor::new(raw);
@@ -615,16 +1056,21 @@ pub(super) fn publication(raw: &[u8], formats: &[DataVersionFormat]) -> Result<P
     };
     ensure!(
         usize::from(c.u16()?) == formats.len(),
-        "P occurrence count differs from B/D"
+        "P occurrence count differs from B"
     );
+    let mut watermarks = Vec::new();
     for format in formats {
         let n = c.u16()?;
         ensure!(
             n <= format.maximum && n <= 256,
             "publication value exceeds declared maximum"
         );
-        c.take(usize::from(n))?;
+        watermarks.push(c.take(usize::from(n))?.to_vec());
     }
     c.done()?;
-    Ok(Publication { id, rows })
+    Ok(Publication {
+        id,
+        rows,
+        watermarks,
+    })
 }

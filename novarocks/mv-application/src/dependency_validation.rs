@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Canonical dependency validation borrows definition occurrences; classification
+//! Canonical dependency validation borrows binding occurrences; classification
 //! uses the same read snapshot inventory without a local collection quota.
 
 use crate::dependency::{MvDependencyObjectType, MvDependencyStorageEngine};
@@ -24,14 +24,15 @@ use crate::repository::{MvProjectionInventoryEntry, MvRepositoryError, MvReposit
 
 pub(crate) fn validate_canonical_parts(
     mv_id: i64,
-    definition: &crate::persistence::codec::DefinitionDocument,
+    created_at_ms: u64,
+    binding: &crate::persistence::codec::BindingDocument,
     dependencies: &[StoredMvDependency],
 ) -> Result<(), MvRepositoryError> {
-    let occurrences = &definition.relation_occurrences;
+    let occurrences = &binding.occurrences;
     if dependencies.len() != occurrences.len()
         || dependencies.iter().any(|dependency| {
             dependency.downstream_mv_id != mv_id
-                || dependency.created_at_ms != definition.created_at_ms
+                || dependency.created_at_ms != created_at_ms
                 || dependency.upstream.object_type != MvDependencyObjectType::Unclassified
                 || dependency.upstream.storage_engine != MvDependencyStorageEngine::Unclassified
                 || !occurrences.iter().any(|occurrence| {

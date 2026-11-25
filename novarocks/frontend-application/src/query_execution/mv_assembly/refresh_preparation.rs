@@ -259,4 +259,5 @@ enum PreparedIncrementalRefreshWork {
 pub(crate) mod async_facts;
 pub(crate) mod captured_sources;
 
+mod binding_marker;
 pub(crate) mod pure_reader;

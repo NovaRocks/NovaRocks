@@ -564,6 +564,8 @@ fn view_definition_needs_only_the_declaration_and_saved_context_is_exact() {
     );
     let view = Arc::new(crate::catalog::SqlViewDefinition {
         identity: novarocks_types::naming::TableIdentity::new("ice", "db", "v"),
+        origin: crate::catalog::SqlViewOrigin::Session,
+        dialect: crate::catalog::SqlViewDialect::Trino,
         version: "v1".into(),
         raw_sql: "SELECT * FROM information_schema.fixture".into(),
         default_catalog: "ice".into(),
