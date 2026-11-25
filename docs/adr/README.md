@@ -169,6 +169,7 @@ code-anchors:
 
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
+- [ADR-0268](ADR-0268-iceberg-mv-converges-from-the-original-commit.md) — Iceberg MV 如何以每轮 main CAS 发布、以原派发证据结算未知结果并保留精确清理与管理保护（active；部分替代 ADR-0180 第 4 条）
 - [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
 - [ADR-0264](ADR-0264-iceberg-rewrites-preserve-row-identity.md) — Iceberg OPTIMIZE 保留已分配的行身份，由 manifest list 为重写输出分配新范围，v3 缺 next-row-id 返回明确诊断（active。部分替代 ADR-0171 的重写 lineage 规则和 ADR-0174 的 P7a。原不可变 operation、依赖验证、产物归属和其余 vendor 补丁政策继续有效）
 - [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) — Iceberg 写类为何共用紧凑接收与 operation 账本，怎样选择建表位置、冻结追加条件并按精确对象清理（active；部分替代 lake publication ADR-0110、ADR-0171、ADR-0198、Iceberg ADR-0239 与维护 ADR-0243）
@@ -244,7 +245,7 @@ code-anchors:
 - ADR-0143 — StateStore 为何只回答自己签发过的 attempt，并删除跨重启 receipt 查询与公共 change feed（active；替换 ADR-0122 的 schema 版本、history 保留与 commit-resolution 三项承诺）
 - ADR-0158 — Parquet 扫描为何由共享 Range 服务派发，并由单一 B/N 后继窗口维持顺序与责任（active；其「同步 reader 占用扫描线程」的妥协已由 ADR-0159 兑现，Range 服务与 B/N 规则不变）
 - ADR-0159 — connector scan 为何由 driver 直接 poll page stream、在 scan 分支内扇出，并以观察到的退出为结束（active）
-- [ADR-0180](ADR-0180-inline-keyed-documents-and-snapshot-records.md) — 应用文档为何按完整语义内联寻址、槽变更推进 main，且快照记录与生命周期回收分工（active；部分替代 ADR-0154、ADR-0171；裁决 1 的额度与首条重评条件由 ADR-0224 部分替代，内联存放、身份、写入形状、回收、证据与外部回滚边界保留）
+- [ADR-0180](ADR-0180-inline-keyed-documents-and-snapshot-records.md) — 应用文档为何按完整语义内联寻址、槽变更推进 main，且快照记录与生命周期回收分工（active；部分替代 ADR-0154、ADR-0171；裁决 1 的额度与首条重评条件由 ADR-0224 部分替代，MV 槽变更的确定竞争重试由 ADR-0268 部分替代第 4 条，第 6 条及其余内联规则保留）
 
 #### 历史
 
@@ -559,8 +560,9 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：MV 领域拥有 D/L/P/C 的持久语义；provider 拥有准确物理事实、附着与提交。Frontend 拥有当前 MV refresh attempt 的准入、效果结算、query orchestration 与用户结果；StateStore 仅保存按湖上来源重建的 Accelerator，不承担 durable ledger。commit truth 使用 typed provider evidence，不从错误文本猜测，也不通过双 journal 或 aggregate facade 掩盖 owner。
 
+- [ADR-0268](ADR-0268-iceberg-mv-converges-from-the-original-commit.md) — Iceberg MV 如何以每轮 main CAS 发布、以原派发证据结算未知结果并保留精确清理与管理保护（active；部分替代 ADR-0180 第 4 条）
 - [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
-- [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) — MV 文档建表如何直接暂存于最终位置，全量刷新与重分区如何原子发布 delete、append 与文档（active）
+- [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) — MV 文档建表如何直接暂存于最终位置，全量刷新与重分区如何原子发布 delete、append 与文档（active；第 6 条的全量 delete 阶段证据见 ADR-0268）
 - [ADR-0232](ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md) — 维护与统计为何归原语句执行，取消为何保留原 Source 至真实退出，状态为何分别由统计、MV 系统关系与管理 API 提供（active；部分替代 ADR-0169/0111/0226，GC Accelerator 由 [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) 部分替代，Catalog 准入与三态 publication 保留）
 - [ADR-0226](ADR-0226-engine-metadata-through-typed-system-relations.md) — 引擎元数据为何通过原语句的类型化批快照进入独立系统关系，名称、只读、Provider与真实退出为何各守原所有者（active；旧 SHOW 保留条款由 ADR-0232 部分替代，类型化系统关系与真实退出保留，验证范围独立核对）
 - [ADR-0224](ADR-0224-mv-document-capacity-comes-from-real-boundaries.md) — MV 文档为何不自设容量额度、读方为何覆盖写方、StateStore 为何声明真实能力、REST 为何按期望值核验并把 413 归为确定拒绝（active；部分替代 ADR-0180 的额度与首条重评条件，以及 REST 会话版 ADR-0175 的属性保留量与拒绝集；原存放、身份、生命周期、认证与路由保留；薄清单条目/名字/token固定界由 ADR-0227 部分替代，其余文档与后端边界保留）
@@ -570,7 +572,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - [ADR-0110](ADR-0110-lake-publication-crash-only-contract.md) — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active；本地期限推导外部效果上界及无条件年龄窗回收由 ADR-0198 部分替代，显式孤儿扫描与自有 ref 回收由 [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) 部分替代，target OCC、autocommit 与无持久接管规则保留；ADD FILES 候选复核由 [ADR-0246](ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md) 部分替代。CTAS 私有暂存与无表锚扫描、统一发布期限由 [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) 部分替代）
 - ADR-0086 — MV storage observation 为何以中立 SPI facts 连接 provider 与 Frontend durable contracts（active）
 - ADR-0154 — MV 领域文档与准确发布附着为何是湖上权威（active；存放与附着条款由 ADR-0180 部分替代，湖上权威、领域分工与 Accelerator 边界保留）
-- [ADR-0180](ADR-0180-inline-keyed-documents-and-snapshot-records.md) — 应用文档为何按完整语义内联寻址、槽变更推进 main，且快照记录与生命周期回收分工（active；部分替代 ADR-0154、ADR-0171；裁决 1 的额度与首条重评条件由 ADR-0224 部分替代，内联存放、身份、写入形状、回收、证据与外部回滚边界保留）
+- [ADR-0180](ADR-0180-inline-keyed-documents-and-snapshot-records.md) — 应用文档为何按完整语义内联寻址、槽变更推进 main，且快照记录与生命周期回收分工（active；部分替代 ADR-0154、ADR-0171；裁决 1 的额度与首条重评条件由 ADR-0224 部分替代，MV 槽变更的确定竞争重试由 ADR-0268 部分替代第 4 条，第 6 条及其余内联规则保留）
 
 #### 历史
 

@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 pub(crate) const FULL_REFRESH_STAGE_SUMMARY_KEY: &str = "novarocks.mv.full-refresh-stage.v1";
 
+// Design: ADR-0268 (docs/adr/ADR-0268-iceberg-mv-converges-from-the-original-commit.md)
 /// The private delete witness binds every selected snapshot to one actual
 /// attempt. It is evidence even when expiry has removed the append snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

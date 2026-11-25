@@ -9,6 +9,9 @@ partially-superseded-by:
   - id: ADR-0224
     scope: "Ruling 1 document-version, aggregate-private-property and snapshot-record capacity quotas, and the first reevaluation trigger; inline storage, identity, request shapes, lifecycle, evidence and external rollback boundaries remain active"
     link: "ADR-0224-mv-document-capacity-comes-from-real-boundaries.md"
+  - id: ADR-0268
+    scope: "Ruling 4 immediate conflict termination for qualifying MV slot changes. Exact slot writers, main advancement, and Ruling 6 cleanup authority remain active."
+    link: "ADR-0268-iceberg-mv-converges-from-the-original-commit.md"
 partially-supersedes:
   - id: ADR-0154
     scope: "Document storage and attachment rules: inline semantic versions, binding documents, slots and snapshot records; lake authority and domain ownership remain unchanged"
