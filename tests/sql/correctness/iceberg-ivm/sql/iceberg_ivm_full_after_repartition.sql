@@ -97,6 +97,7 @@ curl --silent --show-error --fail "$target" > "$after"
 python3 - "$before" "$after" <<'PYTHON'
 import json
 import sys
+import uuid
 
 with open(sys.argv[1]) as source:
     before = json.load(source)["metadata"]
@@ -119,11 +120,25 @@ assert all(
     delete["summary"][key] == "0"
     for key in ("total-records", "total-data-files", "total-delete-files")
 )
-assert not any(key.startswith("novarocks.") for key in delete["summary"])
+stage_key = "novarocks.mv.full-refresh-stage.v1"
+assert {key for key in delete["summary"] if key.startswith("novarocks.")} == {stage_key}
+witness = json.loads(delete["summary"][stage_key])
+assert set(witness) == {
+    "version", "table_uuid", "operation_id", "attempt_ordinal", "attempt_nonce",
+    "asserted_parent", "delete_snapshot", "append_snapshot",
+}
+assert witness["version"] == 1
+assert witness["table_uuid"] == before["table-uuid"] == after["table-uuid"]
+assert witness["asserted_parent"] == before["current-snapshot-id"]
+assert witness["delete_snapshot"] == delete["snapshot-id"]
+assert witness["append_snapshot"] == append["snapshot-id"]
+assert type(witness["attempt_ordinal"]) is int and 0 <= witness["attempt_ordinal"] < 2**32
+assert uuid.UUID(bytes=bytes(witness["attempt_nonce"])).version == 7
 assert append["summary"]["total-records"] == "4"
 assert append["summary"]["novarocks.doc.v2.record.novarocks.mv~publication"]
 marker_key = "novarocks.write.session.v1"
 marker = append["summary"][marker_key]
+assert uuid.UUID(marker).bytes == bytes(witness["operation_id"])
 assert marker and sum(s["summary"].get(marker_key) == marker for s in new.values()) == 1
 assert append["first-row-id"] == before["next-row-id"]
 assert append["added-rows"] == 4

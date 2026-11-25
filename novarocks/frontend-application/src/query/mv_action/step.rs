@@ -620,14 +620,26 @@ impl StepExecution {
                             LakePublicationDisposition::KnownUncommitted => {
                                 Some(EffectDisposition::KnownUncommitted)
                             }
-                            LakePublicationDisposition::CommitUnknown => None,
+                            LakePublicationDisposition::CommitUnknown => publication
+                                .unknown_evidence()
+                                .map(|_| EffectDisposition::CommitUnknown),
                         })
                 }
             });
             if let (Some(source), Some(terminal)) = (&self.source, terminal) {
                 // All original CPU borrowers have now actually exited. A
                 // projection failure cannot rewrite an Applied commit as Unknown.
-                match source.record_terminal(terminal) {
+                let settled = if terminal == EffectDisposition::CommitUnknown
+                    && let Some((evidence, observation)) = self
+                        .publication
+                        .as_ref()
+                        .and_then(StatementPublication::unknown_evidence)
+                {
+                    source.record_unknown(evidence, observation)
+                } else {
+                    source.record_terminal(terminal)
+                };
+                match settled {
                     Ok(()) => self.terminal_recorded = true,
                     Err(error) => {
                         self.terminal_record_failure.get_or_insert(error);

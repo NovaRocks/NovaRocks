@@ -754,7 +754,17 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         }
         *slot = Some(fixture);
         let mut fe_overlay = launch.config_overlay.fe.take().unwrap_or_default();
-        fe_overlay.push_str("\n[runtime]\nquery_blocking_worker_threads = 2\n");
+        fe_overlay.push_str(
+            r#"
+[runtime]
+query_blocking_worker_threads = 2
+
+[standalone_server]
+mv_refresh_scheduler_enabled = true
+mv_refresh_scheduler_interval_ms = 100
+mv_refresh_scheduler_max_concurrent = 1
+"#,
+        );
         launch.config_overlay.fe = Some(fe_overlay);
         Ok(launch)
     }
@@ -771,15 +781,33 @@ impl Scenario for MvRefreshConfigurationInterleaving {
             cluster_size,
             binary,
             original_deadline,
-            vec![FeLaunchIntent::MvActions(vec![control_plan::recovery(
-                "configuration-data-prepared",
-                "system_mv_config_interleaving",
-                "ns",
-                "orders_mv",
-                "data-prepared",
-                "before-configuration-write",
-                &scenario_root.join("mv-recovery-faults"),
-            )?])],
+            vec![FeLaunchIntent::MvActions(vec![
+                control_plan::recovery(
+                    "configuration-data-prepared",
+                    "system_mv_config_interleaving",
+                    "ns",
+                    "orders_mv",
+                    "data-prepared",
+                    "before-configuration-write",
+                    &scenario_root.join("mv-recovery-faults"),
+                )?,
+                control_plan::recovery(
+                    "background-configuration-data-prepared",
+                    "system_mv_config_interleaving",
+                    "ns",
+                    "background_mv",
+                    "data-prepared",
+                    "before-background-configuration-write",
+                    &scenario_root.join("mv-recovery-faults"),
+                )?,
+                control_plan::scheduler_outcome(
+                    "background-configuration-outcome",
+                    "system_mv_config_interleaving",
+                    "ns",
+                    "background_mv",
+                    &scenario_root.join("background-configuration-outcome"),
+                ),
+            ])],
         )
         .map(Some)
     }
@@ -928,7 +956,7 @@ impl Scenario for MvRefreshConfigurationInterleaving {
             &[(1, 10), (2, 20), (3, 30)],
             "read the completed refresh after the configuration write",
         )?;
-        Ok(())
+        background_configuration_writer_conflict(context, &mut conn, &rest_uri)
     }
 
     fn teardown(&self) -> Result<()> {
@@ -942,6 +970,132 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         };
         fixture.shutdown()
     }
+}
+
+fn background_configuration_writer_conflict(
+    context: &mut ScenarioContext,
+    conn: &mut SqlSession,
+    rest_uri: &str,
+) -> Result<()> {
+    use super::mv_uea7_documents::{
+        external_configuration_slot_snapshot, load_metadata,
+        wire::{CONFIG, Graph},
+    };
+    execute(
+        context,
+        conn,
+        "create the first-refresh background target",
+        "CREATE MATERIALIZED VIEW background_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders",
+    )?;
+    execute(
+        context,
+        conn,
+        "create an independent paused configuration fixture",
+        "CREATE MATERIALIZED VIEW paused_configuration_mv WITH (refresh_policy = 'INTERVAL', refresh_interval = '10s', refresh_paused = true) AS SELECT k1, v2 FROM orders",
+    )?;
+    let fault_dir = context.scenario_root().join("mv-recovery-faults");
+    let prepared = FileTrigger::create(
+        &fault_dir.join("mv-refresh-at-data-prepared.trigger"),
+        "token=before-background-configuration-write\n",
+    )?;
+    execute(
+        context,
+        conn,
+        "enable the interval refresh with its first exact slot writer",
+        "ALTER MATERIALIZED VIEW background_mv SET PROPERTIES refresh_policy = 'INTERVAL', refresh_interval = '10s'",
+    )?;
+    let marker = format!(
+        "{} phase=data-prepared token=before-background-configuration-write",
+        novarocks_failpoint::observation_marker::MV_RECOVERY_PHASE,
+    );
+    loop {
+        if context.handle().fe_log_contents()?.contains(&marker) {
+            break;
+        }
+        context.remaining("wait for the original background full refresh to freeze its writer")?;
+        thread::sleep(POLL_INTERVAL);
+    }
+    let initial = load_metadata(context, rest_uri, "ns", "background_mv")?;
+    let original = Graph::from_metadata(&initial)?;
+    let initial_slot = original
+        .slots
+        .get(CONFIG)
+        .context("initial configuration slot missing")?;
+    ensure!(
+        initial_slot.writer == original.current,
+        "original configuration writer was not the selected parent"
+    );
+    let paused_fixture = load_metadata(context, rest_uri, "ns", "paused_configuration_mv")?;
+    let paused_config = Graph::from_metadata(&paused_fixture)?
+        .slots
+        .remove(CONFIG)
+        .context("paused configuration fixture missing")?;
+    ensure!(
+        initial_slot.content != paused_config.content,
+        "paused fixture used the original configuration bytes"
+    );
+    let paused = external_configuration_slot_snapshot(
+        context,
+        rest_uri,
+        "background_mv",
+        &initial,
+        paused_config,
+    )?;
+    let resumed = external_configuration_slot_snapshot(
+        context,
+        rest_uri,
+        "background_mv",
+        &paused,
+        initial_slot.clone(),
+    )?;
+    let paused = Graph::from_metadata(&paused)?;
+    let resumed_graph = Graph::from_metadata(&resumed)?;
+    let resumed_slot = &resumed_graph.slots[CONFIG];
+    ensure!(
+        resumed_slot.content == initial_slot.content
+            && resumed_slot.writer == resumed_graph.current
+            && resumed_slot.writer != initial_slot.writer
+            && paused.slots[CONFIG].writer == paused.current
+            && paused.current != resumed_graph.current,
+        "external pause and same-value resume did not publish distinct configuration writer snapshots"
+    );
+    prepared.remove()?;
+    let outcome = context
+        .scenario_root()
+        .join("background-configuration-outcome");
+    let scope = context.handle().mv_scheduler_outcome_binding(
+        "background-configuration-outcome",
+        "system_mv_config_interleaving",
+        "ns",
+        "background_mv",
+        &outcome,
+    )?;
+    let blocked = loop {
+        if let Some(blocked) = read_scheduler_outcome(
+            &outcome,
+            "background-configuration-outcome",
+            "system_mv_config_interleaving",
+            "background_mv",
+            &scope,
+        )? {
+            break blocked;
+        }
+        context.remaining("observe rejection of the originally admitted background writer")?;
+        thread::sleep(POLL_INTERVAL);
+    };
+    use novarocks_execution_contract::failure::{FailureClass, domain};
+    ensure!(
+        blocked.fact.class() == FailureClass::Dependency
+            && blocked.fact.reason().domain() == domain::CONNECTOR.get()
+            && blocked.fact.reason().code() == 52,
+        "expected the original provider validation conflict, got {blocked}"
+    );
+    let after = load_metadata(context, rest_uri, "ns", "background_mv")?;
+    ensure!(
+        after["snapshots"] == resumed["snapshots"],
+        "the held background refresh published after its configuration writer changed"
+    );
+    Ok(())
 }
 
 fn require_refresh_paused(
@@ -3156,6 +3310,24 @@ fn check_scheduler_outcome(
     mv: &str,
     expected: &novarocks_failpoint::target_binding::RoleProcessReceipt,
 ) -> Result<()> {
+    if let Some(blocked) =
+        read_scheduler_outcome(directory, grant_id, "system_mv_scheduler", mv, expected)?
+    {
+        return Err(anyhow::Error::new(blocked).context(format!(
+            "actual Blocked scheduler request recorded at {}",
+            directory.join("scheduler-outcome.json").display()
+        )));
+    }
+    Ok(())
+}
+
+fn read_scheduler_outcome(
+    directory: &Path,
+    grant_id: &str,
+    catalog: &str,
+    mv: &str,
+    expected: &novarocks_failpoint::target_binding::RoleProcessReceipt,
+) -> Result<Option<SchedulerRequestBlocked>> {
     use prost::Message;
     use std::io::Read;
     expected
@@ -3175,7 +3347,7 @@ fn check_scheduler_outcome(
     const MAX_BYTES: usize = 64 * 1024;
     let file = match fs::File::open(&path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("open finite scheduler outcome {}", path.display()));
@@ -3196,7 +3368,7 @@ fn check_scheduler_outcome(
             && record["semantic_scope"] == "scheduler-request-outcome"
             && record["decision"] == "Blocked"
             && record["grant_id"] == grant_id
-            && record["target"]["catalog"] == "system_mv_scheduler"
+            && record["target"]["catalog"] == catalog
             && record["target"]["namespace"] == "ns"
             && record["target"]["mv"] == mv,
         "finite scheduler outcome has a foreign target/grant or invalid shape; outcome UNKNOWN"
@@ -3319,14 +3491,10 @@ fn check_scheduler_outcome(
         record["public_message"] == public_message,
         "scheduler outcome message disagrees with its decoded domain fact; outcome UNKNOWN"
     );
-    Err(anyhow::Error::new(SchedulerRequestBlocked {
+    Ok(Some(SchedulerRequestBlocked {
         fact,
         public_message,
-    })
-    .context(format!(
-        "actual Blocked scheduler request recorded at {}",
-        path.display()
-    )))
+    }))
 }
 
 struct SchedulerOutcomeTarget {

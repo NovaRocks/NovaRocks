@@ -21,6 +21,7 @@ partially-supersedes:
   - id: ADR-0243
     scope: "Continued independent admission of the built-in unanchored CTAS scan."
     link: "ADR-0243-statement-authorized-iceberg-metadata-maintenance.md"
+related: [ADR-0268]
 date: 2026-11-23
 provenance:
   - "design: 2026-11-23 approved Trino-aligned Iceberg write convergence specification, revision 2"

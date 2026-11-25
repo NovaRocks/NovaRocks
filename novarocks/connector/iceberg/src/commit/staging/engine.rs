@@ -315,6 +315,10 @@ impl<'a> StagingEngine<'a> {
         StagedView::new(
             &self.state.metadata,
             self.stage,
+            match &self.state.identity {
+                BaseIdentity::Existing { parent, .. } => *parent,
+                BaseIdentity::Create { .. } => None,
+            },
             self.intent,
             self.artifacts,
             self.context,

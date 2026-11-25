@@ -40,6 +40,7 @@ pub(crate) mod manifest_merge;
 pub(crate) mod manifest_sources;
 mod manifest_transform;
 pub(crate) mod model;
+pub(crate) mod mv_dispatch;
 pub mod mv_publication_fence;
 pub mod mv_refresh_ref;
 mod new_manifests;
@@ -59,6 +60,7 @@ mod rewrite_data_files;
 mod row_delta;
 pub(crate) mod row_delta_facts;
 
+pub(crate) mod retirement;
 pub mod row_delta_dv_metadata;
 mod row_mutation_preparation;
 #[cfg(test)]

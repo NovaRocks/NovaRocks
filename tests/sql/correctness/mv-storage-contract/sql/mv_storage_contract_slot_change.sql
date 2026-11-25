@@ -68,24 +68,85 @@ CREATE MATERIALIZED VIEW conflict_slot_mv WITH (refresh_policy = 'MANUAL') AS SE
 REFRESH MATERIALIZED VIEW conflict_slot_mv;
 
 -- query 13
--- Freeze the exact prior C bytes before holding ALTER. The concurrent Spark
--- write then advances main, so this immutable slot request must be rejected.
+-- Freeze the parent, the exact P frame, and the configuration writer.
+-- Prepare a native zero-file external replacement that carries P and leaves C alone.
 -- @result_contains=SLOT_BEFORE_SAVED
 shell: set -eu
-curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}/tables/conflict_slot_mv' | python3 -c 'import json,sys; m=json.load(sys.stdin)["metadata"]; p=m["properties"]; key="novarocks.doc.v2.slot.novarocks.mv~configuration"; json.dump({"slot":p[key],"main":m["current-snapshot-id"]},open(sys.argv[1],"w")); print("SLOT_BEFORE_SAVED")' "${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json"
+rest="${NOVAROCKS_ICEBERG_REST_URI:?missing direct fixture endpoint}"
+base="${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json"
+curl --silent --show-error --fail "$rest/v1/namespaces/ns_${uuid0}/tables/conflict_slot_mv" \
+  | python3 -c '
+import json
+import sys
+
+meta = json.load(sys.stdin)["metadata"]
+parent = next(s for s in meta["snapshots"] if s["snapshot-id"] == meta["current-snapshot-id"])
+new_id = max(s["snapshot-id"] for s in meta["snapshots"]) + 1
+publication = "novarocks.doc.v2.record.novarocks.mv~publication"
+config = "novarocks.doc.v2.slot.novarocks.mv~configuration"
+summary = {k: v for k, v in parent["summary"].items() if k.startswith("total-")}
+summary.update({"operation": "replace", publication: parent["summary"][publication]})
+external = {
+    "snapshot-id": new_id, "parent-snapshot-id": parent["snapshot-id"],
+    "sequence-number": meta["last-sequence-number"] + 1,
+    "timestamp-ms": max(meta["last-updated-ms"], parent["timestamp-ms"]) + 1,
+    "manifest-list": parent["manifest-list"], "summary": summary,
+    "schema-id": meta["current-schema-id"], "first-row-id": meta["next-row-id"], "added-rows": 0,
+}
+request = {
+    "requirements": [
+        {"type": "assert-table-uuid", "uuid": meta["table-uuid"]},
+        {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": parent["snapshot-id"]},
+    ],
+    "updates": [
+        {"action": "add-snapshot", "snapshot": external},
+        {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": new_id},
+    ],
+}
+with open(sys.argv[1], "w") as out:
+    json.dump({"slot": json.loads(meta["properties"][config]), "external": external,
+               "snapshots": len(meta["snapshots"])}, out)
+with open(sys.argv[1] + ".request", "w") as out:
+    json.dump(request, out)
+print("SLOT_BEFORE_SAVED")
+' "$base"
 
 -- query 14
+-- The first main condition fails. The unchanged affected slot writer lets
+-- ALTER construct a new request on the true current parent.
+-- @skip_result_check=true
 -- @publication_catalog_fault=table-commit,before-requirement-check-hold-for-concurrent-shell
--- @publication_catalog_concurrent_shell=tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-slot-conflict-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "INSERT INTO ice_rest.ns_${uuid0}.conflict_slot_mv SELECT * FROM ice_rest.ns_${uuid0}.conflict_slot_mv LIMIT 1;" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
--- @expect_error=disposition=KnownUncommitted
+-- @publication_catalog_concurrent_shell=base="${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json"; curl --silent --show-error --fail --request POST --header 'Content-Type: application/json' --data-binary "@$base.request" "${NOVAROCKS_ICEBERG_REST_URI:?missing direct fixture endpoint}/v1/namespaces/ns_${uuid0}/tables/conflict_slot_mv" > /dev/null
 USE mvslot_${uuid0}.ns_${uuid0};
 ALTER MATERIALIZED VIEW conflict_slot_mv SET PROPERTIES refresh_paused = true;
 
 -- query 15
--- @result_contains=SLOT_CONFLICT_UNCHANGED
+-- @result_contains=SLOT_CONFLICT_REBASED
 shell: set -eu
-curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}/tables/conflict_slot_mv' | python3 -c 'import json,sys; m=json.load(sys.stdin)["metadata"]; old=json.load(open(sys.argv[1])); key="novarocks.doc.v2.slot.novarocks.mv~configuration"; assert m["properties"][key]==old["slot"],"rejected ALTER changed C bytes/writer"; assert m["current-snapshot-id"]!=old["main"],"external writer did not advance main"; assert len(m["snapshots"])==3,"ALTER rebased or retried"; print("SLOT_CONFLICT_UNCHANGED")' "${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json"
-rm -f "${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json"
+rest="${NOVAROCKS_ICEBERG_REST_URI:?missing direct fixture endpoint}"
+base="${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json"
+trap 'rm -f "$base" "$base.request"' EXIT
+curl --silent --show-error --fail "$rest/v1/namespaces/ns_${uuid0}/tables/conflict_slot_mv" \
+  | python3 -c '
+import json
+import sys
+
+meta = json.load(sys.stdin)["metadata"]
+old = json.load(open(sys.argv[1]))
+external = old["external"]
+current = next(s for s in meta["snapshots"] if s["snapshot-id"] == meta["current-snapshot-id"])
+key = "novarocks.doc.v2.slot.novarocks.mv~configuration"
+slot = json.loads(meta["properties"][key])
+assert slot["writer"] == current["snapshot-id"] != old["slot"]["writer"]
+assert slot["content"] != old["slot"]["content"]
+assert current["parent-snapshot-id"] == external["snapshot-id"]
+assert current["summary"]["operation"] == "replace"
+assert len(meta["snapshots"]) == old["snapshots"] + 2
+prefix = "novarocks.doc.v2.record."
+assert {k: v for k, v in current["summary"].items() if k.startswith(prefix)} == {
+    k: v for k, v in external["summary"].items() if k.startswith(prefix)}
+print("SLOT_CONFLICT_REBASED")
+' "$base"
 
 -- query 16
 -- @skip_result_check=true
@@ -97,7 +158,8 @@ REFRESH MATERIALIZED VIEW unknown_slot_mv;
 -- A same-value configuration write stays MANUAL and unpaused. Losing its
 -- response must not freeze the subsequent refresh.
 -- @publication_catalog_fault=table-commit,after-commit-before-response
--- @expect_error=unknown
+-- @expect_trino_error=ICEBERG_COMMIT_ERROR,EXTERNAL
+-- @expect_error=Failed to commit during alter materialized view: [CommitUnknown]
 ALTER MATERIALIZED VIEW unknown_slot_mv SET PROPERTIES refresh_policy = 'MANUAL';
 
 -- query 18
@@ -132,7 +194,7 @@ DROP SCHEMA mvslot_${uuid0}.ns_${uuid0};
 -- query 22
 -- @cleanup=true
 -- @skip_result_check=true
-shell: rm -f "${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json" "${TMPDIR:-/tmp}/novarocks-slot-same-${uuid0}.json"
+shell: rm -f "${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json" "${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json.request" "${TMPDIR:-/tmp}/novarocks-slot-same-${uuid0}.json"
 
 -- query 23
 -- Detach even if earlier object cleanup failed, before another case restarts FE.

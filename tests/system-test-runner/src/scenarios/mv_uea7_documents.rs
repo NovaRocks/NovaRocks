@@ -432,6 +432,70 @@ fn append_zero(
     properties: BTreeMap<String, String>,
     extra: Vec<Value>,
 ) -> Result<Value> {
+    post_zero_file_snapshot(
+        context,
+        rest,
+        table,
+        base,
+        record,
+        ExternalZeroFileChange {
+            properties,
+            extra,
+            configuration_slot: None,
+        },
+    )
+}
+
+struct ExternalZeroFileChange {
+    properties: BTreeMap<String, String>,
+    extra: Vec<Value>,
+    configuration_slot: Option<wire::Slot>,
+}
+
+pub(super) fn external_configuration_slot_snapshot(
+    context: &ScenarioContext,
+    rest: &str,
+    table: &str,
+    base: &Value,
+    slot: wire::Slot,
+) -> Result<Value> {
+    let current = base["current-snapshot-id"]
+        .as_i64()
+        .context("configuration slot needs a parent")?;
+    let parent = base["snapshots"]
+        .as_array()
+        .context("no snapshots")?
+        .iter()
+        .find(|snapshot| snapshot["snapshot-id"].as_i64() == Some(current))
+        .context("configuration slot parent is missing")?;
+    let record = parent["summary"][wire::RECORD].as_str();
+    post_zero_file_snapshot(
+        context,
+        rest,
+        table,
+        base,
+        record,
+        ExternalZeroFileChange {
+            properties: BTreeMap::new(),
+            extra: vec![],
+            configuration_slot: Some(slot),
+        },
+    )
+}
+
+fn post_zero_file_snapshot(
+    context: &ScenarioContext,
+    rest: &str,
+    table: &str,
+    base: &Value,
+    record: Option<&str>,
+    change: ExternalZeroFileChange,
+) -> Result<Value> {
+    let ExternalZeroFileChange {
+        mut properties,
+        extra,
+        configuration_slot,
+    } = change;
     let snapshots = base["snapshots"].as_array().context("no snapshots")?;
     let parent = base["current-snapshot-id"]
         .as_i64()
@@ -470,6 +534,12 @@ fn append_zero(
         ("added-delete-files".into(), json!("0")),
         ("added-records".into(), json!("0")),
     ]);
+    if let Some(mut slot) = configuration_slot {
+        slot.replace_writer(id)?;
+        properties.insert(wire::CONFIG.into(), slot.encoded()?);
+        summary.insert("operation".into(), json!("replace"));
+        summary.insert("novarocks.document.slot-change.v1".into(), json!("true"));
+    }
     for (key, value) in old["summary"]
         .as_object()
         .context("parent summary missing")?

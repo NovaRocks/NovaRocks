@@ -1121,6 +1121,15 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         // Derive the minimal proof from verified probe facts. A caller cannot
         // pair a matching observation with a foreign location or a NoOp proof.
         let proof = match observation {
+            PositiveAttributionObservation::KeyedSnapshot { table_uuid, .. } => {
+                let super::super::publication_descriptor::AttributionPlan::KeyedSnapshot(selection) =
+                    &descriptor.attribution
+                else {
+                    unreachable!("verified keyed observation has its original selection");
+                };
+                CommitProof::applied(Some(selection.snapshot))
+                    .with_table_uuid(table_uuid.to_string())
+            }
             PositiveAttributionObservation::SnapshotMarker {
                 table_uuid,
                 snapshot_id,

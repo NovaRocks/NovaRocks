@@ -534,9 +534,10 @@ async fn run_in_phase(
                 if failure.kind() == ConnectorMutationFailureKind::Conflict
                     && intent.shape() != RequestShape::DocumentExpiry
                     && intent.shape() != RequestShape::Create
-                    && intent
-                        .dependencies()
-                        .contains(&super::model::Dependency::RefUnchanged) =>
+                    && (intent.protocol().fixed_mv_main().is_some()
+                        || intent
+                            .dependencies()
+                            .contains(&super::model::Dependency::RefUnchanged)) =>
             {
                 // One diagnostic observation cannot authorize another prepare or dispatch.
                 // Its failure/cancellation never changes the already-known disposition.
@@ -547,7 +548,9 @@ async fn run_in_phase(
             CatalogOutcome::KnownUncommitted { failure } => {
                 if matches!(
                     commit_operation,
-                    CommitOperation::Insert | CommitOperation::CreateTable
+                    CommitOperation::Insert
+                        | CommitOperation::CreateTable
+                        | CommitOperation::RefreshMaterializedView
                 ) && matches!(
                     failure.kind(),
                     ConnectorMutationFailureKind::Cancelled
@@ -608,8 +611,10 @@ fn classify_retry_deadline(
 ) -> ConnectorMutationFailure {
     // Only the strictly earlier retry deadline was installed as a retry
     // bound. Keep its attribution even if both deadlines have since elapsed.
-    if operation == CommitOperation::Insert
-        && failure.kind() == ConnectorMutationFailureKind::DeadlineExceeded
+    if matches!(
+        operation,
+        CommitOperation::Insert | CommitOperation::RefreshMaterializedView
+    ) && failure.kind() == ConnectorMutationFailureKind::DeadlineExceeded
         && retry_deadline.is_some_and(|deadline| Instant::now() >= deadline)
     {
         original_commit_failure(
@@ -664,6 +669,19 @@ async fn diagnose_known_ref_conflict(
     let parent = metadata
         .snapshot_for_ref(intent.target_ref())
         .map(|snapshot| snapshot.snapshot_id());
+    if let Some(detail) = intent.protocol().fixed_mv_main() {
+        if validate_target_branch(&metadata, intent.target_ref()).is_ok()
+            && parent != intent.start().map(|start| start.snapshot_id)
+        {
+            return super::commit_failure::commit_failure(
+                intent.protocol().operation(),
+                CommitFailureKind::Validation,
+                original,
+                detail,
+            );
+        }
+        return original;
+    }
     let verdict = dependency::diagnose_ref_unchanged(intent, &metadata, parent, attempt).await;
     if attempt.check_active().is_err() {
         return original;

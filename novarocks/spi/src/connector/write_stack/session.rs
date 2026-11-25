@@ -62,6 +62,7 @@ pub struct ConnectorWriteNeededReady {
     effect: crate::connector::ExternalMutationEffect,
     receipt: ConnectorWriteReceipt,
     finalization: crate::connector::ExternalMutationFinalization,
+    keyed_observation: Option<Arc<crate::connector::KeyedWriteObservation>>,
 }
 impl ConnectorWriteNeededReady {
     /// Seal the actual provider verdict after its necessary finalization.
@@ -74,7 +75,18 @@ impl ConnectorWriteNeededReady {
             effect,
             receipt,
             finalization,
+            keyed_observation: None,
         }
+    }
+    pub fn with_keyed_observation(
+        mut self,
+        observation: Arc<crate::connector::KeyedWriteObservation>,
+    ) -> Self {
+        self.keyed_observation = Some(observation);
+        self
+    }
+    pub const fn keyed_observation(&self) -> Option<&Arc<crate::connector::KeyedWriteObservation>> {
+        self.keyed_observation.as_ref()
     }
     /// Only a unique, not-yet-published fact can record a local settle failure.
     pub fn finalization_mut(&mut self) -> &mut crate::connector::ExternalMutationFinalization {
@@ -112,6 +124,7 @@ pub enum ConnectorWritePublicationCompletion {
     CommitUnknown {
         failure: crate::connector::ConnectorMutationFailure,
         evidence: ExternalMutationEvidence,
+        keyed_observation: Option<Arc<crate::connector::KeyedWriteObservation>>,
     },
 }
 impl ConnectorWritePublicationCompletion {
@@ -148,9 +161,11 @@ impl ConnectorWritePublicationCompletion {
             ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
                 Self::KnownUncommitted { failure, cleanup }
             }
-            ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
-                Self::CommitUnknown { failure, evidence }
-            }
+            ExternalMutationOutcome::CommitUnknown { failure, evidence } => Self::CommitUnknown {
+                failure,
+                evidence,
+                keyed_observation: None,
+            },
         }
     }
     /// Explicit legacy projection AFTER the original Future fully drained.
@@ -168,12 +183,14 @@ impl ConnectorWritePublicationCompletion {
                     effect,
                     receipt,
                     finalization,
+                    ..
                 } = match Arc::try_unwrap(needed) {
                     Ok(original) => original,
                     Err(shared) => ConnectorWriteNeededReady {
                         effect: shared.effect,
                         receipt: shared.receipt.clone(),
                         finalization: shared.finalization.clone(),
+                        keyed_observation: None,
                     },
                 };
                 Ok(ExternalMutationOutcome::KnownCommitted {
@@ -190,9 +207,9 @@ impl ConnectorWritePublicationCompletion {
             Self::KnownUncommitted { failure, cleanup } => {
                 Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup })
             }
-            Self::CommitUnknown { failure, evidence } => {
-                Ok(ExternalMutationOutcome::CommitUnknown { failure, evidence })
-            }
+            Self::CommitUnknown {
+                failure, evidence, ..
+            } => Ok(ExternalMutationOutcome::CommitUnknown { failure, evidence }),
         }
     }
 }

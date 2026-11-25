@@ -59,6 +59,40 @@ use async_trait::async_trait;
 #[cfg(test)]
 use std::sync::Mutex;
 
+fn admitted_publication_root(
+    metadata: &TableMetadata,
+    properties: &crate::document_storage::keyed::view::KeyedProperties,
+    owner: &str,
+    binding: novarocks_spi::connector::DocumentIdentity,
+) -> Result<Option<novarocks_spi::connector::DocumentIdentity>, ConnectorError> {
+    use crate::document_storage::{
+        keyed::view::{parse_snapshot_records, reference_closure},
+        observation::keyed_read_error,
+    };
+
+    let stored = properties.roots.get(owner);
+    if let Some(snapshot) = metadata.current_snapshot()
+        && stored.is_none_or(|root| root.dangling)
+        && reference_closure(&properties.versions, Some(binding)).is_ok()
+    {
+        let records = parse_snapshot_records(&snapshot.summary().additional_properties, true)
+            .map_err(keyed_read_error)?;
+        let mut publications = records
+            .iter()
+            .filter(|record| record.owner == owner && record.name == "publication");
+        if publications
+            .next()
+            .is_some_and(|record| record.binding == Some(binding))
+            && publications.next().is_none()
+        {
+            // Current proves the admitted binding even when its GC root is
+            // dangling. Guard that original property through every round.
+            return Ok(stored.map(|root| root.identity));
+        }
+    }
+    Ok(Some(binding))
+}
+
 fn format_error(error: ConnectorError) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.message())
         .with_source(error)
@@ -309,6 +343,7 @@ struct WriteRecipe<'a> {
     equality_delete: bool,
     session_protocol: WriteSessionCommitProtocol,
     writer: WriterSchemaSpec,
+    mv_dependencies: Option<crate::commit::model::MvRefreshDependencies>,
     rewrite_removals: Option<Arc<[crate::commit::model::FrozenEntry]>>,
     start: Option<StartSnapshot>,
     target: TableTarget,
@@ -341,6 +376,7 @@ impl<'a> WriteRecipe<'a> {
     fn freeze(
         handle: &'a IcebergWriteCommitSession,
         documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
+        context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         use crate::commit::model::Dependency;
         let facts = handle.table();
@@ -393,6 +429,53 @@ impl<'a> WriteRecipe<'a> {
                 .map_err(|e| invalid(e.to_string()))?,
             uuid: Some(source.uuid()),
         };
+        let mv_dependencies = handle
+            .document_publication()
+            .map(|facts| {
+                use crate::commit::model::MvRefreshDependencies;
+                use crate::document_storage::{
+                    keyed::view::parse_properties, observation::keyed_read_error,
+                };
+                let documents = keyed_documents.as_ref().ok_or_else(|| {
+                    internal("Iceberg managed write lost its keyed publication document")
+                })?;
+                let observed = parse_properties(source.properties()).map_err(keyed_read_error)?;
+                let declaration = facts.declaration();
+                let mut roots: BTreeMap<_, _> = documents
+                    .roots
+                    .keys()
+                    .map(|name| {
+                        (
+                            name.clone(),
+                            observed.roots.get(name).map(|root| root.identity),
+                        )
+                    })
+                    .collect();
+                let mut slots = BTreeMap::new();
+                if let Some((owner, binding)) = declaration.expected_root() {
+                    let root = admitted_publication_root(&source, &observed, owner, binding)?;
+                    roots.insert(owner.to_owned(), root);
+                    if context.initiation()
+                        == novarocks_spi::connector::ConnectorRequestInitiation::Background
+                        || handle.repartition().is_some()
+                    {
+                        let name = novarocks_spi::connector::ConnectorSlotName::try_new(
+                            owner,
+                            "configuration",
+                        )?;
+                        let slot = observed.slots.get(&name).ok_or_else(|| {
+                            corrupt("Managed refresh is missing its admitted configuration slot")
+                        })?;
+                        let digest = slot.value.digest(&name, slot.writer);
+                        slots.insert(name, Some(digest));
+                    }
+                }
+                if let Some(update) = declaration.slot_update() {
+                    slots.insert(update.name().clone(), Some(update.expected_old()));
+                }
+                Ok::<_, ConnectorError>(MvRefreshDependencies { roots, slots })
+            })
+            .transpose()?;
         let repartition = managed_repartition::Effect::freeze(handle, &source)?;
         Ok(Self {
             source,
@@ -402,6 +485,7 @@ impl<'a> WriteRecipe<'a> {
                 == crate::commit::write_stack::domain::IcebergWriteFlavor::EqualityDelete,
             session_protocol: handle.commit_protocol(),
             writer,
+            mv_dependencies,
             rewrite_removals: handle.frozen_rewrite_removals().cloned(),
             start: facts.base_snapshot_id().map(|id| StartSnapshot {
                 snapshot_id: id,
@@ -458,6 +542,16 @@ impl<'a> WriteRecipe<'a> {
                     })?),
                 },
             ),
+            WriteSessionCommitProtocol::RefreshMaterializedView(mode) => (
+                Vec::new(),
+                CommitProtocol::MvRefresh {
+                    mode,
+                    admitted: self.mv_dependencies.clone().ok_or_else(|| {
+                        format_error(internal("Iceberg refresh lost its admitted dependencies"))
+                    })?,
+                    writer: self.writer,
+                },
+            ),
             WriteSessionCommitProtocol::RowDelta(_) => {
                 let window = operation.row_delta_check().ok_or_else(|| {
                     format_error(internal(
@@ -490,10 +584,13 @@ impl<'a> WriteRecipe<'a> {
         .and_then(|intent| {
             let intent = intent.with_compact_stage(self.leading_stage().as_slice().len())?;
             Ok(
-                if matches!(self.session_protocol, WriteSessionCommitProtocol::Legacy)
+                if matches!(
+                    self.session_protocol,
+                    WriteSessionCommitProtocol::RefreshMaterializedView(_)
+                ) || (matches!(self.session_protocol, WriteSessionCommitProtocol::Legacy)
                     && self.summary.keys().any(|key| {
                         key.starts_with(crate::document_storage::keyed::keys::RECORD_PREFIX)
-                    })
+                    }))
                 {
                     intent.with_snapshot_loading(crate::catalog::SnapshotLoading::Refs)
                 } else {
@@ -595,11 +692,11 @@ impl Preparer for KeyedPublicationPreparer {
         let prepared = if self.full_refresh {
             // The staged append already names the new records. Validate the
             // actual attempt's preceding publication before adding their closure.
-            let predecessor = intent
-                .start()
-                .map(|base| {
-                    metadata.snapshot_by_id(base.snapshot_id).ok_or_else(|| {
-                        format_error(corrupt("Full refresh lost its original document snapshot"))
+            let predecessor = view
+                .round_parent()
+                .map(|parent| {
+                    metadata.snapshot_by_id(parent).ok_or_else(|| {
+                        format_error(corrupt("Full refresh lost its round's parent snapshot"))
                     })
                 })
                 .transpose()?;
@@ -730,7 +827,9 @@ impl WritePublicationVerdict {
                 canonical
             },
             Self::KnownUncommitted { failure, cleanup } => novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownUncommitted { failure, cleanup },
-            Self::CommitUnknown { failure, evidence } => novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::CommitUnknown { failure, evidence },
+            Self::CommitUnknown { failure, evidence } => novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::CommitUnknown {
+                failure, evidence, keyed_observation: None,
+            },
         }
     }
 }
@@ -765,7 +864,7 @@ impl IcebergWriteSessionControl {
     ) -> Result<ReceivedOperation<'a>, ConnectorError> {
         let (operation, journal) =
             self.adopt_compact_operation(handle, received.compact_files(), context)?;
-        let recipe = WriteRecipe::freeze(handle, documents).and_then(|mut recipe| {
+        let recipe = WriteRecipe::freeze(handle, documents, context).and_then(|mut recipe| {
             let validation = recipe
                 .session_protocol
                 .row_delta_isolation()
@@ -928,9 +1027,30 @@ impl IcebergWriteSessionControl {
                 // Mandatory receipt facts are frozen before mutation becomes
                 // possible. Catalog reload and row-count enrichment are optional.
                 let receipt = match request.ref_snapshot_after(request.target_ref()) {
-                    Some(snapshot) => crate::write_codec::connector_write_receipt_with_partitioning_and_output_facts(
-                        snapshot, None, receipt_partitioning.clone(), Some(receipt_output_facts),
-                    ).map_err(|error| format_error(corrupt(error)))?,
+                    Some(snapshot) => {
+                        let rows = if template.document_record_digest.is_some() {
+                            let selected = request
+                                .updates()
+                                .iter()
+                                .find_map(|update| match update {
+                                    crate::iceberg::TableUpdate::AddSnapshot {
+                                        snapshot: selected,
+                                    } if selected.snapshot_id() == snapshot => Some(selected),
+                                    _ => None,
+                                })
+                                .ok_or_else(|| {
+                                    format_error(corrupt(
+                                        "keyed write has no selected receipt snapshot",
+                                    ))
+                                })?;
+                            publication_row_count(selected).map_err(format_error)?
+                        } else {
+                            None
+                        };
+                        crate::write_codec::connector_write_receipt_with_partitioning_and_output_facts(
+                            snapshot, rows, receipt_partitioning.clone(), Some(receipt_output_facts),
+                        ).map_err(|error| format_error(corrupt(error)))?
+                    }
                     None => unprojected_committed_receipt(),
                 };
                 preflight_journal.record(evidence, receipt, request)
@@ -1304,11 +1424,15 @@ pub(super) struct RecoveryPayload {
     pub base_sequence_number: i64,
     pub staging_dir: String,
     pub document_record_digest: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) publication_id: Option<[u8; 16]>,
     operation_id: [u8; 16],
     attempt: RecoveryAttempt,
     parent_snapshot_id: Option<i64>,
     metadata_location: String,
     published_snapshot_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) keyed_selection: Option<crate::commit::mv_dispatch::KeyedSnapshotSelection>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1337,6 +1461,7 @@ struct RecoveryTemplate {
     base_sequence_number: i64,
     staging_dir: String,
     document_record_digest: Option<[u8; 32]>,
+    publication_id: Option<[u8; 16]>,
 }
 
 impl RecoveryTemplate {
@@ -1361,6 +1486,9 @@ impl RecoveryTemplate {
             base_sequence_number: handle.table().base_sequence_number(),
             staging_dir: handle.staging_dir(),
             document_record_digest: handle.document_records_digest()?,
+            publication_id: handle
+                .document_publication()
+                .map(|publication| publication.declaration().publication_id().to_bytes()),
         })
     }
 
@@ -1394,6 +1522,13 @@ impl RecoveryTemplate {
                 "Recovery envelope target differs from its frozen request",
             ));
         }
+        let keyed_selection = crate::commit::mv_dispatch::KeyedSnapshotSelection::frozen(request)
+            .map_err(format_error_to_connector)?;
+        if self.document_record_digest.is_some() && keyed_selection.is_none() {
+            return Err(corrupt(
+                "keyed recovery lost its selected snapshots and exact record identity",
+            ));
+        }
         let payload = RecoveryPayload {
             version: ICEBERG_WRITE_SESSION_EVIDENCE_VERSION,
             session_id: self.session_id.to_string(),
@@ -1405,11 +1540,13 @@ impl RecoveryTemplate {
             base_sequence_number: self.base_sequence_number,
             staging_dir: self.staging_dir.clone(),
             document_record_digest: self.document_record_digest,
+            publication_id: self.publication_id,
             operation_id: operation.token().to_bytes(),
             attempt: request.artifacts().attempt().into(),
             parent_snapshot_id: *parent,
             metadata_location: metadata_location.clone(),
             published_snapshot_id: request.ref_snapshot_after(&self.target_ref),
+            keyed_selection,
         };
         payload.validate_facts(self)?;
         let bytes = serde_json::to_vec(&payload).map_err(|error| internal(error.to_string()))?;
@@ -1455,10 +1592,20 @@ impl RecoveryPayload {
             || self.base_sequence_number != expected.base_sequence_number
             || self.staging_dir != expected.staging_dir
             || self.document_record_digest != expected.document_record_digest
+            || self.publication_id != expected.publication_id
             || self.metadata_location.is_empty()
         {
             return Err(corrupt(
                 "Iceberg recovery envelope disagrees with exact admitted session facts",
+            ));
+        }
+        if let Some(selection) = &self.keyed_selection
+            && (selection.table_uuid.to_string() != self.table_uuid
+                || selection.parent != self.parent_snapshot_id
+                || Some(selection.snapshot) != self.published_snapshot_id)
+        {
+            return Err(corrupt(
+                "keyed recovery group disagrees with its exact round",
             ));
         }
         if uuid::Uuid::from_bytes(self.attempt.nonce).get_version_num() != 7 {
@@ -1530,6 +1677,7 @@ mod recovery_tests {
                 base_sequence_number: 0,
                 staging_dir: location,
                 document_record_digest: None,
+                publication_id: None,
             };
             Self {
                 directory,

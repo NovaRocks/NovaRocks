@@ -429,6 +429,7 @@ fn require_rewrite(context: &mut ScenarioContext, conn: &mut SqlSession) -> Resu
 
 #[derive(Debug, PartialEq)]
 struct DocumentGraph {
+    table_uuid: String,
     definition: Value,
     interpretation: Value,
     mapping: String,
@@ -485,6 +486,10 @@ fn load_graph(context: &ScenarioContext, rest_uri: &str, expected: usize) -> Res
         .clone();
     snapshots.sort_by_key(|snapshot| snapshot["sequence-number"].as_i64());
     Ok(DocumentGraph {
+        table_uuid: metadata["table-uuid"]
+            .as_str()
+            .context("MV metadata has no table UUID")?
+            .to_owned(),
         definition: Value::String(graph.definition),
         interpretation: Value::String(graph.interpretation),
         mapping: graph.mapping,
@@ -506,6 +511,7 @@ fn assert_full_refresh_pair(
 ) -> Result<()> {
     use super::mv_uea7_documents::wire::RECORD;
     const SESSION_MARKER: &str = "novarocks.write.session.v1";
+    const STAGE: &str = "novarocks.mv.full-refresh-stage.v1";
 
     let retained = before.snapshots.len();
     ensure!(
@@ -535,13 +541,39 @@ fn assert_full_refresh_pair(
             .all(|key| delete["summary"][*key].as_str() == Some("0"))
             && delete_summary
                 .keys()
-                .all(|key| !key.starts_with("novarocks.")),
-        "FULL delete must be empty and have only standard summary fields"
+                .all(|key| key == STAGE || !key.starts_with("novarocks.")),
+        "FULL delete must be empty and carry only its private stage witness"
     );
     let append_summary = &append["summary"];
     let session = append_summary[SESSION_MARKER]
         .as_str()
         .context("FULL append session missing")?;
+    let witness: Value = serde_json::from_str(
+        delete_summary
+            .get(STAGE)
+            .and_then(Value::as_str)
+            .context("FULL delete stage witness missing")?,
+    )
+    .context("FULL delete stage witness is invalid JSON")?;
+    let operation: [u8; 16] = serde_json::from_value(witness["operation_id"].clone())
+        .context("FULL delete stage witness has no operation ID")?;
+    let nonce: [u8; 16] = serde_json::from_value(witness["attempt_nonce"].clone())
+        .context("FULL delete stage witness has no attempt nonce")?;
+    let operation_hex: String = operation.iter().map(|byte| format!("{byte:02x}")).collect();
+    ensure!(
+        witness["version"] == 1
+            && witness.as_object().is_some_and(|fields| fields.len() == 8)
+            && before.table_uuid == after.table_uuid
+            && witness["table_uuid"].as_str() == Some(after.table_uuid.as_str())
+            && witness["asserted_parent"].as_i64() == before.current
+            && witness["delete_snapshot"] == delete["snapshot-id"]
+            && witness["append_snapshot"] == append["snapshot-id"]
+            && u32::try_from(witness["attempt_ordinal"].as_u64().unwrap_or(u64::MAX)).is_ok()
+            && nonce[6] >> 4 == 7
+            && nonce[8] >> 6 == 2
+            && operation_hex == session.replace('-', ""),
+        "FULL delete stage witness does not bind the exact dispatch"
+    );
     ensure!(
         !session.is_empty()
             && after

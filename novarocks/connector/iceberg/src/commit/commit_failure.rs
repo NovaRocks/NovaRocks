@@ -110,6 +110,12 @@ pub(crate) fn commit_failure(
         CommitOperation::Delete => "Failed to commit during delete: ",
         CommitOperation::OptimizeManifests => "Failed to commit during optimize_manifests: ",
         CommitOperation::ExpireSnapshots => "Failed to commit during expire_snapshots: ",
+        CommitOperation::RefreshMaterializedView => {
+            "Failed to commit the transaction during refresh materialized view: "
+        }
+        CommitOperation::AlterMaterializedViewProperties => {
+            "Failed to commit during alter materialized view: "
+        }
     };
     let metadata_maintenance = matches!(
         operation,

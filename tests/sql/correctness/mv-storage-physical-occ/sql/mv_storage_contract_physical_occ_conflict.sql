@@ -20,8 +20,6 @@
 -- The runner's private REST proxy holds only the MV's target commit. Spark
 -- advances the real target through the downstream catalog before that exact
 -- request can reach the catalog requirement check.
--- The external commit has no MV P attachment, so this case uses its own
--- disposable REST fixture instead of leaving that target for recovery cases.
 
 -- query 1
 -- @skip_result_check=true
@@ -51,32 +49,50 @@ REFRESH MATERIALIZED VIEW mv_conflict;
 INSERT INTO mvocc_${uuid0}.ns_${uuid0}.fact VALUES ROW('west', 20);
 
 -- query 7
--- Spark's committed DELETE changes main after this refresh freezes its
--- original expected main. The old publication must fail without rebasing or
--- replaying its computed rows onto the external snapshot.
+-- Spark moves main before the held commit. FULL builds a fresh pair on that
+-- exact parent and publishes all rows from the original source.
+-- @skip_result_check=true
 -- @publication_catalog_fault=table-commit,before-requirement-check-hold-for-concurrent-shell
--- @publication_catalog_concurrent_shell=tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-mv-physical-conflict-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "DELETE FROM ice_rest.ns_${uuid0}.mv_conflict WHERE k = 'east';" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
--- @expect_error=dependency: RefUnchanged
+-- @publication_catalog_concurrent_shell=set -eu; tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-mv-occ-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "DELETE FROM ice_rest.ns_${uuid0}.mv_conflict WHERE k = 'east';" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 USE mvocc_${uuid0}.ns_${uuid0};
 SET SESSION "mvocc_${uuid0}".incremental_refresh_enabled = false;
 REFRESH MATERIALIZED VIEW mv_conflict;
 
 -- query 8
--- The private REST fixture is disposable because the external writer does
--- not attach an MV P to its new snapshot. Exactly two snapshots remain: the
--- first MV publication and the external DELETE, with no stale MV commit.
--- @result_contains=MV_PHYSICAL_CONFLICT_OK
+-- @result_contains=MV_FULL_REBASED
 shell: set -eu
-tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-mv-physical-conflict-XXXXXX.scala")"
+tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-mv-occ-XXXXXX.scala")"
 trap 'rm -f "$tmp_scala"' EXIT
-cat > "$tmp_scala" <<'SPARK_SCALA'
-import scala.jdk.CollectionConverters._
-import org.apache.iceberg.spark.Spark3Util
-
-val table = Spark3Util.loadIcebergTable(spark, "ice_rest.ns_${uuid0}.mv_conflict")
-require(table.snapshots().asScala.size == 2, "stale MV publication committed after the external DELETE")
-println("MV_PHYSICAL_CONFLICT_OK")
+cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iru5-commit-interop/SparkCommitInterop.scala" > "$tmp_scala"
+cat >> "$tmp_scala" <<'SPARK_SCALA'
+Iru5SparkCommitInterop.checked("MV_FULL_REBASED") {
+  val qualified = "ice_rest.ns_${uuid0}.mv_conflict"
+  val table = Iru5SparkCommitInterop.table(spark, qualified)
+  val current = table.currentSnapshot()
+  val rebuiltDelete = table.snapshot(current.parentId())
+  val external = table.snapshot(rebuiltDelete.parentId())
+  val original = table.snapshot(external.parentId())
+  val oldDelete = table.snapshot(original.parentId())
+  require(table.snapshots().asScala.map(_.snapshotId()).toSet ==
+    Set(current, rebuiltDelete, external, original, oldDelete).map(_.snapshotId()),
+    "Expected exactly the original pair, one external commit and one rebuilt pair")
+  require(current.operation() == "append" && rebuiltDelete.operation() == "delete")
+  require(original.summary().containsKey("novarocks.doc.v2.record.novarocks.mv~publication") &&
+    !external.summary().containsKey("novarocks.doc.v2.record.novarocks.mv~publication") &&
+    current.summary().containsKey("novarocks.doc.v2.record.novarocks.mv~publication") &&
+    current.summary().get("novarocks.doc.v2.record.novarocks.mv~publication") != original.summary().get("novarocks.doc.v2.record.novarocks.mv~publication"))
+  require(oldDelete.summary().containsKey("novarocks.mv.full-refresh-stage.v1") &&
+    rebuiltDelete.summary().containsKey("novarocks.mv.full-refresh-stage.v1"))
+  val rows = spark.sql(s"SELECT k, v FROM $qualified ORDER BY k, v").collect().toVector
+  require(rows.map(r => (r.getString(0), r.getLong(1))) == Vector(("east", 10L), ("west", 20L)))
+}
 SPARK_SCALA
-spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)"
-printf '%s\n' "$spark_out"
-printf '%s\n' "$spark_out" | grep -F "MV_PHYSICAL_CONFLICT_OK"
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala"
+
+-- query 9
+-- @cleanup=true
+-- @skip_result_check=true
+DROP MATERIALIZED VIEW IF EXISTS mvocc_${uuid0}.ns_${uuid0}.mv_conflict;
+DROP TABLE IF EXISTS mvocc_${uuid0}.ns_${uuid0}.fact;
+DROP SCHEMA IF EXISTS mvocc_${uuid0}.ns_${uuid0};
+DROP CATALOG IF EXISTS mvocc_${uuid0};

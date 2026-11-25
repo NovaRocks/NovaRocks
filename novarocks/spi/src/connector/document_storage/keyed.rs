@@ -277,6 +277,38 @@ pub struct KeyedSlotChange {
     pub markers_remove: BTreeSet<ConnectorMarkerKey>,
 }
 
+/// Atomically retires one observed publication without writing data files.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyedRetirement {
+    pub operation_id: crate::connector::ConnectorMutationOperationId,
+    pub retired_publication: crate::connector::LakePublicationId,
+    pub expected_root: DocumentIdentity,
+    pub retired_record: ConnectorSnapshotRecord,
+    pub record: ConnectorSnapshotRecord,
+    pub invalid_marker: (ConnectorMarkerKey, ConnectorMarkerValue),
+}
+
+impl KeyedRetirement {
+    fn validate(&self) -> Result<(), ConnectorError> {
+        self.retired_record.validate()?;
+        self.record.validate()?;
+        self.invalid_marker.0.validate()?;
+        self.invalid_marker.1.validate()?;
+        if self.retired_record.owner != self.record.owner
+            || self.retired_record.owner != self.invalid_marker.0.owner
+            || self.retired_record.name == self.record.name
+            || self.retired_record.binding != Some(self.expected_root)
+            || self.record.binding.is_some()
+            || self.invalid_marker.0.name != "invalid"
+        {
+            return Err(invalid(
+                "retirement requires its admitted publication, record and Invalid marker",
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn validate_slots(
     slots: &BTreeMap<ConnectorSlotName, ConnectorSlotValue>,
 ) -> Result<(), ConnectorError> {
@@ -476,6 +508,8 @@ pub struct KeyedSnapshotObservation {
     pub records: Vec<ConnectorSnapshotRecord>,
     /// Immutable provider witness on a combined slot and table-property snapshot.
     pub slot_storage_effect_digest: Option<[u8; 32]>,
+    pub full_refresh_stage_witness: Option<String>,
+    pub managed_repartition_effect: Option<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FullKeyedDocumentView {
@@ -485,6 +519,32 @@ pub struct FullKeyedDocumentView {
     pub diagnostics: Vec<String>,
     pub token: FullObservationToken,
 }
+/// The exact opaque snapshot record frame authored by a managed dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyedDispatchRecord {
+    pub owner: String,
+    pub name: String,
+    pub envelope: Bytes,
+}
+
+/// The non-receipt snapshot selected alongside the final append.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyedDispatchDeleteStage {
+    pub snapshot: i64,
+    pub witness: String,
+}
+
+/// The original operation and group. Individual snapshot IDs do not prove
+/// publication. The sealed record or stage witness must also be observed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyedSnapshotDispatch {
+    pub target: ConnectorTableObjectId,
+    pub operation_id: crate::connector::ConnectorMutationOperationId,
+    pub delete_stage: Option<KeyedDispatchDeleteStage>,
+    pub records: Vec<KeyedDispatchRecord>,
+    pub repartition_effect: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnknownCommitIdentity {
     SlotWriter {
@@ -499,6 +559,7 @@ pub enum UnknownCommitIdentity {
         name: String,
         bytes: Bytes,
     },
+    SnapshotDispatch(Box<KeyedSnapshotDispatch>),
     None,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -523,6 +584,15 @@ pub enum CommitConclusion {
     InvalidatedUndetermined,
     StillUnknown,
 }
+/// Read-only recovery facts from the original write session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyedWriteObservation {
+    pub publication_id: crate::connector::LakePublicationId,
+    pub evidence: UnknownCommitEvidence,
+    pub conclusion: CommitConclusion,
+    pub observed_current_snapshot: Option<i64>,
+}
+
 /// The exact admission remains attached to every catalog mutation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum KeyedMutation {
@@ -534,6 +604,7 @@ pub enum KeyedMutation {
         properties: Arc<[(Arc<str>, DdlPropertyChange)]>,
     },
     Expiry(KeyedExpiry),
+    Retirement(Box<KeyedRetirement>),
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct KeyedMutationIntent {
@@ -543,6 +614,15 @@ pub struct KeyedMutationIntent {
     pub mutation: KeyedMutation,
 }
 impl KeyedMutationIntent {
+    pub const fn management_operation(&self) -> super::ConnectorDocumentManagementOperation {
+        match self.mutation {
+            KeyedMutation::Retirement(_) => {
+                super::ConnectorDocumentManagementOperation::Publication
+            }
+            _ => super::ConnectorDocumentManagementOperation::SingleTargetUpdate,
+        }
+    }
+
     pub fn validate_for(
         &self,
         owner: &ConnectorProviderBindingKey,
@@ -552,8 +632,7 @@ impl KeyedMutationIntent {
         self.expected_metadata.validate()?;
         if self.admission.owner() != owner
             || self.admission.operation_id() != operation_id
-            || self.admission.operation()
-                != super::ConnectorDocumentManagementOperation::SingleTargetUpdate
+            || self.admission.operation() != self.management_operation()
         {
             return Err(invalid(
                 "keyed mutation does not match its exact management admission",
@@ -576,6 +655,18 @@ impl KeyedMutationIntent {
                     return Err(ConnectorError::new(
                         ConnectorErrorKind::Unsupported,
                         "combined slot change cannot replace partitioning without its managed write",
+                    ));
+                }
+                Ok(())
+            }
+            KeyedMutation::Retirement(retirement) => {
+                retirement.validate()?;
+                if retirement.operation_id != operation_id
+                    || self.expected_snapshot.is_none()
+                    || self.expected_snapshot != self.expected_metadata.snapshot_id()
+                {
+                    return Err(invalid(
+                        "retirement does not match its exact operation and parent observation",
                     ));
                 }
                 Ok(())

@@ -17,10 +17,14 @@
 
 //! Current admission policies decide which source scope to observe.
 
-use super::super::model::{ArtifactWriter, Dependency, OperationIntent, WindowValidation};
+use super::super::commit_failure::validation_failure;
+use super::super::model::{
+    ArtifactWriter, CommitProtocol, Dependency, OperationIntent, WindowValidation,
+};
 use super::rewrite_files::{RewriteFilesWindowCheck, validate_rewrite_files};
 use super::row_delta::validate_row_delta;
 use super::{Culprit, RemovedDataFiles, ValidationInputs, Verdict};
+use crate::document_storage::keyed::view::parse_properties;
 use crate::iceberg::Result;
 use crate::iceberg::spec::TableMetadata;
 
@@ -48,20 +52,62 @@ pub(crate) async fn validate_with_removed_data(
     if dependency != Verdict::Holds {
         return Ok(dependency);
     }
-    match intent.protocol().window() {
-        WindowValidation::None => Ok(Verdict::Holds),
-        WindowValidation::RowDelta(check) => {
-            validate_row_delta(check, &inputs, start, io, removed_data).await
+    let protocol = intent.protocol();
+    let (roots, slots) = match protocol {
+        CommitProtocol::MvRefresh { admitted, .. } | CommitProtocol::MvRetirement { admitted } => {
+            (Some(&admitted.roots), &admitted.slots)
         }
-        WindowValidation::RewriteFiles(replaced) => {
-            validate_rewrite_files(
-                RewriteFilesWindowCheck::new(replaced, intent.start()),
-                &inputs,
-                io,
-            )
-            .await
+        CommitProtocol::MvAlterProperties { slots } => (None, slots),
+        _ => {
+            return match protocol.window() {
+                WindowValidation::None => Ok(Verdict::Holds),
+                WindowValidation::RowDelta(check) => {
+                    validate_row_delta(check, &inputs, start, io, removed_data).await
+                }
+                WindowValidation::RewriteFiles(replaced) => {
+                    validate_rewrite_files(
+                        RewriteFilesWindowCheck::new(replaced, intent.start()),
+                        &inputs,
+                        io,
+                    )
+                    .await
+                }
+            };
         }
+    };
+    let reject = |detail: &'static str| {
+        Ok(Verdict::ValidationConflict(validation_failure(
+            protocol.operation(),
+            detail,
+        )))
+    };
+    if let Some(detail) = protocol.fixed_mv_main()
+        && parent != start
+    {
+        return reject(detail);
     }
+    let properties = parse_properties(metadata.properties()).map_err(|error| {
+        super::super::slot_change::document_error(
+            crate::document_storage::observation::keyed_read_error(error),
+        )
+    })?;
+    if roots.is_some_and(|roots| {
+        roots.iter().any(|(name, expected)| {
+            properties.roots.get(name).map(|root| root.identity) != *expected
+        })
+    }) {
+        return reject("Materialized view root changed since admission");
+    }
+    if slots.iter().any(|(name, expected)| {
+        properties
+            .slots
+            .get(name)
+            .map(|slot| slot.value.digest(name, slot.writer))
+            != *expected
+    }) {
+        return reject("Materialized view slot value or writer changed since admission");
+    }
+    Ok(Verdict::Holds)
 }
 
 /// Reuse the dependency owner for a metadata-only post-rejection diagnosis.

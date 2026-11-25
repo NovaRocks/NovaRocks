@@ -19,6 +19,7 @@ pub(in crate::scenarios) const MANAGEMENT: &str =
     "novarocks.doc.v2.slot.novarocks.storage~management";
 pub(in crate::scenarios) const RECORD: &str = "novarocks.doc.v2.record.novarocks.mv~publication";
 const PREFIX: &str = "novarocks.doc.v2.";
+const RETIREMENT: &str = "novarocks.doc.v2.record.novarocks.mv~retirement";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -217,6 +218,11 @@ impl Slot {
         self.digest = self.digest()?;
         Ok(())
     }
+    pub fn replace_writer(&mut self, writer: i64) -> Result<()> {
+        self.writer = Some(writer);
+        self.digest = self.digest()?;
+        Ok(())
+    }
     pub fn content_revision(&self) -> Result<Vec<u8>> {
         Ok(Sha256::digest(decode64(&self.content)?).to_vec())
     }
@@ -308,6 +314,129 @@ pub(in crate::scenarios) fn record(frame: &str) -> Result<Record> {
         frame: frame.into(),
     })
 }
+struct Retirement {
+    retired: [u8; 16],
+    operation: [u8; 16],
+    revision: [u8; 32],
+}
+
+fn decode_retirement(record: &Record) -> Result<Retirement> {
+    ensure!(record.binding.is_none(), "retirement record binds a B");
+    let schema = [
+        (1, 0, false),
+        (2, 2, false),
+        (3, 2, false),
+        (4, 0, false),
+        (5, 0, false),
+        (6, 0, false),
+        (7, 2, false),
+    ];
+    idl_shape(&record.payload, &schema, &[1, 2, 3, 4, 5, 6])?;
+    let fields = proto_fields(&record.payload)?;
+    ensure!(fields[0].1 == [1], "unknown retirement record version");
+    ensure!(
+        fields[3..6]
+            .iter()
+            .all(|(_, value)| scalar(value) <= i64::MAX as u64),
+        "out-of-range retirement count"
+    );
+    ensure!(
+        fields.get(6).is_none_or(|(_, value)| value.len() == 16),
+        "invalid retirement fingerprint"
+    );
+    Ok(Retirement {
+        retired: fields[1]
+            .1
+            .as_slice()
+            .try_into()
+            .context("invalid retired publication")?,
+        operation: fields[2]
+            .1
+            .as_slice()
+            .try_into()
+            .context("invalid retirement operation")?,
+        revision: Sha256::digest(record.frame.as_bytes()).into(),
+    })
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct RetirementMarker {
+    retired: [u8; 16],
+    revision: [u8; 32],
+}
+
+/// These marker keys are scoped to the original P or to its exact attempt.
+fn check_retirement_or_attempt_marker(marker: &Marker) -> Result<Option<RetirementMarker>> {
+    if marker.owner != "novarocks.mv" {
+        return Ok(None);
+    }
+    let (body_tag, fields, required) = match marker.name.as_str() {
+        "pending" => (
+            4,
+            &[
+                (1, 2, false),
+                (2, 2, false),
+                (3, 2, true),
+                (4, 2, false),
+                (5, 0, false),
+                (6, 2, false),
+                (7, 2, false),
+            ][..],
+            &[1, 2, 3, 4, 5, 6, 7][..],
+        ),
+        "pending-released" => (5, &[(1, 2, false)][..], &[1][..]),
+        "invalid" => (8, &[(1, 2, false)][..], &[1][..]),
+        _ => return Ok(None),
+    };
+    ensure!(
+        marker.format.owner == marker.owner
+            && marker.format.name == marker.name
+            && marker.format.version == 1,
+        "wrong MV effect marker format"
+    );
+    let raw = decode64(&marker.content)?;
+    idl_shape(
+        &raw,
+        &[(1, 0, false), (2, 2, false), (body_tag, 2, false)],
+        &[1, 2, body_tag],
+    )?;
+    let value = proto_fields(&raw)?;
+    ensure!(value[0].1 == [1], "unknown MV marker version");
+    let publication: [u8; 16] = value[1]
+        .1
+        .as_slice()
+        .try_into()
+        .context("invalid marker P")?;
+    idl_shape(&value[2].1, fields, required)?;
+    let body = proto_fields(&value[2].1)?;
+    let proof = &body[0].1;
+    let mut key = Vec::new();
+    content(&mut key, b"novarocks.mv.marker-binding");
+    key.extend_from_slice(&1u32.to_be_bytes());
+    key.extend_from_slice(&1u32.to_be_bytes());
+    content(&mut key, &publication);
+    if body_tag != 8 {
+        ensure!(proof.len() == 16, "invalid marker attempt");
+        content(&mut key, proof);
+    }
+    ensure!(
+        marker.binding == hex(Sha256::digest(&key)),
+        "wrong MV effect marker scope"
+    );
+    if body_tag == 8 {
+        let revision = proof
+            .as_slice()
+            .try_into()
+            .context("invalid retirement revision")?;
+        Ok(Some(RetirementMarker {
+            retired: publication,
+            revision,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
 pub(in crate::scenarios) fn record_frame(binding: &str, payload: &[u8]) -> String {
     format!("2.{binding}.{}", URL_SAFE_NO_PAD.encode(payload))
 }
@@ -346,6 +475,9 @@ impl Graph {
             mapping: String::new(),
             binding: String::new(),
         };
+        let mut invalid = BTreeSet::new();
+        let mut retirements = BTreeMap::<[u8; 16], String>::new();
+        let mut current_retirement = None;
         for (key, value) in metadata["properties"]
             .as_object()
             .context("metadata lacks properties")?
@@ -387,6 +519,9 @@ impl Graph {
                         && marker.checksum()? == marker.digest,
                     "{key}: invalid marker"
                 );
+                if let Some(identity) = check_retirement_or_attempt_marker(&marker)? {
+                    invalid.insert(identity);
+                }
             } else {
                 bail!("{key}: unrecognized private property key")
             }
@@ -399,6 +534,7 @@ impl Graph {
                 .as_i64()
                 .context("snapshot lacks ID")?;
             let mut publication = None;
+            let mut retirement = None;
             for (key, value) in snapshot["summary"]
                 .as_object()
                 .context("snapshot lacks summary")?
@@ -424,7 +560,28 @@ impl Graph {
                 graph.record_bytes.push(frame.len());
                 if key == RECORD {
                     publication = Some(parsed);
+                } else if key == RETIREMENT {
+                    let decoded = decode_retirement(&parsed)?;
+                    if let Some(earlier) =
+                        retirements.insert(decoded.operation, parsed.frame.clone())
+                    {
+                        ensure!(
+                            earlier == parsed.frame,
+                            "retirement operation reused with different bytes"
+                        );
+                    }
+                    retirement = Some(RetirementMarker {
+                        retired: decoded.retired,
+                        revision: decoded.revision,
+                    });
                 }
+            }
+            ensure!(
+                retirement.is_none() || publication.is_none(),
+                "retired snapshot also carries P"
+            );
+            if Some(id) == graph.current {
+                current_retirement = retirement;
             }
             graph.snapshots.push((id, publication));
         }
@@ -452,6 +609,11 @@ impl Graph {
         graph.mapping = m;
         if let Some(p) = active {
             let _ = graph.record_logical_rows(p)?;
+        } else if let Some(retirement) = current_retirement {
+            ensure!(
+                invalid.contains(&retirement),
+                "Current retirement lacks its exact Invalid marker"
+            );
         } else if let Some(id) = graph.current {
             let snapshot = metadata["snapshots"]
                 .as_array()
@@ -1356,5 +1518,30 @@ mod tests {
             format!("{:#}", Graph::from_metadata(&metadata).unwrap_err())
                 .contains("novarocks.doc.v2.unknown.test")
         );
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+
+    #[test]
+    fn retirement_decodes_the_original_operation_and_rejects_binding() {
+        let mut payload = vec![8, 1, 18, 16];
+        payload.extend_from_slice(&[1; 16]);
+        payload.extend_from_slice(&[26, 16]);
+        payload.extend_from_slice(&[2; 16]);
+        payload.extend_from_slice(&[32, 11, 40, 9, 48, 1]);
+        let frame = record_frame("-", &payload);
+        let first = decode_retirement(&record(&frame).unwrap()).unwrap();
+        assert_eq!(first.retired, [1; 16]);
+        assert_eq!(first.operation, [2; 16]);
+        payload[22] = 3;
+        let second = decode_retirement(&record(&record_frame("-", &payload)).unwrap()).unwrap();
+        assert_eq!(first.retired, second.retired);
+        assert_ne!(first.operation, second.operation);
+        assert_ne!(first.revision, second.revision);
+        let bound = record_frame(&"07".repeat(32), &payload);
+        assert!(decode_retirement(&record(&bound).unwrap()).is_err());
     }
 }

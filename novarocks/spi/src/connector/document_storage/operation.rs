@@ -259,6 +259,7 @@ pub struct ConnectorDocumentPublicationDeclaration {
     expected_committed_partitioning: Option<crate::connector::ConnectorCommittedPartitioning>,
     storage_projection_digest: Option<[u8; 32]>,
     slot_update: Option<ConnectorDocumentPublicationSlotUpdate>,
+    expected_root: Option<(String, super::DocumentIdentity)>,
 }
 
 impl ConnectorDocumentPublicationDeclaration {
@@ -348,6 +349,7 @@ impl ConnectorDocumentPublicationDeclaration {
             expected_committed_partitioning,
             storage_projection_digest,
             slot_update: None,
+            expected_root: None,
         })
     }
 
@@ -397,6 +399,26 @@ impl ConnectorDocumentPublicationDeclaration {
         }
         self.slot_update = Some(update);
         Ok(self)
+    }
+
+    /// Guard the original application binding across all Provider commit rounds.
+    pub fn with_expected_root(
+        mut self,
+        owner: String,
+        binding: super::DocumentIdentity,
+    ) -> Result<Self, ConnectorError> {
+        super::validate_document_token(&owner)?;
+        if self.expected_root.is_some() {
+            return Err(invalid("document publication already has an admitted root"));
+        }
+        self.expected_root = Some((owner, binding));
+        Ok(self)
+    }
+
+    pub fn expected_root(&self) -> Option<(&str, super::DocumentIdentity)> {
+        self.expected_root
+            .as_ref()
+            .map(|(owner, binding)| (owner.as_str(), *binding))
     }
 
     pub const fn slot_update(&self) -> Option<&ConnectorDocumentPublicationSlotUpdate> {
@@ -686,6 +708,23 @@ impl ConnectorDocumentStorage {
         self.observation()?
             .decode_keyed_slot_change_evidence(request, evidence)
     }
+    pub fn decode_keyed_retirement_evidence(
+        &self,
+        request: super::KeyedDocumentObservationRequest,
+        evidence: crate::connector::ExternalMutationEvidence,
+    ) -> Result<super::UnknownCommitEvidence, ConnectorError> {
+        self.validate_keyed_request(&request)?;
+        if evidence.descriptor() != self.binding.descriptor()
+            || evidence.incarnation() != self.owner.incarnation
+        {
+            return Err(invalid(
+                "retirement evidence does not match its retained control generation",
+            ));
+        }
+        self.observation()?
+            .decode_keyed_retirement_evidence(request, evidence)
+    }
+
     pub fn resolve_keyed_commit(
         &self,
         request: super::KeyedDocumentObservationRequest,

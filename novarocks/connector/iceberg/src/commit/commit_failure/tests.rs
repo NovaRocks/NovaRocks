@@ -40,6 +40,16 @@ fn known_conflict_uses_the_operation_style_and_public_detail() {
             "Failed to commit the transaction during optimize: ",
         ),
         (
+            CommitOperation::RefreshMaterializedView,
+            COMMIT_TRANSACTION_CONFLICT,
+            "Failed to commit the transaction during refresh materialized view: ",
+        ),
+        (
+            CommitOperation::AlterMaterializedViewProperties,
+            ICEBERG_COMMIT_ERROR,
+            "Failed to commit during alter materialized view: ",
+        ),
+        (
             CommitOperation::Truncate,
             ICEBERG_COMMIT_ERROR,
             "Failed to commit during truncate: ",
@@ -70,22 +80,36 @@ fn known_conflict_uses_the_operation_style_and_public_detail() {
 
 #[test]
 fn unknown_marker_is_written_exactly_once() {
-    let failure = commit_failure(
-        CommitOperation::Optimize,
-        CommitFailureKind::Unknown,
-        original(ConnectorMutationFailureKind::Unavailable),
-        "[CommitUnknown] Catalog did not confirm the request",
-    );
-    assert_eq!(
-        failure.failure_fact().reason(),
-        ICEBERG_COMMIT_STATE_UNKNOWN
-    );
-    assert_eq!(
-        failure.connector_source().unwrap().public_failure_detail(),
-        Some(
-            "Failed to commit the transaction during optimize: [CommitUnknown] Catalog did not confirm the request"
-        )
-    );
+    for (operation, prefix) in [
+        (
+            CommitOperation::Optimize,
+            "Failed to commit the transaction during optimize: ",
+        ),
+        (
+            CommitOperation::RefreshMaterializedView,
+            "Failed to commit the transaction during refresh materialized view: ",
+        ),
+        (
+            CommitOperation::AlterMaterializedViewProperties,
+            "Failed to commit during alter materialized view: ",
+        ),
+    ] {
+        let body = "[CommitUnknown] Catalog did not confirm the request";
+        let failure = commit_failure(
+            operation,
+            CommitFailureKind::Unknown,
+            original(ConnectorMutationFailureKind::Unavailable),
+            body,
+        );
+        assert_eq!(
+            failure.failure_fact().reason(),
+            ICEBERG_COMMIT_STATE_UNKNOWN
+        );
+        assert_eq!(
+            failure.connector_source().unwrap().public_failure_detail(),
+            Some(format!("{prefix}{body}").as_str())
+        );
+    }
 }
 
 #[test]
@@ -140,6 +164,10 @@ fn insert_and_create_table_preserve_transaction_failure_facts() {
     for (operation, name) in [
         (CommitOperation::Insert, "insert"),
         (CommitOperation::CreateTable, "create table"),
+        (
+            CommitOperation::RefreshMaterializedView,
+            "refresh materialized view",
+        ),
     ] {
         for (kind, reason, marker) in [
             (

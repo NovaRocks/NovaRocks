@@ -134,6 +134,7 @@ impl EffectResponsibility {
             EffectDisposition::CommitUnknown => {
                 EffectTerminalFact::CommitUnknown(UnsettledEffect {
                     responsibility: self,
+                    publication_recovery: None,
                 })
             }
         }
@@ -217,11 +218,22 @@ pub enum EffectTerminalFact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnsettledEffect {
     responsibility: EffectResponsibility,
+    pub(super) publication_recovery: Option<PublicationRecoveryEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicationRecoveryEvidence {
+    pub original: novarocks_spi::connector::ExternalMutationEvidence,
+    pub observation: Option<std::sync::Arc<novarocks_spi::connector::KeyedWriteObservation>>,
 }
 
 impl UnsettledEffect {
     pub const fn responsibility(&self) -> &EffectResponsibility {
         &self.responsibility
+    }
+
+    pub const fn publication_recovery(&self) -> Option<&PublicationRecoveryEvidence> {
+        self.publication_recovery.as_ref()
     }
 
     pub const fn original_disposition(&self) -> EffectDisposition {

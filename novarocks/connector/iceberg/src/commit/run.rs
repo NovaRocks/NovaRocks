@@ -413,13 +413,14 @@ mod keyed_publication_trace_tests {
     }
 
     async fn fixture_with_format(format_version: FormatVersion, row_lineage: bool) -> Fixture {
-        publication_fixture(format_version, row_lineage, false).await
+        publication_fixture(format_version, row_lineage, false, None).await
     }
 
     async fn publication_fixture(
         format_version: FormatVersion,
         row_lineage: bool,
         lose_reply: bool,
+        retry_limit: Option<u32>,
     ) -> Fixture {
         let warehouse = tempfile::tempdir().expect("warehouse tempdir");
         let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
@@ -510,6 +511,19 @@ mod keyed_publication_trace_tests {
                 owner,
             ),
         );
+        let mut properties = HashMap::from([
+            (
+                crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY.to_string(),
+                "false".to_string(),
+            ),
+            ("write.row-lineage".to_string(), row_lineage.to_string()),
+        ]);
+        if let Some(retry_limit) = retry_limit {
+            properties.insert(
+                "commit.retry.num-retries".to_owned(),
+                retry_limit.to_string(),
+            );
+        }
         let table = crate::catalog::admission_test_support::create_static_fixture_table(
             &runtime,
             incarnation,
@@ -517,13 +531,7 @@ mod keyed_publication_trace_tests {
             TableCreation::builder()
                 .name("t".to_string())
                 .schema(schema)
-                .properties(HashMap::from([
-                    (
-                        crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY.to_string(),
-                        "false".to_string(),
-                    ),
-                    ("write.row-lineage".to_string(), row_lineage.to_string()),
-                ]))
+                .properties(properties)
                 .format_version(format_version)
                 .build(),
         )

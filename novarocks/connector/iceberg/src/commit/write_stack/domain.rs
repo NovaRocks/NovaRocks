@@ -2244,6 +2244,7 @@ pub struct IcebergWriteCommitSession {
         std::sync::Mutex<novarocks_spi::connector::write_stack::ConnectorWriteCleanupState>,
     recovery_evidence:
         Arc<std::sync::Mutex<Option<novarocks_spi::connector::ExternalMutationEvidence>>>,
+    keyed_observation: Mutex<Option<Arc<novarocks_spi::connector::KeyedWriteObservation>>>,
     // The original session retains the actual operation and journal before
     // their first poll. Neither a waiter nor an evidence projection owns exit.
     publication: std::sync::Mutex<Option<IcebergWritePublication>>,
@@ -2562,11 +2563,28 @@ impl IcebergWriteCommitSession {
             session_id,
             creation_scope: None,
             mutation_read: None,
-            commit_protocol: match flavor {
-                IcebergWriteFlavor::Append => {
+            commit_protocol: match (flavor, &document_publication) {
+                (_, Some(publication)) => {
+                    use crate::commit::model::{MvRefreshMode, WriteSessionCommitProtocol};
+                    let mode = if repartition.is_some() {
+                        MvRefreshMode::Repartition
+                    } else {
+                        match publication.technique() {
+                            ConnectorManagedPublicationTechnique::Full => MvRefreshMode::Full,
+                            ConnectorManagedPublicationTechnique::Incremental => {
+                                MvRefreshMode::Incremental
+                            }
+                            ConnectorManagedPublicationTechnique::MetadataOnly => {
+                                MvRefreshMode::MetadataOnly
+                            }
+                        }
+                    };
+                    WriteSessionCommitProtocol::RefreshMaterializedView(mode)
+                }
+                (IcebergWriteFlavor::Append, None) => {
                     crate::commit::model::WriteSessionCommitProtocol::Append
                 }
-                flavor if flavor.is_distributed_rewrite() => {
+                (flavor, None) if flavor.is_distributed_rewrite() => {
                     crate::commit::model::WriteSessionCommitProtocol::RewriteFiles
                 }
                 _ => crate::commit::model::WriteSessionCommitProtocol::Legacy,
@@ -2591,6 +2609,7 @@ impl IcebergWriteCommitSession {
                 novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Pending,
             ),
             recovery_evidence: Arc::new(std::sync::Mutex::new(None)),
+            keyed_observation: Mutex::new(None),
             publication: std::sync::Mutex::new(None),
             empty_cleanup_disposed: std::sync::atomic::AtomicBool::new(false),
             progress: Mutex::new(IcebergWriteSessionProgress {
@@ -3286,6 +3305,25 @@ impl IcebergWriteCommitSession {
         &self,
     ) -> Arc<std::sync::Mutex<Option<novarocks_spi::connector::ExternalMutationEvidence>>> {
         Arc::clone(&self.recovery_evidence)
+    }
+
+    pub(super) fn retain_keyed_observation(
+        &self,
+        observation: novarocks_spi::connector::KeyedWriteObservation,
+    ) {
+        *self
+            .keyed_observation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(observation));
+    }
+
+    pub(super) fn keyed_observation(
+        &self,
+    ) -> Option<Arc<novarocks_spi::connector::KeyedWriteObservation>> {
+        self.keyed_observation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub(crate) fn retain_recovery_evidence(

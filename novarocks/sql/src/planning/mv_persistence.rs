@@ -1062,16 +1062,20 @@ fn path_lineage(
             Ok(Some(column_lineage(*column_id, builder)?.clone()))
         }
         ExprKind::FunctionCall { args, binding, .. }
-            if binding.function_id.as_str() == "builtin.scalar/__struct_subfield/v1" =>
+            if binding.function_id.as_str() == "builtin.scalar/__row_field/v1" =>
         {
-            let [base, name] = args.as_slice() else {
+            let [base, ordinal] = args.as_slice() else {
                 return Err(AnalyzeError::internal(
-                    "bound struct field access has invalid arity",
+                    "bound ROW field access has invalid arity",
                 ));
             };
-            let ExprKind::Literal(LiteralValue::String(name)) = &name.kind else {
-                return Ok(None);
+            let ExprKind::Literal(LiteralValue::Int(ordinal)) = &ordinal.kind else {
+                return Err(AnalyzeError::internal(
+                    "bound ROW field access has no positional identity",
+                ));
             };
+            let ordinal = usize::try_from(*ordinal)
+                .map_err(|_| AnalyzeError::internal("bound ROW field ordinal is out of range"))?;
             let Some(mut lineage) = path_lineage(base, builder)? else {
                 return Ok(None);
             };
@@ -1080,18 +1084,12 @@ fn path_lineage(
             }
             let DataType::Struct(fields) = base.value_type.data_type() else {
                 return Err(AnalyzeError::internal(
-                    "bound struct field access has no struct layout",
+                    "bound ROW field access has no ROW layout",
                 ));
             };
-            let Some((ordinal, field)) = fields
-                .iter()
-                .enumerate()
-                .find(|(_, field)| field.name() == name)
-            else {
-                return Err(AnalyzeError::internal(
-                    "bound struct field access is absent from the original layout",
-                ));
-            };
+            let field = fields.get(ordinal).ok_or_else(|| {
+                AnalyzeError::internal("bound ROW field is absent from the original layout")
+            })?;
             let coordinate = SqlMvFieldCoordinate {
                 ordinal: u32_from_usize("MV nested source field ordinal", ordinal)?,
                 name: field.name().clone(),
@@ -1700,6 +1698,11 @@ mod tests {
     #[test]
     fn struct_paths_keep_the_original_layout_across_passthroughs() {
         let direct = facts("SELECT attrs.id AS a FROM orders");
+        let positional = facts("SELECT attrs[1] AS a FROM orders");
+        assert_eq!(
+            positional.relation_occurrences()[0].canonical_bytes(),
+            direct.relation_occurrences()[0].canonical_bytes()
+        );
         let aliased =
             facts("SELECT payload.id AS a FROM (SELECT attrs AS payload, amount FROM orders) q");
         let occurrence = &aliased.relation_occurrences()[0];

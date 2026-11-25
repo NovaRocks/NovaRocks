@@ -363,3 +363,150 @@ fn combined_slot_recovery_requires_the_selected_immutable_property_effect() {
         CommitConclusion::Committed(CommitProof::Snapshot),
     );
 }
+
+fn grouped(
+    target: &ConnectorTableObjectId,
+    publication: &ConnectorSnapshotRecord,
+    delete: Option<i64>,
+) -> UnknownCommitEvidence {
+    UnknownCommitEvidence {
+        asserted_parent: Some(10),
+        preselected_snapshot: 20,
+        identity: UnknownCommitIdentity::SnapshotDispatch(Box::new(KeyedSnapshotDispatch {
+            target: target.clone(),
+            operation_id: ConnectorMutationOperationId::from_bytes([8; 16]),
+            records: vec![KeyedDispatchRecord {
+                owner: publication.owner.clone(),
+                name: publication.name.clone(),
+                envelope: Bytes::from(encode_record(publication).unwrap()),
+            }],
+            delete_stage: delete.map(|snapshot| KeyedDispatchDeleteStage {
+                snapshot,
+                witness: "exact original stage".into(),
+            }),
+            repartition_effect: None,
+        })),
+    }
+}
+
+#[test]
+fn grouped_recovery_requires_a_stage_witness_or_the_exact_final_record_and_parent() {
+    let publication = record(b"original publication", None);
+    let first = full(
+        Some(10),
+        vec![Snapshot::new(10, None)],
+        HashMap::new(),
+        vec![],
+    );
+    let evidence = grouped(&first.current.object_id, &publication, Some(19));
+    assert_eq!(
+        conclusion(resolve(&first.current, Some(&first), &evidence).unwrap()),
+        CommitConclusion::StillUnknown,
+    );
+    let mut later = full(
+        Some(40),
+        vec![Snapshot::new(19, Some(10)), Snapshot::new(40, Some(20))],
+        HashMap::new(),
+        vec![],
+    );
+    assert_eq!(
+        conclusion(resolve(&first.current, Some(&later), &evidence).unwrap()),
+        CommitConclusion::InvalidatedUndetermined,
+    );
+    later.snapshots[0].full_refresh_stage_witness = Some("exact original stage".into());
+    assert_eq!(
+        conclusion(resolve(&first.current, Some(&later), &evidence).unwrap()),
+        CommitConclusion::Committed(CommitProof::Snapshot),
+    );
+
+    let append = full(
+        Some(40),
+        vec![
+            Snapshot::new(20, Some(19)).record(publication.clone()),
+            Snapshot::new(40, Some(20)),
+        ],
+        HashMap::new(),
+        vec![],
+    );
+    assert_eq!(
+        conclusion(resolve(&append.current, Some(&append), &evidence).unwrap()),
+        CommitConclusion::Committed(CommitProof::Snapshot),
+    );
+    let carried = full(
+        Some(40),
+        vec![Snapshot::new(40, Some(20)).record(publication)],
+        HashMap::new(),
+        vec![],
+    );
+    assert_eq!(
+        conclusion(resolve(&carried.current, Some(&carried), &evidence).unwrap()),
+        CommitConclusion::Committed(CommitProof::CarriedRecord),
+    );
+}
+
+#[test]
+fn grouped_negative_proof_excludes_both_stages_and_requires_complete_ancestry() {
+    let publication = record(b"original publication", None);
+    let alternative = full(
+        Some(40),
+        vec![
+            Snapshot::new(10, None),
+            Snapshot::new(30, Some(10)),
+            Snapshot::new(40, Some(30)),
+        ],
+        HashMap::new(),
+        vec![],
+    );
+    let evidence = grouped(&alternative.current.object_id, &publication, Some(19));
+    assert_eq!(
+        conclusion(resolve(&alternative.current, Some(&alternative), &evidence).unwrap()),
+        CommitConclusion::NotCommitted(CommitProof::NegativeProof),
+    );
+    let mut incomplete = alternative.clone();
+    incomplete
+        .snapshots
+        .retain(|snapshot| snapshot.snapshot_id != 10);
+    assert_eq!(
+        conclusion(resolve(&incomplete.current, Some(&incomplete), &evidence).unwrap()),
+        CommitConclusion::InvalidatedUndetermined,
+    );
+    let also_selected = full(
+        Some(40),
+        vec![
+            Snapshot::new(10, None),
+            Snapshot::new(19, Some(10)),
+            Snapshot::new(30, Some(10)),
+            Snapshot::new(40, Some(30)),
+        ],
+        HashMap::new(),
+        vec![],
+    );
+    assert_eq!(
+        conclusion(resolve(&also_selected.current, Some(&also_selected), &evidence).unwrap()),
+        CommitConclusion::InvalidatedUndetermined,
+    );
+}
+
+#[test]
+fn a_same_parent_retirement_with_another_operation_does_not_prove_the_request() {
+    let mut original = record(b"retirement operation 1", None);
+    original.name = "retirement".into();
+    let competing = ConnectorSnapshotRecord {
+        payload: Bytes::from_static(b"retirement operation 2"),
+        ..original.clone()
+    };
+    let current = full(
+        Some(20),
+        vec![
+            Snapshot::new(10, None),
+            Snapshot::new(20, Some(10)).record(competing),
+        ],
+        HashMap::new(),
+        vec![],
+    );
+    let evidence = grouped(&current.current.object_id, &original, None);
+    assert_eq!(
+        conclusion(resolve(&current.current, Some(&current), &evidence).unwrap()),
+        CommitConclusion::InvalidatedUndetermined,
+    );
+}

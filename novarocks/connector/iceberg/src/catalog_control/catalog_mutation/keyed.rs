@@ -24,8 +24,9 @@ use crate::commit::attempt::prepared::{
 };
 use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
-    BaseIdentity, Dependency, FileChanges, FrozenRequest, OperationIntent, OperationIntentParts,
-    OperationToken, RequestShape, StartSnapshot, TableTarget,
+    BaseIdentity, CommitProtocol, Dependency, FileChanges, FrozenRequest, MV_MAIN_ADVANCED,
+    MvRefreshDependencies, OperationIntent, OperationIntentParts, OperationToken, RequestShape,
+    StartSnapshot, TableTarget,
 };
 use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
 use crate::commit::slot_change::{
@@ -35,9 +36,17 @@ use crate::commit::staging::{PreparedChange, Preparer, StagedView, StagingBase};
 use crate::document_storage::{keyed, observation};
 use novarocks_spi::connector::{
     ConnectorProviderBindingKey, DocumentIdentity, KeyedDocumentObservationRequest,
-    KeyedMarkerWrite, KeyedMutation, KeyedMutationIntent, KeyedSlotChange,
+    KeyedMarkerWrite, KeyedMutation, KeyedMutationIntent, KeyedRetirement, KeyedSlotChange,
 };
 use sha2::{Digest, Sha256};
+
+pub(super) fn catalog_operation(documents: &KeyedMutationIntent) -> CatalogOperation {
+    if matches!(documents.mutation, KeyedMutation::Retirement(_)) {
+        CatalogOperation::PublishDocuments
+    } else {
+        CatalogOperation::UpdateDocuments
+    }
+}
 
 struct MarkerPreparer(KeyedMarkerWrite);
 #[async_trait::async_trait]
@@ -150,6 +159,142 @@ fn slot_change_evidence_target(
     }
 }
 
+fn snapshot_mismatch(
+    documents: &KeyedMutationIntent,
+    observed: Option<i64>,
+) -> Option<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>> {
+    if documents.expected_snapshot == observed {
+        return None;
+    }
+    Some(
+        if matches!(documents.mutation, KeyedMutation::Retirement(_)) {
+            ExternalMutationOutcome::KnownUncommitted {
+                failure: crate::commit::commit_failure::validation_failure(
+                    crate::commit::model::CommitOperation::RefreshMaterializedView,
+                    MV_MAIN_ADVANCED,
+                ),
+                cleanup: ExternalMutationFinalization::Complete,
+            }
+        } else {
+            known_conflict("keyed document mutation snapshot does not match its observation")
+        },
+    )
+}
+
+fn retirement_evidence_target(
+    frozen: &FrozenRequest,
+    retirement: &KeyedRetirement,
+    target: &ConnectorTableIdentity,
+    uuid: uuid::Uuid,
+    parent: Option<i64>,
+) -> crate::iceberg::Result<IcebergMutationEvidenceTarget> {
+    let parent =
+        parent.ok_or_else(|| document_error(internal("retirement has no asserted parent")))?;
+    let selected = frozen
+        .ref_snapshot_after("main")
+        .ok_or_else(|| document_error(internal("retirement has no selected snapshot")))?;
+    let record = &retirement.record;
+    let key = keyed::keys::record_key(&record.owner, &record.name);
+    let envelope = keyed::record::encode_record(record).map_err(document_error)?;
+    let exact_snapshot = frozen.updates().iter().any(|update| {
+        matches!(update, TableUpdate::AddSnapshot { snapshot }
+            if snapshot.snapshot_id() == selected
+                && snapshot.parent_snapshot_id() == Some(parent)
+                && snapshot.summary().operation == crate::iceberg::spec::Operation::Append
+                && snapshot.summary().additional_properties.get(&key) == Some(&envelope))
+    });
+    if !exact_snapshot {
+        return Err(document_error(internal(
+            "retirement lost the original selected snapshot or record",
+        )));
+    }
+    Ok(IcebergMutationEvidenceTarget::KeyedRetirement {
+        namespace: target.namespace.to_string(),
+        table: target.table.to_string(),
+        table_uuid: uuid.to_string(),
+        operation_id: retirement.operation_id.to_bytes(),
+        retired_publication: retirement.retired_publication.to_bytes(),
+        asserted_parent: parent,
+        preselected_snapshot: selected,
+        record_owner: record.owner.clone(),
+        record_name: record.name.clone(),
+        record_envelope: envelope,
+    })
+}
+
+fn mutation_intent(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    documents: &KeyedMutationIntent,
+    token: OperationToken,
+    summary: std::collections::BTreeMap<String, String>,
+) -> Result<OperationIntent, ConnectorError> {
+    let (shape, dependencies, protocol) = match &documents.mutation {
+        KeyedMutation::Markers(_) => (
+            RequestShape::MetadataOnly,
+            vec![Dependency::NoRead],
+            CommitProtocol::Legacy,
+        ),
+        KeyedMutation::SlotChange(change)
+        | KeyedMutation::SlotChangeWithTableProperties { change, .. } => {
+            let observed = keyed::view::parse_properties(metadata.properties())
+                .map_err(observation::keyed_read_error)?;
+            let slots = change
+                .slots
+                .keys()
+                .map(|name| {
+                    let digest = observed
+                        .slots
+                        .get(name)
+                        .map(|slot| slot.value.digest(name, slot.writer));
+                    (name.clone(), digest)
+                })
+                .collect();
+            (
+                RequestShape::SnapshotProducing,
+                Vec::new(),
+                CommitProtocol::MvAlterProperties { slots },
+            )
+        }
+        KeyedMutation::Retirement(retirement) => (
+            RequestShape::SnapshotProducing,
+            Vec::new(),
+            CommitProtocol::MvRetirement {
+                admitted: MvRefreshDependencies {
+                    roots: std::collections::BTreeMap::from([(
+                        retirement.retired_record.owner.clone(),
+                        Some(retirement.expected_root),
+                    )]),
+                    slots: Default::default(),
+                },
+            },
+        ),
+        KeyedMutation::Expiry(_) => (
+            RequestShape::DocumentExpiry,
+            vec![Dependency::NoRead],
+            CommitProtocol::Legacy,
+        ),
+    };
+    OperationIntent::new(OperationIntentParts {
+        target: TableTarget {
+            ident: table_ident(documents.admission.target()).map_err(invalid)?,
+            uuid: Some(metadata.uuid()),
+        },
+        target_ref: "main".into(),
+        start: metadata.current_snapshot().map(|snapshot| StartSnapshot {
+            snapshot_id: snapshot.snapshot_id(),
+            sequence_number: snapshot.sequence_number(),
+        }),
+        changes: FileChanges::default(),
+        dependencies,
+        protocol,
+        shape,
+        summary,
+        token,
+    })
+    .map(|intent| intent.with_snapshot_loading(SnapshotLoading::Refs))
+    .map_err(|error| invalid(error.to_string()))
+}
+
 pub(super) fn execute(
     provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
@@ -193,8 +338,9 @@ pub(super) fn execute(
             observation::validate_expected_object(object_id, table.metadata())?;
             keyed::view::parse_properties(table.metadata().properties())
                 .map_err(observation::keyed_read_error)?;
-            if observation::committed_version(&table)? != documents.expected_metadata
-                || table.metadata().current_snapshot_id() != documents.expected_snapshot
+            if !matches!(documents.mutation, KeyedMutation::Retirement(_))
+                && (observation::committed_version(&table)? != documents.expected_metadata
+                    || table.metadata().current_snapshot_id() != documents.expected_snapshot)
             {
                 return Ok(known_conflict(
                     "keyed document mutation observation has changed",
@@ -212,10 +358,8 @@ pub(super) fn execute(
         }
     };
     observation::validate_expected_object(object_id, &metadata)?;
-    if metadata.current_snapshot_id() != documents.expected_snapshot {
-        return Ok(known_conflict(
-            "keyed document mutation snapshot does not match its observation",
-        ));
+    if let Some(conflict) = snapshot_mismatch(documents, metadata.current_snapshot_id()) {
+        return Ok(conflict);
     }
     let (prefix, storage_effect) =
         match prepare_slot_storage_prefix(provider, request, documents, &metadata, prefix) {
@@ -241,36 +385,8 @@ pub(super) fn execute(
         OperationLimits::default(),
     )
     .map_err(|error| invalid(error.to_string()))?;
-    let shape = match &documents.mutation {
-        KeyedMutation::Markers(_) => RequestShape::MetadataOnly,
-        KeyedMutation::SlotChange(_) | KeyedMutation::SlotChangeWithTableProperties { .. } => {
-            RequestShape::SnapshotProducing
-        }
-        KeyedMutation::Expiry(_) => RequestShape::DocumentExpiry,
-    };
-    let intent = OperationIntent::new(OperationIntentParts {
-        target: TableTarget {
-            ident: table_ident(target).map_err(invalid)?,
-            uuid: Some(metadata.uuid()),
-        },
-        target_ref: "main".into(),
-        start: metadata.current_snapshot().map(|snapshot| StartSnapshot {
-            snapshot_id: snapshot.snapshot_id(),
-            sequence_number: snapshot.sequence_number(),
-        }),
-        changes: FileChanges::default(),
-        dependencies: vec![if shape == RequestShape::SnapshotProducing {
-            Dependency::RefUnchanged
-        } else {
-            Dependency::NoRead
-        }],
-        protocol: crate::commit::model::CommitProtocol::Legacy,
-        shape,
-        summary,
-        token: operation.token(),
-    })
-    .map_err(|error| invalid(error.to_string()))?
-    .with_snapshot_loading(SnapshotLoading::Refs);
+    let intent = mutation_intent(&metadata, documents, operation.token(), summary)?;
+    let shape = intent.shape();
     let policy = RetryPolicy::from_properties(metadata.properties())
         .map_err(|error| invalid(error.to_string()))?;
     let journal = PublicationJournal::for_runtime(operation.token(), operation.runtime());
@@ -321,6 +437,9 @@ pub(super) fn execute(
                             .map(|(updates, digest)| (updates.as_slice(), *digest)),
                     )?
                 }
+                KeyedMutation::Retirement(retirement) => {
+                    retirement_evidence_target(frozen, retirement, target, *uuid, *parent)?
+                }
                 KeyedMutation::Expiry(_) => IcebergMutationEvidenceTarget::KeyedExpiry {
                     namespace: target.namespace.to_string(),
                     table: target.table.to_string(),
@@ -347,7 +466,7 @@ pub(super) fn execute(
     );
     let owner_publisher: Arc<dyn PublicationPreparer> = Arc::new(CatalogPublisher {
         expected_table_uuid: None,
-        catalog_operation: CatalogOperation::UpdateDocuments,
+        catalog_operation: catalog_operation(documents),
         catalog: Arc::clone(provider.runtime().novarocks_catalog()),
         ident: intent.target().ident.clone(),
         target_ref: "main".into(),
@@ -373,6 +492,11 @@ pub(super) fn execute(
         | KeyedMutation::SlotChangeWithTableProperties { change, .. } => {
             Some(Box::new(SlotChangePreparer {
                 change: change.clone(),
+            }))
+        }
+        KeyedMutation::Retirement(retirement) => {
+            Some(Box::new(crate::commit::retirement::RetirementPreparer {
+                retirement: retirement.as_ref().clone(),
             }))
         }
         KeyedMutation::Expiry(_) => None,
@@ -571,8 +695,9 @@ pub(super) async fn execute_async(
             observation::validate_expected_object(object_id, table.metadata())?;
             keyed::view::parse_properties(table.metadata().properties())
                 .map_err(observation::keyed_read_error)?;
-            if observation::committed_version(&table)? != documents.expected_metadata
-                || table.metadata().current_snapshot_id() != documents.expected_snapshot
+            if !matches!(documents.mutation, KeyedMutation::Retirement(_))
+                && (observation::committed_version(&table)? != documents.expected_metadata
+                    || table.metadata().current_snapshot_id() != documents.expected_snapshot)
             {
                 return Ok(known_conflict(
                     "keyed document mutation observation has changed",
@@ -590,10 +715,8 @@ pub(super) async fn execute_async(
         }
     };
     observation::validate_expected_object(object_id, &metadata)?;
-    if metadata.current_snapshot_id() != documents.expected_snapshot {
-        return Ok(known_conflict(
-            "keyed document mutation snapshot does not match its observation",
-        ));
+    if let Some(conflict) = snapshot_mismatch(documents, metadata.current_snapshot_id()) {
+        return Ok(conflict);
     }
     let (prefix, storage_effect) =
         match prepare_slot_storage_prefix(provider, request, documents, &metadata, prefix) {
@@ -619,36 +742,8 @@ pub(super) async fn execute_async(
         OperationLimits::default(),
     )
     .map_err(|error| invalid(error.to_string()))?;
-    let shape = match &documents.mutation {
-        KeyedMutation::Markers(_) => RequestShape::MetadataOnly,
-        KeyedMutation::SlotChange(_) | KeyedMutation::SlotChangeWithTableProperties { .. } => {
-            RequestShape::SnapshotProducing
-        }
-        KeyedMutation::Expiry(_) => RequestShape::DocumentExpiry,
-    };
-    let intent = OperationIntent::new(OperationIntentParts {
-        target: TableTarget {
-            ident: table_ident(target).map_err(invalid)?,
-            uuid: Some(metadata.uuid()),
-        },
-        target_ref: "main".into(),
-        start: metadata.current_snapshot().map(|snapshot| StartSnapshot {
-            snapshot_id: snapshot.snapshot_id(),
-            sequence_number: snapshot.sequence_number(),
-        }),
-        changes: FileChanges::default(),
-        dependencies: vec![if shape == RequestShape::SnapshotProducing {
-            Dependency::RefUnchanged
-        } else {
-            Dependency::NoRead
-        }],
-        protocol: crate::commit::model::CommitProtocol::Legacy,
-        shape,
-        summary,
-        token: operation.token(),
-    })
-    .map_err(|error| invalid(error.to_string()))?
-    .with_snapshot_loading(SnapshotLoading::Refs);
+    let intent = mutation_intent(&metadata, documents, operation.token(), summary)?;
+    let shape = intent.shape();
     let policy = RetryPolicy::from_properties(metadata.properties())
         .map_err(|error| invalid(error.to_string()))?;
     let journal = PublicationJournal::for_runtime(operation.token(), operation.runtime());
@@ -699,6 +794,9 @@ pub(super) async fn execute_async(
                             .map(|(updates, digest)| (updates.as_slice(), *digest)),
                     )?
                 }
+                KeyedMutation::Retirement(retirement) => {
+                    retirement_evidence_target(frozen, retirement, target, *uuid, *parent)?
+                }
                 KeyedMutation::Expiry(_) => IcebergMutationEvidenceTarget::KeyedExpiry {
                     namespace: target.namespace.to_string(),
                     table: target.table.to_string(),
@@ -725,7 +823,7 @@ pub(super) async fn execute_async(
     );
     let owner_publisher: Arc<dyn PublicationPreparer> = Arc::new(CatalogPublisher {
         expected_table_uuid: None,
-        catalog_operation: CatalogOperation::UpdateDocuments,
+        catalog_operation: catalog_operation(documents),
         catalog: Arc::clone(provider.runtime().novarocks_catalog()),
         ident: intent.target().ident.clone(),
         target_ref: "main".into(),
@@ -750,6 +848,11 @@ pub(super) async fn execute_async(
         | KeyedMutation::SlotChangeWithTableProperties { change, .. } => {
             Some(Box::new(SlotChangePreparer {
                 change: change.clone(),
+            }))
+        }
+        KeyedMutation::Retirement(retirement) => {
+            Some(Box::new(crate::commit::retirement::RetirementPreparer {
+                retirement: retirement.as_ref().clone(),
             }))
         }
         KeyedMutation::Expiry(_) => None,

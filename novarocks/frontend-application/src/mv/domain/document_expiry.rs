@@ -525,6 +525,8 @@ mod tests {
             snapshot_id: id,
             parent,
             slot_storage_effect_digest: None,
+            full_refresh_stage_witness: None,
+            managed_repartition_effect: None,
             records: Vec::new(),
         }
     }

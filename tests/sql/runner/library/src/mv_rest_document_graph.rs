@@ -497,15 +497,6 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
     let snapshots = metadata["snapshots"]
         .as_array()
         .context("REST metadata lacks snapshots")?;
-    ensure!(
-        snapshots.len()
-            == expectation.publications + expectation.slot_changes + expectation.full_refreshes,
-        "retained snapshots {} differ from publications {} + slot changes {} + FULL deletes {}",
-        snapshots.len(),
-        expectation.publications,
-        expectation.slot_changes,
-        expectation.full_refreshes,
-    );
     let mut by_id = BTreeMap::new();
     let mut by_sequence = BTreeMap::new();
     for snapshot in snapshots {
@@ -535,7 +526,8 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
             "current and main ref differ"
         );
     }
-    let (full_deletes, full_appends) = full_refresh_pairs(&by_sequence)?;
+    let (full_deletes, full_appends) =
+        full_refresh_pairs(&by_sequence, metadata["table-uuid"].as_str())?;
     ensure!(
         full_appends.len() == expectation.full_refreshes,
         "FULL pairs {}, expected {}",
@@ -543,6 +535,7 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         expectation.full_refreshes
     );
     let mut publications = BTreeMap::<[u8; 16], String>::new();
+    let mut retirements = BTreeMap::<[u8; 16], String>::new();
     let mut slots = 0;
     let mut slot_ids = BTreeSet::new();
     let mut interpretations = BTreeSet::new();
@@ -587,6 +580,56 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
             }
         }
         let frame = records.get(wire::PUBLICATION_KEY);
+        if let Some(retirement_frame) = records.get(wire::RETIREMENT_KEY) {
+            let retirement = wire::retirement(retirement_frame)?;
+            ensure!(frame.is_none(), "retired snapshot also carries P");
+            if Some(id) == current {
+                ensure!(
+                    markers.iter().any(|marker| marker.name == "invalid"
+                        && marker.identity == retirement.retired
+                        && marker.retirement_revision == Some(retirement.revision)),
+                    "Current retirement lacks its exact Invalid marker"
+                );
+            }
+            match retirements.entry(retirement.operation) {
+                std::collections::btree_map::Entry::Occupied(proved) => {
+                    ensure!(
+                        proved.get() == retirement_frame,
+                        "retirement operation reused with different bytes"
+                    );
+                }
+                std::collections::btree_map::Entry::Vacant(unseen) => {
+                    ensure!(
+                        operation == "append" && !files_changed,
+                        "retirement must be a zero-file append"
+                    );
+                    let parent = parent.context("retirement lacks its original parent")?;
+                    ensure!(
+                        parent["manifest-list"] != snapshot["manifest-list"],
+                        "retirement reused the parent's manifest list identity"
+                    );
+                    let parent_frame = parent["summary"][wire::PUBLICATION_KEY]
+                        .as_str()
+                        .context("retirement parent lacks P")?;
+                    let previous = wire::record(parent_frame)?;
+                    let previous_binding = previous.binding.context("retired P lacks B")?;
+                    let facts = binding_facts(&properties, &previous_binding)?;
+                    ensure!(
+                        wire::publication(&previous.payload, &facts.formats)?.id
+                            == retirement.retired,
+                        "retirement names a different P than its exact parent"
+                    );
+                    for key in ["total-data-files", "total-delete-files", "total-records"] {
+                        ensure!(
+                            parent["summary"][key] == snapshot["summary"][key],
+                            "retirement changed parent {key}"
+                        );
+                    }
+                    unseen.insert(retirement_frame.clone());
+                    continue;
+                }
+            }
+        }
         let mut is_publication = false;
         if let Some(frame) = frame {
             let record = wire::record(frame)?;
@@ -711,6 +754,14 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         publications.len(),
         expectation.publications
     );
+    ensure!(
+        snapshots.len()
+            == expectation.publications
+                + expectation.slot_changes
+                + expectation.full_refreshes
+                + retirements.len(),
+        "retained snapshots differ from publications, slot changes, FULL deletes and retirements"
+    );
     if let Some(changes) = expectation.binding_changes {
         let actual = ordered_bindings
             .windows(2)
@@ -822,7 +873,12 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         properties.private_bytes
     ))
 }
-fn full_refresh_pairs(snapshots: &BTreeMap<u64, &Value>) -> Result<(BTreeSet<i64>, BTreeSet<i64>)> {
+const FULL_REFRESH_STAGE: &str = "novarocks.mv.full-refresh-stage.v1";
+
+fn full_refresh_pairs(
+    snapshots: &BTreeMap<u64, &Value>,
+    table_uuid: Option<&str>,
+) -> Result<(BTreeSet<i64>, BTreeSet<i64>)> {
     const MARKER: &str = "novarocks.write.session.v1";
     let mut deletes = BTreeSet::new();
     let mut appends = BTreeSet::new();
@@ -832,7 +888,13 @@ fn full_refresh_pairs(snapshots: &BTreeMap<u64, &Value>) -> Result<(BTreeSet<i64
             .as_i64()
             .context("snapshot lacks ID")?;
         let summary = &snapshot["summary"];
-        if summary["operation"] == "delete" && summary[wire::PUBLICATION_KEY].is_null() {
+        if !summary[FULL_REFRESH_STAGE].is_null()
+            || (summary["operation"] == "delete" && summary[wire::PUBLICATION_KEY].is_null())
+        {
+            ensure!(
+                summary["operation"] == "delete" && summary[wire::PUBLICATION_KEY].is_null(),
+                "FULL delete stage contains a publication record or has a different operation"
+            );
             ensure!(
                 previous_id == snapshot["parent-snapshot-id"].as_i64(),
                 "FULL delete did not extend the retained prior head"
@@ -840,8 +902,8 @@ fn full_refresh_pairs(snapshots: &BTreeMap<u64, &Value>) -> Result<(BTreeSet<i64
             ensure!(
                 summary.as_object().is_some_and(|summary| summary
                     .keys()
-                    .all(|key| !key.starts_with("novarocks."))),
-                "FULL delete summary contains nonstandard fields"
+                    .all(|key| key == FULL_REFRESH_STAGE || !key.starts_with("novarocks."))),
+                "FULL delete summary contains a private field other than its stage witness"
             );
             for key in ["total-records", "total-data-files", "total-delete-files"] {
                 ensure!(
@@ -868,6 +930,33 @@ fn full_refresh_pairs(snapshots: &BTreeMap<u64, &Value>) -> Result<(BTreeSet<i64
                         .count()
                         == 1,
                 "FULL append did not extend its delete with one unique marked publication"
+            );
+            let witness: Value = serde_json::from_str(
+                summary[FULL_REFRESH_STAGE]
+                    .as_str()
+                    .context("FULL delete lacks its stage witness")?,
+            )
+            .context("FULL delete stage witness is invalid JSON")?;
+            let operation: [u8; 16] = serde_json::from_value(witness["operation_id"].clone())
+                .context("FULL delete stage witness has no operation identity")?;
+            let operation_hex: String =
+                operation.iter().map(|byte| format!("{byte:02x}")).collect();
+            let nonce: [u8; 16] = serde_json::from_value(witness["attempt_nonce"].clone())
+                .context("FULL delete stage witness has no attempt nonce")?;
+            ensure!(
+                witness["version"] == 1
+                    && witness.as_object().is_some_and(|fields| fields.len() == 8)
+                    && witness["table_uuid"].as_str() == table_uuid
+                    && table_uuid.is_some()
+                    && witness["asserted_parent"] == snapshot["parent-snapshot-id"]
+                    && witness["delete_snapshot"] == snapshot["snapshot-id"]
+                    && witness["append_snapshot"] == append["snapshot-id"]
+                    && u32::try_from(witness["attempt_ordinal"].as_u64().unwrap_or(u64::MAX))
+                        .is_ok()
+                    && nonce[6] >> 4 == 7
+                    && nonce[8] >> 6 == 2
+                    && operation_hex == marker.replace('-', ""),
+                "FULL delete stage does not bind the exact table, parent, session and selected pair"
             );
             deletes.insert(id);
             appends.insert(

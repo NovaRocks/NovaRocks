@@ -115,6 +115,7 @@ pub struct MvRefreshPublicationIntent {
     expected_committed_partitioning: Option<ConnectorCommittedPartitioning>,
     storage_projection_digest: Option<[u8; 32]>,
     configuration_slot_update: Option<ConnectorDocumentPublicationSlotUpdate>,
+    expected_root: Option<novarocks_spi::connector::DocumentIdentity>,
 }
 
 impl MvRefreshPublicationIntent {
@@ -173,6 +174,7 @@ impl MvRefreshPublicationIntent {
             expected_committed_partitioning: None,
             storage_projection_digest: None,
             configuration_slot_update: None,
+            expected_root: None,
         })
     }
 
@@ -235,6 +237,15 @@ impl MvRefreshPublicationIntent {
 
     pub const fn storage_projection_digest(&self) -> Option<[u8; 32]> {
         self.storage_projection_digest
+    }
+
+    pub fn with_expected_root(mut self, root: novarocks_spi::connector::DocumentIdentity) -> Self {
+        self.expected_root = Some(root);
+        self
+    }
+
+    pub const fn expected_root(&self) -> Option<novarocks_spi::connector::DocumentIdentity> {
+        self.expected_root
     }
 
     pub const fn configuration_slot_update(
