@@ -309,7 +309,7 @@ impl CountSession {
         observed: Arc<Observations>,
     ) -> Arc<Self> {
         let arc_header = 2 * std::mem::size_of::<usize>();
-        let mut bytes = RootInputAuthority::initial_backing_bytes()
+        let bytes = RootInputAuthority::initial_backing_bytes()
             + std::mem::size_of::<Self>()
             + arc_header
             + std::mem::size_of::<crate::root_result_channel::RootMetadataReservation>()
@@ -318,9 +318,7 @@ impl CountSession {
             + arc_header
             + Observable::bounded_backing_bytes(1).unwrap();
         #[cfg(target_vendor = "apple")]
-        {
-            bytes += std::mem::size_of::<(isize, [u8; 56])>();
-        }
+        let bytes = bytes + std::mem::size_of::<(isize, [u8; 56])>();
         let metadata = Arc::new(channel.try_reserve_metadata(bytes).unwrap());
         let authority =
             RootInputAuthority::try_new_retained(channel.spec(), health, metadata.clone()).unwrap();
