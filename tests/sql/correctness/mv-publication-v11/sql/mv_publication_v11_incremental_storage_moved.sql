@@ -56,11 +56,12 @@ curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}
 
 -- query 8
 -- Make the already-dispatched incremental write lose to a physical advance.
+-- @db=mvincr_${uuid0}.ns_${uuid0}
 -- @publication_service_hold=ns_${uuid0}.target_mv
 -- @publication_catalog_concurrent_shell=set -eu; tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-mv-occ-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "DELETE FROM ice_rest.ns_${uuid0}.target_mv WHERE k = 'east';" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 -- @expect_trino_error=ICEBERG_COMMIT_ERROR,EXTERNAL
 -- @expect_error=Failed to commit the transaction during refresh materialized view: Materialized view storage table changed during incremental refresh
-REFRESH MATERIALIZED VIEW mvincr_${uuid0}.ns_${uuid0}.target_mv;
+REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 9
 -- @result_contains=MV_OCC_FIXED
