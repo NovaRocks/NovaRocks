@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) const PREFIX: &str = "novarocks.doc.";
 const V2: &str = "novarocks.doc.v2.";
+pub(super) const RETIREMENT_KEY: &str = "novarocks.doc.v2.record.novarocks.mv~retirement";
 pub(super) const PUBLICATION_KEY: &str = "novarocks.doc.v2.record.novarocks.mv~publication";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -801,11 +802,54 @@ pub(super) enum MarkerScope {
     Binding,
 }
 
+pub(super) struct Retirement {
+    pub retired: [u8; 16],
+    pub operation: [u8; 16],
+    pub revision: [u8; 32],
+}
+
+pub(super) fn retirement(frame: &str) -> Result<Retirement> {
+    let record = record(frame)?;
+    ensure!(record.binding.is_none(), "retirement record binds a B");
+    let fields = proto(
+        &record.payload,
+        &[(1, 0), (2, 2), (3, 2), (4, 0), (5, 0), (6, 0), (7, 2)],
+        &[],
+    )?;
+    version(&fields, 1, "retirement")?;
+    for tag in 4..=6 {
+        let field = fields
+            .iter()
+            .find(|(n, _)| *n == tag)
+            .context("missing retirement count")?;
+        ensure!(
+            i64::try_from(field.1.int()?).is_ok(),
+            "retirement count exceeds Int64"
+        );
+    }
+    if let Some((_, fingerprint)) = fields.iter().find(|(n, _)| *n == 7) {
+        ensure!(
+            fingerprint.bytes()?.len() == 16,
+            "invalid retirement fingerprint"
+        );
+    }
+    Ok(Retirement {
+        retired: required(&fields, 2)?
+            .try_into()
+            .context("invalid retired publication")?,
+        operation: required(&fields, 3)?
+            .try_into()
+            .context("invalid retirement operation")?,
+        revision: Sha256::digest(frame.as_bytes()).into(),
+    })
+}
+
 #[derive(Debug)]
 pub(super) struct Marker {
     pub name: String,
     pub scope: MarkerScope,
     pub identity: Vec<u8>,
+    pub retirement_revision: Option<[u8; 32]>,
 }
 
 fn frame64(bytes: &mut Vec<u8>, value: &[u8]) {
@@ -844,6 +888,7 @@ pub(super) fn markers(properties: &Properties) -> Result<Vec<Marker>> {
             };
             let body = fields[2].1.bytes()?;
             let mut attempt = None;
+            let mut retirement_revision = None;
             let name = match fields[2].0 {
                 4 | 5 => {
                     ensure!(
@@ -903,9 +948,11 @@ pub(super) fn markers(properties: &Properties) -> Result<Vec<Marker>> {
                 }
                 8 => {
                     let invalid = proto(body, &[(1, 2)], &[])?;
-                    ensure!(
-                        scope == MarkerScope::Publication && required(&invalid, 1)?.len() == 32,
-                        "invalid marker lacks publication or retirement identity"
+                    ensure!(scope == MarkerScope::Publication, "Invalid must scope to P");
+                    retirement_revision = Some(
+                        required(&invalid, 1)?
+                            .try_into()
+                            .context("invalid marker lacks its retirement revision")?,
                     );
                     "invalid"
                 }
@@ -934,6 +981,7 @@ pub(super) fn markers(properties: &Properties) -> Result<Vec<Marker>> {
                 name: name.to_string(),
                 scope,
                 identity: identity.to_vec(),
+                retirement_revision,
             })
         })
         .collect()

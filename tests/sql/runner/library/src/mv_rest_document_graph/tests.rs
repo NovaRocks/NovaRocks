@@ -477,3 +477,24 @@ fn invalid_definition_marker_requires_the_exact_unpublished_binding_scope() {
     );
     assert!(verify_graph(&r, &valid).is_err());
 }
+
+#[test]
+fn retirement_wire_binds_the_exact_original_operation() {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let mut payload = vec![8, 1, 18, 16];
+    payload.extend_from_slice(&[3; 16]);
+    payload.extend_from_slice(&[26, 16]);
+    payload.extend_from_slice(&[4; 16]);
+    payload.extend_from_slice(&[32, 11, 40, 9, 48, 1]);
+    let frame = |payload| format!("2.-.{}", URL_SAFE_NO_PAD.encode(payload));
+    let first = wire::retirement(&frame(&payload)).unwrap();
+    assert_eq!(first.retired, [3; 16]);
+    assert_eq!(first.operation, [4; 16]);
+    payload[22] = 5;
+    let second = wire::retirement(&frame(&payload)).unwrap();
+    assert_eq!(second.retired, first.retired);
+    assert_ne!(second.operation, first.operation);
+    assert_ne!(second.revision, first.revision);
+    payload.pop();
+    assert!(wire::retirement(&frame(&payload)).is_err());
+}

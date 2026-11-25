@@ -771,15 +771,26 @@ impl Scenario for MvRefreshConfigurationInterleaving {
             cluster_size,
             binary,
             original_deadline,
-            vec![FeLaunchIntent::MvActions(vec![control_plan::recovery(
-                "configuration-data-prepared",
-                "system_mv_config_interleaving",
-                "ns",
-                "orders_mv",
-                "data-prepared",
-                "before-configuration-write",
-                &scenario_root.join("mv-recovery-faults"),
-            )?])],
+            vec![FeLaunchIntent::MvActions(vec![
+                control_plan::recovery(
+                    "configuration-data-prepared",
+                    "system_mv_config_interleaving",
+                    "ns",
+                    "orders_mv",
+                    "data-prepared",
+                    "before-configuration-write",
+                    &scenario_root.join("mv-recovery-faults"),
+                )?,
+                control_plan::recovery(
+                    "background-configuration-data-prepared",
+                    "system_mv_config_interleaving",
+                    "ns",
+                    "background_mv",
+                    "data-prepared",
+                    "before-background-configuration-write",
+                    &scenario_root.join("mv-recovery-faults"),
+                )?,
+            ])],
         )
         .map(Some)
     }
@@ -928,7 +939,7 @@ impl Scenario for MvRefreshConfigurationInterleaving {
             &[(1, 10), (2, 20), (3, 30)],
             "read the completed refresh after the configuration write",
         )?;
-        Ok(())
+        background_configuration_writer_conflict(context, &mut conn, &rest_uri)
     }
 
     fn teardown(&self) -> Result<()> {
@@ -942,6 +953,113 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         };
         fixture.shutdown()
     }
+}
+
+fn background_configuration_writer_conflict(
+    context: &mut ScenarioContext,
+    conn: &mut SqlSession,
+    rest_uri: &str,
+) -> Result<()> {
+    use super::mv_uea7_documents::{
+        external_configuration_slot_snapshot, load_metadata,
+        wire::{CONFIG, Graph},
+    };
+    execute(
+        context,
+        conn,
+        "create the first-refresh background target",
+        "CREATE MATERIALIZED VIEW background_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders",
+    )?;
+    execute(
+        context,
+        conn,
+        "create an independent paused configuration fixture",
+        "CREATE MATERIALIZED VIEW paused_configuration_mv WITH (refresh_policy = 'INTERVAL', refresh_interval = '10s', refresh_paused = true) AS SELECT k1, v2 FROM orders",
+    )?;
+    let fault_dir = context.scenario_root().join("mv-recovery-faults");
+    let prepared = FileTrigger::create(
+        &fault_dir.join("mv-refresh-at-data-prepared.trigger"),
+        "token=before-background-configuration-write\n",
+    )?;
+    execute(
+        context,
+        conn,
+        "enable the interval refresh with its first exact slot writer",
+        "ALTER MATERIALIZED VIEW background_mv SET PROPERTIES refresh_policy = 'INTERVAL', refresh_interval = '10s'",
+    )?;
+    let marker = format!(
+        "{} phase=data-prepared token=before-background-configuration-write",
+        novarocks_failpoint::observation_marker::MV_RECOVERY_PHASE,
+    );
+    loop {
+        if context.handle().fe_log_contents()?.contains(&marker) {
+            break;
+        }
+        context.remaining("wait for the original background full refresh to freeze its writer")?;
+        thread::sleep(POLL_INTERVAL);
+    }
+    let initial = load_metadata(context, rest_uri, "ns", "background_mv")?;
+    let original = Graph::from_metadata(&initial)?;
+    let initial_slot = original
+        .slots
+        .get(CONFIG)
+        .context("initial configuration slot missing")?;
+    ensure!(
+        initial_slot.writer == original.current,
+        "original configuration writer was not the selected parent"
+    );
+    let paused_fixture = load_metadata(context, rest_uri, "ns", "paused_configuration_mv")?;
+    let paused_config = Graph::from_metadata(&paused_fixture)?
+        .slots
+        .remove(CONFIG)
+        .context("paused configuration fixture missing")?;
+    ensure!(
+        initial_slot.content != paused_config.content,
+        "paused fixture used the original configuration bytes"
+    );
+    let paused = external_configuration_slot_snapshot(
+        context,
+        rest_uri,
+        "background_mv",
+        &initial,
+        paused_config,
+    )?;
+    let resumed = external_configuration_slot_snapshot(
+        context,
+        rest_uri,
+        "background_mv",
+        &paused,
+        initial_slot.clone(),
+    )?;
+    let paused = Graph::from_metadata(&paused)?;
+    let resumed_graph = Graph::from_metadata(&resumed)?;
+    let resumed_slot = &resumed_graph.slots[CONFIG];
+    ensure!(
+        resumed_slot.content == initial_slot.content
+            && resumed_slot.writer == resumed_graph.current
+            && resumed_slot.writer != initial_slot.writer
+            && paused.slots[CONFIG].writer == paused.current
+            && paused.current != resumed_graph.current,
+        "external pause and same-value resume did not publish distinct configuration writer snapshots"
+    );
+    prepared.remove()?;
+    loop {
+        if context.handle().fe_log_contents()?.lines().any(|line| {
+            line.contains("frontend MV scheduler refresh did not complete")
+                && line.contains("background_mv")
+                && line.contains("Materialized view slot value or writer changed since admission")
+        }) {
+            break;
+        }
+        context.remaining("observe rejection of the originally admitted background writer")?;
+        thread::sleep(POLL_INTERVAL);
+    }
+    let after = load_metadata(context, rest_uri, "ns", "background_mv")?;
+    ensure!(
+        after["snapshots"] == resumed["snapshots"],
+        "the held background refresh published after its configuration writer changed"
+    );
+    Ok(())
 }
 
 fn require_refresh_paused(

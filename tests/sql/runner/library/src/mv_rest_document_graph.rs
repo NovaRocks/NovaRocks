@@ -497,15 +497,6 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
     let snapshots = metadata["snapshots"]
         .as_array()
         .context("REST metadata lacks snapshots")?;
-    ensure!(
-        snapshots.len()
-            == expectation.publications + expectation.slot_changes + expectation.full_refreshes,
-        "retained snapshots {} differ from publications {} + slot changes {} + FULL deletes {}",
-        snapshots.len(),
-        expectation.publications,
-        expectation.slot_changes,
-        expectation.full_refreshes,
-    );
     let mut by_id = BTreeMap::new();
     let mut by_sequence = BTreeMap::new();
     for snapshot in snapshots {
@@ -544,6 +535,7 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         expectation.full_refreshes
     );
     let mut publications = BTreeMap::<[u8; 16], String>::new();
+    let mut retirements = BTreeMap::<[u8; 16], String>::new();
     let mut slots = 0;
     let mut slot_ids = BTreeSet::new();
     let mut interpretations = BTreeSet::new();
@@ -588,6 +580,56 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
             }
         }
         let frame = records.get(wire::PUBLICATION_KEY);
+        if let Some(retirement_frame) = records.get(wire::RETIREMENT_KEY) {
+            let retirement = wire::retirement(retirement_frame)?;
+            ensure!(frame.is_none(), "retired snapshot also carries P");
+            if Some(id) == current {
+                ensure!(
+                    markers.iter().any(|marker| marker.name == "invalid"
+                        && marker.identity == retirement.retired
+                        && marker.retirement_revision == Some(retirement.revision)),
+                    "Current retirement lacks its exact Invalid marker"
+                );
+            }
+            match retirements.entry(retirement.operation) {
+                std::collections::btree_map::Entry::Occupied(proved) => {
+                    ensure!(
+                        proved.get() == retirement_frame,
+                        "retirement operation reused with different bytes"
+                    );
+                }
+                std::collections::btree_map::Entry::Vacant(unseen) => {
+                    ensure!(
+                        operation == "append" && !files_changed,
+                        "retirement must be a zero-file append"
+                    );
+                    let parent = parent.context("retirement lacks its original parent")?;
+                    ensure!(
+                        parent["manifest-list"] != snapshot["manifest-list"],
+                        "retirement reused the parent's manifest list identity"
+                    );
+                    let parent_frame = parent["summary"][wire::PUBLICATION_KEY]
+                        .as_str()
+                        .context("retirement parent lacks P")?;
+                    let previous = wire::record(parent_frame)?;
+                    let previous_binding = previous.binding.context("retired P lacks B")?;
+                    let facts = binding_facts(&properties, &previous_binding)?;
+                    ensure!(
+                        wire::publication(&previous.payload, &facts.formats)?.id
+                            == retirement.retired,
+                        "retirement names a different P than its exact parent"
+                    );
+                    for key in ["total-data-files", "total-delete-files", "total-records"] {
+                        ensure!(
+                            parent["summary"][key] == snapshot["summary"][key],
+                            "retirement changed parent {key}"
+                        );
+                    }
+                    unseen.insert(retirement_frame.clone());
+                    continue;
+                }
+            }
+        }
         let mut is_publication = false;
         if let Some(frame) = frame {
             let record = wire::record(frame)?;
@@ -711,6 +753,14 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         "unique publications {}, expected {}",
         publications.len(),
         expectation.publications
+    );
+    ensure!(
+        snapshots.len()
+            == expectation.publications
+                + expectation.slot_changes
+                + expectation.full_refreshes
+                + retirements.len(),
+        "retained snapshots differ from publications, slot changes, FULL deletes and retirements"
     );
     if let Some(changes) = expectation.binding_changes {
         let actual = ordered_bindings

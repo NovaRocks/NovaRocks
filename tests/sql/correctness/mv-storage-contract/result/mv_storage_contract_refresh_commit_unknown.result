@@ -1,0 +1,8 @@
+-- query 13
+-- types	varchar	bigint
+k	v
+east	10
+east	10
+east	10
+north	30
+west	20
