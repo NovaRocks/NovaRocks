@@ -48,8 +48,12 @@ fn owner() -> JsonCanonicalOwner {
 }
 fn args(nullable: bool, logical: ValueLogicalType) -> [FunctionArgument; 1] {
     [FunctionArgument::Value {
-        value_type: FunctionValueType::try_with_logical_type(DataType::LargeBinary, nullable, logical)
-            .unwrap(),
+        value_type: FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            nullable,
+            logical,
+        )
+        .unwrap(),
         constant: None,
     }]
 }
@@ -214,7 +218,11 @@ fn canonical_selected_sparse_and_last_buffer_alias_keep_original_host() {
     let array = out.values().as_any().downcast_ref::<BinaryArray>().unwrap();
     assert_eq!(
         array.iter().collect::<Vec<_>>(),
-        vec![Some(b"\x00".as_slice()), None, Some(b"\x04\x00\x00\x00\x00\x00\x01\x01".as_slice())]
+        vec![
+            Some(b"\x00".as_slice()),
+            None,
+            Some(b"\x04\x00\x00\x00\x00\x00\x01\x01".as_slice())
+        ]
     );
     let alias = array.values().clone();
     drop(out);
@@ -262,7 +270,8 @@ fn canonical_invalid_native_json_preserves_invariant_and_failed_instance_lifecyc
 #[test]
 fn direct_helper_uses_original_opaque_journal_and_releases_it_with_the_key() {
     let host = Arc::new(Host::default());
-    let key = crate::json_canonical::normalize_json_key(b"\x01\x20", host.clone(), &Control).unwrap();
+    let key =
+        crate::json_canonical::normalize_json_key(b"\x01\x20", host.clone(), &Control).unwrap();
     let journal = crate::aggregate_helper_memory::private_mutex_backing_bytes().unwrap();
     assert_eq!(host.opaque.load(Ordering::SeqCst), journal);
     drop(key);
