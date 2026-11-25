@@ -832,6 +832,15 @@ fn checked_row(
             "comparison argument differs from its frozen flat carrier",
         ));
     }
+    checked_address(argument, ordinal, batch_row, work)
+}
+
+fn checked_address(
+    argument: EvaluatedArgument<'_>,
+    ordinal: usize,
+    batch_row: usize,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<usize, KernelFailure> {
     match argument {
         EvaluatedArgument::Scalar(array) if array.len() != 1 => {
             return Err(invalid("comparison scalar has invalid cardinality"));
@@ -857,6 +866,11 @@ fn checked_row(
     work.step()?;
     Ok(row)
 }
+
+mod composite;
+pub use composite::{
+    ComparisonAllocator, CompositeComparisonResult, PreparedCompositeComparisonRecipe,
+};
 
 mod nullsafe;
 pub use nullsafe::PreparedNullSafeComparisonRecipe;
