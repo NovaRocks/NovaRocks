@@ -378,7 +378,7 @@ fn record_flat_bits_sparse_ids_and_original_unlabelled_logical_field_roundtrip()
     assert_eq!(actual.value(1).to_bits(), bits[1]);
     assert!(actual.is_null(2));
     assert_eq!(actual.value(3).to_bits(), bits[3]);
-    let array: ArrayRef = Arc::new(arrow_array::LargeBinaryArray::from(vec![
+    let array: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
         Some(b"\x01\x42\x01".as_slice()),
         None,
         Some(b"\x01\x20".as_slice()),
@@ -633,7 +633,7 @@ fn record_field_value_pair_and_ipc_schema_mismatches_do_not_retag_or_reauthor() 
             .is_err()
         );
     }
-    let array: ArrayRef = Arc::new(arrow_array::LargeBinaryArray::from(vec![
+    let array: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
         b"\x01\x20".as_slice(),
     ]));
     let field = Arc::new(
