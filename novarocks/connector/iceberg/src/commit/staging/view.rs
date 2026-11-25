@@ -29,6 +29,7 @@ use crate::iceberg::spec::{ManifestList, Snapshot, TableMetadata};
 pub struct StagedView<'a> {
     metadata: &'a Arc<TableMetadata>,
     stage: usize,
+    round_parent: Option<i64>,
     intent: &'a OperationIntent,
     artifacts: &'a dyn ArtifactWriter,
     context: PreparationContext,
@@ -39,6 +40,7 @@ impl<'a> StagedView<'a> {
     pub(super) fn new(
         metadata: &'a Arc<TableMetadata>,
         stage: usize,
+        round_parent: Option<i64>,
         intent: &'a OperationIntent,
         artifacts: &'a dyn ArtifactWriter,
         context: PreparationContext,
@@ -47,6 +49,7 @@ impl<'a> StagedView<'a> {
         Self {
             metadata,
             stage,
+            round_parent,
             intent,
             artifacts,
             context,
@@ -55,6 +58,9 @@ impl<'a> StagedView<'a> {
     }
     pub fn metadata(&self) -> &TableMetadata {
         self.metadata
+    }
+    pub(crate) const fn round_parent(&self) -> Option<i64> {
+        self.round_parent
     }
     pub(crate) fn metadata_ref(&self) -> Arc<TableMetadata> {
         Arc::clone(self.metadata)

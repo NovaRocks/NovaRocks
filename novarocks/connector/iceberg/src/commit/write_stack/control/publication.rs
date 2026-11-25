@@ -309,6 +309,7 @@ struct WriteRecipe<'a> {
     equality_delete: bool,
     session_protocol: WriteSessionCommitProtocol,
     writer: WriterSchemaSpec,
+    mv_dependencies: Option<crate::commit::model::MvRefreshDependencies>,
     rewrite_removals: Option<Arc<[crate::commit::model::FrozenEntry]>>,
     start: Option<StartSnapshot>,
     target: TableTarget,
@@ -341,6 +342,7 @@ impl<'a> WriteRecipe<'a> {
     fn freeze(
         handle: &'a IcebergWriteCommitSession,
         documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
+        context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         use crate::commit::model::Dependency;
         let facts = handle.table();
@@ -393,6 +395,52 @@ impl<'a> WriteRecipe<'a> {
                 .map_err(|e| invalid(e.to_string()))?,
             uuid: Some(source.uuid()),
         };
+        let mv_dependencies = handle
+            .document_publication()
+            .map(|facts| {
+                use crate::commit::model::MvRefreshDependencies;
+                use crate::document_storage::{
+                    keyed::view::parse_properties, observation::keyed_read_error,
+                };
+                let documents = keyed_documents.as_ref().ok_or_else(|| {
+                    internal("Iceberg managed write lost its keyed publication document")
+                })?;
+                let observed = parse_properties(source.properties()).map_err(keyed_read_error)?;
+                let declaration = facts.declaration();
+                let mut roots: BTreeMap<_, _> = documents
+                    .roots
+                    .keys()
+                    .map(|name| {
+                        (
+                            name.clone(),
+                            observed.roots.get(name).map(|root| root.identity),
+                        )
+                    })
+                    .collect();
+                let mut slots = BTreeMap::new();
+                if let Some((owner, root)) = declaration.expected_root() {
+                    roots.insert(owner.to_owned(), Some(root));
+                    if context.initiation()
+                        == novarocks_spi::connector::ConnectorRequestInitiation::Background
+                        || handle.repartition().is_some()
+                    {
+                        let name = novarocks_spi::connector::ConnectorSlotName::try_new(
+                            owner,
+                            "configuration",
+                        )?;
+                        let slot = observed.slots.get(&name).ok_or_else(|| {
+                            corrupt("Managed refresh is missing its admitted configuration slot")
+                        })?;
+                        let digest = slot.value.digest(&name, slot.writer);
+                        slots.insert(name, Some(digest));
+                    }
+                }
+                if let Some(update) = declaration.slot_update() {
+                    slots.insert(update.name().clone(), Some(update.expected_old()));
+                }
+                Ok::<_, ConnectorError>(MvRefreshDependencies { roots, slots })
+            })
+            .transpose()?;
         let repartition = managed_repartition::Effect::freeze(handle, &source)?;
         Ok(Self {
             source,
@@ -402,6 +450,7 @@ impl<'a> WriteRecipe<'a> {
                 == crate::commit::write_stack::domain::IcebergWriteFlavor::EqualityDelete,
             session_protocol: handle.commit_protocol(),
             writer,
+            mv_dependencies,
             rewrite_removals: handle.frozen_rewrite_removals().cloned(),
             start: facts.base_snapshot_id().map(|id| StartSnapshot {
                 snapshot_id: id,
@@ -458,6 +507,16 @@ impl<'a> WriteRecipe<'a> {
                     })?),
                 },
             ),
+            WriteSessionCommitProtocol::RefreshMaterializedView(mode) => (
+                Vec::new(),
+                CommitProtocol::MvRefresh {
+                    mode,
+                    admitted: self.mv_dependencies.clone().ok_or_else(|| {
+                        format_error(internal("Iceberg refresh lost its admitted dependencies"))
+                    })?,
+                    writer: self.writer,
+                },
+            ),
             WriteSessionCommitProtocol::RowDelta(_) => {
                 let window = operation.row_delta_check().ok_or_else(|| {
                     format_error(internal(
@@ -490,10 +549,13 @@ impl<'a> WriteRecipe<'a> {
         .and_then(|intent| {
             let intent = intent.with_compact_stage(self.leading_stage().as_slice().len())?;
             Ok(
-                if matches!(self.session_protocol, WriteSessionCommitProtocol::Legacy)
+                if matches!(
+                    self.session_protocol,
+                    WriteSessionCommitProtocol::RefreshMaterializedView(_)
+                ) || (matches!(self.session_protocol, WriteSessionCommitProtocol::Legacy)
                     && self.summary.keys().any(|key| {
                         key.starts_with(crate::document_storage::keyed::keys::RECORD_PREFIX)
-                    })
+                    }))
                 {
                     intent.with_snapshot_loading(crate::catalog::SnapshotLoading::Refs)
                 } else {
@@ -595,11 +657,11 @@ impl Preparer for KeyedPublicationPreparer {
         let prepared = if self.full_refresh {
             // The staged append already names the new records. Validate the
             // actual attempt's preceding publication before adding their closure.
-            let predecessor = intent
-                .start()
-                .map(|base| {
-                    metadata.snapshot_by_id(base.snapshot_id).ok_or_else(|| {
-                        format_error(corrupt("Full refresh lost its original document snapshot"))
+            let predecessor = view
+                .round_parent()
+                .map(|parent| {
+                    metadata.snapshot_by_id(parent).ok_or_else(|| {
+                        format_error(corrupt("Full refresh lost its round's parent snapshot"))
                     })
                 })
                 .transpose()?;
@@ -765,7 +827,7 @@ impl IcebergWriteSessionControl {
     ) -> Result<ReceivedOperation<'a>, ConnectorError> {
         let (operation, journal) =
             self.adopt_compact_operation(handle, received.compact_files(), context)?;
-        let recipe = WriteRecipe::freeze(handle, documents).and_then(|mut recipe| {
+        let recipe = WriteRecipe::freeze(handle, documents, context).and_then(|mut recipe| {
             let validation = recipe
                 .session_protocol
                 .row_delta_isolation()

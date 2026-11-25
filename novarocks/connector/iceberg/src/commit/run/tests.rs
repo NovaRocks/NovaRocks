@@ -437,7 +437,7 @@ async fn keyed_full_zero_output_deletes_then_appends_an_empty_snapshot() {
 
 #[tokio::test]
 async fn full_refresh_lost_reply_recovers_only_the_marked_append() {
-    let fixture = publication_fixture(FormatVersion::V2, false, true).await;
+    let fixture = publication_fixture(FormatVersion::V2, false, true, None).await;
     let prepared = prepare_keyed(&fixture, b"result").await;
     let control = write_control(&fixture);
     let plan = control.begin_write(keyed_begin(&prepared)).unwrap();
@@ -851,8 +851,12 @@ async fn assert_keyed_unknown_retains_artifacts(fixture: Fixture, prepared: Prep
 }
 
 #[tokio::test]
-async fn keyed_conflict_cleans_owned_files_without_another_prepare() {
-    let fixture = keyed_fixture().await;
+async fn keyed_full_refresh_conflict_with_zero_retries_cleans_owned_files() {
+    use novarocks_failure_contract::{
+        FailureProjection, connector_reason::COMMIT_TRANSACTION_CONFLICT,
+    };
+
+    let fixture = publication_fixture(FormatVersion::V2, false, false, Some(0)).await;
     let prepared = prepare_keyed(&fixture, b"result").await;
     let control = write_control(&fixture);
     let plan = control.begin_write(keyed_begin(&prepared)).unwrap();
@@ -872,6 +876,7 @@ async fn keyed_conflict_cleans_owned_files_without_another_prepare() {
         failure.kind(),
         novarocks_spi::connector::ConnectorMutationFailureKind::Conflict
     );
+    assert_eq!(failure.failure_fact().reason(), COMMIT_TRANSACTION_CONFLICT);
     assert_eq!(fixture.catalog.commits().len(), 1);
     let snapshots = actual_snapshot_updates(&fixture);
     let [deleted, appended] = snapshots.as_slice() else {

@@ -52,8 +52,8 @@ pub use outcome::{
     RemainingArtifact,
 };
 pub(crate) use protocol::{
-    CommitOperation, CommitProtocol, CommitStyle, WindowValidation, WriteSessionCommitProtocol,
-    WriterSchemaSpec, validate_target_branch,
+    CommitOperation, CommitProtocol, CommitStyle, MvRefreshDependencies, MvRefreshMode,
+    WindowValidation, WriteSessionCommitProtocol, WriterSchemaSpec, validate_target_branch,
 };
 pub use request::{
     BaseIdentity, FrozenBaseFacts, FrozenRequest, FrozenRequestParts, RequestShape,

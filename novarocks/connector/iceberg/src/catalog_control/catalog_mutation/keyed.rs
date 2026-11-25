@@ -24,8 +24,8 @@ use crate::commit::attempt::prepared::{
 };
 use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
-    BaseIdentity, Dependency, FileChanges, FrozenRequest, OperationIntent, OperationIntentParts,
-    OperationToken, RequestShape, StartSnapshot, TableTarget,
+    BaseIdentity, CommitProtocol, Dependency, FileChanges, FrozenRequest, OperationIntent,
+    OperationIntentParts, OperationToken, RequestShape, StartSnapshot, TableTarget,
 };
 use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
 use crate::commit::slot_change::{
@@ -150,6 +150,66 @@ fn slot_change_evidence_target(
     }
 }
 
+fn mutation_intent(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    documents: &KeyedMutationIntent,
+    token: OperationToken,
+    summary: std::collections::BTreeMap<String, String>,
+) -> Result<OperationIntent, ConnectorError> {
+    let (shape, dependencies, protocol) = match &documents.mutation {
+        KeyedMutation::Markers(_) => (
+            RequestShape::MetadataOnly,
+            vec![Dependency::NoRead],
+            CommitProtocol::Legacy,
+        ),
+        KeyedMutation::SlotChange(change)
+        | KeyedMutation::SlotChangeWithTableProperties { change, .. } => {
+            let observed = keyed::view::parse_properties(metadata.properties())
+                .map_err(observation::keyed_read_error)?;
+            let slots = change
+                .slots
+                .keys()
+                .map(|name| {
+                    let digest = observed
+                        .slots
+                        .get(name)
+                        .map(|slot| slot.value.digest(name, slot.writer));
+                    (name.clone(), digest)
+                })
+                .collect();
+            (
+                RequestShape::SnapshotProducing,
+                Vec::new(),
+                CommitProtocol::MvAlterProperties { slots },
+            )
+        }
+        KeyedMutation::Expiry(_) => (
+            RequestShape::DocumentExpiry,
+            vec![Dependency::NoRead],
+            CommitProtocol::Legacy,
+        ),
+    };
+    OperationIntent::new(OperationIntentParts {
+        target: TableTarget {
+            ident: table_ident(documents.admission.target()).map_err(invalid)?,
+            uuid: Some(metadata.uuid()),
+        },
+        target_ref: "main".into(),
+        start: metadata.current_snapshot().map(|snapshot| StartSnapshot {
+            snapshot_id: snapshot.snapshot_id(),
+            sequence_number: snapshot.sequence_number(),
+        }),
+        changes: FileChanges::default(),
+        dependencies,
+        protocol,
+        shape,
+        summary,
+        token,
+    })
+    .map(|intent| intent.with_snapshot_loading(SnapshotLoading::Refs))
+    .map_err(|error| invalid(error.to_string()))
+}
+
 pub(super) fn execute(
     provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
@@ -241,36 +301,8 @@ pub(super) fn execute(
         OperationLimits::default(),
     )
     .map_err(|error| invalid(error.to_string()))?;
-    let shape = match &documents.mutation {
-        KeyedMutation::Markers(_) => RequestShape::MetadataOnly,
-        KeyedMutation::SlotChange(_) | KeyedMutation::SlotChangeWithTableProperties { .. } => {
-            RequestShape::SnapshotProducing
-        }
-        KeyedMutation::Expiry(_) => RequestShape::DocumentExpiry,
-    };
-    let intent = OperationIntent::new(OperationIntentParts {
-        target: TableTarget {
-            ident: table_ident(target).map_err(invalid)?,
-            uuid: Some(metadata.uuid()),
-        },
-        target_ref: "main".into(),
-        start: metadata.current_snapshot().map(|snapshot| StartSnapshot {
-            snapshot_id: snapshot.snapshot_id(),
-            sequence_number: snapshot.sequence_number(),
-        }),
-        changes: FileChanges::default(),
-        dependencies: vec![if shape == RequestShape::SnapshotProducing {
-            Dependency::RefUnchanged
-        } else {
-            Dependency::NoRead
-        }],
-        protocol: crate::commit::model::CommitProtocol::Legacy,
-        shape,
-        summary,
-        token: operation.token(),
-    })
-    .map_err(|error| invalid(error.to_string()))?
-    .with_snapshot_loading(SnapshotLoading::Refs);
+    let intent = mutation_intent(&metadata, documents, operation.token(), summary)?;
+    let shape = intent.shape();
     let policy = RetryPolicy::from_properties(metadata.properties())
         .map_err(|error| invalid(error.to_string()))?;
     let journal = PublicationJournal::for_runtime(operation.token(), operation.runtime());
@@ -619,36 +651,8 @@ pub(super) async fn execute_async(
         OperationLimits::default(),
     )
     .map_err(|error| invalid(error.to_string()))?;
-    let shape = match &documents.mutation {
-        KeyedMutation::Markers(_) => RequestShape::MetadataOnly,
-        KeyedMutation::SlotChange(_) | KeyedMutation::SlotChangeWithTableProperties { .. } => {
-            RequestShape::SnapshotProducing
-        }
-        KeyedMutation::Expiry(_) => RequestShape::DocumentExpiry,
-    };
-    let intent = OperationIntent::new(OperationIntentParts {
-        target: TableTarget {
-            ident: table_ident(target).map_err(invalid)?,
-            uuid: Some(metadata.uuid()),
-        },
-        target_ref: "main".into(),
-        start: metadata.current_snapshot().map(|snapshot| StartSnapshot {
-            snapshot_id: snapshot.snapshot_id(),
-            sequence_number: snapshot.sequence_number(),
-        }),
-        changes: FileChanges::default(),
-        dependencies: vec![if shape == RequestShape::SnapshotProducing {
-            Dependency::RefUnchanged
-        } else {
-            Dependency::NoRead
-        }],
-        protocol: crate::commit::model::CommitProtocol::Legacy,
-        shape,
-        summary,
-        token: operation.token(),
-    })
-    .map_err(|error| invalid(error.to_string()))?
-    .with_snapshot_loading(SnapshotLoading::Refs);
+    let intent = mutation_intent(&metadata, documents, operation.token(), summary)?;
+    let shape = intent.shape();
     let policy = RetryPolicy::from_properties(metadata.properties())
         .map_err(|error| invalid(error.to_string()))?;
     let journal = PublicationJournal::for_runtime(operation.token(), operation.runtime());

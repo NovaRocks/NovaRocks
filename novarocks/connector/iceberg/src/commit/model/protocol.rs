@@ -20,7 +20,8 @@
 use super::{FrozenEntry, IsolationLevel};
 use crate::commit::dependency::RowDeltaWindowCheck;
 use crate::iceberg::{TableRequirement, spec::TableMetadata};
-use std::sync::Arc;
+use novarocks_spi::connector::{ConnectorSlotName, DocumentIdentity};
+use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommitOperation {
@@ -33,6 +34,8 @@ pub(crate) enum CommitOperation {
     Delete,
     OptimizeManifests,
     ExpireSnapshots,
+    RefreshMaterializedView,
+    AlterMaterializedViewProperties,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,12 +49,16 @@ impl CommitOperation {
     pub(crate) const fn style(self) -> CommitStyle {
         match self {
             Self::Legacy => CommitStyle::Legacy,
-            Self::Write | Self::Insert | Self::CreateTable | Self::Optimize => {
-                CommitStyle::Transaction
-            }
-            Self::Truncate | Self::Delete | Self::OptimizeManifests | Self::ExpireSnapshots => {
-                CommitStyle::Update
-            }
+            Self::Write
+            | Self::Insert
+            | Self::CreateTable
+            | Self::Optimize
+            | Self::RefreshMaterializedView => CommitStyle::Transaction,
+            Self::Truncate
+            | Self::Delete
+            | Self::OptimizeManifests
+            | Self::ExpireSnapshots
+            | Self::AlterMaterializedViewProperties => CommitStyle::Update,
         }
     }
 }
@@ -83,7 +90,28 @@ pub(crate) enum WriteSessionCommitProtocol {
     Append,
     RowDelta(IsolationLevel),
     RewriteFiles,
+    RefreshMaterializedView(MvRefreshMode),
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MvRefreshMode {
+    Full,
+    Repartition,
+    Incremental,
+    MetadataOnly,
+}
+
+/// Digests include the slot writer as well as the slot's format and value.
+pub(crate) type SlotExpectations = BTreeMap<ConnectorSlotName, Option<DocumentIdentity>>;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MvRefreshDependencies {
+    pub(crate) roots: BTreeMap<String, Option<DocumentIdentity>>,
+    pub(crate) slots: SlotExpectations,
+}
+
+pub(crate) const MV_MAIN_ADVANCED: &str =
+    "Materialized view storage table changed during incremental refresh";
 
 impl WriteSessionCommitProtocol {
     pub(crate) const fn operation(self) -> CommitOperation {
@@ -92,12 +120,15 @@ impl WriteSessionCommitProtocol {
             Self::Append => CommitOperation::Insert,
             Self::RowDelta(_) => CommitOperation::Write,
             Self::RewriteFiles => CommitOperation::Optimize,
+            Self::RefreshMaterializedView(_) => CommitOperation::RefreshMaterializedView,
         }
     }
 
     pub(crate) const fn row_delta_isolation(self) -> Option<IsolationLevel> {
         match self {
-            Self::Legacy | Self::Append | Self::RewriteFiles => None,
+            Self::Legacy | Self::Append | Self::RewriteFiles | Self::RefreshMaterializedView(_) => {
+                None
+            }
             Self::RowDelta(isolation) => Some(isolation),
         }
     }
@@ -106,6 +137,7 @@ impl WriteSessionCommitProtocol {
 // Design: ADR-0251 (docs/adr/ADR-0251-iceberg-maintenance-commits-by-operation.md)
 /// Encodes only combinations authored by their operation.
 #[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
 pub(crate) enum CommitProtocol {
     Legacy,
     CreateTable,
@@ -122,6 +154,14 @@ pub(crate) enum CommitProtocol {
         replaced: Arc<[FrozenEntry]>,
         output_spec_id: i32,
     },
+    MvRefresh {
+        mode: MvRefreshMode,
+        admitted: MvRefreshDependencies,
+        writer: WriterSchemaSpec,
+    },
+    MvAlterProperties {
+        slots: SlotExpectations,
+    },
 }
 
 impl CommitProtocol {
@@ -134,6 +174,8 @@ impl CommitProtocol {
             Self::Delete => CommitOperation::Delete,
             Self::RowDelta { .. } => CommitOperation::Write,
             Self::RewriteFiles { .. } => CommitOperation::Optimize,
+            Self::MvRefresh { .. } => CommitOperation::RefreshMaterializedView,
+            Self::MvAlterProperties { .. } => CommitOperation::AlterMaterializedViewProperties,
         }
     }
 
@@ -143,7 +185,9 @@ impl CommitProtocol {
             | Self::CreateTable
             | Self::Append { .. }
             | Self::Truncate
-            | Self::Delete => WindowValidation::None,
+            | Self::Delete
+            | Self::MvRefresh { .. }
+            | Self::MvAlterProperties { .. } => WindowValidation::None,
             Self::RowDelta { window, .. } => WindowValidation::RowDelta(window),
             Self::RewriteFiles { replaced, .. } => WindowValidation::RewriteFiles(replaced),
         }
@@ -156,8 +200,9 @@ impl CommitProtocol {
             | Self::Append { .. }
             | Self::Truncate
             | Self::Delete
-            | Self::RewriteFiles { .. } => None,
-            Self::RowDelta { writer, .. } => Some(*writer),
+            | Self::RewriteFiles { .. }
+            | Self::MvAlterProperties { .. } => None,
+            Self::RowDelta { writer, .. } | Self::MvRefresh { writer, .. } => Some(*writer),
         }
     }
 
@@ -172,15 +217,42 @@ impl CommitProtocol {
             | Self::CreateTable
             | Self::Truncate
             | Self::Delete
-            | Self::RowDelta { .. } => None,
+            | Self::RowDelta { .. }
+            | Self::MvRefresh { .. }
+            | Self::MvAlterProperties { .. } => None,
         }
     }
 
     pub(crate) const fn requires_target_branch(&self) -> bool {
         matches!(
             self,
-            Self::Truncate | Self::Delete | Self::RewriteFiles { .. }
+            Self::Truncate
+                | Self::Delete
+                | Self::RewriteFiles { .. }
+                | Self::MvRefresh { .. }
+                | Self::MvAlterProperties { .. }
         )
+    }
+
+    pub(crate) const fn is_mv(&self) -> bool {
+        matches!(
+            self,
+            Self::MvRefresh { .. } | Self::MvAlterProperties { .. }
+        )
+    }
+
+    pub(crate) const fn fixed_mv_main(&self) -> Option<&'static str> {
+        match self {
+            Self::MvRefresh {
+                mode: MvRefreshMode::Incremental | MvRefreshMode::MetadataOnly,
+                ..
+            } => Some(MV_MAIN_ADVANCED),
+            Self::MvRefresh {
+                mode: MvRefreshMode::Repartition,
+                ..
+            } => Some("Materialized view storage table changed during repartition"),
+            _ => None,
+        }
     }
 }
 

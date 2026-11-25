@@ -2562,11 +2562,28 @@ impl IcebergWriteCommitSession {
             session_id,
             creation_scope: None,
             mutation_read: None,
-            commit_protocol: match flavor {
-                IcebergWriteFlavor::Append => {
+            commit_protocol: match (flavor, &document_publication) {
+                (_, Some(publication)) => {
+                    use crate::commit::model::{MvRefreshMode, WriteSessionCommitProtocol};
+                    let mode = if repartition.is_some() {
+                        MvRefreshMode::Repartition
+                    } else {
+                        match publication.technique() {
+                            ConnectorManagedPublicationTechnique::Full => MvRefreshMode::Full,
+                            ConnectorManagedPublicationTechnique::Incremental => {
+                                MvRefreshMode::Incremental
+                            }
+                            ConnectorManagedPublicationTechnique::MetadataOnly => {
+                                MvRefreshMode::MetadataOnly
+                            }
+                        }
+                    };
+                    WriteSessionCommitProtocol::RefreshMaterializedView(mode)
+                }
+                (IcebergWriteFlavor::Append, None) => {
                     crate::commit::model::WriteSessionCommitProtocol::Append
                 }
-                flavor if flavor.is_distributed_rewrite() => {
+                (flavor, None) if flavor.is_distributed_rewrite() => {
                     crate::commit::model::WriteSessionCommitProtocol::RewriteFiles
                 }
                 _ => crate::commit::model::WriteSessionCommitProtocol::Legacy,

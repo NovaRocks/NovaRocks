@@ -1112,7 +1112,7 @@ async fn frontend_refresh_publication_intent(
         attempt.publication_id,
         projection.facts.source_revision().target_object_id.clone(),
         expected_target_snapshot(contract),
-        admitted.admission().clone(),
+        admitted,
         MvRefreshPublicationTechnique::Full,
         &snapshots,
         base_table_object_ids,
@@ -1243,7 +1243,7 @@ async fn prepare_metadata_only_publication(
         attempt.publication_id,
         projection.facts.source_revision().target_object_id.clone(),
         expected_target_snapshot(contract),
-        admitted.admission().clone(),
+        &admitted,
         MvRefreshPublicationTechnique::MetadataOnly,
         &snapshots,
         base_table_object_ids,
@@ -1309,7 +1309,7 @@ async fn mv_refresh_publication_intent(
     publication_id: novarocks_spi::connector::LakePublicationId,
     target_object_id: ConnectorTableObjectId,
     expected_target_snapshot_id: Option<i64>,
-    admission: novarocks_spi::connector::document_storage::ConnectorDocumentManagementAdmission,
+    admitted: &crate::mv::domain::staged_create::AdmittedMvPublication,
     technique: MvRefreshPublicationTechnique,
     snapshots: &BTreeMap<SqlMvRelationOccurrenceId, (novarocks_types::naming::TableIdentity, i64)>,
     base_table_object_ids: &BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
@@ -1355,7 +1355,7 @@ async fn mv_refresh_publication_intent(
         publication_id,
         target_object_id,
         expected_target_snapshot_id,
-        admission,
+        admitted.admission().clone(),
         technique,
         bases,
         definition_fingerprint,
@@ -1363,6 +1363,7 @@ async fn mv_refresh_publication_intent(
         target_namespace,
         target_name,
     )
+    .map(|intent| intent.with_expected_root(admitted.root_binding()))
     .map_err(PreparationError::from)
 }
 
@@ -1630,7 +1631,7 @@ async fn prepare_frontend_incremental_write(
                 .target_object_id
                 .clone(),
             *target_snapshot_id,
-            admitted_publication.admission().clone(),
+            &admitted_publication,
             MvRefreshPublicationTechnique::Incremental,
             &rewrite.pinned_snapshots_by_occurrence()?,
             &rewrite.pinned_objects_by_occurrence()?,
@@ -1809,7 +1810,7 @@ async fn prepare_frontend_incremental_write(
             .target_object_id
             .clone(),
         *target_snapshot_id,
-        admitted_publication.admission().clone(),
+        &admitted_publication,
         MvRefreshPublicationTechnique::Incremental,
         &rewrite.pinned_snapshots_by_occurrence()?,
         &rewrite.pinned_objects_by_occurrence()?,

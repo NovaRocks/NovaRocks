@@ -584,6 +584,17 @@ pub(crate) fn document_publication_declaration(
         publication.storage_projection_digest(),
     )
     .map_err(|error| format!("build the MV document publication declaration: {error}"))?;
+    let declaration = if let Some(binding) = publication.expected_root() {
+        declaration
+            .with_expected_root(
+                novarocks_mv_application::persistence::keyed_documents::MV_DOCUMENT_OWNER
+                    .to_owned(),
+                binding,
+            )
+            .map_err(|error| format!("bind the original MV root to publication: {error}"))?
+    } else {
+        declaration
+    };
     match publication.configuration_slot_update() {
         Some(update) => declaration
             .with_slot_update(update.clone())

@@ -1178,7 +1178,7 @@ pub(crate) mod preparer_tests {
                 start: intent.start(),
                 changes: intent.changes().clone(),
                 dependencies: intent.dependencies().to_vec(),
-                protocol: crate::commit::model::CommitProtocol::Legacy,
+                protocol: intent.protocol().clone(),
                 shape: intent.shape(),
                 summary: intent.summary().clone(),
                 token: operation.token(),

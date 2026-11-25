@@ -114,6 +114,15 @@ impl OperationIntent {
                 "Append requires a snapshot operation without a read dependency",
             ));
         }
+        if parts.protocol.is_mv()
+            && (parts.shape != RequestShape::SnapshotProducing
+                || parts.target_ref != "main"
+                || !parts.dependencies.is_empty())
+        {
+            return Err(invalid(
+                "Materialized view protocol requires a snapshot-producing main intent",
+            ));
+        }
         if matches!(&parts.protocol, CommitProtocol::CreateTable)
             && parts.shape != RequestShape::Create
         {
@@ -157,6 +166,7 @@ impl OperationIntent {
         self.shape() != RequestShape::Create
             && self.shape() != RequestShape::DocumentExpiry
             && !self.dependencies().contains(&Dependency::RefUnchanged)
+            && self.protocol().fixed_mv_main().is_none()
     }
     pub(crate) const fn protocol(&self) -> &CommitProtocol {
         &self.parts.protocol

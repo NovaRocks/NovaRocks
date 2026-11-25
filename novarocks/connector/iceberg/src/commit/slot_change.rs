@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Main-conditioned, zero-file slot changes. No conflict may rebase this intent.
+//! Zero-file slot changes carry the observed round's records and assert its main.
 // Design: ADR-0180 (docs/adr/ADR-0180-inline-keyed-documents-and-snapshot-records.md)
 
 use super::{
-    model::{Dependency, OperationIntent, RequestShape},
+    model::{CommitProtocol, OperationIntent, RequestShape},
     staging::{PreparedChange, Preparer, StagedView},
 };
 use crate::document_storage::keyed::{envelope, keys, record, view};
@@ -133,13 +133,13 @@ impl Preparer for SlotChangePreparer {
         self.change.validate().map_err(document_error)?;
         if intent.shape() != RequestShape::SnapshotProducing
             || intent.target_ref() != "main"
-            || !intent.dependencies().contains(&Dependency::RefUnchanged)
+            || !matches!(intent.protocol(), CommitProtocol::MvAlterProperties { .. })
             || !intent.changes().added.is_empty()
             || !intent.changes().removed.is_empty()
         {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
-                "Slot change requires a ref-frozen, zero-file main intent",
+                "Slot change requires a zero-file alter materialized view properties intent on main",
             ));
         }
         if intent
@@ -255,8 +255,10 @@ mod tests {
                 sequence_number: s.sequence_number(),
             }),
             changes: FileChanges::default(),
-            dependencies: vec![Dependency::RefUnchanged],
-            protocol: crate::commit::model::CommitProtocol::Legacy,
+            dependencies: Vec::new(),
+            protocol: CommitProtocol::MvAlterProperties {
+                slots: Default::default(),
+            },
             shape: RequestShape::SnapshotProducing,
             summary,
             token: fixture.operation.token(),

@@ -1855,7 +1855,7 @@ async fn unknown_reused_manifest_request_retains_all_possible_operation_outputs(
     assert_eq!(publisher.requests.lock().unwrap().len(), 1);
 }
 #[tokio::test]
-async fn slot_conflict_deletes_its_one_new_list_without_reprepare_or_source_cleanup() {
+async fn slot_conflict_reprepares_without_deleting_source() {
     use crate::commit::model::StartSnapshot;
     use crate::commit::slot_change::SlotChangePreparer;
     use bytes::Bytes;
@@ -1894,8 +1894,13 @@ async fn slot_conflict_deletes_its_one_new_list_without_reprepare_or_source_clea
             sequence_number: snapshot.sequence_number(),
         }),
         changes: FileChanges::default(),
-        dependencies: vec![Dependency::RefUnchanged],
-        protocol: crate::commit::model::CommitProtocol::Legacy,
+        dependencies: Vec::new(),
+        protocol: crate::commit::model::CommitProtocol::MvAlterProperties {
+            slots: std::collections::BTreeMap::from([(
+                ConnectorSlotName::try_new("novarocks.mv", "configuration").unwrap(),
+                None,
+            )]),
+        },
         shape: RequestShape::SnapshotProducing,
         summary: Default::default(),
         token: fixture.operation.token(),
@@ -1914,12 +1919,14 @@ async fn slot_conflict_deletes_its_one_new_list_without_reprepare_or_source_clea
             markers_remove: Default::default(),
         },
     };
-    // Deliberately retain the same main in the injected catalog conflict. A
-    // mistaken retry would otherwise pass RefUnchanged and commit attempt 2.
+    // The new main keeps the configuration slot unchanged.
+    let competitor = Fixture::new();
+    let raced = append_state(&competitor, metadata.clone(), 3).await;
+    let raced_parent = raced.current_snapshot_id().unwrap();
     let publisher = ControlledPublisher::new(
         &fixture,
         metadata.clone(),
-        Dispatch::ConflictThen(Box::new(metadata)),
+        Dispatch::ConflictThen(Box::new(raced)),
     );
     let counted = CountingPreparer {
         inner: &preparer,
@@ -1934,26 +1941,28 @@ async fn slot_conflict_deletes_its_one_new_list_without_reprepare_or_source_clea
         policy(),
     )
     .await;
-    let PublicationOutcome::KnownUncommitted(failure) = report.publication else {
-        panic!("slot conflict must terminate the operation");
-    };
-    assert_eq!(failure.kind(), ConnectorMutationFailureKind::Conflict);
+    assert!(matches!(
+        report.publication,
+        PublicationOutcome::Committed(_)
+    ));
     assert_eq!(
         report.cleanup,
         IcebergCleanupReport::Complete { deleted: 1 }
     );
     assert_eq!(publisher.loads.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        *publisher.load_modes.lock().unwrap(),
-        vec![
-            crate::catalog::SnapshotLoading::All,
-            crate::catalog::SnapshotLoading::Refs
-        ]
-    );
-    assert_eq!(counted.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(failure.message(), "Injected concurrent catalog commit");
+    assert_eq!(counted.calls.load(Ordering::SeqCst), 2);
     let requests = publisher.requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]["requirements"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!({
+                "type": "assert-ref-snapshot-id",
+                "ref": "main",
+                "snapshot-id": raced_parent
+            }))
+    );
     let list = requests[0]["updates"]
         .as_array()
         .unwrap()
@@ -1963,7 +1972,6 @@ async fn slot_conflict_deletes_its_one_new_list_without_reprepare_or_source_clea
         .as_str()
         .unwrap();
     assert!(!std::path::Path::new(list.strip_prefix("file://").unwrap()).exists());
-    assert!(fixture.operation.artifacts().unwrap().is_empty());
     for original in source_objects {
         assert!(std::path::Path::new(original.strip_prefix("file://").unwrap()).exists());
     }
@@ -2816,3 +2824,262 @@ async fn rewrite_policy_reuses_its_previous_group_before_considering_concurrent_
 mod new_manifest_reuse;
 mod statistics_carry_ledger;
 mod terminal_cleanup;
+
+fn mv_refresh_intent(
+    fixture: &Fixture,
+    metadata: &TableMetadata,
+    mode: super::super::model::MvRefreshMode,
+    admitted: super::super::model::MvRefreshDependencies,
+) -> OperationIntent {
+    OperationIntent::new(OperationIntentParts {
+        target: TableTarget {
+            ident: crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+            uuid: Some(metadata.uuid()),
+        },
+        target_ref: "main".into(),
+        start: metadata
+            .current_snapshot()
+            .map(|snapshot| super::super::model::StartSnapshot {
+                snapshot_id: snapshot.snapshot_id(),
+                sequence_number: snapshot.sequence_number(),
+            }),
+        changes: FileChanges::default(),
+        dependencies: Vec::new(),
+        protocol: CommitProtocol::MvRefresh {
+            mode,
+            admitted,
+            writer: super::super::model::WriterSchemaSpec {
+                schema_id: metadata.current_schema_id(),
+                default_spec_id: metadata.default_partition_spec_id(),
+            },
+        },
+        shape: RequestShape::SnapshotProducing,
+        summary: Default::default(),
+        token: fixture.operation.token(),
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn mv_full_refresh_retries_both_stages_with_round_main_and_original_writer() {
+    use super::super::model::MvRefreshMode;
+    use novarocks_failure_contract::{
+        FailureProjection, connector_reason::COMMIT_TRANSACTION_CONFLICT,
+    };
+
+    let initial = Fixture::new();
+    let base = append_state(&initial, initial.metadata(FormatVersion::V3), 2).await;
+    let competitor = Fixture::new();
+    let raced = append_state(&competitor, base.clone(), 4).await;
+    for retries in [0, 1] {
+        let fixture = Fixture::new();
+        let intent = mv_refresh_intent(&fixture, &base, MvRefreshMode::Full, Default::default());
+        let publisher = ControlledPublisher::new(
+            &fixture,
+            base.clone(),
+            Dispatch::ConflictThen(Box::new(raced.clone())),
+        );
+        let delete = crate::commit::filter_delete::FilterDeletePreparer::for_full_refresh();
+        let append = crate::commit::fast_append::FullRefreshAppendFixture(None);
+        let policy = RetryPolicy::from_properties(&HashMap::from([
+            ("commit.retry.num-retries".into(), retries.to_string()),
+            ("commit.retry.min-wait-ms".into(), "0".into()),
+            ("commit.retry.max-wait-ms".into(), "0".into()),
+        ]))
+        .unwrap();
+        let report = run(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&delete, &append],
+            &publisher,
+            policy,
+        )
+        .await;
+        if retries == 0 {
+            let PublicationOutcome::KnownUncommitted(failure) = report.publication else {
+                panic!("expected terminal full refresh conflict");
+            };
+            assert_eq!(failure.failure_fact().reason(), COMMIT_TRANSACTION_CONFLICT);
+            assert!(
+                failure
+                    .connector_source()
+                    .unwrap()
+                    .public_failure_detail()
+                    .unwrap()
+                    .starts_with(
+                        "Failed to commit the transaction during refresh materialized view: "
+                    )
+            );
+        } else {
+            assert!(matches!(
+                report.publication,
+                PublicationOutcome::Committed(_)
+            ));
+        }
+
+        let requests = publisher.requests.lock().unwrap();
+        assert_eq!(requests.len(), retries + 1);
+        for (request, parent) in requests.iter().zip([&base, &raced]) {
+            let reqs = request["requirements"].as_array().unwrap();
+            assert!(reqs.contains(&serde_json::json!({
+                "type": "assert-table-uuid", "uuid": base.uuid().to_string()
+            })));
+            assert!(reqs.contains(&serde_json::json!({
+                "type": "assert-ref-snapshot-id", "ref": "main",
+                "snapshot-id": parent.current_snapshot_id()
+            })));
+            assert!(reqs.contains(&serde_json::json!({
+                "type": "assert-current-schema-id", "current-schema-id": base.current_schema_id()
+            })));
+            assert!(reqs.contains(&serde_json::json!({
+                "type": "assert-default-spec-id", "default-spec-id": base.default_partition_spec_id()
+            })));
+            let snapshots: Vec<_> = request["updates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|update| update["action"] == "add-snapshot")
+                .map(|update| &update["snapshot"])
+                .collect();
+            assert_eq!(snapshots.len(), 2);
+            assert_eq!(
+                snapshots[0]["parent-snapshot-id"],
+                parent.current_snapshot_id().unwrap()
+            );
+            assert_eq!(
+                snapshots[1]["parent-snapshot-id"],
+                snapshots[0]["snapshot-id"]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn mv_fixed_main_diagnoses_only_a_definite_same_object_advance() {
+    use super::super::model::MvRefreshMode;
+    use novarocks_failure_contract::{
+        FailureProjection, connector_reason::ICEBERG_COMMIT_VALIDATION_CONFLICT,
+    };
+
+    let initial = Fixture::new();
+    let base = append_state(&initial, initial.metadata(FormatVersion::V3), 2).await;
+    let competitor = Fixture::new();
+    let raced = append_state(&competitor, base.clone(), 4).await;
+    for mode in [
+        MvRefreshMode::Incremental,
+        MvRefreshMode::MetadataOnly,
+        MvRefreshMode::Repartition,
+    ] {
+        for (metadata, dispatch, loads, requests, advanced) in [
+            (&raced, Dispatch::Commit, 1, 0, true),
+            (
+                &base,
+                Dispatch::UpdateBeforeRequirements(Box::new(raced.clone())),
+                2,
+                1,
+                true,
+            ),
+            (
+                &base,
+                Dispatch::ConflictThen(Box::new(base.clone())),
+                2,
+                1,
+                false,
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let intent = mv_refresh_intent(&fixture, &base, mode, Default::default());
+            let publisher = ControlledPublisher::new(&fixture, metadata.clone(), dispatch);
+            let PublicationOutcome::KnownUncommitted(failure) =
+                invoke(&fixture, &intent, &publisher).await.publication
+            else {
+                panic!("expected definite fixed-main conflict");
+            };
+            assert_eq!(publisher.loads.load(Ordering::SeqCst), loads);
+            assert_eq!(publisher.requests.lock().unwrap().len(), requests);
+            if advanced {
+                assert_eq!(
+                    failure.failure_fact().reason(),
+                    ICEBERG_COMMIT_VALIDATION_CONFLICT
+                );
+                assert_eq!(
+                    failure.message(),
+                    intent.protocol().fixed_mv_main().unwrap()
+                );
+            } else {
+                assert_eq!(failure.message(), "Injected concurrent catalog commit");
+            }
+        }
+    }
+    let fixture = Fixture::new();
+    let intent = mv_refresh_intent(
+        &fixture,
+        &base,
+        MvRefreshMode::Incremental,
+        Default::default(),
+    );
+    let publisher = ControlledPublisher::new(&fixture, base, Dispatch::Unknown);
+    assert!(matches!(
+        invoke(&fixture, &intent, &publisher).await.publication,
+        PublicationOutcome::Unknown { .. }
+    ));
+    assert_eq!(publisher.loads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn mv_full_refresh_rejects_same_value_configuration_from_another_writer() {
+    use super::super::model::{MvRefreshDependencies, MvRefreshMode};
+    use crate::document_storage::keyed::{envelope::encode_slot, keys::slot_key};
+    use novarocks_failure_contract::{
+        FailureProjection, connector_reason::ICEBERG_COMMIT_VALIDATION_CONFLICT,
+    };
+    use novarocks_spi::connector::{
+        ConnectorDocumentFormat, ConnectorSlotName, ConnectorSlotValue,
+    };
+
+    let fixture = Fixture::new();
+    let base = fixture.metadata(FormatVersion::V3);
+    let name = ConnectorSlotName::try_new("novarocks.mv", "configuration").unwrap();
+    let value = ConnectorSlotValue {
+        format: ConnectorDocumentFormat::try_new("novarocks.mv", "configuration", 1).unwrap(),
+        content: bytes::Bytes::from_static(b"active"),
+    };
+    let base = base
+        .into_builder(None)
+        .set_properties(HashMap::from([(
+            slot_key(&name),
+            encode_slot(&name, &value, Some(21)).unwrap(),
+        )]))
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+    let intent = mv_refresh_intent(
+        &fixture,
+        &base,
+        MvRefreshMode::Full,
+        MvRefreshDependencies {
+            roots: Default::default(),
+            slots: std::collections::BTreeMap::from([(
+                name.clone(),
+                Some(value.digest(&name, Some(20))),
+            )]),
+        },
+    );
+    let publisher = ControlledPublisher::new(&fixture, base, Dispatch::Commit);
+    let PublicationOutcome::KnownUncommitted(failure) =
+        invoke(&fixture, &intent, &publisher).await.publication
+    else {
+        panic!("a same-value configuration rewrite must invalidate the frozen writer");
+    };
+    assert_eq!(
+        failure.failure_fact().reason(),
+        ICEBERG_COMMIT_VALIDATION_CONFLICT
+    );
+    assert_eq!(
+        failure.message(),
+        "Materialized view slot value or writer changed since admission"
+    );
+    assert!(publisher.requests.lock().unwrap().is_empty());
+}

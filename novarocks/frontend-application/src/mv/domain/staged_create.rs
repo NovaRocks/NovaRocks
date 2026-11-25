@@ -1623,6 +1623,10 @@ impl AdmittedMvPublication {
         &self.admission
     }
 
+    pub(crate) fn root_binding(&self) -> novarocks_spi::connector::DocumentIdentity {
+        self.versions.binding.identity()
+    }
+
     pub(crate) const fn configuration_slot_update(
         &self,
     ) -> Option<&ConnectorDocumentPublicationSlotUpdate> {
