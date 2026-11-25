@@ -936,7 +936,7 @@ fn visit<E: From<CopyError>>(
                 })?;
                 let selection = full_child_selection(&children, work)?;
                 if let Some(invoice) = work.3.as_deref_mut() {
-                    invoice.original_dictionary_merge_scratch(&children, key, sources.len())?;
+                    invoice.original_dictionary_merge_scratch(&children, key, sources)?;
                 }
                 // Original merge/interleave produces at most the full values
                 // domain; original fallback concatenates that domain. No key or

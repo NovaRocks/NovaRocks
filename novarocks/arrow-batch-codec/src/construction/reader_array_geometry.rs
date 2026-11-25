@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Pinned Arrow60.1.0 RecordBatchDecoder public array/header construction.
+//! Pinned Arrow 60.2.0 RecordBatchDecoder public array/header construction.
 //! This model reads only the already constructed, verified source schema and the
 //! borrowed record metadata; it never authors execution semantics.
 use super::reader_geometry::ReaderStructureFailure;
@@ -955,90 +955,42 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         self.body(ty, class)?;
         Ok(facts)
     }
-    fn field_lookup(
+    fn dictionary_value_in_field<'a>(
         &mut self,
-        field: &arrow_schema::Field,
-    ) -> Result<usize, ReaderStructureFailure<H>> {
-        // Original Field::fields starts vec![self], recursively builds the
-        // descendants, then appends them. fields_with_dict_id filters that
-        // owning Vec in place without allocating a second reference table.
-        self.array::<&arrow_schema::Field>(1, ReaderArrayHeaderClass::Temporary)?;
-        let descendants = self.descendant_lookup(field.data_type())?;
-        if descendants != 0 {
-            let growth = original_resize_growth::<&arrow_schema::Field>(
-                1,
-                1,
-                descendants
-                    .checked_add(1)
-                    .ok_or(LayoutResourceError::Arithmetic)?,
-            )?;
-            if let Some(layout) = growth.requested_backing {
-                self.layout(layout, ReaderArrayHeaderClass::Temporary)?;
-            }
-        }
+        field: &'a arrow_schema::Field,
+        id: i64,
+    ) -> Result<Option<&'a DataType>, ReaderStructureFailure<H>> {
         self.step()?;
-        descendants
-            .checked_add(1)
-            .ok_or(LayoutResourceError::Arithmetic.into())
+        #[expect(
+            deprecated,
+            reason = "Arrow IPC readers use Field dictionary IDs; the prepared recipe reconstructs the same IDs"
+        )]
+        if field.dict_id() == Some(id)
+            && let DataType::Dictionary(_, value) = field.data_type()
+        {
+            return Ok(Some(value));
+        }
+        self.dictionary_value_in_children(field.data_type(), id)
     }
-    fn flat_segment<T>(
+
+    fn dictionary_value_in_children<'a>(
         &mut self,
-        length: &mut usize,
-        capacity: &mut usize,
-        count: usize,
-    ) -> Result<(), ReaderStructureFailure<H>> {
-        if count == 0 {
-            return Ok(());
-        }
-        let target = length
-            .checked_add(count)
-            .ok_or(LayoutResourceError::Arithmetic)?;
-        if *length == 0 {
-            // FlatMap's first owning inner IntoIter exposes its remaining lower
-            // size hint. SpecFromIter reserves the WHOLE first segment (min4),
-            // rather than fabricating a sequence of tiny growth allocations.
-            let minimum = original_resize_growth::<T>(0, 0, 1)?.requested_capacity;
-            *capacity = count.max(minimum);
-            self.array::<T>(*capacity, ReaderArrayHeaderClass::Temporary)?;
-            *length = 1;
-            self.step()?;
-        }
-        while *length < target {
-            let next = length
-                .checked_add(1)
-                .ok_or(LayoutResourceError::Arithmetic)?;
-            let growth = original_resize_growth::<T>(*length, *capacity, next)?;
-            if let Some(layout) = growth.requested_backing {
-                self.layout(layout, ReaderArrayHeaderClass::Temporary)?;
-            }
-            *length = next;
-            *capacity = growth.requested_capacity;
-            self.step()?;
-        }
-        Ok(())
-    }
-    fn descendant_lookup(&mut self, ty: &DataType) -> Result<usize, ReaderStructureFailure<H>> {
-        let mut descendants = 0usize;
-        let mut capacity = 0usize;
+        ty: &'a DataType,
+        id: i64,
+    ) -> Result<Option<&'a DataType>, ReaderStructureFailure<H>> {
         match ty {
             DataType::Struct(fields) => {
-                for field in fields {
-                    let count = self.field_lookup(field)?;
-                    self.flat_segment::<&arrow_schema::Field>(
-                        &mut descendants,
-                        &mut capacity,
-                        count,
-                    )?;
+                for child in fields {
+                    if let Some(value) = self.dictionary_value_in_field(child, id)? {
+                        return Ok(Some(value));
+                    }
                 }
             }
             DataType::Union(fields, _) => {
-                for (_, field) in fields.iter() {
-                    let count = self.field_lookup(field)?;
-                    self.flat_segment::<&arrow_schema::Field>(
-                        &mut descendants,
-                        &mut capacity,
-                        count,
-                    )?;
+                for (_, child) in fields.iter() {
+                    if let Some(value) = self.dictionary_value_in_field(child, id)? {
+                        return Ok(Some(value));
+                    }
                 }
             }
             DataType::List(field)
@@ -1047,12 +999,15 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
             | DataType::LargeListView(field)
             | DataType::FixedSizeList(field, _)
             | DataType::Map(field, _)
-            | DataType::RunEndEncoded(_, field) => descendants = self.field_lookup(field)?,
-            DataType::Dictionary(_, values) => descendants = self.descendant_lookup(values)?,
+            | DataType::RunEndEncoded(_, field) => {
+                return self.dictionary_value_in_field(field, id);
+            }
+            DataType::Dictionary(_, value) => return self.dictionary_value_in_children(value, id),
             _ => {}
         }
-        Ok(descendants)
+        Ok(None)
     }
+
     pub fn dictionary_batch(
         &mut self,
         schema: &Schema,
@@ -1087,56 +1042,14 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
             ReaderArrayHeaderClass::Retained,
             repair_payload,
         )?;
-        let mut matches = 0usize;
-        let mut capacity = 0usize;
+        // Arrow IPC finds the first matching field by borrowing the schema tree.
+        // The lookup only incurs traversal work and stops at the first match.
         let mut value = None;
-        fn find<'a>(
-            field: &'a arrow_schema::Field,
-            id: i64,
-            count: &mut usize,
-            value: &mut Option<&'a DataType>,
-        ) -> Result<(), LayoutResourceError> {
-            #[expect(
-                deprecated,
-                reason = "Arrow 60.1 readers still use Field dictionary IDs; the prepared recipe reconstructs the same IDs"
-            )]
-            if field.dict_id() == Some(id)
-                && let DataType::Dictionary(_, values) = field.data_type()
-            {
-                *count = count
-                    .checked_add(1)
-                    .ok_or(LayoutResourceError::Arithmetic)?;
-                if value.is_none() {
-                    *value = Some(values.as_ref());
-                }
-            }
-            match field.data_type() {
-                DataType::Struct(fields) => {
-                    for child in fields {
-                        find(child, id, count, value)?;
-                    }
-                }
-                DataType::Union(fields, _) => {
-                    for (_, child) in fields.iter() {
-                        find(child, id, count, value)?;
-                    }
-                }
-                DataType::List(child)
-                | DataType::LargeList(child)
-                | DataType::ListView(child)
-                | DataType::LargeListView(child)
-                | DataType::FixedSizeList(child, _)
-                | DataType::Map(child, _)
-                | DataType::RunEndEncoded(_, child) => find(child, id, count, value)?,
-                _ => {}
-            }
-            Ok(())
-        }
         for field in schema.fields() {
-            self.field_lookup(field)?;
-            let mut count = 0usize;
-            find(field, id, &mut count, &mut value)?;
-            self.flat_segment::<&arrow_schema::Field>(&mut matches, &mut capacity, count)?;
+            value = self.dictionary_value_in_field(field, id)?;
+            if value.is_some() {
+                break;
+            }
         }
         let value = value.ok_or(ReaderStructureFailure::SourceModel(
             "IPC dictionary id has no source field",
@@ -1147,7 +1060,7 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
             ));
         }
         // get_dictionary_values authors a genuine one-column temporary schema
-        // with empty label and required source value DataType. No metadata or
+        // with an empty label and the source value DataType. No metadata or
         // execution semantic declaration is read/recreated here.
         self.array::<arrow_schema::Field>(1, ReaderArrayHeaderClass::Temporary)?;
         self.shared::<arrow_schema::Field>(ReaderArrayHeaderClass::Temporary)?;
@@ -1238,6 +1151,46 @@ mod tests {
     use arrow_schema::{Field, UnionFields};
     use std::io::Cursor;
     use std::sync::Arc;
+
+    #[test]
+    fn dictionary_lookup_borrows_the_first_match_without_requesting_storage() {
+        #[expect(
+            deprecated,
+            reason = "The Arrow IPC fixture uses explicit dictionary IDs"
+        )]
+        let dictionary = |name, value| {
+            Field::new_dict(
+                name,
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(value)),
+                true,
+                7,
+                false,
+            )
+        };
+        let root = Field::new_struct(
+            "root",
+            vec![
+                dictionary("first", DataType::Utf8),
+                dictionary("later", DataType::LargeUtf8),
+            ],
+            true,
+        );
+        let mut steps = 0;
+        let value = ReaderArrayStructureObserver {
+            request: &mut |_, _| panic!("dictionary lookup does not allocate"),
+            opaque: &mut |_, _| panic!("dictionary lookup does not allocate"),
+            work: &mut || {
+                steps += 1;
+                Ok::<_, &'static str>(())
+            },
+        }
+        .dictionary_value_in_field(&root, 7)
+        .unwrap();
+
+        assert_eq!(value, Some(&DataType::Utf8));
+        assert_eq!(steps, 2);
+    }
+
     fn sources() -> Vec<ArrayRef> {
         let entries = StructArray::try_new(
             vec![

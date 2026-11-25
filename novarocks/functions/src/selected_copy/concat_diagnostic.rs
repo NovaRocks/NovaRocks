@@ -129,10 +129,19 @@ impl TypeFormatGeometry {
         work.step()?;
         let child = Self::data_type(field.data_type(), work)?;
         let metadata = Self::metadata(field, work)?;
-        let name = if field.name() == "item" {
-            0
+        let (name, name_peak) = if field.name() == "item" {
+            (0, 0)
         } else {
-            add(", field: ''".len(), field.name().len())?
+            // Arrow 60.2 builds an escaped name String before the field suffix.
+            let mut escaped = 0;
+            for ch in field.name().chars() {
+                work.step()?;
+                for escaped_ch in ch.escape_debug() {
+                    escaped = add(escaped, escaped_ch.len_utf8())?;
+                }
+            }
+            let name = add(", field: ''".len(), escaped)?;
+            (name, add(string_peak(escaped)?, string_peak(name)?)?)
         };
         let nullable = if field.is_nullable() {
             0
@@ -143,7 +152,6 @@ impl TypeFormatGeometry {
             add(prefix, nullable)?,
             add(child.bytes, add(name, metadata.bytes)?)?,
         )?;
-        let name_peak = if name == 0 { 0 } else { string_peak(name)? };
         Ok(Self {
             bytes,
             temporary: add(add(child.temporary, metadata.temporary)?, name_peak)?,
