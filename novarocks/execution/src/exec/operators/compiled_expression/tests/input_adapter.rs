@@ -25,7 +25,7 @@ use crate::exec::operators::compiled_expression::{
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeErrorState;
 use arrow::{
-    array::{Array, BooleanArray, Int64Array},
+    array::{Array, BooleanArray, Int64Array, LargeBinaryArray},
     datatypes::DataType,
     record_batch::RecordBatch,
 };
@@ -200,7 +200,7 @@ fn projected_input_does_not_promote_equal_arrow_fields_to_a_logical_binding() {
     use novarocks_type_contract::{FunctionValueType, ValueLogicalType, ValueTypeStorageLifetime};
     use novarocks_types::SlotId;
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-        arrow::datatypes::Field::new("json", DataType::Utf8, true),
+        arrow::datatypes::Field::new("json", DataType::LargeBinary, true),
     ]));
     let logical = FunctionValueType::try_with_logical_type(
         DataType::LargeBinary,
@@ -217,11 +217,13 @@ fn projected_input_does_not_promote_equal_arrow_fields_to_a_logical_binding() {
     let actual = crate::exec::chunk::typed_fixture::chunk(
         RecordBatch::try_new(
             schema,
-            vec![Arc::new(arrow::array::StringArray::from(vec!["[]"]))],
+            vec![Arc::new(LargeBinaryArray::from(vec![
+                b"\x01\x20".as_slice(),
+            ]))],
         )
         .unwrap(),
         &[SlotId::new(7)],
-        &[FunctionValueType::new(DataType::Utf8, true)],
+        &[FunctionValueType::new(DataType::LargeBinary, true)],
     );
     let projection = Arc::new(InputColumnProjection::from_owned(
         vec![0],

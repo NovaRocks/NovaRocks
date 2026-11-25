@@ -97,12 +97,17 @@ mod tests {
         values: Vec<&str>,
         key: i32,
     ) -> (Arc<online_unit::ExchangeRecipe>, Vec<u8>) {
+        dictionary_unit(expected, factory, Arc::new(StringArray::from(values)), key)
+    }
+
+    fn dictionary_unit(
+        expected: &ChunkSchemaRef,
+        factory: &dyn InputConstructionFactory,
+        values: ArrayRef,
+        key: i32,
+    ) -> (Arc<online_unit::ExchangeRecipe>, Vec<u8>) {
         let array: ArrayRef = Arc::new(
-            DictionaryArray::<Int32Type>::try_new(
-                Int32Array::from(vec![key]),
-                Arc::new(StringArray::from(values)),
-            )
-            .unwrap(),
+            DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![key]), values).unwrap(),
         );
         // Source names, IDs and metadata never author the receiver's domain.
         #[expect(
@@ -147,14 +152,11 @@ mod tests {
         let factory_weak = Arc::downgrade(&factory);
         let expected = declaration(ValueLogicalType::Json);
         let null_document = b"\x01\x20".as_slice();
-        let wire_field = Field::new("wire", DataType::LargeBinary, false).with_metadata(
-            HashMap::from([("nr.logical_type".into(), "variant".into())]),
-        );
-        let (recipe, source) = make_unit(
+        let (recipe, source) = dictionary_unit(
             &expected,
             factory.as_ref(),
-            wire_field.clone(),
             Arc::new(LargeBinaryArray::from(vec![null_document])),
+            0,
         );
         let (old_recipe, old_bytes) = unit(
             &declaration(ValueLogicalType::Physical),
@@ -165,11 +167,11 @@ mod tests {
         assert_ne!(recipe.value.digest(), old_recipe.value.digest());
         assert!(online_unit::decode(&recipe, &old_bytes, &expected, factory.as_ref()).is_err());
         drop(old_recipe);
-        let (_, bad_bytes) = make_unit(
+        let (_, bad_bytes) = dictionary_unit(
             &expected,
             factory.as_ref(),
-            wire_field,
             Arc::new(LargeBinaryArray::from(vec![b"null".as_slice()])),
+            0,
         );
         let wrong_value =
             online_unit::decode(&recipe, &bad_bytes, &expected, factory.as_ref()).unwrap_err();
