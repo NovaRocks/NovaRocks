@@ -358,7 +358,7 @@ fn original_aggregate<'source>(
     }
     panic!("actual aggregate emission must contain the selected phase")
 }
-fn assert_original_min_signature(
+fn assert_nullable_value_signature(
     source: &novarocks_physical_plan::AggregateCall,
     captured: &crate::binding::CapturedAggregateLogicalRequest,
     canonical: &super::super::lowered_draft::CanonicalAggregateOperationalRequest,
@@ -430,7 +430,7 @@ fn single_count_star_and_repeat_nullable_channels_publish_actual_selected_reques
 }
 
 #[test]
-fn single_min_keeps_nested_field_metadata_and_nominal_json_source_facts() {
+fn single_aggregate_keeps_nested_field_metadata_and_nominal_json_source_facts() {
     let nested = DataType::Struct(
         vec![Arc::new(
             Field::new("中国", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
@@ -443,21 +443,24 @@ fn single_min_keeps_nested_field_metadata_and_nominal_json_source_facts() {
         )]
         .into(),
     );
-    for ty in [
-        ValueType::new(nested, false),
-        ValueType::try_with_logical_type(
-            DataType::Utf8,
-            false,
-            novarocks_type_contract::ValueLogicalType::Json,
-        )
-        .unwrap(),
+    for (name, ty) in [
+        ("min", ValueType::new(nested, false)),
+        (
+            "any_value",
+            ValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                false,
+                novarocks_type_contract::ValueLogicalType::Json,
+            )
+            .unwrap(),
+        ),
     ] {
         let mut input = column(7, "full_source", ty.data_type().clone(), ty.nullable());
         input.value_type = ty.clone();
         // Empty Values publishes a real typed channel without fabricating a
         // nested literal or claiming a pure MIN kernel for the Struct profile.
         let plan = aggregate(
-            "min",
+            name,
             vec![reference(&input)],
             vec![],
             values(vec![input], vec![]),
@@ -466,7 +469,7 @@ fn single_min_keeps_nested_field_metadata_and_nominal_json_source_facts() {
             let (result, calls) = observe_original_min(&plan, &Control::default(), |view, work| {
                 let actual =
                     original_aggregate(&view, |phase| phase == AggregatePhase::Single, work)?;
-                assert_original_min_signature(
+                assert_nullable_value_signature(
                     actual.source,
                     actual.captured(),
                     actual.canonical(),
@@ -477,11 +480,9 @@ fn single_min_keeps_nested_field_metadata_and_nominal_json_source_facts() {
             assert_eq!(calls, 1);
             assert_min_carrier_refusal(result);
         } else {
-            // Json UTF8 is an actual supported MIN carrier, so keep the full
-            // original completed-owner route and signature assertions.
             let owner = authored(&plan, &Control::default()).unwrap();
             let actual = loan(&owner);
-            assert_original_min_signature(
+            assert_nullable_value_signature(
                 actual.source(),
                 actual.captured(),
                 actual.canonical().unwrap(),

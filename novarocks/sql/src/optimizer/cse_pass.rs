@@ -3992,7 +3992,8 @@ mod intrinsic_eligibility_tests {
         let catalog = crate::functions::builtin_engine_function_catalog();
         for (name, input_type, expected) in [
             ("assert_true", DataType::Boolean, false),
-            ("parse_json", DataType::Utf8, true),
+            ("json_parse", DataType::Utf8, false),
+            ("__json_try_read_text", DataType::Utf8, true),
         ] {
             let child = arena.intern(
                 ScalarNode::ColumnRef(ColumnId(1)),
@@ -4040,13 +4041,10 @@ mod intrinsic_eligibility_tests {
                     ),
                     volatility,
                 },
-                novarocks_type_contract::FunctionValueType::new(
-                    output.data_type().clone(),
-                    output.nullable(),
-                ),
+                output,
             );
             assert_eq!(eligible(&arena, call), expected, "{name}");
-            if !expected {
+            if name == "assert_true" {
                 let condition = arena.intern(
                     ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
                         crate::analysis::LiteralValue::Bool(false),

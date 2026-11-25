@@ -219,7 +219,7 @@ fn scalar_width_units_and_decimal_parameters_are_exact_standard_arrow_schema() {
 #[test]
 fn nested_field_boundaries_keep_order_names_metadata_nullability_and_union_ids() {
     let json = Arc::new(
-        Field::new("json_value", DataType::Utf8, true).with_metadata(HashMap::from([
+        Field::new("json_value", DataType::LargeBinary, true).with_metadata(HashMap::from([
             (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
             ("provider_id".to_owned(), "17".to_owned()),
         ])),
@@ -293,7 +293,9 @@ fn dictionary_ids_and_order_preserve_root_and_actual_nested_field_boundaries() {
 #[test]
 fn authored_nominal_metadata_is_preserved_without_inference_from_carrier() {
     for (ty, label) in [
+        // IPC preserves source metadata even when it cannot author an execution type.
         (DataType::Utf8, "json"),
+        (DataType::LargeBinary, "json"),
         (DataType::LargeBinary, "variant"),
         (DataType::FixedSizeBinary(16), "largeint"),
         (DataType::FixedSizeBinary(16), "uuid"),

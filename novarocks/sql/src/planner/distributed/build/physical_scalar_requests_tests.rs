@@ -725,13 +725,17 @@ fn scalar_requests_reject_wrong_kind_shape_missing_argument_and_excess_before_ex
 
 fn declared_json_list(nullable: bool, child_nullable: bool) -> FunctionValueType {
     let child = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         child_nullable,
         ValueLogicalType::Json,
     )
     .unwrap();
     let layout = FunctionValueType::new(
-        DataType::List(Arc::new(Field::new("item", DataType::Utf8, child_nullable))),
+        DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::LargeBinary,
+            child_nullable,
+        ))),
         nullable,
     );
     let value = novarocks_type_contract::ValueTypeRef::try_new(
@@ -745,12 +749,12 @@ fn declared_json_list(nullable: bool, child_nullable: bool) -> FunctionValueType
 #[test]
 fn scalar_requests_lambda_preserves_full_static_signature_and_observes_actual_parameter_quantum() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
-    let item = Arc::new(Field::new("json item", DataType::Utf8, true).with_metadata(
-        HashMap::from([
+    let item = Arc::new(
+        Field::new("json item", DataType::LargeBinary, true).with_metadata(HashMap::from([
             ("nr_logical_type".into(), "json".into()),
             ("provider.id".into(), "71".into()),
-        ]),
-    ));
+        ])),
+    );
     let parameter = declared_json_list(true, true);
     let DataType::List(original_layout) = parameter.data_type() else {
         unreachable!()

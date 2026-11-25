@@ -189,6 +189,7 @@ impl SourceWireOracle {
             | DataType::Int64
             | DataType::Float64
             | DataType::Utf8
+            | DataType::LargeBinary
             | DataType::Utf8View
             | DataType::List(_)
             | DataType::LargeList(_)
@@ -554,7 +555,7 @@ fn actual_recursive_writer_struct_largelist_map_nested_spans_match_independent_a
 fn actual_recursive_writer_nested_views_preserve_all_headers_and_nominal_metadata() {
     let text = "external-string-long-enough-for-a-view";
     let views = StringViewArray::from(vec![Some(text), None, Some("small")]);
-    let json = Field::new("json", DataType::Utf8, true).with_metadata(HashMap::from([
+    let json = Field::new("json", DataType::LargeBinary, true).with_metadata(HashMap::from([
         (
             NR_LOGICAL_TYPE_KEY.into(),
             ValueLogicalType::Json.metadata_value().unwrap().into(),
@@ -569,10 +570,10 @@ fn actual_recursive_writer_nested_views_preserve_all_headers_and_nominal_metadat
         .into(),
         vec![
             Arc::new(views),
-            Arc::new(StringArray::from(vec![
-                Some("{\"a\":1}"),
+            Arc::new(LargeBinaryArray::from(vec![
+                Some(b"\x01\x42\x01".as_slice()),
                 None,
-                Some("null"),
+                Some(b"\x01\x20".as_slice()),
             ])),
         ],
         None,

@@ -120,7 +120,7 @@ fn fixture() -> FunctionValueType {
     );
     let data_type = DataType::Struct(
         vec![
-            Arc::new(Field::new("json", DataType::Utf8, true)),
+            Arc::new(Field::new("json", DataType::LargeBinary, true)),
             Arc::new(Field::new(
                 "strings",
                 DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8View, true))),
@@ -367,10 +367,15 @@ fn every_binding_and_definition_is_validated_and_ref_forgery_refused() {
     let mut table = original.clone();
     table.value_bindings.push(table.value_bindings[0].clone());
     assert!(decode(&table).is_err());
-    let mut table = original;
-    struct_fields(&mut table)[0].r#type.as_mut().unwrap().kind =
-        Some(Kind::Primitive(wire::ArrowPrimitiveType::Int32 as i32));
-    assert!(decode(&table).is_err());
+    for carrier in [
+        wire::ArrowPrimitiveType::Int32,
+        wire::ArrowPrimitiveType::Utf8,
+    ] {
+        let mut table = original.clone();
+        struct_fields(&mut table)[0].r#type.as_mut().unwrap().kind =
+            Some(Kind::Primitive(carrier as i32));
+        assert!(decode(&table).is_err());
+    }
 }
 #[test]
 fn accurate_offsets_parameters_and_union_mode_survive() {

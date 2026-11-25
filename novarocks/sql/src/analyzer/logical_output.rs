@@ -645,7 +645,7 @@ mod scalar_domain_tests {
         let ExprKind::FunctionCall { binding, .. } = &parsed.kind else {
             panic!("real JSON parser owner");
         };
-        assert_eq!(binding.function_id.as_str(), "builtin.scalar/parse_json/v1");
+        assert_eq!(binding.function_id.as_str(), "builtin.scalar/json_parse/v1");
     }
 
     #[test]
@@ -741,7 +741,7 @@ mod scalar_domain_tests {
         let scope = AnalyzerScope::new(factory.clone());
         let context = context(factory);
         let json = novarocks_type_contract::FunctionValueType::try_with_logical_type(
-            DataType::Utf8,
+            DataType::LargeBinary,
             true,
             novarocks_type_contract::ValueLogicalType::Json,
         )
@@ -760,17 +760,15 @@ mod scalar_domain_tests {
                 .unwrap(),
             Some(SqlType::Json)
         );
-        // JSON's installed profile remains Utf8-only. Ordinary String offsets
-        // have one semantic declaration without widening that capability.
-        assert!(
-            novarocks_type_contract::FunctionValueType::try_with_logical_type(
-                DataType::LargeUtf8,
-                true,
-                novarocks_type_contract::ValueLogicalType::Json
-            )
-            .is_err()
-        );
         for target in [DataType::Utf8, DataType::LargeUtf8] {
+            assert!(
+                novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                    target.clone(),
+                    true,
+                    novarocks_type_contract::ValueLogicalType::Json
+                )
+                .is_err()
+            );
             let expression = TypedExpr {
                 kind: ExprKind::ColumnRef {
                     column_id: crate::column_id::ColumnId::UNSET,
@@ -1344,7 +1342,7 @@ mod scalar_domain_tests {
         assert!(matches!(
             &original.kind,
             ExprKind::FunctionCall { binding, .. }
-                if binding.function_id.as_str() == "builtin.scalar/parse_json/v1"
+                if binding.function_id.as_str() == "builtin.scalar/json_parse/v1"
         ));
     }
 

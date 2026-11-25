@@ -484,7 +484,7 @@ mod tests {
         .unwrap();
         let partition = ColumnDef {
             name: "_partition".into(),
-            data_type: D::Struct(vec![Field::new("historical", D::Utf8, true)].into()),
+            data_type: D::Struct(vec![Field::new("historical", D::LargeBinary, true)].into()),
             nullable: true,
             write_default: None,
             logical_type: Some(SqlType::Struct(vec![("historical".into(), SqlType::Json)])),
@@ -689,7 +689,7 @@ mod tests {
         use novarocks_type_contract::{FunctionValueType, ValueLogicalType as V};
         for (logical, storage, domain, private) in [
             (V::Physical, D::Binary, ResultValueDomain::Plain, false),
-            (V::Json, D::Utf8, ResultValueDomain::Json, false),
+            (V::Json, D::LargeBinary, ResultValueDomain::Json, false),
             (
                 V::Variant,
                 D::LargeBinary,

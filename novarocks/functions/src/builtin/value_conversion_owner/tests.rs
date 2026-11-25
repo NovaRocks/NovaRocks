@@ -442,6 +442,10 @@ fn source_carriers_cannot_author_nominal_domains_or_bypass_the_explicit_target()
             nominal(DataType::LargeBinary, false, ValueLogicalType::Json),
             large(false),
         ),
+        (
+            nominal(DataType::LargeBinary, false, ValueLogicalType::Json),
+            ty(DataType::LargeBinary, false),
+        ),
         (ty(DataType::Null, true), ty(DataType::Int64, false)),
     ] {
         let args = arguments(&source);
@@ -777,20 +781,20 @@ fn largeint_decimal_effects_refine_exact_range_and_freeze_overflow_policy() {
 }
 
 fn conversion_compile_profiles() -> Vec<(FunctionValueType, FunctionValueType)> {
-    let json = Arc::new(
-        Field::new("actual_json", DataType::Utf8, true).with_metadata(HashMap::from([
-            (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
+    let variant = Arc::new(
+        Field::new("actual_variant", DataType::LargeBinary, true).with_metadata(HashMap::from([
+            (NR_LOGICAL_TYPE_KEY.to_owned(), "variant".to_owned()),
             ("provider_id".to_owned(), "731".to_owned()),
         ])),
     );
-    let mut metadata = json.metadata().clone();
+    let mut metadata = variant.metadata().clone();
     metadata.remove(NR_LOGICAL_TYPE_KEY);
-    let text = Arc::new(json.as_ref().clone().with_metadata(metadata));
+    let binary = Arc::new(variant.as_ref().clone().with_metadata(metadata));
     vec![
         (ty(DataType::Int64, true), large(true)),
         (
-            ty(DataType::List(json), true),
-            ty(DataType::List(text), true),
+            ty(DataType::List(variant), true),
+            ty(DataType::List(binary), true),
         ),
     ]
 }
