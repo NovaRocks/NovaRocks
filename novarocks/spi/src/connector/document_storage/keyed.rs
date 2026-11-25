@@ -508,6 +508,8 @@ pub struct KeyedSnapshotObservation {
     pub records: Vec<ConnectorSnapshotRecord>,
     /// Immutable provider witness on a combined slot and table-property snapshot.
     pub slot_storage_effect_digest: Option<[u8; 32]>,
+    pub full_refresh_stage_witness: Option<String>,
+    pub managed_repartition_effect: Option<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FullKeyedDocumentView {
@@ -517,6 +519,32 @@ pub struct FullKeyedDocumentView {
     pub diagnostics: Vec<String>,
     pub token: FullObservationToken,
 }
+/// The exact opaque snapshot record frame authored by a managed dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyedDispatchRecord {
+    pub owner: String,
+    pub name: String,
+    pub envelope: Bytes,
+}
+
+/// The non-receipt snapshot selected alongside the final append.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyedDispatchDeleteStage {
+    pub snapshot: i64,
+    pub witness: String,
+}
+
+/// The original operation and group. Individual snapshot IDs do not prove
+/// publication. The sealed record or stage witness must also be observed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyedSnapshotDispatch {
+    pub target: ConnectorTableObjectId,
+    pub operation_id: crate::connector::ConnectorMutationOperationId,
+    pub delete_stage: Option<KeyedDispatchDeleteStage>,
+    pub records: Vec<KeyedDispatchRecord>,
+    pub repartition_effect: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnknownCommitIdentity {
     SlotWriter {
@@ -531,6 +559,7 @@ pub enum UnknownCommitIdentity {
         name: String,
         bytes: Bytes,
     },
+    SnapshotDispatch(Box<KeyedSnapshotDispatch>),
     None,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -555,6 +584,14 @@ pub enum CommitConclusion {
     InvalidatedUndetermined,
     StillUnknown,
 }
+/// Read-only recovery facts from the original write session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyedWriteObservation {
+    pub evidence: UnknownCommitEvidence,
+    pub conclusion: CommitConclusion,
+    pub observed_current_snapshot: Option<i64>,
+}
+
 /// The exact admission remains attached to every catalog mutation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum KeyedMutation {

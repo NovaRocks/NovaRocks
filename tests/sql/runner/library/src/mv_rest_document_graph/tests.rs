@@ -286,39 +286,65 @@ fn logical_rows_are_distinct_from_physical_records() {
 }
 #[test]
 fn full_refresh_pairs_require_empty_delete_and_unique_marked_append() {
+    const TABLE_UUID: Option<&str> = Some("22222222-2222-4222-8222-222222222222");
+    const SESSION: &str = "01010101-0101-0101-0101-010101010101";
     let mut delete = snapshot(1, None, "delete", None);
     delete["summary"]["total-data-files"] = json!("0");
     delete["summary"]["total-records"] = json!("0");
+    let mut nonce = [2u8; 16];
+    nonce[6] = 0x72;
+    nonce[8] = 0x82;
+    delete["summary"][FULL_REFRESH_STAGE] = json!(
+        json!({
+            "version": 1,
+            "table_uuid": TABLE_UUID,
+            "operation_id": ([1u8; 16]),
+            "attempt_ordinal": 0,
+            "attempt_nonce": nonce,
+            "asserted_parent": null,
+            "delete_snapshot": 1,
+            "append_snapshot": 2
+        })
+        .to_string()
+    );
     let mut append = snapshot(2, Some(1), "append", Some(frame(1)));
-    append["summary"]["novarocks.write.session.v1"] = json!("first");
+    append["summary"]["novarocks.write.session.v1"] = json!(SESSION);
     let snapshots = BTreeMap::from([(1, &delete), (2, &append)]);
     assert_eq!(
-        full_refresh_pairs(&snapshots).unwrap(),
+        full_refresh_pairs(&snapshots, TABLE_UUID).unwrap(),
         (BTreeSet::from([1]), BTreeSet::from([2]))
     );
 
     let mut corrupt_delete = delete.clone();
     corrupt_delete["summary"][wire::PUBLICATION_KEY] = json!(frame(2));
     assert!(
-        full_refresh_pairs(&BTreeMap::from([(1, &corrupt_delete), (2, &append)]))
-            .unwrap()
-            .0
-            .is_empty()
+        full_refresh_pairs(
+            &BTreeMap::from([(1, &corrupt_delete), (2, &append)]),
+            TABLE_UUID
+        )
+        .is_err()
     );
     let mut nonempty = delete.clone();
     nonempty["summary"]["total-records"] = json!("1");
-    assert!(full_refresh_pairs(&BTreeMap::from([(1, &nonempty), (2, &append)])).is_err());
+    assert!(
+        full_refresh_pairs(&BTreeMap::from([(1, &nonempty), (2, &append)]), TABLE_UUID).is_err()
+    );
     let mut wrong_parent = append.clone();
     wrong_parent["parent-snapshot-id"] = json!(0);
-    assert!(full_refresh_pairs(&BTreeMap::from([(1, &delete), (2, &wrong_parent)])).is_err());
-    let mut repeated_marker = snapshot(3, Some(2), "append", Some(frame(3)));
-    repeated_marker["summary"]["novarocks.write.session.v1"] = json!("first");
     assert!(
-        full_refresh_pairs(&BTreeMap::from([
-            (1, &delete),
-            (2, &append),
-            (3, &repeated_marker)
-        ]))
+        full_refresh_pairs(
+            &BTreeMap::from([(1, &delete), (2, &wrong_parent)]),
+            TABLE_UUID
+        )
+        .is_err()
+    );
+    let mut repeated_marker = snapshot(3, Some(2), "append", Some(frame(3)));
+    repeated_marker["summary"]["novarocks.write.session.v1"] = json!(SESSION);
+    assert!(
+        full_refresh_pairs(
+            &BTreeMap::from([(1, &delete), (2, &append), (3, &repeated_marker)]),
+            TABLE_UUID
+        )
         .is_err()
     );
 }

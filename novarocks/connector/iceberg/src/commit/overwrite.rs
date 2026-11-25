@@ -181,6 +181,18 @@ pub(super) async fn prepare_filtered_delete_snapshot_change(
     full_refresh: bool,
 ) -> crate::iceberg::Result<super::staging::PreparedChange> {
     let mut properties = snapshot_file_summary_with_mode(&[], removed, true)?;
+    if full_refresh
+        && matches!(
+            intent.protocol(),
+            super::model::CommitProtocol::MvRefresh { .. }
+        )
+    {
+        use super::mv_dispatch::{FULL_REFRESH_STAGE_SUMMARY_KEY, FullRefreshStageWitness};
+        properties.insert(
+            FULL_REFRESH_STAGE_SUMMARY_KEY.to_owned(),
+            FullRefreshStageWitness::prepare(view, snapshot_id)?,
+        );
+    }
     let manifests = manifests.into_snapshot_manifests(&mut properties);
     prepare_snapshot_change_with_summary(
         view,

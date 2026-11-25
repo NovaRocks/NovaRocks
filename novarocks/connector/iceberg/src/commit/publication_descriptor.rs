@@ -26,6 +26,7 @@ use uuid::Uuid;
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum AttributionPlan {
     ObserveOnly,
+    KeyedSnapshot(super::mv_dispatch::KeyedSnapshotSelection),
     Snapshot {
         table_uuid: Uuid,
         snapshot_id: i64,
@@ -58,6 +59,10 @@ pub(crate) enum AttributionPlan {
 /// Facts returned by the exact read-only probe declared in AttributionPlan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PositiveAttributionObservation {
+    KeyedSnapshot {
+        table_uuid: Uuid,
+        observed: super::mv_dispatch::KeyedSnapshotObservation,
+    },
     SnapshotMarker {
         table_uuid: Uuid,
         snapshot_id: i64,
@@ -99,6 +104,12 @@ impl AttributionPlan {
         metadata: &crate::iceberg::spec::TableMetadata,
     ) -> Option<PositiveAttributionObservation> {
         match self {
+            Self::KeyedSnapshot(selection) => selection.observe(metadata).map(|observed| {
+                PositiveAttributionObservation::KeyedSnapshot {
+                    table_uuid: metadata.uuid(),
+                    observed,
+                }
+            }),
             Self::Snapshot {
                 snapshot_id,
                 marker_key,
@@ -152,6 +163,13 @@ impl AttributionPlan {
 
     pub(crate) fn matches_observation(&self, observation: &PositiveAttributionObservation) -> bool {
         match (self, observation) {
+            (
+                Self::KeyedSnapshot(selection),
+                PositiveAttributionObservation::KeyedSnapshot {
+                    table_uuid,
+                    observed,
+                },
+            ) => *table_uuid == selection.table_uuid && selection.matches(observed),
             (
                 Self::Snapshot {
                     table_uuid: a,
@@ -221,6 +239,7 @@ impl AttributionPlan {
     }
     fn table_uuid(&self) -> Option<Uuid> {
         match self {
+            Self::KeyedSnapshot(selection) => Some(selection.table_uuid),
             Self::Snapshot { table_uuid, .. }
             | Self::ManagedRepartition { table_uuid, .. }
             | Self::Property { table_uuid, .. }
@@ -486,7 +505,10 @@ impl PublicationDescriptor {
             request.artifacts().attempt().operation().to_bytes(),
             vec![format!("{}", request.identifier())],
             bytes,
-            managed.unwrap_or(attribution),
+            super::mv_dispatch::KeyedSnapshotSelection::frozen(request)?
+                .map(AttributionPlan::KeyedSnapshot)
+                .or(managed)
+                .unwrap_or(attribution),
             key,
         )?;
         descriptor.table_uuid = Some(table_uuid);

@@ -20,7 +20,8 @@
 use super::record::encode_record;
 use novarocks_spi::connector::{
     CommitConclusion, CommitProof, ConnectorError, ConnectorErrorKind, FullKeyedDocumentView,
-    KeyedDocumentView, KeyedSnapshotObservation, UnknownCommitEvidence, UnknownCommitIdentity,
+    KeyedDispatchRecord, KeyedDocumentView, KeyedSnapshotDispatch, KeyedSnapshotObservation,
+    UnknownCommitEvidence, UnknownCommitIdentity,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,6 +48,24 @@ pub(crate) fn resolve(
             "commit observations belong to different provider or table scopes",
         ));
     }
+    if let UnknownCommitIdentity::SnapshotDispatch(dispatch) = &evidence.identity {
+        if refs.object_id != dispatch.target {
+            return Ok(Resolution::Conclusion(
+                CommitConclusion::InvalidatedUndetermined,
+            ));
+        }
+        let Some(full) = full else {
+            return Ok(Resolution::NeedFull);
+        };
+        let snapshots = index_snapshots(&full.snapshots)?;
+        return resolve_snapshot_dispatch(
+            full.current.current_snapshot,
+            &snapshots,
+            evidence,
+            dispatch,
+        )
+        .map(Resolution::Conclusion);
+    }
     let combined_effect = match &evidence.identity {
         UnknownCommitIdentity::SlotStorageEffect { effect_digest, .. } => Some(effect_digest),
         _ => None,
@@ -70,15 +89,7 @@ pub(crate) fn resolve(
     {
         return Ok(committed(proof));
     }
-    let mut snapshots = BTreeMap::new();
-    for snapshot in &full.snapshots {
-        if snapshots.insert(snapshot.snapshot_id, snapshot).is_some() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "full commit observation repeats a snapshot ID",
-            ));
-        }
-    }
+    let snapshots = index_snapshots(&full.snapshots)?;
     if let Some(digest) = combined_effect {
         // Main, SlotWriter and a parent edge do not independently identify
         // the frozen storage effect. Missing history leaves this unknown.
@@ -146,6 +157,90 @@ pub(crate) fn resolve(
     Ok(Resolution::Conclusion(
         CommitConclusion::InvalidatedUndetermined,
     ))
+}
+
+pub(crate) fn index_snapshots(
+    entries: &[KeyedSnapshotObservation],
+) -> Result<BTreeMap<i64, &KeyedSnapshotObservation>, ConnectorError> {
+    let mut snapshots = BTreeMap::new();
+    for snapshot in entries {
+        if snapshots.insert(snapshot.snapshot_id, snapshot).is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "full commit observation repeats a snapshot ID",
+            ));
+        }
+    }
+    Ok(snapshots)
+}
+
+pub(crate) fn resolve_snapshot_dispatch(
+    current: Option<i64>,
+    snapshots: &BTreeMap<i64, &KeyedSnapshotObservation>,
+    evidence: &UnknownCommitEvidence,
+    dispatch: &KeyedSnapshotDispatch,
+) -> Result<CommitConclusion, ConnectorError> {
+    let selected = evidence.preselected_snapshot;
+    let parent = evidence.asserted_parent;
+    let delete = dispatch.delete_stage.as_ref();
+    let receipt_parent = delete.map(|delete| delete.snapshot).or(parent);
+    if let Some(snapshot) = snapshots.get(&selected)
+        && snapshot.parent == receipt_parent
+        && snapshot.managed_repartition_effect == dispatch.repartition_effect
+        && has_dispatch_records(snapshot, &dispatch.records)?
+    {
+        return Ok(CommitConclusion::Committed(CommitProof::Snapshot));
+    }
+    if let Some(delete) = delete
+        && let Some(snapshot) = snapshots.get(&delete.snapshot)
+        && snapshot.parent == parent
+        && snapshot.full_refresh_stage_witness.as_deref() == Some(delete.witness.as_str())
+    {
+        return Ok(CommitConclusion::Committed(CommitProof::Snapshot));
+    }
+    // A carried frame also needs the lineage to the selected append. A bare
+    // pointer, or an equal app payload on a different branch, does not suffice.
+    let mut observed_record = false;
+    for snapshot in snapshots.values() {
+        if has_dispatch_records(snapshot, &dispatch.records)? {
+            observed_record = true;
+            if dispatch.repartition_effect.is_none() && snapshot.parent == Some(selected) {
+                return Ok(CommitConclusion::Committed(CommitProof::CarriedRecord));
+            }
+        }
+    }
+    if current == parent {
+        return Ok(CommitConclusion::StillUnknown);
+    }
+    let appears = |id| {
+        snapshots.contains_key(&id) || snapshots.values().any(|value| value.parent == Some(id))
+    };
+    if !observed_record
+        && !appears(selected)
+        && delete.is_none_or(|delete| !appears(delete.snapshot))
+        && has_negative_ancestry(snapshots, current, parent)
+    {
+        return Ok(CommitConclusion::NotCommitted(CommitProof::NegativeProof));
+    }
+    Ok(CommitConclusion::InvalidatedUndetermined)
+}
+
+fn has_dispatch_records(
+    snapshot: &KeyedSnapshotObservation,
+    records: &[KeyedDispatchRecord],
+) -> Result<bool, ConnectorError> {
+    if records.is_empty() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "managed snapshot evidence has no record frame",
+        ));
+    }
+    for record in records {
+        if !has_record(snapshot, &record.owner, &record.name, &record.envelope)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn committed(proof: CommitProof) -> Resolution {

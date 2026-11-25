@@ -281,6 +281,28 @@ fn proves_initial_slot_history(metadata: &TableMetadata) -> bool {
     sequence == 0
 }
 
+pub(crate) fn project_snapshot(
+    snapshot: &crate::iceberg::spec::Snapshot,
+    current: bool,
+) -> Result<KeyedSnapshotObservation, KeyedDocumentReadError> {
+    let summary = &snapshot.summary().additional_properties;
+    Ok(KeyedSnapshotObservation {
+        snapshot_id: snapshot.snapshot_id(),
+        parent: snapshot.parent_snapshot_id(),
+        records: parse_snapshot_records(summary, current)?,
+        slot_storage_effect_digest: summary
+            .get(crate::commit::slot_change::SLOT_STORAGE_EFFECT_SUMMARY_KEY)
+            .and_then(|value| DocumentIdentity::parse_hex(value).ok())
+            .map(DocumentIdentity::to_bytes),
+        full_refresh_stage_witness: summary
+            .get(crate::commit::mv_dispatch::FULL_REFRESH_STAGE_SUMMARY_KEY)
+            .cloned(),
+        managed_repartition_effect: summary
+            .get(crate::commit::write_stack::control::MANAGED_REPARTITION_EFFECT_SUMMARY_KEY)
+            .cloned(),
+    })
+}
+
 pub(crate) fn project_full_view(
     metadata: &TableMetadata,
     request: &KeyedDocumentObservationRequest,
@@ -290,12 +312,12 @@ pub(crate) fn project_full_view(
     let mut snapshots = Vec::new();
     let mut diagnostics = Vec::new();
     for snapshot in metadata.snapshots() {
-        let snapshot_records = parse_snapshot_records(
-            &snapshot.summary().additional_properties,
-            snapshot.snapshot_id() == metadata.current_snapshot_id().unwrap_or(-1),
+        let observed = project_snapshot(
+            snapshot,
+            Some(snapshot.snapshot_id()) == metadata.current_snapshot_id(),
         )?;
         if Some(snapshot.snapshot_id()) != metadata.current_snapshot_id() {
-            for record in &snapshot_records {
+            for record in &observed.records {
                 if let Err(error) = reference_closure(&current.versions, record.binding) {
                     diagnostics.push(format!(
                         "history cannot be interpreted: snapshot {} record {}: {error}",
@@ -305,17 +327,7 @@ pub(crate) fn project_full_view(
                 }
             }
         }
-        snapshots.push(KeyedSnapshotObservation {
-            snapshot_id: snapshot.snapshot_id(),
-            parent: snapshot.parent_snapshot_id(),
-            records: snapshot_records,
-            slot_storage_effect_digest: snapshot
-                .summary()
-                .additional_properties
-                .get(crate::commit::slot_change::SLOT_STORAGE_EFFECT_SUMMARY_KEY)
-                .and_then(|value| DocumentIdentity::parse_hex(value).ok())
-                .map(DocumentIdentity::to_bytes),
-        });
+        snapshots.push(observed);
     }
     snapshots.sort_by_key(|s| s.snapshot_id);
     diagnostics.sort();

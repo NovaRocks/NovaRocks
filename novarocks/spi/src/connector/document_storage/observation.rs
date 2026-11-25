@@ -546,6 +546,16 @@ pub trait ConnectorDocumentStorageObservation: Send + Sync {
         request: super::KeyedDocumentObservationRequest,
         evidence: crate::connector::ExternalMutationEvidence,
     ) -> Result<super::UnknownCommitEvidence, ConnectorError>;
+    fn decode_keyed_retirement_evidence(
+        &self,
+        _request: super::KeyedDocumentObservationRequest,
+        _evidence: crate::connector::ExternalMutationEvidence,
+    ) -> Result<super::UnknownCommitEvidence, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "document observation capability does not decode retirement evidence",
+        ))
+    }
     fn resolve_keyed_commit(
         &self,
         request: super::KeyedDocumentObservationRequest,

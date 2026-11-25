@@ -424,6 +424,7 @@ async fn originating_mutation_failure_keeps_one_cause_through_product_and_statem
                         Some(Ok(ConnectorWritePublicationCompletion::CommitUnknown {
                             failure: mutation.clone(),
                             evidence,
+                            keyed_observation: None,
                         }));
                 } else {
                     publication.abort_outcome =

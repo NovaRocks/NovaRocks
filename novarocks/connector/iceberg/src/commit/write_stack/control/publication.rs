@@ -792,7 +792,9 @@ impl WritePublicationVerdict {
                 canonical
             },
             Self::KnownUncommitted { failure, cleanup } => novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownUncommitted { failure, cleanup },
-            Self::CommitUnknown { failure, evidence } => novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::CommitUnknown { failure, evidence },
+            Self::CommitUnknown { failure, evidence } => novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::CommitUnknown {
+                failure, evidence, keyed_observation: None,
+            },
         }
     }
 }
@@ -990,9 +992,30 @@ impl IcebergWriteSessionControl {
                 // Mandatory receipt facts are frozen before mutation becomes
                 // possible. Catalog reload and row-count enrichment are optional.
                 let receipt = match request.ref_snapshot_after(request.target_ref()) {
-                    Some(snapshot) => crate::write_codec::connector_write_receipt_with_partitioning_and_output_facts(
-                        snapshot, None, receipt_partitioning.clone(), Some(receipt_output_facts),
-                    ).map_err(|error| format_error(corrupt(error)))?,
+                    Some(snapshot) => {
+                        let rows = if template.document_record_digest.is_some() {
+                            let selected = request
+                                .updates()
+                                .iter()
+                                .find_map(|update| match update {
+                                    crate::iceberg::TableUpdate::AddSnapshot {
+                                        snapshot: selected,
+                                    } if selected.snapshot_id() == snapshot => Some(selected),
+                                    _ => None,
+                                })
+                                .ok_or_else(|| {
+                                    format_error(corrupt(
+                                        "keyed write has no selected receipt snapshot",
+                                    ))
+                                })?;
+                            publication_row_count(selected).map_err(format_error)?
+                        } else {
+                            None
+                        };
+                        crate::write_codec::connector_write_receipt_with_partitioning_and_output_facts(
+                            snapshot, rows, receipt_partitioning.clone(), Some(receipt_output_facts),
+                        ).map_err(|error| format_error(corrupt(error)))?
+                    }
                     None => unprojected_committed_receipt(),
                 };
                 preflight_journal.record(evidence, receipt, request)
@@ -1371,6 +1394,8 @@ pub(super) struct RecoveryPayload {
     parent_snapshot_id: Option<i64>,
     metadata_location: String,
     published_snapshot_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) keyed_selection: Option<crate::commit::mv_dispatch::KeyedSnapshotSelection>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1456,6 +1481,13 @@ impl RecoveryTemplate {
                 "Recovery envelope target differs from its frozen request",
             ));
         }
+        let keyed_selection = crate::commit::mv_dispatch::KeyedSnapshotSelection::frozen(request)
+            .map_err(format_error_to_connector)?;
+        if self.document_record_digest.is_some() && keyed_selection.is_none() {
+            return Err(corrupt(
+                "keyed recovery lost its selected snapshots and exact record identity",
+            ));
+        }
         let payload = RecoveryPayload {
             version: ICEBERG_WRITE_SESSION_EVIDENCE_VERSION,
             session_id: self.session_id.to_string(),
@@ -1472,6 +1504,7 @@ impl RecoveryTemplate {
             parent_snapshot_id: *parent,
             metadata_location: metadata_location.clone(),
             published_snapshot_id: request.ref_snapshot_after(&self.target_ref),
+            keyed_selection,
         };
         payload.validate_facts(self)?;
         let bytes = serde_json::to_vec(&payload).map_err(|error| internal(error.to_string()))?;
@@ -1521,6 +1554,15 @@ impl RecoveryPayload {
         {
             return Err(corrupt(
                 "Iceberg recovery envelope disagrees with exact admitted session facts",
+            ));
+        }
+        if let Some(selection) = &self.keyed_selection
+            && (selection.table_uuid.to_string() != self.table_uuid
+                || selection.parent != self.parent_snapshot_id
+                || Some(selection.snapshot) != self.published_snapshot_id)
+        {
+            return Err(corrupt(
+                "keyed recovery group disagrees with its exact round",
             ));
         }
         if uuid::Uuid::from_bytes(self.attempt.nonce).get_version_num() != 7 {

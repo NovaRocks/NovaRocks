@@ -1200,6 +1200,12 @@ fn publication_row_count_from_metadata(
     if let Some(records) = handle.document_records()? {
         validate_document_records(snapshot, &records)?;
     }
+    publication_row_count(snapshot)
+}
+
+fn publication_row_count(
+    snapshot: &crate::iceberg::spec::Snapshot,
+) -> Result<Option<u64>, ConnectorError> {
     snapshot
         .summary()
         .additional_properties
@@ -1456,15 +1462,12 @@ impl IcebergWriteSessionControl {
             None
         };
         let facts = handle.table();
+        let read_context = read_context
+            .without_vended_credential_lease_sink()
+            .after_external_effect();
         let physical = match self
             .runtime
-            .load_table_for_request_async(
-                facts.namespace(),
-                facts.table_name(),
-                &read_context
-                    .without_vended_credential_lease_sink()
-                    .after_external_effect(),
-            )
+            .load_table_for_request_async(facts.namespace(), facts.table_name(), &read_context)
             .await
         {
             Ok(physical) => physical,
@@ -1511,9 +1514,112 @@ impl IcebergWriteSessionControl {
             ));
         }
         use crate::commit::publication_descriptor::AttributionPlan;
+        use novarocks_spi::connector::{CommitConclusion, KeyedWriteObservation};
         let descriptor = journal
             .entry_descriptor(entry)
             .ok_or_else(|| invalid("Write journal entry is unavailable"))?;
+        if let Some(selection) = decoded.keyed_selection.as_ref() {
+            if !matches!(&descriptor.attribution, AttributionPlan::KeyedSnapshot(original)
+                if original == selection)
+            {
+                return failed_observation(corrupt(
+                    "keyed recovery selection differs from the original journal",
+                ));
+            }
+            let Some(publication) = handle.document_publication() else {
+                return failed_observation(corrupt(
+                    "keyed recovery has no original write declaration",
+                ));
+            };
+            let frames = handle
+                .document_records()?
+                .ok_or_else(|| corrupt("keyed recovery lost the original record frames"))?;
+            let exact = selection
+                .to_evidence(
+                    handle.session_id().to_bytes(),
+                    publication.declaration().target_object_id().clone(),
+                    &frames,
+                )
+                .map_err(|error| corrupt(error.to_string()))?;
+            let mut current = metadata.current_snapshot_id();
+            let mut conclusion = match observe_keyed_dispatch(metadata, &exact) {
+                Ok(conclusion) => conclusion,
+                Err(error) => return failed_observation(error),
+            };
+            let mut positive = descriptor.attribution.observe_table_metadata(metadata);
+            if conclusion == CommitConclusion::StillUnknown {
+                // A freshly visible result can settle this original statement.
+                // Both observations use the same exact authority and deadline.
+                if let Ok(later) = self
+                    .runtime
+                    .load_table_for_request_async(
+                        facts.namespace(),
+                        facts.table_name(),
+                        &read_context.clone().after_external_effect(),
+                    )
+                    .await
+                {
+                    let later = later.into_table();
+                    let later_metadata = later.metadata();
+                    if later_metadata.uuid() == metadata.uuid() {
+                        if let Ok(next) = observe_keyed_dispatch(later_metadata, &exact) {
+                            conclusion = next;
+                            current = later_metadata.current_snapshot_id();
+                            positive = descriptor
+                                .attribution
+                                .observe_table_metadata(later_metadata);
+                        }
+                    } else {
+                        conclusion = CommitConclusion::InvalidatedUndetermined;
+                        current = None;
+                    }
+                }
+            }
+            if matches!(conclusion, CommitConclusion::Committed(_)) {
+                let Some(observation) = positive else {
+                    return failed_observation(corrupt(
+                        "keyed observation did not match the original dispatch probe",
+                    ));
+                };
+                if journal
+                    .append_positive_proof_with_finalization(
+                        descriptor.key,
+                        observation,
+                        self.runtime
+                            .novarocks_catalog()
+                            .positive_attribution_finalization(),
+                    )
+                    .is_err()
+                {
+                    return Ok(journal.catalog_entry_outcome(entry));
+                }
+                let mut outcome = journal.catalog_entry_outcome(entry);
+                if let Err(error) = receive_existing_finalization_context(
+                    handle,
+                    &journal,
+                    entry,
+                    context,
+                    self.runtime.novarocks_catalog().evidence_policy(),
+                ) && let ExternalMutationOutcome::KnownCommitted { finalization, .. } =
+                    &mut outcome
+                {
+                    *finalization = add_finalization_failure(finalization.clone(), error.message());
+                    journal.record_entry_finalization(entry, finalization.clone());
+                }
+                handle.retain_keyed_observation(KeyedWriteObservation {
+                    evidence: exact,
+                    conclusion,
+                    observed_current_snapshot: current,
+                });
+                return Ok(outcome);
+            }
+            handle.retain_keyed_observation(KeyedWriteObservation {
+                evidence: exact,
+                conclusion,
+                observed_current_snapshot: current,
+            });
+            return Ok(journal.catalog_entry_outcome(entry));
+        }
         let managed_repartition = handle
             .repartition()
             .is_some_and(|value| value.storage_updates().is_some())
@@ -1620,6 +1726,29 @@ impl IcebergWriteSessionControl {
     }
 }
 
+fn observe_keyed_dispatch(
+    metadata: &TableMetadata,
+    evidence: &novarocks_spi::connector::UnknownCommitEvidence,
+) -> Result<novarocks_spi::connector::CommitConclusion, ConnectorError> {
+    use crate::document_storage::keyed::{resolution, view::project_snapshot};
+    use novarocks_spi::connector::UnknownCommitIdentity;
+    let UnknownCommitIdentity::SnapshotDispatch(dispatch) = &evidence.identity else {
+        return Err(internal(
+            "keyed snapshot selection did not produce grouped evidence",
+        ));
+    };
+    let current = metadata.current_snapshot_id();
+    let snapshots = metadata
+        .snapshots()
+        .map(|snapshot| {
+            project_snapshot(snapshot, Some(snapshot.snapshot_id()) == current)
+                .map_err(crate::document_storage::observation::keyed_read_error)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let snapshots = resolution::index_snapshots(&snapshots)?;
+    resolution::resolve_snapshot_dispatch(current, &snapshots, evidence, dispatch)
+}
+
 fn failed_write_observation<R>(
     operation: CommitOperation,
     original: ExternalMutationOutcome<R>,
@@ -1704,6 +1833,13 @@ fn retained_committed_completion(
                 cleanup: handle.terminal_cleanup(),
             }
         }
+        ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
+            ConnectorWritePublicationCompletion::CommitUnknown {
+                failure,
+                evidence,
+                keyed_observation: handle.keyed_observation(),
+            }
+        }
         other => ConnectorWritePublicationCompletion::from_outcome(other),
     }
 }
@@ -1730,13 +1866,18 @@ fn retain_reconciled_committed_fact(
         {
             needed
         }
-        _ => Arc::new(
-            novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+        _ => {
+            let needed = novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
                 *effect,
                 receipt.clone(),
                 finalization.clone(),
-            ),
-        ),
+            );
+            Arc::new(if let Some(observation) = handle.keyed_observation() {
+                needed.with_keyed_observation(observation)
+            } else {
+                needed
+            })
+        }
     };
     if let Err(error) = handle.settle(IcebergWriteSessionState::KnownCommitted { needed }) {
         *finalization = add_finalization_failure(finalization.clone(), error.message());

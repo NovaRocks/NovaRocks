@@ -290,6 +290,83 @@ impl ConnectorDocumentStorageObservation for super::create::IcebergDocumentStora
         decode_keyed_slot_evidence(self, &request, &evidence)
     }
 
+    fn decode_keyed_retirement_evidence(
+        &self,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+        evidence: novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<novarocks_spi::connector::UnknownCommitEvidence, ConnectorError> {
+        use crate::reconcile_payload::{IcebergMutationEvidenceTarget, decode_mutation_evidence};
+        use novarocks_spi::connector::{
+            KeyedDispatchRecord, KeyedSnapshotDispatch, UnknownCommitEvidence,
+            UnknownCommitIdentity,
+        };
+        request.validate()?;
+        let invalid = |message| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message);
+        if evidence.descriptor() != self.descriptor()
+            || evidence.incarnation() != self.incarnation()
+            || request.owner.instance_id != self.descriptor().instance_id
+            || request.owner.incarnation != self.incarnation()
+            || evidence.schema_version()
+                != crate::reconcile_payload::ICEBERG_MUTATION_EVIDENCE_VERSION
+            || evidence.operation_kind() != "keyed-documents"
+        {
+            return Err(invalid(
+                "retirement evidence belongs to another provider or operation",
+            ));
+        }
+        let payload = decode_mutation_evidence(evidence.provider_payload())
+            .map_err(|message| ConnectorError::new(ConnectorErrorKind::CorruptData, message))?;
+        let IcebergMutationEvidenceTarget::KeyedRetirement {
+            namespace,
+            table,
+            table_uuid,
+            operation_id,
+            asserted_parent,
+            preselected_snapshot,
+            record_owner,
+            record_name,
+            record_envelope,
+            ..
+        } = payload.target
+        else {
+            return Err(invalid("evidence does not describe a retirement"));
+        };
+        if namespace != request.target.namespace.as_ref()
+            || table != request.target.table.as_ref()
+            || table_uuid.as_bytes() != request.object_id.as_bytes().as_ref()
+            || operation_id != evidence.operation_id().to_bytes()
+            || asserted_parent <= 0
+            || preselected_snapshot <= 0
+            || asserted_parent == preselected_snapshot
+        {
+            return Err(invalid(
+                "retirement evidence does not match its exact object and operation",
+            ));
+        }
+        let key = super::keyed::keys::record_key(&record_owner, &record_name);
+        let record = super::keyed::record::decode_record(&key, &record_envelope)?;
+        if record.binding.is_some() || record.payload.is_empty() {
+            return Err(invalid(
+                "retirement evidence has no detached retirement record",
+            ));
+        }
+        Ok(UnknownCommitEvidence {
+            asserted_parent: Some(asserted_parent),
+            preselected_snapshot,
+            identity: UnknownCommitIdentity::SnapshotDispatch(Box::new(KeyedSnapshotDispatch {
+                target: request.object_id,
+                operation_id: evidence.operation_id(),
+                delete_stage: None,
+                records: vec![KeyedDispatchRecord {
+                    owner: record_owner,
+                    name: record_name,
+                    envelope: Bytes::from(record_envelope),
+                }],
+                repartition_effect: None,
+            })),
+        })
+    }
+
     fn resolve_keyed_commit(
         &self,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,

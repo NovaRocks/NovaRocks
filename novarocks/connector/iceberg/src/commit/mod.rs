@@ -40,6 +40,7 @@ pub(crate) mod manifest_merge;
 pub(crate) mod manifest_sources;
 mod manifest_transform;
 pub(crate) mod model;
+pub(crate) mod mv_dispatch;
 pub mod mv_publication_fence;
 pub mod mv_refresh_ref;
 mod new_manifests;

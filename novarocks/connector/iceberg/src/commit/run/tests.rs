@@ -436,7 +436,7 @@ async fn keyed_full_zero_output_deletes_then_appends_an_empty_snapshot() {
 }
 
 #[tokio::test]
-async fn full_refresh_lost_reply_recovers_only_the_marked_append() {
+async fn full_refresh_lost_reply_recognizes_delete_stage_and_recovers_the_original_append() {
     let fixture = publication_fixture(FormatVersion::V2, false, true, None).await;
     let prepared = prepare_keyed(&fixture, b"result").await;
     let control = write_control(&fixture);
@@ -461,6 +461,49 @@ async fn full_refresh_lost_reply_recovers_only_the_marked_append() {
     assert!(marked.next().is_none());
     assert_eq!(append.parent_snapshot_id(), Some(deleted.snapshot_id()));
     assert_eq!(deleted.parent_snapshot_id(), prepared.base_snapshot_id);
+    let storage = fixture
+        .catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .unwrap();
+    let (_, journal) = iceberg_handle(&fixture, &plan)
+        .retained_publication()
+        .unwrap()
+        .unwrap();
+    let original = journal
+        .entry_descriptor(journal.current_entry().unwrap())
+        .unwrap();
+    let crate::commit::publication_descriptor::AttributionPlan::KeyedSnapshot(selection) =
+        &original.attribution
+    else {
+        panic!("the frozen request must own grouped dispatch attribution");
+    };
+    assert_eq!(selection.snapshot, append.snapshot_id());
+    assert_eq!(selection.parent, prepared.base_snapshot_id);
+    let witness = &deleted.summary().additional_properties
+        [crate::commit::mv_dispatch::FULL_REFRESH_STAGE_SUMMARY_KEY];
+    let proof: serde_json::Value = serde_json::from_str(witness).unwrap();
+    assert_eq!(proof["delete_snapshot"], deleted.snapshot_id());
+    assert_eq!(proof["append_snapshot"], append.snapshot_id());
+    assert_eq!(proof["table_uuid"], storage.metadata().uuid().to_string());
+
+    let mut without_append = serde_json::to_value(storage.metadata()).unwrap();
+    without_append["snapshots"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|snapshot| snapshot["snapshot-id"] != append.snapshot_id());
+    without_append["current-snapshot-id"] = deleted.snapshot_id().into();
+    without_append["refs"]["main"]["snapshot-id"] = deleted.snapshot_id().into();
+    let without_append = serde_json::from_value(without_append).unwrap();
+    assert!(matches!(
+        original.attribution.observe_table_metadata(&without_append),
+        Some(
+            crate::commit::publication_descriptor::PositiveAttributionObservation::KeyedSnapshot {
+                observed: crate::commit::mv_dispatch::KeyedSnapshotObservation::Delete { .. },
+                ..
+            }
+        )
+    ));
     let ExternalMutationOutcome::KnownCommitted { receipt, .. } = control
         .reconcile_write(ConnectorWriteSessionReconcileRequest {
             commit: plan.commit_session(),
