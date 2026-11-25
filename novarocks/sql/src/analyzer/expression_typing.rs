@@ -20,7 +20,7 @@ use novarocks_expression::typing::{
 };
 use novarocks_functions::{
     ConstantPolicy, FunctionArgument, FunctionBindingError, FunctionBindingRequest,
-    FunctionResultType, ResolvedFunctionBinding,
+    FunctionResultType, HigherOrderBindingCandidate, ResolvedFunctionBinding,
 };
 use novarocks_parser::{Span, ast};
 use novarocks_type_contract::{
@@ -38,6 +38,35 @@ use crate::compiler::SqlFunctionCatalog;
 struct StatementScalarCatalog<'a>(&'a dyn SqlFunctionCatalog);
 
 impl ScalarBindingCatalog for StatementScalarCatalog<'_> {
+    fn begin_higher_order_binding(
+        &self,
+        name: &str,
+        ordinary_ordinal: usize,
+        ordinary: &FunctionArgument,
+        lambda_ordinal: usize,
+        lambda_arity: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<HigherOrderBindingCandidate, FunctionBindingError> {
+        self.0.begin_higher_order_binding(
+            name,
+            ordinary_ordinal,
+            ordinary,
+            lambda_ordinal,
+            lambda_arity,
+            control,
+        )
+    }
+
+    fn finish_higher_order_binding(
+        &self,
+        candidate: &HigherOrderBindingCandidate,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.0
+            .finish_higher_order_binding(candidate, request, control)
+    }
+
     fn select_scalar(
         &self,
         name: &str,
@@ -100,6 +129,65 @@ impl ScalarBindingCatalog for StatementScalarCatalog<'_> {
 }
 
 impl AnalyzerContext<'_> {
+    pub(super) fn begin_collection_lambda(
+        &self,
+        name: &str,
+        collection: TypedExpr,
+        arity: usize,
+        span: Span,
+    ) -> Result<(HigherOrderBindingCandidate, TypedExpr), AnalyzeError> {
+        let args = vec![collection];
+        let ordinals = self.described_arguments(&args);
+        let (candidate, mut converted) = self.with_typing(span, |context, work| {
+            let children = typed_children(context, &args, true, work)?;
+            let (candidate, conversion) =
+                typing::begin_collection_lambda(context, name, &children[0], arity, work)?;
+            let converted = apply_conversions(
+                context,
+                args,
+                vec![conversion],
+                self.sql_semantics.statement_time(),
+                self.purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition,
+                work,
+            )?;
+            Ok((candidate, converted))
+        })?;
+        self.observe_argument_types(ordinals, converted.iter().map(|arg| Some(&arg.value_type)))?;
+        Ok((
+            candidate,
+            converted.pop().expect("one converted collection"),
+        ))
+    }
+
+    pub(super) fn finish_collection_lambda(
+        &self,
+        candidate: &HigherOrderBindingCandidate,
+        collection: TypedExpr,
+        lambda: TypedExpr,
+        span: Span,
+    ) -> Result<BoundScalarCall, AnalyzeError> {
+        self.with_typing(span, |context, work| {
+            let mut args = vec![collection];
+            let children = typed_children(context, &args, true, work)?;
+            let binding = typing::finish_collection_lambda(
+                context,
+                candidate,
+                &children[0],
+                &lambda.value_type,
+                work,
+            )?;
+            let dependencies = self.function_catalog.scalar_time_dependencies(&binding);
+            enforce_mv_time_independence(
+                self.purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition,
+                dependencies,
+            )?;
+            let binding = SqlFunctionBinding::new(binding, context.decimal_overflow_policy)
+                .with_statement_time(self.sql_semantics.statement_time(), dependencies)?;
+            args.push(lambda);
+            Ok(BoundScalarCall { args, binding })
+        })
+    }
+
     pub(super) fn described_arguments(&self, args: &[TypedExpr]) -> Option<Vec<Option<usize>>> {
         let factory = self.factory.borrow();
         let description = factory.prepared_description.as_ref()?;

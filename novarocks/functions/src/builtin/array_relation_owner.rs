@@ -306,6 +306,10 @@ impl PreparedScalarKernel for PreparedArrayRelation {
         &self.contract
     }
 
+    fn supports_scalar_broadcast(&self, ordinal: usize) -> bool {
+        self.relation.supports_scalar_broadcast(ordinal)
+    }
+
     fn instance_retained_upper_bound(&self) -> usize {
         size_of::<ArrayRelationInstance>() + HostAggregateAllocator::metadata_allocation_bytes()
     }

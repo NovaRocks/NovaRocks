@@ -20,21 +20,30 @@
 
 use std::{fmt, sync::Arc};
 
+#[cfg(test)]
 use arrow_array::new_empty_array;
 use novarocks_type_contract::{
     CallEffects, ExpressionEffectContext, FunctionIntrinsicRowError, PureCompileControl,
 };
 
+use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::{EvaluationCheckpoints, logical_is_null, validate_argument_observed};
 use crate::{
-    BoundLambdaBodyEvaluator, CallEffectInput, EvaluatedArgument, FunctionArgumentType,
+    AggregateStateAllocator, CallEffectInput, EvaluatedArgument, FunctionArgumentType,
     FunctionBindingError, FunctionBindingResolver, FunctionBindingSelection, FunctionEffectOwner,
     FunctionSpecializationFailure, FunctionValueType, HigherOrderCallContract,
-    KernelEvaluationControl, KernelFailure, LambdaBodyContract, LambdaBodyInput,
-    LambdaBodyInvocation, LambdaBodyOutput, LambdaElementRowMap, RequiredLambdaBodyError,
-    ScopedExpressionEffects, SelectedValues, Selection,
+    KernelEvaluationControl, KernelFailure, LambdaBodyContract, RequiredLambdaBodyError,
+    RowDataError, ScopedExpressionEffects, SelectedValues, Selection,
 };
+#[cfg(test)]
+use crate::{
+    BoundLambdaBodyEvaluator, LambdaBodyInput, LambdaBodyInvocation, LambdaBodyOutput,
+    LambdaElementRowMap,
+};
+
+mod steps;
+pub use steps::*;
 
 /// The compiler supplies the inner root context/captures and complete body
 /// effects. Ordinary child effects are supplied in the outer call context.
@@ -259,15 +268,14 @@ fn specialize_once_core<
     Ok(HigherOrderSpecialization { prepared, effects })
 }
 
-/// Ordinary argument vectors omit the lambda channel but retain their exact
-/// selected order. Ordered captures are already evaluated in the outer domain
-/// by their expression host, including enclosing lambda parameters. Expansion
-/// gathers only from these supplied values; no source/ExprId lookup is exposed.
+/// Ordinary arguments omit the lambda channel but retain their exact order.
+/// Captures belong to the expression host and its original lexical frames.
 #[derive(Clone, Copy, Debug)]
 pub struct HigherOrderCallInput<'contract, 'input> {
     contract: &'contract HigherOrderCallContract,
     selection: Selection<'input>,
     arguments: &'input [EvaluatedArgument<'input>],
+    #[cfg(test)]
     captures: &'input [EvaluatedArgument<'input>],
 }
 impl<'contract, 'input> HigherOrderCallInput<'contract, 'input> {
@@ -280,6 +288,7 @@ impl<'contract, 'input> HigherOrderCallInput<'contract, 'input> {
     pub const fn arguments(self) -> &'input [EvaluatedArgument<'input>] {
         self.arguments
     }
+    #[cfg(test)]
     pub const fn captures(self) -> &'input [EvaluatedArgument<'input>] {
         self.captures
     }
@@ -314,12 +323,23 @@ impl<'input> HigherOrderOutput<'input> {
 }
 
 pub trait HigherOrderKernelInstance: Send {
+    fn begin<'call, 'input: 'call>(
+        &'call mut self,
+        _input: HigherOrderCallInput<'_, 'input>,
+        _allocator: &Arc<dyn AggregateStateAllocator>,
+        _control: &dyn KernelEvaluationControl,
+    ) -> Result<Box<dyn HigherOrderCall<'input> + 'call>, KernelFailure> {
+        Err(invalid("higher-order kernel has no staged invocation"))
+    }
+    #[cfg(test)]
     fn evaluate<'input>(
         &mut self,
-        input: HigherOrderCallInput<'_, 'input>,
-        body: &mut LambdaBodyExecutor<'_, 'input>,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<HigherOrderOutput<'input>, KernelFailure>;
+        _input: HigherOrderCallInput<'_, 'input>,
+        _body: &mut LambdaBodyExecutor<'_, 'input>,
+        _control: &dyn KernelEvaluationControl,
+    ) -> Result<HigherOrderOutput<'input>, KernelFailure> {
+        Err(invalid("higher-order kernel has no direct test invocation"))
+    }
     fn retained_bytes(&self) -> usize;
 }
 
@@ -332,12 +352,14 @@ pub trait HigherOrderKernelInstance: Send {
 /// non-overlap across expansion frames remain the exact owner's responsibility.
 /// Expansion bytes and work are authorized by the host before invocation; this
 /// object does not issue MEM grants or expose a source-row fallback.
+#[cfg(test)]
 pub struct LambdaBodyExecutor<'evaluator, 'outer> {
     evaluator: &'evaluator mut dyn BoundLambdaBodyEvaluator,
     contract: Arc<LambdaBodyContract>,
     outer: Selection<'outer>,
     failure: Option<KernelFailure>,
 }
+#[cfg(test)]
 impl<'outer> LambdaBodyExecutor<'_, 'outer> {
     pub fn evaluate<'input>(
         &mut self,
@@ -440,6 +462,7 @@ impl HigherOrderEvaluationInstance {
         }
         Ok(size_of::<Self>() + bytes)
     }
+    #[cfg(test)]
     pub fn evaluate<'input>(
         &mut self,
         selection: Selection<'input>,
@@ -457,6 +480,7 @@ impl HigherOrderEvaluationInstance {
         }
         result
     }
+    #[cfg(test)]
     fn evaluate_once<'input>(
         &mut self,
         selection: Selection<'input>,
@@ -473,26 +497,13 @@ impl HigherOrderEvaluationInstance {
                 "higher-order evaluation received a different compiled body",
             ));
         }
-        let selected = self.contract.call().selected();
-        if arguments.len() != selected.argument_types.len() - 1
-            || captures.len() != self.body.capture_types().len()
-        {
+        validate_ordinary_inputs(&self.contract, selection, arguments, control)?;
+        if captures.len() != self.body.capture_types().len() {
             return Err(invalid(
                 "higher-order values differ from their exact input shape",
             ));
         }
-        let expected = selected
-            .argument_types
-            .iter()
-            .filter_map(|argument| match argument {
-                FunctionArgumentType::Value(value) => Some(value),
-                FunctionArgumentType::Lambda { .. } => None,
-            });
-        for (argument, ty) in arguments
-            .iter()
-            .zip(expected)
-            .chain(captures.iter().zip(self.body.capture_types()))
-        {
+        for (argument, ty) in captures.iter().zip(self.body.capture_types()) {
             validate_argument_observed(*argument, selection, ty, control)?;
         }
         if selection.is_empty() {
@@ -528,7 +539,14 @@ impl HigherOrderEvaluationInstance {
         self.validate_metadata()?;
         self.retained_bytes()?;
         control.checkpoint(0)?;
-        validate_output(&self.contract, &self.body, selection, &output, control)?;
+        validate_output(
+            &self.contract,
+            &self.body,
+            selection,
+            &output,
+            None,
+            control,
+        )?;
         Ok(output.values)
     }
     fn validate_metadata(&self) -> Result<(), KernelFailure> {
@@ -539,6 +557,31 @@ impl HigherOrderEvaluationInstance {
             self.retained_bound,
         )
     }
+}
+
+fn validate_ordinary_inputs(
+    contract: &HigherOrderCallContract,
+    selection: Selection<'_>,
+    arguments: &[EvaluatedArgument<'_>],
+    control: &dyn KernelEvaluationControl,
+) -> Result<(), KernelFailure> {
+    let selected = contract.call().selected();
+    if arguments.len() != selected.argument_types.len() - 1 {
+        return Err(invalid(
+            "higher-order values differ from their exact input shape",
+        ));
+    }
+    let expected = selected
+        .argument_types
+        .iter()
+        .filter_map(|argument| match argument {
+            FunctionArgumentType::Value(value) => Some(value),
+            FunctionArgumentType::Lambda { .. } => None,
+        });
+    for (argument, ty) in arguments.iter().zip(expected) {
+        validate_argument_observed(*argument, selection, ty, control)?;
+    }
+    Ok(())
 }
 
 fn validate_prepared_metadata(
@@ -563,6 +606,7 @@ fn validate_output(
     body: &Arc<LambdaBodyContract>,
     selection: Selection<'_>,
     output: &HigherOrderOutput<'_>,
+    origin: Option<&HostAggregateAllocator>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<(), KernelFailure> {
     let values = output.values();
@@ -594,6 +638,11 @@ fn validate_output(
                 .same_rows_observed(selection, || work.step())?
             || ordinal >= selection.len()
             || previous.is_some_and(|previous| previous >= ordinal)
+            || match (&evidence.origin, origin) {
+                (Some(source), Some(origin)) => !source.same_allocation(origin),
+                (None, None) => false,
+                _ => true,
+            }
         {
             return Err(internal(
                 "required lambda errors have unrelated or duplicate provenance",
@@ -606,7 +655,7 @@ fn validate_output(
     for error in values.errors() {
         match child_errors.peek() {
             Some(evidence) if evidence.error().selected_ordinal() == error.selected_ordinal() => {
-                if evidence.error().message() != error.message() {
+                if !same_row_error(evidence.error(), error) {
                     return Err(internal(
                         "required lambda error differs from the parent diagnostic",
                     ));
@@ -645,6 +694,18 @@ fn validate_output(
         }
     }
     work.finish()
+}
+
+fn same_row_error(left: &RowDataError, right: &RowDataError) -> bool {
+    use novarocks_failure_contract::SharedFailureCause;
+    use std::error::Error;
+    let left_source = left
+        .source()
+        .and_then(|source| source.downcast_ref::<SharedFailureCause>());
+    let right_source = right
+        .source()
+        .and_then(|source| source.downcast_ref::<SharedFailureCause>());
+    left == right && left_source == right_source
 }
 
 #[cfg(test)]

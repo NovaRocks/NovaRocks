@@ -230,7 +230,7 @@ pub(crate) mod array_generation_owner;
 mod array_join;
 mod array_join_owner;
 mod array_order;
-mod array_order_owner;
+pub(crate) mod array_order_owner;
 mod array_relation;
 mod array_relation_owner;
 mod array_scalar_output;

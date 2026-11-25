@@ -17,8 +17,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, ListArray, StructArray, make_array};
-use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
+use arrow_array::{Array, ArrayRef, ListArray, MapArray, StructArray, make_array};
+use arrow_buffer::{NullBuffer, NullBufferBuilder, OffsetBuffer};
 use arrow_data::{ArrayData, transform::MutableArrayData};
 use arrow_schema::{DataType, FieldRef, Fields};
 
@@ -151,35 +151,40 @@ impl<'a> ListOutput<'a> {
         child: ArrayRef,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<ArrayRef, KernelFailure> {
-        let offset_count = add(self.row_lengths.len(), 1).map_err(CopyError::into_kernel)?;
-        let mut offsets = Vec::new();
-        offsets
-            .try_reserve_exact(offset_count)
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
-        let mut nulls = self
-            .has_null
-            .then(|| NullBufferBuilder::new(self.row_lengths.len()));
-        let mut offset = 0i32;
-        offsets.push(offset);
-        for len in self.row_lengths {
-            work.step()?;
-            if let Some(nulls) = &mut nulls {
-                nulls.append(len.is_some());
-            }
-            offset += len.unwrap_or(0) as i32;
-            offsets.push(offset);
-        }
-        work.flush()?;
+        let (offsets, nulls) = offsets_and_validity(self.row_lengths, self.has_null, work)?;
         Ok(Arc::new(
-            ListArray::try_new(
-                Arc::clone(self.field),
-                OffsetBuffer::new(offsets.into()),
-                child,
-                nulls.and_then(|mut nulls| nulls.finish()),
-            )
-            .map_err(arrow_failure)?,
+            ListArray::try_new(Arc::clone(self.field), offsets, child, nulls)
+                .map_err(arrow_failure)?,
         ))
     }
+}
+
+fn offsets_and_validity(
+    row_lengths: &[Option<usize>],
+    has_null: bool,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<(OffsetBuffer<i32>, Option<NullBuffer>), KernelFailure> {
+    let offset_count = add(row_lengths.len(), 1).map_err(CopyError::into_kernel)?;
+    let mut offsets = Vec::new();
+    offsets
+        .try_reserve_exact(offset_count)
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    let mut nulls = has_null.then(|| NullBufferBuilder::new(row_lengths.len()));
+    let mut offset = 0i32;
+    offsets.push(offset);
+    for len in row_lengths {
+        work.step()?;
+        if let Some(nulls) = &mut nulls {
+            nulls.append(len.is_some());
+        }
+        offset += len.unwrap_or(0) as i32;
+        offsets.push(offset);
+    }
+    work.flush()?;
+    Ok((
+        OffsetBuffer::new(offsets.into()),
+        nulls.and_then(|mut nulls| nulls.finish()),
+    ))
 }
 
 fn arrow_failure(source: arrow_schema::ArrowError) -> KernelFailure {
@@ -253,6 +258,83 @@ pub(crate) fn list_from_struct_children_in(
     let child = StructArray::try_new_with_length(fields.clone(), fields_copy, None, layout.total)
         .map_err(arrow_failure)?;
     let output = layout.build(Arc::new(child), work)?;
+    facts.bind_original_copy(&output);
+    Ok(retain_copied_result_backing(
+        output,
+        backing,
+        charge,
+        &mut reservation,
+        allocator.clone(),
+        &facts,
+        work,
+    )?
+    .values)
+}
+
+/// Assemble compact MAP rows from the original, already funded entry columns.
+/// Only the MAP offsets/validity and the all-valid entry structure are new.
+pub(crate) fn map_from_struct_children_in(
+    target: &DataType,
+    children: [ArrayRef; 2],
+    row_lengths: &[Option<usize>],
+    host: &Arc<dyn AggregateStateAllocator>,
+    allocator: &HostAggregateAllocator,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ArrayRef, KernelFailure> {
+    let DataType::Map(entries, sorted) = target else {
+        return Err(internal("MAP result does not have its frozen carrier"));
+    };
+    let DataType::Struct(fields) = entries.data_type() else {
+        return Err(internal("MAP result has no frozen entry structure"));
+    };
+    let copy = CopyError::into_kernel;
+    let mut total = 0i32;
+    let mut has_null = false;
+    for length in row_lengths {
+        total = crate::aggregate_scalar::checked_map_output_offset(total, length.unwrap_or(0))?;
+        has_null |= length.is_none();
+        work.step()?;
+    }
+    let (backing, metadata) = observe_sources(&children, allocator, work)?;
+    let mut invoice = CopyInvoiceTotals::default();
+    invoice
+        .interleave_exact_payload(
+            mul(add(row_lengths.len(), 1).map_err(copy)?, size_of::<i32>()).map_err(copy)?,
+        )
+        .map_err(copy)?;
+    if has_null {
+        invoice
+            .interleave_validity(row_lengths.len())
+            .map_err(copy)?;
+    }
+    invoice
+        .original_comparator_scratch(
+            result_node_metadata_upper(target, 1, has_null, 1).map_err(copy)?,
+        )
+        .map_err(copy)?;
+    invoice
+        .original_comparator_scratch(
+            result_node_metadata_upper(entries.data_type(), 0, false, 2).map_err(copy)?,
+        )
+        .map_err(copy)?;
+    invoice
+        .original_comparator_scratch(metadata)
+        .map_err(copy)?;
+    let mut facts = invoice
+        .finish(mul(metadata, 2).map_err(copy)?)
+        .map_err(copy)?;
+    let charge = OpaqueRetainedCharge::try_new(Arc::clone(host))?;
+    work.flush()?;
+    let mut reservation = charge.reserve_operation(facts.operation_peak_bytes())?;
+    work.flush()?;
+    let (offsets, nulls) = offsets_and_validity(row_lengths, has_null, work)?;
+    let entries_array =
+        StructArray::try_new_with_length(fields.clone(), Vec::from(children), None, total as usize)
+            .map_err(arrow_failure)?;
+    let output: ArrayRef = Arc::new(
+        MapArray::try_new(Arc::clone(entries), offsets, entries_array, nulls, *sorted)
+            .map_err(arrow_failure)?,
+    );
     facts.bind_original_copy(&output);
     Ok(retain_copied_result_backing(
         output,

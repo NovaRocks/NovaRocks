@@ -82,11 +82,15 @@ pub struct CompiledExprSet {
     all_ports: Option<ScopeLayout>,
     roots: Box<[CompiledRoot]>,
     effects: BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    pub(crate) lambdas: crate::compiler::lambda::CompiledLambdas,
     ids: BTreeMap<ExprId, CompiledExprId>,
     _storage: ValueTypeStorageLifetime,
 }
 #[path = "evaluator_view.rs"]
 pub mod evaluator_view;
+pub use crate::compiler::lambda::{
+    CompiledLambdaBody, CompiledLambdaCapture, LambdaCaptureSource, LambdaReuseScope,
+};
 
 fn publication<H>(e: ProgramCreationFailure<ProgramPrimitiveError, H>) -> ExprCompileFailure<H> {
     match e {
@@ -238,7 +242,7 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         factory,
     )?;
     let creation = factory.map(|f| (f, &policy));
-    let (calls, effects) = crate::compiler::prepare_core(
+    let (calls, effects, lambdas) = crate::compiler::prepare_core(
         unit,
         environment,
         &lowered,
@@ -246,6 +250,8 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         control,
         work,
         creation,
+        crate::creation::borrow_scope(&mut temporary),
+        crate::creation::borrow_scope(&mut retained),
     )?;
     let mut inputs = BTreeMap::new();
     let mut roots = Vec::new();
@@ -435,6 +441,7 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         all_ports,
         roots: roots.into_boxed_slice(),
         effects,
+        lambdas,
         ids: lowered.ids,
         _storage: storage,
     }))

@@ -50,6 +50,7 @@ mod copy_buffer_peak;
 mod list_output;
 pub(crate) use list_output::{
     array_from_segments_in, list_child_count, list_from_segments_in, list_from_struct_children_in,
+    map_from_struct_children_in,
 };
 #[path = "selected_copy/slice_host.rs"]
 mod slice_host;

@@ -22,7 +22,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionParameterTypes,
+    PureCompileControl,
 };
 use sha2::{Digest, Sha256};
 
@@ -177,9 +178,14 @@ impl<'a> CheckedCallEffectInput<'a> {
         input: crate::CallEffectInput<'_>,
     ) -> Result<(), FunctionBindingError> {
         self.require_input(input, self.constant_policy)?;
-        if !matches!(&self.binding.resolver.0, BindingResolverOwnerKind::FixedScalar(owner)
-            if std::ptr::eq(owner.as_ref(), resolver))
-        {
+        let same = match &self.binding.resolver.0 {
+            BindingResolverOwnerKind::FixedScalar(owner) => std::ptr::eq(owner.as_ref(), resolver),
+            BindingResolverOwnerKind::ArrayOrder(owner) => {
+                owner.owns_natural_binding(resolver, input)
+            }
+            _ => false,
+        };
+        if !same {
             return Err(invalid_binding(
                 "checked selection borrows a different original binding author",
             ));
@@ -565,10 +571,59 @@ pub struct FunctionBindingSelection {
     pub aggregate: Option<AggregateBindingSelection>,
 }
 
+/// The original catalog candidate, before its body has a type. The caller
+/// retains the syntax and binds the body with these exact parameter types.
+#[derive(Clone, Debug)]
+pub struct HigherOrderBindingCandidate {
+    declaration: Arc<FunctionBindingDeclaration>,
+    overload: FunctionOverloadId,
+    collection_target: FunctionValueType,
+    parameter_types: FunctionParameterTypes,
+}
+
+impl HigherOrderBindingCandidate {
+    pub fn function_id(&self) -> &FunctionId {
+        self.declaration.function_id()
+    }
+
+    pub fn overload(&self) -> &FunctionOverloadId {
+        &self.overload
+    }
+
+    pub fn collection_target(&self) -> &FunctionValueType {
+        &self.collection_target
+    }
+
+    pub fn parameter_types(&self) -> &FunctionParameterTypes {
+        &self.parameter_types
+    }
+}
+
+/// A candidate's single, exact value target and contextual lambda parameters.
+/// Only the installed binding author may supply these facts to its catalogue.
+#[doc(hidden)]
+pub struct HigherOrderBindingShape {
+    pub overload: FunctionOverloadId,
+    pub collection_target: FunctionValueType,
+    pub parameter_types: FunctionParameterTypes,
+}
+
 /// FE resolution and BE selected-binding validation are distinct operations.
 /// Implementations must validate the requested overload directly; validation
 /// must not call resolution to choose a possibly different candidate.
 pub trait FunctionBindingResolver: Send + Sync {
+    fn begin_higher_order_binding(
+        &self,
+        _ordinary_ordinal: usize,
+        _ordinary: &FunctionArgument,
+        _lambda_ordinal: usize,
+        _lambda_arity: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<HigherOrderBindingShape, FunctionBindingError> {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+        Err(FunctionBindingError::NoMatchingOverload)
+    }
+
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
@@ -632,6 +687,8 @@ enum BindingResolverOwnerKind {
     BorrowedArraySequence(Arc<crate::builtin::array_generation_owner::SequenceResolver>),
     BorrowedTemporalContext(Arc<crate::builtin::temporal_context::TemporalContextResolver>),
     BorrowedBinaryOperator(Arc<crate::builtin::binary_operator_owner::BinaryOperatorOwner>),
+    CollectionLambda(Arc<crate::builtin::collection_lambda::CollectionLambdaOwner>),
+    ArrayOrder(Arc<crate::builtin::array_order_owner::ArrayOrderOwner>),
     ParametricAggregate(Arc<ParametricAggregateBindingResolver>),
     Original(Arc<dyn FunctionBindingResolver>),
 }
@@ -696,6 +753,16 @@ impl FunctionBindingResolverOwner {
     pub(crate) fn parametric_aggregate(owner: Arc<ParametricAggregateBindingResolver>) -> Self {
         Self(BindingResolverOwnerKind::ParametricAggregate(owner))
     }
+    pub(crate) fn collection_lambda(
+        owner: Arc<crate::builtin::collection_lambda::CollectionLambdaOwner>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::CollectionLambda(owner))
+    }
+    pub(crate) fn array_order(
+        owner: Arc<crate::builtin::array_order_owner::ArrayOrderOwner>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::ArrayOrder(owner))
+    }
     fn validate_selected_with_creation<H>(
         &self,
         selected: &FunctionBindingSelection,
@@ -742,6 +809,11 @@ impl FunctionBindingResolverOwner {
                     BindingResolverOwnerKind::BorrowedBinaryOperator(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
+                    BindingResolverOwnerKind::CollectionLambda(owner) => owner
+                        .validate_selected(selected, request, control)
+                        .map_err(Into::into),
+                    BindingResolverOwnerKind::ArrayOrder(owner) => owner
+                        .validate_selected_with_creator_in(selected, request, creation, control),
                     BindingResolverOwnerKind::ParametricAggregate(owner) => owner
                         .validate_selected_with_creator_in(selected, request, creation, control),
                     BindingResolverOwnerKind::Original(_) => {
@@ -764,6 +836,8 @@ impl FunctionBindingResolverOwner {
             BindingResolverOwnerKind::BorrowedArraySequence(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedTemporalContext(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedBinaryOperator(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::CollectionLambda(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::ArrayOrder(owner) => owner.as_ref(),
             BindingResolverOwnerKind::ParametricAggregate(owner) => owner.as_ref(),
             BindingResolverOwnerKind::Original(owner) => owner.as_ref(),
         }
@@ -1111,6 +1185,131 @@ impl EngineFunctionCatalog {
         self.identities
             .get(identity)
             .map(|index| &self.definitions[*index])
+    }
+
+    pub fn begin_higher_order_binding(
+        &self,
+        name: &str,
+        ordinary_ordinal: usize,
+        ordinary: &FunctionArgument,
+        lambda_ordinal: usize,
+        lambda_arity: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<HigherOrderBindingCandidate, FunctionBindingError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            work.step()?;
+            let definition = self
+                .definition(name, FunctionKind::Scalar)
+                .ok_or(FunctionBindingError::UnknownFunction)?;
+            if definition.visibility == FunctionVisibility::Hidden {
+                return Err(FunctionBindingError::HiddenFunction);
+            }
+            let binding = exact_definition(definition)?;
+            validate_request(
+                FunctionKind::Scalar,
+                FunctionBindingRequest {
+                    arguments: std::slice::from_ref(ordinary),
+                    logical_argument_count: 1,
+                    expected_result_type: None,
+                },
+                &mut work,
+            )?;
+            if lambda_arity > crate::MAX_CALL_EFFECT_ARGUMENTS {
+                return Err(CompileControlError::ResourceExhausted.into());
+            }
+            work.flush()?;
+            let shape = binding.resolver.pure_author().begin_higher_order_binding(
+                ordinary_ordinal,
+                ordinary,
+                lambda_ordinal,
+                lambda_arity,
+                control,
+            )?;
+            let effect = binding.declaration.effect_declaration(&shape.overload)?;
+            if !matches!(
+                effect.argument_control,
+                novarocks_type_contract::ArgumentControl::HigherOrder { body_ordinal, .. }
+                    if u32::try_from(lambda_ordinal) == Ok(body_ordinal)
+            ) || shape.parameter_types.len() != lambda_arity
+            {
+                return Err(invalid_binding(
+                    "higher-order candidate differs from its declaration",
+                ));
+            }
+            Ok(HigherOrderBindingCandidate {
+                declaration: Arc::clone(&binding.declaration),
+                overload: shape.overload,
+                collection_target: shape.collection_target,
+                parameter_types: shape.parameter_types,
+            })
+        })();
+        finish_binding_work(result, work)
+    }
+
+    pub fn finish_higher_order_binding(
+        &self,
+        candidate: &HigherOrderBindingCandidate,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            work.step()?;
+            let definition = self
+                .definition_by_id(candidate.function_id())
+                .ok_or(FunctionBindingError::UnknownFunction)?;
+            let binding = exact_definition(definition)?;
+            if !Arc::ptr_eq(&binding.declaration, &candidate.declaration) {
+                return Err(invalid_binding(
+                    "higher-order candidate has a different declaring owner",
+                ));
+            }
+            let [
+                FunctionArgument::Value { value_type, .. },
+                FunctionArgument::Lambda {
+                    parameter_types, ..
+                },
+            ] = request.arguments
+            else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            let mut observe = || work.step().map_err(FunctionBindingError::from);
+            if !candidate
+                .collection_target
+                .exactly_equals_checked_observed(value_type, &mut observe)?
+                || candidate.parameter_types.len() != parameter_types.len()
+            {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            for (expected, actual) in candidate.parameter_types.iter().zip(parameter_types.iter()) {
+                if !expected.exactly_equals_checked_observed(actual, &mut observe)? {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                }
+            }
+            let selected = select_exact_definition(
+                binding,
+                FunctionKind::Scalar,
+                candidate.overload(),
+                request,
+                &mut work,
+            )?;
+            let mut resolved = resolved_definition_selection(binding, request, selected)?;
+            resolved.admitted_execution_abi = binding
+                .pure
+                .as_ref()
+                .and_then(|attachment| attachment.implementation_abi(candidate.overload()));
+            if resolved
+                .admitted_execution_abi
+                .is_some_and(|abi| abi != crate::PureKernelAbi::HigherOrderV1)
+            {
+                return Err(invalid_binding(
+                    "higher-order candidate has a different installed ABI",
+                ));
+            }
+            Ok(resolved)
+        })();
+        finish_binding_work(result, work)
     }
 
     pub fn resolve_bound_user(

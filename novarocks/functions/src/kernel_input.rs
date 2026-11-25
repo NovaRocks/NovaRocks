@@ -263,6 +263,21 @@ pub fn visit_selected_nulls(
 }
 
 /// Observe borrowed logical NULL access without materializing a bitmap.
+pub fn inspect_logical_null(
+    array: &dyn Array,
+    row: usize,
+    mut observe: impl FnMut() -> Result<(), KernelFailure>,
+) -> Result<bool, KernelFailure> {
+    crate::logical_null::logical_is_null_observed(array, row, 1, &mut observe).map_err(|error| {
+        match error {
+            crate::logical_null::NullVisitError::Control(cause) => cause,
+            crate::logical_null::NullVisitError::Invalid(source) => {
+                KernelFailure::from_domain(source)
+            }
+        }
+    })
+}
+
 pub(crate) fn logical_is_null(
     array: &dyn Array,
     row: usize,

@@ -38,6 +38,8 @@ use std::{
     fmt,
     sync::Arc,
 };
+pub(crate) mod lambda;
+
 pub(crate) struct LoweredExpressions {
     pub arena: Arc<ImmutableExpressions>,
     pub ids: BTreeMap<ExprId, CompiledExprId>,
@@ -346,6 +348,20 @@ expression_creation_cause!(ExpressionsCompileError);
 expression_creation_cause!(novarocks_functions::ArithmeticPrepareError);
 expression_creation_cause!(novarocks_functions::CastPrepareError);
 expression_creation_cause!(novarocks_functions::ComparisonPrepareError);
+impl<H> From<crate::ProgramCreationFailure<ExprCompileError, H>> for ExprCompileFailure<H> {
+    fn from(error: crate::ProgramCreationFailure<ExprCompileError, H>) -> Self {
+        use crate::ProgramCreationFailure as Failure;
+        match error {
+            Failure::Control(cause) => Self::Control(cause),
+            Failure::Creator(cause) => Self::Creator(cause),
+            Failure::Resource(cause) => Self::Resource(cause),
+            Failure::Capacity(cause) => {
+                Self::Owner(ExprCompileError::Publication(Failure::Capacity(cause)))
+            }
+            Failure::Owner(cause) => cause.into(),
+        }
+    }
+}
 impl<H> From<EffectContractError> for ExprCompileFailure<H> {
     fn from(error: EffectContractError) -> Self {
         ExprCompileError::from(error).into()
@@ -593,7 +609,10 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                 );
             }
             let child = match &node.kind {
-                ExprKind::Constant(_) | ExprKind::Value(_) => None,
+                ExprKind::Constant(_) | ExprKind::Value(_) | ExprKind::LambdaParameter { .. } => {
+                    None
+                }
+                ExprKind::Lambda { body, .. } => (next == 0).then_some(*body),
                 ExprKind::FunctionCall { args, .. }
                 | ExprKind::Conjunction { args }
                 | ExprKind::Disjunction { args } => args.get(next).copied(),
@@ -645,6 +664,15 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
             }
             let kind = match &node.kind {
                 ExprKind::Value(_) => StaticExprKind::Input,
+                ExprKind::Lambda { body, .. } => StaticExprKind::Lambda {
+                    body: *ids
+                        .get(body)
+                        .ok_or(ExprCompileError::Invalid("lambda body was not lowered"))?,
+                },
+                ExprKind::LambdaParameter { lambda, ordinal } => StaticExprKind::LambdaParameter {
+                    lambda: *lambda,
+                    ordinal: *ordinal,
+                },
                 ExprKind::Constant(reference) => StaticExprKind::Constant(
                     environment
                         .constants
@@ -1009,7 +1037,31 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                 ty.clone_observed(|| work.step())?,
             ));
             observe_type_push(&types, crate::creation::borrow_scope(&mut creation), work)?;
-            types.push(FunctionArgumentType::Value(ty));
+            let argument_type = match &node.kind {
+                ExprKind::Lambda {
+                    parameter_types, ..
+                } => {
+                    let mut owner = crate::creation::ProgramCreation {
+                        creator: crate::creation::borrow_scope(&mut creation),
+                    };
+                    let mut parameters =
+                        owner.reserve::<ExprCompileError, _>(parameter_types.len(), work)?;
+                    for parameter in parameter_types {
+                        parameters.push(parameter.clone_observed(|| work.step())?);
+                    }
+                    FunctionArgumentType::Lambda {
+                        parameter_types: crate::creation::publish_argument_types(
+                            parameters,
+                            crate::creation::borrow_scope(&mut creation),
+                            work,
+                        )
+                        .map_err(|e| e.map_owner(|never| match never {}))?,
+                        result_type: ty,
+                    }
+                }
+                _ => FunctionArgumentType::Value(ty),
+            };
+            types.push(argument_type);
             work.flush()?;
             ids.insert(id, CompiledExprId::new(nodes.len() - 1));
             active.remove(&id);
@@ -1051,7 +1103,9 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
 pub(crate) type PreparedUnitCalls = (
     Vec<(ExpressionUseId, PureCallSpecialization)>,
     BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    lambda::CompiledLambdas,
 );
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     unit: &BoundExprSet,
     environment: crate::EvaluationEnvironment<'_>,
@@ -1060,6 +1114,8 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
     control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
     creation: CallCreation<'_, F>,
+    temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    retained: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
 ) -> Result<PreparedUnitCalls, ExprCompileFailure<H>> {
     if lowered.ids.len() != unit.definitions().len()
         || lowered.types.len() != lowered.arena.nodes().len()
@@ -1076,8 +1132,42 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
         if !local_ids.insert(local_id) {
             return Err(ExprCompileError::Invalid("distinct definitions share a local ID").into());
         }
-        let Some(FunctionArgumentType::Value(ty)) = lowered.types.get(local_id.index()) else {
+        let Some(local_type) = lowered.types.get(local_id.index()) else {
             return Err(ExprCompileError::Invalid("missing complete local value type").into());
+        };
+        let ty = match (&definition.kind, local_type) {
+            (
+                ExprKind::Lambda {
+                    parameter_types, ..
+                },
+                FunctionArgumentType::Lambda {
+                    parameter_types: actual,
+                    result_type,
+                },
+            ) => {
+                if parameter_types.len() != actual.len() {
+                    return Err(ExprCompileError::Invalid("lowered lambda arity differs").into());
+                }
+                for (expected, found) in parameter_types.iter().zip(actual) {
+                    if !expected.exactly_equals_observed(found, || {
+                        work.step().map_err(ExprCompileError::from)
+                    })? {
+                        return Err(ExprCompileError::Invalid(
+                            "lowered lambda parameter type differs",
+                        )
+                        .into());
+                    }
+                }
+                result_type
+            }
+            (kind, FunctionArgumentType::Value(ty)) if !matches!(kind, ExprKind::Lambda { .. }) => {
+                ty
+            }
+            _ => {
+                return Err(
+                    ExprCompileError::Invalid("lowered lambda and value channels differ").into(),
+                );
+            }
         };
         // The shared walker observes borrowed work before its operations.
         // These are cancellation observations, not fabricated completed units.
@@ -1190,6 +1280,24 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                     .arena
                     .node(child_id)
                     .ok_or(ExprCompileError::Invalid("missing local static argument"))?;
+                let argument_type =
+                    lowered
+                        .types
+                        .get(child_id.index())
+                        .ok_or(ExprCompileError::Invalid(
+                            "missing lowered static argument type",
+                        ))?;
+                if matches!(argument_type, FunctionArgumentType::Lambda { .. })
+                    && !argument_types_equal(
+                        argument_type,
+                        &function.argument_types[ordinal],
+                        work,
+                    )?
+                {
+                    return Err(
+                        ExprCompileError::Invalid("lowered static argument type differs").into(),
+                    );
+                }
                 work.flush()?;
                 // Check the independent physical/local projection. It cannot
                 // supply the original binding request's constant channel.
@@ -1233,6 +1341,10 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
     let flow = unit.control_flow();
     let mut effects = BTreeMap::<ExpressionUseId, ScopedExpressionEffects>::new();
     let mut tokens = BTreeMap::new();
+    let mut lambdas = lambda::CompiledLambdas::default();
+    let mut lexical_references = lambda::LexicalReferences::default();
+    let mut temporary = crate::creation::ProgramCreation { creator: temporary };
+    let mut retained = crate::creation::ProgramCreation { creator: retained };
     let mut active = BTreeSet::new();
     let mut stack = Vec::new();
     for &root in flow.uses().keys() {
@@ -1293,6 +1405,53 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                         .into());
                     }
                     ScopedExpressionEffects::pure_value(invocation.context)
+                }
+                (
+                    ExprKind::LambdaParameter { lambda, ordinal },
+                    StaticExprKind::LambdaParameter {
+                        lambda: lowered_lambda,
+                        ordinal: lowered_ordinal,
+                    },
+                ) => {
+                    if lambda != lowered_lambda
+                        || ordinal != lowered_ordinal
+                        || invocation.control != ControlShape::Eager
+                        || !invocation.arguments.is_empty()
+                    {
+                        return Err(ExprCompileError::Invalid(
+                            "lambda parameter lost its original lexical source",
+                        )
+                        .into());
+                    }
+                    ScopedExpressionEffects::pure_value(invocation.context)
+                }
+                (ExprKind::Lambda { body, .. }, StaticExprKind::Lambda { body: lowered_body }) => {
+                    let [body_use] = invocation.arguments.as_ref() else {
+                        return Err(ExprCompileError::Invalid(
+                            "lambda wrapper must have one body use",
+                        )
+                        .into());
+                    };
+                    if invocation.control != ControlShape::LambdaBody
+                        || flow
+                            .uses()
+                            .get(body_use)
+                            .is_none_or(|actual| actual.definition != *body)
+                        || lowered.ids.get(body) != Some(lowered_body)
+                    {
+                        return Err(ExprCompileError::Invalid(
+                            "lambda wrapper lost its original body",
+                        )
+                        .into());
+                    }
+                    let child_effects = *effects.get(body_use).ok_or(ExprCompileError::Invalid(
+                        "lambda body does not have an effect summary",
+                    ))?;
+                    ScopedExpressionEffects::pure_value(invocation.context).join_control_argument(
+                        child_effects,
+                        flow,
+                        0,
+                    )?
                 }
                 (ExprKind::Constant(_), StaticExprKind::Constant(_)) => {
                     if invocation.control != ControlShape::Eager || !invocation.arguments.is_empty()
@@ -1899,27 +2058,34 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                             ExprCompileError::Invalid("frozen occurrence context differs").into(),
                         );
                     }
-                    let (type_only, control_intrinsic) =
+                    let (type_only, control_intrinsic, body_ordinal) =
                         match (invocation.control, frozen.effects.argument_control) {
                             (ControlShape::Eager, ArgumentControl::Eager)
                             | (ControlShape::OrderedNull, ArgumentControl::OrderedNull) => {
-                                (false, false)
+                                (false, false, None)
                             }
-                            (ControlShape::TypeOnly, ArgumentControl::TypeOnly) => (true, false),
+                            (ControlShape::TypeOnly, ArgumentControl::TypeOnly) => {
+                                (true, false, None)
+                            }
                             (ControlShape::NoArguments, ArgumentControl::NoArguments) => {
-                                (true, false)
+                                (true, false, None)
                             }
                             (ControlShape::If, ArgumentControl::If)
                             | (ControlShape::Coalesce, ArgumentControl::Coalesce)
                             | (ControlShape::Try, ArgumentControl::Try)
                             | (ControlShape::NullIf, ArgumentControl::NullIf)
                             | (ControlShape::OrderedRegexp, ArgumentControl::OrderedRegexp) => {
-                                (false, true)
+                                (false, true, None)
                             }
                             (
                                 ControlShape::TemporalSource(shape),
                                 ArgumentControl::TemporalSource(kind),
-                            ) if shape.kind() == kind => (false, true),
+                            ) if shape.kind() == kind => (false, true, None),
+                            (shape @ ControlShape::HigherOrder { body_ordinal, .. }, control)
+                                if control.matches_scalar_shape(shape) =>
+                            {
+                                (false, false, Some(body_ordinal as usize))
+                            }
                             _ => return Err(ExprCompileError::UnsupportedCall(site).into()),
                         };
                     if args.len() != local_args.len()
@@ -1976,13 +2142,15 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                                 )
                                 .into());
                             }
-                            children = children.join_control_argument(
-                                *effects.get(&child_use).ok_or(ExprCompileError::Invalid(
-                                    "argument effects were not prepared",
-                                ))?,
-                                flow,
-                                ordinal,
-                            )?;
+                            if Some(ordinal) != body_ordinal {
+                                children = children.join_control_argument(
+                                    *effects.get(&child_use).ok_or(ExprCompileError::Invalid(
+                                        "argument effects were not prepared",
+                                    ))?,
+                                    flow,
+                                    ordinal,
+                                )?;
+                            }
                             if let Some(source_plan) = &frozen.temporal_source {
                                 let source = &source_plan.sources[ordinal];
                                 if source.use_id != child_use {
@@ -2027,7 +2195,23 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                         proof_scope: frozen.effects.proof_scope,
                     };
                     work.flush()?;
-                    let options = if control_intrinsic {
+                    let body_edge = body_ordinal
+                        .map(|ordinal| {
+                            lambda::body_edge(|id| unit.definition(id), flow, invocation, ordinal)
+                        })
+                        .transpose()
+                        .map_err(ExprCompileError::Invalid)?;
+                    let options = if let Some(edge) = &body_edge {
+                        PureCallPreparation::HigherOrder(lexical_references.preparation(
+                            edge,
+                            flow,
+                            |id| unit.definition(id),
+                            &effects,
+                            children,
+                            &mut retained,
+                            work,
+                        )?)
+                    } else if control_intrinsic {
                         PureCallPreparation::ControlIntrinsic {
                             arguments: children,
                         }
@@ -2047,6 +2231,47 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                     )?;
                     work.flush()?;
                     validate_prepared_call(&token, invocation, function, args.len(), work)?;
+                    if let Some(edge) = body_edge {
+                        let novarocks_functions::PreparedPureKernel::HigherOrder(prepared) =
+                            token.prepared()
+                        else {
+                            return Err(ExprCompileError::Invalid(
+                                "lambda requires its higher-order ABI",
+                            )
+                            .into());
+                        };
+                        let contract = prepared.body_contract();
+                        if contract.context() != edge.root.context
+                            || prepared.contract().body_edge_use() != edge.wrapper_use
+                        {
+                            return Err(ExprCompileError::Invalid(
+                                "prepared lambda lost its original body use",
+                            )
+                            .into());
+                        }
+                        let (capture_count, captures) = lexical_references.captures(&edge);
+                        let mut capture_sources = retained
+                            .reserve::<ExprCompileError, lambda::CompiledLambdaCapture>(
+                                capture_count,
+                                work,
+                            )?;
+                        for capture in captures {
+                            capture_sources.push(capture);
+                            work.step()?;
+                        }
+                        retained.before_tree_insert::<ExprCompileError, ExpressionUseId, lambda::CompiledLambdaBody>(
+                            lambdas.bodies.len(), work,
+                        )?;
+                        lambdas.bodies.insert(
+                            id,
+                            lambda::CompiledLambdaBody {
+                                body_use: edge.root.context.use_id,
+                                lambda_definition: edge.lambda_definition,
+                                contract: Arc::clone(contract),
+                                captures: capture_sources.into_boxed_slice(),
+                            },
+                        );
+                    }
                     let result = ScopedExpressionEffects::primitive(
                         invocation.context,
                         token.effects().for_use(invocation.context)?,
@@ -2061,6 +2286,19 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                     .into());
                 }
             };
+            lexical_references.record(source, invocation, &mut temporary, work)?;
+            if let Some(scope) = lexical_references.reuse_scope(
+                source,
+                id,
+                scoped,
+                |id| unit.definition(id),
+                work,
+            )? {
+                retained.before_tree_insert::<ExprCompileError, ExpressionUseId, lambda::LambdaReuseScope>(
+                    lambdas.reuse.len(), work,
+                )?;
+                lambdas.reuse.insert(id, scope);
+            }
             effects.insert(id, scoped);
             active.remove(&id);
             stack.pop();
@@ -2072,7 +2310,7 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
         result.push(entry);
         work.step()?;
     }
-    Ok((result, effects))
+    Ok((result, effects, lambdas))
 }
 
 // Static constants retain the actual checked source owner through binding;
@@ -2099,7 +2337,11 @@ fn literal_argument(
             (ExprKind::Constant(_), StaticExprKind::Constant(value)) => Ok(Some(value.clone())),
             // A resolved input is not a constant, even if this particular runtime
             // batch happens to broadcast one scalar value (notably RAND seeds).
-            (ExprKind::Value(_), StaticExprKind::Input) => Ok(None),
+            (ExprKind::Value(_), StaticExprKind::Input)
+            | (ExprKind::Lambda { .. }, StaticExprKind::Lambda { .. })
+            | (ExprKind::LambdaParameter { .. }, StaticExprKind::LambdaParameter { .. }) => {
+                Ok(None)
+            }
             (ExprKind::FunctionCall { .. }, StaticExprKind::BoundCall { .. }) => Ok(None),
             (ExprKind::Conjunction { .. }, StaticExprKind::NaryAnd { .. })
             | (ExprKind::Disjunction { .. }, StaticExprKind::NaryOr { .. }) => Ok(None),
@@ -2203,14 +2445,19 @@ fn validate_prepared_call(
             .effects()
             .argument_control
             .matches_scalar_shape(invocation.control)
-        || !matches!(
-            token.prepared(),
-            PreparedPureKernel::Scalar(_)
+        || match (invocation.control, token.prepared()) {
+            (ControlShape::HigherOrder { .. }, PreparedPureKernel::HigherOrder(_)) => false,
+            (ControlShape::HigherOrder { .. }, _) => true,
+            (
+                _,
+                PreparedPureKernel::Scalar(_)
                 | PreparedPureKernel::ScalarInvocation(_)
                 | PreparedPureKernel::ControlIntrinsic(_)
                 | PreparedPureKernel::OrderedRegexp(_)
-                | PreparedPureKernel::NullIf(_)
-        )
+                | PreparedPureKernel::NullIf(_),
+            ) => false,
+            _ => true,
+        }
         || call.function_id() != &function.function_id
         || call.selected().overload != function.overload
         || call.logical_argument_count() != arity
@@ -2227,16 +2474,7 @@ fn validate_prepared_call(
         .zip(&function.argument_types)
     {
         work.step()?;
-        let (FunctionArgumentType::Value(actual), FunctionArgumentType::Value(expected)) =
-            (actual, expected)
-        else {
-            return Err(ExprCompileError::Invalid(
-                "compiled scalar call contains a lambda argument",
-            ));
-        };
-        if !actual
-            .exactly_equals_observed(expected, || work.step().map_err(ExprCompileError::from))?
-        {
+        if !argument_types_equal(actual, expected, work)? {
             return Err(ExprCompileError::Invalid(
                 "prepared call argument complete type differs",
             ));
@@ -2256,6 +2494,36 @@ fn validate_prepared_call(
     }
     token.effects().for_use(invocation.context)?;
     Ok(())
+}
+
+fn argument_types_equal(
+    actual: &FunctionArgumentType,
+    expected: &FunctionArgumentType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, ExprCompileError> {
+    match (actual, expected) {
+        (FunctionArgumentType::Value(a), FunctionArgumentType::Value(b)) => {
+            a.exactly_equals_observed(b, || work.step().map_err(Into::into))
+        }
+        (
+            FunctionArgumentType::Lambda {
+                parameter_types: a,
+                result_type: a_result,
+            },
+            FunctionArgumentType::Lambda {
+                parameter_types: b,
+                result_type: b_result,
+            },
+        ) if a.len() == b.len() => {
+            for (a, b) in a.iter().zip(b) {
+                if !a.exactly_equals_observed(b, || work.step().map_err(ExprCompileError::from))? {
+                    return Ok(false);
+                }
+            }
+            a_result.exactly_equals_observed(b_result, || work.step().map_err(Into::into))
+        }
+        _ => Ok(false),
+    }
 }
 
 #[cfg(test)]

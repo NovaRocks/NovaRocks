@@ -52,7 +52,11 @@ fn base(control: ArgumentControl) -> FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
         own_row_error: FunctionIntrinsicRowError::NoRowError,
         failure_behavior: FunctionFailureBehavior::Propagate,
-        null_behavior: FunctionNullBehavior::CalledOnNull,
+        null_behavior: if matches!(control, ArgumentControl::HigherOrder { .. }) {
+            FunctionNullBehavior::ControlDefined
+        } else {
+            FunctionNullBehavior::CalledOnNull
+        },
         argument_control: control,
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects::NONE,

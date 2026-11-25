@@ -212,28 +212,26 @@ impl<
     }
 }
 
-pub(crate) fn publish_argument_types<H>(
-    types: Vec<novarocks_type_contract::FunctionArgumentType>,
+pub(crate) fn publish_argument_types<H, T: novarocks_type_contract::TypedFact>(
+    types: Vec<T>,
     mut creation: Option<&mut dyn ValueSchemaCreationScope<H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<
-    novarocks_type_contract::FunctionArgumentTypes,
+    novarocks_type_contract::TypedFactSlice<T>,
     ProgramCreationFailure<std::convert::Infallible, H>,
 > {
     use ProgramCreationFailure as Failure;
-    use novarocks_type_contract::{
-        FunctionArgumentType, FunctionArgumentTypes, ValueTypeStorageLifetime,
-    };
+    use novarocks_type_contract::{TypedFactSlice, ValueTypeStorageLifetime};
     if let Some(c) = crate::creation::borrow_scope(&mut creation) {
         if types.capacity() != types.len() && !types.is_empty() {
-            let layout = Layout::array::<FunctionArgumentType>(types.len())
+            let layout = Layout::array::<T>(types.len())
                 .map_err(|_| Failure::Resource(LayoutResourceError::Arithmetic))?;
             work.flush()?;
             c.request_layout(layout).map_err(Failure::Creator)?;
         }
         if !types.is_empty() {
             let layout =
-                FunctionArgumentTypes::storage_allocation_layout().map_err(Failure::Resource)?;
+                TypedFactSlice::<T>::storage_allocation_layout().map_err(Failure::Resource)?;
             work.flush()?;
             c.request_layout(layout).map_err(Failure::Creator)?;
         }
@@ -241,7 +239,7 @@ pub(crate) fn publish_argument_types<H>(
     let storage = creation
         .as_ref()
         .map_or_else(ValueTypeStorageLifetime::pure, |c| c.storage_lifetime());
-    Ok(FunctionArgumentTypes::from_boxed_in(
+    Ok(TypedFactSlice::from_boxed_in(
         types.into_boxed_slice(),
         storage,
     ))

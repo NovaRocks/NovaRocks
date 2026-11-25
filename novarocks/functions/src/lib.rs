@@ -155,8 +155,8 @@ pub use invocation_scalar_resources::{
 pub use kernel_control::*;
 pub use kernel_input::validate_type_observed as validate_function_value_type_observed;
 pub use kernel_input::{
-    EvaluationCheckpoints, validate_argument_observed as validate_evaluated_argument_observed,
-    visit_selected_nulls,
+    EvaluationCheckpoints, inspect_logical_null,
+    validate_argument_observed as validate_evaluated_argument_observed, visit_selected_nulls,
 };
 pub use lambda_rows::*;
 pub use novarocks_constant_contract::{

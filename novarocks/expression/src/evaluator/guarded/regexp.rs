@@ -48,6 +48,18 @@ impl OwnedValue {
                 }
                 (value, ordinal)
             }
+            Self::Mapped(value) => {
+                if let Ok(error) = value
+                    .errors()
+                    .binary_search_by_key(&ordinal, RowDataError::selected_ordinal)
+                {
+                    return Ok(Cell::Error(&value.errors()[error]));
+                }
+                let Some(cell) = value.value(ordinal) else {
+                    return Ok(Cell::Null);
+                };
+                cell
+            }
             Self::Continued(_, _) => unreachable!("continuation was unwrapped"),
         };
         if row >= array.len() {
@@ -112,6 +124,7 @@ impl TreeDriver<'_, '_> {
         arguments: &[ExpressionUseId],
         frame: &mut Frame,
         rows: &[usize],
+        lambda: Option<&LambdaFrame<'_>>,
         instances: &mut BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
         work: &mut Work<'_, '_, R>,
     ) -> Result<OwnedValue, ExprEvaluationFailure<R>> {
@@ -174,7 +187,7 @@ impl TreeDriver<'_, '_> {
             let mut len = 0;
             let mut terminal = false;
             for &child in &arguments[PATTERN_ORDINAL + 1..] {
-                let value = self.regexp_argument(child, frame, row, instances, work)?;
+                let value = self.regexp_argument(child, frame, row, lambda, instances, work)?;
                 match value.regexp_cell(0, row)? {
                     Cell::Null => {
                         terminal = true;
@@ -220,6 +233,7 @@ impl TreeDriver<'_, '_> {
         child: ExpressionUseId,
         parent: &Frame,
         row: usize,
+        lambda: Option<&LambdaFrame<'_>>,
         instances: &mut BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
         work: &mut Work<'_, '_, R>,
     ) -> Result<OwnedValue, ExprEvaluationFailure<R>> {
@@ -249,6 +263,6 @@ impl TreeDriver<'_, '_> {
             Vec::new(),
             work,
         )?;
-        self.drive(frame, instances, work)
+        self.drive(frame, lambda, None, instances, work)
     }
 }

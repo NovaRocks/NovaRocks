@@ -427,6 +427,43 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
+    /// Select the original scalar candidate before typing its lexical body.
+    fn begin_higher_order_binding(
+        &self,
+        _name: &str,
+        _ordinary_ordinal: usize,
+        _ordinary: &novarocks_functions::FunctionArgument,
+        _lambda_ordinal: usize,
+        _lambda_arity: usize,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::HigherOrderBindingCandidate,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    /// Finalize only the original candidate with its actual converted arguments.
+    fn finish_higher_order_binding(
+        &self,
+        _candidate: &novarocks_functions::HigherOrderBindingCandidate,
+        _request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
     /// The grammar has already identified this closed built-in operator.
     fn resolve_scalar_operator_binding(
         &self,

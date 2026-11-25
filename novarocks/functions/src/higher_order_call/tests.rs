@@ -130,7 +130,7 @@ impl Owner {
                 value_stability: FunctionVolatility::Immutable,
                 own_row_error: FunctionIntrinsicRowError::NoRowError,
                 failure_behavior: FunctionFailureBehavior::Propagate,
-                null_behavior: FunctionNullBehavior::CalledOnNull,
+                null_behavior: FunctionNullBehavior::ControlDefined,
                 argument_control: ArgumentControl::HigherOrder {
                     body_ordinal: 1,
                     body_demand: demand,
@@ -898,27 +898,16 @@ fn body_context_capture_domain_and_compile_observation_are_exact() {
     )
     .unwrap();
     assert!(body.capture_types()[0].same_semantics(&different_domain));
-    assert_eq!(
-        LambdaBodyContract::try_new(
-            call.clone(),
-            exact,
-            body_effects(exact),
-            vec![i64_type(false); crate::MAX_CALL_EFFECT_ARGUMENTS + 1].into_boxed_slice(),
-            &CompileControl::default()
-        )
-        .unwrap_err(),
-        KernelFailure::ResourceExhausted
-    );
-    assert!(
-        LambdaBodyContract::try_new(
-            call.clone(),
-            exact,
-            body_effects(exact),
-            vec![i64_type(false); crate::MAX_CALL_EFFECT_ARGUMENTS].into_boxed_slice(),
-            &CompileControl::default()
-        )
-        .is_ok()
-    );
+    let capture_count = crate::MAX_CALL_EFFECT_ARGUMENTS + 1;
+    let wide_body = LambdaBodyContract::try_new(
+        call.clone(),
+        exact,
+        body_effects(exact),
+        vec![i64_type(false); capture_count].into_boxed_slice(),
+        &CompileControl::default(),
+    )
+    .unwrap();
+    assert_eq!(wide_body.capture_types().len(), capture_count);
     for failure in [
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,

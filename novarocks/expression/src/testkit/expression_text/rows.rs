@@ -263,7 +263,7 @@ impl TypedText<'_> {
                 )?),
                 kind => kind.clone(),
             };
-            let id = draft.add(None, definition.ty.clone(), kind)?;
+            let id = draft.add(definition.lambda_scope, definition.ty.clone(), kind)?;
             if id != definition.id {
                 return Err(TextError::Layout(
                     "substituted unit changed a definition identity",
@@ -335,6 +335,15 @@ fn call_inapplicability(
                 }
                 PreparedPureKernel::Scalar(_) => Some(CallInapplicability::InstanceState),
                 PreparedPureKernel::ControlIntrinsic(_) => None,
+                PreparedPureKernel::HigherOrder(kernel) => {
+                    let body = kernel.body_contract();
+                    let effects = body
+                        .effects()
+                        .for_use(body.context())
+                        .map_err(|_| TextError::Layout("lambda body effects lost their scope"))?;
+                    (!effects.permits_same_row_kernel_replay())
+                        .then_some(CallInapplicability::WholeInvocation)
+                }
                 _ => Some(CallInapplicability::WholeInvocation),
             }
         };
@@ -345,6 +354,7 @@ fn call_inapplicability(
             | ArgumentControl::Try
             | ArgumentControl::OrderedRegexp
             | ArgumentControl::OrderedNull
+            | ArgumentControl::HigherOrder { .. }
             | ArgumentControl::NoArguments => None,
             _ => Some(CallInapplicability::ArgumentControl),
         });
@@ -402,11 +412,13 @@ fn evaluate(
         input_columns: batch.num_columns(),
         input_rows: batch.num_rows(),
     };
-    let needs_regexp_host = compiled
-        .calls()
-        .values()
-        .any(|call| matches!(call.prepared(), PreparedPureKernel::OrderedRegexp(_)));
-    let allocator = needs_regexp_host.then(|| {
+    let needs_allocator = compiled.calls().values().any(|call| {
+        matches!(
+            call.prepared(),
+            PreparedPureKernel::OrderedRegexp(_) | PreparedPureKernel::HigherOrder(_)
+        )
+    });
+    let allocator = needs_allocator.then(|| {
         let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
             Arc::new(crate::testkit::CountingAllocator::new(usize::MAX));
         host

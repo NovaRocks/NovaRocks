@@ -28,6 +28,7 @@ use novarocks_functions::{
     PreparedNullIfEquality,
 };
 use novarocks_type_contract::EvaluationDemand;
+use std::{cell::RefCell, rc::Rc};
 
 mod ordered_null;
 mod regexp;
@@ -60,6 +61,7 @@ enum OwnedValue {
     Column(ArrayRef),
     Source(ArrayRef, Arc<input_source::ActualInvocationDomain>),
     Selected(ArrayRef, Box<[RowDataError]>),
+    Mapped(super::mapped::MappedValues),
     Continued(Box<Self>, input_source::ArrayContinuation),
 }
 impl OwnedValue {
@@ -86,9 +88,27 @@ impl OwnedValue {
         selection: Selection<'a>,
         work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<Value<'a>, KernelFailure> {
+        let value = self.into_value_mapped(selection, work)?;
+        if matches!(value.uncontinued(), Value::Mapped(_)) {
+            let ty = value.data_type()?.clone();
+            let materialized = value.materialize(selection, &ty, work)?;
+            let continuation = materialized.continuation.clone();
+            let value = Value::Selected(materialized.value);
+            if let Some(owner) = continuation {
+                return Ok(Value::Continued(Box::new(value), owner));
+            }
+            return Ok(value);
+        }
+        Ok(value)
+    }
+    fn into_value_mapped<'a>(
+        self,
+        selection: Selection<'a>,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<Value<'a>, KernelFailure> {
         Ok(match self {
             Self::Continued(value, owner) => value
-                .into_value(selection, work)?
+                .into_value_mapped(selection, work)?
                 .retaining_continuation(owner, work)?,
             Self::Constant(value) => Value::Constant(value),
             Self::ConstantView(value) => Value::ConstantView(value),
@@ -138,6 +158,7 @@ impl OwnedValue {
                     || work.step(),
                 )?)
             }
+            Self::Mapped(value) => Value::Mapped(value),
         })
     }
     fn retaining_children(
@@ -276,6 +297,10 @@ impl OwnedValue {
             Self::Continued(value, owner) => value
                 .catch_try_row_errors(work)?
                 .with_continuation(Some(owner)),
+            Self::Mapped(mut value) => {
+                value.catch_try_errors(try_catches, work)?;
+                Self::Mapped(value)
+            }
             value => value,
         })
     }
@@ -585,7 +610,7 @@ impl<K> Frame<K> {
         }
         let selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
         let value = child.value.into_value(selection, work)?;
-        let ty = value.argument().array().data_type().clone();
+        let ty = value.data_type()?.clone();
         let output = value.materialize(selection, &ty, work)?;
         let mut good = Vec::with_capacity(child.ordinals.len());
         let mut ordinals = Vec::with_capacity(child.ordinals.len());
@@ -668,7 +693,7 @@ impl<K> Frame<K> {
         }
         let selection = Selection::try_sparse_observed(batch_rows, &child_rows, || work.step())?;
         let value = child.value.into_value(selection, work)?;
-        let ty = value.argument().array().data_type().clone();
+        let ty = value.data_type()?.clone();
         let output = value.materialize(selection, &ty, work)?;
         for error in output.errors() {
             let parent = *child
@@ -788,7 +813,7 @@ impl<K> Frame<K> {
         }
         let selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
         let value = child.value.into_value(selection, work)?;
-        let ty = value.argument().array().data_type().clone();
+        let ty = value.data_type()?.clone();
         let output = value.materialize(selection, &ty, work)?;
         let expected = if ordinal == 0 {
             recipe.source_type()
@@ -901,7 +926,7 @@ impl<K> Frame<K> {
         }
         let selected = Selection::try_sparse_observed(batch_rows, &child_rows, || work.step())?;
         let child_value = child.value.into_value(selected, work)?;
-        let ty = child_value.argument().array().data_type().clone();
+        let ty = child_value.data_type()?.clone();
         let materialized = child_value.materialize(selected, &ty, work)?;
         if self.children.is_empty() {
             let mut present = Vec::with_capacity(child.ordinals.len());
@@ -1079,8 +1104,50 @@ impl<K> Frame<K> {
             work.step()?;
         }
         let selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
+        if let OwnedValue::Mapped(value) = child.value.uncontinued() {
+            let case_result = matches!(shape, ControlShape::Case { simple, arms, .. }
+                if self.next - 1 >= usize::from(simple) &&
+                    ((self.next - 1 - usize::from(simple)) % 2 == 1 ||
+                     self.next - 1 == usize::from(simple) + arms as usize * 2));
+            if matches!(shape, ControlShape::Coalesce)
+                || shape == ControlShape::If && child_index > 0
+                || case_result
+            {
+                let mut errors = value.errors().iter().peekable();
+                let mut remaining = Vec::new();
+                for (local, &parent) in child.ordinals.iter().enumerate() {
+                    if errors
+                        .peek()
+                        .is_some_and(|error| error.selected_ordinal() == local)
+                    {
+                        let error = errors.next().expect("checked mapped child error");
+                        self.errors
+                            .insert(parent, error.with_selected_ordinal(parent));
+                    } else if shape == ControlShape::Coalesce
+                        && value
+                            .value(local)
+                            .is_none_or(|(source, row)| source.is_null(row))
+                    {
+                        remaining.push(parent);
+                    } else {
+                        self.choices[parent] = Some((child_index, local));
+                    }
+                    work.step()?;
+                }
+                if shape == ControlShape::Coalesce {
+                    self.remaining = remaining;
+                } else if let ControlShape::Case { simple, arms, .. } = shape {
+                    self.matched.clear();
+                    if self.next - 1 == usize::from(simple) + arms as usize * 2 {
+                        self.remaining.clear();
+                    }
+                }
+                self.children.push(child);
+                return Ok(());
+            }
+        }
         let value = child.value.into_value(selection, work)?;
-        let ty = value.argument().array().data_type().clone();
+        let ty = value.data_type()?.clone();
         let output = value.materialize(selection, &ty, work)?;
         if let ControlShape::Case { simple, arms, .. } = shape {
             let ordinal = self
@@ -1403,6 +1470,7 @@ fn complete_node<'a, R, K: Ord + Clone>(
     result_type: &novarocks_functions::FunctionValueType,
     local_selection: Selection<'a>,
     original_domain: bool,
+    lambda: Option<&LambdaFrame<'_>>,
     instances: &mut BTreeMap<K, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     work: &mut Work<'_, '_, R>,
@@ -1431,8 +1499,8 @@ fn complete_node<'a, R, K: Ord + Clone>(
             }
             work.flush()?;
             let output = recipe.evaluate_selected(
-                text.argument(),
-                pattern.argument(),
+                text.argument()?,
+                pattern.argument()?,
                 local_selection,
                 demand == EvaluationDemand::TruthOnly,
                 work.control,
@@ -1667,15 +1735,23 @@ fn complete_node<'a, R, K: Ord + Clone>(
                     } else {
                         let mut children = Vec::with_capacity(frame.children.len());
                         for child in std::mem::take(&mut frame.children) {
-                            children.push(child.value.into_value(local_selection, work)?);
+                            children.push(child.value.into_value_mapped(local_selection, work)?);
                             work.step()?;
                         }
+                        let parent = |row| {
+                            lambda
+                                .and_then(|lambda| lambda.rows.parent_row(row))
+                                .ok_or_else(|| invalid("leaf row has no actual lambda parent"))
+                        };
+                        let parent = lambda
+                            .map(|_| &parent as &dyn Fn(usize) -> Result<usize, KernelFailure>);
                         OwnedValue::from_selected(evaluate_scalar::<R, K>(
                             frame.occurrence.clone(),
                             prepared,
                             &children,
                             local_selection,
                             frame.activation,
+                            parent,
                             instances,
                             allocator,
                             work,
@@ -1837,7 +1913,7 @@ pub(super) fn evaluate_tree<'a, R>(
         root_invocation.control,
         root_type,
         rows,
-        domain,
+        Arc::clone(&domain),
         needs_original.contains(&root_use),
         activation,
         Vec::new(),
@@ -1853,11 +1929,13 @@ pub(super) fn evaluate_tree<'a, R>(
         needs_original,
         source_captured: false,
         source_custody: None,
+        root_domain: domain,
+        root_reuse: Rc::new(RefCell::new(super::mapped::ScopedMap::new())),
     };
-    let value = driver.drive(first, instances, work)?;
+    let value = driver.drive(first, None, None, instances, work)?;
     let value = value.into_value(selection, work)?;
     if let Some(custody) = &driver.source_custody {
-        let ty = value.argument().array().data_type().clone();
+        let ty = value.data_type()?.clone();
         let value = value.materialize(selection, &ty, work)?;
         let continuation = value.continuation.clone();
         let (_, array, errors) = value.into_parts();
@@ -1883,12 +1961,345 @@ struct TreeDriver<'s, 'input> {
     needs_original: BTreeSet<ExpressionUseId>,
     source_captured: bool,
     source_custody: Option<input_source::CapturedInputSource>,
+    root_domain: Arc<input_source::ActualInvocationDomain>,
+    root_reuse: ReuseCache,
+}
+
+type ReuseCache = Rc<RefCell<super::mapped::ScopedMap<(ExpressionUseId, usize), CachedRow>>>;
+
+struct CachedRow {
+    array: ArrayRef,
+    ordinal: usize,
+    error: Option<RowDataError>,
+    _continuation: Option<input_source::ArrayContinuation>,
+}
+
+struct LambdaFrame<'a> {
+    definition: novarocks_expression_contract::ExprId,
+    parent: Option<&'a LambdaFrame<'a>>,
+    rows: novarocks_functions::LambdaElementRowMap<'a>,
+    batch: &'a novarocks_functions::LambdaBodyBatch,
+    domain: Arc<input_source::ActualInvocationDomain>,
+    reuse: ReuseCache,
+}
+
+impl LambdaFrame<'_> {
+    fn root_row(&self, mut row: usize) -> Result<usize, KernelFailure> {
+        let mut frame = self;
+        loop {
+            row = frame
+                .rows
+                .parent_row(row)
+                .ok_or_else(|| invalid("lambda element is outside its actual parent domain"))?;
+            match frame.parent {
+                Some(parent) => frame = parent,
+                None => return Ok(row),
+            }
+        }
+    }
+
+    fn parameter(
+        &self,
+        definition: novarocks_expression_contract::ExprId,
+        parameter: usize,
+        mut row: usize,
+    ) -> Result<(&ArrayRef, usize), KernelFailure> {
+        let mut frame = self;
+        while frame.definition != definition {
+            row = frame
+                .rows
+                .parent_row(row)
+                .ok_or_else(|| invalid("lambda parameter is outside its actual parent domain"))?;
+            frame = frame
+                .parent
+                .ok_or_else(|| invalid("lambda parameter has no active lexical declaration"))?;
+        }
+        let source = frame
+            .batch
+            .parameter_sources()
+            .get(parameter)
+            .ok_or_else(|| invalid("lambda parameter ordinal differs from its original binding"))?;
+        let row = frame
+            .batch
+            .parameter_position(parameter, row)
+            .ok_or_else(|| invalid("lambda parameter has no actual source position"))?;
+        Ok((source, row))
+    }
+
+    fn ancestor(
+        &self,
+        definition: novarocks_expression_contract::ExprId,
+        mut row: usize,
+    ) -> Result<(&Self, usize), KernelFailure> {
+        let mut frame = self;
+        while frame.definition != definition {
+            row = frame
+                .rows
+                .parent_row(row)
+                .ok_or_else(|| invalid("lambda reuse row is outside its original demand"))?;
+            frame = frame
+                .parent
+                .ok_or_else(|| invalid("lambda reuse has no active lexical ancestor"))?;
+        }
+        Ok((frame, row))
+    }
 }
 
 impl TreeDriver<'_, '_> {
+    fn evaluate_reused<R>(
+        &mut self,
+        use_id: ExpressionUseId,
+        scope: crate::compiler::lambda::LambdaReuseScope,
+        result_type: &DataType,
+        rows: &[usize],
+        lambda: &LambdaFrame<'_>,
+        instances: &mut BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
+        work: &mut Work<'_, '_, R>,
+    ) -> Result<OwnedValue, ExprEvaluationFailure<R>> {
+        use super::mapped;
+        use crate::compiler::lambda::LambdaReuseScope;
+
+        let allocator = self.allocator;
+        let ancestor = match scope {
+            LambdaReuseScope::TopLevel => None,
+            LambdaReuseScope::Ancestor(definition) => Some(lambda.ancestor(definition, rows[0])?.0),
+        };
+        let (domain, batch_rows, cache) = match ancestor {
+            Some(frame) => (
+                Arc::clone(&frame.domain),
+                frame.rows.element_rows(),
+                Rc::clone(&frame.reuse),
+            ),
+            None => (
+                Arc::clone(&self.root_domain),
+                self.input.num_rows(),
+                Rc::clone(&self.root_reuse),
+            ),
+        };
+        let _scratch = mapped::reserve(allocator, mapped::bytes::<[usize; 2]>(rows.len())?)?;
+        let mut target_rows = mapped::buffer(rows.len())?;
+        let mut missing = mapped::buffer(rows.len())?;
+        let mut distinct = 0usize;
+        for &row in rows {
+            let target = match scope {
+                LambdaReuseScope::TopLevel => lambda.root_row(row)?,
+                LambdaReuseScope::Ancestor(definition) => lambda.ancestor(definition, row)?.1,
+            };
+            if target_rows.last() != Some(&target) {
+                distinct += 1;
+                if cache.borrow().get(&(use_id, target)).is_none() {
+                    missing.push(target);
+                }
+            }
+            target_rows.push(target);
+            work.step()?;
+        }
+        if !missing.is_empty() {
+            let invocation = &self.program.control_flow().uses()[&use_id];
+            let first = Frame::new(
+                use_id,
+                invocation.control,
+                result_type,
+                missing.clone(),
+                domain,
+                false,
+                novarocks_functions::ScalarInvocationActivation::Activated,
+                Vec::new(),
+                work,
+            )?;
+            let selection = Selection::try_sparse_observed(batch_rows, &missing, || work.step())?;
+            let value = self.drive(first, ancestor, Some(use_id), instances, work)?;
+            let value = value.into_value_mapped(selection, work)?.materialize(
+                selection,
+                result_type,
+                work,
+            )?;
+            let mut errors = value.errors().iter().peekable();
+            for (ordinal, &row) in missing.iter().enumerate() {
+                let error = errors
+                    .next_if(|error| error.selected_ordinal() == ordinal)
+                    .cloned();
+                cache.borrow_mut().insert(
+                    (use_id, row),
+                    CachedRow {
+                        array: Arc::clone(value.values()),
+                        ordinal,
+                        error,
+                        _continuation: value.continuation.clone(),
+                    },
+                    allocator,
+                    work,
+                )?;
+                work.step()?;
+            }
+        }
+        let mut value = mapped::MappedValues::new(result_type, distinct, rows.len(), allocator)?;
+        let mut errors = Vec::new();
+        let mut previous = None;
+        let mut slot = 0;
+        let cache = cache.borrow();
+        for (ordinal, row) in target_rows.into_iter().enumerate() {
+            let cell = cache
+                .get(&(use_id, row))
+                .ok_or_else(|| internal("requested lexical row was not evaluated"))?;
+            if let Some(error) = &cell.error {
+                errors.push(error.with_selected_ordinal(ordinal));
+                value.push(None)?;
+            } else {
+                if previous != Some(row) {
+                    slot = value.push_source(Arc::clone(&cell.array))?;
+                }
+                value.push(Some((slot, cell.ordinal)))?;
+            }
+            previous = Some(row);
+            work.step()?;
+        }
+        Ok(OwnedValue::Mapped(
+            value.with_errors(errors.into_boxed_slice()),
+        ))
+    }
+
+    fn evaluate_higher_order<'a, R>(
+        &mut self,
+        prepared: &Arc<dyn novarocks_functions::PreparedHigherOrderKernel>,
+        frame: &mut Frame,
+        selection: Selection<'a>,
+        enclosing: Option<&LambdaFrame<'_>>,
+        instances: &mut BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
+        work: &mut Work<'_, '_, R>,
+    ) -> Result<OwnedValue, ExprEvaluationFailure<R>> {
+        use novarocks_functions::{HigherOrderEvaluationInstance, HigherOrderEvaluationStep};
+        use scalar_invocation::CallInstance;
+
+        let program = self.program;
+        let use_id = frame.occurrence;
+        let body = program
+            .higher_order_body(use_id)
+            .ok_or_else(|| invalid("higher-order call has no original compiled body"))?;
+        if !Arc::ptr_eq(prepared.body_contract(), &body.contract) {
+            return Err(invalid("prepared higher-order call belongs to a different body").into());
+        }
+        let allocator = self.allocator.ok_or_else(|| {
+            invalid("higher-order evaluation requires its original allocation host")
+        })?;
+        let children = std::mem::take(&mut frame.children);
+        let mut values = Vec::with_capacity(children.len());
+        let mut inherited = BTreeMap::new();
+        for child in children {
+            let value = child.value.into_value(selection, work)?;
+            for error in value.errors() {
+                inherited
+                    .entry(error.selected_ordinal())
+                    .or_insert_with(|| error.clone());
+                work.step()?;
+            }
+            values.push(value);
+            work.step()?;
+        }
+        let mut arguments = Vec::with_capacity(values.len());
+        for value in &values {
+            arguments.push(value.argument()?);
+            work.step()?;
+        }
+        let control = work.control;
+        work.flush()?;
+        let mut higher = match instances.remove(&use_id) {
+            Some(instance) => instance,
+            None => {
+                let state = super::mapped::reserve(
+                    Some(allocator),
+                    prepared.instance_retained_upper_bound(),
+                )?;
+                let instance =
+                    HigherOrderEvaluationInstance::instantiate(Arc::clone(prepared), control)?;
+                CallInstance::HigherOrder {
+                    instance,
+                    _state: state,
+                }
+            }
+        };
+        let CallInstance::HigherOrder { instance, .. } = &mut higher else {
+            return Err(internal("higher-order use retained another kernel lifecycle").into());
+        };
+        let output = {
+            let mut invocation = instance.begin(selection, &arguments, allocator, control)?;
+            loop {
+                work.flush()?;
+                match invocation.advance(control)? {
+                    HigherOrderEvaluationStep::Complete(output) => break output,
+                    HigherOrderEvaluationStep::Request(obligation) => {
+                        obligation.run_with::<ExprEvaluationFailure<R>>(control, |demand| {
+                            let rows = demand.row_map();
+                            let body_use = &program.control_flow().uses()[&body.body_use];
+                            let result_type = body.contract.result_type().data_type();
+                            let row_count = rows.element_rows();
+                            let _row_storage = super::mapped::reserve(
+                                Some(allocator),
+                                super::mapped::bytes::<[usize; 2]>(row_count)?,
+                            )?;
+                            let mut selected = super::mapped::buffer(row_count)?;
+                            for row in 0..row_count {
+                                selected.push(row);
+                                work.step()?;
+                            }
+                            work.flush()?;
+                            let domain = Arc::new(input_source::ActualInvocationDomain::elements(
+                                &selected, row_count, allocator, control,
+                            )?);
+                            let lambda = LambdaFrame {
+                                definition: body.lambda_definition,
+                                parent: enclosing,
+                                rows,
+                                batch: demand.batch(),
+                                domain: Arc::clone(&domain),
+                                reuse: Rc::new(RefCell::new(super::mapped::ScopedMap::new())),
+                            };
+                            let first = Frame::new(
+                                body.body_use,
+                                body_use.control,
+                                result_type,
+                                selected,
+                                domain,
+                                self.needs_original.contains(&body.body_use),
+                                novarocks_functions::ScalarInvocationActivation::Activated,
+                                Vec::new(),
+                                work,
+                            )?;
+                            let selection = rows.all_elements();
+                            let value = self.drive(first, Some(&lambda), None, instances, work)?;
+                            let value = value.into_value_mapped(selection, work)?;
+                            let output = value.materialize(selection, result_type, work)?;
+                            work.flush()?;
+                            demand
+                                .complete(&body.contract, output.value)
+                                .map_err(Into::into)
+                        })?;
+                    }
+                }
+            }
+        };
+        instances.insert(use_id, higher);
+        if inherited.is_empty() {
+            return Ok(OwnedValue::from_selected(output));
+        }
+        let (_, array, errors) = output.into_parts();
+        for error in errors {
+            inherited.entry(error.selected_ordinal()).or_insert(error);
+            work.step()?;
+        }
+        let mut errors = super::mapped::buffer(inherited.len())?;
+        for error in inherited.into_values() {
+            errors.push(error);
+            work.step()?;
+        }
+        Ok(OwnedValue::Selected(array, errors.into_boxed_slice()))
+    }
+
     fn drive<R>(
         &mut self,
         first: Frame,
+        lambda: Option<&LambdaFrame<'_>>,
+        reused_use: Option<ExpressionUseId>,
         instances: &mut BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
         work: &mut Work<'_, '_, R>,
     ) -> Result<OwnedValue, ExprEvaluationFailure<R>> {
@@ -1898,6 +2309,7 @@ impl TreeDriver<'_, '_> {
         let input_scope = self.input_scope;
         let allocator = self.allocator;
         let effects = self.effects;
+        let batch_rows = lambda.map_or(input.num_rows(), |frame| frame.rows.element_rows());
         let flow = program.control_flow();
         let definitions = program.definitions();
         let mut frames = vec![first];
@@ -1914,6 +2326,18 @@ impl TreeDriver<'_, '_> {
             else {
                 return Err(invalid("ordinary root cannot materialize a lambda definition").into());
             };
+            let reuse = lambda.and_then(|lambda| {
+                if reused_use == Some(frame.occurrence)
+                    || frame.rows.is_empty()
+                    || self.needs_original.contains(&frame.occurrence)
+                {
+                    None
+                } else {
+                    program
+                        .reuse_scope(frame.occurrence)
+                        .map(|scope| (lambda, scope))
+                }
+            });
             let original_domain = match definition.kind() {
                 StaticExprKind::BoundCall { .. } => {
                     matches!(program.calls()[&frame.occurrence].prepared(),
@@ -1921,10 +2345,17 @@ impl TreeDriver<'_, '_> {
                 }
                 _ => false,
             };
+            if let ControlShape::HigherOrder { body_ordinal, .. } = invocation.control
+                && frame.next == body_ordinal as usize
+            {
+                frame.next += 1;
+            }
             // ValidateOnly with no demanded rows enters no children or leaf.
             // Activated empty invocations retain their original arity behavior.
-            let next = if frame.rows.is_empty()
-                && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
+            let next = if reuse.is_some()
+                || frame.rows.is_empty()
+                    && frame.activation
+                        == novarocks_functions::ScalarInvocationActivation::ValidateOnly
             {
                 None
             } else {
@@ -1946,7 +2377,7 @@ impl TreeDriver<'_, '_> {
                     invocation.control,
                     invocation.arguments.len(),
                     next_is_pure,
-                    input.num_rows(),
+                    batch_rows,
                     work,
                 )?
             };
@@ -1988,9 +2419,9 @@ impl TreeDriver<'_, '_> {
             let completion_rows = std::mem::take(&mut frame.rows);
             let completion_output_rows = std::mem::take(&mut frame.output_rows);
             let local_selection =
-                Selection::try_sparse_observed(input.num_rows(), &completion_rows, || work.step())?;
+                Selection::try_sparse_observed(batch_rows, &completion_rows, || work.step())?;
             let output_selection =
-                Selection::try_sparse_observed(input.num_rows(), &completion_output_rows, || {
+                Selection::try_sparse_observed(batch_rows, &completion_output_rows, || {
                     work.step()
                 })?;
             // Clone only explicit finite continuations of actually evaluated
@@ -2000,7 +2431,17 @@ impl TreeDriver<'_, '_> {
                 .iter()
                 .filter_map(|child| child.value.continuation())
                 .collect();
-            let value = if completion_rows.is_empty()
+            let value = if let Some((lambda, scope)) = reuse {
+                self.evaluate_reused(
+                    frame.occurrence,
+                    scope,
+                    result_type.data_type(),
+                    &completion_rows,
+                    lambda,
+                    instances,
+                    work,
+                )?
+            } else if completion_rows.is_empty()
                 && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
             {
                 complete_undemanded_leaf(result_type.data_type(), work)?
@@ -2029,10 +2470,14 @@ impl TreeDriver<'_, '_> {
                         // Obtain the source at the original checked Slot. Current
                         // kernels still consume only the evaluated array; this
                         // synchronous borrow neither captures nor wraps its owner.
-                        let (_original, _source) = column.into_parts();
-                        let array = frame.domain.column(ordinal).ok_or_else(|| {
-                            invalid("actual source domain has no checked Slot ordinal")
-                        })?;
+                        let (original, _source) = column.into_parts();
+                        let array = if lambda.is_some() {
+                            original
+                        } else {
+                            frame.domain.column(ordinal).ok_or_else(|| {
+                                invalid("actual source domain has no checked Slot ordinal")
+                            })?
+                        };
                         if !self.source_captured {
                             self.source_custody = input.capture_source(allocator, work.control)?;
                             self.source_captured = true;
@@ -2046,28 +2491,78 @@ impl TreeDriver<'_, '_> {
                             .as_ref()
                             .map(|custody| custody.continuation(&array, work.control))
                             .transpose()?;
-                        OwnedValue::Source(array, frame.domain.clone()).with_continuation(owner)
+                        if let Some(lambda) = lambda {
+                            let mut value = super::mapped::MappedValues::new(
+                                result_type.data_type(),
+                                1,
+                                completion_rows.len(),
+                                allocator,
+                            )?;
+                            let source = value.push_source(array)?;
+                            for &row in &completion_rows {
+                                value.push(Some((source, lambda.root_row(row)?)))?;
+                                work.step()?;
+                            }
+                            OwnedValue::Mapped(value).with_continuation(owner)
+                        } else {
+                            OwnedValue::Source(array, frame.domain.clone()).with_continuation(owner)
+                        }
+                    }
+                    StaticExprKind::LambdaParameter {
+                        lambda: definition,
+                        ordinal,
+                    } => {
+                        let active =
+                            lambda.ok_or_else(|| invalid("lambda parameter has no body frame"))?;
+                        let mut value = super::mapped::MappedValues::new(
+                            result_type.data_type(),
+                            1,
+                            completion_rows.len(),
+                            allocator,
+                        )?;
+                        let mut source_slot = None;
+                        for &row in &completion_rows {
+                            let (source, row) =
+                                active.parameter(*definition, *ordinal as usize, row)?;
+                            let slot = match source_slot {
+                                Some(slot) => slot,
+                                None => {
+                                    let slot = value.push_source(Arc::clone(source))?;
+                                    source_slot = Some(slot);
+                                    slot
+                                }
+                            };
+                            value.push(Some((slot, row)))?;
+                            work.step()?;
+                        }
+                        OwnedValue::Mapped(value)
                     }
                     kind => {
                         let recipes = UnitNodeRecipes {
                             unit: program,
                             occurrence: frame.occurrence,
                         };
-                        if let Some(PreparedPureKernel::OrderedRegexp(prepared)) = program
-                            .calls()
-                            .get(&frame.occurrence)
-                            .map(|call| call.prepared())
-                        {
-                            self.evaluate_regexp(
-                                prepared,
-                                &invocation.arguments,
-                                &mut frame,
-                                &completion_rows,
-                                instances,
-                                work,
-                            )?
-                        } else {
-                            complete_node::<R, _>(
+                        match recipes.prepared_call() {
+                            Some(PreparedPureKernel::OrderedRegexp(prepared)) => self
+                                .evaluate_regexp(
+                                    prepared,
+                                    &invocation.arguments,
+                                    &mut frame,
+                                    &completion_rows,
+                                    lambda,
+                                    instances,
+                                    work,
+                                )?,
+                            Some(PreparedPureKernel::HigherOrder(prepared)) => self
+                                .evaluate_higher_order(
+                                    prepared,
+                                    &mut frame,
+                                    local_selection,
+                                    lambda,
+                                    instances,
+                                    work,
+                                )?,
+                            _ => complete_node::<R, _>(
                                 &CompletionKind::from_static(kind).ok_or_else(|| {
                                     invalid("unsupported compiled root definition")
                                 })?,
@@ -2078,10 +2573,11 @@ impl TreeDriver<'_, '_> {
                                 result_type,
                                 local_selection,
                                 original_domain,
+                                lambda,
                                 instances,
                                 allocator,
                                 work,
-                            )?
+                            )?,
                         }
                     }
                 }
@@ -2091,7 +2587,7 @@ impl TreeDriver<'_, '_> {
                     value,
                     &completion_rows,
                     &completion_output_rows,
-                    input.num_rows(),
+                    batch_rows,
                     work,
                 )?
             } else {
@@ -2104,10 +2600,12 @@ impl TreeDriver<'_, '_> {
                     program.calls().get(&parent.occurrence).map(|call|call.prepared()),
                     Some(PreparedPureKernel::ScalarInvocation(prepared)) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain
                 );
-                if parent_requires_original
-                    && let OwnedValue::Selected(_, errors) = value.uncontinued()
-                    && let Some(error) = errors.first()
-                {
+                let error = match value.uncontinued() {
+                    OwnedValue::Selected(_, errors) => errors.first(),
+                    OwnedValue::Mapped(value) => value.errors().first(),
+                    _ => None,
+                };
+                if parent_requires_original && let Some(error) = error {
                     work.control
                         .operation_aborted
                         .store(true, Ordering::Relaxed);
@@ -2151,7 +2649,7 @@ impl TreeDriver<'_, '_> {
                     shape,
                     parent_invocation.context.demand,
                     child_is_pure,
-                    input.num_rows(),
+                    batch_rows,
                     work,
                     allocator,
                 )?;
@@ -2178,8 +2676,17 @@ fn evaluate_original_invocation<'a, R, K: Ord + Clone>(
 ) -> Result<SelectedValues<'a>, ExprEvaluationFailure<R>> {
     use novarocks_functions::{EvaluatedSourceLoan, ScalarInvocationScope, ScalarInvocationSource};
     let actual = domain.selection(work.control)?;
-    let mut sources = Vec::with_capacity(children.len());
+    let mut materialized = Vec::with_capacity(children.len());
     for child in children {
+        let array = match child.value.uncontinued() {
+            OwnedValue::Mapped(value) => Some(value.materialize(0..actual.len(), work)?),
+            _ => None,
+        };
+        materialized.push(array);
+        work.step()?;
+    }
+    let mut sources = Vec::with_capacity(children.len());
+    for (child, array) in children.iter().zip(&materialized) {
         sources.push(match child.value.uncontinued() {
             OwnedValue::Constant(value) => ScalarInvocationSource::Constant(value),
             OwnedValue::ConstantView(value) => ScalarInvocationSource::ConstantView(value.view()),
@@ -2190,6 +2697,12 @@ fn evaluate_original_invocation<'a, R, K: Ord + Clone>(
             OwnedValue::Column(array) | OwnedValue::Selected(array, _) => {
                 ScalarInvocationSource::Array(EvaluatedSourceLoan::new(array, actual))
             }
+            OwnedValue::Mapped(_) => ScalarInvocationSource::Array(EvaluatedSourceLoan::new(
+                array
+                    .as_ref()
+                    .ok_or_else(|| internal("mapped invocation input lacked its funded carrier"))?,
+                actual,
+            )),
         });
         work.step()?;
     }
@@ -2246,7 +2759,7 @@ fn project_owned(
 ) -> Result<OwnedValue, KernelFailure> {
     let actual = Selection::try_sparse_observed(batch_rows, actual_rows, || work.step())?;
     let value = value.into_value(actual, work)?;
-    let ty = value.argument().array().data_type().clone();
+    let ty = value.data_type()?.clone();
     let actual_value = value.materialize(actual, &ty, work)?;
     let mut indices = Vec::with_capacity(demand_rows.len());
     let mut errors = Vec::new();
@@ -2330,6 +2843,15 @@ fn assemble(
     selection: Selection<'_>,
     work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<OwnedValue, KernelFailure> {
+    if let Some(first) = children
+        .iter()
+        .find_map(|child| match child.value.uncontinued() {
+            OwnedValue::Mapped(mapped) => Some(mapped),
+            _ => None,
+        })
+    {
+        return assemble_mapped(children, choices, row_errors, ty, first.allocator(), work);
+    }
     // The shared pure assembly receives only already-evaluated compact values.
     // Frame scheduling and its original lazy row demand remain in this host.
     let mut sources = Vec::with_capacity(children.len());
@@ -2365,6 +2887,75 @@ fn assemble(
     )?))
 }
 
+fn assemble_mapped(
+    children: &[Child],
+    choices: &[Option<(usize, usize)>],
+    row_errors: &mut BTreeMap<usize, RowDataError>,
+    ty: &DataType,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<OwnedValue, KernelFailure> {
+    use super::mapped;
+    let mut sources = 0usize;
+    for child in children {
+        let count = match child.value.uncontinued() {
+            OwnedValue::Mapped(value) => value.sources().len(),
+            OwnedValue::Selected(_, _) => 1,
+            _ => 0,
+        };
+        sources = sources
+            .checked_add(count)
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        work.step()?;
+    }
+    let _offsets = mapped::reserve(allocator, mapped::bytes::<usize>(children.len())?)?;
+    let mut offsets = mapped::buffer(children.len())?;
+    let mut output = mapped::MappedValues::new(ty, sources, choices.len(), allocator)?;
+    for child in children {
+        offsets.push(output.sources().len());
+        match child.value.uncontinued() {
+            OwnedValue::Mapped(value) => {
+                for source in value.sources() {
+                    output.push_source(Arc::clone(source))?;
+                    work.step()?;
+                }
+            }
+            OwnedValue::Selected(source, _) => {
+                output.push_source(Arc::clone(source))?;
+            }
+            _ => {}
+        }
+        work.step()?;
+    }
+    for choice in choices {
+        let row = match *choice {
+            Some((child, row)) => match children[child].value.uncontinued() {
+                OwnedValue::Mapped(value) => value
+                    .address(row)
+                    .map(|(source, row)| (offsets[child] + source, row)),
+                OwnedValue::Selected(source, _) if source.data_type() == &DataType::Null => None,
+                OwnedValue::Selected(_, _) => Some((offsets[child], row)),
+                _ => {
+                    return Err(internal(
+                        "mapped guarded result has no selected child source",
+                    ));
+                }
+            },
+            None => None,
+        };
+        output.push(row)?;
+        work.step()?;
+    }
+    let mut errors = mapped::buffer(row_errors.len())?;
+    for error in std::mem::take(row_errors).into_values() {
+        errors.push(error);
+        work.step()?;
+    }
+    Ok(OwnedValue::Mapped(
+        output.with_errors(errors.into_boxed_slice()),
+    ))
+}
+
 /// Re-address one retained phase result through the existing selected COPY
 /// author. Nothing reads an inactive original batch row or supplies a new FVT.
 fn between_comparison_operand<'a>(
@@ -2382,7 +2973,7 @@ fn between_comparison_operand<'a>(
     }
     let source_selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
     let value = child.value.into_value(source_selection, work)?;
-    let ty = value.argument().array().data_type().clone();
+    let ty = value.data_type()?.clone();
     let output = value.materialize(source_selection, &ty, work)?;
     let mut indices = Vec::with_capacity(parent_ordinals.len());
     for &parent in parent_ordinals {
@@ -2483,19 +3074,19 @@ fn evaluate_comparison<'a>(
             work.flush()?;
             let compared = match recipe {
                 ComparisonRecipe::Ordinary(recipe) => recipe.compare_rows(
-                    left.argument(),
+                    left.argument()?,
                     ordinal,
                     row,
-                    right.argument(),
+                    right.argument()?,
                     ordinal,
                     row,
                     &observed,
                 )?,
                 ComparisonRecipe::NullSafe(recipe) => Some(recipe.compare_rows(
-                    left.argument(),
+                    left.argument()?,
                     ordinal,
                     row,
-                    right.argument(),
+                    right.argument()?,
                     ordinal,
                     row,
                     &observed,
@@ -2622,10 +3213,10 @@ fn evaluate_arithmetic<'a>(
         } else {
             work.flush()?;
             recipe.evaluate_row(
-                left.argument(),
+                left.argument()?,
                 ordinal,
                 row,
-                right.argument(),
+                right.argument()?,
                 ordinal,
                 row,
                 work.control,
@@ -2718,7 +3309,7 @@ fn evaluate_cast<'a>(
     work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     work.flush()?;
-    recipe.evaluate_selected(child.argument(), selection, child.errors(), work.control)
+    recipe.evaluate_selected(child.argument()?, selection, child.errors(), work.control)
 }
 
 // Pure values from ordered, separately evaluated source occurrences. Scheduling
@@ -3046,6 +3637,7 @@ fn duplicate_child(
         OwnedValue::ConstantView(value) => OwnedValue::ConstantView(value.clone()),
         OwnedValue::Column(value) => OwnedValue::Column(Arc::clone(value)),
         OwnedValue::Source(value, domain) => OwnedValue::Source(Arc::clone(value), domain.clone()),
+        OwnedValue::Mapped(value) => OwnedValue::Mapped(value.copy_mapping(work)?),
         OwnedValue::Selected(value, source_errors) => {
             let mut errors = Vec::with_capacity(source_errors.len());
             for error in source_errors.iter() {

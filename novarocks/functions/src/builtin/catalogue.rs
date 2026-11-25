@@ -1548,14 +1548,6 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
         request: FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        if request
-            .arguments
-            .iter()
-            .any(|argument| matches!(argument, FunctionArgument::Lambda { .. }))
-            && let Some(signature) = super::collection_lambda::signature(&self.canonical_name)
-        {
-            return signature.resolve(request, control);
-        }
         binding_control::scope(control, |work| {
             request_types_with_constants(request, work)?;
             let argument_types = binding_control::scalar_types(request, work)?;
@@ -3377,11 +3369,9 @@ pub(super) fn scalar_definition_parts(
                 }
             })
             .chain((name == "array_sort").then(|| {
-                let mut comparator = super::collection_lambda::signature(name)
+                super::collection_lambda::signature(name)
                     .expect("declared array_sort comparator")
-                    .declaration();
-                comparator.effects = Some(super::array_order_owner::comparator_effects());
-                comparator
+                    .declaration()
             })),
     )
     .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
@@ -3602,7 +3592,7 @@ pub fn contribute_builtin_functions(
         }
     }
     builder.register(super::binary_operator_owner::modulus_definition()?)?;
-    super::collection_lambda::register(builder)?;
+    super::collection_lambda::register(builder, None)?;
     builder.register(super::array_generation_owner::sequence_definition()?)?;
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         let (declaration, resolver) = dynamic_definition_parts(name)?;
@@ -3773,7 +3763,7 @@ pub fn contribute_builtin_functions(
                 super::array_generation_owner::repeat_definition(&name, declaration, resolver)?
             }
             name if super::array_order_owner::operation(name).is_some() => {
-                super::array_order_owner::definition(name, declaration, resolver)?
+                super::array_order_owner::definition(name, declaration, resolver, None)?
             }
             name if super::array_relation_owner::operation(name).is_some() => {
                 super::array_relation_owner::definition(name, declaration, resolver)?

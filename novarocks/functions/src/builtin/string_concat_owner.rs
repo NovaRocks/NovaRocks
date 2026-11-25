@@ -326,6 +326,11 @@ impl PreparedScalarKernel for PreparedConcat {
         &self.contract
     }
 
+    fn supports_scalar_broadcast(&self, ordinal: usize) -> bool {
+        matches!(self.kind, ConcatKind::Array)
+            && ordinal < self.contract.value_argument_types().len()
+    }
+
     fn instance_retained_upper_bound(&self) -> usize {
         match self.kind {
             ConcatKind::String | ConcatKind::TrinoScalar => {

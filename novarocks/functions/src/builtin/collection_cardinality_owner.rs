@@ -319,6 +319,10 @@ impl PreparedScalarKernel for PreparedCollectionCardinality {
         &self.contract
     }
 
+    fn supports_scalar_broadcast(&self, ordinal: usize) -> bool {
+        ordinal == 0
+    }
+
     fn instance_retained_upper_bound(&self) -> usize {
         // This stateless instance bound is not a formal Account/grant receipt.
         std::mem::size_of::<CollectionCardinalityInstance>()

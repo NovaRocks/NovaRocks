@@ -162,9 +162,6 @@ impl LambdaBodyContract {
                 "lambda body effects differ from its element context",
             ));
         }
-        if capture_types.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
-            return Err(KernelFailure::ResourceExhausted);
-        }
         for capture in &capture_types {
             validate_type_observed(capture, &mut work)?;
             work.step().map_err(compile_failure)?;
@@ -320,6 +317,7 @@ impl<'input> LambdaBodyOutput<'input> {
             contract: Arc::clone(&self.contract),
             outer: self.row_map.outer_selection(),
             error: error.with_selected_ordinal(parent),
+            origin: None,
         }))
     }
 }
@@ -333,8 +331,24 @@ pub struct RequiredLambdaBodyError<'input> {
     contract: Arc<LambdaBodyContract>,
     outer: Selection<'input>,
     error: RowDataError,
+    pub(crate) origin: Option<crate::aggregate_host_allocator::HostAggregateAllocator>,
 }
 impl<'input> RequiredLambdaBodyError<'input> {
+    pub(crate) fn from_batch(
+        contract: Arc<LambdaBodyContract>,
+        outer: Selection<'input>,
+        parent: usize,
+        error: &RowDataError,
+        origin: crate::aggregate_host_allocator::HostAggregateAllocator,
+    ) -> Self {
+        Self {
+            contract,
+            outer,
+            error: error.with_selected_ordinal(parent),
+            origin: Some(origin),
+        }
+    }
+
     pub fn contract(&self) -> &Arc<LambdaBodyContract> {
         &self.contract
     }
@@ -366,6 +380,7 @@ impl<'input> RequiredLambdaBodyError<'input> {
             contract: self.contract,
             outer,
             error: self.error,
+            origin: self.origin,
         })
     }
 }
@@ -424,7 +439,7 @@ impl<'evaluator, 'contract, 'input> LambdaBodyInvocation<'evaluator, 'contract, 
         let output = result?;
         self.validate_metadata()?;
         control.checkpoint(0)?;
-        validate_body_output(input, &output, control)?;
+        validate_body_output(input.contract(), input.selection(), &output, control)?;
         Ok(LambdaBodyOutput {
             contract: Arc::clone(&self.contract),
             row_map: input.row_map(),
@@ -441,18 +456,19 @@ impl<'evaluator, 'contract, 'input> LambdaBodyInvocation<'evaluator, 'contract, 
     }
 }
 
-fn validate_body_output(
-    input: LambdaBodyInput<'_, '_>,
+pub(crate) fn validate_body_output(
+    body: &LambdaBodyContract,
+    selection: Selection<'_>,
     output: &SelectedValues<'_>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<(), KernelFailure> {
     let mut work = EvaluationCheckpoints::new(control);
     if !output
         .selection()
-        .same_rows_observed(input.selection(), || work.step())?
+        .same_rows_observed(selection, || work.step())?
         || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
             output.values().data_type(),
-            input.contract().result_type().data_type(),
+            body.result_type().data_type(),
             || work.step(),
         )?
     {
@@ -461,10 +477,9 @@ fn validate_body_output(
         ));
     }
     if !output.errors().is_empty()
-        && !input
-            .contract()
+        && !body
             .effects()
-            .for_use(input.contract().context())
+            .for_use(body.context())
             .map_err(|_| internal("lambda body lost its exact effect scope"))?
             .may_raise_row_error
     {
@@ -474,7 +489,7 @@ fn validate_body_output(
     }
     // SelectedValues already checks compact shape and ordered error NULLs.
     // Errors are child errors: the parent's own_row_error does not gate them.
-    if !input.contract().result_type().nullable() {
+    if !body.result_type().nullable() {
         let mut errors = output.errors().iter().peekable();
         for ordinal in 0..output.values().len() {
             if errors

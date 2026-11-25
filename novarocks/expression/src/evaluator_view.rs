@@ -120,6 +120,12 @@ impl CompiledExprSet {
     pub fn effects(&self) -> &BTreeMap<ExpressionUseId, ScopedExpressionEffects> {
         &self.effects
     }
+    pub fn higher_order_body(&self, id: ExpressionUseId) -> Option<&CompiledLambdaBody> {
+        self.lambdas.bodies.get(&id)
+    }
+    pub fn reuse_scope(&self, id: ExpressionUseId) -> Option<LambdaReuseScope> {
+        self.lambdas.reuse.get(&id).copied()
+    }
 }
 impl UnitRecipes {
     pub fn requires_guarded_comparison_allocator(

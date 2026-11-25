@@ -66,7 +66,12 @@ impl<'a> LambdaElementRowMap<'a> {
         if work != 0 {
             control.checkpoint(work)?;
         }
-        Ok(Self { outer, parents })
+        Ok(Self::from_validated(outer, parents))
+    }
+
+    // The staged request verifies these exact borrows before publication.
+    pub(crate) const fn from_validated(outer: Selection<'a>, parents: &'a [usize]) -> Self {
+        Self { outer, parents }
     }
 
     pub const fn outer_selection(self) -> Selection<'a> {

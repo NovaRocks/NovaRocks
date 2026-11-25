@@ -309,3 +309,40 @@ fn array_relation_map_identity_ignores_entry_order_and_releases_comparison_scrat
     drop(allocator);
     host.released();
 }
+
+#[test]
+fn scalar_broadcast_differential_for_contains_and_array_position() {
+    use crate::builtin::array_invocation_test_support::assert_scalar_broadcast_equivalent;
+
+    let wide: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([
+        Some(vec![Some(0)]),
+        Some((0..2048).map(Some).chain([None]).collect()),
+        None,
+    ]));
+    let wanted = array(vec![Some(0), Some(1234), None]);
+    let row = |x| -> ArrayRef {
+        Arc::new(StructArray::new(
+            vec![Field::new("x", DataType::Int64, true)].into(),
+            vec![x],
+            None,
+        ))
+    };
+    let row_child = row(array(vec![Some(10), None, Some(30)]));
+    let row_list: ArrayRef = Arc::new(
+        ListArray::try_new(
+            Arc::new(Field::new("item", row_child.data_type().clone(), true)),
+            OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+            row_child,
+            None,
+        )
+        .unwrap(),
+    );
+    let row_probe = row(array(vec![Some(11), Some(12), Some(13)]));
+
+    for name in ["contains", "array_position"] {
+        assert_scalar_broadcast_equivalent(name, &[(&wide, 1), (&wanted, 1)], false);
+        assert_scalar_broadcast_equivalent(name, &[(&wide, 1), (&wanted, 2)], false);
+        assert_scalar_broadcast_equivalent(name, &[(&wide, 2), (&wanted, 1)], false);
+        assert_scalar_broadcast_equivalent(name, &[(&row_list, 1), (&row_probe, 1)], true);
+    }
+}
