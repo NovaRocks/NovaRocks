@@ -23,7 +23,7 @@ use super::{
     JsonError, JsonValueError, JsonWork, MAX_DEPTH, Node, ObservedError, Scalar, Scratch, VERSION,
 };
 use crate::KernelFailure;
-use crate::cast::array_json::{LeafError, LexNumber, LexWork, Reader, lex_number};
+use crate::cast::array_json::{InvalidJson, LeafError, LexNumber, LexWork, Reader, lex_number};
 use std::cmp::Ordering;
 
 #[derive(Clone, Copy, Debug)]
@@ -145,7 +145,11 @@ impl<'a, R, W: JsonWork<Reservation = R>> Scan<'a, W> for TextScanner<'a, R> {
 fn project_text(error: LeafError, offset: usize) -> JsonError {
     match error {
         LeafError::Outer(error) => error.into(),
-        LeafError::Parse(_) => JsonError::InvalidText(offset),
+        LeafError::Parse(
+            InvalidJson::Syntax | InvalidJson::NumberRange | InvalidJson::FloatParser(_),
+        ) => JsonError::InvalidText(offset),
+        #[cfg(test)]
+        LeafError::Parse(InvalidJson::NestingDepth) => JsonError::InvalidText(offset),
         #[cfg(test)]
         LeafError::Conversion(_) => JsonValueError::Scalar.into(),
     }
@@ -156,7 +160,6 @@ fn text_step<'a>(
     phase: &mut Vec<Phase>,
     root: &mut bool,
 ) -> Result<Option<Event<'a>>, LeafError> {
-    use crate::cast::array_json::InvalidJson;
     use Phase::*;
     loop {
         reader.space()?;
@@ -214,7 +217,6 @@ fn text_step<'a>(
 }
 
 fn text_item<'a>(reader: &mut Reader<'a, '_>) -> Result<Event<'a>, LeafError> {
-    use crate::cast::array_json::InvalidJson;
     let source = match reader.byte() {
         Some(b'[') => {
             reader.require(b'[')?;
@@ -463,10 +465,8 @@ fn emit<'a, W: JsonWork>(
     while let Some(event) = reader.advance(work)? {
         work.step()?;
         if matches!(event, Event::Start(_) | Event::Key(_) | Event::Item(_)) {
-            if !has_key {
-                if let Some(parent) = stack.values.last_mut() {
-                    parent.record_offset(&mut out, at);
-                }
+            if !has_key && let Some(parent) = stack.values.last_mut() {
+                parent.record_offset(&mut out, at);
             }
             has_key = matches!(event, Event::Key(_));
         }

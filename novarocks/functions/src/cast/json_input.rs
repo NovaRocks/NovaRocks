@@ -288,7 +288,7 @@ impl<'a, 'w, 'c> Scan<'a, RowWork<'w, 'c>> for SourceScan<'a> {
                 if let Some(row) = remaining.next() {
                     let item = Cell {
                         array: *values,
-                        ty: *ty,
+                        ty,
                         row,
                     };
                     return self.item(item, work).map(Some);

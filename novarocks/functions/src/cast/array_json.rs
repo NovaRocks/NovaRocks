@@ -905,13 +905,14 @@ pub(crate) fn lex_number(raw: &str, work: &mut dyn LexWork) -> Result<LexNumber,
         return Ok(LexNumber::Double(parse_double(&facts, work)?));
     }
     let integer = !facts.coefficient.contains('.');
-    if integer && facts.significant <= 19 {
-        if let Ok(value) = raw.parse::<i64>() {
-            return Ok(match i32::try_from(value) {
-                Ok(value) => LexNumber::Integer(value),
-                Err(_) => LexNumber::BigInt(value),
-            });
-        }
+    if integer
+        && facts.significant <= 19
+        && let Ok(value) = raw.parse::<i64>()
+    {
+        return Ok(match i32::try_from(value) {
+            Ok(value) => LexNumber::Integer(value),
+            Err(_) => LexNumber::BigInt(value),
+        });
     }
     if decimal_profile(&facts) {
         let mut coefficient = 0;

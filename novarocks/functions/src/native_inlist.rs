@@ -835,10 +835,6 @@ impl PreparedNativeInListRecipe {
         matches!(self.equality, MembershipEquality::Json)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Keep the exact candidate, parent positions, optional constant proof and original control explicit"
-    )]
     pub fn json_equalities_observed<E>(
         &self,
         probe: &mut JsonProbeKeys,

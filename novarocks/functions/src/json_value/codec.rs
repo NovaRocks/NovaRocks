@@ -229,6 +229,8 @@ impl<'a> Node<'a> {
     }
 }
 
+pub(super) type RawEntry<'a> = (Option<&'a [u8]>, Node<'a>, usize);
+
 #[derive(Clone, Copy, Debug)]
 pub struct Container<'a> {
     count: usize,
@@ -373,7 +375,7 @@ impl<'a> Container<'a> {
         self,
         index: usize,
         consumed: usize,
-    ) -> Result<Option<(Option<&'a [u8]>, Node<'a>, usize)>, Error> {
+    ) -> Result<Option<RawEntry<'a>>, Error> {
         let original = self.data.get(consumed..).ok_or(Error::Extent)?;
         if index == self.count {
             return if original.is_empty() {

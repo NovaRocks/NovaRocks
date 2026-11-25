@@ -671,9 +671,8 @@ fn visit_jdk_utf16(
     work: &mut RowWork<'_, '_>,
     mut emit: impl FnMut(char) -> Result<(), JsonError>,
 ) -> Result<(), JsonError> {
-    let units = bytes.chunks_exact(2);
-    let trailing = !units.remainder().is_empty();
-    let mut units = units.map(|unit| u16::from_le_bytes([unit[0], unit[1]]));
+    let (units, trailing) = bytes.as_chunks::<2>();
+    let mut units = units.iter().copied().map(u16::from_le_bytes);
     while let Some(unit) = units.next() {
         work.step()?;
         let value = match unit {
@@ -696,7 +695,7 @@ fn visit_jdk_utf16(
         };
         emit(value)?;
     }
-    if trailing {
+    if !trailing.is_empty() {
         work.step()?;
         emit(char::REPLACEMENT_CHARACTER)?;
     }
@@ -709,10 +708,8 @@ fn visit_jdk_utf32(
     mut emit: impl FnMut(char) -> Result<(), JsonError>,
 ) -> Result<(), JsonError> {
     let bytes = bytes.strip_prefix(&[0xff, 0xfe, 0, 0]).unwrap_or(bytes);
-    let chunks = bytes.chunks_exact(4);
-    let trailing = !chunks.remainder().is_empty();
-    let mut units =
-        chunks.map(|unit| u32::from_le_bytes(unit.try_into().expect("known UTF-32 width")));
+    let (units, trailing) = bytes.as_chunks::<4>();
+    let mut units = units.iter().copied().map(u32::from_le_bytes);
     let mut offset = 0;
     while let Some(unit) = units.next() {
         work.step()?;
@@ -731,7 +728,7 @@ fn visit_jdk_utf32(
         emit(value)?;
         offset += 4;
     }
-    if trailing {
+    if !trailing.is_empty() {
         work.step()?;
         emit(char::REPLACEMENT_CHARACTER)?;
     }

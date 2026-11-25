@@ -75,7 +75,7 @@ fn selected_sql(case: Case) -> String {
         _ => (String::new(), "rhs"),
     };
     format!(
-        "{session}SELECT p.id, parse_json(p.txt) IN (SELECT parse_json(txt) FROM {CATALOG}.{DATABASE}.{rhs}) AS present FROM {CATALOG}.{DATABASE}.probe p ORDER BY p.id"
+        "{session}SELECT p.id, json_parse(p.txt) IN (SELECT json_parse(txt) FROM {CATALOG}.{DATABASE}.{rhs}) AS present FROM {CATALOG}.{DATABASE}.probe p ORDER BY p.id"
     )
 }
 impl Scenario for JsonMembership {
@@ -105,6 +105,10 @@ impl Scenario for JsonMembership {
                 "novarocks/functions/src/native_inlist*.rs",
                 "novarocks/functions/src/json_canonical*.rs",
                 "novarocks/functions/src/builtin/json_canonical*.rs",
+                "novarocks/functions/src/json_value.rs",
+                "novarocks/functions/src/json_value/**",
+                "novarocks/functions/src/builtin/parse_json_owner.rs",
+                "novarocks/json-value-format/**",
                 "tests/system-test-runner/src/scenarios/json_membership.rs",
                 "tests/system-test-runner/src/scenarios/writer_statement_actor.rs",
             ]
@@ -321,7 +325,7 @@ impl Scenario for JsonMembership {
         }
         await_resource_convergence(context, &baseline)?;
         // Empty RHS still preserves every outer occurrence, including SQL NULL.
-        let empty_result = control.execute(format!("SELECT COUNT(*) FROM (SELECT id,parse_json(txt) IN (SELECT parse_json(txt) FROM {CATALOG}.{DATABASE}.rhs WHERE FALSE) AS m FROM {CATALOG}.{DATABASE}.probe) q WHERE m=FALSE"))?;
+        let empty_result = control.execute(format!("SELECT COUNT(*) FROM (SELECT id,json_parse(txt) IN (SELECT json_parse(txt) FROM {CATALOG}.{DATABASE}.rhs WHERE FALSE) AS m FROM {CATALOG}.{DATABASE}.probe) q WHERE m=FALSE"))?;
         require_result_types(&empty_result, &["bigint"])?;
         let empty = sql::integer_column(&empty_result)?;
         ensure!(
@@ -510,10 +514,8 @@ fn seed_capacity(context: &mut ScenarioContext, control: &mut SqlSession) -> Res
     control.execute(format!(
         "CREATE TABLE {CATALOG}.{DATABASE}.big_rhs (txt VARCHAR)"
     ))?;
-    // Keep each JSON small: PARSE_JSON's original worst-case RawValue resource
-    // envelope grows quadratically in one value's length. Large individual
-    // values exercise that producer's admission rather than retained RHS size.
-    // Each independent INSERT has at most 2MiB of string body before metadata.
+    // Use many small JSON objects to exercise the budget for retained RHS keys.
+    // Each independent INSERT has at most 2MiB of padded payload before object fields.
     let seed_rows = 2 * 1024 * 1024 / BIG_TEXT;
     let key_prefix = r#"{"key":"#;
     let text_prefix = r#","large":""#;
@@ -525,11 +527,10 @@ fn seed_capacity(context: &mut ScenarioContext, control: &mut SqlSession) -> Res
     context.action("bounded large RHS fixture written");
     CAPACITY_SETTINGS.apply(control)?;
     context.action("applied original pipeline_dop=1 session property; batch size remains default");
-    // PARSE_JSON can return NULL even with a non-null input, so counting its
-    // results requires the producer. Sum the original compact payload lengths
+    // Count the parsed JSON values and sum the original compact payload lengths
     // separately. The snapshot, pipeline settings and budget match the target.
     let produced = control.execute(format!(
-        "WITH SESSION query_mem_limit = {CAPACITY_BYTES} SELECT COUNT(*), COUNT(parse_json(txt)), SUM(LENGTH(txt)) FROM {CATALOG}.{DATABASE}.big_rhs"))?;
+        "WITH SESSION query_mem_limit = {CAPACITY_BYTES} SELECT COUNT(*), COUNT(json_parse(txt)), SUM(LENGTH(txt)) FROM {CATALOG}.{DATABASE}.big_rhs"))?;
     require_result_types(&produced, &["bigint", "bigint", "bigint"])?;
     // Each source key is distinct, so the canonical set cannot collapse it.
     let object_overhead = (key_prefix.len() + text_prefix.len() + object_suffix.len()) as i64;
