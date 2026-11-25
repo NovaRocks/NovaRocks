@@ -2307,7 +2307,7 @@ impl TreeDriver<'_, '_> {
         ))
     }
 
-    // Design: ADR-0270 (docs/adr/ADR-0270-collection-lambdas-use-bound-body-requests.md)
+    // Design: ADR-0272 (docs/adr/ADR-0272-collection-lambdas-use-bound-body-requests.md)
     fn evaluate_higher_order<'a, R>(
         &mut self,
         prepared: &Arc<dyn novarocks_functions::PreparedHigherOrderKernel>,

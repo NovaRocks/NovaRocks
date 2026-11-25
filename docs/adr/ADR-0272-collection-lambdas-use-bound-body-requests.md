@@ -1,5 +1,5 @@
 ---
-id: ADR-0270
+id: ADR-0272
 title: "Collection lambdas use bound body requests"
 domain: [sql-compiler, execution-functions]
 status: active

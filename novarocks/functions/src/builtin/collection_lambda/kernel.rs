@@ -18,7 +18,7 @@
 //! Selected, resumable collection evaluation. A request contains only the
 //! source positions chosen by this overload's current algorithm frontier.
 
-// Design: ADR-0270 (docs/adr/ADR-0270-collection-lambdas-use-bound-body-requests.md)
+// Design: ADR-0272 (docs/adr/ADR-0272-collection-lambdas-use-bound-body-requests.md)
 use std::{fmt, ops::Range, sync::Arc};
 
 use allocator_api2::vec::Vec as AllocVec;
