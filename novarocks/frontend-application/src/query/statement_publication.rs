@@ -31,7 +31,7 @@ use novarocks_spi::connector::write_stack::{
     ConnectorWriteNeededReady, ConnectorWritePublicationCompletion,
 };
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorRequestContext, ConnectorWriteAbortOutcome,
+    ConnectorError, ConnectorRequestContext, ConnectorWriteAbortOutcome, ExternalMutationEvidence,
     ExternalMutationFinalization, LakePublicationDisposition,
 };
 use std::task::{Context, Poll};
@@ -316,6 +316,28 @@ impl StatementPublication {
                     .and_then(WritePublicationCall::received_committed_effect)
             })
     }
+    pub(crate) fn unknown_evidence(
+        &self,
+    ) -> Option<(
+        &ExternalMutationEvidence,
+        Option<Arc<novarocks_spi::connector::KeyedWriteObservation>>,
+    )> {
+        match (&self.outcome, &self.abort_outcome) {
+            (
+                Some(Ok(ConnectorWritePublicationCompletion::CommitUnknown {
+                    evidence,
+                    keyed_observation,
+                    ..
+                })),
+                _,
+            ) => Some((evidence, keyed_observation.clone())),
+            (_, Some(Ok(ConnectorWriteAbortOutcome::CommitUnknown { evidence, .. }))) => {
+                Some((evidence, None))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn committed(&self) -> bool {
         self.disposition() == Some(LakePublicationDisposition::KnownCommitted)
     }

@@ -1896,6 +1896,47 @@ impl ManagementEntranceObligation {
         self.record_terminal(disposition)
     }
 
+    /// Hand off the same publication effect under the existing unresolved
+    /// barrier. Only passive evidence survives this transition.
+    pub fn record_unknown_publication(
+        mut self,
+        publication_id: novarocks_spi::connector::LakePublicationId,
+        original: &novarocks_spi::connector::ExternalMutationEvidence,
+        observation: Option<std::sync::Arc<novarocks_spi::connector::KeyedWriteObservation>>,
+    ) -> Result<(), ManagementAdmissionError> {
+        use novarocks_spi::connector::{CommitConclusion, UnknownCommitIdentity};
+        let Some(DispatchedEffect::Exact(responsibility)) = self.dispatched.as_ref() else {
+            return Err(ManagementAdmissionError::EffectNotDispatched);
+        };
+        if self.request.operation != ConnectorDocumentManagementOperation::Publication
+            || responsibility.identity().to_bytes() != publication_id.to_bytes()
+            || responsibility.target().table().instance_id != original.descriptor().instance_id
+            || observation.as_ref().is_some_and(|observed| {
+                observed.publication_id != publication_id
+                    || matches!(observed.conclusion, CommitConclusion::Committed(_))
+                    || !matches!(&observed.evidence.identity,
+                        UnknownCommitIdentity::SnapshotDispatch(dispatch)
+                        if dispatch.operation_id == original.operation_id()
+                            && &dispatch.target == responsibility.target().object_id()
+                            && !dispatch.records.is_empty()
+                            && observed.evidence.preselected_snapshot > 0)
+            })
+        {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        record_unsettled_with_evidence(
+            &self.entrance,
+            responsibility.clone(),
+            Some(super::PublicationRecoveryEvidence {
+                original: original.without_process_local_payload(),
+                observation,
+            }),
+        )?;
+        self.dispatched.take();
+        self.activity.take();
+        Ok(())
+    }
+
     pub fn record_terminal(
         mut self,
         disposition: EffectDisposition,
@@ -2211,17 +2252,26 @@ fn record_unsettled(
     entrance: &Weak<EntranceInner>,
     responsibility: EffectResponsibility,
 ) -> Result<(), ManagementAdmissionError> {
+    record_unsettled_with_evidence(entrance, responsibility, None)
+}
+
+fn record_unsettled_with_evidence(
+    entrance: &Weak<EntranceInner>,
+    responsibility: EffectResponsibility,
+    publication_recovery: Option<super::PublicationRecoveryEvidence>,
+) -> Result<(), ManagementAdmissionError> {
     let entrance = entrance
         .upgrade()
         .ok_or(ManagementAdmissionError::EntranceDropped)?;
     let table = responsibility.target().table().clone();
-    let unknown = match responsibility
+    let mut unknown = match responsibility
         .clone()
         .record_terminal(EffectDisposition::CommitUnknown)
     {
         super::EffectTerminalFact::CommitUnknown(unknown) => unknown,
         _ => unreachable!("explicit CommitUnknown always yields an unsettled effect"),
     };
+    unknown.publication_recovery = publication_recovery;
     let mut state = lock(&entrance.state);
     let target = state.entry(table).or_insert_with(|| TargetAdmissionState {
         target: responsibility.target().clone(),

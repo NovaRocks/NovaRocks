@@ -13,7 +13,7 @@ use super::{
 use crate::management::{DeploymentOwner, ManagedMvTarget, ProcessIncarnation};
 use bytes::Bytes;
 use novarocks_spi::connector::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const MV_DOCUMENT_OWNER: &str = "novarocks.mv";
 pub const CONFIGURATION_SLOT_OWNER: &str = MV_DOCUMENT_OWNER;
@@ -354,6 +354,111 @@ impl MvKeyedObservedCurrentDocuments {
         )
     }
 }
+/// Form the marker mutation for a proved refusal of this exact original
+/// incremental publication. The caller retains the original write outcome
+/// and uses the existing scoped marker channel. Ancestor observations never
+/// produce a known-uncommitted write completion.
+pub fn pending_release_for_publication(
+    current: &KeyedDocumentView,
+    intent: &crate::publication::MvRefreshPublicationIntent,
+    previous: &crate::persistence::identity::PublicationIdentity,
+    original: &LakePublicationTerminal,
+) -> Result<Option<novarocks_spi::connector::KeyedMarkerWrite>, MvDocumentError> {
+    use crate::publication::MvRefreshPublicationTechnique;
+    if original.disposition() != LakePublicationDisposition::KnownUncommitted
+        || original.header().family() != LakePublicationFamily::MaterializedViewRefresh
+        || original.header().publication_id() != intent.publication_id()
+        || original.target().catalog() != current.table.instance_id.as_str()
+        || original.target().namespace() != current.table.namespace.as_ref()
+        || original.target().table() != Some(current.table.table.as_ref())
+        || !matches!(
+            intent.technique(),
+            MvRefreshPublicationTechnique::Incremental
+                | MvRefreshPublicationTechnique::MetadataOnly
+        )
+        || current.object_id != *intent.target_object_id()
+        || &current.table != intent.admission().target()
+        || current.owner != *intent.admission().owner()
+    {
+        return Ok(None);
+    }
+    let Some(base) = intent.expected_target_snapshot_id() else {
+        return Ok(None);
+    };
+    let Some(storage_uuid) = std::str::from_utf8(current.object_id.as_bytes())
+        .ok()
+        .and_then(|name| uuid::Uuid::parse_str(name).ok())
+    else {
+        return Ok(None);
+    };
+    let attempt = intent.publication_id().to_bytes();
+    let mut exact = false;
+    for (key, value) in current
+        .markers
+        .iter()
+        .filter(|(key, _)| key.owner == MV_DOCUMENT_OWNER && key.name == "pending")
+    {
+        let Marker::Pending {
+            publication,
+            evidence,
+        } = Marker::decode(key, value)?
+        else {
+            unreachable!("the marker codec validates its key and body");
+        };
+        if publication == *previous
+            && evidence.attempt == attempt
+            && evidence.storage_uuid == *storage_uuid.as_bytes()
+            && evidence.baseline_snapshot == base
+        {
+            exact = true;
+            break;
+        }
+    }
+    if !exact {
+        return Ok(None);
+    }
+    let (key, value) = Marker::PendingReleased {
+        publication: previous.clone(),
+        attempt,
+    }
+    .encode()?;
+    if current.markers.get(&key) == Some(&value) {
+        return Ok(None);
+    }
+    Ok(Some(novarocks_spi::connector::KeyedMarkerWrite {
+        markers: BTreeMap::from([(key, value)]),
+    }))
+}
+
+pub fn released_pending_marker_keys(
+    current: &MvKeyedObservedCurrentDocuments,
+) -> Result<BTreeSet<ConnectorMarkerKey>, MvDocumentError> {
+    let decoded = current.decoded_markers()?;
+    let releases: BTreeMap<_, _> = decoded
+        .iter()
+        .filter_map(|(key, marker)| match marker {
+            Marker::PendingReleased {
+                publication,
+                attempt,
+            } => Some(((publication, *attempt), key)),
+            _ => None,
+        })
+        .collect();
+    let mut remove = BTreeSet::new();
+    for (key, marker) in &decoded {
+        if let Marker::Pending {
+            publication,
+            evidence,
+        } = marker
+            && let Some(release) = releases.get(&(publication, evidence.attempt))
+        {
+            remove.insert(key.clone());
+            remove.insert((*release).clone());
+        }
+    }
+    Ok(remove)
+}
+
 pub fn never_published(view: &KeyedDocumentView) -> bool {
     view.before_first_data_publication
         && !view
@@ -858,7 +963,19 @@ pub fn keyed_view_fixture(
     snapshot: Option<i64>,
     published: bool,
 ) -> (CatalogHandle, KeyedDocumentView) {
-    let f = crate::persistence::test_support::MvDocumentFixture::new();
+    keyed_view_from_fixture(
+        crate::persistence::test_support::MvDocumentFixture::new(),
+        snapshot,
+        published,
+    )
+}
+
+#[cfg(any(test, novarocks_dev_controls))]
+fn keyed_view_from_fixture(
+    f: crate::persistence::test_support::MvDocumentFixture,
+    snapshot: Option<i64>,
+    published: bool,
+) -> (CatalogHandle, KeyedDocumentView) {
     let mut inputs = Vec::new();
     for occurrence in &f.binding.occurrences {
         let raw = super::exact_revision::restore_persisted_object(&occurrence.object_id).unwrap();
@@ -1009,6 +1126,143 @@ pub(crate) mod tests {
         };
         assert!(!never_published(&view));
         assert!(decode_current_keyed_documents(view, catalog).is_err());
+    }
+
+    #[test]
+    fn pending_release_requires_the_original_refusal_and_exact_attempt_and_scope() {
+        use crate::persistence::identity::{
+            NativeDataVersion, ObjectIdentity, PublicationIdentity,
+        };
+        use crate::publication::{MvRefreshPublicationIntent, MvRefreshPublicationTechnique};
+
+        let uuid = uuid::Uuid::now_v7();
+        let object_bytes = uuid.to_string().into_bytes();
+        let mut documents = crate::persistence::test_support::MvDocumentFixture::new();
+        documents.interpretation.target.object_id =
+            ObjectIdentity::try_new(object_bytes.clone()).unwrap();
+        documents.object_id = ConnectorTableObjectId::try_new(Bytes::from(object_bytes)).unwrap();
+        let (catalog, mut view) = keyed_view_from_fixture(documents, Some(17), true);
+        let previous = decode_current_keyed_documents(view.clone(), catalog.clone())
+            .unwrap()
+            .publication
+            .unwrap()
+            .publication_id;
+        let attempt = LakePublicationId::new_v7();
+        let admission = crate::test_admission::publication_admission(
+            view.table.instance_id.as_str(),
+            &view.table.namespace,
+            &view.table.table,
+            attempt,
+            &view.object_id,
+        );
+        view.owner = admission.owner().clone();
+        let intent = MvRefreshPublicationIntent::try_new(
+            attempt,
+            view.object_id.clone(),
+            Some(17),
+            admission,
+            MvRefreshPublicationTechnique::Incremental,
+            vec![
+                crate::publication::MvRefreshPublicationBase::try_new(
+                    0,
+                    "ice.sales.base".into(),
+                    view.object_id.clone(),
+                    Some(3),
+                    4,
+                )
+                .unwrap(),
+            ],
+            "definition".into(),
+            view.table.instance_id.as_str().into(),
+            view.table.namespace.to_string(),
+            view.table.table.to_string(),
+        )
+        .unwrap();
+        let pending = |publication: PublicationIdentity, attempt: [u8; 16]| {
+            let rev = DocumentRevision::from_canonical_bytes(b"scope");
+            Marker::Pending {
+                publication,
+                evidence: PendingEvidence {
+                    attempt,
+                    refresh_identity: Bytes::from_static(b"original refresh"),
+                    source_windows: vec![SourceVersionWindow {
+                        occurrence: 0,
+                        from: NativeDataVersion::try_new(vec![1]).unwrap(),
+                        to: NativeDataVersion::try_new(vec![2]).unwrap(),
+                    }],
+                    storage_uuid: *uuid.as_bytes(),
+                    baseline_snapshot: 17,
+                    mapping_revision: rev,
+                    verification_requirement: Bytes::from_static(b"verify"),
+                },
+            }
+            .encode()
+            .unwrap()
+        };
+        let (orig_key, orig_value) = pending(previous.clone(), attempt.to_bytes());
+        let (other_key, other_value) = pending(previous.clone(), [3; 16]);
+        view.markers.extend([
+            (orig_key.clone(), orig_value),
+            (other_key.clone(), other_value),
+        ]);
+        let terminal = |id, disposition| {
+            LakePublicationTerminal::new(
+                LakePublicationMarkerHeader::new(
+                    id,
+                    LakePublicationFamily::MaterializedViewRefresh,
+                ),
+                LakePublicationTarget::try_new(
+                    view.table.instance_id.as_str().into(),
+                    view.table.namespace.to_string(),
+                    Some(view.table.table.to_string()),
+                    None,
+                )
+                .unwrap(),
+                disposition,
+                LakePublicationNextAction::InspectPublishedState,
+                None,
+            )
+        };
+        assert!(
+            pending_release_for_publication(
+                &view,
+                &intent,
+                &previous,
+                &terminal(attempt, LakePublicationDisposition::CommitUnknown),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            pending_release_for_publication(
+                &view,
+                &intent,
+                &previous,
+                &terminal(
+                    LakePublicationId::new_v7(),
+                    LakePublicationDisposition::KnownUncommitted
+                ),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let refused = terminal(attempt, LakePublicationDisposition::KnownUncommitted);
+        let release = pending_release_for_publication(&view, &intent, &previous, &refused)
+            .unwrap()
+            .expect("only the definitively refused original attempt releases");
+        let release_key = release.markers.keys().next().unwrap().clone();
+        view.markers.extend(release.markers);
+        assert!(
+            pending_release_for_publication(&view, &intent, &previous, &refused)
+                .unwrap()
+                .is_none()
+        );
+        let current = decode_current_keyed_documents(view, catalog).unwrap();
+        assert_eq!(
+            released_pending_marker_keys(&current).unwrap(),
+            BTreeSet::from([orig_key, release_key]),
+        );
+        assert!(current.view.markers.contains_key(&other_key));
     }
 
     #[test]

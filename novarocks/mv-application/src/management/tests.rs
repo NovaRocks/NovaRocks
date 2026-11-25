@@ -1618,6 +1618,98 @@ fn local_publication_cannot_claim_an_unissued_commit_or_unknown_effect() {
 }
 
 #[test]
+fn publication_unknown_handoff_keeps_exact_passive_evidence_and_the_original_barrier() {
+    use novarocks_spi::connector::{
+        CommitConclusion, CommitProof, ConnectorInstanceDescriptor, ConnectorMutationOperationId,
+        ConnectorProcessLocalPayload, ConnectorProviderBindingKey, ConnectorProviderId,
+        ExternalMutationEvidence, KeyedDispatchRecord, KeyedSnapshotDispatch, KeyedWriteObservation,
+        LakePublicationId, ProviderBindingEpoch, UnknownCommitEvidence, UnknownCommitIdentity,
+    };
+
+    for conclusion in [
+        CommitConclusion::StillUnknown,
+        CommitConclusion::InvalidatedUndetermined,
+        CommitConclusion::NotCommitted(CommitProof::NegativeProof),
+    ] {
+        let (entrance, target, request) =
+            publication_terminal_fixture(ConnectorDocumentManagementOperation::Publication);
+        let mut lease = entrance.acquire(request.clone(), || false).unwrap();
+        let publication_id = LakePublicationId::new_v7();
+        let identity = EffectIdentity::from_bytes(publication_id.to_bytes());
+        lease
+            .mark_dispatched(EffectResponsibility::new(
+                identity,
+                target.clone(),
+                incarnation("inc-a"),
+                EffectScope::CATALOG_COMMIT,
+                ManagementTimestamp::from_unix_millis(1_000),
+            ))
+            .unwrap();
+
+        let session = ConnectorMutationOperationId::from_bytes([55; 16]);
+        let owner = ConnectorProviderBindingKey {
+            instance_id: target.table().instance_id.clone(),
+            incarnation: ProviderBindingEpoch::from_bytes([3; 16]),
+        };
+        let original = ExternalMutationEvidence::try_new(
+            1,
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                instance_id: owner.instance_id.clone(),
+            },
+            owner.incarnation,
+            session,
+            "iceberg-write",
+            bytes::Bytes::from_static(b"original"),
+        )
+        .unwrap()
+        .with_process_local_payload(ConnectorProcessLocalPayload::new(owner, Arc::new(())))
+        .unwrap();
+        let observation = Arc::new(KeyedWriteObservation {
+            publication_id,
+            evidence: UnknownCommitEvidence {
+                asserted_parent: Some(10),
+                preselected_snapshot: 20,
+                identity: UnknownCommitIdentity::SnapshotDispatch(Box::new(
+                    KeyedSnapshotDispatch {
+                        target: target.object_id().clone(),
+                        operation_id: session,
+                        delete_stage: None,
+                        records: vec![KeyedDispatchRecord {
+                            owner: "novarocks.mv".to_owned(),
+                            name: "publication".to_owned(),
+                            envelope: bytes::Bytes::from_static(b"2.-.b3JpZ2luYWw"),
+                        }],
+                        repartition_effect: None,
+                    },
+                )),
+            },
+            conclusion,
+            observed_current_snapshot: Some(30),
+        });
+        lease
+            .record_unknown_publication(publication_id, &original, Some(observation.clone()))
+            .unwrap();
+        let [unsettled]: [UnsettledEffect; 1] = entrance
+            .unsettled_effects(target.table())
+            .try_into()
+            .unwrap();
+        assert_eq!(unsettled.responsibility().identity(), identity);
+        let evidence = unsettled.publication_recovery().unwrap();
+        assert_eq!(evidence.original, original);
+        assert!(evidence.original.process_local_payload().is_none());
+        assert!(Arc::ptr_eq(
+            evidence.observation.as_ref().unwrap(),
+            &observation
+        ));
+        assert_eq!(
+            entrance.acquire(request, || false).err().unwrap(),
+            ManagementAdmissionError::EffectUnsettled,
+        );
+    }
+}
+
+#[test]
 fn dispatched_publication_preserves_the_providers_actual_terminal() {
     for (disposition, expected_phase) in [
         (

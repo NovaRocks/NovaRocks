@@ -46,7 +46,8 @@ pub use continuation::{
 };
 pub use effects::{
     CreateIntentResponsibility, EffectDisposition, EffectIdentity, EffectPath,
-    EffectResponsibility, EffectScope, EffectTerminalFact, UnsettledEffect,
+    EffectResponsibility, EffectScope, EffectTerminalFact, PublicationRecoveryEvidence,
+    UnsettledEffect,
 };
 pub use observation::{
     FreshCreateIntentObservation, FreshManagementObservation, ManagementContinuation,

@@ -1607,6 +1607,7 @@ impl IcebergWriteSessionControl {
                     journal.record_entry_finalization(entry, finalization.clone());
                 }
                 handle.retain_keyed_observation(KeyedWriteObservation {
+                    publication_id: publication.declaration().publication_id(),
                     evidence: exact,
                     conclusion,
                     observed_current_snapshot: current,
@@ -1614,6 +1615,7 @@ impl IcebergWriteSessionControl {
                 return Ok(outcome);
             }
             handle.retain_keyed_observation(KeyedWriteObservation {
+                publication_id: publication.declaration().publication_id(),
                 evidence: exact,
                 conclusion,
                 observed_current_snapshot: current,

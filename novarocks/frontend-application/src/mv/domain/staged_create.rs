@@ -353,7 +353,7 @@ pub(crate) async fn install_published_current_projection_async_in(
     catalog: CatalogHandle,
     target: novarocks_mv_application::product::MvTarget,
     operation_id: uuid::Uuid,
-    published: PublishedOutput,
+    published: Option<PublishedOutput>,
     context: ConnectorRequestContext,
     metadata_cpu: &CurrentProjectionMetadataCpu,
     registration: &CurrentProjectionRegistration,
@@ -369,7 +369,7 @@ pub(crate) async fn install_published_current_projection_async_in(
         catalog,
         target,
         operation_id,
-        Some(published),
+        published,
         MvConvergence::CommittedEffect,
         context,
     )
@@ -1615,6 +1615,9 @@ pub(crate) struct AdmittedMvPublication {
     repartitioned: bool,
     replacement: Option<novarocks_mv_application::persistence::keyed_documents::MvKeyedVersions>,
     markers_remove: std::collections::BTreeSet<novarocks_spi::connector::ConnectorMarkerKey>,
+    released_pending: std::sync::OnceLock<
+        std::collections::BTreeSet<novarocks_spi::connector::ConnectorMarkerKey>,
+    >,
     configuration_slot_update: Option<ConnectorDocumentPublicationSlotUpdate>,
 }
 
@@ -1693,7 +1696,15 @@ impl AdmittedMvPublication {
             }
         })?;
         self.validate_current_dependency_documents(&documents)
-            .map_err(domain)
+            .map_err(domain)?;
+        let released =
+            novarocks_mv_application::persistence::keyed_documents::released_pending_marker_keys(
+                &documents,
+            )
+            .map_err(|error| domain(error.to_string()))?;
+        self.released_pending.set(released).map_err(|_| {
+            domain("MV publication rechecked its released Pending markers twice".into())
+        })
     }
 
     fn validate_current_dependency_binding(
@@ -1869,11 +1880,25 @@ impl AdmittedMvPublication {
         documents
             .markers_remove
             .extend(self.markers_remove.iter().cloned());
+        if let Some(released) = self.released_pending.get() {
+            documents.markers_remove.extend(released.iter().cloned());
+        }
         Ok(documents)
     }
 
     /// Close either the local admission or the dispatched publication with
     /// its actual outcome. A pre-dispatch refusal owns no external effect.
+    pub(crate) fn record_unknown_publication(
+        self,
+        publication_id: LakePublicationId,
+        original: &novarocks_spi::connector::ExternalMutationEvidence,
+        observation: Option<Arc<novarocks_spi::connector::KeyedWriteObservation>>,
+    ) -> Result<(), String> {
+        self.management
+            .record_unknown_publication(publication_id, original, observation)
+            .map_err(|error| format!("retain original MV publication evidence: {error:?}"))
+    }
+
     pub(crate) fn record_terminal(self, disposition: EffectDisposition) -> Result<(), String> {
         self.management
             .record_publication_terminal(disposition)
@@ -1941,6 +1966,16 @@ impl AdmittedMvDataPublication {
     ) -> Result<novarocks_spi::connector::KeyedPublication, String> {
         self.publication
             .publication_document_set(publication_id, &self.inputs, logical_result_rows)
+    }
+
+    pub(crate) fn record_unknown_publication(
+        self,
+        publication_id: LakePublicationId,
+        original: &novarocks_spi::connector::ExternalMutationEvidence,
+        observation: Option<Arc<novarocks_spi::connector::KeyedWriteObservation>>,
+    ) -> Result<(), String> {
+        self.publication
+            .record_unknown_publication(publication_id, original, observation)
     }
 
     pub(crate) fn record_terminal(self, disposition: EffectDisposition) -> Result<(), String> {
@@ -2027,6 +2062,7 @@ impl MvPublicationAdmissionParts {
             repartitioned: false,
             replacement: None,
             markers_remove: Default::default(),
+            released_pending: std::sync::OnceLock::new(),
             configuration_slot_update: self.configuration_slot_update,
         }
     }

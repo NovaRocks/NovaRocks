@@ -554,6 +554,26 @@ impl StepSource {
         &self,
         disposition: EffectDisposition,
     ) -> Result<(), QueryServiceError> {
+        self.record_publication_terminal(disposition, None)
+    }
+    pub(super) fn record_unknown(
+        &self,
+        evidence: &novarocks_spi::connector::ExternalMutationEvidence,
+        observation: Option<Arc<novarocks_spi::connector::KeyedWriteObservation>>,
+    ) -> Result<(), QueryServiceError> {
+        self.record_publication_terminal(
+            EffectDisposition::CommitUnknown,
+            Some((evidence, observation)),
+        )
+    }
+    fn record_publication_terminal(
+        &self,
+        disposition: EffectDisposition,
+        recovery: Option<(
+            &novarocks_spi::connector::ExternalMutationEvidence,
+            Option<Arc<novarocks_spi::connector::KeyedWriteObservation>>,
+        )>,
+    ) -> Result<(), QueryServiceError> {
         let mut loan = self.loan()?;
         let body = loan.body.as_mut().unwrap();
         if let Some((original, result)) = &body.terminal_recorded {
@@ -581,7 +601,14 @@ impl StepSource {
             source: self,
             normal: false,
         };
-        let result = admitted.record_terminal(disposition);
+        let result = match recovery {
+            Some((evidence, observation)) => admitted.record_unknown_publication(
+                body.attempt.publication_id,
+                evidence,
+                observation,
+            ),
+            None => admitted.record_terminal(disposition),
+        };
         guard.normal = true;
         let result = result.map_err(service);
         body.terminal_recorded = Some((disposition, result.clone()));
@@ -1104,6 +1131,30 @@ impl Body {
             .as_ref()
             .ok_or_else(|| phase_service("MV projection has no received committed facts"))?;
         let snapshot_id = publication_snapshot_id(published)?;
+        let original_carrier = match self
+            .needed
+            .as_ref()
+            .and_then(|needed| needed.keyed_observation())
+        {
+            Some(observation)
+                if observation.publication_id == self.attempt.publication_id
+                    && observation.evidence.preselected_snapshot == snapshot_id
+                    && matches!(
+                        observation.conclusion,
+                        novarocks_spi::connector::CommitConclusion::Committed(_)
+                    ) =>
+            {
+                // This receipt proves the original effect, even after a
+                // successor is visible. The authority below observes Current.
+                None
+            }
+            Some(_) => {
+                return Err(phase_service(
+                    "MV reconciliation did not prove this original publication",
+                ));
+            }
+            None => Some(PublishedOutput { snapshot_id }),
+        };
         #[cfg(novarocks_dev_controls)]
         if let Some(controls) = &self.input.services.controls {
             let target = self.product_target.as_ref().unwrap();
@@ -1170,7 +1221,7 @@ impl Body {
             catalog,
             self.product_target.as_ref().unwrap().clone(),
             *self.attempt.publication_id.as_uuid(),
-            PublishedOutput { snapshot_id },
+            original_carrier,
             project.context.clone(),
             &factory,
             &source.project_registration,

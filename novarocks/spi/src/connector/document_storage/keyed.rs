@@ -587,6 +587,7 @@ pub enum CommitConclusion {
 /// Read-only recovery facts from the original write session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyedWriteObservation {
+    pub publication_id: crate::connector::LakePublicationId,
     pub evidence: UnknownCommitEvidence,
     pub conclusion: CommitConclusion,
     pub observed_current_snapshot: Option<i64>,

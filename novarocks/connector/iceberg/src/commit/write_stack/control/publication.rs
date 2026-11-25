@@ -1389,6 +1389,8 @@ pub(super) struct RecoveryPayload {
     pub base_sequence_number: i64,
     pub staging_dir: String,
     pub document_record_digest: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) publication_id: Option<[u8; 16]>,
     operation_id: [u8; 16],
     attempt: RecoveryAttempt,
     parent_snapshot_id: Option<i64>,
@@ -1424,6 +1426,7 @@ struct RecoveryTemplate {
     base_sequence_number: i64,
     staging_dir: String,
     document_record_digest: Option<[u8; 32]>,
+    publication_id: Option<[u8; 16]>,
 }
 
 impl RecoveryTemplate {
@@ -1448,6 +1451,9 @@ impl RecoveryTemplate {
             base_sequence_number: handle.table().base_sequence_number(),
             staging_dir: handle.staging_dir(),
             document_record_digest: handle.document_records_digest()?,
+            publication_id: handle
+                .document_publication()
+                .map(|publication| publication.declaration().publication_id().to_bytes()),
         })
     }
 
@@ -1499,6 +1505,7 @@ impl RecoveryTemplate {
             base_sequence_number: self.base_sequence_number,
             staging_dir: self.staging_dir.clone(),
             document_record_digest: self.document_record_digest,
+            publication_id: self.publication_id,
             operation_id: operation.token().to_bytes(),
             attempt: request.artifacts().attempt().into(),
             parent_snapshot_id: *parent,
@@ -1550,6 +1557,7 @@ impl RecoveryPayload {
             || self.base_sequence_number != expected.base_sequence_number
             || self.staging_dir != expected.staging_dir
             || self.document_record_digest != expected.document_record_digest
+            || self.publication_id != expected.publication_id
             || self.metadata_location.is_empty()
         {
             return Err(corrupt(
@@ -1634,6 +1642,7 @@ mod recovery_tests {
                 base_sequence_number: 0,
                 staging_dir: location,
                 document_record_digest: None,
+                publication_id: None,
             };
             Self {
                 directory,
