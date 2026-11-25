@@ -26,6 +26,11 @@ use novarocks_type_contract::{
 };
 use std::{error::Error, fmt, ops::Range};
 
+#[path = "array_json_numeric.rs"]
+mod numeric;
+#[path = "array_json_structure.rs"]
+pub(super) mod structure;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Operation {
     JsonToVarchar,
@@ -327,6 +332,36 @@ impl Reader<'_, '_, '_> {
         self.require(b'"')?;
         Ok((begin..self.at, len))
     }
+    fn scalar(&mut self) -> Result<Scalar, LeafError> {
+        match self.byte() {
+            Some(b'n') => {
+                self.literal(b"null")?;
+                Ok(Scalar::Null)
+            }
+            Some(b't') => {
+                self.literal(b"true")?;
+                Ok(Scalar::Boolean(true))
+            }
+            Some(b'f') => {
+                self.literal(b"false")?;
+                Ok(Scalar::Boolean(false))
+            }
+            Some(b'"') => {
+                let (token, decoded_bytes) = self.string_token()?;
+                Ok(Scalar::String {
+                    token,
+                    decoded_bytes,
+                })
+            }
+            Some(b'-' | b'0'..=b'9') => {
+                let token = self.number_token()?;
+                validate_number(&self.raw[token.clone()], self.work)?;
+                Ok(Scalar::Number(token))
+            }
+            _ => bad(),
+        }
+    }
+
     fn number_token(&mut self) -> Result<Range<usize>, LeafError> {
         let begin = self.at;
         if self.byte() == Some(b'-') {
@@ -431,40 +466,25 @@ pub fn validate_trino_json_literal(
 
 fn validate(raw: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<Scalar, LeafError> {
     let mut reader = Reader { raw, at: 0, work };
+    let root = consume_value(&mut reader)?;
+    reader.space()?;
+    if reader.at != raw.len() {
+        return bad();
+    }
+    Ok(root)
+}
+
+// Read exactly one value, leaving an enclosing array or object delimiter for
+// its owner. This also validates ignored members and JSON-valued leaf spans.
+fn consume_value(reader: &mut Reader<'_, '_, '_>) -> Result<Scalar, LeafError> {
     let mut stack = Vec::<Frame>::new();
     let mut root = None;
     let mut want_value = true;
     loop {
-        reader.space()?;
         if want_value {
+            reader.space()?;
             let is_root = root.is_none();
             let value = match reader.byte() {
-                Some(b'n') => {
-                    reader.literal(b"null")?;
-                    Scalar::Null
-                }
-                Some(b't') => {
-                    reader.literal(b"true")?;
-                    Scalar::Boolean(true)
-                }
-                Some(b'f') => {
-                    reader.literal(b"false")?;
-                    Scalar::Boolean(false)
-                }
-                Some(b'"') => {
-                    let (token, decoded_bytes) = reader.string_token()?;
-                    Scalar::String {
-                        token,
-                        decoded_bytes,
-                    }
-                }
-                Some(b'-' | b'0'..=b'9') => {
-                    let token = reader.number_token()?;
-                    // Parsing builds every child before castToVarchar rejects a
-                    // container. Child numeric parse errors retain code 7.
-                    validate_number(&raw[token.clone()], reader.work)?;
-                    Scalar::Number(token)
-                }
                 Some(b'[') => {
                     reader.require(b'[')?;
                     push_frame(&mut stack, Frame::ArrayFirst, reader.work)?;
@@ -475,7 +495,7 @@ fn validate(raw: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<Scalar, L
                     push_frame(&mut stack, Frame::ObjectFirst, reader.work)?;
                     Scalar::Container
                 }
-                _ => return bad(),
+                _ => reader.scalar()?,
             };
             if is_root {
                 root = Some(value);
@@ -486,6 +506,7 @@ fn validate(raw: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<Scalar, L
         let Some(frame) = stack.last_mut() else {
             break;
         };
+        reader.space()?;
         match *frame {
             Frame::ArrayFirst => {
                 if reader.byte() == Some(b']') {
@@ -536,10 +557,6 @@ fn validate(raw: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<Scalar, L
                 _ => return bad(),
             },
         }
-    }
-    reader.space()?;
-    if reader.at != raw.len() {
-        return bad();
     }
     root.ok_or(LeafError::Parse(InvalidJson::Syntax))
 }

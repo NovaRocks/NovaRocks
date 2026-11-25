@@ -480,12 +480,13 @@ pub(super) fn evaluate<'a>(
                     argument.array().slice(row, 1)
                 } else if matches!(
                     recipe.body,
-                    CastBody::ExplicitMap | CastBody::ExplicitRow { .. }
+                    CastBody::ExplicitMap | CastBody::ExplicitRow { .. } | CastBody::JsonStructure
                 ) {
-                    let evaluate_row = if recipe.body == CastBody::ExplicitMap {
-                        super::map_mode::evaluate_row
-                    } else {
-                        super::row_mode::evaluate_row
+                    let evaluate_row = match recipe.body {
+                        CastBody::ExplicitMap => super::map_mode::evaluate_row,
+                        CastBody::ExplicitRow { .. } => super::row_mode::evaluate_row,
+                        CastBody::JsonStructure => super::array_json::structure::evaluate_row,
+                        _ => unreachable!("validated structured CAST body"),
                     };
                     match evaluate_row(recipe, argument.array(), row, ordinal, control, &mut work)?
                     {

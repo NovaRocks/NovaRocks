@@ -437,6 +437,7 @@ enum CastBody {
     ArrayText,
     ArrayDateText,
     ArrayJson(array_json::Operation),
+    JsonStructure,
     Trino(trino::Scalar),
     ExtendedScalar(f3_scalar::Body),
     SelectedArray(f3_array::Body),
@@ -621,7 +622,7 @@ impl PreparedCastRecipe {
         self.source.nullable()
             || matches!(
                 self.body,
-                CastBody::ArrayJson(array_json::Operation::JsonToVarchar)
+                CastBody::ArrayJson(array_json::Operation::JsonToVarchar) | CastBody::JsonStructure
             )
             || (self.trino_mode == Some(TrinoCastMode::Try) && self.conversion_may_raise())
     }
@@ -1242,6 +1243,7 @@ impl PreparedCastRecipe {
                 | CastBody::ExplicitArray
                 | CastBody::ExplicitMap
                 | CastBody::ExplicitRow { .. }
+                | CastBody::JsonStructure
                 | CastBody::ArrayNull
                 | CastBody::TemporalWiden(_)
         )
@@ -1257,6 +1259,7 @@ impl PreparedCastRecipe {
             CastBody::ExplicitArray
             | CastBody::ExplicitMap
             | CastBody::ExplicitRow { .. }
+            | CastBody::JsonStructure
             | CastBody::ArrayNull
             | CastBody::TemporalWiden(_) => {
                 array_mode::evaluate(self, argument, selection, inherited, control)
@@ -1320,7 +1323,10 @@ impl PreparedCastRecipe {
             {
                 false
             }
-            CastBody::ArrayText | CastBody::ArrayDateText | CastBody::ArrayJson(_) => true,
+            CastBody::ArrayText
+            | CastBody::ArrayDateText
+            | CastBody::ArrayJson(_)
+            | CastBody::JsonStructure => true,
             CastBody::SelectedArray(f3_array::Body::ArrowScalar) => self.trino_mode.is_none(),
             CastBody::SelectedArray(
                 f3_array::Body::Structure

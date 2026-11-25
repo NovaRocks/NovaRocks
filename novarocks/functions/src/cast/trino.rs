@@ -71,7 +71,7 @@ pub(super) enum Numeric {
 }
 
 impl Numeric {
-    fn from_kind(value: &ValueKind) -> Option<Self> {
+    pub(super) fn from_kind(value: &ValueKind) -> Option<Self> {
         let ValueKind::Scalar(value) = value else {
             return None;
         };
@@ -394,6 +394,19 @@ fn prepare_value(
         return Ok(recipe);
     }
 
+    if matches!(from, Nominal(ValueLogicalType::Json))
+        && matches!(to, List(_) | Map { .. } | Struct(_))
+        && matches!(mode, TrinoCastMode::Explicit | TrinoCastMode::Try)
+    {
+        if source.data_type() != &Utf8 {
+            return Err(CastPrepareError::Unsupported);
+        }
+        array_json::structure::validate_target(result.value_type(), result.data_type(), work)?;
+        recipe.body = CastBody::JsonStructure;
+        recipe.array_failure_mode = Some(failure_mode);
+        return Ok(recipe);
+    }
+
     if is_timestamp_text_cast(from, to, mode) {
         let cast = crate::builtin::TemporalTextCast::bind(source, result)
             .ok_or(CastPrepareError::Unsupported)?;
@@ -681,7 +694,18 @@ impl Number {
     }
 }
 
-fn signed_result(value: i128, width: SignedWidth) -> Result<CastRowResult, ConversionFailure> {
+pub(super) fn convert_double(
+    value: f64,
+    target: Numeric,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<CastRowResult, ConversionFailure> {
+    Number::Double(value).convert(target, work)
+}
+
+pub(super) fn signed_result(
+    value: i128,
+    width: SignedWidth,
+) -> Result<CastRowResult, ConversionFailure> {
     let accepted = match width {
         SignedWidth::I8 => i8::try_from(value).is_ok(),
         SignedWidth::I16 => i16::try_from(value).is_ok(),
@@ -941,7 +965,7 @@ fn convert_character(
     Ok(output)
 }
 
-fn parse_boolean(value: &str) -> Result<bool, ConversionFailure> {
+pub(super) fn parse_boolean(value: &str) -> Result<bool, ConversionFailure> {
     if value == "1" || value.eq_ignore_ascii_case("t") || value.eq_ignore_ascii_case("true") {
         Ok(true)
     } else if value == "0" || value.eq_ignore_ascii_case("f") || value.eq_ignore_ascii_case("false")
@@ -952,7 +976,7 @@ fn parse_boolean(value: &str) -> Result<bool, ConversionFailure> {
     }
 }
 
-fn parse_number(
+pub(super) fn parse_number(
     value: &str,
     target: Numeric,
     work: &mut EvaluationCheckpoints<'_>,
@@ -972,7 +996,7 @@ fn parse_number(
 
 /// Retain at most the target's 38 coefficients and the first discarded digit.
 /// Even a very long exponent cannot cause unbounded allocation or scaling.
-fn parse_decimal(
+pub(super) fn parse_decimal(
     value: &str,
     precision: u8,
     scale: u8,
