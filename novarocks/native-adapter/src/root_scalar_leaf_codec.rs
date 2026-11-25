@@ -791,16 +791,16 @@ mod tests {
     }
     #[test]
     fn empty_dictionary_does_not_select_retained_values_and_requires_logical_facts() {
-        let unused = vec![0xff; novarocks_result_contract::ScalarProfileV1::SINGLE_VALUE_BYTES + 1];
-        let values: ArrayRef = Arc::new(LargeBinaryArray::from(vec![unused.as_slice()]));
+        let unused = "x".repeat(novarocks_result_contract::ScalarProfileV1::SINGLE_VALUE_BYTES + 1);
+        let values: ArrayRef = Arc::new(StringArray::from(vec![unused]));
         let dictionary: ArrayRef = Arc::new(
             DictionaryArray::<Int32Type>::try_new(Int32Array::from(Vec::<i32>::new()), values)
                 .unwrap(),
         );
-        let source = chunk(Arc::clone(&dictionary), Some(ValueLogicalType::Json), None);
+        let source = chunk(dictionary, None, None);
         let mut cursor = NativeScalarLeafEncoder::try_validate_empty(
             &source,
-            schema(ScalarValueType::Json, true),
+            schema(ScalarValueType::String, true),
             NativeScalarLeafEncoder::scratch_capacity_bytes(),
         )
         .unwrap();
@@ -811,7 +811,17 @@ mod tests {
         assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
         assert_eq!(cursor.encoded_len(), Some(0));
         assert_eq!(output, [0xa5; 32]);
-        let untrusted = chunk(dictionary, None, None);
+        let binary: ArrayRef = Arc::new(LargeBinaryArray::from(Vec::<Option<&[u8]>>::new()));
+        let json = chunk(Arc::clone(&binary), Some(ValueLogicalType::Json), None);
+        assert!(
+            NativeScalarLeafEncoder::try_validate_empty(
+                &json,
+                schema(ScalarValueType::Json, true),
+                NativeScalarLeafEncoder::scratch_capacity_bytes(),
+            )
+            .is_ok()
+        );
+        let untrusted = chunk(binary, None, None);
         assert!(matches!(
             NativeScalarLeafEncoder::try_validate_empty(
                 &untrusted,
