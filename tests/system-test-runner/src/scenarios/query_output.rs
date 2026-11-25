@@ -18,8 +18,7 @@
 //! Public typed layout, strict single-statement admission and explicit effects.
 //! MySQL packet sequencing and negotiated batches have no Trino carrier.
 
-use super::connector::{create_catalog, create_warehouse};
-use super::connector_control_plan::with_cleanup;
+use super::connector::{create_catalog, create_warehouse, with_cleanup};
 use crate::actors::sql::{self, SqlSession, TrinoValue};
 use crate::actors::trino_protocol::{RawResponse, TrinoClient};
 use crate::scenario::{Scenario, ScenarioContext};

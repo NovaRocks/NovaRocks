@@ -4,6 +4,8 @@ mod storage_control_plan;
 #[path = "connector_control_plan.rs"]
 mod connector_control_plan;
 
+pub(super) use connector_control_plan::with_cleanup;
+
 use crate::actors::sql::{self, SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
