@@ -232,6 +232,35 @@ mod tests {
     }
 
     #[test]
+    fn peer_on_revision_42_cannot_share_the_multicast_binding_island() {
+        let manifest = server_manifest();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .unwrap();
+        let prior = super::derive_repository_native_compatibility_material(
+            native_carrier_declarations(manifest.contracts()).unwrap(),
+            [0x31; 32],
+            42,
+            COMPILED,
+        )
+        .unwrap();
+        assert_eq!(prior.plan_contract_revision(), 42);
+        assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
+        assert_ne!(current.id(), prior.id());
+        assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
+        assert_eq!(current.carriers(), prior.carriers());
+        assert_eq!(current.epoch(), prior.epoch());
+        assert_eq!(
+            current.function_catalog_digest(),
+            prior.function_catalog_digest()
+        );
+        assert_eq!(
+            current.static_plan_interpreter(),
+            prior.static_plan_interpreter()
+        );
+    }
+
+    #[test]
     fn peer_with_writer_count_and_token_quotas_has_a_distinct_plan_contract() {
         let manifest = server_manifest();
         let current =

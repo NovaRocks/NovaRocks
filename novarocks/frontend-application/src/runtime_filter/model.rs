@@ -11,8 +11,6 @@ use std::fmt;
 use crate::query_execution::artifact::RuntimeFilterArtifactId;
 use novarocks_proto_models::{common, filter};
 
-use super::deployment::RuntimeFilterWaitGraph;
-
 const BLOOM_BITS_PER_KEY: u64 = 8;
 const BLOOM_HASH_COUNT: u32 = 5;
 const BLOOM_SEED: u64 = 17;
@@ -404,7 +402,6 @@ impl FrontendRuntimeFilterDeployment {
         lifecycle: FrontendRuntimeFilterLifecycle,
         expected_task_hosting_backend_ids: impl IntoIterator<Item = usize>,
         participants: impl IntoIterator<Item = FrontendRuntimeFilterParticipant>,
-        wait_graph: &RuntimeFilterWaitGraph,
     ) -> Result<Self, RuntimeFilterDeploymentError> {
         if query_id.hi == 0 && query_id.lo == 0 {
             return Err(RuntimeFilterDeploymentError::Invalid(
@@ -416,9 +413,6 @@ impl FrontendRuntimeFilterDeployment {
                 "runtime filter deployment epoch must be nonzero".to_string(),
             ));
         }
-        wait_graph
-            .validate()
-            .map_err(|error| RuntimeFilterDeploymentError::Invalid(error.to_string()))?;
 
         let expected_task_hosting_backend_ids = expected_task_hosting_backend_ids
             .into_iter()

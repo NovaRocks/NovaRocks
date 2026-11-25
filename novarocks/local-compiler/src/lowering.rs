@@ -33,8 +33,9 @@ use crate::{
     scan::{admit_scan, lower_scan_with_creation},
     sort::lower_sort,
     stream_sink::{
-        lower_router_sink_with_creation, lower_stream_sink_with_creation,
-        lower_summary_outputs_with_creation,
+        admit_multicast_cut, lower_multicast_sink_with_creation, lower_router_sink_with_creation,
+        lower_stream_sink_with_creation, lower_summary_outputs_with_creation,
+        plan_multicast_output,
     },
     topn::lower_topn,
     unpivot::{UnpivotLoweringError, UnpivotLoweringInput, lower_unpivot_with_creation},
@@ -324,9 +325,11 @@ fn lower_with_creation<
     }
     let outbound = &package.cuts().outbound;
     let is_router = matches!(physical.sink(), FragmentSink::Router { .. });
-    // A Result sink publishes the result port; a Stream sink publishes its
-    // one exact outbound cut. Every other sink family remains explicit.
-    let stream_cut = match physical.sink() {
+    let is_result = matches!(
+        physical.sink(),
+        FragmentSink::Result | FragmentSink::RootResult(_)
+    );
+    let (stream_cut, multicast) = match physical.sink() {
         FragmentSink::Result | FragmentSink::RootResult(_) => {
             if outbound.len() != physical.summaries().len() {
                 return Err((FragmentCompileError::Invalid(
@@ -334,7 +337,7 @@ fn lower_with_creation<
                 ))
                 .into());
             }
-            None
+            (None, None)
         }
         FragmentSink::Stream { edge } => {
             let cut = outbound
@@ -345,6 +348,12 @@ fn lower_with_creation<
                 return Err((FragmentCompileError::Invalid(
                     "stream sink edge differs from its outbound cut",
                 ))
+                .into());
+            }
+            if cut.kind == EdgeKind::CteMulticast {
+                return Err(FragmentCompileError::Invalid(
+                    "multicast cut requires a multicast sink",
+                )
                 .into());
             }
             if cut.kind != EdgeKind::Stream {
@@ -370,13 +379,22 @@ fn lower_with_creation<
                 })
                 .into());
             }
-            Some(cut)
+            (Some(cut), None)
         }
-        FragmentSink::Router { .. } => None,
-        FragmentSink::Multicast { .. } | FragmentSink::Noop => {
+        FragmentSink::Router { .. } => (None, None),
+        FragmentSink::Multicast { edges } => (
+            None,
+            Some(plan_multicast_output(
+                package,
+                edges,
+                crate::creation::borrow_scope(&mut temporary),
+                work,
+            )?),
+        ),
+        FragmentSink::Noop => {
             return Err((FragmentCompileError::Unsupported {
                 node: None,
-                feature: "multicast or noop sink",
+                feature: "noop sink",
             })
             .into());
         }
@@ -384,12 +402,14 @@ fn lower_with_creation<
     let mut routing_receivers = BTreeSet::new();
     for cut in package.cuts().inbound.iter() {
         work.step()?;
-        if cut.kind != EdgeKind::Stream && cut.kind != EdgeKind::ChangeStreamRouter {
-            return Err((FragmentCompileError::Unsupported {
-                node: Some(cut.destination_node),
-                feature: "inbound CTE edge",
-            })
-            .into());
+        if cut.kind == EdgeKind::CteMulticast {
+            admit_multicast_cut(
+                cut.kind,
+                cut.delivery,
+                cut.source_port,
+                &cut.payload,
+                &cut.partitioning,
+            )?;
         }
         if !cut.partitioning.routing_only.is_empty() {
             routing_receivers.insert(cut.destination_node);
@@ -408,10 +428,10 @@ fn lower_with_creation<
     // The result port exists exactly for a Result sink; a stream producer
     // has no result labels and never borrows another fragment's port.
     let result = package.result();
-    if !is_router && stream_cut.is_none() && result.is_none() {
+    if is_result && result.is_none() {
         return Err((FragmentCompileError::Invalid("missing result port")).into());
     }
-    if (is_router || stream_cut.is_some()) && result.is_some() {
+    if !is_result && result.is_some() {
         return Err((FragmentCompileError::Invalid("stream sink carries a result port")).into());
     }
     // Borrowed input order determines the bounded postorder. Each physical
@@ -495,20 +515,27 @@ fn lower_with_creation<
         }
         work.step()?;
     }
-    if let FragmentSink::Router { routes, .. } = physical.sink() {
-        let root_width = physical
-            .nodes()
-            .get(&physical.root())
-            .ok_or(FragmentCompileError::Invalid("missing router root"))?
-            .output
-            .columns
-            .len();
-        let width = routes
-            .iter()
-            .try_fold(root_width, |width, route| {
-                width.checked_add(route.input_mapping.len())
-            })
-            .ok_or(CompileControlError::ResourceExhausted)?;
+    let multicast_aliases = multicast
+        .as_ref()
+        .map_or(&[][..], |output| output.alias_sources.as_slice());
+    let root_width = physical.nodes()[&physical.root()].output.columns.len();
+    let sink_project_width = match physical.sink() {
+        FragmentSink::Router { routes, .. } => {
+            Some(routes.iter().try_fold(root_width, |width, route| {
+                work.step()?;
+                width
+                    .checked_add(route.input_mapping.len())
+                    .ok_or(CompileControlError::ResourceExhausted)
+            })?)
+        }
+        FragmentSink::Multicast { .. } if !multicast_aliases.is_empty() => Some(
+            root_width
+                .checked_add(multicast_aliases.len())
+                .ok_or(CompileControlError::ResourceExhausted)?,
+        ),
+        _ => None,
+    };
+    if let Some(width) = sink_project_width {
         expanded_nodes = expanded_nodes
             .checked_add(1)
             .ok_or(CompileControlError::ResourceExhausted)?;
@@ -945,8 +972,13 @@ fn lower_with_creation<
         properties.insert(id, (expanded || changes, ordered, placed));
     }
     work.flush()?;
-    let channels_plan =
-        resolve_tree_channels_with_creation(package, &order, work.control(), creation)?;
+    let channels_plan = resolve_tree_channels_with_creation(
+        package,
+        &order,
+        multicast_aliases,
+        work.control(),
+        creation,
+    )?;
     let runtime_filter_keys = runtime_filters.consumer_keys(
         &channels_plan.nodes,
         crate::creation::borrow_scope(&mut temporary),
@@ -2015,12 +2047,15 @@ fn lower_with_creation<
                 .unions
                 .get(&physical.root())
                 .ok_or(FragmentCompileError::Invalid(
-                    "router projection sources are absent",
+                    "sink projection sources are absent",
                 ))?;
-        let branch = branches.last().ok_or(FragmentCompileError::Invalid(
-            "router projection source is absent",
-        ))?;
-        let roots = crate::union_flow::compile_branch_reads(
+        let branch = branches
+            .last()
+            .filter(|branch| branch.normalizer == projection.node)
+            .ok_or(FragmentCompileError::Invalid(
+                "sink projection source is absent",
+            ))?;
+        let definitions = crate::union_flow::compile_branch_reads(
             package,
             &mut expressions,
             functions,
@@ -2033,41 +2068,8 @@ fn lower_with_creation<
             factory,
             work,
         )?;
-        if !expressions.union_ids.contains_key(&physical.root()) {
-            crate::creation::before_tree_insert::<
-                NodeId,
-                Vec<Vec<novarocks_local_program::ProgramRootRef>>,
-                H,
-            >(
-                expressions.union_ids.len(),
-                crate::creation::borrow_scope(&mut temporary),
-                work,
-            )?;
-        }
-        let branches = expressions.union_ids.entry(physical.root()).or_default();
-        crate::creation::reserve_vec(
-            branches,
-            1,
-            crate::creation::borrow_scope(&mut temporary),
-            work,
-        )?;
-        branches.push(roots);
-        let branch = channels_plan
-            .unions
-            .get(&physical.root())
-            .and_then(|branches| branches.last())
-            .ok_or(FragmentCompileError::Invalid(
-                "missing router projection source",
-            ))?;
-        let definitions = expressions
-            .union_ids
-            .get(&physical.root())
-            .and_then(|branches| branches.last())
-            .ok_or(FragmentCompileError::Invalid(
-                "missing router projection definitions",
-            ))?;
         if projection.node.index() != nodes.len() || definitions.len() != projection.slots.len() {
-            return Err(FragmentCompileError::Invalid("router projection schedule differs").into());
+            return Err(FragmentCompileError::Invalid("sink projection schedule differs").into());
         }
         let mut typed = crate::typed_layout::TypedLayoutBuilder::new_with_creation(
             branch.sources.len(),
@@ -2082,10 +2084,9 @@ fn lower_with_creation<
                     ordinal,
                 } if node == root => ordinal as usize,
                 _ => {
-                    return Err(FragmentCompileError::Invalid(
-                        "router alias reads a foreign input",
-                    )
-                    .into());
+                    return Err(
+                        FragmentCompileError::Invalid("sink alias reads a foreign input").into(),
+                    );
                 }
             };
             let name = nodes[root.index()]
@@ -2107,6 +2108,17 @@ fn lower_with_creation<
             work.step()?;
         }
         let layout = typed.finish_with_creation(&projection.slots, work, creation)?;
+        let mut expr_slot_ids = Vec::new();
+        crate::creation::reserve_vec(
+            &mut expr_slot_ids,
+            projection.slots.len(),
+            Some(creation),
+            work,
+        )?;
+        for &slot in projection.slots.iter() {
+            expr_slot_ids.push(slot);
+            work.step()?;
+        }
         let diagnostic = DiagnosticSourceNodeId::new(physical.root().get());
         let operator = LocalOperatorId::new(
             u32::try_from(projection.node.index())
@@ -2135,8 +2147,8 @@ fn lower_with_creation<
                 input: root,
                 is_subordinate: true,
                 validate_final_result_input: false,
-                exprs: definitions.clone(),
-                expr_slot_ids: projection.slots.to_vec(),
+                exprs: definitions,
+                expr_slot_ids,
                 expr_slot_schemas: None,
                 output_indices: None,
             },
@@ -2153,8 +2165,8 @@ fn lower_with_creation<
         options.kernel_abi,
     );
     let mut requirement_entries = source_requirements;
-    let (sink, _) = match stream_cut {
-        Some(cut) => {
+    let (sink, _) = match (stream_cut, multicast.as_ref()) {
+        (Some(cut), _) => {
             work.flush()?;
             let lowered = lower_stream_sink_with_creation(
                 package,
@@ -2172,7 +2184,7 @@ fn lower_with_creation<
             requirement_entries.extend(lowered.requirements);
             (lowered.sink, ())
         }
-        None if is_router => {
+        (None, None) if is_router => {
             let projection = channels_plan
                 .sink_projection
                 .as_ref()
@@ -2193,7 +2205,25 @@ fn lower_with_creation<
             requirement_entries.extend(lowered.requirements);
             (lowered.sink, ())
         }
-        None => {
+        (None, Some(multicast)) => {
+            work.flush()?;
+            let lowered = lower_multicast_sink_with_creation(
+                package,
+                multicast,
+                root,
+                root_layout,
+                &mut expressions,
+                functions,
+                options.constants,
+                work.control(),
+                creation,
+                crate::creation::borrow_scope(&mut temporary),
+                factory,
+            )?;
+            requirement_entries.extend(lowered.requirements);
+            (lowered.sink, ())
+        }
+        (None, None) => {
             // The published layout's names are the result's: the frontend
             // checks them against the declared schema. Any root other than a
             // provider scan publishes a layout some node labeled from the

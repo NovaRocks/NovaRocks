@@ -391,6 +391,63 @@ fn complete_aggregate_on_low_priority_branch_absorbs_the_shared_output() {
 }
 
 #[test]
+fn split_feedback_group_rolls_back_without_changing_a_safe_frozen_activation() {
+    let mut fixture = Fixture::default();
+    fixture.values(0, 0);
+    fixture.exchange(1, 0, 0);
+    fixture.aggregate(1, 1, 0);
+    fixture.exchange(2, 0, 1);
+    fixture.exchange(2, 1, 0);
+    fixture.hash_join(2, 2, 0, 1, JoinSide::Right);
+    let filter = membership_filter(1, operator(2, 2), operator(2, 0));
+    let id = filter.id;
+    let mut graph = fixture.finish(&[filter]);
+    let control = TestCompileControl;
+    let mut work =
+        CompileCheckpoints::try_new(&control, novarocks_type_contract::CompilePhase::Validate)
+            .unwrap();
+    assert_eq!(
+        graph.active_cycles_observed(&mut work).unwrap(),
+        ActiveWaitCycles::default()
+    );
+    let original = graph.dependencies.clone();
+    let witness = graph
+        .try_add_split_feedback_waits_observed(id, [operator(2, 0), operator(1, 0)], &mut work)
+        .unwrap()
+        .expect("withholding the common producer's aggregate input blocks the filter");
+    assert!(
+        witness
+            .edges
+            .iter()
+            .any(|kinds| kinds.contains(&WaitEdgeKind::SplitFeedbackWait))
+    );
+    assert_eq!(graph.dependencies, original);
+
+    assert_eq!(
+        graph
+            .try_add_split_feedback_waits_observed(id, [operator(2, 0)], &mut work)
+            .unwrap(),
+        None
+    );
+    assert_ne!(graph.dependencies, original);
+    assert_eq!(
+        graph.active_cycles_observed(&mut work).unwrap(),
+        ActiveWaitCycles::default()
+    );
+    assert!(
+        graph.dependencies[&WaitNode::FilterConsumer(FilterConsumerRef {
+            filter: id,
+            ordinal: 0
+        })][&WaitNode::Filter(id)]
+            .contains(&WaitEdgeKind::FilterWait(FilterConsumerRef {
+                filter: id,
+                ordinal: 0
+            }))
+    );
+    work.finish().unwrap();
+}
+
+#[test]
 fn complete_aggregate_on_high_priority_branch_does_not_break_the_cycle() {
     let mut fixture = Fixture::default();
     fixture.values(0, 0);

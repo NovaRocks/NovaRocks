@@ -656,7 +656,7 @@ impl fmt::Display for CredentialEpoch {
 ///
 /// An edge is the frontend-frozen connection between the producer tasks of
 /// one stage and the complete destination set of one exchange node. The
-/// frontend allocates edge ids while it builds the static schedule; the
+/// frontend projects the physical edge id into the static schedule; the
 /// descriptor freezes each edge's destination membership, so opening an edge
 /// never adds a destination.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -675,6 +675,14 @@ impl fmt::Display for ZeroExchangeEdgeId {
 impl std::error::Error for ZeroExchangeEdgeId {}
 
 impl ExchangeEdgeId {
+    /// Project a zero-based physical edge ordinal into the nonzero native space.
+    pub fn from_physical_ordinal(ordinal: u32) -> Option<Self> {
+        ordinal
+            .checked_add(1)
+            .and_then(std::num::NonZeroU32::new)
+            .map(Self)
+    }
+
     pub fn new(value: u32) -> Result<Self, ZeroExchangeEdgeId> {
         std::num::NonZeroU32::new(value)
             .map(Self)
@@ -734,7 +742,23 @@ impl EdgeOpenVersion {
 
 #[cfg(test)]
 mod tests {
-    use super::{DomainConflict, DomainProgression, SplitOffer, SplitSequence, SplitWatermark};
+    use super::{
+        DomainConflict, DomainProgression, ExchangeEdgeId, SplitOffer, SplitSequence,
+        SplitWatermark,
+    };
+
+    #[test]
+    fn physical_edge_ordinals_project_into_the_nonzero_native_space() {
+        assert_eq!(ExchangeEdgeId::from_physical_ordinal(0).unwrap().get(), 1);
+        assert_eq!(ExchangeEdgeId::from_physical_ordinal(41).unwrap().get(), 42);
+        assert_eq!(
+            ExchangeEdgeId::from_physical_ordinal(u32::MAX - 1)
+                .unwrap()
+                .get(),
+            u32::MAX
+        );
+        assert_eq!(ExchangeEdgeId::from_physical_ordinal(u32::MAX), None);
+    }
 
     fn sequence(value: u64) -> SplitSequence {
         SplitSequence::new(value).expect("nonzero sequence")

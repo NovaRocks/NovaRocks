@@ -17,6 +17,7 @@
 
 use super::{ExecutionFailure, sink_failure};
 use crate::exec::fragment::sink::DataStreamSinkFactoryInput;
+use crate::exec::operators::compiled_multicast::CompiledMulticastFactory;
 use crate::exec::operators::{CompiledPartitionKeys, DataStreamSinkFactory, NoopSinkFactory};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::task::error::{
@@ -76,18 +77,26 @@ pub(crate) fn materialize_compiled_sink(
             task_key,
             transmitter,
             edge_gates,
-        ),
+        )
+        .map(|factory| Box::new(factory) as Box<dyn OperatorFactory>),
         (StaticSinkProgram::ChangeStreamRouter { .. }, _) => Err(materialization_contract(
             "compiled change router requires computing-pipeline geometry and its independent summary output",
         )),
         (
-            StaticSinkProgram::MultiCastDataStream { .. }
-            | StaticSinkProgram::SplitDataStream { .. },
-            _,
-        ) => Err(materialization_contract(format!(
-            "compiled {} sink not executable yet",
-            sink_program_name(sink)
-        ))),
+            StaticSinkProgram::MultiCastDataStream { branches },
+            TaskSinkAssignment::DestinationGroups { groups, .. },
+        ) if branches.len() == groups.len() => materialize_multicast(
+            program,
+            graph.nodes()[graph.root().index()].output_layout(),
+            branches,
+            &AssignedStreams { assignment },
+            task_key,
+            transmitter,
+            edge_gates,
+        ),
+        (StaticSinkProgram::SplitDataStream { .. }, _) => Err(materialization_contract(
+            "compiled split sink not executable yet",
+        )),
         (static_program, dynamic_assignment) => Err(materialization_contract(format!(
             "compiled sink {} cannot be materialized with assignment {}",
             sink_program_name(static_program),
@@ -124,7 +133,7 @@ fn materialize_stream_branch(
     task_key: novarocks_types::UniqueId,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
-) -> Result<Box<dyn OperatorFactory>, LocalTaskLaunchError> {
+) -> Result<DataStreamSinkFactory, LocalTaskLaunchError> {
     let partition_keys = compiled_partition_keys(program, branch)?;
     if let Some(limit) = branch.limit() {
         return Err(materialization_contract(format!(
@@ -153,7 +162,7 @@ fn materialize_stream_branch(
         Some(gates) => factory.with_edge_gates(gates),
         None => factory,
     };
-    Ok(Box::new(factory))
+    Ok(factory)
 }
 
 /// Borrow the original assignment. Side outputs do not clone destination groups
@@ -187,6 +196,44 @@ impl AssignedStreams<'_> {
             | TaskSinkAssignment::DestinationGroups { sender_id, .. } => *sender_id,
         }
     }
+}
+
+fn materialize_multicast(
+    program: &std::sync::Arc<novarocks_local_program::LocalProgram>,
+    root_layout: &novarocks_local_program::StaticLayout,
+    branches: &[StaticStreamBranch],
+    assigned: &AssignedStreams<'_>,
+    task_key: novarocks_types::UniqueId,
+    transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
+    edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
+) -> Result<Box<dyn OperatorFactory>, LocalTaskLaunchError> {
+    let mut factories = Vec::with_capacity(branches.len());
+    for (index, branch) in branches.iter().enumerate() {
+        if branch.contract().delivery
+            != novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven
+            || branch.contract().role != novarocks_local_program::ProgramOutputRole::Relational
+        {
+            return Err(materialization_contract(
+                "compiled multicast branch requires a demand-driven relational stream",
+            ));
+        }
+        let destinations = assigned
+            .get(index)
+            .ok_or_else(|| materialization_contract("multicast branch assignment is absent"))?;
+        let factory = materialize_stream_branch(
+            program,
+            root_layout,
+            branch,
+            destinations,
+            assigned.sender_id(),
+            task_key,
+            transmitter.clone(),
+            edge_gates.clone(),
+        )?
+        .for_multicast_branch();
+        factories.push(Box::new(factory) as Box<dyn OperatorFactory>);
+    }
+    Ok(Box::new(CompiledMulticastFactory::new(factories)))
 }
 
 /// The graph has authored its exact root width. Every author freezes its unit
@@ -250,7 +297,7 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
             })?
         }
         StaticSinkProgram::Noop => Box::new(NoopSinkFactory::new()),
-        StaticSinkProgram::DataStream { branch, .. } => materialize_stream_branch(
+        StaticSinkProgram::DataStream { branch, .. } => Box::new(materialize_stream_branch(
             program,
             root_layout,
             branch,
@@ -261,7 +308,7 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
             task_key,
             transmitter.clone(),
             edge_gates.clone(),
-        )?,
+        )?),
         StaticSinkProgram::ChangeStreamRouter {
             branches,
             effect_slot,
@@ -284,7 +331,7 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
                 } else {
                     None
                 };
-            let mut factories = Vec::with_capacity(routes.len());
+            let mut factories: Vec<Arc<dyn OperatorFactory>> = Vec::with_capacity(routes.len());
             let mut dense_routes = Vec::with_capacity(routes.len());
             for (dense, route) in routes.iter().enumerate() {
                 let index = usize::try_from(route.branch)
@@ -292,7 +339,7 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
                 let branch = branches
                     .get(index)
                     .ok_or_else(|| materialization_contract("router provider branch is absent"))?;
-                factories.push(Arc::from(materialize_stream_branch(
+                factories.push(Arc::new(materialize_stream_branch(
                     program,
                     root_layout,
                     branch,
@@ -319,10 +366,18 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
                 .map_err(materialization_error)?,
             )
         }
-        StaticSinkProgram::MultiCastDataStream { .. }
-        | StaticSinkProgram::SplitDataStream { .. } => {
+        StaticSinkProgram::MultiCastDataStream { branches } => materialize_multicast(
+            program,
+            root_layout,
+            branches,
+            &assigned,
+            task_key,
+            transmitter.clone(),
+            edge_gates.clone(),
+        )?,
+        StaticSinkProgram::SplitDataStream { .. } => {
             return Err(materialization_contract(
-                "compiled multicast or split sink is not executable yet",
+                "compiled split sink not executable yet",
             ));
         }
     };
@@ -335,7 +390,7 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
         let state = states.get(output.kind()).ok_or_else(|| {
             materialization_contract("summary author did not register its exact state")
         })?;
-        let summary_sink = materialize_stream_branch(
+        let summary_sink = Box::new(materialize_stream_branch(
             program,
             output.layout(),
             output.branch(),
@@ -346,7 +401,7 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
             task_key,
             transmitter.clone(),
             edge_gates.clone(),
-        )?;
+        )?);
         summaries.push(IndependentSummaryPipeline {
             source: Box::new(
                 SummarySourceFactory::new(state.clone(), output.layout().clone())

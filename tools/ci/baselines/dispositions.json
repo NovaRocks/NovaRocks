@@ -242,23 +242,13 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:cte/cte_in_where_subquery",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:cte/cte_multi_alias",
       "failure": {
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
+      "reason": "Native baseline f4bd895533 reaches UnsupportedCompiledShape at step 2. Independent declared-schema SQL replays identify StructuralWaitCycle (domain 11, reason 14) for the shared-input shapes in steps 2 through 4. Restore their progress and verify the complete original native case and cleanup.",
+      "owner": "UEA-5E B4c",
       "expires": "2026-12-15"
     },
     {
@@ -267,7 +257,7 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "B4a restores statement 10 and the original plain verification reaches statement 16. The native query and an isolated CONTRACT EXPLAIN both return UnsupportedCompiledShape before rendering. An independent typed replay of statement 16 with the original employees schema, row count and NULL facts reproduces SQL StructuralWaitCycle (domain 11, reason 14) for the shared const_cte output. Its no-statistics control admits a multicast plan, so retain the native public refusal and use the typed replay for the B4c handoff. Statement 16's original result oracle remains unexecuted. Evidence: p07-plain/cte.jsonl, p07-cte-contract and p07-cte-typed/result-explain-rows-25.log. Remove only after the complete original native 1FE+3BE case and cleanup pass.",
+      "reason": "The historical B4a run reaches statement 16, where native SQL and CONTRACT EXPLAIN return UnsupportedCompiledShape. An independent replay with the original employees schema, row count and NULL facts identifies StructuralWaitCycle (domain 11, reason 14). Its no-statistics control admits a multicast plan. Evidence: p07-plain/cte.jsonl, p07-cte-contract and p07-cte-typed/result-explain-rows-25.log. Native baseline f4bd895533 first fails earlier at step 5 on the expected varchar versus actual varchar(4) result type; this entry does not cover that mismatch. Remove only after the complete original native case and cleanup pass.",
       "owner": "UEA-5E B4c",
       "expires": "2026-12-15"
     },
@@ -842,43 +832,13 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:join/join_non_finite_float_key_null_semantics",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:join/join_range_direct_mapping",
       "failure": {
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_reorder_no_op_invocations",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:limit/limit_offset_basic",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
+      "reason": "Historical CTE carrier refusal in the shared-input suffix. Native baseline f4bd895533 and the B4b candidate stop earlier at step 11 with sql.analyze.unknown_function for concat('str-', idx); this entry does not cover that failure. B4c owns reassessment of the shared-input suffix after setup succeeds. Remove only after the original complete native case and cleanup pass.",
+      "owner": "UEA-5E B4c",
       "expires": "2026-12-15"
     },
     {
@@ -927,8 +887,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4; remove after capability repair and native verification",
-      "owner": "B4",
+      "reason": "Native baseline f4bd895533 reaches UnsupportedCompiledShape at the first shared-input join (step 5). Independent declared-schema SQL replay with absent statistics identifies StructuralWaitCycle (domain 11, reason 14). Restore progress for the shared input and verify the full original result, EXPLAIN oracles and cleanup.",
+      "owner": "UEA-5E B4c",
       "expires": "2026-12-15"
     },
     {
@@ -967,18 +927,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "After B3 restores checked join instance placement, the unchanged complete native case passes its original join checks through step 31, then fails at step 32 before BE execution with the SQL-authored Unsupported StructuralWaitCycle fact (domain 11, code 14). The original full-case diagnostic confirms this exact typed source; it is not the CTE carrier refusal. Contract lowering requires decoupled retained output (B4) for the cyclic shared-CTE plan. Keep the original FAIL, 80 required / 30 executed passing oracles and 50 unexecuted suffix oracles. This historical B3 row stays until the same entire case passes all original oracles with closed cleanup; component or diagnostic progress does not close it. Evidence: B3 plan v5 P08/P10 execution record and p13-rf-multicolumns-original-source-diagnostic-evidence-01/sql.results.jsonl.",
-      "owner": "B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:runtime-filter/runtime_filter_outer_cross_exchange_guard",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4; remove after capability repair and native verification",
-      "owner": "B4",
+      "reason": "The historical B3 full-case run reaches step 32 and reports StructuralWaitCycle (domain 11, reason 14) before BE execution. Its record retains 80 required, 30 executed passing and 50 unexecuted suffix oracles. Evidence: B3 plan v5 P08/P10 and p13-rf-multicolumns-original-source-diagnostic-evidence-01/sql.results.jsonl. Native baseline f4bd895533 and the B4b candidate fail earlier at step 1, statement 5, when the setup assigns bigint sequence output to varchar. This entry does not cover that analysis error. B4c owns the historical shared-input suffix. Remove only after the complete native case and cleanup pass.",
+      "owner": "UEA-5E B4c",
       "expires": "2026-12-15"
     },
     {
@@ -987,8 +937,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Compiled carrier does not express CTE multicast sinks; owner B4; remove after capability repair and native verification",
-      "owner": "B4",
+      "reason": "Native baseline f4bd895533 reaches UnsupportedCompiledShape at step 1. Independent replay of the all-inline query over the same SQL compiler identifies StructuralWaitCycle (domain 11, reason 14) for its shared input. Restore progress and verify the complete original native query and cleanup.",
+      "owner": "UEA-5E B4c",
       "expires": "2026-12-15"
     },
     {
@@ -1357,13 +1307,6 @@
       "reason": "Approved D0-5(a) named capability gap: sum_state/derived-v1 missing installed aggregate carrier implementation. Clean fffbffe8 actual native 1FE+3BE result remains FAIL (exit1), with complete formal and scene cleanup; business suffix remains unobserved. See independent evidence p30-system11-fff-independent-review-r1.json, ordinal 68.",
       "owner": "B1",
       "exit_condition": "B1 installs the selected builtin.aggregate/sum_state/derived-v1 pure aggregate carrier/effect contract and all required MV-state owners, then the entire unchanged scenario passes its original publication/target-binding/fault and cleanup assertions. Reassess any newly exposed first failure independently; do not close on admission alone.",
-      "review_by": "2026-12-15"
-    },
-    {
-      "unit": "system-scenario:task-execution/multicast-normal-close-keeps-sibling",
-      "reason": "Approved D0-5(a) named capability gap: Multicast sink/CTE cuts missing from LocalCompiler. Clean fffbffe8 actual native 1FE+3BE result remains FAIL (exit1), with complete formal and scene cleanup; business suffix remains unobserved. See independent evidence p30-system11-fff-independent-review-r1.json, ordinal 86.",
-      "owner": "B4",
-      "exit_condition": "B4 restores compiled Multicast/CTE sink and cut lowering, then the unchanged scenario observes Installed, A normal close, B sibling rows/EOS and producer/B actual exit with all original cleanup/resource assertions passing. A disappeared first refusal alone does not close this record.",
       "review_by": "2026-12-15"
     },
     {

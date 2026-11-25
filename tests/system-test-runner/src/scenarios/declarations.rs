@@ -663,6 +663,18 @@ pub(super) fn for_module(
     if module == "native_creation" {
         paths.push("tests/system-test-runner/src/actors/trino_protocol.rs".into());
     }
+    if module == "exchange_normal_close" {
+        paths.extend([
+            "novarocks/physical-plan/**".into(),
+            "novarocks/local-compiler/**".into(),
+            "novarocks/task-codec/**".into(),
+            "tests/system-test-runner/src/scenarios/exchange_flow.rs".into(),
+            "tests/system-test-runner/src/scenarios/native_compatibility.rs".into(),
+            "tests/system-test-runner/src/scenarios/native_creation.rs".into(),
+            "tests/system-test-runner/src/scenarios/query_lifecycle.rs".into(),
+            "tests/system-test-runner/src/scenarios/result_delivery_root_protocol.rs".into(),
+        ]);
+    }
     if module == "query_lifecycle" && name == "query-lifecycle/limit-zero-unknown-sender" {
         // Only ordinary setup uses the migrated shared catalog helper. The
         // original target protocol and its P05 properties remain unported.
@@ -752,6 +764,11 @@ pub(super) fn for_module(
     if module == "exchange_flow" {
         declaration.basis = Some(
             "Fresh native FE+3BE and a private managed-runtime Hadoop Iceberg warehouse; original invocation budget, authenticated finite statement/role scopes, exact stream fault receipts, actual SlotPool/call guards and joined SQL/process owners. No shared fixture mutation or prepared benchmark input.",
+        );
+    }
+    if module == "exchange_normal_close" {
+        declaration.basis = Some(
+            "Fresh native FE+3BE, independent raw Task attempts and exact process scopes; the multicast case also authenticates and holds an actual granted Data Unit during withdrawal. The same-edge control uses the original pre-open withdrawal. Root End, Task exits and resource convergence are observed.",
         );
     }
     if name == "connector/distributed-writer-row-level-small-slots" {

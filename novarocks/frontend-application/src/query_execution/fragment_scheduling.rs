@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 
 use crate::query_execution::artifact::FragmentId;
+use novarocks_execution_contract::ExchangeEdgeId;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_query_application::api::RuntimeSplitPlacement;
 use novarocks_query_application::api::{
@@ -71,6 +72,7 @@ pub struct SchedulingFragmentFacts {
 /// One edge, as scheduling sees it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchedulingEdgeFacts {
+    pub edge_id: ExchangeEdgeId,
     pub source: FragmentId,
     pub target: FragmentId,
     /// The exchange node in the target fragment that receives this edge.
@@ -150,6 +152,7 @@ impl FragmentSchedulingFacts {
                 .edges
                 .iter()
                 .map(|edge| QueryApplicationEdgeFacts {
+                    edge_id: edge.edge_id,
                     source_fragment_id: edge.source,
                     target_fragment_id: edge.target,
                     target_exchange_node_id: edge.target_exchange_node_id,

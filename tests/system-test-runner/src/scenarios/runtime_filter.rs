@@ -180,9 +180,9 @@ impl Scenario for CancelWithTerminalAckReplay {
         binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
-        Ok(Some(self.intent.freeze(
+        Ok(Some(self.intent.freeze_terminal_split_replay(
             vec![cancel_spec()],
-            &[],
+            0,
             cluster_size,
             binary,
             deadline,
@@ -375,9 +375,9 @@ impl Scenario for NativeTrustDirectional {
         binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
-        Ok(Some(self.intent.freeze(
+        Ok(Some(self.intent.freeze_terminal_split_replay(
             vec![retry_spec(), cancel_spec(), candidate_spec()],
-            &[],
+            1,
             cluster_size,
             binary,
             deadline,
@@ -528,9 +528,9 @@ fn run_accepted_after_ack_drop(
 ///
 /// The lost-acknowledgement half is the task protocol's own terminal ack:
 /// `task-update-terminal-ack-drop` loses the answer to a terminal, non-empty
-/// split delivery the backend already applied. The frontend resends the exact
-/// request and the backend must recognise it as a replay rather than assign the
-/// same splits twice, which is what the accepted/duplicate marker pair says.
+/// split delivery the backend already applied. The declared replay barrier
+/// retains the original scan input through the exact retry, so a fast scan
+/// cannot retire it before the duplicate watermark is observed.
 /// Both are waited for *before* the cancellation, so the loss and its replay are
 /// facts of this attempt rather than a race against the kill.
 ///

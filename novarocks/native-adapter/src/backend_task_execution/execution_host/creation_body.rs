@@ -306,6 +306,99 @@ impl Body {
         body.assignment.sink_edge_ids = edge_ids;
         body
     }
+
+    pub(crate) fn multicast() -> Self {
+        let mut builder = FragmentBuilder::new(FragmentId::new(7));
+        let root = NodeId::new(10);
+        let source = pool(Arc::new(Int64Array::from(vec![51, 79])), false);
+        let ty = source.value_type().clone();
+        let (values, row): (Vec<_>, Vec<_>) = (0..2)
+            .map(|ordinal| {
+                let value = builder
+                    .add_value(
+                        ty.clone(),
+                        ValueOrigin::NodeOutput {
+                            node: root,
+                            output_ordinal: ordinal,
+                        },
+                    )
+                    .unwrap();
+                let unit = builder.unit(root).unwrap();
+                let expression = unit
+                    .add(
+                        None,
+                        ty.clone(),
+                        ExprKind::Constant(ConstantReference {
+                            pool: ConstantPoolId::new(0),
+                            ordinal,
+                        }),
+                    )
+                    .unwrap();
+                let cell = unit
+                    .root(expression, EvaluationDemand::Value, RootScope::AllPorts)
+                    .unwrap();
+                (value, cell)
+            })
+            .unzip();
+        builder
+            .add_values(
+                root,
+                Box::from([row.into_boxed_slice()]),
+                values.clone().into_boxed_slice(),
+            )
+            .unwrap();
+        let edges = [9, 2].map(EdgeId::new);
+        let outbound = edges
+            .into_iter()
+            .zip([8, 9])
+            .zip(values)
+            .map(|((edge, fragment), value)| {
+                let destination = ValueId::new(0);
+                let projected = CutValue {
+                    value,
+                    ty: ty.clone(),
+                };
+                OutboundFragmentCut {
+                    edge,
+                    kind: EdgeKind::CteMulticast,
+                    destination_fragment: FragmentId::new(fragment),
+                    destination_node: NodeId::new(11),
+                    projection: Box::from([projected.clone()]),
+                    destination_imports: Box::from([CutImport {
+                        source: projected,
+                        destination,
+                    }]),
+                    partitioning: edge_partition(
+                        DataStreamPartitionType::Unpartitioned,
+                        value,
+                        destination,
+                    ),
+                    source_port: FragmentOutputPort::Root,
+                    delivery: DeliveryRequirement::DemandDriven,
+                    payload: ExchangePayloadContract::Relational,
+                }
+            })
+            .rev()
+            .collect();
+        let mut constants = ConstantPools::empty();
+        constants.insert(ConstantPoolId::new(0), source).unwrap();
+        let mut body = finish(
+            builder,
+            root,
+            FragmentSink::Multicast {
+                edges: Box::from(edges),
+            },
+            1,
+            constants,
+            FragmentCuts {
+                outbound,
+                ..FragmentCuts::default()
+            },
+        );
+        body.assignment.sink_edge_ids = vec![10, 3];
+        body
+    }
+
     pub(crate) fn bounded_root(
         output: novarocks_result_contract::FrozenRootOutput,
         rows: &[i64],

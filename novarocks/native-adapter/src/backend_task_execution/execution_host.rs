@@ -110,7 +110,7 @@ use crate::root_result_session::{NativeRootResultSession, RootProducerPool};
 use crate::task_instance::{NativeTaskInstanceInput, project_task_instance};
 #[cfg(novarocks_dev_controls)]
 use crate::task_protocol_fault as fault;
-use crate::task_submission::compiled_task_sink_assignment;
+use crate::task_submission::compiled_task_sink_assignment_with_multicast_edges;
 use novarocks_local_program::LocalProgram;
 use novarocks_worker::read_attempt::{ReceivedReadSplit, TaskReadBindingRegistry};
 use novarocks_worker::{
@@ -1003,9 +1003,10 @@ impl NativeTaskExecutionHost {
             descriptor.topology(),
         )
         .map_err(protocol_failure)?;
-        let sink_assignment = compiled_task_sink_assignment(
+        let sink_assignment = compiled_task_sink_assignment_with_multicast_edges(
             sink,
             program.graph().summaries(),
+            compiled.multicast_edges(),
             &instance_input.sink_edge_ids,
             descriptor_task_key,
             descriptor.topology(),
@@ -4946,6 +4947,76 @@ pub(crate) mod tests {
             },
         );
         assert_nothing_prepared(&host, &facts);
+    }
+
+    #[test]
+    fn native_multicast_binds_equal_node_and_partition_to_exact_physical_edges() {
+        let query = 49;
+        let producer = identity(query, 1, 1);
+        let edge = |id, stage, key| {
+            let destination = identity(query, stage, 1);
+            let node = FragmentNodeId::new(11);
+            ExchangeEdge::try_new(
+                ExchangeEdgeId::new(id).unwrap(),
+                node,
+                DataStreamPartitionType::Unpartitioned,
+                vec![ExchangeDestination::new(
+                    destination,
+                    UniqueId::new(key, 1),
+                    RuntimeEndpoint::new("127.0.0.1", 9060).unwrap(),
+                    node,
+                )],
+                0,
+                NonZeroU32::MIN,
+            )
+            .unwrap()
+        };
+        let topology =
+            ExchangeTopology::try_new(vec![edge(3, 3, 79), edge(10, 2, 51)], vec![]).unwrap();
+        let descriptor = descriptor_with(producer, UniqueId::new(query, 1), 1, topology);
+        let body = Body::multicast();
+        for swapped in [true, false] {
+            let facts = Arc::new(StubParticipationFacts::default());
+            let host = Arc::new(host(Arc::clone(&facts)));
+            let mut body = body.clone();
+            if swapped {
+                body.assignment.sink_edge_ids.swap(0, 1);
+            }
+            inspect_native_receiver(
+                &host,
+                facts.clone(),
+                descriptor.clone(),
+                body.input(&descriptor),
+                None,
+                move |result| {
+                    if swapped {
+                        let refusal = result
+                            .as_ref()
+                            .expect_err("the original package order disambiguates the routes");
+                        assert_protocol_refusal(
+                            refusal,
+                            TaskFailureCategory::Protocol,
+                            6,
+                            novarocks_proto_codec::error::ProtocolErrorKind::InconsistentFields,
+                            crate::task_instance::task_sink_edge_ids_path().index(0),
+                            "assigned edge differs from the frozen multicast branch",
+                        );
+                    } else {
+                        assert_eq!(
+                            result
+                                .as_ref()
+                                .expect("correct edges install")
+                                .facts()
+                                .sink_kind(),
+                            FragmentSinkKind::MultiCastDataStream
+                        );
+                    }
+                },
+            );
+            if swapped {
+                assert_nothing_prepared(&host, &facts);
+            }
+        }
     }
 
     #[test]

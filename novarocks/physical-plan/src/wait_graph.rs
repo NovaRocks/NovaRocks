@@ -74,6 +74,7 @@ pub enum WaitEdgeKind {
     Backpressure,
     DataWait,
     FilterWait(FilterConsumerRef),
+    SplitFeedbackWait,
 }
 
 /// A closed directed path, including the repeated first vertex at the end.
@@ -137,6 +138,7 @@ pub enum WaitGraphError {
     MissingNode(OperatorRef),
     MissingEdge(EdgeId),
     MissingFragment(FragmentId),
+    MissingFilter(RuntimeFilterId),
     InvalidSummaryOutput(EdgeId),
     InvalidInput {
         operator: OperatorRef,
@@ -157,6 +159,9 @@ impl fmt::Display for WaitGraphError {
             Self::MissingEdge(edge) => write!(f, "wait graph refers to missing edge {edge:?}"),
             Self::MissingFragment(fragment) => {
                 write!(f, "wait graph refers to missing fragment {fragment:?}")
+            }
+            Self::MissingFilter(filter) => {
+                write!(f, "wait graph refers to missing filter {filter:?}")
             }
             Self::InvalidSummaryOutput(edge) => {
                 write!(
@@ -493,7 +498,9 @@ impl WaitGraph {
                 work.step()?;
                 kinds.retain(|kind| match kind {
                     WaitEdgeKind::FilterWait(consumer) => !downgrades.contains(consumer),
-                    WaitEdgeKind::Backpressure | WaitEdgeKind::DataWait => true,
+                    WaitEdgeKind::Backpressure
+                    | WaitEdgeKind::DataWait
+                    | WaitEdgeKind::SplitFeedbackWait => true,
                 });
                 if !kinds.is_empty() {
                     destinations.insert(target, kinds);
@@ -531,6 +538,63 @@ impl WaitGraph {
                 .into_boxed_slice(),
             data_cycles: data_cycles.into_boxed_slice(),
         })
+    }
+
+    /// Add one filter's optional split feedback waits to an already validated
+    /// frozen graph. Every wait in the group is retained or rolled back together.
+    pub fn try_add_split_feedback_waits_observed(
+        &mut self,
+        filter: RuntimeFilterId,
+        scans: impl IntoIterator<Item = OperatorRef>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<CycleWitness>, WaitGraphError> {
+        let target = WaitNode::Filter(filter);
+        if !self.dependencies.contains_key(&target) {
+            return Err(WaitGraphError::MissingFilter(filter));
+        }
+        let mut sources = BTreeSet::new();
+        for scan in scans {
+            work.step()?;
+            let source = WaitNode::Backpressure(scan);
+            if !self.dependencies.contains_key(&source) {
+                return Err(WaitGraphError::MissingNode(scan));
+            }
+            if !self.dependencies[&source]
+                .get(&target)
+                .is_some_and(|kinds| kinds.contains(&WaitEdgeKind::SplitFeedbackWait))
+            {
+                sources.insert(source);
+            }
+        }
+        if sources.is_empty() {
+            return Ok(None);
+        }
+        for &source in &sources {
+            self.add_edge(source, target, WaitEdgeKind::SplitFeedbackWait);
+        }
+
+        let result = (|| {
+            for component in self.components(work)? {
+                if component.contains(&target) {
+                    let witness = self.cycle_witness(&component, work)?;
+                    work.flush()?;
+                    return Ok(witness);
+                }
+            }
+            work.flush()?;
+            Ok(None)
+        })();
+        if !matches!(&result, Ok(None)) {
+            for source in sources {
+                let destinations = self.dependencies.get_mut(&source).expect("checked source");
+                let kinds = destinations.get_mut(&target).expect("inserted dependency");
+                kinds.remove(&WaitEdgeKind::SplitFeedbackWait);
+                if kinds.is_empty() {
+                    destinations.remove(&target);
+                }
+            }
+        }
+        result
     }
 
     /// Inspect the actual frozen waits without applying planning policy.

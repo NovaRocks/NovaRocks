@@ -39,6 +39,7 @@ use novarocks_local_compiler::{
     validate_fragment_providers,
 };
 use novarocks_local_program::{KernelAbiVersion, LocalProgram};
+use novarocks_physical_plan::{EdgeId, FragmentSink};
 use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
 use novarocks_plan_codec::physical_package_v2::{
     PackageDecodeError, PackageDecodeLimits, decode_fragment_package_with_factory,
@@ -47,7 +48,7 @@ use novarocks_plan_codec::physical_package_v2::{
 use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 use novarocks_spi::connector::ConnectorStopView;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, PureCompileControl, ValueSchemaCreation,
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueSchemaCreation,
 };
 
 pub use crate::native_type_construction::NativeTypeConstructionError;
@@ -148,12 +149,13 @@ fn provider_preparation_failure<E: Error + FailureProjection + Send + Sync + 'st
     CompiledPackageError::Provider(SharedFailureCause::new(error))
 }
 
-/// One task's compiled program and the runtime-filter bindings its package
-/// numbers.
+/// One task's compiled program and the package's original binding facts.
 ///
 /// The program names each runtime-filter site by its plan-global binding
 /// identity only; which filter and endpoint a binding is stays in the
 /// package's cuts, so it is projected here, before the package is consumed.
+/// Native multicast similarly retains the physical edges in sink declaration
+/// order for the exact binding to the task's runtime topology.
 #[derive(Debug)]
 pub struct CompiledTaskProgram {
     output: CompiledProgramOutput,
@@ -168,6 +170,7 @@ enum CompiledProgramOutput {
 #[derive(Debug)]
 struct ValidatedNativeProgram {
     program: LocalProgram,
+    multicast_edges: Box<[EdgeId]>,
 }
 impl CompiledTaskProgram {
     /// Independently authored programs retain their original Direct preparation.
@@ -184,6 +187,13 @@ impl CompiledTaskProgram {
         }
     }
 
+    pub(crate) fn multicast_edges(&self) -> &[EdgeId] {
+        match &self.output {
+            CompiledProgramOutput::Native(source) => &source.multicast_edges,
+            CompiledProgramOutput::Direct(_) => &[],
+        }
+    }
+
     /// Transfer the actual received program to a component execution fixture.
     /// This creates no metadata authority and is absent from product builds.
     #[cfg(any(test, novarocks_dev_controls))]
@@ -194,9 +204,16 @@ impl CompiledTaskProgram {
             CompiledProgramOutput::Direct(program) => program,
         }
     }
-    fn native(program: LocalProgram, runtime_filters: CompiledRuntimeFilterEndpoints) -> Self {
+    fn native(
+        program: LocalProgram,
+        runtime_filters: CompiledRuntimeFilterEndpoints,
+        multicast_edges: Box<[EdgeId]>,
+    ) -> Self {
         Self {
-            output: CompiledProgramOutput::Native(ValidatedNativeProgram { program }),
+            output: CompiledProgramOutput::Native(ValidatedNativeProgram {
+                program,
+                multicast_edges,
+            }),
             runtime_filters,
         }
     }
@@ -447,13 +464,27 @@ impl<E: Error + FailureProjection + Send + Sync + 'static> CompiledPackageInterp
         .map_err(package_decode_failure)?;
         let runtime_filters = CompiledRuntimeFilterEndpoints::from_package(&package)
             .map_err(CompiledPackageError::RuntimeFilter)?;
+        let multicast_edges = match (native, package.fragment().sink()) {
+            (true, FragmentSink::Multicast { edges }) => {
+                let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)
+                    .map_err(CompiledPackageError::Control)?;
+                let mut physical_edges = Vec::new();
+                physical_edges.try_reserve_exact(edges.len()).map_err(|_| {
+                    CompiledPackageError::Control(CompileControlError::ResourceExhausted)
+                })?;
+                for edge in edges {
+                    physical_edges.push(*edge);
+                    work.step().map_err(CompiledPackageError::Control)?;
+                }
+                work.finish().map_err(CompiledPackageError::Control)?;
+                physical_edges.into_boxed_slice()
+            }
+            _ => Box::default(),
+        };
         // The compiled RootResult algorithm gathers its terminal pipeline to
         // one driver; this width is independent of the task pipeline DOP.
-        let root_sink_dop = matches!(
-            package.fragment().sink(),
-            novarocks_physical_plan::FragmentSink::RootResult(_)
-        )
-        .then_some(NonZeroUsize::MIN);
+        let root_sink_dop = matches!(package.fragment().sink(), FragmentSink::RootResult(_))
+            .then_some(NonZeroUsize::MIN);
         let validated = validate_fragment_providers(Arc::new(package), &self.providers, control)
             .map_err(provider_preparation_failure)?;
         use novarocks_type_contract::ValueSchemaCreationFactory;
@@ -496,7 +527,7 @@ impl<E: Error + FailureProjection + Send + Sync + 'static> CompiledPackageInterp
             FragmentCreationError::Compile(source) => CompiledPackageError::Compile(source),
         })?;
         Ok(if native {
-            CompiledTaskProgram::native(program, runtime_filters)
+            CompiledTaskProgram::native(program, runtime_filters, multicast_edges)
         } else {
             CompiledTaskProgram::direct(program, runtime_filters)
         })

@@ -1270,7 +1270,7 @@ fn bind_candidate(
     }
 }
 
-fn await_fault_exit(
+pub(super) fn await_fault_exit(
     context: &mut ScenarioContext,
     fault: &RootReplyFaultControl,
 ) -> Result<ExchangeFaultObservation> {
@@ -1328,14 +1328,14 @@ fn await_pressure(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct Park {
+pub(super) struct Park {
     driver: i32,
     epoch: u64,
     generation: u64,
     line: String,
 }
 
-fn scalar<T: std::str::FromStr>(line: &str, name: &str) -> Result<T> {
+pub(super) fn scalar<T: std::str::FromStr>(line: &str, name: &str) -> Result<T> {
     let prefix = format!("{name}=");
     let values: Vec<_> = line
         .split_whitespace()
@@ -1347,7 +1347,7 @@ fn scalar<T: std::str::FromStr>(line: &str, name: &str) -> Result<T> {
         .map_err(|_| anyhow::anyhow!("invalid exchange event {name}"))
 }
 
-fn parked(
+pub(super) fn parked(
     context: &mut ScenarioContext,
     candidate: &ExchangeFaultCandidate,
 ) -> Result<Option<Park>> {
@@ -1461,7 +1461,7 @@ fn phase(evidence: &mut Value, value: Value) {
         .push(value);
 }
 
-fn capture_healthy(fault: &RootReplyFaultControl) -> Result<()> {
+pub(super) fn capture_healthy(fault: &RootReplyFaultControl) -> Result<()> {
     let original = fault.observation();
     ensure!(
         original.failures.is_empty() && !original.failure_overflow,
@@ -1475,7 +1475,7 @@ fn capture_healthy(fault: &RootReplyFaultControl) -> Result<()> {
     Ok(())
 }
 
-fn original_still_held(observation: &ExchangeFaultObservation) -> bool {
+pub(super) fn original_still_held(observation: &ExchangeFaultObservation) -> bool {
     let Some(candidate) = observation.candidate.as_ref() else {
         return false;
     };

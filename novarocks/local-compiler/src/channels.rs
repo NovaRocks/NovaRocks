@@ -169,17 +169,20 @@ type Port = BTreeMap<ValueId, usize>;
 pub(crate) fn resolve_tree_channels_with_creation<H>(
     package: &FragmentPackage,
     root_first: &[NodeId],
+    multicast_aliases: &[usize],
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<PlannedChannels, crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = resolve_core_with_creation(package, root_first, &mut work, creation);
+    let result =
+        resolve_core_with_creation(package, root_first, multicast_aliases, &mut work, creation);
     crate::creation::finish_attempt(result, work)
 }
 
 fn resolve_core_with_creation<H>(
     package: &FragmentPackage,
     root_first: &[NodeId],
+    multicast_aliases: &[usize],
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<PlannedChannels, crate::FragmentCreationError<H>> {
@@ -837,79 +840,90 @@ fn resolve_core_with_creation<H>(
         ports.insert(source, port);
         work.step()?;
     }
-    let sink_projection =
-        if let novarocks_physical_plan::FragmentSink::Router { routes, .. } = fragment.sink() {
-            let root = fragment
-                .nodes()
-                .get(&fragment.root())
-                .ok_or(ChannelLoweringError::Invalid("missing router root"))?;
-            let root_channels = &nodes[&fragment.root()];
-            let width = routes
-                .iter()
-                .try_fold(root.output.columns.len(), |count, route| {
-                    count.checked_add(route.input_mapping.len())
-                })
-                .ok_or(CompileControlError::ResourceExhausted)?;
-            if next_node >= novarocks_local_program::MAX_PROGRAM_NODES
-                || width > novarocks_type_contract::MAX_CONTROL_DEFINITIONS
-            {
-                return Err(CompileControlError::ResourceExhausted.into());
-            }
-            let local = ProgramNodeId::new(next_node);
-            let mut sources = Vec::new();
-            reserve_vec(&mut sources, width, work)?;
-            let mut output_slots = Vec::new();
-            reserve_vec(&mut output_slots, width, work)?;
-            // Every output gets a fresh identity. Reusing a child's slot here
-            // would shadow later reads of that same child inside the Project.
-            // The original ordered control occurrences remain in the prefix.
-            let prefix_slots = fresh_slots(root.output.columns.len(), &mut next_slot, work)?;
-            for (ordinal, value) in root.output.columns.iter().enumerate() {
-                sources.push(UnionChannelSource {
-                    input: ResolvedInput {
-                        slot: root_channels.slots[ordinal],
-                        source: ProgramChannelSite::Layout {
-                            node: root_channels.local,
-                            role: ProgramChannelLayoutRole::NodeOutput,
-                            ordinal: u32::try_from(ordinal)
-                                .map_err(|_| CompileControlError::ResourceExhausted)?,
-                        },
+    let router_routes = match fragment.sink() {
+        novarocks_physical_plan::FragmentSink::Router { routes, .. } => Some(routes),
+        _ => None,
+    };
+    let sink_projection = if router_routes.is_some() || !multicast_aliases.is_empty() {
+        let root = fragment
+            .nodes()
+            .get(&fragment.root())
+            .ok_or(ChannelLoweringError::Invalid(
+                "missing sink projection root",
+            ))?;
+        let root_channels = &nodes[&fragment.root()];
+        let width = root
+            .output
+            .columns
+            .len()
+            .checked_add(multicast_aliases.len())
+            .and_then(|count| {
+                router_routes
+                    .into_iter()
+                    .flat_map(|routes| routes.iter())
+                    .try_fold(count, |count, route| {
+                        count.checked_add(route.input_mapping.len())
+                    })
+            })
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        if next_node >= novarocks_local_program::MAX_PROGRAM_NODES
+            || width > novarocks_type_contract::MAX_CONTROL_DEFINITIONS
+        {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
+        let local = ProgramNodeId::new(next_node);
+        let mut sources = Vec::new();
+        reserve_vec(&mut sources, width, work)?;
+        // Every output gets a fresh identity. Reusing a child's slot here
+        // would shadow later reads of that same child inside the Project.
+        // The original ordered control occurrences remain in the prefix.
+        let slots = fresh_slots(width, &mut next_slot, work)?;
+        for ordinal in (0..root.output.columns.len()).chain(multicast_aliases.iter().copied()) {
+            let value = root.output.columns[ordinal];
+            sources.push(UnionChannelSource {
+                input: ResolvedInput {
+                    slot: root_channels.slots[ordinal],
+                    source: ProgramChannelSite::Layout {
+                        node: root_channels.local,
+                        role: ProgramChannelLayoutRole::NodeOutput,
+                        ordinal: u32::try_from(ordinal)
+                            .map_err(|_| CompileControlError::ResourceExhausted)?,
                     },
+                },
+                ty: fragment.values()[&value]
+                    .ty
+                    .clone_observed(|| work.step())?,
+            });
+            work.step()?;
+        }
+        let mut route_slots = BTreeMap::new();
+        for route in router_routes.into_iter().flat_map(|routes| routes.iter()) {
+            let first = sources.len();
+            for (_, value) in &route.input_mapping {
+                sources.push(UnionChannelSource {
+                    input: resolve_input(*value, root_channels, &ports[&fragment.root()])?,
                     ty: fragment.values()[value].ty.clone_observed(|| work.step())?,
                 });
-                output_slots.push(prefix_slots[ordinal]);
                 work.step()?;
             }
-            let mut route_slots = BTreeMap::new();
-            for route in routes {
-                let aliases = fresh_slots(route.input_mapping.len(), &mut next_slot, work)?;
-                for ((_, value), slot) in route.input_mapping.iter().zip(aliases.iter()) {
-                    sources.push(UnionChannelSource {
-                        input: resolve_input(*value, root_channels, &ports[&fragment.root()])?,
-                        ty: fragment.values()[value].ty.clone_observed(|| work.step())?,
-                    });
-                    output_slots.push(*slot);
-                    work.step()?;
-                }
-                route_slots.insert(route.edge, aliases);
-            }
-            let slots: Arc<[SlotId]> = Arc::from(output_slots);
-            unions
-                .entry(fragment.root())
-                .or_default()
-                .push(UnionChannelBranch {
-                    normalizer: local,
-                    input: root_channels.local,
-                    sources,
-                });
-            Some(SinkProjectionChannels {
-                node: local,
-                slots,
-                route_slots,
-            })
-        } else {
-            None
-        };
+            route_slots.insert(route.edge, Arc::from(&slots[first..sources.len()]));
+        }
+        unions
+            .entry(fragment.root())
+            .or_default()
+            .push(UnionChannelBranch {
+                normalizer: local,
+                input: root_channels.local,
+                sources,
+            });
+        Some(SinkProjectionChannels {
+            node: local,
+            slots,
+            route_slots,
+        })
+    } else {
+        None
+    };
     let mut summary_slots = novarocks_local_program::PerKind::empty();
     for summary in fragment.summaries() {
         let slots = match summary.author {

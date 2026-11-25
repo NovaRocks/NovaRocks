@@ -1,5 +1,5 @@
 -- query 2
--- legacy
+-- types	bigint	bigint	bigint
 k	s_now	s_prev
 1	110	110
 2	440	440

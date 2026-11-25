@@ -622,7 +622,14 @@ fn schedule_edges(
         .map(|fragment| (fragment.fragment_id, fragment.tasks.as_ref()))
         .collect::<BTreeMap<_, _>>();
     let mut sources_by_exchange = BTreeMap::<(u32, i32), BTreeSet<u32>>::new();
+    let mut edge_ids = BTreeSet::new();
     for edge in &plan.edges {
+        if !edge_ids.insert(edge.edge_id) {
+            return Err(AttemptScheduleError::new(format!(
+                "scheduling repeats exchange edge id {}",
+                edge.edge_id
+            )));
+        }
         let key = (edge.target_fragment_id, edge.target_exchange_node_id);
         if !sources_by_exchange
             .entry(key)
@@ -660,11 +667,9 @@ fn schedule_edges(
         sender_sets.insert(key, (ordinals, count));
     }
 
-    let mut next_edge_id = Some(1_u32);
     plan.edges
         .iter()
         .map(|edge| {
-            let edge_id = take_exchange_edge_id(&mut next_edge_id)?;
             let key = (edge.target_fragment_id, edge.target_exchange_node_id);
             let (ordinals, sender_count) = &sender_sets[&key];
             let producers = tasks_by_fragment
@@ -693,7 +698,7 @@ fn schedule_edges(
                 .map(|task| task.identity)
                 .collect::<Vec<_>>();
             Ok(ScheduledEdge {
-                edge_id,
+                edge_id: edge.edge_id,
                 source_fragment_id: edge.source_fragment_id,
                 target_fragment_id: edge.target_fragment_id,
                 target_exchange_node_id: edge.target_exchange_node_id,
@@ -703,16 +708,6 @@ fn schedule_edges(
             })
         })
         .collect()
-}
-
-fn take_exchange_edge_id(next: &mut Option<u32>) -> Result<ExchangeEdgeId, AttemptScheduleError> {
-    let current = next
-        .take()
-        .ok_or_else(|| AttemptScheduleError::new("exchange edge id space exhausted"))?;
-    let edge_id = ExchangeEdgeId::new(current)
-        .map_err(|error| AttemptScheduleError::new(error.to_string()))?;
-    *next = current.checked_add(1);
-    Ok(edge_id)
 }
 
 #[cfg(test)]
@@ -754,6 +749,7 @@ mod tests {
                 },
             ],
             edges: vec![SchedulingEdgeFacts {
+                edge_id: ExchangeEdgeId::new(1).unwrap(),
                 source_fragment_id: 1,
                 target_fragment_id: 2,
                 target_exchange_node_id: 0,
@@ -1202,16 +1198,34 @@ mod tests {
     }
 
     #[test]
-    fn exchange_edge_ids_are_contiguous_and_exhaustion_is_explicit() {
-        let mut next = Some(1);
-        assert_eq!(take_exchange_edge_id(&mut next).unwrap().get(), 1);
-        assert_eq!(take_exchange_edge_id(&mut next).unwrap().get(), 2);
+    fn scheduling_preserves_sparse_edge_ids_across_reordering_and_rejects_duplicates() {
+        let mut plan = scan_edge_inputs(NativeScanWork::Empty);
+        let mut another = plan.edges[0];
+        another.edge_id = ExchangeEdgeId::new(42).unwrap();
+        another.target_exchange_node_id = 1;
+        plan.edges.push(another);
+        plan.edges.reverse();
 
-        let mut last = Some(u32::MAX);
-        assert_eq!(take_exchange_edge_id(&mut last).unwrap().get(), u32::MAX);
+        let schedule = build_scan_edge(
+            execution(1),
+            FrontendProcessId::new_v7(),
+            &backends(1),
+            NativeScanWork::Empty,
+        );
+        let edges = schedule_edges(&plan, &schedule.fragments).unwrap();
         assert_eq!(
-            take_exchange_edge_id(&mut last).unwrap_err().to_string(),
-            "exchange edge id space exhausted"
+            edges
+                .iter()
+                .map(|edge| edge.edge_id.get())
+                .collect::<Vec<_>>(),
+            [42, 1]
+        );
+        plan.edges[1].edge_id = another.edge_id;
+        assert_eq!(
+            schedule_edges(&plan, &schedule.fragments)
+                .unwrap_err()
+                .to_string(),
+            "scheduling repeats exchange edge id 42"
         );
     }
     #[test]

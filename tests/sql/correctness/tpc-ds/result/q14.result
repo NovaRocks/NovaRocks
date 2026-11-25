@@ -103,7 +103,7 @@ catalog	1002001	4	NULL	182427.69	32
 catalog	1002001	4	1	66896.68	15
 
 -- query 2
--- legacy
+-- types	varchar(5)	integer	integer	integer	decimal(38, 2)	bigint	varchar(5)	integer	integer	integer	decimal(38, 2)	bigint
 ty_channel	ty_brand	ty_class	ty_category	ty_sales	ty_number_sales	ly_channel	ly_brand	ly_class	ly_category	ly_sales	ly_number_sales
 store	1001001	1	1	372549.59	137	store	1001001	1	1	1316197.43	340
 store	1001002	1	1	799646.86	229	store	1001002	1	1	775776.63	188

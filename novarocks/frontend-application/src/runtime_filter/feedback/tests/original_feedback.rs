@@ -24,18 +24,55 @@ fn original_feedback_close_releases_initial_wait_and_refuses_reconfiguration() {
     let execution = execution_id();
     let process = BackendProcessId::new_v7();
     let state = RuntimeFilterFeedbackState::new(execution, declaration(process)).unwrap();
-    assert!(state.is_initial_wait_blocked(17, [7]));
+    assert!(state.is_initial_wait_blocked(ScanNodeKey::new(2, 17), [7]));
     let feedback =
         TaskRuntimeFilterFeedback::parse(&task_envelope(execution, 7, [9; 32], exact(41))).unwrap();
     state.close();
-    assert!(!state.is_initial_wait_blocked(17, [7]));
+    assert!(!state.is_initial_wait_blocked(ScanNodeKey::new(2, 17), [7]));
     state.close();
     assert_eq!(
         state.admit_task_feedback(&feedback, process).unwrap(),
         RuntimeFilterFeedbackAdmission::Applied
     );
-    assert!(!state.is_initial_wait_blocked(17, [7]));
+    assert!(!state.is_initial_wait_blocked(ScanNodeKey::new(2, 17), [7]));
     assert!(state.state.lock().unwrap().channels[&7].winner.is_none());
     assert!(state.configure(declaration(process)).is_err());
     assert!(state.state.lock().unwrap().closed);
+}
+
+#[test]
+fn a_cyclic_split_wait_skips_initial_blocking_and_still_accepts_late_feedback() {
+    use novarocks_physical_plan::wait_graph::{CycleWitness, WaitNode};
+
+    let execution = execution_id();
+    let process = BackendProcessId::new_v7();
+    let admitted = declaration(process);
+    let scan = ScanNodeKey::new(2, 17);
+    let same_node_in_another_fragment = ScanNodeKey::new(3, 17);
+    let safe = RuntimeFilterFeedbackState::new(execution, admitted.clone()).unwrap();
+    assert!(safe.is_initial_wait_blocked(scan, [7]));
+    assert!(!safe.is_initial_wait_blocked(same_node_in_another_fragment, [7]));
+
+    let mut channel = admitted.channels().next().unwrap().clone();
+    let filter = WaitNode::Filter(novarocks_physical_plan::RuntimeFilterId::new(7));
+    channel.wait_eligibility = FrontendRuntimeFilterFeedbackWaitEligibility::IneligibleCycle {
+        witness: std::sync::Arc::new(CycleWitness {
+            nodes: Box::from([filter, filter]),
+            edges: Box::from([BTreeSet::from([
+                novarocks_physical_plan::wait_graph::WaitEdgeKind::SplitFeedbackWait,
+            ])]),
+        }),
+    };
+    let ineligible = FrontendRuntimeFilterFeedbackDeclaration::new([channel]).unwrap();
+    let state = RuntimeFilterFeedbackState::new(execution, ineligible).unwrap();
+    assert!(!state.is_initial_wait_blocked(scan, [7]));
+    let domain = exact(41);
+    let feedback =
+        TaskRuntimeFilterFeedback::parse(&task_envelope(execution, 7, [9; 32], domain.clone()))
+            .unwrap();
+    state.admit_task_feedback(&feedback, process).unwrap();
+    assert_eq!(
+        state.state.lock().unwrap().channels[&7].winner.as_ref(),
+        Some(&domain)
+    );
 }

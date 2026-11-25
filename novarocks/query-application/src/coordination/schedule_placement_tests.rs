@@ -40,6 +40,7 @@ fn independently_placed_write(work: NativeScanWork) -> ExecutionSchedulingFacts 
         .into_iter()
         .enumerate()
         .map(|(index, (source, target, hash))| SchedulingEdgeFacts {
+            edge_id: ExchangeEdgeId::new(index as u32 + 1).unwrap(),
             source_fragment_id: source,
             target_fragment_id: target,
             target_exchange_node_id: index as i32,
@@ -134,6 +135,7 @@ fn follow_sources_reads_only_the_explicit_predecessor_set() {
     plan.topological_fragment_order = vec![1, 2, 3, 5, 4];
     for source in [2, 3] {
         plan.edges.push(SchedulingEdgeFacts {
+            edge_id: ExchangeEdgeId::new(plan.edges.len() as u32 + 1).unwrap(),
             source_fragment_id: source,
             target_fragment_id: 5,
             target_exchange_node_id: 10 + source as i32,

@@ -65,6 +65,8 @@ fn make_test_operator(fixture: &Fixture) -> DataStreamSinkOperator {
         error_state: Some(fixture.state().error_state()),
         #[cfg(novarocks_dev_controls)]
         writer_diagnostics: None,
+        #[cfg(novarocks_dev_controls)]
+        multicast_enqueue_observer: None,
         finish_state: Arc::new(DataStreamSinkFinishState::default()),
         profile_initialized: false,
         profiles: None,
@@ -75,6 +77,8 @@ fn make_test_operator(fixture: &Fixture) -> DataStreamSinkOperator {
         compiled_partition: None,
         construction_factory: None,
         frozen_output: Some(frozen_test_output(typed_int64_chunk(0).chunk_schema())),
+        multicast_branch: false,
+        empty_projection: None,
         recipe: None,
         prepared: false,
         exiting: false,
@@ -416,6 +420,7 @@ fn test_payload(bytes: usize) -> PendingPayload {
         be_number: 0,
         payload: ExchangeRetainedPayload::new(vec![7; bytes], None),
         payload_bytes: bytes,
+        rows: 0,
         eos: false,
     }
 }
@@ -556,6 +561,53 @@ fn closed_edge_keeps_original_encoded_bytes_without_consuming_a_unit_sequence() 
     assert_eq!(frames[0].receiver.payload.as_ptr(), original.as_ptr());
 }
 
+#[cfg(novarocks_dev_controls)]
+#[test]
+fn multicast_observer_records_only_the_first_successful_positive_enqueue() {
+    #[derive(Debug, Default)]
+    struct Events(std::sync::Mutex<Vec<String>>);
+
+    impl crate::runtime::exchange::TestEventObserver for Events {
+        fn is_active(&self) -> bool {
+            true
+        }
+
+        fn observe(&self, event: &str) {
+            self.0.lock().unwrap().push(event.to_owned());
+        }
+    }
+
+    let fixture = Fixture::new();
+    let mut sink = make_test_operator(&fixture);
+    sink.multicast_branch = true;
+    gate_destinations(&mut sink, vec![make_test_destination(&fixture)]);
+    prepare_test_operator(&fixture, &mut sink);
+    let events = Arc::new(Events::default());
+    sink.multicast_enqueue_observer = Some(events.clone());
+
+    sink.buffer_chunk(typed_int64_chunk(8)).unwrap();
+    sink.flush_pending(true).unwrap();
+    assert!(events.0.lock().unwrap().is_empty());
+
+    open_edges(&sink, &[edge_id(1)]);
+    sink.flush_pending(true).unwrap();
+    sink.buffer_chunk(typed_int64_chunk(4)).unwrap();
+    sink.flush_pending(true).unwrap();
+
+    assert_eq!(fixture.transport().frames().len(), 2);
+    let events = events.0.lock().unwrap();
+    let [event] = events.as_slice() else {
+        panic!("expected one multicast driver enqueue event, got {events:?}");
+    };
+    assert!(
+        event.starts_with(
+            novarocks_failpoint::observation_marker::EXCHANGE_MULTICAST_DRIVER_ENQUEUED
+        )
+    );
+    assert!(event.contains(" task_key=1:2 driver_id=0 edge_id=1 "));
+    assert!(event.ends_with(" destination_task_key=9:9 node_id=1 rows=8"));
+}
+
 #[test]
 fn pending_grant_keeps_the_next_payload_and_retries_without_a_sequence_gap() {
     let fixture = Fixture::new();
@@ -645,6 +697,107 @@ fn every_nonempty_payload_is_an_independent_prepared_unit() {
     .unwrap();
     assert_eq!(decoded.len(), 1);
     assert_eq!(decoded[0].len(), 2);
+}
+
+#[test]
+fn multicast_empty_output_preserves_producer_rows_without_sending_its_columns() {
+    let fixture = Fixture::new();
+    let mut sink = make_test_operator(&fixture);
+    sink.multicast_branch = true;
+    gate_destinations(&mut sink, vec![make_test_destination(&fixture)]);
+    prepare_test_operator(&fixture, &mut sink);
+    assert!(sink.empty_projection.is_some());
+
+    let input = typed_int64_chunk(7);
+    assert_eq!(input.columns().len(), 1);
+    sink.buffer_chunk(input).unwrap();
+    sink.flush_pending(true).unwrap();
+
+    let payload = sink.pending_payloads_per_dest[0].as_ref().unwrap();
+    let schema = zero_column_chunk_with_rows(0).chunk_schema_ref();
+    let factory = sink.construction_factory.as_ref().unwrap();
+    let decoded = crate::runtime::exchange::online_unit::decode(
+        sink.recipe.as_deref().unwrap(),
+        payload.payload.bytes(),
+        &schema,
+        factory.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(decoded.len(), 1);
+    assert!(decoded[0].columns().is_empty());
+    assert_eq!(decoded[0].len(), 7);
+}
+
+#[test]
+fn multicast_stream_sinks_keep_shared_backing_at_the_source_and_charge_new_partitions() {
+    let fixture = Fixture::new();
+    let mut broadcast = make_test_operator(&fixture);
+    let mut random = make_test_operator(&fixture);
+    broadcast.multicast_branch = true;
+    random.multicast_branch = true;
+    broadcast.input.output_columns = vec![SlotId::new(1)];
+    random.input.output_columns = vec![SlotId::new(1)];
+    random.input.output_partition_type = DataStreamPartitionType::Random;
+    gate_destinations(&mut broadcast, vec![destination_with_task_key(&fixture, 1)]);
+    gate_destinations(
+        &mut random,
+        vec![
+            destination_with_task_key(&fixture, 2),
+            destination_with_task_key(&fixture, 3),
+        ],
+    );
+    prepare_test_operator(&fixture, &mut broadcast);
+    prepare_test_operator(&fixture, &mut random);
+
+    let memory = MemTracker::new_root("multicast fixture");
+    let source = MemTracker::new_child("multicast input", &memory);
+    let broadcast_memory = MemTracker::new_child("broadcast branch", &memory);
+    let random_memory = MemTracker::new_child("random branch", &memory);
+    broadcast.set_mem_tracker(broadcast_memory.clone());
+    random.set_mem_tracker(random_memory.clone());
+
+    let mut chunk = typed_int64_chunk(8);
+    chunk.transfer_to(&source);
+    let source_bytes = source.current();
+    assert!(source_bytes > 0);
+    chunk.retain_shared_accounting();
+    random.buffer_chunk(chunk.clone()).unwrap();
+    broadcast.buffer_chunk(chunk).unwrap();
+    assert_eq!(source.current(), source_bytes);
+    assert_eq!(broadcast_memory.current(), 0);
+    assert!(random_memory.current() > 0);
+
+    // Retire the branch's actual buffered work. The other branch still owns
+    // its original batch, so the shared charge survives the cancellation.
+    random.cancel();
+    assert_eq!(random_memory.current(), 0);
+    assert_eq!(source.current(), source_bytes);
+    open_edges(&broadcast, &[edge_id(1)]);
+    let state = fixture.state();
+    SinkKernel::finish_for_test(&mut broadcast, &state).unwrap();
+    let frames = fixture.transport().take_frames();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| matches!(
+                frame.receiver.item,
+                crate::runtime::task::io::exchange_unit::ExchangeUnitItem::End(_)
+            ))
+            .count(),
+        1
+    );
+    broadcast.begin_exit().unwrap();
+    assert!(matches!(
+        broadcast.observe_exit().progress,
+        crate::exec::pipeline::operator::ExitProgress::Exited
+    ));
+    assert_eq!(source.current(), 0);
+    assert!(
+        broadcast_memory.current() > 0,
+        "recorded calls still retain the wire bytes"
+    );
+    drop(frames);
+    assert_eq!(memory.current(), 0);
 }
 
 #[test]

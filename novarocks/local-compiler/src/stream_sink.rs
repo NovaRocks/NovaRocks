@@ -20,8 +20,9 @@
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
 use novarocks_local_program::*;
 use novarocks_physical_plan::{
-    Distribution, EdgeId, ExchangePayloadContract, FragmentPackage, FragmentSink,
-    OutboundFragmentCut, ValueId,
+    DeliveryRequirement, Distribution, EdgeId, EdgeKind, EdgePartitioning, ExchangePayloadContract,
+    FragmentOutputPort, FragmentPackage, FragmentSink, OutboundFragmentCut, RowMultiplicity,
+    ValueId,
 };
 use novarocks_type_contract::{
     BucketLayoutAlgorithm, CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand,
@@ -74,9 +75,175 @@ pub(crate) fn cut_delivery(
 
 enum OutputSelection<'a> {
     Stream(&'a OutboundFragmentCut),
+    Multicast(&'a MulticastOutput<'a>),
     Router {
         aliases: &'a BTreeMap<EdgeId, Arc<[SlotId]>>,
     },
+}
+
+pub(crate) struct MulticastOutput<'a> {
+    cuts: Vec<&'a OutboundFragmentCut>,
+    projections: Vec<Vec<usize>>,
+    /// For each appended alias, the original root occurrence it reads.
+    pub(crate) alias_sources: Vec<usize>,
+}
+
+/// Physical validation has already proved that both distributions match the
+/// import mapping. Admit the supported relational multicast subset here.
+pub(crate) fn admit_multicast_cut(
+    kind: EdgeKind,
+    delivery: DeliveryRequirement,
+    port: FragmentOutputPort,
+    payload: &ExchangePayloadContract,
+    partitioning: &EdgePartitioning,
+) -> Result<(), FragmentCompileError> {
+    let supported_partitioning = matches!(
+        partitioning.source,
+        Distribution::Singleton | Distribution::RoundRobin | Distribution::Broadcast
+    ) || matches!(
+        &partitioning.source,
+        Distribution::Hash { keys, scheme }
+            if !keys.is_empty()
+                && matches!(scheme.definition.algorithm,
+                    PartitionHashAlgorithm::NativeExchangeV1
+                        | PartitionHashAlgorithm::NativeExchangeV2
+                        | PartitionHashAlgorithm::NativeHierarchicalV1)
+    );
+    if kind != EdgeKind::CteMulticast
+        || delivery != DeliveryRequirement::DemandDriven
+        || port != FragmentOutputPort::Root
+        || !matches!(payload, ExchangePayloadContract::Relational)
+        || partitioning.source_multiplicity != RowMultiplicity::SingleCopy
+        || !partitioning.routing_only.is_empty()
+        || !supported_partitioning
+    {
+        return Err(FragmentCompileError::Invalid(
+            "multicast cut requires a partitioned demand-driven relational root output",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn plan_multicast_output<'a, H>(
+    package: &'a FragmentPackage,
+    edges: &[EdgeId],
+    mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<MulticastOutput<'a>, crate::FragmentCreationError<H>> {
+    use crate::creation::{before_tree_insert, before_vec_push, borrow_scope, reserve_vec};
+
+    if edges.is_empty()
+        || edges
+            .len()
+            .checked_add(package.fragment().summaries().len())
+            != Some(package.cuts().outbound.len())
+    {
+        return Err(FragmentCompileError::Invalid("multicast output cut coverage differs").into());
+    }
+    if edges.len() > MAX_STATIC_SINK_BRANCHES {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    let mut by_edge = BTreeMap::new();
+    for cut in package.cuts().outbound.iter() {
+        before_tree_insert::<EdgeId, &OutboundFragmentCut, H>(
+            by_edge.len(),
+            borrow_scope(&mut temporary),
+            work,
+        )?;
+        if by_edge.insert(cut.edge, cut).is_some() {
+            return Err(FragmentCompileError::Invalid("duplicate multicast output cut").into());
+        }
+        work.step()?;
+    }
+    let fragment = package.fragment();
+    let root_values = &fragment.nodes()[&fragment.root()].output.columns;
+    let mut ordinals_by_value = BTreeMap::<ValueId, Vec<usize>>::new();
+    for (ordinal, &value) in root_values.iter().enumerate() {
+        if !ordinals_by_value.contains_key(&value) {
+            before_tree_insert::<ValueId, Vec<usize>, H>(
+                ordinals_by_value.len(),
+                borrow_scope(&mut temporary),
+                work,
+            )?;
+        }
+        let ordinals = ordinals_by_value.entry(value).or_default();
+        before_vec_push(ordinals, borrow_scope(&mut temporary), work)?;
+        ordinals.push(ordinal);
+        work.step()?;
+    }
+    let mut result = MulticastOutput {
+        cuts: Vec::new(),
+        projections: Vec::new(),
+        alias_sources: Vec::new(),
+    };
+    reserve_vec(
+        &mut result.cuts,
+        edges.len(),
+        borrow_scope(&mut temporary),
+        work,
+    )?;
+    reserve_vec(
+        &mut result.projections,
+        edges.len(),
+        borrow_scope(&mut temporary),
+        work,
+    )?;
+    for edge in edges {
+        let cut = by_edge.remove(edge).ok_or(FragmentCompileError::Invalid(
+            "missing or repeated multicast output cut",
+        ))?;
+        admit_multicast_cut(
+            cut.kind,
+            cut.delivery,
+            cut.source_port,
+            &cut.payload,
+            &cut.partitioning,
+        )?;
+        if cut.projection.len() > MAX_STATIC_SINK_COLUMNS {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
+        let mut used = BTreeMap::<ValueId, usize>::new();
+        let mut projection = Vec::new();
+        reserve_vec(
+            &mut projection,
+            cut.projection.len(),
+            borrow_scope(&mut temporary),
+            work,
+        )?;
+        for projected in &cut.projection {
+            let ordinals = ordinals_by_value.get_mut(&projected.value).ok_or(
+                FragmentCompileError::Invalid("multicast projected value is outside root"),
+            )?;
+            if !used.contains_key(&projected.value) {
+                before_tree_insert::<ValueId, usize, H>(
+                    used.len(),
+                    borrow_scope(&mut temporary),
+                    work,
+                )?;
+            }
+            let occurrence = used.entry(projected.value).or_default();
+            if *occurrence == ordinals.len() {
+                let alias_ordinal = root_values
+                    .len()
+                    .checked_add(result.alias_sources.len())
+                    .ok_or(CompileControlError::ResourceExhausted)?;
+                if alias_ordinal >= novarocks_type_contract::MAX_CONTROL_DEFINITIONS {
+                    return Err(CompileControlError::ResourceExhausted.into());
+                }
+                before_vec_push(&result.alias_sources, borrow_scope(&mut temporary), work)?;
+                result.alias_sources.push(ordinals[0]);
+                before_vec_push(ordinals, borrow_scope(&mut temporary), work)?;
+                ordinals.push(alias_ordinal);
+            }
+            projection.push(ordinals[*occurrence]);
+            *occurrence += 1;
+            work.step()?;
+        }
+        result.cuts.push(cut);
+        result.projections.push(projection);
+        work.step()?;
+    }
+    Ok(result)
 }
 #[expect(
     clippy::too_many_arguments,
@@ -101,6 +268,41 @@ pub(crate) fn lower_stream_sink_with_creation<
     lower_selected(
         package,
         OutputSelection::Stream(cut),
+        root,
+        root_layout,
+        expressions,
+        functions,
+        policy,
+        control,
+        creation,
+        temporary,
+        factory,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Sink routes, immutable expression facts and original creator ports retain separate responsibilities"
+)]
+pub(crate) fn lower_multicast_sink_with_creation<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    package: &FragmentPackage,
+    multicast: &MulticastOutput<'_>,
+    root: ProgramNodeId,
+    root_layout: &StaticLayout,
+    expressions: &mut crate::expressions::LoweredExpressions,
+    functions: &novarocks_functions::PureEngineFunctionCatalog,
+    policy: novarocks_constant_contract::ConstantPolicy,
+    control: &dyn PureCompileControl,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
+) -> Result<LoweredStreamSink, crate::FragmentCreationError<H>> {
+    lower_selected(
+        package,
+        OutputSelection::Multicast(multicast),
         root,
         root_layout,
         expressions,
@@ -210,18 +412,15 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     let mut branches = Vec::new();
     let mut requirements = Vec::new();
     let mut router_routes = Vec::new();
-    let mut cuts = Vec::new();
-    let router = match &selection {
-        OutputSelection::Stream(cut) => {
-            reserve_vec(&mut cuts, 1, work)?;
-            cuts.push(*cut);
-            None
-        }
+    let mut router_cuts = Vec::new();
+    let (cuts, router) = match &selection {
+        OutputSelection::Stream(cut) => (std::slice::from_ref(cut), None),
+        OutputSelection::Multicast(multicast) => (multicast.cuts.as_slice(), None),
         OutputSelection::Router { .. } => {
             let FragmentSink::Router { effect, routes } = fragment.sink() else {
                 return Err(FragmentCompileError::Invalid("router sink kind differs").into());
             };
-            reserve_vec(&mut cuts, routes.len(), work)?;
+            reserve_vec(&mut router_cuts, routes.len(), work)?;
             let mut by_edge = BTreeMap::new();
             for cut in package.cuts().outbound.iter() {
                 if by_edge.insert(cut.edge, cut).is_some() {
@@ -230,21 +429,21 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                 work.step()?;
             }
             for edge in routes.iter().map(|route| route.edge) {
-                cuts.push(
+                router_cuts.push(
                     by_edge
                         .remove(&edge)
                         .ok_or(FragmentCompileError::Invalid("missing router output cut"))?,
                 );
                 work.step()?;
             }
-            if cuts.len().checked_add(fragment.summaries().len())
+            if router_cuts.len().checked_add(fragment.summaries().len())
                 != Some(package.cuts().outbound.len())
             {
                 return Err(
                     FragmentCompileError::Invalid("router output cut coverage differs").into(),
                 );
             }
-            Some((*effect, routes))
+            (router_cuts.as_slice(), Some((*effect, routes)))
         }
     };
     if cuts.len() > MAX_STATIC_SINK_BRANCHES {
@@ -252,7 +451,7 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     }
     // Preserve the original combined sink-read bound before creating any unit.
     let mut definitions = 0usize;
-    for cut in &cuts {
+    for cut in cuts {
         let count = match &cut.partitioning.source {
             Distribution::ConditionalKey { keys, .. } => keys.len().checked_add(1),
             Distribution::Hash { keys, .. } | Distribution::BucketShuffle { keys, .. } => {
@@ -269,11 +468,17 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     if definitions > novarocks_expression::MAX_STATIC_EXPRESSIONS {
         return Err(CompileControlError::ResourceExhausted.into());
     }
-    reserve_vec(&mut router_routes, cuts.len(), work)?;
+    if router.is_some() {
+        reserve_vec(&mut router_routes, cuts.len(), work)?;
+    }
     reserve_vec(&mut branches, cuts.len(), work)?;
     reserve_vec(&mut requirements, cuts.len(), work)?;
     let mut source_columns = Vec::new();
     reserve_vec(&mut source_columns, root_layout.slots().len(), work)?;
+    let multicast_aliases = match &selection {
+        OutputSelection::Multicast(multicast) => multicast.alias_sources.as_slice(),
+        _ => &[],
+    };
     for value in root_values
         .iter()
         .copied()
@@ -282,6 +487,11 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                 .iter()
                 .flat_map(|route| route.input_mapping.iter().map(|(_, value)| *value))
         }))
+        .chain(
+            multicast_aliases
+                .iter()
+                .map(|&ordinal| root_values[ordinal]),
+        )
     {
         let ty = &fragment
             .values()
@@ -435,6 +645,20 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                     .ok_or(FragmentCompileError::Invalid("missing exact route aliases"))?
                     .to_vec(),
                 OutputSelection::Stream(_) => projected_slots(cut, root_values, root_layout, work)?,
+                OutputSelection::Multicast(multicast) => {
+                    let projection = &multicast.projections[branch_index];
+                    let mut slots = Vec::new();
+                    reserve_vec(&mut slots, projection.len(), work)?;
+                    for &ordinal in projection {
+                        slots.push(*root_layout.slots().get(ordinal).ok_or(
+                            FragmentCompileError::Invalid(
+                                "multicast projection is outside root layout",
+                            ),
+                        )?);
+                        work.step()?;
+                    }
+                    slots
+                }
             };
             for (source, _) in &cut.partitioning.routing_only {
                 let ordinal = first_ordinal(root_values, *source, work)?.ok_or(
@@ -443,17 +667,25 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                 columns.push(root_layout.slots()[ordinal]);
                 work.step()?;
             }
-            let storage = creation.storage_lifetime();
-            let layout = root_layout.project_by_slots_typed_with_creator(
-                &columns,
-                storage,
-                |layout| {
-                    creation
-                        .request_layout(layout)
-                        .map_err(novarocks_local_program::LayoutCreationFailure::Creator)
-                },
-                work.control(),
-            )?;
+            let layout = if columns.is_empty() && matches!(selection, OutputSelection::Multicast(_))
+            {
+                // The ordinary projection helper treats an empty selection as
+                // the original layout. Here the checked cut owns a zero-column relation.
+                crate::typed_layout::TypedLayoutBuilder::new_with_creation(0, work, creation)?
+                    .finish_with_creation(&columns, work, creation)?
+            } else {
+                let storage = creation.storage_lifetime();
+                root_layout.project_by_slots_typed_with_creator(
+                    &columns,
+                    storage,
+                    |layout| {
+                        creation
+                            .request_layout(layout)
+                            .map_err(novarocks_local_program::LayoutCreationFailure::Creator)
+                    },
+                    work.control(),
+                )?
+            };
             (columns, layout)
         };
         let role = cut_role(&cut.payload);
@@ -539,6 +771,8 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             router_routes,
         )
         .map_err(sink_error)?
+    } else if matches!(selection, OutputSelection::Multicast(_)) {
+        StaticSinkProgram::try_multicast(branches, &units).map_err(sink_error)?
     } else {
         let branch = branches
             .pop()

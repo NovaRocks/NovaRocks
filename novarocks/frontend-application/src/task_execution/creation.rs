@@ -317,6 +317,25 @@ pub(crate) struct TaskTopologyView {
 }
 
 impl TaskTopologyView {
+    pub(crate) fn check_native_cardinality(
+        outbound_edges: usize,
+        inbound_nodes: usize,
+    ) -> Result<(), TaskExecutionError> {
+        use novarocks_task_codec::descriptor::MAX_TOPOLOGY_ENTRIES;
+
+        for (count, entries) in [
+            (outbound_edges, "outbound edges"),
+            (inbound_nodes, "inbound nodes"),
+        ] {
+            if count > MAX_TOPOLOGY_ENTRIES {
+                return Err(TaskExecutionError::Schedule(format!(
+                    "task topology has {count} {entries}, exceeding the native limit of {MAX_TOPOLOGY_ENTRIES}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// `inbound` names, per exchange node this task consumes, every edge that
     /// feeds that node.
     pub(crate) fn new(
@@ -986,6 +1005,7 @@ pub(crate) mod tests {
                 requires_power_of_two: false,
             },
             Some((
+                novarocks_physical_plan::EdgeId::new(0),
                 2,
                 20,
                 novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,

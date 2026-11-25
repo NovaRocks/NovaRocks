@@ -7,3 +7,13 @@ partitioned_probe	1000	1001000
 -- types	varchar(17)	bigint	bigint
 scenario	row_count	id_sum
 partitioned_probe	1000	1001000
+
+-- query 28
+-- types	bigint	bigint
+matching_rows	grouped_rows
+1	10
+
+-- query 31
+-- types	bigint
+competing_wait_rows
+10

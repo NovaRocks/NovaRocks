@@ -123,7 +123,9 @@ pub fn grouped_state_topn_key_supported(
 /// Revision 42 freezes NULLIF's guarded comparison and left-value selection.
 /// Revision 43 freezes MAP-key exchange, ordered NULL argument demand and
 /// exact named and anonymous ROW calls.
-pub const PLAN_CONTRACT_REVISION: u32 = 43;
+/// Revision 44 admits CTE multicast packages and binds their ordered physical
+/// edges to the original native exchange identities.
+pub const PLAN_CONTRACT_REVISION: u32 = 44;
 
 #[cfg(test)]
 mod tests;

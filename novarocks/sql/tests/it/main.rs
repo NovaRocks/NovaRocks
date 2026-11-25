@@ -18,6 +18,7 @@ mod call_dependency_loans;
 mod call_sources;
 mod compile_control;
 mod constant_folding;
+mod cte_multicast;
 mod fixtures;
 mod fold_observation;
 mod implementation_availability;

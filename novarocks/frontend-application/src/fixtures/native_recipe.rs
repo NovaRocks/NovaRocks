@@ -599,7 +599,12 @@ impl RecipeRoot {
             leaf_node,
             *version.as_bytes(),
             dop,
-            Some((middle, middle_node, delivery)),
+            Some((
+                novarocks_physical_plan::EdgeId::new(0),
+                middle,
+                middle_node,
+                delivery,
+            )),
             0,
         );
         let middle_artifact = frozen_package(
@@ -607,7 +612,12 @@ impl RecipeRoot {
             middle_node,
             *version.as_bytes(),
             dop,
-            Some((root, root_node, delivery)),
+            Some((
+                novarocks_physical_plan::EdgeId::new(1),
+                root,
+                root_node,
+                delivery,
+            )),
             0,
         );
         let edges = vec![
@@ -734,8 +744,14 @@ impl RecipeRoot {
             edges: self
                 .protocol_edges()
                 .into_iter()
+                .enumerate()
                 .map(
-                    |edge| novarocks_query_application::api::SchedulingEdgeFacts {
+                    |(ordinal, edge)| novarocks_query_application::api::SchedulingEdgeFacts {
+                        edge_id:
+                            novarocks_execution_contract::ExchangeEdgeId::from_physical_ordinal(
+                                u32::try_from(ordinal).expect("fixture edge ordinal"),
+                            )
+                            .expect("fixture exchange edge id"),
                         source_fragment_id: edge.source_fragment_id,
                         target_fragment_id: edge.target_fragment_id,
                         target_exchange_node_id: edge.target_exchange_node_id,

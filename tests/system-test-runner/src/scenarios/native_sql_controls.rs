@@ -187,6 +187,7 @@ enum StatementRefinement {
     RootObservation,
     RemoteWriterSender(usize),
     MarkJoinBuild(usize),
+    TerminalSplitReplay(usize),
 }
 impl SqlIntentOwner {
     pub fn freeze(
@@ -307,6 +308,37 @@ impl SqlIntentOwner {
         )
     }
 
+    /// Hold the actual split input of the selected ACK drop until its exact replay.
+    pub fn freeze_terminal_split_replay(
+        &self,
+        specs: Vec<StatementSpec>,
+        statement_index: usize,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<ClusterTestSessionPlan> {
+        let selected = specs
+            .get(statement_index)
+            .context("terminal split replay statement is absent")?;
+        ensure!(
+            selected
+                .faults
+                .iter()
+                .filter(|(_, kind)| *kind == "task-update-terminal-ack-drop")
+                .count()
+                == 1,
+            "terminal split replay requires one declared terminal TaskUpdate ACK drop"
+        );
+        self.freeze_internal(
+            specs,
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+            Some(StatementRefinement::TerminalSplitReplay(statement_index)),
+        )
+    }
+
     fn freeze_internal(
         &self,
         specs: Vec<StatementSpec>,
@@ -388,6 +420,12 @@ impl SqlIntentOwner {
                 {
                     bind["task_selector"] = json!("left-mark-build");
                     fault["task_selector"] = json!("left-mark-build");
+                }
+                if matches!(refinement, Some(StatementRefinement::TerminalSplitReplay(selected)) if selected == statement_index)
+                    && kind == "task-update-terminal-ack-drop"
+                {
+                    bind["hold_split_consumption_until_replay"] = json!(true);
+                    fault["hold_split_consumption_until_replay"] = json!(true);
                 }
                 add(
                     launches.get_mut(&RoleSlot::Frontend).unwrap(),

@@ -1,5 +1,5 @@
 -- query 11
--- legacy
+-- types	integer	integer	integer
 id	k	rk
 1	10	10
 2	NULL	NULL
@@ -7,7 +7,7 @@ id	k	rk
 NULL	NULL	40
 
 -- query 13
--- legacy
+-- types	integer	integer	integer
 id	k	rk
 1	10	10
 2	NULL	NULL

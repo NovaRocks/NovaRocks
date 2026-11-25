@@ -1689,6 +1689,7 @@ pub struct DataStreamSinkFactory {
     send_group: Arc<ExchangeSenderGroup>,
     edge_gates: Option<Arc<ExchangeEdgeGates>>,
     compiled_partition: Option<CompiledPartitionKeys>,
+    multicast_branch: bool,
     frozen_output: Option<novarocks_local_program::StaticLayout>,
 }
 
@@ -1721,6 +1722,7 @@ impl DataStreamSinkFactory {
             send_group: ExchangeSenderGroup::new(),
             edge_gates: None,
             compiled_partition: None,
+            multicast_branch: false,
             frozen_output: None,
         }
     }
@@ -1730,6 +1732,11 @@ impl DataStreamSinkFactory {
         output: &novarocks_local_program::StaticLayout,
     ) -> Self {
         self.frozen_output = Some(output.clone());
+        self
+    }
+
+    pub(crate) fn for_multicast_branch(mut self) -> Self {
+        self.multicast_branch = true;
         self
     }
 
@@ -1879,6 +1886,8 @@ impl OperatorFactory for DataStreamSinkFactory {
             send_observable,
             construction_factory: None,
             frozen_output: self.frozen_output.clone(),
+            multicast_branch: self.multicast_branch,
+            empty_projection: None,
             recipe: None,
             prepared: false,
             exiting: false,
@@ -1886,6 +1895,8 @@ impl OperatorFactory for DataStreamSinkFactory {
             error_state: None,
             #[cfg(novarocks_dev_controls)]
             writer_diagnostics: None,
+            #[cfg(novarocks_dev_controls)]
+            multicast_enqueue_observer: None,
             finish_state: Arc::clone(&self.finish_state),
             profile_initialized: false,
             profiles: None,
@@ -1912,6 +1923,7 @@ struct PendingPayload {
     be_number: i32,
     payload: ExchangeRetainedPayload,
     payload_bytes: usize,
+    rows: usize,
     eos: bool,
 }
 
@@ -1978,6 +1990,8 @@ struct DataStreamSinkOperator {
     error_state: Option<Arc<RuntimeErrorState>>,
     #[cfg(novarocks_dev_controls)]
     writer_diagnostics: Option<crate::runtime::writer_diagnostics::WriterDiagnostics>,
+    #[cfg(novarocks_dev_controls)]
+    multicast_enqueue_observer: Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>,
     finish_state: Arc<DataStreamSinkFinishState>,
     profile_initialized: bool,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
@@ -1989,6 +2003,8 @@ struct DataStreamSinkOperator {
     construction_factory:
         Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     frozen_output: Option<novarocks_local_program::StaticLayout>,
+    multicast_branch: bool,
+    empty_projection: Option<crate::exec::chunk::ChunkSchemaRef>,
     recipe: Option<Arc<crate::runtime::exchange::online_unit::ExchangeRecipe>>,
     prepared: bool,
     exiting: bool,
@@ -2044,6 +2060,9 @@ impl OperatorLifecycle for DataStreamSinkOperator {
         {
             self.writer_diagnostics =
                 crate::runtime::writer_diagnostics::WriterDiagnostics::from_runtime(state);
+            if self.multicast_branch {
+                self.multicast_enqueue_observer = state.exchange_test_observer();
+            }
         }
         let mut control = RuntimeKernelControl::new(state.error_state());
         control.bind_runtime_memory(state);
@@ -2105,9 +2124,15 @@ impl OperatorLifecycle for DataStreamSinkOperator {
             .as_ref()
             .ok_or_else(|| stream_contract("exchange sender has no frozen output declaration"))?;
         let schema = factory.create_compiled_chunk_schema(output)?;
+        if self.multicast_branch
+            && self.input.output_columns.is_empty()
+            && !schema.slots().is_empty()
+        {
+            self.empty_projection = Some(empty_projection_schema(&schema, factory.as_ref())?);
+        }
         self.recipe = Some(
             crate::runtime::exchange::online_unit::prepare_recipe(
-                &schema,
+                self.empty_projection.as_ref().unwrap_or(&schema),
                 &self.input.output_columns,
                 factory.as_ref(),
             )
@@ -2785,12 +2810,14 @@ impl DataStreamSinkOperator {
                 "encoded exchange backend number differs from its frozen stream metadata",
             ));
         }
-        let gate = self.destination_gate(dest)?;
-        match gate.as_ref().map(|gate| gate.state()) {
-            Some(EdgeSendState::AwaitingPermission) => {
+        let gate = self.destination_gate(dest)?.ok_or_else(|| {
+            stream_contract("exchange publication has no frozen destination gate")
+        })?;
+        match gate.state() {
+            EdgeSendState::AwaitingPermission => {
                 return Ok(PayloadEnqueue::NoCapacity(pending));
             }
-            Some(EdgeSendState::NormallyCanceled) => {
+            EdgeSendState::NormallyCanceled => {
                 if self.input.delivery
                     == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
                 {
@@ -2804,12 +2831,7 @@ impl DataStreamSinkOperator {
                 }
                 return Ok(PayloadEnqueue::Discarded);
             }
-            Some(EdgeSendState::Open) => {}
-            None => {
-                return Err(stream_contract(
-                    "exchange publication has no frozen destination gate",
-                ));
-            }
+            EdgeSendState::Open => {}
         }
         let outcome = if pending.eos && pending.payload_bytes == 0 {
             self.send_group.finish(stream)?
@@ -2824,11 +2846,62 @@ impl DataStreamSinkOperator {
                 if let Some(tracker) = self.retained_payload_mem_tracker.as_ref() {
                     pending.payload.transfer_to(tracker.clone());
                 }
+                if self.multicast_branch
+                    && pending.rows != 0
+                    && let Some(profile) = self.profiles.as_ref()
+                {
+                    profile
+                        .common
+                        .counter_add_unit("RowsPublished", clamp_u128_to_i64(pending.rows as u128));
+                }
+                #[cfg(novarocks_dev_controls)]
+                if pending.rows != 0 {
+                    self.observe_first_multicast_enqueue(stream, &gate, pending.rows);
+                }
                 #[cfg(test)]
                 record_payload_identity_for_test(self.task_key, pending.be_number, pending.eos);
                 Ok(PayloadEnqueue::Enqueued)
             }
         }
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    fn observe_first_multicast_enqueue(
+        &mut self,
+        stream: novarocks_execution_contract::ExchangeStreamIdentity,
+        gate: &EdgeSendGate,
+        rows: usize,
+    ) {
+        let Some(observer) = self
+            .multicast_enqueue_observer
+            .take()
+            .filter(|observer| observer.is_active())
+        else {
+            return;
+        };
+        let source = stream.source();
+        let identity = source.task();
+        let execution = identity.query_execution_id();
+        let task_key = source.task_key();
+        let destination_task_key = stream.destination_task_key();
+        observer.observe(&format!(
+            "{} execution_id={}:{}:{} stage={} task={} backend={} task_key={:x}:{:x} driver_id={} edge_id={} destination_task={} destination_task_key={:x}:{:x} node_id={} rows={rows}",
+            novarocks_failpoint::observation_marker::EXCHANGE_MULTICAST_DRIVER_ENQUEUED,
+            execution.query_id().high(),
+            execution.query_id().low(),
+            execution.attempt_id().get(),
+            identity.stage_id().get(),
+            identity.task_id().get(),
+            identity.backend_process_id(),
+            task_key.high(),
+            task_key.low(),
+            self.driver_id,
+            gate.edge_id().get(),
+            stream.destination(),
+            destination_task_key.high(),
+            destination_task_key.low(),
+            stream.destination_node().get(),
+        ));
     }
 
     fn transmit_partition(
@@ -2861,7 +2934,9 @@ impl DataStreamSinkOperator {
             .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
         let projection_owner;
         let projected_storage;
-        let chunks = if self.input.output_columns.is_empty() || chunks.is_empty() {
+        let chunks = if chunks.is_empty()
+            || (self.input.output_columns.is_empty() && self.empty_projection.is_none())
+        {
             projection_owner = None;
             chunks
         } else {
@@ -2870,11 +2945,15 @@ impl DataStreamSinkOperator {
             owner.request(std::alloc::Layout::array::<Chunk>(chunks.len()).map_err(|_| crate::exec::pipeline::operator::ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
             let mut projected = Vec::with_capacity(chunks.len());
             for chunk in chunks {
-                projected.push(project_chunk_by_slot_ids_with_creation(
-                    chunk,
-                    &self.input.output_columns,
-                    factory.as_ref(),
-                )?);
+                let projected_chunk = match &self.empty_projection {
+                    Some(schema) => project_empty_chunk(chunk.len(), schema, factory.as_ref())?,
+                    None => project_chunk_by_slot_ids_with_creation(
+                        chunk,
+                        &self.input.output_columns,
+                        factory.as_ref(),
+                    )?,
+                };
+                projected.push(projected_chunk);
             }
             projection_owner = Some(owner);
             projected_storage = projected;
@@ -2949,6 +3028,7 @@ impl DataStreamSinkOperator {
             be_number,
             payload: ExchangeRetainedPayload::new(payload, accounting),
             payload_bytes,
+            rows: row_count,
             eos,
         };
 
@@ -3513,6 +3593,15 @@ impl SinkKernel for DataStreamSinkOperator {
             })
         {
             self.cancel();
+            if self.multicast_branch
+                && let Some(profile) = self.profiles.as_ref()
+                && !self
+                    .finish_state
+                    .withdrawal_recorded
+                    .swap(true, Ordering::AcqRel)
+            {
+                profile.common.counter_add_unit("BranchWithdrawn", 1);
+            }
             return Ok(ControlStep::Withdrawn);
         }
         Ok(ControlStep::Active)
@@ -3597,6 +3686,7 @@ impl SinkKernel for DataStreamSinkOperator {
 struct DataStreamSinkFinishState {
     remaining_drivers: AtomicUsize,
     force_eos_sent: AtomicBool,
+    withdrawal_recorded: AtomicBool,
 }
 
 impl Default for DataStreamSinkFinishState {
@@ -3604,6 +3694,7 @@ impl Default for DataStreamSinkFinishState {
         Self {
             remaining_drivers: AtomicUsize::new(0),
             force_eos_sent: AtomicBool::new(false),
+            withdrawal_recorded: AtomicBool::new(false),
         }
     }
 }
@@ -3680,6 +3771,47 @@ fn split_oversized_chunks_core<E>(
         }
     }
     Ok(out)
+}
+
+fn empty_projection_schema(
+    source: &crate::exec::chunk::ChunkSchemaRef,
+    factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+) -> ExecutionResult<crate::exec::chunk::ChunkSchemaRef> {
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use novarocks_type_contract::owned_resources::layout::arc_layout;
+
+    let owner = factory.begin_typed_construction(source)?;
+    let schema = ChunkSchema::try_new_typed_observed::<ConstructionFailure>(
+        Vec::new(),
+        owner.storage_lifetime(),
+        |layout| owner.request(layout),
+        |units| factory.observe_input_work(units),
+    )?;
+    owner.request(
+        arc_layout(std::alloc::Layout::new::<ChunkSchema>()).map_err(ConstructionFailure::from)?,
+    )?;
+    Ok(Arc::new(schema))
+}
+
+fn project_empty_chunk(
+    rows: usize,
+    schema: &crate::exec::chunk::ChunkSchemaRef,
+    factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+) -> ExecutionResult<Chunk> {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+
+    let owner = factory.begin_typed_construction(schema)?;
+    Ok(Chunk::try_new_typed_with_columns_owned_observed::<
+        ConstructionFailure,
+        _,
+    >(
+        schema.clone(),
+        Vec::new(),
+        rows,
+        owner.storage_lifetime(),
+        |step| owner.observe(0, &[], step),
+    )?)
 }
 
 fn project_chunk_by_slot_ids_with_creation(

@@ -96,6 +96,18 @@ fn bind_sink_edges(
                 "static sink target fragment {fragment_id} node {node_id} does not identify exactly one task edge"
             )));
         };
+        let physical_id = target.edge().get();
+        let expected = ExchangeEdgeId::from_physical_ordinal(physical_id).ok_or_else(|| {
+            TaskExecutionError::Schedule(format!(
+                "physical edge {physical_id} does not fit the native exchange edge space"
+            ))
+        })?;
+        if edge.edge_id() != expected {
+            return Err(TaskExecutionError::Schedule(format!(
+                "static sink physical edge {physical_id} expects native edge {expected}, found {}",
+                edge.edge_id()
+            )));
+        }
         if target.delivery() != edge.delivery() {
             return Err(TaskExecutionError::Schedule(
                 "static sink delivery differs from its frozen task edge".to_owned(),
@@ -425,7 +437,7 @@ impl TaskGraph {
 fn task_topology_views(
     tasks: &BTreeMap<TaskId, TaskNode>,
     edges: &BTreeMap<ExchangeEdgeId, EdgeNode>,
-) -> BTreeMap<TaskId, TaskTopologyView> {
+) -> Result<BTreeMap<TaskId, TaskTopologyView>, TaskExecutionError> {
     let task_of_identity = tasks
         .iter()
         .map(|(&task_id, node)| (node.identity, task_id))
@@ -451,13 +463,10 @@ fn task_topology_views(
     tasks
         .keys()
         .map(|&task_id| {
-            (
-                task_id,
-                TaskTopologyView::new(
-                    outbound.remove(&task_id).unwrap_or_default(),
-                    inbound.remove(&task_id).unwrap_or_default(),
-                ),
-            )
+            let outbound = outbound.remove(&task_id).unwrap_or_default();
+            let inbound = inbound.remove(&task_id).unwrap_or_default();
+            TaskTopologyView::check_native_cardinality(outbound.len(), inbound.len())?;
+            Ok((task_id, TaskTopologyView::new(outbound, inbound)))
         })
         .collect()
 }
@@ -713,7 +722,7 @@ pub(crate) fn build_task_graph_from_manifest(
             )));
         }
     }
-    let views = task_topology_views(&tasks, &edges);
+    let views = task_topology_views(&tasks, &edges)?;
     let mut stage_of_fragment = BTreeMap::new();
     for (&stage_id, &fragment_id) in &stage_fragments {
         if stage_of_fragment.insert(fragment_id, stage_id).is_some() {

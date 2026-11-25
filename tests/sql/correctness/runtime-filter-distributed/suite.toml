@@ -33,6 +33,7 @@ paths = [
     "novarocks/local-compiler/src/runtime_filter/**",
     "novarocks/local-program/src/runtime_filter.rs",
     "novarocks/execution/src/exec/pipeline/builder/runtime_filter.rs",
+    "novarocks/frontend-application/src/runtime_filter/**",
 ]
 
 [reuse]

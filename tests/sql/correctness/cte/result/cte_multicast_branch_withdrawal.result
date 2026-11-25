@@ -1,0 +1,4 @@
+-- query 1
+-- types	bigint	bigint
+drained_count	limited_count
+32768	1

@@ -214,6 +214,9 @@ impl ChunkMemoryCharge {
                     .state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
+                if state.retained_at_original_owner {
+                    return Ok(None);
+                }
                 if bytes > state.bytes {
                     return Err(ExecutionFailure::from_domain(
                         ChunkChargeFailure::NativeSplit {
@@ -366,6 +369,7 @@ pub(super) struct ChunkAccounting {
 struct ChunkAccountingState {
     bytes: i64,
     tracker: Arc<MemTracker>,
+    retained_at_original_owner: bool,
 }
 
 impl ChunkAccounting {
@@ -379,13 +383,29 @@ impl ChunkAccounting {
             state: Mutex::new(ChunkAccountingState {
                 bytes,
                 tracker: Arc::clone(tracker),
+                retained_at_original_owner: false,
             }),
         }
     }
 
+    /// A fork keeps the original backing invoice until its final alias exits.
+    pub(super) fn retain_at_original_owner(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retained_at_original_owner = true;
+    }
+
+    pub(super) fn retained_at_original_owner(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retained_at_original_owner
+    }
+
     pub(super) fn transfer_to(&self, tracker: &Arc<MemTracker>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if Arc::ptr_eq(&state.tracker, tracker) {
+        if state.retained_at_original_owner || Arc::ptr_eq(&state.tracker, tracker) {
             return;
         }
         state.tracker.release(state.bytes);
@@ -398,7 +418,7 @@ impl ChunkAccounting {
         tracker: &Arc<MemTracker>,
     ) -> Result<(), crate::runtime::mem_tracker::MemTrackerLimitExceeded> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if Arc::ptr_eq(&state.tracker, tracker) {
+        if state.retained_at_original_owner || Arc::ptr_eq(&state.tracker, tracker) {
             return Ok(());
         }
         MemTracker::try_transfer_charge_typed(&state.tracker, tracker, state.bytes)?;

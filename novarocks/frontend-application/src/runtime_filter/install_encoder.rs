@@ -1,5 +1,7 @@
 //! Frontend-owned runtime-filter lifecycle contribution encoder.
 
+pub(crate) use crate::query_execution::attempt_runtime_filter_facts::FrontendRuntimeFilterFeedbackWaitEligibility;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
@@ -112,12 +114,6 @@ pub(crate) struct FrontendRuntimeFilterFeedbackScanBinding {
     pub(crate) plan_node_id: i32,
     pub(crate) binding_id: u32,
     pub(crate) data_type: DataType,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum FrontendRuntimeFilterFeedbackWaitEligibility {
-    Eligible,
-    IneligibleCycle { witness: Vec<u32> },
 }
 
 #[allow(
