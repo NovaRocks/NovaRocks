@@ -18,7 +18,7 @@
 //! A relational multicast shares its root input across independent stream sinks.
 //! Partitioning, projection and sender completion remain owned by each child.
 
-// Design: ADR-0264 (docs/adr/ADR-0264-cte-multicast-freezes-exact-branches.md)
+// Design: ADR-0269 (docs/adr/ADR-0269-cte-multicast-freezes-exact-branches.md)
 
 use crate::{
     exec::{

@@ -89,7 +89,7 @@ code-anchors:
 
 领域哲学：runtime filter 是保守预过滤，activation、等待和降级只影响性能，join 本体负责结果语义。SQL 和完成计划复核共用结构等待图。FE 封存可选 split feedback 等待前沿同一图检验候选，部署层独立核对绑定、发布者和载荷资格。运行时沿原期限等候或继续。
 
-- [ADR-0264](ADR-0264-cte-multicast-freezes-exact-branches.md) — 静态 activation 与可选 split feedback 等待为何共用准确的算子等待图，部署为何按原绑定、发布者和期限行事（active）
+- [ADR-0269](ADR-0269-cte-multicast-freezes-exact-branches.md) — 静态 activation 与可选 split feedback 等待为何共用准确的算子等待图，部署为何按原绑定、发布者和期限行事（active）
 - ADR-0001 — runtime filter 等待环为何静态 strict-fail，而不是靠运行时 timeout 兜底（active）
 - ADR-0002 — multicast 反压为何保持消费者耦合（active）
 - ADR-0003 — RF consumer 为何默认 BlockingSnapshot、NonBlockingLive 只做定点降级（active）
@@ -129,7 +129,7 @@ code-anchors:
 
 ### pipeline-execution
 
-- [ADR-0264](ADR-0264-cte-multicast-freezes-exact-branches.md) — 共享 CTE 为何逐分支绑定既有 stream sink，撤回、End、实际退出与共享 backing 如何分工（active）
+- [ADR-0269](ADR-0269-cte-multicast-freezes-exact-branches.md) — 共享 CTE 为何逐分支绑定既有 stream sink，撤回、End、实际退出与共享 backing 如何分工（active）
 - [ADR-0248](ADR-0248-parquet-reader-sizing-and-scan-output-policy.md) — Parquet 读取规模和扫描输出为何各有作者，完整前缀、来源持有和合作调度如何交接（active，替代 ADR-0014 的批预算与会话属性 ADR-0222 的读设置传递阶段安排）
 - [ADR-0252](ADR-0252-trino-casts-and-row-error-scopes.md) — Trino 转换语境、完整类型与选中行错误作用域如何在编译、折叠和执行中保持一致（active）
 - [ADR-0245](ADR-0245-scalar-typing-finalizes-the-original-overload.md) — 表达式层为何在转换后以原重载定稿，语句准入、实际端口和两套入口如何交接（active）
@@ -337,7 +337,7 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
-- [ADR-0264](ADR-0264-cte-multicast-freezes-exact-branches.md) — 共享 CTE 的相邻 exchange 如何融合，物理边和 Task 运行边为何沿同一受检投影绑定（active）
+- [ADR-0269](ADR-0269-cte-multicast-freezes-exact-branches.md) — 共享 CTE 的相邻 exchange 如何融合，物理边和 Task 运行边为何沿同一受检投影绑定（active）
 - [ADR-0263](ADR-0263-trino-scalar-values-and-publication-eligibility.md) — Trino 标量定型、UUID 呈现与受影响 MV 的发布资格（active）
 - [ADR-0256](ADR-0256-temporal-calls-freeze-overloads-and-selected-row-effects.md) — 时态调用如何冻结重载、环境和选中行错误，并以实际发布验值完成 MV 切换（active）
 
