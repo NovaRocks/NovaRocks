@@ -356,12 +356,15 @@ fn value_namespace_all_nine_origins_have_independent_wire_and_typed_source_oracl
 #[test]
 fn value_namespace_exact_type_and_source_binding_refuse_foreign_or_missing_facts() {
     let control = Control::default();
-    let base = nested();
+    let binary_struct = |child_nullable| {
+        ty(DataType::Struct(
+            vec![Field::new("child", DataType::LargeBinary, child_nullable)].into(),
+        ))
+    };
+    let base = binary_struct(false);
     let mut other_nullable = base.clone();
     other_nullable = other_nullable.with_nullable(false).unwrap();
-    let different_child_nullability = ty(DataType::Struct(
-        vec![Arc::new(Field::new("child", DataType::Utf8, true))].into(),
-    ));
+    let different_child_nullability = binary_struct(true);
     let json = FunctionValueType::try_with_logical_type(
         DataType::LargeBinary,
         true,
@@ -391,7 +394,7 @@ fn value_namespace_exact_type_and_source_binding_refuse_foreign_or_missing_facts
         (0, base.clone()),
         (1, other_nullable),
         (2, different_child_nullability),
-        (3, ty(DataType::Utf8)),
+        (3, ty(DataType::LargeBinary)),
         (4, json.clone()),
         (5, nested_json),
     ];
@@ -429,7 +432,7 @@ fn value_namespace_exact_type_and_source_binding_refuse_foreign_or_missing_facts
         )
         .is_err()
     );
-    let original = def(1, ty(DataType::Utf8), provider());
+    let original = def(1, ty(DataType::LargeBinary), provider());
     let foreign = original.clone();
     let raw_payloads = [(0, payload(&foreign))];
     let foreign_namespace =

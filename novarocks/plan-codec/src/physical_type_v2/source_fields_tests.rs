@@ -324,7 +324,7 @@ fn associated_value() -> FunctionValueType {
     )
     .unwrap();
     let layout = ValueLayout::try_new(
-        &DataType::Struct(vec![Arc::new(Field::new("payload", DataType::Utf8, false))].into()),
+        &DataType::Struct(vec![Field::new("payload", DataType::LargeBinary, false)].into()),
         storage,
     )
     .unwrap();
@@ -444,9 +444,7 @@ fn execution_field_association_refuses_dangling_child_nullability_and_attributes
         (
             Field::new(
                 "output",
-                DataType::Struct(
-                    vec![Arc::new(Field::new("payload", DataType::Utf8, true))].into(),
-                ),
+                DataType::Struct(vec![Field::new("payload", DataType::LargeBinary, true)].into()),
                 true,
             ),
             Some(0),
