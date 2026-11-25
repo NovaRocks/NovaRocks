@@ -8,6 +8,7 @@ superseded-by: null
 date: 2026-11-24
 provenance:
   - "discussion: 2026-11-24 compiled CTE multicast, exact edge binding and shared waits"
+  - "PR #1366: https://github.com/NovaRocks/NovaRocks/pull/1366"
 code-anchors:
   - "novarocks/sql/src/planner/distributed/build/contract_lowering.rs (lower_fused_cte_consume, lower_comparison_set_exchange)"
   - "novarocks/physical-plan/src/wait_graph.rs (WaitGraph::try_add_split_feedback_waits_observed)"
