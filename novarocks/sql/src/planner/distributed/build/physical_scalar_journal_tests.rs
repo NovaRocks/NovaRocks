@@ -27,10 +27,7 @@ use crate::{
         },
     },
 };
-use arrow::{
-    array::{Array, StringArray},
-    datatypes::DataType,
-};
+use arrow::{array::Array, datatypes::DataType};
 use novarocks_constant_contract::ConstantPool;
 use novarocks_physical_plan::{ConstantReference, Fragment};
 use novarocks_type_contract::{DecimalOverflowPolicy, PureCompileControl, ValueLogicalType};
@@ -271,7 +268,7 @@ fn scalar_journal_conversion_retains_original_none_and_true_intermediate_constra
         ValueLogicalType::LargeInt,
     )
     .unwrap();
-    let field = Arc::new(json.try_to_field("largeint_original").unwrap());
+    let field = Arc::new(largeint.try_to_field("largeint_original").unwrap());
     let pool = ConstantPool::try_new(
         field.clone(),
         largeint.clone(),
