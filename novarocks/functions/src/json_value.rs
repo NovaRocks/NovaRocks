@@ -26,6 +26,7 @@ mod render;
 
 pub use build::{Input, encode, parse};
 pub use codec::{Container, Entries, Entry, Kind, Lookup, Node, Number, Scalar};
+pub use novarocks_json_value_format::VERSION;
 pub(crate) use number::{FixedText, write_scalar_text};
 pub use number::{java_double_decimal, write_scalar_cast};
 pub use render::{TextCursor, TextEvent, format};
@@ -33,7 +34,6 @@ pub use render::{TextCursor, TextEvent, format};
 use crate::KernelFailure;
 use std::fmt;
 
-pub const VERSION: u8 = 1;
 pub const MAX_DEPTH: usize = 1024;
 
 /// Errors at the native value boundary. External text syntax errors and
@@ -47,6 +47,18 @@ pub enum JsonValueError {
     Scalar,
     Directory,
     Depth,
+}
+
+impl From<novarocks_json_value_format::FrameError> for JsonValueError {
+    fn from(error: novarocks_json_value_format::FrameError) -> Self {
+        use novarocks_json_value_format::FrameError;
+        match error {
+            FrameError::Version => Self::Version,
+            FrameError::Extent => Self::Extent,
+            FrameError::Tag => Self::Tag,
+            FrameError::Scalar => Self::Scalar,
+        }
+    }
 }
 
 impl fmt::Display for JsonValueError {

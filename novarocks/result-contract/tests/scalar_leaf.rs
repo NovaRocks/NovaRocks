@@ -402,6 +402,11 @@ fn native_json_scalar_frame_preserves_its_marker_and_exact_record_limit() {
         (12, json_null.as_slice()),
         (18, b"null".as_slice()),
         (18, &[1]),
+        (18, &[1, 0x42]),
+        (18, &[1, 0x80, 2, 0]),
+        (18, &[1, 0x20, 0x20]),
+        (18, &[1, 0xff]),
+        (18, &[1, 0x44, 0x80, 0]),
     ] {
         assert_eq!(
             V::decode(&schema, &golden([tag, 0, 0, 0, 0, 0, 0, 0], bytes)),

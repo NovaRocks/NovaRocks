@@ -15,18 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{JsonValueError as Error, MAX_DEPTH, ObservedError, VERSION};
+use super::{JsonValueError as Error, MAX_DEPTH, ObservedError};
+use novarocks_json_value_format::{
+    ARRAY, INDEX_ARRAY, INDEX_OBJECT, NULL, OBJECT, SCALAR, container_is_object as container_kind,
+    exact_item, read_length, root_item, split_item,
+};
 use novarocks_type_contract::{
     PICOS_PER_SECOND, TemporalMicros, TemporalPrecision, TemporalType, TemporalValue, TimeZoneKey,
 };
 
-const NULL: u8 = 1 << 5;
-const SCALAR: u8 = 2 << 5;
 pub(super) const STRING_TAG: u8 = SCALAR | (2 << 1);
-const ARRAY: u8 = 3 << 5;
-const OBJECT: u8 = 4 << 5;
-const INDEX_ARRAY: u8 = 5 << 5;
-const INDEX_OBJECT: u8 = 6 << 5;
 const INDEX_THRESHOLD: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
@@ -75,77 +73,16 @@ pub struct Node<'a>(&'a [u8]);
 
 impl<'a> Node<'a> {
     pub fn from_root(bytes: &'a [u8]) -> Result<Self, Error> {
-        let (version, bytes) = bytes.split_first().ok_or(Error::Version)?;
-        if *version != VERSION {
-            return Err(Error::Version);
-        }
-        Self::exact(bytes)
+        Ok(Self(root_item(bytes)?))
     }
 
     pub(super) fn exact(bytes: &'a [u8]) -> Result<Self, Error> {
-        let (node, rest) = Self::split(bytes)?;
-        if rest.is_empty() {
-            Ok(node)
-        } else {
-            Err(Error::Extent)
-        }
+        Ok(Self(exact_item(bytes)?))
     }
 
     fn split(bytes: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
-        let (tag, body) = bytes.split_first().ok_or(Error::Extent)?;
-        let mut payload = Reader(body);
-        match *tag {
-            NULL => {}
-            tag if tag & 0xe1 == SCALAR => match (tag >> 1) & 15 {
-                1 | 3 => {
-                    payload.take(1)?;
-                }
-                2 => {
-                    payload.blob()?;
-                }
-                4 => {
-                    payload.take(2)?;
-                }
-                5 | 7 | 11 => {
-                    payload.take(4)?;
-                }
-                6 | 8 => {
-                    payload.take(8)?;
-                }
-                9 => {
-                    payload.take(2)?;
-                    payload.blob()?;
-                }
-                10 => match payload.byte()? {
-                    0 => {
-                        payload.take(4)?;
-                        payload.blob()?;
-                    }
-                    1..=3 => {}
-                    _ => return Err(Error::Scalar),
-                },
-                12 => {
-                    payload.take(9)?;
-                }
-                13 => {
-                    payload.take(13)?;
-                }
-                14 => {
-                    payload.take(17)?;
-                }
-                15 => {
-                    payload.take(17)?;
-                    payload.blob()?;
-                }
-                _ => return Err(Error::Tag),
-            },
-            tag if container_kind(tag).is_some() => {
-                payload.blob()?;
-            }
-            _ => return Err(Error::Tag),
-        }
-        let size = bytes.len() - payload.0.len();
-        Ok((Self(&bytes[..size]), payload.0))
+        let (item, rest) = split_item(bytes)?;
+        Ok((Self(item), rest))
     }
 
     pub(super) fn string_bytes(self) -> Result<Option<&'a [u8]>, Error> {
@@ -289,16 +226,6 @@ impl<'a> Node<'a> {
                 depth -= 1;
             }
         }
-    }
-}
-
-fn container_kind(tag: u8) -> Option<bool> {
-    match tag {
-        ARRAY => Some(false),
-        OBJECT => Some(true),
-        tag if tag & 0xe7 == INDEX_ARRAY => Some(false),
-        tag if tag & 0xe1 == INDEX_OBJECT => Some(true),
-        _ => None,
     }
 }
 
@@ -694,21 +621,7 @@ impl<'a> Reader<'a> {
     }
 
     fn len(&mut self) -> Result<usize, Error> {
-        let mut value = 0_u64;
-        for shift in (0..64).step_by(7) {
-            let byte = self.byte()?;
-            if shift == 63 && byte > 1 {
-                return Err(Error::Extent);
-            }
-            value |= u64::from(byte & 127) << shift;
-            if byte < 128 {
-                if shift != 0 && byte == 0 {
-                    return Err(Error::Extent);
-                }
-                return usize::try_from(value).map_err(|_| Error::Extent);
-            }
-        }
-        Err(Error::Extent)
+        Ok(read_length(&mut self.0)?)
     }
 
     pub(super) fn blob(&mut self) -> Result<&'a [u8], Error> {

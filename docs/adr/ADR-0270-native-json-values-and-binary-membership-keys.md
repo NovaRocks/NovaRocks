@@ -46,8 +46,8 @@ SQL NULL 和 JSON null 各自有原值。在 Trino HTTP 的 JSON 列中，JSON n
    查找重复键时按原 ordinal 返回。长度和数目用最短 ULEB128，精确数字的有符号系数用最短小端二补码。
    已冻结常量保留可见类型、浮点位、标度、时区和成员顺序作为原值事实。
 2. **按边界校验。** Package 解码在常量恢复之后、绑定请求之前完整验证每个可达 JSON 值，跳过父 NULL 和无关载体。
-   同兼容岛的 Exchange 使用精确 Arrow 布局及可达根范围。InternalScalar 保留版本化 JSON bytes，
-   记录作者检查帧与类型，Native 标量作者校验 JSON 根范围。访问器每次解读实际触及的项和范围。
+   同兼容岛的 Exchange 使用精确 Arrow 布局及可达根范围。InternalScalar 保留版本化 JSON bytes，记录接收端检查帧与类型。
+   记录接收端与 Functions 共用 `json-value-format` 中无分配的版本和根范围检查。Functions 负责值语义、完整验证和受检借读。
    计划修订 45、结果 descriptor 标签和密封函数目录共同区分本次原生切换，继续使用执行 epoch 18。
 3. **共用扫描与呈现。** JSON 字面量、`json_parse`、构造和选中行转换共用值合同。文本经相同扫描作者测量并直接写最终区域。
    容器支持 1,024 层，独立于 SQL 类型深度。结果页、`json_format` 与 `JSON_SERIALIZE` 共用文档写出，

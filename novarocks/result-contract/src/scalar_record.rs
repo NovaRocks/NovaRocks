@@ -535,6 +535,41 @@ mod tests {
     }
 
     #[test]
+    fn nested_json_record_requires_an_exact_root_item() {
+        let element = field(ScalarValueType::Json, false);
+        let schema = ScalarSchema::try_new(field(
+            ScalarValueType::List(Box::new(element.clone())),
+            false,
+        ))
+        .unwrap();
+        for (bytes, valid) in [
+            (b"\x01\x20".as_slice(), true),
+            (b"null".as_slice(), false),
+            (b"\x01\x42".as_slice(), false),
+            (b"\x01\x80\x02\x00".as_slice(), false),
+            (b"\x01\x20\x20".as_slice(), false),
+            (b"\x01\xff".as_slice(), false),
+        ] {
+            let mut record = buffer();
+            let mut writer = ScalarRecordWriter::new(&schema, &mut record).unwrap();
+            writer.count(1).unwrap();
+            writer.presence(&element, false).unwrap();
+            // Supply the wire bytes directly so the leaf writer does not validate them.
+            writer.count(bytes.len()).unwrap();
+            writer.append(bytes).unwrap();
+            writer.finish(&schema).unwrap();
+            let expected = if valid {
+                Ok(ScalarRecord::Value(ScalarValue::List(vec![
+                    ScalarValue::Json(bytes.to_vec()),
+                ])))
+            } else {
+                Err(ScalarLeafError::MalformedRecord)
+            };
+            assert_eq!(ScalarRecord::decode_owned(&schema, &record), expected);
+        }
+    }
+
+    #[test]
     fn list_record_round_trips_with_null_elements() {
         let schema = list_of_strings();
         let ScalarValueType::List(element) = &schema.field().value_type else {

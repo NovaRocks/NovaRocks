@@ -526,14 +526,10 @@ impl<'a> ScalarLeafCursor<'a> {
     }
 }
 
-/// Check the representation marker within the admitted frame. Native JSON
-/// item geometry belongs to the value owner and is checked before accessing
-/// the document, through the shared native JSON reader.
+/// Check the version and exact root-item extent within the admitted frame.
 pub(crate) fn native_json_payload(bytes: &[u8]) -> Result<&[u8], ScalarLeafError> {
-    match bytes {
-        [0x01, _, ..] => Ok(bytes),
-        _ => Err(ScalarLeafError::MalformedRecord),
-    }
+    novarocks_json_value_format::root_item(bytes).map_err(|_| ScalarLeafError::MalformedRecord)?;
+    Ok(bytes)
 }
 fn timestamp_unit(unit: ScalarTimestampUnit) -> u8 {
     match unit {

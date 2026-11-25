@@ -3685,6 +3685,7 @@ dependencies = [
  "novarocks-constant-contract",
  "novarocks-failure-contract",
  "novarocks-function-contract",
+ "novarocks-json-value-format",
  "novarocks-type-contract",
  "novarocks-value-arrays",
  "num-traits",
@@ -3698,6 +3699,10 @@ dependencies = [
  "sha2 0.10.9",
  "xxhash-rust",
 ]
+
+[[package]]
+name = "novarocks-json-value-format"
+version = "0.1.0"
 
 [[package]]
 name = "novarocks-local-compiler"
@@ -4023,6 +4028,7 @@ name = "novarocks-result-contract"
 version = "0.1.0"
 dependencies = [
  "novarocks-failure-contract",
+ "novarocks-json-value-format",
 ]
 
 [[package]]
