@@ -22,7 +22,7 @@ use crate::creation::{ProgramCreation, ProgramCreationFailure};
 use crate::{CompiledParts, StaticExprKind};
 use novarocks_functions::{
     ComparisonOperator, ComparisonPrepareError, FunctionArgumentType, FunctionValueType,
-    PreparedComparisonRecipe,
+    PreparedComparisonRecipe, PreparedCompositeComparisonRecipe,
 };
 use novarocks_type_contract::ExpressionUseId;
 use novarocks_type_contract::{
@@ -41,6 +41,12 @@ pub enum ComparisonSite {
         occurrence: ExpressionUseId,
         arm: u32,
     },
+}
+
+#[derive(Debug)]
+pub(crate) enum PreparedNodeComparison {
+    Ordinary(PreparedComparisonRecipe),
+    Composite(PreparedCompositeComparisonRecipe),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,7 +202,7 @@ pub(crate) fn compile_comparisons_with_factory<H, F: ValueSchemaCreationFactory<
     factory: Option<&F>,
     control: &dyn PureCompileControl,
 ) -> Result<
-    CreatedPrimitiveMap<ComparisonSite, PreparedComparisonRecipe>,
+    CreatedPrimitiveMap<ComparisonSite, PreparedNodeComparison>,
     ProgramCreationFailure<ProgramPrimitiveError, H>,
 > {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
@@ -233,7 +239,7 @@ fn compile_core<H>(
     retained: &mut ProgramCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<
-    BTreeMap<ComparisonSite, PreparedComparisonRecipe>,
+    BTreeMap<ComparisonSite, PreparedNodeComparison>,
     ProgramCreationFailure<ProgramPrimitiveError, H>,
 > {
     let mut recipes = BTreeMap::new();
@@ -304,12 +310,12 @@ fn compile_core<H>(
                     before_recipe_insert(&recipes, retained, work)?;
                     recipes.insert(
                         ComparisonSite::BetweenLower(occurrence),
-                        recipe.lower().clone(),
+                        PreparedNodeComparison::Ordinary(recipe.lower().clone()),
                     );
                     before_recipe_insert(&recipes, retained, work)?;
                     recipes.insert(
                         ComparisonSite::BetweenUpper(occurrence),
-                        recipe.upper().clone(),
+                        PreparedNodeComparison::Ordinary(recipe.upper().clone()),
                     );
                     work.step()?;
                 }
@@ -340,7 +346,10 @@ fn compile_core<H>(
                         .into());
                     }
                     before_recipe_insert(&recipes, retained, work)?;
-                    recipes.insert(ComparisonSite::Binary(occurrence), recipe);
+                    recipes.insert(
+                        ComparisonSite::Binary(occurrence),
+                        PreparedNodeComparison::Ordinary(recipe),
+                    );
                     work.step()?;
                 }
                 StaticExprKind::Case {
@@ -388,11 +397,27 @@ fn compile_core<H>(
                         let left = value(children[0])?;
                         let right = value(children[1 + arm as usize * 2])?;
                         let recipe = if *ieee_float_equality {
-                            PreparedComparisonRecipe::try_new_ieee_float_equality(
-                                left, right, control,
-                            )?
+                            PreparedNodeComparison::Ordinary(
+                                PreparedComparisonRecipe::try_new_ieee_float_equality(
+                                    left, right, control,
+                                )?,
+                            )
+                        } else if PreparedCompositeComparisonRecipe::is_composite(left) {
+                            PreparedNodeComparison::Composite(
+                                PreparedCompositeComparisonRecipe::try_new(
+                                    novarocks_type_contract::KeyRelation::Equal,
+                                    left,
+                                    right,
+                                    control,
+                                )?,
+                            )
                         } else {
-                            prepare_comparison_node(ComparisonOperator::Eq, left, right, control)?
+                            PreparedNodeComparison::Ordinary(prepare_comparison_node(
+                                ComparisonOperator::Eq,
+                                left,
+                                right,
+                                control,
+                            )?)
                         };
                         before_recipe_insert(&recipes, retained, work)?;
                         recipes.insert(ComparisonSite::CaseWhen { occurrence, arm }, recipe);

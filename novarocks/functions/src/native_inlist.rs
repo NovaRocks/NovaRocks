@@ -19,14 +19,15 @@
 use crate::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
 use crate::selected_copy::{CopyError, fixed_interleave_extent};
 use crate::{
-    AggregateStateAllocator, ComparisonOperator, EvaluatedArgument, KernelControlObservation,
-    KernelEvaluationControl, KernelFailure, PreparedComparisonRecipe,
+    AggregateStateAllocator, ComparisonAllocator, ComparisonOperator, CompositeComparisonResult,
+    EvaluatedArgument, KernelControlObservation, KernelEvaluationControl, KernelFailure,
+    PreparedComparisonRecipe, PreparedCompositeComparisonRecipe, RowDataError,
     UnaccountedAggregateStateAllocator,
 };
 use arrow_array::builder::BooleanBuilder;
 use arrow_array::{Array, ArrayRef, BooleanArray, StringArray};
 use arrow_schema::DataType;
-use novarocks_type_contract::arrow_data_types_exact_observed;
+use novarocks_type_contract::{ExpressionEffects, KeyRelation, arrow_data_types_exact_observed};
 use std::{convert::Infallible, sync::Arc};
 #[derive(Clone, Copy, Debug)]
 pub enum InObservation {
@@ -287,16 +288,25 @@ fn row_index(row: usize, len: usize) -> usize {
     if len == 1 { 0 } else { row }
 }
 
-/// Comparison buffers are destroyed before their original reservation is returned.
-/// Access borrows the values without publishing an independently owned Arrow array.
+/// Comparison buffers are destroyed before their original reservations are returned.
+/// Access borrows values and errors within the same compact candidate domain.
 pub struct MembershipEqualities {
     array: BooleanArray,
+    errors: Vec<RowDataError>,
     _reservation: Option<OpaqueReservation>,
+    _errors_reservation: Option<OpaqueReservation>,
 }
 impl MembershipEqualities {
     pub fn iter(&self) -> impl Iterator<Item = Option<bool>> + '_ {
         self.array.iter()
     }
+
+    /// Journaled errors use compact candidate ordinals. A row with an error
+    /// has a NULL placeholder in the equality array.
+    pub fn errors(&self) -> &[RowDataError] {
+        &self.errors
+    }
+
     pub fn apply_to_selected_observed<E>(
         &self,
         state: &mut InRows,
@@ -333,7 +343,24 @@ fn append_equalities_observed<E>(
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MembershipEquality {
     Comparison(PreparedComparisonRecipe),
+    Composite(PreparedCompositeComparisonRecipe),
     Json,
+}
+
+impl MembershipEquality {
+    fn effects(&self) -> ExpressionEffects {
+        let mut effects = ExpressionEffects::PURE_VALUE;
+        match self {
+            Self::Comparison(_) => {}
+            Self::Composite(recipe) => effects.may_raise_row_error = recipe.may_raise_row_error(),
+            Self::Json => {
+                // Malformed logical JSON is the original atomic invocation Data failure.
+                effects.may_raise_row_error = true;
+                effects.may_raise_invocation_data = true;
+            }
+        }
+        effects
+    }
 }
 
 /// Common exact typed domain and membership equality for an IN expression.
@@ -437,7 +464,7 @@ impl PreparedNativeInListRecipe {
             None,
             control,
         )
-        .map(|recipe| recipe.expect("recipe publication requested"))
+        .map(|(recipe, _)| recipe.expect("recipe publication requested"))
         .map_err(inlist_pure_failure)
     }
     pub fn try_new_with_creator_in<H>(
@@ -456,7 +483,7 @@ impl PreparedNativeInListRecipe {
             Some(creation),
             control,
         )
-        .map(|recipe| recipe.expect("recipe publication requested"))
+        .map(|(recipe, _)| recipe.expect("recipe publication requested"))
     }
 
     /// Validate a static complete profile before any invocation exists.
@@ -488,7 +515,7 @@ impl PreparedNativeInListRecipe {
         Self::try_new_core::<false, std::convert::Infallible, _>(
             false, source, candidates, result, None, control,
         )
-        .map(|_| inlist_own_effects(source, context))
+        .map(|(_, effects)| crate::ScopedExpressionEffects::primitive(context, effects))
         .map_err(inlist_pure_failure)
     }
 
@@ -499,17 +526,18 @@ impl PreparedNativeInListRecipe {
         result: &novarocks_type_contract::FunctionValueType,
         mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
         control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<Option<Self>, NativeInListCreationFailure<H>>
+    ) -> Result<(Option<Self>, ExpressionEffects), NativeInListCreationFailure<H>>
     where
         I: ExactSizeIterator<Item = &'a novarocks_type_contract::FunctionValueType>,
     {
         use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueLogicalType};
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-        let outcome: Result<Option<Self>, NativeInListCreationFailure<H>> = (|| {
+        let outcome = (|| -> Result<_, NativeInListCreationFailure<H>> {
             crate::kernel_input::validate_type_observed(source, &mut work)
                 .map_err(crate::ComparisonPrepareError::Kernel)?;
             crate::kernel_input::validate_type_observed(result, &mut work)
                 .map_err(crate::ComparisonPrepareError::Kernel)?;
+            let composite = PreparedCompositeComparisonRecipe::is_composite(source);
             let mut comparison_right = source;
             let mut nullable = source.nullable() || source.data_type() == &DataType::Null;
             if candidates.len() != 0 {
@@ -529,13 +557,19 @@ impl PreparedNativeInListRecipe {
             for candidate in candidates {
                 crate::kernel_input::validate_type_observed(candidate, &mut work)
                     .map_err(crate::ComparisonPrepareError::Kernel)?;
-                if candidate.logical_type() != source.logical_type()
-                    || !arrow_data_types_exact_observed::<crate::ComparisonPrepareError>(
-                        source.data_type(),
-                        candidate.data_type(),
-                        || work.step().map_err(Into::into),
-                    )?
-                {
+                let same_domain = if composite {
+                    source.same_physical_binding_ignoring_root_nullability_observed::<
+                        crate::ComparisonPrepareError,
+                    >(candidate, || work.step().map_err(Into::into))?
+                } else {
+                    candidate.logical_type() == source.logical_type()
+                        && arrow_data_types_exact_observed::<crate::ComparisonPrepareError>(
+                            source.data_type(),
+                            candidate.data_type(),
+                            || work.step().map_err(Into::into),
+                        )?
+                };
+                if !same_domain {
                     return Err(crate::ComparisonPrepareError::TypeMismatch.into());
                 }
                 // All candidates have the same domain. Use an existing nullable
@@ -561,6 +595,17 @@ impl PreparedNativeInListRecipe {
                 && source.data_type() == &DataType::Utf8
             {
                 MembershipEquality::Json
+            } else if composite {
+                let recipe = PreparedCompositeComparisonRecipe::try_new(
+                    KeyRelation::Equal,
+                    source,
+                    comparison_right,
+                    control,
+                )?;
+                if recipe.nullable_result() && !result.nullable() {
+                    return Err(crate::ComparisonPrepareError::TypeMismatch.into());
+                }
+                MembershipEquality::Composite(recipe)
             } else {
                 MembershipEquality::Comparison(PreparedComparisonRecipe::try_new(
                     ComparisonOperator::Eq,
@@ -569,8 +614,9 @@ impl PreparedNativeInListRecipe {
                     control,
                 )?)
             };
+            let effects = equality.effects();
             let Some(types) = types else {
-                return Ok(None);
+                return Ok((None, effects));
             };
             let facts = novarocks_type_contract::owned_resources::vec::box_facts(&types)
                 .map_err(|e| match e {
@@ -599,13 +645,16 @@ impl PreparedNativeInListRecipe {
             } else {
                 novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(items)
             };
-            Ok(Some(Self {
-                negated,
-                source: source.clone(),
-                candidates,
-                result: result.clone(),
-                equality,
-            }))
+            Ok((
+                Some(Self {
+                    negated,
+                    source: source.clone(),
+                    candidates,
+                    result: result.clone(),
+                    equality,
+                }),
+                effects,
+            ))
         })();
         if matches!(
             outcome,
@@ -647,10 +696,16 @@ impl PreparedNativeInListRecipe {
             }
         }
         observe(observer, InObservation::OpaqueBoundary)?;
+        let composite_nulls = matches!(
+            &self.equality,
+            MembershipEquality::Composite(recipe)
+                if recipe.nullable_result() || recipe.may_raise_row_error()
+        );
         let has_nulls = !input.is_empty()
             && (input.null_count() != 0
                 || candidate.null_count() != 0
-                || input.data_type() == &DataType::Null);
+                || input.data_type() == &DataType::Null
+                || composite_nulls);
         let bytes = boolean_buffer_bytes(input.len(), has_nulls).map_err(InError::Operation)?;
         let reservation = host
             .as_ref()
@@ -659,17 +714,83 @@ impl PreparedNativeInListRecipe {
             .transpose()
             .map_err(InError::Operation)?;
         let mut builder = BooleanBuilder::with_capacity(input.len());
+        let mut errors_reservation = None;
+        let mut errors = Vec::new();
+        let left = EvaluatedArgument::Column(input);
+        let right = if candidate.len() == 1 {
+            EvaluatedArgument::Scalar(candidate)
+        } else {
+            EvaluatedArgument::Column(candidate)
+        };
         match &self.equality {
             MembershipEquality::Comparison(recipe) => {
-                let left = EvaluatedArgument::Column(input);
-                let right = if candidate.len() == 1 {
-                    EvaluatedArgument::Scalar(candidate)
-                } else {
-                    EvaluatedArgument::Column(candidate)
-                };
                 append_equalities_observed(&mut builder, input.len(), observer, |row| {
                     recipe.compare_rows(left, row, row, right, row, row, &control)
                 })?;
+            }
+            MembershipEquality::Composite(recipe) => {
+                let allocator = host
+                    .as_ref()
+                    .filter(|_| recipe.requires_allocator() && !input.is_empty())
+                    .map(|host| ComparisonAllocator::try_new(Arc::clone(host)))
+                    .transpose()
+                    .map_err(InError::Operation)?;
+                let mut journal_slots = 0usize;
+                for row in 0..input.len() {
+                    observe(observer, InObservation::Step)?;
+                    let outcome = recipe
+                        .compare_rows(
+                            left,
+                            row,
+                            row,
+                            right,
+                            row,
+                            row,
+                            allocator.as_ref(),
+                            &control,
+                        )
+                        .map_err(InError::Operation)?;
+                    match outcome {
+                        CompositeComparisonResult::Value(value) => builder.append_option(value),
+                        CompositeComparisonResult::Indeterminate => {
+                            if errors.len() == journal_slots {
+                                // Grow for actual failures, keeping the old charge
+                                // through replacement allocation.
+                                let slots = journal_slots
+                                    .saturating_mul(2)
+                                    .max(1)
+                                    .min(errors.len() + (input.len() - row));
+                                let bytes = slots
+                                    .checked_mul(
+                                        size_of::<RowDataError>()
+                                            + crate::MAX_ROW_ERROR_MESSAGE_BYTES,
+                                    )
+                                    .ok_or(InError::Operation(KernelFailure::ResourceExhausted))?;
+                                observe(observer, InObservation::OpaqueBoundary)?;
+                                let new_reservation = host
+                                    .as_ref()
+                                    .map(|host| {
+                                        OpaqueRetainedCharge::try_new(Arc::clone(host))?
+                                            .reserve_operation(bytes)
+                                    })
+                                    .transpose()
+                                    .map_err(InError::Operation)?;
+                                errors
+                                    .try_reserve_exact(slots - errors.len())
+                                    .map_err(|_| {
+                                        InError::Operation(KernelFailure::ResourceExhausted)
+                                    })?;
+                                errors_reservation = new_reservation;
+                                journal_slots = slots;
+                            }
+                            let error = outcome.row_error(row).ok_or_else(|| {
+                                InError::Operation(contract("IN lost an indeterminate comparison"))
+                            })?;
+                            errors.push(error);
+                            builder.append_null();
+                        }
+                    }
+                }
             }
             MembershipEquality::Json => {
                 let left = input
@@ -710,8 +831,14 @@ impl PreparedNativeInListRecipe {
         observe(observer, InObservation::OpaqueBoundary)?;
         Ok(MembershipEqualities {
             array: builder.finish(),
+            errors,
             _reservation: reservation,
+            _errors_reservation: errors_reservation,
         })
+    }
+
+    pub fn requires_comparison_allocator(&self) -> bool {
+        matches!(&self.equality, MembershipEquality::Composite(recipe) if recipe.requires_allocator())
     }
 
     pub fn negated(&self) -> bool {
@@ -730,25 +857,8 @@ impl PreparedNativeInListRecipe {
         &self,
         context: novarocks_type_contract::ExpressionEffectContext,
     ) -> crate::ScopedExpressionEffects {
-        inlist_own_effects(&self.source, context)
+        crate::ScopedExpressionEffects::primitive(context, self.equality.effects())
     }
-}
-fn inlist_own_effects(
-    source: &novarocks_type_contract::FunctionValueType,
-    context: novarocks_type_contract::ExpressionEffectContext,
-) -> crate::ScopedExpressionEffects {
-    // JSON normalization can reject malformed logical JSON as required Data.
-    // Unlike buffered row errors, that outer failure cannot be reordered or
-    // skipped by Boolean control. Physical Utf8 remains ordinary byte equality.
-    let json = source.logical_type() == novarocks_type_contract::ValueLogicalType::Json;
-    crate::ScopedExpressionEffects::primitive(
-        context,
-        novarocks_type_contract::ExpressionEffects {
-            may_raise_row_error: json,
-            may_raise_invocation_data: json,
-            ..novarocks_type_contract::ExpressionEffects::PURE_VALUE
-        },
-    )
 }
 
 #[derive(Debug)]

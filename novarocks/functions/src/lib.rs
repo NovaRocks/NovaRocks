@@ -2892,7 +2892,7 @@ mod f3_recipe_independent_tests;
 #[cfg(any(test, novarocks_dev_controls))]
 pub mod testkit;
 
-pub use builtin::nullif::PreparedNullIf;
+pub use builtin::nullif::{PreparedNullIf, PreparedNullIfEquality};
 pub use novarocks_value_arrays::uuid::parse_uuid;
 mod persistent_scalar;
 pub use persistent_scalar::{PersistentScalarContract, validate_published_scalar_contracts};

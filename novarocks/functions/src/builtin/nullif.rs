@@ -16,14 +16,20 @@
 // under the License.
 
 //! NULLIF comparison setup and the compatibility entry for already evaluated inputs.
-use novarocks_type_contract::{OperatorFunction, PureCompileControl, TrinoCastMode};
+use novarocks_type_contract::{KeyRelation, OperatorFunction, PureCompileControl, TrinoCastMode};
+
+#[derive(Clone, Debug)]
+pub enum PreparedNullIfEquality {
+    Ordinary(crate::PreparedComparisonRecipe),
+    Composite(crate::PreparedCompositeComparisonRecipe),
+}
 
 /// Exact control recipe prepared from the verified left value and right comparison domain.
 #[derive(Clone, Debug)]
 pub struct PreparedNullIf {
     call: std::sync::Arc<crate::FunctionCallContract>,
     left_cast: crate::PreparedCastRecipe,
-    equality: crate::PreparedComparisonRecipe,
+    equality: PreparedNullIfEquality,
 }
 impl PreparedNullIf {
     pub(crate) fn from_call(
@@ -57,12 +63,8 @@ impl PreparedNullIf {
                 FunctionSpecializationFailure::Control,
             )
         })?;
-        let equality = super::operator_kernel::comparison_recipe(
-            OperatorFunction::Equal,
-            [&compare_left, right],
-            control,
-        )
-        .map_err(FunctionSpecializationFailure::Binding)?;
+        let equality = prepare_equality(&compare_left, right, control)
+            .map_err(FunctionSpecializationFailure::Binding)?;
         Ok(Self {
             call,
             left_cast,
@@ -76,9 +78,33 @@ impl PreparedNullIf {
     pub fn left_cast(&self) -> &crate::PreparedCastRecipe {
         &self.left_cast
     }
-    pub fn equality(&self) -> &crate::PreparedComparisonRecipe {
+    pub fn equality(&self) -> &PreparedNullIfEquality {
         &self.equality
     }
+}
+
+pub(super) fn prepare_equality(
+    left: &crate::FunctionValueType,
+    right: &crate::FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<PreparedNullIfEquality, crate::FunctionBindingError> {
+    if crate::PreparedCompositeComparisonRecipe::is_composite(left) {
+        return crate::PreparedCompositeComparisonRecipe::try_new(
+            KeyRelation::Equal,
+            left,
+            right,
+            control,
+        )
+        .map(PreparedNullIfEquality::Composite)
+        .map_err(|error| {
+            error.control_error().map_or(
+                crate::FunctionBindingError::NoMatchingOverload,
+                crate::FunctionBindingError::Control,
+            )
+        });
+    }
+    super::operator_kernel::comparison_recipe(OperatorFunction::Equal, [left, right], control)
+        .map(PreparedNullIfEquality::Ordinary)
 }
 
 use crate::{

@@ -2948,11 +2948,7 @@ impl BuiltinDynamicScalarResolver {
                 borrow_creator(&mut creation),
             )?;
             work.flush()?;
-            super::operator_kernel::comparison_recipe(
-                novarocks_type_contract::OperatorFunction::Equal,
-                [&left_comparison, &right],
-                work.control(),
-            )?;
+            super::nullif::prepare_equality(&left_comparison, &right, work.control())?;
             let result = dynamic_nullable(left, true, work, borrow_creator(&mut creation))?;
             with_binding_creation(borrow_creator(&mut creation), work, |cx| {
                 cx.array::<FunctionArgumentType>(2)

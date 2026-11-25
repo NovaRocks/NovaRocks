@@ -1518,3 +1518,57 @@ fn map_concat_ordered_null_short_circuits_only_later_conversions() {
         DataFailureReason::Domain(INVALID_CAST_ARGUMENT)
     );
 }
+
+#[test]
+fn nullif_composite_keeps_original_left_values_and_only_demands_present_rows() {
+    use arrow::array::{ListArray, ListBuilder, StringBuilder, types::Int32Type};
+    use novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT;
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let left: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>([
+        None,
+        Some(vec![Some(1), None]),
+        Some(vec![Some(2)]),
+        Some(vec![Some(3)]),
+        Some(vec![Some(4)]),
+    ]));
+    let mut lists = ListBuilder::new(StringBuilder::new());
+    for row in [&["bad"][..], &["1", "5"], &["2"], &["bad"], &["9"]] {
+        for value in row {
+            lists.values().append_value(*value);
+        }
+        lists.append(true);
+    }
+    let right: ArrayRef = Arc::new(lists.finish());
+    let columns = [
+        column("x", 1, left.data_type().clone(), true),
+        column("txt", 2, right.data_type().clone(), false),
+    ];
+    let rows = batch(&columns, vec![left, right]);
+    let result = evaluate(
+        &compile("NULLIF(x, CAST(txt AS ARRAY(BIGINT)))", &columns, &context),
+        &rows,
+    );
+    assert_eq!(result.batch.result_type, columns[0].value_type);
+    assert_eq!(
+        result.batch.values.to_data(),
+        ListArray::from_iter_primitive::<Int32Type, _, _>([
+            None,
+            Some(vec![Some(1), None]),
+            None,
+            None,
+            Some(vec![Some(4)]),
+        ])
+        .to_data(),
+    );
+    let [error] = result.batch.errors.as_ref() else {
+        panic!("the invalid right child of the absent left row must not be demanded");
+    };
+    assert_eq!(error.selected_ordinal(), 3);
+    assert_eq!(
+        error.reason(),
+        DataFailureReason::Domain(INVALID_CAST_ARGUMENT)
+    );
+}

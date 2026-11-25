@@ -2236,12 +2236,18 @@ mod join_demotion_tests {
 
     #[test]
     fn cross_type_array_pair_has_no_hash_join_alternative() {
+        for comparison in [BinOp::Eq, BinOp::EqForNull] {
+            assert_cross_type_array_pair_has_no_hash_join_alternative(comparison);
+        }
+    }
+
+    fn assert_cross_type_array_pair_has_no_hash_join_alternative(comparison: BinOp) {
         let mut memo = Memo::new();
         let left_group = mk_scan_group(&mut memo, &["a_arr"]);
         let right_group = mk_scan_group(&mut memo, &["b_arr"]);
         let condition = bin(
             col_typed("a_arr", list_type(DataType::Utf8)),
-            BinOp::Eq,
+            comparison,
             col_typed("b_arr", list_type(DataType::Int64)),
         );
         let join_mexpr = logical_join_expr(
@@ -2283,13 +2289,19 @@ mod join_demotion_tests {
 
     #[test]
     fn complex_pair_demotes_when_scalar_hash_key_remains() {
+        for comparison in [BinOp::Eq, BinOp::EqForNull] {
+            assert_complex_pair_demotes_when_scalar_hash_key_remains(comparison);
+        }
+    }
+
+    fn assert_complex_pair_demotes_when_scalar_hash_key_remains(comparison: BinOp) {
         let mut memo = Memo::new();
         let left_group = mk_scan_group(&mut memo, &["a_id", "a_arr"]);
         let right_group = mk_scan_group(&mut memo, &["b_id", "b_arr"]);
         let scalar_eq = bin(col("a_id"), BinOp::Eq, col("b_id"));
         let complex_eq = bin(
             col_typed("a_arr", list_type(DataType::Utf8)),
-            BinOp::Eq,
+            comparison,
             col_typed("b_arr", list_type(DataType::Utf8)),
         );
         let condition = bin(scalar_eq, BinOp::And, complex_eq);

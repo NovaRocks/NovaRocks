@@ -31,8 +31,8 @@ use novarocks_expression_contract::{
 };
 use novarocks_functions::{
     CallArgumentUses, CallEffectInput, PreparedArithmeticRecipe, PreparedCastRecipe,
-    PreparedComparisonRecipe, PreparedNullSafeComparisonRecipe, PureCallPreparation, PureKernelAbi,
-    ScopedExpressionEffects, TemporalSourceChannel,
+    PreparedComparisonRecipe, PreparedCompositeComparisonRecipe, PreparedNullSafeComparisonRecipe,
+    PureCallPreparation, PureKernelAbi, ScopedExpressionEffects, TemporalSourceChannel,
 };
 use novarocks_type_contract::{
     ArrowTypeProfile, CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase,
@@ -657,6 +657,26 @@ fn own_effects(
             )
             .map_err(comparison_author_error)?;
             recipe.own_effects(context)
+        }
+        ExprKind::Case {
+            operand: Some(operand),
+            when_then,
+            ..
+        } if PreparedCompositeComparisonRecipe::is_composite(&definition(unit, *operand)?.ty) => {
+            let left = &definition(unit, *operand)?.ty;
+            let mut effects = novarocks_type_contract::ExpressionEffects::PURE_VALUE;
+            for (label, _) in when_then {
+                work.step()?;
+                let recipe = PreparedCompositeComparisonRecipe::try_new(
+                    novarocks_type_contract::KeyRelation::Equal,
+                    left,
+                    &definition(unit, *label)?.ty,
+                    work.control(),
+                )
+                .map_err(comparison_author_error)?;
+                effects.may_raise_row_error |= recipe.may_raise_row_error();
+            }
+            ScopedExpressionEffects::primitive(context, effects)
         }
         ExprKind::Unary {
             op: UnaryOperator::Not,

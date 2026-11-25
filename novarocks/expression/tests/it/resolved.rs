@@ -1346,8 +1346,16 @@ fn type_only_hidden_float_in_compiles_without_evaluating_arguments() {
     );
 }
 #[test]
-fn type_only_hidden_text_array_in_keeps_the_profile_refusal() {
-    check_type_only_hidden_native_profile_refusal("in_text_array");
+fn type_only_hidden_text_array_in_compiles_without_evaluating_arguments() {
+    let compiled = compile_type_only_hidden_native_profile("in_text_array").unwrap();
+    let [root] = compiled.roots() else {
+        panic!("expected one type-only root");
+    };
+    let uses = compiled.control_flow().uses();
+    assert_eq!(uses.len(), 1);
+    let invocation = &uses[&root.use_id];
+    assert_eq!(invocation.control, ControlShape::TypeOnly);
+    assert!(invocation.arguments.is_empty());
 }
 #[test]
 fn type_only_hidden_json_between_keeps_the_original_profile_refusal() {
