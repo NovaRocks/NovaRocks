@@ -633,9 +633,7 @@ fn record_field_value_pair_and_ipc_schema_mismatches_do_not_retag_or_reauthor() 
             .is_err()
         );
     }
-    let array: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
-        b"\x01\x20".as_slice(),
-    ]));
+    let array: ArrayRef = Arc::new(LargeBinaryArray::from(vec![b"\x01\x20".as_slice()]));
     let field = Arc::new(
         Field::new("json", DataType::LargeBinary, true)
             .with_metadata(HashMap::from([(NR_LOGICAL_TYPE_KEY.into(), "json".into())])),
