@@ -5582,7 +5582,7 @@ mod aggregate_recipe_tests {
             novarocks_type_contract::ValueLayout::try_new(
                 &DataType::List(Arc::new(arrow_schema::Field::new(
                     "item",
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     false,
                 ))),
                 novarocks_type_contract::ValueTypeStorageLifetime::pure(),

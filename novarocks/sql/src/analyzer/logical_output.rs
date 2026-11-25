@@ -1281,7 +1281,10 @@ mod scalar_domain_tests {
     #[test]
     fn typed_wrapper_transparent_cast_cannot_wash_original_nominal_child() {
         let original = typed_list_source(true, false);
-        let target = FunctionValueType::new(original.value_type.data_type().clone(), false);
+        let target = novarocks_type_contract::FunctionValueType::new(
+            original.value_type.data_type().clone(),
+            false,
+        );
         let coerced = TypedExpr {
             kind: ExprKind::Cast {
                 cast_mode: None,

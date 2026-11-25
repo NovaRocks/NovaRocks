@@ -31,8 +31,8 @@ use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use std::{alloc::Layout, cell::RefCell};
 
 /// Admit the observed carrier profiles and the explicit NULL-to-JSON list
-/// conversion. The original complete target Field remains the representation
-/// author; a shared UTF8 carrier alone grants no nominal conversion.
+/// conversion. The complete target Field authors the output layout. Lifting
+/// to LargeBinary requires a nullable nominal JSON child in the target.
 pub(crate) fn profile(source: &FunctionValueType, result: &FunctionValueType) -> bool {
     if novarocks_type_contract::is_null_list_to_json_cast(source, result) {
         return true;
@@ -181,33 +181,32 @@ pub(crate) fn evaluate<'a>(
             ListCastObservation::Step => work.borrow_mut().step(),
             ListCastObservation::OpaqueBoundary => work.borrow_mut().flush(),
         };
-        let out = list_cast_core::cast_observed(
-            &compact,
-            target_field,
-            &mut |child, target| {
-                if child.data_type() != &DataType::Null
-                    || target != target_field.data_type()
-                    || (!null_lift_profile || !matches!(target, DataType::Int32 | DataType::Utf8))
-                {
-                    return Err(ListCastError::Host(internal(
-                        "prepared List CAST has a foreign child operation",
-                    )));
-                }
-                list_cast_core::null_source_observed(
-                    child.len(),
-                    target,
-                    &mut |event| match event {
-                        ListCastObservation::Step => work.borrow_mut().step(),
-                        ListCastObservation::OpaqueBoundary => work.borrow_mut().flush(),
-                    },
-                )
-            },
-            &mut observe,
-        )
-        .map_err(|cause| match cause {
-            ListCastError::Host(cause) => cause,
-            ListCastError::Domain(cause) => KernelFailure::from_domain(cause),
-        })?;
+        let out =
+            list_cast_core::cast_observed(
+                &compact,
+                target_field,
+                &mut |child, target| {
+                    if child.data_type() != &DataType::Null
+                        || target != target_field.data_type()
+                        || !null_lift_profile
+                    {
+                        return Err(ListCastError::Host(internal(
+                            "prepared List CAST has a foreign child operation",
+                        )));
+                    }
+                    list_cast_core::null_source_observed(child.len(), target, &mut |event| {
+                        match event {
+                            ListCastObservation::Step => work.borrow_mut().step(),
+                            ListCastObservation::OpaqueBoundary => work.borrow_mut().flush(),
+                        }
+                    })
+                },
+                &mut observe,
+            )
+            .map_err(|cause| match cause {
+                ListCastError::Host(cause) => cause,
+                ListCastError::Domain(cause) => KernelFailure::from_domain(cause),
+            })?;
         let mut errors = reserve::<RowDataError>(inherited.len(), &work)?;
         for error in inherited {
             work.borrow_mut().flush()?;

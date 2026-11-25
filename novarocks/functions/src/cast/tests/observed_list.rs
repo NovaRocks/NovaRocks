@@ -466,14 +466,21 @@ fn list_cast_recipe_constant_null_root_broadcast_and_nested_logical_identity_gua
         novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
         "json".to_string(),
     );
-    let json = DataType::List(Arc::new(field.as_ref().clone().with_metadata(meta)));
-    // A nominal child may not silently become Physical just because Utf8 is shared.
-    let source = FunctionValueType::from_legacy_declared_projection(json, true);
+    let json = DataType::List(Arc::new(
+        field
+            .as_ref()
+            .clone()
+            .with_data_type(DataType::LargeBinary)
+            .with_metadata(meta),
+    ));
+    let source = FunctionValueType::from_legacy_declared_projection(json.clone(), true);
+    let physical = FunctionValueType::new(json, true);
+    assert_eq!(source.data_type(), physical.data_type());
     assert_eq!(
         PreparedCastRecipe::try_new(
             CastOperation::Carrier,
             &source,
-            &FunctionValueType::from_legacy_declared_projection(target, true),
+            &physical,
             DecimalOverflowPolicy::OutputNull,
             false,
             None,

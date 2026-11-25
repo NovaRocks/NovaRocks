@@ -124,7 +124,7 @@ fn arguments() -> [FunctionArgument; 1] {
     .unwrap();
     let semantic = ValueTypeRef::try_new(ValueKind::List(item), true, storage.clone()).unwrap();
     let layout = ValueLayout::try_new(
-        &DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+        &DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, false))),
         storage,
     )
     .unwrap();
@@ -312,7 +312,7 @@ fn unnest_created_validation_rejects_foreign_identity_arity_and_same_carrier_dom
     let mut wrong = bound.selected.clone();
     wrong.result_type = FunctionResultType::Relation(
         novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(Box::from([
-            FunctionValueType::new(DataType::Utf8, true),
+            FunctionValueType::new(DataType::LargeBinary, true),
         ])),
     );
     let (_, mut scope) = Scope::new(None);
