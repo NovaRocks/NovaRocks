@@ -206,10 +206,10 @@ impl LexicalReferences {
         let track_references = source.lambda_scope.is_some() || wrapper;
         let mut references = FreeReferences::default();
         for child in &invocation.arguments {
-            if let Some(child) = self.pending.remove(child) {
-                if track_references {
-                    references.merge(child, owner, work)?;
-                }
+            if let Some(child) = self.pending.remove(child)
+                && track_references
+            {
+                references.merge(child, owner, work)?;
             }
             if track_references {
                 work.step()?;

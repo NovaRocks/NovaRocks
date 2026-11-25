@@ -1237,7 +1237,7 @@ impl<K> Frame<K> {
                 return Ok(());
             }
             let case_result = matches!(shape, ControlShape::Case { simple, arms, .. }
-                if self.next - 1 >= usize::from(simple) &&
+                if self.next > usize::from(simple) &&
                     (!(self.next - 1 - usize::from(simple)).is_multiple_of(2) ||
                      self.next - 1 == usize::from(simple) + arms as usize * 2));
             if matches!(shape, ControlShape::Coalesce)
