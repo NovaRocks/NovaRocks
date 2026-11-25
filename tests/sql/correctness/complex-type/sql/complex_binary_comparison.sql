@@ -103,8 +103,8 @@ select cast(row(1, null) as ROW(a int, b array<int>));
 select cast(MAP(ARRAY[1], ARRAY[null]) as map<int, array<int>>);
 
 -- query 18
--- Casting BOOLEAN (TRUE) to MAP<INT,INT> field of STRUCT: runtime error
--- @expect_error=CAST failed
+-- BOOLEAN to a MAP field is rejected while binding the conversion.
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
 select cast(row(1, TRUE) as ROW(a int, b map<int, int>));
 
 -- query 19
@@ -395,12 +395,12 @@ select st1 != null from ${case_db}.sc2 order by v1, fixture_order;
 
 -- query 112
 -- Frozen Map keys reject construction before comparison.
--- @expect_error=phase=EXECUTION, detail=fragment execution error (pipeline): operator[1] Push: map key must not be NULL
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
 select MAP(ARRAY[1, null], ARRAY[1, 2]) = MAP(ARRAY[1, 2], ARRAY[1, null]);
 
 -- query 113
 -- Frozen Map keys reject construction before comparison.
--- @expect_error=phase=EXECUTION, detail=fragment execution error (pipeline): operator[1] Push: map key must not be NULL
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
 select MAP(ARRAY[1, null], ARRAY[1, 2]) != MAP(ARRAY[1, 2], ARRAY[1, null]);
 
 -- query 114

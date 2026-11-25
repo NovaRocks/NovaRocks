@@ -83,20 +83,22 @@ INSERT INTO ${case_db}.t_insert_exact_nested VALUES
       row(123456789.123456789, [123456789.123456789, 1e0]));
 
 -- query 9
-SELECT id, a[1] AS first_value, a[2] AS second_value,
-       a[3] AS third_value, cardinality(a) AS element_count,
+-- Missing positions yield NULL for short or empty stored arrays.
+SELECT id, element_at(a, 1) AS first_value, element_at(a, 2) AS second_value,
+       element_at(a, 3) AS third_value, cardinality(a) AS element_count,
        a IS NULL AS whole_null
 FROM ${case_db}.t_insert_exact_nested ORDER BY id;
 
 -- query 10
 -- Read keys and values without introducing a mixed-scale lookup comparison.
-SELECT id, map_keys(m)[1] AS first_key, map_values(m)[1] AS first_value,
+SELECT id, element_at(map_keys(m), 1) AS first_key,
+       element_at(map_values(m), 1) AS first_value,
        cardinality(m) AS entry_count, m IS NULL AS whole_null
 FROM ${case_db}.t_insert_exact_nested ORDER BY id;
 
 -- query 11
-SELECT id, s.d AS decimal_field, s.a[1] AS nested_first,
-       s.a[2] AS nested_second, cardinality(s.a) AS nested_count,
+SELECT id, s.d AS decimal_field, element_at(s.a, 1) AS nested_first,
+       element_at(s.a, 2) AS nested_second, cardinality(s.a) AS nested_count,
        s IS NULL AS whole_null
 FROM ${case_db}.t_insert_exact_nested ORDER BY id;
 
@@ -114,17 +116,19 @@ INSERT INTO ${case_db}.t_insert_exact_controls VALUES ROW(3, CAST(2.5 AS DOUBLE)
 SELECT id, d FROM ${case_db}.t_insert_exact_controls ORDER BY id;
 
 -- query 14
+-- Author the original FF bytes explicitly in both input paths.
+-- The refused implicit assignments have their own negative case.
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.t_insert_exact_bytes;
 CREATE TABLE ${case_db}.t_insert_exact_bytes (id INT, b VARBINARY);
-INSERT INTO ${case_db}.t_insert_exact_bytes VALUES ROW(1,'ÿ'),ROW(2,X'FF00');
-INSERT INTO ${case_db}.t_insert_exact_bytes SELECT 3,'ÿ';
+INSERT INTO ${case_db}.t_insert_exact_bytes VALUES ROW(1,from_hex('FF')),ROW(2,X'FF00');
+INSERT INTO ${case_db}.t_insert_exact_bytes SELECT 3,from_hex('FF');
 INSERT INTO ${case_db}.t_insert_exact_bytes SELECT 4,X'FF00';
 INSERT INTO ${case_db}.t_insert_exact_bytes VALUES ROW(5,NULL),ROW(6,X'FF');
 INSERT INTO ${case_db}.t_insert_exact_bytes SELECT 7,X'FF00';
 
 -- query 15
--- LATIN1 U+00FF is FF rather than UTF8 C3BF.
+-- Verify the exact supplied bytes for VALUES, SELECT, and NULL rows.
 SELECT id,to_hex(b) AS bytes_hex FROM ${case_db}.t_insert_exact_bytes ORDER BY id;
 
 -- query 16

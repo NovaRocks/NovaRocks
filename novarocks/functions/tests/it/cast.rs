@@ -444,6 +444,188 @@ mod standard_conversion {
     }
 
     #[test]
+    fn casts_row_fields_by_position_and_journals_only_reachable_rows() {
+        use arrow_array::StructArray;
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::{Field, Fields};
+
+        let source_fields: Fields = vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("raw", DataType::Utf8, true),
+        ]
+        .into();
+        let target_fields: Fields = vec![
+            Field::new("raw", DataType::Int32, false),
+            Field::new("id", DataType::Int32, true),
+        ]
+        .into();
+        let source = physical(DataType::Struct(source_fields.clone()), true);
+        let target = physical(DataType::Struct(target_fields.clone()), true);
+        let input: ArrayRef = Arc::new(
+            StructArray::try_new(
+                source_fields,
+                vec![
+                    Arc::new(Int32Array::from(vec![5, 7, 8, 9, 11, 13])),
+                    Arc::new(StringArray::from(vec![
+                        Some("unselected"),
+                        Some("8"),
+                        Some("hidden"),
+                        Some("bad"),
+                        None,
+                        Some("unselected"),
+                    ])),
+                ],
+                Some(NullBuffer::from(vec![true, true, false, true, true, true])),
+            )
+            .unwrap(),
+        );
+        let control = LargeIntConversionControl;
+        let selection = Selection::try_sparse(6, &[1, 2, 3, 4]).unwrap();
+        for (mode, error_count) in [(TrinoCastMode::Explicit, 1), (TrinoCastMode::Try, 0)] {
+            let recipe =
+                PreparedCastRecipe::try_new_trino(&source, &target, mode, &control).unwrap();
+            let out = recipe
+                .evaluate_selected(EvaluatedArgument::Column(&input), selection, &[], &control)
+                .unwrap();
+            assert_eq!(out.errors().len(), error_count);
+            if let Some(error) = out.errors().first() {
+                assert_eq!(error.selected_ordinal(), 2);
+                assert_eq!(
+                    error.reason(),
+                    DataFailureReason::Domain(INVALID_CAST_ARGUMENT)
+                );
+            }
+            let row = out.values().as_any().downcast_ref::<StructArray>().unwrap();
+            assert_eq!(row.fields(), &target_fields);
+            assert!(row.is_valid(0));
+            assert!(row.is_null(1));
+            assert!(row.is_null(2));
+            assert!(row.is_valid(3));
+            let first = row.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            assert_eq!((first.value(0), first.value(3)), (7, 11));
+            let second = row.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+            assert_eq!(second.value(0), 8);
+            assert!(second.is_null(3));
+        }
+
+        let compact = novarocks_functions::SelectedValues::try_new(
+            selection,
+            source.data_type(),
+            input.slice(1, 4),
+            Box::new([RowDataError::with_reason(
+                1,
+                DataFailureReason::Domain(INVALID_FUNCTION_ARGUMENT),
+                "original ROW source error",
+            )]),
+        )
+        .unwrap();
+        let try_cast =
+            PreparedCastRecipe::try_new_trino(&source, &target, TrinoCastMode::Try, &control)
+                .unwrap();
+        let output = try_cast
+            .evaluate_selected(
+                EvaluatedArgument::SelectedColumn(&compact),
+                selection,
+                compact.errors(),
+                &control,
+            )
+            .unwrap();
+        assert_eq!(output.errors(), compact.errors());
+
+        let wrong_arity = physical(
+            DataType::Struct(vec![Field::new("raw", DataType::Int32, true)].into()),
+            true,
+        );
+        assert_eq!(
+            PreparedCastRecipe::try_new_trino(&source, &wrong_arity, TrinoCastMode::Try, &control),
+            Err(novarocks_functions::CastPrepareError::Illegal)
+        );
+    }
+
+    #[test]
+    fn casts_timestamp_array_through_the_original_temporal_text_formatter() {
+        use arrow_array::{ListArray, TimestampMicrosecondArray};
+        use arrow_buffer::{NullBuffer, OffsetBuffer};
+        use novarocks_type_contract::{
+            TemporalPrecision, TemporalType, list_value_type_with_construction,
+        };
+
+        let temporal = TemporalType::Timestamp(TemporalPrecision::MICROSECONDS);
+        let storage = ValueTypeStorageLifetime::pure();
+        let item = FunctionValueType::try_from_value(
+            ValueTypeRef::try_new(ValueKind::Temporal(temporal), true, storage.clone()).unwrap(),
+            ValueLayout::try_new(&temporal.carrier(), storage.clone()).unwrap(),
+        )
+        .unwrap();
+        let source = list_value_type_with_construction::<CompileControlError>(
+            &item,
+            true,
+            storage.clone(),
+            None,
+        )
+        .unwrap();
+        let target = list_value_type_with_construction::<CompileControlError>(
+            &physical(DataType::Utf8, true),
+            true,
+            storage,
+            None,
+        )
+        .unwrap();
+        let DataType::List(field) = source.data_type() else {
+            unreachable!();
+        };
+        let input: ArrayRef = Arc::new(
+            ListArray::try_new(
+                Arc::clone(field),
+                OffsetBuffer::new(vec![0_i32, 3, 3, 4].into()),
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(0),
+                    None,
+                    Some(-1),
+                    Some(1),
+                ])),
+                Some(NullBuffer::from(vec![true, true, false])),
+            )
+            .unwrap(),
+        );
+        let control = LargeIntConversionControl;
+        for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
+            let recipe =
+                PreparedCastRecipe::try_new_trino(&source, &target, mode, &control).unwrap();
+            let result = recipe
+                .evaluate_selected(
+                    EvaluatedArgument::Column(&input),
+                    Selection::all(3),
+                    &[],
+                    &control,
+                )
+                .unwrap();
+            assert!(result.errors().is_empty());
+            let lists = result
+                .values()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let values = lists.value(0);
+            let text = values.as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(
+                text.iter().collect::<Vec<_>>(),
+                vec![
+                    Some("1970-01-01 00:00:00.000000"),
+                    None,
+                    Some("1969-12-31 23:59:59.999999"),
+                ],
+            );
+            assert!(lists.value(1).is_empty());
+            assert!(lists.is_null(2));
+        }
+        assert_eq!(
+            PreparedCastRecipe::try_new_trino(&source, &target, TrinoCastMode::Implicit, &control),
+            Err(novarocks_functions::CastPrepareError::Illegal)
+        );
+    }
+
+    #[test]
     fn casts_map_rejects_converted_duplicates_and_nulls_only_the_failed_try_row() {
         use arrow_array::{Int64Array, MapArray, StructArray};
         use arrow_buffer::OffsetBuffer;
@@ -771,8 +953,22 @@ mod standard_conversion {
             ))),
             true,
         );
+        assert!(
+            PreparedCastRecipe::try_new_trino(&json, &array, TrinoCastMode::Explicit, &control)
+                .is_ok()
+        );
+        let mixed_row = physical(
+            DataType::Struct(
+                vec![
+                    arrow_schema::Field::new("a", DataType::Int32, true),
+                    arrow_schema::Field::new("", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
         assert!(matches!(
-            PreparedCastRecipe::try_new_trino(&json, &array, TrinoCastMode::Explicit, &control),
+            PreparedCastRecipe::try_new_trino(&json, &mixed_row, TrinoCastMode::Explicit, &control),
             Err(CastPrepareError::Unsupported),
         ));
     }

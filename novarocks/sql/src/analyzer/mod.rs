@@ -4587,6 +4587,11 @@ mod tests {
                 DataType::Int32,
             ),
             (
+                "SELECT CAST(s AS ROW(a bigint)).a FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
+                None,
+                DataType::Int64,
+            ),
+            (
                 "SELECT s.A FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
                 Some("A"),
                 DataType::Int32,
@@ -4599,13 +4604,6 @@ mod tests {
             assert_eq!(output.field_name.as_deref(), expected_name, "{sql}");
             assert_eq!(output.value_type.data_type(), &expected_type, "{sql}");
         }
-        let changing_value_type = "SELECT CAST(s AS ROW(a bigint)).a FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t";
-        let query = parse_native_query(changing_value_type).unwrap();
-        let error = analyze(&query, &TestCatalog, "default").unwrap_err();
-        assert_eq!(
-            error.kind(),
-            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
-        );
     }
 
     #[test]
@@ -6810,13 +6808,15 @@ mod tests {
 
     #[test]
     fn in_predicate_apply_rejects_scalar_vs_array_key() {
-        let err = parse_raw_and_analyze(
+        let query = parse_native_query(
             "SELECT 1 FROM array_test s WHERE 1 NOT IN (SELECT i_1 FROM array_test t)",
         )
-        .expect_err("scalar-vs-array IN subquery should be rejected before planning");
-        assert!(
-            err.contains("does not support binary predicate operation between"),
-            "unexpected error: {err}"
+        .unwrap();
+        let error = analyze(&query, &TestCatalog, "default")
+            .expect_err("scalar-vs-array IN subquery should be rejected before planning");
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TypeMismatch
         );
     }
 

@@ -25,16 +25,18 @@ use arrow_array::types::{
 use arrow_array::{Array, ArrayRef, PrimitiveArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    ArithmeticOperator, ComparisonOperator, OperatorFunction, PureCompileControl,
+    ArithmeticOperator, ComparisonOperator, KeyRelation, OperatorFunction, PureCompileControl,
 };
 
 use crate::arithmetic::{ArithmeticRowResult, SignedWidth, signed_arithmetic_row, trino_decimal};
 use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
-    DataFailureReason, EvaluatedArgument, FunctionBindingError, FunctionValueType,
-    KernelEvaluationControl, KernelFailure, PreparedComparisonRecipe, PreparedScalarKernel,
-    RowDataError, ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
+    AggregateStateAllocator, ComparisonAllocator, ComparisonPrepareError,
+    CompositeComparisonResult, DataFailureReason, EvaluatedArgument, FunctionBindingError,
+    FunctionValueType, KernelEvaluationControl, KernelFailure, PreparedComparisonRecipe,
+    PreparedCompositeComparisonRecipe, PreparedScalarKernel, RowDataError, ScalarCallContract,
+    ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
 #[derive(Debug)]
@@ -53,6 +55,10 @@ enum Operation {
         operator: OperatorFunction,
         recipe: PreparedComparisonRecipe,
     },
+    CompositeCompare {
+        negated: bool,
+        recipe: PreparedCompositeComparisonRecipe,
+    },
 }
 
 impl BinaryOperatorKernel {
@@ -61,6 +67,9 @@ impl BinaryOperatorKernel {
         operands: [&FunctionValueType; 2],
         control: &dyn PureCompileControl,
     ) -> Result<bool, FunctionBindingError> {
+        if let Some(recipe) = composite_comparison_recipe(operator, operands, control)? {
+            return Ok(recipe.nullable_result());
+        }
         comparison_recipe(operator, operands, control).map(|recipe| recipe.nullable_result())
     }
 
@@ -104,6 +113,16 @@ impl BinaryOperatorKernel {
                     Operation::Signed(op, width)
                 }
             }
+        } else if let Some(recipe) = composite_comparison_recipe(operator, [left, right], control)
+            .map_err(comparison_kernel_error)?
+        {
+            Operation::CompositeCompare {
+                negated: matches!(
+                    operator,
+                    OperatorFunction::NotEqual | OperatorFunction::Distinct
+                ),
+                recipe,
+            }
         } else {
             let recipe =
                 comparison_recipe(operator, [left, right], control).map_err(
@@ -119,6 +138,53 @@ impl BinaryOperatorKernel {
             operation: Arc::new(operation),
         })
     }
+}
+
+fn comparison_kernel_error(error: FunctionBindingError) -> KernelFailure {
+    match error {
+        FunctionBindingError::Control(error) => compile_failure(error),
+        _ => invalid("Binary comparison has no exact implementation"),
+    }
+}
+
+pub(super) fn preserves_integer_array_operands(
+    operator: OperatorFunction,
+    operands: [&FunctionValueType; 2],
+) -> bool {
+    matches!(
+        operator,
+        OperatorFunction::Equal | OperatorFunction::NotEqual
+    ) && operands
+        .into_iter()
+        .all(PreparedComparisonRecipe::supports_array_equality_operand)
+}
+
+pub(super) fn composite_comparison_recipe(
+    operator: OperatorFunction,
+    operands: [&FunctionValueType; 2],
+    control: &dyn PureCompileControl,
+) -> Result<Option<PreparedCompositeComparisonRecipe>, FunctionBindingError> {
+    if preserves_integer_array_operands(operator, operands)
+        || !operands
+            .into_iter()
+            .any(PreparedCompositeComparisonRecipe::is_composite)
+    {
+        return Ok(None);
+    }
+    let relation = match operator {
+        OperatorFunction::Equal | OperatorFunction::NotEqual => KeyRelation::Equal,
+        OperatorFunction::Identical | OperatorFunction::Distinct => KeyRelation::Identical,
+        _ => return Err(FunctionBindingError::NoMatchingOverload),
+    };
+    let [left, right] = operands;
+    PreparedCompositeComparisonRecipe::try_new(relation, left, right, control)
+        .map(Some)
+        .map_err(
+            |error: ComparisonPrepareError| match error.control_error() {
+                Some(error) => FunctionBindingError::Control(error),
+                None => FunctionBindingError::NoMatchingOverload,
+            },
+        )
 }
 
 pub(super) fn comparison_recipe(
@@ -179,10 +245,11 @@ impl PreparedScalarKernel for BinaryOperatorKernel {
             DataType::Decimal128(..) => Output::Decimal128,
             _ => unreachable!("binary operator declares a funded primitive result"),
         };
-        let row_errors = matches!(
-            self.operation.as_ref(),
-            Operation::Signed(..) | Operation::Decimal(..)
-        );
+        let row_errors = match self.operation.as_ref() {
+            Operation::Signed(..) | Operation::Decimal(..) => true,
+            Operation::CompositeCompare { recipe, .. } => recipe.may_raise_row_error(),
+            _ => false,
+        };
         Some(crate::ScalarInvocationResourceProfile::primitive_builder(
             output, row_errors,
         ))
@@ -190,14 +257,43 @@ impl PreparedScalarKernel for BinaryOperatorKernel {
 
     fn instance_retained_upper_bound(&self) -> usize {
         std::mem::size_of::<Instance>()
+            + if self.instance_inline_allocation_bytes() != 0 {
+                ComparisonAllocator::retained_bytes()
+            } else {
+                0
+            }
+    }
+
+    fn instance_inline_allocation_bytes(&self) -> usize {
+        match self.operation.as_ref() {
+            Operation::CompositeCompare { recipe, .. } if recipe.requires_allocator() => {
+                std::mem::size_of::<Instance>()
+            }
+            _ => 0,
+        }
     }
 
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
-        Ok(Box::new(Instance(Arc::clone(&self.operation))))
+        self.create_instance_with_allocator(None)
+    }
+
+    fn create_instance_with_allocator(
+        &self,
+        host: Option<Arc<dyn AggregateStateAllocator>>,
+    ) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
+        let allocator = match self.operation.as_ref() {
+            Operation::CompositeCompare { recipe, .. } if recipe.requires_allocator() => {
+                Some(ComparisonAllocator::try_new(host.ok_or_else(|| {
+                    invalid("MAP comparison requires its allocation host")
+                })?)?)
+            }
+            _ => None,
+        };
+        Ok(Box::new(Instance(Arc::clone(&self.operation), allocator)))
     }
 }
 
-struct Instance(Arc<Operation>);
+struct Instance(Arc<Operation>, Option<ComparisonAllocator>);
 
 impl ScalarKernelInstance for Instance {
     fn evaluate<'a>(
@@ -274,6 +370,46 @@ impl ScalarKernelInstance for Instance {
                     }))
                 },
             ),
+            Operation::CompositeCompare { negated, recipe } => {
+                let selection = input.selection();
+                let observed = crate::KernelControlObservation::new(control);
+                capacity(selection.len(), 1)?;
+                work.flush()?;
+                let mut output = BooleanBuilder::with_capacity(selection.len());
+                for (ordinal, row) in selection.iter().enumerate() {
+                    work.step()?;
+                    let result = recipe.compare_rows(
+                        *left,
+                        ordinal,
+                        row,
+                        *right,
+                        ordinal,
+                        row,
+                        self.1.as_ref(),
+                        &observed,
+                    )?;
+                    match result {
+                        CompositeComparisonResult::Value(value) => {
+                            output.append_option(value.map(|value| value ^ *negated));
+                        }
+                        CompositeComparisonResult::Indeterminate => {
+                            if errors.is_empty() {
+                                errors
+                                    .try_reserve_exact(selection.len())
+                                    .map_err(|_| KernelFailure::ResourceExhausted)?;
+                            }
+                            errors.push(
+                                result
+                                    .row_error(ordinal)
+                                    .expect("indeterminate has a row error"),
+                            );
+                            output.append_null();
+                        }
+                    }
+                }
+                work.flush()?;
+                Ok(Arc::new(output.finish()) as ArrayRef)
+            }
             Operation::Compare { operator, recipe } => {
                 let observed = crate::KernelControlObservation::new(control);
                 match recipe.left_type().data_type() {
@@ -327,6 +463,11 @@ impl ScalarKernelInstance for Instance {
 
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            + if self.1.is_some() {
+                ComparisonAllocator::retained_bytes()
+            } else {
+                0
+            }
     }
 }
 

@@ -21,7 +21,12 @@
 use super::boolean_region::BooleanRows;
 use super::node_recipes::{ComparisonPosition, NodeRecipes, UnitNodeRecipes};
 use super::*;
+use crate::primitives::PreparedNodeComparison;
 use arrow::array::{Array, BooleanArray};
+use novarocks_functions::{
+    ComparisonAllocator, CompositeComparisonResult, PreparedCompositeComparisonRecipe,
+    PreparedNullIfEquality,
+};
 use novarocks_type_contract::EvaluationDemand;
 
 mod ordered_null;
@@ -29,6 +34,24 @@ mod regexp;
 
 pub(super) fn supports_result(ty: &DataType) -> bool {
     novarocks_functions::control_values::supports_indexed_result(ty)
+}
+
+fn comparison_allocator(
+    recipe: &PreparedCompositeComparisonRecipe,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<Option<ComparisonAllocator>, KernelFailure> {
+    if !recipe.requires_allocator() {
+        return Ok(None);
+    }
+    work.flush()?;
+    if let Some(host) = work.scalar_host.as_deref() {
+        host.validate_frame_allocator(allocator)?;
+    }
+    allocator
+        .cloned()
+        .map(ComparisonAllocator::try_new)
+        .transpose()
 }
 
 enum OwnedValue {
@@ -847,6 +870,14 @@ impl<K> Frame<K> {
             equalities
                 .apply_to_selected_observed(state, &parents, &mut |event| in_event(event, work)),
         )?;
+        for error in equalities.errors() {
+            let parent = *parents
+                .get(error.selected_ordinal())
+                .ok_or_else(|| internal("IN comparison returned an error outside its demand"))?;
+            self.errors
+                .insert(parent, error.with_selected_ordinal(parent));
+            work.step()?;
+        }
         // A match never suppresses the next original candidate invocation.
         work.flush()?;
         drop(equalities);
@@ -861,6 +892,7 @@ impl<K> Frame<K> {
         prepared: &novarocks_functions::PreparedNullIf,
         batch_rows: usize,
         work: &mut Work<'_, '_, impl Sized>,
+        allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     ) -> Result<(), KernelFailure> {
         let mut child_rows = Vec::with_capacity(child.ordinals.len());
         for &ordinal in &child.ordinals {
@@ -930,6 +962,12 @@ impl<K> Frame<K> {
             .operand
             .as_ref()
             .ok_or_else(|| invalid("NULLIF comparison has no retained left values"))?;
+        let comparison_allocator = match prepared.equality() {
+            PreparedNullIfEquality::Ordinary(_) => None,
+            PreparedNullIfEquality::Composite(recipe) => {
+                comparison_allocator(recipe, allocator, work)?
+            }
+        };
         let mut compared = self.matched.iter().enumerate().peekable();
         let mut errors = materialized.errors().iter().peekable();
         for (local, &parent) in child.ordinals.iter().enumerate() {
@@ -954,16 +992,36 @@ impl<K> Frame<K> {
                 self.choices[parent] = None;
             } else {
                 work.flush()?;
-                let equal = prepared.equality().compare_rows(
-                    EvaluatedArgument::Column(operand),
-                    left,
-                    left,
-                    EvaluatedArgument::SelectedColumn(&materialized),
-                    local,
-                    self.rows[parent],
-                    work.control,
-                )?;
-                if equal == Some(true) {
+                let left_argument = EvaluatedArgument::Column(operand);
+                let right_argument = EvaluatedArgument::SelectedColumn(&materialized);
+                let batch_row = self.rows[parent];
+                let result = match prepared.equality() {
+                    PreparedNullIfEquality::Ordinary(recipe) => {
+                        CompositeComparisonResult::Value(recipe.compare_rows(
+                            left_argument,
+                            left,
+                            left,
+                            right_argument,
+                            local,
+                            batch_row,
+                            work.control,
+                        )?)
+                    }
+                    PreparedNullIfEquality::Composite(recipe) => recipe.compare_rows(
+                        left_argument,
+                        left,
+                        left,
+                        right_argument,
+                        local,
+                        batch_row,
+                        comparison_allocator.as_ref(),
+                        work.control,
+                    )?,
+                };
+                if let Some(error) = result.row_error(parent) {
+                    self.errors.insert(parent, error);
+                    self.choices[parent] = None;
+                } else if result == CompositeComparisonResult::Value(Some(true)) {
                     self.choices[parent] = None;
                 }
             }
@@ -992,7 +1050,7 @@ impl<K> Frame<K> {
                     "NULLIF occurrence has no exact prepared comparison",
                 ));
             };
-            return self.attach_null_if(child, prepared, batch_rows, work);
+            return self.attach_null_if(child, prepared, batch_rows, work, allocator);
         }
         if let ControlShape::Membership { .. } = shape {
             return self.attach_membership(child, recipes, batch_rows, work, allocator);
@@ -1096,13 +1154,17 @@ impl<K> Frame<K> {
                 let recipe = if simple {
                     Some(
                         recipes
-                            .comparison_recipe(ComparisonPosition::CaseWhen(
-                                ((ordinal - offset) / 2) as u32,
-                            ))
+                            .case_comparison(((ordinal - offset) / 2) as u32)
                             .ok_or_else(|| invalid("missing exact CASE WHEN comparison recipe"))?,
                     )
                 } else {
                     None
+                };
+                let comparison_allocator = match recipe {
+                    Some(PreparedNodeComparison::Composite(recipe)) => {
+                        comparison_allocator(recipe, allocator, work)?
+                    }
+                    _ => None,
                 };
                 let mut errors = output.errors().iter().peekable();
                 let mut remaining = Vec::with_capacity(child.ordinals.len());
@@ -1122,15 +1184,38 @@ impl<K> Frame<K> {
                             (recipe, operand.as_ref())
                         {
                             work.flush()?;
-                            recipe.compare_rows(
-                                EvaluatedArgument::SelectedColumn(operand),
-                                parent,
-                                self.rows[parent],
-                                EvaluatedArgument::SelectedColumn(&output),
-                                local,
-                                self.rows[parent],
-                                work.control,
-                            )? == Some(true)
+                            let left = EvaluatedArgument::SelectedColumn(operand);
+                            let right = EvaluatedArgument::SelectedColumn(&output);
+                            let batch_row = self.rows[parent];
+                            let result = match recipe {
+                                PreparedNodeComparison::Ordinary(recipe) => {
+                                    CompositeComparisonResult::Value(recipe.compare_rows(
+                                        left,
+                                        parent,
+                                        batch_row,
+                                        right,
+                                        local,
+                                        batch_row,
+                                        work.control,
+                                    )?)
+                                }
+                                PreparedNodeComparison::Composite(recipe) => recipe.compare_rows(
+                                    left,
+                                    parent,
+                                    batch_row,
+                                    right,
+                                    local,
+                                    batch_row,
+                                    comparison_allocator.as_ref(),
+                                    work.control,
+                                )?,
+                            };
+                            if let Some(error) = result.row_error(parent) {
+                                self.errors.insert(parent, error);
+                                work.step()?;
+                                continue;
+                            }
+                            result == CompositeComparisonResult::Value(Some(true))
                         } else {
                             let booleans = booleans
                                 .ok_or_else(|| internal("missing searched CASE Boolean carrier"))?;

@@ -39,7 +39,7 @@ pub mod value_conversion;
 mod value_conversion_kernel;
 mod value_conversion_owner;
 mod value_conversion_temporal;
-pub(crate) use value_conversion_temporal::LosslessTemporalWiden;
+pub(crate) use value_conversion_temporal::{LosslessTemporalWiden, TemporalTextCast};
 
 pub(crate) mod binding_control;
 

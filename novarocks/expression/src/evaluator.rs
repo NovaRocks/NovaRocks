@@ -428,6 +428,28 @@ impl CompiledExpressionInstance {
                                     .native_inlist(occurrence)
                                     .ok_or_else(|| invalid("missing mandatory IN effect recipe"))?
                                     .own_effects(invocation.context)
+                            } else if let ControlShape::Case {
+                                simple: true, arms, ..
+                            } = invocation.control
+                            {
+                                let mut own =
+                                    novarocks_type_contract::ExpressionEffects::PURE_VALUE;
+                                for arm in 0..arms {
+                                    work.step()?;
+                                    let recipe = program
+                                        .recipes()
+                                        .case_comparison(occurrence, arm)
+                                        .ok_or_else(|| {
+                                            invalid("missing mandatory CASE WHEN effect recipe")
+                                        })?;
+                                    if let crate::primitives::PreparedNodeComparison::Composite(
+                                        recipe,
+                                    ) = recipe
+                                    {
+                                        own.may_raise_row_error |= recipe.may_raise_row_error();
+                                    }
+                                }
+                                ScopedExpressionEffects::primitive(invocation.context, own)
                             } else if let StaticExprKind::PreparedBetween { plan, .. } = node.kind()
                             {
                                 let lower = program

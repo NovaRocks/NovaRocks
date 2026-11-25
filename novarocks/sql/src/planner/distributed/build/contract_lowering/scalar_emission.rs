@@ -519,8 +519,14 @@ impl ScalarEmission<'_, '_> {
                     .into_iter()
                     .map(|candidate| self.cast_expression_to(candidate, &compared))
                     .collect::<Result<Vec<_>, _>>()?;
+                let input = self.cast_expression_to(input, &compared)?;
+                if !ty.nullable() && self.membership_nullable(input, &list)? {
+                    ty = ty
+                        .with_nullable(true)
+                        .expect("validated Boolean NULL contract");
+                }
                 ContractExprKind::InList {
-                    expr: self.cast_expression_to(input, &compared)?,
+                    expr: input,
                     list: list.into_boxed_slice(),
                     negated: *negated,
                 }

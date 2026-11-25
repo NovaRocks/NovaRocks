@@ -127,6 +127,44 @@ impl ScalarEmission<'_, '_> {
             .ok_or_else(|| invalid("nullable transaction expression is absent"))
     }
 
+    pub(super) fn membership_nullable(
+        &mut self,
+        source: ExprId,
+        candidates: &[ExprId],
+    ) -> Result<bool, ContractLoweringError> {
+        use novarocks_functions::PreparedCompositeComparisonRecipe;
+        let source = self.expression_value_type(source)?;
+        if source.nullable() {
+            return Ok(true);
+        }
+        let composite = PreparedCompositeComparisonRecipe::is_composite(&source);
+        for &candidate in candidates {
+            self.work.step()?;
+            let candidate = self.expression_value_type(candidate)?;
+            if candidate.nullable() {
+                return Ok(true);
+            }
+            if composite {
+                let recipe = PreparedCompositeComparisonRecipe::try_new(
+                    novarocks_type_contract::KeyRelation::Equal,
+                    &source,
+                    &candidate,
+                    self.control,
+                )
+                .map_err(|error| match error.control_error() {
+                    Some(cause) => ContractLoweringError::Control(cause),
+                    None => ContractLoweringError::InvalidFunctionBinding {
+                        detail: error.to_string(),
+                    },
+                })?;
+                if recipe.nullable_result() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Visit every original definition event, including CAST/negate seeds with
     /// no dirty dependency. A true result requires the caller's original dirty
     /// insertion and immediately following checkpoint before its next event.
@@ -201,6 +239,16 @@ impl ScalarEmission<'_, '_> {
             ),
             ContractExprKind::Lambda { body, .. } if dependency_changed => {
                 published_value_type(&old.ty, &self.nullability_definition(*body)?.ty)
+            }
+            ContractExprKind::InList { expr, list, .. } if dependency_changed => {
+                let source = *expr;
+                let candidates = list.clone();
+                let nullable =
+                    old.ty.nullable() || self.membership_nullable(source, &candidates)?;
+                old.ty
+                    .clone()
+                    .with_nullable(nullable)
+                    .expect("validated Boolean NULL contract")
             }
             _ if dependency_changed && kind_follows_operand_nullability(&old.kind) => {
                 let mut revised = old.ty.clone();

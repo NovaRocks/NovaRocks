@@ -48,3 +48,8 @@ col_int	_col1	unnest
 2	[["c",3]]	["c",3]
 3	[["d",4],["e",5]]	["d",4]
 3	[["d",4],["e",5]]	["e",5]
+
+-- query 11
+-- types	row(A array(map(integer, integer)))
+_col0
+[[{}]]

@@ -27,7 +27,10 @@ use novarocks_parser::printer::print_object_name;
 
 use crate::analysis::*;
 use crate::analyze_error::{AnalyzeError, AnalyzeErrorKind};
-use novarocks_type_contract::{ArithmeticOperator, arithmetic_result_value_type_with_op};
+use novarocks_functions::PreparedCompositeComparisonRecipe;
+use novarocks_type_contract::{
+    ArithmeticOperator, KeyRelation, arithmetic_result_value_type_with_op,
+};
 
 use super::functions::*;
 use super::helpers::{eval_const_i64, expr_display_name};
@@ -1085,12 +1088,24 @@ impl<'a> super::AnalyzerContext<'a> {
             coerced_list.push(self.coerce_common_value(item, &common_type, span)?);
         }
         let list_typed = coerced_list;
-        // Three-valued: `NULL IN (1, 2)` and `1 IN (NULL, 2)` are both
-        // NULL, so the result is nullable whenever any operand is.
-        let nullable = expr_typed.value_type.nullable()
-            || list_typed
-                .iter()
-                .any(|candidate| candidate.value_type.nullable());
+        let nullable = if PreparedCompositeComparisonRecipe::is_composite(&common_type) {
+            let mut nullable = false;
+            for candidate in &list_typed {
+                nullable |= self
+                    .prepare_composite_equality(
+                        &expr_typed.value_type,
+                        &candidate.value_type,
+                        span,
+                    )?
+                    .nullable_result();
+            }
+            nullable
+        } else {
+            expr_typed.value_type.nullable()
+                || list_typed
+                    .iter()
+                    .any(|candidate| candidate.value_type.nullable())
+        };
         Ok(TypedExpr {
             kind: ExprKind::InList {
                 expr: novarocks_parser::ast::AstBox::new(expr_typed),
@@ -1103,6 +1118,24 @@ impl<'a> super::AnalyzerContext<'a> {
             ),
         })
     }
+    fn prepare_composite_equality(
+        &self,
+        left: &novarocks_type_contract::FunctionValueType,
+        right: &novarocks_type_contract::FunctionValueType,
+        span: Span,
+    ) -> Result<PreparedCompositeComparisonRecipe, AnalyzeError> {
+        PreparedCompositeComparisonRecipe::try_new(KeyRelation::Equal, left, right, self.control)
+            .map_err(|error| match error.control_error() {
+                Some(cause) => AnalyzeError::control(cause),
+                None => match error {
+                    novarocks_functions::ComparisonPrepareError::Unsupported => {
+                        AnalyzeError::unsupported_expression(error.to_string(), span)
+                    }
+                    _ => AnalyzeError::type_mismatch(error.to_string(), span),
+                },
+            })
+    }
+
     fn analyze_between_predicate(
         &self,
         value: &ast::Expr,
@@ -1465,6 +1498,27 @@ impl<'a> super::AnalyzerContext<'a> {
                     left.span(),
                 ));
             }
+            let ordinary_composite_equality =
+                matches!(
+                    operator,
+                    OperatorFunction::Equal
+                        | OperatorFunction::NotEqual
+                        | OperatorFunction::Identical
+                        | OperatorFunction::Distinct
+                ) && [&left_typed, &right_typed].into_iter().any(|operand| {
+                    novarocks_functions::PreparedCompositeComparisonRecipe::is_composite(
+                        &operand.value_type,
+                    )
+                });
+            if ordinary_composite_equality && !legacy_wide {
+                return self.analyze_binary_operator(
+                    operator,
+                    left_typed,
+                    right_typed,
+                    left.span(),
+                );
+            }
+
             let integer_array_equality =
                 matches!(
                     operator,
@@ -1969,12 +2023,17 @@ impl<'a> super::AnalyzerContext<'a> {
                     self.coerce_common_value(input, &common, span)
                 }
             };
-            operand_typed = Some(Box::new(cast(*value)?));
+            let value = Box::new(cast(*value)?);
             let mut coerced_when_then = Vec::with_capacity(when_then.len());
             for (label, result) in when_then {
                 self.check_control()?;
-                coerced_when_then.push((cast(label)?, result));
+                let label = cast(label)?;
+                if PreparedCompositeComparisonRecipe::is_composite(&value.value_type) {
+                    self.prepare_composite_equality(&value.value_type, &label.value_type, span)?;
+                }
+                coerced_when_then.push((label, result));
             }
+            operand_typed = Some(value);
             when_then = coerced_when_then;
         }
 
@@ -9015,35 +9074,8 @@ mod tests {
     }
 
     #[test]
-    fn nested_decimal_cast_admits_array_and_map_and_refuses_row_child_conversion() {
+    fn nested_decimal_cast_admits_array_map_and_row_child_conversion() {
         use novarocks_type_contract::TrinoCastMode;
-
-        let sql = "SELECT CAST(ROW(DECIMAL '123.5') AS ROW(a DECIMAL(3,0)))";
-        let query = novarocks_parser::parser::parse_query(sql).unwrap();
-        let error = super::super::analyze_with_function_catalog_and_sql_semantics(
-            &query,
-            &EmptyCatalog,
-            "default",
-            crate::functions::builtin_sql_function_catalog(),
-            &crate::sql_mode::SqlSemanticSettings::default(),
-            crate::constant::test_constant_policy(),
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.kind(),
-            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
-        );
-        assert!(
-            error
-                .message()
-                .contains("cast requires an implemented exact Physical scalar domain"),
-            "{error}"
-        );
-        assert_eq!(
-            error.span(),
-            Some(novarocks_parser::Span::new(7, sql.len()))
-        );
 
         for (name, mode) in [
             ("CAST", TrinoCastMode::Explicit),
@@ -9051,6 +9083,7 @@ mod tests {
         ] {
             for (source, target, child) in [
                 ("ARRAY[DECIMAL '123.5']", "ARRAY(DECIMAL(3,0))", 0),
+                ("ROW(DECIMAL '123.5')", "ROW(a DECIMAL(3,0))", 0),
                 (
                     "MAP(ARRAY[1], ARRAY[DECIMAL '123.5'])",
                     "MAP(INTEGER, DECIMAL(3,0))",

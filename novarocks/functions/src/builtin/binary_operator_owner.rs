@@ -28,7 +28,9 @@ use novarocks_type_contract::{
 use super::binding_control;
 use super::catalogue::request_types_with_constants;
 use super::operator_arithmetic::{ArithmeticSignature, arithmetic_types};
-use super::operator_kernel::BinaryOperatorKernel;
+use super::operator_kernel::{
+    BinaryOperatorKernel, composite_comparison_recipe, preserves_integer_array_operands,
+};
 use crate::kernel_control::{compile_failure, invalid};
 use crate::{
     CallEffectInput, FunctionArgument, FunctionArgumentType, FunctionBindingDeclaration,
@@ -99,7 +101,14 @@ fn operator_definition(
             "comparison",
             "(comparable T,comparable T)",
             "boolean",
-            FunctionIntrinsicRowError::NoRowError,
+            if matches!(
+                operator,
+                OperatorFunction::Equal | OperatorFunction::NotEqual
+            ) {
+                FunctionIntrinsicRowError::MayRaise
+            } else {
+                FunctionIntrinsicRowError::NoRowError
+            },
         )?]
     };
     let declaration = FunctionBindingDeclaration::try_new(id, FunctionKind::Scalar, overloads)
@@ -266,9 +275,7 @@ impl BinaryOperatorOwner {
             }
         } else {
             let [left, right] = inputs;
-            let args = if matches!(left.data_type(), DataType::List(_))
-                && matches!(right.data_type(), DataType::List(_))
-            {
+            let args = if preserves_integer_array_operands(self.operator, inputs) {
                 // The equality recipe widens only the actual signed elements.
                 // The two independently authored ARRAY layouts stay intact.
                 [left.clone(), right.clone()]
@@ -329,7 +336,11 @@ impl BinaryOperatorOwner {
         })
     }
 
-    fn effects(&self, input: CallEffectInput<'_>) -> Result<CallEffects, FunctionBindingError> {
+    fn effects(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, FunctionBindingError> {
         if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
         {
             return Err(FunctionBindingError::UnknownFunction);
@@ -346,9 +357,27 @@ impl BinaryOperatorOwner {
         let base = self
             .declaration
             .effect_declaration(&input.selected.overload)?;
+        let own_row_error = if matches!(
+            self.operator,
+            OperatorFunction::Equal | OperatorFunction::NotEqual
+        ) {
+            let [
+                FunctionArgumentType::Value(left),
+                FunctionArgumentType::Value(right),
+            ] = input.selected.argument_types.as_ref()
+            else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            match composite_comparison_recipe(self.operator, [left, right], control)? {
+                Some(recipe) if recipe.may_raise_row_error() => FunctionIntrinsicRowError::MayRaise,
+                _ => FunctionIntrinsicRowError::NoRowError,
+            }
+        } else {
+            base.own_row_error
+        };
         Ok(CallEffects {
             value_stability: base.value_stability,
-            own_row_error: base.own_row_error,
+            own_row_error,
             failure_behavior: base.failure_behavior,
             null_behavior: base.null_behavior,
             argument_control: base.argument_control,
@@ -371,7 +400,10 @@ impl BinaryOperatorOwner {
             FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
             other => FunctionEffectOwnerError::Owner(other),
         })?;
-        let effects = self.effects(input)?;
+        let effects = self.effects(input, control).map_err(|error| match error {
+            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+            other => FunctionEffectOwnerError::Owner(other),
+        })?;
         work.finish().map_err(FunctionEffectOwnerError::Control)?;
         Ok(effects)
     }
@@ -390,9 +422,10 @@ impl BinaryOperatorOwner {
             || novarocks_type_contract::CallEffectContext::from(contract.context()) != input.context
             || contract.decimal_overflow_policy() != input.decimal_overflow_policy
             || contract.effects()
-                != &self
-                    .effects(input)
-                    .map_err(|_| invalid("Invalid binary operator effects"))?
+                != &self.effects(input, control).map_err(|error| match error {
+                    FunctionBindingError::Control(error) => compile_failure(error),
+                    _ => invalid("Invalid binary operator effects"),
+                })?
         {
             return Err(invalid(
                 "Binary operator differs from its checked invocation",

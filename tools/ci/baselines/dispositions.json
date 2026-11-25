@@ -52,16 +52,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:aggregate/agg_test_map_agg",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:aggregate/agg_test_percentile_approx_weighted",
       "failure": {
         "class": "error_code",
@@ -112,32 +102,12 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:complex-type/array_varchar_common_coercion",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.type_mismatch"
-      },
-      "reason": "The unchanged native 1FE+3BE case verifies its first result at step 4. Its first refusal at step 5 is the explicit recursive CAST from ARRAY(TIMESTAMP(6)) to ARRAY(VARCHAR); the recursive element conversion belongs to B7e. Keep all subsequent original oracles. Evidence: B7b p07-matrix-v3/complex-type. Exit after the full original case and cleanup pass.",
-      "owner": "UEA-5E B7e",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:complex-type/complex_any_value",
       "failure": {
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
       "reason": "Missing installed pure implementation for builtin.scalar/row/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_binary_comparison",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
       "owner": "B7, B8, I1, I5",
       "expires": "2026-12-15"
     },
@@ -205,10 +175,10 @@
       "unit": "sql-case:complex-type/complex_test_array_contains",
       "failure": {
         "class": "error_code",
-        "code": "sql.analyze.unsupported_expression"
+        "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Native 1FE+3BE executes the full prefix through step 196, including the stored temporal comparison and both argument orders of mixed-precision contains_sequence. Step 197 first refuses the recursive ROW conversion for INSERT of the anonymous ROW array into ARRAY(ROW(f1 INTEGER, f2 VARCHAR)). B7e owns changing the nested ROW member type. Preserve all later MAP, JSON, and ROW oracles. Evidence: B7b p07-matrix-v6/complex-type. Exit after the complete case and cleanup pass.",
-      "owner": "UEA-5E B7e",
+      "reason": "Native 1FE+3BE passed the complete prefix through step 200, including the original recursive ROW write at step 197 and the MAP and mixed-domain checks. Step 201 statement 2 refuses the selected contains_sequence overload on ARRAY(JSON) with sql.analyze.unavailable_implementation. F7 owns JSON keys in the original array relation. Preserve the step 201 result and the unexecuted steps 202–240. Remove only after the complete case and actual cleanup pass.",
+      "owner": "7B3F F7",
       "expires": "2026-12-15"
     },
     {
@@ -317,8 +287,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/named_struct/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 1; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-shared-02/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B7a",
+      "reason": "Native 1FE+3BE now creates the schema and table and inserts one row after the recursive ROW conversion. Step 1 statement 4 refuses the selected builtin.scalar/filter/lambda-v1 overload with sql.analyze.unavailable_implementation. Preserve the original typed result oracle and remove only after the complete case and actual cleanup pass.",
+      "owner": "UEA-5E B7c",
       "expires": "2026-12-15"
     },
     {
@@ -349,16 +319,6 @@
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/variant_typeof/(any)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7d, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 4; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-dml-oracle-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
       "owner": "UEA-5E B7d",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/write_adaptation_types",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/named_struct/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 1; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-dml-oracle-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B7a",
       "expires": "2026-12-15"
     },
     {
@@ -812,16 +772,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:join/join_composite_in_unknown",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The first five ARRAY cases pass with the original value oracles converted to typed snapshots. Statement 6 selects builtin.scalar/row/dynamic-v1, which has no installed pure implementation. Earlier array_repeat failure and later unexecuted oracles remain recorded. Restore the ROW capability and verify the complete native case and cleanup before removal.",
-      "owner": "UEA-5E B7a",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:join/join_map_type",
       "failure": {
         "class": "error_code",
@@ -899,26 +849,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/variant_get/dynamic-v1; owner B7; remove after capability repair and native verification",
       "owner": "B7",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:project/project_cast_json_to_map",
-      "failure": {
-        "class": "error_code",
-        "code": "query.execution.unsupported"
-      },
-      "reason": "Unsupported compiled cast from: Utf8, to: Map(Field { name: \"entries\", data_type: Struct([Field { name: \"key\", data_type: Utf8 }, Field { name: \"value\", data_type: Utf8, nullable: true }]) }, false); owner B7, B8, I1, I5; remove after capability repair and native verification Native b722 and TST-G9b1 c30 both refuse unchanged step 3; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:project/project_cast_json_to_struct",
-      "failure": {
-        "class": "error_code",
-        "code": "query.execution.unsupported"
-      },
-      "reason": "Unsupported compiled cast from: Utf8, to: Struct([Field { name: \"col1\", data_type: Int32, nullable: true }, Field { name: \"col2\", data_type: Int32, nullable: true }, Field { name: \"col3\", data_type: Int32, nullable: true }]); owner B7, B8, I1, I5; remove after capability repair and native verification Native b722 and TST-G9b1 c30 both refuse unchanged step 1; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "B7, B8, I1, I5",
       "expires": "2026-12-15"
     },
     {
@@ -1182,16 +1112,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:complex-type/array_comparison_null_contract",
-      "failure": {
-        "class": "error_code",
-        "code": "query.execution.unsupported"
-      },
-      "reason": "The unchanged case reaches nested ARRAY comparison at statement 2; the frozen prepared comparison recipe accepts flat physical leaves and refuses this List carrier. No independent failed oracle or cleanup violation accompanies it. Restore nested comparison semantics and pass the unchanged full case before removal. Native b722 and TST-G9b1 c30 both refuse unchanged step 2; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "UEA-5E B7",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:complex-type/complex_test_array",
       "failure": {
         "class": "error_code",
@@ -1199,16 +1119,6 @@
       },
       "reason": "The unchanged case reaches nested ARRAY comparison at statement 5; the frozen prepared comparison recipe accepts flat physical leaves and refuses this List carrier. No independent failed oracle or cleanup violation accompanies it. Restore nested comparison semantics and pass the unchanged full case before removal. Native b722 and TST-G9b1 c30 both refuse unchanged step 5; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
       "owner": "UEA-5E B7",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_array_not_in_element_null",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.type_mismatch"
-      },
-      "reason": "The same statement 5 refuses ordinary equality between ARRAY(DECIMAL(26,2)) and ARRAY(INTEGER), which is outside the installed integral ARRAY comparison and widening domain. The original query.execution.unsupported result remains in baseline evidence. Restore this comparison and verify every original oracle and actual 1FE+3BE cleanup before removal.",
-      "owner": "UEA-5E B7e",
       "expires": "2026-12-15"
     },
     {
@@ -1229,16 +1139,6 @@
       },
       "reason": "Approved B1b-10 exact first-cause handoff to the existing B1a aggregate-state capability, explicitly anticipated for this unit by accepted spec section 5.10. Original complete native 1FE+3BE p11-native-private-sql-current-01 remains FAIL (exit1, stable input 391c2211): iceberg_ivm_projection_repartition first fails at step 11, statement 2/2, with [sql.analyze.unavailable_implementation] selected overload `builtin.aggregate/count_state/derived-v1` having no installed implementation for the selected carrier. Required result oracles at steps 3/5/7/9/10 passed; required result oracles 13/14/16/17 and expected-error oracle 18 remain unfulfilled, and original cleanup step 19 passed. The new predicate deliberately changes the exact public code from UnsupportedCompiledShape to sql.analyze.unavailable_implementation; class remains error_code. Unit and expiry are unchanged. This code-only classifier does not establish the overload or dispose a later first failure: every newly exposed first cause requires original statement/source review. Preserve the old Unsupported/B3 raw FAIL, all original result/expected-error oracles and unexecuted suffix. Evidence: p11-private-sql-current-01/sql.results.jsonl, its original case failure.txt, p11-private-sql-first-cause-disposition-review/exact-forty-seven-failures.json, and p11-repartition-pure-handoff-proposal/mapping.json. Remove only after the same complete original native case passes every required oracle and its original case/suite/server/fixture cleanup; no case PASS, System or final CI acceptance is inferred.",
       "owner": "UEA-5E B1a",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_test_cast_array",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unsupported_expression"
-      },
-      "reason": "Native 1FE+3BE verifies through step 9 after equivalent legacy conversion. Step 10 first refuses CAST of an exact JSON literal to ARRAY(ARRAY(INTEGER)). Two Trino 484 attempts reject the old VARCHAR source and confirm the JSON-source step 10 and 11 results on the original repeated values. Preserve step 11 and table cleanup. Evidence: B7b p07-cast-array-migration. Exit after complete native verification and cleanup.",
-      "owner": "UEA-5E B7e",
       "expires": "2026-12-15"
     },
     {
@@ -1332,9 +1232,9 @@
     },
     {
       "unit": "sql-case:join/join_struct_type",
-      "reason": "D0-6 originally preserved the missing ROW constructor refusal at statement 3 and its masked wrong-field-count assertion. B7a restores construction. The same four-field input for the two-field target now returns TYPE_MISMATCH during assignment analysis, matching the Trino 484 reference. The original 1FE+3BE scenario then stops at statement 4 with sql.analyze.unsupported_expression for a non-NULL ROW child conversion from VARCHAR(2) to VARCHAR. Preserve all remaining result and error assertions and the raw earlier failures.",
-      "owner": "UEA-5E B7e",
-      "exit_condition": "B7e delivers the exact ROW child conversion and applicable ordinary composite predicates. Rerun the complete original native 1FE+3BE case with its wrong-field-count assertion, all remaining result and error assertions and actual lifecycle cleanup passing, then remove this quarantine.",
+      "reason": "The original wrong-field-count oracle at statement 3 passes with TYPE_MISMATCH. Native 1FE+3BE now passes analysis of the non-NULL ROW VARCHAR child and reaches the Iceberg assignment of the JSON leaf in s4 to the stored String field at statement 4. The observed sql.analyze.type_mismatch belongs to the F6 persisted JSON fixture migration. Preserve the original SQL, result and error assertions, and prior failures.",
+      "owner": "7B3F F6",
+      "exit_condition": "F6 preserves the fixture through explicit JSON text storage and typed parsing. Rerun the complete original native 1FE+3BE case with its wrong-field-count assertion, all remaining result and error assertions, and actual lifecycle cleanup passing, then remove this quarantine.",
       "review_by": "2026-12-15"
     },
     {

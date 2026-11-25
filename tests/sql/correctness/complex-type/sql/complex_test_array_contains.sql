@@ -939,7 +939,8 @@ USE ${case_db};
 CREATE TABLE test_array_contains_complex_type (
     id INT,
     array_map ARRAY<MAP<VARCHAR, INT>>,
-    array_json ARRAY<JSON>,
+    -- Store JSON text; cast the parsed value to ARRAY(JSON) at each predicate.
+    array_json VARCHAR,
     array_struct ARRAY<ROW(f1 INT, f2 VARCHAR)>
 ) WITH (format_version = 3);
 
@@ -947,14 +948,15 @@ CREATE TABLE test_array_contains_complex_type (
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO test_array_contains_complex_type VALUES
-ROW(1, [MAP(ARRAY['a', 'b'], ARRAY[1, 2]), MAP(ARRAY['c', 'd'], ARRAY[3, 4])], [JSON '{"key1": 100, "key2": 200}', JSON '{"key3": 300}'], [row(10, 'hello'), row(20, 'world')]),
-ROW(2, [MAP(ARRAY['x', 'y'], ARRAY[5, 6])], [JSON '{"key4": 400}', JSON '{"key5": 500, "key6": 600}'], [row(30,'starrocks'), row(40, 'database')]),
+ROW(1, [MAP(ARRAY['a', 'b'], ARRAY[1, 2]), MAP(ARRAY['c', 'd'], ARRAY[3, 4])], '[{"key1": 100, "key2": 200}, {"key3": 300}]', [row(10, 'hello'), row(20, 'world')]),
+ROW(2, [MAP(ARRAY['x', 'y'], ARRAY[5, 6])], '[{"key4": 400}, {"key5": 500, "key6": 600}]', [row(30,'starrocks'), row(40, 'database')]),
 ROW(3, NULL, NULL, NULL),
-ROW(4, [], [], []);
+ROW(4, [], '[]', []);
 
 -- query 198
+-- Compare MAP values after matching the declared key type.
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([MAP(ARRAY['c', 'd'], ARRAY[3, 4])], array_map) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([CAST(MAP(ARRAY['c', 'd'], ARRAY[3, 4]) AS MAP(VARCHAR, INTEGER))], array_map) ORDER BY id;
 
 -- query 199
 USE ${case_db};
@@ -963,11 +965,11 @@ SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([], arra
 -- query 200
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE contains_sequence(['{"key3": 300}'], array_json) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains_sequence(['{"key3": 300}'], CAST(PARSE_JSON(array_json) AS ARRAY(JSON))) ORDER BY id;
 
 -- query 201
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([NULL], array_json) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([NULL], CAST(PARSE_JSON(array_json) AS ARRAY(JSON))) ORDER BY id;
 
 -- query 202
 USE ${case_db};
@@ -980,7 +982,7 @@ SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([NULL], 
 -- query 204
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE contains_sequence(array_json, ['{"key3": 300}']) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains_sequence(CAST(PARSE_JSON(array_json) AS ARRAY(JSON)), ['{"key3": 300}']) ORDER BY id;
 
 -- query 205
 USE ${case_db};
@@ -1011,27 +1013,27 @@ SELECT id FROM test_array_contains_complex_type WHERE contains(array_map, map())
 -- query 211
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, '{"key1": 100, "key2": 200}') ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(CAST(PARSE_JSON(array_json) AS ARRAY(JSON)), '{"key1": 100, "key2": 200}') ORDER BY id;
 
 -- query 212
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, '{"key3": 300}') ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(CAST(PARSE_JSON(array_json) AS ARRAY(JSON)), '{"key3": 300}') ORDER BY id;
 
 -- query 213
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, '{"key5": 500, "key6": 600}') ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(CAST(PARSE_JSON(array_json) AS ARRAY(JSON)), '{"key5": 500, "key6": 600}') ORDER BY id;
 
 -- query 214
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, NULL) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(CAST(PARSE_JSON(array_json) AS ARRAY(JSON)), NULL) ORDER BY id;
 
 -- query 215
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, '{}') ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(CAST(PARSE_JSON(array_json) AS ARRAY(JSON)), '{}') ORDER BY id;
 
 -- query 216
 USE ${case_db};
@@ -1073,26 +1075,26 @@ SELECT id, array_position(array_map, map()) FROM test_array_contains_complex_typ
 -- query 225
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
-SELECT id, array_position(array_json, '{"key1": 100, "key2": 200}') FROM test_array_contains_complex_type ORDER BY id;
+SELECT id, array_position(CAST(PARSE_JSON(array_json) AS ARRAY(JSON)), '{"key1": 100, "key2": 200}') FROM test_array_contains_complex_type ORDER BY id;
 
 -- query 226
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
-SELECT id, array_position(array_json, '{"key3": 300}') FROM test_array_contains_complex_type ORDER BY id;
+SELECT id, array_position(CAST(PARSE_JSON(array_json) AS ARRAY(JSON)), '{"key3": 300}') FROM test_array_contains_complex_type ORDER BY id;
 
 -- query 227
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
-SELECT id, array_position(array_json, '{"key5": 500, "key6": 600}') FROM test_array_contains_complex_type ORDER BY id;
+SELECT id, array_position(CAST(PARSE_JSON(array_json) AS ARRAY(JSON)), '{"key5": 500, "key6": 600}') FROM test_array_contains_complex_type ORDER BY id;
 
 -- query 228
 USE ${case_db};
-SELECT id, array_position(array_json, NULL) FROM test_array_contains_complex_type ORDER BY id;
+SELECT id, array_position(CAST(PARSE_JSON(array_json) AS ARRAY(JSON)), NULL) FROM test_array_contains_complex_type ORDER BY id;
 
 -- query 229
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
-SELECT id, array_position(array_json, '{}') FROM test_array_contains_complex_type ORDER BY id;
+SELECT id, array_position(CAST(PARSE_JSON(array_json) AS ARRAY(JSON)), '{}') FROM test_array_contains_complex_type ORDER BY id;
 
 -- query 230
 USE ${case_db};

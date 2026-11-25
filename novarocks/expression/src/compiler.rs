@@ -1810,7 +1810,18 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                         )
                         .into());
                     }
-                    let mut combined = ScopedExpressionEffects::pure_value(invocation.context);
+                    let value_type = |id| {
+                        unit.definition(id)
+                            .map(|node| &node.ty)
+                            .ok_or(ExprCompileError::Invalid("missing original CASE source"))
+                    };
+                    let mut combined = crate::primitives::case_own_effects(
+                        operand.map(value_type).transpose()?,
+                        when_then.iter().map(|(label, _)| value_type(*label)),
+                        invocation.context,
+                        work,
+                        ExprCompileError::from,
+                    )?;
                     for (ordinal, local_child) in children.iter().enumerate() {
                         let source_child = case_child(*operand, when_then, *else_expr, ordinal)
                             .ok_or(ExprCompileError::Invalid("missing actual CASE operand"))?;

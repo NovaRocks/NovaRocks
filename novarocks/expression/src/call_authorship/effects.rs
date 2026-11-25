@@ -658,14 +658,26 @@ fn own_effects(
             .map_err(comparison_author_error)?;
             recipe.own_effects(context)
         }
+        ExprKind::Case {
+            operand, when_then, ..
+        } => crate::primitives::case_own_effects(
+            operand
+                .map(|id| definition(unit, id).map(|node| &node.ty))
+                .transpose()?,
+            when_then
+                .iter()
+                .map(|(id, _)| definition(unit, *id).map(|node| &node.ty)),
+            context,
+            work,
+            comparison_author_error,
+        )?,
         ExprKind::Unary {
             op: UnaryOperator::Not,
             ..
         }
         | ExprKind::IsNull { .. }
         | ExprKind::Conjunction { .. }
-        | ExprKind::Disjunction { .. }
-        | ExprKind::Case { .. } => ScopedExpressionEffects::pure_value(context),
+        | ExprKind::Disjunction { .. } => ScopedExpressionEffects::pure_value(context),
         ExprKind::Cast {
             expr,
             target,

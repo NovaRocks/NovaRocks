@@ -1,0 +1,20 @@
+-- query 1
+-- types	bigint	boolean	boolean
+id	member	nonmember
+1	NULL	NULL
+2	false	true
+3	false	true
+4	true	false
+
+-- query 2
+-- types	bigint	bigint
+probe_id	candidate_id
+2	2
+3	3
+
+-- query 3
+-- types	bigint	bigint
+probe_id	candidate_id
+1	2
+2	4
+3	6

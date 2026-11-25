@@ -17,7 +17,9 @@
 
 //! One immutable compiled unit and its original per-use facts.
 use crate::creation::{ProgramCreation, ProgramCreationFailure};
-use crate::primitives::{ComparisonSite, CreatedPrimitiveMap, ProgramPrimitiveError};
+use crate::primitives::{
+    ComparisonSite, CreatedPrimitiveMap, PreparedNodeComparison, ProgramPrimitiveError,
+};
 use crate::{
     CompiledExprId, ExprCompileError, ExprCompileFailure, ImmutableExpressions, InputBinding,
     ScopeLayout, ScopeLayouts,
@@ -65,7 +67,7 @@ pub struct UnitRecipes {
         CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedNativeInListRecipe>,
     arithmetic: CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedArithmeticRecipe>,
     casts: CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedCastRecipe>,
-    comparisons: CreatedPrimitiveMap<ComparisonSite, novarocks_functions::PreparedComparisonRecipe>,
+    comparisons: CreatedPrimitiveMap<ComparisonSite, PreparedNodeComparison>,
     null_safe:
         CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedNullSafeComparisonRecipe>,
 }

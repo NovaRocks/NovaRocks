@@ -59,7 +59,8 @@ SELECT [CAST('1' AS DECIMAL(26,2)), CAST(NULL AS DECIMAL(26,2))]
          IN (SELECT [CAST('1' AS DECIMAL(4,3)), CAST('2' AS DECIMAL(4,3))]) AS match;
 
 -- query 9
--- Preserve the FE's frozen STRING promotion for nested string/numeric pairs.
+-- An ARRAY(VARCHAR) and an ARRAY(DECIMAL) have no implicit comparison type.
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
 SELECT ['1','2'] IN (SELECT [CAST('1' AS DECIMAL(4,2)),CAST('2' AS DECIMAL(4,2))]) AS text_differs;
 
 -- query 10

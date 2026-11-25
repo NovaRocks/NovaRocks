@@ -1480,3 +1480,178 @@ mod control_observation {
         }
     }
 }
+
+fn composite_recipe(
+    relation: novarocks_type_contract::KeyRelation,
+    left: &ArrayRef,
+    right: &ArrayRef,
+) -> PreparedCompositeComparisonRecipe {
+    PreparedCompositeComparisonRecipe::try_new(
+        relation,
+        &ty(left.data_type().clone(), false),
+        &ty(right.data_type().clone(), false),
+        &CompileControl::default(),
+    )
+    .unwrap()
+}
+
+fn composite_pair(
+    recipe: &PreparedCompositeComparisonRecipe,
+    left: &ArrayRef,
+    right: &ArrayRef,
+    allocator: Option<&ComparisonAllocator>,
+) -> Result<CompositeComparisonResult, KernelFailure> {
+    recipe.compare_rows(
+        EvaluatedArgument::Column(left),
+        0,
+        0,
+        EvaluatedArgument::Column(right),
+        0,
+        0,
+        allocator,
+        &Control::default(),
+    )
+}
+
+#[test]
+fn composite_array_comparison_distinguishes_ieee_equality_identity_and_member_null() {
+    use novarocks_type_contract::KeyRelation::{Equal, Identical};
+
+    let list = |items| -> ArrayRef {
+        Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>([Some(
+            items,
+        )]))
+    };
+    let left = list([Some(f64::NAN), Some(-0.0)]);
+    let right = list([Some(f64::from_bits(0xfff8_0000_0000_0002)), Some(0.0)]);
+    for (relation, expected) in [(Equal, false), (Identical, true)] {
+        let recipe = composite_recipe(relation, &left, &right);
+        assert!(!recipe.requires_allocator());
+        assert!(!recipe.may_raise_row_error());
+        assert_eq!(
+            composite_pair(&recipe, &left, &right, None).unwrap(),
+            CompositeComparisonResult::Value(Some(expected)),
+        );
+    }
+
+    let left = list([None, Some(-0.0)]);
+    let right = list([Some(1.0), Some(0.0)]);
+    let recipe = composite_recipe(Equal, &left, &right);
+    assert!(recipe.nullable_result());
+    assert!(!recipe.may_raise_row_error());
+    assert_eq!(
+        composite_pair(&recipe, &left, &right, None).unwrap(),
+        CompositeComparisonResult::Value(None),
+    );
+    let recipe = composite_recipe(Identical, &left, &right);
+    assert!(!recipe.nullable_result());
+    assert_eq!(
+        composite_pair(&recipe, &left, &right, None).unwrap(),
+        CompositeComparisonResult::Value(Some(false)),
+    );
+}
+
+fn composite_map(keys: [[Option<i64>; 1]; 2], values: [i64; 2]) -> ArrayRef {
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::Field;
+    let keys: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+        keys.map(Some),
+    ));
+    let values: ArrayRef = Arc::new(Int64Array::from(values.to_vec()));
+    let fields = [
+        Arc::new(Field::new("key", keys.data_type().clone(), false)),
+        Arc::new(Field::new("value", values.data_type().clone(), false)),
+    ];
+    let entries = StructArray::new(fields.to_vec().into(), vec![keys, values], None);
+    Arc::new(MapArray::new(
+        Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+        OffsetBuffer::new(vec![0, 2].into()),
+        entries,
+        None,
+        false,
+    ))
+}
+
+#[derive(Default)]
+struct ComparisonTestHost {
+    live_blocks: std::sync::atomic::AtomicUsize,
+    refuse_scratch: std::sync::atomic::AtomicBool,
+}
+
+impl AggregateStateAllocator for ComparisonTestHost {
+    fn allocate(&self, layout: std::alloc::Layout) -> Result<std::ptr::NonNull<u8>, KernelFailure> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.refuse_scratch.load(Relaxed) {
+            return Err(KernelFailure::Operational(KernelDiagnostic::new(
+                "original scratch refusal",
+            )));
+        }
+        // SAFETY: the allocator contract supplies an exact nonzero layout.
+        let block = std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) })
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        self.live_blocks.fetch_add(1, Relaxed);
+        Ok(block)
+    }
+
+    unsafe fn release(&self, block: std::ptr::NonNull<u8>, layout: std::alloc::Layout) {
+        self.live_blocks
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: the caller returns the exact live allocation and its layout.
+        unsafe { std::alloc::dealloc(block.as_ptr(), layout) };
+    }
+}
+
+#[test]
+fn composite_map_comparison_separates_row_error_from_null_and_retires_scratch() {
+    use novarocks_failure_contract::kernel_reason::MAP_KEY_INDETERMINATE;
+    use novarocks_type_contract::KeyRelation::{Equal, Identical};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let left = composite_map([[None], [Some(1)]], [10, 11]);
+    let reordered = composite_map([[Some(1)], [None]], [11, 10]);
+    let different = composite_map([[Some(1)], [None]], [12, 10]);
+    let ordinary = composite_recipe(Equal, &left, &reordered);
+    assert!(!ordinary.nullable_result());
+    assert!(ordinary.may_raise_row_error());
+    assert!(ordinary.requires_allocator());
+
+    let host = Arc::new(ComparisonTestHost::default());
+    let allocator = ComparisonAllocator::try_new(host.clone()).unwrap();
+    let result = composite_pair(&ordinary, &left, &reordered, Some(&allocator)).unwrap();
+    assert_eq!(result, CompositeComparisonResult::Indeterminate);
+    let error = result.row_error(3).unwrap();
+    assert_eq!(error.selected_ordinal(), 3);
+    assert_eq!(
+        error.reason(),
+        DataFailureReason::Domain(MAP_KEY_INDETERMINATE)
+    );
+    for (left, right) in [(&left, &different), (&different, &left)] {
+        assert_eq!(
+            composite_pair(&ordinary, left, right, Some(&allocator)).unwrap(),
+            CompositeComparisonResult::Value(Some(false)),
+        );
+        assert_eq!(host.live_blocks.load(Relaxed), 1);
+    }
+
+    let identity = composite_recipe(Identical, &left, &reordered);
+    assert!(!identity.may_raise_row_error());
+    assert_eq!(
+        composite_pair(&identity, &left, &reordered, Some(&allocator)).unwrap(),
+        CompositeComparisonResult::Value(Some(true)),
+    );
+    assert_eq!(host.live_blocks.load(Relaxed), 1);
+
+    host.refuse_scratch.store(true, Relaxed);
+    assert_eq!(
+        composite_pair(&identity, &left, &reordered, Some(&allocator)).unwrap_err(),
+        KernelFailure::Operational(KernelDiagnostic::new("original scratch refusal")),
+    );
+    assert_eq!(host.live_blocks.load(Relaxed), 1);
+    host.refuse_scratch.store(false, Relaxed);
+    assert_eq!(
+        composite_pair(&identity, &left, &reordered, Some(&allocator)).unwrap(),
+        CompositeComparisonResult::Value(Some(true)),
+    );
+    drop(allocator);
+    assert_eq!(host.live_blocks.load(Relaxed), 0);
+}
