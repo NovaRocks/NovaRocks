@@ -1149,14 +1149,12 @@ mod tests {
 
     #[test]
     fn named_structs_and_nominal_children_remain_distinct() {
-        let nominal =
-            Field::new("item", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
-                String,
-                String,
-            >::from([(
+        let nominal = Field::new("item", DataType::LargeBinary, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
                 crate::NR_LOGICAL_TYPE_KEY.into(),
                 "json".into(),
-            )]));
+            )]),
+        );
         let list = |field| {
             ValueTypeRef::try_from_declared_arrow(
                 &DataType::List(Arc::new(field)),
@@ -1168,7 +1166,7 @@ mod tests {
         };
         assert_ne!(
             list(nominal),
-            list(Field::new("item", DataType::Utf8, true))
+            list(Field::new("item", DataType::LargeBinary, true))
         );
         let structure = |name: &str| {
             ValueTypeRef::try_from_declared_arrow(

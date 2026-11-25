@@ -697,9 +697,12 @@ fn actual_flat_writer_exact_timezone_and_nominal_metadata_use_original_source() 
         }
     }
     for labelled in [false, true] {
-        let ty =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
+        let ty = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let mut metadata = HashMap::from([
             ("provider-field-id".into(), "2147483647".into()),
             ("custom".into(), "unchanged".into()),

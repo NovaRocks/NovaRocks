@@ -536,13 +536,13 @@ select arrays_overlap(NULL, NULL) from array_test order by pk;
 
 -- query 111
 USE ${case_db};
-select arrays_overlap([parse_json('{"addr": 1}'), parse_json('{"addr": 2}')],
-                        [parse_json('{"addr": 2}'), parse_json('{"addr": 3}')]);
+select arrays_overlap([json_parse('{"addr": 1}'), json_parse('{"addr": 2}')],
+                        [json_parse('{"addr": 2}'), json_parse('{"addr": 3}')]);
 
 -- query 112
 USE ${case_db};
-select arrays_overlap([parse_json('{"addr": 1}'), parse_json('{"addr": 2}')],
-                        [parse_json('{"addr": 3}'), parse_json('{"addr": 4}')]);
+select arrays_overlap([json_parse('{"addr": 1}'), json_parse('{"addr": 2}')],
+                        [json_parse('{"addr": 3}'), json_parse('{"addr": 4}')]);
 
 -- query 113
 USE ${case_db};

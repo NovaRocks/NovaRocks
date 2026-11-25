@@ -597,11 +597,14 @@ SELECT CAST(id AS INT) id, repeat('x', 32768) payload FROM range(96);
             "--", self.args.nova, self.args.user, table], "jdbc-probe")
         if not re.search(rb"^JDBC_PROBE_OK validated=true server_version=\S[^\r\n]*$", result.stdout, re.MULTILINE):
             raise ProbeFailure("JDBC probe did not confirm validated HEAD /v1/statement and /v1/info version")
+        if b"JDBC_JSON_OK direct=true nested=true sql_null=true json_null=true" not in result.stdout.splitlines():
+            raise ProbeFailure("JDBC probe did not confirm direct and nested JSON values and nulls")
         for mode in (b"true", b"false"):
             if b"JDBC_PREPARED_OK explicitPrepare=" + mode not in result.stdout:
                 raise ProbeFailure("JDBC prepared mode did not finish: " + mode.decode())
         write_json(self.root / "jdbc-probe.json", {"status": "PASS", "jar": str(self.args.trino_jdbc_jar),
-                                                  "prepared_modes": ["explicit", "immediate"], "table": table})
+                                                  "prepared_modes": ["explicit", "immediate"], "table": table,
+                                                  "json": ["direct", "nested", "sql_null", "json_null"]})
 
 
 def resume_cleanup(args):

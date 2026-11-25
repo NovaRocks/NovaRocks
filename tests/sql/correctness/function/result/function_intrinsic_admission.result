@@ -52,3 +52,13 @@ NULL
 -- types	array(integer)
 result
 [1,null]
+
+-- query 16
+-- types	varchar	varchar	varchar	varchar
+default_json_type	native_json_type	array_text	object_text
+varchar	json	[1]	{"k":null}
+
+-- query 17
+-- types	varchar(3)	varchar
+shortened	encoded
+"\"ab"	3100

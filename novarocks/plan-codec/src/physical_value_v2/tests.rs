@@ -265,8 +265,12 @@ fn value_namespace_all_nine_origins_have_independent_wire_and_typed_source_oracl
         (0, nested()),
         (
             u32::MAX,
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Json,
+            )
+            .unwrap(),
         ),
     ];
     let type_sources = encode_type_table_sources(&types, &[], type_limits(), &control).unwrap();
@@ -358,9 +362,12 @@ fn value_namespace_exact_type_and_source_binding_refuse_foreign_or_missing_facts
     let different_child_nullability = ty(DataType::Struct(
         vec![Arc::new(Field::new("child", DataType::Utf8, true))].into(),
     ));
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
     let json_child = novarocks_type_contract::ValueTypeRef::try_new(
         novarocks_type_contract::ValueKind::Nominal(ValueLogicalType::Json),

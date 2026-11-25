@@ -2584,7 +2584,7 @@ mod tests {
             (ValueLogicalType::LargeInt, DataType::FixedSizeBinary(16)),
             (ValueLogicalType::Uuid, DataType::FixedSizeBinary(16)),
             (ValueLogicalType::Variant, DataType::LargeBinary),
-            (ValueLogicalType::Json, DataType::Utf8),
+            (ValueLogicalType::Json, DataType::LargeBinary),
             (ValueLogicalType::Hll, DataType::Binary),
             (ValueLogicalType::Bitmap, DataType::Binary),
             (ValueLogicalType::Object, DataType::Binary),
@@ -2677,9 +2677,12 @@ mod tests {
             assert_eq!(slot.field().metadata()["nr_logical_type"], "json");
             assert!(!slot.nullable());
         }
-        let declaration =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap();
+        let declaration = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let types = vec![declaration.clone(); 257];
         let slots = original_source.slot_ids();
         let schema = Arc::new(Schema::new(
@@ -2726,9 +2729,12 @@ mod tests {
         .unwrap();
         // The old nullable=true semantic claim contradicts its non-null field.
         // It remains an explicit strong negative rather than a weak success.
-        let widening =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
+        let widening = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let negative = StaticLayout::try_new_typed_with_creator(
             schema.clone(),
             Arc::from(slots),

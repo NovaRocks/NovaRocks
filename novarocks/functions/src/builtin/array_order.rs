@@ -414,7 +414,7 @@ mod tests {
         use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
 
         let typed_field = |logical| {
-            let mut item = Field::new_list_field(DataType::Utf8, true);
+            let mut item = Field::new_list_field(DataType::LargeBinary, true);
             if let Some(logical) = logical {
                 item = item.with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), logical)]);
             }

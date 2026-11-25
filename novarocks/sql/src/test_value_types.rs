@@ -27,7 +27,14 @@ pub(crate) fn string_structure(fields: &[(&str, bool, bool)], nullable: bool) ->
     let layout = DataType::Struct(
         fields
             .iter()
-            .map(|(name, nullable, _)| Field::new(*name, DataType::Utf8, *nullable))
+            .map(|(name, nullable, json)| {
+                let carrier = if *json {
+                    DataType::LargeBinary
+                } else {
+                    DataType::Utf8
+                };
+                Field::new(*name, carrier, *nullable)
+            })
             .collect::<Vec<_>>()
             .into(),
     );
@@ -80,10 +87,15 @@ pub(crate) fn string_list(item_nullable: bool, json: bool, nullable: bool) -> Fu
     )
     .unwrap();
     let value = ValueTypeRef::try_new(ValueKind::List(item), nullable, storage.clone()).unwrap();
+    let carrier = if json {
+        DataType::LargeBinary
+    } else {
+        DataType::Utf8
+    };
     let layout = ValueLayout::try_new(
         &DataType::List(std::sync::Arc::new(Field::new(
             "item",
-            DataType::Utf8,
+            carrier,
             item_nullable,
         ))),
         storage,

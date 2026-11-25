@@ -1194,12 +1194,12 @@ mod tests {
             }
         }
         let json = FunctionValueType::try_with_logical_type(
-            DataType::Utf8,
+            DataType::LargeBinary,
             true,
             novarocks_type_contract::ValueLogicalType::Json,
         )
         .unwrap();
-        let plain = FunctionValueType::new(DataType::Utf8, false);
+        let plain = FunctionValueType::new(DataType::LargeBinary, false);
         for (name, arguments) in [
             (
                 "lead",
@@ -1329,7 +1329,7 @@ mod tests {
                 &Control
             )
             .is_err(),
-            "text offset cannot widen"
+            "binary offset cannot widen"
         );
         assert!(
             resolve_scalar_value_signature_with_overload("lead", &[plain, json], &Control).is_err(),
@@ -1350,15 +1350,20 @@ mod tests {
             }
         }
         let text = FunctionValueType::new(DataType::Utf8, false);
-        let integer = FunctionValueType::new(DataType::Int64, false);
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            novarocks_type_contract::ValueLogicalType::Json,
+        )
+        .unwrap();
         for (name, arguments) in [
-            ("parse_json", vec![text.clone()]),
-            ("json_object", vec![text.clone(), integer.clone()]),
-            ("json_array", vec![integer]),
+            ("json_parse", vec![text.clone()]),
+            ("__json_object_null", vec![text.clone(), json.clone()]),
+            ("__json_array_absent", vec![json]),
         ] {
             let (overload, resolved) =
                 resolve_scalar_value_signature_with_overload(name, &arguments, &Control).unwrap();
-            assert_eq!(resolved.return_type.data_type(), &DataType::Utf8);
+            assert_eq!(resolved.return_type.data_type(), &DataType::LargeBinary);
             assert_eq!(
                 resolved.return_type.logical_type(),
                 novarocks_type_contract::ValueLogicalType::Json,
@@ -1389,7 +1394,7 @@ mod tests {
         assert_eq!(
             upper.return_type.logical_type(),
             novarocks_type_contract::ValueLogicalType::Physical,
-            "the same Utf8 carrier does not turn a text producer into JSON"
+            "a text producer retains its physical domain"
         );
     }
 

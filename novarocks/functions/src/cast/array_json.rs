@@ -15,47 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! D33 conversion of authored raw JSON text and ordinary VARCHAR values.
-//! This is a value author inside the existing prepared CAST recipe. It owns
-//! no row selection, Arrow result assembly, inherited errors or allocation grant.
+//! Shared JSON text lexemes and bounded exact numeric parsing.
+use crate::KernelFailure;
 use crate::kernel_input::EvaluationCheckpoints;
-use crate::{CompileKernelControl, KernelFailure};
+#[cfg(test)]
 use arrow_schema::DataType;
-use novarocks_type_contract::{
-    CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
-};
+#[cfg(test)]
+use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use std::{error::Error, fmt, ops::Range};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(super) enum Operation {
     JsonToVarchar,
     VarcharToJson,
 }
 
-pub(super) fn profile(source: &FunctionValueType, result: &FunctionValueType) -> Option<Operation> {
-    if source.data_type() != &DataType::Utf8
-        || result.data_type() != &DataType::Utf8
-        || (source.nullable() && !result.nullable())
-    {
-        return None;
-    }
-    match (source.logical_type(), result.logical_type()) {
-        (ValueLogicalType::Json, ValueLogicalType::Physical) if result.nullable() => {
-            Some(Operation::JsonToVarchar)
-        }
-        (ValueLogicalType::Physical, ValueLogicalType::Json) => Some(Operation::VarcharToJson),
-        _ => None,
-    }
-}
-
 #[derive(Debug)]
-pub(super) struct InvalidCast;
+#[cfg(test)]
+pub(crate) struct InvalidCast;
+#[cfg(test)]
 impl fmt::Display for InvalidCast {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Cannot cast JSON array element to VARCHAR")
     }
 }
+#[cfg(test)]
 impl Error for InvalidCast {}
+#[cfg(test)]
 impl novarocks_failure_contract::FailureProjection for InvalidCast {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
@@ -65,9 +52,10 @@ impl novarocks_failure_contract::FailureProjection for InvalidCast {
     }
 }
 #[derive(Debug)]
-pub(super) enum InvalidJson {
+pub(crate) enum InvalidJson {
     Syntax,
     NumberRange,
+    #[cfg(test)]
     NestingDepth,
     FloatParser(std::num::ParseFloatError),
 }
@@ -76,6 +64,7 @@ impl fmt::Display for InvalidJson {
         match self {
             Self::Syntax => f.write_str("Invalid raw JSON array element"),
             Self::NumberRange => f.write_str("Raw JSON number is outside the supported range"),
+            #[cfg(test)]
             Self::NestingDepth => f.write_str("Raw JSON nesting depth exceeds 1024"),
             Self::FloatParser(source) => write!(f, "Raw JSON number cannot be parsed: {source}"),
         }
@@ -98,7 +87,8 @@ impl novarocks_failure_contract::FailureProjection for InvalidJson {
     }
 }
 #[derive(Debug)]
-pub(super) enum LeafError {
+pub(crate) enum LeafError {
+    #[cfg(test)]
     Conversion(InvalidCast),
     Parse(InvalidJson),
     Outer(KernelFailure),
@@ -114,12 +104,14 @@ fn bad<T>() -> Result<T, LeafError> {
 fn bad_number<T>() -> Result<T, LeafError> {
     Err(LeafError::Parse(InvalidJson::NumberRange))
 }
+#[cfg(test)]
 fn extent(n: usize) -> Result<usize, LeafError> {
     if n > i32::MAX as usize {
         return Err(KernelFailure::ResourceExhausted.into());
     }
     Ok(n)
 }
+#[cfg(test)]
 fn string_with_capacity(
     n: usize,
     work: &mut EvaluationCheckpoints<'_>,
@@ -135,6 +127,7 @@ fn string_with_capacity(
 
 /// The caller has already handled the actual source SQL NULL. A successful
 /// None here is JSON null, not a conversion error inferred from a NULL value.
+#[cfg(test)]
 pub(super) fn convert_non_null_observed(
     op: Operation,
     raw: &str,
@@ -158,6 +151,7 @@ pub(super) fn convert_non_null_observed(
         }
     }
 }
+#[cfg(test)]
 fn copy_text(value: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<String, LeafError> {
     let mut out = string_with_capacity(value.len(), work)?;
     for ch in value.chars() {
@@ -167,6 +161,7 @@ fn copy_text(value: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<String
     Ok(out)
 }
 
+#[cfg(test)]
 fn quote(value: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<String, LeafError> {
     // Exact escaped geometry, not a conservative six-times limit that can
     // reject a representable large value. Every original byte is observed.
@@ -208,6 +203,7 @@ fn quote(value: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<String, Le
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 enum Scalar {
     Null,
     Boolean(bool),
@@ -218,23 +214,37 @@ enum Scalar {
     Number(Range<usize>),
     Container,
 }
-struct Reader<'a, 'w, 'c> {
-    raw: &'a str,
-    at: usize,
-    work: &'w mut EvaluationCheckpoints<'c>,
+pub(crate) trait LexWork {
+    fn step(&mut self) -> Result<(), KernelFailure>;
+    fn flush(&mut self) -> Result<(), KernelFailure>;
 }
-impl Reader<'_, '_, '_> {
-    fn byte(&self) -> Option<u8> {
+
+impl LexWork for EvaluationCheckpoints<'_> {
+    fn step(&mut self) -> Result<(), KernelFailure> {
+        EvaluationCheckpoints::step(self)
+    }
+    fn flush(&mut self) -> Result<(), KernelFailure> {
+        EvaluationCheckpoints::flush(self)
+    }
+}
+
+pub(crate) struct Reader<'a, 'w> {
+    pub(crate) raw: &'a str,
+    pub(crate) at: usize,
+    pub(crate) work: &'w mut dyn LexWork,
+}
+impl Reader<'_, '_> {
+    pub(crate) fn byte(&self) -> Option<u8> {
         self.raw.as_bytes().get(self.at).copied()
     }
-    fn space(&mut self) -> Result<(), LeafError> {
+    pub(crate) fn space(&mut self) -> Result<(), LeafError> {
         while matches!(self.byte(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
             self.work.step()?;
             self.at += 1;
         }
         Ok(())
     }
-    fn require(&mut self, b: u8) -> Result<(), LeafError> {
+    pub(crate) fn require(&mut self, b: u8) -> Result<(), LeafError> {
         self.work.step()?;
         if self.byte() != Some(b) {
             return bad();
@@ -242,7 +252,7 @@ impl Reader<'_, '_, '_> {
         self.at += 1;
         Ok(())
     }
-    fn literal(&mut self, text: &[u8]) -> Result<(), LeafError> {
+    pub(crate) fn literal(&mut self, text: &[u8]) -> Result<(), LeafError> {
         for &b in text {
             self.require(b)?;
         }
@@ -260,7 +270,7 @@ impl Reader<'_, '_, '_> {
         }
         Ok(value)
     }
-    fn string_char(&mut self) -> Result<char, LeafError> {
+    pub(crate) fn string_char(&mut self) -> Result<char, LeafError> {
         self.work.step()?;
         let Some(b) = self.byte() else {
             return bad();
@@ -314,7 +324,7 @@ impl Reader<'_, '_, '_> {
             _ => return bad(),
         })
     }
-    fn string_token(&mut self) -> Result<(Range<usize>, usize), LeafError> {
+    pub(crate) fn string_token(&mut self) -> Result<(Range<usize>, usize), LeafError> {
         let begin = self.at;
         self.require(b'"')?;
         let mut len = 0_usize;
@@ -327,7 +337,7 @@ impl Reader<'_, '_, '_> {
         self.require(b'"')?;
         Ok((begin..self.at, len))
     }
-    fn number_token(&mut self) -> Result<Range<usize>, LeafError> {
+    pub(crate) fn number_token(&mut self) -> Result<Range<usize>, LeafError> {
         let begin = self.at;
         if self.byte() == Some(b'-') {
             self.work.step()?;
@@ -381,8 +391,10 @@ impl Reader<'_, '_, '_> {
 // An explicit frame stack validates actual bytes and trailing tokens without
 // recursive value trees. The depth is the pinned JsonItems raw-entry semantic
 // constraint, independent of SQL input quotas and host allocation grants.
+#[cfg(test)]
 const JSON_MAX_NESTING_DEPTH: usize = 1024;
 #[derive(Clone, Copy)]
+#[cfg(test)]
 enum Frame {
     ArrayFirst,
     ArrayNext,
@@ -392,10 +404,11 @@ enum Frame {
     ObjectValue,
     ObjectNext,
 }
+#[cfg(test)]
 fn push_frame(
     stack: &mut Vec<Frame>,
     frame: Frame,
-    work: &mut EvaluationCheckpoints<'_>,
+    work: &mut dyn LexWork,
 ) -> Result<(), LeafError> {
     if stack.len() == JSON_MAX_NESTING_DEPTH {
         return Err(LeafError::Parse(InvalidJson::NestingDepth));
@@ -408,27 +421,7 @@ fn push_frame(
     work.flush()?;
     Ok(())
 }
-/// Check a SQL JSON literal before it can reach a runtime conversion or TRY.
-/// The same JSON reader checks containers, scalar values and number ranges.
-pub fn validate_trino_json_literal(
-    raw: &str,
-    control: &dyn PureCompileControl,
-) -> Result<bool, KernelFailure> {
-    let control = CompileKernelControl::new(control, CompilePhase::Validate);
-    let mut work = EvaluationCheckpoints::new(&control);
-    match validate(raw, &mut work) {
-        Ok(_) => {
-            work.finish()?;
-            Ok(true)
-        }
-        Err(LeafError::Parse(_)) => Ok(false),
-        Err(LeafError::Outer(error)) => Err(error),
-        Err(LeafError::Conversion(_)) => Err(crate::kernel_control::internal(
-            "JSON literal validation attempted a value conversion",
-        )),
-    }
-}
-
+#[cfg(test)]
 fn validate(raw: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<Scalar, LeafError> {
     let mut reader = Reader { raw, at: 0, work };
     let mut stack = Vec::<Frame>::new();
@@ -543,6 +536,7 @@ fn validate(raw: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<Scalar, L
     }
     root.ok_or(LeafError::Parse(InvalidJson::Syntax))
 }
+#[cfg(test)]
 fn decode_string(
     raw: &str,
     decoded_bytes: usize,
@@ -566,10 +560,7 @@ struct NumberFacts<'a> {
     significant: usize,
     zero: bool,
 }
-fn number_facts<'a>(
-    raw: &'a str,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<NumberFacts<'a>, LeafError> {
+fn number_facts<'a>(raw: &'a str, work: &mut dyn LexWork) -> Result<NumberFacts<'a>, LeafError> {
     let negative = raw.starts_with('-');
     let unsigned = if negative { &raw[1..] } else { raw };
     let mut end = unsigned.len();
@@ -622,10 +613,7 @@ struct Number {
     scale: i128,
     negative: bool,
 }
-fn promoted_number(
-    facts: &NumberFacts<'_>,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<Number, LeafError> {
+fn promoted_number(facts: &NumberFacts<'_>, work: &mut dyn LexWork) -> Result<Number, LeafError> {
     let mut out = Number {
         digits: [0; NUMBER_PRECISION],
         len: 0,
@@ -690,7 +678,8 @@ fn promoted_number(
 fn decimal_profile(facts: &NumberFacts<'_>) -> bool {
     facts.significant.max(1) <= 38 && facts.fractional <= 38
 }
-fn validate_number(raw: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<(), LeafError> {
+#[cfg(test)]
+fn validate_number(raw: &str, work: &mut dyn LexWork) -> Result<(), LeafError> {
     let facts = number_facts(raw, work)?;
     if facts.exponent.is_some() {
         parse_double(&facts, work)?;
@@ -699,6 +688,7 @@ fn validate_number(raw: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<()
     }
     Ok(())
 }
+#[cfg(test)]
 fn number_text(raw: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<String, LeafError> {
     let facts = number_facts(raw, work)?;
     if facts.exponent.is_some() {
@@ -772,10 +762,7 @@ fn number_text(raw: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<String
 // such midpoints. This bounds the opaque standard float parser, not accepted
 // user text: every remaining original digit is still observed and classified.
 const DOUBLE_PARSE_DIGITS: usize = 1075 + 309 + 2;
-fn parse_double(
-    facts: &NumberFacts<'_>,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<f64, LeafError> {
+fn parse_double(facts: &NumberFacts<'_>, work: &mut dyn LexWork) -> Result<f64, LeafError> {
     if facts.zero {
         return Ok(if facts.negative { -0.0 } else { 0.0 });
     }
@@ -825,7 +812,7 @@ fn parse_double(
         return bad_number();
     }
     let retain = facts.significant.min(DOUBLE_PARSE_DIGITS);
-    let mut normalized = string_with_capacity(retain + 32, work)?;
+    let mut normalized = DoubleLexeme::new();
     if facts.negative {
         normalized.push('-');
     }
@@ -850,9 +837,10 @@ fn parse_double(
         power -= 1;
     }
     normalized.push('e');
-    normalized.push_str(&power.to_string());
+    std::fmt::Write::write_fmt(&mut normalized, format_args!("{power}"))
+        .expect("bounded scientific exponent");
     work.flush()?;
-    let result = normalized.parse::<f64>();
+    let result = normalized.as_str().parse::<f64>();
     work.flush()?;
     match result {
         Ok(value) if value.is_finite() => Ok(value),
@@ -861,6 +849,96 @@ fn parse_double(
     }
 }
 
+struct DoubleLexeme {
+    bytes: [u8; DOUBLE_PARSE_DIGITS + 32],
+    len: usize,
+}
+
+impl DoubleLexeme {
+    fn new() -> Self {
+        Self {
+            bytes: [0; DOUBLE_PARSE_DIGITS + 32],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, value: char) {
+        debug_assert!(value.is_ascii());
+        self.bytes[self.len] = value as u8;
+        self.len += 1;
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("ASCII scientific notation")
+    }
+}
+
+impl fmt::Write for DoubleLexeme {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        for ch in value.chars() {
+            self.push(ch);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) enum LexNumber {
+    Integer(i32),
+    BigInt(i64),
+    Double(f64),
+    Decimal {
+        precision: u8,
+        scale: u8,
+        coefficient: i128,
+    },
+    Number {
+        scale: i32,
+        negative: bool,
+        digits: [u8; NUMBER_PRECISION],
+        len: usize,
+    },
+}
+
+pub(crate) fn lex_number(raw: &str, work: &mut dyn LexWork) -> Result<LexNumber, LeafError> {
+    let facts = number_facts(raw, work)?;
+    if facts.exponent.is_some() {
+        return Ok(LexNumber::Double(parse_double(&facts, work)?));
+    }
+    let integer = !facts.coefficient.contains('.');
+    if integer && facts.significant <= 19 {
+        if let Ok(value) = raw.parse::<i64>() {
+            return Ok(match i32::try_from(value) {
+                Ok(value) => LexNumber::Integer(value),
+                Err(_) => LexNumber::BigInt(value),
+            });
+        }
+    }
+    if decimal_profile(&facts) {
+        let mut coefficient = 0;
+        for byte in facts.coefficient.bytes().filter(u8::is_ascii_digit) {
+            work.step()?;
+            coefficient = coefficient * 10 + i128::from(byte - b'0');
+        }
+        return Ok(LexNumber::Decimal {
+            precision: facts.significant.max(facts.fractional).max(1) as u8,
+            scale: facts.fractional as u8,
+            coefficient: if facts.negative {
+                -coefficient
+            } else {
+                coefficient
+            },
+        });
+    }
+    let value = promoted_number(&facts, work)?;
+    Ok(LexNumber::Number {
+        scale: i32::try_from(value.scale).map_err(|_| KernelFailure::ResourceExhausted)?,
+        negative: value.negative,
+        digits: value.digits,
+        len: value.len,
+    })
+}
+
+#[cfg(test)]
 fn double_text(value: f64, work: &mut EvaluationCheckpoints<'_>) -> Result<String, LeafError> {
     if !value.is_finite() {
         return bad_number();
@@ -871,3 +949,17 @@ fn double_text(value: f64, work: &mut EvaluationCheckpoints<'_>) -> Result<Strin
 #[cfg(test)]
 #[path = "array_json_tests.rs"]
 mod tests;
+
+pub(crate) fn cast_float_double(
+    value: f64,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<String, KernelFailure> {
+    super::trino_float_text::format_double(value, work)
+}
+
+pub(crate) fn cast_float_real(
+    value: f32,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<String, KernelFailure> {
+    super::trino_float_text::format_real(value, work)
+}

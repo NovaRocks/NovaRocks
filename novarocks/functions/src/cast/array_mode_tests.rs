@@ -20,7 +20,7 @@ use crate::{
     ConstantPolicy, ConstantPool, DataFailureReason, KernelCapacityRefusal, KernelDiagnostic,
     SelectedValues, Selection,
 };
-use arrow_array::{ArrayRef, ListArray};
+use arrow_array::{ArrayRef, LargeBinaryArray, ListArray};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::Field;
 use novarocks_failure_contract::{
@@ -114,12 +114,15 @@ fn evaluate<'a>(
     input: &ArrayRef,
     selection: Selection<'a>,
 ) -> SelectedValues<'a> {
+    let host: Arc<dyn crate::AggregateStateAllocator> =
+        Arc::new(crate::source_custody_direct_tests::Host::default());
     recipe
-        .evaluate_selected(
+        .evaluate_selected_scoped(
             EvaluatedArgument::Column(input),
             selection,
             &[],
             &Control::default(),
+            Some(&host),
         )
         .unwrap()
 }
@@ -833,7 +836,11 @@ fn explicit_unknown_arrays_keep_json_nominal_and_text_converts_through_its_autho
     .unwrap();
     let semantics = ValueTypeRef::try_new(ValueKind::List(json), true, storage.clone()).unwrap();
     let layout = ValueLayout::try_new(
-        &DataType::List(Arc::new(Field::new("json_target", DataType::Utf8, true))),
+        &DataType::List(Arc::new(Field::new(
+            "json_target",
+            DataType::LargeBinary,
+            true,
+        ))),
         storage,
     )
     .unwrap();
@@ -878,7 +885,7 @@ fn explicit_unknown_arrays_keep_json_nominal_and_text_converts_through_its_autho
     );
     let expected = list(
         &target,
-        Arc::new(StringArray::from(vec![None::<&str>])),
+        Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>])),
         &[0, 0, 1, 1],
         Some(&[true, true, false]),
     );
@@ -895,7 +902,7 @@ fn explicit_unknown_arrays_keep_json_nominal_and_text_converts_through_its_autho
         );
         let expected = list(
             &target,
-            Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+            Arc::new(LargeBinaryArray::from(Vec::<Option<&[u8]>>::new())),
             &[0, 0],
             Some(&[false]),
         );
@@ -916,9 +923,9 @@ fn explicit_unknown_arrays_keep_json_nominal_and_text_converts_through_its_autho
         let actual = evaluate(&conversion, &raw, Selection::all(1));
         let expected = list(
             &target,
-            Arc::new(StringArray::from(vec![
-                Some("\"not json\""),
-                Some("\"null\""),
+            Arc::new(LargeBinaryArray::from(vec![
+                Some(&b"\x01\x44\x08not json"[..]),
+                Some(&b"\x01\x44\x04null"[..]),
                 None,
             ])),
             &[0, 3],
@@ -944,8 +951,7 @@ fn explicit_unknown_arrays_keep_json_nominal_and_text_converts_through_its_autho
 }
 
 #[test]
-fn json_array_conversion_keeps_raw_text_boundary_parse_and_cast_failures_separate() {
-    use novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT;
+fn json_array_conversion_keeps_json_and_sql_null_separate_from_owned_failures() {
     use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime};
     let storage = ValueTypeStorageLifetime::pure();
     let item = ValueTypeRef::try_new(
@@ -956,7 +962,7 @@ fn json_array_conversion_keeps_raw_text_boundary_parse_and_cast_failures_separat
     .unwrap();
     let semantics = ValueTypeRef::try_new(ValueKind::List(item), true, storage.clone()).unwrap();
     let layout = ValueLayout::try_new(
-        &DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        &DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true))),
         storage,
     )
     .unwrap();
@@ -964,22 +970,26 @@ fn json_array_conversion_keeps_raw_text_boundary_parse_and_cast_failures_separat
     let target = ty(DataType::Utf8, true, true, "varchar-target");
     let input = list(
         &source,
-        Arc::new(StringArray::from(vec![
-            Some("1e2"),
-            Some("100.0"),
-            Some("null"),
-            Some("\"text\""),
+        Arc::new(LargeBinaryArray::from(vec![
+            Some(&b"\x01\x50\x00\x00\x00\x00\x00\x00\x59\x40"[..]),
+            Some(&b"\x01\x52\x04\x01\x02\xe8\x03"[..]),
+            Some(&b"\x01\x20"[..]),
+            Some(&b"\x01\x44\x04text"[..]),
             None,
-            Some("{}"),
-            Some("bad"),
-            Some("1e309"),
+            Some(&b"\x01\x80\x01\x00"[..]),
         ])),
-        &[0, 5, 6, 7, 8],
+        &[0, 5, 6],
+        None,
+    );
+    let damaged = list(
+        &source,
+        Arc::new(LargeBinaryArray::from(vec![Some(&b"\x02\x20"[..])])),
+        &[0, 1],
         None,
     );
     for mode in modes() {
         let recipe = prepare(&source, &target, mode);
-        let actual = evaluate(&recipe, &input, Selection::all(4));
+        let actual = evaluate(&recipe, &input, Selection::all(2));
         let expected = list(
             &target,
             Arc::new(StringArray::from(vec![
@@ -989,22 +999,35 @@ fn json_array_conversion_keeps_raw_text_boundary_parse_and_cast_failures_separat
                 Some("text"),
                 None,
             ])),
-            &[0, 5, 5, 5, 5],
-            Some(&[true, false, false, false]),
+            &[0, 5, 5],
+            Some(&[true, false]),
         );
         same(&actual, &expected, &target);
-        domain_errors(
-            &actual,
-            if mode == ArrayCastFailureMode::ReportError {
-                &[
-                    (1, INVALID_CAST_ARGUMENT),
-                    (2, INVALID_FUNCTION_ARGUMENT),
-                    (3, INVALID_FUNCTION_ARGUMENT),
-                ]
-            } else {
-                &[]
-            },
-        );
+        if mode == ArrayCastFailureMode::ReportError {
+            let [error] = actual.errors() else {
+                panic!("one failed original array row");
+            };
+            assert_eq!(error.selected_ordinal(), 1);
+            assert_eq!(
+                error.reason(),
+                DataFailureReason::Domain(INVALID_CAST_ARGUMENT)
+            );
+            assert_eq!(error.projected_fact().class(), FailureClass::Data);
+        } else {
+            assert!(actual.errors().is_empty());
+        }
+        let host: Arc<dyn crate::AggregateStateAllocator> =
+            Arc::new(crate::source_custody_direct_tests::Host::default());
+        let error = recipe
+            .evaluate_selected_scoped(
+                EvaluatedArgument::Column(&damaged),
+                Selection::all(1),
+                &[],
+                &Control::default(),
+                Some(&host),
+            )
+            .unwrap_err();
+        assert!(matches!(error, KernelFailure::Internal(_)));
     }
 }
 
@@ -1020,7 +1043,11 @@ fn explicit_json_text_guards_distinguish_json_null_from_required_string_encoding
     .unwrap();
     let value = ValueTypeRef::try_new(ValueKind::List(item), true, storage.clone()).unwrap();
     let layout = ValueLayout::try_new(
-        &DataType::List(Arc::new(Field::new("declared_json", DataType::Utf8, false))),
+        &DataType::List(Arc::new(Field::new(
+            "declared_json",
+            DataType::LargeBinary,
+            false,
+        ))),
         storage,
     )
     .unwrap();
@@ -1029,7 +1056,10 @@ fn explicit_json_text_guards_distinguish_json_null_from_required_string_encoding
     let optional_text = ty(DataType::Utf8, true, true, "optional-text");
     let json_input = list(
         &required_json,
-        Arc::new(StringArray::from(vec![Some("null"), Some("\"x\"")])),
+        Arc::new(LargeBinaryArray::from(vec![
+            Some(&b"\x01\x20"[..]),
+            Some(&b"\x01\x44\x01x"[..]),
+        ])),
         &[0, 2],
         None,
     );
@@ -1089,7 +1119,10 @@ fn explicit_json_text_guards_distinguish_json_null_from_required_string_encoding
         );
         let expected = list(
             &required_json,
-            Arc::new(StringArray::from(vec![Some("\"null\""), Some("\"bad\"")])),
+            Arc::new(LargeBinaryArray::from(vec![
+                Some(&b"\x01\x44\x04null"[..]),
+                Some(&b"\x01\x44\x03bad"[..]),
+            ])),
             &[0, 2],
             None,
         );

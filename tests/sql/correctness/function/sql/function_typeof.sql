@@ -80,7 +80,7 @@ select typeof(MAP(ARRAY[1, 2, 3], ARRAY['apple', 'orange', 'pear']));
 select typeof(CAST(NULL AS ROW(col1 INTEGER, col2 INTEGER, col3 INTEGER, col4 INTEGER)));
 
 -- query 20
-select typeof(parse_json('{"a": 1, "b": true}'));
+select typeof(json_parse('{"a": 1, "b": true}'));
 
 -- query 21
 select typeof(null);
@@ -108,7 +108,7 @@ create table t1 (
   c17 VARCHAR,
   c18 map<tinyint, varchar>,
   c19 ROW(col1 tinyint, col2 tinyint, col3 tinyint, col4 tinyint),
-  c20 json
+  c20 VARCHAR
 ) WITH (format_version = 3);
 insert into t1 values ROW(
   NULL, NULL, NULL, NULL, NULL,
@@ -138,7 +138,7 @@ select typeof(c1)
   ,typeof(c17)
   ,typeof(c18)
   ,typeof(c19)
-  ,typeof(c20)
+  ,typeof(json_parse(c20))
   from t1;
 
 -- query 24

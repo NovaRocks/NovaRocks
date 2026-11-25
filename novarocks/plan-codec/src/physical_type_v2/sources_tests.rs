@@ -75,8 +75,12 @@ fn source_token_retains_exact_root_identity_full_facts_and_sparse_namespaces() {
         (0, FunctionValueType::new(nested, false)),
         (
             u32::MAX,
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Json,
+            )
+            .unwrap(),
         ),
     ];
     let fields = [

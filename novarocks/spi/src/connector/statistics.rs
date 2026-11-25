@@ -1770,7 +1770,7 @@ mod tests {
         use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
         for (logical_type, data_type) in [
             (ValueLogicalType::Physical, DataType::Int64),
-            (ValueLogicalType::Json, DataType::Utf8),
+            (ValueLogicalType::Json, DataType::LargeBinary),
             (ValueLogicalType::Variant, DataType::LargeBinary),
             (ValueLogicalType::Hll, DataType::Binary),
             (ValueLogicalType::Bitmap, DataType::LargeBinary),
@@ -1825,13 +1825,16 @@ mod tests {
             ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
         };
         let storage = ValueTypeStorageLifetime::pure();
-        let payload =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap();
+        let payload = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let codes = FunctionValueType::new(DataType::Utf8, true);
         let source = DataType::Struct(
             vec![
-                Field::new("payload", DataType::Utf8, false).with_metadata(
+                Field::new("payload", DataType::LargeBinary, false).with_metadata(
                     std::collections::HashMap::<String, String>::from([
                         (
                             NR_LOGICAL_TYPE_KEY.into(),
@@ -1917,9 +1920,12 @@ mod tests {
             );
         }
         let storage = ValueTypeStorageLifetime::pure();
-        let json =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let semantic = ValueTypeRef::try_new(
             ValueKind::List(json.value_type().clone()),
             true,

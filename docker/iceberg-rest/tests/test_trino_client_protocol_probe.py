@@ -188,14 +188,16 @@ class ReferenceInputTests(unittest.TestCase):
             value.jdbc()
         value.command.assert_not_called()
 
-    def test_jdbc_requires_validated_version_and_both_prepared_modes(self):
+    def test_jdbc_requires_validated_version_json_and_both_prepared_modes(self):
         validated = b"JDBC_PROBE_OK validated=true server_version=server-build\n"
+        json_values = b"JDBC_JSON_OK direct=true nested=true sql_null=true json_null=true\n"
         named = b"JDBC_PREPARED_OK explicitPrepare=true\n"
         immediate = b"JDBC_PREPARED_OK explicitPrepare=false\n"
         for output, error in [
-            (validated + named + immediate, None),
-            (validated + named, "prepared mode"),
-            (validated + immediate, "prepared mode"),
+            (validated + json_values + named + immediate, None),
+            (validated + json_values + named, "prepared mode"),
+            (validated + json_values + immediate, "prepared mode"),
+            (validated + named + immediate, "direct and nested JSON"),
             (b"JDBC_PROBE_OK version=server-build\n", "validated HEAD"),
             (b"JDBC_PROBE_OK validated=false server_version=server-build\n", "validated HEAD"),
             (b"JDBC_PROBE_OK validated=true server_version=\n", "validated HEAD"),
@@ -211,6 +213,7 @@ class ReferenceInputTests(unittest.TestCase):
                 if error is None:
                     value.jdbc()
                     self.assertEqual(write.call_args.args[1]["status"], "PASS")
+                    self.assertEqual(write.call_args.args[1]["json"], ["direct", "nested", "sql_null", "json_null"])
                 else:
                     with self.assertRaisesRegex(probe.ProbeFailure, error):
                         value.jdbc()

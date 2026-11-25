@@ -258,11 +258,11 @@ fn prepare_element(
             None,
         ));
     }
-    if let Some(operation) = super::array_json::profile(source, result) {
+    if let Some(operation) = super::json_mode::bind(source, result, work)? {
         return Ok(recipe(
             source,
             result,
-            CastBody::ArrayJson(operation),
+            CastBody::NativeJson(operation),
             None,
             policy,
             allow,
@@ -342,6 +342,7 @@ pub(super) fn evaluate<'a>(
     selection: Selection<'a>,
     inherited: &[RowDataError],
     control: &dyn KernelEvaluationControl,
+    allocator: Option<&Arc<dyn crate::AggregateStateAllocator>>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
@@ -482,6 +483,7 @@ pub(super) fn evaluate<'a>(
                         row,
                         ordinal,
                         control,
+                        allocator,
                         &mut work,
                     )? {
                         Ok(value) => value,
@@ -511,11 +513,12 @@ pub(super) fn evaluate<'a>(
                     };
                     work.flush()?;
                     let values = list.values().slice(start, end - start);
-                    let converted = child.evaluate_selected(
+                    let converted = child.evaluate_selected_scoped(
                         EvaluatedArgument::Column(&values),
                         Selection::all(end - start),
                         &[],
                         control,
+                        allocator,
                     )?;
                     work.flush()?;
                     if let Some(error) = converted.errors().first() {
@@ -559,6 +562,11 @@ pub(super) fn evaluate<'a>(
         let out = if arrays.is_empty() {
             work.flush()?;
             new_empty_array(recipe.result.data_type())
+        } else if recipe.uses_native_json_conversion() {
+            let host = allocator.ok_or_else(|| {
+                invalid("JSON CAST requires its original expression allocation scope")
+            })?;
+            collect_hosted_json_cast(&arrays, host, &mut work)?
         } else {
             selected_copy::preflight_guarded_interleave(
                 recipe.result.data_type(),
@@ -588,6 +596,43 @@ pub(super) fn evaluate<'a>(
         )
     })();
     work.finish_result(outcome)
+}
+
+fn collect_hosted_json_cast(
+    arrays: &[ArrayRef],
+    host: &Arc<dyn crate::AggregateStateAllocator>,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ArrayRef, KernelFailure> {
+    use crate::aggregate_host_allocator::HostAggregateAllocator;
+    use crate::opaque_memory::OpaqueRetainedCharge;
+    use crate::selected_copy::ExtendSegment;
+
+    work.flush()?;
+    let allocator = HostAggregateAllocator::try_new(Arc::clone(host))?;
+    let charge = OpaqueRetainedCharge::try_new(Arc::clone(host))?;
+    let _reservation = charge.reserve_operation(
+        arrays
+            .len()
+            .checked_mul(size_of::<ExtendSegment>())
+            .ok_or(KernelFailure::ResourceExhausted)?,
+    )?;
+    let mut segments = reserve::<ExtendSegment>(arrays.len(), work)?;
+    for (source, array) in arrays.iter().enumerate() {
+        work.step()?;
+        if array.len() != 1 {
+            return Err(internal(
+                "JSON CAST container output lost its selected parent row",
+            ));
+        }
+        segments.push(ExtendSegment {
+            source,
+            start: 0,
+            len: 1,
+            repeats: 1,
+            nulls: 0,
+        });
+    }
+    selected_copy::array_from_segments_in(arrays, &segments, arrays.len(), host, &allocator, work)
 }
 
 #[derive(Debug)]
@@ -747,67 +792,4 @@ pub(super) fn evaluate_leaf(
             )?)
         }
     })
-}
-
-/// The same original selected scalar result author owns text and NULL output.
-pub(super) fn evaluate_json(
-    recipe: &PreparedCastRecipe,
-    operation: super::array_json::Operation,
-    argument: EvaluatedArgument<'_>,
-    ordinal: usize,
-    logical_row: usize,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<CastRowResult, KernelFailure> {
-    let row = recipe.checked_row_with_shape(argument, ordinal, logical_row, work, |array| {
-        array.as_any().is::<StringArray>()
-    })?;
-    if logical_is_null(argument.array().as_ref(), row, 1, work)? {
-        return if recipe.source.nullable() {
-            Ok(CastRowResult::Null)
-        } else {
-            Err(invalid(
-                "non-null JSON array CAST input contains a selected SQL NULL",
-            ))
-        };
-    }
-    let raw = argument
-        .array()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("checked JSON text carrier")
-        .value(row);
-    Ok(
-        match super::array_json::convert_non_null_observed(operation, raw, work) {
-            Ok(Some(text)) => {
-                if recipe.trino_mode.is_some()
-                    && operation == super::array_json::Operation::JsonToVarchar
-                    && let novarocks_type_contract::ValueKind::BoundedCharacter(character) =
-                        recipe.result.value_type().kind()
-                {
-                    let mut count = 0;
-                    for _ in text.chars() {
-                        work.step()?;
-                        count += 1;
-                        if count > character.length() {
-                            return Ok(CastRowResult::RowError(RowDataError::from_domain(
-                                ordinal,
-                                super::array_json::InvalidCast,
-                            )?));
-                        }
-                    }
-                }
-                CastRowResult::Text(text)
-            }
-            Ok(None) => CastRowResult::Null,
-            Err(super::array_json::LeafError::Outer(cause)) => return Err(cause),
-            Err(super::array_json::LeafError::Conversion(cause)) => {
-                work.flush()?;
-                CastRowResult::RowError(RowDataError::from_domain(ordinal, cause)?)
-            }
-            Err(super::array_json::LeafError::Parse(cause)) => {
-                work.flush()?;
-                CastRowResult::RowError(RowDataError::from_domain(ordinal, cause)?)
-            }
-        },
-    )
 }

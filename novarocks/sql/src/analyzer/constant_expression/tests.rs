@@ -106,7 +106,7 @@ fn required_constant_implicit_targets_do_not_use_general_cast_admission() {
     ] {
         assert!(syntax(sql, target).is_err(), "{sql}");
     }
-    for sql in ["JSON '1'", "parse_json('1')", "CAST(NULL AS json)"] {
+    for sql in ["JSON '1'", "json_parse('1')", "CAST(NULL AS json)"] {
         let Err(SqlCompileError::Analyze(error)) = syntax(sql, Varchar) else {
             panic!("{sql}: expected nominal JSON implicit type refusal");
         };
@@ -309,7 +309,10 @@ fn required_implicit_coercion_uses_semantic_kind_not_encoded_layout() {
         )
         .is_ok()
     );
-    let nominal_json = binding(ValueKind::Nominal(ValueLogicalType::Json), DataType::Utf8);
+    let nominal_json = binding(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        DataType::LargeBinary,
+    );
     assert!(
         validate_target(
             &nominal_json,

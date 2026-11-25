@@ -668,6 +668,6 @@ WHERE id = 1;
 
 -- query 60
 USE ${case_db};
-SELECT array_agg(parse_json(array_json[ordinal]) ORDER BY ordinal) AS parsed_json_values
+SELECT array_agg(json_parse(array_json[ordinal]) ORDER BY ordinal) AS parsed_json_values
 FROM test_array_sortby CROSS JOIN (VALUES (1), (2)) AS positions(ordinal)
 WHERE id = 1;

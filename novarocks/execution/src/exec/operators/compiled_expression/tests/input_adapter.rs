@@ -202,9 +202,12 @@ fn projected_input_does_not_promote_equal_arrow_fields_to_a_logical_binding() {
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("json", DataType::Utf8, true),
     ]));
-    let logical =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let logical = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let layout = crate::exec::chunk::typed_fixture::layout(
         Arc::clone(&schema),
         &[SlotId::new(7)],

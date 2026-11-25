@@ -38,7 +38,7 @@ use crate::{
     ScalarCallInput, SelectedValues,
 };
 
-/// Invalid JSON is a required typed Data failure, never successful NULL.
+/// The original host can refuse key allocation or stop the exact invocation.
 pub(super) fn effects() -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
@@ -89,7 +89,7 @@ impl JsonCanonicalOwner {
                 subject: "builtin JSON canonical whole-call declaration",
                 value: error.to_string().into(),
             })?;
-        let function = "builtin.scalar/__json_canonical_key/v1";
+        let function = crate::json_canonical::FUNCTION_ID;
         let expected = effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
@@ -104,7 +104,7 @@ impl JsonCanonicalOwner {
             });
         }
         let implementation =
-            PureImplementationId::try_new("builtin.scalar/__json_canonical_key/selected-v1")?;
+            PureImplementationId::try_new("builtin.scalar/__json_canonical_key/selected-v2")?;
         let implementations = declaration
             .overloads()
             .iter()

@@ -744,7 +744,7 @@ fn namespace_full_type_and_original_binding_tokens_refuse_substitution() {
     for (left, right) in [
         (
             FunctionValueType::try_from_legacy_declared_projection(
-                DataType::Utf8,
+                DataType::LargeBinary,
                 true,
                 ValueLogicalType::Json,
             )

@@ -1426,8 +1426,8 @@ mod tests {
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 
         let sql = r#"
-            SELECT p.id, parse_json(p.txt) IN (
-                SELECT parse_json(CONCAT('{"key":', CAST(sequential_number AS VARCHAR), '}'))
+            SELECT p.id, json_parse(p.txt) IN (
+                SELECT json_parse(CONCAT('{"key":', CAST(sequential_number AS VARCHAR), '}'))
                 FROM TABLE(sequence(0, 1))
             ) AS present
             FROM (
@@ -1467,6 +1467,9 @@ mod tests {
                         novarocks_expression_contract::ExprKind::FunctionCall { function, .. }
                             if function.function_id.as_str()
                                 == "builtin.scalar/__json_canonical_key/v1"
+                                && expression.ty.data_type() == &arrow::datatypes::DataType::Binary
+                                && expression.ty.logical_type()
+                                    == novarocks_type_contract::ValueLogicalType::Physical
                     )
                 });
         }
@@ -3055,7 +3058,7 @@ mod tests {
             .unwrap();
         let (_root, scope) = query_scope();
         let completed = runtime.block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete_for_test(
-            request_for("SELECT CAST(NULL AS UUID) AS u, CAST(JSON '7' AS VARCHAR(8)) AS text_value, parse_json('{}') AS j, CAST(NULL AS VARBINARY) AS raw"), &scope,
+            request_for("SELECT CAST(NULL AS UUID) AS u, CAST(JSON '7' AS VARCHAR(8)) AS text_value, json_parse('{}') AS j, CAST(NULL AS VARBINARY) AS raw"), &scope,
         )).unwrap();
         let plan = completed.candidate().plan();
         let result = plan.result_port().unwrap();

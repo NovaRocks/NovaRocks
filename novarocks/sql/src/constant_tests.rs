@@ -839,12 +839,16 @@ fn first_syntax_runs_preserve_scalar_rows_types_nulls_and_original_field() {
             ],
         ),
         (
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Json,
+            )
+            .unwrap(),
             vec![
-                LiteralValue::String("{\"x\":1}".into()),
+                LiteralValue::Binary(b"\x01\x80\x01\x00".to_vec()),
                 LiteralValue::Null,
-                LiteralValue::String("null".into()),
+                LiteralValue::Binary(b"\x01\x20".to_vec()),
             ],
         ),
         (

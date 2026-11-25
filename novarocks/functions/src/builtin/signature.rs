@@ -72,7 +72,7 @@ pub enum TypeSpec {
     Float64,
     Utf8,
     Character(CharacterKind, CharacterWidth),
-    /// Explicit JSON semantics; Utf8 is its canonical storage, not its identity.
+    /// Explicit JSON semantics carried by the versioned LargeBinary value.
     Json,
     Uuid,
     Binary,
@@ -121,12 +121,9 @@ pub enum TypeSpec {
     /// argument type during polymorphic resolution.
     Any(&'static str),
     /// Any type at all, binding nothing. This is what a position accepts when
-    /// the function genuinely does not constrain it -- `json_object`'s
-    /// alternating keys and values, for instance. It differs from `Any(name)`
-    /// in exactly the way that matters for a variadic tail: a repeated type
-    /// *variable* asserts every argument shares one type, which for these
-    /// functions is false. Like `AnyDecimal128` it keeps the argument's own
-    /// type and cannot be a return type, having nothing to realize.
+    /// the function genuinely does not constrain it. A repeated `Any(name)`
+    /// variable requires a shared type. Like `AnyDecimal128`, this keeps the
+    /// argument's own type and cannot be a return type.
     AnyType,
 }
 
@@ -427,7 +424,7 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
         (TypeSpec::Float64, DataType::Float64) => true,
         (TypeSpec::Utf8, DataType::Utf8) => true,
         (TypeSpec::Utf8, DataType::LargeUtf8) => true,
-        (TypeSpec::Json, DataType::Utf8) => true,
+        (TypeSpec::Json, DataType::LargeBinary) => true,
         (TypeSpec::Uuid, DataType::FixedSizeBinary(16)) => true,
         (TypeSpec::Bitmap, DataType::Binary) => true,
         (TypeSpec::Binary, DataType::Binary) => true,
@@ -528,7 +525,8 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
         TypeSpec::Int64 => DataType::Int64,
         TypeSpec::Float32 => DataType::Float32,
         TypeSpec::Float64 => DataType::Float64,
-        TypeSpec::Utf8 | TypeSpec::Json => DataType::Utf8,
+        TypeSpec::Utf8 => DataType::Utf8,
+        TypeSpec::Json => DataType::LargeBinary,
         TypeSpec::Uuid => DataType::FixedSizeBinary(16),
         TypeSpec::Character(..) => {
             return Err("character declarations require complete SQL value types".into());
@@ -1067,12 +1065,6 @@ pub(super) fn merge_value_types_with_construction<E>(
         (left.logical_type(), None)
     } else if widening {
         match (left.logical_type(), right.logical_type()) {
-            (ValueLogicalType::Json, ValueLogicalType::Physical)
-            | (ValueLogicalType::Physical, ValueLogicalType::Json)
-                if left.data_type() == &DataType::Utf8 && right.data_type() == &DataType::Utf8 =>
-            {
-                (ValueLogicalType::Physical, Some(DataType::Utf8))
-            }
             (ValueLogicalType::LargeInt, ValueLogicalType::Physical)
                 if matches!(
                     right.data_type(),
@@ -1481,17 +1473,12 @@ pub(super) fn unify_value_with_construction<E>(
         TypeSpec::Json => {
             ty.data_type() == &DataType::Null
                 || (ty.logical_type() == ValueLogicalType::Json
-                    && ty.data_type() == &DataType::Utf8)
+                    && ty.data_type() == &DataType::LargeBinary)
         }
         TypeSpec::Uuid => {
             ty.data_type() == &DataType::Null
                 || (ty.logical_type() == ValueLogicalType::Uuid
                     && ty.data_type() == &DataType::FixedSizeBinary(16))
-        }
-        TypeSpec::Utf8 if ty.logical_type() == ValueLogicalType::Json => {
-            let target =
-                creation.value(DataType::Utf8, ty.nullable(), ValueLogicalType::Physical)?;
-            super::value_conversion::recipe_family(ty, &target).is_ok()
         }
         _ => ty.logical_type() == ValueLogicalType::Physical,
     })

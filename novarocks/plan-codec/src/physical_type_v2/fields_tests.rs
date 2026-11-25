@@ -85,9 +85,12 @@ fn authored_root_field_keeps_complete_identity_without_inferred_logical_metadata
         Field::new("真实根", DataType::Utf8, true)
             .with_metadata(HashMap::from([("source".into(), "原样".into())])),
     );
-    let value =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let value = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let table = encode_type_table(&[(7, value)], envelope(), &Scope::default()).unwrap();
     let decoded = decode_type_table(&table, envelope(), &Scope::default()).unwrap();
     let source = source_encode(

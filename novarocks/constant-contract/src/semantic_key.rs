@@ -558,12 +558,16 @@ mod tests {
 
     #[test]
     fn explicit_root_domains_are_preserved_in_typed_value_buckets() {
-        let array = StringArray::from(vec!["{\"v\":1}"]);
+        let array = arrow_array::LargeBinaryArray::from(vec![b"\x01\x20".as_slice()]);
         let physical = value(Arc::new(array.clone()), false);
         let json = ConstantPool::try_new(
-            Arc::new(Field::new("literal", DataType::Utf8, false)),
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap(),
+            Arc::new(Field::new("literal", DataType::LargeBinary, false)),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                false,
+                ValueLogicalType::Json,
+            )
+            .unwrap(),
             array.to_data(),
             policy(),
             CompilePhase::Validate,

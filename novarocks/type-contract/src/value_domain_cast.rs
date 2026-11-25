@@ -97,37 +97,9 @@ fn preserves<E>(
     }
 }
 
-/// The original default JSON-text parser CAST dispatch. This is a carrier
-/// capability, not a value-domain authorization or a second conversion rule.
-/// The existing runtime owns parsing, positional/named projection and NULLs.
-pub fn default_json_structure_carrier_cast_supported(source: &DataType, target: &DataType) -> bool {
-    source == &DataType::Utf8
-        && matches!(
-            target,
-            DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
-        )
-}
-
-/// Complete typed source/target admission for that existing intrinsic. Both
-/// authored JSON text and ordinary UTF8 text used the original parser CAST;
-/// target child domains are supplied by the explicit target, never inferred
-/// from observed values. Non-text nominal domains cannot enter this port.
-pub fn is_default_json_structure_cast(
-    source: &FunctionValueType,
-    target: &FunctionValueType,
-) -> bool {
-    (!source.nullable() || target.nullable())
-        && matches!(
-            source.logical_type(),
-            ValueLogicalType::Json | ValueLogicalType::Physical
-        )
-        && target.logical_type() == ValueLogicalType::Physical
-        && default_json_structure_carrier_cast_supported(source.data_type(), target.data_type())
-}
-
 /// Describe the explicit lifting of a physical NULL element into a nullable
 /// JSON list element. This does not preserve a value domain, prepare a runtime
-/// cast, or infer nominal identity from the UTF8 carrier.
+/// cast, or infer nominal identity from the LargeBinary carrier.
 pub fn is_null_list_to_json_cast(source: &FunctionValueType, target: &FunctionValueType) -> bool {
     if source.logical_type() != ValueLogicalType::Physical
         || target.logical_type() != ValueLogicalType::Physical
@@ -153,7 +125,7 @@ pub fn is_null_list_to_json_cast(source: &FunctionValueType, target: &FunctionVa
         )
         && target_item.nullable()
         && target_field.is_nullable()
-        && target_field.data_type() == &DataType::Utf8
+        && target_field.data_type() == &DataType::LargeBinary
 }
 
 #[cfg(test)]
@@ -244,7 +216,7 @@ mod tests {
             true,
         );
         let json = value(ValueKind::Nominal(ValueLogicalType::Json));
-        let target = list(json.clone(), DataType::Utf8, true);
+        let target = list(json.clone(), DataType::LargeBinary, true);
         assert!(is_null_list_to_json_cast(&source, &target));
         assert!(
             !check(source.value_type(), target.value_type()),
@@ -261,7 +233,7 @@ mod tests {
             .unwrap();
         assert!(!is_null_list_to_json_cast(
             &source,
-            &list(required_json, DataType::Utf8, true)
+            &list(required_json, DataType::LargeBinary, true)
         ));
         for ordinary in [
             list(value(ValueKind::String), DataType::Utf8, true),
@@ -277,8 +249,12 @@ mod tests {
         assert!(!is_null_list_to_json_cast(&text_source, &target));
         assert!(!is_null_list_to_json_cast(
             &source,
-            &FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap()
+            &FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Json
+            )
+            .unwrap()
         ));
     }
 }

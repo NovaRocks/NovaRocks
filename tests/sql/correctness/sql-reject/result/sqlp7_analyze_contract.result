@@ -8,6 +8,36 @@ _col0
 _col0
 NULL
 
+-- query 40
+-- types	varchar
+document
+[]
+
+-- query 42
+-- types	varchar
+document
+{}
+
+-- query 43
+-- types	varchar
+document
+{"a":1}
+
+-- query 44
+-- types	varchar
+document
+{"a":1}
+
+-- query 45
+-- types	varchar
+document
+{"a":null}
+
+-- query 46
+-- types	varchar
+document
+[1]
+
 -- query 47
 -- types	timestamp(0) with time zone
 _col0

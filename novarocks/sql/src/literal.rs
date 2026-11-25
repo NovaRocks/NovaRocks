@@ -26,7 +26,6 @@ use std::sync::Arc;
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, TimeUnit};
-use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
 use crate::semantic::Literal;
 use novarocks_parser::ast;
@@ -396,82 +395,6 @@ pub(crate) fn negate_literal(literal: Literal) -> Result<Literal, LiteralFailure
     }
 }
 
-fn literal_to_json_key(literal: Literal) -> Result<Option<String>, LiteralFailure> {
-    Ok(match literal {
-        Literal::Null => None,
-        Literal::Bool(v) => Some(if v { "true" } else { "false" }.to_string()),
-        Literal::Int(v) => Some(v.to_string()),
-        Literal::Float(v) => Some(v.to_string()),
-        Literal::String(v) | Literal::Date(v) => Some(v),
-        Literal::Array(_) | Literal::Map(_) | Literal::Struct(_) => {
-            return Err(LiteralFailure::rejected(
-                "json_object key does not support complex type",
-            ));
-        }
-    })
-}
-
-fn literal_to_json_value(literal: Literal) -> Result<JsonValue, LiteralFailure> {
-    Ok(match literal {
-        Literal::Null => JsonValue::Null,
-        Literal::Bool(v) => JsonValue::Bool(v),
-        Literal::Int(v) => JsonValue::Number(JsonNumber::from(v)),
-        Literal::Float(v) => JsonNumber::from_f64(v)
-            .map(JsonValue::Number)
-            .unwrap_or(JsonValue::Null),
-        Literal::String(v) | Literal::Date(v) => {
-            serde_json::from_str::<JsonValue>(&v).unwrap_or(JsonValue::String(v))
-        }
-        Literal::Array(items) => JsonValue::Array(
-            items
-                .into_iter()
-                .map(literal_to_json_value)
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        Literal::Map(entries) => {
-            let mut map = JsonMap::new();
-            for (key, value) in entries {
-                if let Some(key) = literal_to_json_key(key)? {
-                    map.insert(key, literal_to_json_value(value)?);
-                } else {
-                    return Ok(JsonValue::Null);
-                }
-            }
-            JsonValue::Object(map)
-        }
-        Literal::Struct(fields) => JsonValue::Array(
-            fields
-                .into_iter()
-                .map(literal_to_json_value)
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-    })
-}
-
-fn json_object_literal(args: &[&ast::Expr]) -> Result<Literal, LiteralFailure> {
-    let mut object = JsonMap::new();
-    let mut idx = 0usize;
-    while idx < args.len() {
-        let key = expr_to_literal(args[idx])?;
-        let Some(key) = literal_to_json_key(key)? else {
-            return Ok(Literal::Null);
-        };
-        let value = if let Some(value_expr) = args.get(idx + 1) {
-            literal_to_json_value(expr_to_literal(value_expr)?)?
-        } else {
-            JsonValue::Null
-        };
-        object.insert(key, value);
-        idx += 2;
-    }
-    let json_text =
-        serde_json::to_string(&JsonValue::Object(object)).map_err(LiteralFailure::json)?;
-    let bytes =
-        novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(&json_text)
-            .map_err(|source| LiteralFailure::variant("json_object failed", source))?;
-    Ok(Literal::String(bytes_to_latin1_string(&bytes)))
-}
-
 pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, LiteralFailure> {
     if func.processing_mode.is_some() {
         return Err(LiteralFailure::rejected(
@@ -481,7 +404,6 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, L
     let args = function_expr_args(&func.arguments)?;
     let name = object_name_lower(&func.name)?;
     match name.as_str() {
-        "json_object" => json_object_literal(&args),
         "to_binary" => {
             if args.len() != 1 && args.len() != 2 {
                 return Err(LiteralFailure::rejected(
@@ -524,24 +446,6 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, L
             Ok(Literal::String(
                 bytes.iter().map(|b| char::from(*b)).collect(),
             ))
-        }
-        "parse_json" => {
-            if args.len() != 1 {
-                return Err(LiteralFailure::rejected("parse_json expects 1 argument"));
-            }
-            let Literal::String(json_text) = expr_to_literal(args[0])? else {
-                return Err(LiteralFailure::rejected(
-                    "parse_json expects VARCHAR argument",
-                ));
-            };
-            let bytes = novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(
-                &json_text,
-            )
-            .map_err(|source| LiteralFailure::variant("parse_json failed", source))?;
-            // Pack raw variant bytes into Literal::String via Latin-1 (matches
-            // `to_binary` convention; INSERT VALUES decodes via
-            // `latin1_string_to_bytes`).
-            Ok(Literal::String(bytes_to_latin1_string(&bytes)))
         }
         "row" => Ok(Literal::Struct(
             args.into_iter()
@@ -657,7 +561,8 @@ pub fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, String> {
         )),
         SqlType::Float => Ok(DataType::Float32),
         SqlType::Double => Ok(DataType::Float64),
-        SqlType::String | SqlType::BoundedCharacter(_) | SqlType::Json => Ok(DataType::Utf8),
+        SqlType::String | SqlType::BoundedCharacter(_) => Ok(DataType::Utf8),
+        SqlType::Json => Ok(DataType::LargeBinary),
         SqlType::Binary
         | SqlType::Bitmap
         | SqlType::Hll
@@ -1455,37 +1360,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_json_folds_to_variant_bytes_via_latin1_string() {
-        // The native parser builds a FunctionCall node for `parse_json('{"a":1}')`.
-        let raw = parse_expr(r#"parse_json('{"a":1}')"#);
-        let novarocks_parser::ast::Expr::FunctionCall(ref func) = raw else {
-            panic!("expected Function node, got {raw:?}");
-        };
-
-        let lit = function_to_literal(func).expect("parse_json fold");
-        let Literal::String(packed) = lit else {
-            panic!("expected Literal::String");
-        };
-        let unpacked = latin1_string_to_bytes(&packed).expect("latin1 decode");
-
-        // Must equal the encoder's output for the same JSON.
-        let expected =
-            novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(r#"{"a":1}"#)
-                .expect("encode");
-        assert_eq!(unpacked, expected);
-    }
-
-    #[test]
-    fn parse_json_rejects_invalid_argument_count() {
-        let raw = parse_expr(r#"parse_json('{"a":1}', 'extra')"#);
-        let novarocks_parser::ast::Expr::FunctionCall(ref func) = raw else {
-            panic!("expected Function node");
-        };
-        let err = function_to_literal(func).expect_err("must fail");
-        assert!(
-            err.to_string().contains("parse_json expects 1 argument"),
-            "unexpected error: {err}"
-        );
+    fn sql_json_functions_are_owned_by_typed_evaluation() {
+        for sql in [
+            "json_parse('1')",
+            "parse_json('1')",
+            "JSON_OBJECT('k' VALUE 1)",
+        ] {
+            let expr = parse_expr(sql);
+            assert!(expr_to_literal(&expr).is_err(), "{sql}");
+        }
     }
 
     #[test]
@@ -1633,7 +1516,7 @@ mod source_failure_tests {
         expr_to_literal(&expr)
     }
     #[test]
-    fn literal_source_keeps_original_bitmap_and_variant_facts_without_text_classification() {
+    fn literal_source_keeps_original_bitmap_facts_without_text_classification() {
         if let Some(entries) = (u32::MAX as usize).checked_add(1) {
             let bitmap = novarocks_types::value::bitmap::BitmapValueFailure::EntryCount { entries };
             let expected = bitmap.failure_fact();
@@ -1646,14 +1529,6 @@ mod source_failure_tests {
                     .is::<novarocks_types::value::bitmap::BitmapValueFailure>()
             );
         }
-        let error = fold("parse_json('not-json')").unwrap_err();
-        assert!(
-            error
-                .source()
-                .unwrap()
-                .is::<novarocks_types::value::variant_encode::VariantEncodeFailure>()
-        );
-        assert_eq!(error.failure_fact().class(), FailureClass::Data);
         let error = LiteralFailure::rejected("cancelled resource exhausted numeric overflow");
         assert_eq!(error.failure_fact().class(), FailureClass::Data);
         assert_ne!(

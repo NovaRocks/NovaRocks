@@ -21,24 +21,25 @@ use std::sync::Arc;
 
 #[test]
 fn m07_common_type_keeps_original_logical_marker_but_not_provider_decoration() {
-    let tagged = Arc::new(Field::new("item", DataType::Utf8, false).with_metadata(
-        std::collections::HashMap::<String, String>::from([
-            (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
-            ("provider_field_id".to_owned(), "17".to_owned()),
-        ]),
-    ));
+    let tagged = Arc::new(
+        Field::new("item", DataType::LargeBinary, false).with_metadata(
+            std::collections::HashMap::<String, String>::from([
+                (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
+                ("provider_field_id".to_owned(), "17".to_owned()),
+            ]),
+        ),
+    );
     let empty = Arc::new(Field::new("item", DataType::Null, true));
     let result = wider_type(&DataType::List(tagged), &DataType::List(empty));
     assert_eq!(
         result,
         DataType::List(Arc::new(
-            Field::new("item", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
-                String,
-                String,
-            >::from([(
-                NR_LOGICAL_TYPE_KEY.to_owned(),
-                "json".to_owned()
-            )]))
+            Field::new("item", DataType::LargeBinary, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    NR_LOGICAL_TYPE_KEY.to_owned(),
+                    "json".to_owned()
+                )])
+            )
         ))
     );
 }

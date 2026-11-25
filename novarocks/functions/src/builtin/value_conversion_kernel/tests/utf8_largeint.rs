@@ -51,8 +51,12 @@ fn utf8_largeint_exact_nullable_family_keeps_complete_binding_and_rejects_other_
     for source in [
         physical(DataType::LargeUtf8, true),
         physical(DataType::FixedSizeBinary(16), true),
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap(),
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
         FunctionValueType::try_with_logical_type(
             DataType::FixedSizeBinary(16),
             true,
@@ -70,8 +74,12 @@ fn utf8_largeint_exact_nullable_family_keeps_complete_binding_and_rejects_other_
             ValueLogicalType::Uuid,
         )
         .unwrap(),
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap(),
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
     ] {
         assert!(resolve_value_conversion(&utf8, &target, &CompileControl::default()).is_err());
     }

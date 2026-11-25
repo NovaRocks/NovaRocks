@@ -128,13 +128,13 @@ mod scalar_domain_tests {
             table: &str,
         ) -> Result<ResolvedAnalyzerTable, String> {
             let json_item = field_with_logical_type(
-                Field::new("item", DataType::Utf8, true),
+                Field::new("item", DataType::LargeBinary, true),
                 LogicalType::Json,
             );
             let planner = TableDef {
                 name: table.into(),
                 columns: vec![
-                    declared("j", DataType::Utf8, SqlType::Json),
+                    declared("j", DataType::LargeBinary, SqlType::Json),
                     declared("h", DataType::Binary, SqlType::Hll),
                     declared("b", DataType::Binary, SqlType::Bitmap),
                     declared("s", DataType::Utf8, SqlType::String),
@@ -168,7 +168,7 @@ mod scalar_domain_tests {
                         "r",
                         DataType::Struct(
                             vec![
-                                Field::new("json", DataType::Utf8, true),
+                                Field::new("json", DataType::LargeBinary, true),
                                 Field::new("bitmap", DataType::Binary, true),
                             ]
                             .into(),
@@ -270,7 +270,7 @@ mod scalar_domain_tests {
         );
         assert_eq!(
             output_domains(
-                "select CAST([json_object('k':1)] AS ARRAY<varchar>),CAST(['plain'] AS ARRAY<json>)"
+                "select CAST([json_object('k':1 RETURNING JSON)] AS ARRAY<varchar>),CAST(['plain'] AS ARRAY<json>)"
             ),
             vec![
                 Some(SqlType::Array(Box::new(SqlType::String))),
@@ -326,7 +326,7 @@ mod scalar_domain_tests {
         }
         // Both declarations belong to the ordinary outer CAST. Their source
         // constructors retain the original text and JSON domains separately.
-        let sql = "select CAST(['{}'] AS ARRAY<json>),CAST([parse_json('{}')] AS ARRAY<json>)";
+        let sql = "select CAST(['{}'] AS ARRAY<json>),CAST([json_parse('{}')] AS ARRAY<json>)";
         assert_eq!(
             output_domains(sql),
             vec![Some(SqlType::Array(Box::new(SqlType::Json))); 2]
@@ -363,7 +363,7 @@ mod scalar_domain_tests {
             let DataType::List(item) = expression.value_type.data_type() else {
                 panic!("list")
             };
-            assert_eq!(item.data_type(), &DataType::Utf8);
+            assert_eq!(item.data_type(), &DataType::LargeBinary);
             assert!(item.metadata().as_arc().is_none());
         }
     }
@@ -574,7 +574,7 @@ mod scalar_domain_tests {
         );
         assert_eq!(
             output_domains(
-                "select coalesce(null,parse_json('null')),if(false,null,json_object('k':1)),case when true then null else parse_json('null') end"
+                "select coalesce(null,json_parse('null')),if(false,null,json_object('k':1 RETURNING JSON)),case when true then null else json_parse('null') end"
             ),
             vec![Some(SqlType::Json); 3]
         );
@@ -637,7 +637,7 @@ mod scalar_domain_tests {
             novarocks_type_contract::ValueLogicalType::Physical
         );
 
-        let parsed = output_expressions("select parse_json('{}')").remove(0);
+        let parsed = output_expressions("select json_parse('{}')").remove(0);
         assert_eq!(
             parsed.value_type.logical_type(),
             novarocks_type_contract::ValueLogicalType::Json
@@ -919,7 +919,7 @@ mod scalar_domain_tests {
             output_domains("select first_value(row(null,b)) over () from t"),
             vec![None]
         );
-        let sql = "with q as (select [parse_json('{}')] as j) select lead(j,1,j) over (order by 1) from q";
+        let sql = "with q as (select [json_parse('{}')] as j) select lead(j,1,j) over (order by 1) from q";
         let expression = output_expressions(sql).remove(0);
         let ExprKind::WindowCall { binding, args, .. } = &original_window(&expression).kind else {
             panic!("actual window");
@@ -1054,7 +1054,7 @@ mod scalar_domain_tests {
 
     #[test]
     fn m07_window_value_domains_require_exact_selected_binding_and_carrier() {
-        let original = output_expressions("select first_value(parse_json('{}')) over ()").remove(0);
+        let original = output_expressions("select first_value(json_parse('{}')) over ()").remove(0);
         let (binding, args) = match &original.kind {
             ExprKind::FunctionCall { binding, args, .. }
             | ExprKind::WindowCall { binding, args, .. } => (binding, args),
@@ -1306,7 +1306,7 @@ mod scalar_domain_tests {
     #[test]
     fn typed_wrapper_keeps_genuine_explicit_json_to_text_conversion() {
         let expression =
-            output_expressions("select row(cast(parse_json('{}') as varchar))").remove(0);
+            output_expressions("select row(cast(json_parse('{}') as varchar))").remove(0);
         let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
             panic!("row");
         };
@@ -1475,19 +1475,19 @@ mod scalar_domain_tests {
         use novarocks_result_contract::ScalarValueType as V;
         for (sql, uses_catalog, domain, scalar) in [
             (
-                "select first_value(parse_json('{}')) over ()",
+                "select first_value(json_parse('{}')) over ()",
                 false,
                 D::Json,
                 V::Json,
             ),
             (
-                "select lead(parse_json('{}'),1,null) over (order by 1)",
+                "select lead(json_parse('{}'),1,null) over (order by 1)",
                 false,
                 D::Json,
                 V::Json,
             ),
             (
-                "select lag(parse_json('{}'),1,null) over (order by 1)",
+                "select lag(json_parse('{}'),1,null) over (order by 1)",
                 false,
                 D::Json,
                 V::Json,
@@ -1748,7 +1748,7 @@ mod scalar_domain_tests {
             crate::analyze_error::AnalyzeErrorKind::TypeMismatch
         );
         let mixed_error = super::super::analyze(
-            &query("select element_at([parse_json('{}'),'plain'],1)"),
+            &query("select element_at([json_parse('{}'),'plain'],1)"),
             &Catalog,
             "db",
         )
@@ -1849,7 +1849,7 @@ mod scalar_domain_tests {
     fn m07_container_transforms_forward_exact_leaf_domains() {
         assert_eq!(
             output_domains(
-                "select element_at(flatten([[b]]),1),element_at(repeat(parse_json('{}'),2),1),element_at(__array_struct_subfield(ARRAY[r],'BITMAP'),1) from t"
+                "select element_at(flatten([[b]]),1),element_at(repeat(json_parse('{}'),2),1),element_at(__array_struct_subfield(ARRAY[r],'BITMAP'),1) from t"
             ),
             vec![
                 Some(SqlType::Bitmap),
@@ -1858,7 +1858,7 @@ mod scalar_domain_tests {
             ]
         );
         let expressions = output_expressions(
-            "select flatten([[parse_json('{}')]]),repeat(b,2),__array_struct_subfield(ARRAY[r],'JSON') from t",
+            "select flatten([[json_parse('{}')]]),repeat(b,2),__array_struct_subfield(ARRAY[r],'JSON') from t",
         );
         for (expression, id, marker) in [
             (
@@ -1906,7 +1906,7 @@ mod scalar_domain_tests {
     #[test]
     fn m07_container_zip_preserves_selected_names_nullability_and_partial_null() {
         assert_eq!(
-            output_domains("select zip([b],[parse_json('{}')]) from t"),
+            output_domains("select zip([b],[json_parse('{}')]) from t"),
             vec![Some(SqlType::Array(Box::new(SqlType::Struct(vec![
                 (String::new(), SqlType::Bitmap),
                 (String::new(), SqlType::Json),
@@ -2003,7 +2003,7 @@ mod scalar_domain_tests {
         let DataType::List(item) = expression.value_type.data_type() else {
             panic!("typed NULL List");
         };
-        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(item.data_type(), &DataType::LargeBinary);
         assert!(item.metadata().as_arc().is_none());
         assert_eq!(
             domain_at(&expression, &[0]),
@@ -2162,13 +2162,13 @@ mod scalar_domain_tests {
         };
         for (sql, uses_catalog, domain, scalar) in [
             (
-                "select element_at([parse_json('{}')],1)",
+                "select element_at([json_parse('{}')],1)",
                 false,
                 D::Json,
                 V::Json,
             ),
             (
-                "select [parse_json('{}')]",
+                "select [json_parse('{}')]",
                 false,
                 D::Plain,
                 V::List(Box::new(F {

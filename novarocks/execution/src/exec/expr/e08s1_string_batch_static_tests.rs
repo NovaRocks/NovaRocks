@@ -135,7 +135,7 @@ fn e08s1_string_batch_static_exact_arity_nominal_result_and_nullability_refusal(
                     index,
                     FunctionArgumentType::Value(
                         FunctionValueType::try_with_logical_type(
-                            DataType::Utf8,
+                            DataType::LargeBinary,
                             true,
                             ValueLogicalType::Json,
                         )

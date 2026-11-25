@@ -27,6 +27,9 @@ use novarocks_result_render::{
     ArrowTrinoJsonEncoder, BoundedClientRowEncoder, RenderErrorKind as E, RenderTurnStatus,
 };
 use std::sync::Arc;
+#[path = "support/native_json.rs"]
+mod native_json_fixture;
+use native_json_fixture::native_json;
 fn field(n: N, p: P, nullable: bool) -> RenderField {
     RenderField {
         native_type: n,
@@ -252,23 +255,21 @@ fn unsupported_and_cancel() {
     );
     assert_eq!(e.step(&mut [0; 100]).unwrap_err().kind, E::InvalidValue);
     for json in [
-        "",
-        "[1,]",
-        "{\"a\":}",
-        "{\"a\":1,}",
-        "01",
-        "1e",
-        "\"a\n\"",
-        "null null",
+        b"".as_slice(),
+        b"\x02\x20",
+        b"\x01\x20\x20",
+        b"\x01\x44\x02a",
+        b"\x01\x44\x01\xff",
+        b"\x01\x60\x02\x01\x00",
     ] {
         let mut e = encoder(
-            input(vec![Arc::new(StringArray::from(vec![json]))]),
+            input(vec![Arc::new(LargeBinaryArray::from(vec![json]))]),
             vec![field(N::Json, P::TrinoValue, true)],
         );
         let cause = e.step(&mut [0; 100]).unwrap_err();
-        assert_eq!(cause.kind, E::InvalidJson, "{json}");
+        assert_eq!(cause.kind, E::InvalidJson, "{json:?}");
         use novarocks_failure_contract::{FailureClass, FailureProjection};
-        assert_eq!(cause.failure_fact().class(), FailureClass::Data);
+        assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
         assert_eq!(cause.failure_fact().reason().code(), 110);
     }
     let value = "x".repeat(1000000);
@@ -330,10 +331,13 @@ fn json_more_than_turn_cell_limit_keeps_exact_state() {
         "{{\"a\":[{}],\"b\":{{\"c\":true}}}}",
         vec!["0"; 4096].join(",")
     );
+    let native = native_json(&value);
     assert_eq!(
         encode(
             encoder(
-                input(vec![Arc::new(StringArray::from(vec![value.as_str()]))]),
+                input(vec![Arc::new(LargeBinaryArray::from(vec![
+                    native.as_slice()
+                ]))]),
                 vec![field(N::Json, P::TrinoValue, true)]
             ),
             65536
@@ -443,18 +447,22 @@ fn native_and_dynamic_depth_boundaries() {
             assert_eq!(run_error(&mut e), E::DepthLimit);
         }
     }
-    for (n, ok) in [(64, true), (65, false)] {
-        let text = format!("{}{}", "[".repeat(n), "]".repeat(n));
-        let mut e = encoder(
-            input(vec![Arc::new(StringArray::from(vec![text.as_str()]))]),
-            vec![field(N::Json, P::TrinoValue, true)],
-        );
-        if ok {
-            encode(e, 65536);
-        } else {
-            assert_eq!(run_error(&mut e), E::DepthLimit);
-        }
-    }
+}
+
+#[test]
+fn native_json_depth_is_independent_from_sql_container_depth() {
+    let text = format!("{}null{}", "[".repeat(1024), "]".repeat(1024));
+    let native = native_json(&text);
+    let array = || Arc::new(LargeBinaryArray::from(vec![native.as_slice()])) as ArrayRef;
+    let render = field(N::Json, P::TrinoValue, true);
+    let direct = encoder(input(vec![array()]), vec![render.clone()]);
+    assert_eq!(encode(direct, 7).0, row(format!("[\"{text}\"]").as_bytes()));
+    let (array, nested_render) = wrap_list(array(), render);
+    let nested = encoder(input(vec![array]), vec![nested_render]);
+    assert_eq!(
+        encode(nested, 7).0,
+        row(format!("[[\"{text}\"]]").as_bytes())
+    );
 }
 #[test]
 fn row_limit_exact_and_plus_one() {
@@ -660,9 +668,14 @@ fn timestamp_signed_units_and_gregorian_years() {
 }
 #[test]
 fn trino_row_uses_declared_struct_json_children() {
+    let value = native_json(r#"{"a":1,"a":2}"#);
     let array = StructArray::new(
-        vec![Arc::new(Field::new("payload", DataType::Utf8, true))].into(),
-        vec![Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#)])) as ArrayRef],
+        vec![Arc::new(Field::new("payload", DataType::LargeBinary, true))].into(),
+        vec![Arc::new(LargeBinaryArray::from(vec![
+            Some(value.as_slice()),
+            None,
+            Some(b"\x01\x20".as_slice()),
+        ])) as ArrayRef],
         None,
     );
     let declared = field(
@@ -675,6 +688,11 @@ fn trino_row_uses_declared_struct_json_children() {
     );
     assert_eq!(
         encode(encoder(input(vec![Arc::new(array)]), vec![declared]), 1024).0,
-        row(br#"[["{\"a\":1}"]]"#),
+        [
+            row(br#"[["{\"a\":1,\"a\":2}"]]"#),
+            row(b"[[null]]"),
+            row(br#"[["null"]]"#),
+        ]
+        .concat(),
     );
 }

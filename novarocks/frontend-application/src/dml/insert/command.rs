@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn retains_variant_function_for_target_representation() {
-        let command = convert(r#"INSERT INTO t VALUES (parse_json('{"a":1}'))"#).unwrap();
+        let command = convert(r#"INSERT INTO t VALUES (json_parse('{"a":1}'))"#).unwrap();
         let ast::SetExpr::Values(values) = command.source.body.as_ref() else {
             panic!("VALUES");
         };

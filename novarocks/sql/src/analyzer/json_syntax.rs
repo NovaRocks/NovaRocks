@@ -15,9 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow::datatypes::DataType;
+use novarocks_expression::typing::NodeShape;
+use novarocks_functions::builtin::json_sql::{JsonEncoding, JsonFunction, is_json, is_text};
 use novarocks_parser::ast;
+use novarocks_type_contract::{FunctionValueType, TrinoCastMode, ValueKind};
 
-use crate::analysis::TypedExpr;
+use crate::analysis::{ExprKind, TypedExpr};
 use crate::analyze_error::AnalyzeError;
 
 use super::AnalyzerContext;
@@ -38,48 +42,74 @@ pub(crate) fn is_plain_json_query(node: &ast::JsonQuery) -> bool {
         && node.error_behavior == ast::JsonQueryBehavior::Null
 }
 
-/// D22 preserves the existing object's NULL-value and duplicate-key semantics.
-/// This admits a syntax profile to the original binder, not an arity guarantee.
-pub(crate) fn is_supported_json_object_profile(node: &ast::JsonObject) -> bool {
-    node.null_on_null
-        && !node.unique_keys
-        && node.returned_type.is_none()
-        && node.output_format.is_none()
-        && node.members.iter().all(|member| member.format.is_none())
-}
-
-/// Only profiles expressible without filtering or reinterpreting elements may
-/// reach the original JSON_ARRAY binder. Its unavailable implementation remains
-/// unavailable; this predicate does not install or promise an execution kernel.
-pub(crate) fn is_supported_json_array_profile(node: &ast::JsonArray) -> bool {
-    node.returned_type.is_none()
-        && node.output_format.is_none()
-        && node.elements.iter().all(|element| element.format.is_none())
-        && if node.elements.is_empty() {
-            !node.null_on_null
-        } else {
-            node.null_on_null
-        }
-}
-
 impl AnalyzerContext<'_> {
+    pub(super) fn analyze_json_constructor_syntax(
+        &self,
+        node: &ast::JsonConstructor,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let source = self.analyze_expr(&node.expression, scope)?;
+        self.read_json_input(source, node.format, false, node.expression.span())
+    }
+
+    pub(super) fn analyze_json_serialize_syntax(
+        &self,
+        node: &ast::JsonSerialize,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let source = self.analyze_expr(&node.expression, scope)?;
+        let source = self.read_json_input(
+            source,
+            node.input_format,
+            node.error_behavior == ast::JsonSerializeErrorBehavior::Null,
+            node.expression.span(),
+        )?;
+        self.write_json_output(
+            source,
+            node.returned_type.as_ref(),
+            node.output_format,
+            false,
+            node.span,
+        )
+    }
+
     pub(super) fn analyze_json_object_syntax(
         &self,
         node: &ast::JsonObject,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        if !is_supported_json_object_profile(node) {
-            return Err(AnalyzeError::unsupported_expression(
-                "JSON_OBJECT only supports NULL ON NULL without UNIQUE KEYS, RETURNING, or FORMAT",
-                node.span,
-            ));
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        for member in &node.members {
+            self.check_control()?;
+            let key = self.analyze_expr(&member.key, scope)?;
+            if !is_text(&key.value_type) {
+                return Err(AnalyzeError::invalid_function_argument(
+                    "JSON_OBJECT key must be a character string",
+                    member.key.span(),
+                ));
+            }
+            keys.push(key);
+            values.push(self.analyze_json_member(&member.value, member.format, scope)?);
         }
-        let arguments = node
-            .members
-            .iter()
-            .flat_map(|member| [&member.key, &member.value])
-            .collect::<Vec<_>>();
-        self.analyze_json_scalar_call("json_object", &arguments, node.span, scope)
+        // Trino evaluates the key row before the value row. Preserve
+        // each group's original order when lowering to selected arguments.
+        keys.extend(values);
+        let source = self.bind_json_call(
+            JsonFunction::Object {
+                null_on_null: node.null_on_null,
+                unique: node.unique_keys,
+            },
+            keys,
+            node.span,
+        )?;
+        self.write_json_output(
+            source,
+            node.returned_type.as_ref(),
+            node.output_format,
+            true,
+            node.span,
+        )
     }
 
     pub(super) fn analyze_json_array_syntax(
@@ -87,18 +117,191 @@ impl AnalyzerContext<'_> {
         node: &ast::JsonArray,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        if !is_supported_json_array_profile(node) {
-            return Err(AnalyzeError::unsupported_expression(
-                "JSON_ARRAY only supports its empty default profile or NULL ON NULL without RETURNING or FORMAT",
-                node.span,
+        let mut args = Vec::new();
+        for element in &node.elements {
+            self.check_control()?;
+            args.push(self.analyze_json_member(&element.value, element.format, scope)?);
+        }
+        let source = self.bind_json_call(
+            JsonFunction::Array {
+                null_on_null: node.null_on_null,
+            },
+            args,
+            node.span,
+        )?;
+        self.write_json_output(
+            source,
+            node.returned_type.as_ref(),
+            node.output_format,
+            true,
+            node.span,
+        )
+    }
+
+    fn analyze_json_member(
+        &self,
+        expr: &ast::Expr,
+        format: Option<ast::JsonFormat>,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let mut source = self.analyze_expr(expr, scope)?;
+        if let Some(format) = format.or_else(|| {
+            (is_json(&source.value_type)
+                || matches!(
+                    expr,
+                    ast::Expr::JsonObject(_) | ast::Expr::JsonArray(_) | ast::Expr::JsonQuery(_)
+                ))
+            .then_some(ast::JsonFormat::Json)
+        }) {
+            return self.read_json_input(source, format, false, expr.span());
+        }
+        if !is_text(&source.value_type)
+            && !matches!(
+                source.value_type.value_type().kind(),
+                ValueKind::Scalar(
+                    DataType::Null
+                        | DataType::Boolean
+                        | DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float32
+                        | DataType::Float64
+                        | DataType::Decimal128(..)
+                )
+            )
+        {
+            // The constructor has its own implicit text conversion for
+            // nonnumeric scalars, including UUID and datetime.
+            if matches!(source.value_type.value_type().kind(), ValueKind::Binary)
+                || !matches!(
+                    source.value_type.value_type().kind(),
+                    ValueKind::Nominal(novarocks_type_contract::ValueLogicalType::Uuid)
+                        | ValueKind::Temporal(_)
+                        | ValueKind::Scalar(DataType::Date32)
+                )
+            {
+                return Err(AnalyzeError::unsupported_expression(
+                    "Unsupported type of SQL/JSON constructor member",
+                    expr.span(),
+                ));
+            }
+            source = self.cast_with_trino_mode(
+                source,
+                FunctionValueType::new(DataType::Utf8, true),
+                TrinoCastMode::Explicit,
+                expr.span(),
+            )?;
+        }
+        self.bind_json_call(JsonFunction::Scalar, vec![source], expr.span())
+    }
+
+    fn read_json_input(
+        &self,
+        source: TypedExpr,
+        format: ast::JsonFormat,
+        null_on_error: bool,
+        span: novarocks_parser::Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let ty = &source.value_type;
+        let operation = if format == ast::JsonFormat::Json && is_json(ty) {
+            return Ok(source);
+        } else if format == ast::JsonFormat::Json
+            && (is_text(ty) || ty.data_type() == &DataType::Null)
+        {
+            JsonFunction::ReadText { null_on_error }
+        } else if (ty.value_type().kind() == &ValueKind::Binary
+            && ty.data_type() == &DataType::Binary)
+            || ty.data_type() == &DataType::Null
+        {
+            JsonFunction::ReadBinary {
+                encoding: json_encoding(format),
+                null_on_error,
+            }
+        } else {
+            return Err(AnalyzeError::type_mismatch(
+                format!(
+                    "Cannot read input of type {:?} with JSON format {format:?}",
+                    ty.value_type().kind()
+                ),
+                span,
+            ));
+        };
+        self.bind_json_call(operation, vec![source], span)
+    }
+
+    fn write_json_output(
+        &self,
+        source: TypedExpr,
+        declaration: Option<&ast::TypeName>,
+        format: Option<ast::JsonFormat>,
+        allows_json: bool,
+        span: novarocks_parser::Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let target = declaration
+            .map(|decl| {
+                super::helpers::sql_type_to_value_type(
+                    decl,
+                    source.value_type.nullable(),
+                    self.control,
+                )
+            })
+            .transpose()?
+            .unwrap_or_else(|| {
+                FunctionValueType::new(DataType::Utf8, source.value_type.nullable())
+            });
+        let format = format.unwrap_or(ast::JsonFormat::Json);
+        if allows_json && format == ast::JsonFormat::Json && is_json(&target) {
+            return Ok(source);
+        }
+        if target.value_type().kind() == &ValueKind::Binary
+            && target.data_type() == &DataType::Binary
+        {
+            return self.bind_json_call(
+                JsonFunction::SerializeBinary(json_encoding(format)),
+                vec![source],
+                span,
+            );
+        }
+        if format != ast::JsonFormat::Json || !is_text(&target) {
+            return Err(AnalyzeError::type_mismatch(
+                format!(
+                    "Cannot output JSON as {:?} with format {format:?}",
+                    target.value_type().kind()
+                ),
+                span,
             ));
         }
-        let arguments = node
-            .elements
-            .iter()
-            .map(|element| &element.value)
-            .collect::<Vec<_>>();
-        self.analyze_json_scalar_call("json_array", &arguments, node.span, scope)
+        let text = self.bind_json_call(JsonFunction::Format, vec![source], span)?;
+        if text.value_type == target {
+            return Ok(text);
+        }
+        self.cast_with_trino_mode(text, target, TrinoCastMode::Explicit, span)
+    }
+
+    fn bind_json_call(
+        &self,
+        operation: JsonFunction,
+        arguments: Vec<TypedExpr>,
+        span: novarocks_parser::Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let call = self.type_scalar_call(
+            NodeShape::TrustedCall {
+                function: &operation.function_id(),
+            },
+            arguments,
+            span,
+        )?;
+        Ok(TypedExpr {
+            value_type: call.value_type().clone(),
+            kind: ExprKind::FunctionCall {
+                name: operation.name().to_string(),
+                args: call.args.into(),
+                volatility: call.binding.semantics.volatility,
+                binding: call.binding,
+                distinct: false,
+            },
+        })
     }
 
     /// Enter the original scalar-function analysis owner, including its arity,
@@ -153,6 +356,14 @@ impl AnalyzerContext<'_> {
             invocation.json_path.span,
             scope,
         )
+    }
+}
+
+fn json_encoding(format: ast::JsonFormat) -> JsonEncoding {
+    match format {
+        ast::JsonFormat::Json | ast::JsonFormat::Utf8 => JsonEncoding::Utf8,
+        ast::JsonFormat::Utf16 => JsonEncoding::Utf16,
+        ast::JsonFormat::Utf32 => JsonEncoding::Utf32,
     }
 }
 
@@ -355,9 +566,16 @@ mod tests {
                         .sql_semantics
                         .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(mode));
                     let mut scope = ctx.new_scope();
-                    let input_type =
-                        FunctionValueType::try_with_logical_type(DataType::Utf8, nullable, logical)
-                            .unwrap();
+                    let input_type = FunctionValueType::try_with_logical_type(
+                        if logical == ValueLogicalType::Json {
+                            DataType::LargeBinary
+                        } else {
+                            DataType::Utf8
+                        },
+                        nullable,
+                        logical,
+                    )
+                    .unwrap();
                     let input_id = scope.add_column(None, "document", input_type.clone());
                     let node = plain(
                         ast::Expr::Identifier(build::ident_at(
@@ -390,7 +608,7 @@ mod tests {
                             &FunctionArgumentType::Value(arg.value_type.clone())
                         );
                     }
-                    assert_eq!(actual.value_type.data_type(), &DataType::Utf8);
+                    assert_eq!(actual.value_type.data_type(), &DataType::LargeBinary);
                     assert_eq!(actual.value_type.logical_type(), ValueLogicalType::Json);
                     assert_eq!(
                         binding.selected.result_type,
@@ -407,7 +625,7 @@ mod tests {
         let ctx = context(&control);
         let scope = ctx.new_scope();
         let input = build::function(
-            build::object_name(vec![build::ident("parse_json", false)]).unwrap(),
+            build::object_name(vec![build::ident("json_parse", false)]).unwrap(),
             vec![build::string("{\"雪'\\\\name\":1}")],
         );
         let path = "lax $.\"雪'\\\\name\"";
@@ -580,7 +798,7 @@ mod tests {
         for input in [
             build::string("{\"a\":1}"),
             build::function(
-                build::object_name(vec![build::ident("parse_json", false)]).unwrap(),
+                build::object_name(vec![build::ident("json_parse", false)]).unwrap(),
                 vec![build::string("{\"a\":1}")],
             ),
         ] {
@@ -675,42 +893,6 @@ mod tests {
         assert!(error.message().contains("JSON_TABLE"));
     }
 
-    fn object(members: Vec<(ast::Expr, ast::Expr)>) -> ast::JsonObject {
-        ast::JsonObject {
-            members: members
-                .into_iter()
-                .map(|(key, value)| ast::JsonObjectMember {
-                    key,
-                    value,
-                    format: None,
-                    span: Span::new(20, 90),
-                })
-                .collect(),
-            null_on_null: true,
-            unique_keys: false,
-            returned_type: None,
-            output_format: None,
-            span: Span::new(10, 100),
-        }
-    }
-
-    fn array(values: Vec<ast::Expr>, null_on_null: bool) -> ast::JsonArray {
-        ast::JsonArray {
-            elements: values
-                .into_iter()
-                .map(|value| ast::JsonArrayElement {
-                    value,
-                    format: None,
-                    span: Span::new(120, 150),
-                })
-                .collect(),
-            null_on_null,
-            returned_type: None,
-            output_format: None,
-            span: Span::new(110, 160),
-        }
-    }
-
     fn ordinary_constructor(name: &str, arguments: Vec<ast::Expr>, span: Span) -> ast::Expr {
         let mut expression = build::function(
             build::object_name(vec![build::ident(name, false)]).unwrap(),
@@ -723,274 +905,75 @@ mod tests {
         expression
     }
 
-    fn assert_same_refusal(actual: &AnalyzeError, expected: &AnalyzeError) {
-        assert_eq!(actual.kind(), expected.kind());
-        assert_eq!(actual.code(), expected.code());
-        assert_eq!(actual.span(), expected.span());
-        assert_eq!(actual.message(), expected.message());
-        assert_eq!(actual.control_error(), expected.control_error());
-        assert_eq!(
-            std::error::Error::source(actual).map(ToString::to_string),
-            std::error::Error::source(expected).map(ToString::to_string),
-        );
-    }
-
     #[test]
-    fn object_whole_query_preserves_null_key_value_duplicates_and_nested_json_owner() {
-        let nested = object(vec![(build::string("inner"), build::integer(3))]);
-        let node = object(vec![
-            (build::string("z"), build::null()),
-            (build::null(), build::integer(7)),
-            (build::string("duplicate"), build::string("{\"raw\":1}")),
-            (
-                build::string("duplicate"),
-                ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(nested)),
-            ),
-        ]);
-        assert!(is_supported_json_object_profile(&node));
-        let original = node.clone();
-        let ordinary = ordinary_constructor(
-            "json_object",
-            vec![
-                build::string("z"),
-                build::null(),
-                build::null(),
-                build::integer(7),
-                build::string("duplicate"),
-                build::string("{\"raw\":1}"),
-                build::string("duplicate"),
-                ordinary_constructor(
-                    "json_object",
-                    vec![build::string("inner"), build::integer(3)],
-                    Span::new(10, 100),
-                ),
-            ],
-            node.span,
-        );
-        let actual_query = projection_query(
-            ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(node)),
-            vec![],
-        );
-        let expected_query = projection_query(ordinary, vec![]);
-        let (actual, _, _) =
-            crate::analyzer::analyze(&actual_query, &NO_TABLES, "default").unwrap();
-        let (expected, _, _) =
-            crate::analyzer::analyze(&expected_query, &NO_TABLES, "default").unwrap();
-        let actual = first_projection(&actual);
-        assert_same_typed(actual, first_projection(&expected));
-        let ExprKind::FunctionCall { binding, args, .. } = &actual.kind else {
-            panic!("scalar")
-        };
-        assert_eq!(
-            binding.function_id.as_str(),
-            "builtin.scalar/json_object/v1"
-        );
-        assert_eq!(
-            binding.semantics.argument_evaluation,
-            novarocks_functions::FunctionArgumentEvaluation::Eager
-        );
-        assert_eq!(actual.value_type.logical_type(), ValueLogicalType::Json);
-        assert_eq!(args.len(), 8);
-        assert!(matches!(
-            args[1].kind,
-            ExprKind::Literal(LiteralValue::Null)
-        ));
-        assert!(matches!(
-            args[2].kind,
-            ExprKind::Literal(LiteralValue::Null)
-        ));
-        assert!(
-            matches!(&args[4].kind, ExprKind::Literal(LiteralValue::String(value)) if value == "duplicate")
-        );
-        assert!(
-            matches!(&args[6].kind, ExprKind::Literal(LiteralValue::String(value)) if value == "duplicate")
-        );
-        assert_eq!(args[7].value_type.logical_type(), ValueLogicalType::Json);
-        let ast::SetExpr::Select(select) = actual_query.body.as_ref() else {
-            panic!("select")
-        };
-        let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
-            panic!("object")
-        };
-        assert!(projection_column.alias.is_none(), "anonymous projection");
-        let ast::Expr::JsonObject(after) = &projection_column.expression else {
-            panic!("object")
-        };
-        assert_eq!(after.as_ref(), &original);
-        // The original owner decides SQL-NULL keys, JSON text embedding and
-        // numeric encoding. This syntax consumer preserves its exact arguments.
-    }
-
-    #[test]
-    fn empty_object_keeps_the_original_zero_argument_binding() {
+    fn constructor_clauses_bind_each_original_source_and_exact_output() {
         let control = SqlCompileControl::unbounded();
         let ctx = context(&control);
         let scope = ctx.new_scope();
-        let node = object(vec![]);
-        assert!(is_supported_json_object_profile(&node));
-        let actual = ctx.analyze_json_object_syntax(&node, &scope).unwrap();
-        let expected = ctx
-            .analyze_expr(
-                &ordinary_constructor("json_object", vec![], node.span),
-                &scope,
-            )
-            .unwrap();
-        assert_same_typed(&actual, &expected);
-        let ExprKind::FunctionCall { args, binding, .. } = &actual.kind else {
-            panic!("canonical function")
+        let span = novarocks_parser::SYNTHETIC;
+        let object = ast::JsonObject {
+            members: vec![ast::JsonObjectMember {
+                key: build::string("k"),
+                value: build::string("[1]"),
+                format: Some(ast::JsonFormat::Json),
+                span,
+            }],
+            null_on_null: false,
+            unique_keys: true,
+            returned_type: Some(build::simple_type("JSON")),
+            output_format: None,
+            span,
         };
-        assert!(args.is_empty());
+        let value = ctx.analyze_json_object_syntax(&object, &scope).unwrap();
+        assert!(is_json(&value.value_type));
+        let ExprKind::FunctionCall { binding, args, .. } = &value.kind else {
+            panic!("Expected bound SQL/JSON object call");
+        };
         assert_eq!(
-            binding.function_id.as_str(),
-            "builtin.scalar/json_object/v1"
-        );
-    }
-
-    #[test]
-    fn array_expressible_profiles_preserve_original_arity_or_unavailable_result() {
-        let control = SqlCompileControl::unbounded();
-        let ctx = context(&control);
-        let scope = ctx.new_scope();
-        for node in [
-            array(vec![], false),
-            array(
-                vec![
-                    build::null(),
-                    build::integer(2),
-                    build::string("{\"raw\":1}"),
-                ],
-                true,
-            ),
-            array(
-                vec![ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(
-                    object(vec![(build::string("k"), build::integer(1))]),
-                ))],
-                true,
-            ),
-        ] {
-            assert!(is_supported_json_array_profile(&node));
-            let ordinary = ordinary_constructor(
-                "json_array",
-                node.elements
-                    .iter()
-                    .map(|element| element.value.clone())
-                    .collect(),
-                node.span,
-            );
-            let actual = ctx.analyze_json_array_syntax(&node, &scope).unwrap_err();
-            let expected = ctx.analyze_expr(&ordinary, &scope).unwrap_err();
-            assert_same_refusal(&actual, &expected);
-            if !node.elements.is_empty() {
-                assert_eq!(actual.kind(), AnalyzeErrorKind::UnsupportedExpression);
-                assert!(
-                    actual
-                        .message()
-                        .contains("no admitted selected scalar implementation")
-                );
+            binding.function_id,
+            JsonFunction::Object {
+                null_on_null: false,
+                unique: true
             }
-        }
-    }
+            .function_id()
+        );
+        let ExprKind::FunctionCall {
+            binding,
+            args: input_args,
+            ..
+        } = &args[1].kind
+        else {
+            panic!("Expected selected FORMAT JSON input call");
+        };
+        assert_eq!(
+            binding.function_id,
+            JsonFunction::ReadText {
+                null_on_error: false
+            }
+            .function_id()
+        );
+        assert!(
+            matches!(&input_args[0].kind, ExprKind::Literal(LiteralValue::String(value)) if value == "[1]")
+        );
 
-    #[test]
-    fn array_original_operands_are_analyzed_in_order_before_catalog_availability() {
-        let control = SqlCompileControl::unbounded();
-        let ctx = context(&control);
-        let scope = ctx.new_scope();
-        let first =
-            ast::Expr::Identifier(build::ident_at("first_missing", false, Span::new(120, 130)));
-        let second = ast::Expr::Identifier(build::ident_at(
-            "second_missing",
-            false,
-            Span::new(140, 150),
-        ));
-        for (arguments, error_span) in [
-            (vec![first.clone(), second.clone()], first.span()),
-            (vec![second, first], Span::new(140, 150)),
-        ] {
-            let node = array(arguments.clone(), true);
-            let actual = ctx.analyze_json_array_syntax(&node, &scope).unwrap_err();
-            let expected = ctx
-                .analyze_expr(
-                    &ordinary_constructor("json_array", arguments, node.span),
-                    &scope,
-                )
-                .unwrap_err();
-            assert_same_refusal(&actual, &expected);
-            assert_eq!(actual.kind(), AnalyzeErrorKind::UnknownColumn);
-            assert_eq!(actual.span(), Some(error_span));
-        }
-    }
-
-    #[test]
-    fn nondefault_object_and_array_profiles_reject_before_operands_or_discovery() {
-        let unknown = ast::Expr::Identifier(build::ident("unknown_constructor_operand", false));
-        let base = object(vec![(unknown.clone(), unknown.clone())]);
-        let mut objects = Vec::new();
-        let mut node = base.clone();
-        node.null_on_null = false;
-        objects.push(node);
-        let mut node = base.clone();
-        node.unique_keys = true;
-        objects.push(node);
-        let mut node = base.clone();
-        node.returned_type = Some(build::simple_type("VARCHAR"));
-        objects.push(node);
-        let mut node = base.clone();
-        node.output_format = Some(ast::JsonFormat::Json);
-        objects.push(node);
-        for format in [ast::JsonFormat::Json, ast::JsonFormat::Utf16] {
-            let mut node = base.clone();
-            node.members[0].format = Some(format);
-            objects.push(node);
-        }
-        let control = SqlCompileControl::unbounded();
-        let ctx = context(&control);
-        let scope = ctx.new_scope();
-        for node in objects {
-            assert!(!is_supported_json_object_profile(&node));
-            let error = ctx.analyze_json_object_syntax(&node, &scope).unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-            assert_eq!(error.span(), Some(node.span));
-            let span = node.span;
-            let query = projection_query(
-                ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(node)),
-                vec![missing_table("must_not_discover_object")],
-            );
-            let error = crate::analyzer::analyze(&query, &NO_TABLES, "default").unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-            assert_eq!(error.span(), Some(span));
-        }
-        let base = array(vec![unknown], true);
-        let mut arrays = Vec::new();
-        let mut node = base.clone();
-        node.null_on_null = false;
-        arrays.push(node);
-        let mut node = base.clone();
-        node.returned_type = Some(build::simple_type("VARCHAR"));
-        arrays.push(node);
-        let mut node = base.clone();
-        node.output_format = Some(ast::JsonFormat::Json);
-        arrays.push(node);
-        for format in [ast::JsonFormat::Json, ast::JsonFormat::Utf32] {
-            let mut node = base.clone();
-            node.elements[0].format = Some(format);
-            arrays.push(node);
-        }
-        arrays.push(array(vec![], true));
-        for node in arrays {
-            assert!(!is_supported_json_array_profile(&node));
-            let error = ctx.analyze_json_array_syntax(&node, &scope).unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-            assert_eq!(error.span(), Some(node.span));
-            let span = node.span;
-            let query = projection_query(
-                ast::Expr::JsonArray(novarocks_parser::ast::AstBox::new(node)),
-                vec![missing_table("must_not_discover_array")],
-            );
-            let error = crate::analyzer::analyze(&query, &NO_TABLES, "default").unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-            assert_eq!(error.span(), Some(span));
-        }
+        let array = ast::JsonArray {
+            elements: vec![ast::JsonArrayElement {
+                value: build::null(),
+                format: None,
+                span,
+            }],
+            null_on_null: false,
+            returned_type: None,
+            output_format: None,
+            span,
+        };
+        let result = ctx.analyze_json_array_syntax(&array, &scope).unwrap();
+        assert_eq!(result.value_type.data_type(), &DataType::Utf8);
+        let ExprKind::FunctionCall { binding, args, .. } = &result.kind else {
+            panic!("Expected text output wrapper");
+        };
+        assert_eq!(binding.function_id, JsonFunction::Format.function_id());
+        assert!(is_json(&args[0].value_type));
     }
 
     #[test]
@@ -1004,83 +987,18 @@ mod tests {
         let control = SqlCompileControl::new(None, std::sync::Arc::new(Cancelled));
         let ctx = context(&control);
         let scope = ctx.new_scope();
-        let object = object(vec![(build::string("k"), build::null())]);
-        let array = array(vec![build::null()], true);
-        for (actual, ordinary) in [
-            (
-                ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(object.clone())),
-                ordinary_constructor(
-                    "json_object",
-                    vec![build::string("k"), build::null()],
-                    object.span,
-                ),
-            ),
-            (
-                ast::Expr::JsonArray(novarocks_parser::ast::AstBox::new(array.clone())),
-                ordinary_constructor("json_array", vec![build::null()], array.span),
-            ),
-        ] {
-            let actual = ctx.analyze_expr(&actual, &scope).unwrap_err();
-            let expected = ctx.analyze_expr(&ordinary, &scope).unwrap_err();
-            assert_same_refusal(&actual, &expected);
-            assert_eq!(
-                actual.control_error(),
-                Some(novarocks_type_contract::CompileControlError::Cancelled)
-            );
-        }
-    }
-    #[test]
-    fn typed_json_typeof_preserves_bad_operands_and_clause_refusals() {
-        let control = SqlCompileControl::unbounded();
-        let ctx = context(&control);
-        let scope = ctx.new_scope();
-        let unknown = || build::identifier(build::ident("must_not_resolve", false));
-        let object_node = object(vec![(build::string("k"), unknown())]);
-        let array_node = array(vec![unknown()], true);
-        for (typed, ordinary) in [
-            (
-                ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(object_node.clone())),
-                ordinary_constructor(
-                    "json_object",
-                    vec![build::string("k"), unknown()],
-                    object_node.span,
-                ),
-            ),
-            (
-                ast::Expr::JsonArray(novarocks_parser::ast::AstBox::new(array_node.clone())),
-                ordinary_constructor("json_array", vec![unknown()], array_node.span),
-            ),
-        ] {
-            let actual = ctx
-                .analyze_expr(
-                    &ordinary_constructor("typeof", vec![typed], Span::new(0, 90)),
-                    &scope,
-                )
-                .unwrap_err();
-            let expected = ctx
-                .analyze_expr(
-                    &ordinary_constructor("typeof", vec![ordinary], Span::new(0, 90)),
-                    &scope,
-                )
-                .unwrap_err();
-            assert_same_refusal(&actual, &expected);
-            assert_eq!(actual.kind(), AnalyzeErrorKind::UnknownColumn);
-        }
-        let mut unsupported_object = object_node;
-        unsupported_object.unique_keys = true;
-        let unsupported_array = array(vec![unknown()], false);
-        for typed in [
-            ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(unsupported_object)),
-            ast::Expr::JsonArray(novarocks_parser::ast::AstBox::new(unsupported_array)),
-        ] {
-            let error = ctx
-                .analyze_expr(
-                    &ordinary_constructor("typeof", vec![typed], Span::new(0, 90)),
-                    &scope,
-                )
-                .unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-        }
+        let array = ast::Expr::JsonArray(ast::AstBox::new(ast::JsonArray {
+            elements: Vec::new(),
+            null_on_null: false,
+            returned_type: None,
+            output_format: None,
+            span: novarocks_parser::SYNTHETIC,
+        }));
+        let actual = ctx.analyze_expr(&array, &scope).unwrap_err();
+        assert_eq!(
+            actual.control_error(),
+            Some(novarocks_type_contract::CompileControlError::Cancelled)
+        );
     }
 
     fn opaque_dynamic_json_call(quoted: bool) -> ast::Expr {

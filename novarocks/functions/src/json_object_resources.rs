@@ -35,6 +35,28 @@ use arrow_schema::DataType;
 use arrow_schema::Field;
 use std::alloc::Layout;
 
+pub(crate) trait JsonObjectArguments {
+    fn len(&self) -> usize;
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn array(&self, argument: usize) -> &ArrayRef;
+    fn value_row(&self, argument: usize, ordinal: usize, batch_row: usize) -> usize;
+}
+#[cfg(test)]
+impl JsonObjectArguments for [ArrayRef] {
+    fn len(&self) -> usize {
+        <[ArrayRef]>::len(self)
+    }
+    fn array(&self, argument: usize) -> &ArrayRef {
+        &self[argument]
+    }
+    fn value_row(&self, _: usize, _: usize, batch_row: usize) -> usize {
+        batch_row
+    }
+}
+
 fn add(a: usize, b: usize) -> Result<usize, KernelFailure> {
     a.checked_add(b).ok_or(KernelFailure::ResourceExhausted)
 }
@@ -480,7 +502,7 @@ pub(crate) struct JsonObjectBatchResources {
 impl JsonObjectBatchResources {
     /// Fold one borrowed row. Unknown fragments remain absent; their copy
     /// prefixes and complete diagnostics still contribute to admission.
-    pub(crate) fn add_row<A: crate::json_object_core::JsonObjectArguments + ?Sized>(
+    pub(crate) fn add_row<A: JsonObjectArguments + ?Sized>(
         &mut self,
         arguments: &A,
         ordinal: usize,
@@ -523,6 +545,7 @@ impl JsonObjectBatchResources {
         self.row_requested_bytes = add(self.row_requested_bytes, allocations.requested_bytes)?;
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn diagnostic_grant(&self) -> Result<usize, KernelFailure> {
         let bytes = self.diagnostic_bytes.max(178);
         mul(add(add(76, mul(bytes, 2)?)?, 8)?, 2)
@@ -551,6 +574,7 @@ impl JsonObjectBatchResources {
                 peak_bytes: validation,
             })
     }
+    #[cfg(test)]
     pub(crate) fn body_grant(&self, selected_rows: usize) -> Result<usize, KernelFailure> {
         Ok(self.body_geometry(selected_rows)?.peak_bytes)
     }

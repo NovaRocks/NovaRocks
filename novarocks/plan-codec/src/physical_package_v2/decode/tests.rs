@@ -53,6 +53,82 @@ fn model() -> FragmentDecodeResourceModel {
 fn encode(package: &p::FragmentPackage) -> Result<Vec<u8>, PackageEncodeError> {
     Ok(encode_fragment_package(package, &encode_limits(), &Control::default())?.encode_to_vec())
 }
+
+#[test]
+fn json_constants_validate_only_reachable_nominal_cells() {
+    use arrow::array::{Array, LargeBinaryArray, StructArray};
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_type_contract::{
+        FunctionValueType, ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+    use std::sync::Arc;
+
+    let field = Arc::new(Field::new("doc", DataType::LargeBinary, true));
+    let plain = Arc::new(Field::new("bytes", DataType::LargeBinary, true));
+    // The second JSON item has a valid root extent but an invalid boolean
+    // value. Ordinary binary contents have no JSON meaning.
+    let source = Arc::new(LargeBinaryArray::from(vec![
+        b"\x01\x20".as_slice(),
+        b"\x01\x42\x02".as_slice(),
+    ]));
+    let binary = Arc::new(LargeBinaryArray::from(vec![b"text".as_slice(); 2]));
+    let pure = ValueTypeStorageLifetime::pure();
+    let json = ValueTypeRef::try_new(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        true,
+        pure.clone(),
+    )
+    .unwrap();
+    let binary_type = ValueTypeRef::try_new(ValueKind::Binary, true, pure.clone()).unwrap();
+    let structure = ValueTypeRef::try_new(
+        ValueKind::Struct(
+            vec![
+                ValueField::new("doc", json, pure.clone()),
+                ValueField::new("bytes", binary_type, pure.clone()),
+            ]
+            .into(),
+        ),
+        true,
+        pure.clone(),
+    )
+    .unwrap();
+    let control = Control::default();
+    for valid in [false, true] {
+        let array = StructArray::new(
+            vec![field.clone(), plain.clone()].into(),
+            vec![source.clone(), binary.clone()],
+            Some(vec![true, valid].into()),
+        );
+        let layout = ValueLayout::try_new(array.data_type(), pure.clone()).unwrap();
+        let ty = FunctionValueType::try_from_value(structure.clone(), layout).unwrap();
+        let root = Arc::new(Field::new("c", array.data_type().clone(), true));
+        let pool = p::ConstantPool::try_new(
+            root,
+            ty,
+            array.to_data(),
+            decode_limits().constant_policy,
+            CompilePhase::Decode,
+            &control,
+        )
+        .unwrap();
+        let mut pools = p::ConstantPools::empty();
+        pools.insert(p::ConstantPoolId::new(1), pool).unwrap();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let result = super::validate_json_constants_in(&pools, &mut work);
+        if valid {
+            assert!(matches!(
+                result,
+                Err(super::PhysicalConstantCodecError::JsonValue(
+                    novarocks_functions::json_value::JsonValueError::Scalar
+                ))
+            ));
+        } else {
+            result.unwrap();
+        }
+    }
+}
+
 fn fixtures() -> Vec<(&'static str, p::FragmentPackage)> {
     let mut fixtures = vec![
         ("rich", rich_package()),

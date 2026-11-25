@@ -1076,9 +1076,12 @@ mod tests {
     #[test]
     fn final_identity_keeps_supported_dictionary_carriers() {
         use novarocks_type_contract::FunctionValueType;
-        let declaration =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
+        let declaration = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let array: ArrayRef = Arc::new(
             vec![Some("{}"), None, Some("[]"), Some("null")]
                 .into_iter()
@@ -1429,9 +1432,12 @@ mod tests {
     #[test]
     fn project_runtime_keeps_full_json_declaration_and_separate_source_attributes() {
         use novarocks_type_contract::FunctionValueType;
-        let declaration =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
+        let declaration = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let source_format_field =
             Field::new("payload", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
                 String,

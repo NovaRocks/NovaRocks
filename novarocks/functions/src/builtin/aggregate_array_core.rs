@@ -135,6 +135,7 @@ pub enum ArrayAggValue {
     Int64(i64),
     Float64(f64),
     Utf8(String),
+    Binary(Vec<u8>),
     Date32(i32),
     Timestamp(i64),
     Decimal128(i128),
@@ -172,6 +173,11 @@ pub fn to_common_scalar(
             let value = v.clone();
             work.flush()?;
             AggScalarValue::Utf8(value)
+        }
+        ArrayAggValue::Binary(_) => {
+            return Err(failure::contract(
+                "array_agg binary payload cannot be used as a comparison key",
+            ));
         }
         ArrayAggValue::Date32(v) => AggScalarValue::Date32(*v),
         ArrayAggValue::Timestamp(v) => AggScalarValue::Timestamp(*v),
@@ -261,6 +267,7 @@ fn array_value_from_common(
         AggScalarValue::Int64(value) => ArrayAggValue::Int64(value),
         AggScalarValue::Float64(value) => ArrayAggValue::Float64(value),
         AggScalarValue::Utf8(value) => ArrayAggValue::Utf8(value),
+        AggScalarValue::Binary(value) => ArrayAggValue::Binary(value),
         AggScalarValue::Date32(value) => ArrayAggValue::Date32(value),
         AggScalarValue::Timestamp(value) => ArrayAggValue::Timestamp(value),
         AggScalarValue::Decimal128(value) => ArrayAggValue::Decimal128(value),
@@ -296,9 +303,7 @@ fn array_value_from_common(
                 })
                 .collect::<Result<Vec<_>, KernelFailure>>()?,
         ),
-        AggScalarValue::Decimal256(_)
-        | AggScalarValue::Binary(_)
-        | AggScalarValue::Temporal(..) => {
+        AggScalarValue::Decimal256(_) | AggScalarValue::Temporal(..) => {
             return Err(failure::contract(
                 "array_agg tracked scalar type is not supported by its output ABI",
             ));
@@ -373,7 +378,7 @@ fn extract_final_values<A: ScalarStateAllocator>(
     let mut seen = HashSet::new();
     for row in rows {
         work.step()?;
-        let value = row.first().cloned().unwrap_or(None);
+        let value = row.into_iter().next().flatten();
         if distinct {
             let key = distinct_key(&value, work)?;
             if seen.insert(key) {
@@ -726,6 +731,24 @@ fn build_scalar_array(
                 }
             }
             Ok(Arc::new(StringArray::from(out)) as ArrayRef)
+        }
+        DataType::LargeBinary => {
+            let values = values
+                .into_iter()
+                .map(|value| {
+                    work.step()?;
+                    match value {
+                        Some(ArrayAggValue::Binary(value)) => {
+                            Ok(Some(AggScalarValue::Binary(value)))
+                        }
+                        None => Ok(None),
+                        _ => Err(failure::contract(
+                            "scalar output type mismatch for LargeBinary",
+                        )),
+                    }
+                })
+                .collect::<Result<_, _>>()?;
+            crate::aggregate_scalar::build_scalar_array(output_type, values, work)
         }
         DataType::Date32 => {
             let mut out = Vec::with_capacity(values.len());
@@ -1271,7 +1294,7 @@ pub fn build_array<
             let first = fields.first().ok_or_else(|| {
                 failure::contract("array_agg struct target type must contain at least 1 field")
             })?;
-            let DataType::List(first_list_field) = first.data_type() else {
+            let DataType::List(_) = first.data_type() else {
                 return Err(failure::contract(format_args!(
                     "array_agg struct field[0] must be List, got {:?}",
                     first.data_type()
@@ -1312,15 +1335,16 @@ pub fn build_array<
                 out_offsets.push(current);
                 for row in rows {
                     work.step()?;
-                    for (col_idx, values) in flattened_by_col.iter_mut().enumerate() {
+                    let mut row = row.into_iter();
+                    for values in &mut flattened_by_col {
                         work.step()?;
-                        values.push(row.get(col_idx).cloned().unwrap_or(None));
+                        values.push(row.next().flatten());
                     }
                 }
             }
 
             let mut columns = Vec::with_capacity(fields.len());
-            for (idx, field) in fields.iter().enumerate() {
+            for (idx, (field, values)) in fields.iter().zip(flattened_by_col).enumerate() {
                 work.step()?;
                 let DataType::List(list_field) = field.data_type() else {
                     return Err(failure::contract(format_args!(
@@ -1329,15 +1353,7 @@ pub fn build_array<
                         field.data_type()
                     )));
                 };
-                let values = if idx == 0 {
-                    build_scalar_array(
-                        first_list_field.data_type(),
-                        flattened_by_col[idx].clone(),
-                        work,
-                    )?
-                } else {
-                    build_scalar_array(list_field.data_type(), flattened_by_col[idx].clone(), work)?
-                };
+                let values = build_scalar_array(list_field.data_type(), values, work)?;
                 let output_list_field = reconcile_field_to_data_type(
                     list_field,
                     values.data_type(),

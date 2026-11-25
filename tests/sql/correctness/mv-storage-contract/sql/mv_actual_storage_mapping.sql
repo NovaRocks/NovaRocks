@@ -34,8 +34,42 @@ SELECT id, price FROM target_mv ORDER BY id;
 SELECT id, price FROM source_table ORDER BY id;
 
 -- query 6
+-- @skip_result_check=true
+-- @expect_update_count=0
+-- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
+-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
+CREATE TABLE IF NOT EXISTS source_table AS
+SELECT JSON '1' AS payload FROM missing_json_source;
+
+-- query 7
+-- @expect_trino_error=TABLE_ALREADY_EXISTS,USER_ERROR
+CREATE TABLE source_table AS SELECT JSON '1' AS payload;
+
+-- query 8
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_error=Unsupported: Iceberg JSON writes are not supported yet
+-- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
+-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
+CREATE TABLE rejected_json_ctas AS SELECT id, ARRAY[JSON '1'] AS payload FROM source_table;
+
+-- query 9
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
+-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
+CREATE MATERIALIZED VIEW rejected_json_mv WITH (refresh_policy = 'MANUAL')
+AS SELECT id, JSON '1' AS payload FROM source_table;
+
+-- query 10
+SELECT count(*) AS rejected_targets
+FROM rwm10b_${uuid0}.information_schema.tables
+WHERE table_schema = 'ns_${uuid0}'
+  AND table_name IN ('rejected_json_ctas', 'rejected_json_mv');
+
+-- query 11
 -- @cleanup=true
 -- @skip_result_check=true
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.rejected_json_mv;
+DROP TABLE IF EXISTS ns_${uuid0}.rejected_json_ctas;
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.target_mv;
 DROP TABLE IF EXISTS ns_${uuid0}.source_table;
 DROP SCHEMA IF EXISTS rwm10b_${uuid0}.ns_${uuid0};

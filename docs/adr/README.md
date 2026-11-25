@@ -122,7 +122,8 @@ code-anchors:
 领域哲学：join 的行拓扑（key → 枚举该 key 全部 build 行 + gather 物化）与聚合状态不同，分别归原消费者；实例内键相等类、typed 读取与 bulk 构建共享唯一索引。速度来自算法与数据布局（直接寻址、合并列存、选择向量、membership 零枚举、整列直发），不来自手写 SIMD。受支持 join 类型、null-safe 等值与残差谓词的独立结果必须保留；尚未支持的准确拒绝及既有隔离分别记录，不能冒充成功或正式准入。
 
 - [ADR-0223](ADR-0223-result-content-identity-and-deterministic-fingerprints.md) — 内容身份为何逐列显式选择、NaN 规范化与首次接纳代表为何分开、确定指纹为何只作证据并由原 owner 判定适用资格（active；补充 ADR-0205，限当前准入支持面）
-- [ADR-0220](ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md) — JSON membership为何共用规范键与哈希null-aware LeftMark、JSON与VARIANT为何分析期隔离、Variant时间戳为何纯UTC渲染（active；补充ADR-0212的mark输出，原join生命周期保留）
+- [ADR-0270](ADR-0270-native-json-values-and-binary-membership-keys.md) — JSON v1 值、原生载体、Binary membership 键与 Iceberg 目标准入（active）
+- [ADR-0220](ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md) — JSON membership为何共用规范键与哈希null-aware LeftMark、JSON与VARIANT为何分析期隔离、Variant时间戳为何纯UTC渲染（active；补充ADR-0212的mark输出，原join生命周期保留）；483 JSON 等值由 ADR-0270 部分替代)
 - [ADR-0212](ADR-0212-shared-join-stages-and-exact-demand-retirement.md) — SharedBuild 为何分开 E/F/Q/T、原 K 工作、准确需求与 data-only 发布，并以增量候选和独立 tail 维持正常退休（active；部分替代 ADR-0004 的单 Chunk/整批选择向量/拒绝增量 cursor，补充 ADR-0205 的推进与 assignment 交接）（共享阶段件的归属与参数化由 ADR-0243 修订，原 join 需求和退休规则保留）
 - [ADR-0205](ADR-0205-shared-local-key-index-and-consumer-row-topology.md) — 实例内键相等类为何共用唯一索引、bulk 工作与完成协议为何分开，而 join 行关系与聚合状态仍归原消费者（active；部分替代 ADR-0004 的索引分家裁决；推进结果、调用方唤醒和范围 assignment 由 ADR-0212 补充，内容政策与指纹由 ADR-0223 补充）
 - ADR-0004 — hash join 执行核心为何保留专有行拓扑与 selection/gather，且不写显式 SIMD（active；索引分家与旧 method 前提由 ADR-0205 部分替代；单 Chunk、整批选择向量和拒绝增量 cursor 由 ADR-0212 部分替代，行拓扑与正确性要求保留）
@@ -372,7 +373,8 @@ code-anchors:
 - [ADR-0236](ADR-0236-installed-optimization-domains-and-partition-rank-retention.md) — 可选优化为何只在共享安装域内规划、分区限额为何共用排序名次保留作者、改写为何显式核对键等式（active；语义规则与原生验收分别核对）
 - [ADR-0226](ADR-0226-engine-metadata-through-typed-system-relations.md) — 引擎元数据为何通过原语句的类型化批快照进入独立系统关系，名称、只读、Provider与真实退出为何各守原所有者（active；旧 SHOW 保留条款由 ADR-0232 部分替代，类型化系统关系与真实退出保留，验证范围独立核对）
 - [ADR-0222](ADR-0222-session-property-declarations-and-required-constant-evaluation.md) — 会话属性为何共用唯一声明、分离四层输入与实例代次，并由原受监督 CPU 必求值后一次提交（active，补充 ADR-0100/0191/0203，Iceberg 读设置传递见 ADR-0248）
-- [ADR-0220](ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md) — JSON membership为何共用规范键与哈希null-aware LeftMark、JSON与VARIANT为何分析期隔离、Variant时间戳为何纯UTC渲染（active；补充ADR-0212的mark输出，原join生命周期保留）
+- [ADR-0270](ADR-0270-native-json-values-and-binary-membership-keys.md) — JSON v1 值、原生载体、Binary membership 键与 Iceberg 目标准入（active）
+- [ADR-0220](ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md) — JSON membership为何共用规范键与哈希null-aware LeftMark、JSON与VARIANT为何分析期隔离、Variant时间戳为何纯UTC渲染（active；补充ADR-0212的mark输出，原join生命周期保留）；483 JSON 等值由 ADR-0270 部分替代)
 - [ADR-0218](ADR-0218-sql-output-declarations-and-stored-view-analysis.md) — SQL 为何分离自然名称、内部标签与冻结根，并从同版本完整事实分析视图声明（active；应用接线与验证状态独立核对，部分替代 ADR-0095 的 MV String 例外）
 - [ADR-0192](ADR-0192-provider-work-units-share-one-runtime-split-path.md) — Provider 工作单元为何统一走 runtime split，单例提示为何只影响放置，分布聚合与恢复为何各守原 owner（active）
 - [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何保留真实 binding、共享转换与 typed 失败，兼容材料为何只保留真实 owner（active；COW 专属声明、物化与赋值接缝由 ADR-0233 部分替代；专用折叠请求、FE 投影与单节点入口由 ADR-0242 部分替代）
@@ -408,7 +410,8 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 - [ADR-0241](ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md) — Trino SQL 为何是唯一文法，语法扩展、AST 差异、能力准入与 printer 的边界（active；补充 ADR-0090／0101／0231。扩展清单由 [ADR-0261](ADR-0261-trino-sql-without-syntax-extensions.md) 清空，AST、printer 与准入规则继续有效）
 - [ADR-0232](ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md) — 维护与统计为何归原语句执行，取消为何保留原 Source 至真实退出，状态为何分别由统计、MV 系统关系与管理 API 提供（active；部分替代 ADR-0169/0111/0226，GC Accelerator 由 [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) 部分替代，Catalog 准入与三态 publication 保留）
 - [ADR-0222](ADR-0222-session-property-declarations-and-required-constant-evaluation.md) — 会话属性为何共用唯一声明、分离四层输入与实例代次，并由原受监督 CPU 必求值后一次提交（active；补充 ADR-0100/0191/0203，optional folding 与原协议生命周期保留，Iceberg 读设置传递见 ADR-0248）
-- [ADR-0220](ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md) — JSON membership为何共用规范键与哈希null-aware LeftMark、JSON与VARIANT为何分析期隔离、Variant时间戳为何纯UTC渲染（active；补充ADR-0212的mark输出，原join生命周期保留）
+- [ADR-0270](ADR-0270-native-json-values-and-binary-membership-keys.md) — JSON v1 值、原生载体、Binary membership 键与 Iceberg 目标准入（active）
+- [ADR-0220](ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md) — JSON membership为何共用规范键与哈希null-aware LeftMark、JSON与VARIANT为何分析期隔离、Variant时间戳为何纯UTC渲染（active；补充ADR-0212的mark输出，原join生命周期保留）；483 JSON 等值由 ADR-0270 部分替代)
 - [ADR-0217](ADR-0217-sole-trino-entry-and-application-owned-completion.md) — 客户端为何只保留 Trino，命令形状、领域计数与协议投影为何各有原作者，计数数据页为何仍须终页确认（active；部分替代 ADR-0102/0172/0095/0203，原授权、查询期限、typed 事实与实际退出保留）
 - [ADR-0203](ADR-0203-client-result-presentation-and-trino-paged-delivery.md) — 客户端结果为何由 FE 冻结呈现族、BE 根任务编码，并以页确认决定 Trino 送达、重放与唯一结算；会话值、变化与查询身份归原应用 owner（active；实现与验证状态独立核对；双族过渡与完成投影由 ADR-0217 部分替代，原查询期限与实际退出规则保留）
 - ADR-0090 — MV/View定义为何持久化用户有效SQL原文与解析上下文，而不是AST Display（active）

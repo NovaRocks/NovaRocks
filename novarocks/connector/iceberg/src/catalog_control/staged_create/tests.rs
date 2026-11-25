@@ -436,7 +436,7 @@ fn schema_nesting_refuses_sync_and_async_ctas_before_any_request() {
 }
 
 #[test]
-fn variant_columns_and_shredding_properties_refuse_ctas_before_any_request() {
+fn variant_and_json_columns_and_shredding_properties_refuse_ctas_before_any_request() {
     use crate::rest_protocol::test_server::{Script, TestServer};
     use novarocks_spi::connector::{ConnectorDataType, ConnectorStructField};
 
@@ -474,6 +474,24 @@ fn variant_columns_and_shredding_properties_refuse_ctas_before_any_request() {
         (ConnectorDataType::Variant, Vec::new(), "column payload"),
         (nested, Vec::new(), "column payload.leaf.element"),
         (
+            ConnectorDataType::Json,
+            Vec::new(),
+            "Iceberg JSON writes are not supported yet: table db.t, column payload",
+        ),
+        (
+            ConnectorDataType::Array(Box::new(ConnectorDataType::Json)),
+            Vec::new(),
+            "column payload.element",
+        ),
+        (
+            ConnectorDataType::Map(
+                Box::new(ConnectorDataType::Json),
+                Box::new(ConnectorDataType::Variant),
+            ),
+            Vec::new(),
+            "Iceberg Variant writes are not supported yet: table db.t, column payload.value",
+        ),
+        (
             ConnectorDataType::Int,
             vec![(
                 Arc::from("write.parquet.variant-shredding.enabled"),
@@ -490,14 +508,19 @@ fn variant_columns_and_shredding_properties_refuse_ctas_before_any_request() {
             default: None,
         }];
         if properties.is_empty() {
-            let outcome = adapter.prepare(request).unwrap();
-            assert!(
-                matches!(outcome,
-                ConnectorStagedCreatePrepareOutcome::KnownUncommitted { ref failure }
-                    if failure.kind() == ConnectorMutationFailureKind::Unsupported
-                        && failure.message().contains(diagnostic)),
-                "{outcome:?}"
-            );
+            let operation = request.operation_id;
+            let sync = adapter.prepare(request.clone()).unwrap();
+            let asynchronous = executor.block_on(adapter.prepare_async(request)).unwrap();
+            for outcome in [sync, asynchronous] {
+                assert!(
+                    matches!(outcome,
+                        ConnectorStagedCreatePrepareOutcome::KnownUncommitted { ref failure }
+                            if failure.kind() == ConnectorMutationFailureKind::Unsupported
+                                && failure.message().contains(diagnostic)),
+                    "{outcome:?}"
+                );
+            }
+            assert!(!adapter.operations.lock().unwrap().contains_key(&operation));
         } else {
             let lease = ordinary_ctas_lease(&adapter);
             let mut typed = ctas_defaults(&lease);
@@ -1186,9 +1209,9 @@ fn typed_mv_staged_preflight_binds_visible_partition_and_refuses_hidden_partitio
     use crate::rest_protocol::test_server::{Script, TestServer};
     use novarocks_spi::connector::{
         CatalogHandle, CatalogProperties, CatalogVersion, ConnectorControlBinding,
-        ConnectorControlPlanningPin, ConnectorDocumentManagementAdmissionRequest,
-        ConnectorDocumentManagementOperation, ConnectorDocumentStorageBinding, DdlPropertyValue,
-        InvalidTableProperty,
+        ConnectorControlPlanningPin, ConnectorDataType,
+        ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentManagementOperation,
+        ConnectorDocumentStorageBinding, DdlPropertyValue, InvalidTableProperty,
     };
 
     let server = TestServer::start(Script::new());
@@ -1349,6 +1372,23 @@ fn typed_mv_staged_preflight_binds_visible_partition_and_refuses_hidden_partitio
     assert_eq!(prepared.properties["write.format.default"], "parquet");
 
     for asynchronous in [false, true] {
+        let mut json = request("id", false);
+        json.columns[0].data_type = ConnectorDataType::Array(Box::new(ConnectorDataType::Json));
+        let operation = json.operation_id;
+        let outcome = if asynchronous {
+            let receiving = Mutex::new(None);
+            executor.block_on(lease.prepare_async(json, &receiving))
+        } else {
+            lease.prepare(json)
+        }
+        .unwrap();
+        let ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure } = outcome else {
+            panic!("A JSON output column must fail before dispatch");
+        };
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unsupported);
+        assert!(failure.message().contains("column id.element"));
+        assert!(!adapter.operations.lock().unwrap().contains_key(&operation));
+
         let invalid = request("hidden_key", false);
         let operation = invalid.operation_id;
         let outcome = if asynchronous {

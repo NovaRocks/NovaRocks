@@ -77,7 +77,7 @@ impl PlannerTableProvider for SourceCatalog {
             column("off64", DataType::Int64, self.offset_nullable, None),
             column("d", DataType::Int32, true, None),
             column("text", DataType::Utf8, true, None),
-            column("j", DataType::Utf8, true, Some(SqlType::Json)),
+            column("j", DataType::LargeBinary, true, Some(SqlType::Json)),
             column("nested", nested, true, None),
         ];
         if table == "wide_source" {

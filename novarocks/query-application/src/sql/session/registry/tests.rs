@@ -744,7 +744,7 @@ fn checked_sql_constants_read_selected_ordinal_and_retain_complete_source() {
 #[test]
 fn checked_sql_constants_reject_actual_null_and_nominal_lookalikes() {
     use arrow::{
-        array::{Int32Array, StringArray},
+        array::{Int32Array, LargeBinaryArray},
         datatypes::DataType,
     };
     use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
@@ -768,10 +768,16 @@ fn checked_sql_constants_reject_actual_null_and_nominal_lookalikes() {
             .value(),
         &SessionPropertyValue::Integer(7)
     );
-    let ty =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
-    let nominal = constant_pool(Arc::new(StringArray::from(vec!["1", "2", "3"])), ty);
+    let ty = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let nominal = constant_pool(
+        Arc::new(LargeBinaryArray::from(vec![b"\x01\x20".as_slice(); 3])),
+        ty,
+    );
     assert!(matches!(
         registry.prepare_sql_constant(
             "sql_mode",

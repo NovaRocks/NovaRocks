@@ -495,14 +495,14 @@ fn format_cast_type(data_type: &ast::TypeName) -> String {
 }
 
 fn format_cast_type_for_expression(data_type: &ast::TypeName, expression: &ast::Expr) -> String {
-    if is_parse_json_call(expression) {
+    if is_json_parse_call(expression) {
         format_json_cast_type(data_type)
     } else {
         format_cast_type(data_type)
     }
 }
 
-fn is_parse_json_call(expression: &ast::Expr) -> bool {
+fn is_json_parse_call(expression: &ast::Expr) -> bool {
     let ast::Expr::FunctionCall(function) = expression else {
         return false;
     };
@@ -510,7 +510,7 @@ fn is_parse_json_call(expression: &ast::Expr) -> bool {
         .name
         .parts
         .last()
-        .is_some_and(|part| part.value.eq_ignore_ascii_case("parse_json"))
+        .is_some_and(|part| part.value.eq_ignore_ascii_case("json_parse"))
 }
 
 fn format_json_cast_type(data_type: &ast::TypeName) -> String {
@@ -1465,7 +1465,7 @@ mod tests {
     #[test]
     fn expr_display_name_keeps_json_struct_field_widths_but_canonicalizes_other_structs() {
         let json_expr = parse_select_expr(
-            "SELECT CAST(parse_json('[1,2,3]') AS ROW(col1 INT, col2 ARRAY<INT>, col3 ROW(nested TINYINT)))",
+            "SELECT CAST(json_parse('[1,2,3]') AS ROW(col1 INT, col2 ARRAY<INT>, col3 ROW(nested TINYINT)))",
         );
         let row_expr = parse_select_expr(
             "SELECT CAST(row(1, 2, 3) AS ROW(col1 INT, col2 ARRAY<INT>, col3 ROW(nested TINYINT)))",
@@ -1473,7 +1473,7 @@ mod tests {
 
         assert_eq!(
             expr_display_name(&json_expr),
-            "CAST((parse_json('[1,2,3]')) AS struct<col1 int(11), col2 array<int(11)>, \
+            "CAST((json_parse('[1,2,3]')) AS struct<col1 int(11), col2 array<int(11)>, \
              col3 struct<nested tinyint(4)>>)"
         );
         assert_eq!(

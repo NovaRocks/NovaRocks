@@ -224,7 +224,6 @@ pub(super) fn assign(
         return typed_null(context, target.clone(), work);
     }
     if preserves_domains(child, target, work)?
-        || novarocks_type_contract::is_default_json_structure_cast(source, target)
         || novarocks_type_contract::is_null_list_to_json_cast(source, target)
     {
         // The old same-domain conversion was emitted by CASE lowering with

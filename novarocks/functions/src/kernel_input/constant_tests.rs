@@ -204,7 +204,7 @@ fn constant_nullability_widens_only_from_the_checked_source() {
 #[test]
 fn typed_null_and_empty_selection_keep_the_complete_logical_identity() {
     let p = pool(
-        Arc::new(StringArray::from(vec![
+        Arc::new(crate::json_value::test_array(&[
             Some("{\"unused\":1}"),
             None,
             Some("{\"unused\":2}"),
@@ -214,7 +214,7 @@ fn typed_null_and_empty_selection_keep_the_complete_logical_identity() {
     );
     let value = p.value(1).unwrap();
     assert_eq!(value.value_type().logical_type(), ValueLogicalType::Json);
-    assert_eq!(value.try_utf8().unwrap(), None);
+    assert_eq!(value.try_binary().unwrap(), None);
     validate(
         &value,
         Selection::all(0),
@@ -233,7 +233,7 @@ fn typed_null_and_empty_selection_keep_the_complete_logical_identity() {
         EvaluatedArgument::Constant(&value).array(),
         p.array()
     ));
-    let wrong = FunctionValueType::new(DataType::Utf8, true);
+    let wrong = FunctionValueType::new(DataType::LargeBinary, true);
     assert!(matches!(
         validate(&value, Selection::all(0), &wrong, &Control::default()),
         Err(KernelFailure::InvalidProgram(_))
@@ -244,10 +244,10 @@ fn typed_null_and_empty_selection_keep_the_complete_logical_identity() {
 fn equal_arrow_carriers_do_not_exchange_json_variant_and_physical_roots() {
     for (array, logical) in [
         (
-            Arc::new(StringArray::from(vec![
-                "{\"a\":1}",
-                "{\"b\":2}",
-                "{\"c\":3}",
+            Arc::new(crate::json_value::test_array(&[
+                Some("{\"a\":1}"),
+                Some("{\"b\":2}"),
+                Some("{\"c\":3}"),
             ])) as ArrayRef,
             ValueLogicalType::Json,
         ),
@@ -288,28 +288,29 @@ fn equal_arrow_carriers_do_not_exchange_json_variant_and_physical_roots() {
 
 #[test]
 fn nested_field_metadata_logical_identity_and_nullability_are_exact() {
-    let child =
-        Field::new("payload", DataType::Utf8, false).with_metadata(std::collections::HashMap::<
-            String,
-            String,
-        >::from([
+    let child = Field::new("payload", DataType::LargeBinary, false).with_metadata(
+        std::collections::HashMap::<String, String>::from([
             ("nr_logical_type".into(), "json".into()),
             ("provider.field-id".into(), "17".into()),
-        ]));
+        ]),
+    );
     let array = StructArray::new(
         vec![Arc::new(child.clone())].into(),
-        vec![Arc::new(StringArray::from(vec![
-            "{\"n\":1}",
-            "{\"n\":2}",
-            "{\"n\":3}",
+        vec![Arc::new(crate::json_value::test_array(&[
+            Some("{\"n\":1}"),
+            Some("{\"n\":2}"),
+            Some("{\"n\":3}"),
         ]))],
         None,
     );
     let array: ArrayRef = Arc::new(array);
     let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
-    let nominal =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let nominal = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let semantic = novarocks_type_contract::ValueTypeRef::try_new(
         novarocks_type_contract::ValueKind::Struct(
             vec![novarocks_type_contract::ValueField::new(
@@ -369,10 +370,10 @@ fn nested_field_metadata_logical_identity_and_nullability_are_exact() {
     // canonical view is a paired execution loan, not another CV declaration.
     let raw: ArrayRef = Arc::new(StructArray::new(
         vec![Arc::new(child.clone())].into(),
-        vec![Arc::new(StringArray::from(vec![
-            "{\"unused\":1}",
-            "{\"selected\":2}",
-            "{\"future\":3}",
+        vec![Arc::new(crate::json_value::test_array(&[
+            Some("{\"unused\":1}"),
+            Some("{\"selected\":2}"),
+            Some("{\"future\":3}"),
         ]))],
         None,
     ));
@@ -409,6 +410,7 @@ fn nested_field_metadata_logical_identity_and_nullability_are_exact() {
         raw_pool.array()
     ));
     let sparse_rows = [2usize, 8, 10];
+    let expected = crate::json_value::test_array(&[Some("{\"selected\":2}")]);
     for selection in [
         Selection::all(0),
         Selection::all(3),
@@ -427,10 +429,10 @@ fn nested_field_metadata_logical_identity_and_nullability_are_exact() {
                 actual
                     .column(0)
                     .as_any()
-                    .downcast_ref::<StringArray>()
+                    .downcast_ref::<LargeBinaryArray>()
                     .unwrap()
                     .value(argument.value_row(ordinal, row)),
-                "{\"selected\":2}"
+                expected.value(0)
             );
         }
     }

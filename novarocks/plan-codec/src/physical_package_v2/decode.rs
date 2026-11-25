@@ -99,7 +99,7 @@ use crate::{
     resource_preflight_v2::{DecodeProjectionLimits, FragmentDecodeResourceModel},
 };
 use novarocks_arrow_ipc_frame::VerifierOptions;
-use novarocks_constant_contract::ConstantPolicy;
+use novarocks_constant_contract::{ConstantPolicy, ConstantPools};
 use novarocks_physical_plan::{
     self as p, CallRequestError, FragmentPackageError, FragmentStructureError,
 };
@@ -382,6 +382,47 @@ impl std::error::Error for PackageDecodeError {
 }
 
 type Error = PackageDecodeError;
+
+fn validate_json_constants_in(
+    pools: &ConstantPools,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), PhysicalConstantCodecError> {
+    use novarocks_arrow_batch_codec::{CodecError, JsonCellObserver, visit_json_cells};
+    use novarocks_functions::json_value::{Node, ObservedError};
+
+    struct Observer<'a, 'b>(&'a mut CompileCheckpoints<'b>);
+    impl JsonCellObserver for Observer<'_, '_> {
+        type Error = PhysicalConstantCodecError;
+
+        fn step(&mut self) -> Result<(), Self::Error> {
+            Ok(self.0.step()?)
+        }
+
+        fn value(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+            let node = Node::from_root(bytes).map_err(PhysicalConstantCodecError::JsonValue)?;
+            node.validate(|| self.0.step())
+                .map_err(|error| match error {
+                    ObservedError::Value(error) => PhysicalConstantCodecError::JsonValue(error),
+                    ObservedError::Control(error) => PhysicalConstantCodecError::Control(error),
+                })
+        }
+    }
+
+    let mut observer = Observer(work);
+    for pool in pools.entries().values() {
+        visit_json_cells(
+            pool.array().as_ref(),
+            pool.value_type().value_type(),
+            &mut observer,
+        )
+        .map_err(|error| match error {
+            CodecError::Observer(error) => error,
+            CodecError::Invalid(detail) => PhysicalConstantCodecError::InvalidShape(detail),
+            _ => PhysicalConstantCodecError::InvalidShape("invalid JSON constant carrier"),
+        })?;
+    }
+    Ok(())
+}
 
 fn exhausted() -> Error {
     Error::Control(CompileControlError::ResourceExhausted)
@@ -1049,6 +1090,7 @@ fn decode_fragment_package_factory_core<
         let requests = prepared.facts().new_allocation_request_bytes_upper_bound;
         (prepared.materialize_in(&mut |_| Ok(()), work)?, requests)
     };
+    validate_json_constants_in(&pools, work)?;
     invoice = add(add(invoice, pool_requests)?, size_of_val(&pools))?;
     let (requests, request_storage, request_facts) = if let Some(creator) = creation.as_deref_mut()
     {

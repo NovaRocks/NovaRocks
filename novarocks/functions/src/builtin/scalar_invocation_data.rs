@@ -37,6 +37,10 @@ enum SourceDomain {
         batch_rows: usize,
         rows: HostVec<usize, HostAggregateAllocator>,
     },
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Original I3 direct source layout.")
+    )]
     DirectSparse {
         batch_rows: usize,
         // Field destruction order keeps the actual grant live through Vec Drop.
@@ -163,6 +167,7 @@ pub(super) struct ScalarDataSlot(HostShared<ScalarDataInner>);
 
 /// A virgin direct slot cannot be cloned or published through the old borrowed
 /// slot interface. Its sole writer consumes it before exposing any Data alias.
+#[cfg(test)]
 pub(super) struct DirectScalarDataSlot(HostShared<ScalarDataInner>);
 
 /// The exact requests of the original direct holder, before constructing it.
@@ -180,6 +185,7 @@ pub(crate) fn direct_slot_request_layouts(
     };
     Ok((HostShared::<ScalarDataInner>::allocation_layout(), rows))
 }
+#[cfg(test)]
 impl DirectScalarDataSlot {
     pub(super) fn publish_original(
         self,
@@ -193,6 +199,7 @@ impl DirectScalarDataSlot {
     }
 }
 impl ScalarDataSlot {
+    #[cfg(test)]
     pub(super) fn prepare_direct_for_actual_invocation(
         contract: Arc<ScalarCallContract>,
         selection: Selection<'_>,

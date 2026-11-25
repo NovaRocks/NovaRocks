@@ -265,14 +265,21 @@ fn scalar_journal_keeps_original_none_for_cast_and_nested_physical_constants() {
 
 #[test]
 fn scalar_journal_conversion_retains_original_none_and_true_intermediate_constraint() {
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
-    let field = Arc::new(json.try_to_field("json_original").unwrap());
+    let largeint = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        false,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap();
+    let field = Arc::new(json.try_to_field("largeint_original").unwrap());
     let pool = ConstantPool::try_new(
         field.clone(),
-        json.clone(),
-        StringArray::from(vec!["unused", "{\"kept\":7}"]).to_data(),
+        largeint.clone(),
+        arrow::array::FixedSizeBinaryArray::try_from_iter(
+            [0_i128.to_be_bytes(), 7_i128.to_be_bytes()].into_iter(),
+        )
+        .unwrap()
+        .to_data(),
         policy(),
         CompilePhase::Validate,
         &Control::default(),
@@ -280,7 +287,7 @@ fn scalar_journal_conversion_retains_original_none_and_true_intermediate_constra
     .unwrap();
     let input = TypedExpr {
         kind: TypedKind::Constant(pool.value(1).unwrap()),
-        value_type: json.clone(),
+        value_type: largeint.clone(),
     };
     let conversion = TypedExpr {
         kind: TypedKind::Cast {
@@ -301,7 +308,7 @@ fn scalar_journal_conversion_retains_original_none_and_true_intermediate_constra
     else {
         unreachable!()
     };
-    assert_eq!(value_type, &json);
+    assert_eq!(value_type, &largeint);
     assert!(constant.is_none());
     assert_eq!(
         request.request().expected_result_type,

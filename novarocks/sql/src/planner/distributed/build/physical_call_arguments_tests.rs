@@ -439,9 +439,12 @@ fn physical_call_request_wide_lambda_observes_real_parameter_quantum_and_exact_o
             )
         })
         .collect();
-    let result =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let result = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let node = source(
         result.clone(),
         ExprKind::Lambda {

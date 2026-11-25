@@ -23,7 +23,8 @@ use crate::exec::pipeline::operator::{
 };
 use novarocks_arrow_batch_codec::record_geometry::{GeometryError, GeometryProfile, GeometryWork};
 use novarocks_arrow_batch_codec::{
-    BatchRecipe, CodecError, DecodeKind, RecipeField, RepresentationPolicy, UnitObserver,
+    BatchRecipe, CodecError, DecodeKind, JsonCellObserver, RecipeField, RepresentationPolicy,
+    UnitObserver, visit_json_cells,
 };
 use novarocks_type_contract::{
     CompileControlError, FunctionValueType, ValueSchemaCreation, ValueTypeStorageLifetime,
@@ -34,6 +35,20 @@ pub(crate) struct ExchangeRecipe {
     pub(super) value: BatchRecipe,
     storage: ValueTypeStorageLifetime,
     declarations: Vec<FunctionValueType>,
+}
+
+impl JsonCellObserver for UnitConstruction<'_> {
+    type Error = ExchangeFailure;
+
+    fn step(&mut self) -> Result<(), Self::Error> {
+        UnitObserver::checkpoint(self)
+    }
+
+    fn value(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        novarocks_functions::json_value::Node::from_root(bytes)
+            .map(|_| ())
+            .map_err(|cause| failure::metadata("decode JSON value", cause))
+    }
 }
 
 fn codec_error(
@@ -530,6 +545,10 @@ pub(crate) fn decode(
     };
     let batch = novarocks_arrow_batch_codec::decode_unit(&recipe.value, bytes, &mut observer)
         .map_err(|error| codec_error(error, failure::ArrowOperation::Decode))?;
+    for (column, declaration) in batch.columns().iter().zip(&recipe.declarations) {
+        visit_json_cells(column.as_ref(), declaration.value_type(), &mut observer)
+            .map_err(|error| codec_error(error, failure::ArrowOperation::Decode))?;
+    }
     let body_storage = retained
         .storage_lifetime()
         .retaining_observed(&schema.storage_lifetime(), |layout| {

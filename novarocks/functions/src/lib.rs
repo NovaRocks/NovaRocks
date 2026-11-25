@@ -96,8 +96,10 @@ pub mod hll;
 pub mod invocation_arity;
 mod invocation_scalar_resources;
 pub mod json_canonical;
-pub mod json_object_core;
+#[cfg(test)]
+mod json_object_core;
 mod json_object_resources;
+pub mod json_value;
 mod kernel_control;
 mod kernel_input;
 mod lambda_rows;
@@ -108,7 +110,6 @@ pub mod math_numeric;
 pub mod opaque_memory;
 mod operator_functions;
 pub mod parse_json_core;
-mod parse_json_resources;
 pub mod pattern_memo;
 pub mod percentile_input;
 pub use operator_functions::{OperatorFunctionCatalogError, validate_installed_operator_functions};
@@ -2858,9 +2859,6 @@ pub mod approx_top_k_core;
 
 #[cfg(test)]
 mod common_type_m07_contract_tests;
-
-#[cfg(test)]
-mod parse_json_renderer_trace_tests;
 
 #[cfg(test)]
 mod aggregate_scalar_debug_legacy_contract_tests;

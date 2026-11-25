@@ -137,9 +137,9 @@ fn matches_storage(field: &S, carrier: &D) -> bool {
         | (S::LargeInt, D::FixedSizeBinary(16))
         | (S::Float32, D::Float32)
         | (S::Float64, D::Float64)
-        | (S::String | S::Json, D::Utf8)
+        | (S::String, D::Utf8)
         | (S::Binary | S::Opaque(_), D::Binary)
-        | (S::Variant, D::LargeBinary)
+        | (S::Json | S::Variant, D::LargeBinary)
         | (S::Date, D::Date32)
         | (S::TimeMicros, D::Time64(U::Microsecond)) => true,
         (
@@ -203,14 +203,14 @@ mod binding_tests {
             if json {
                 ValueKind::Nominal(ValueLogicalType::Json)
             } else {
-                ValueKind::String
+                ValueKind::Binary
             },
             child_nullable,
             Hold::pure(),
         )
         .unwrap();
         let value = ValueTypeRef::try_new(ValueKind::List(child), false, Hold::pure()).unwrap();
-        let layout = D::List(Arc::new(Field::new("item", D::Utf8, child_nullable)));
+        let layout = D::List(Arc::new(Field::new("item", D::LargeBinary, child_nullable)));
         FunctionValueType::try_from_value(
             value,
             ValueLayout::try_new(&layout, Hold::pure()).unwrap(),
@@ -231,15 +231,15 @@ mod binding_tests {
     fn scalar_binding_rejects_same_carrier_nested_domain_drift_and_accepts_independent_equal_authors()
      {
         let json = list(true, true);
-        let text = list(false, true);
-        assert_eq!(json.data_type(), text.data_type());
+        let binary = list(false, true);
+        assert_eq!(json.data_type(), binary.data_type());
         assert!(
-            scalar_field_matches_storage(&scalar(), text.data_type(), text.nullable()),
+            scalar_field_matches_storage(&scalar(), binary.data_type(), binary.nullable()),
             "carrier alone cannot establish child identity"
         );
         assert!(!scalar_field_matches_binding(
             &scalar(),
-            text.typed_binding()
+            binary.typed_binding()
         ));
         let independent = list(true, true);
         assert!(!json.value_type().shares_storage(independent.value_type()));

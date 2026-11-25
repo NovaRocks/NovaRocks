@@ -362,12 +362,12 @@ fn variant_direct_and_explicit_cast_inputs_use_canonical_payloads() {
     // metadata dictionary (11 00 00), then primitive INT8 (0C) and value 42.
     let expected = [5, 0, 0, 0, 0x11, 0, 0, 0x0c, 42];
     for sql in [
-        "VALUES (parse_json('42'))",
-        "SELECT parse_json(('42'))",
-        "VALUES (CAST(parse_json('42') AS VARIANT))",
-        "SELECT CAST(parse_json('42') AS VARIANT)",
-        "VALUES (parse_json(CAST('42' AS VARCHAR)))",
-        "SELECT parse_json(CAST('42' AS VARCHAR))",
+        "VALUES (json_parse('42'))",
+        "SELECT json_parse(('42'))",
+        "VALUES (CAST(json_parse('42') AS VARIANT))",
+        "SELECT CAST(json_parse('42') AS VARIANT)",
+        "VALUES (json_parse(CAST('42' AS VARCHAR)))",
+        "SELECT json_parse(CAST('42' AS VARCHAR))",
     ] {
         let variant = ColumnDef::from_value_type(
             "v".into(),

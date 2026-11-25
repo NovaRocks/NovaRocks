@@ -24,7 +24,7 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.sc2 (
   "v1" BIGINT,
-  "js" json ,
+  "js" VARCHAR ,
   "array1" ARRAY<INT> ,
   "array2" ARRAY<MAP<INT, INT>> ,
   "array3" ARRAY<ROW(a INT, b INT)> ,
@@ -37,7 +37,7 @@ CREATE TABLE ${case_db}.sc2 (
 insert into ${case_db}.sc2 values ROW(0, null, null, null, null, null, null, null, null);
 insert into ${case_db}.sc2 values (2, json_object('a': null), [1,3,2], [MAP(ARRAY[-1], ARRAY[null])], [row(1, 2)], MAP(ARRAY[2], ARRAY[null]), MAP(ARRAY[2, 1], ARRAY[[2,3,4], [1,2,3]]), MAP(ARRAY[2, 1], ARRAY[row(2,4), row(1,2)]), row(1, [2,1,3], MAP(ARRAY[2, 1], ARRAY[2, 1]), null));
 insert into ${case_db}.sc2 values (3, json_object('a': 1,'b':2), [1,2,3], [],               [row(1, 2)], MAP(ARRAY[2, 1, 3], ARRAY[20, null, 30]), MAP(ARRAY[2, 1], ARRAY[[3,2,4], [1,2,3]]), MAP(ARRAY[2, 1], ARRAY[row(2,4), row(1,2)]), row(1, [2,1,3], MAP(ARRAY[1, 2], ARRAY[1, 2]), row(3, 2)));
-insert into ${case_db}.sc2 values (4, json_object('a': 1,null:null), [1,2,3], [MAP(ARRAY[2, -1], ARRAY[20, 10])],       [row(1, 3)], map(), MAP(ARRAY[2, 1], ARRAY[[3,2,4], [1,2,3]]), MAP(ARRAY[2, 1], ARRAY[row(2,4), row(1,null)]), row(1, null, MAP(ARRAY[1, 2], ARRAY[1, 2]), row(1, 2)));
+insert into ${case_db}.sc2 values (4, json_object('a' VALUE 1), [1,2,3], [MAP(ARRAY[2, -1], ARRAY[20, 10])],       [row(1, 3)], map(), MAP(ARRAY[2, 1], ARRAY[[3,2,4], [1,2,3]]), MAP(ARRAY[2, 1], ARRAY[row(2,4), row(1,null)]), row(1, null, MAP(ARRAY[1, 2], ARRAY[1, 2]), row(1, 2)));
 insert into ${case_db}.sc2 values (5, json_object('a': 1,'b':null), [1,2,3], [null],       [row(1, 2)], MAP(ARRAY[1, 2, -1], ARRAY[10, 20, 40]), MAP(ARRAY[1, 2], ARRAY[[1,2,3], [2,3,4]]), map(), row(1, [], MAP(ARRAY[1, 2], ARRAY[1, null]), row(null, 2)));
 insert into ${case_db}.sc2 values (6, json_object('a': 1,'b':3), [1,3,2], [map()],       [row(1, 2)], MAP(ARRAY[1, 2, 4], ARRAY[10, 20, 40]), MAP(ARRAY[1, 2], ARRAY[[2,1,3], [2,3,4]]), MAP(ARRAY[1, 2], ARRAY[row(2,3), row(2,3)]), row(1, [null], map(), row(1, 2)));
 insert into ${case_db}.sc2 values (7, json_object('a': 1, 'b':4), [2,1,3], [MAP(ARRAY[1, 3, 2], ARRAY[10, 30, 20])], [], map(), MAP(ARRAY[1, 2], ARRAY[[2,1,3], [2,4,3]]), MAP(ARRAY[1, 2], ARRAY[row(2,3), row(2,4)]), row(1, [1,2,3], MAP(ARRAY[2], ARRAY[null]), row(1, 2)));
@@ -45,59 +45,59 @@ insert into ${case_db}.sc2 values (8, json_object('a': 1, 'c': null), [2,1,3], [
 insert into ${case_db}.sc2 values (9, json_object('a': 1), [],      [MAP(ARRAY[1, 3, 2], ARRAY[10, 30, 20])], [row(1, 2),null], MAP(ARRAY[1, 2, 3], ARRAY[10, 20, 30]), MAP(ARRAY[1, 2], ARRAY[[1,2,3], [2,4,3]]), MAP(ARRAY[1, 2], ARRAY[row(1,3), row(2,4)]), row(1, [1,2,3], MAP(ARRAY[2, 3, 1], ARRAY[2, 3, 1]), null));
 insert into ${case_db}.sc2 values (10, json_object('a': NULL), [1,2,null], [MAP(ARRAY[2, 1, -1], ARRAY[20, 10, 30])], [row(1, 2)], MAP(ARRAY[1, 4], ARRAY[10, 40]), MAP(ARRAY[2, 1], ARRAY[[2,null,4], [1,2,null]]), MAP(ARRAY[-1], ARRAY[null]), row(1, [2,1,null], MAP(ARRAY[2, 1], ARRAY[2, 1]), row(null, 2)));
 insert into ${case_db}.sc2 values (11, json_object('': 2), [2,1,null], [MAP(ARRAY[2, 1, -1], ARRAY[20, 10, 30])], [row(1, null)], map(), MAP(ARRAY[2, 1], ARRAY[[2,null,4], [1,2,null]]), MAP(ARRAY[2, 1], ARRAY[row(2,4), row(1,2)]), row(1, [2,1,null], null, row(null, 2)));
-insert into ${case_db}.sc2 values ROW(12, parse_json('{}'), [1,2],  [MAP(ARRAY[2, 1, -1], ARRAY[20, 10, 30])], [row(1, 2)], MAP(ARRAY[2, 1, -1], ARRAY[20, 10, 30]), MAP(ARRAY[2, 1], ARRAY[[2,null,4], [1,2,null]]), MAP(ARRAY[2, 1], ARRAY[row(2,4), row(1,2)]), row(1, [null], MAP(ARRAY[-1, 1], ARRAY[2, 1]), row(null, 2)));
+insert into ${case_db}.sc2 values ROW(12, json_format(json_parse('{}')), [1,2],  [MAP(ARRAY[2, 1, -1], ARRAY[20, 10, 30])], [row(1, 2)], MAP(ARRAY[2, 1, -1], ARRAY[20, 10, 30]), MAP(ARRAY[2, 1], ARRAY[[2,null,4], [1,2,null]]), MAP(ARRAY[2, 1], ARRAY[row(2,4), row(1,2)]), row(1, [null], MAP(ARRAY[-1, 1], ARRAY[2, 1]), row(null, 2)));
 insert into ${case_db}.sc2 values ROW(13, null, [],     [MAP(ARRAY[2, 1], ARRAY[20, 10])],       [row(1, 2)], MAP(ARRAY[2, 1, -1], ARRAY[20, 10, 30]), MAP(ARRAY[2, 1], ARRAY[[null,2,4], [1,2,null]]), MAP(ARRAY[2, 1], ARRAY[row(2,4), row(1,2)]), row(1, [2,1,null], MAP(ARRAY[1, 2], ARRAY[1, 2]), row(null, 2)));
 
 -- query 2
 -- JSON IN predicate
-select js in (parse_json('{}'),json_object('a':1)) from ${case_db}.sc2 order by 1;
+select json_parse(js) in (json_parse('{}'),json_object('a':1 RETURNING JSON)) from ${case_db}.sc2 order by 1;
 
 -- query 3
-select js not in (parse_json('{}'),json_object('a':1)) from ${case_db}.sc2 order by 1;
+select json_parse(js) not in (json_parse('{}'),json_object('a':1 RETURNING JSON)) from ${case_db}.sc2 order by 1;
 
 -- query 4
-select parse_json('{}') in (js,json_object('a':1)) from ${case_db}.sc2 order by 1;
+select json_parse('{}') in (json_parse(js),json_object('a':1 RETURNING JSON)) from ${case_db}.sc2 order by 1;
 
 -- query 5
-select parse_json('{}') not in (js,json_object('a':1)) from ${case_db}.sc2 order by 1;
+select json_parse('{}') not in (json_parse(js),json_object('a':1 RETURNING JSON)) from ${case_db}.sc2 order by 1;
 
 -- query 6
-select js in (null,json_object('a':1)) from ${case_db}.sc2 order by 1;
+select json_parse(js) in (null,json_object('a':1 RETURNING JSON)) from ${case_db}.sc2 order by 1;
 
 -- query 7
-select js not in (null) from ${case_db}.sc2 order by 1;
+select json_parse(js) not in (null) from ${case_db}.sc2 order by 1;
 
 -- query 8
-select null in (js,json_object('a':1)) from ${case_db}.sc2 order by 1;
+select null in (json_parse(js),json_object('a':1 RETURNING JSON)) from ${case_db}.sc2 order by 1;
 
 -- query 9
-select null not in (js, json_object('a':3)) from ${case_db}.sc2 order by 1;
+select null not in (json_parse(js), json_object('a':3 RETURNING JSON)) from ${case_db}.sc2 order by 1;
 
 -- query 10
-select js in (1,3,json_object('a':2)) from ${case_db}.sc2 order by 1;
+select json_parse(js) in (1,3,json_object('a':2 RETURNING JSON)) from ${case_db}.sc2 order by 1;
 
 -- query 11
-select js not in (2,3) from ${case_db}.sc2 order by 1;
+select json_parse(js) not in (2,3) from ${case_db}.sc2 order by 1;
 
 -- query 12
-select js in (1,3,v1,json_object('a':11)) from ${case_db}.sc2 order by 1;
+select json_parse(js) in (1,3,v1,json_object('a':11 RETURNING JSON)) from ${case_db}.sc2 order by 1;
 
 -- query 13
-select js not in (2,3,v1) from ${case_db}.sc2 order by 1;
+select json_parse(js) not in (2,3,v1) from ${case_db}.sc2 order by 1;
 
 -- query 14
-select js in (json_object('a': 1),json_object('ab': 12, 'bc':4),json_object('ab': 14),json_object('ac': 15, '6b':46)) from ${case_db}.sc2 order by 1;
+select json_parse(js) in (json_object('a': 1 RETURNING JSON),json_object('ab': 12, 'bc':4 RETURNING JSON),json_object('ab': 14 RETURNING JSON),json_object('ac': 15, '6b':46 RETURNING JSON)) from ${case_db}.sc2 order by 1;
 
 -- query 15
-select js not in (json_object('a': 1),json_object('ab': 13, 'b':4) ) from ${case_db}.sc2 order by 1;
+select json_parse(js) not in (json_object('a': 1 RETURNING JSON),json_object('ab': 13, 'b':4 RETURNING JSON) ) from ${case_db}.sc2 order by 1;
 
 -- query 16
 -- JSON subquery predicate.
-select js not in (select js from ${case_db}.sc2 where v1>3) from ${case_db}.sc2;
+select json_parse(js) not in (select json_parse(js) from ${case_db}.sc2 where v1>3) from ${case_db}.sc2;
 
 -- query 17
 -- JSON subquery predicate.
-select js in (select js from ${case_db}.sc2 where v1>3) from ${case_db}.sc2;
+select json_parse(js) in (select json_parse(js) from ${case_db}.sc2 where v1>3) from ${case_db}.sc2;
 
 -- query 18
 -- ARRAY IN predicates

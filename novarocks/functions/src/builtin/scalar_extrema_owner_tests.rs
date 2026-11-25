@@ -182,9 +182,12 @@ fn extrema_owner_rejects_unordered_domains_and_invalid_zones() {
     );
     for name in ["greatest", "least"] {
         assert!(prepared_for_test(name, &[map.clone(), map.clone()]).is_err());
-        let json =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         assert!(prepared_for_test(name, &[json.clone(), json.clone()]).is_err());
         let text = FunctionValueType::new(DataType::Utf8, true);
         for mixed in [[json.clone(), text.clone()], [text, json]] {

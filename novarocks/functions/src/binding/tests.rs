@@ -1253,9 +1253,12 @@ fn frozen_bindings_refuse_root_and_nested_logical_identity_drift() {
         vec![overload("test/echo/T/v1", "(T)")],
     );
     let catalog = catalog(Arc::new(EchoResolver::default()), declaration);
-    let typed =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let typed = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let arguments = [FunctionArgument::Value {
         value_type: typed,
         constant: None,
@@ -1271,7 +1274,7 @@ fn frozen_bindings_refuse_root_and_nested_logical_identity_drift() {
     let mut forged = bound.clone();
     forged.selected.argument_types =
         novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::from([
-            FunctionArgumentType::Value(FunctionValueType::new(DataType::Utf8, false)),
+            FunctionArgumentType::Value(FunctionValueType::new(DataType::LargeBinary, false)),
         ]));
     assert!(
         catalog
@@ -1292,8 +1295,12 @@ fn frozen_bindings_refuse_root_and_nested_logical_identity_drift() {
         )]));
     assert!(FunctionValueType::try_from_legacy_field_projection(&unknown).is_err());
     let nested_json = crate::builtin::signature::declared_list(
-        &FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap(),
+        &FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
         false,
     )
     .unwrap();

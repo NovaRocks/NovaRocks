@@ -1162,9 +1162,12 @@ mod runtime_projection_tests {
         let factory=crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
             crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),tracker.clone(),errors.clone(),
         ).unwrap();
-        let ty =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap();
+        let ty = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let provider_schema = Arc::new(Schema::new(vec![Field::new(
             "document",
             DataType::Utf8,

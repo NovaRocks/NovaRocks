@@ -325,9 +325,12 @@ fn attribute_lookup_uses_original_invoice_and_preserves_every_refusal() {
 }
 #[test]
 fn explicit_execution_binding_keeps_nested_nominal_null_and_offset_contracts() {
-    let child =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let child = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let logical =
         ValueTypeRef::try_new(ValueKind::List(child.value_type().clone()), false, pure()).unwrap();
     let carrier = DataType::LargeList(Arc::new(Field::new("source-role", DataType::Utf8, true)));

@@ -28,10 +28,10 @@ SET SESSION sql_mode = 'STRUCT_CAST_BY_NAME';
 -- query 2
 -- UNION ALL with different field order via parse_json + CAST
 with source_1 as (
-    select parse_json('{"product_id": "id_100", "price": 100}') as dimensions
+    select json_parse('{"product_id": "id_100", "price": 100}') as dimensions
 ),
 source_2 as (
-    select parse_json('{"product_id": "id_200", "price": 200}') as dimensions
+    select json_parse('{"product_id": "id_200", "price": 200}') as dimensions
 ),
 source_3 as (
     select CAST(

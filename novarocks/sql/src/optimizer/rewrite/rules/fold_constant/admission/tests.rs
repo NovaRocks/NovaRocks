@@ -58,7 +58,7 @@ fn nested_nominal_type(logical: ValueLogicalType, carrier: DataType) -> Function
 #[test]
 fn authored_nominal_and_nested_domains_decline_without_carrier_retagging() {
     for (carrier, logical) in [
-        (DataType::Utf8, ValueLogicalType::Json),
+        (DataType::LargeBinary, ValueLogicalType::Json),
         (DataType::LargeBinary, ValueLogicalType::Variant),
         (DataType::Binary, ValueLogicalType::Hll),
         (DataType::Binary, ValueLogicalType::Bitmap),
@@ -69,7 +69,7 @@ fn authored_nominal_and_nested_domains_decline_without_carrier_retagging() {
         assert_eq!(ty.data_type(), &carrier);
         assert_eq!(ty.logical_type(), logical);
     }
-    let list = nested_nominal_type(ValueLogicalType::Json, DataType::Utf8);
+    let list = nested_nominal_type(ValueLogicalType::Json, DataType::LargeBinary);
     assert!(!value_type_supported(&list));
     assert_eq!(
         list.child_at(0).unwrap().logical_type(),

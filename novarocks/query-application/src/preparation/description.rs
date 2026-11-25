@@ -623,7 +623,7 @@ mod tests {
         use novarocks_type_contract::{ValueKind, ValueLogicalType as L};
         let completed = crate::completed_plan_fixture::completed_literal_query(
             [42; 16],
-            "select [parse_json('{}')] as nested",
+            "select [json_parse('{}')] as nested",
         )
         .await;
         let output = OutputContract::from_completed_plan(

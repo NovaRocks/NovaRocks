@@ -329,13 +329,14 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::JsonQuery(node) => self.analyze_json_query_syntax(node, scope),
             ast::Expr::JsonObject(node) => self.analyze_json_object_syntax(node, scope),
             ast::Expr::JsonArray(node) => self.analyze_json_array_syntax(node, scope),
-            ast::Expr::JsonConstructor(_)
-            | ast::Expr::JsonExists(_)
-            | ast::Expr::JsonValue(_)
-            | ast::Expr::JsonSerialize(_) => Err(AnalyzeError::unsupported_expression(
-                "SQL/JSON constructor is not supported",
-                expr.span(),
-            )),
+            ast::Expr::JsonConstructor(node) => self.analyze_json_constructor_syntax(node, scope),
+            ast::Expr::JsonSerialize(node) => self.analyze_json_serialize_syntax(node, scope),
+            ast::Expr::JsonExists(_) | ast::Expr::JsonValue(_) => {
+                Err(AnalyzeError::unsupported_expression(
+                    "SQL/JSON path expression is not supported",
+                    expr.span(),
+                ))
+            }
 
             // Simple column reference
             ast::Expr::Identifier(ident) => {
@@ -3204,6 +3205,16 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::JsonQuery(node) => {
                 self.expr_contains_aggregate(&node.path_invocation.input_expression)
             }
+            ast::Expr::JsonConstructor(node) => self.expr_contains_aggregate(&node.expression),
+            ast::Expr::JsonSerialize(node) => self.expr_contains_aggregate(&node.expression),
+            ast::Expr::JsonObject(node) => node.members.iter().any(|member| {
+                self.expr_contains_aggregate(&member.key)
+                    || self.expr_contains_aggregate(&member.value)
+            }),
+            ast::Expr::JsonArray(node) => node
+                .elements
+                .iter()
+                .any(|element| self.expr_contains_aggregate(&element.value)),
             ast::Expr::GroupingOperation(node) => node
                 .grouping_columns
                 .iter()
@@ -3318,32 +3329,15 @@ impl<'a> super::AnalyzerContext<'a> {
 }
 
 fn json_semantic_group_by_type_name(expr: &TypedExpr) -> Option<String> {
-    match &expr.kind {
-        ExprKind::FunctionCall { name, .. }
-            if matches!(
-                name.as_str(),
-                "json_query"
-                    | "json_extract"
-                    | "get_json_object"
-                    | "json_object"
-                    | "json_array"
-                    | "to_json"
-                    | "parse_json"
-            ) =>
-        {
-            Some("json".to_string())
+    fn declared(value: &novarocks_type_contract::ValueTypeRef) -> Option<String> {
+        use novarocks_type_contract::{ValueKind, ValueLogicalType};
+        match value.kind() {
+            ValueKind::Nominal(ValueLogicalType::Json) => Some("json".to_string()),
+            ValueKind::List(child) => declared(child).map(|inner| format!("array<{inner}>")),
+            _ => None,
         }
-        ExprKind::FunctionCall { name, args, .. } if name == "__array_literal" => args
-            .first()
-            .and_then(json_semantic_group_by_type_name)
-            .map(|inner| format!("array<{inner}>")),
-        ExprKind::AggregateCall { name, args, .. } if name == "array_agg" => args
-            .first()
-            .and_then(json_semantic_group_by_type_name)
-            .map(|inner| format!("array<{inner}>")),
-        ExprKind::Nested(inner) => json_semantic_group_by_type_name(inner),
-        _ => None,
     }
+    declared(expr.value_type.value_type())
 }
 
 /// A carrier-compatible value is not authority to cross the JSON domain.
@@ -3378,14 +3372,8 @@ fn check_json_comparison_domains(
     Ok(())
 }
 
-pub(super) fn is_json_in_subquery_operand(expr: &TypedExpr, scope: &AnalyzerScope) -> bool {
-    matches!(
-        scope.logical_type_of_expr(expr),
-        Some(novarocks_types::schema::SqlType::Json)
-    ) || matches!(
-        json_semantic_group_by_type_name(expr).as_deref(),
-        Some("json")
-    )
+pub(super) fn is_json_in_subquery_operand(expr: &TypedExpr, _scope: &AnalyzerScope) -> bool {
+    expr.value_type.logical_type() == novarocks_type_contract::ValueLogicalType::Json
 }
 
 fn is_bitmap_or_hll_type(sql_type: &novarocks_types::schema::SqlType) -> bool {
@@ -4829,9 +4817,14 @@ mod tests {
             json.value_type.logical_type(),
             novarocks_type_contract::ValueLogicalType::Json
         );
-        assert!(
-            matches!(json.kind, ExprKind::Literal(LiteralValue::String(value)) if value == "{\"a\": 1}")
-        );
+        let ExprKind::Constant(value) = json.kind else {
+            panic!("A typed JSON literal must have its frozen binary value");
+        };
+        let bytes = value.try_binary().unwrap().unwrap();
+        assert!(matches!(
+            novarocks_functions::json_value::Node::from_root(bytes).unwrap().kind().unwrap(),
+            novarocks_functions::json_value::Kind::Object(object) if object.len() == 1,
+        ));
     }
 
     #[test]
@@ -4924,8 +4917,8 @@ mod tests {
             "SELECT typeof(CAST(only_missing_child AS integer))",
             "SELECT typeof((CAST(only_missing_child AS integer)))",
             "SELECT typeof(((CAST(only_missing_child AS integer))))",
-            "SELECT typeof(parse_json(only_missing_child))",
-            "SELECT typeof((parse_json(only_missing_child)))",
+            "SELECT typeof(json_parse(only_missing_child))",
+            "SELECT typeof((json_parse(only_missing_child)))",
         ] {
             let query = novarocks_parser::parser::parse_query(sql).unwrap();
             let error = analyze(&query, &EmptyCatalog, "default").unwrap_err();
@@ -5829,11 +5822,11 @@ mod tests {
     }
 
     #[test]
-    fn map_constructor_preserves_complete_json_and_same_carrier_string_children() {
+    fn map_constructor_preserves_json_and_string_child_declarations() {
         use novarocks_type_contract::ValueLogicalType;
         let mut outputs = Vec::new();
         for (input, domain) in [
-            ("parse_json('{}')", Some(ValueLogicalType::Json)),
+            ("json_parse('{}')", Some(ValueLogicalType::Json)),
             ("'{}'", None),
         ] {
             let sql = format!("SELECT map(ARRAY[1], ARRAY[{input}])");
@@ -5869,16 +5862,16 @@ mod tests {
             );
             outputs.push(expression.value_type);
         }
-        assert_eq!(outputs[0].data_type(), outputs[1].data_type());
+        assert_ne!(outputs[0].data_type(), outputs[1].data_type());
         assert_ne!(
             outputs[0], outputs[1],
-            "equal carriers preserve distinct nominal domains"
+            "JSON and VARCHAR preserve their distinct domains"
         );
     }
 
     #[test]
     fn map_selector_preserves_row_children_and_nested_nulls() {
-        let row = "CAST(ROW(parse_json('{}'), CAST(NULL AS VARCHAR)) AS ROW(j JSON, s VARCHAR))";
+        let row = "CAST(ROW(json_parse('{}'), CAST(NULL AS VARCHAR)) AS ROW(j JSON, s VARCHAR))";
         let map = format!("map(ARRAY[1], ARRAY[{row}])");
         let source = analyze_projection_expr(&format!("SELECT {map}")).unwrap();
         let output = analyze_projection_expr(&format!("SELECT element_at({map}, 1)")).unwrap();
@@ -5920,7 +5913,7 @@ mod tests {
                 self.cancel_at.is_some_and(|at| poll >= at)
             }
         }
-        let source = analyze_projection_expr("select map(ARRAY[1], ARRAY[parse_json('{}')])")
+        let source = analyze_projection_expr("select map(ARRAY[1], ARRAY[json_parse('{}')])")
             .unwrap()
             .value_type;
         let observation = Arc::new(Observation {
@@ -5987,7 +5980,7 @@ mod tests {
         let DataType::List(item) = expression.value_type.data_type() else {
             panic!("expected List");
         };
-        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(item.data_type(), &DataType::LargeBinary);
         assert_eq!(
             expression
                 .value_type
@@ -6007,13 +6000,13 @@ mod tests {
     #[test]
     fn json_array_literal_and_concat_keep_complete_exact_owner_bindings() {
         let expression =
-            analyze_projection_expr("select [json_object('k':1), json_object('k':2), null]")
+            analyze_projection_expr("select [JSON_OBJECT('k' VALUE 1 RETURNING JSON), JSON_OBJECT('k' VALUE 2 RETURNING JSON), null]")
                 .unwrap();
         assert_json_list_scalar_owner(&expression, "builtin.scalar/__array_literal/v1");
         for (sql, source_carrier, source_domain) in [
             (
-                "select CAST([json_object('k':1), null] AS ARRAY<json>)",
-                DataType::Utf8,
+                "select CAST([JSON_OBJECT('k' VALUE 1 RETURNING JSON), null] AS ARRAY<json>)",
+                DataType::LargeBinary,
                 novarocks_type_contract::ValueLogicalType::Json,
             ),
             (
@@ -6046,17 +6039,17 @@ mod tests {
             assert!(!expr.value_type.nullable());
         }
         for sql in [
-            "select concat([json_object('k':1), json_object('k':2)], CAST(ARRAY[] AS ARRAY(JSON)))",
+            "select concat([JSON_OBJECT('k' VALUE 1 RETURNING JSON), JSON_OBJECT('k' VALUE 2 RETURNING JSON)], CAST(ARRAY[] AS ARRAY(JSON)))",
             "select concat(cast(['not JSON', '123'] as array<json>), CAST(ARRAY[] AS ARRAY(JSON)))",
             "with q as (select cast(['not JSON', '123'] as array<json>) as j) select concat(j, CAST(ARRAY[] AS ARRAY(JSON))) from q",
             "select concat(j2, CAST(ARRAY[] AS ARRAY(JSON))) from (select cast(['not JSON','123'] as array<json>) as j, j as j2) q",
-            "select concat(CAST([json_object('k':1), json_object('k':2)] AS ARRAY<json>), CAST(ARRAY[] AS ARRAY(JSON)))",
-            "select concat(cast([json_object('k':1), json_object('k':2)] as array<json>), CAST(ARRAY[] AS ARRAY(JSON)))",
-            "with q as (select [json_object('k':1), json_object('k':2)] as j) select concat(j, CAST(ARRAY[] AS ARRAY(JSON))) from q",
-            "select concat(j2, CAST(ARRAY[] AS ARRAY(JSON))) from (select [json_object('k':1),json_object('k':2)] as j, j as j2) q",
-            "select concat(j, CAST(ARRAY[] AS ARRAY(JSON))) from (values ([json_object('k':1),json_object('k':2)]), (null)) q(j)",
-            "select concat(j, CAST(ARRAY[] AS ARRAY(JSON))) from (select [json_object('k':1),json_object('k':2)] as j union all select null) q",
-            "select concat(case when true then [json_object('k':1),json_object('k':2)] else null end, CAST(ARRAY[] AS ARRAY(JSON)))",
+            "select concat(CAST([JSON_OBJECT('k' VALUE 1 RETURNING JSON), JSON_OBJECT('k' VALUE 2 RETURNING JSON)] AS ARRAY<json>), CAST(ARRAY[] AS ARRAY(JSON)))",
+            "select concat(cast([JSON_OBJECT('k' VALUE 1 RETURNING JSON), JSON_OBJECT('k' VALUE 2 RETURNING JSON)] as array<json>), CAST(ARRAY[] AS ARRAY(JSON)))",
+            "with q as (select [JSON_OBJECT('k' VALUE 1 RETURNING JSON), JSON_OBJECT('k' VALUE 2 RETURNING JSON)] as j) select concat(j, CAST(ARRAY[] AS ARRAY(JSON))) from q",
+            "select concat(j2, CAST(ARRAY[] AS ARRAY(JSON))) from (select [JSON_OBJECT('k' VALUE 1 RETURNING JSON),JSON_OBJECT('k' VALUE 2 RETURNING JSON)] as j, j as j2) q",
+            "select concat(j, CAST(ARRAY[] AS ARRAY(JSON))) from (values ([JSON_OBJECT('k' VALUE 1 RETURNING JSON),JSON_OBJECT('k' VALUE 2 RETURNING JSON)]), (null)) q(j)",
+            "select concat(j, CAST(ARRAY[] AS ARRAY(JSON))) from (select [JSON_OBJECT('k' VALUE 1 RETURNING JSON),JSON_OBJECT('k' VALUE 2 RETURNING JSON)] as j union all select null) q",
+            "select concat(case when true then [JSON_OBJECT('k' VALUE 1 RETURNING JSON),JSON_OBJECT('k' VALUE 2 RETURNING JSON)] else null end, CAST(ARRAY[] AS ARRAY(JSON)))",
         ] {
             let expression =
                 analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
@@ -6069,7 +6062,7 @@ mod tests {
                 "builtin.scalar/__array_literal/v1",
             ),
             (
-                "select CAST([json_object('k':1), json_object('k':2)] AS ARRAY<varchar>)",
+                "select CAST([JSON_OBJECT('k' VALUE 1 RETURNING JSON), JSON_OBJECT('k' VALUE 2 RETURNING JSON)] AS ARRAY<varchar>)",
                 true,
                 "builtin.scalar/__array_literal/v1",
             ),
@@ -6079,7 +6072,7 @@ mod tests {
                 "builtin.scalar/concat/v1",
             ),
             (
-                "select concat(cast([json_object('k':1), json_object('k':2)] as array<varchar>), CAST(ARRAY[] AS ARRAY(VARCHAR)))",
+                "select concat(cast([JSON_OBJECT('k' VALUE 1 RETURNING JSON), JSON_OBJECT('k' VALUE 2 RETURNING JSON)] as array<varchar>), CAST(ARRAY[] AS ARRAY(VARCHAR)))",
                 false,
                 "builtin.scalar/concat/v1",
             ),
@@ -6113,15 +6106,18 @@ mod tests {
 
     #[test]
     fn json_list_output_adapters_preserve_existing_distinct_error_contract() {
-        let error =
-            analyze_projection_expr("select array_agg(distinct ARRAY[JSON_OBJECT('2': 3)])")
-                .unwrap_err();
+        let error = analyze_projection_expr(
+            "select array_agg(distinct ARRAY[JSON_OBJECT('2' VALUE 3 RETURNING JSON)])",
+        )
+        .unwrap_err();
         assert!(
             error.contains("can't rewrite distinct to group by on (array<json>)."),
             "{error}"
         );
-        let error =
-            analyze_projection_expr("select array_agg(distinct JSON_OBJECT('2': 3))").unwrap_err();
+        let error = analyze_projection_expr(
+            "select array_agg(distinct JSON_OBJECT('2' VALUE 3 RETURNING JSON))",
+        )
+        .unwrap_err();
         assert!(
             error.contains("can't rewrite distinct to group by on (json)."),
             "{error}"
@@ -6132,7 +6128,7 @@ mod tests {
         let DataType::List(item) = &expression.value_type.data_type() else {
             panic!("expected List");
         };
-        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(item.data_type(), &DataType::LargeBinary);
         assert_eq!(
             expression
                 .value_type
@@ -6267,40 +6263,33 @@ mod tests {
     #[test]
     fn array_agg_freezes_json_output_separately_from_physical_binding() {
         for sql in [
-            "select array_agg(JSON_OBJECT('2': 3))",
-            "select array_agg(parse_json('[1]'))",
-            "select array_agg(j2) from (select cast(json_object('k':1) as json) as j, j as j2) s",
-            "select array_agg(j) from (values (cast(json_object('k':1) as json)), (null)) q(j)",
-            "select array_agg(j) from (select cast(json_object('k':1) as json) as j union all select null) q",
-            "select array_agg(case when true then json_object('k':1) else null end)",
-            "select array_agg(case when true then json_object('k':1) else json_object('k':2) end)",
-            "select array_agg(parse_json('{\"k\":1}'))",
-            "select array_agg(cast(json_object('k':1) as json))",
-            "select array_agg(json_object('k': 1) order by 1 desc)",
-            "select array_agg(json_object('k': 1)) over ()",
-            "select array_agg(j) from (select json_object('k': 1) as j) s",
-            "select array_agg(j) from (select cast(json_object('k':1) as json) as j) s",
-            "with s as (select cast(json_object('k':1) as json) as j) select array_agg(j) from s",
-            "with s as (select json_object('k':1) as j) select array_agg(a.j) from s a, s b",
-            "select array_agg(j) from (select json_object('k':1) as j union all select json_object('k':2)) s",
+            "select array_agg(JSON_OBJECT('2' VALUE 3 RETURNING JSON))",
+            "select array_agg(json_parse('[1]'))",
+            "select array_agg(j2) from (select cast(JSON_OBJECT('k' VALUE 1 RETURNING JSON) as json) as j, j as j2) s",
+            "select array_agg(j) from (values (cast(JSON_OBJECT('k' VALUE 1 RETURNING JSON) as json)), (null)) q(j)",
+            "select array_agg(j) from (select cast(JSON_OBJECT('k' VALUE 1 RETURNING JSON) as json) as j union all select null) q",
+            "select array_agg(case when true then JSON_OBJECT('k' VALUE 1 RETURNING JSON) else null end)",
+            "select array_agg(case when true then JSON_OBJECT('k' VALUE 1 RETURNING JSON) else JSON_OBJECT('k' VALUE 2 RETURNING JSON) end)",
+            "select array_agg(json_parse('{\"k\":1}'))",
+            "select array_agg(cast(JSON_OBJECT('k' VALUE 1 RETURNING JSON) as json))",
+            "select array_agg(JSON_OBJECT('k' VALUE 1 RETURNING JSON) order by 1 desc)",
+            "select array_agg(JSON_OBJECT('k' VALUE 1 RETURNING JSON)) over ()",
+            "select array_agg(j) from (select JSON_OBJECT('k' VALUE 1 RETURNING JSON) as j) s",
+            "select array_agg(j) from (select cast(JSON_OBJECT('k' VALUE 1 RETURNING JSON) as json) as j) s",
+            "with s as (select cast(JSON_OBJECT('k' VALUE 1 RETURNING JSON) as json) as j) select array_agg(j) from s",
+            "with s as (select JSON_OBJECT('k' VALUE 1 RETURNING JSON) as j) select array_agg(a.j) from s a, s b",
+            "select array_agg(j) from (select JSON_OBJECT('k' VALUE 1 RETURNING JSON) as j union all select JSON_OBJECT('k' VALUE 2 RETURNING JSON)) s",
         ] {
             let expression =
                 analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
             assert_array_agg_json_owner(&expression);
         }
-        // JSON_ARRAY has a legacy declaration but no installed scalar kernel.
-        // Keep its admission control alongside the JSON aggregate boundary.
         for sql in [
-            "select array_agg(JSON_ARRAY(1 NULL ON NULL))",
-            "select array_agg(JSON_ARRAY(1 NULL ON NULL)) where false",
+            "select array_agg(JSON_ARRAY(1 NULL ON NULL RETURNING JSON))",
+            "select array_agg(JSON_ARRAY(1 NULL ON NULL RETURNING JSON)) where false",
         ] {
-            let error = analyze_projection_expr(sql).unwrap_err();
-            assert!(
-                error.contains(
-                    "builtin function `json_array` has no admitted selected scalar implementation"
-                ),
-                "{sql}: {error}"
-            );
+            let expression = analyze_projection_expr(sql).unwrap();
+            assert_array_agg_json_owner(&expression);
         }
     }
 
@@ -6313,10 +6302,10 @@ mod tests {
             "with q as (select cast(cast('not JSON' as json) as varchar) as j) select array_agg(j) from q",
             "select array_agg(j2) from (select cast(cast('not JSON' as json) as varchar) as j, j as j2) q",
             "select array_agg(j) from (values (cast('{\"k\":1}' as varchar)), (null)) q(j)",
-            "select array_agg(cast(json_object('k':1) as varchar))",
-            "select array_agg(case when true then cast(json_object('k':1) as varchar) else cast(json_object('k':2) as varchar) end)",
-            "select array_agg(j) from (select cast(json_object('k':1) as varchar) as j) s",
-            "with s as (select cast(json_object('k':1) as varchar) as j) select array_agg(j) from s",
+            "select array_agg(cast(JSON_OBJECT('k' VALUE 1) as varchar))",
+            "select array_agg(case when true then cast(JSON_OBJECT('k' VALUE 1) as varchar) else cast(JSON_OBJECT('k' VALUE 2) as varchar) end)",
+            "select array_agg(j) from (select cast(JSON_OBJECT('k' VALUE 1) as varchar) as j) s",
+            "with s as (select cast(JSON_OBJECT('k' VALUE 1) as varchar) as j) select array_agg(j) from s",
         ] {
             let expression =
                 analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
@@ -6339,7 +6328,7 @@ mod tests {
             ValueLogicalType::Json
         );
         let mixed = analyze_projection_expr(
-            "select array_agg(j) from (values (cast(json_object('k':1) as json)), ('{\"k\":2}')) q(j)",
+            "select array_agg(j) from (values (cast(JSON_OBJECT('k' VALUE 1 RETURNING JSON) as json)), ('{\"k\":2}')) q(j)",
         ).unwrap_err();
         assert!(mixed.contains("do not have a common Trino type"), "{mixed}");
     }
@@ -6361,7 +6350,7 @@ mod tests {
                     columns: vec![
                         novarocks_types::schema::ColumnDef {
                             name: "j".into(),
-                            data_type: DataType::Utf8,
+                            data_type: DataType::LargeBinary,
                             nullable: true,
                             write_default: None,
                             logical_type: Some(novarocks_types::schema::SqlType::Json),
@@ -6369,7 +6358,7 @@ mod tests {
                         novarocks_types::schema::ColumnDef {
                             name: "ja".into(),
                             data_type: DataType::List(std::sync::Arc::new(
-                                arrow::datatypes::Field::new("item", DataType::Utf8, true),
+                                arrow::datatypes::Field::new("item", DataType::LargeBinary, true),
                             )),
                             nullable: true,
                             write_default: None,
@@ -6908,7 +6897,7 @@ mod tests {
     fn explicit_json_text_comparison_channels_invoke_exact_semantic_conversion() {
         use novarocks_type_contract::ValueLogicalType;
         let catalog = UnaryInputCatalog {
-            key_type: DataType::Utf8,
+            key_type: DataType::LargeBinary,
             nullable: false,
             logical_type: Some(novarocks_types::schema::SqlType::Json),
         };
@@ -6975,7 +6964,7 @@ mod tests {
     #[test]
     fn implicit_json_comparison_channels_reject_foreign_domains() {
         let catalog = UnaryInputCatalog {
-            key_type: DataType::Utf8,
+            key_type: DataType::LargeBinary,
             nullable: false,
             logical_type: Some(novarocks_types::schema::SqlType::Json),
         };

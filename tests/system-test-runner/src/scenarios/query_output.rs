@@ -19,10 +19,12 @@
 //! MySQL packet sequencing and negotiated batches have no Trino carrier.
 
 use crate::actors::sql::{self, SqlSession};
-use crate::actors::trino_protocol::TrinoClient;
+use crate::actors::trino_protocol::{RawResponse, TrinoClient};
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::TestClusterOwner;
+use novarocks_result_contract::RootProfileV1;
+use serde_json::{Value, json};
 
 const TWO_ROW_QUERY: &str =
     "SELECT v FROM (SELECT CAST(1 AS BIGINT) AS v UNION ALL SELECT CAST(2 AS BIGINT)) t ORDER BY v";
@@ -76,29 +78,7 @@ impl Scenario for TypedLayout {
             r#"SELECT ROW(7 AS "id", CAST(NULL AS INTEGER), 9) AS payload,
                 MAP(ARRAY[MAP(ARRAY[2, 1], ARRAY['a"b', 'x=y,{z}'])], ARRAY[7]) AS keyed"#,
         )?;
-        let mut columns = None;
-        let mut rows = Vec::new();
-        for page in &pages {
-            let value = page.json()?;
-            ensure!(
-                page.status == 200 && value.get("error").is_none(),
-                "ROW/MAP result page failed: {value}"
-            );
-            if let Some(page_columns) = value.get("columns") {
-                if let Some(previous) = &columns {
-                    ensure!(
-                        previous == page_columns,
-                        "result metadata changed between pages"
-                    );
-                } else {
-                    columns = Some(page_columns.clone());
-                }
-            }
-            if let Some(data) = value.get("data").and_then(|data| data.as_array()) {
-                rows.extend(data.iter().cloned());
-            }
-        }
-        let columns = columns.context("ROW/MAP result omitted column metadata")?;
+        let (columns, rows) = read_typed_pages(&pages, "ROW/MAP")?;
         ensure!(
             columns[0]["type"] == "row(id integer, integer, integer)"
                 && columns[0]["typeSignature"]["rawType"] == "row"
@@ -111,23 +91,157 @@ impl Scenario for TypedLayout {
             "ROW field declarations changed: {columns}"
         );
         ensure!(
-            rows == [serde_json::json!([[7, null, 9], {"{2=a\"b, 1=x=y,{z}}": 7}])],
+            rows == [json!([[7, null, 9], {"{2=a\"b, 1=x=y,{z}}": 7}])],
             "ROW/MAP result changed its field positions or key text: {rows:?}"
         );
-        let terminal = pages
-            .last()
-            .context("ROW/MAP result omitted its terminal page")?;
-        ensure!(
-            terminal.next_uri()?.is_none() && terminal.json()?["stats"]["state"] == "FINISHED",
-            "ROW/MAP result did not reach its original terminal page"
-        );
         context.action("verified anonymous ROW declarations and MAP key text on raw Trino pages");
+        native_json_pages(context)?;
         let deadline = context.deadline();
         context
             .handle()
             .await_query_execution_resource_convergence(&baseline, deadline)?;
         Ok(())
     }
+}
+
+fn read_typed_pages(pages: &[RawResponse], label: &str) -> Result<(Value, Vec<Value>)> {
+    let mut columns = None;
+    let mut rows = Vec::new();
+    for page in pages {
+        let value = page.json()?;
+        ensure!(
+            page.status == 200 && value.get("error").is_none(),
+            "{label} result page failed (HTTP {}): {:?}",
+            page.status,
+            value.get("error")
+        );
+        if let Some(page_columns) = value.get("columns") {
+            if let Some(previous) = &columns {
+                ensure!(
+                    previous == page_columns,
+                    "{label} metadata changed between pages"
+                );
+            } else {
+                columns = Some(page_columns.clone());
+            }
+        }
+        if let Some(data) = value.get("data").and_then(Value::as_array) {
+            rows.extend(data.iter().cloned());
+        }
+    }
+    let terminal = pages
+        .last()
+        .with_context(|| format!("{label} omitted its terminal page"))?;
+    ensure!(
+        terminal.next_uri()?.is_none() && terminal.json()?["stats"]["state"] == "FINISHED",
+        "{label} did not reach its original terminal page"
+    );
+    Ok((
+        columns.with_context(|| format!("{label} omitted column metadata"))?,
+        rows,
+    ))
+}
+
+fn native_json_pages(context: &mut ScenarioContext) -> Result<()> {
+    // The document itself makes the row exceed a Native root segment. Tables
+    // and external fixtures are unnecessary: two sequence branches yield
+    // real BE input and the grouping and ordered output consume Exchanges.
+    let wide = RootProfileV1::SEGMENT_BYTES;
+    let sql = format!(
+        r#"WITH input_rows AS (
+               SELECT sequential_number AS n FROM TABLE(sequence(1, 4))
+               UNION ALL
+               SELECT sequential_number AS n FROM TABLE(sequence(5, 9))
+           ), source AS (
+               SELECT n, n % 3 AS bucket,
+                      CASE n
+                          WHEN 1 THEN CAST(NULL AS JSON)
+                          WHEN 2 THEN JSON 'null'
+                          WHEN 3 THEN json_parse(concat(rpad('', 1024, '['), CAST(n AS VARCHAR), rpad('', 1024, ']')))
+                          WHEN 8 THEN json_parse(concat('"', rpad('', {wide}, 'q'), CAST(n AS VARCHAR), '"'))
+                          ELSE json_parse(concat('{{"b":', CAST(n AS VARCHAR), ',"a":1,"a":2}}'))
+                      END AS doc
+               FROM input_rows
+           ), grouped AS (
+               SELECT bucket, array_agg(doc ORDER BY n) AS documents
+               FROM source GROUP BY bucket
+           )
+           SELECT bucket, documents[1] AS direct, documents AS nested
+           FROM grouped ORDER BY bucket"#
+    );
+    let root = context.scenario_root().join("native-json-http");
+    let client = TrinoClient::new(
+        context.trino_port(),
+        context.sql_user(),
+        context.deadline(),
+        &root,
+    )?;
+    let before = native_json_exchange_metrics(context, &root, "before")?;
+    let pages = client.execute(&sql)?;
+    let after = native_json_exchange_metrics(context, &root, "after")?;
+    let (columns, rows) = read_typed_pages(&pages, "native JSON")?;
+    ensure!(
+        columns[1]["type"] == "json"
+            && columns[1]["typeSignature"] == json!({"rawType":"json", "arguments":[]})
+            && columns[2]["type"] == "array(json)"
+            && columns[2]["typeSignature"]["arguments"][0]
+                == json!({"kind":"TYPE", "value":{"rawType":"json", "arguments":[]}}),
+        "unexpected native JSON column declarations: {columns}"
+    );
+    let object = |n| format!(r#"{{"b":{n},"a":1,"a":2}}"#);
+    let depth = format!("{}3{}", "[".repeat(1024), "]".repeat(1024));
+    let large_document = format!("\"{}8\"", "q".repeat(wide));
+    let expected = [
+        json!([0, depth, [depth, object(6), object(9)]]),
+        json!([1, null, [null, object(4), object(7)]]),
+        json!([2, "null", ["null", object(5), large_document]]),
+    ];
+    ensure!(
+        rows == expected,
+        "native JSON values differ across direct and aggregate array fields (expected three ordered buckets)"
+    );
+    let active = before
+        .iter()
+        .zip(&after)
+        .filter(|(before, after)| after.0 > before.0)
+        .count();
+    ensure!(
+        active >= 2
+            && before
+                .iter()
+                .zip(&after)
+                .any(|(before, after)| after.1 > before.1),
+        "native JSON query lacks observed distributed Task and exchange receipts: {before:?} -> {after:?}"
+    );
+    context.action("verified native JSON text, SQL NULL and JSON null through actual distributed Tasks and exchange");
+    Ok(())
+}
+
+fn native_json_exchange_metrics(
+    context: &mut ScenarioContext,
+    root: &std::path::Path,
+    phase: &str,
+) -> Result<Vec<(f64, u64)>> {
+    let handle = context.handle();
+    (0..handle.be_count())
+        .map(|index| {
+            let text = handle.backend_prometheus_text(index)?;
+            std::fs::write(root.join(format!("be-{index}-{phase}.prom")), &text)?;
+            let mut samples = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("novarocks_exchange_shuffle_bytes_total "));
+            let bytes = samples
+                .next()
+                .context("BE exchange bytes metric missing")?
+                .parse()?;
+            ensure!(
+                samples.next().is_none(),
+                "duplicate BE exchange bytes metric"
+            );
+            let tasks = handle.backend_task_execution_tasks_created(index)?;
+            Ok((tasks, bytes))
+        })
+        .collect()
 }
 
 impl Scenario for SingleStatementEffects {

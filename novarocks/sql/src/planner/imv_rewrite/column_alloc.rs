@@ -155,20 +155,25 @@ mod tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
         ctx.set_column_ref_factory(Rc::clone(&factory));
-        let json =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let output = allocate_imv_output_column(&ctx, "visible", json.clone(), false).unwrap();
         assert_eq!(output.value_type, json);
         assert_eq!(factory.borrow().get(output.column_id).value_type, json);
         let nested = FunctionValueType::new(
             DataType::Struct(
-                vec![Field::new("payload", DataType::Utf8, false).with_metadata(
-                    std::collections::HashMap::<String, String>::from([
-                        ("nr_logical_type".into(), "json".into()),
-                        ("provider.field-id".into(), "71".into()),
-                    ]),
-                )]
+                vec![
+                    Field::new("payload", DataType::LargeBinary, false).with_metadata(
+                        std::collections::HashMap::<String, String>::from([
+                            ("nr_logical_type".into(), "json".into()),
+                            ("provider.field-id".into(), "71".into()),
+                        ]),
+                    ),
+                ]
                 .into(),
             ),
             false,
@@ -219,8 +224,12 @@ mod tests {
         let fixture_ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
         assert_eq!(
             declared_imv_column_value_type(&json, &fixture_ctx).unwrap(),
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap()
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Json
+            )
+            .unwrap()
         );
         let wide = ColumnDef {
             name: "wide".into(),

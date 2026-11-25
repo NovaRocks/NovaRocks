@@ -308,9 +308,12 @@ fn aggregate_signature_checks_complete_phase_format_function_and_nested_type() {
     );
     assert!(!compare(&right));
     right = left.clone();
-    right.function.result_type =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    right.function.result_type = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     assert!(!compare(&right));
 }
 

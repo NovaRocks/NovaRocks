@@ -80,33 +80,43 @@ fn is_parse(result: Result<Option<String>, LeafError>) {
 
 #[test]
 fn json_leaf_profile_requires_authored_domains_and_successful_null_declarations() {
+    use super::super::{CastPrepareError, PreparedCastRecipe};
+    use novarocks_type_contract::TrinoCastMode;
     let json = |nullable| {
-        FunctionValueType::try_with_logical_type(DataType::Utf8, nullable, ValueLogicalType::Json)
-            .unwrap()
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            nullable,
+            ValueLogicalType::Json,
+        )
+        .unwrap()
     };
     let text = |nullable| FunctionValueType::new(DataType::Utf8, nullable);
-    assert_eq!(
-        profile(&json(false), &text(true)),
-        Some(Operation::JsonToVarchar)
-    );
-    assert_eq!(
-        profile(&json(false), &text(false)),
-        None,
-        "JSON null succeeds as SQL NULL"
-    );
-    assert_eq!(
-        profile(&text(false), &json(false)),
-        Some(Operation::VarcharToJson)
-    );
-    assert_eq!(profile(&text(true), &json(false)), None);
-    assert_eq!(profile(&text(true), &text(true)), None);
-    assert_eq!(profile(&json(true), &json(true)), None);
-    assert_eq!(
-        profile(
+    let prepare = |source: &FunctionValueType, target: &FunctionValueType| {
+        PreparedCastRecipe::try_new_trino(
+            source,
+            target,
+            TrinoCastMode::Explicit,
+            crate::binding_test_control(),
+        )
+    };
+    assert!(prepare(&json(false), &text(true)).is_ok());
+    assert!(matches!(
+        prepare(&json(false), &text(false)),
+        Err(CastPrepareError::TypeMismatch)
+    ));
+    assert!(prepare(&text(false), &json(false)).is_ok());
+    assert!(matches!(
+        prepare(&text(true), &json(false)),
+        Err(CastPrepareError::TypeMismatch)
+    ));
+    assert!(prepare(&text(true), &text(true)).unwrap().is_identity());
+    assert!(prepare(&json(true), &json(true)).unwrap().is_identity());
+    assert!(
+        prepare(
             &FunctionValueType::new(DataType::Binary, false),
             &json(true)
-        ),
-        None
+        )
+        .is_err()
     );
 }
 

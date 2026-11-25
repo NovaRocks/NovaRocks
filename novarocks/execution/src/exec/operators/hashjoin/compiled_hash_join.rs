@@ -66,7 +66,7 @@ use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use crate::runtime_filter::RuntimeFilterProducerFailure;
 use novarocks_expression::CompiledExpressionInstance;
-use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+use novarocks_type_contract::{FunctionValueType, ValueLogicalType, ValueTypeStorageLifetime};
 use novarocks_value_arrays::decode::ValueConversionContext;
 
 /// Runtime role schemas retain their own finite source/new storage holds.
@@ -179,11 +179,14 @@ impl CompiledHashJoinPlan {
                 || probe_key_bindings
                     .iter()
                     .chain(&build_key_bindings)
-                    .any(|ty| ty.data_type() != &arrow::datatypes::DataType::Utf8))
+                    .any(|ty| {
+                        ty.data_type() != &arrow::datatypes::DataType::Binary
+                            || ty.logical_type() != ValueLogicalType::Physical
+                    }))
         {
             return Err(program_binding_failure(
                 PlanBindingKind::InvalidAssignment,
-                "mark join requires its frozen single NULL-aware Utf8 equality key",
+                "mark join requires its frozen single NULL-aware Binary equality key",
             ));
         }
         let residual = condition.residual_predicate();

@@ -658,8 +658,12 @@ fn string_reverse_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
         for source in [
             FunctionValueType::new(DataType::LargeUtf8, true),
             FunctionValueType::new(DataType::Int64, true),
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Json,
+            )
+            .unwrap(),
         ] {
             assert!(
                 prepared_for_test_with_policy(name, &source, DecimalOverflowPolicy::OutputNull)

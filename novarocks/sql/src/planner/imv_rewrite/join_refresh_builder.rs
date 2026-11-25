@@ -1919,12 +1919,16 @@ mod tests {
                 ValueLogicalType::Uuid,
             )
             .unwrap(),
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Json,
+            )
+            .unwrap(),
             FunctionValueType::new(
                 DataType::Struct(
                     vec![
-                        Field::new("payload", DataType::Utf8, false).with_metadata(
+                        Field::new("payload", DataType::LargeBinary, false).with_metadata(
                             std::collections::HashMap::<String, String>::from([
                                 ("nr_logical_type".into(), "json".into()),
                                 ("provider.field-id".into(), "71".into()),

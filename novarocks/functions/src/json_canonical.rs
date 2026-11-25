@@ -14,11 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Trino-compatible JSON comparison keys. One iterative, host-funded author.
-//! Strings are decoded UTF-16 units so isolated surrogates and Java key order
-//! survive without being forced through Rust's Unicode-scalar String model.
+//! Canonical Binary equality keys for native SQL JSON.
 
 use crate::aggregate_host_allocator::HostAggregateAllocator;
+use crate::json_value::{Entries, JsonValueError, Kind, Node, Number, Scalar};
 use crate::{AggregateStateAllocator, KernelEvaluationControl, KernelFailure};
 use allocator_api2::vec::Vec as HostVec;
 use std::{cmp::Ordering, fmt, num::NonZeroU16, ops::Range, sync::Arc};
@@ -28,38 +27,52 @@ pub const FUNCTION_ID: &str = "builtin.scalar/__json_canonical_key/v1";
 
 #[derive(Debug)]
 pub struct JsonCanonicalKey {
-    bytes: HostVec<u8, HostAggregateAllocator>,
+    bytes: KeyBytes,
 }
 impl JsonCanonicalKey {
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
-    pub fn as_str(&self) -> &str {
-        // All original scalar characters are UTF8, and surrogate units are
-        // emitted as ASCII escapes by this same writer.
-        std::str::from_utf8(&self.bytes).expect("canonical JSON writer emits UTF8")
+
+    pub(crate) fn equals_observed(
+        &self,
+        other: &Self,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<bool, KernelFailure> {
+        if self.bytes.len() != other.bytes.len() {
+            return Ok(false);
+        }
+        Ok(compare_bytes(&self.bytes, &other.bytes, control)?.is_eq())
     }
 }
+
 #[derive(Debug)]
-pub struct InvalidJsonKey {
-    pub offset: usize,
-}
+pub struct InvalidJsonKey(JsonValueError);
 impl fmt::Display for InvalidJsonKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid JSON comparison value at byte {}", self.offset)
+        write!(f, "Cannot compare malformed native JSON: {}", self.0)
     }
 }
-impl std::error::Error for InvalidJsonKey {}
+impl std::error::Error for InvalidJsonKey {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 impl novarocks_failure_contract::FailureProjection for InvalidJsonKey {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
         FailureFact::new(
-            FailureClass::Data,
+            FailureClass::Invariant,
             FailureReason::new(domain::KERNEL, NonZeroU16::new(419).unwrap()),
         )
     }
 }
 impl novarocks_failure_contract::OuterFailureProjection for InvalidJsonKey {}
+
+fn invalid(error: JsonValueError) -> KernelFailure {
+    KernelFailure::from_domain(InvalidJsonKey(error))
+}
+
 #[derive(Debug)]
 pub struct JsonKeyOutputExtent {
     pub bytes: usize,
@@ -68,7 +81,7 @@ impl fmt::Display for JsonKeyOutputExtent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "canonical JSON output requires {} bytes beyond Utf8's i32 offset representation",
+            "canonical JSON output requires {} bytes beyond Binary's i32 offset representation",
             self.bytes
         )
     }
@@ -84,10 +97,6 @@ impl novarocks_failure_contract::FailureProjection for JsonKeyOutputExtent {
     }
 }
 impl novarocks_failure_contract::OuterFailureProjection for JsonKeyOutputExtent {}
-fn invalid(offset: usize) -> KernelFailure {
-    KernelFailure::from_domain(InvalidJsonKey { offset })
-}
-
 fn push<T>(v: &mut HostVec<T, HostAggregateAllocator>, value: T) -> Result<(), KernelFailure> {
     v.try_reserve(1).map_err(|_| v.allocator().take_failure())?;
     v.push(value);
@@ -99,690 +108,355 @@ fn extend(v: &mut HostVec<u8, HostAggregateAllocator>, bytes: &[u8]) -> Result<(
     v.extend_from_slice(bytes);
     Ok(())
 }
-const NONE: usize = usize::MAX;
-#[derive(Clone, Copy)]
-enum Kind {
-    Null,
-    True,
-    False,
-    String,
-    Number,
-    Array,
-    Object,
-}
-struct Node {
-    kind: Kind,
-    text: Range<usize>,
-    key: Range<usize>,
-    first: usize,
-    next: usize,
-    ordered: Range<usize>,
-}
-struct Frame {
-    node: usize,
-    last: usize,
-    state: u8,
-    key: Range<usize>,
-}
-struct Parser<'a> {
-    input: &'a str,
-    pos: usize,
-    nodes: HostVec<Node, HostAggregateAllocator>,
-    strings: HostVec<u16, HostAggregateAllocator>,
-    frames: HostVec<Frame, HostAggregateAllocator>,
-    control: &'a dyn KernelEvaluationControl,
-}
-impl Parser<'_> {
-    fn work(&self) -> Result<(), KernelFailure> {
-        self.control.checkpoint(1)
+// The representation is private to the Binary projection. Counts delimit
+// container children; a byte length precedes each variable-width payload.
+const JSON_NULL: u8 = 0;
+const FALSE: u8 = 1;
+const TRUE: u8 = 2;
+const STRING: u8 = 3;
+const NUMBER: u8 = 4;
+const DATE: u8 = 5;
+const TIME: u8 = 6;
+const ZONED_TIME: u8 = 7;
+const TIMESTAMP: u8 = 8;
+const ZONED_TIMESTAMP: u8 = 9;
+const ARRAY: u8 = 10;
+const OBJECT: u8 = 11;
+
+type KeyBytes = HostVec<u8, HostAggregateAllocator>;
+type KeyPairs = HostVec<Range<usize>, HostAggregateAllocator>;
+
+fn append_length(out: &mut KeyBytes, mut value: usize) -> Result<(), KernelFailure> {
+    while value >= 128 {
+        push(out, (value as u8) | 0x80)?;
+        value >>= 7;
     }
-    fn byte(&self) -> Option<u8> {
-        self.input.as_bytes().get(self.pos).copied()
-    }
-    fn space(&mut self) -> Result<(), KernelFailure> {
-        while matches!(self.byte(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
-            self.work()?;
-            self.pos += 1;
-        }
-        Ok(())
-    }
-    fn take(&mut self, wanted: u8) -> Result<(), KernelFailure> {
-        self.work()?;
-        if self.byte() != Some(wanted) {
-            return Err(invalid(self.pos));
-        }
-        self.pos += 1;
-        Ok(())
-    }
-    fn string(&mut self) -> Result<Range<usize>, KernelFailure> {
-        self.take(b'"')?;
-        let start = self.strings.len();
-        loop {
-            self.work()?;
-            let b = self.byte().ok_or_else(|| invalid(self.pos))?;
-            if b == b'"' {
-                self.pos += 1;
-                return Ok(start..self.strings.len());
-            }
-            if b < 32 {
-                return Err(invalid(self.pos));
-            }
-            if b == b'\\' {
-                self.pos += 1;
-                let escape = self.byte().ok_or_else(|| invalid(self.pos))?;
-                self.pos += 1;
-                let unit = match escape {
-                    b'"' => 34,
-                    b'\\' => 92,
-                    b'/' => 47,
-                    b'b' => 8,
-                    b'f' => 12,
-                    b'n' => 10,
-                    b'r' => 13,
-                    b't' => 9,
-                    b'u' => {
-                        let mut value = 0u16;
-                        for _ in 0..4 {
-                            self.work()?;
-                            let digit = self
-                                .byte()
-                                .and_then(|v| char::from(v).to_digit(16))
-                                .ok_or_else(|| invalid(self.pos))?;
-                            self.pos += 1;
-                            value = value * 16 + digit as u16;
-                        }
-                        value
-                    }
-                    _ => return Err(invalid(self.pos - 1)),
-                };
-                push(&mut self.strings, unit)?;
-            } else {
-                let ch = self.input[self.pos..]
-                    .chars()
-                    .next()
-                    .ok_or_else(|| invalid(self.pos))?;
-                self.pos += ch.len_utf8();
-                let mut pair = [0; 2];
-                for &unit in ch.encode_utf16(&mut pair).iter() {
-                    push(&mut self.strings, unit)?;
-                }
-            }
-        }
-    }
-    fn number(&mut self) -> Result<Range<usize>, KernelFailure> {
-        let start = self.pos;
-        if self.byte() == Some(b'-') {
-            self.pos += 1;
-        }
-        match self.byte() {
-            Some(b'0') => self.pos += 1,
-            Some(b'1'..=b'9') => {
-                self.pos += 1;
-                while matches!(self.byte(), Some(b'0'..=b'9')) {
-                    self.work()?;
-                    self.pos += 1;
-                }
-            }
-            _ => return Err(invalid(self.pos)),
-        }
-        if self.byte() == Some(b'.') {
-            self.pos += 1;
-            let begin = self.pos;
-            while matches!(self.byte(), Some(b'0'..=b'9')) {
-                self.work()?;
-                self.pos += 1;
-            }
-            if begin == self.pos {
-                return Err(invalid(self.pos));
-            }
-        }
-        if matches!(self.byte(), Some(b'e' | b'E')) {
-            self.pos += 1;
-            if matches!(self.byte(), Some(b'-' | b'+')) {
-                self.pos += 1;
-            }
-            let begin = self.pos;
-            while matches!(self.byte(), Some(b'0'..=b'9')) {
-                self.work()?;
-                self.pos += 1;
-            }
-            if begin == self.pos {
-                return Err(invalid(self.pos));
-            }
-        }
-        // Validate every parsed value before object duplicate-key reduction.
-        // A later key cannot hide an earlier unrepresentable BigDecimal.
-        number_representation(&self.input[start..self.pos], start, self.control)?;
-        Ok(start..self.pos)
-    }
-    fn value(&mut self, key: Range<usize>) -> Result<usize, KernelFailure> {
-        self.space()?;
-        self.work()?;
-        let mut text = 0..0;
-        let kind = match self.byte() {
-            Some(b'"') => {
-                text = self.string()?;
-                Kind::String
-            }
-            Some(b'[') => {
-                self.pos += 1;
-                Kind::Array
-            }
-            Some(b'{') => {
-                self.pos += 1;
-                Kind::Object
-            }
-            Some(b'-' | b'0'..=b'9') => {
-                text = self.number()?;
-                Kind::Number
-            }
-            Some(b'n') => {
-                self.literal(b"null")?;
-                Kind::Null
-            }
-            Some(b't') => {
-                self.literal(b"true")?;
-                Kind::True
-            }
-            Some(b'f') => {
-                self.literal(b"false")?;
-                Kind::False
-            }
-            _ => return Err(invalid(self.pos)),
-        };
-        let id = self.nodes.len();
-        push(
-            &mut self.nodes,
-            Node {
-                kind,
-                text,
-                key,
-                first: NONE,
-                next: NONE,
-                ordered: 0..0,
-            },
-        )?;
-        if matches!(kind, Kind::Array | Kind::Object) {
-            push(
-                &mut self.frames,
-                Frame {
-                    node: id,
-                    last: NONE,
-                    state: 0,
-                    key: 0..0,
-                },
-            )?;
-        }
-        Ok(id)
-    }
-    fn literal(&mut self, literal: &[u8]) -> Result<(), KernelFailure> {
-        for &b in literal {
-            self.take(b)?;
-        }
-        Ok(())
-    }
-    fn parse(&mut self) -> Result<(), KernelFailure> {
-        self.value(0..0)?;
-        while !self.frames.is_empty() {
-            self.space()?;
-            self.work()?;
-            let depth = self.frames.len() - 1;
-            let node = self.frames[depth].node;
-            let object = matches!(self.nodes[node].kind, Kind::Object);
-            let close = if object { b'}' } else { b']' };
-            match self.frames[depth].state {
-                0 | 4 => {
-                    // Only the initial state permits an empty container.
-                    if self.frames[depth].state == 0 && self.byte() == Some(close) {
-                        self.pos += 1;
-                        self.frames.pop();
-                        continue;
-                    }
-                    if object {
-                        let key = self.string()?;
-                        self.space()?;
-                        self.take(b':')?;
-                        self.frames[depth].key = key;
-                    }
-                    let key = self.frames[depth].key.clone();
-                    self.frames[depth].state = 1;
-                    let child = self.value(key)?;
-                    let previous = self.frames[depth].last;
-                    if previous == NONE {
-                        self.nodes[node].first = child;
-                    } else {
-                        self.nodes[previous].next = child;
-                    }
-                    self.frames[depth].last = child;
-                }
-                1 => match self.byte() {
-                    Some(b',') => {
-                        self.pos += 1;
-                        self.frames[depth].state = 4;
-                    }
-                    Some(b) if b == close => {
-                        self.pos += 1;
-                        self.frames.pop();
-                    }
-                    _ => return Err(invalid(self.pos)),
-                },
-                _ => unreachable!("closed parser states"),
-            }
-        }
-        self.space()?;
-        if self.pos != self.input.len() {
-            return Err(invalid(self.pos));
-        }
-        Ok(())
-    }
+    push(out, value as u8)
 }
 
-fn compare_keys(
-    a: usize,
-    b: usize,
-    nodes: &[Node],
-    strings: &[u16],
-    control: &dyn KernelEvaluationControl,
-) -> Result<Ordering, KernelFailure> {
-    let lhs = &strings[nodes[a].key.clone()];
-    let rhs = &strings[nodes[b].key.clone()];
-    for (&l, &r) in lhs.iter().zip(rhs) {
-        control.checkpoint(1)?;
-        if l != r {
-            return Ok(l.cmp(&r));
-        }
-    }
-    Ok(lhs.len().cmp(&rhs.len()).then_with(|| a.cmp(&b)))
-}
-fn same_key(
-    a: usize,
-    b: usize,
-    nodes: &[Node],
-    strings: &[u16],
-    control: &dyn KernelEvaluationControl,
-) -> Result<bool, KernelFailure> {
-    let lhs = &strings[nodes[a].key.clone()];
-    let rhs = &strings[nodes[b].key.clone()];
-    if lhs.len() != rhs.len() {
-        return Ok(false);
-    }
-    for (&left, &right) in lhs.iter().zip(rhs) {
-        control.checkpoint(1)?;
-        if left != right {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-fn sort_members(
-    values: &mut [usize],
-    nodes: &[Node],
-    strings: &[u16],
+fn extend_observed(
+    out: &mut KeyBytes,
+    bytes: &[u8],
     control: &dyn KernelEvaluationControl,
 ) -> Result<(), KernelFailure> {
-    // In-place heapsort needs no library scratch and every comparison observes
-    // the original cancellation/work owner, including very long object names.
-    fn sift(
-        values: &mut [usize],
-        mut parent: usize,
-        end: usize,
-        nodes: &[Node],
-        strings: &[u16],
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<(), KernelFailure> {
-        while let Some(mut child) = parent
-            .checked_mul(2)
-            .and_then(|n| n.checked_add(1))
-            .filter(|&n| n < end)
-        {
-            control.checkpoint(1)?;
-            if child + 1 < end
-                && compare_keys(values[child], values[child + 1], nodes, strings, control)?
-                    == Ordering::Less
-            {
-                child += 1;
-            }
-            if compare_keys(values[parent], values[child], nodes, strings, control)?
-                != Ordering::Less
-            {
-                break;
-            }
-            values.swap(parent, child);
-            parent = child;
-        }
-        Ok(())
-    }
-    for start in (0..values.len() / 2).rev() {
-        sift(values, start, values.len(), nodes, strings, control)?;
-    }
-    for end in (1..values.len()).rev() {
-        values.swap(0, end);
-        sift(values, 0, end, nodes, strings, control)?;
+    out.try_reserve(bytes.len())
+        .map_err(|_| out.allocator().take_failure())?;
+    for section in bytes.chunks(256) {
+        control.checkpoint(1)?;
+        out.extend_from_slice(section);
     }
     Ok(())
 }
-fn write_string(
-    out: &mut HostVec<u8, HostAggregateAllocator>,
-    units: &[u16],
+
+fn append_blob(
+    out: &mut KeyBytes,
+    bytes: &[u8],
     control: &dyn KernelEvaluationControl,
 ) -> Result<(), KernelFailure> {
-    push(out, b'"')?;
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    for &u in units {
-        control.checkpoint(1)?;
-        match u {
-            34 => extend(out, b"\\\"")?,
-            92 => extend(out, b"\\\\")?,
-            8 => extend(out, b"\\b")?,
-            9 => extend(out, b"\\t")?,
-            10 => extend(out, b"\\n")?,
-            12 => extend(out, b"\\f")?,
-            13 => extend(out, b"\\r")?,
-            0..=31 | 0xD800..=0xDFFF => {
-                extend(
-                    out,
-                    &[
-                        b'\\',
-                        b'u',
-                        HEX[(u >> 12) as usize],
-                        HEX[((u >> 8) & 15) as usize],
-                        HEX[((u >> 4) & 15) as usize],
-                        HEX[(u & 15) as usize],
-                    ],
-                )?;
-            }
-            _ => {
-                let mut bytes = [0; 3];
-                let ch = char::from_u32(u32::from(u)).expect("non-surrogate BMP unit");
-                extend(out, ch.encode_utf8(&mut bytes).as_bytes())?;
-            }
-        }
-    }
-    push(out, b'"')
+    append_length(out, bytes.len())?;
+    extend_observed(out, bytes, control)
 }
 
-struct NumberRepresentation {
-    coefficient_end: usize,
-    scale: Option<i64>,
-}
-/// One numeric representation author shared by parsing and writing. Parsing
-/// invokes it even for values later overwritten by a duplicate object key.
-fn number_representation(
-    raw: &str,
-    source_offset: usize,
-    control: &dyn KernelEvaluationControl,
-) -> Result<NumberRepresentation, KernelFailure> {
-    let mut fractional = 0usize;
-    let mut after_point = false;
-    let mut coefficient_end = raw.len();
-    let mut exp_start = raw.len();
-    for (index, b) in raw.bytes().enumerate() {
-        control.checkpoint(1)?;
-        match b {
-            b'.' => after_point = true,
-            b'e' | b'E' => {
-                coefficient_end = index;
-                exp_start = index + 1;
-                break;
-            }
-            b'0'..=b'9' if after_point => fractional += 1,
-            _ => (),
-        }
-    }
-    if !after_point && exp_start == raw.len() {
-        return Ok(NumberRepresentation {
-            coefficient_end,
-            scale: None,
-        });
-    }
-    let mut exponent = 0i64;
-    if exp_start < raw.len() {
-        let exp = &raw[exp_start..];
-        let neg = exp.starts_with('-');
-        for b in exp.bytes().filter(|b| !matches!(b, b'+' | b'-')) {
-            control.checkpoint(1)?;
-            exponent = exponent
-                .checked_mul(10)
-                .and_then(|v| v.checked_sub(i64::from(b - b'0')))
-                .ok_or_else(|| invalid(source_offset + exp_start))?;
-        }
-        if !neg {
-            exponent = exponent
-                .checked_neg()
-                .ok_or_else(|| invalid(source_offset + exp_start))?;
-        }
-    }
-    // Jackson's BigDecimal path uses Java's signed i32 exponent and scale.
-    // Preserve that actual representation boundary, without a private quota.
-    i32::try_from(exponent).map_err(|_| invalid(source_offset + exp_start))?;
-    let scale = i64::try_from(fractional)
-        .ok()
-        .and_then(|v| v.checked_sub(exponent))
-        .ok_or_else(|| invalid(source_offset))?;
-    i32::try_from(scale).map_err(|_| invalid(source_offset))?;
-    Ok(NumberRepresentation {
-        coefficient_end,
-        scale: Some(scale),
-    })
+fn finite_key(out: &mut KeyBytes, scale: i32, coefficient: &[u8]) -> Result<(), KernelFailure> {
+    push(out, 0)?;
+    extend(out, &scale.to_le_bytes())?;
+    append_length(out, coefficient.len())?;
+    extend(out, coefficient)
 }
 
-fn write_number(
-    out: &mut HostVec<u8, HostAggregateAllocator>,
-    raw: &str,
-    control: &dyn KernelEvaluationControl,
+fn finite_integer_key(
+    out: &mut KeyBytes,
+    mut coefficient: i128,
+    mut scale: i32,
 ) -> Result<(), KernelFailure> {
-    let representation = number_representation(raw, 0, control)?;
-    let mut digits = HostVec::new_in(out.allocator().clone());
-    let negative = raw.starts_with('-');
-    for b in raw[..representation.coefficient_end].bytes() {
-        control.checkpoint(1)?;
-        if b.is_ascii_digit() {
-            push(&mut digits, b)?;
+    if coefficient == 0 {
+        scale = 0;
+    } else {
+        while coefficient % 10 == 0 {
+            coefficient /= 10;
+            scale -= 1;
         }
     }
-    let mut first = digits.len() - 1;
-    let mut nonzero = false;
-    for (index, &digit) in digits.iter().enumerate() {
-        control.checkpoint(1)?;
-        if digit != b'0' {
-            first = index;
-            nonzero = true;
+    let bytes = coefficient.to_le_bytes();
+    let mut minimal = bytes.as_slice();
+    while let [.., next, last] = minimal {
+        if (*last == 0 && next & 128 == 0) || (*last == 255 && next & 128 != 0) {
+            minimal = &minimal[..minimal.len() - 1];
+        } else {
             break;
         }
     }
-    let digits = &digits[first..];
-    if negative && nonzero {
-        push(out, b'-')?;
+    finite_key(out, scale, minimal)
+}
+
+fn float_key(out: &mut KeyBytes, value: f64) -> Result<(), KernelFailure> {
+    match crate::json_value::java_double_decimal(value) {
+        Some((coefficient, scale)) => finite_integer_key(out, i128::from(coefficient), scale),
+        None => push(
+            out,
+            if value.is_nan() {
+                1
+            } else if value.is_sign_positive() {
+                2
+            } else {
+                3
+            },
+        ),
     }
-    let Some(scale) = representation.scale else {
-        return extend(out, digits);
+}
+
+fn scalar_key(
+    out: &mut KeyBytes,
+    value: Scalar<'_>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<(), KernelFailure> {
+    match value {
+        Scalar::Boolean(false) => return push(out, FALSE),
+        Scalar::Boolean(true) => return push(out, TRUE),
+        Scalar::String(text) => {
+            push(out, STRING)?;
+            return append_blob(out, text.as_bytes(), control);
+        }
+        Scalar::Date(days) => {
+            push(out, DATE)?;
+            return extend(out, &days.to_le_bytes());
+        }
+        Scalar::Temporal { ty, value } => {
+            use novarocks_type_contract::TemporalType;
+            push(
+                out,
+                match ty {
+                    TemporalType::Time(_) => TIME,
+                    TemporalType::TimeWithTimeZone(_) => ZONED_TIME,
+                    TemporalType::Timestamp(_) => TIMESTAMP,
+                    TemporalType::TimestampWithTimeZone(_) => ZONED_TIMESTAMP,
+                    TemporalType::Interval(_) => return Err(invalid(JsonValueError::Scalar)),
+                },
+            )?;
+            let key = value
+                .relation_key(ty)
+                .map_err(|_| invalid(JsonValueError::Scalar))?;
+            return extend(out, &key.order_bytes());
+        }
+        _ => {}
+    }
+    push(out, NUMBER)?;
+    match value {
+        Scalar::TinyInt(n) => finite_integer_key(out, i128::from(n), 0),
+        Scalar::SmallInt(n) => finite_integer_key(out, i128::from(n), 0),
+        Scalar::Integer(n) => finite_integer_key(out, i128::from(n), 0),
+        Scalar::BigInt(n) => finite_integer_key(out, i128::from(n), 0),
+        Scalar::Real(n) => float_key(out, f64::from(n)),
+        Scalar::Double(n) => float_key(out, n),
+        Scalar::Decimal {
+            coefficient, scale, ..
+        } => finite_integer_key(out, coefficient, i32::from(scale)),
+        Scalar::Number(Number::Finite { coefficient, scale }) => {
+            finite_key(out, scale, coefficient)
+        }
+        Scalar::Number(Number::NaN) => push(out, 1),
+        Scalar::Number(Number::PositiveInfinity) => push(out, 2),
+        Scalar::Number(Number::NegativeInfinity) => push(out, 3),
+        _ => unreachable!("non-numeric JSON values were handled above"),
+    }
+}
+
+struct ObjectFrame {
+    pairs: usize,
+    output: usize,
+    last: Option<usize>,
+}
+
+// One shared allocation for all completed pairs and a reusable reorder buffer.
+// Nested object pairs are retired before their enclosing pair is completed.
+struct Frame<'a> {
+    entries: Entries<'a>,
+    object: Option<ObjectFrame>,
+}
+
+fn consume_key(
+    root: Node<'_>,
+    allocator: HostAggregateAllocator,
+    control: &dyn KernelEvaluationControl,
+) -> Result<KeyBytes, KernelFailure> {
+    let mut frames = HostVec::new_in(allocator.clone());
+    let mut pairs = HostVec::new_in(allocator.clone());
+    let mut scratch = HostVec::new_in(allocator.clone());
+    let mut out = HostVec::new_in(allocator);
+    let mut pending = Some(root);
+    loop {
+        control.checkpoint(1)?;
+        if let Some(node) = pending.take() {
+            let kind =
+                node.kind_observed(|| control.checkpoint(1))
+                    .map_err(|error| match error {
+                        crate::json_value::ObservedError::Value(error) => invalid(error),
+                        crate::json_value::ObservedError::Control(error) => error,
+                    })?;
+            match kind {
+                Kind::Null => push(&mut out, JSON_NULL)?,
+                Kind::Scalar(scalar) => scalar_key(&mut out, scalar, control)?,
+                Kind::Array(container) | Kind::Object(container) => {
+                    if frames.len() == crate::json_value::MAX_DEPTH {
+                        return Err(invalid(JsonValueError::Depth));
+                    }
+                    let object = matches!(kind, Kind::Object(_));
+                    push(&mut out, if object { OBJECT } else { ARRAY })?;
+                    append_length(&mut out, container.len())?;
+                    push(
+                        &mut frames,
+                        Frame {
+                            entries: container.entries(),
+                            object: object.then_some(ObjectFrame {
+                                pairs: pairs.len(),
+                                output: out.len(),
+                                last: None,
+                            }),
+                        },
+                    )?;
+                }
+            }
+        }
+        let Some(frame) = frames.last_mut() else {
+            return Ok(out);
+        };
+        if let Some(object) = frame.object.as_mut()
+            && let Some(begin) = object.last.take()
+        {
+            push(&mut pairs, begin..out.len())?;
+        }
+        match frame.entries.next().transpose().map_err(invalid)? {
+            Some(entry) => {
+                if let Some(object) = frame.object.as_mut() {
+                    let key = entry.key.ok_or_else(|| invalid(JsonValueError::Tag))?;
+                    object.last = Some(out.len());
+                    append_blob(&mut out, key.as_bytes(), control)?;
+                }
+                pending = Some(entry.value);
+            }
+            None => {
+                if let Some(object) = frame.object.take() {
+                    order_pairs(object, &mut pairs, &mut out, &mut scratch, control)?;
+                }
+                frames.pop();
+            }
+        }
+    }
+}
+
+fn order_pairs(
+    frame: ObjectFrame,
+    pairs: &mut KeyPairs,
+    out: &mut KeyBytes,
+    scratch: &mut KeyBytes,
+    control: &dyn KernelEvaluationControl,
+) -> Result<(), KernelFailure> {
+    let children = &mut pairs[frame.pairs..];
+    let compare = |a: &Range<usize>, b: &Range<usize>| {
+        compare_bytes(&out[a.clone()], &out[b.clone()], control)
     };
-    let precision = i64::try_from(digits.len()).map_err(|_| invalid(0))?;
-    let adjusted = precision
-        .checked_sub(1)
-        .and_then(|v| v.checked_sub(scale))
-        .ok_or_else(|| invalid(0))?;
-    if scale >= 0 && adjusted >= -6 {
-        let point = precision - scale;
-        if point > 0 {
-            extend(out, &digits[..point as usize])?;
-            if scale > 0 {
-                push(out, b'.')?;
-                extend(out, &digits[point as usize..])?;
-            }
-        } else {
-            extend(out, b"0.")?;
-            for _ in point..0 {
-                control.checkpoint(1)?;
-                push(out, b'0')?;
-            }
-            extend(out, digits)?;
+    let mut sorted = true;
+    for pair in children.windows(2) {
+        if compare(&pair[0], &pair[1])?.is_gt() {
+            sorted = false;
+            break;
         }
-    } else {
-        push(out, digits[0])?;
-        if digits.len() > 1 {
-            push(out, b'.')?;
-            extend(out, &digits[1..])?;
+    }
+    if !sorted {
+        sort_pairs(children, compare)?;
+        scratch.clear();
+        scratch
+            .try_reserve(out.len() - frame.output)
+            .map_err(|_| scratch.allocator().take_failure())?;
+        for child in children {
+            extend_observed(scratch, &out[child.clone()], control)?;
         }
-        push(out, b'E')?;
-        if adjusted >= 0 {
-            push(out, b'+')?;
+        out.truncate(frame.output);
+        extend_observed(out, scratch, control)?;
+    }
+    pairs.truncate(frame.pairs);
+    Ok(())
+}
+
+fn compare_bytes(
+    left: &[u8],
+    right: &[u8],
+    control: &dyn KernelEvaluationControl,
+) -> Result<Ordering, KernelFailure> {
+    control.checkpoint(1)?;
+    for (a, b) in left.chunks(256).zip(right.chunks(256)) {
+        control.checkpoint(1)?;
+        let order = a.cmp(b);
+        if !order.is_eq() {
+            return Ok(order);
         }
-        // Decimal formatting of this signed machine-width exponent uses only
-        // a fixed stack buffer; the input coefficient itself is arbitrary size.
-        let mut value = adjusted.unsigned_abs();
-        let mut buffer = [0u8; 20];
-        let mut i = buffer.len();
-        loop {
-            i -= 1;
-            buffer[i] = b'0' + (value % 10) as u8;
-            value /= 10;
-            if value == 0 {
+    }
+    Ok(left.len().cmp(&right.len()))
+}
+
+fn sort_pairs(
+    pairs: &mut [Range<usize>],
+    compare: impl Fn(&Range<usize>, &Range<usize>) -> Result<Ordering, KernelFailure>,
+) -> Result<(), KernelFailure> {
+    fn sift(
+        pairs: &mut [Range<usize>],
+        mut index: usize,
+        compare: &impl Fn(&Range<usize>, &Range<usize>) -> Result<Ordering, KernelFailure>,
+    ) -> Result<(), KernelFailure> {
+        while index < pairs.len() / 2 {
+            let left = index * 2 + 1;
+            let right = left + 1;
+            let larger = if right < pairs.len() && compare(&pairs[left], &pairs[right])?.is_lt() {
+                right
+            } else {
+                left
+            };
+            if !compare(&pairs[index], &pairs[larger])?.is_lt() {
                 break;
             }
+            pairs.swap(index, larger);
+            index = larger;
         }
-        if adjusted < 0 {
-            push(out, b'-')?;
-        }
-        extend(out, &buffer[i..])?;
+        Ok(())
+    }
+    for index in (0..pairs.len() / 2).rev() {
+        sift(pairs, index, &compare)?;
+    }
+    for end in (1..pairs.len()).rev() {
+        pairs.swap(0, end);
+        sift(&mut pairs[..end], 0, &compare)?;
     }
     Ok(())
 }
 
-/// Normalize one logically JSON value on its original allocation/control host.
-/// No input-size, node-count or depth quota is introduced. The iterative arena
-/// and writer drop without recursive user-depth destructors.
-// Design: ADR-0220 (docs/adr/ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md)
+/// Project a value on the original allocation and control host.
 pub fn normalize_json_key(
-    input: &str,
+    input: &[u8],
     host: Arc<dyn AggregateStateAllocator>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<JsonCanonicalKey, KernelFailure> {
     control.checkpoint(0)?;
-    let allocator = if host.opaque_allocation_host().is_some() {
-        // The original host covers the platform-private journal before its
-        // first lock. It stays with the same returned key's actual owner.
-        HostAggregateAllocator::try_new_with_journal(host)?
+    normalize_json_key_in(input, key_allocator(host)?, control)
+}
+
+pub(crate) fn key_allocator(
+    host: Arc<dyn AggregateStateAllocator>,
+) -> Result<HostAggregateAllocator, KernelFailure> {
+    if host.opaque_allocation_host().is_some() {
+        HostAggregateAllocator::try_new_with_journal(host)
     } else {
-        // Explicit non-runtime block-only callers keep their original policy;
-        // this branch supplies no opaque capacity or process fallback.
-        HostAggregateAllocator::try_new(host)?
-    };
-    normalize_json_key_in(input, allocator, control)
+        HostAggregateAllocator::try_new(host)
+    }
 }
 
 pub(crate) fn normalize_json_key_in(
-    input: &str,
+    input: &[u8],
     allocator: HostAggregateAllocator,
     control: &dyn KernelEvaluationControl,
 ) -> Result<JsonCanonicalKey, KernelFailure> {
     control.checkpoint(0)?;
-    let mut parser = Parser {
-        input,
-        pos: 0,
-        nodes: HostVec::new_in(allocator.clone()),
-        strings: HostVec::new_in(allocator.clone()),
-        frames: HostVec::new_in(allocator.clone()),
-        control,
-    };
-    parser.parse()?;
-    let mut ordered = HostVec::new_in(allocator.clone());
-    for node in 0..parser.nodes.len() {
-        control.checkpoint(1)?;
-        if !matches!(parser.nodes[node].kind, Kind::Array | Kind::Object) {
-            continue;
-        }
-        let begin = ordered.len();
-        let mut next = parser.nodes[node].first;
-        while next != NONE {
-            control.checkpoint(1)?;
-            push(&mut ordered, next)?;
-            next = parser.nodes[next].next;
-        }
-        if matches!(parser.nodes[node].kind, Kind::Object) {
-            sort_members(
-                &mut ordered[begin..],
-                &parser.nodes,
-                &parser.strings,
-                control,
-            )?;
-            let end = ordered.len();
-            let mut write = begin;
-            let mut read = begin;
-            while read < end {
-                control.checkpoint(1)?;
-                let mut last = read;
-                while last + 1 < end
-                    && same_key(
-                        ordered[last],
-                        ordered[last + 1],
-                        &parser.nodes,
-                        &parser.strings,
-                        control,
-                    )?
-                {
-                    control.checkpoint(1)?;
-                    last += 1;
-                }
-                ordered[write] = ordered[last];
-                write += 1;
-                read = last + 1;
-            }
-            ordered.truncate(write);
-        }
-        parser.nodes[node].ordered = begin..ordered.len();
-    }
-    enum Emit {
-        Node(usize),
-        Byte(u8),
-        Key(usize),
-    }
-    let mut pending = HostVec::new_in(allocator.clone());
-    push(&mut pending, Emit::Node(0))?;
-    let mut bytes = HostVec::new_in(allocator);
-    while let Some(next) = pending.pop() {
-        control.checkpoint(1)?;
-        match next {
-            Emit::Byte(b) => push(&mut bytes, b)?,
-            Emit::Key(node) => {
-                write_string(
-                    &mut bytes,
-                    &parser.strings[parser.nodes[node].key.clone()],
-                    control,
-                )?;
-                push(&mut bytes, b':')?;
-            }
-            Emit::Node(id) => {
-                let node = &parser.nodes[id];
-                match node.kind {
-                    Kind::Null => extend(&mut bytes, b"null")?,
-                    Kind::True => extend(&mut bytes, b"true")?,
-                    Kind::False => extend(&mut bytes, b"false")?,
-                    Kind::String => {
-                        write_string(&mut bytes, &parser.strings[node.text.clone()], control)?
-                    }
-                    Kind::Number => write_number(&mut bytes, &input[node.text.clone()], control)?,
-                    Kind::Array | Kind::Object => {
-                        let object = matches!(node.kind, Kind::Object);
-                        push(&mut bytes, if object { b'{' } else { b'[' })?;
-                        push(&mut pending, Emit::Byte(if object { b'}' } else { b']' }))?;
-                        for (ordinal, &child) in
-                            ordered[node.ordered.clone()].iter().enumerate().rev()
-                        {
-                            control.checkpoint(1)?;
-                            push(&mut pending, Emit::Node(child))?;
-                            if object {
-                                push(&mut pending, Emit::Key(child))?;
-                            }
-                            if ordinal > 0 {
-                                push(&mut pending, Emit::Byte(b','))?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let value = Node::from_root(input).map_err(invalid)?;
+    let bytes = consume_key(value, allocator, control)?;
     control.checkpoint(0)?;
     Ok(JsonCanonicalKey { bytes })
 }

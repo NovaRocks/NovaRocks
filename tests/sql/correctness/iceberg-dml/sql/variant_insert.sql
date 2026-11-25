@@ -35,21 +35,21 @@ grep -E '^IRU9_(EMPTY_INT_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
 -- @expect_error_tier=drift
 -- @expect_error=Iceberg Variant writes are not supported
 INSERT INTO iru9_variant_insert_${uuid0}.iru9_${uuid0}.t_v3_variant VALUES
-  ROW(1, parse_json('{"a":1,"b":"x"}')),
-  ROW(2, parse_json('[10,20,30]')),
-  ROW(3, parse_json('null')),
+  ROW(1, json_parse('{"a":1,"b":"x"}')),
+  ROW(2, json_parse('[10,20,30]')),
+  ROW(3, json_parse('null')),
   ROW(4, NULL);
 
 -- query 4
-SELECT variant_typeof(parse_json('{"a":1}')) AS object_kind,
-       variant_typeof(parse_json('[10,20,30]')) AS array_kind,
-       variant_typeof(parse_json('null')) AS variant_null_kind,
+SELECT variant_typeof(json_parse('{"a":1}')) AS object_kind,
+       variant_typeof(json_parse('[10,20,30]')) AS array_kind,
+       variant_typeof(json_parse('null')) AS variant_null_kind,
        variant_typeof(CAST(NULL AS VARIANT)) AS sql_null_kind,
-       parse_json('null') IS NULL AS variant_is_sql_null,
+       json_parse('null') IS NULL AS variant_is_sql_null,
        CAST(NULL AS VARIANT) IS NULL AS sql_is_null;
 
 -- query 5
-SELECT get_json_string(parse_json('{"a":1,"b":"x"}'), '$.b') AS b;
+SELECT get_json_string(json_parse('{"a":1,"b":"x"}'), '$.b') AS b;
 
 -- query 6
 SELECT COUNT(*) AS remaining_rows FROM iru9_variant_insert_${uuid0}.iru9_${uuid0}.t_v3_variant;

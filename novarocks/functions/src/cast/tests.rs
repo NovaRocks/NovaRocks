@@ -1110,7 +1110,7 @@ fn exact_largeint_identity_preserves_nominal_domain_and_refuses_narrowing_or_ret
             )
             .unwrap();
             let json = FunctionValueType::try_with_logical_type(
-                DataType::Utf8,
+                DataType::LargeBinary,
                 true,
                 ValueLogicalType::Json,
             )

@@ -22,8 +22,12 @@ fn physical(ty: DataType, nullable: bool) -> FunctionValueType {
     FunctionValueType::new(ty, nullable)
 }
 fn json(nullable: bool) -> FunctionValueType {
-    FunctionValueType::try_with_logical_type(DataType::Utf8, nullable, ValueLogicalType::Json)
-        .unwrap()
+    FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        nullable,
+        ValueLogicalType::Json,
+    )
+    .unwrap()
 }
 fn infer(
     args: &[&FunctionValueType],
@@ -145,11 +149,11 @@ fn empty_unknown_original_precision_and_duplicate_occurrences_keep_their_facts()
 }
 
 #[test]
-fn json_identity_unknown_and_string_conflict_use_actual_semantics() {
+fn json_identity_unknown_and_binary_conflict_use_actual_semantics() {
     let json = json(false);
-    let text = physical(DataType::Utf8, false);
+    let binary = physical(DataType::LargeBinary, false);
     let null = physical(DataType::Null, true);
-    assert_eq!(json.data_type(), text.data_type());
+    assert_eq!(json.data_type(), binary.data_type());
     for args in [
         vec![&json],
         vec![&json, &json],
@@ -161,7 +165,7 @@ fn json_identity_unknown_and_string_conflict_use_actual_semantics() {
             ValueLogicalType::Json
         );
     }
-    for args in [[&json, &text], [&text, &json]] {
+    for args in [[&json, &binary], [&binary, &json]] {
         assert!(matches!(
             infer(&args),
             Err(ArrayCommonTypeFailure::Rule(
@@ -170,7 +174,7 @@ fn json_identity_unknown_and_string_conflict_use_actual_semantics() {
         ));
     }
     let a = nested(&json, false);
-    let b = nested(&text, false);
+    let b = nested(&binary, false);
     assert_eq!(a.data_type(), b.data_type());
     assert!(matches!(
         infer(&[&a, &b]),
@@ -318,7 +322,7 @@ fn common_coercion_cannot_borrow_explicit_cast_or_narrowing_profiles() {
         ),
         (DataType::Float64, DataType::Decimal128(20, 0), false),
         (DataType::Int64, DataType::Int32, false),
-        (DataType::Utf8, DataType::Int32, false),
+        (DataType::LargeBinary, DataType::Int32, false),
         (
             DataType::Decimal128(4, 1),
             DataType::Decimal128(3, 0),
@@ -338,11 +342,14 @@ fn common_coercion_cannot_borrow_explicit_cast_or_narrowing_profiles() {
             allowed
         );
     }
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
-    let text = FunctionValueType::new(DataType::Utf8, true);
-    for (source, target) in [(&json, &text), (&text, &json)] {
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let binary = FunctionValueType::new(DataType::LargeBinary, true);
+    for (source, target) in [(&json, &binary), (&binary, &json)] {
         assert!(
             !array_common_coercion_types_valid_observed::<std::convert::Infallible>(
                 source,

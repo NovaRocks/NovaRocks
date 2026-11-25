@@ -257,7 +257,7 @@ fn static_comparisons_keep_nullsafe_domains_and_type_only_checks() {
                 for (left, right) in [
                     (
                         ValueType::try_with_logical_type(
-                            DataType::Utf8,
+                            DataType::LargeBinary,
                             false,
                             ValueLogicalType::Json,
                         )
@@ -426,8 +426,12 @@ fn static_unary_null_predicates_preserve_value_demand_and_reject_narrowing() {
                 for input in [
                     boolean(true),
                     integer(true),
-                    ValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                        .unwrap(),
+                    ValueType::try_with_logical_type(
+                        DataType::LargeBinary,
+                        false,
+                        ValueLogicalType::Json,
+                    )
+                    .unwrap(),
                 ] {
                     let (unit, definition) = run(input.clone(), boolean(false)).unwrap();
                     assert_eq!(unit.definition(definition).unwrap().ty, boolean(false));
@@ -465,8 +469,12 @@ fn static_unary_null_predicates_preserve_value_demand_and_reject_narrowing() {
             type_error(run(boolean(true), boolean(false)), "unary expression types");
             for unsupported in [
                 ValueType::new(DataType::Utf8, false),
-                ValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                    .unwrap(),
+                ValueType::try_with_logical_type(
+                    DataType::LargeBinary,
+                    false,
+                    ValueLogicalType::Json,
+                )
+                .unwrap(),
             ] {
                 type_error(run(unsupported, boolean(false)), "unary expression types");
             }

@@ -204,7 +204,7 @@ fn values(
     canonical: bool,
 ) -> [ValueId; 2] {
     let ty = if canonical {
-        FunctionValueType::new(DataType::Utf8, false)
+        FunctionValueType::new(DataType::Binary, false)
     } else {
         int64()
     };
@@ -229,10 +229,10 @@ fn values(
                             node,
                             ty.clone(),
                             if canonical {
-                                crate::test_constants::utf8(
+                                crate::test_constants::binary(
                                     constants,
                                     &ty,
-                                    &cell.to_string(),
+                                    &cell.to_be_bytes(),
                                     options().constants,
                                 )
                             } else {
@@ -295,7 +295,7 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
         }
     );
     let key_ty = if canonical {
-        FunctionValueType::new(DataType::Utf8, false)
+        FunctionValueType::new(DataType::Binary, false)
     } else {
         int64()
     };

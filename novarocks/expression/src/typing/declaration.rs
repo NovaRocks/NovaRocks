@@ -304,7 +304,7 @@ fn resolve_leaf(
             (ValueKind::Temporal(temporal), temporal.carrier())
         }
         "varbinary" => (ValueKind::Binary, Binary),
-        "json" => (ValueKind::Nominal(ValueLogicalType::Json), Utf8),
+        "json" => (ValueKind::Nominal(ValueLogicalType::Json), LargeBinary),
         "uuid" => (
             ValueKind::Nominal(ValueLogicalType::Uuid),
             FixedSizeBinary(16),

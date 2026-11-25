@@ -369,14 +369,19 @@ fn source_type_requires_exact_nullable_nested_metadata_and_nominal_identity() {
         })
         .unwrap();
     }
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     table
         .insert(
             ConstantPoolId::new(2),
             pool(
-                Arc::new(StringArray::from(vec!["x"])),
+                Arc::new(arrow_array::LargeBinaryArray::from(vec![
+                    b"\x01\x20".as_slice(),
+                ])),
                 json.clone(),
                 Arc::new(json.try_to_field("literal").unwrap()),
             ),
@@ -385,7 +390,7 @@ fn source_type_requires_exact_nullable_nested_metadata_and_nominal_identity() {
     assert_eq!(
         completed(&Control::good(), |w| table.resolve_observed(
             reference(2, 0),
-            &FunctionValueType::new(DataType::Utf8, false),
+            &FunctionValueType::new(DataType::LargeBinary, false),
             w
         ))
         .unwrap_err(),

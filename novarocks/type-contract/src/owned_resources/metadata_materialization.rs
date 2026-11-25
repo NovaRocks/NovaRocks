@@ -607,7 +607,7 @@ mod value_field_author_tests {
     fn legacy_value_field_receipt_matches_the_actual_source_author() {
         for domain in [ValueLogicalType::Json, ValueLogicalType::Hll] {
             let carrier = if domain == ValueLogicalType::Json {
-                DataType::Utf8
+                DataType::LargeBinary
             } else {
                 DataType::Binary
             };

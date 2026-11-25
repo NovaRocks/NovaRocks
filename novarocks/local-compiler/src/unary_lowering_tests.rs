@@ -928,8 +928,12 @@ fn physical_unary_type_and_control_contradictions_cannot_publish_a_local_program
     // Numeric physical NOT is supported; raw text and nominal JSON are not.
     for input_type in [
         FunctionValueType::new(DataType::Utf8, true),
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap(),
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
     ] {
         assert!(match fixture(
             &functions,

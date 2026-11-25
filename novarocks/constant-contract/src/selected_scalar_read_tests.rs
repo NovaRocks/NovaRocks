@@ -126,7 +126,10 @@ fn exact_utf8_carriers_borrow_selected_nonzero_ordinal_and_slice_without_reautho
 #[test]
 fn borrowed_utf8_distinguishes_null_from_wrong_nominal_carrier_and_dictionary() {
     let json = pool(
-        Arc::new(StringArray::from(vec![Some("{}"), None])),
+        Arc::new(arrow_array::LargeBinaryArray::from(vec![
+            Some(b"\x01\x20".as_slice()),
+            None,
+        ])),
         ValueLogicalType::Json,
     );
     let integers = pool(

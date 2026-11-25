@@ -55,6 +55,7 @@ message SourceArrowFieldFacts {
 enum LogicalType {
   LOGICAL_TYPE_UNSPECIFIED = 0;
   LOGICAL_TYPE_PHYSICAL = 1;
+  // In plan contract revision 45 and later, JSON uses native v1 in LargeBinary.
   LOGICAL_TYPE_JSON = 2;
   LOGICAL_TYPE_VARIANT = 3;
   LOGICAL_TYPE_HLL = 4;

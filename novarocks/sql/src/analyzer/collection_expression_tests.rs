@@ -80,9 +80,12 @@ fn json_list_target() -> novarocks_type_contract::FunctionValueType {
         FunctionValueType, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
         ValueTypeStorageLifetime,
     };
-    let item =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let item = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let value = ValueTypeRef::try_new(
         ValueKind::List(item.value_type().clone()),
         true,

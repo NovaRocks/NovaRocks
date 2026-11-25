@@ -1,17 +1,17 @@
 -- query 1
 -- types	boolean
 included
-false
+true
 
 -- query 2
 -- types	boolean
 included
-false
+true
 
 -- query 3
 -- types	boolean
 included
-false
+true
 
 -- query 4
 -- types	boolean
@@ -31,7 +31,7 @@ true
 -- query 7
 -- types	boolean
 included
-false
+true
 
 -- query 8
 -- types	boolean
@@ -46,7 +46,7 @@ false
 -- query 10
 -- types	boolean
 included
-true
+false
 
 -- query 11
 -- types	boolean
@@ -101,7 +101,7 @@ false
 -- query 21
 -- types	boolean
 included
-false
+true
 
 -- query 22
 -- types	boolean
@@ -111,9 +111,49 @@ true
 -- query 23
 -- types	boolean
 included
-true
+false
 
 -- query 24
+-- types	boolean
+included
+true
+
+-- query 25
+-- types	boolean
+included
+true
+
+-- query 26
+-- types	boolean
+included
+true
+
+-- query 27
+-- types	boolean
+included
+false
+
+-- query 28
+-- types	boolean
+included
+true
+
+-- query 29
+-- types	boolean
+included
+true
+
+-- query 30
+-- types	boolean
+included
+true
+
+-- query 31
+-- types	boolean
+included
+true
+
+-- query 32
 -- types	boolean
 included
 true

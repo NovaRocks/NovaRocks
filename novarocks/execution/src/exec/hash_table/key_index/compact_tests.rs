@@ -1199,9 +1199,12 @@ fn nominal_byte_fixture(
     second: &[u8],
 ) -> (Vec<ArrayRef>, Vec<FunctionValueType>, Vec<usize>) {
     use novarocks_type_contract::ValueLogicalType;
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let hll = FunctionValueType::try_with_logical_type(
         if dictionary {
             DataType::LargeBinary
@@ -1621,9 +1624,12 @@ fn nominal_raw_byte_compaction_retains_the_actual_old_creator_until_the_last_buf
         }
     }
     let (owner, tracker) = owner_with_tracker();
-    let ty =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let ty = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let spec = KeySpec::new(
         std::slice::from_ref(&ty),
         &[NullPolicy::Equal],

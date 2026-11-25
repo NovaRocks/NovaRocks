@@ -31,7 +31,7 @@ grep -E '^IRU9_(SHREDDED_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
 -- query 2
 -- @expect_error_tier=drift
 -- @expect_error=Iceberg Variant writes are not supported
-INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} VALUES ROW(9,parse_json('1'));
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} VALUES ROW(9,json_parse('1'));
 
 -- query 3
 -- @expect_error_tier=drift

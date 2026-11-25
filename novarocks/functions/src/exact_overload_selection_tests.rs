@@ -330,7 +330,7 @@ fn exact_overload_identity_kind_result_and_domain_failures_remain_explicit() {
     );
     let nominal = [FunctionArgument::Value {
         value_type: FunctionValueType::try_with_logical_type(
-            DataType::Utf8,
+            DataType::LargeBinary,
             false,
             novarocks_type_contract::ValueLogicalType::Json,
         )

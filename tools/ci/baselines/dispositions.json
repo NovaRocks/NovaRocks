@@ -905,20 +905,20 @@
       "unit": "sql-case:project/project_cast_json_to_map",
       "failure": {
         "class": "error_code",
-        "code": "query.execution.unsupported"
+        "code": "sql.analyze.unsupported_expression"
       },
-      "reason": "Unsupported compiled cast from: Utf8, to: Map(Field { name: \"entries\", data_type: Struct([Field { name: \"key\", data_type: Utf8 }, Field { name: \"value\", data_type: Utf8, nullable: true }]) }, false); owner B7, B8, I1, I5; remove after capability repair and native verification Native b722 and TST-G9b1 c30 both refuse unchanged step 3; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "B7, B8, I1, I5",
+      "reason": "F6 native 1FE+3BE preview completed catalog and server cleanup. Step 3 first refused the exact JSON to MAP conversion at analysis with sql.analyze.unsupported_expression on the nominal JSON input. Native b722 and TST-G9b1 c30 first refused step 3 during compiled execution, when the value used the former Utf8 carrier. B7e owns the deferred conversion. Keep all original expected results and the unexecuted suffix and remove only after the complete original case and actual cleanup pass.",
+      "owner": "UEA-5E B7e",
       "expires": "2026-12-15"
     },
     {
       "unit": "sql-case:project/project_cast_json_to_struct",
       "failure": {
         "class": "error_code",
-        "code": "query.execution.unsupported"
+        "code": "sql.analyze.unsupported_expression"
       },
-      "reason": "Unsupported compiled cast from: Utf8, to: Struct([Field { name: \"col1\", data_type: Int32, nullable: true }, Field { name: \"col2\", data_type: Int32, nullable: true }, Field { name: \"col3\", data_type: Int32, nullable: true }]); owner B7, B8, I1, I5; remove after capability repair and native verification Native b722 and TST-G9b1 c30 both refuse unchanged step 1; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "B7, B8, I1, I5",
+      "reason": "F6 native 1FE+3BE preview completed catalog and server cleanup. Step 1 first refused the exact JSON to ROW conversion at analysis with sql.analyze.unsupported_expression on the nominal JSON input. Native b722 and TST-G9b1 c30 first refused step 1 during compiled execution, when the value used the former Utf8 carrier. B7e owns the deferred conversion. Keep all original expected results and the unexecuted suffix and remove only after the complete original case and actual cleanup pass.",
+      "owner": "UEA-5E B7e",
       "expires": "2026-12-15"
     },
     {

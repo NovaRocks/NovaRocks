@@ -220,7 +220,7 @@ fn encode_type(
             out.time_zone = timezone.clone();
             K::Timestamp
         }
-        NativeRenderType::Json => K::Json,
+        NativeRenderType::Json => K::NativeJson,
         NativeRenderType::Variant => K::Variant,
         NativeRenderType::Opaque(kind) => {
             out.opaque_kind = match kind {
@@ -562,7 +562,7 @@ fn decode_type(
             unit: decode_time_unit(src.time_unit, path.clone())?,
             timezone: src.time_zone.clone(),
         },
-        K::Json => NativeRenderType::Json,
+        K::NativeJson => NativeRenderType::Json,
         K::Variant => NativeRenderType::Variant,
         K::Opaque => NativeRenderType::Opaque(match wire::OpaqueKind::try_from(src.opaque_kind) {
             Ok(wire::OpaqueKind::Hll) => OpaqueRenderType::Hll,
@@ -634,6 +634,29 @@ mod schema_tests {
                 .character_length = None;
             assert!(decode_client_schema(&encoded, 1, path()).is_err());
         }
+    }
+
+    #[test]
+    fn native_json_uses_its_own_render_kind() {
+        let schema = ClientRenderSchema::try_new(
+            ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
+            vec![col(
+                0,
+                NativeRenderType::Json,
+                RenderPresentation::TrinoValue,
+            )],
+            1,
+        )
+        .unwrap();
+        let mut encoded = encode_client_schema(&schema);
+        let path = || FieldPath::root("schema");
+        assert_eq!(
+            encoded.field_nodes[0].native_type.as_ref().unwrap().kind,
+            wire::RenderTypeKind::NativeJson as i32
+        );
+        assert_eq!(decode_client_schema(&encoded, 1, path()).unwrap(), schema);
+        encoded.field_nodes[0].native_type.as_mut().unwrap().kind = 14;
+        assert!(decode_client_schema(&encoded, 1, path()).is_err());
     }
     #[test]
     fn trino_facts_round_trip_and_missing_or_retired_wire_values_are_refused() {

@@ -551,10 +551,9 @@ fn null_list_json_types() -> (ArrayRef, FunctionValueType, FunctionValueType) {
     // must retain that exact canonical Field, not interpret these annotations.
     let layout = ValueLayout::try_new(
         &DataType::List(Arc::new(
-            Field::new("source_annotation", DataType::Utf8, true).with_metadata(HashMap::from([(
-                "custom".into(),
-                "must not author a nominal identity".into(),
-            )])),
+            Field::new("source_annotation", DataType::LargeBinary, true).with_metadata(
+                HashMap::from([("custom".into(), "must not author a nominal identity".into())]),
+            ),
         )),
         storage,
     )
@@ -570,7 +569,7 @@ fn json_null_lists(target: &FunctionValueType, offsets: Vec<i32>, roots: Vec<boo
     Arc::new(ListArray::new(
         field.clone(),
         OffsetBuffer::new(ScalarBuffer::from(offsets)),
-        Arc::new(StringArray::from(vec![None::<&str>; elements])),
+        arrow_array::new_null_array(field.data_type(), elements),
         Some(NullBuffer::from(roots)),
     ))
 }
@@ -578,11 +577,12 @@ fn json_null_lists(target: &FunctionValueType, offsets: Vec<i32>, roots: Vec<boo
 #[test]
 fn null_list_to_json_or_utf8_keeps_actual_rows_and_nonzero_constant_ordinal() {
     let (input, source, target) = null_list_json_types();
-    let physical = FunctionValueType::new(target.data_type().clone(), target.nullable());
-    assert_eq!(physical.data_type(), target.data_type());
-    assert_ne!(
-        physical, target,
-        "the identical UTF8 layout does not erase JSON identity"
+    let ordinary_binary = FunctionValueType::new(target.data_type().clone(), target.nullable());
+    assert_eq!(ordinary_binary.data_type(), target.data_type());
+    assert_ne!(ordinary_binary, target);
+    let physical = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        target.nullable(),
     );
     for target in [target, physical] {
         let domain = target.child_at(0).unwrap().logical_type();
@@ -732,13 +732,16 @@ fn null_list_to_json_or_utf8_keeps_exact_profile_journal_and_original_refusals()
         )
         .unwrap(),
         ValueLayout::try_new(
-            &DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            &DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, false))),
             storage,
         )
         .unwrap(),
     )
     .unwrap();
-    let physical = FunctionValueType::new(target.data_type().clone(), true);
+    let physical = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        true,
+    );
     let required_physical = FunctionValueType::new(
         DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
         true,

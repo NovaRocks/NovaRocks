@@ -192,7 +192,9 @@ impl FailureProjection for crate::physical_constant_v2::PhysicalConstantCodecErr
             Self::Type(source) => source.failure_fact(),
             Self::Reader(source) => source.failure_fact(),
             Self::Reference(source) => source.failure_fact(),
-            Self::InvalidShape(_) => CodecReason::ConstantShape.fact(FailureClass::Data),
+            Self::InvalidShape(_) | Self::JsonValue(_) => {
+                CodecReason::ConstantShape.fact(FailureClass::Data)
+            }
         }
     }
 }

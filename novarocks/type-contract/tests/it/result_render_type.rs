@@ -58,3 +58,34 @@ fn uuid_render_declaration_authenticates_the_nominal_type_and_width() {
         false
     ));
 }
+
+#[test]
+fn native_json_render_requires_its_own_large_binary_declaration() {
+    let render = RenderField {
+        native_type: NativeRenderType::Json,
+        nullable: true,
+        presentation: RenderPresentation::TrinoValue,
+    };
+    for (logical, valid) in [
+        (ValueLogicalType::Json, true),
+        (ValueLogicalType::Variant, false),
+        (ValueLogicalType::Physical, false),
+    ] {
+        let declaration =
+            FunctionValueType::try_with_logical_type(DataType::LargeBinary, true, logical).unwrap();
+        assert_eq!(
+            render_field_matches_declaration(&render, &declaration),
+            valid
+        );
+    }
+    assert!(!render_field_matches_storage(
+        &render,
+        &DataType::Utf8,
+        true
+    ));
+    assert!(!render_field_matches_storage(
+        &render,
+        &DataType::Binary,
+        true
+    ));
+}

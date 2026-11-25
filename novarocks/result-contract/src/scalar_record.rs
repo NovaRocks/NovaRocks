@@ -43,6 +43,7 @@
 
 use crate::scalar_leaf::{
     ABSENT, CONTAINER_LIST, CONTAINER_MAP, CONTAINER_STRUCT, NULL, decimal_in_range,
+    native_json_payload,
 };
 use crate::{
     BorrowedScalarLeaf, SCALAR_LEAF_HEADER_BYTES, ScalarField, ScalarLeafCursor, ScalarLeafError,
@@ -203,7 +204,7 @@ pub enum ScalarValue {
         ticks: i64,
         unit: ScalarTimestampUnit,
     },
-    Json(String),
+    Json(Vec<u8>),
     Variant(Vec<u8>),
     Opaque {
         kind: ScalarOpaqueType,
@@ -221,10 +222,11 @@ impl ScalarValue {
     ) -> Result<Self, ScalarLeafError> {
         use BorrowedScalarLeaf as L;
         match leaf {
-            L::String(value) | L::Json(value) => owned.reserve::<u8>(value.len())?,
-            L::Binary(value) | L::Variant(value) | L::Opaque { bytes: value, .. } => {
-                owned.reserve::<u8>(value.len())?
-            }
+            L::String(value) => owned.reserve::<u8>(value.len())?,
+            L::Json(value)
+            | L::Binary(value)
+            | L::Variant(value)
+            | L::Opaque { bytes: value, .. } => owned.reserve::<u8>(value.len())?,
             _ => {}
         }
         Ok(match leaf {
@@ -257,7 +259,7 @@ impl ScalarValue {
             L::Date(days) => Self::Date(days),
             L::TimeMicros(ticks) => Self::TimeMicros(ticks),
             L::Timestamp { ticks, unit } => Self::Timestamp { ticks, unit },
-            L::Json(value) => Self::Json(value.to_owned()),
+            L::Json(value) => Self::Json(value.to_vec()),
             L::Variant(value) => Self::Variant(value.to_vec()),
             L::Opaque { kind, bytes } => Self::Opaque {
                 kind,
@@ -447,21 +449,22 @@ impl<'a> Reader<'a> {
                 ticks: i64::from_le_bytes(self.take(8)?.try_into().unwrap()),
                 unit: *unit,
             },
-            T::String | T::Json => {
+            T::String => {
                 let len = self.u32()?;
                 let text = std::str::from_utf8(self.take(len)?).map_err(|_| malformed)?;
                 self.owned.reserve::<u8>(len)?;
-                match &field.value_type {
-                    T::String => ScalarValue::String(text.to_owned()),
-                    _ => ScalarValue::Json(text.to_owned()),
-                }
+                ScalarValue::String(text.to_owned())
             }
-            T::Binary | T::Variant | T::Opaque(_) => {
+            T::Json | T::Binary | T::Variant | T::Opaque(_) => {
                 let len = self.u32()?;
                 let source = self.take(len)?;
+                if matches!(field.value_type, T::Json) {
+                    native_json_payload(source)?;
+                }
                 self.owned.reserve::<u8>(len)?;
                 let bytes = source.to_vec();
                 match &field.value_type {
+                    T::Json => ScalarValue::Json(bytes),
                     T::Binary => ScalarValue::Binary(bytes),
                     T::Variant => ScalarValue::Variant(bytes),
                     T::Opaque(kind) => ScalarValue::Opaque { kind: *kind, bytes },
@@ -860,8 +863,9 @@ mod tests {
 
     fn owned_bytes(value: &ScalarValue) -> usize {
         match value {
-            ScalarValue::String(value) | ScalarValue::Json(value) => value.capacity(),
-            ScalarValue::Binary(value)
+            ScalarValue::String(value) => value.capacity(),
+            ScalarValue::Json(value)
+            | ScalarValue::Binary(value)
             | ScalarValue::Variant(value)
             | ScalarValue::Opaque { bytes: value, .. } => value.capacity(),
             ScalarValue::List(values) | ScalarValue::Struct(values) => {
@@ -898,9 +902,12 @@ mod tests {
             .unwrap();
             for extra in [0, 1] {
                 let text = "x".repeat(exact_bytes + extra);
+                let mut json = vec![1, 0x44, u8::try_from(text.len() - 3).unwrap()];
+                assert!(json[2] < 128);
+                json.resize(text.len(), b'x');
                 let leaf = match value_type {
                     ScalarValueType::String => BorrowedScalarLeaf::String(&text),
-                    ScalarValueType::Json => BorrowedScalarLeaf::Json(&text),
+                    ScalarValueType::Json => BorrowedScalarLeaf::Json(&json),
                     ScalarValueType::Binary => BorrowedScalarLeaf::Binary(text.as_bytes()),
                     ScalarValueType::Variant => BorrowedScalarLeaf::Variant(text.as_bytes()),
                     ScalarValueType::Opaque(kind) => BorrowedScalarLeaf::Opaque {

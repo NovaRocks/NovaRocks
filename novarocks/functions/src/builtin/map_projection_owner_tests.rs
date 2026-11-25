@@ -134,7 +134,8 @@ fn map_parts_actual_generic_declarations_freeze_logical_child_and_real_result_fi
                 )
                 .unwrap(),
                 ValueLogicalType::Json => {
-                    FunctionValueType::try_with_logical_type(DataType::Utf8, true, logical).unwrap()
+                    FunctionValueType::try_with_logical_type(DataType::LargeBinary, true, logical)
+                        .unwrap()
                 }
                 _ => FunctionValueType::new(DataType::Int32, true),
             };

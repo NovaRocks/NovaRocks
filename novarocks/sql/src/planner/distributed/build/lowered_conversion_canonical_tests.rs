@@ -54,7 +54,7 @@ fn assert_selection(
         "conversion's original parameter shape"
     );
     assert!(matches!(&captured.request().arguments[0],
-        FunctionArgument::Value { value_type, constant: None } if value_type == &json(false)));
+        FunctionArgument::Value { value_type, constant: None } if value_type == &largeint(false)));
     assert_eq!(captured.request().logical_argument_count, 1);
 }
 
@@ -64,7 +64,7 @@ fn canonical_conversion_constant_none_intermediate_target_and_following_cast_are
         (false, DecimalOverflowPolicy::ReportError),
         (true, DecimalOverflowPolicy::OutputNull),
     ] {
-        let input = selected_json();
+        let input = selected_largeint();
         let ExprKind::Constant(original) = &input.kind else {
             unreachable!()
         };
@@ -92,14 +92,14 @@ fn canonical_conversion_constant_none_intermediate_target_and_following_cast_are
         assert_eq!(receipt.captured().constant_policy(), policy());
         let actual = source_constant(&owner, unit_node, receipt.arguments()[0]);
         assert_eq!(actual.ordinal(), 1);
-        assert_eq!(actual.try_utf8().unwrap(), Some("{\"kept\":7}"));
-        assert_eq!(actual.value_type(), &json(false));
+        assert_eq!(actual.try_largeint().unwrap(), Some(7));
+        assert_eq!(actual.value_type(), &largeint(false));
         assert!(Arc::ptr_eq(actual.pool().array(), original.pool().array()));
         assert!(Arc::ptr_eq(
             actual.pool().field_ref(),
             original.pool().field_ref()
         ));
-        assert_eq!(actual.pool().field_ref().name(), "original_json");
+        assert_eq!(actual.pool().field_ref().name(), "original_largeint");
         assert_eq!(
             actual
                 .pool()
@@ -107,7 +107,7 @@ fn canonical_conversion_constant_none_intermediate_target_and_following_cast_are
                 .metadata()
                 .get(NR_LOGICAL_TYPE_KEY)
                 .map(String::as_str),
-            ValueLogicalType::Json.metadata_value()
+            ValueLogicalType::LargeInt.metadata_value()
         );
         let control = Control::default();
         let mut work =
@@ -118,7 +118,7 @@ fn canonical_conversion_constant_none_intermediate_target_and_following_cast_are
         work.finish().unwrap();
         assert!(
             matches!(&operational[0], FunctionArgument::Value { value_type, constant: None }
-            if value_type == &json(false))
+            if value_type == &largeint(false))
         );
         assert_eq!(
             selected.argument_types.as_ref(),
@@ -178,17 +178,17 @@ fn canonical_conversion_raw_lambda_uses_original_lexical_scope_and_none_request(
     // installed HOF/lifecycle capability is inferred from this lexical test.
     let input = TypedExpr {
         kind: ExprKind::LambdaParamRef {
-            name: "json_arg".into(),
+            name: "largeint_arg".into(),
             slot_id: 11,
         },
-        value_type: json(false),
+        value_type: largeint(false),
     };
     let expression = TypedExpr {
         kind: ExprKind::LambdaFunction {
             params: vec![crate::analysis::LambdaParam {
-                name: "json_arg".into(),
+                name: "largeint_arg".into(),
                 slot_id: 11,
-                value_type: json(false),
+                value_type: largeint(false),
             }],
             body: novarocks_parser::ast::AstBox::new(cast(
                 input,
@@ -252,11 +252,11 @@ fn canonical_conversion_raw_lambda_uses_original_lexical_scope_and_none_request(
         unreachable!()
     };
     assert_eq!(entry.arguments.as_ref(), args.as_ref());
-    assert_eq!(parameter_types.as_ref(), &[json(false)]);
+    assert_eq!(parameter_types.as_ref(), &[largeint(false)]);
     let parameter = unit.definition(args[0]).unwrap();
     assert!(matches!(parameter.kind,
         ContractExprKind::LambdaParameter { lambda: scope, ordinal: 0 } if scope == lambda));
-    assert_eq!(parameter.ty, json(false));
+    assert_eq!(parameter.ty, largeint(false));
     assert_eq!(parameter.lambda_scope, Some(lambda));
     validate_expression_source_entry_observed(
         entry,

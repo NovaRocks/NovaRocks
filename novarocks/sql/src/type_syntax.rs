@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn nominal_syntax_uses_authored_domains() {
         for (domain, carrier, spelling) in [
-            (ValueLogicalType::Json, DataType::Utf8, "JSON"),
+            (ValueLogicalType::Json, DataType::LargeBinary, "JSON"),
             (ValueLogicalType::Variant, DataType::LargeBinary, "VARIANT"),
             (ValueLogicalType::Hll, DataType::Binary, "HLL"),
             (ValueLogicalType::Bitmap, DataType::Binary, "BITMAP"),

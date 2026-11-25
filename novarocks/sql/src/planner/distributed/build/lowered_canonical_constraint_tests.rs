@@ -97,13 +97,13 @@ fn explicit_json_text_casts_keep_their_target_and_original_scalar_sources() {
     // with a real table added for this catalog/statistics/provider driver.
     for (sql, nested) in [
         (
-            "SELECT array_agg(JSON_OBJECT('2': 3)) AS j, array_agg(CAST(JSON_OBJECT('2': 3) AS VARCHAR)) AS s FROM orders",
+            "SELECT array_agg(JSON_OBJECT('2' VALUE 3 RETURNING JSON)) AS j, array_agg(CAST(JSON_OBJECT('2' VALUE 3 RETURNING JSON) AS VARCHAR)) AS s FROM orders",
             false,
         ),
         (
             "SELECT CAST(concat(
-                ARRAY[json_object('k': order_key), json_object('m': order_key)],
-                ARRAY[json_object('n': order_key), json_object('p': order_key)]
+                ARRAY[JSON_OBJECT('k' VALUE order_key RETURNING JSON), JSON_OBJECT('m' VALUE order_key RETURNING JSON)],
+                ARRAY[JSON_OBJECT('n' VALUE order_key RETURNING JSON), JSON_OBJECT('p' VALUE order_key RETURNING JSON)]
              ) AS ARRAY(VARCHAR)) AS s FROM orders",
             true,
         ),

@@ -437,11 +437,18 @@ mod typed_tests {
         let exec_exits = Arc::new(AtomicUsize::new(0));
         let shape_exits = Arc::new(AtomicUsize::new(0));
         let public_exits = Arc::new(AtomicUsize::new(0));
-        let binding =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap();
+        let binding = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let execution = ConnectorReadExecutionSchema::try_new(
-            Arc::new(Schema::new(vec![Field::new("scan", DataType::Utf8, false)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "scan",
+                DataType::LargeBinary,
+                false,
+            )])),
             vec![binding.clone()].into(),
             held(&exec_exits),
         )
@@ -449,7 +456,7 @@ mod typed_tests {
         let shape = ConnectorSourceSchemaShape::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "source",
-                DataType::Utf8,
+                DataType::LargeBinary,
                 false,
             )])),
             held(&shape_exits),

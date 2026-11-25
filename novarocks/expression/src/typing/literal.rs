@@ -15,20 +15,83 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::{cell::Cell, sync::Arc};
 
+use arrow::array::{Array, LargeBinaryArray};
+use arrow::buffer::{Buffer, OffsetBuffer};
 use arrow::datatypes::{DataType, Field};
-use novarocks_constant_contract::{ConstantPolicy, ConstantValue};
+use novarocks_constant_contract::{ConstantError, ConstantPolicy, ConstantValue};
 use novarocks_functions::temporal_value::{
     ParsedTemporal, parse_time_literal, parse_timestamp_literal,
 };
-use novarocks_functions::{KernelFailure, validate_trino_json_literal};
+use novarocks_functions::{
+    KernelFailure,
+    json_value::{self, JsonError, JsonWork},
+};
 use novarocks_parser::ast;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, ValueLogicalType,
 };
 
 use super::{CarrierConversion, LiteralValue, TypingError, admit_syntax_constant};
+
+// Compilation admits permanent constant bytes and parser scratch against the
+// original statement's ConstantPolicy, independently of its work checkpoints.
+struct LiteralJsonWork<'a, 'c> {
+    compile: &'a mut CompileCheckpoints<'c>,
+    policy: ConstantPolicy,
+    scratch: &'a Cell<usize>,
+}
+struct LiteralScratch<'a> {
+    live: &'a Cell<usize>,
+    bytes: usize,
+}
+impl Drop for LiteralScratch<'_> {
+    fn drop(&mut self) {
+        self.live.set(self.live.get() - self.bytes);
+    }
+}
+impl<'a> JsonWork for LiteralJsonWork<'a, '_> {
+    type Reservation = LiteralScratch<'a>;
+
+    fn step(&mut self) -> Result<(), KernelFailure> {
+        self.compile.step().map_err(KernelFailure::CompileControl)
+    }
+
+    fn reserve(&mut self, bytes: usize) -> Result<Self::Reservation, KernelFailure> {
+        self.compile
+            .flush()
+            .map_err(KernelFailure::CompileControl)?;
+        let live = self
+            .scratch
+            .get()
+            .checked_add(bytes)
+            .filter(|live| {
+                u64::try_from(*live)
+                    .is_ok_and(|live| live <= self.policy.max_library_validation_bytes)
+            })
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        self.scratch.set(live);
+        Ok(LiteralScratch {
+            live: self.scratch,
+            bytes,
+        })
+    }
+
+    fn reserve_output(&mut self, bytes: usize) -> Result<(), KernelFailure> {
+        self.compile
+            .flush()
+            .map_err(KernelFailure::CompileControl)?;
+        let retained = bytes
+            .checked_add(size_of::<[i64; 2]>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        if retained > self.policy.max_retained_buffer_bytes {
+            return Err(KernelFailure::ResourceExhausted);
+        }
+        Ok(())
+    }
+}
 
 /// The skeleton supplies decoded text and parser-admitted values.
 #[derive(Clone, Copy, Debug)]
@@ -180,25 +243,48 @@ pub(super) fn type_literal(
             }
             if target.logical_type() == ValueLogicalType::Json {
                 work.flush()?;
-                let valid = validate_trino_json_literal(value, work.control()).map_err(
-                    |error| match error {
-                        KernelFailure::CompileControl(error) => TypingError::Control(error),
-                        KernelFailure::ResourceExhausted => {
+                let scratch = Cell::new(0);
+                let mut json_work = LiteralJsonWork {
+                    compile: work,
+                    policy: context.constant_policy,
+                    scratch: &scratch,
+                };
+                let bytes =
+                    json_value::parse(value, &mut json_work).map_err(|error| match error {
+                        JsonError::InvalidText(_) | JsonError::Depth => {
+                            TypingError::InvalidLiteral(error.to_string())
+                        }
+                        JsonError::Host(KernelFailure::CompileControl(error)) => {
+                            TypingError::Control(error)
+                        }
+                        JsonError::Host(KernelFailure::ResourceExhausted) => {
                             TypingError::Control(CompileControlError::ResourceExhausted)
                         }
-                        error => TypingError::JsonLiteralValidation(error),
-                    },
-                )?;
-                if !valid {
-                    return Err(TypingError::InvalidLiteral("Invalid JSON literal".into()));
-                }
-                return TypedLiteral::checked(
-                    LiteralValue::String(value.to_owned()),
-                    target,
+                        JsonError::Host(error) => TypingError::JsonLiteralValidation(error),
+                        JsonError::Value(cause) => {
+                            TypingError::JsonLiteralValidation(KernelFailure::from_domain(cause))
+                        }
+                    })?;
+                let end = i64::try_from(bytes.len())
+                    .map_err(|_| ConstantError::Limit("JSON literal exceeds its Arrow offset"))?;
+                let array = LargeBinaryArray::new(
+                    OffsetBuffer::new(vec![0i64, end].into()),
+                    Buffer::from_vec(bytes),
+                    None,
+                );
+                work.flush()?;
+                let value = ConstantValue::from_scalar_array(
+                    Arc::new(Field::new("literal", DataType::LargeBinary, false)),
+                    target.clone(),
+                    array.to_data(),
                     context.constant_policy,
-                    work,
-                )
-                .map(LiteralEmission::Direct);
+                    CompilePhase::FunctionSpecialization,
+                    work.control(),
+                )?;
+                return Ok(LiteralEmission::Constant {
+                    value_type: target,
+                    value,
+                });
             }
             if target.data_type() == &DataType::Date32 {
                 let days = novarocks_functions::temporal_value::parse_date_literal_observed(

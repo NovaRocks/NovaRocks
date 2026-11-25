@@ -16,12 +16,28 @@
 -- under the License.
 
 -- @tags=iceberg_ddl,default,json,validation
--- Test Objective:
--- 1. Validate JSON DEFAULT with an invalid JSON literal is rejected at ALTER time.
--- 2. Complement to default_json.sql (positive case for JSON DEFAULT).
 
+-- query 1
+-- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.t;
-CREATE TABLE ${case_db}.t (id INT, name VARCHAR) WITH (format_version = 3);
+CREATE TABLE ${case_db}.t (id INT, name VARCHAR) WITH (format_version = 2);
 
--- @expect_error=invalid JSON DEFAULT literal
+-- query 2
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_error=[query.execution.unsupported] Iceberg JSON writes are not supported yet
 ALTER TABLE ${case_db}.t ADD COLUMN meta JSON DEFAULT 'not-a-json';
+
+-- query 3
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_error=column meta.element
+ALTER TABLE ${case_db}.t ADD COLUMN meta ARRAY(JSON) DEFAULT 'not-an-array';
+
+-- query 4
+SELECT count(*) AS rejected_columns
+FROM iceberg_ddl_cat_${suite_uuid0}.information_schema.columns
+WHERE table_schema = '${case_db}' AND table_name = 't' AND column_name = 'meta';
+
+-- query 5
+-- @cleanup=true
+-- @skip_result_check=true
+DROP TABLE IF EXISTS ${case_db}.t;

@@ -45,6 +45,7 @@ use crate::catalog::admission::{
 use crate::catalog::error::CatalogOutcome;
 use crate::catalog::{CatalogCreateIntent, CatalogNamespaceName, CatalogTableName};
 use crate::commit::lower_ref_action;
+use crate::commit::validation::{NewColumnDomain, deny_column_definition, deny_column_definitions};
 use crate::iceberg::spec::{
     FormatVersion, NestedField, PrimitiveType, Schema, StructType, Transform, Type,
     UnboundPartitionField, UnboundPartitionSpecBuilder,
@@ -376,12 +377,12 @@ fn validate_request(
             "Iceberg catalog mutation does not match this control generation",
         ));
     }
-    // New definitions need no table or format-version facts. Keep this before
-    // catalog admission and every read/dispatch, including IF NOT EXISTS.
+    // Preserve the early Variant definition contract, including IF NOT EXISTS.
+    // JSON definitions are rejected only on the actual create/evolution paths.
     match &request.operation {
         ConnectorCatalogMutationOperation::CreateTable { table, columns, .. } => {
             ensure_owner(provider, &table.instance_id)?;
-            crate::commit::validation::deny_variant_column_definitions(
+            deny_column_definitions(
                 columns,
                 &format!(
                     "{}.{}.{}",
@@ -389,6 +390,7 @@ fn validate_request(
                     table.namespace,
                     table.table
                 ),
+                NewColumnDomain::Variant,
             )?;
         }
         ConnectorCatalogMutationOperation::DropTable {
@@ -402,14 +404,8 @@ fn validate_request(
             ensure_owner(provider, &table.instance_id)?;
             for change in changes {
                 if let ConnectorSchemaChange::AddColumn { parent, column, .. } = change {
-                    let path = parent
-                        .segments
-                        .iter()
-                        .map(AsRef::as_ref)
-                        .chain(std::iter::once(column.name.as_ref()))
-                        .collect::<Vec<&str>>()
-                        .join(".");
-                    crate::commit::validation::deny_variant_column_definition(
+                    let path = schema_add_path(parent, &column.name);
+                    deny_column_definition(
                         &column.data_type,
                         &path,
                         &format!(
@@ -418,6 +414,7 @@ fn validate_request(
                             table.namespace,
                             table.table
                         ),
+                        NewColumnDomain::Variant,
                     )?;
                 }
             }
@@ -561,6 +558,7 @@ fn execute_existing_publication(
                         ConnectorCatalogMutationOperation::AlterSchema { changes, .. } => {
                             prepare_schema_change(
                                 provider.runtime(),
+                                table,
                                 &loaded.table,
                                 changes,
                                 &request.context,
@@ -1002,6 +1000,7 @@ pub(in crate::catalog_control) struct CreatePreflightFacts {
     name: String,
     seed: ConnectorCatalogMutationReceipt,
     properties: crate::table_properties::PreparedCreateTableProperties,
+    json_definition: Result<(), ConnectorError>,
 }
 
 fn prepare_create_preflight(
@@ -1023,11 +1022,24 @@ fn prepare_create_preflight(
     let namespace = normalize_identifier(&table.namespace).map_err(invalid)?;
     let name = normalize_identifier(&table.table).map_err(invalid)?;
     let seed = receipt(provider, request.operation_id, request.operation.kind())?;
+    // Collect the declaration fact in the original metadata CPU phase.
+    // Only the absence branch below may consume a type refusal.
+    let json_definition = deny_column_definitions(
+        columns,
+        &format!(
+            "{}.{}.{}",
+            table.instance_id.as_str(),
+            table.namespace,
+            table.table
+        ),
+        NewColumnDomain::Json,
+    );
     Ok(CreatePreflightFacts {
         namespace,
         name,
         seed,
         properties,
+        json_definition,
     })
 }
 
@@ -1117,6 +1129,7 @@ async fn prepare_ordinary_create<R: CreateCatalogReads>(
                         .into())
                     };
                 }
+                facts.json_definition.as_ref().map_err(Clone::clone)?;
                 let target = CatalogTableName::new(facts.namespace.clone(), facts.name.clone());
                 facts.properties.location = reads
                     .create_location(
@@ -2067,6 +2080,7 @@ fn is_engine_namespace(key: &str) -> bool {
 // Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
 fn prepare_schema_change(
     runtime: &IcebergMetadataContext,
+    table: &ConnectorTableIdentity,
     loaded: &crate::iceberg::table::Table,
     changes: &[ConnectorSchemaChange],
     context: &ConnectorRequestContext,
@@ -2081,6 +2095,7 @@ fn prepare_schema_change(
     // Reserved lineage columns are an engine contract rather than observed
     // schema fields, so reject them before any lookup can report them absent.
     reject_reserved_schema_change(change)?;
+    validate_json_schema_definition(metadata.current_schema(), table, change)?;
     if let ConnectorSchemaChange::DropColumn { path } = change {
         let dropped_id = find_field_id(metadata.current_schema().as_struct().fields(), path)?;
         if metadata
@@ -2120,6 +2135,67 @@ fn prepare_schema_change(
         return Err(invalid("Iceberg column defaults require format-version 3"));
     }
     prepare_schema_updates(metadata, change)
+}
+
+fn schema_add_path(parent: &ConnectorColumnPath, name: &str) -> String {
+    parent
+        .segments
+        .iter()
+        .map(AsRef::as_ref)
+        .chain(std::iter::once(name))
+        .collect::<Vec<&str>>()
+        .join(".")
+}
+
+fn validate_json_schema_definition(
+    schema: &Schema,
+    table: &ConnectorTableIdentity,
+    change: &ConnectorSchemaChange,
+) -> Result<(), ConnectorError> {
+    let (data_type, path) = match change {
+        ConnectorSchemaChange::AddColumn { parent, column, .. } => {
+            (&column.data_type, schema_add_path(parent, &column.name))
+        }
+        ConnectorSchemaChange::ModifyColumn { path, data_type } => (
+            data_type,
+            path.segments
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>()
+                .join("."),
+        ),
+        _ => return Ok(()),
+    };
+    let Err(rejection) = deny_column_definition(
+        data_type,
+        &path,
+        &format!(
+            "{}.{}.{}",
+            table.instance_id.as_str(),
+            table.namespace,
+            table.table
+        ),
+        NewColumnDomain::Json,
+    ) else {
+        return Ok(());
+    };
+    let fields = schema.as_struct().fields();
+    match change {
+        ConnectorSchemaChange::AddColumn { parent, column, .. } => {
+            // Use the same observed schema and parent/name rules as the update.
+            let mut siblings = fields.to_vec();
+            for segment in &parent.segments {
+                let index = field_index(&siblings, segment)?;
+                siblings = composite_children(&siblings[index].field_type)?;
+            }
+            validate_new_column_name(&siblings, &column.name)?;
+        }
+        ConnectorSchemaChange::ModifyColumn { path, .. } => {
+            find_field_id(fields, path)?;
+        }
+        _ => unreachable!("only new column definitions can produce a JSON refusal"),
+    }
+    Err(rejection)
 }
 
 /// The commit of one validated schema change against `metadata`, or `None`
@@ -2367,15 +2443,7 @@ fn apply_schema_change(
             column,
             position,
         } => update_parent(fields, &parent.segments, |siblings| {
-            let name = normalize_identifier(&column.name).map_err(invalid)?;
-            if siblings
-                .iter()
-                .any(|field| field.name.eq_ignore_ascii_case(&name))
-            {
-                return Err(already_exists(format!(
-                    "Iceberg column `{name}` already exists"
-                )));
-            }
+            validate_new_column_name(siblings, &column.name)?;
             let id = *next_id;
             *next_id = next_id
                 .checked_add(1)
@@ -2591,6 +2659,19 @@ fn field_index(fields: &[Arc<NestedField>], name: &str) -> Result<usize, Connect
         .iter()
         .position(|field| field.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| not_found(format!("Iceberg column `{name}` does not exist")))
+}
+
+fn validate_new_column_name(fields: &[Arc<NestedField>], name: &str) -> Result<(), ConnectorError> {
+    let name = normalize_identifier(name).map_err(invalid)?;
+    if fields
+        .iter()
+        .any(|field| field.name.eq_ignore_ascii_case(&name))
+    {
+        return Err(already_exists(format!(
+            "Iceberg column `{name}` already exists"
+        )));
+    }
+    Ok(())
 }
 
 fn insert_at_position(
@@ -9462,6 +9543,180 @@ mod tests {
             nullable: true,
             default: None,
         }
+    }
+
+    #[test]
+    fn json_create_and_alter_refuse_only_actual_new_definitions() {
+        use novarocks_spi::connector::ConnectorStructField;
+
+        let (_runtime, _warehouse, provider) = provider();
+        create_namespace(&provider, "atomic");
+        let create =
+            |policy| create_request(&provider, ConnectorMutationOperationId::new(), policy);
+        assert!(matches!(
+            provider
+                .execute(create(CreatePolicy::FailIfExists))
+                .unwrap(),
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                ..
+            }
+        ));
+        let current = || {
+            provider
+                .runtime()
+                .load_table_for_request("atomic", "events", &context())
+                .unwrap()
+                .table
+        };
+        let initial = current();
+        let location = initial.metadata().location();
+        let count = metadata_file_count(location);
+        let assert_refusal = |request, kind, detail: &str| {
+            let outcome = provider.execute(request).unwrap();
+            let ExternalMutationOutcome::KnownUncommitted { failure, cleanup } = outcome else {
+                panic!("expected a known refusal: {outcome:?}");
+            };
+            assert_eq!(failure.kind(), kind);
+            assert!(failure.message().contains(detail), "{failure}");
+            assert_eq!(cleanup, ExternalMutationFinalization::Complete);
+        };
+        let create_json = |policy, name: &'static str, data_type| {
+            let mut request = create(policy);
+            let ConnectorCatalogMutationOperation::CreateTable { table, columns, .. } =
+                &mut request.operation
+            else {
+                unreachable!();
+            };
+            table.table = name.into();
+            *columns = vec![definition_column(data_type)];
+            request
+        };
+        let json = ConnectorDataType::Json;
+        assert!(matches!(
+            provider
+                .execute(create_json(
+                    CreatePolicy::NoOpIfExists,
+                    "events",
+                    json.clone()
+                ))
+                .unwrap(),
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                ..
+            }
+        ));
+        assert_refusal(
+            create_json(CreatePolicy::FailIfExists, "events", json.clone()),
+            ConnectorMutationFailureKind::AlreadyExists,
+            "Iceberg table already exists",
+        );
+
+        for (data_type, path) in [
+            (json.clone(), "payload"),
+            (
+                ConnectorDataType::Array(Box::new(json.clone())),
+                "payload.element",
+            ),
+            (
+                ConnectorDataType::Map(Box::new(json.clone()), Box::new(ConnectorDataType::String)),
+                "payload.key",
+            ),
+            (
+                ConnectorDataType::Map(Box::new(ConnectorDataType::String), Box::new(json.clone())),
+                "payload.value",
+            ),
+            (
+                ConnectorDataType::Struct(vec![ConnectorStructField {
+                    name: "leaf".into(),
+                    data_type: json.clone(),
+                    nullable: true,
+                }]),
+                "payload.leaf",
+            ),
+        ] {
+            assert_refusal(
+                create_json(CreatePolicy::NoOpIfExists, "fresh", data_type),
+                ConnectorMutationFailureKind::Unsupported,
+                &format!(
+                    "Iceberg JSON writes are not supported yet: table ice.atomic.fresh, column {path}"
+                ),
+            );
+        }
+
+        let alter = |change| {
+            let mut request = create(CreatePolicy::FailIfExists);
+            let ConnectorCatalogMutationOperation::CreateTable { table, .. } = request.operation
+            else {
+                unreachable!();
+            };
+            request.operation = ConnectorCatalogMutationOperation::AlterSchema {
+                table,
+                changes: vec![change],
+            };
+            request
+        };
+        let add = |parent: Vec<Arc<str>>, name: &'static str| {
+            alter(ConnectorSchemaChange::AddColumn {
+                parent: ConnectorColumnPath { segments: parent },
+                column: ConnectorColumnDefinition {
+                    name: name.into(),
+                    data_type: json.clone(),
+                    nullable: true,
+                    // A legacy default on a lower format must not mask the
+                    // observed existence or the JSON target refusal.
+                    default: Some(novarocks_spi::connector::ConnectorDefaultValue::String(
+                        "not-json".into(),
+                    )),
+                },
+                position: ConnectorColumnPosition::Default,
+            })
+        };
+        let modify = |name: &'static str| {
+            alter(ConnectorSchemaChange::ModifyColumn {
+                path: ConnectorColumnPath {
+                    segments: vec![name.into()],
+                },
+                data_type: json.clone(),
+            })
+        };
+        assert_refusal(
+            add(vec![], "id"),
+            ConnectorMutationFailureKind::InvalidRequest,
+            "column `id` already exists",
+        );
+        assert_refusal(
+            add(vec!["missing".into()], "payload"),
+            ConnectorMutationFailureKind::NotFound,
+            "column `missing` does not exist",
+        );
+        assert_refusal(
+            add(vec![], "payload"),
+            ConnectorMutationFailureKind::Unsupported,
+            "table ice.atomic.events, column payload",
+        );
+        assert_refusal(
+            modify("missing"),
+            ConnectorMutationFailureKind::NotFound,
+            "column `missing` does not exist",
+        );
+        assert_refusal(
+            modify("id"),
+            ConnectorMutationFailureKind::Unsupported,
+            "table ice.atomic.events, column id",
+        );
+        let after = current();
+        assert_eq!(after.metadata(), initial.metadata());
+        assert_eq!(metadata_file_count(location), count);
+        assert_eq!(
+            provider
+                .runtime()
+                .load_table_classified_for_request("atomic", "fresh", &context())
+                .err()
+                .expect("JSON CREATE must leave no table")
+                .0,
+            ConnectorErrorKind::NotFound
+        );
     }
 
     fn variant_definitions() -> Vec<(ConnectorDataType, &'static str)> {

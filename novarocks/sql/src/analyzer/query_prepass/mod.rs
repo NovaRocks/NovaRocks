@@ -128,12 +128,6 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                         list.span,
                     ));
                 }
-                Expr::JsonConstructor(_) => {
-                    self.0 = Some(AnalyzeError::unsupported_expression(
-                        "SQL/JSON constructor is not supported",
-                        expression.span(),
-                    ));
-                }
                 Expr::JsonExists(_) => {
                     self.0 = Some(AnalyzeError::unsupported_expression(
                         "JSON_EXISTS is not supported",
@@ -145,24 +139,6 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                         "JSON_VALUE is not supported",
                         expression.span(),
                     ))
-                }
-                Expr::JsonSerialize(_) => {
-                    self.0 = Some(AnalyzeError::unsupported_expression(
-                        "JSON_SERIALIZE is not supported",
-                        expression.span(),
-                    ))
-                }
-                Expr::JsonObject(node) if !super::is_supported_json_object_profile(node) => {
-                    self.0 = Some(AnalyzeError::unsupported_expression(
-                        "JSON_OBJECT clauses are not supported by the existing function",
-                        node.span,
-                    ));
-                }
-                Expr::JsonArray(node) if !super::is_supported_json_array_profile(node) => {
-                    self.0 = Some(AnalyzeError::unsupported_expression(
-                        "JSON_ARRAY clauses are not supported by the existing function",
-                        node.span,
-                    ));
                 }
                 Expr::JsonQuery(node) if !super::is_plain_json_query(node) => {
                     self.0 = Some(AnalyzeError::unsupported_expression(

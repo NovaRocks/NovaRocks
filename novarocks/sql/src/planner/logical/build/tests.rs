@@ -3288,8 +3288,8 @@ fn plan_exists_subquery_expr_is_boolean_colref() {
 fn array_agg_json_project_retains_semantics_above_exact_aggregate_slots() {
     use novarocks_type_contract::ValueLogicalType;
     for sql in [
-        "select array_agg(json_object('k':1)) as j, array_agg(cast(json_object('k':1) as varchar)) as s",
-        "select array_agg(json_object('k':1) order by a) as j, array_agg(cast(json_object('k':1) as varchar)) as s from t",
+        "select array_agg(json_object('k': 1 RETURNING JSON)) as j, array_agg(json_object('k':1)) as s",
+        "select array_agg(json_object('k': 1 RETURNING JSON) order by a) as j, array_agg(json_object('k':1)) as s from t",
     ] {
         let plan = plan_test_query(sql);
         let (project, aggregate) = root_project_over_aggregate(&plan);
@@ -3442,12 +3442,12 @@ fn m07_aggregate_symbol_rewrites_keep_original_output_domains() {
     for (sql, domain) in [
         ("select any_value(CAST(NULL AS UUID)) from orders", S::Uuid),
         ("select any_value(CAST(NULL AS JSON)) from orders", S::Json),
-        ("select any_value(parse_json('{}')) from orders", S::Json),
+        ("select any_value(json_parse('{}')) from orders", S::Json),
     ] {
         assert_m07_planned_domains(sql, vec![Some(domain)]);
     }
     assert_m07_planned_domains(
-        "select o_custkey,any_value(CAST(NULL AS UUID)) as u,any_value(CAST(NULL AS JSON)) as j,any_value(parse_json('{}')) as p from orders group by o_custkey",
+        "select o_custkey,any_value(CAST(NULL AS UUID)) as u,any_value(CAST(NULL AS JSON)) as j,any_value(json_parse('{}')) as p from orders group by o_custkey",
         vec![None, Some(S::Uuid), Some(S::Json), Some(S::Json)],
     );
     assert_m07_planned_domains(
@@ -3489,7 +3489,7 @@ fn m07_aggregate_symbol_rewrites_keep_original_output_domains() {
 fn m07_duplicate_and_window_projections_keep_complete_source_witnesses() {
     use novarocks_types::schema::SqlType as S;
     assert_m07_planned_domains(
-        "select parse_json('{}') as x,parse_json('{}') as y",
+        "select json_parse('{}') as x,json_parse('{}') as y",
         vec![Some(S::Json); 2],
     );
     assert_m07_planned_domains(
@@ -3497,22 +3497,22 @@ fn m07_duplicate_and_window_projections_keep_complete_source_witnesses() {
         vec![None; 2],
     );
     assert_m07_planned_domains(
-        "select array_agg(parse_json('{}')) as x,array_agg(parse_json('{}')) as y from orders",
+        "select array_agg(json_parse('{}')) as x,array_agg(json_parse('{}')) as y from orders",
         vec![Some(S::Array(Box::new(S::Json))); 2],
     );
     assert_m07_planned_domains(
         "SELECT
-            concat(ARRAY[json_object('k': o_orderkey), json_object('m': o_orderkey)],
-                   ARRAY[json_object('n': o_orderkey), json_object('p': o_orderkey)]) AS x,
-            concat(ARRAY[json_object('k': o_orderkey), json_object('m': o_orderkey)],
-                   ARRAY[json_object('n': o_orderkey), json_object('p': o_orderkey)]) AS y
+            concat(ARRAY[json_object('k': o_orderkey RETURNING JSON), json_object('m': o_orderkey RETURNING JSON)],
+                   ARRAY[json_object('n': o_orderkey RETURNING JSON), json_object('p': o_orderkey RETURNING JSON)]) AS x,
+            concat(ARRAY[json_object('k': o_orderkey RETURNING JSON), json_object('m': o_orderkey RETURNING JSON)],
+                   ARRAY[json_object('n': o_orderkey RETURNING JSON), json_object('p': o_orderkey RETURNING JSON)]) AS y
          FROM orders",
         vec![Some(S::Array(Box::new(S::Json))); 2],
     );
     // Exercise the duplicate-ID builder path with an actual analyzer-owned
     // JSON expression; no window producer domain is inferred by this fixture.
     let (resolved, _, mut factory) =
-        parse_analyze_query("select parse_json('{}') as x,parse_json('{}') as y").unwrap();
+        parse_analyze_query("select json_parse('{}') as x,json_parse('{}') as y").unwrap();
     let QueryBody::Select(mut select) = resolved.body else {
         panic!("expected select");
     };
@@ -3636,7 +3636,7 @@ fn m07_same_value_transfer_checks_carrier_nullability_and_existing_facts() {
 #[test]
 fn flattened_union_spine_keeps_each_original_complete_declaration() {
     let (resolved, registry, mut factory) = parse_analyze_query(
-        "SELECT 1 AS n, json_object('k':1) AS j UNION ALL SELECT 2, json_object('k':2) UNION ALL SELECT 3, NULL",
+        "SELECT 1 AS n, json_object('k': 1 RETURNING JSON) AS j UNION ALL SELECT 2, json_object('k': 2 RETURNING JSON) UNION ALL SELECT 3, NULL",
     ).unwrap();
     let mut original_layers = Vec::new();
     let mut query = &resolved;
@@ -3690,7 +3690,7 @@ fn flattened_union_spine_keeps_each_original_complete_declaration() {
 #[test]
 fn json_mark_probe_is_materialized_after_its_aggregate() {
     let plan = parse_analyze_and_plan_apply(
-        "select count(*) from orders having false or parse_json(cast(max(o_orderkey) as varchar)) in (select parse_json('1'))"
+        "select count(*) from orders having false or json_parse(cast(max(o_orderkey) as varchar)) in (select json_parse('1'))"
     ).expect("HAVING mark plan");
     fn find(plan: &LogicalPlanNode) -> Option<&LogicalPlanNode> {
         if matches!(&plan.kind, LogicalPlanKind::Join(j) if matches!(j.join_type, JoinKind::LeftMark { .. }))
@@ -3729,7 +3729,7 @@ fn json_mark_probe_is_materialized_after_its_aggregate() {
         unreachable!()
     };
     let ExprKind::FunctionCall { args, .. } = &probe.items.last().unwrap().expr.kind else {
-        panic!("parse_json probe");
+        panic!("json_parse probe");
     };
     let ExprKind::Cast { expr, .. } = &args[0].kind else {
         panic!("aggregate value conversion");

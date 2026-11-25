@@ -22,7 +22,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, Int32Array, Int64Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
+    ArrayRef, Int32Array, Int64Array, LargeBinaryArray, ListArray, MapArray, RecordBatch,
+    StringArray, StructArray,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::{DataType, Field, Fields};
@@ -254,8 +255,9 @@ fn struct_with_nested_list_and_null_member_round_trips() {
 #[test]
 fn nested_json_leaf_requires_its_logical_metadata() {
     let schema = schema(list_of(leaf(true, ScalarValueType::Json), true));
+    let json = b"\x01\x80\x08\x01\x01a\x4a\x01\x00\x00\x00";
     let make = |metadata: bool| {
-        let mut item = Field::new("item", DataType::Utf8, true);
+        let mut item = Field::new("item", DataType::LargeBinary, true);
         if metadata {
             item = item.with_metadata(std::collections::HashMap::<String, String>::from([(
                 NR_LOGICAL_TYPE_KEY.to_string(),
@@ -264,8 +266,12 @@ fn nested_json_leaf_requires_its_logical_metadata() {
         }
         let list = ListArray::try_new(
             Arc::new(item),
-            OffsetBuffer::from_lengths([1]),
-            Arc::new(StringArray::from(vec!["{\"a\":1}"])),
+            OffsetBuffer::from_lengths([3]),
+            Arc::new(LargeBinaryArray::from(vec![
+                Some(json.as_slice()),
+                None,
+                Some(b"\x01\x20".as_slice()),
+            ])),
             None,
         )
         .unwrap();
@@ -273,9 +279,11 @@ fn nested_json_leaf_requires_its_logical_metadata() {
     };
     assert_eq!(
         encode(&make(true), &schema).unwrap(),
-        ScalarRecord::Value(ScalarValue::List(vec![ScalarValue::Json(
-            "{\"a\":1}".into()
-        )]))
+        ScalarRecord::Value(ScalarValue::List(vec![
+            ScalarValue::Json(json.to_vec()),
+            ScalarValue::Null,
+            ScalarValue::Json(vec![1, 0x20]),
+        ]))
     );
     assert!(matches!(
         NativeScalarContainerEncoder::try_encode(&make(false), &schema, prepaid()),

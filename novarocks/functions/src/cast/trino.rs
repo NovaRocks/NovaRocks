@@ -71,7 +71,7 @@ pub(super) enum Numeric {
 }
 
 impl Numeric {
-    fn from_kind(value: &ValueKind) -> Option<Self> {
+    pub(super) fn from_kind(value: &ValueKind) -> Option<Self> {
         let ValueKind::Scalar(value) = value else {
             return None;
         };
@@ -274,7 +274,7 @@ fn prepare_value(
 ) -> Result<PreparedCastRecipe, CastPrepareError> {
     use DataType::{Boolean, Date32, Null, Time64, Timestamp, Utf8};
     use TimeUnit::{Microsecond, Nanosecond};
-    use ValueKind::{Binary, List, Map, Nominal, Scalar as Kind, Struct};
+    use ValueKind::{Binary, List, Map, Scalar as Kind, Struct};
     use trino_temporal::Operation as Temporal;
 
     let from = source.value_type().kind();
@@ -373,6 +373,10 @@ fn prepare_value(
 
     if !context_allows(from, to, mode) {
         return Err(CastPrepareError::Illegal);
+    }
+    if let Some(operation) = super::json_mode::bind(source, result, work)? {
+        recipe.body = CastBody::NativeJson(operation);
+        return Ok(recipe);
     }
     let from_text = TextKind::from_kind(from);
     let to_text = TextKind::from_kind(to);
@@ -479,16 +483,6 @@ fn prepare_value(
         }
     } else {
         match (from, to) {
-            (Nominal(ValueLogicalType::Json), _)
-                if matches!(to_text, Some(TextKind::Varchar(_))) =>
-            {
-                CastBody::ArrayJson(array_json::Operation::JsonToVarchar)
-            }
-            (_, Nominal(ValueLogicalType::Json))
-                if matches!(from_text, Some(TextKind::Varchar(_))) =>
-            {
-                CastBody::ArrayJson(array_json::Operation::VarcharToJson)
-            }
             // Legal temporal, JSON and composite shapes with no corresponding
             // installed prepared body keep their exact capability refusal.
             (_, Kind(Timestamp(..))) if from_text.is_some() => {
@@ -971,6 +965,26 @@ fn parse_decimal(
     scale: u8,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Option<i128>, KernelFailure> {
+    Ok(
+        match parse_decimal_outcome(value, precision, scale, work)? {
+            DecimalInput::Value(coefficient) => Some(coefficient),
+            DecimalInput::Invalid | DecimalInput::Range => None,
+        },
+    )
+}
+
+enum DecimalInput {
+    Value(i128),
+    Invalid,
+    Range,
+}
+
+fn parse_decimal_outcome(
+    value: &str,
+    precision: u8,
+    scale: u8,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<DecimalInput, KernelFailure> {
     let (negative, value) = strip_sign(value);
     let mut leading = [0_u8; 39];
     let mut significant = 0_i64;
@@ -985,14 +999,14 @@ fn parse_decimal(
             '.' if !dot => dot = true,
             'e' | 'E' if saw_digit => {
                 let Some(parsed) = parse_exponent(chars.as_str(), work)? else {
-                    return Ok(None);
+                    return Ok(DecimalInput::Invalid);
                 };
                 exponent = parsed;
                 break;
             }
             _ => {
                 let Some(digit) = array_text::digit(ch, work)? else {
-                    return Ok(None);
+                    return Ok(DecimalInput::Invalid);
                 };
                 saw_digit = true;
                 if dot {
@@ -1008,17 +1022,17 @@ fn parse_decimal(
         }
     }
     if !saw_digit || i32::try_from(fractional - exponent).is_err() {
-        return Ok(None);
+        return Ok(DecimalInput::Invalid);
     }
     if significant == 0 {
-        return Ok(Some(0));
+        return Ok(DecimalInput::Value(0));
     }
     let keep = significant + i64::from(scale) + exponent - fractional;
     if keep < 0 {
-        return Ok(Some(0));
+        return Ok(DecimalInput::Value(0));
     }
     if keep > i64::from(precision) {
-        return Ok(None);
+        return Ok(DecimalInput::Range);
     }
     let keep = keep as usize;
     let mut coefficient = leading[..keep].iter().fold(0_i128, |coefficient, digit| {
@@ -1028,9 +1042,13 @@ fn parse_decimal(
         coefficient += 1;
     }
     if coefficient >= 10_i128.pow(u32::from(precision)) {
-        return Ok(None);
+        return Ok(DecimalInput::Range);
     }
-    Ok(Some(if negative { -coefficient } else { coefficient }))
+    Ok(DecimalInput::Value(if negative {
+        -coefficient
+    } else {
+        coefficient
+    }))
 }
 
 fn strip_sign(value: &str) -> (bool, &str) {
@@ -1272,4 +1290,124 @@ fn render(
     };
     work.flush()?;
     Ok(value)
+}
+
+fn from_json_number(value: crate::json_value::Scalar<'_>) -> Option<Number> {
+    use crate::json_value::Scalar as J;
+    Some(match value {
+        J::Boolean(value) => Number::Integer(i64::from(value)),
+        J::TinyInt(value) => Number::Integer(i64::from(value)),
+        J::SmallInt(value) => Number::Integer(i64::from(value)),
+        J::Integer(value) => Number::Integer(i64::from(value)),
+        J::BigInt(value) => Number::Integer(value),
+        J::Real(value) => Number::Real(value),
+        J::Double(value) => Number::Double(value),
+        J::Decimal {
+            coefficient, scale, ..
+        } => Number::Decimal(coefficient, scale),
+        _ => return None,
+    })
+}
+
+pub(super) fn json_boolean_cast(
+    value: crate::json_value::Scalar<'_>,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<bool, ConversionFailure> {
+    use crate::json_value::{Number as JNumber, Scalar as J};
+    work.step()?;
+    match value {
+        J::String(text) => parse_boolean(text),
+        J::Number(JNumber::NaN) => Err(ConversionFailure::Invalid),
+        J::Number(JNumber::Finite { coefficient, .. }) => Ok(coefficient != [0]),
+        J::Number(_) => Ok(true),
+        _ => from_json_number(value)
+            .map(Number::is_nonzero)
+            .ok_or(ConversionFailure::Invalid),
+    }
+}
+
+pub(super) fn json_number_cast(
+    value: crate::json_value::Scalar<'_>,
+    target: Numeric,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<CastRowResult, ConversionFailure> {
+    use crate::json_value::{Number as JNumber, Scalar as J};
+    use trino_array_leaf::FloatWidth;
+    match value {
+        J::String(text) => match target {
+            Numeric::Decimal(p, s) => json_decimal_text(text, p, s, work),
+            _ => parse_number(text, target, work),
+        },
+        scalar @ (J::Real(_) | J::Double(_)) if let Numeric::Decimal(p, s) = target => {
+            let approximation = match scalar {
+                J::Real(value) => f64::from(value),
+                J::Double(value) => value,
+                _ => unreachable!(),
+            };
+            if approximation.is_nan() {
+                return Err(ConversionFailure::Invalid);
+            }
+            if approximation.is_infinite() {
+                return Err(ConversionFailure::Range);
+            }
+            let mut text = crate::json_value::FixedText::<32>::new();
+            crate::json_value::write_scalar_text(&mut text, scalar)
+                .map_err(|_| internal("JSON float lost its bounded decimal rendering"))?;
+            json_decimal_text(text.as_str(), p, s, work)
+        }
+        J::Decimal {
+            coefficient, scale, ..
+        } if matches!(target, Numeric::Real | Numeric::Double) => {
+            let bits = |width| trino_array_leaf::decimal_to_float_bits(coefficient, scale, width);
+            Ok(match target {
+                Numeric::Real => {
+                    CastRowResult::Float32(f32::from_bits(bits(FloatWidth::F32) as u32))
+                }
+                Numeric::Double => CastRowResult::Float64(f64::from_bits(bits(FloatWidth::F64))),
+                _ => unreachable!(),
+            })
+        }
+        J::Number(value) => {
+            let mut text = crate::json_value::FixedText::<256>::new();
+            crate::json_value::write_scalar_cast(&mut text, J::Number(value), work).map_err(
+                |cause| match cause {
+                    crate::json_value::JsonError::Host(cause) => ConversionFailure::Outer(cause),
+                    cause => ConversionFailure::Outer(internal(&cause.to_string())),
+                },
+            )?;
+            match target {
+                Numeric::Real | Numeric::Double => parse_float(text.as_str(), target, work),
+                Numeric::Integer(_)
+                    if matches!(value, JNumber::PositiveInfinity | JNumber::NegativeInfinity) =>
+                {
+                    Err(ConversionFailure::Range)
+                }
+                _ if !matches!(value, JNumber::Finite { .. }) => Err(ConversionFailure::Invalid),
+                Numeric::Integer(width) => {
+                    let value = parse_decimal(text.as_str(), 38, 0, work)?
+                        .ok_or(ConversionFailure::Range)?;
+                    signed_result(value, width)
+                }
+                Numeric::Decimal(p, s) => parse_decimal(text.as_str(), p, s, work)?
+                    .map(CastRowResult::Decimal128)
+                    .ok_or(ConversionFailure::Range),
+            }
+        }
+        _ => from_json_number(value)
+            .ok_or(ConversionFailure::Invalid)?
+            .convert(target, work),
+    }
+}
+
+fn json_decimal_text(
+    text: &str,
+    precision: u8,
+    scale: u8,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<CastRowResult, ConversionFailure> {
+    match parse_decimal_outcome(text, precision, scale, work)? {
+        DecimalInput::Value(coefficient) => Ok(CastRowResult::Decimal128(coefficient)),
+        DecimalInput::Invalid => Err(ConversionFailure::Invalid),
+        DecimalInput::Range => Err(ConversionFailure::Range),
+    }
 }

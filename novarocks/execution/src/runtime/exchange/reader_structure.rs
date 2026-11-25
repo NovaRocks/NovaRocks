@@ -42,7 +42,7 @@ pub(super) fn model_error(cause: ReaderStructureFailure<ExchangeFailure>) -> Exc
 mod tests {
     use super::*;
     use crate::exec::pipeline::operator::InputConstructionFactory;
-    use arrow::array::{DictionaryArray, Int32Array, StringArray};
+    use arrow::array::{DictionaryArray, Int32Array, LargeBinaryArray, StringArray};
     use arrow::datatypes::{Field, Int32Type};
     use novarocks_type_contract::{
         TypedValueBinding, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
@@ -57,22 +57,22 @@ mod tests {
             panic!("unit construction does not wait")
         }
     }
-    fn declaration() -> ChunkSchemaRef {
+    fn declaration(logical: ValueLogicalType) -> ChunkSchemaRef {
         let pure = ValueTypeStorageLifetime::pure();
-        let value = ValueTypeRef::try_new(
-            ValueKind::Nominal(ValueLogicalType::Json),
-            false,
-            pure.clone(),
-        )
-        .unwrap();
+        let (kind, carrier) = match logical {
+            ValueLogicalType::Json => (ValueKind::Nominal(logical), DataType::LargeBinary),
+            ValueLogicalType::Physical => (ValueKind::String, DataType::Utf8),
+            _ => unreachable!("fixture supports only JSON and text"),
+        };
+        let value = ValueTypeRef::try_new(kind, false, pure.clone()).unwrap();
         let binding = TypedValueBinding::try_new(
             value,
-            ValueLayout::try_new(&DataType::Utf8, pure.clone()).unwrap(),
+            ValueLayout::try_new(&carrier, pure.clone()).unwrap(),
         )
         .unwrap();
         let slot = crate::exec::chunk::ChunkSlotSchema::try_new_typed(
             SlotId::new(9),
-            Arc::new(Field::new("json", DataType::Utf8, false)),
+            Arc::new(Field::new("document", carrier, false)),
             binding,
             None,
             pure.clone(),
@@ -104,7 +104,7 @@ mod tests {
             )
             .unwrap(),
         );
-        // Source names, IDs and metadata never author the receiver's JSON domain.
+        // Source names, IDs and metadata never author the receiver's domain.
         #[expect(
             deprecated,
             reason = "fixture exercises noncanonical source dictionary IDs"
@@ -114,6 +114,15 @@ mod tests {
                 "novarocks.logical_type".to_owned(),
                 "bitmap".to_owned(),
             )]));
+        make_unit(expected, factory, field, array)
+    }
+
+    fn make_unit(
+        expected: &ChunkSchemaRef,
+        factory: &dyn InputConstructionFactory,
+        field: Field,
+        array: ArrayRef,
+    ) -> (Arc<online_unit::ExchangeRecipe>, Vec<u8>) {
         let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap();
         let owner = factory.begin_typed_construction(expected).unwrap();
         let chunk = materialize_chunk_for_wire_meta(
@@ -136,8 +145,40 @@ mod tests {
         let tracker = MemTracker::new_root("reader finite prepared schema");
         let (factory, error_weak) = factory(tracker.clone());
         let factory_weak = Arc::downgrade(&factory);
-        let expected = declaration();
-        let (recipe, source) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
+        let expected = declaration(ValueLogicalType::Json);
+        let null_document = b"\x01\x20".as_slice();
+        let wire_field = Field::new("wire", DataType::LargeBinary, false).with_metadata(
+            HashMap::from([("nr.logical_type".into(), "variant".into())]),
+        );
+        let (recipe, source) = make_unit(
+            &expected,
+            factory.as_ref(),
+            wire_field.clone(),
+            Arc::new(LargeBinaryArray::from(vec![null_document])),
+        );
+        let (old_recipe, old_bytes) = unit(
+            &declaration(ValueLogicalType::Physical),
+            factory.as_ref(),
+            vec!["null"],
+            0,
+        );
+        assert_ne!(recipe.value.digest(), old_recipe.value.digest());
+        assert!(online_unit::decode(&recipe, &old_bytes, &expected, factory.as_ref()).is_err());
+        drop(old_recipe);
+        let (_, bad_bytes) = make_unit(
+            &expected,
+            factory.as_ref(),
+            wire_field,
+            Arc::new(LargeBinaryArray::from(vec![b"null".as_slice()])),
+        );
+        let wrong_value =
+            online_unit::decode(&recipe, &bad_bytes, &expected, factory.as_ref()).unwrap_err();
+        assert!(
+            wrong_value
+                .to_string()
+                .contains("Invalid native JSON version")
+        );
+        drop(wrong_value);
         let chunks = online_unit::decode(&recipe, &source, &expected, factory.as_ref()).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].len(), 1);
@@ -170,7 +211,7 @@ mod tests {
         let tracker = MemTracker::new_root("reader per-unit array header");
         let (factory, error_weak) = factory(tracker.clone());
         let factory_weak = Arc::downgrade(&factory);
-        let expected = declaration();
+        let expected = declaration(ValueLogicalType::Physical);
         let (recipe, source) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
         let mut chunks =
             online_unit::decode(&recipe, &source, &expected, factory.as_ref()).unwrap();
@@ -212,7 +253,7 @@ mod tests {
     fn reader_last_real_buffer_alias_keeps_body_responsibility_after_chunk_exit() {
         let tracker = MemTracker::new_root("reader actual Buffer alias exit");
         let (factory, error_weak) = factory(tracker.clone());
-        let expected = declaration();
+        let expected = declaration(ValueLogicalType::Physical);
         let (recipe, bytes) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
         let mut chunks = online_unit::decode(&recipe, &bytes, &expected, factory.as_ref()).unwrap();
         let array = chunks.remove(0).columns()[0].clone();
@@ -527,7 +568,7 @@ mod tests {
     fn reader_each_unit_has_complete_dictionary_and_last_projection_releases_its_group() {
         let tracker = MemTracker::new_root("reader independent full dictionary units");
         let (factory, error_weak) = factory(tracker.clone());
-        let expected = declaration();
+        let expected = declaration(ValueLogicalType::Physical);
         let (recipe, first) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
         let (_, second) = unit(&expected, factory.as_ref(), vec!["{}", "[]"], 1);
         let first = online_unit::decode(&recipe, &first, &expected, factory.as_ref()).unwrap();
@@ -564,7 +605,7 @@ mod tests {
     fn reader_schema_message_is_rejected_and_malformed_metadata_keeps_original_source() {
         let tracker = MemTracker::new_root("unexpected online schema");
         let (factory, _) = factory(tracker.clone());
-        let expected = declaration();
+        let expected = declaration(ValueLogicalType::Physical);
         let recipe = online_unit::prepare_recipe(&expected, &[], factory.as_ref()).unwrap();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
@@ -625,7 +666,7 @@ mod tests {
     fn reader_first_unit_recipe_allocation_refusal_rolls_back_without_publication() {
         let tracker = MemTracker::new_root("reader first unit recipe refusal");
         let (factory, _) = factory(tracker.clone());
-        let expected = declaration();
+        let expected = declaration(ValueLogicalType::Physical);
         let (recipe, bytes) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
         let baseline = tracker.current();
         tracker.install_limit_once(baseline + 1).unwrap();

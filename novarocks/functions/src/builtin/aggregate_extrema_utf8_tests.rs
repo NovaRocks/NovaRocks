@@ -334,63 +334,56 @@ fn frozen(fixture: &Fixture, phase: AggregateKernelPhase) -> PureCallSpecializat
 }
 
 #[test]
-fn utf8_extrema_real_installed_fresh_frozen_four_phases_preserve_physical_json_and_policy() {
+fn utf8_extrema_real_installed_fresh_frozen_four_phases_preserve_type_and_policy() {
     for name in ["min", "max"] {
         for policy in [
             DecimalOverflowPolicy::OutputNull,
             DecimalOverflowPolicy::ReportError,
         ] {
-            for logical_type in [ValueLogicalType::Physical, ValueLogicalType::Json] {
-                for nullable in [false, true] {
-                    let source = FunctionValueType::try_from_legacy_declared_projection(
-                        DataType::Utf8,
-                        nullable,
-                        logical_type,
-                    )
-                    .expect("valid temporary legacy function value declaration");
-                    let fixture = Fixture::new(name, source.clone(), policy);
-                    for phase in [
-                        AggregateKernelPhase::Single,
-                        AggregateKernelPhase::Partial,
-                        AggregateKernelPhase::Intermediate,
-                        AggregateKernelPhase::Final,
-                    ] {
-                        let fresh = fixture.prepare(phase, &CompileControl::default()).unwrap();
-                        let frozen = frozen(&fixture, phase);
-                        for prepared in [&fresh, &frozen] {
-                            assert!(Arc::ptr_eq(
-                                prepared.call_contract().selected_owner(),
-                                &fixture.selected
-                            ));
-                            assert_eq!(prepared.call_contract().decimal_overflow_policy(), policy);
-                            assert_eq!(
-                                prepared.call_contract().effects().null_behavior,
-                                FunctionNullBehavior::CalledOnNull
-                            );
-                            assert_eq!(
-                                prepared.call_contract().effects().instance_state,
-                                FunctionInstanceState::AggregateInstance
-                            );
-                            let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
-                                panic!("actual aggregate attachment")
-                            };
-                            let mut expected = source.clone();
-                            expected = expected
-                                .with_nullable(true)
-                                .expect("valid function nullability declaration");
-                            assert_eq!(handle.contract().final_type(), &expected);
-                            assert_eq!(handle.contract().intermediate_type(), &expected);
-                            assert_eq!(
-                                handle.contract().state_format().as_str(),
-                                format!("novarocks/{name}/state-v1")
-                            );
-                            assert_eq!(
-                                handle.memory_policy(),
-                                AggregateStateMemoryPolicy::BoundedRetained {
-                                    max_retained_bytes_per_state: maximum_retained()
-                                }
-                            );
-                        }
+            for nullable in [false, true] {
+                let source = ty(nullable);
+                let fixture = Fixture::new(name, source.clone(), policy);
+                for phase in [
+                    AggregateKernelPhase::Single,
+                    AggregateKernelPhase::Partial,
+                    AggregateKernelPhase::Intermediate,
+                    AggregateKernelPhase::Final,
+                ] {
+                    let fresh = fixture.prepare(phase, &CompileControl::default()).unwrap();
+                    let frozen = frozen(&fixture, phase);
+                    for prepared in [&fresh, &frozen] {
+                        assert!(Arc::ptr_eq(
+                            prepared.call_contract().selected_owner(),
+                            &fixture.selected
+                        ));
+                        assert_eq!(prepared.call_contract().decimal_overflow_policy(), policy);
+                        assert_eq!(
+                            prepared.call_contract().effects().null_behavior,
+                            FunctionNullBehavior::CalledOnNull
+                        );
+                        assert_eq!(
+                            prepared.call_contract().effects().instance_state,
+                            FunctionInstanceState::AggregateInstance
+                        );
+                        let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
+                            panic!("actual aggregate attachment")
+                        };
+                        let mut expected = source.clone();
+                        expected = expected
+                            .with_nullable(true)
+                            .expect("valid function nullability declaration");
+                        assert_eq!(handle.contract().final_type(), &expected);
+                        assert_eq!(handle.contract().intermediate_type(), &expected);
+                        assert_eq!(
+                            handle.contract().state_format().as_str(),
+                            format!("novarocks/{name}/state-v1")
+                        );
+                        assert_eq!(
+                            handle.memory_policy(),
+                            AggregateStateMemoryPolicy::BoundedRetained {
+                                max_retained_bytes_per_state: maximum_retained()
+                            }
+                        );
                     }
                 }
             }
@@ -400,7 +393,6 @@ fn utf8_extrema_real_installed_fresh_frozen_four_phases_preserve_physical_json_a
 
 #[test]
 fn utf8_extrema_independent_bytelex_empty_null_unicode_and_nul_oracles() {
-    json_byte_oracle();
     let values = text(&[
         Some("中"),
         Some("a\0z"),
@@ -462,36 +454,6 @@ fn utf8_extrema_independent_bytelex_empty_null_unicode_and_nul_oracles() {
                     .unwrap()
             ),
             vec![None, Some("")]
-        );
-    }
-}
-
-// JSON identity does not select a JSON semantic comparator: the original
-// installed Utf8 path compares these complete valid JSON texts as bytes.
-fn json_byte_oracle() {
-    let source = text(&[Some("1"), Some("2"), Some("10"), Some("\"é\"")]);
-    for (name, expected) in [("min", "\"é\""), ("max", "2")] {
-        let value_type =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap();
-        let kernel = Fixture::new(name, value_type, DecimalOverflowPolicy::OutputNull)
-            .kernel(AggregateKernelPhase::Single);
-        let state = apply(
-            &kernel,
-            &[EvaluatedArgument::Column(&source)],
-            Selection::all(4),
-        );
-        assert_eq!(
-            kernel.contract.final_type().logical_type(),
-            ValueLogicalType::Json
-        );
-        assert_eq!(
-            strings(
-                &kernel
-                    .build_final([&state].into_iter(), &RuntimeControl::default())
-                    .unwrap()
-            ),
-            vec![Some(expected)]
         );
     }
 }

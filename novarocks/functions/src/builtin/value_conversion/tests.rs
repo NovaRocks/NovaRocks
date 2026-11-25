@@ -109,7 +109,7 @@ fn explicit_opaque_binary_erasure_freezes_the_only_owner_without_inverse_authori
     assert!(
         resolve_value_conversion(
             &physical(DataType::Utf8, false),
-            &logical(DataType::Utf8, false, ValueLogicalType::Json),
+            &logical(DataType::LargeBinary, false, ValueLogicalType::Json),
             crate::binding_test_control()
         )
         .is_err()
@@ -134,7 +134,6 @@ fn exact_hidden_owner_and_full_effects_are_declared() {
             DECIMAL256_LARGEINT,
             FLOAT32_LARGEINT,
             FLOAT64_LARGEINT,
-            JSON_TEXT,
             LARGEINT_DECIMAL,
             LARGEINT_FLOAT,
             LARGEINT_SIGNED,
@@ -181,7 +180,11 @@ fn exact_hidden_owner_and_full_effects_are_declared() {
         )
         .unwrap();
     assert_ne!(catalog().digest(), builder.seal().unwrap().digest());
-    let source = [value(logical(DataType::Utf8, true, ValueLogicalType::Json))];
+    let source = [value(logical(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    ))];
     let target = physical(DataType::Utf8, true);
     assert!(matches!(
         catalog().resolve_bound_user(
@@ -196,11 +199,13 @@ fn exact_hidden_owner_and_full_effects_are_declared() {
 
 #[test]
 fn actual_supported_root_pairs_resolve_and_freeze() {
-    freeze(
-        logical(DataType::Utf8, false, ValueLogicalType::Json),
-        &physical(DataType::Utf8, true),
-        JSON_TEXT,
-    );
+    let json = logical(DataType::LargeBinary, false, ValueLogicalType::Json);
+    for target in [
+        physical(DataType::Utf8, true),
+        physical(DataType::LargeBinary, true),
+    ] {
+        assert!(resolve_value_conversion(&json, &target, crate::binding_test_control()).is_err());
+    }
     for carrier in [
         DataType::Int8,
         DataType::Int16,
@@ -239,13 +244,13 @@ fn actual_supported_root_pairs_resolve_and_freeze() {
     }
 }
 
-fn json_field_type(domain: bool, name: &str, nullable: bool) -> Arc<Field> {
+fn opaque_field_type(domain: bool, name: &str, nullable: bool) -> Arc<Field> {
     let mut metadata =
         std::collections::HashMap::from([("source".to_string(), "user-column".to_string())]);
     if domain {
-        metadata.insert(NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string());
+        metadata.insert(NR_LOGICAL_TYPE_KEY.to_string(), "variant".to_string());
     }
-    Arc::new(Field::new(name, DataType::Utf8, nullable).with_metadata(metadata))
+    Arc::new(Field::new(name, DataType::LargeBinary, nullable).with_metadata(metadata))
 }
 
 #[test]
@@ -254,7 +259,7 @@ fn nested_same_structure_preserves_every_other_field_fact() {
         DataType::Struct(
             vec![Field::new(
                 "items",
-                DataType::List(json_field_type(true, "item", true)),
+                DataType::List(opaque_field_type(true, "item", true)),
                 false,
             )]
             .into(),
@@ -265,18 +270,21 @@ fn nested_same_structure_preserves_every_other_field_fact() {
         DataType::Struct(
             vec![Field::new(
                 "items",
-                DataType::List(json_field_type(false, "item", true)),
+                DataType::List(opaque_field_type(false, "item", true)),
                 false,
             )]
             .into(),
         ),
         false,
     );
-    freeze(source.clone(), &target, JSON_TEXT);
+    freeze(source.clone(), &target, OPAQUE_BINARY);
     for (child, refused) in [
-        (json_field_type(false, "renamed", true), false),
-        (json_field_type(false, "item", false), true),
-        (Arc::new(Field::new("item", DataType::Utf8, true)), false),
+        (opaque_field_type(false, "renamed", true), false),
+        (opaque_field_type(false, "item", false), true),
+        (
+            Arc::new(Field::new("item", DataType::LargeBinary, true)),
+            false,
+        ),
     ] {
         let wrong = physical(
             DataType::Struct(vec![Field::new("items", DataType::List(child), false)].into()),
@@ -314,17 +322,17 @@ fn invalid_domains_policies_and_missing_explicit_target_are_rejected() {
         ),
         (
             physical(DataType::Utf8, false),
-            logical(DataType::Utf8, false, ValueLogicalType::Json),
+            logical(DataType::LargeBinary, false, ValueLogicalType::Json),
         ),
         (physical(DataType::UInt64, false), large.clone()),
         (large.clone(), physical(DataType::Int64, false)),
         (large.clone(), physical(DataType::Decimal128(18, 2), false)),
         (
-            logical(DataType::Utf8, true, ValueLogicalType::Json),
+            logical(DataType::LargeBinary, true, ValueLogicalType::Json),
             physical(DataType::Utf8, false),
         ),
         (
-            logical(DataType::Utf8, false, ValueLogicalType::Json),
+            logical(DataType::LargeBinary, false, ValueLogicalType::Json),
             physical(DataType::LargeUtf8, false),
         ),
     ] {
@@ -412,8 +420,8 @@ fn frozen_validation_cannot_reselect_or_replace_full_target() {
 
 #[test]
 fn nested_container_parameters_and_dictionary_identity_are_not_rewritten() {
-    let a = json_field_type(true, "item", true);
-    let b = json_field_type(false, "item", true);
+    let a = opaque_field_type(true, "item", true);
+    let b = opaque_field_type(false, "item", true);
     for (source, target) in [
         (
             DataType::LargeList(a.clone()),
@@ -454,7 +462,11 @@ fn nested_container_parameters_and_dictionary_identity_are_not_rewritten() {
             ),
         ),
     ] {
-        freeze(physical(source, false), &physical(target, false), JSON_TEXT);
+        freeze(
+            physical(source, false),
+            &physical(target, false),
+            OPAQUE_BINARY,
+        );
     }
     let source = [value(physical(
         DataType::FixedSizeList(a.clone(), 3),
@@ -532,11 +544,11 @@ fn nested_container_parameters_and_dictionary_identity_are_not_rewritten() {
 }
 
 #[test]
-fn two_stage_json_assignment_preserves_source_fields_before_carrier_cast() {
-    let source_field = json_field_type(true, "provider-item", false);
+fn two_stage_opaque_assignment_preserves_source_fields_before_carrier_cast() {
+    let source_field = opaque_field_type(true, "provider-item", false);
     let source = physical(DataType::List(source_field.clone()), false);
     let target = physical(
-        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true))),
         true,
     );
     let intermediate = conversion_intermediate_type(&source, &target)
@@ -550,7 +562,7 @@ fn two_stage_json_assignment_preserves_source_fields_before_carrier_cast() {
     assert!(field.metadata().is_empty());
     assert!(!field.metadata().contains_key(NR_LOGICAL_TYPE_KEY));
     assert!(!intermediate.nullable());
-    freeze(source, &intermediate, JSON_TEXT);
+    freeze(source, &intermediate, OPAQUE_BINARY);
     assert!(novarocks_type_contract::preserves_nested_logical_identity(
         intermediate.data_type(),
         target.data_type()
@@ -566,8 +578,8 @@ fn two_stage_json_assignment_preserves_source_fields_before_carrier_cast() {
     );
     assert!(
         conversion_intermediate_type(
-            &physical(DataType::Utf8, true),
-            &physical(DataType::Utf8, false)
+            &physical(DataType::LargeBinary, true),
+            &physical(DataType::LargeBinary, false)
         )
         .is_err(),
         "the same-domain None branch cannot narrow source nullability"
@@ -578,8 +590,18 @@ fn two_stage_json_assignment_preserves_source_fields_before_carrier_cast() {
 fn nonliteral_null_lift_has_an_exact_eager_strict_owner_binding() {
     let source = physical(DataType::Null, true);
     for target in [
-        logical(DataType::Utf8, true, ValueLogicalType::Json),
-        physical(DataType::List(json_field_type(true, "item", false)), true),
+        logical(DataType::LargeBinary, true, ValueLogicalType::Json),
+        physical(
+            DataType::List(Arc::new(
+                Field::new("item", DataType::LargeBinary, false).with_metadata(
+                    std::collections::HashMap::from([(
+                        NR_LOGICAL_TYPE_KEY.to_owned(),
+                        "json".to_owned(),
+                    )]),
+                ),
+            )),
+            true,
+        ),
     ] {
         assert_eq!(
             conversion_intermediate_type(&source, &target).unwrap(),

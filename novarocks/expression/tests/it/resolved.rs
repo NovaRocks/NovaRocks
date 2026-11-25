@@ -1227,10 +1227,12 @@ fn compile_type_only_hidden_native_profile(
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
             false,
         ),
-        "like_json" | "between_json" => {
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap()
-        }
+        "like_json" | "between_json" => FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
         _ => unreachable!(),
     };
     let mut ports = vec![

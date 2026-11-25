@@ -21,7 +21,7 @@ use crate::{
     InvocationScalarEvaluationInstance, ScopedExpressionEffects, Selection,
     specialize_invocation_scalar,
 };
-use arrow_array::{ArrayRef, StringArray};
+use arrow_array::{ArrayRef, BinaryArray, LargeBinaryArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
@@ -48,7 +48,7 @@ fn owner() -> JsonCanonicalOwner {
 }
 fn args(nullable: bool, logical: ValueLogicalType) -> [FunctionArgument; 1] {
     [FunctionArgument::Value {
-        value_type: FunctionValueType::try_with_logical_type(DataType::Utf8, nullable, logical)
+        value_type: FunctionValueType::try_with_logical_type(DataType::LargeBinary, nullable, logical)
             .unwrap(),
         constant: None,
     }]
@@ -174,7 +174,7 @@ fn canonical_key_hidden_exact_json_profile_and_nullability() {
         let FunctionResultType::Scalar(result) = binding.selected.result_type else {
             panic!("scalar result")
         };
-        assert_eq!(result.data_type(), &DataType::Utf8);
+        assert_eq!(result.data_type(), &DataType::Binary);
         assert_eq!(result.logical_type(), ValueLogicalType::Physical);
         assert_eq!(result.nullable(), nullable);
     }
@@ -194,11 +194,11 @@ fn canonical_key_hidden_exact_json_profile_and_nullability() {
 fn canonical_selected_sparse_and_last_buffer_alias_keep_original_host() {
     let host = Arc::new(Host::default());
     let mut kernel = instance(host.clone());
-    let source: ArrayRef = Arc::new(StringArray::from(vec![
-        Some("unselected invalid"),
-        Some(r#"{"b":1,"a":2}"#),
+    let source: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+        Some(b"unselected invalid".as_slice()),
+        Some(b"\x01\x20".as_slice()),
         None,
-        Some("1e2"),
+        Some(b"\x01\x4A\x01\x00\x00\x00".as_slice()),
     ]));
     let rows = [1, 2, 3];
     let selection = Selection::try_sparse(4, &rows).unwrap();
@@ -211,10 +211,10 @@ fn canonical_selected_sparse_and_last_buffer_alias_keep_original_host() {
             &Control,
         )
         .unwrap();
-    let array = out.values().as_any().downcast_ref::<StringArray>().unwrap();
+    let array = out.values().as_any().downcast_ref::<BinaryArray>().unwrap();
     assert_eq!(
         array.iter().collect::<Vec<_>>(),
-        vec![Some(r#"{"a":2,"b":1}"#), None, Some("1E+2")]
+        vec![Some(b"\x00".as_slice()), None, Some(b"\x04\x00\x00\x00\x00\x00\x01\x01".as_slice())]
     );
     let alias = array.values().clone();
     drop(out);
@@ -225,11 +225,11 @@ fn canonical_selected_sparse_and_last_buffer_alias_keep_original_host() {
     assert_eq!(host.owned.load(Ordering::SeqCst), 0);
 }
 #[test]
-fn canonical_invalid_json_preserves_data_and_failed_instance_lifecycle() {
+fn canonical_invalid_native_json_preserves_invariant_and_failed_instance_lifecycle() {
     use novarocks_failure_contract::{FailureClass, FailureProjection};
     let host = Arc::new(Host::default());
     let mut kernel = instance(host.clone());
-    let source: ArrayRef = Arc::new(StringArray::from(vec![Some("not JSON")]));
+    let source: ArrayRef = Arc::new(LargeBinaryArray::from(vec![Some(b"not JSON".as_slice())]));
     let failure = kernel
         .evaluate(
             Selection::all(1),
@@ -239,9 +239,9 @@ fn canonical_invalid_json_preserves_data_and_failed_instance_lifecycle() {
         )
         .unwrap_err();
     let crate::ScalarInvocationFailure::Kernel(cause) = &failure else {
-        panic!("canonical malformed JSON preserves its original typed Kernel Data");
+        panic!("canonical malformed JSON preserves its original invariant failure");
     };
-    assert_eq!(cause.failure_fact().class(), FailureClass::Data);
+    assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
     assert_eq!(
         kernel
             .evaluate(
@@ -262,7 +262,7 @@ fn canonical_invalid_json_preserves_data_and_failed_instance_lifecycle() {
 #[test]
 fn direct_helper_uses_original_opaque_journal_and_releases_it_with_the_key() {
     let host = Arc::new(Host::default());
-    let key = crate::json_canonical::normalize_json_key("1", host.clone(), &Control).unwrap();
+    let key = crate::json_canonical::normalize_json_key(b"\x01\x20", host.clone(), &Control).unwrap();
     let journal = crate::aggregate_helper_memory::private_mutex_backing_bytes().unwrap();
     assert_eq!(host.opaque.load(Ordering::SeqCst), journal);
     drop(key);
@@ -293,7 +293,7 @@ fn opaque_journal_refusal_precedes_first_owned_allocation_and_preserves_cause() 
     }
     let host: Arc<dyn crate::AggregateStateAllocator> = Arc::new(Refuse);
     assert!(matches!(
-        crate::json_canonical::normalize_json_key("1", host.clone(), &Control),
+        crate::json_canonical::normalize_json_key(b"\x01\x20", host.clone(), &Control),
         Err(KernelFailure::DeadlineExceeded)
     ));
 }

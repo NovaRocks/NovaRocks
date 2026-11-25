@@ -397,17 +397,17 @@ fn tagged_field(name: &str, carrier: DataType, tag: Option<&str>, field_id: &str
 }
 
 #[test]
-fn actual_compiled_value_conversion_json_root_and_nested_struct_preserve_bytes_nulls_and_nominal_sibling()
+fn actual_compiled_value_conversion_opaque_root_and_nested_struct_preserve_bytes_nulls_and_nominal_sibling()
  {
-    let source = nominal(DataType::Utf8, ValueLogicalType::Json);
-    let target = FunctionValueType::new(DataType::Utf8, true);
+    let source = nominal(DataType::LargeBinary, ValueLogicalType::Bitmap);
+    let target = FunctionValueType::new(DataType::LargeBinary, true);
     let program = direct_program(source, target.clone());
-    let original: ArrayRef = Arc::new(StringArray::from(vec![
-        Some("unused"),
-        Some("{\"a\":1}"),
+    let original: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+        Some(b"unused".as_slice()),
+        Some(b"\0\x80\xff".as_slice()),
         None,
-        Some("bad-json-is-unchanged"),
-        Some("suffix"),
+        Some(b"\xff\0".as_slice()),
+        Some(b"suffix".as_slice()),
     ]));
     let input = input_batch(&program, vec![original.slice(1, 3)]);
     let rows = [0, 1, 2];
@@ -433,18 +433,22 @@ fn actual_compiled_value_conversion_json_root_and_nested_struct_preserve_bytes_n
         output
             .values()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeBinaryArray>()
             .unwrap()
             .iter()
             .collect::<Vec<_>>(),
-        vec![Some("{\"a\":1}"), None, Some("bad-json-is-unchanged")]
+        vec![
+            Some(b"\0\x80\xff".as_slice()),
+            None,
+            Some(b"\xff\0".as_slice())
+        ]
     );
 
-    let json = tagged_field("payload", DataType::Utf8, Some("json"), "17");
-    let text = tagged_field("payload", DataType::Utf8, None, "17");
+    let bitmap = tagged_field("payload", DataType::LargeBinary, Some("bitmap"), "17");
+    let binary = tagged_field("payload", DataType::LargeBinary, None, "17");
     let sibling = tagged_field("opaque", DataType::LargeBinary, Some("variant"), "29");
-    let source_fields = vec![json, sibling.clone()];
-    let target_fields = vec![text, sibling];
+    let source_fields = vec![bitmap, sibling.clone()];
+    let target_fields = vec![binary, sibling];
     let explicit_struct = |fields: &[Arc<Field>], payload: ValueKind| {
         let storage = ValueTypeStorageLifetime::pure();
         let payload = ValueTypeRef::try_new(payload, true, storage.clone()).unwrap();
@@ -472,19 +476,19 @@ fn actual_compiled_value_conversion_json_root_and_nested_struct_preserve_bytes_n
         )
         .unwrap()
     };
-    let source = explicit_struct(&source_fields, ValueKind::Nominal(ValueLogicalType::Json));
-    let target = explicit_struct(&target_fields, ValueKind::String);
+    let source = explicit_struct(&source_fields, ValueKind::Nominal(ValueLogicalType::Bitmap));
+    let target = explicit_struct(&target_fields, ValueKind::Binary);
     let program = direct_program(source, target.clone());
     let original: ArrayRef = Arc::new(StructArray::new(
         source_fields.into(),
         vec![
-            Arc::new(StringArray::from(vec![
-                Some("prefix"),
-                Some("null"),
-                Some("hidden"),
+            Arc::new(LargeBinaryArray::from(vec![
+                Some(b"prefix".as_slice()),
+                Some(b"\x00\xff".as_slice()),
+                Some(b"hidden".as_slice()),
                 None,
-                Some("[1]"),
-                Some("suffix"),
+                Some(b"\x81".as_slice()),
+                Some(b"suffix".as_slice()),
             ])),
             Arc::new(LargeBinaryArray::from(vec![
                 Some(b"prefix".as_slice()),
@@ -530,13 +534,13 @@ fn actual_compiled_value_conversion_json_root_and_nested_struct_preserve_bytes_n
     assert!(!array.is_null(0));
     assert!(array.is_null(1));
     assert!(!array.is_null(2));
-    let text = array
+    let payload = array
         .column(0)
         .as_any()
-        .downcast_ref::<StringArray>()
+        .downcast_ref::<LargeBinaryArray>()
         .unwrap();
-    assert_eq!(text.value(0), "null");
-    assert_eq!(text.value(2), "[1]");
+    assert_eq!(payload.value(0), b"\x00\xff");
+    assert_eq!(payload.value(2), b"\x81");
     let opaque = array
         .column(1)
         .as_any()

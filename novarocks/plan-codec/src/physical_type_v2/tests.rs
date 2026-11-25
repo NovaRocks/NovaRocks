@@ -380,7 +380,7 @@ fn normalized_value_layout_strips_encoding_and_source_metadata_preserving_union_
 fn complete_scalar_logical_domains_and_temporal_facts_survive_public_table_apis() {
     let mut values = Vec::new();
     for (logical, carrier) in [
-        (ValueLogicalType::Json, DataType::Utf8),
+        (ValueLogicalType::Json, DataType::LargeBinary),
         (ValueLogicalType::Variant, DataType::LargeBinary),
         (ValueLogicalType::Hll, DataType::Binary),
         (ValueLogicalType::Bitmap, DataType::Binary),

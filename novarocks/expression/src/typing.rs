@@ -192,6 +192,9 @@ pub enum NodeShape<'a> {
         name: &'a str,
         expected_result: Option<&'a FunctionValueType>,
     },
+    TrustedCall {
+        function: &'a FunctionId,
+    },
     Row {
         fields: Option<&'a [novarocks_parser::ast::RowField]>,
     },
@@ -588,6 +591,16 @@ pub fn type_node(
             name,
             expected_result,
         } => type_catalog_call(context, name, expected_result, children, work)?,
+        NodeShape::TrustedCall { function } => {
+            let args = arguments(children, work)?;
+            work.flush()?;
+            let binding = context.catalog.select_trusted_scalar(
+                function,
+                request(&args, None),
+                work.control(),
+            )?;
+            type_selected_call(context, binding, None, children, work)?
+        }
         NodeShape::Coalesce => {
             let Some((first, remaining)) = children.split_first() else {
                 return Err(TypingError::InvalidShape("COALESCE requires operands"));

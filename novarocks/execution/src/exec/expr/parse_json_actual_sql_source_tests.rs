@@ -21,7 +21,7 @@ use novarocks_expression_contract::ExprKind;
 use novarocks_physical_plan::StaticFunctionArgument;
 
 use novarocks_type_contract::{FunctionArgumentType, FunctionValueType, ValueLogicalType};
-const SQL: &str = "SELECT parse_json('[1,2,3]') AS parsed";
+const SQL: &str = "SELECT json_parse('[1,2,3]') AS parsed";
 fn check() {
     let source = super::sql_test_source::sql_source_with_declared_fields(SQL, &[]);
     let mut count = 0;
@@ -30,7 +30,7 @@ fn check() {
             let ExprKind::FunctionCall { function, args } = &node.kind else {
                 continue;
             };
-            if function.function_id.as_str() != "builtin.scalar/parse_json/v1" {
+            if function.function_id.as_str() != "builtin.scalar/json_parse/v1" {
                 continue;
             }
             let request = unit.requests().get(id).unwrap();
@@ -47,7 +47,7 @@ fn check() {
             );
             assert_eq!(&unit.definition(args[0]).unwrap().ty, value_type);
             let result = FunctionValueType::try_with_logical_type(
-                DataType::Utf8,
+                DataType::LargeBinary,
                 true,
                 ValueLogicalType::Json,
             )

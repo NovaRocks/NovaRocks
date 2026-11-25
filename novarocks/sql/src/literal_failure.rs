@@ -32,13 +32,8 @@ enum Cause {
         source: hex::FromHexError,
     },
     Base64(base64::DecodeError),
-    JsonSerialize(serde_json::Error),
     #[cfg(test)]
     DecimalParameters(arrow::error::ArrowError),
-    Variant {
-        context: &'static str,
-        source: novarocks_types::value::variant_encode::VariantEncodeFailure,
-    },
     Bitmap(novarocks_types::value::bitmap::BitmapValueFailure),
 }
 impl LiteralFailure {
@@ -63,15 +58,6 @@ impl LiteralFailure {
     pub(super) fn base64(source: base64::DecodeError) -> Self {
         Self(Box::new(Cause::Base64(source)))
     }
-    pub(super) fn json(source: serde_json::Error) -> Self {
-        Self(Box::new(Cause::JsonSerialize(source)))
-    }
-    pub(super) fn variant(
-        context: &'static str,
-        source: novarocks_types::value::variant_encode::VariantEncodeFailure,
-    ) -> Self {
-        Self(Box::new(Cause::Variant { context, source }))
-    }
 }
 impl From<novarocks_types::value::bitmap::BitmapValueFailure> for LiteralFailure {
     fn from(source: novarocks_types::value::bitmap::BitmapValueFailure) -> Self {
@@ -89,8 +75,6 @@ impl fmt::Display for LiteralFailure {
                 write!(f, "invalid literal DECIMAL parameters: {source}")
             }
             Cause::Base64(source) => write!(f, "to_binary encode64 decode failed: {source}"),
-            Cause::JsonSerialize(source) => write!(f, "json_object stringify failed: {source}"),
-            Cause::Variant { context, source } => write!(f, "{context}: {source}"),
             Cause::Bitmap(source) => source.fmt(f),
         }
     }
@@ -102,8 +86,6 @@ impl Error for LiteralFailure {
             Cause::Base64(source) => Some(source),
             #[cfg(test)]
             Cause::DecimalParameters(source) => Some(source),
-            Cause::JsonSerialize(source) => Some(source),
-            Cause::Variant { source, .. } => Some(source),
             Cause::Bitmap(source) => Some(source),
             _ => None,
         }
@@ -121,9 +103,7 @@ impl FailureProjection for LiteralFailure {
             Cause::Hex { .. } | Cause::Base64(_) => {
                 return novarocks_functions::DataFailureReason::InvalidEncoding.failure_fact();
             }
-            Cause::Variant { source, .. } => return source.failure_fact(),
             Cause::Bitmap(source) => return source.failure_fact(),
-            Cause::JsonSerialize(_) => (FailureClass::Invariant, 3),
         };
         FailureFact::new(
             class,

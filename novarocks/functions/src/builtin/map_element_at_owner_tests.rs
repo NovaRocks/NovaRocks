@@ -240,8 +240,12 @@ fn uninhabited_key_profile_preserves_complete_map_value_and_independent_probe() 
             DataType::List(Arc::new(Field::new("nested-item", DataType::Int32, false))),
             false,
         ),
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap(),
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
         FunctionValueType::try_with_logical_type(
             DataType::FixedSizeBinary(16),
             true,
@@ -257,8 +261,12 @@ fn uninhabited_key_profile_preserves_complete_map_value_and_independent_probe() 
             DataType::List(Arc::new(Field::new("probe-item", DataType::Int32, true))),
             true,
         ),
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap(),
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
     ];
     let owner = owner("__map_element_at");
     for value in values {

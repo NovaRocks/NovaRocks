@@ -680,7 +680,7 @@ mod tests {
             for source in [
                 FunctionValueType::new(DataType::Int64, true),
                 FunctionValueType::try_with_logical_type(
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     true,
                     ValueLogicalType::Json,
                 )

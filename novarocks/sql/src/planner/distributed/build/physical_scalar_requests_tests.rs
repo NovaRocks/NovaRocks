@@ -756,9 +756,12 @@ fn scalar_requests_lambda_preserves_full_static_signature_and_observes_actual_pa
         unreachable!()
     };
     let original_layout = original_layout.clone();
-    let result =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let result = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     for count in [2, 320] {
         let mut parameters = vec![parameter.clone(); count];
         parameters[0] = FunctionValueType::try_with_logical_type(

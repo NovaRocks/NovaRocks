@@ -242,7 +242,7 @@ fn kind(value: &ValueTypeRef, layout: &D) -> Result<Kind, String> {
         }
         ValueKind::Binary if matches!(layout, D::Binary | D::LargeBinary) => Kind::Leaf(N::Binary),
         ValueKind::Nominal(domain) => Kind::Leaf(match (domain, layout) {
-            (V::Json, D::Utf8) => N::Json,
+            (V::Json, D::LargeBinary) => N::Json,
             (V::Variant, D::LargeBinary) => N::Variant,
             (V::LargeInt, D::FixedSizeBinary(16)) => N::LargeInt,
             (V::Uuid, D::FixedSizeBinary(16)) => N::Uuid,
@@ -584,7 +584,7 @@ mod tests {
         let mut fields = vec![
             output("bitmap", D::Binary, Domain::Plain),
             output("same", D::Binary, Domain::Bitmap),
-            output("same", D::Utf8, Domain::Json),
+            output("same", D::LargeBinary, Domain::Json),
         ];
         fields[1].alias = Some("display".into());
         assert_eq!(
@@ -616,7 +616,7 @@ mod tests {
         let nested = structure(&[
             (
                 "j",
-                ValueType::try_with_logical_type(D::Utf8, false, V::Json).unwrap(),
+                ValueType::try_with_logical_type(D::LargeBinary, false, V::Json).unwrap(),
             ),
             ("bytes", ValueType::new(D::Binary, true)),
             (
@@ -727,9 +727,9 @@ mod tests {
     #[test]
     fn metadata_free_struct_map_list_children_keep_domains_and_null_contracts() {
         let storage = ValueTypeStorageLifetime::pure();
-        let json = ValueType::try_with_logical_type(D::Utf8, false, V::Json).unwrap();
+        let json = ValueType::try_with_logical_type(D::LargeBinary, false, V::Json).unwrap();
         let key = ValueType::new(D::Utf8, false);
-        let list_layout = D::LargeList(Arc::new(Field::new("item", D::Utf8, false)));
+        let list_layout = D::LargeList(Arc::new(Field::new("item", D::LargeBinary, false)));
         let list = ValueType::try_from_value(
             ValueTypeRef::try_new(
                 ValueKind::List(json.value_type().clone()),
@@ -832,7 +832,7 @@ mod tests {
         let nested = structure(&[
             (
                 "json",
-                ValueType::try_with_logical_type(D::Utf8, false, V::Json).unwrap(),
+                ValueType::try_with_logical_type(D::LargeBinary, false, V::Json).unwrap(),
             ),
             (
                 "variant",

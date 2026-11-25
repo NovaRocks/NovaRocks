@@ -208,9 +208,12 @@ fn in_comparison_accepts_nullable_candidate_beside_required_source() {
 #[test]
 fn in_admission_checks_the_comparison_domain_and_exact_operand_carriers() {
     let utf8 = FunctionValueType::new(DataType::Utf8, true);
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let unsupported_list = FunctionValueType::new(
         DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
         true,
@@ -247,51 +250,72 @@ fn in_admission_checks_the_comparison_domain_and_exact_operand_carriers() {
 }
 
 fn json_recipe() -> PreparedNativeInListRecipe {
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     prepare(&json, &json)
+}
+
+struct JsonWork;
+impl novarocks_functions::json_value::JsonWork for JsonWork {
+    type Reservation = ();
+
+    fn step(&mut self) -> Result<(), KernelFailure> {
+        Ok(())
+    }
+
+    fn reserve(&mut self, _: usize) -> Result<Self::Reservation, KernelFailure> {
+        Ok(())
+    }
+
+    fn reserve_output(&mut self, _: usize) -> Result<(), KernelFailure> {
+        Ok(())
+    }
 }
 
 #[test]
 fn in_json_uses_canonical_keys_while_varchar_compares_bytes() {
     let string = FunctionValueType::new(DataType::Utf8, false);
-    let equalities = |recipe: &PreparedNativeInListRecipe, left, right| {
-        let input: ArrayRef = Arc::new(StringArray::from(vec![left]));
-        let candidate: ArrayRef = Arc::new(StringArray::from(vec![right]));
+    let evaluate = |recipe: &PreparedNativeInListRecipe, left: ArrayRef, right: ArrayRef| {
         recipe
-            .membership_equalities_observed(&input, &candidate, None, &Active, &mut |_| {
-                Ok::<_, ()>(())
-            })
+            .membership_equalities_observed(&left, &right, None, &Active, &mut |_| Ok::<_, ()>(()))
             .unwrap()
             .iter()
             .next()
             .unwrap()
     };
+    let json = |text| -> ArrayRef {
+        let bytes = novarocks_functions::json_value::parse(text, &mut JsonWork).unwrap();
+        Arc::new(LargeBinaryArray::from(vec![bytes.as_slice()]))
+    };
+    let text = |text| -> ArrayRef { Arc::new(StringArray::from(vec![text])) };
     let keys = json_recipe();
     let strings = prepare(&string, &string);
     for (left, right, equal_json) in [
-        ("1.0", "1.00", false),
+        ("1.0", "1.00", true),
         (r#"{"b":1,"a":2}"#, r#"{"a":2,"b":1}"#, true),
         ("1.5e-7", "0.00000015", true),
         ("-0.0", "0.0", true),
     ] {
-        assert_eq!(equalities(&keys, left, right), Some(equal_json));
-        assert_eq!(equalities(&strings, left, right), Some(false));
+        assert_eq!(evaluate(&keys, json(left), json(right)), Some(equal_json));
+        assert_eq!(evaluate(&strings, text(left), text(right)), Some(false));
     }
 }
 
 #[test]
-fn in_json_rejects_invalid_values_even_beside_sql_null() {
+fn in_json_rejects_damaged_values_even_beside_sql_null() {
     let recipe = json_recipe();
-    let bad: ArrayRef = Arc::new(StringArray::from(vec!["bad"]));
-    let null: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>]));
+    let bad: ArrayRef = Arc::new(LargeBinaryArray::from(vec![b"bad".as_slice()]));
+    let null: ArrayRef = Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>]));
     for (left, right) in [(&bad, &bad), (&bad, &null), (&null, &bad)] {
         let result = recipe
             .membership_equalities_observed(left, right, None, &Active, &mut |_| Ok::<_, ()>(()));
         assert!(matches!(
             result,
-            Err(InError::Operation(error)) if error.failure_fact().class() == FailureClass::Data
+            Err(InError::Operation(error)) if error.failure_fact().class() == FailureClass::Invariant
         ));
     }
 }

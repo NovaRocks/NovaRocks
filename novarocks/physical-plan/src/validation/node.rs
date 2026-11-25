@@ -938,17 +938,18 @@ pub(crate) fn validate_node_semantics(
                     )
                     && matches!(condition, crate::HashJoinCondition::NullAwareEqual { value_equal_keys, scope_keys, eligibility } if value_equal_keys.len() == 1 && scope_keys.is_empty() && eligibility.is_none())
                     && condition.keys().iter().all(|key| {
-                        !key.null_safe
-                            && [key.left, key.right].iter().all(|id| {
-                                fragment
-                                    .root_expression(node.id, *id)
-                                    .is_some_and(|expression| {
-                                        *expression.ty.data_type() == DataType::Utf8
-                                    })
-                            })
+                        !key.null_safe && [key.left, key.right].iter().all(|id| {
+                            fragment
+                                .root_expression(node.id, *id)
+                                .is_some_and(|expression| {
+                                    *expression.ty.data_type() == DataType::Binary
+                                        && expression.ty.logical_type()
+                                            == novarocks_type_contract::ValueLogicalType::Physical
+                                })
+                        })
                     });
                 if !supported {
-                    errors.push(ValidationError::new(path, "left mark hash join requires one null-aware Utf8 key, a right build and singleton or broadcast placement"));
+                    errors.push(ValidationError::new(path, "left mark hash join requires one null-aware Binary key, a right build and singleton or broadcast placement"));
                 }
             }
             let keys = condition.keys();

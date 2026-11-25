@@ -837,11 +837,11 @@ mod tests {
             ValueKind::Struct(vec![ValueField::new("j", json, pure())].into()),
             false,
         );
-        let valid = DataType::Struct(vec![Field::new("j", DataType::Utf8, true)].into());
+        let valid = DataType::Struct(vec![Field::new("j", DataType::LargeBinary, true)].into());
         TypedValueBinding::try_new(structure.clone(), layout(&valid)).unwrap();
         for invalid in [
-            DataType::Struct(vec![Field::new("renamed", DataType::Utf8, true)].into()),
-            DataType::Struct(vec![Field::new("j", DataType::Utf8, false)].into()),
+            DataType::Struct(vec![Field::new("renamed", DataType::LargeBinary, true)].into()),
+            DataType::Struct(vec![Field::new("j", DataType::LargeBinary, false)].into()),
             DataType::Struct(vec![Field::new("j", DataType::Binary, true)].into()),
         ] {
             assert!(TypedValueBinding::try_new(structure.clone(), layout(&invalid)).is_err());

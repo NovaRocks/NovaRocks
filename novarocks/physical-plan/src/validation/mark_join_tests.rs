@@ -33,7 +33,7 @@ fn mark_fragment(
     let mut inputs = Vec::new();
     for node in [left, right] {
         let value = builder.add_value(
-            ValueType::new(DataType::Utf8, true),
+            ValueType::new(DataType::Binary, true),
             ValueOrigin::NodeOutput {
                 node,
                 output_ordinal: 0,
@@ -59,12 +59,12 @@ fn mark_fragment(
     let kind = if hash {
         let key_left = builder.define(
             join,
-            ValueType::new(DataType::Utf8, true),
+            ValueType::new(DataType::Binary, true),
             ExprKind::Value(inputs[0]),
         )?;
         let key_right = builder.define(
             join,
-            ValueType::new(DataType::Utf8, true),
+            ValueType::new(DataType::Binary, true),
             ExprKind::Value(inputs[1]),
         )?;
         let key_left = builder.root_definition(
@@ -98,7 +98,7 @@ fn mark_fragment(
     } else {
         let input = builder.define(
             join,
-            ValueType::new(DataType::Utf8, true),
+            ValueType::new(DataType::Binary, true),
             ExprKind::Value(inputs[0]),
         )?;
         let predicate = builder.define(

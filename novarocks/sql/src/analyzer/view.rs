@@ -1292,7 +1292,7 @@ mod tests {
     #[test]
     fn mixed_view_projection_keeps_exact_sibling_origins_and_authors_converted_metadata() {
         let body =
-            "SELECT parse_json('{}') AS j, CAST(ARRAY[] AS ARRAY(JSON)) AS a, CAST(1 AS INT) AS n";
+            "SELECT json_parse('{}') AS j, CAST(ARRAY[] AS ARRAY(JSON)) AS a, CAST(1 AS INT) AS n";
         let query = novarocks_parser::parser::parse_query(body).unwrap();
         let empty = Catalog::default();
         let (original, _, _) = crate::analyzer::analyze(&query, &empty, "db").unwrap();

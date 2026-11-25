@@ -399,8 +399,12 @@ fn actual_reader_exact_empty_timezone_and_nominal_metadata_retain_source_author(
         ),
         (
             Arc::new(StringArray::from(vec![Some("{\"x\":1}"), None])),
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Json,
+            )
+            .unwrap(),
             HashMap::from([
                 (NR_LOGICAL_TYPE_KEY.into(), "json".into()),
                 ("provider".into(), "unchanged".into()),

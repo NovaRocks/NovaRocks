@@ -12,9 +12,7 @@ use novarocks_spi::connector::{
     MvCurrentStorageMapping, MvObservedStorageMapping, MvStorageColumnDeclaration,
     MvStorageColumnRequest, MvStoragePushdownClass, ProviderSourceType,
 };
-use novarocks_type_contract::{
-    CanonicalFactWriter, CharacterKind, ValueKind, ValueLogicalType, ValueTypeRef,
-};
+use novarocks_type_contract::{CanonicalFactWriter, CharacterKind, ValueKind, ValueTypeRef};
 
 use crate::iceberg::spec::{FormatVersion, NestedField, TableMetadata};
 use crate::schema_mapping::{nominal_declaration::TableNominalDocument, typed_value};
@@ -237,10 +235,7 @@ fn supports_values(logical: &ValueTypeRef, physical: &ValueTypeRef) -> bool {
                 value: storage_value,
             },
         ) => supports_values(key, storage_key) && supports_values(value, storage_value),
-        (
-            ValueKind::BoundedCharacter(_) | ValueKind::Nominal(ValueLogicalType::Json),
-            ValueKind::String,
-        ) => true,
+        (ValueKind::BoundedCharacter(_), ValueKind::String) => true,
         (logical, storage) => logical == storage,
     }
 }
@@ -253,7 +248,9 @@ mod tests {
     use novarocks_spi::connector::{
         ConnectorColumnDefinition, ConnectorDataType, ConnectorStructField,
     };
-    use novarocks_type_contract::{CharacterType, FunctionValueType, ValueTypeStorageLifetime};
+    use novarocks_type_contract::{
+        CharacterType, FunctionValueType, ValueLogicalType, ValueTypeStorageLifetime,
+    };
     use std::sync::Arc;
 
     fn table(version: FormatVersion) -> TableMetadata {
@@ -272,6 +269,7 @@ mod tests {
                     }])),
                 ),
             ),
+            ("text_list", Type::Array(Box::new(Type::String))),
         ]
         .into_iter()
         .map(|(name, data_type)| ConnectorColumnDefinition {
@@ -347,6 +345,7 @@ mod tests {
             )
             .unwrap(),
             fields[2].2.read_type.clone(),
+            fields[3].2.read_type.clone(),
         ];
         assert!(matches!(
             types[2].kind(),
@@ -371,6 +370,7 @@ mod tests {
                     MvStoragePushdownClass::Identity,
                     MvStoragePushdownClass::OrderPreservingInjective,
                     MvStoragePushdownClass::Opaque,
+                    MvStoragePushdownClass::Opaque,
                 ][i]
             );
             assert_eq!(mapped.declaration.storage_format_version, 3);
@@ -388,6 +388,53 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             ConnectorErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn actual_string_storage_refuses_json_outputs_at_the_root_and_inside_an_array() {
+        let fields = mappings(&table(FormatVersion::V3));
+        let json = |nullable| {
+            ValueTypeRef::try_new(
+                ValueKind::Nominal(ValueLogicalType::Json),
+                nullable,
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap()
+        };
+        let nested = ValueTypeRef::try_new(
+            ValueKind::List(json(true)),
+            false,
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        for (ordinal, logical_type) in [(1, json(false)), (3, nested)] {
+            let (field, storage, declaration) = &fields[ordinal];
+            let request = MvStorageColumnRequest {
+                output_ordinal: ordinal as u32,
+                field_id: Bytes::copy_from_slice(&field.id.to_be_bytes()),
+                logical_type,
+            };
+            let error = map_column(&request, storage, !field.required, declaration).unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            assert_eq!(
+                error.message(),
+                format!(
+                    "Iceberg field cannot preserve the exact logical content of MV output {ordinal}"
+                )
+            );
+        }
+        let (field, storage, declaration) = &fields[1];
+        let request = MvStorageColumnRequest {
+            output_ordinal: 1,
+            field_id: Bytes::copy_from_slice(&field.id.to_be_bytes()),
+            logical_type: declaration.read_type.clone(),
+        };
+        assert_eq!(
+            map_column(&request, storage, !field.required, declaration)
+                .unwrap()
+                .pushdown,
+            MvStoragePushdownClass::Identity
         );
     }
 

@@ -21,30 +21,31 @@ use crate::kernel_control::{internal, invalid};
 use crate::opaque_memory::OpaqueAllocationHost;
 use crate::{
     AggregateStateAllocator, EvaluatedArgument, FunctionArgument, FunctionSpecializationFailure,
-    FunctionValueType, KernelDiagnostic, ScalarEvaluationInstance, ScopedExpressionEffects,
-    SelectedValues, Selection, specialize_scalar,
+    FunctionValueType, KernelDiagnostic, RowDataError, ScalarEvaluationInstance,
+    ScopedExpressionEffects, SelectedValues, Selection, specialize_scalar,
 };
-use arrow_array::{Array, ArrayRef, StringArray};
+use arrow_array::{Array, ArrayRef, LargeBinaryArray, StringArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     ExpressionUseId, SemanticParameters,
 };
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
-fn owner() -> ParseJsonOwner {
+fn owner(operation: JsonFunction) -> ParseJsonOwner {
     let signatures = super::super::registry::builtin_scalar_declarations()
         .into_iter()
-        .find(|(n, _)| n == "parse_json")
+        .find(|(n, _)| n == operation.name())
         .unwrap()
         .1;
     let (declaration, resolver) = super::super::catalogue::scalar_definition_parts(
-        "parse_json",
+        operation.name(),
         &signatures,
         FunctionKind::Scalar,
     )
     .unwrap();
-    ParseJsonOwner::new(declaration, resolver).unwrap()
+    ParseJsonOwner::new(operation, declaration, resolver).unwrap()
 }
+
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
@@ -72,9 +73,18 @@ fn prepare_with(
     uses: &[Option<ExpressionUseId>],
     control: &dyn PureCompileControl,
 ) -> Result<Arc<dyn PreparedScalarKernel>, FunctionSpecializationFailure> {
-    let owner = owner();
     let args = arguments(n);
-    let selected = Arc::new(owner.resolve(request(&args), control)?);
+    prepare_operation(JsonFunction::Parse, &args, uses, control)
+}
+
+fn prepare_operation(
+    operation: JsonFunction,
+    args: &[FunctionArgument],
+    uses: &[Option<ExpressionUseId>],
+    control: &dyn PureCompileControl,
+) -> Result<Arc<dyn PreparedScalarKernel>, FunctionSpecializationFailure> {
+    let owner = owner(operation);
+    let selected = Arc::new(owner.resolve(request(args), control)?);
     let parameters = SemanticParameters::try_new([]).unwrap();
     specialize_scalar(
         &owner,
@@ -84,7 +94,7 @@ fn prepare_with(
             function_id: owner.declaration.function_id(),
             kind: FunctionKind::Scalar,
             selected: &selected,
-            request: request(&args),
+            request: request(args),
             environment: &[],
             parameters: &parameters,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
@@ -111,12 +121,27 @@ fn instance(n: usize, host: &Arc<Host>) -> ScalarEvaluationInstance {
 fn strings(values: Vec<Option<&str>>) -> ArrayRef {
     Arc::new(StringArray::from(values))
 }
+struct Unmetered;
+impl crate::json_value::JsonWork for Unmetered {
+    type Reservation = ();
+
+    fn step(&mut self) -> Result<(), KernelFailure> {
+        Ok(())
+    }
+    fn reserve(&mut self, _: usize) -> Result<(), KernelFailure> {
+        Ok(())
+    }
+    fn reserve_output(&mut self, _: usize) -> Result<(), KernelFailure> {
+        Ok(())
+    }
+}
+
 fn texts(out: &ArrayRef) -> Vec<Option<String>> {
     out.as_any()
-        .downcast_ref::<StringArray>()
+        .downcast_ref::<LargeBinaryArray>()
         .unwrap()
         .iter()
-        .map(|s| s.map(str::to_owned))
+        .map(|value| value.map(|bytes| crate::json_value::format(bytes, &mut Unmetered).unwrap()))
         .collect()
 }
 #[derive(Default)]
@@ -249,7 +274,6 @@ fn parse_json_actual_host_precedes_parser_and_preserves_all_seven_refusals() {
         let mut kernel = instance(1, &host);
         let next = host.ledger.lock().unwrap().opaque_attempts;
         *host.opaque_refusal.lock().unwrap() = Some((next, cause.clone()));
-        crate::parse_json_core::PARSE_ENTRIES.with(|entries| entries.set(0));
         assert_eq!(
             kernel
                 .evaluate(
@@ -260,7 +284,6 @@ fn parse_json_actual_host_precedes_parser_and_preserves_all_seven_refusals() {
                 .unwrap_err(),
             cause
         );
-        crate::parse_json_core::PARSE_ENTRIES.with(|entries| assert_eq!(entries.get(), 0));
         assert_eq!(
             kernel
                 .evaluate(
@@ -308,9 +331,16 @@ fn parse_json_selected_compact_nulls_and_original_data_errors() {
             .unwrap();
         assert_eq!(
             texts(out.values()),
-            vec![None, Some("null".into()), Some("[1, 2]".into())]
+            vec![None, Some("null".into()), Some("[1,2]".into())]
         );
-        assert!(out.errors().is_empty());
+        assert_eq!(out.errors().len(), 1);
+        assert_eq!(out.errors()[0].selected_ordinal(), 0);
+        assert_eq!(
+            out.errors()[0].reason(),
+            crate::DataFailureReason::Domain(
+                novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT
+            ),
+        );
         drop(out);
         drop(kernel);
         empty(&host);
@@ -436,7 +466,7 @@ fn parse_json_owned_custody_host_refusals_release_every_actual_block() {
 fn parse_json_missing_real_allocation_capability_is_named_rejection() {
     assert!(
         matches!(prepare(1).create_instance(), Err(KernelFailure::InvalidProgram(ref diagnostic))
-        if diagnostic.message() == "parse_json requires its actual scalar allocation host")
+        if diagnostic.message() == "JSON requires its actual scalar allocation host")
     );
     assert!(matches!(
         prepare(1).create_instance_with_allocator(None),
@@ -454,6 +484,141 @@ fn parse_json_missing_real_allocation_capability_is_named_rejection() {
     assert!(matches!(
         prepare(1).create_instance_with_allocator(Some(Arc::new(NoOpaqueHost))),
         Err(KernelFailure::InvalidProgram(ref diagnostic))
-            if diagnostic.message() == "parse_json requires its actual scalar allocation host"
+            if diagnostic.message() == "JSON requires its actual scalar allocation host"
     ));
+}
+
+fn selected_operation(
+    operation: JsonFunction,
+    arg_types: Vec<FunctionValueType>,
+    host: &Arc<Host>,
+) -> ScalarEvaluationInstance {
+    let count = arg_types.len();
+    let args = arg_types
+        .into_iter()
+        .map(|value_type| FunctionArgument::Value {
+            value_type,
+            constant: None,
+        })
+        .collect::<Vec<_>>();
+    let uses = (0..count)
+        .map(|index| Some(ExpressionUseId::new(u32::try_from(index).unwrap() + 42)))
+        .collect::<Vec<_>>();
+    let prepared =
+        prepare_operation(operation, &args, &uses, crate::binding_test_control()).unwrap();
+    ScalarEvaluationInstance::instantiate_with_allocator(
+        prepared,
+        Some(host.clone() as Arc<dyn AggregateStateAllocator>),
+    )
+    .unwrap()
+}
+
+fn json_strings(values: &[Option<&str>]) -> ArrayRef {
+    let owned = values
+        .iter()
+        .map(|value| value.map(|raw| crate::json_value::parse(raw, &mut Unmetered).unwrap()))
+        .collect::<Vec<_>>();
+    let array = LargeBinaryArray::from_iter(owned.iter().map(|value| value.as_deref()));
+    Arc::new(array)
+}
+
+#[test]
+fn json_object_selected_keeps_original_members_and_applies_null_and_unique_policies() {
+    let key = strings(vec![Some("k"), Some("k"), Some("k"), None]);
+    let rhs_key = strings(vec![Some("k"), Some("k"), Some("x"), Some("k")]);
+    let left = json_strings(&[Some("1.00"), Some("1.00"), Some(r#"{"a":1,"a":2}"#), None]);
+    let right = json_strings(&[Some("2e0"), None, None, None]);
+    let args = [
+        EvaluatedArgument::Column(&key),
+        EvaluatedArgument::Column(&rhs_key),
+        EvaluatedArgument::Column(&left),
+        EvaluatedArgument::Column(&right),
+    ];
+    for unique in [false, true] {
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Json,
+        )
+        .unwrap();
+        let text = FunctionValueType::new(DataType::Utf8, true);
+        let host = Arc::new(Host::default());
+        let mut kernel = selected_operation(
+            JsonFunction::Object {
+                null_on_null: false,
+                unique,
+            },
+            vec![text.clone(), text, json.clone(), json],
+            &host,
+        );
+        let out = kernel
+            .evaluate(Selection::all(4), &args, &Control::default())
+            .unwrap();
+        assert_eq!(
+            texts(out.values()),
+            if unique {
+                vec![None, Some(r#"{"k":1.00}"#.into()), None, None]
+            } else {
+                vec![
+                    Some(r#"{"k":1.00,"k":2.0}"#.into()),
+                    Some(r#"{"k":1.00}"#.into()),
+                    Some(r#"{"k":{"a":1,"a":2}}"#.into()),
+                    None,
+                ]
+            }
+        );
+        let ordinals = out
+            .errors()
+            .iter()
+            .map(RowDataError::selected_ordinal)
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, if unique { vec![0, 2, 3] } else { vec![3] });
+        let hold = out.values().slice(0, 2);
+        drop(out);
+        drop(kernel);
+        assert!(host.ledger.lock().unwrap().opaque_bytes > 0);
+        drop(hold);
+        empty(&host);
+    }
+}
+
+#[test]
+fn json_serialization_input_error_is_row_scoped_and_can_return_sql_null() {
+    use super::super::json_sql::JsonEncoding;
+    let source: ArrayRef = Arc::new(arrow_array::BinaryArray::from(vec![
+        Some([b'"', 0xff, b'"'].as_slice()),
+        Some(b"oops".as_slice()),
+        None,
+    ]));
+    for null_on_error in [false, true] {
+        let host = Arc::new(Host::default());
+        let mut kernel = selected_operation(
+            JsonFunction::ReadBinary {
+                encoding: JsonEncoding::Utf8,
+                null_on_error,
+            },
+            vec![FunctionValueType::new(DataType::Binary, true)],
+            &host,
+        );
+        let args = [EvaluatedArgument::Column(&source)];
+        let out = kernel
+            .evaluate(Selection::all(3), &args, &Control::default())
+            .unwrap();
+        assert_eq!(texts(out.values()), vec![Some(r#""�""#.into()), None, None]);
+        if null_on_error {
+            assert!(out.errors().is_empty());
+        } else {
+            assert_eq!(out.errors().len(), 1);
+            assert_eq!(out.errors()[0].selected_ordinal(), 1);
+            assert_eq!(
+                out.errors()[0].reason(),
+                crate::DataFailureReason::Domain(
+                    novarocks_function_contract::kernel_failure::JSON_INPUT_CONVERSION_ERROR,
+                )
+            );
+        }
+        drop(out);
+        drop(kernel);
+        empty(&host);
+    }
 }

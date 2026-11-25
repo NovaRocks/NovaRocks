@@ -6,6 +6,7 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Types;
+import java.util.Arrays;
 import java.util.Properties;
 import java.util.Optional;
 import io.trino.jdbc.TrinoConnection;
@@ -25,6 +26,7 @@ public final class JdbcProbe {
                 throw new AssertionError("JDBC /v1/info returned no original server version");
             }
             System.out.println("JDBC_PROBE_OK validated=true server_version=" + version.get());
+            jsonResults(connection);
         }
         for (boolean explicit : new boolean[] {true, false}) {
             properties.setProperty("explicitPrepare", Boolean.toString(explicit));
@@ -40,6 +42,42 @@ public final class JdbcProbe {
             check(rows.next() && rows.getLong(1) == 51, "explicit prepared INSERT readback");
             check(rows.next() && rows.getLong(1) == 52 && !rows.next(), "immediate prepared INSERT readback");
         }
+    }
+
+    private static void jsonResults(Connection connection) throws Exception {
+        String document = "{\"b\":2,\"a\":1,\"a\":2}";
+        try (var statement = connection.createStatement();
+                var rows = statement.executeQuery("""
+                        SELECT JSON '{"b":2,"a":1,"a":2}' AS doc,
+                               CAST(NULL AS JSON) AS sql_null,
+                               JSON 'null' AS json_null,
+                               ARRAY[JSON '{"b":2,"a":1,"a":2}', CAST(NULL AS JSON), JSON 'null'] AS nested
+                        """)) {
+            var metadata = rows.getMetaData();
+            for (int column = 1; column <= 3; column++) {
+                check(metadata.getColumnType(column) == Types.JAVA_OBJECT, "JSON JDBC type");
+                check(metadata.getColumnTypeName(column).equals("json"), "JSON SQL type");
+                check(metadata.getColumnClassName(column).equals(String.class.getName()), "JSON JDBC class");
+            }
+            check(metadata.getColumnType(4) == Types.ARRAY, "array(json) JDBC type");
+            check(metadata.getColumnTypeName(4).equals("array(json)"), "array(json) SQL type");
+            check(rows.next(), "missing JSON result row");
+            check(document.equals(rows.getObject(1)) && !rows.wasNull(), "direct JSON text and duplicates");
+            check(rows.getObject(2) == null && rows.wasNull(), "JSON column SQL NULL");
+            check("null".equals(rows.getString(3)) && !rows.wasNull(), "present JSON null text");
+            var nested = rows.getArray(4);
+            try {
+                check(nested.getBaseType() == Types.JAVA_OBJECT
+                        && nested.getBaseTypeName().equals("json"), "nested JSON element type");
+                check(Arrays.equals((Object[]) nested.getArray(), new Object[] {document, null, "null"}),
+                        "nested JSON text and nulls");
+            }
+            finally {
+                nested.free();
+            }
+            check(!rows.next(), "unexpected additional JSON result row");
+        }
+        System.out.println("JDBC_JSON_OK direct=true nested=true sql_null=true json_null=true");
     }
 
     private static void preparedReads(Connection connection) throws Exception {

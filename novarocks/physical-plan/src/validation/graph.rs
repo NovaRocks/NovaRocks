@@ -1796,7 +1796,7 @@ mod scalar_binding_tests {
             if json {
                 ValueKind::Nominal(ValueLogicalType::Json)
             } else {
-                ValueKind::String
+                ValueKind::Binary
             },
             true,
             Hold::pure(),
@@ -1805,7 +1805,7 @@ mod scalar_binding_tests {
         let root = ValueTypeRef::try_new(ValueKind::List(item), false, Hold::pure()).unwrap();
         let layout = arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
             "item",
-            arrow_schema::DataType::Utf8,
+            arrow_schema::DataType::LargeBinary,
             true,
         )));
         FunctionValueType::try_from_value(
@@ -1816,7 +1816,7 @@ mod scalar_binding_tests {
     }
 
     #[test]
-    fn actual_result_port_rejects_nested_json_text_drift_on_the_same_value_layout() {
+    fn actual_result_port_rejects_nested_json_domain_drift_on_the_same_value_layout() {
         let expected = list(true);
         for json in [false, true] {
             let actual = list(json);

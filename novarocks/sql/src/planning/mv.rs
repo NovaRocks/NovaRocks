@@ -287,7 +287,7 @@ mod refresh_property_facade_tests {
                 columns: if table == "logical_domains" {
                     use novarocks_types::schema::SqlType;
                     [
-                        ("doc", DataType::Utf8, Some(SqlType::Json)),
+                        ("doc", DataType::LargeBinary, Some(SqlType::Json)),
                         (
                             "variant_value",
                             DataType::LargeBinary,
@@ -3451,18 +3451,12 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
             reject_unsupported_expr(&node.trim_source)?;
         }
         Expr::JsonObject(node) => {
-            if !crate::analyzer::is_supported_json_object_profile(node) {
-                return Err(projection_filter_error());
-            }
             for member in &node.members {
                 reject_unsupported_expr(&member.key)?;
                 reject_unsupported_expr(&member.value)?;
             }
         }
         Expr::JsonArray(node) => {
-            if !crate::analyzer::is_supported_json_array_profile(node) {
-                return Err(projection_filter_error());
-            }
             for element in &node.elements {
                 reject_unsupported_expr(&element.value)?;
             }
@@ -3475,10 +3469,9 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
             reject_unsupported_expr(&node.path_invocation.input_expression)?;
         }
 
-        Expr::JsonConstructor(_)
-        | Expr::JsonExists(_)
-        | Expr::JsonValue(_)
-        | Expr::JsonSerialize(_) => return Err(projection_filter_error()),
+        Expr::JsonConstructor(node) => reject_unsupported_expr(&node.expression)?,
+        Expr::JsonSerialize(node) => reject_unsupported_expr(&node.expression)?,
+        Expr::JsonExists(_) | Expr::JsonValue(_) => return Err(projection_filter_error()),
 
         Expr::Subquery(_) | Expr::Exists(_) | Expr::Unique(_) | Expr::WindowOperation(_) => {
             return Err(projection_filter_error());

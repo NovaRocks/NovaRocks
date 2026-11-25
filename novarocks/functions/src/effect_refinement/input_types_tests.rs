@@ -210,8 +210,12 @@ fn reject(fixture: &Fixture, argument_control: ArgumentControl) {
     owner.untouched();
 }
 fn json(nullable: bool) -> FunctionValueType {
-    FunctionValueType::try_with_logical_type(DataType::Utf8, nullable, ValueLogicalType::Json)
-        .unwrap()
+    FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        nullable,
+        ValueLogicalType::Json,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -219,8 +223,8 @@ fn value_domains_and_nullable_covariance_are_checked_before_owner() {
     for (actual, selected, valid) in [
         (ty(DataType::Int64, false), ty(DataType::Int64, true), true),
         (ty(DataType::Int64, true), ty(DataType::Int64, false), false),
-        (json(false), ty(DataType::Utf8, false), false),
-        (ty(DataType::Utf8, false), json(false), false),
+        (json(false), ty(DataType::LargeBinary, false), false),
+        (ty(DataType::LargeBinary, false), json(false), false),
         (
             ty(DataType::Int32, false),
             ty(DataType::Int64, false),

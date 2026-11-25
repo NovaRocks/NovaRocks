@@ -23,7 +23,8 @@ use std::sync::Arc;
 fn list(domain: ValueLogicalType, root_nullable: bool, child_nullable: bool) -> FunctionValueType {
     let storage = ValueTypeStorageLifetime::pure();
     let child =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, child_nullable, domain).unwrap();
+        FunctionValueType::try_with_logical_type(DataType::LargeBinary, child_nullable, domain)
+            .unwrap();
     let value = ValueTypeRef::try_new(
         ValueKind::List(child.value_type().clone()),
         root_nullable,
@@ -31,7 +32,11 @@ fn list(domain: ValueLogicalType, root_nullable: bool, child_nullable: bool) -> 
     )
     .unwrap();
     let layout = ValueLayout::try_new(
-        &DataType::List(Arc::new(Field::new("item", DataType::Utf8, child_nullable))),
+        &DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::LargeBinary,
+            child_nullable,
+        ))),
         storage,
     )
     .unwrap();
@@ -200,9 +205,12 @@ fn physical_binding_comparison_ignores_only_root_nullability_and_keeps_original_
             assert_eq!(seen, stop);
         }
     }
-    let narrow = list(ValueLogicalType::Physical, false, true);
+    let narrow = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Binary, true))),
+        false,
+    );
     let wide = FunctionValueType::new(
-        DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
+        DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true))),
         true,
     );
     assert!(narrow.same_value_domain(&wide));

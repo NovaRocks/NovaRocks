@@ -46,9 +46,7 @@ mod helpers;
 mod json_syntax;
 #[cfg(test)]
 pub(crate) use helpers::sql_logical_projection;
-pub(crate) use json_syntax::{
-    is_plain_json_query, is_supported_json_array_profile, is_supported_json_object_profile,
-};
+pub(crate) use json_syntax::is_plain_json_query;
 #[cfg(test)]
 mod collection_expression_tests;
 #[cfg(test)]
@@ -5805,27 +5803,27 @@ mod tests {
     fn json_in_value_form_admission_preserves_clause_and_json_evidence() {
         for (sql, clause) in [
             (
-                "select parse_json('{}') in (select parse_json('{}'))",
+                "select json_parse('{}') in (select json_parse('{}'))",
                 ApplyClause::Projection,
             ),
             (
-                "select 1 where false or parse_json('{}') not in (select parse_json('null'))",
+                "select 1 where false or json_parse('{}') not in (select json_parse('null'))",
                 ApplyClause::Where,
             ),
             (
-                "select 1 where (false or parse_json('{}') not in (select parse_json('null'))) is true",
+                "select 1 where (false or json_parse('{}') not in (select json_parse('null'))) is true",
                 ApplyClause::Where,
             ),
             (
-                "select count(*) from orders having false or parse_json(cast(max(o_orderkey) as varchar)) in (select parse_json('1'))",
+                "select count(*) from orders having false or json_parse(cast(max(o_orderkey) as varchar)) in (select json_parse('1'))",
                 ApplyClause::Having,
             ),
             (
-                "select parse_json(cast(max(o_orderkey) as varchar)) as j from orders having false or j in (select parse_json('1'))",
+                "select json_parse(cast(max(o_orderkey) as varchar)) as j from orders having false or j in (select json_parse('1'))",
                 ApplyClause::Having,
             ),
             (
-                "select false or parse_json('{}') in (select parse_json('{}'))",
+                "select false or json_parse('{}') in (select json_parse('{}'))",
                 ApplyClause::Projection,
             ),
         ] {
@@ -5854,7 +5852,7 @@ mod tests {
                 else {
                     panic!("scalar key")
                 };
-                assert_eq!(result.data_type(), &DataType::Utf8);
+                assert_eq!(result.data_type(), &DataType::Binary);
                 assert_eq!(
                     result.logical_type(),
                     novarocks_type_contract::ValueLogicalType::Physical
@@ -5866,24 +5864,25 @@ mod tests {
     #[test]
     fn json_in_subquery_rejects_unsupported_positions_and_erased_identity() {
         for sql in [
-            "select 1 where parse_json('{}') in (select parse_json('{}'))",
-            "select 1 where not (parse_json('{}') in (select parse_json('{}')))",
-            "select 1 where case when parse_json('{}') in (select parse_json('{}')) then true else false end",
-            "select parse_json('{}') in (select '{}')",
-            "select parse_json('1') in (select cast(1 as variant))",
-            "select cast(1 as variant) in (select parse_json('1'))",
-            "select '{}' in (select parse_json('{}'))",
-            "select parse_json('{}') in (select parse_json('{}'), parse_json('{}'))",
-            "select parse_json('{}') in (select parse_json(cast(o_orderkey as varchar))) from orders",
-            "select count(parse_json('{}') in (select parse_json('{}'))) from orders",
-            "select * from orders join lineitem on parse_json('{}') in (select parse_json('{}'))",
+            "select 1 where json_parse('{}') in (select json_parse('{}'))",
+            "select 1 where not (json_parse('{}') in (select json_parse('{}')))",
+            "select 1 where case when json_parse('{}') in (select json_parse('{}')) then true else false end",
+            "select json_parse('{}') in (select '{}')",
+            "select json_parse('1') in (select cast(1 as variant))",
+            "select cast(1 as variant) in (select json_parse('1'))",
+            "select '{}' in (select json_parse('{}'))",
+            "select json_parse('{}') in (select json_parse('{}'), json_parse('{}'))",
+            "select json_parse('{}') in (select json_parse(cast(o_orderkey as varchar))) from orders",
+            "select count(json_parse('{}') in (select json_parse('{}'))) from orders",
+            "select * from orders join lineitem on json_parse('{}') in (select json_parse('{}'))",
         ] {
             assert!(parse_and_analyze(sql).is_err(), "must reject: {sql}");
         }
     }
 
     #[test]
-    fn json_typed_literals_preserve_the_declared_domain_and_original_bytes() {
+    fn json_typed_literals_preserve_the_declared_domain_and_numeric_class() {
+        use novarocks_functions::json_value::{Kind, Node, Scalar};
         for text in ["1.00", "123456789012345678901234567890", "1E308"] {
             let sql = format!("select JSON '{text}'");
             let resolved = parse_and_analyze(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
@@ -5893,9 +5892,31 @@ mod tests {
                 novarocks_type_contract::ValueLogicalType::Json
             );
             assert!(!item.value_type.nullable());
-            assert!(
-                matches!(&item.kind, ExprKind::Literal(LiteralValue::String(actual)) if actual == text)
-            );
+            assert_eq!(item.value_type.data_type(), &DataType::LargeBinary);
+            let ExprKind::Constant(value) = &item.kind else {
+                panic!("native JSON constant");
+            };
+            let node = Node::from_root(value.try_binary().unwrap().unwrap()).unwrap();
+            match (text, node.kind().unwrap()) {
+                (
+                    "1.00",
+                    Kind::Scalar(Scalar::Decimal {
+                        scale: 2,
+                        coefficient: 100,
+                        ..
+                    }),
+                ) => {}
+                (
+                    "123456789012345678901234567890",
+                    Kind::Scalar(Scalar::Decimal {
+                        precision: 30,
+                        scale: 0,
+                        coefficient: 123456789012345678901234567890,
+                    }),
+                ) => {}
+                ("1E308", Kind::Scalar(Scalar::Double(value))) if value == 1e308 => {}
+                (_, actual) => panic!("unexpected numeric class for {text}: {actual:?}"),
+            }
         }
         for text in ["1E400", "not JSON"] {
             let sql = format!("select JSON '{text}'");
@@ -5913,24 +5934,33 @@ mod tests {
             .expect("typed JSON mark admission");
         let spec = only_scalar_spec(select_body(&resolved));
         assert!(spec.mark_key_bindings.is_some());
-        assert!(
-            matches!(&spec.mark_probe.as_ref().unwrap().kind, ExprKind::Literal(LiteralValue::String(value)) if value == "1.00")
-        );
+        let ExprKind::Constant(probe) = &spec.mark_probe.as_ref().unwrap().kind else {
+            panic!("native JSON probe constant");
+        };
+        let node = Node::from_root(probe.try_binary().unwrap().unwrap()).unwrap();
+        assert!(matches!(
+            node.kind().unwrap(),
+            Kind::Scalar(Scalar::Decimal {
+                scale: 2,
+                coefficient: 100,
+                ..
+            })
+        ));
     }
 
     #[test]
     fn json_comparison_rejects_foreign_domains_before_carrier_coercion() {
         for sql in [
-            "select parse_json('1') in (cast(1 as variant))",
-            "select cast(1 as variant) in (parse_json('1'))",
-            "select parse_json('1') = cast(1 as variant)",
-            "select parse_json('1') in ('1')",
-            "select parse_json('1') in (1)",
-            "select __json_canonical_key(parse_json('1'))",
+            "select json_parse('1') in (cast(1 as variant))",
+            "select cast(1 as variant) in (json_parse('1'))",
+            "select json_parse('1') = cast(1 as variant)",
+            "select json_parse('1') in ('1')",
+            "select json_parse('1') in (1)",
+            "select __json_canonical_key(json_parse('1'))",
         ] {
             assert!(parse_and_analyze(sql).is_err(), "must reject {sql}");
         }
-        assert!(parse_and_analyze("select parse_json('1') in (parse_json('1'), null)").is_ok());
+        assert!(parse_and_analyze("select json_parse('1') in (json_parse('1'), null)").is_ok());
         assert!(parse_and_analyze("select '1.0' in ('1.00')").is_ok());
     }
 

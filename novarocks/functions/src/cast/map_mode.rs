@@ -34,6 +34,7 @@ pub(super) fn evaluate_row(
     row: usize,
     ordinal: usize,
     control: &dyn KernelEvaluationControl,
+    allocator: Option<&Arc<dyn crate::AggregateStateAllocator>>,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Result<ArrayRef, RowDataError>, KernelFailure> {
     let map = input
@@ -61,11 +62,12 @@ pub(super) fn evaluate_row(
         .map(Ok);
     }
     let keys = map.keys().slice(start, count);
-    let key_output = children[0].evaluate_selected(
+    let key_output = children[0].evaluate_selected_scoped(
         EvaluatedArgument::Column(&keys),
         Selection::all(count),
         &[],
         control,
+        allocator,
     )?;
     if let Some(error) = key_output.errors().first() {
         return Ok(Err(error.with_selected_ordinal(ordinal)));
@@ -77,11 +79,12 @@ pub(super) fn evaluate_row(
     }
     work.flush()?;
     let source_values = map.values().slice(start, count);
-    let value_output = children[1].evaluate_selected(
+    let value_output = children[1].evaluate_selected_scoped(
         EvaluatedArgument::Column(&source_values),
         Selection::all(count),
         &[],
         control,
+        allocator,
     )?;
     if let Some(error) = value_output.errors().first() {
         return Ok(Err(error.with_selected_ordinal(ordinal)));

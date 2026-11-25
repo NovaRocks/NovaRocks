@@ -3157,10 +3157,10 @@ mod tests {
     fn array_agg_json_semantic_schema_survives_optimizer_and_exact_final_plan() {
         use arrow::datatypes::DataType;
         for sql in [
-            "select array_agg(JSON_OBJECT('2': 3)) as j, array_agg(cast(JSON_OBJECT('2': 3) as varchar)) as s",
-            "with q as (select cast(json_object('k':1) as json) as j) select array_agg(j) as j, array_agg(cast(j as varchar)) as s from q",
-            "select concat(ARRAY[json_object('k':1)], ARRAY[json_object('k':2)]) as j, concat(cast(ARRAY[json_object('k':1), json_object('k':2)] as ARRAY(VARCHAR)), ARRAY['plain']) as s",
-            "with q as (select [json_object('k':1),json_object('k':2)] as j) select concat(j, ARRAY[json_object('k':3)]) as j, concat(cast(j as ARRAY(VARCHAR)), ARRAY['plain']) as s from q",
+            "select array_agg(JSON_OBJECT('2' VALUE 3 RETURNING JSON)) as j, array_agg(cast(JSON_OBJECT('2' VALUE 3 RETURNING JSON) as varchar)) as s",
+            "with q as (select cast(JSON_OBJECT('k' VALUE 1 RETURNING JSON) as json) as j) select array_agg(j) as j, array_agg(cast(j as varchar)) as s from q",
+            "select concat(ARRAY[JSON_OBJECT('k' VALUE 1 RETURNING JSON)], ARRAY[JSON_OBJECT('k' VALUE 2 RETURNING JSON)]) as j, concat(cast(ARRAY[JSON_OBJECT('k' VALUE 1 RETURNING JSON), JSON_OBJECT('k' VALUE 2 RETURNING JSON)] as ARRAY(VARCHAR)), ARRAY['plain']) as s",
+            "with q as (select [JSON_OBJECT('k' VALUE 1 RETURNING JSON),JSON_OBJECT('k' VALUE 2 RETURNING JSON)] as j) select concat(j, ARRAY[JSON_OBJECT('k' VALUE 3 RETURNING JSON)]) as j, concat(cast(j as ARRAY(VARCHAR)), ARRAY['plain']) as s from q",
         ] {
             let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
             let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
@@ -3327,7 +3327,7 @@ mod tests {
     fn ordered_array_agg_nullable_json_union_reaches_exact_final_plan() {
         // Exact original public SQL source, using the ordinary builtin catalog
         // and compiler path, not a hand-built selected signature or expression.
-        let sql = "WITH q AS (SELECT 1 AS n, json_object('k':1) AS j UNION ALL SELECT 2, json_object('k':2) UNION ALL SELECT 3, NULL) SELECT array_agg(j ORDER BY n) AS json_values, array_agg(CAST(j AS VARCHAR) ORDER BY n) AS string_values FROM q";
+        let sql = "WITH q AS (SELECT 1 AS n, JSON_OBJECT('k' VALUE 1 RETURNING JSON) AS j UNION ALL SELECT 2, JSON_OBJECT('k' VALUE 2 RETURNING JSON) UNION ALL SELECT 3, NULL) SELECT array_agg(j ORDER BY n) AS json_values, array_agg(CAST(j AS VARCHAR) ORDER BY n) AS string_values FROM q";
         let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());

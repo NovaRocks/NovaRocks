@@ -20490,7 +20490,7 @@ mod logical_projection_tests {
     #[test]
     fn contract_decoration_projection_preserves_all_declared_root_domains() {
         for source in [
-            semantic(DataType::Utf8, ValueLogicalType::Json),
+            semantic(DataType::LargeBinary, ValueLogicalType::Json),
             semantic(DataType::LargeBinary, ValueLogicalType::Variant),
             semantic(DataType::Binary, ValueLogicalType::Hll),
             semantic(DataType::LargeBinary, ValueLogicalType::Bitmap),
@@ -20549,7 +20549,7 @@ mod logical_projection_tests {
         assert_eq!(projected, source);
         assert_eq!(projected.logical_type(), ValueLogicalType::Physical);
         projected.validate().unwrap();
-        let json = semantic(DataType::Utf8, ValueLogicalType::Json);
+        let json = semantic(DataType::LargeBinary, ValueLogicalType::Json);
         let variant = semantic(DataType::LargeBinary, ValueLogicalType::Variant);
         let lambda = FunctionArgumentType::Lambda {
             parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(

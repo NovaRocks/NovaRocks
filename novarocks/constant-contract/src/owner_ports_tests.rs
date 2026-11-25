@@ -633,21 +633,25 @@ fn actual_nested_unknown_source_attributes_are_retained_counted_and_never_semant
         ),
         ("provider.large.fact".into(), "x".repeat(2049)),
     ]);
-    let child =
-        Arc::new(Field::new("payload", DataType::Utf8, false).with_metadata(attributes.clone()));
+    let child = Arc::new(
+        Field::new("payload", DataType::LargeBinary, false).with_metadata(attributes.clone()),
+    );
     let array: ArrayRef = Arc::new(StructArray::new(
         vec![child].into(),
-        vec![Arc::new(arrow_array::StringArray::from(vec![
-            "{}",
-            "{\"a\":1}",
+        vec![Arc::new(arrow_array::LargeBinaryArray::from(vec![
+            b"\x01\x20".as_slice(),
+            b"\x01\x42\x01".as_slice(),
         ]))],
         None,
     ));
     let field =
         Arc::new(Field::new("source", array.data_type().clone(), false).with_metadata(attributes));
-    let child_type =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let child_type = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let storage = ValueTypeStorageLifetime::pure();
     let semantic = ValueTypeRef::try_new(
         ValueKind::Struct(
@@ -715,7 +719,7 @@ fn actual_nested_unknown_source_attributes_are_retained_counted_and_never_semant
         Err(ConstantError::Limit(_))
     ));
     prefixes(&input, capped, true);
-    // The same physical source can be independently declared as plain text;
+    // The same physical source can be independently declared as ordinary binary;
     // that complete semantic declaration never equals this JSON descendant.
     let physical_type = FunctionValueType::new(input.field.data_type().clone(), false);
     let physical = ConstantPool::try_new(

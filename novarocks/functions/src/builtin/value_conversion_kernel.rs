@@ -25,9 +25,9 @@ pub(super) mod temporal_assignment;
 
 use super::value_conversion::{
     ARRAY_COMMON_COERCION, BOOLEAN_LARGEINT, DECIMAL128_LARGEINT, DECIMAL256_LARGEINT,
-    FLOAT32_LARGEINT, FLOAT64_LARGEINT, JSON_TEXT, LARGEINT_DECIMAL, LARGEINT_FLOAT,
-    LARGEINT_SIGNED, LARGEINT_TEXT, NULL_LIFT, OPAQUE_BINARY, OPERATOR_DECIMAL_FLOAT_COERCION,
-    SIGNED_LARGEINT, TEMPORAL_WRITE_ASSIGNMENT, UTF8_LARGEINT, operator_decimal_float_types,
+    FLOAT32_LARGEINT, FLOAT64_LARGEINT, LARGEINT_DECIMAL, LARGEINT_FLOAT, LARGEINT_SIGNED,
+    LARGEINT_TEXT, NULL_LIFT, OPAQUE_BINARY, OPERATOR_DECIMAL_FLOAT_COERCION, SIGNED_LARGEINT,
+    TEMPORAL_WRITE_ASSIGNMENT, UTF8_LARGEINT, operator_decimal_float_types,
 };
 use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionBindingSelection, KernelEvaluationControl,
@@ -106,7 +106,7 @@ enum NumericLargeIntSource {
     Boolean,
 }
 #[derive(Clone, Copy, Debug)]
-enum JsonKind {
+enum SameShapeKind {
     Keep,
     List,
     LargeList,
@@ -115,8 +115,8 @@ enum JsonKind {
     Map,
 }
 #[derive(Debug)]
-struct JsonNode {
-    kind: JsonKind,
+struct SameShapeNode {
+    kind: SameShapeKind,
     children: Range<usize>,
 }
 
@@ -131,7 +131,7 @@ pub(super) struct ConversionRecipe {
     // The inline root is counted by size_of::<Self>(); all actually created
     // recursive recipe/projection heap is counted by the original CAST author.
     array_common: Option<crate::PreparedCastRecipe>,
-    nodes: Vec<JsonNode>,
+    nodes: Vec<SameShapeNode>,
     edges: Vec<usize>,
     retained: usize,
 }
@@ -151,7 +151,7 @@ impl ConversionRecipe {
             validate_type_observed(source, &mut work)?;
             validate_type_observed(target, &mut work)?;
             let operation = match contract.selected().overload.as_str() {
-                JSON_TEXT | OPAQUE_BINARY => Operation::SameShape,
+                OPAQUE_BINARY => Operation::SameShape,
                 SIGNED_LARGEINT => {
                     Operation::SignedLargeInt(Signed::from_type(source.data_type())?)
                 }
@@ -244,7 +244,7 @@ impl ConversionRecipe {
                     recipe
                         .nodes
                         .capacity()
-                        .checked_mul(std::mem::size_of::<JsonNode>())
+                        .checked_mul(std::mem::size_of::<SameShapeNode>())
                         .ok_or(KernelFailure::ResourceExhausted)?,
                 )
                 .and_then(|bytes| {
@@ -299,21 +299,21 @@ impl ConversionRecipe {
             work.step().map_err(compile_failure)
         })?;
         let (kind, count) = if same {
-            (JsonKind::Keep, 0)
+            (SameShapeKind::Keep, 0)
         } else {
             match (source, target) {
-                (DataType::List(_), DataType::List(_)) => (JsonKind::List, 1),
-                (DataType::LargeList(_), DataType::LargeList(_)) => (JsonKind::LargeList, 1),
+                (DataType::List(_), DataType::List(_)) => (SameShapeKind::List, 1),
+                (DataType::LargeList(_), DataType::LargeList(_)) => (SameShapeKind::LargeList, 1),
                 (DataType::FixedSizeList(_, a), DataType::FixedSizeList(_, b)) if a == b => {
-                    (JsonKind::FixedList, 1)
+                    (SameShapeKind::FixedList, 1)
                 }
                 (DataType::Struct(a), DataType::Struct(b)) if a.len() == b.len() => {
-                    (JsonKind::Struct, a.len())
+                    (SameShapeKind::Struct, a.len())
                 }
-                (DataType::Map(_, a), DataType::Map(_, b)) if a == b => (JsonKind::Map, 1),
+                (DataType::Map(_, a), DataType::Map(_, b)) if a == b => (SameShapeKind::Map, 1),
                 _ => {
                     return Err(invalid(
-                        "canonical JSON conversion changed an unsupported structure",
+                        "same-shape opaque conversion changed an unsupported structure",
                     ));
                 }
             }
@@ -327,7 +327,7 @@ impl ConversionRecipe {
             .checked_add(1)
             .ok_or(KernelFailure::ResourceExhausted)?;
         extent(end, std::mem::size_of::<usize>())?;
-        extent(next, std::mem::size_of::<JsonNode>())?;
+        extent(next, std::mem::size_of::<SameShapeNode>())?;
         if next > self.nodes.capacity() {
             work.flush().map_err(compile_failure)?;
             let reserved = self
@@ -346,7 +346,7 @@ impl ConversionRecipe {
             reserved?;
             work.flush().map_err(compile_failure)?;
         }
-        self.nodes.push(JsonNode {
+        self.nodes.push(SameShapeNode {
             kind,
             children: first..end,
         });
@@ -563,16 +563,16 @@ impl ConversionRecipe {
         let node = self
             .nodes
             .get(node)
-            .ok_or_else(|| internal("JSON recipe node is missing"))?;
+            .ok_or_else(|| internal("same-shape recipe node is missing"))?;
         let child = |ordinal| {
             self.edges
                 .get(node.children.start + ordinal)
                 .copied()
-                .ok_or_else(|| internal("JSON recipe child is missing"))
+                .ok_or_else(|| internal("same-shape recipe child is missing"))
         };
         let output: ArrayRef = match (node.kind, target) {
-            (JsonKind::Keep, _) => super::value_conversion::share_same_structure_keep(array),
-            (JsonKind::List, DataType::List(field)) => {
+            (SameShapeKind::Keep, _) => super::value_conversion::share_same_structure_keep(array),
+            (SameShapeKind::List, DataType::List(field)) => {
                 let source: &ListArray = downcast(array)?;
                 let values = self.rebind(child(0)?, source.values(), field.data_type(), work)?;
                 work.flush()?;
@@ -582,11 +582,11 @@ impl ConversionRecipe {
                     values,
                     source.nulls().cloned(),
                 )
-                .map_err(|_| internal("canonical JSON list reconstruction failed"));
+                .map_err(|_| internal("same-shape opaque list reconstruction failed"));
                 work.flush()?;
                 Arc::new(output?)
             }
-            (JsonKind::LargeList, DataType::LargeList(field)) => {
+            (SameShapeKind::LargeList, DataType::LargeList(field)) => {
                 let source: &LargeListArray = downcast(array)?;
                 let values = self.rebind(child(0)?, source.values(), field.data_type(), work)?;
                 work.flush()?;
@@ -596,11 +596,11 @@ impl ConversionRecipe {
                     values,
                     source.nulls().cloned(),
                 )
-                .map_err(|_| internal("canonical JSON large-list reconstruction failed"));
+                .map_err(|_| internal("same-shape opaque large-list reconstruction failed"));
                 work.flush()?;
                 Arc::new(output?)
             }
-            (JsonKind::FixedList, DataType::FixedSizeList(field, width)) => {
+            (SameShapeKind::FixedList, DataType::FixedSizeList(field, width)) => {
                 let source: &FixedSizeListArray = downcast(array)?;
                 let values = self.rebind(child(0)?, source.values(), field.data_type(), work)?;
                 work.flush()?;
@@ -611,11 +611,11 @@ impl ConversionRecipe {
                     source.nulls().cloned(),
                     source.len(),
                 )
-                .map_err(|_| internal("canonical JSON fixed-list reconstruction failed"));
+                .map_err(|_| internal("same-shape opaque fixed-list reconstruction failed"));
                 work.flush()?;
                 Arc::new(output?)
             }
-            (JsonKind::Struct, DataType::Struct(fields)) => {
+            (SameShapeKind::Struct, DataType::Struct(fields)) => {
                 let source: &StructArray = downcast(array)?;
                 let mut columns = Vec::with_capacity(fields.len());
                 for (ordinal, field) in fields.iter().enumerate() {
@@ -634,11 +634,11 @@ impl ConversionRecipe {
                     source.nulls().cloned(),
                     source.len(),
                 )
-                .map_err(|_| internal("canonical JSON struct reconstruction failed"));
+                .map_err(|_| internal("same-shape opaque struct reconstruction failed"));
                 work.flush()?;
                 Arc::new(output?)
             }
-            (JsonKind::Map, DataType::Map(field, sorted)) => {
+            (SameShapeKind::Map, DataType::Map(field, sorted)) => {
                 let source: &MapArray = downcast(array)?;
                 // Map entries are concrete StructArray; only its immutable
                 // shallow handles are copied before the changed-path walk.
@@ -655,13 +655,13 @@ impl ConversionRecipe {
                     source.nulls().cloned(),
                     *sorted,
                 )
-                .map_err(|_| internal("canonical JSON map reconstruction failed"));
+                .map_err(|_| internal("same-shape opaque map reconstruction failed"));
                 work.flush()?;
                 Arc::new(output?)
             }
             _ => {
                 return Err(internal(
-                    "JSON recipe target differs from its frozen structure",
+                    "same-shape recipe target differs from its frozen structure",
                 ));
             }
         };
@@ -697,8 +697,8 @@ fn child_type(ty: &DataType, ordinal: usize) -> Result<&DataType, KernelFailure>
         DataType::Struct(fields) => fields
             .get(ordinal)
             .map(|field| field.data_type())
-            .ok_or_else(|| invalid("canonical JSON child type is missing")),
-        _ => Err(invalid("canonical JSON container type is missing")),
+            .ok_or_else(|| invalid("same-shape opaque child type is missing")),
+        _ => Err(invalid("same-shape opaque container type is missing")),
     }
 }
 fn downcast<T: 'static>(array: &ArrayRef) -> Result<&T, KernelFailure> {

@@ -65,14 +65,14 @@ fn output(binding: &ResolvedFunctionBinding) -> &FunctionValueType {
     output
 }
 fn json() -> FunctionValueType {
-    logical(DataType::Utf8, ValueLogicalType::Json)
+    logical(DataType::LargeBinary, ValueLogicalType::Json)
 }
 
 #[test]
 fn variant_typeof_keeps_exact_json_and_variant_domains_for_fresh_and_frozen_binding() {
     for nullable in [false, true] {
         for (carrier, domain) in [
-            (DataType::Utf8, ValueLogicalType::Json),
+            (DataType::LargeBinary, ValueLogicalType::Json),
             (DataType::LargeBinary, ValueLogicalType::Variant),
         ] {
             let ty = FunctionValueType::try_with_logical_type(carrier, nullable, domain).unwrap();
@@ -119,12 +119,14 @@ fn variant_typeof_rejects_plain_carriers_and_cannot_thaw_json_as_text() {
     }
 }
 fn json_item(nullable: bool) -> Arc<Field> {
-    Arc::new(Field::new("item", DataType::Utf8, nullable).with_metadata(
-        std::collections::HashMap::<String, String>::from([(
-            novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
-            "json".to_string(),
-        )]),
-    ))
+    Arc::new(
+        Field::new("item", DataType::LargeBinary, nullable).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
+                "json".to_string(),
+            )]),
+        ),
+    )
 }
 
 #[test]
@@ -148,7 +150,7 @@ fn repeated_variables_select_owner_authorized_common_domains() {
     let binding = resolve("coalesce", FunctionKind::Scalar, &arguments);
     assert_eq!(output(&binding).logical_type(), ValueLogicalType::Json);
     let mut forged = binding;
-    forged.selected.result_type = FunctionResultType::Scalar(physical(DataType::Utf8));
+    forged.selected.result_type = FunctionResultType::Scalar(physical(DataType::LargeBinary));
     assert!(
         catalog
             .validate_bound(&forged, request(&arguments), crate::binding_test_control())
@@ -438,14 +440,8 @@ fn largeint_anchor_has_exact_domain_and_numeric_results_are_owner_declared() {
 fn json_producer_domains_follow_exact_registered_owners() {
     let catalog = builtin_engine_function_catalog();
     for (name, arguments) in [
-        ("parse_json", vec![value(physical(DataType::Utf8))]),
-        (
-            "json_object",
-            vec![
-                value(physical(DataType::Utf8)),
-                value(physical(DataType::Int64)),
-            ],
-        ),
+        ("json_parse", vec![value(physical(DataType::Utf8))]),
+        ("json_scalar", vec![value(physical(DataType::Int64))]),
         (
             "json_query",
             vec![value(json()), value(physical(DataType::Utf8))],
@@ -457,7 +453,7 @@ fn json_producer_domains_follow_exact_registered_owners() {
             ValueLogicalType::Json,
             "{name}"
         );
-        assert_eq!(output(&binding).data_type().clone(), DataType::Utf8);
+        assert_eq!(output(&binding).data_type(), &DataType::LargeBinary);
         let definition = catalog.definition_by_id(&binding.function_id).unwrap();
         assert!(
             definition
@@ -469,7 +465,7 @@ fn json_producer_domains_follow_exact_registered_owners() {
                     && overload.result_pattern.ends_with(";root=json"))
         );
         let mut forged = binding;
-        forged.selected.result_type = FunctionResultType::Scalar(physical(DataType::Utf8));
+        forged.selected.result_type = FunctionResultType::Scalar(physical(DataType::LargeBinary));
         assert!(
             catalog
                 .validate_bound(&forged, request(&arguments), crate::binding_test_control())
@@ -477,13 +473,11 @@ fn json_producer_domains_follow_exact_registered_owners() {
             "{name}"
         );
     }
-    // A provenance vocabulary entry does not install an implementation.
-    // Both declarations are still explicitly unavailable in the manifest.
-    for name in ["json_array", "to_json"] {
-        assert_eq!(
-            super::builtin_disposition(name),
-            Some(super::BuiltinDisposition::Unavailable)
-        );
+    assert_eq!(
+        super::builtin_disposition("to_json"),
+        Some(super::BuiltinDisposition::Unavailable)
+    );
+    for name in ["parse_json", "json_array", "json_object", "to_json"] {
         assert!(catalog.definition(name, FunctionKind::Scalar).is_none());
         let arguments = [value(json())];
         assert!(matches!(
@@ -572,7 +566,7 @@ fn array_aggregate_final_json_and_ordered_physical_state_are_separate() {
                 panic!("ordered state");
             };
             assert_eq!(fields.len(), 2);
-            for (field, carrier) in fields.iter().zip([DataType::Utf8, DataType::Int64]) {
+            for (field, carrier) in fields.iter().zip([DataType::LargeBinary, DataType::Int64]) {
                 let DataType::List(item) = field.data_type() else {
                     panic!("channel list");
                 };
@@ -586,7 +580,7 @@ fn array_aggregate_final_json_and_ordered_physical_state_are_separate() {
             let DataType::List(item) = state.data_type() else {
                 panic!("state list");
             };
-            assert_eq!(item.data_type(), &DataType::Utf8);
+            assert_eq!(item.data_type(), &DataType::LargeBinary);
             assert_eq!(
                 novarocks_type_contract::field_logical_type(item).unwrap(),
                 ValueLogicalType::Physical
@@ -594,7 +588,7 @@ fn array_aggregate_final_json_and_ordered_physical_state_are_separate() {
         }
         let mut forged = binding;
         forged.selected.result_type = FunctionResultType::Scalar(physical(DataType::List(
-            Arc::new(Field::new("item", DataType::Utf8, true)),
+            Arc::new(Field::new("item", DataType::LargeBinary, true)),
         )));
         assert!(
             catalog
@@ -613,6 +607,18 @@ fn value_domain_aggregate_states_preserve_complete_source_identity() {
     ] {
         let arguments = [value(source.clone())];
         for name in ["min", "max", "any_value"] {
+            if source.logical_type() == ValueLogicalType::Json && name != "any_value" {
+                assert!(matches!(
+                    builtin_engine_function_catalog().resolve_bound_user(
+                        name,
+                        FunctionKind::Aggregate,
+                        request(&arguments),
+                        crate::binding_test_control(),
+                    ),
+                    Err(FunctionBindingError::NoMatchingOverload)
+                ));
+                continue;
+            }
             let binding = resolve(name, FunctionKind::Aggregate, &arguments);
             let mut expected = source.clone();
             expected = expected
@@ -657,7 +663,7 @@ fn array_literal_and_sortby_preserve_complete_json_child_identity() {
             .unwrap()
     );
     assert!(!output(&literal).nullable());
-    let mixed = [value(json()), value(physical(DataType::Utf8))];
+    let mixed = [value(json()), value(physical(DataType::LargeBinary))];
     let catalog = builtin_engine_function_catalog();
     for arguments in [mixed.clone(), [mixed[1].clone(), mixed[0].clone()]] {
         assert!(matches!(
@@ -881,11 +887,14 @@ fn variant_get_json_text_and_nominal_inputs_keep_complete_fresh_and_frozen_domai
                 assert_eq!(output(&binding), &expected);
                 // A binding for validated Json and a binding for ordinary text
                 // must never be replayed against one another's original fact.
-                if source.data_type() == &DataType::Utf8 {
-                    let other = if source.logical_type() == ValueLogicalType::Json {
-                        physical(DataType::Utf8)
-                    } else {
+                if matches!(
+                    source.logical_type(),
+                    ValueLogicalType::Physical | ValueLogicalType::Json
+                ) {
+                    let other = if source.logical_type() == ValueLogicalType::Physical {
                         json()
+                    } else {
+                        physical(DataType::Utf8)
                     };
                     let foreign = variant_get_arguments(other, typed);
                     assert!(

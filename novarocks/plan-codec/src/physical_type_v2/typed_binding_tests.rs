@@ -197,9 +197,12 @@ fn typed_semantic_external_metadata_and_dictionary_descriptors_remain_independen
             "unknown-source-attribute".into(),
         )])),
     );
-    let expected =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let expected = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let table = encode(&[(0, expected.clone())], &[]);
     let decoded = decode_type_table_pure(&table, limits(), &Control).unwrap();
     assert_eq!(decoded.value_type(0), Some(&expected));
@@ -354,9 +357,12 @@ fn typed_semantic_production_decode_holds_the_actual_creator_until_last_child_or
 #[test]
 fn typed_semantic_writer_pairs_its_explicit_binding_while_preserving_source_metadata() {
     use novarocks_connector_contract as c;
-    let expected =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let expected = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let source = Field::new("input", DataType::Utf8, false).with_metadata(HashMap::from([(
         novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
         "external-fact".into(),
