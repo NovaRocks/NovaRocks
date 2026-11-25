@@ -754,7 +754,17 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         }
         *slot = Some(fixture);
         let mut fe_overlay = launch.config_overlay.fe.take().unwrap_or_default();
-        fe_overlay.push_str("\n[runtime]\nquery_blocking_worker_threads = 2\n");
+        fe_overlay.push_str(
+            r#"
+[runtime]
+query_blocking_worker_threads = 2
+
+[standalone_server]
+mv_refresh_scheduler_enabled = true
+mv_refresh_scheduler_interval_ms = 100
+mv_refresh_scheduler_max_concurrent = 1
+"#,
+        );
         launch.config_overlay.fe = Some(fe_overlay);
         Ok(launch)
     }
