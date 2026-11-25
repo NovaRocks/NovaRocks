@@ -36,6 +36,7 @@ Iceberg MV 怎样在 main 竞争、提交响应丢失和原发布被取代时结
 一个 MV 存储表 S 以同一份 Iceberg metadata 发布 main、文档根 B、配置槽及快照记录。一个配置版本由值和 writer 快照共同标识。相同配置字节可以随不同 writer 生效。Provider 原写会话保管紧凑写集和已派发对象。FE 的原发布义务保管语句结论，现有管理责任保持跨语句及冷启动保护。
 
 Catalog 原子校验表 UUID 和该轮 main。由 NovaRocks 管理的根与槽变更随写入推进 main。Provider 在每次派发前核对轮次所需的 B、槽 writer 和 writer schema/spec，并将可由 Catalog 核对的约束带入请求。维护与刷新分别保有各自对记录携带和对象生命周期的合同。
+Current 的发布记录提供 B 的准确解释。回收根悬空时，在原 Current 记录和闭包确证相同 B 后，刷新保留实际观察的回收根作为每轮条件，并在提交中修复它。
 
 ## 考虑过的选项
 

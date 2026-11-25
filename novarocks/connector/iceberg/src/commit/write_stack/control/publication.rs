@@ -59,6 +59,40 @@ use async_trait::async_trait;
 #[cfg(test)]
 use std::sync::Mutex;
 
+fn admitted_publication_root(
+    metadata: &TableMetadata,
+    properties: &crate::document_storage::keyed::view::KeyedProperties,
+    owner: &str,
+    binding: novarocks_spi::connector::DocumentIdentity,
+) -> Result<Option<novarocks_spi::connector::DocumentIdentity>, ConnectorError> {
+    use crate::document_storage::{
+        keyed::view::{parse_snapshot_records, reference_closure},
+        observation::keyed_read_error,
+    };
+
+    let stored = properties.roots.get(owner);
+    if let Some(snapshot) = metadata.current_snapshot()
+        && stored.is_none_or(|root| root.dangling)
+        && reference_closure(&properties.versions, Some(binding)).is_ok()
+    {
+        let records = parse_snapshot_records(&snapshot.summary().additional_properties, true)
+            .map_err(keyed_read_error)?;
+        let mut publications = records
+            .iter()
+            .filter(|record| record.owner == owner && record.name == "publication");
+        if publications
+            .next()
+            .is_some_and(|record| record.binding == Some(binding))
+            && publications.next().is_none()
+        {
+            // Current proves the admitted binding even when its GC root is
+            // dangling. Guard that original property through every round.
+            return Ok(stored.map(|root| root.identity));
+        }
+    }
+    Ok(Some(binding))
+}
+
 fn format_error(error: ConnectorError) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.message())
         .with_source(error)
@@ -418,8 +452,9 @@ impl<'a> WriteRecipe<'a> {
                     })
                     .collect();
                 let mut slots = BTreeMap::new();
-                if let Some((owner, root)) = declaration.expected_root() {
-                    roots.insert(owner.to_owned(), Some(root));
+                if let Some((owner, binding)) = declaration.expected_root() {
+                    let root = admitted_publication_root(&source, &observed, owner, binding)?;
+                    roots.insert(owner.to_owned(), root);
                     if context.initiation()
                         == novarocks_spi::connector::ConnectorRequestInitiation::Background
                         || handle.repartition().is_some()
