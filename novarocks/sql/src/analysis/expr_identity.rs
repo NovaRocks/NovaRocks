@@ -45,6 +45,10 @@ pub(crate) fn typed_expr_semantically_eq(
 #[recursive::recursive]
 pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
     use super::{BinOp, UnOp};
+    use novarocks_functions::PreparedCompositeComparisonRecipe;
+    let comparison_can_fail = |value: &TypedExpr| {
+        PreparedCompositeComparisonRecipe::equal_may_raise_row_error(&value.value_type)
+    };
     let share = expression_can_share_evaluation;
     let result_type = &expr.value_type;
     match &expr.kind {
@@ -101,7 +105,14 @@ pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
             filter,
             ..
         } => aggregate_inputs_can_share_evaluation(args, order_by, filter.as_deref()),
-        ExprKind::InList { expr, list, .. } => share(expr) && list.iter().all(share),
+        ExprKind::InList { expr, list, .. } => {
+            expr.value_type.logical_type() != novarocks_type_contract::ValueLogicalType::Json
+                && !comparison_can_fail(expr)
+                && share(expr)
+                && list
+                    .iter()
+                    .all(|item| !comparison_can_fail(item) && share(item))
+        }
         ExprKind::Between {
             expr, low, high, ..
         } => share(expr) && share(low) && share(high),
@@ -111,11 +122,13 @@ pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
             else_expr,
             ..
         } => {
-            operand.as_deref().is_none_or(share)
+            operand
+                .as_deref()
+                .is_none_or(|expr| !comparison_can_fail(expr) && share(expr))
                 && else_expr.as_deref().is_none_or(share)
-                && when_then
-                    .iter()
-                    .all(|(when, then)| share(when) && share(then))
+                && when_then.iter().all(|(when, then)| {
+                    (operand.is_none() || !comparison_can_fail(when)) && share(when) && share(then)
+                })
         }
         ExprKind::Like { .. }
         | ExprKind::WindowCall { .. }

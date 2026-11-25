@@ -141,8 +141,9 @@ impl PreparedCompositeComparisonRecipe {
             )? {
                 return Err(ComparisonPrepareError::TypeMismatch);
             }
-            let mut facts = comparison_facts(left.value_type(), &mut work)?
-                .join(comparison_facts(right.value_type(), &mut work)?);
+            let mut observe = || work.step();
+            let mut facts = comparison_facts(left.value_type(), &mut observe)?
+                .join(comparison_facts(right.value_type(), &mut observe)?);
             if relation == KeyRelation::Identical {
                 facts.nullable = false;
                 facts.may_raise_row_error = false;
@@ -172,6 +173,17 @@ impl PreparedCompositeComparisonRecipe {
         }
         work.finish()?;
         result
+    }
+
+    /// Row error possible for a selected ordinary equality domain.
+    /// This is the same structural fact used by checked recipe preparation.
+    pub fn equal_may_raise_row_error(ty: &FunctionValueType) -> bool {
+        match comparison_facts(ty.value_type(), &mut || {
+            Ok::<_, std::convert::Infallible>(())
+        }) {
+            Ok(facts) => facts.may_raise_row_error,
+            Err(never) => match never {},
+        }
     }
 
     pub fn left_type(&self) -> &FunctionValueType {
@@ -270,23 +282,23 @@ impl PreparedCompositeComparisonRecipe {
     }
 }
 
-fn comparison_facts(
+fn comparison_facts<E>(
     ty: &ValueTypeRef,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<ComparisonFacts, ComparisonPrepareError> {
-    work.step()?;
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<ComparisonFacts, E> {
+    observe()?;
     let root = ComparisonFacts {
         nullable: ty.nullable() || matches!(ty.kind(), ValueKind::Scalar(DataType::Null)),
         ..ComparisonFacts::default()
     };
     Ok(match ty.kind() {
         ValueKind::List(child) | ValueKind::FixedSizeList { item: child, .. } => {
-            root.join(comparison_facts(child, work)?)
+            root.join(comparison_facts(child, observe)?)
         }
         ValueKind::Struct(fields) => {
             let mut result = root;
             for field in fields.iter() {
-                result = result.join(comparison_facts(field.value_type(), work)?);
+                result = result.join(comparison_facts(field.value_type(), observe)?);
             }
             result
         }
@@ -295,8 +307,8 @@ fn comparison_facts(
             root
         }
         ValueKind::Map { key, value } => {
-            let keys = comparison_facts(key, work)?;
-            let values = comparison_facts(value, work)?;
+            let keys = comparison_facts(key, observe)?;
+            let values = comparison_facts(value, observe)?;
             ComparisonFacts {
                 nullable: root.nullable || values.nullable,
                 may_raise_row_error: keys.nullable
