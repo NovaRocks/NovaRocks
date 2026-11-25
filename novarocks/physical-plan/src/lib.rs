@@ -125,7 +125,9 @@ pub fn grouped_state_topn_key_supported(
 /// exact named and anonymous ROW calls.
 /// Revision 44 admits CTE multicast packages and binds their ordered physical
 /// edges to the original native exchange identities.
-pub const PLAN_CONTRACT_REVISION: u32 = 44;
+/// Revision 45 executes collection lambda claims and requires the original
+/// higher-order overload to own NULL control.
+pub const PLAN_CONTRACT_REVISION: u32 = 45;
 
 #[cfg(test)]
 mod tests;

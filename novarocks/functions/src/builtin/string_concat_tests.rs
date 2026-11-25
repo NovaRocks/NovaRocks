@@ -26,6 +26,7 @@ use crate::{
     PureFunctionMetadataOwner, PureScalarImplementation, ScalarEvaluationInstance,
     ScopedExpressionEffects, Selection, specialize_frozen_scalar, specialize_scalar,
 };
+use arrow_schema::Field;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
     EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,

@@ -885,7 +885,7 @@ fn evaluate_scalar<'a, R, K: Ord + Clone>(
     children: &[Value<'a>],
     selection: Selection<'a>,
     activation: novarocks_functions::ScalarInvocationActivation,
-    parent_row: Option<&dyn Fn(usize) -> Result<usize, KernelFailure>>,
+    parent_row: Option<scalar_groups::ParentRow<'_>>,
     instances: &mut BTreeMap<K, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     work: &mut Work<'_, '_, R>,
@@ -1233,5 +1233,7 @@ mod unary;
 
 pub use filter_conjunction::CompiledFilterConjunctionInstance;
 
+#[cfg(test)]
+mod lambda_observation;
 #[cfg(test)]
 mod tests;

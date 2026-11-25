@@ -3592,7 +3592,7 @@ pub fn contribute_builtin_functions(
         }
     }
     builder.register(super::binary_operator_owner::modulus_definition()?)?;
-    super::collection_lambda::register(builder, None)?;
+    super::collection_lambda::register(builder, Some(super::collection_lambda::prepare_kernel))?;
     builder.register(super::array_generation_owner::sequence_definition()?)?;
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         let (declaration, resolver) = dynamic_definition_parts(name)?;
@@ -3646,6 +3646,7 @@ pub fn contribute_builtin_functions(
             }
             Some(
                 BuiltinDisposition::AggregateBoundary
+                | BuiltinDisposition::InstalledHigherOrder
                 | BuiltinDisposition::LoweredOnly
                 | BuiltinDisposition::Unavailable,
             ) => continue,
@@ -3762,6 +3763,12 @@ pub fn contribute_builtin_functions(
             "repeat" => {
                 super::array_generation_owner::repeat_definition(&name, declaration, resolver)?
             }
+            "array_sort" => super::array_order_owner::definition(
+                &name,
+                declaration,
+                resolver,
+                Some(super::collection_lambda::prepare_kernel),
+            )?,
             name if super::array_order_owner::operation(name).is_some() => {
                 super::array_order_owner::definition(name, declaration, resolver, None)?
             }

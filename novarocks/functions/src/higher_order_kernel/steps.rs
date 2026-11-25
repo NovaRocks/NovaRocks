@@ -18,6 +18,7 @@
 //! A kernel step prepares owned data and returns before the body borrows its host.
 //! Invocation state alone observes body completions and selects required errors.
 
+// Design: ADR-0270 (docs/adr/ADR-0270-collection-lambdas-use-bound-body-requests.md)
 use std::{cell::RefCell, sync::Arc};
 
 use allocator_api2::vec::Vec as HostVec;

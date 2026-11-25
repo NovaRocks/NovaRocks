@@ -1105,9 +1105,43 @@ impl<K> Frame<K> {
         }
         let selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
         if let OwnedValue::Mapped(value) = child.value.uncontinued() {
+            if matches!(shape, ControlShape::Conjunction | ControlShape::Disjunction) {
+                self.remaining = self
+                    .boolean
+                    .as_mut()
+                    .ok_or_else(|| internal("missing mapped Boolean continuation"))?
+                    .consume_mapped(
+                        value,
+                        &child.ordinals,
+                        shape,
+                        demand,
+                        child_is_pure,
+                        &mut self.errors,
+                        work,
+                    )?;
+                return Ok(());
+            }
+            if shape == ControlShape::If && child_index == 0 {
+                let mut errors = value.errors().iter().peekable();
+                self.routes.reserve(self.rows.len());
+                for ordinal in 0..rows.len() {
+                    let route = if let Some(error) =
+                        errors.next_if(|error| error.selected_ordinal() == ordinal)
+                    {
+                        self.errors.insert(ordinal, error.clone());
+                        None
+                    } else {
+                        Some(value.boolean(ordinal)?.unwrap_or(false))
+                    };
+                    self.routes.push(route);
+                    work.step()?;
+                }
+                self.children.push(child);
+                return Ok(());
+            }
             let case_result = matches!(shape, ControlShape::Case { simple, arms, .. }
                 if self.next - 1 >= usize::from(simple) &&
-                    ((self.next - 1 - usize::from(simple)) % 2 == 1 ||
+                    (!(self.next - 1 - usize::from(simple)).is_multiple_of(2) ||
                      self.next - 1 == usize::from(simple) + arms as usize * 2));
             if matches!(shape, ControlShape::Coalesce)
                 || shape == ControlShape::If && child_index > 0
@@ -1123,11 +1157,7 @@ impl<K> Frame<K> {
                         let error = errors.next().expect("checked mapped child error");
                         self.errors
                             .insert(parent, error.with_selected_ordinal(parent));
-                    } else if shape == ControlShape::Coalesce
-                        && value
-                            .value(local)
-                            .is_none_or(|(source, row)| source.is_null(row))
-                    {
+                    } else if shape == ControlShape::Coalesce && value.is_null(local, work)? {
                         remaining.push(parent);
                     } else {
                         self.choices[parent] = Some((child_index, local));
@@ -2095,6 +2125,12 @@ impl TreeDriver<'_, '_> {
             work.step()?;
         }
         if !missing.is_empty() {
+            #[cfg(test)]
+            super::lambda_observation::record(|| super::lambda_observation::Event::Reuse {
+                scope,
+                use_id,
+                rows: missing.clone(),
+            });
             let invocation = &self.program.control_flow().uses()[&use_id];
             let first = Frame::new(
                 use_id,
@@ -2159,6 +2195,7 @@ impl TreeDriver<'_, '_> {
         ))
     }
 
+    // Design: ADR-0270 (docs/adr/ADR-0270-collection-lambdas-use-bound-body-requests.md)
     fn evaluate_higher_order<'a, R>(
         &mut self,
         prepared: &Arc<dyn novarocks_functions::PreparedHigherOrderKernel>,
@@ -2186,7 +2223,7 @@ impl TreeDriver<'_, '_> {
         let mut values = Vec::with_capacity(children.len());
         let mut inherited = BTreeMap::new();
         for child in children {
-            let value = child.value.into_value(selection, work)?;
+            let value = child.value.into_value_mapped(selection, work)?;
             for error in value.errors() {
                 inherited
                     .entry(error.selected_ordinal())
@@ -2196,9 +2233,69 @@ impl TreeDriver<'_, '_> {
             values.push(value);
             work.step()?;
         }
-        let mut arguments = Vec::with_capacity(values.len());
+        let _selection_scratch = if inherited.is_empty() {
+            None
+        } else {
+            super::mapped::reserve(
+                Some(allocator),
+                super::mapped::bytes::<[usize; 2]>(selection.len())?,
+            )?
+        };
+        let mut active_rows = Vec::new();
+        let mut active_ordinals = Vec::new();
+        let call_selection = if inherited.is_empty() {
+            selection
+        } else {
+            active_rows = super::mapped::buffer(selection.len())?;
+            active_ordinals = super::mapped::buffer(selection.len())?;
+            for (ordinal, row) in selection.iter().enumerate() {
+                if !inherited.contains_key(&ordinal) {
+                    active_rows.push(row);
+                    active_ordinals.push(ordinal);
+                }
+                work.step()?;
+            }
+            Selection::try_sparse_observed(selection.batch_rows(), &active_rows, || work.step())?
+        };
+        let mut compact = Vec::with_capacity(values.len());
         for value in &values {
-            arguments.push(value.argument()?);
+            let projected = match value.uncontinued() {
+                Value::Mapped(value) if inherited.is_empty() => {
+                    Some(value.materialize(0..selection.len(), work)?)
+                }
+                Value::Mapped(value) => {
+                    Some(value.materialize(active_ordinals.iter().copied(), work)?)
+                }
+                Value::Selected(value) if !inherited.is_empty() => Some(super::mapped::take_rows(
+                    value.values(),
+                    active_ordinals.iter().copied().map(Some),
+                    Some(allocator),
+                    work,
+                )?),
+                _ => None,
+            };
+            compact.push(
+                projected
+                    .map(|array| {
+                        let ty = array.data_type().clone();
+                        SelectedValues::try_new_observed::<KernelFailure>(
+                            call_selection,
+                            &ty,
+                            array,
+                            Box::default(),
+                            || work.step(),
+                        )
+                    })
+                    .transpose()?,
+            );
+            work.step()?;
+        }
+        let mut arguments = Vec::with_capacity(values.len());
+        for (value, projected) in values.iter().zip(&compact) {
+            arguments.push(match projected {
+                Some(value) => EvaluatedArgument::SelectedColumn(value),
+                None => value.argument()?,
+            });
             work.step()?;
         }
         let control = work.control;
@@ -2222,7 +2319,7 @@ impl TreeDriver<'_, '_> {
             return Err(internal("higher-order use retained another kernel lifecycle").into());
         };
         let output = {
-            let mut invocation = instance.begin(selection, &arguments, allocator, control)?;
+            let mut invocation = instance.begin(call_selection, &arguments, allocator, control)?;
             loop {
                 work.flush()?;
                 match invocation.advance(control)? {
@@ -2230,6 +2327,12 @@ impl TreeDriver<'_, '_> {
                     HigherOrderEvaluationStep::Request(obligation) => {
                         obligation.run_with::<ExprEvaluationFailure<R>>(control, |demand| {
                             let rows = demand.row_map();
+                            #[cfg(test)]
+                            super::lambda_observation::record(|| {
+                                super::lambda_observation::Event::Body {
+                                    parents: demand.batch().parent_ordinals().to_vec(),
+                                }
+                            });
                             let body_use = &program.control_flow().uses()[&body.body_use];
                             let result_type = body.contract.result_type().data_type();
                             let row_count = rows.element_rows();
@@ -2284,15 +2387,33 @@ impl TreeDriver<'_, '_> {
         }
         let (_, array, errors) = output.into_parts();
         for error in errors {
-            inherited.entry(error.selected_ordinal()).or_insert(error);
+            let ordinal = active_ordinals[error.selected_ordinal()];
+            inherited.insert(ordinal, error.with_selected_ordinal(ordinal));
             work.step()?;
         }
+        let mut selected = active_ordinals.into_iter().peekable();
+        let mut ordinal = 0;
+        let projected = super::mapped::take_rows(
+            &array,
+            (0..selection.len()).map(|row| {
+                if selected.peek() == Some(&row) {
+                    selected.next();
+                    let current = ordinal;
+                    ordinal += 1;
+                    Some(current)
+                } else {
+                    None
+                }
+            }),
+            Some(allocator),
+            work,
+        )?;
         let mut errors = super::mapped::buffer(inherited.len())?;
         for error in inherited.into_values() {
             errors.push(error);
             work.step()?;
         }
-        Ok(OwnedValue::Selected(array, errors.into_boxed_slice()))
+        Ok(OwnedValue::Selected(projected, errors.into_boxed_slice()))
     }
 
     fn drive<R>(

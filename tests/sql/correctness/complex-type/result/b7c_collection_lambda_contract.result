@@ -1,0 +1,62 @@
+-- query 3
+-- types	integer	array(integer)	array(integer)	boolean	boolean	array(integer)	array(integer)
+id	transformed	filtered	has_zero	all_positive	compared	natural_order
+0	[4,5]	[1]	true	false	[1,0]	[0,1]
+1	[3]	[1]	false	true	[1]	[1]
+
+-- query 4
+-- types	integer	map(integer, integer)	map(integer, integer)	map(integer, integer)	map(integer, integer)
+id	filtered	keyed	valued	guarded
+0	{"1":4}	{"11":4,"12":5}	{"1":4,"2":null}	{"1":4,"2":5}
+1	{"1":2,"2":3}	{"12":2,"13":3}	{"1":3,"2":null}	NULL
+
+-- query 5
+-- types	map(integer, integer)	map(integer, integer)	map(unknown, integer)	bigint
+null_key	empty_map	unknown_empty	composite_keys
+NULL	{}	{}	2
+
+-- query 6
+-- types	integer	boolean	array(array(integer))	array(array(bigint))	array(array(array(integer)))
+id	nested_match	nested_filter	shared_top	shared_ancestor
+0	true	[[5],[6]]	[[4,4,4],[4,4]]	[[[12,13],[13,14]],[[13,14],[14,15]]]
+1	false	[[3],[]]	[[2,2],[2]]	[[[8]],[[11]]]
+
+-- query 7
+-- types	integer	array(integer)
+id	early_true
+0	[0,1]
+1	[1]
+
+-- query 8
+-- types	integer	array(integer)
+id	late_true
+0	[0,1]
+1	[1]
+
+-- query 10
+-- types	integer	boolean	boolean	boolean	boolean
+id	any_original	any_reversed	all_original	all_reversed
+0	NULL	true	NULL	false
+1	true	true	false	false
+
+-- query 14
+-- types	integer	array(integer)	array(integer)	array(integer)
+id	caught	skipped	guarded
+0	NULL	[]	[0,1]
+1	[]	[]	[1]
+
+-- query 20
+-- types	integer	bigint	boolean
+id	retained	match_before_tail_error
+3	20000	true
+
+-- query 21
+-- types	integer	bigint	integer	integer	boolean
+id	retained	first_item	second_item	same_order
+1	20000	1	2	true
+2	20000	2	1	true
+
+-- query 22
+-- types	bigint	boolean
+sorted_count	stable_order
+20000	true

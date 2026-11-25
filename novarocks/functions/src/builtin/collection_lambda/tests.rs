@@ -18,7 +18,7 @@
 use std::{
     alloc::Layout,
     ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -203,19 +203,36 @@ fn run(
     kernel: Arc<dyn PreparedHigherOrderKernel>,
     input: EvaluatedArgument<'_>,
     selection: Selection<'_>,
+    evaluate: impl FnMut(&LambdaBodyBatch) -> Result<(ArrayRef, Vec<RowDataError>), KernelFailure>,
+) -> Result<Trial, KernelFailure> {
+    run_controlled(
+        kernel,
+        input,
+        selection,
+        Arc::new(Ledger::default()),
+        &Control,
+        evaluate,
+    )
+}
+
+fn run_controlled(
+    kernel: Arc<dyn PreparedHigherOrderKernel>,
+    input: EvaluatedArgument<'_>,
+    selection: Selection<'_>,
+    ledger: Arc<Ledger>,
+    control: &dyn KernelEvaluationControl,
     mut evaluate: impl FnMut(&LambdaBodyBatch) -> Result<(ArrayRef, Vec<RowDataError>), KernelFailure>,
 ) -> Result<Trial, KernelFailure> {
     let body = Arc::clone(kernel.body_contract());
-    let mut instance = HigherOrderEvaluationInstance::instantiate(kernel, &Control)?;
-    let ledger = Arc::new(Ledger::default());
+    let mut instance = HigherOrderEvaluationInstance::instantiate(kernel, control)?;
     let host: Arc<dyn AggregateStateAllocator> = ledger.clone();
     let arguments = [input];
-    let mut execution = instance.begin(selection, &arguments, &host, &Control)?;
+    let mut execution = instance.begin(selection, &arguments, &host, control)?;
     let mut batches = vec![];
     loop {
-        match execution.advance(&Control)? {
+        match execution.advance(control)? {
             HigherOrderEvaluationStep::Request(obligation) => {
-                obligation.run_with(&Control, |demand| {
+                obligation.run_with(control, |demand| {
                     let batch = demand.batch();
                     batches.push(
                         batch
@@ -748,4 +765,146 @@ fn effectful_comparator_does_not_request_tail_after_invalid_result() {
     );
     assert!(trial.output.is_null(0));
     trial.check_release();
+}
+
+#[test]
+fn rotating_requests_preserve_selected_parent_order_and_all_values() {
+    let input = list((0..100).map(|index| row(index * 10..index * 10 + 9)));
+    let trial = run(
+        prepared(
+            "transform",
+            &input,
+            FunctionValueType::new(DataType::Int64, true),
+            ExpressionEffects::PURE_VALUE,
+        ),
+        EvaluatedArgument::Column(&input),
+        Selection::all(100),
+        |batch| {
+            let result = Int64Array::from_iter_values(
+                (0..batch.parent_ordinals().len()).map(|ordinal| value(batch, 0, ordinal).unwrap()),
+            );
+            Ok((Arc::new(result), vec![]))
+        },
+    )
+    .unwrap();
+    assert_eq!(&*trial.output, &*input);
+    assert_eq!(trial.batches[0].len(), 256);
+    assert!(trial.batches[0].last().unwrap().0 < 99);
+    assert_eq!(trial.batches[1].first().unwrap().0, 0);
+    assert!(trial.batches[1].iter().any(|(parent, _)| *parent == 99));
+    trial.check_release();
+}
+
+#[test]
+fn long_match_uses_geometric_demand_through_its_first_decisive_window() {
+    let input = list([row(0..129)]);
+    let trial = run(
+        prepared(
+            "any_match",
+            &input,
+            FunctionValueType::new(DataType::Boolean, true),
+            ExpressionEffects {
+                may_raise_row_error: true,
+                ..ExpressionEffects::PURE_VALUE
+            },
+        ),
+        EvaluatedArgument::Column(&input),
+        Selection::all(1),
+        |batch| {
+            let mut errors = Vec::new();
+            let result =
+                BooleanArray::from_iter((0..batch.parent_ordinals().len()).map(|ordinal| {
+                    let value = value(batch, 0, ordinal).unwrap();
+                    if value == 20 {
+                        errors.push(RowDataError::with_reason(
+                            ordinal,
+                            DataFailureReason::DivisionByZero,
+                            "irrelevant later element error",
+                        ));
+                        None
+                    } else {
+                        Some(value == 17)
+                    }
+                }));
+            Ok((Arc::new(result), errors))
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        trial.batches.iter().map(Vec::len).collect::<Vec<_>>(),
+        [1, 2, 4, 8, 16]
+    );
+    assert_eq!(trial.output.as_ref(), &BooleanArray::from(vec![true]));
+    assert!(trial.errors.is_empty());
+    trial.check_release();
+}
+
+#[test]
+fn whole_invocation_failure_policy_keeps_each_demand_and_its_nominal_cause() {
+    let array = list([row(0..30), row(30..60)]);
+    let kernel = prepared(
+        "filter",
+        &array,
+        FunctionValueType::new(DataType::Boolean, false),
+        ExpressionEffects {
+            may_raise_invocation_data: true,
+            ..ExpressionEffects::PURE_VALUE
+        },
+    );
+    let original =
+        KernelFailure::Operational(crate::KernelDiagnostic::new("original whole body refusal"));
+    let mut calls = 0;
+    let result = run(
+        kernel,
+        EvaluatedArgument::Column(&array),
+        Selection::all(2),
+        |batch| {
+            calls += 1;
+            assert_eq!(batch.parent_ordinals(), [0]);
+            assert_eq!(batch.parameter_position(0, 0), Some(0));
+            Err(original.clone())
+        },
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(result.err().unwrap(), original);
+}
+
+#[test]
+fn cancellation_while_a_body_request_is_live_refunds_its_actual_host() {
+    struct Stop(AtomicBool);
+    impl KernelEvaluationControl for Stop {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            if self.0.load(Ordering::Relaxed) {
+                Err(KernelFailure::Cancelled)
+            } else {
+                Ok(())
+            }
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            unreachable!()
+        }
+    }
+    let input = list([row(0..129)]);
+    let kernel = prepared(
+        "any_match",
+        &input,
+        FunctionValueType::new(DataType::Boolean, false),
+        ExpressionEffects::PURE_VALUE,
+    );
+    let ledger = Arc::new(Ledger::default());
+    let control = Stop(AtomicBool::new(false));
+    let result = run_controlled(
+        kernel,
+        EvaluatedArgument::Column(&input),
+        Selection::all(1),
+        Arc::clone(&ledger),
+        &control,
+        |_| {
+            control.0.store(true, Ordering::Relaxed);
+            Ok((Arc::new(BooleanArray::from(vec![false])), vec![]))
+        },
+    );
+    assert_eq!(result.err().unwrap(), KernelFailure::Cancelled);
+    assert!(ledger.peak.load(Ordering::Relaxed) > 0);
+    assert_eq!(ledger.live.load(Ordering::Relaxed), 0);
 }

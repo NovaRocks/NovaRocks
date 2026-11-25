@@ -24,7 +24,9 @@ use arrow_schema::{DataType, FieldRef, Fields};
 
 use super::{
     ChildScratchVec, CopyError, CopyLayout, CopyObservation, ExtendSegment, ScratchCoverage,
-    WorkObservation, add, limit, mul, preflight_extend_multi_with_observation,
+    WorkObservation, add,
+    construction::null_node,
+    limit, mul, preflight_extend_multi_with_observation,
     take_host::{CopyInvoiceTotals, result_node_metadata_upper},
 };
 use crate::aggregate_host_allocator::HostAggregateAllocator;
@@ -84,6 +86,41 @@ pub(crate) fn array_from_segments_in(
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
     copy_segments_in(sources, segments, total, None, host, allocator, work)
+}
+
+/// Construct one exact, input-free empty child. The null constructor has the
+/// same buffer and wrapper geometry as Arrow's empty author. Settlement uses
+/// that geometry and counts only newly retained buffers and custody metadata.
+pub(crate) fn empty_array_in(
+    ty: &DataType,
+    host: &Arc<dyn AggregateStateAllocator>,
+    allocator: &HostAggregateAllocator,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ArrayRef, KernelFailure> {
+    let copy = CopyError::into_kernel;
+    let mut invoice = CopyInvoiceTotals::default();
+    let metadata = null_node(ty, 0, &mut invoice, true, &mut |boundary| {
+        if boundary { work.flush() } else { work.step() }.map_err(CopyError::Control)
+    })
+    .map_err(copy)?;
+    let mut facts = invoice.finish(metadata).map_err(copy)?;
+    let sources = Sources(ChildScratchVec::try_with_capacity(0, Some(allocator)).map_err(copy)?);
+    let charge = OpaqueRetainedCharge::try_new(Arc::clone(host))?;
+    work.flush()?;
+    let mut reservation = charge.reserve_operation(facts.operation_peak_bytes())?;
+    work.flush()?;
+    let output = arrow_array::new_empty_array(ty);
+    facts.bind_original_copy(&output);
+    Ok(retain_copied_result_backing(
+        output,
+        sources,
+        charge,
+        &mut reservation,
+        allocator.clone(),
+        &facts,
+        work,
+    )?
+    .values)
 }
 
 /// Preflight the outer List before producing any of its child values.

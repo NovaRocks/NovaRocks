@@ -19,7 +19,7 @@
 
 use super::{Work, gather, internal};
 use arrow::{
-    array::{Array, ArrayRef, UInt64Array, new_empty_array, new_null_array},
+    array::{Array, ArrayRef, BooleanArray, UInt64Array, new_empty_array, new_null_array},
     compute::concat,
     datatypes::DataType,
 };
@@ -238,6 +238,19 @@ impl MappedValues {
             }
             None => Ok(true),
         }
+    }
+
+    pub(super) fn boolean(&self, ordinal: usize) -> Result<Option<bool>, KernelFailure> {
+        let Some((array, row)) = self.value(ordinal) else {
+            return Ok(None);
+        };
+        let values = array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                super::invalid("mapped Boolean operand differs from its frozen carrier")
+            })?;
+        Ok((!values.is_null(row)).then(|| values.value(row)))
     }
 
     pub(super) fn push_source(&mut self, source: ArrayRef) -> Result<usize, KernelFailure> {
@@ -480,15 +493,23 @@ pub(super) fn take_rows(
         Some(host) => {
             work.flush()?;
             let indices = CopyIndices::UInt64(Arc::new(UInt64Array::from_iter(indices)));
-            Ok(take_copy_in(
+            let copied = take_copy_in(
                 Arc::clone(array),
                 indices,
                 indices_charge,
                 Arc::clone(host),
                 work.control,
             )
-            .map_err(copy_failure)?
-            .into_values())
+            .map_err(copy_failure)?;
+            #[cfg(test)]
+            super::lambda_observation::record(|| super::lambda_observation::Event::Gather {
+                is_collection: matches!(
+                    array.data_type(),
+                    DataType::List(_) | DataType::LargeList(_) | DataType::Map(..)
+                ),
+                new_stock: copied.new_buffer_stock(),
+            });
+            Ok(copied.into_values())
         }
         None => gather(array, &indices, work),
     }

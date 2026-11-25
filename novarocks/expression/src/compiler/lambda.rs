@@ -17,6 +17,7 @@
 
 //! Exact lambda body occurrences and free references in their original flow.
 
+// Design: ADR-0270 (docs/adr/ADR-0270-collection-lambdas-use-bound-body-requests.md)
 use super::{ExprCompileError, ExprCompileFailure};
 use crate::creation::ProgramCreation;
 use novarocks_expression_contract::{ExprId, ExprKind, ExprNode, ValueId};

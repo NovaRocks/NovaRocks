@@ -796,7 +796,7 @@ fn array_constructor_infers_independently_of_outer_expected_type_and_rejects_for
 }
 
 #[test]
-fn transform_keeps_typed_lambda_capability_and_arity_refusals_distinct() {
+fn transform_keeps_the_installed_lambda_and_arity_refusals_distinct() {
     let catalog = builtin_engine_function_catalog();
     let source = value(physical(DataType::List(json_item(true))));
     let lambda = |parameters: Vec<FunctionValueType>| FunctionArgument::Lambda {
@@ -807,11 +807,22 @@ fn transform_keeps_typed_lambda_capability_and_arity_refusals_distinct() {
     };
     let arguments = [source.clone(), lambda(vec![json()])];
     let control = crate::binding_test_control();
-    assert!(matches!(
-        catalog.resolve_bound_user("transform", FunctionKind::Scalar, request(&arguments), control),
-        Err(FunctionBindingError::UnavailableImplementation(overload))
-            if overload.as_str() == "builtin.scalar/transform/lambda-v1"
-    ));
+    let binding = catalog
+        .resolve_bound_user(
+            "transform",
+            FunctionKind::Scalar,
+            request(&arguments),
+            control,
+        )
+        .unwrap();
+    assert_eq!(
+        binding.selected.overload.as_str(),
+        "builtin.scalar/transform/lambda-v1"
+    );
+    assert_eq!(
+        binding.admitted_execution_abi,
+        Some(crate::PureKernelAbi::HigherOrderV1)
+    );
     assert!(matches!(
         catalog.resolve_bound_user(
             "array_map",

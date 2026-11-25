@@ -49,7 +49,7 @@ struct Group {
     next_collision: Option<usize>,
 }
 
-type ParentRow<'a> = &'a dyn Fn(usize) -> Result<usize, KernelFailure>;
+pub(super) type ParentRow<'a> = &'a dyn Fn(usize) -> Result<usize, KernelFailure>;
 
 impl Groups {
     pub(super) fn plan(
@@ -285,6 +285,11 @@ impl Groups {
                 work.step()?;
             }
             work.flush()?;
+            #[cfg(test)]
+            super::lambda_observation::record(|| super::lambda_observation::Event::ScalarLeaf {
+                rows: selected.len(),
+                broadcast: self.arguments.clone(),
+            });
             let result = scalar_invocation::invoke(
                 instance, selected, &arguments, activation, allocator, work,
             )?;

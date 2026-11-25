@@ -18,6 +18,7 @@
 //! Selected, resumable collection evaluation. A request contains only the
 //! source positions chosen by this overload's current algorithm frontier.
 
+// Design: ADR-0270 (docs/adr/ADR-0270-collection-lambdas-use-bound-body-requests.md)
 use std::{fmt, ops::Range, sync::Arc};
 
 use allocator_api2::vec::Vec as AllocVec;
@@ -25,10 +26,7 @@ use arrow_array::{Array, ArrayRef, BooleanArray, ListArray, MapArray, builder::B
 use arrow_schema::DataType;
 use hashbrown::{HashMap, hash_map::DefaultHashBuilder};
 use novarocks_failure_contract::kernel_reason::INVALID_FUNCTION_ARGUMENT;
-use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, KeyComparison, KeyRelation, ValueSchemaCreation,
-    ValueTypeStorageLifetime,
-};
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, KeyComparison, KeyRelation};
 use novarocks_value_arrays::{
     ValueFailure,
     hash_eq::{KeyPreparationFailure, KeyRows, PreparedKeyOperations},
@@ -49,8 +47,8 @@ use crate::{
     kernel_input::{EvaluationCheckpoints, logical_is_null},
     opaque_memory::{OpaqueReservation, OpaqueRetainedCharge},
     selected_copy::{
-        CopyConstructionError, ExtendSegment, array_from_segments_in, list_from_segments_in,
-        map_from_struct_children_in, preflight_null_arrow_structure_observed,
+        ExtendSegment, array_from_segments_in, empty_array_in, list_from_segments_in,
+        map_from_struct_children_in,
     },
 };
 
@@ -814,41 +812,10 @@ fn pieces_for<'a>(
         }
     }
     if sources.is_empty() {
-        storage.push(&mut sources, funded_empty_child(empty_type, storage, work)?)?;
+        let empty = empty_array_in(empty_type, &storage.host, &storage.allocator, work)?;
+        storage.push(&mut sources, empty)?;
     }
     Ok((sources, segments))
-}
-
-fn funded_empty_child(
-    ty: &DataType,
-    storage: &Storage,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<ArrayRef, KernelFailure> {
-    let mut layout = |_| Ok(());
-    let mut opaque = |_| Ok(());
-    let mut creation =
-        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut layout, &mut opaque);
-    let facts = preflight_null_arrow_structure_observed(ty, 0, &mut creation, &mut |boundary| {
-        if boundary { work.flush() } else { work.step() }
-    })
-    .map_err(|error| match error {
-        CopyConstructionError::Copy(cause) => cause.into_kernel(),
-        CopyConstructionError::Creator(cause) => cause,
-        CopyConstructionError::Resource(cause) => KernelFailure::from_domain(cause),
-    })?;
-    let charge = OpaqueRetainedCharge::try_new(Arc::clone(&storage.host))?;
-    work.flush()?;
-    let mut reservation = charge.reserve_operation(facts.operation_peak_bytes())?;
-    work.flush()?;
-    let output = arrow_array::new_empty_array(ty);
-    Ok(retain_result_backing_direct(
-        output,
-        charge,
-        &mut reservation,
-        storage.allocator.clone(),
-        work,
-    )?
-    .values)
 }
 
 fn duplicate(
@@ -900,8 +867,12 @@ fn duplicate(
                         &storage.allocator,
                         &mut observe,
                     )
-                    .map_err(key_failure)?
-                {
+                    .map_err(|error| {
+                        storage
+                            .allocator
+                            .take_recorded_failure()
+                            .unwrap_or_else(|| key_failure(error))
+                    })? {
                     KeyComparison::True => return Ok(true),
                     KeyComparison::False => {}
                     _ => return Err(internal("transformed key identity is not total")),
