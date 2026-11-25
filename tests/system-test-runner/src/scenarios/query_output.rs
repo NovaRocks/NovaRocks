@@ -18,7 +18,9 @@
 //! Public typed layout, strict single-statement admission and explicit effects.
 //! MySQL packet sequencing and negotiated batches have no Trino carrier.
 
-use crate::actors::sql::{self, SqlSession};
+use super::connector::{create_catalog, create_warehouse};
+use super::connector_control_plan::with_cleanup;
+use crate::actors::sql::{self, SqlSession, TrinoValue};
 use crate::actors::trino_protocol::{RawResponse, TrinoClient};
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
@@ -95,7 +97,7 @@ impl Scenario for TypedLayout {
             "ROW/MAP result changed its field positions or key text: {rows:?}"
         );
         context.action("verified anonymous ROW declarations and MAP key text on raw Trino pages");
-        native_json_pages(context)?;
+        native_json_fixture(context, &mut session)?;
         let deadline = context.deadline();
         context
             .handle()
@@ -142,17 +144,47 @@ fn read_typed_pages(pages: &[RawResponse], label: &str) -> Result<(Value, Vec<Va
     ))
 }
 
-fn native_json_pages(context: &mut ScenarioContext) -> Result<()> {
-    // The document itself makes the row exceed a Native root segment. Tables
-    // and external fixtures are unnecessary: two sequence branches yield
-    // real BE input and the grouping and ordered output consume Exchanges.
+fn native_json_fixture(context: &mut ScenarioContext, session: &mut SqlSession) -> Result<()> {
+    const CATALOG: &str = "native_json_output";
+    let schema = format!("{CATALOG}.fixture");
+    let table = format!("{schema}.numbers");
+    let warehouse = create_warehouse(context, "native-json-output")?;
+    let result = (|| -> Result<()> {
+        create_catalog(session, CATALOG, &warehouse)?;
+        session.execute(format!("CREATE SCHEMA {schema}"))?;
+        session.execute(format!("CREATE TABLE {table} (n BIGINT NOT NULL)"))?;
+        // Each commit supplies an independent scan split to the live BE roster.
+        for n in 1..=9 {
+            sql::expect_update_count(
+                &session.execute(format!("INSERT INTO {table} VALUES (BIGINT '{n}')"))?,
+                1,
+            )?;
+        }
+        let counts = sql::integer_column(&session.execute(format!(
+            "SELECT record_count FROM {schema}.\"numbers$files\""
+        ))?)?;
+        ensure!(
+            counts == [1; 9],
+            "expected nine single-row JSON source files"
+        );
+        native_json_pages(context, session, &table)
+    })();
+    let cleanup = session
+        .execute(format!("DROP CATALOG IF EXISTS {CATALOG}"))
+        .map(|_| ())
+        .context("drop the native JSON fixture catalog");
+    with_cleanup(result, cleanup)
+}
+
+fn native_json_pages(
+    context: &mut ScenarioContext,
+    session: &mut SqlSession,
+    table: &str,
+) -> Result<()> {
+    // The document itself makes the row exceed a Native root segment.
     let wide = RootProfileV1::SEGMENT_BYTES;
     let sql = format!(
-        r#"WITH input_rows AS (
-               SELECT sequential_number AS n FROM TABLE(sequence(1, 4))
-               UNION ALL
-               SELECT sequential_number AS n FROM TABLE(sequence(5, 9))
-           ), source AS (
+        r#"WITH source AS (
                SELECT n, n % 3 AS bucket,
                       CASE n
                           WHEN 1 THEN CAST(NULL AS JSON)
@@ -161,7 +193,7 @@ fn native_json_pages(context: &mut ScenarioContext) -> Result<()> {
                           WHEN 8 THEN CAST(rpad(CAST(n AS VARCHAR), {wide}, 'q') AS JSON)
                           ELSE json_parse(concat('{{"b":', CAST(n AS VARCHAR), ',"a":1,"a":2}}'))
                       END AS doc
-               FROM input_rows
+               FROM {table}
            ), grouped AS (
                SELECT bucket, array_agg(doc ORDER BY n) AS documents
                FROM source GROUP BY bucket
@@ -176,6 +208,22 @@ fn native_json_pages(context: &mut ScenarioContext) -> Result<()> {
         context.deadline(),
         &root,
     )?;
+    let plan = session.execute(format!(
+        "EXPLAIN WITH SESSION explain_detail = 'CONTRACT' {sql}"
+    ))?;
+    let mut plan_text = String::new();
+    for row in &plan.rows {
+        let [TrinoValue::Text(line)] = row.as_slice() else {
+            anyhow::bail!("unexpected native JSON EXPLAIN row: {row:?}");
+        };
+        plan_text.push_str(line);
+        plan_text.push('\n');
+    }
+    std::fs::write(root.join("source-plan.txt"), &plan_text)?;
+    ensure!(
+        plan_text.contains("EDGE GRAPH"),
+        "native JSON source plan has no Exchange"
+    );
     let before = native_json_exchange_metrics(context, &root, "before")?;
     let pages = client.execute(&sql)?;
     let after = native_json_exchange_metrics(context, &root, "after")?;
@@ -200,17 +248,13 @@ fn native_json_pages(context: &mut ScenarioContext) -> Result<()> {
         rows == expected,
         "native JSON values differ across direct and aggregate array fields (expected three ordered buckets)"
     );
-    let active = before
+    let senders = before
         .iter()
         .zip(&after)
-        .filter(|(before, after)| after.0 > before.0)
+        .filter(|(before, after)| after.0 > before.0 && after.1 > before.1)
         .count();
     ensure!(
-        active >= 2
-            && before
-                .iter()
-                .zip(&after)
-                .any(|(before, after)| after.1 > before.1),
+        senders >= 2,
         "native JSON query lacks observed distributed Task and exchange receipts: {before:?} -> {after:?}"
     );
     context.action("verified native JSON text, SQL NULL and JSON null through actual distributed Tasks and exchange");
