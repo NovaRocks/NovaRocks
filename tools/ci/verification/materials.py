@@ -200,6 +200,7 @@ def sql_scope_identity(run, selection, suite):
 SQL_ORACLES = {"result_set", "expected_error", "explain_contains", "explain_not_contains",
                "be_log", "runtime_lifecycle", "text_assertions", "imv_equivalence",
                "imv_stateless_rebuild", "mv_rest_document_graph", "iceberg_orphan_absent",
+               "iceberg_view_fixture", "iceberg_view_fixture_unchanged",
                "query_stats_contract", "update_count"}
 
 
