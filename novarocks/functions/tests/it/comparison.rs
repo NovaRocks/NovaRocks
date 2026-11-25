@@ -678,13 +678,22 @@ fn unsupported_domains_and_bad_selected_addresses_refuse_before_null_short_circu
         ),
         Err(KernelFailure::InvalidProgram(_))
     ));
-    let json = constant(correct.clone(), false, ValueLogicalType::Json, 0);
+    let native: ArrayRef = Arc::new(LargeBinaryArray::from(vec![b"\x01\x20".as_slice()]));
+    let json = constant(native.clone(), false, ValueLogicalType::Json, 0);
+    let binary = ty(DataType::LargeBinary, true);
+    let binary_comparison = PreparedComparisonRecipe::try_new(
+        ComparisonOperator::Eq,
+        &binary,
+        &binary,
+        &CompileControl::default(),
+    )
+    .unwrap();
     assert!(matches!(
-        prepared.compare_rows(
+        binary_comparison.compare_rows(
             EvaluatedArgument::Constant(&json),
             0,
             0,
-            EvaluatedArgument::Scalar(&correct),
+            EvaluatedArgument::Scalar(&native),
             0,
             0,
             &Control::default()

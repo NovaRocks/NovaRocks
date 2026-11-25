@@ -261,7 +261,7 @@ fn literal_typing_preserves_date_json_and_exact_temporal_values() {
     assert!(!value_type.nullable());
     assert_eq!(value.value_type(), &value_type);
     assert_eq!(value.pool().array().data_type(), &DataType::LargeBinary);
-    use novarocks_functions::json_value::{Kind, Node, Number, Scalar};
+    use novarocks_functions::json_value::{Kind, Node, Scalar};
     let json = Node::from_root(value.try_binary().unwrap().unwrap()).unwrap();
     let Kind::Object(object) = json.kind().unwrap() else {
         panic!("expected a JSON object");
@@ -270,13 +270,10 @@ fn literal_typing_preserves_date_json_and_exact_temporal_values() {
     assert_eq!(members.len(), 2);
     for (member, (key, digit)) in members.iter().zip([("b", 1), ("a", 2)]) {
         assert_eq!(member.key, Some(key));
-        let Kind::Scalar(Scalar::Number(Number::Finite { scale, coefficient })) =
-            member.value.kind().unwrap()
-        else {
-            panic!("expected a JSON number");
+        let Kind::Scalar(Scalar::Integer(integer)) = member.value.kind().unwrap() else {
+            panic!("expected a JSON integer");
         };
-        assert_eq!(scale, 0);
-        assert_eq!(coefficient, [digit]);
+        assert_eq!(integer, digit);
     }
     let NodeTyping::Literal(LiteralEmission::Constant { value_type, value }) = literal(
         LiteralSyntax::TypedString {
