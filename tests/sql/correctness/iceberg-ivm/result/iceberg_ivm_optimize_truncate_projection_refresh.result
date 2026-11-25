@@ -28,3 +28,38 @@ live_rows
 -- types	bigint
 live_rows
 0
+
+-- query 15
+-- types	varchar	boolean	boolean
+operation	direct_child	applied_delete
+replace	true	true
+
+-- query 18
+-- types	boolean	boolean	boolean	boolean
+direct_child	new_publication	same_record_count	no_file_changes
+true	true	true	true
+
+-- query 19
+-- types	varchar	bigint
+customer	amount
+A	10
+B	30
+B	30
+
+-- query 25
+-- types	varchar	varchar	boolean	boolean	boolean
+delete_operation	optimize_operation	directly_after_refresh	added_dv	applied_delete
+delete	replace	true	true	true
+
+-- query 28
+-- types	boolean	boolean	boolean
+direct_child	new_publication	changed_files
+true	true	true
+
+-- query 29
+-- types	varchar	bigint
+customer	amount
+A	10
+A	10
+B	30
+B	30

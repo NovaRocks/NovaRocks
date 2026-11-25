@@ -62,11 +62,10 @@ mod test_streams;
 pub use change_window::{
     ICEBERG_CHANGE_OP_COLUMN, ICEBERG_CHANGE_OP_FIELD_ID, IcebergAddedRows, IcebergChangeSide,
     IcebergChangeSplit, IcebergChangeWindowHandle, IcebergChangeWindowHandleParams,
-    IcebergChangeWindowPlan, IcebergChangeWindowPlanOutcome, IcebergDeletedDataFileRows,
-    IcebergEndpointVisibility, IcebergVisibilityDifferenceRows, MAX_RESTRICTED_ROW_IDS,
-    TABLE_CHANGES_METADATA_COLUMNS, TableChangesChangeType, TableChangesFileChange,
-    TableChangesFunctionHandle, TableChangesFunctionHandleParams, TableChangesSplit,
-    TableChangesSplitParams, change_op_column_handle,
+    IcebergChangeWindowPlan, IcebergDeletedDataFileRows, IcebergVisibilityDifferenceRows,
+    MAX_RESTRICTED_ROW_IDS, TABLE_CHANGES_METADATA_COLUMNS, TableChangesChangeType,
+    TableChangesFileChange, TableChangesFunctionHandle, TableChangesFunctionHandleParams,
+    TableChangesSplit, TableChangesSplitParams, change_op_column_handle,
 };
 pub use change_window_page_source::{
     IcebergChangeWindowPageSourceRequest, create_iceberg_change_window_page_stream,

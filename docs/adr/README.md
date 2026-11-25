@@ -171,6 +171,7 @@ code-anchors:
 
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
+- [ADR-0271](ADR-0271-iceberg-change-window-facts-and-complete-enumeration.md) — Iceberg 源窗口怎样冻结增量能力、净零依据、负权重与差集体量，并由自然末批证明完整枚举（active，部分替代 ADR-0207 的准备投影词汇与空 Delta 称呼）
 - [ADR-0268](ADR-0268-iceberg-mv-converges-from-the-original-commit.md) — Iceberg MV 如何以每轮 main CAS 发布、以原派发证据结算未知结果并保留精确清理与管理保护（active；部分替代 ADR-0180 第 4 条）
 - [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
 - [ADR-0264](ADR-0264-iceberg-rewrites-preserve-row-identity.md) — Iceberg OPTIMIZE 保留已分配的行身份，由 manifest list 为重写输出分配新范围，v3 缺 next-row-id 返回明确诊断（active。部分替代 ADR-0171 的重写 lineage 规则和 ADR-0174 的 P7a。原不可变 operation、依赖验证、产物归属和其余 vendor 补丁政策继续有效）
@@ -196,7 +197,7 @@ code-anchors:
 - [ADR-0214](ADR-0214-iceberg-schema-depth-by-decoder-owner.md) — Iceberg schema 为何按解码作者区分逻辑深度、文法物理深度与 SDK manifest 能力边界，并在 DDL 发布前和实际 manifest 解码前准确拒绝（active；部分替代 ADR-0213 的经验深度推导，运行验证状态独立核对）
 - [ADR-0213](ADR-0213-iceberg-read-interpretation-and-current-write-authority.md) — Iceberg 读取为何先选 Parquet 解释政策、分开原始与解释缓存，并把历史只读事实与当前写权限分离（active，经验物理深度推导由 ADR-0214 部分替代，supplied schema 边界由 ADR-0247 部分替代，缓存隔离与 Current/Historical 权威保留）
 - [ADR-0204](ADR-0204-upstream-iceberg-backports-and-provider-suspension.md) — Iceberg 为何仅允许有界的原样上游依赖移植，实验性 Provider 为何保留注册并明确暂停能力（active；部分替代 ADR-0138/0139/0170/0174，授权读取、唯一 manifest、禁止计量 fork 与同源基线责任保留）
-- [ADR-0207](ADR-0207-single-prepared-change-window-and-frozen-source-endpoints.md) — 增量刷新为何每 attempt 只准备一次 typed 窗口、允许源越过冻结 To，并在执行期重新观察对象与端点（active；单次准备与执行观察已接线，验证范围与验收资格另核）
+- [ADR-0207](ADR-0207-single-prepared-change-window-and-frozen-source-endpoints.md) — 增量刷新为何每 attempt 只准备一次 typed 窗口、允许源越过冻结 To，并在执行期重新观察对象与端点（active。准备投影与空 Delta 词汇由 ADR-0271 部分替代。单次准备、冻结端点及真实执行观察继续有效，验证范围与验收资格另核）
 - [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对；FE Native attempt 的决定 owner 由 ADR-0230 部分替代；异步逻辑 actor 与分散授权的妥协由 ADR-0237 部分替代；显式孤儿扫描与自有 ref 回收由 [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) 部分替代，原 publication 与实际退出规则保留。无表锚 CTAS 扫描由 [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) 退役）
 - [ADR-0230](ADR-0230-frontend-attempt-decisions-and-transport-custody.md) — FE Native attempt 使用同一共用控制运行时推进纯协议决定，宿主负责原传输与退出。按物理发送代次准入，进程及后端键的配额统一入账。（异步 QA 桥的描述由 ADR-0237 部分替代，纯 attempt 与原传输/准入规则保留）
 - [ADR-0196](ADR-0196-hadoop-test-catalog-complete-version-installation.md) — Hadoop 测试 catalog 为何共用完整不替换安装、只读版本发现与完整清单建删表，普通回收为何保护发现根（active；部分替代 ADR-0077/0118/0179 的 Hadoop 发现、存在性、DROP 与旧 UPDATE 协议，其余 owner 和生命周期保留；固定65,536项清单拒绝由 ADR-0227 部分替代，完整发现/安装与生命周期保留）
@@ -564,6 +565,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：MV 领域拥有 D/L/P/C 的持久语义；provider 拥有准确物理事实、附着与提交。Frontend 拥有当前 MV refresh attempt 的准入、效果结算、query orchestration 与用户结果；StateStore 仅保存按湖上来源重建的 Accelerator，不承担 durable ledger。commit truth 使用 typed provider evidence，不从错误文本猜测，也不通过双 journal 或 aggregate facade 掩盖 owner。
 
+- [ADR-0271](ADR-0271-iceberg-change-window-facts-and-complete-enumeration.md) — Iceberg 源窗口怎样冻结增量能力、净零依据、负权重与差集体量，并由自然末批证明完整枚举（active，部分替代 ADR-0207 的准备投影词汇与空 Delta 称呼）
 - [ADR-0268](ADR-0268-iceberg-mv-converges-from-the-original-commit.md) — Iceberg MV 如何以每轮 main CAS 发布、以原派发证据结算未知结果并保留精确清理与管理保护（active；部分替代 ADR-0180 第 4 条）
 - [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
 - [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) — MV 文档建表如何直接暂存于最终位置，全量刷新与重分区如何原子发布 delete、append 与文档（active；第 6 条的全量 delete 阶段证据见 ADR-0268）
@@ -572,7 +574,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - [ADR-0224](ADR-0224-mv-document-capacity-comes-from-real-boundaries.md) — MV 文档为何不自设容量额度、读方为何覆盖写方、StateStore 为何声明真实能力、REST 为何按期望值核验并把 413 归为确定拒绝（active；部分替代 ADR-0180 的额度与首条重评条件，以及 REST 会话版 ADR-0175 的属性保留量与拒绝集；原存放、身份、生命周期、认证与路由保留；薄清单条目/名字/token固定界由 ADR-0227 部分替代，其余文档与后端边界保留）
 - [ADR-0223](ADR-0223-result-content-identity-and-deterministic-fingerprints.md) — 内容身份为何逐列显式选择、NaN 规范化与首次接纳代表为何分开、确定指纹为何只作证据并由原 owner 判定适用资格（active；补充 ADR-0205，限当前准入支持面）
 - [ADR-0219](ADR-0219-iceberg-v3-lineage-and-planned-duplicate-match-errors.md) — Iceberg lineage 为何只认格式版本、MV为何观察所选快照范围、重复匹配为何按物理行与子句判重并由规划声明Trino错误（active；部分替代ADR-0055的属性准入历史，Provider策略与SQL谓词所有权保留）
-- [ADR-0207](ADR-0207-single-prepared-change-window-and-frozen-source-endpoints.md) — 增量刷新为何每 attempt 只准备一次 typed 窗口、允许源越过冻结 To，并在执行期重新观察对象与端点（active；单次准备与执行观察已接线，验证范围与验收资格另核）
+- [ADR-0207](ADR-0207-single-prepared-change-window-and-frozen-source-endpoints.md) — 增量刷新为何每 attempt 只准备一次 typed 窗口、允许源越过冻结 To，并在执行期重新观察对象与端点（active。准备投影与空 Delta 词汇由 ADR-0271 部分替代。单次准备、冻结端点及真实执行观察继续有效，验证范围与验收资格另核）
 - [ADR-0110](ADR-0110-lake-publication-crash-only-contract.md) — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active；本地期限推导外部效果上界及无条件年龄窗回收由 ADR-0198 部分替代，显式孤儿扫描与自有 ref 回收由 [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) 部分替代，target OCC、autocommit 与无持久接管规则保留；ADD FILES 候选复核由 [ADR-0246](ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md) 部分替代。CTAS 私有暂存与无表锚扫描、统一发布期限由 [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) 部分替代）
 - ADR-0086 — MV storage observation 为何以中立 SPI facts 连接 provider 与 Frontend durable contracts（active）
 - ADR-0154 — MV 领域文档与准确发布附着为何是湖上权威（active；存放与附着条款由 ADR-0180 部分替代，湖上权威、领域分工与 Accelerator 边界保留）

@@ -15,21 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use novarocks_spi::connector::{
-    ConnectorChangeWindowAdmission, ConnectorChangeWindowFullRebuildReason,
-    ConnectorChangeWindowReplaceFailure, ConnectorTableObjectId,
+    ConnectorChangeWindowFacts, ConnectorChangeWindowNegativeWeight,
+    ConnectorChangeWindowNotIncrementalReason, ConnectorTableObjectId,
 };
 use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_types::naming::TableIdentity;
+
+use super::rewrite_context::{OccurrenceWindow, occurrence_window};
 
 pub struct NonJoinBaseChange<'a> {
     pub occurrence_id: SqlMvRelationOccurrenceId,
     pub base_ref: &'a TableIdentity,
     pub current_snapshot_id: i64,
     pub current_table_object_id: &'a ConnectorTableObjectId,
-    pub admission: ConnectorChangeWindowAdmission,
+    pub window_facts: ConnectorChangeWindowFacts,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,12 +39,30 @@ pub enum NonJoinIncrementalChangePlan {
     MetadataOnly(NonJoinLineage),
     FullRebuild {
         lineage: NonJoinLineage,
-        reason: String,
+        reasons: Vec<NonJoinRebuildReason>,
     },
     ChangeStream {
         lineage: NonJoinLineage,
-        has_delete_changes: bool,
+        negative_weight: ConnectorChangeWindowNegativeWeight,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NonJoinRebuildReason {
+    occurrence_id: SqlMvRelationOccurrenceId,
+    base_fqn: String,
+    reason: ConnectorChangeWindowNotIncrementalReason,
+}
+
+impl NonJoinRebuildReason {
+    pub(crate) fn log_message(&self) -> String {
+        format!(
+            "occurrence {} ({}): {}",
+            self.occurrence_id.get(),
+            self.base_fqn,
+            not_incremental_reason_message(self.reason),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,26 +77,12 @@ struct PlannedFact {
     base_fqn: String,
     current_snapshot_id: i64,
     current_table_object_id: ConnectorTableObjectId,
-    admission: ConnectorChangeWindowAdmission,
+    window_facts: ConnectorChangeWindowFacts,
 }
 
 pub fn plan_non_join_incremental_changes(
     changes: &[NonJoinBaseChange<'_>],
 ) -> Result<NonJoinIncrementalChangePlan, String> {
-    if changes.is_empty() {
-        return Err("iceberg MV incremental refresh requires at least one base change".to_string());
-    }
-
-    let mut seen = BTreeSet::new();
-    for change in changes {
-        if !seen.insert(change.occurrence_id) {
-            return Err(format!(
-                "iceberg MV incremental refresh has duplicate relation occurrence {}",
-                change.occurrence_id.get()
-            ));
-        }
-    }
-
     let facts = changes
         .iter()
         .map(|change| PlannedFact {
@@ -84,7 +90,7 @@ pub fn plan_non_join_incremental_changes(
             base_fqn: change.base_ref.fqn(),
             current_snapshot_id: change.current_snapshot_id,
             current_table_object_id: change.current_table_object_id.clone(),
-            admission: change.admission.clone(),
+            window_facts: change.window_facts.clone(),
         })
         .collect();
     reduce_non_join_incremental_facts(facts)
@@ -116,278 +122,56 @@ fn reduce_non_join_incremental_facts(
         table_object_ids,
     };
 
-    let mut has_insert_changes = false;
-    let mut has_delete_changes = false;
-    let mut full_rebuild_reasons = BTreeMap::new();
+    let mut has_difference = false;
+    let mut negative_weight = ConnectorChangeWindowNegativeWeight::Absent;
+    let mut reasons = Vec::new();
     for fact in facts {
-        match fact.admission {
-            ConnectorChangeWindowAdmission::MetadataOnly => {}
-            ConnectorChangeWindowAdmission::Incremental {
-                has_inserts,
-                has_deletes,
-                ..
-            } => {
-                has_insert_changes |= has_inserts;
-                has_delete_changes |= has_deletes;
+        match occurrence_window(&fact.window_facts) {
+            Ok(OccurrenceWindow::Unchanged) => {}
+            Ok(OccurrenceWindow::Changed {
+                negative_weight: weight,
+            }) => {
+                has_difference = true;
+                if weight == ConnectorChangeWindowNegativeWeight::Possible {
+                    negative_weight = weight;
+                }
             }
-            ConnectorChangeWindowAdmission::FullRebuild(reason) => {
-                full_rebuild_reasons.insert(
-                    fact.occurrence_id,
-                    (fact.base_fqn, full_rebuild_reason_message(reason)),
-                );
+            Err(reason) => {
+                reasons.push(NonJoinRebuildReason {
+                    occurrence_id: fact.occurrence_id,
+                    base_fqn: fact.base_fqn,
+                    reason,
+                });
             }
         }
     }
-    if !full_rebuild_reasons.is_empty() {
-        let reason = if full_rebuild_reasons.len() == 1 {
-            full_rebuild_reasons
-                .into_values()
-                .next()
-                .expect("one full-rebuild reason")
-                .1
-        } else {
-            full_rebuild_reasons
-                .into_iter()
-                .map(|(occurrence, (base_fqn, reason))| {
-                    format!("occurrence {} ({base_fqn}): {reason}", occurrence.get())
-                })
-                .collect::<Vec<_>>()
-                .join("; ")
-        };
-        return Ok(NonJoinIncrementalChangePlan::FullRebuild { lineage, reason });
+    if !reasons.is_empty() {
+        reasons.sort_unstable_by_key(|reason| reason.occurrence_id);
+        return Ok(NonJoinIncrementalChangePlan::FullRebuild { lineage, reasons });
     }
 
-    if !has_insert_changes && !has_delete_changes {
-        Ok(NonJoinIncrementalChangePlan::MetadataOnly(lineage))
-    } else {
+    if has_difference {
         Ok(NonJoinIncrementalChangePlan::ChangeStream {
             lineage,
-            has_delete_changes,
+            negative_weight,
         })
+    } else {
+        Ok(NonJoinIncrementalChangePlan::MetadataOnly(lineage))
     }
 }
 
-pub(crate) fn full_rebuild_reason_message(
-    reason: ConnectorChangeWindowFullRebuildReason,
+pub(crate) fn not_incremental_reason_message(
+    reason: ConnectorChangeWindowNotIncrementalReason,
 ) -> String {
     match reason {
-        ConnectorChangeWindowFullRebuildReason::LineageBroken { from_snapshot_id } => {
+        ConnectorChangeWindowNotIncrementalReason::SnapshotAncestryBroken { from_snapshot_id } => {
             format!("previous snapshot {from_snapshot_id} is not reachable")
         }
-        ConnectorChangeWindowFullRebuildReason::UnprovenReplace {
-            snapshot_id,
-            failure,
-        } => {
-            let failure = match failure {
-                ConnectorChangeWindowReplaceFailure::MissingParent => "missing parent",
-                ConnectorChangeWindowReplaceFailure::RecordCountChanged => "record count changed",
-                ConnectorChangeWindowReplaceFailure::MissingOrInvalidSummary => {
-                    "missing or invalid summary"
-                }
-                ConnectorChangeWindowReplaceFailure::InvalidDataFileCounts => {
-                    "invalid data-file counts"
-                }
-                ConnectorChangeWindowReplaceFailure::SchemaChanged => "schema changed",
-            };
-            format!("replace snapshot {snapshot_id} is unproven: {failure}")
+        ConnectorChangeWindowNotIncrementalReason::SchemaChanged { snapshot_id } => {
+            format!("snapshot {snapshot_id} changes the schema beyond field renames")
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fact(
-        base_fqn: &str,
-        current_snapshot_id: i64,
-        admission: ConnectorChangeWindowAdmission,
-    ) -> PlannedFact {
-        PlannedFact {
-            occurrence_id: SqlMvRelationOccurrenceId::new(current_snapshot_id as u32),
-            base_fqn: base_fqn.to_string(),
-            current_snapshot_id,
-            current_table_object_id: ConnectorTableObjectId::try_new(
-                bytes::Bytes::copy_from_slice(format!("object-{base_fqn}").as_bytes()),
-            )
-            .expect("valid test object ID"),
-            admission,
-        }
-    }
-
-    fn incremental(has_inserts: bool, has_deletes: bool) -> ConnectorChangeWindowAdmission {
-        ConnectorChangeWindowAdmission::Incremental {
-            has_inserts,
-            has_deletes,
-            partition_impact:
-                novarocks_spi::connector::ConnectorChangeWindowPartitionImpact::Unavailable,
-        }
-    }
-
-    #[test]
-    fn empty_changes_are_rejected() {
-        let err = reduce_non_join_incremental_facts(Vec::new()).expect_err("empty changes");
-        assert!(err.contains("at least one base change"), "{err}");
-    }
-
-    #[test]
-    fn repeated_table_occurrences_remain_distinct() {
-        let plan = reduce_non_join_incremental_facts(vec![
-            fact("c.db.t", 2, ConnectorChangeWindowAdmission::MetadataOnly),
-            fact("c.db.t", 3, ConnectorChangeWindowAdmission::MetadataOnly),
-        ])
-        .expect("separate relation occurrences may name the same table");
-        let NonJoinIncrementalChangePlan::MetadataOnly(lineage) = plan else {
-            panic!("expected metadata-only plan");
-        };
-        assert_eq!(lineage.snapshots.len(), 2);
-        assert_eq!(lineage.snapshots[&SqlMvRelationOccurrenceId::new(2)], 2);
-        assert_eq!(lineage.snapshots[&SqlMvRelationOccurrenceId::new(3)], 3);
-    }
-
-    #[test]
-    fn duplicate_relation_occurrence_is_rejected() {
-        let mut duplicate = fact("c.db.t", 3, ConnectorChangeWindowAdmission::MetadataOnly);
-        duplicate.occurrence_id = SqlMvRelationOccurrenceId::new(2);
-        let err = reduce_non_join_incremental_facts(vec![
-            fact("c.db.t", 2, ConnectorChangeWindowAdmission::MetadataOnly),
-            duplicate,
-        ])
-        .expect_err("duplicate occurrence");
-        assert!(err.contains("duplicate relation occurrence 2"), "{err}");
-    }
-
-    #[test]
-    fn all_empty_batches_are_metadata_only() {
-        let plan = reduce_non_join_incremental_facts(vec![fact(
-            "c.db.t",
-            2,
-            ConnectorChangeWindowAdmission::MetadataOnly,
-        )])
-        .expect("metadata only");
-        assert!(matches!(
-            plan,
-            NonJoinIncrementalChangePlan::MetadataOnly(_)
-        ));
-    }
-
-    #[test]
-    fn insert_only_batch_is_delete_free_change_stream() {
-        let plan =
-            reduce_non_join_incremental_facts(vec![fact("c.db.t", 2, incremental(true, false))])
-                .expect("change stream");
-        assert!(matches!(
-            plan,
-            NonJoinIncrementalChangePlan::ChangeStream {
-                has_delete_changes: false,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn delete_admission_marks_change_stream_as_delete_capable() {
-        let plan =
-            reduce_non_join_incremental_facts(vec![fact("c.db.t", 2, incremental(false, true))])
-                .expect("delete change stream");
-        assert!(matches!(
-            plan,
-            NonJoinIncrementalChangePlan::ChangeStream {
-                has_delete_changes: true,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn lineage_and_unsafe_replace_request_typed_full_rebuild() {
-        for admission in [
-            ConnectorChangeWindowAdmission::FullRebuild(
-                ConnectorChangeWindowFullRebuildReason::LineageBroken {
-                    from_snapshot_id: 1,
-                },
-            ),
-            ConnectorChangeWindowAdmission::FullRebuild(
-                ConnectorChangeWindowFullRebuildReason::UnprovenReplace {
-                    snapshot_id: 2,
-                    failure: ConnectorChangeWindowReplaceFailure::RecordCountChanged,
-                },
-            ),
-        ] {
-            let plan = reduce_non_join_incremental_facts(vec![fact("c.db.t", 2, admission)])
-                .expect("typed full rebuild");
-            assert!(matches!(
-                plan,
-                NonJoinIncrementalChangePlan::FullRebuild { .. }
-            ));
-        }
-    }
-
-    #[test]
-    fn multiple_full_rebuild_reasons_are_stable_across_input_order() {
-        let lineage_broken = fact(
-            "z.db.lineage",
-            2,
-            ConnectorChangeWindowAdmission::FullRebuild(
-                ConnectorChangeWindowFullRebuildReason::LineageBroken {
-                    from_snapshot_id: 1,
-                },
-            ),
-        );
-        let unsafe_replace = fact(
-            "a.db.replace",
-            3,
-            ConnectorChangeWindowAdmission::FullRebuild(
-                ConnectorChangeWindowFullRebuildReason::UnprovenReplace {
-                    snapshot_id: 3,
-                    failure: ConnectorChangeWindowReplaceFailure::RecordCountChanged,
-                },
-            ),
-        );
-
-        let forward =
-            reduce_non_join_incremental_facts(vec![lineage_broken.clone(), unsafe_replace.clone()])
-                .expect("forward full rebuild");
-        let reverse = reduce_non_join_incremental_facts(vec![unsafe_replace, lineage_broken])
-            .expect("reverse full rebuild");
-
-        assert_eq!(forward, reverse);
-        let NonJoinIncrementalChangePlan::FullRebuild { reason, .. } = forward else {
-            panic!("expected full rebuild");
-        };
-        assert!(
-            reason.contains("occurrence 3 (a.db.replace): replace snapshot"),
-            "{reason}"
-        );
-        assert!(
-            reason.contains("occurrence 2 (z.db.lineage): previous snapshot"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn lineage_maps_are_complete_and_sorted_by_occurrence() {
-        let plan = reduce_non_join_incremental_facts(vec![
-            fact("z.db.t", 3, ConnectorChangeWindowAdmission::MetadataOnly),
-            fact("a.db.t", 2, ConnectorChangeWindowAdmission::MetadataOnly),
-        ])
-        .expect("metadata only");
-        let NonJoinIncrementalChangePlan::MetadataOnly(lineage) = plan else {
-            panic!("expected metadata only");
-        };
-        assert_eq!(
-            lineage.snapshots.keys().cloned().collect::<Vec<_>>(),
-            [
-                SqlMvRelationOccurrenceId::new(2),
-                SqlMvRelationOccurrenceId::new(3)
-            ]
-        );
-        assert_eq!(lineage.snapshots[&SqlMvRelationOccurrenceId::new(2)], 2);
-        assert_eq!(
-            lineage.table_object_ids[&SqlMvRelationOccurrenceId::new(3)]
-                .as_bytes()
-                .as_ref(),
-            b"object-z.db.t"
-        );
-    }
-}
+mod tests;

@@ -23,7 +23,7 @@
 
 use super::{ConnectorReadBinding, ConnectorReadChangeWindow, OpaquePayload, SchemaTableName};
 use crate::connector::{
-    ConnectorChangeWindowAdmission, ConnectorExactSemanticRevision, ConnectorProcessLocalPayload,
+    ConnectorChangeWindowFacts, ConnectorExactSemanticRevision, ConnectorProcessLocalPayload,
     ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableObjectId,
 };
 use std::sync::Arc;
@@ -169,7 +169,7 @@ pub enum ConnectorReadSourceProjection {
 pub struct ConnectorPreparedSourceRead {
     binding: ConnectorReadBinding,
     request: ConnectorReadSourcePreparationRequest,
-    admission: Option<ConnectorChangeWindowAdmission>,
+    window_facts: Option<ConnectorChangeWindowFacts>,
     payload: OpaquePayload,
     to_metadata: Arc<ConnectorTableMetadata>,
 }
@@ -183,10 +183,9 @@ impl ConnectorPreparedSourceRead {
         &self.request
     }
 
-    /// Only a change-window selection carries a lineage decision. Snapshot
-    /// reads do not masquerade as MetadataOnly or as a full-rebuild window.
-    pub const fn admission(&self) -> Option<&ConnectorChangeWindowAdmission> {
-        self.admission.as_ref()
+    /// Only a change-window selection carries window facts.
+    pub const fn window_facts(&self) -> Option<&ConnectorChangeWindowFacts> {
+        self.window_facts.as_ref()
     }
 
     /// Complete catalog projection of the selected To schema. Its column
@@ -199,14 +198,14 @@ impl ConnectorPreparedSourceRead {
     pub(crate) fn new<T: Send + Sync + 'static>(
         binding: ConnectorReadBinding,
         request: ConnectorReadSourcePreparationRequest,
-        admission: Option<ConnectorChangeWindowAdmission>,
+        window_facts: Option<ConnectorChangeWindowFacts>,
         to_metadata: Arc<ConnectorTableMetadata>,
         facts: T,
     ) -> Self {
         Self {
             binding,
             request,
-            admission,
+            window_facts,
             payload: OpaquePayload::new(facts),
             to_metadata,
         }
@@ -217,23 +216,11 @@ impl ConnectorPreparedSourceRead {
     }
 
     pub(crate) fn permits(&self, projection: ConnectorReadSourceProjection) -> bool {
-        match projection {
-            ConnectorReadSourceProjection::To => true,
-            ConnectorReadSourceProjection::From => matches!(
-                self.admission,
-                Some(ConnectorChangeWindowAdmission::Incremental { .. })
-            ),
-            ConnectorReadSourceProjection::Delta => matches!(
-                (self.request.selection(), &self.admission),
-                (
-                    ConnectorReadSourceSelection::ChangeWindow(_),
-                    Some(
-                        ConnectorChangeWindowAdmission::Incremental { .. }
-                            | ConnectorChangeWindowAdmission::MetadataOnly
-                    )
-                )
-            ),
-        }
+        self.window_facts
+            .as_ref()
+            .map_or(projection == ConnectorReadSourceProjection::To, |facts| {
+                facts.permits(projection)
+            })
     }
 }
 
@@ -242,7 +229,7 @@ impl std::fmt::Debug for ConnectorPreparedSourceRead {
         f.debug_struct("ConnectorPreparedSourceRead")
             .field("binding", &self.binding)
             .field("selection", &self.request.selection)
-            .field("admission", &self.admission)
+            .field("window_facts", &self.window_facts)
             .finish_non_exhaustive()
     }
 }

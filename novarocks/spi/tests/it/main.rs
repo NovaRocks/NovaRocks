@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod change_window_facts;
 mod data_mutation;
 mod scan_output_policy;
 mod write_arrival;

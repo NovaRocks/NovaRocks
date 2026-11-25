@@ -36,35 +36,44 @@ use novarocks_mv_application::persistence::{
 };
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
-    ConnectorChangeWindowAdmission, ConnectorControlRegistry, ConnectorExactSemanticRevision,
-    ConnectorRequestContext,
+    ConnectorChangeWindowFacts, ConnectorChangeWindowNegativeWeight,
+    ConnectorChangeWindowNotIncrementalReason, ConnectorControlRegistry,
+    ConnectorExactSemanticRevision, ConnectorRequestContext,
 };
 use novarocks_sql::planning::mv::SqlMvAggregateCalls;
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
 use novarocks_types::naming::TableIdentity;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AdmittedChangeFacts {
-    pub has_inserts: bool,
-    pub has_deletes: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OccurrenceWindow {
+    Unchanged,
+    Changed {
+        negative_weight: ConnectorChangeWindowNegativeWeight,
+    },
 }
 
-pub fn admitted_change_facts(
-    admission: &ConnectorChangeWindowAdmission,
-) -> Result<AdmittedChangeFacts, String> {
-    match admission {
-        ConnectorChangeWindowAdmission::MetadataOnly => Ok(AdmittedChangeFacts::default()),
-        ConnectorChangeWindowAdmission::Incremental {
-            has_inserts,
-            has_deletes,
-            ..
-        } => Ok(AdmittedChangeFacts {
-            has_inserts: *has_inserts,
-            has_deletes: *has_deletes,
+impl OccurrenceWindow {
+    pub(crate) const fn negative_weight_possible(self) -> bool {
+        matches!(
+            self,
+            Self::Changed {
+                negative_weight: ConnectorChangeWindowNegativeWeight::Possible,
+            }
+        )
+    }
+}
+
+pub(crate) fn occurrence_window(
+    facts: &ConnectorChangeWindowFacts,
+) -> Result<OccurrenceWindow, ConnectorChangeWindowNotIncrementalReason> {
+    match facts {
+        ConnectorChangeWindowFacts::NetZero(_) => Ok(OccurrenceWindow::Unchanged),
+        ConnectorChangeWindowFacts::Difference {
+            negative_weight, ..
+        } => Ok(OccurrenceWindow::Changed {
+            negative_weight: *negative_weight,
         }),
-        ConnectorChangeWindowAdmission::FullRebuild(reason) => Err(
-            crate::mv::domain::refresh::non_join_incremental::full_rebuild_reason_message(*reason),
-        ),
+        ConnectorChangeWindowFacts::NotIncremental(reason) => Err(*reason),
     }
 }
 
@@ -245,7 +254,7 @@ pub(crate) fn project_prepared_change_window_for_table_original(
     to_snapshot_id: i64,
     connector_context: &ConnectorRequestContext,
 ) -> Result<
-    (ConnectorChangeWindowAdmission, MvSourceSchemaObservation),
+    (ConnectorChangeWindowFacts, MvSourceSchemaObservation),
     crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
 > {
     use crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError;
@@ -264,9 +273,9 @@ pub(crate) fn project_prepared_change_window_for_table_original(
     let prepared = captured.receipt(Some(from_revision)).ok_or_else(|| {
         PreparationError::user("MV change window has no completed original typed preparation")
     })?;
-    let admission = prepared
-        .admission()
-        .ok_or("MV change-window source has no lineage admission")?
+    let facts = prepared
+        .window_facts()
+        .ok_or("MV change-window source has no prepared window facts")?
         .clone();
     let observation = crate::mv::domain::storage_observation::observe_source_schema(
         storage_observation,
@@ -274,5 +283,5 @@ pub(crate) fn project_prepared_change_window_for_table_original(
         prepared.to_metadata(),
         connector_context.clone(),
     )?;
-    Ok((admission, observation))
+    Ok((facts, observation))
 }

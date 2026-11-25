@@ -30,7 +30,8 @@
 
 use novarocks_spi::connector::StatisticsBasisRelation;
 
-use crate::iceberg::spec::{Operation, TableMetadata};
+use crate::iceberg::spec::TableMetadata;
+use crate::snapshot_history::{SnapshotDataEffect, SnapshotHistory};
 
 /// Upper bound on how far back the walk looks before giving up. A basis older
 /// than this is reported as incomparable rather than costing an unbounded
@@ -54,14 +55,10 @@ pub fn basis_relation(
 
     let mut only_added_rows = false;
     let mut only_removed_rows = false;
-    let mut cursor = Some(queried_snapshot);
+    let mut history = SnapshotHistory::new(metadata, queried_snapshot);
 
     for _ in 0..MAX_BASIS_LINEAGE_STEPS {
-        let Some(snapshot_id) = cursor else {
-            // Walked past the root without meeting the basis.
-            return StatisticsBasisRelation::Incomparable;
-        };
-        if snapshot_id == basis_snapshot {
+        if history.next_id() == Some(basis_snapshot) {
             return match (only_added_rows, only_removed_rows) {
                 // Only rewrites/compactions: the logical row set is unchanged.
                 (false, false) => StatisticsBasisRelation::Identical,
@@ -71,20 +68,17 @@ pub fn basis_relation(
                 (true, true) => StatisticsBasisRelation::Incomparable,
             };
         }
-        let Some(snapshot) = metadata.snapshot_by_id(snapshot_id) else {
+        let Some(step) = history.next() else {
             return StatisticsBasisRelation::Incomparable;
         };
-        match snapshot.summary().operation {
-            Operation::Append => only_added_rows = true,
-            Operation::Delete => only_removed_rows = true,
-            // A rewrite/compaction preserves the logical row set.
-            Operation::Replace => {}
-            // Overwrite can add and remove in one commit, and its summary does
-            // not let us prove which. Treat it as unclassifiable rather than
-            // picking a direction.
-            Operation::Overwrite => return StatisticsBasisRelation::Incomparable,
+        match step.data_effect {
+            SnapshotDataEffect::Adds => only_added_rows = true,
+            SnapshotDataEffect::Removes => only_removed_rows = true,
+            SnapshotDataEffect::Preserves => {}
+            SnapshotDataEffect::MayAddAndRemove => {
+                return StatisticsBasisRelation::Incomparable;
+            }
         }
-        cursor = snapshot.parent_snapshot_id();
     }
 
     StatisticsBasisRelation::Incomparable
@@ -96,8 +90,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::iceberg::spec::{
-        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, Snapshot, SortOrder,
-        Summary, TableMetadataBuilder, Type,
+        FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
+        SortOrder, Summary, TableMetadataBuilder, Type,
     };
 
     use super::*;
@@ -242,6 +236,39 @@ mod tests {
         let metadata = metadata_with_snapshots(vec![snapshot(1, None, Operation::Append)]);
         assert_eq!(
             basis_relation(&metadata, 7, 1),
+            StatisticsBasisRelation::Incomparable
+        );
+    }
+
+    #[test]
+    fn an_expired_basis_body_can_still_be_reached_by_parent_id() {
+        let metadata = linear_chain(&[Operation::Replace, Operation::Replace])
+            .into_builder(None)
+            .remove_snapshots(&[1])
+            .build()
+            .unwrap()
+            .metadata;
+        assert!(metadata.snapshot_by_id(1).is_none());
+        assert_eq!(
+            basis_relation(&metadata, 1, 3),
+            StatisticsBasisRelation::Identical
+        );
+        assert_eq!(
+            basis_relation(&metadata, 0, 3),
+            StatisticsBasisRelation::Incomparable
+        );
+    }
+
+    #[test]
+    fn the_basis_identity_must_be_seen_before_the_last_step_is_consumed() {
+        let metadata = linear_chain(&vec![Operation::Replace; MAX_BASIS_LINEAGE_STEPS]);
+        let head = MAX_BASIS_LINEAGE_STEPS as i64 + 1;
+        assert_eq!(
+            basis_relation(&metadata, 2, head),
+            StatisticsBasisRelation::Identical
+        );
+        assert_eq!(
+            basis_relation(&metadata, 1, head),
             StatisticsBasisRelation::Incomparable
         );
     }

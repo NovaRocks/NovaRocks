@@ -945,10 +945,13 @@ impl ProviderReadMetadata for SourceFixture {
                 .map_err(crate::connector::schema_creation::connector_schema_error)?;
             Ok(ProviderPreparedSourceRead::change_window(
                 (),
-                ConnectorChangeWindowAdmission::Incremental {
-                    has_inserts: true,
-                    has_deletes: false,
+                ConnectorChangeWindowFacts::Difference {
+                    negative_weight: ConnectorChangeWindowNegativeWeight::Absent,
                     partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
+                    volume: ConnectorChangeWindowVolume {
+                        source_event_rows_upper_bound: 1,
+                        source_data_file_bytes: 128,
+                    },
                 },
                 Arc::new(metadata),
             ))
@@ -1563,14 +1566,13 @@ async fn explain_counted_with_initial_schema(
     let projections_before = source.schema_projections.load(Ordering::SeqCst);
     let mut occurrences = BTreeSet::new();
     for occurrence in &source.projection.facts.binding().occurrences {
-        let (admission,observation)=crate::mv::domain::refresh::rewrite_context::project_prepared_change_window_for_table_original(
+        let (window_facts,observation)=crate::mv::domain::refresh::rewrite_context::project_prepared_change_window_for_table_original(
             explain.reader.original_io_for_test(),source.as_ref(),&table,&from,17,18,&context,
         ).unwrap();
         assert!(matches!(
-            admission,
-            ConnectorChangeWindowAdmission::Incremental {
-                has_inserts: true,
-                has_deletes: false,
+            window_facts,
+            ConnectorChangeWindowFacts::Difference {
+                negative_weight: ConnectorChangeWindowNegativeWeight::Absent,
                 ..
             }
         ));

@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Provider-owned Iceberg change-window admission and manifest planning.
+//! Provider-owned Iceberg change-window facts and manifest planning.
+
+// Design: ADR-0271 (docs/adr/ADR-0271-iceberg-change-window-facts-and-complete-enumeration.md)
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -24,25 +26,22 @@ use std::sync::Arc;
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorChangePartition, ConnectorChangePartitionField, ConnectorChangePartitionTransform,
-    ConnectorChangePartitionValue, ConnectorChangeWindowAdmission,
-    ConnectorChangeWindowFullRebuildReason, ConnectorChangeWindowPartitionImpact,
-    ConnectorChangeWindowReplaceFailure, ConnectorError, ConnectorErrorKind,
-    ConnectorRequestContext,
+    ConnectorChangePartitionValue, ConnectorChangeWindowFacts, ConnectorChangeWindowNegativeWeight,
+    ConnectorChangeWindowNetZeroBasis, ConnectorChangeWindowNotIncrementalReason,
+    ConnectorChangeWindowPartitionImpact, ConnectorChangeWindowPartitionImpactBuilder,
+    ConnectorChangeWindowVolume, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
 };
 
+use crate::delete_semantics::{DeleteSet, PositionSource};
 use crate::iceberg::spec::{
-    FormatVersion, NestedField, Operation, Schema, Snapshot, TableMetadata, Type,
+    FormatVersion, NestedField, PartitionSpec, Schema, Snapshot, Struct, TableMetadata, Type,
 };
+use crate::read_model::IcebergReadFile;
+use crate::snapshot_history::{SnapshotDataEffect, SnapshotHistory};
 
 #[derive(Debug)]
-enum LineageAdmission {
-    MetadataOnly,
-    Incremental,
-    FullRebuild(ConnectorChangeWindowFullRebuildReason),
-}
-
 pub(crate) enum ChangeWindowPlan {
-    Resolved(ConnectorChangeWindowAdmission),
+    Resolved(ConnectorChangeWindowFacts),
     Endpoints { schema: Arc<Schema> },
 }
 
@@ -62,27 +61,7 @@ pub(crate) fn prepare_change_window(
             "Iceberg change-window scans require table format v2 or v3",
         ));
     }
-    match classify_lineage(metadata, from_exclusive, to_inclusive)? {
-        LineageAdmission::MetadataOnly => Ok(ChangeWindowPlan::Resolved(
-            ConnectorChangeWindowAdmission::MetadataOnly,
-        )),
-        LineageAdmission::FullRebuild(reason) => Ok(ChangeWindowPlan::Resolved(
-            ConnectorChangeWindowAdmission::FullRebuild(reason),
-        )),
-        LineageAdmission::Incremental => Ok(ChangeWindowPlan::Endpoints {
-            schema: resolved_window_schema(metadata, to_inclusive)?,
-        }),
-    }
-}
-
-/// The actual endpoint comparison used by the typed original preparation.
-pub(crate) fn finish_change_window(
-    metadata: &TableMetadata,
-    from: &[crate::read_model::IcebergReadFile],
-    to: &[crate::read_model::IcebergReadFile],
-    context: &ConnectorRequestContext,
-) -> Result<ConnectorChangeWindowAdmission, ConnectorError> {
-    endpoint_admission(metadata, from, to, context)
+    classify_lineage(metadata, from_exclusive, to_inclusive, context)
 }
 
 /// Admission and execution use the same pinned upper-endpoint interpretation.
@@ -98,10 +77,7 @@ pub(crate) fn resolved_window_schema(
         .map_err(|e| corrupt(e.to_string()))
 }
 
-pub(crate) fn same_immutable_data_facts(
-    a: &crate::read_model::IcebergReadFile,
-    b: &crate::read_model::IcebergReadFile,
-) -> bool {
+pub(crate) fn same_immutable_data_facts(a: &IcebergReadFile, b: &IcebergReadFile) -> bool {
     a.path == b.path
         && a.size == b.size
         && a.record_count == b.record_count
@@ -113,11 +89,20 @@ pub(crate) fn same_immutable_data_facts(
         && a.manifest.key_metadata == b.manifest.key_metadata
 }
 
-fn index_endpoint_files(
-    files: &[crate::read_model::IcebergReadFile],
-) -> Result<BTreeMap<&str, &crate::read_model::IcebergReadFile>, ConnectorError> {
+/// Admission and execution compare the unpruned logical delete facts.
+pub(crate) fn delete_closure_changed(from: &IcebergReadFile, to: &IcebergReadFile) -> bool {
+    let before = from.logical_delete_set();
+    let after = to.logical_delete_set();
+    !before.same_addresses(after) || !before.same_applications(after)
+}
+
+fn index_endpoint_files<'a>(
+    files: &'a [IcebergReadFile],
+    context: &ConnectorRequestContext,
+) -> Result<BTreeMap<&'a str, &'a IcebergReadFile>, ConnectorError> {
     let mut indexed = BTreeMap::new();
     for file in files {
+        check_active(context)?;
         if indexed.insert(file.path.as_str(), file).is_some() {
             return Err(corrupt(format!(
                 "Iceberg endpoint contains duplicate data file {}",
@@ -128,137 +113,258 @@ fn index_endpoint_files(
     Ok(indexed)
 }
 
-fn endpoint_admission(
+/// Compare original endpoints and collect their fixed facts and optional impact
+/// independently. A full impact budget cannot stop the comparison.
+pub(crate) fn finish_change_window(
     metadata: &TableMetadata,
-    from: &[crate::read_model::IcebergReadFile],
-    to: &[crate::read_model::IcebergReadFile],
+    from: &[IcebergReadFile],
+    to: &[IcebergReadFile],
     context: &ConnectorRequestContext,
-) -> Result<ConnectorChangeWindowAdmission, ConnectorError> {
-    let from = index_endpoint_files(from)?;
-    let to = index_endpoint_files(to)?;
-    let mut added = Vec::new();
-    let mut removed = Vec::new();
-    let mut row_deletes = false;
+) -> Result<ConnectorChangeWindowFacts, ConnectorError> {
+    check_active(context)?;
+    let from = index_endpoint_files(from, context)?;
+    let to = index_endpoint_files(to, context)?;
+    let unpartitioned = metadata
+        .partition_specs_iter()
+        .all(|spec| spec.is_unpartitioned());
+    let mut impact =
+        (!unpartitioned).then(|| ConnectorChangeWindowPartitionImpactBuilder::new(false, context));
+    let mut has_difference = false;
+    let mut negative_weight = ConnectorChangeWindowNegativeWeight::Absent;
+    let mut volume = ConnectorChangeWindowVolume {
+        source_event_rows_upper_bound: 0,
+        source_data_file_bytes: 0,
+    };
+
     for (path, file) in &to {
+        check_active(context)?;
         if let Some(previous) = from.get(path) {
             if !same_immutable_data_facts(previous, file) {
                 return Err(corrupt(format!(
                     "Iceberg data file {path} changes immutable facts across endpoints"
                 )));
             }
-            let before = previous.logical_delete_set();
-            let after = file.logical_delete_set();
-            row_deletes |= !before.same_addresses(after) || !before.same_applications(after);
+            if delete_closure_changed(previous, file) {
+                has_difference = true;
+                negative_weight = ConnectorChangeWindowNegativeWeight::Possible;
+                file_partition(metadata, file)?;
+                let record_count = required_record_count(file)?;
+                let before = dv_cardinality(previous, record_count)?;
+                let after = dv_cardinality(file, record_count)?;
+                let rows = match (before, after) {
+                    (Some(before), Some(after)) => after.checked_sub(before).ok_or_else(|| {
+                        corrupt(format!(
+                            "Iceberg deletion vector cardinality decreased for data file {path}"
+                        ))
+                    })?,
+                    _ => record_count,
+                };
+                add_source_volume(&mut volume, file, rows)?;
+                if let Some(builder) = &mut impact {
+                    builder.mark_row_deletes();
+                }
+            }
         } else {
-            added.push(*file);
+            has_difference = true;
+            let record_count = required_record_count(file)?;
+            add_source_volume(&mut volume, file, visible_rows(file, record_count)?)?;
+            collect_partition(
+                &mut impact,
+                metadata,
+                file,
+                ConnectorChangeWindowPartitionImpactBuilder::add,
+            )?;
         }
     }
     for (path, file) in &from {
+        check_active(context)?;
         if !to.contains_key(path) {
-            removed.push(*file);
+            has_difference = true;
+            negative_weight = ConnectorChangeWindowNegativeWeight::Possible;
+            let record_count = required_record_count(file)?;
+            add_source_volume(&mut volume, file, visible_rows(file, record_count)?)?;
+            collect_partition(
+                &mut impact,
+                metadata,
+                file,
+                ConnectorChangeWindowPartitionImpactBuilder::remove,
+            )?;
         }
     }
-    if added.is_empty() && removed.is_empty() && !row_deletes {
-        return Ok(ConnectorChangeWindowAdmission::MetadataOnly);
+    if !has_difference {
+        return Ok(ConnectorChangeWindowFacts::NetZero(
+            ConnectorChangeWindowNetZeroBasis::EqualEndpoints,
+        ));
     }
-    Ok(ConnectorChangeWindowAdmission::Incremental {
-        has_inserts: !added.is_empty(),
-        has_deletes: !removed.is_empty() || row_deletes,
-        partition_impact: endpoint_partition_impact(
-            metadata,
-            &added,
-            &removed,
-            row_deletes,
-            context,
-        )?,
+    let partition_impact = if unpartitioned {
+        ConnectorChangeWindowPartitionImpact::Unpartitioned
+    } else {
+        impact.map_or(
+            ConnectorChangeWindowPartitionImpact::Unavailable,
+            ConnectorChangeWindowPartitionImpactBuilder::finish,
+        )
+    };
+    Ok(ConnectorChangeWindowFacts::Difference {
+        negative_weight,
+        partition_impact,
+        volume,
     })
+}
+
+fn required_record_count(file: &IcebergReadFile) -> Result<u64, ConnectorError> {
+    file.record_count
+        .and_then(|count| u64::try_from(count).ok())
+        .ok_or_else(|| {
+            corrupt(format!(
+                "Iceberg data file {} is missing a non-negative record count",
+                file.path
+            ))
+        })
+}
+
+fn add_source_volume(
+    volume: &mut ConnectorChangeWindowVolume,
+    file: &IcebergReadFile,
+    rows: u64,
+) -> Result<(), ConnectorError> {
+    let size = u128::try_from(file.size).map_err(|_| {
+        corrupt(format!(
+            "Iceberg data file {} has a negative size",
+            file.path
+        ))
+    })?;
+    volume.source_event_rows_upper_bound = volume
+        .source_event_rows_upper_bound
+        .checked_add(u128::from(rows))
+        .ok_or_else(|| corrupt("Iceberg change-window row count overflow"))?;
+    volume.source_data_file_bytes = volume
+        .source_data_file_bytes
+        .checked_add(size)
+        .ok_or_else(|| corrupt("Iceberg change-window data file size overflow"))?;
+    Ok(())
+}
+
+fn visible_rows(file: &IcebergReadFile, record_count: u64) -> Result<u64, ConnectorError> {
+    Ok(record_count - dv_cardinality(file, record_count)?.unwrap_or(0))
+}
+
+fn dv_cardinality(
+    file: &IcebergReadFile,
+    record_count: u64,
+) -> Result<Option<u64>, ConnectorError> {
+    let deletes: &DeleteSet = file.logical_delete_set();
+    if !deletes.equality().is_empty() {
+        return Ok(None);
+    }
+    let count = match deletes.position() {
+        PositionSource::None => 0,
+        PositionSource::Files(_) => return Ok(None),
+        PositionSource::OneDv(dv) => dv.read().record_count,
+    };
+    if count > record_count {
+        return Err(corrupt(format!(
+            "Iceberg deletion vector cardinality exceeds the record count of data file {}",
+            file.path
+        )));
+    }
+    Ok(Some(count))
 }
 
 fn classify_lineage(
     metadata: &TableMetadata,
     from_exclusive: i64,
     to_inclusive: i64,
-) -> Result<LineageAdmission, ConnectorError> {
+    context: &ConnectorRequestContext,
+) -> Result<ChangeWindowPlan, ConnectorError> {
     if from_exclusive == to_inclusive {
-        return Ok(LineageAdmission::MetadataOnly);
+        return Ok(ChangeWindowPlan::Resolved(
+            ConnectorChangeWindowFacts::NetZero(ConnectorChangeWindowNetZeroBasis::SameSnapshot),
+        ));
     }
-    let Some(mut current) = metadata.snapshot_by_id(to_inclusive) else {
+    if metadata.snapshot_by_id(to_inclusive).is_none() {
         return Err(corrupt(format!(
             "Iceberg change-window upper snapshot {to_inclusive} is missing from metadata"
         )));
-    };
-    if metadata.snapshot_by_id(from_exclusive).is_none() {
-        return Ok(LineageAdmission::FullRebuild(
-            ConnectorChangeWindowFullRebuildReason::LineageBroken {
+    }
+    let broken = || {
+        ChangeWindowPlan::Resolved(ConnectorChangeWindowFacts::NotIncremental(
+            ConnectorChangeWindowNotIncrementalReason::SnapshotAncestryBroken {
                 from_snapshot_id: from_exclusive,
             },
-        ));
-    }
+        ))
+    };
+    let Some(from) = metadata.snapshot_by_id(from_exclusive) else {
+        return Ok(broken());
+    };
 
+    let mut history = SnapshotHistory::new(metadata, to_inclusive);
+    let mut previous = None;
+    let mut schema_pairs = Vec::new();
     let mut changed = false;
-    loop {
-        let snapshot = current.as_ref();
-        let parent_id = snapshot.parent_snapshot_id();
-        let parent = parent_id
-            .and_then(|id| metadata.snapshot_by_id(id))
-            .map(|value| value.as_ref());
-        match classify_snapshot(snapshot, parent)? {
-            SnapshotDecision::Changed => changed = true,
-            SnapshotDecision::MetadataOnly => {}
-            SnapshotDecision::FullRebuild(reason) => {
-                return Ok(LineageAdmission::FullRebuild(reason));
-            }
+    for _ in 0..metadata.snapshots().len() {
+        check_active(context)?;
+        let Some(step) = history.next() else {
+            break;
+        };
+        changed |= step.data_effect != SnapshotDataEffect::Preserves;
+        if let Some(child) = previous {
+            remember_schema_pair(&mut schema_pairs, child, step.snapshot);
         }
-        if !matches!(snapshot.summary().operation, Operation::Replace)
-            && let Some(parent) = parent
-            && snapshot.schema_id() != parent.schema_id()
-        {
-            let previous_schema = parent.schema(metadata).map_err(|error| {
-                corrupt(format!(
-                    "resolve Iceberg snapshot {} schema: {error}",
-                    parent.snapshot_id()
-                ))
-            })?;
-            let next_schema = snapshot.schema(metadata).map_err(|error| {
+        if history.next_id() == Some(from_exclusive) {
+            if !changed {
+                return Ok(ChangeWindowPlan::Resolved(
+                    ConnectorChangeWindowFacts::NetZero(
+                        ConnectorChangeWindowNetZeroBasis::ReplaceOnly,
+                    ),
+                ));
+            }
+            remember_schema_pair(&mut schema_pairs, step.snapshot, from);
+            return classify_proven_change(metadata, to_inclusive, schema_pairs, context);
+        }
+        previous = Some(step.snapshot);
+    }
+    Ok(broken())
+}
+
+fn remember_schema_pair<'a>(
+    pairs: &mut Vec<(&'a Snapshot, &'a Snapshot)>,
+    child: &'a Snapshot,
+    parent: &'a Snapshot,
+) {
+    if child.schema_id() != parent.schema_id() {
+        pairs.push((child, parent));
+    }
+}
+
+fn classify_proven_change(
+    metadata: &TableMetadata,
+    to: i64,
+    schema_pairs: Vec<(&Snapshot, &Snapshot)>,
+    context: &ConnectorRequestContext,
+) -> Result<ChangeWindowPlan, ConnectorError> {
+    for (child, parent) in schema_pairs {
+        check_active(context)?;
+        let resolve = |snapshot: &Snapshot| {
+            snapshot.schema(metadata).map_err(|error| {
                 corrupt(format!(
                     "resolve Iceberg snapshot {} schema: {error}",
                     snapshot.snapshot_id()
                 ))
-            })?;
-            if !schema_differs_only_by_field_names(&previous_schema, &next_schema) {
-                return Ok(LineageAdmission::FullRebuild(
-                    ConnectorChangeWindowFullRebuildReason::UnprovenReplace {
-                        snapshot_id: snapshot.snapshot_id(),
-                        failure: ConnectorChangeWindowReplaceFailure::SchemaChanged,
+            })
+        };
+        if !schema_differs_only_by_field_names(resolve(parent)?.as_ref(), resolve(child)?.as_ref())
+        {
+            return Ok(ChangeWindowPlan::Resolved(
+                ConnectorChangeWindowFacts::NotIncremental(
+                    ConnectorChangeWindowNotIncrementalReason::SchemaChanged {
+                        snapshot_id: child.snapshot_id(),
                     },
-                ));
-            }
-        }
-        match parent_id {
-            Some(id) if id == from_exclusive => break,
-            Some(id) => {
-                let Some(parent) = metadata.snapshot_by_id(id) else {
-                    return Ok(LineageAdmission::FullRebuild(
-                        ConnectorChangeWindowFullRebuildReason::LineageBroken {
-                            from_snapshot_id: from_exclusive,
-                        },
-                    ));
-                };
-                current = parent;
-            }
-            None => {
-                return Ok(LineageAdmission::FullRebuild(
-                    ConnectorChangeWindowFullRebuildReason::LineageBroken {
-                        from_snapshot_id: from_exclusive,
-                    },
-                ));
-            }
+                ),
+            ));
         }
     }
-    Ok(if !changed {
-        LineageAdmission::MetadataOnly
-    } else {
-        LineageAdmission::Incremental
+    Ok(ChangeWindowPlan::Endpoints {
+        schema: resolved_window_schema(metadata, to)?,
     })
 }
 
@@ -307,136 +413,53 @@ fn type_differs_only_by_field_names(previous: &Type, next: &Type) -> bool {
     }
 }
 
-enum SnapshotDecision {
-    Changed,
-    MetadataOnly,
-    FullRebuild(ConnectorChangeWindowFullRebuildReason),
+fn file_partition<'a>(
+    metadata: &'a TableMetadata,
+    file: &'a IcebergReadFile,
+) -> Result<(&'a PartitionSpec, &'a Struct), ConnectorError> {
+    let spec_id = file.partition_spec_id.ok_or_else(|| {
+        corrupt(format!(
+            "Iceberg data file {} is missing its partition spec id",
+            file.path
+        ))
+    })?;
+    let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
+        corrupt(format!(
+            "Iceberg table metadata is missing partition spec id {spec_id}"
+        ))
+    })?;
+    let values = file.partition_values.as_ref().ok_or_else(|| {
+        corrupt(format!(
+            "Iceberg data file {} is missing its partition values",
+            file.path
+        ))
+    })?;
+    if values.fields().len() != spec.fields().len() {
+        return Err(corrupt(format!(
+            "Iceberg data file {} has the wrong partition field count for spec id {spec_id}",
+            file.path
+        )));
+    }
+    Ok((spec, values))
 }
 
-fn classify_snapshot(
-    snapshot: &Snapshot,
-    parent: Option<&Snapshot>,
-) -> Result<SnapshotDecision, ConnectorError> {
-    let snapshot_id = snapshot.snapshot_id();
-    Ok(match snapshot.summary().operation {
-        Operation::Append | Operation::Delete | Operation::Overwrite => SnapshotDecision::Changed,
-        Operation::Replace => {
-            let Some(parent) = parent else {
-                return Ok(SnapshotDecision::FullRebuild(unproven_replace(
-                    snapshot_id,
-                    ConnectorChangeWindowReplaceFailure::MissingParent,
-                )));
-            };
-            if let Some(failure) = validate_replace_snapshot(snapshot, parent)? {
-                SnapshotDecision::FullRebuild(unproven_replace(snapshot_id, failure))
-            } else {
-                SnapshotDecision::MetadataOnly
-            }
-        }
-    })
-}
-
-fn validate_replace_snapshot(
-    snapshot: &Snapshot,
-    parent: &Snapshot,
-) -> Result<Option<ConnectorChangeWindowReplaceFailure>, ConnectorError> {
-    let summary = &snapshot.summary().additional_properties;
-    let parent_summary = &parent.summary().additional_properties;
-    let records = parse_summary_i64(summary.get("total-records"))?;
-    let parent_records = parse_summary_i64(parent_summary.get("total-records"))?;
-    let (Some(records), Some(parent_records)) = (records, parent_records) else {
-        return Ok(Some(
-            ConnectorChangeWindowReplaceFailure::MissingOrInvalidSummary,
-        ));
-    };
-    if records != parent_records {
-        return Ok(Some(
-            ConnectorChangeWindowReplaceFailure::RecordCountChanged,
-        ));
-    }
-    let Some(added) = parse_summary_i64(summary.get("added-data-files"))? else {
-        return Ok(Some(
-            ConnectorChangeWindowReplaceFailure::MissingOrInvalidSummary,
-        ));
-    };
-    let Some(removed) = parse_summary_i64(summary.get("deleted-data-files"))? else {
-        return Ok(Some(
-            ConnectorChangeWindowReplaceFailure::MissingOrInvalidSummary,
-        ));
-    };
-    if added < 0 || removed < 0 {
-        return Ok(Some(
-            ConnectorChangeWindowReplaceFailure::InvalidDataFileCounts,
-        ));
-    }
-    let valid = (added > 0 && removed > 0)
-        || (added == 0 && removed == 0)
-        || (records == 0 && added == 0 && removed > 0);
-    if !valid {
-        return Ok(Some(
-            ConnectorChangeWindowReplaceFailure::InvalidDataFileCounts,
-        ));
-    }
-    if snapshot.schema_id() != parent.schema_id() {
-        return Ok(Some(ConnectorChangeWindowReplaceFailure::SchemaChanged));
-    }
-    Ok(None)
-}
-
-fn parse_summary_i64(value: Option<&String>) -> Result<Option<i64>, ConnectorError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    Ok(value.parse::<i64>().ok())
-}
-
-fn unproven_replace(
-    snapshot_id: i64,
-    failure: ConnectorChangeWindowReplaceFailure,
-) -> ConnectorChangeWindowFullRebuildReason {
-    ConnectorChangeWindowFullRebuildReason::UnprovenReplace {
-        snapshot_id,
-        failure,
-    }
-}
-
-fn endpoint_partition_impact(
+fn collect_partition(
+    impact: &mut Option<ConnectorChangeWindowPartitionImpactBuilder>,
     metadata: &TableMetadata,
-    added: &[&crate::read_model::IcebergReadFile],
-    removed: &[&crate::read_model::IcebergReadFile],
-    row_deletes: bool,
-    context: &ConnectorRequestContext,
-) -> Result<ConnectorChangeWindowPartitionImpact, ConnectorError> {
-    if metadata
-        .partition_specs_iter()
-        .all(|spec| spec.is_unpartitioned())
-    {
-        return Ok(ConnectorChangeWindowPartitionImpact::Unpartitioned);
-    }
-    let project = |file: &&crate::read_model::IcebergReadFile| {
-        let (Some(spec), Some(values)) = (file.partition_spec_id, file.partition_values.as_ref())
-        else {
-            return Ok(None);
-        };
-        connector_partition(
-            Some(spec),
-            &change_partition_field_values(metadata, spec, values)?,
-        )
+    file: &IcebergReadFile,
+    retain: impl FnOnce(&mut ConnectorChangeWindowPartitionImpactBuilder, ConnectorChangePartition),
+) -> Result<(), ConnectorError> {
+    let (spec, values) = file_partition(metadata, file)?;
+    let Some(builder) = impact.as_mut().filter(|builder| builder.is_available()) else {
+        return Ok(());
     };
-    let added = added
-        .iter()
-        .map(project)
-        .collect::<Result<Option<Vec<_>>, _>>()?;
-    let removed = removed
-        .iter()
-        .map(project)
-        .collect::<Result<Option<Vec<_>>, _>>()?;
-    match (added, removed) {
-        (Some(added), Some(removed)) => {
-            ConnectorChangeWindowPartitionImpact::try_exact(row_deletes, added, removed, context)
-        }
-        _ => Ok(ConnectorChangeWindowPartitionImpact::Unavailable),
+    let fields = change_partition_field_values(metadata, spec, values);
+    if let Some(partition) = connector_partition(Some(spec.spec_id()), &fields)? {
+        retain(builder, partition);
+    } else {
+        *impact = None;
     }
+    Ok(())
 }
 
 fn connector_partition(
@@ -517,33 +540,22 @@ enum ChangePartitionValue {
 }
 
 fn change_partition_field_values(
-    metadata: &crate::iceberg::spec::TableMetadata,
-    spec_id: i32,
-    partition: &crate::iceberg::spec::Struct,
-) -> Result<Vec<ChangePartitionFieldValue>, ConnectorError> {
-    let Some(spec) = metadata.partition_spec_by_id(spec_id) else {
-        return Err(corrupt(format!(
-            "iceberg table metadata missing partition spec id {spec_id}"
-        )));
-    };
+    metadata: &TableMetadata,
+    spec: &PartitionSpec,
+    partition: &Struct,
+) -> Vec<ChangePartitionFieldValue> {
     let schema = metadata.current_schema();
     spec.fields()
         .iter()
-        .enumerate()
-        .map(|(idx, field)| {
-            let literal = partition.fields().get(idx).ok_or_else(|| {
-                corrupt(format!(
-                    "iceberg partition struct for spec id {spec_id} is missing field {} at index {idx}",
-                    field.name
-                ))
-            })?;
-            Ok(ChangePartitionFieldValue {
-                source_field_id: field.source_id,
-                source_column: schema.field_by_id(field.source_id).map(|source| source.name.clone()),
-                field_name: field.name.clone(),
-                transform: change_partition_transform_name(&field.transform),
-                value: change_partition_value(literal.as_ref()),
-            })
+        .zip(partition.fields())
+        .map(|(field, literal)| ChangePartitionFieldValue {
+            source_field_id: field.source_id,
+            source_column: schema
+                .field_by_id(field.source_id)
+                .map(|source| source.name.clone()),
+            field_name: field.name.clone(),
+            transform: change_partition_transform_name(&field.transform),
+            value: change_partition_value(literal.as_ref()),
         })
         .collect()
 }
@@ -617,494 +629,4 @@ fn unsupported(message: impl Into<String>) -> ConnectorError {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    use crate::iceberg::spec::{
-        FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
-        SortOrder, Summary, TableMetadata, TableMetadataBuilder, Type,
-    };
-
-    use super::*;
-
-    fn snapshot(
-        snapshot_id: i64,
-        parent_snapshot_id: Option<i64>,
-        operation: Operation,
-        properties: &[(&str, &str)],
-        schema_id: i32,
-    ) -> Snapshot {
-        Snapshot::builder()
-            .with_snapshot_id(snapshot_id)
-            .with_parent_snapshot_id(parent_snapshot_id)
-            .with_sequence_number(snapshot_id)
-            .with_timestamp_ms(1_700_000_000_000 + snapshot_id)
-            .with_manifest_list(format!("file:///tmp/manifest-list-{snapshot_id}.avro"))
-            .with_summary(Summary {
-                operation,
-                additional_properties: properties
-                    .iter()
-                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-                    .collect::<HashMap<_, _>>(),
-            })
-            .with_schema_id(schema_id)
-            .build()
-    }
-
-    fn metadata_with_snapshots(snapshots: Vec<Snapshot>) -> TableMetadata {
-        let schema = Schema::builder()
-            .with_fields(vec![Arc::new(NestedField::required(
-                1,
-                "id",
-                Type::Primitive(PrimitiveType::Long),
-            ))])
-            .build()
-            .expect("schema");
-        let mut builder = TableMetadataBuilder::new(
-            schema,
-            PartitionSpec::unpartition_spec(),
-            SortOrder::unsorted_order(),
-            "/tmp/change-window-test".to_string(),
-            FormatVersion::V2,
-            HashMap::new(),
-        )
-        .expect("metadata builder");
-        for snapshot in snapshots {
-            builder = builder.add_snapshot(snapshot).expect("add snapshot");
-        }
-        builder.build().expect("metadata").metadata
-    }
-
-    fn replace_failure(
-        parent: Option<&Snapshot>,
-        properties: &[(&str, &str)],
-        schema_id: i32,
-    ) -> ConnectorChangeWindowReplaceFailure {
-        let replace = snapshot(
-            2,
-            parent.map(Snapshot::snapshot_id),
-            Operation::Replace,
-            properties,
-            schema_id,
-        );
-        let SnapshotDecision::FullRebuild(
-            ConnectorChangeWindowFullRebuildReason::UnprovenReplace { failure, .. },
-        ) = classify_snapshot(&replace, parent).expect("replace admission")
-        else {
-            panic!("expected typed unproven REPLACE admission")
-        };
-        failure
-    }
-
-    #[test]
-    fn replace_failures_are_typed_without_provider_reason_strings() {
-        let parent = snapshot(1, None, Operation::Append, &[("total-records", "100")], 0);
-        assert_eq!(
-            replace_failure(None, &[("total-records", "100")], 0),
-            ConnectorChangeWindowReplaceFailure::MissingParent
-        );
-        assert_eq!(
-            replace_failure(
-                Some(&parent),
-                &[
-                    ("total-records", "101"),
-                    ("added-data-files", "1"),
-                    ("deleted-data-files", "1"),
-                ],
-                0,
-            ),
-            ConnectorChangeWindowReplaceFailure::RecordCountChanged
-        );
-        assert_eq!(
-            replace_failure(
-                Some(&parent),
-                &[("added-data-files", "1"), ("deleted-data-files", "1")],
-                0,
-            ),
-            ConnectorChangeWindowReplaceFailure::MissingOrInvalidSummary
-        );
-        assert_eq!(
-            replace_failure(
-                Some(&parent),
-                &[
-                    ("total-records", "100"),
-                    ("added-data-files", "0"),
-                    ("deleted-data-files", "1"),
-                ],
-                0,
-            ),
-            ConnectorChangeWindowReplaceFailure::InvalidDataFileCounts
-        );
-        assert_eq!(
-            replace_failure(
-                Some(&parent),
-                &[
-                    ("total-records", "100"),
-                    ("added-data-files", "1"),
-                    ("deleted-data-files", "1"),
-                ],
-                7,
-            ),
-            ConnectorChangeWindowReplaceFailure::SchemaChanged
-        );
-    }
-
-    #[test]
-    fn valid_replace_is_metadata_only() {
-        let parent = snapshot(1, None, Operation::Append, &[("total-records", "100")], 0);
-        let replace = snapshot(
-            2,
-            Some(1),
-            Operation::Replace,
-            &[
-                ("total-records", "100"),
-                ("added-data-files", "3"),
-                ("deleted-data-files", "2"),
-            ],
-            0,
-        );
-        assert!(matches!(
-            classify_snapshot(&replace, Some(&parent)).expect("replace admission"),
-            SnapshotDecision::MetadataOnly
-        ));
-    }
-
-    #[test]
-    fn partition_transform_projection_is_typed_and_bounded() {
-        assert_eq!(
-            connector_transform("bucket(16)"),
-            Some(ConnectorChangePartitionTransform::Bucket {
-                buckets: NonZeroU32::new(16).expect("nonzero")
-            })
-        );
-        assert_eq!(connector_transform("bucket(0)"), None);
-        assert_eq!(connector_transform("void"), None);
-    }
-
-    #[test]
-    fn file_partition_impact_preserves_opaque_source_and_spec_identities() {
-        let values = vec![ChangePartitionFieldValue {
-            source_field_id: 17,
-            source_column: Some("renamed_region".to_string()),
-            field_name: "region_bucket".to_string(),
-            transform: "bucket(8)".to_string(),
-            value: ChangePartitionValue::Primitive("3".to_string()),
-        }];
-        let partition = connector_partition(Some(9), &values)
-            .expect("provider partition projection")
-            .expect("exact partition");
-        assert_eq!(
-            partition.partition_spec_identity(),
-            &crate::storage_inspector::exact_partition_spec_version(9)
-        );
-        assert_eq!(
-            partition.fields()[0].source_field_identity().as_ref(),
-            &17_i32.to_be_bytes()
-        );
-        assert_eq!(partition.fields()[0].source_column(), "renamed_region");
-        assert!(
-            connector_partition(None, &values)
-                .expect("missing spec identity remains unavailable")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn equal_endpoints_are_metadata_only_without_ordering_snapshot_identities() {
-        let metadata = metadata_with_snapshots(Vec::new());
-        assert!(matches!(
-            classify_lineage(&metadata, 41, 41).expect("equal endpoint admission"),
-            LineageAdmission::MetadataOnly
-        ));
-    }
-
-    #[test]
-    fn missing_from_snapshot_is_a_typed_lineage_full_rebuild() {
-        let current = snapshot(2, None, Operation::Append, &[], 0);
-        let metadata = metadata_with_snapshots(vec![current]);
-        assert!(matches!(
-            classify_lineage(&metadata, 1, 2).expect("lineage admission"),
-            LineageAdmission::FullRebuild(ConnectorChangeWindowFullRebuildReason::LineageBroken {
-                from_snapshot_id: 1
-            })
-        ));
-    }
-
-    #[test]
-    fn missing_upper_snapshot_remains_a_hard_corrupt_data_error() {
-        let metadata = metadata_with_snapshots(Vec::new());
-        let error = classify_lineage(&metadata, 1, 2).expect_err("missing upper snapshot");
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-    }
-
-    #[test]
-    fn field_id_preserving_rename_is_the_only_incremental_schema_change() {
-        let previous = Schema::builder()
-            .with_fields(vec![Arc::new(NestedField::optional(
-                7,
-                "region",
-                Type::Primitive(PrimitiveType::String),
-            ))])
-            .build()
-            .expect("previous schema");
-        let renamed = Schema::builder()
-            .with_fields(vec![Arc::new(NestedField::optional(
-                7,
-                "area",
-                Type::Primitive(PrimitiveType::String),
-            ))])
-            .build()
-            .expect("renamed schema");
-        let widened = Schema::builder()
-            .with_fields(vec![Arc::new(NestedField::optional(
-                7,
-                "area",
-                Type::Primitive(PrimitiveType::Long),
-            ))])
-            .build()
-            .expect("widened schema");
-
-        assert!(schema_differs_only_by_field_names(&previous, &renamed));
-        assert!(!schema_differs_only_by_field_names(&previous, &widened));
-    }
-    #[test]
-    fn rename_only_identifier_sets_ignore_independent_hash_iteration_order() {
-        let schema = |name: &str, ids: &[i32]| {
-            Schema::builder()
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        1,
-                        name,
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        2,
-                        "second",
-                        Type::Primitive(PrimitiveType::String),
-                    )),
-                ])
-                .with_identifier_field_ids(ids.iter().copied())
-                .build()
-                .unwrap()
-        };
-        let original = schema("first", &[1, 2]);
-        for _ in 0..64 {
-            assert!(schema_differs_only_by_field_names(
-                &original,
-                &schema("renamed", &[2, 1])
-            ));
-        }
-        assert!(!schema_differs_only_by_field_names(
-            &original,
-            &schema("renamed", &[1])
-        ));
-    }
-
-    fn request_context() -> ConnectorRequestContext {
-        ConnectorRequestContext::try_new(
-            std::time::Instant::now() + std::time::Duration::from_secs(30),
-            novarocks_spi::connector::ConnectorStopOwner::new().view(),
-            256 * 1024,
-            1024 * 1024,
-        )
-        .unwrap()
-    }
-
-    fn endpoint_file(
-        metadata: &TableMetadata,
-        snapshot: i64,
-        delete_sequence: i64,
-        prune: bool,
-    ) -> crate::read_model::IcebergReadFile {
-        use crate::delete_semantics::*;
-        use crate::iceberg::spec::{DataFileFormat, Datum, Struct};
-        let schema = metadata.current_schema();
-        let spec = PartitionSpec::unpartition_spec();
-        let partition = TypedPartition::bind(&spec, schema, &Struct::empty()).unwrap();
-        let metrics = |lo, hi| {
-            FileMetrics::new(BTreeMap::from([(
-                1,
-                FieldMetrics {
-                    resolved_type: PrimitiveType::Long,
-                    value_count: Some(10),
-                    null_count: Some(0),
-                    nan_count: None,
-                    lower_bound: Some(Datum::long(lo)),
-                    upper_bound: Some(Datum::long(hi)),
-                },
-            )]))
-        };
-        let data = DataFileFact::try_new(
-            "data",
-            DataSequenceNumber::try_new(1).unwrap(),
-            partition.clone(),
-            10,
-            metrics(8, 9),
-        )
-        .unwrap();
-        let fact = DeleteFact::try_new(DeleteFactParams {
-            address: DeleteContentAddress::file("same.parquet").unwrap(),
-            kind: DeleteKind::Equality(EqualityFieldGroup::bind(&[1], schema).unwrap()),
-            sequence: DataSequenceNumber::try_new(delete_sequence).unwrap(),
-            partition,
-            read: DeleteReadFacts {
-                format: DeleteFormat::Parquet,
-                record_count: 10,
-                file_size: 100,
-                key_metadata: Arc::from([]),
-            },
-            metrics: metrics(1, 2),
-        })
-        .unwrap();
-        let index = DeleteCandidateIndex::try_new(
-            test_read_domain(schema, &[spec], snapshot),
-            DeleteObservation::from_normalized_recall([Arc::new(fact)]).unwrap(),
-        )
-        .unwrap();
-        crate::read_model::IcebergReadFile {
-            path: "data".into(),
-            size: 100,
-            record_count: Some(10),
-            column_stats: None,
-            partition_spec_id: Some(0),
-            partition_key: None,
-            partition_values: Some(Struct::empty()),
-            manifest_path: None,
-            first_row_id: None,
-            data_sequence_number: Some(1),
-            manifest: Arc::new(crate::read_model::IcebergDataFileMetadata {
-                file_format: DataFileFormat::Parquet,
-                split_offsets: vec![],
-                key_metadata: vec![],
-                value_counts: HashMap::new(),
-                null_value_counts: HashMap::new(),
-                nan_value_counts: HashMap::new(),
-                lower_bounds: HashMap::new(),
-                upper_bounds: HashMap::new(),
-            }),
-            deletes: index.for_data(&data).unwrap().load_view(if prune {
-                StatisticsPolicy::MetadataBudget {
-                    max_candidate_members: 10,
-                    max_field_comparisons: 10,
-                }
-            } else {
-                StatisticsPolicy::Disabled
-            }),
-        }
-    }
-
-    #[test]
-    fn admission_uses_logical_applications_and_ignores_optional_load_pruning() {
-        let metadata = metadata_with_snapshots(vec![]);
-        let from = endpoint_file(&metadata, 10, 2, false);
-        let pruned = endpoint_file(&metadata, 20, 2, true);
-        assert_eq!(from.deletes.member_count(), 1);
-        assert_eq!(pruned.deletes.member_count(), 0);
-        assert!(matches!(
-            endpoint_admission(
-                &metadata,
-                std::slice::from_ref(&from),
-                &[pruned],
-                &request_context()
-            )
-            .unwrap(),
-            ConnectorChangeWindowAdmission::MetadataOnly
-        ));
-        let changed = endpoint_file(&metadata, 20, 3, false);
-        assert!(matches!(
-            endpoint_admission(&metadata, &[from], &[changed], &request_context()).unwrap(),
-            ConnectorChangeWindowAdmission::Incremental {
-                has_inserts: false,
-                has_deletes: true,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn admission_endpoint_membership_excludes_transient_files_and_checks_data_identity() {
-        let metadata = metadata_with_snapshots(vec![]);
-        let file = endpoint_file(&metadata, 10, 2, false);
-        assert!(matches!(
-            endpoint_admission(&metadata, &[], &[], &request_context()).unwrap(),
-            ConnectorChangeWindowAdmission::MetadataOnly
-        ));
-        assert!(matches!(
-            endpoint_admission(
-                &metadata,
-                &[],
-                std::slice::from_ref(&file),
-                &request_context()
-            )
-            .unwrap(),
-            ConnectorChangeWindowAdmission::Incremental {
-                has_inserts: true,
-                has_deletes: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            endpoint_admission(
-                &metadata,
-                std::slice::from_ref(&file),
-                &[],
-                &request_context()
-            )
-            .unwrap(),
-            ConnectorChangeWindowAdmission::Incremental {
-                has_inserts: false,
-                has_deletes: true,
-                ..
-            }
-        ));
-        let mut mutated = file.clone();
-        mutated.record_count = Some(11);
-        assert_eq!(
-            endpoint_admission(&metadata, &[file], &[mutated], &request_context())
-                .unwrap_err()
-                .kind(),
-            ConnectorErrorKind::CorruptData
-        );
-    }
-
-    #[test]
-    fn shared_lineage_plan_preserves_the_upper_endpoint_schema_for_both_reads() {
-        let from = snapshot(1, None, Operation::Append, &[], 0);
-        let metadata = metadata_with_snapshots(vec![from]);
-        let renamed = Schema::builder()
-            .with_schema_id(1)
-            .with_fields(vec![Arc::new(NestedField::required(
-                1,
-                "renamed",
-                Type::Primitive(PrimitiveType::Long),
-            ))])
-            .build()
-            .unwrap();
-        let metadata = metadata
-            .into_builder(None)
-            .add_current_schema(renamed)
-            .unwrap()
-            .add_snapshot(snapshot(2, Some(1), Operation::Append, &[], 1))
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata;
-        assert_eq!(
-            metadata
-                .snapshot_by_id(1)
-                .unwrap()
-                .schema(&metadata)
-                .unwrap()
-                .schema_id(),
-            0
-        );
-        let ChangeWindowPlan::Endpoints { schema } =
-            prepare_change_window(&metadata, 1, 2, &request_context()).unwrap()
-        else {
-            panic!("rename-only lineage must retain incremental endpoint semantics");
-        };
-        assert_eq!(schema.schema_id(), 1);
-        assert_eq!(schema.as_struct().fields()[0].name, "renamed");
-    }
-}
+mod tests;

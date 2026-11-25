@@ -200,7 +200,14 @@ impl ProviderReadMetadata for LateProvider {
             let metadata = Arc::clone(&source.metadata);
             Ok(match request.selection() {
                 ConnectorReadSourceSelection::Snapshot(_) | ConnectorReadSourceSelection::CurrentAtSnapshot(_) => novarocks_spi::connector::read_stack::adapter::ProviderPreparedSourceRead::snapshot(facts, metadata),
-                ConnectorReadSourceSelection::ChangeWindow(_) => novarocks_spi::connector::read_stack::adapter::ProviderPreparedSourceRead::change_window(facts, ConnectorChangeWindowAdmission::Incremental { has_inserts: true, has_deletes: false, partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned }, metadata),
+                ConnectorReadSourceSelection::ChangeWindow(_) => novarocks_spi::connector::read_stack::adapter::ProviderPreparedSourceRead::change_window(facts, ConnectorChangeWindowFacts::Difference {
+                    negative_weight: ConnectorChangeWindowNegativeWeight::Absent,
+                    partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
+                    volume: ConnectorChangeWindowVolume {
+                        source_event_rows_upper_bound: 1,
+                        source_data_file_bytes: 128,
+                    },
+                }, metadata),
             })
         })
     }

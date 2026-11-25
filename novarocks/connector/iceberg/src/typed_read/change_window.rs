@@ -50,9 +50,7 @@ use novarocks_proto_codec::connector_read::{
 use novarocks_spi::connector::read_stack::{
     ConnectorSplit, ConnectorTableFunctionHandle, HostAddress, SchemaTableName, SplitWeight,
 };
-use novarocks_spi::connector::{
-    ConnectorChangeWindowFullRebuildReason, ConnectorError, ConnectorErrorKind,
-};
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 use crate::iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Type};
 
@@ -946,7 +944,7 @@ impl IcebergChangeSplit {
             IcebergChangeSide::Reverse => -1,
         }
     }
-    const fn variant(&self) -> ChangeVariant {
+    pub(super) const fn variant(&self) -> ChangeVariant {
         match self {
             Self::AddedRows(_) => ChangeVariant::AddedRows,
             Self::VisibilityDifference(_) => ChangeVariant::VisibilityDifference,
@@ -1038,25 +1036,6 @@ impl ConnectorSplit for IcebergChangeSplit {
     }
 }
 
-/// Whether planning proved both endpoints' visible-row sets.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IcebergEndpointVisibility {
-    /// Both endpoints resolved to exact, ancestor-linked snapshots whose file
-    /// membership and delete closures are known.
-    Proven,
-    /// Something about the window could not be proven. The typed reason is the
-    /// same one `change_planning` produces, so the caller keeps exactly one
-    /// full-rebuild vocabulary.
-    Unproven(ConnectorChangeWindowFullRebuildReason),
-}
-
-/// What planning a change window produced.
-#[derive(Clone, Debug)]
-pub enum IcebergChangeWindowPlanOutcome {
-    Incremental(IcebergChangeWindowPlan),
-    FullRebuild(ConnectorChangeWindowFullRebuildReason),
-}
-
 /// One handle plus the complete, proven-disjoint split set for its window.
 #[derive(Clone, Debug)]
 pub struct IcebergChangeWindowPlan {
@@ -1065,7 +1044,7 @@ pub struct IcebergChangeWindowPlan {
 }
 
 impl IcebergChangeWindowPlan {
-    /// Admit a change window, or hand back a typed full rebuild.
+    /// Validate the split set for one exact change-window handle.
     ///
     /// The split set is checked as a whole because disjointness is a property
     /// of the set, not of any one split: per data file the byte ranges of one
@@ -1073,18 +1052,8 @@ impl IcebergChangeWindowPlan {
     /// are exactly the ones the endpoint difference allows.
     pub fn try_plan(
         handle: IcebergChangeWindowHandle,
-        visibility: IcebergEndpointVisibility,
         splits: Vec<IcebergChangeSplit>,
-    ) -> Result<IcebergChangeWindowPlanOutcome, ConnectorError> {
-        match visibility {
-            // Nothing is emitted from an unproven window. Guessing here is what
-            // silently produces a materialized view that never converges.
-            IcebergEndpointVisibility::Unproven(reason) => {
-                return Ok(IcebergChangeWindowPlanOutcome::FullRebuild(reason));
-            }
-            IcebergEndpointVisibility::Proven => {}
-        }
-
+    ) -> Result<Self, ConnectorError> {
         for split in &splits {
             let expected = match split {
                 IcebergChangeSplit::DeletedDataFileRows(_) => handle.from_read_domain(),
@@ -1099,10 +1068,7 @@ impl IcebergChangeWindowPlan {
             }
         }
         validate_disjoint_splits(&splits)?;
-        Ok(IcebergChangeWindowPlanOutcome::Incremental(Self {
-            handle,
-            splits,
-        }))
+        Ok(Self { handle, splits })
     }
 
     pub const fn handle(&self) -> &IcebergChangeWindowHandle {
@@ -1119,7 +1085,7 @@ impl IcebergChangeWindowPlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum ChangeVariant {
+pub(super) enum ChangeVariant {
     AddedRows,
     VisibilityDifference,
     DeletedDataFileRows,
@@ -1389,7 +1355,6 @@ fn decode_data_split(
 
 #[cfg(test)]
 mod tests {
-    use novarocks_spi::connector::ConnectorChangeWindowReplaceFailure;
     use novarocks_spi::connector::read_stack::TupleDomain;
 
     use super::super::split::{IcebergSplitParams, tests::position_delete};
@@ -1475,14 +1440,8 @@ mod tests {
             .unwrap(),
         )
     }
-    fn plan(
-        splits: Vec<IcebergChangeSplit>,
-    ) -> Result<IcebergChangeWindowPlanOutcome, ConnectorError> {
-        IcebergChangeWindowPlan::try_plan(
-            change_window_handle(),
-            IcebergEndpointVisibility::Proven,
-            splits,
-        )
+    fn plan(splits: Vec<IcebergChangeSplit>) -> Result<IcebergChangeWindowPlan, ConnectorError> {
+        IcebergChangeWindowPlan::try_plan(change_window_handle(), splits)
     }
     #[test]
     fn complete_endpoint_variants_round_trip_with_derived_signs() {
@@ -1501,10 +1460,13 @@ mod tests {
                 }
             );
         }
-        assert!(matches!(
-            plan(vec![added("a"), removed("b", 0, 100), difference("c")]).unwrap(),
-            IcebergChangeWindowPlanOutcome::Incremental(_)
-        ));
+        assert_eq!(
+            plan(vec![added("a"), removed("b", 0, 100), difference("c")])
+                .unwrap()
+                .splits()
+                .len(),
+            3,
+        );
     }
     #[test]
     fn surviving_file_has_one_row_owner_and_exact_range_tiling() {
@@ -1536,23 +1498,6 @@ mod tests {
             );
         }
     }
-    #[test]
-    fn unproven_visibility_emits_only_the_typed_full_rebuild() {
-        let reason = ConnectorChangeWindowFullRebuildReason::UnprovenReplace {
-            snapshot_id: 20,
-            failure: ConnectorChangeWindowReplaceFailure::MissingOrInvalidSummary,
-        };
-        let outcome = IcebergChangeWindowPlan::try_plan(
-            change_window_handle(),
-            IcebergEndpointVisibility::Unproven(reason),
-            vec![],
-        )
-        .unwrap();
-        assert!(
-            matches!(outcome, IcebergChangeWindowPlanOutcome::FullRebuild(actual) if actual == reason)
-        );
-    }
-
     #[test]
     fn table_changes_reports_only_whole_file_events() {
         assert_eq!(

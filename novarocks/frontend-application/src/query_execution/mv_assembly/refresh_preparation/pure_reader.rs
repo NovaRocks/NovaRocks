@@ -23,8 +23,13 @@ use super::io_gate::MvRefreshPreparationIo;
 use super::*;
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::mv::domain::application::{MvApplicationError, MvRepartitionFields};
+use crate::mv::domain::refresh::planning::RefreshBaseRelationOccurrence;
 use crate::mv::domain::refresh::target_binding::MvTargetBinding;
 use crate::mv::domain::rewrite::context::IcebergMvRewriteContext;
+use novarocks_spi::connector::{
+    ConnectorChangeWindowFacts, ConnectorChangeWindowNegativeWeight,
+    ConnectorChangeWindowPartitionImpact, ConnectorRequestContext,
+};
 
 pub(crate) struct MvRefreshPreparationInput {
     pub(crate) source: IcebergMvCorePorts,
@@ -1367,6 +1372,75 @@ async fn mv_refresh_publication_intent(
     .map_err(PreparationError::from)
 }
 
+fn project_occurrence_window_facts(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    rewrite: &IcebergMvRewriteContext,
+    base: &RefreshBaseRelationOccurrence,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+    context: &ConnectorRequestContext,
+) -> Result<ConnectorChangeWindowFacts, PreparationError> {
+    let (facts, _) = project_prepared_change_window_for_table_original(
+        io,
+        source.storage_observation(),
+        &base.table,
+        rewrite.previous_revision(base)?,
+        from_snapshot_id,
+        to_snapshot_id,
+        context,
+    )?;
+    let (outcome, reason, net_zero_basis, difference) = match &facts {
+        ConnectorChangeWindowFacts::NotIncremental(reason) => {
+            ("NotIncremental", Some(reason), None, None)
+        }
+        ConnectorChangeWindowFacts::NetZero(basis) => ("NetZero", None, Some(basis), None),
+        ConnectorChangeWindowFacts::Difference {
+            negative_weight,
+            partition_impact,
+            volume,
+        } => (
+            "Difference",
+            None,
+            None,
+            Some((negative_weight, partition_impact, volume)),
+        ),
+    };
+    let (impact, added_partitions, removed_partitions) =
+        match difference.map(|(_, impact, _)| impact) {
+            Some(ConnectorChangeWindowPartitionImpact::Exact(partitions)) => (
+                Some("Exact"),
+                Some(partitions.added().len()),
+                Some(partitions.removed().len()),
+            ),
+            Some(ConnectorChangeWindowPartitionImpact::Unavailable) => {
+                (Some("Unavailable"), None, None)
+            }
+            Some(ConnectorChangeWindowPartitionImpact::Unpartitioned) => {
+                (Some("Unpartitioned"), None, None)
+            }
+            None => (None, None, None),
+        };
+    tracing::debug!(
+        target = %rewrite.target.fqn(),
+        occurrence = base.occurrence_id.get(),
+        source = %base.table.fqn(),
+        from_snapshot_id,
+        to_snapshot_id,
+        outcome,
+        reason = ?reason,
+        net_zero_basis = ?net_zero_basis,
+        negative_weight = ?difference.map(|(weight, _, _)| weight),
+        partition_impact = ?impact,
+        added_partitions = ?added_partitions,
+        removed_partitions = ?removed_partitions,
+        source_event_rows_upper_bound = ?difference.map(|(_, _, volume)| volume.source_event_rows_upper_bound),
+        source_data_file_bytes = ?difference.map(|(_, _, volume)| volume.source_data_file_bytes),
+        "Projected MV source window facts"
+    );
+    Ok(facts)
+}
+
 async fn prepare_frontend_incremental_write(
     io: &MvRefreshPreparationIo,
     captured: &mut CapturedPreparation,
@@ -1520,30 +1594,38 @@ async fn prepare_frontend_incremental_write(
         let right_from = rewrite.previous_snapshot_id(right_ref)?;
         let left_to = rewrite.pinned_snapshot_id(left_ref)?;
         let right_to = rewrite.pinned_snapshot_id(right_ref)?;
-        let (left_admission, _) = crate::mv::domain::refresh::rewrite_context::project_prepared_change_window_for_table_original(io,
-                        source.storage_observation(),
-            &left_ref.table,
-            rewrite.previous_revision(left_ref)?,
+        let left_facts = project_occurrence_window_facts(
+            io,
+            source,
+            &rewrite,
+            left_ref,
             left_from,
             left_to,
             &connector_context,
         )?;
-        let (right_admission, _) = crate::mv::domain::refresh::rewrite_context::project_prepared_change_window_for_table_original(io,
-                        source.storage_observation(),
-            &right_ref.table,
-            rewrite.previous_revision(right_ref)?,
+        let right_facts = project_occurrence_window_facts(
+            io,
+            source,
+            &rewrite,
+            right_ref,
             right_from,
             right_to,
             &connector_context,
         )?;
-        let left_facts = admitted_change_facts(&left_admission);
-        let right_facts = admitted_change_facts(&right_admission);
+        let left_window = occurrence_window(&left_facts);
+        let right_window = occurrence_window(&right_facts);
         let mut full_rebuild_reasons = Vec::new();
-        if let Err(reason) = &left_facts {
-            full_rebuild_reasons.push(format!("{}: {reason}", left_ref.display()));
-        }
-        if let Err(reason) = &right_facts {
-            full_rebuild_reasons.push(format!("{}: {reason}", right_ref.display()));
+        for (side, base, window) in [
+            ("left", left_ref, left_window),
+            ("right", right_ref, right_window),
+        ] {
+            if let Err(reason) = window {
+                full_rebuild_reasons.push(format!(
+                    "{side} {}: {}",
+                    base.display(),
+                    not_incremental_reason_message(reason),
+                ));
+            }
         }
         if !full_rebuild_reasons.is_empty() {
             tracing::info!(
@@ -1574,8 +1656,8 @@ async fn prepare_frontend_incremental_write(
                 admitted,
             ));
         }
-        let left_facts = left_facts.expect("full-rebuild admission returned above");
-        let right_facts = right_facts.expect("full-rebuild admission returned above");
+        let left_window = left_window.expect("non-incremental left window returned above");
+        let right_window = right_window.expect("non-incremental right window returned above");
         let branches = crate::mv::domain::iceberg_join_branch::plan_join_delta_branches(
             &left_ref.table,
             &right_ref.table,
@@ -1587,8 +1669,8 @@ async fn prepare_frontend_incremental_write(
                 from: right_from,
                 to: right_to,
             },
-            left_facts.has_inserts || left_facts.has_deletes,
-            right_facts.has_inserts || right_facts.has_deletes,
+            matches!(left_window, OccurrenceWindow::Changed { .. }),
+            matches!(right_window, OccurrenceWindow::Changed { .. }),
         );
         if branches.is_empty() {
             return Ok(PreparedIncrementalRefreshWork::MetadataOnly);
@@ -1596,7 +1678,10 @@ async fn prepare_frontend_incremental_write(
         let join_mode = if is_aggregate {
             MvIncrementalJoinMode::Coalesce
         } else {
-            select_join_incremental_execution_mode(left_facts.has_deletes, right_facts.has_deletes)
+            select_join_incremental_execution_mode(
+                left_window.negative_weight_possible(),
+                right_window.negative_weight_possible(),
+            )
         };
         let request = MvIncrementalWriteRequest::try_new(
             target.catalog.clone(),
@@ -1700,31 +1785,32 @@ async fn prepare_frontend_incremental_write(
             )
             .into());
         }
-        let (admission, _) = crate::mv::domain::refresh::rewrite_context::project_prepared_change_window_for_table_original(io,
-                                source.storage_observation(),
-                &base.table,
-                rewrite.previous_revision(base)?,
-                previous_snapshot_id,
-                current_snapshot_id,
-                &connector_context,
-            )?;
+        let window_facts = project_occurrence_window_facts(
+            io,
+            source,
+            &rewrite,
+            base,
+            previous_snapshot_id,
+            current_snapshot_id,
+            &connector_context,
+        )?;
         loaded_bases.push((
             base,
             current_snapshot_id,
-            current_table_object_id.clone(),
-            admission,
+            current_table_object_id,
+            window_facts,
         ));
     }
     let changes = loaded_bases
         .iter()
         .map(
-            |(base_ref, current_snapshot_id, current_table_object_id, admission)| {
+            |(base_ref, current_snapshot_id, current_table_object_id, window_facts)| {
                 NonJoinBaseChange {
                     occurrence_id: base_ref.occurrence_id,
                     base_ref: &base_ref.table,
                     current_snapshot_id: *current_snapshot_id,
                     current_table_object_id,
-                    admission: admission.clone(),
+                    window_facts: window_facts.clone(),
                 }
             },
         )
@@ -1733,11 +1819,14 @@ async fn prepare_frontend_incremental_write(
         NonJoinIncrementalChangePlan::MetadataOnly(_) => {
             return Ok(PreparedIncrementalRefreshWork::MetadataOnly);
         }
-        NonJoinIncrementalChangePlan::FullRebuild { reason, .. } => {
-            tracing::info!(
-                target = %rewrite.target.fqn(),
-                "MV refresh SQL preparation selected a distributed full-rebuild staging overwrite: {reason}"
-            );
+        NonJoinIncrementalChangePlan::FullRebuild { reasons, .. } => {
+            for reason in reasons {
+                tracing::info!(
+                    target = %rewrite.target.fqn(),
+                    reason = %reason.log_message(),
+                    "MV refresh SQL preparation selected a distributed full-rebuild staging overwrite"
+                );
+            }
             let (rebuild, admitted) = prepare_frontend_first_refresh_write(
                 io,
                 captured,
@@ -1762,9 +1851,12 @@ async fn prepare_frontend_incremental_write(
             ));
         }
         NonJoinIncrementalChangePlan::ChangeStream {
-            has_delete_changes, ..
+            negative_weight, ..
         } => {
-            let mode = non_join_incremental_write_mode(is_aggregate, has_delete_changes);
+            let mode = non_join_incremental_write_mode(
+                is_aggregate,
+                negative_weight == ConnectorChangeWindowNegativeWeight::Possible,
+            );
             let evidence = if is_aggregate {
                 if is_branch_union {
                     MvIncrementalRewriteEvidence::BranchUnionAggregate
