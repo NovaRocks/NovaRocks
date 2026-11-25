@@ -1,30 +1,30 @@
 -- query 4
--- legacy
+-- types	bigint
 _col0
 1
 
 -- query 5
--- legacy
+-- types	bigint
 _col0
 1
 
 -- query 6
--- legacy
+-- types	bigint
 _col0
 0
 
 -- query 7
--- legacy
+-- types	bigint
 _col0
 1
 
 -- query 8
--- legacy
+-- types	bigint
 _col0
 1
 
 -- query 9
--- legacy
+-- types	bigint
 _col0
 1000000
 1000000
@@ -38,12 +38,12 @@ _col0
 1000000
 
 -- query 10
--- legacy
+-- types	bigint
 _col0
 1
 
 -- query 13
--- legacy
+-- types	array(bigint)
 _col0
 [4,7]
 NULL
@@ -51,7 +51,7 @@ NULL
 [null,null]
 
 -- query 15
--- legacy
+-- types	array(bigint)
 _col0
 [4,7]
 NULL
@@ -59,7 +59,7 @@ NULL
 [null,null]
 
 -- query 16
--- legacy
+-- types	array(bigint)
 _col0
 [5,9]
 NULL
@@ -67,7 +67,7 @@ NULL
 [null,null]
 
 -- query 17
--- legacy
+-- types	array(bigint)
 _col0
 [1,4]
 [1,4]
@@ -75,13 +75,13 @@ _col0
 [1,4]
 
 -- query 18
--- legacy
+-- types	bigint
 k
 1
 3
 
 -- query 19
--- legacy
+-- types	bigint
 k
 1
 2
@@ -89,7 +89,7 @@ k
 4
 
 -- query 20
--- legacy
+-- types	bigint	bigint
 k	col1
 1	2
 2	3
@@ -97,7 +97,7 @@ k	col1
 4	3
 
 -- query 21
--- legacy
+-- types	bigint	bigint	bigint
 k	col1	col2
 1	2	2
 2	3	3
@@ -105,7 +105,7 @@ k	col1	col2
 4	3	3
 
 -- query 22
--- legacy
+-- types	array(bigint)
 _col0
 [1,2]
 [1,2]
@@ -113,7 +113,7 @@ _col0
 [1,2]
 
 -- query 23
--- legacy
+-- types	array(integer)
 _col0
 NULL
 NULL
@@ -121,7 +121,7 @@ NULL
 [10,10]
 
 -- query 24
--- legacy
+-- types	array(bigint)
 _col0
 [1,1]
 NULL
@@ -129,7 +129,7 @@ NULL
 [4,4]
 
 -- query 25
--- legacy
+-- types	array(bigint)
 _col0
 [1,1]
 [2,2]
@@ -137,7 +137,7 @@ _col0
 [4,4]
 
 -- query 26
--- legacy
+-- types	array(integer)
 _col0
 [6,9]
 [6,9]
@@ -145,7 +145,7 @@ _col0
 [6,9]
 
 -- query 27
--- legacy
+-- types	array(integer)
 _col0
 [6,null]
 [6,null]
@@ -153,7 +153,7 @@ _col0
 [6,null]
 
 -- query 28
--- legacy
+-- types	array(integer)
 _col0
 NULL
 NULL
@@ -161,41 +161,41 @@ NULL
 NULL
 
 -- query 29
--- legacy
+-- types	array(array(integer))
 _col0
 [[101,102,103]]
 
 -- query 30
--- legacy
+-- types	array(array(integer))
 _col0
 [[101,102,103],[null]]
 
 -- query 31
--- legacy
+-- types	array(array(array(integer)))
 _col0
 [[[101,102,103]]]
 
 -- query 32
--- legacy
+-- types	array(array(array(array(bigint))))
 _col0
 [[[[2,3]]]]
 
 -- query 33
--- legacy
+-- types	array(array(array(array(bigint))))
 _col0
 [[[[2,3]]]]
 
 -- query 34
--- legacy
+-- types	array(array(array(array(bigint))))
 _col0
 [[[[3,4]]]]
 
 -- query 35
--- legacy
+-- types	array(array(array(array(array(bigint)))))
 _col0
 [[[[[2,3]]]]]
 
 -- query 38
--- legacy
+-- types	array(varchar)	array(array(varchar))
 l	_col1
 []	[["abcdefghasdasdasirnqwrq"],["abcdefghasdasdasirnqwrq"]]

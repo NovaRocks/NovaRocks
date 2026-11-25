@@ -1,15 +1,15 @@
 -- query 11
--- legacy
+-- types	integer	integer	array(integer)
 t1_id	t2_id	arr_largeint
 1	1	[1,2]
 2	2	[3,4,5]
 3	NULL	[6]
 
 -- query 12
--- legacy
+-- types	array(boolean)	array(boolean)
 _col0	_col1
-[1]	[1]
-[1]	[1]
+[true]	[true]
+[true]	[true]
 
 -- query 13
 -- legacy

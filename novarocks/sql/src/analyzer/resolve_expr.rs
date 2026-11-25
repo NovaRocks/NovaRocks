@@ -7920,7 +7920,9 @@ mod tests {
 
     #[test]
     fn lambda_body_resolves_nearest_parameter_ancestor_and_qualified_column() {
-        let sql = "SELECT transform(t.a, x -> transform(t.a, y -> x + y + t.x)), +                   transform(t.a, x -> transform(t.a, x -> x + t.x)) +                   FROM (VALUES (ARRAY[1, 2], 10)) AS t(a, x)";
+        let sql = "SELECT transform(t.a, x -> transform(t.a, y -> x + y + t.x)), \
+                          transform(t.a, x -> transform(t.a, x -> x + t.x)) \
+                   FROM (VALUES (ARRAY[1, 2], 10)) AS t(a, x)";
         let query = novarocks_parser::parser::parse_query(sql).unwrap();
         let (resolved, _, _) = super::super::analyze(&query, &EmptyCatalog, "default").unwrap();
         let QueryBody::Select(select) = &resolved.body else {

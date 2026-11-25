@@ -1,75 +1,75 @@
 -- query 2
--- legacy
+-- types	array(integer)
 _col0
 [5,3,2,2,1]
 
 -- query 5
--- legacy
+-- types	array(integer)
 _col0
 [5,3,2,2,1]
 
 -- query 6
--- legacy
+-- types	array(integer)
 _col0
 [5,3,2,2,1]
 
 -- query 7
--- legacy
+-- types	array(integer)
 _col0
 [5,3,2,2,1]
 
 -- query 8
--- legacy
+-- types	array(bigint)
 _col0
 [5,3,2,2,1]
 
 -- query 9
--- legacy
+-- types	array(decimal(38, 0))
 _col0
-[5,3,2,2,1]
+["5","3","2","2","1"]
 
 -- query 10
--- legacy
+-- types	array(double)
 _col0
-[5,3,2,2,1]
+[5.0,3.0,2.0,2.0,1.0]
 
 -- query 11
--- legacy
+-- types	array(real)
 _col0
-[5,3,2,2,1]
+[5.0,3.0,2.0,2.0,1.0]
 
 -- query 12
--- legacy
+-- types	array(decimal(7, 2))
 _col0
-[5.00,3.00,2.00,2.00,1.00]
+["5.00","3.00","2.00","2.00","1.00"]
 
 -- query 13
--- legacy
+-- types	array(decimal(19, 5))
 _col0
-[5.00000,3.00000,2.00000,2.00000,1.00000]
+["5.00000","3.00000","2.00000","2.00000","1.00000"]
 
 -- query 14
--- legacy
+-- types	array(integer)
 _col0
 [5,3,2,2,1]
 
 -- query 15
--- legacy
+-- types	array(integer)
 _col0
 [1,2,2,3,5]
 
 -- query 16
--- legacy
+-- types	array(unknown)
 _col0
 []
 
 -- query 17
--- legacy
+-- types	array(integer)
 _col0
 [5]
 
 -- query 18
--- legacy
+-- types	array(integer)
 _col0
 [1,1,1,1]
 
@@ -80,7 +80,7 @@ id	result
 1	[1,2,2,3,5]
 
 -- query 20
--- types	integer	array(tinyint)
+-- types	integer	array(integer)
 id	result
 0	[5,3,2,2,1]
 1	[1,2,2,3,5]
@@ -111,32 +111,32 @@ first_item
 10000
 
 -- query 29
--- legacy
+-- types	array(varchar(2))
 _col0
 ["dc","bc","ab"]
 
 -- query 30
--- legacy
+-- types	array(varchar(4))
 _col0
 ["a","abc","abcd"]
 
 -- query 33
--- legacy
+-- types	array(varchar(2))
 _col0
 ["dc","bc","ab"]
 
 -- query 34
--- legacy
+-- types	array(varchar(4))
 _col0
 ["a","abc","abcd"]
 
 -- query 35
--- legacy
+-- types	array(varchar)
 _col0
 ["dc","bc","ab"]
 
 -- query 36
--- legacy
+-- types	array(varchar)
 _col0
 ["a","abc","abcd"]
 
@@ -171,17 +171,17 @@ result
 [5,3,2,2,1,null,null]
 
 -- query 47
--- legacy
+-- types	array(array(integer))
 _col0
 [[1,2],[2,3,1],[4,2,1,4]]
 
 -- query 50
--- legacy
+-- types	array(array(integer))
 _col0
 [[1,2],[2,3,1],[4,2,1,4]]
 
 -- query 51
--- legacy
+-- types	array(array(integer))
 _col0
 [[1,2],[2,3,1],[4,2,1,4]]
 

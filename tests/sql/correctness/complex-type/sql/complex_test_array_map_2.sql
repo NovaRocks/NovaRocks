@@ -55,7 +55,7 @@ select count(any_match(arr_largeint, x -> any_match(arr_largeint, y -> y < 10)))
 
 -- query 8
 USE ${case_db};
-select count(transform(arr_largeint, x->cardinality(concat(arr_str,[])))) from array_map_test;
+select count(transform(arr_largeint, x->cardinality(concat(arr_str, CAST(ARRAY[] AS ARRAY(VARCHAR)))))) from array_map_test;
 
 -- query 9
 USE ${case_db};
@@ -197,7 +197,12 @@ insert into array_map_x values ROW(1, repeat('abcdefghasdasdasirnqwrq', 2), repe
 
 -- query 38
 USE ${case_db};
-select cast(if (1 > rand(), '[]', '') as ARRAY(VARCHAR)) l , transform(arr_str, (x)-> (concat(x,l))) from array_map_x;
+WITH input AS (
+    SELECT arr_str,
+           IF(1 > random(), CAST(ARRAY[] AS ARRAY(VARCHAR)), CAST(NULL AS ARRAY(VARCHAR))) AS l
+    FROM array_map_x
+)
+SELECT l, transform(arr_str, x -> concat(x, l)) FROM input;
 
 -- query 39
 -- @skip_result_check=true

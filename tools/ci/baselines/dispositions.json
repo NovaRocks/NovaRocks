@@ -42,16 +42,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:aggregate/agg_test_groupby_array",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original 2,000,000-element grouping workload uses relational sequence and a typed oracle whose legacy rendering equals the original result. Native 1FE+3BE verifies step 3 and first refuses transform/lambda-v1 at step 5. Preserve the remaining SQL and the legacy step 7 oracle for the next owner. Evidence: B7b p07-convert-v2 and p07-matrix-v3/aggregate. Exit after the complete case and cleanup pass.",
-      "owner": "UEA-5E B7c",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:aggregate/agg_test_percentile_approx_weighted",
       "failure": {
         "class": "error_code",
@@ -109,16 +99,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/row/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
       "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_map_higher_order",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Statement 1 selects builtin.scalar/transform_keys/lambda-v1 with the public argument order, and the overload has no installed pure implementation. The prior missing MAP constructor and wrong argument order failures remain in the native evidence. Verify the original higher-order value oracles and native cleanup after installing the exact overloads.",
-      "owner": "UEA-5E B7c",
       "expires": "2026-12-15"
     },
     {
@@ -182,26 +162,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:complex-type/complex_test_array_map_2",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The Trino-compatible fixture uses DECIMAL(38,0) for the original signed values beyond BIGINT. Native 1FE+3BE first refuses builtin.scalar/transform/lambda-v1 at step 4. Preserve the remaining original result and error oracles. Evidence: B7b p07-matrix-v3/complex-type. Exit after the complete case and cleanup pass.",
-      "owner": "UEA-5E B7c",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_test_array_sort_lambda",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_sort_lambda/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:complex-type/json_list_semantic_schema",
       "failure": {
         "class": "error_code",
@@ -235,10 +195,10 @@
       "unit": "sql-case:filter/test_scan_predicate_expr_reuse",
       "failure": {
         "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
+        "code": "sql.analyze.unsupported_expression"
       },
-      "reason": "Native 1FE+3BE verifies the repeat-backed result at steps 1–3 after equivalent legacy conversion. Step 4 first refuses builtin.scalar/transform/lambda-v1 inside array_max. Preserve all later input, result and error oracles. Evidence: B7b p07-matrix-v3/filter and p07-convert-v2. Exit after complete native verification and cleanup.",
-      "owner": "UEA-5E B7c",
+      "reason": "Native 1FE+3BE verifies steps 1–8, including the original transform predicate at step 4. Statement 9 first refuses the nested ROW cast changing the child array from INTEGER to BIGINT. All later SQL and value oracles remain in the case. Evidence: B7c equivalent-verify/filter. Exit after the complete case and cleanup pass.",
+      "owner": "UEA-5E B7e",
       "expires": "2026-12-15"
     },
     {
@@ -1072,23 +1032,13 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:complex-type/complex_test_array_filter",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original case reaches statement 4 and the frozen selected overload builtin.scalar/array_filter/(list<any<T>>,list<any<M>>)->list<any<T>>;strict;legacy is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B7",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:complex-type/complex_test_array_map",
       "failure": {
         "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
+        "code": "sql.analyze.unsupported_expression"
       },
-      "reason": "The original case reaches statement 6 and the frozen selected overload builtin.scalar/array_map/dynamic-v1 is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B7",
+      "reason": "Native 1FE+3BE verifies the prefix through statement 12, including the original transform results. Statement 13 first refuses the JSON-to-ARRAY(JSON) cast. Preserve the remaining SQL and value oracles. Evidence: B7c equivalent-verify/complex-type. Exit after the complete case and cleanup pass.",
+      "owner": "UEA-5E B7e",
       "expires": "2026-12-15"
     },
     {

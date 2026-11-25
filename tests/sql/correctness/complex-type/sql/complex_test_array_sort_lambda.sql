@@ -128,7 +128,6 @@ SELECT array_sort(ARRAY[ROW(2, 'a'), ROW(1, 'b'), ROW(2, 'c')],
 
 -- query 22
 -- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
-USE ${case_db};
 SELECT array_sort(ARRAY[1, 2], (x, y) -> 2);
 
 -- query 23
@@ -146,8 +145,7 @@ SELECT array_sort(ARRAY[ROW(1, 3), ROW(1, 1), ROW(2, 2), ROW(1, 2)],
 
 -- query 25
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
-USE ${case_db};
-WITH input AS (SELECT array_agg(k0) AS a FROM t0)
+WITH input AS (SELECT array_agg(k0) AS a FROM ${case_db}.t0)
 SELECT array_sort(a, (x, y) -> random()) FROM input;
 
 -- query 26
