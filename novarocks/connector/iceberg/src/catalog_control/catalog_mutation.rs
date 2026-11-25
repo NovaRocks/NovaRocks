@@ -45,7 +45,10 @@ use crate::catalog::admission::{
 use crate::catalog::error::CatalogOutcome;
 use crate::catalog::{CatalogCreateIntent, CatalogNamespaceName, CatalogTableName};
 use crate::commit::lower_ref_action;
-use crate::commit::validation::{NewColumnDomain, deny_column_definition, deny_column_definitions};
+use crate::commit::validation::{
+    IcebergWriteTypeRefusal, NewColumnDomain, check_column_definitions, deny_column_definition,
+    deny_column_definitions,
+};
 use crate::iceberg::spec::{
     FormatVersion, NestedField, PrimitiveType, Schema, StructType, Transform, Type,
     UnboundPartitionField, UnboundPartitionSpecBuilder,
@@ -1000,7 +1003,7 @@ pub(in crate::catalog_control) struct CreatePreflightFacts {
     name: String,
     seed: ConnectorCatalogMutationReceipt,
     properties: crate::table_properties::PreparedCreateTableProperties,
-    json_definition: Result<(), ConnectorError>,
+    json_refusal: Option<IcebergWriteTypeRefusal>,
 }
 
 fn prepare_create_preflight(
@@ -1024,7 +1027,7 @@ fn prepare_create_preflight(
     let seed = receipt(provider, request.operation_id, request.operation.kind())?;
     // Collect the declaration fact in the original metadata CPU phase.
     // Only the absence branch below may consume a type refusal.
-    let json_definition = deny_column_definitions(
+    let json_refusal = check_column_definitions(
         columns,
         &format!(
             "{}.{}.{}",
@@ -1033,13 +1036,14 @@ fn prepare_create_preflight(
             table.table
         ),
         NewColumnDomain::Json,
-    );
+    )
+    .err();
     Ok(CreatePreflightFacts {
         namespace,
         name,
         seed,
         properties,
-        json_definition,
+        json_refusal,
     })
 }
 
@@ -1129,7 +1133,9 @@ async fn prepare_ordinary_create<R: CreateCatalogReads>(
                         .into())
                     };
                 }
-                facts.json_definition.as_ref().map_err(Clone::clone)?;
+                if let Some(refusal) = facts.json_refusal.take() {
+                    return Err(refusal.into_error().into());
+                }
                 let target = CatalogTableName::new(facts.namespace.clone(), facts.name.clone());
                 facts.properties.location = reads
                     .create_location(
@@ -9712,8 +9718,7 @@ mod tests {
             provider
                 .runtime()
                 .load_table_classified_for_request("atomic", "fresh", &context())
-                .err()
-                .expect("JSON CREATE must leave no table")
+                .expect_err("JSON CREATE must leave no table")
                 .0,
             ConnectorErrorKind::NotFound
         );

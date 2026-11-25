@@ -79,11 +79,23 @@ fn deny_type(
 }
 
 fn unwritable_error(kind: &str, table: &str, path: &str) -> ConnectorError {
-    ConnectorError::new(
-        ConnectorErrorKind::Unsupported,
-        format!("Iceberg {kind} writes are not supported yet: table {table}, column {path}"),
-    )
-    .with_public_failure_detail()
+    IcebergWriteTypeRefusal::new(kind, table, path).into_error()
+}
+
+/// The write type diagnostic may cross an existence read before it is admitted
+/// as a failure. Keep its original message in that preparation result.
+pub(crate) struct IcebergWriteTypeRefusal(String);
+
+impl IcebergWriteTypeRefusal {
+    fn new(kind: &str, table: &str, path: &str) -> Self {
+        Self(format!(
+            "Iceberg {kind} writes are not supported yet: table {table}, column {path}"
+        ))
+    }
+
+    pub(crate) fn into_error(self) -> ConnectorError {
+        ConnectorError::new(ConnectorErrorKind::Unsupported, self.0).with_public_failure_detail()
+    }
 }
 
 /// The caller chooses which new column domain to check at its admission point.
@@ -98,8 +110,16 @@ pub(crate) fn deny_column_definitions(
     table: &str,
     domain: NewColumnDomain,
 ) -> Result<(), ConnectorError> {
+    check_column_definitions(columns, table, domain).map_err(IcebergWriteTypeRefusal::into_error)
+}
+
+pub(crate) fn check_column_definitions(
+    columns: &[ConnectorColumnDefinition],
+    table: &str,
+    domain: NewColumnDomain,
+) -> Result<(), IcebergWriteTypeRefusal> {
     for column in columns {
-        deny_column_definition(&column.data_type, &column.name, table, domain)?;
+        check_column_definition(&column.data_type, &column.name, table, domain)?;
     }
     Ok(())
 }
@@ -112,23 +132,33 @@ pub(crate) fn deny_column_definition(
     table: &str,
     domain: NewColumnDomain,
 ) -> Result<(), ConnectorError> {
+    check_column_definition(data_type, path, table, domain)
+        .map_err(IcebergWriteTypeRefusal::into_error)
+}
+
+fn check_column_definition(
+    data_type: &ConnectorDataType,
+    path: &str,
+    table: &str,
+    domain: NewColumnDomain,
+) -> Result<(), IcebergWriteTypeRefusal> {
     match (data_type, domain) {
         (ConnectorDataType::Variant, NewColumnDomain::Variant) => {
-            return Err(unwritable_error("Variant", table, path));
+            return Err(IcebergWriteTypeRefusal::new("Variant", table, path));
         }
         (ConnectorDataType::Json, NewColumnDomain::Json) => {
-            return Err(unwritable_error("JSON", table, path));
+            return Err(IcebergWriteTypeRefusal::new("JSON", table, path));
         }
         (ConnectorDataType::Array(element), _) => {
-            deny_column_definition(element, &format!("{path}.element"), table, domain)?
+            check_column_definition(element, &format!("{path}.element"), table, domain)?
         }
         (ConnectorDataType::Map(key, value), _) => {
-            deny_column_definition(key, &format!("{path}.key"), table, domain)?;
-            deny_column_definition(value, &format!("{path}.value"), table, domain)?;
+            check_column_definition(key, &format!("{path}.key"), table, domain)?;
+            check_column_definition(value, &format!("{path}.value"), table, domain)?;
         }
         (ConnectorDataType::Struct(fields), _) => {
             for field in fields {
-                deny_column_definition(
+                check_column_definition(
                     &field.data_type,
                     &format!("{path}.{}", field.name),
                     table,
