@@ -162,6 +162,9 @@ pub(crate) enum CommitProtocol {
     MvAlterProperties {
         slots: SlotExpectations,
     },
+    MvRetirement {
+        admitted: MvRefreshDependencies,
+    },
 }
 
 impl CommitProtocol {
@@ -174,7 +177,9 @@ impl CommitProtocol {
             Self::Delete => CommitOperation::Delete,
             Self::RowDelta { .. } => CommitOperation::Write,
             Self::RewriteFiles { .. } => CommitOperation::Optimize,
-            Self::MvRefresh { .. } => CommitOperation::RefreshMaterializedView,
+            Self::MvRefresh { .. } | Self::MvRetirement { .. } => {
+                CommitOperation::RefreshMaterializedView
+            }
             Self::MvAlterProperties { .. } => CommitOperation::AlterMaterializedViewProperties,
         }
     }
@@ -187,7 +192,8 @@ impl CommitProtocol {
             | Self::Truncate
             | Self::Delete
             | Self::MvRefresh { .. }
-            | Self::MvAlterProperties { .. } => WindowValidation::None,
+            | Self::MvAlterProperties { .. }
+            | Self::MvRetirement { .. } => WindowValidation::None,
             Self::RowDelta { window, .. } => WindowValidation::RowDelta(window),
             Self::RewriteFiles { replaced, .. } => WindowValidation::RewriteFiles(replaced),
         }
@@ -201,7 +207,8 @@ impl CommitProtocol {
             | Self::Truncate
             | Self::Delete
             | Self::RewriteFiles { .. }
-            | Self::MvAlterProperties { .. } => None,
+            | Self::MvAlterProperties { .. }
+            | Self::MvRetirement { .. } => None,
             Self::RowDelta { writer, .. } | Self::MvRefresh { writer, .. } => Some(*writer),
         }
     }
@@ -219,7 +226,8 @@ impl CommitProtocol {
             | Self::Delete
             | Self::RowDelta { .. }
             | Self::MvRefresh { .. }
-            | Self::MvAlterProperties { .. } => None,
+            | Self::MvAlterProperties { .. }
+            | Self::MvRetirement { .. } => None,
         }
     }
 
@@ -231,13 +239,14 @@ impl CommitProtocol {
                 | Self::RewriteFiles { .. }
                 | Self::MvRefresh { .. }
                 | Self::MvAlterProperties { .. }
+                | Self::MvRetirement { .. }
         )
     }
 
     pub(crate) const fn is_mv(&self) -> bool {
         matches!(
             self,
-            Self::MvRefresh { .. } | Self::MvAlterProperties { .. }
+            Self::MvRefresh { .. } | Self::MvAlterProperties { .. } | Self::MvRetirement { .. }
         )
     }
 
@@ -246,7 +255,8 @@ impl CommitProtocol {
             Self::MvRefresh {
                 mode: MvRefreshMode::Incremental | MvRefreshMode::MetadataOnly,
                 ..
-            } => Some(MV_MAIN_ADVANCED),
+            }
+            | Self::MvRetirement { .. } => Some(MV_MAIN_ADVANCED),
             Self::MvRefresh {
                 mode: MvRefreshMode::Repartition,
                 ..

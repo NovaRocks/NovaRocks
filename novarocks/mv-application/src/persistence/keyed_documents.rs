@@ -963,6 +963,55 @@ pub(crate) mod tests {
     pub(crate) use super::keyed_view_fixture as fixture;
     use super::*;
     #[test]
+    fn retirement_marker_and_record_block_reuse_even_with_an_empty_storage_snapshot() {
+        use crate::persistence::codec::{
+            Marker, PublicationEvidence, RetirementRecord, marker_eligibility,
+        };
+
+        let (catalog, mut view) = fixture(Some(17), true);
+        let previously_published = decode_current_keyed_documents(view.clone(), catalog.clone())
+            .unwrap()
+            .publication
+            .unwrap();
+        let retirement = RetirementRecord {
+            retired_publication: previously_published.publication_id,
+            operation: novarocks_spi::connector::ConnectorMutationOperationId::from_bytes([8; 16]),
+            requested: 4,
+            matched: 3,
+            insufficient_keys: 1,
+            content_fingerprint: None,
+        };
+        let invalid = Marker::Invalid {
+            publication: retirement.retired_publication.clone(),
+            retirement_record_revision: retirement.revision().unwrap(),
+        };
+        let (key, value) = invalid.encode().unwrap();
+        let decoded = Marker::decode(&key, &value).unwrap();
+        assert_eq!(decoded, invalid);
+        let markers = vec![(key.clone(), decoded)];
+        let eligibility = marker_eligibility(
+            PublicationEvidence::Retired(&retirement.retired_publication),
+            &markers,
+        );
+        assert!(eligibility.automatic_reuse_blocked);
+        assert_eq!(eligibility.active, vec![&invalid]);
+
+        let record = retirement.encode().unwrap();
+        assert_eq!(RetirementRecord::decode(&record).unwrap(), retirement);
+        view.current_records = vec![record];
+        view.markers.insert(key, value);
+        view.current_snapshot = Some(18);
+        view.metadata_version =
+            ConnectorCommittedVersion::try_new(Bytes::from_static(b"retired"), Some(18)).unwrap();
+        view.current_snapshot_file_totals = SnapshotFileTotals {
+            data_files: Some(0),
+            delete_files: Some(0),
+        };
+        assert!(!never_published(&view));
+        assert!(decode_current_keyed_documents(view, catalog).is_err());
+    }
+
+    #[test]
     fn no_publication_requires_absent_snapshot_or_known_empty_file_totals() {
         let (catalog, mut view) = fixture(Some(17), false);
         assert!(never_published(&view));

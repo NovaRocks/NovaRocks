@@ -315,7 +315,7 @@ fn catalog_admission_request(request: &ConnectorCatalogMutationRequest) -> Catal
             table_target(table),
         ),
         Mutation::KeyedDocuments { intent } => (
-            CatalogOperation::UpdateDocuments,
+            keyed::catalog_operation(intent),
             table_target(intent.admission.target()),
         ),
         Mutation::DropTable { table, .. } => (CatalogOperation::DropTable, table_target(table)),
@@ -3667,9 +3667,10 @@ fn reconcile_evidence(
             };
         }
         IcebergMutationEvidenceTarget::KeyedSlotChange { .. }
-        | IcebergMutationEvidenceTarget::KeyedSlotStorageChange { .. } => {
+        | IcebergMutationEvidenceTarget::KeyedSlotStorageChange { .. }
+        | IcebergMutationEvidenceTarget::KeyedRetirement { .. } => {
             return Err(unsupported(
-                "slot outcomes are resolved through the retained document lease",
+                "keyed snapshot outcomes are resolved through the retained document lease",
             ));
         }
         IcebergMutationEvidenceTarget::KeyedExpiry { operation_id, .. } => {

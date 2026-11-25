@@ -109,6 +109,18 @@ pub enum IcebergMutationEvidenceTarget {
         effect_digest: [u8; 32],
         request_fingerprint: [u8; 32],
     },
+    KeyedRetirement {
+        namespace: String,
+        table: String,
+        table_uuid: String,
+        operation_id: [u8; 16],
+        retired_publication: [u8; 16],
+        asserted_parent: i64,
+        preselected_snapshot: i64,
+        record_owner: String,
+        record_name: String,
+        record_envelope: String,
+    },
     KeyedExpiry {
         namespace: String,
         table: String,

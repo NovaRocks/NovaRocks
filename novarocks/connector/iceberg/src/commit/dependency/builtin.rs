@@ -54,7 +54,9 @@ pub(crate) async fn validate_with_removed_data(
     }
     let protocol = intent.protocol();
     let (roots, slots) = match protocol {
-        CommitProtocol::MvRefresh { admitted, .. } => (Some(&admitted.roots), &admitted.slots),
+        CommitProtocol::MvRefresh { admitted, .. } | CommitProtocol::MvRetirement { admitted } => {
+            (Some(&admitted.roots), &admitted.slots)
+        }
         CommitProtocol::MvAlterProperties { slots } => (None, slots),
         _ => {
             return match protocol.window() {

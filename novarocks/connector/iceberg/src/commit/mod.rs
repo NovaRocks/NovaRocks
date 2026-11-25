@@ -59,6 +59,7 @@ mod rewrite_data_files;
 mod row_delta;
 pub(crate) mod row_delta_facts;
 
+pub(crate) mod retirement;
 pub mod row_delta_dv_metadata;
 mod row_mutation_preparation;
 #[cfg(test)]
