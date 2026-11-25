@@ -1,5 +1,5 @@
 ---
-id: ADR-0266
+id: ADR-0267
 title: "MV publications bind exact source facts and storage mappings"
 domain: [frontend-mv, provider-spi, sql-compiler]
 status: active
@@ -23,7 +23,7 @@ code-anchors:
   - "novarocks/connector/iceberg/src/storage_inspector/storage_mapping.rs"
 ---
 
-# ADR-0266 物化发布绑定准确源事实与存储映射
+# ADR-0267 物化发布绑定准确源事实与存储映射
 
 ## 问题
 

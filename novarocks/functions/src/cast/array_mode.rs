@@ -182,24 +182,24 @@ pub(super) fn prepare_common(
             None,
         ));
     }
-    if source.data_type() == result.data_type()
+    let body = if let Some(widening) = crate::builtin::LosslessTemporalWiden::bind(source, result) {
+        if source.data_type() == result.data_type() {
+            CastBody::Identity
+        } else {
+            CastBody::TemporalWiden(widening)
+        }
+    } else if source.data_type() == result.data_type()
         && source
             .same_value_domain_observed::<KernelFailure>(result, || {
                 work.step().map_err(crate::kernel_control::compile_failure)
             })
             .map_err(CastPrepareError::Kernel)?
     {
-        return Ok(recipe(
-            source,
-            result,
-            CastBody::Identity,
-            None,
-            policy,
-            false,
-            None,
-        ));
-    }
-    Err(CastPrepareError::Unsupported)
+        CastBody::Identity
+    } else {
+        return Err(CastPrepareError::Unsupported);
+    };
+    Ok(recipe(source, result, body, None, policy, false, None))
 }
 
 fn prepare_element(
@@ -383,6 +383,27 @@ pub(super) fn evaluate<'a>(
             return Err(invalid(
                 "array CAST input differs from its frozen Field metadata",
             ));
+        }
+        if let CastBody::TemporalWiden(widening) = recipe.body {
+            let values = widening.evaluate(
+                argument,
+                selection,
+                recipe.source.nullable(),
+                inherited,
+                &mut work,
+            )?;
+            let mut errors = reserve(inherited.len(), &mut work)?;
+            for error in inherited {
+                work.step()?;
+                errors.push(error.clone());
+            }
+            return SelectedValues::try_new_observed(
+                selection,
+                recipe.result.data_type(),
+                values,
+                errors.into_boxed_slice(),
+                || work.step(),
+            );
         }
         match recipe.source.data_type() {
             DataType::List(_) if !argument.array().as_any().is::<ListArray>() => {

@@ -19,8 +19,7 @@
 //! Shared-buffer metadata reconstruction and Arrow copy remain opaque library
 //! work bracketed by the original control. No allocation grant is claimed.
 
-#[path = "value_conversion_temporal.rs"]
-mod temporal;
+use super::value_conversion_temporal as temporal;
 #[path = "temporal_assignment.rs"]
 pub(super) mod temporal_assignment;
 

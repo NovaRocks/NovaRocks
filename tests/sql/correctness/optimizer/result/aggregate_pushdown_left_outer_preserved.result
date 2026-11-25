@@ -1,10 +1,6 @@
 -- query 9
 -- types	varchar
 Explain String
-RUNTIME FILTER GRAPH
-  runtime filter channel 1
-    producer binding 1, fragment = 1, node = 4, expr = (a.k)
-    consumer binding 1, fragment = 3, node = 10, expr = (b.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   STAGE PLACEMENT: singleton
@@ -23,18 +19,18 @@ PLAN FRAGMENT 1
   STREAM DATA SINK
     EXCHANGE ID: 3
     PARTITION: UNPARTITIONED
-4:HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [b.k = a.k]) stats={rows=100}
-  5:HASH EXCHANGE
-  6:HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=100}
+4:HASH JOIN (PARTITIONED, LEFT OUTER, eq: [a.k = b.k]) stats={rows=100}
+  5:HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=100}
     aggregations: sum(a.v)
-    7:HASH EXCHANGE stats={rows=100}
+    6:HASH EXCHANGE stats={rows=100}
+  7:HASH EXCHANGE
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   STAGE PLACEMENT: scan-work
   DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 7
+    EXCHANGE ID: 6
     PARTITION: HASH_PARTITIONED (a.k)
 8:HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=100}
   aggregations: sum(a.v)
@@ -48,7 +44,7 @@ PLAN FRAGMENT 3
   DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 5
+    EXCHANGE ID: 7
     PARTITION: HASH_PARTITIONED (b.k)
 10:SCAN ${case_db}.t_agg_pd_lo_b (alias=b) stats={rows=50}
      TABLE: ${case_db}.t_agg_pd_lo_b

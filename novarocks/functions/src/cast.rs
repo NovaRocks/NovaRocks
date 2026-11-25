@@ -406,6 +406,23 @@ impl DecimalTextSource {
     }
 }
 
+/// Admission envelope for the original scalar VARCHAR conversion. Text and
+/// JSON CAST may copy the actual input bytes. Native numeric/temporal text,
+/// UUIDs, and JSON numeric normalization retain only bounded formatting scratch.
+pub(crate) fn varchar_row_temporary_extent(
+    source: &arrow_array::ArrayRef,
+    row: usize,
+) -> Result<usize, KernelFailure> {
+    const FIXED_FORMATTING_SCRATCH: usize = 1024;
+    let variable = source
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .map_or(0, |text| text.value_length(row) as usize);
+    variable
+        .checked_add(FIXED_FORMATTING_SCRATCH)
+        .ok_or(KernelFailure::ResourceExhausted)
+}
+
 /// What a prepared cast does to a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CastBody {
@@ -455,6 +472,7 @@ enum CastBody {
     TemporalCarrier {
         source: Source,
     },
+    TemporalWiden(crate::builtin::LosslessTemporalWiden),
     Text {
         source: Source,
     },
@@ -1217,6 +1235,7 @@ impl PreparedCastRecipe {
                 | CastBody::ExplicitArray
                 | CastBody::ExplicitMap
                 | CastBody::ArrayNull
+                | CastBody::TemporalWiden(_)
         )
     }
     pub fn evaluate_selected_array<'a>(
@@ -1227,7 +1246,10 @@ impl PreparedCastRecipe {
         control: &dyn KernelEvaluationControl,
     ) -> Result<crate::SelectedValues<'a>, KernelFailure> {
         match self.body {
-            CastBody::ExplicitArray | CastBody::ExplicitMap | CastBody::ArrayNull => {
+            CastBody::ExplicitArray
+            | CastBody::ExplicitMap
+            | CastBody::ArrayNull
+            | CastBody::TemporalWiden(_) => {
                 array_mode::evaluate(self, argument, selection, inherited, control)
             }
             CastBody::Collection => {
@@ -1356,6 +1378,7 @@ impl PreparedCastRecipe {
             | CastBody::TimeText { .. }
             | CastBody::BinaryText
             | CastBody::LargeIntText
+            | CastBody::TemporalWiden(_)
             | CastBody::Identity
             | CastBody::Text { .. } => false,
             CastBody::Carrier { source, target } => {

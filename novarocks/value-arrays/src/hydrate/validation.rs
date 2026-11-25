@@ -28,7 +28,8 @@ use crate::{
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    ArrowTypeDepth, ArrowTypeProfile, BorrowedTypedValueBinding, TypedValueBinding,
+    ArrowTypeDepth, ArrowTypeProfile, BorrowedTypedValueBinding, CarrierNullabilityPolicy,
+    TypedValueBinding,
 };
 
 /// Validate original encoded keys independently of materialization, then enforce
@@ -219,13 +220,20 @@ fn validate_structure<E>(
         }
     }
     let matches = if options.dictionary_value_layout.is_some()
-        || options.projection != HydrateProjection::Exact
+        || options.projection.projects_byte_layouts()
+        || options.projection == HydrateProjection::FrozenNamesAndNullability
     {
         parameterized_shape(source, binding.borrowed(), options, work)?
     } else {
-        novarocks_type_contract::value_layout_matches_carrier_observed(
+        let nullability = if options.projection.permits_physical_nullability() {
+            CarrierNullabilityPolicy::Permissive
+        } else {
+            CarrierNullabilityPolicy::Exact
+        };
+        novarocks_type_contract::value_layout_matches_carrier_with_nullability_observed(
             binding.layout(),
             source.data_type(),
+            nullability,
             |units| work(units).map_err(MatchError::Caller),
         )
         .map_err(|error| match error {
@@ -422,6 +430,7 @@ fn parameterized_shape<E>(
         work(1).map_err(ValueFailure::Caller)?;
         if options.projection != HydrateProjection::FrozenNamesAndNullability
             && expected.is_nullable() != actual.is_nullable()
+            && !(options.projection.permits_physical_nullability() && actual.is_nullable())
         {
             return Ok(false);
         }
@@ -476,7 +485,7 @@ fn parameterized_shape<E>(
                     layout.is_utf8() && &layout.data_type() == values.as_ref()
                 }));
         }
-        if options.projection == HydrateProjection::ExactByteLayouts
+        if options.projection.projects_byte_layouts()
             && let (Some(target), Some(source)) = (
                 ByteLayout::from_data_type(expected),
                 ByteLayout::from_data_type(actual),
@@ -553,6 +562,11 @@ fn parameterized_shape<E>(
                     return Ok(false);
                 };
                 if af.len() != 2 || bf.len() != 2 {
+                    return Ok(false);
+                }
+                if options.projection.permits_physical_nullability()
+                    && af[0].is_nullable() != bf[0].is_nullable()
+                {
                     return Ok(false);
                 }
                 Ok(field(

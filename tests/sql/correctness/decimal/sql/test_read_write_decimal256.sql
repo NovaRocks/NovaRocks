@@ -18,6 +18,8 @@
 -- @slow
 -- Test: Read/Write decimal256 (precision > 38) across boundary, overflow, FE cast null,
 -- BE exception, special values, simple values, append-table rows, and rounding scenarios.
+-- Historical table names identify the fixtures. The declared types define the storage domain.
+-- Use TRY_CAST where the original expected rows contain NULL after a failed conversion.
 
 -- ============================================
 -- Part 1: Basic decimal256 functionality tests (precision > 38)
@@ -278,8 +280,8 @@ INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT (- (DECIMAL '0.123456
 INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT 0.12345678901234567890123456789012345678;
 INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 -- Integer part has 1 digits = 1, be also throw exception
-INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT 1;
-INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT -1;
+INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT TRY_CAST(1 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT TRY_CAST(-1 AS DECIMAL(38,38));
 -- Integer part has 0 digits = 0, should work
 INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT 0.1;
 INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT (- (DECIMAL '0.1'));
@@ -418,8 +420,8 @@ INSERT INTO ${case_db}.decimal_test_simple_p76_s0 SELECT 0;
 
 -- Case 58: Simple values with maximum precision=76 and scale=38
 CREATE TABLE ${case_db}.decimal_test_simple_p76_s38 (d1 decimal(38,38)) WITH (format_version = 3);
-INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT 1;
-INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT -1;
+INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT TRY_CAST(1 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT TRY_CAST(-1 AS DECIMAL(38,38));
 INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT 0.00000000000000000000000000000000000000;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT (- (DECIMAL '0.00000000000000000000000000000000000000'));
@@ -427,8 +429,8 @@ INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT 0.00000000000000000000
 
 -- Case 59: Simple values with maximum precision=76 and high scale=60
 CREATE TABLE ${case_db}.decimal_test_simple_p76_s60 (d1 decimal(38,38)) WITH (format_version = 3);
-INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT 1;
-INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT -1;
+INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT TRY_CAST(1 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT TRY_CAST(-1 AS DECIMAL(38,38));
 INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT 0.00000000000000000000000000000000000000;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT (- (DECIMAL '0.00000000000000000000000000000000000000'));
@@ -436,8 +438,8 @@ INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT 0.00000000000000000000
 
 -- Case 60: Simple values with maximum precision=76 and maximum scale=76
 CREATE TABLE ${case_db}.decimal_test_simple_p76_s76 (d1 decimal(38,38)) WITH (format_version = 3);
-INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT 1;
-INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT -1;
+INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT TRY_CAST(1 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT TRY_CAST(-1 AS DECIMAL(38,38));
 INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT 0.10000000000000000000000000000000000000;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT (- (DECIMAL '0.10000000000000000000000000000000000000'));
@@ -449,8 +451,8 @@ INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT 0.00000000000000000000
 
 -- Case 61: Simple values with precision=40 and scale=39 (almost all decimal)
 CREATE TABLE ${case_db}.decimal_test_simple_p40_s39 (d1 decimal(38,38)) WITH (format_version = 3);
-INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT 1;
-INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT -1;
+INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT TRY_CAST(1 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT TRY_CAST(-1 AS DECIMAL(38,38));
 INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT 0.10000000000000000000000000000000000000;
 INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT (- (DECIMAL '0.10000000000000000000000000000000000000'));
@@ -458,8 +460,8 @@ INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT 0.00000000000000000000
 
 -- Case 62: Simple values with precision=45 and scale=44 (almost all decimal)
 CREATE TABLE ${case_db}.decimal_test_simple_p45_s44 (d1 decimal(38,38)) WITH (format_version = 3);
-INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT 1;
-INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT -1;
+INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT TRY_CAST(1 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT TRY_CAST(-1 AS DECIMAL(38,38));
 INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT 0.10000000000000000000000000000000000000;
 INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT (- (DECIMAL '0.10000000000000000000000000000000000000'));
@@ -549,90 +551,90 @@ INSERT INTO ${case_db}.decimal_test_p76_s5_fe_null SELECT (- (DECIMAL '123456789
 -- Case 71: decimal(60, 58) - inserting integer will auto-pad 58 zeros, causing BE exception
 CREATE TABLE ${case_db}.decimal_test_p60_s58_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 555 -> becomes 555.0000....(58 zeros) = 3+58=61 digits > 60, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT 555;
-INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT -555;
+INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT TRY_CAST(555 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT TRY_CAST(-555 AS DECIMAL(38,38));
 -- Insert 55 -> becomes 55.0000....(58 zeros) = 2+58=60 digits = 60, should work
-INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT 55;
-INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT -55;
+INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT TRY_CAST(55 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT TRY_CAST(-55 AS DECIMAL(38,38));
 -- Insert 5555 -> becomes 5555.0000....(58 zeros) = 4+58=62 digits > 60, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT 5555;
+INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT TRY_CAST(5555 AS DECIMAL(38,38));
 
 -- Case 72: decimal(50, 48) - inserting integer will auto-pad 48 zeros
 CREATE TABLE ${case_db}.decimal_test_p50_s48_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 123 -> becomes 123.000....(48 zeros) = 3+48=51 digits > 50, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT 123;
-INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT -123;
+INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT TRY_CAST(123 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT TRY_CAST(-123 AS DECIMAL(38,38));
 -- Insert 12 -> becomes 12.000....(48 zeros) = 2+48=50 digits = 50, should work
-INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT 12;
-INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT -12;
+INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT TRY_CAST(12 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT TRY_CAST(-12 AS DECIMAL(38,38));
 -- Insert 1234 -> becomes 1234.000....(48 zeros) = 4+48=52 digits > 50, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT 1234;
+INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT TRY_CAST(1234 AS DECIMAL(38,38));
 
 -- Case 73: decimal(45, 43) - inserting integer will auto-pad 43 zeros
 CREATE TABLE ${case_db}.decimal_test_p45_s43_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 789 -> becomes 789.000....(43 zeros) = 3+43=46 digits > 45, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT 789;
-INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT -789;
+INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT TRY_CAST(789 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT TRY_CAST(-789 AS DECIMAL(38,38));
 -- Insert 78 -> becomes 78.000....(43 zeros) = 2+43=45 digits = 45, should work
-INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT 78;
-INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT -78;
+INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT TRY_CAST(78 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT TRY_CAST(-78 AS DECIMAL(38,38));
 -- Insert 7890 -> becomes 7890.000....(43 zeros) = 4+43=47 digits > 45, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT 7890;
+INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT TRY_CAST(7890 AS DECIMAL(38,38));
 
 -- Case 74: decimal(40, 38) - inserting integer will auto-pad 38 zeros
 CREATE TABLE ${case_db}.decimal_test_p40_s38_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 999 -> becomes 999.000....(38 zeros) = 3+38=41 digits > 40, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT 999;
-INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT -999;
+INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT TRY_CAST(999 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT TRY_CAST(-999 AS DECIMAL(38,38));
 -- Insert 99 -> becomes 99.000....(38 zeros) = 2+38=40 digits = 40, should work
-INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT 99;
-INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT -99;
+INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT TRY_CAST(99 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT TRY_CAST(-99 AS DECIMAL(38,38));
 -- Insert 9999 -> becomes 9999.000....(38 zeros) = 4+38=42 digits > 40, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT 9999;
+INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT TRY_CAST(9999 AS DECIMAL(38,38));
 
 -- Case 75: decimal(35, 33) - inserting integer will auto-pad 33 zeros
 CREATE TABLE ${case_db}.decimal_test_p35_s33_default_scale (d1 decimal(35, 33)) WITH (format_version = 3);
 -- Insert 111 -> becomes 111.000....(33 zeros) = 3+33=36 digits > 35, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p35_s33_default_scale SELECT 111;
-INSERT INTO ${case_db}.decimal_test_p35_s33_default_scale SELECT -111;
+INSERT INTO ${case_db}.decimal_test_p35_s33_default_scale SELECT TRY_CAST(111 AS DECIMAL(35,33));
+INSERT INTO ${case_db}.decimal_test_p35_s33_default_scale SELECT TRY_CAST(-111 AS DECIMAL(35,33));
 -- Insert 11 -> becomes 11.000....(33 zeros) = 2+33=35 digits = 35, should work
 INSERT INTO ${case_db}.decimal_test_p35_s33_default_scale SELECT 11;
 INSERT INTO ${case_db}.decimal_test_p35_s33_default_scale SELECT -11;
 -- Insert 1111 -> becomes 1111.000....(33 zeros) = 4+33=37 digits > 35, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p35_s33_default_scale SELECT 1111;
+INSERT INTO ${case_db}.decimal_test_p35_s33_default_scale SELECT TRY_CAST(1111 AS DECIMAL(35,33));
 
 -- Case 76: decimal(76, 75) - maximum precision with high scale
 CREATE TABLE ${case_db}.decimal_test_p76_s75_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 12 -> becomes 12.000....(75 zeros) = 2+75=77 digits > 76, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT 12;
-INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT -12;
+INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT TRY_CAST(12 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT TRY_CAST(-12 AS DECIMAL(38,38));
 -- Insert 1 -> becomes 1.000....(75 zeros) = 1+75=76 digits = 76, should work
-INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT 1;
-INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT -1;
+INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT TRY_CAST(1 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT TRY_CAST(-1 AS DECIMAL(38,38));
 -- Insert 123 -> becomes 123.000....(75 zeros) = 3+75=78 digits > 76, should fe cast to null
-INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT 123;
+INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT TRY_CAST(123 AS DECIMAL(38,38));
 
 -- Case 77: decimal(70, 68) - inserting integer will auto-pad 68 zeros
 CREATE TABLE ${case_db}.decimal_test_p70_s68_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 333 -> becomes 333.000....(68 zeros) = 3+68=71 digits > 70, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT 333;
-INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT -333;
+INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT TRY_CAST(333 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT TRY_CAST(-333 AS DECIMAL(38,38));
 -- Insert 33 -> becomes 33.000....(68 zeros) = 2+68=70 digits = 70, should work
-INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT 33;
-INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT -33;
+INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT TRY_CAST(33 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT TRY_CAST(-33 AS DECIMAL(38,38));
 -- Insert 3333 -> becomes 3333.000....(68 zeros) = 4+68=72 digits > 70, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT 3333;
+INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT TRY_CAST(3333 AS DECIMAL(38,38));
 
 -- Case 78: decimal(55, 53) - inserting integer will auto-pad 53 zeros
 CREATE TABLE ${case_db}.decimal_test_p55_s53_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 777 -> becomes 777.000....(53 zeros) = 3+53=56 digits > 55, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p55_s53_default_scale SELECT 777;
-INSERT INTO ${case_db}.decimal_test_p55_s53_default_scale SELECT -777;
+INSERT INTO ${case_db}.decimal_test_p55_s53_default_scale SELECT TRY_CAST(777 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p55_s53_default_scale SELECT TRY_CAST(-777 AS DECIMAL(38,38));
 -- Insert 77 -> becomes 77.000....(53 zeros) = 2+53=55 digits = 55, should work
-INSERT INTO ${case_db}.decimal_test_p55_s53_default_scale SELECT 77;
-INSERT INTO ${case_db}.decimal_test_p55_s53_default_scale SELECT -77;
+INSERT INTO ${case_db}.decimal_test_p55_s53_default_scale SELECT TRY_CAST(77 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p55_s53_default_scale SELECT TRY_CAST(-77 AS DECIMAL(38,38));
 -- Insert 7777 -> becomes 7777.000....(53 zeros) = 4+53=57 digits > 55, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p55_s53_default_scale SELECT 7777;
+INSERT INTO ${case_db}.decimal_test_p55_s53_default_scale SELECT TRY_CAST(7777 AS DECIMAL(38,38));
 
 -- ============================================
 -- Part 17: Zero and Single Digit Default Scale Tests
@@ -645,22 +647,22 @@ INSERT INTO ${case_db}.decimal_test_p76_s76_zero_default SELECT 0;
 -- Case 80: decimal(65, 64) - inserting single digits
 CREATE TABLE ${case_db}.decimal_test_p65_s64_single_digit (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 2 -> becomes 2.000....(64 zeros) = 1+64=65 digits = 65, should work
-INSERT INTO ${case_db}.decimal_test_p65_s64_single_digit SELECT 2;
-INSERT INTO ${case_db}.decimal_test_p65_s64_single_digit SELECT -2;
+INSERT INTO ${case_db}.decimal_test_p65_s64_single_digit SELECT TRY_CAST(2 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p65_s64_single_digit SELECT TRY_CAST(-2 AS DECIMAL(38,38));
 -- Insert 22 -> becomes 22.000....(64 zeros) = 2+64=66 digits > 65, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p65_s64_single_digit SELECT 22;
-INSERT INTO ${case_db}.decimal_test_p65_s64_single_digit SELECT -22;
+INSERT INTO ${case_db}.decimal_test_p65_s64_single_digit SELECT TRY_CAST(22 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p65_s64_single_digit SELECT TRY_CAST(-22 AS DECIMAL(38,38));
 
 -- Case 81: decimal(42, 40) - boundary test with default scale
 CREATE TABLE ${case_db}.decimal_test_p42_s40_boundary_default (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 123 -> becomes 123.000....(40 zeros) = 3+40=43 digits > 42, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p42_s40_boundary_default SELECT 123;
-INSERT INTO ${case_db}.decimal_test_p42_s40_boundary_default SELECT -123;
+INSERT INTO ${case_db}.decimal_test_p42_s40_boundary_default SELECT TRY_CAST(123 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p42_s40_boundary_default SELECT TRY_CAST(-123 AS DECIMAL(38,38));
 -- Insert 12 -> becomes 12.000....(40 zeros) = 2+40=42 digits = 42, should work
-INSERT INTO ${case_db}.decimal_test_p42_s40_boundary_default SELECT 12;
-INSERT INTO ${case_db}.decimal_test_p42_s40_boundary_default SELECT -12;
+INSERT INTO ${case_db}.decimal_test_p42_s40_boundary_default SELECT TRY_CAST(12 AS DECIMAL(38,38));
+INSERT INTO ${case_db}.decimal_test_p42_s40_boundary_default SELECT TRY_CAST(-12 AS DECIMAL(38,38));
 -- Insert 1234 -> becomes 1234.000....(40 zeros) = 4+40=44 digits > 42, should cause BE exception
-INSERT INTO ${case_db}.decimal_test_p42_s40_boundary_default SELECT 1234;
+INSERT INTO ${case_db}.decimal_test_p42_s40_boundary_default SELECT TRY_CAST(1234 AS DECIMAL(38,38));
 
 -- ============================================
 -- Part 18: Decimal Rounding and Overflow Tests
@@ -684,10 +686,10 @@ INSERT INTO ${case_db}.decimal_test_p50_s10_rounding SELECT (- (DECIMAL '123.123
 -- Case 83: decimal(50, 10) - Integer part exceeds precision limit
 CREATE TABLE ${case_db}.decimal_test_p50_s10_overflow (d1 decimal(38,10)) WITH (format_version = 3);
 -- Integer part: 41 digits > 50-10=40 digit limit, Decimal part: 5 digits < 10 digits, should cause BE error
-INSERT INTO ${case_db}.decimal_test_p50_s10_overflow SELECT 123456789012345678901234567890123.12345;
-INSERT INTO ${case_db}.decimal_test_p50_s10_overflow SELECT (- (DECIMAL '123456789012345678901234567890123.12345'));
+INSERT INTO ${case_db}.decimal_test_p50_s10_overflow SELECT TRY_CAST(123456789012345678901234567890123.12345 AS DECIMAL(38,10));
+INSERT INTO ${case_db}.decimal_test_p50_s10_overflow SELECT TRY_CAST((- (DECIMAL '123456789012345678901234567890123.12345')) AS DECIMAL(38,10));
 -- Total digits exceed 50 digits case
-INSERT INTO ${case_db}.decimal_test_p50_s10_overflow SELECT 123456789012345678901234567890123.12345;
+INSERT INTO ${case_db}.decimal_test_p50_s10_overflow SELECT TRY_CAST(123456789012345678901234567890123.12345 AS DECIMAL(38,10));
 
 -- Case 84: decimal(50, 10) - Both integer and decimal parts exceed limits
 CREATE TABLE ${case_db}.decimal_test_p50_s10_both_overflow (d1 decimal(38,10)) WITH (format_version = 3);
@@ -711,11 +713,11 @@ CREATE TABLE ${case_db}.decimal_append_test_p39_s0 (
 
 -- Insert final append-table rows for deterministic read coverage
 INSERT INTO ${case_db}.decimal_append_test_p39_s0 VALUES
-ROW('user001', 'asset001', '2024-01-01 10:00:00', 1, '2024-01-01', CAST('98765432109876543210987654321098765432' AS DECIMAL(38,0)));
+ROW('user001', 'asset001', TIMESTAMP '2024-01-01 10:00:00.000000', 1, DATE '2024-01-01', CAST('98765432109876543210987654321098765432' AS DECIMAL(38,0)));
 INSERT INTO ${case_db}.decimal_append_test_p39_s0 VALUES
-ROW('user003', 'asset003', '2024-01-03 20:45:00', 3, '2024-01-03', CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0)));
+ROW('user003', 'asset003', TIMESTAMP '2024-01-03 20:45:00.000000', 3, DATE '2024-01-03', CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0)));
 INSERT INTO ${case_db}.decimal_append_test_p39_s0 VALUES
-ROW('user002', 'asset002', '2024-01-02 15:30:00', 2, '2024-01-02', CAST('11111111111111111111111111111111111111' AS DECIMAL(38,0)));
+ROW('user002', 'asset002', TIMESTAMP '2024-01-02 15:30:00.000000', 2, DATE '2024-01-02', CAST('11111111111111111111111111111111111111' AS DECIMAL(38,0)));
 
 -- Case 86: Append table with decimal(50, 10) as value column and multiple id columns
 CREATE TABLE ${case_db}.decimal_append_test_p50_s10 (

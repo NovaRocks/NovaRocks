@@ -1,104 +1,114 @@
 -- query 4
--- legacy
+-- types	integer	array(boolean)
 id	intersect_boolean
-1	[0,1]
-2	[0]
-3	[1]
+1	[true,false]
+2	[false]
+3	[true]
 
 -- query 5
--- legacy
+-- types	integer	array(integer)
 id	intersect_tinyint
 1	[2]
 2	[]
 3	[8]
 
 -- query 6
--- legacy
+-- types	integer	array(integer)
 id	intersect_smallint
-1	[300,100]
+1	[100,300]
 2	[]
 3	[]
 
 -- query 7
--- legacy
+-- types	integer	array(integer)
 id	intersect_int
 1	[]
 2	[]
 3	[]
 
 -- query 8
--- legacy
+-- types	integer	array(bigint)
 id	intersect_bigint
 1	[]
 2	[]
 3	[]
 
 -- query 9
--- legacy
+-- types	integer	array(decimal(38, 0))
 id	intersect_largeint
 1	[]
 2	[]
 3	[]
 
 -- query 10
--- legacy
+-- types	integer	array(real)
 id	intersect_float
-1	[]
+1	[1.1,3.3]
 2	[]
 3	[]
 
 -- query 11
--- legacy
+-- types	integer	array(double)
 id	intersect_double
 1	[]
 2	[]
 3	[]
 
 -- query 12
--- legacy
+-- types	integer	array(decimal(27, 9))
 id	intersect_decimalv2
-1	[123.450000000,789.010000000,456.780000000]
-2	[123.450000000]
+1	["123.450000000","456.780000000","789.010000000"]
+2	["123.450000000"]
 3	[]
 
 -- query 13
--- legacy
+-- types	integer	array(decimal(10, 2))
 id	intersect_decimal32
-1	[123.45,890.12]
+1	["123.45","890.12"]
 2	[]
 3	[]
 
 -- query 14
--- legacy
+-- types	integer	array(decimal(18, 4))
 id	intersect_decimal64
 1	[]
 2	[]
 3	[]
 
 -- query 15
--- legacy
+-- types	integer	array(decimal(28, 10))
 id	intersect_decimal128
-1	[1234567890.1234567890]
+1	["1234567890.1234567890"]
 2	[]
 3	[]
 
 -- query 16
--- legacy
+-- types	integer	array(varchar)
 id	intersect_varchar
-1	["cherry","apple","banana"]
+1	["apple","banana","cherry"]
 2	[]
 3	[]
 
 -- query 17
--- legacy
+-- types	integer	array(date)
 id	intersect_date
 1	["2025-01-01","2025-01-08"]
 2	[]
 3	[]
 
 -- query 18
--- legacy
+-- types	integer	array(timestamp(6))
 id	intersect_datetime
-1	["2025-01-01 12:00:00","2025-01-08 19:00:00"]
+1	["2025-01-01 12:00:00.000000","2025-01-08 19:00:00.000000"]
 2	[]
 3	[]
+
+-- query 20
+-- types	bigint
+intersect_count
+4
+
+-- query 21
+-- types	array(integer)	array(integer)	array(double)
+tied_left_order	longer_right_order	float_representatives
+[2,1,null]	[null,2]	[-0.0,"NaN"]

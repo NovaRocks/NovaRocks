@@ -179,8 +179,11 @@ impl ExecutionFailurePresentation for ExecutionFailureInput {
         {
             K::InvalidFunctionArgument
         } else if self.fact().class() == FailureClass::Data
-            && self.fact().reason()
-                == novarocks_failure_contract::kernel_reason::MAP_KEY_INDETERMINATE
+            && matches!(
+                self.fact().reason(),
+                novarocks_failure_contract::kernel_reason::MAP_KEY_INDETERMINATE
+                    | novarocks_function_contract::kernel_failure::ARRAY_ELEMENT_COMPARISON_INDETERMINATE
+            )
         {
             K::Unsupported
         } else if self.fact().class() == FailureClass::Data

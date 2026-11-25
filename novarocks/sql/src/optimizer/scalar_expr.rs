@@ -1021,15 +1021,17 @@ pub(crate) fn scalar_cast_can_fail(
     let result_carrier = result.data_type();
     match cast_mode {
         Some(TrinoCastMode::Explicit) => {
-            use novarocks_type_contract::ValueLogicalType;
-            let total_signed_decimal_cast = source.logical_type() == ValueLogicalType::Physical
+            use novarocks_type_contract::{ValueKind, ValueLogicalType};
+            let total_signed_cast = source.logical_type() == ValueLogicalType::Physical
                 && result.logical_type() == ValueLogicalType::Physical
                 && signed_integer_fits(0, source_carrier)
-                && novarocks_type_contract::trino_decimal_widening_is_total(
+                && (novarocks_type_contract::trino_decimal_widening_is_total(
                     source_carrier,
                     result_carrier,
-                );
-            !(signed_widening_domains(source, result) || total_signed_decimal_cast)
+                ) || matches!(result.value_type().kind(), ValueKind::String)
+                    && result_carrier == &DataType::Utf8);
+            // The signed renderer has no length check for unbounded VARCHAR.
+            !(signed_widening_domains(source, result) || total_signed_cast)
         }
         Some(TrinoCastMode::StoreAssignment) => !signed_widening_domains(source, result),
         Some(TrinoCastMode::Try) => false,
@@ -1947,7 +1949,7 @@ mod intrinsic_cast_effect_tests {
     }
 
     #[test]
-    fn explicit_signed_decimal_cast_requires_full_declared_domain() {
+    fn explicit_signed_cast_totality_requires_full_declared_domain() {
         use novarocks_type_contract::{FunctionValueType, TrinoCastMode};
 
         for (source, target, expected) in [
@@ -1955,6 +1957,9 @@ mod intrinsic_cast_effect_tests {
             (DataType::Int16, DataType::Decimal128(5, 0), false),
             (DataType::Int32, DataType::Decimal128(10, 0), false),
             (DataType::Int64, DataType::Decimal128(19, 0), false),
+            (DataType::Int32, DataType::Utf8, false),
+            (DataType::Int64, DataType::Utf8, false),
+            (DataType::Utf8, DataType::Int64, true),
             (DataType::Int32, DataType::Decimal128(9, 0), true),
             (DataType::Int32, DataType::Decimal128(12, 2), false),
             (DataType::Int32, DataType::Decimal128(11, 2), true),

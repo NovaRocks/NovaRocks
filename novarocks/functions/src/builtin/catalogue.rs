@@ -861,60 +861,11 @@ fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
 
 // These generic declarations still freeze an exact installed input domain.
 // Unsupported types must fail binding, before an optimizer can remove the call.
-// ARRAY equality and hash share this recursive carrier domain. This is a
-// selected-overload admission fact, not a runtime or optimizer name dispatch.
-fn builtin_array_equality_item(ty: &DataType) -> bool {
-    match ty {
-        DataType::Null
-        | DataType::Boolean
-        | DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Utf8
-        | DataType::Date32
-        | DataType::Decimal128(..)
-        | DataType::Timestamp(_, None) => true,
-        DataType::List(item) => builtin_array_equality_item(item.data_type()),
-        DataType::Struct(fields) => fields
-            .iter()
-            .all(|field| builtin_array_equality_item(field.data_type())),
-        DataType::Map(entries, _) => {
-            matches!(entries.data_type(),DataType::Struct(fields) if fields.len()==2)
-                && builtin_array_equality_item(entries.data_type())
-        }
-        _ => novarocks_type_contract::is_largeint_data_type(ty),
-    }
-}
-
 fn validate_builtin_selected_domain(
     name: &str,
     arguments: ScalarCarriers<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), FunctionBindingError> {
-    let ordered_item = |ty: &DataType| {
-        matches!(
-            ty,
-            DataType::Null
-                | DataType::Boolean
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Utf8
-                | DataType::Date32
-                | DataType::Decimal128(..)
-                | DataType::Timestamp(_, None)
-        ) || novarocks_type_contract::is_largeint_data_type(ty)
-    };
-    let ordered_list =
-        |ty: &DataType| matches!(ty, DataType::List(item) if ordered_item(item.data_type()));
-    // The shared comparator supports one closed primitive item domain. SORTBY
-    // compares only key lists; arbitrary output values remain admitted.
     let shape = match name {
         "zip" => {
             (2..=5).contains(&arguments.len())
@@ -933,48 +884,22 @@ fn validate_builtin_selected_domain(
                 )?
         }
         "map_entries" => arguments.len() == 1 && matches!(&arguments[0], DataType::Map(_, _)),
-        "contains" | "contains_sequence" | "arrays_overlap" | "array_position" | "array_remove"
-        | "array_distinct" => arguments.first().is_some_and(
-            |ty| matches!(ty,DataType::List(item) if builtin_array_equality_item(item.data_type())),
-        ),
         "flatten" => {
             arguments.len() == 1
-                && matches!(&arguments[0],DataType::List(outer) if matches!(outer.data_type(),DataType::List(_)))
+                && match &arguments[0] {
+                    DataType::Null => true,
+                    DataType::List(outer) => {
+                        matches!(outer.data_type(), DataType::List(_) | DataType::Null)
+                    }
+                    _ => false,
+                }
         }
         _ => true,
     };
     if !shape {
         return Err(FunctionBindingError::NoMatchingOverload);
     }
-    let ordered = match name {
-        "array_sort" | "array_min" | "array_max" => arguments.first().is_some_and(ordered_list),
-        _ => true,
-    };
-    if !ordered {
-        return Err(FunctionBindingError::NoMatchingOverload);
-    }
-    let admitted = |ty: &DataType| match name {
-        "mv_group_row_id" => matches!(
-            ty,
-            DataType::Boolean
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::Date32
-                | DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
-                | DataType::Utf8
-                | DataType::Decimal128(..)
-        ),
-        // ENCODE_ROW_ID is the installed fingerprint alias. Its owner ignores
-        // unencoded carriers; ENCODE_SORT_KEY instead rejects them.
-        _ => true,
-    };
-    if observed_all(arguments.iter(), admitted, work)? {
-        Ok(())
-    } else {
-        Err(FunctionBindingError::NoMatchingOverload)
-    }
+    Ok(())
 }
 
 pub(crate) struct BuiltinScalarResolver {
@@ -1107,6 +1032,7 @@ fn scalar_result_nullable_from_types(
         "coalesce" | "ifnull" | "nvl" => {
             nullable_arguments(0..logical_argument_count, true, &value_nullable, work)?
         }
+        "repeat" => value_nullable(1),
         "if" => nullable_arguments(1..logical_argument_count, false, &value_nullable, work)?,
         "case" => nullable_arguments(
             (1..logical_argument_count).step_by(2),
@@ -1360,6 +1286,66 @@ impl BuiltinScalarResolver {
         let carriers = ScalarCarriers::from_values(ScalarTypes::from_values(argument_types));
         validate_builtin_selected_domain(&self.canonical_name, carriers, work)?;
         let name = self.canonical_name.as_ref();
+        if matches!(
+            name,
+            "slice"
+                | "reverse"
+                | "array_distinct"
+                | "array_sort"
+                | "array_min"
+                | "array_max"
+                | "array_join"
+        ) && let Some(FunctionArgument::Value { value_type, .. }) = request.arguments.first()
+            && matches!(value_type.data_type(), DataType::List(_))
+        {
+            // These overloads consume the original item declaration. A
+            // carrier-only template may widen item nullability or rename it.
+            argument_types[0] = value_type.clone();
+        }
+        if let Some(operation) = super::array_relation_owner::operation(name) {
+            let item = argument_types[0]
+                .value_type()
+                .child_type_at(0)
+                .ok_or(FunctionBindingError::NoMatchingOverload)?;
+            if operation
+                .relation()
+                .validate_type_observed(item, |_| work.step())?
+                .is_err()
+            {
+                return Err(FunctionBindingError::UnavailableImplementation(
+                    overload.clone(),
+                ));
+            }
+        }
+        if name == "array_join" {
+            let item = argument_types[0]
+                .child_at(0)
+                .ok_or(FunctionBindingError::NoMatchingOverload)?;
+            work.flush()?;
+            super::array_join::ElementCast::bind(&item, work.control()).map_err(|error| {
+                use crate::cast::CastPrepareError;
+                match error {
+                    CastPrepareError::Illegal => FunctionBindingError::OperatorNotFound,
+                    CastPrepareError::Unsupported => {
+                        FunctionBindingError::UnavailableImplementation(overload.clone())
+                    }
+                    error => match error.control_error() {
+                        Some(control) => FunctionBindingError::Control(control),
+                        None => FunctionBindingError::InvalidBinding(error.to_string().into()),
+                    },
+                }
+            })?;
+        }
+        if super::array_order_owner::operation(name).is_some() {
+            if !super::array_order::is_trino_orderable(&argument_types[0], || work.step())? {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            if !super::array_order::supports(&argument_types[0], || work.step())? {
+                return Err(FunctionBindingError::UnavailableImplementation(
+                    overload.clone(),
+                ));
+            }
+        }
         if matches!(name, "__map_element_at" | "__map_subscript" | "element_at")
             && let Some(collection) = argument_types.first()
             && let novarocks_type_contract::ValueKind::Map { key, .. } =
@@ -1373,7 +1359,8 @@ impl BuiltinScalarResolver {
             ));
         }
         match name {
-            "contains_sequence" | "arrays_overlap" | "concat"
+            "contains" | "array_position" | "array_remove" | "contains_sequence"
+            | "arrays_overlap" | "concat"
                 if name != "concat"
                     || argument_types
                         .iter()
@@ -1493,6 +1480,21 @@ impl BuiltinScalarResolver {
                 return Err(FunctionBindingError::NoMatchingOverload);
             };
             Some(value_type)
+        } else if matches!(
+            self.canonical_name.as_ref(),
+            "slice" | "reverse" | "array_distinct" | "array_sort"
+        ) {
+            request
+                .arguments
+                .first()
+                .and_then(|argument| match argument {
+                    FunctionArgument::Value { value_type, .. }
+                        if matches!(value_type.data_type(), DataType::List(_)) =>
+                    {
+                        Some(value_type)
+                    }
+                    _ => None,
+                })
         } else {
             None
         };
@@ -1509,13 +1511,7 @@ impl BuiltinScalarResolver {
         request: FunctionBindingRequest<'_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        // This declared ARRAY shape has no executable owner yet. Its
-        // signature is selected by the public resolver, but never enters the
-        // pure attachment that contains the installed VARCHAR overload.
-        if matches!(self.canonical_name.as_ref(), "cosh" | "sinh" | "tanh")
-            || (self.canonical_name.as_ref() == "reverse"
-                && matches!(resolved.return_type.data_type(), DataType::List(_)))
-        {
+        if matches!(self.canonical_name.as_ref(), "cosh" | "sinh" | "tanh") {
             return Err(FunctionBindingError::UnavailableImplementation(
                 self.overloads[index].clone(),
             ));
@@ -2200,23 +2196,6 @@ fn dynamic_scalar_data_type_with_construction<E>(
     }))
 }
 
-fn fold_value_types_with_creation<'a, H>(
-    values: impl Iterator<Item = &'a FunctionValueType>,
-    work: &mut CompileCheckpoints<'_>,
-    mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
-) -> Result<FunctionValueType, FunctionBindingCreationFailure<H>> {
-    let mut result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-        cx.value(DataType::Null, true, ValueLogicalType::Physical)
-    })?;
-    for value in values {
-        work.step()?;
-        result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-            super::signature::merge_value_types_with_construction(&result, value, true, cx)
-        })?
-        .ok_or(FunctionBindingError::NoMatchingOverload)?;
-    }
-    Ok(result)
-}
 fn full_list_item_with_creation<H>(
     ty: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
@@ -2482,6 +2461,27 @@ fn bind_dynamic_scalar_result_with_creation<H>(
             })
         });
     }
+    if name == "array_intersect" {
+        let [
+            FunctionArgument::Value {
+                value_type: left, ..
+            },
+            FunctionArgument::Value {
+                value_type: right, ..
+            },
+        ] = request.arguments
+        else {
+            return Err(FunctionBindingError::NoMatchingOverload.into());
+        };
+        let left = full_list_item_with_creation(left, work, borrow_creator(&mut creation))?;
+        let right = full_list_item_with_creation(right, work, borrow_creator(&mut creation))?;
+        let item = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+            cx.trino_common(&left, &right)
+        })?
+        .ok_or(FunctionBindingError::NoMatchingOverload)?;
+        let nullable = scalar_result_nullable(name, request, work)?;
+        return dynamic_list(&item, nullable, work, creation);
+    }
     let argument_types =
         dynamic_argument_data_types_with_creation(request, work, borrow_creator(&mut creation))?;
     validate_builtin_selected_domain(name, ScalarCarriers::from_data_types(&argument_types), work)?;
@@ -2597,73 +2597,36 @@ fn bind_dynamic_scalar_result_with_creation<H>(
         borrow_creator(&mut creation),
     )?;
     match name {
-        "array_intersect" => {
-            let arguments =
-                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
-            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                cx.collected_vec::<FunctionValueType>(arguments.len())
-            })?;
-            let items = arguments
-                .into_iter()
-                .map(|value| {
-                    work.step()?;
-                    full_list_item_with_creation(value, work, borrow_creator(&mut creation))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let item =
-                fold_value_types_with_creation(items.iter(), work, borrow_creator(&mut creation))?;
-            full_result = dynamic_list(
-                &item,
-                full_result.nullable(),
-                work,
-                borrow_creator(&mut creation),
-            )?;
-        }
         "flatten" => {
             let outer =
                 full_list_item_with_creation(value(0)?, work, borrow_creator(&mut creation))?;
-            full_result = dynamic_list(
-                &full_list_item_with_creation(&outer, work, borrow_creator(&mut creation))?,
-                full_result.nullable(),
-                work,
-                borrow_creator(&mut creation),
-            )?;
+            let inner = full_list_item_with_creation(&outer, work, borrow_creator(&mut creation))?;
+            full_result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                super::signature::declared_list_exact_with_construction(&inner, nullable, cx)
+            })?;
         }
         "zip" => {
             let arguments =
                 dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
             with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                cx.collected_vec::<FunctionValueType>(arguments.len())
+                cx.collected_vec::<(String, FunctionValueType)>(arguments.len())
             })?;
-            let items = arguments
-                .into_iter()
+            let fields = arguments
+                .iter()
                 .map(|value| {
                     work.step()?;
-                    full_list_item_with_creation(value, work, borrow_creator(&mut creation))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                cx.collected_vec::<(String, FunctionValueType)>(items.len())
-            })?;
-            let fields = items
-                .into_iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    work.step()?;
-                    Ok((
-                        with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                            cx.col_name(index)
-                        })?,
-                        item,
-                    ))
+                    let item =
+                        full_list_item_with_creation(value, work, borrow_creator(&mut creation))?;
+                    let item = dynamic_nullable(&item, true, work, borrow_creator(&mut creation))?;
+                    Ok((String::new(), item))
                 })
                 .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?;
-            full_result = dynamic_list(
-                &dynamic_struct(fields, true, work, borrow_creator(&mut creation))?,
-                full_result.nullable(),
-                work,
-                borrow_creator(&mut creation),
-            )?;
+            full_result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                let row = super::signature::declared_struct_fields_with_construction(
+                    fields, false, true, cx,
+                )?;
+                super::signature::declared_list_exact_with_construction(&row, nullable, cx)
+            })?;
         }
         "map_entries" => {
             let (key, value) =
@@ -3015,7 +2978,89 @@ impl BuiltinDynamicScalarResolver {
             work,
             borrow_creator(&mut creation),
         )?;
-        let argument_types = if self.function_id.as_str() == "builtin.scalar/__array_literal/v1" {
+        let argument_types = if self.canonical_name.as_ref() == "array_intersect" {
+            let item = result
+                .value_type()
+                .child_type_at(0)
+                .ok_or(FunctionBindingError::NoMatchingOverload)?;
+            if novarocks_type_contract::KeyRelation::Identical
+                .validate_type_observed(item, |_| work.step())?
+                .is_err()
+            {
+                return Err(
+                    FunctionBindingError::UnavailableImplementation(overload.clone()).into(),
+                );
+            }
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.array::<FunctionArgumentType>(request.arguments.len())
+            })?;
+            request
+                .arguments
+                .iter()
+                .map(|argument| {
+                    work.step()?;
+                    let FunctionArgument::Value {
+                        value_type: source, ..
+                    } = argument
+                    else {
+                        return Err(FunctionBindingError::NoMatchingOverload.into());
+                    };
+                    let target = dynamic_nullable(
+                        &result,
+                        source.nullable(),
+                        work,
+                        borrow_creator(&mut creation),
+                    )?;
+                    if !novarocks_type_contract::array_common_coercion_types_valid_observed(
+                        source,
+                        &target,
+                        || work.step(),
+                    )? {
+                        return Err(FunctionBindingError::NoMatchingOverload.into());
+                    }
+                    Ok(FunctionArgumentType::Value(target))
+                })
+                .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?
+        } else if matches!(self.canonical_name.as_ref(), "flatten" | "zip") {
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.collected_vec::<FunctionArgumentType>(request.arguments.len())
+            })?;
+            request
+                .arguments
+                .iter()
+                .map(|argument| {
+                    work.step()?;
+                    let FunctionArgument::Value {
+                        value_type: source, ..
+                    } = argument
+                    else {
+                        return Err(FunctionBindingError::NoMatchingOverload.into());
+                    };
+                    let item = match self.canonical_name.as_ref() {
+                        "flatten"
+                            if !matches!(source.data_type(), DataType::List(field)
+                            if matches!(field.data_type(), DataType::List(_))) =>
+                        {
+                            &result
+                        }
+                        "zip" if source.data_type() == &DataType::Null => source,
+                        _ => return Ok(FunctionArgumentType::Value(source.clone())),
+                    };
+                    // SQL unknown can stand for a nullable List. Freeze the
+                    // concrete nested shape before preparing the selected kernel.
+                    let target =
+                        dynamic_list(item, source.nullable(), work, borrow_creator(&mut creation))?;
+                    if !novarocks_type_contract::array_common_coercion_types_valid_observed(
+                        source,
+                        &target,
+                        || work.step(),
+                    )? {
+                        return Err(FunctionBindingError::NoMatchingOverload.into());
+                    }
+                    Ok(FunctionArgumentType::Value(target))
+                })
+                .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?
+        } else if self.function_id.as_str() == "builtin.scalar/__array_literal/v1" {
             let item = full_list_item_with_creation(&result, work, borrow_creator(&mut creation))?;
             with_binding_creation(borrow_creator(&mut creation), work, |cx| {
                 cx.collected_vec::<FunctionArgumentType>(request.arguments.len())
@@ -3246,6 +3291,15 @@ fn scalar_overload_effects(
             Some(super::string_concat_ws_owner::trino_effects())
         }
         "split" => Some(super::string_split_owner::trino_effects()),
+        "slice" => Some(super::array_slice_owner::effects()),
+        "repeat" => Some(super::array_generation_owner::effects(name)),
+        name if let Some(op) = super::array_relation_owner::operation(name) => {
+            Some(super::array_relation_owner::effects(op))
+        }
+        name if super::array_order_owner::operation(name).is_some() => {
+            Some(super::array_order_owner::effects())
+        }
+        "array_join" => Some(super::array_join_owner::effects()),
         "__map_element_at" | "__map_subscript" | "element_at" => {
             Some(super::map_element_at_owner::effects())
         }
@@ -3305,7 +3359,6 @@ pub(super) fn scalar_definition_parts(
         overloads
             .into_iter()
             .zip(signatures)
-            .filter(|(_, signature)| name != "reverse" || !signature.starts_with("(list<"))
             .map(|(identity, signature)| {
                 let effects = scalar_overload_effects(name, signature);
                 FunctionOverloadDeclaration {
@@ -3328,9 +3381,11 @@ pub(super) fn scalar_definition_parts(
                 }
             })
             .chain((name == "array_sort").then(|| {
-                super::collection_lambda::signature(name)
+                let mut comparator = super::collection_lambda::signature(name)
                     .expect("declared array_sort comparator")
-                    .declaration()
+                    .declaration();
+                comparator.effects = Some(super::array_order_owner::comparator_effects());
+                comparator
             })),
     )
     .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
@@ -3384,6 +3439,12 @@ pub(super) fn dynamic_definition_parts(
         "row" | "__row_field" => Some(super::row_owner::effects()),
         "__array_struct_subfield" => Some(super::array_struct_subfield_owner::effects()),
         "map_entries" => Some(super::map_entries_owner::effects()),
+        name if super::array_structure_owner::operation(name).is_some() => {
+            Some(super::array_structure_owner::effects())
+        }
+        "array_intersect" => Some(super::array_relation_owner::effects(
+            super::array_relation::Operation::Intersect,
+        )),
         "map_concat" => Some(super::map_concat_owner::effects()),
         "__array_literal" => Some(super::array_literal_owner::effects()),
         "truncate" => Some(super::truncate_owner::effects()),
@@ -3399,6 +3460,20 @@ pub(super) fn dynamic_definition_parts(
         // T is the selected field of the input row, named by the constant VARCHAR.
         "__array_struct_subfield" => &[("array(row(...)), varchar", "array(T)")],
         "map_entries" => &[("map(K,V)", "array(row(K,V))")],
+        "array_intersect" => &[("array(T), array(T)", "array(T)")],
+        "flatten" => &[("array(array(T))", "array(T)")],
+        "zip" => &[
+            ("array(T1), array(T2)", "array(row(T1,T2))"),
+            ("array(T1), array(T2), array(T3)", "array(row(T1,T2,T3))"),
+            (
+                "array(T1), array(T2), array(T3), array(T4)",
+                "array(row(T1,T2,T3,T4))",
+            ),
+            (
+                "array(T1), array(T2), array(T3), array(T4), array(T5)",
+                "array(row(T1,T2,T3,T4,T5))",
+            ),
+        ],
         "map_concat" => &[("map(K,V), map(K,V), map(K,V)...", "map(K,V)")],
         "greatest" | "least" => &[("T...", "T")],
         "round" | "truncate" => super::rounding_binding::public_signatures(name),
@@ -3532,6 +3607,7 @@ pub fn contribute_builtin_functions(
     }
     builder.register(super::binary_operator_owner::modulus_definition()?)?;
     super::collection_lambda::register(builder)?;
+    builder.register(super::array_generation_owner::sequence_definition()?)?;
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         let (declaration, resolver) = dynamic_definition_parts(name)?;
         let definition = match *name {
@@ -3539,6 +3615,12 @@ pub fn contribute_builtin_functions(
                 super::array_struct_subfield_owner::definition(name, declaration, resolver)?
             }
             "map_entries" => super::map_entries_owner::definition(name, declaration, resolver)?,
+            name if super::array_structure_owner::operation(name).is_some() => {
+                super::array_structure_owner::dynamic_definition(name, declaration, resolver)?
+            }
+            "array_intersect" => {
+                super::array_relation_owner::dynamic_definition(name, declaration, resolver)?
+            }
             "map_concat" => super::map_concat_owner::definition(name, declaration, resolver)?,
             "row" | "__row_field" => super::row_owner::definition(name, declaration, resolver)?,
             "__array_literal" | "map" => {
@@ -3565,6 +3647,9 @@ pub fn contribute_builtin_functions(
         builder.register(definition)?;
     }
     for (name, signatures) in registry::builtin_scalar_declarations() {
+        if name == "sequence" {
+            continue;
+        }
         let kind = match builtin_disposition(&name) {
             Some(BuiltinDisposition::InstalledScalar(_)) => FunctionKind::Scalar,
             Some(BuiltinDisposition::WindowBoundary) => FunctionKind::Window,
@@ -3687,6 +3772,17 @@ pub fn contribute_builtin_functions(
                 super::string_concat_ws_owner::definition(name, declaration, resolver)?
             }
             "split" => super::string_split_owner::definition(&name, declaration, resolver)?,
+            "slice" => super::array_slice_owner::definition(&name, declaration, resolver)?,
+            "repeat" => {
+                super::array_generation_owner::repeat_definition(&name, declaration, resolver)?
+            }
+            name if super::array_order_owner::operation(name).is_some() => {
+                super::array_order_owner::definition(name, declaration, resolver)?
+            }
+            name if super::array_relation_owner::operation(name).is_some() => {
+                super::array_relation_owner::definition(name, declaration, resolver)?
+            }
+            "array_join" => super::array_join_owner::definition(&name, declaration, resolver)?,
             "__map_element_at" | "__map_subscript" | "element_at" => {
                 super::map_element_at_owner::definition(&name, declaration, resolver)?
             }
@@ -4891,74 +4987,97 @@ mod tests {
 
     #[test]
     fn array_ordering_binding_closes_comparator_domain() {
+        use novarocks_type_contract::{
+            TemporalPrecision, TemporalType, ValueKind, ValueLayout, ValueTypeRef,
+            ValueTypeStorageLifetime,
+        };
+
         let catalog = build_builtin_engine_function_catalog().unwrap();
         let list = |ty| DataType::List(Arc::new(arrow_schema::Field::new("item", ty, true)));
-        for ty in [
-            list(DataType::Int64),
-            DataType::Map(
-                Arc::new(arrow_schema::Field::new(
-                    "entries",
-                    DataType::Struct(
-                        vec![
-                            Arc::new(arrow_schema::Field::new("key", DataType::Int64, false)),
-                            Arc::new(arrow_schema::Field::new("value", DataType::Int64, true)),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
+        let row = |ty| DataType::Struct(vec![arrow_schema::Field::new("x", ty, true)].into());
+        let map = DataType::Map(
+            Arc::new(arrow_schema::Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        arrow_schema::Field::new("key", DataType::Int64, false),
+                        arrow_schema::Field::new("value", DataType::Int64, true),
+                    ]
+                    .into(),
+                ),
                 false,
-            ),
-            DataType::Struct(
-                vec![Arc::new(arrow_schema::Field::new(
-                    "x",
-                    DataType::Int64,
-                    true,
-                ))]
-                .into(),
-            ),
-            DataType::Decimal256(60, 2),
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
-        ] {
+            )),
+            false,
+        );
+        for ty in [map.clone(), row(list(map))] {
             for name in ["array_sort", "array_min", "array_max"] {
-                let arguments = vec![value_argument(list(ty.clone()), true, None)];
+                let arguments = [value_argument(list(ty.clone()), true, None)];
                 assert!(
-                    catalog
-                        .resolve_bound_user(
+                    matches!(
+                        catalog.resolve_bound_user(
                             name,
                             FunctionKind::Scalar,
                             FunctionBindingRequest {
                                 expected_result_type: None,
                                 arguments: &arguments,
-                                logical_argument_count: arguments.len()
+                                logical_argument_count: arguments.len(),
                             },
-                            crate::binding_test_control()
-                        )
-                        .is_err(),
+                            crate::binding_test_control(),
+                        ),
+                        Err(FunctionBindingError::NoMatchingOverload)
+                    ),
                     "{name}"
                 );
             }
         }
-        for ty in [
+        let mut supported = [
             DataType::Null,
             DataType::Int8,
             DataType::Date32,
             DataType::Decimal128(38, 2),
             DataType::FixedSizeBinary(16),
+            list(row(DataType::Int64)),
+            row(list(DataType::Int64)),
+        ]
+        .into_iter()
+        .map(|item| FunctionValueType::from_legacy_declared_projection(item, true))
+        .collect::<Vec<_>>();
+        for temporal in [
+            TemporalType::TimeWithTimeZone(TemporalPrecision::PICOSECONDS),
+            TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS),
         ] {
-            let arguments = [value_argument(list(ty), true, None)];
-            let bound = resolve_exact_scalar(&catalog, "array_sort", &arguments);
-            catalog
-                .validate_bound(
-                    &bound,
-                    FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &arguments,
-                        logical_argument_count: 1,
-                    },
-                    crate::binding_test_control(),
+            let storage = ValueTypeStorageLifetime::pure();
+            supported.push(
+                FunctionValueType::try_from_value(
+                    ValueTypeRef::try_new(ValueKind::Temporal(temporal), true, storage.clone())
+                        .unwrap(),
+                    ValueLayout::try_new(&temporal.carrier(), storage).unwrap(),
                 )
-                .unwrap();
+                .unwrap(),
+            );
+        }
+        for item in supported {
+            let array = declared_list(&item, true).unwrap();
+            let arguments = [FunctionArgument::Value {
+                value_type: array.clone(),
+                constant: None,
+            }];
+            for name in ["array_sort", "array_min", "array_max"] {
+                let bound = resolve_exact_scalar(&catalog, name, &arguments);
+                catalog
+                    .validate_bound(
+                        &bound,
+                        FunctionBindingRequest {
+                            expected_result_type: None,
+                            arguments: &arguments,
+                            logical_argument_count: 1,
+                        },
+                        crate::binding_test_control(),
+                    )
+                    .unwrap();
+                let expected = if name == "array_sort" { &array } else { &item };
+                assert_eq!(scalar_result(&bound), expected, "{name}");
+            }
         }
     }
 
@@ -4980,21 +5099,18 @@ mod tests {
             if name != "array_distinct" {
                 arguments.push(value_argument(DataType::Decimal256(60, 2), true, None));
             }
-            assert!(
-                catalog
-                    .resolve_bound_user(
-                        name,
-                        FunctionKind::Scalar,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: arguments.len()
-                        },
-                        crate::binding_test_control()
-                    )
-                    .is_err(),
-                "{name}"
-            );
+            let bound = resolve_exact_scalar(&catalog, name, &arguments);
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        expected_result_type: None,
+                        arguments: &arguments,
+                        logical_argument_count: arguments.len(),
+                    },
+                    crate::binding_test_control(),
+                )
+                .unwrap();
         }
         for name in ["contains", "array_position", "array_remove"] {
             let item = list(DataType::FixedSizeBinary(16));

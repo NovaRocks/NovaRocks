@@ -68,11 +68,11 @@ select  count(), cardinality(array_agg(arr)) from (select ['abcdefghijklmnopqabc
 
 -- query 10
 USE ${case_db};
-select cardinality(array_agg(arr)) from (select cast('[[1, 2, 3], [1, 2, 3]]' as array<array<int>>) arr from (select t1.k3 from tbl t1 join tbl t2 ON TRUE) t)  t;
+select cardinality(array_agg(arr)) from (select CAST(JSON '[[1, 2, 3], [1, 2, 3]]' as array<array<int>>) arr from (select t1.k3 from tbl t1 join tbl t2 ON TRUE) t)  t;
 
 -- query 11
 USE ${case_db};
-select array_agg(arr)[1] from (select cast('[[1, 2, 3], [1, 2, 3]]' as array<array<int>>) arr from (select t1.k3 from tbl t1 join tbl t2 ON TRUE) t)  t;
+select array_agg(arr)[1] from (select CAST(JSON '[[1, 2, 3], [1, 2, 3]]' as array<array<int>>) arr from (select t1.k3 from tbl t1 join tbl t2 ON TRUE) t)  t;
 
 -- query 12
 -- @skip_result_check=true

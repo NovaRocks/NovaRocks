@@ -40,8 +40,7 @@ PLAN FRAGMENT 2
   6:HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) bcast_verdict=feasible stats={rows=2}
     7:SCAN ${case_db}.g3_bj_left (alias=a) stats={rows=2}
          TABLE: ${case_db}.g3_bj_left
-         columns: k, v, _file, _pos
-         min-max stats
+         columns: k, v, _file, _pos, _spec_id, _partition
          predicates: a.k IS NOT NULL
     8:BROADCAST EXCHANGE stats={rows=2}
   9:BROADCAST EXCHANGE stats={rows=1}
@@ -55,8 +54,7 @@ PLAN FRAGMENT 3
     PARTITION: BROADCAST
 10:SCAN ${case_db}.g3_bj_right (alias=b) stats={rows=2}
      TABLE: ${case_db}.g3_bj_right
-     columns: k, w, _file, _pos
-     min-max stats
+     columns: k, w, _file, _pos, _spec_id, _partition
      predicates: b.k IS NOT NULL
 PLAN FRAGMENT 4
   OUTPUT EXPRS: *
@@ -68,6 +66,5 @@ PLAN FRAGMENT 4
     PARTITION: BROADCAST
 11:SCAN ${case_db}.g3_bj_small (alias=s) stats={rows=1}
      TABLE: ${case_db}.g3_bj_small
-     columns: s, x, _file, _pos
-     min-max stats
+     columns: s, x, _file, _pos, _spec_id, _partition
      predicates: s.s IS NOT NULL

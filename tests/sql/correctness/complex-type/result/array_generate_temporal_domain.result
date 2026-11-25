@@ -1,8 +1,8 @@
 -- query 2
--- types	integer	array(timestamp)	array(timestamp)	array(date)
+-- types	integer	array(timestamp(6))	array(timestamp(6))	array(date)
 id	forward	reverse	anchored_text
-1	["2025-10-01 00:00:00.000"]	["2025-10-01 01:00:00.000"]	["2025-10-01","2025-10-02"]
-2	["2025-10-02 00:00:00.000"]	["2025-10-02 01:00:00.000"]	NULL
+1	["2025-10-01 00:00:00.000000"]	["2025-10-01 01:00:00.000000"]	["2025-10-01","2025-10-02"]
+2	["2025-10-02 00:00:00.000000"]	["2025-10-02 01:00:00.000000"]	NULL
 3	NULL	NULL	NULL
 
 -- query 3
@@ -11,14 +11,14 @@ dates	month_end	descending
 ["2025-10-01","2025-10-02","2025-10-03"]	["2025-01-31","2025-02-28","2025-03-31","2025-04-30"]	["2025-10-03","2025-10-02","2025-10-01"]
 
 -- query 4
--- types	array(timestamp)	array(timestamp)
+-- types	array(timestamp(6))	array(timestamp(6))
 forward	reverse
-["2025-10-01 14:28:31.000","2025-10-01 14:28:31.500","2025-10-01 14:28:32.000","2025-10-01 14:28:32.500"]	["2025-10-01 14:28:32.800","2025-10-01 14:28:32.300","2025-10-01 14:28:31.800","2025-10-01 14:28:31.300"]
+["2025-10-01 14:28:31.000000","2025-10-01 14:28:31.500000","2025-10-01 14:28:32.000000","2025-10-01 14:28:32.500000"]	["2025-10-01 14:28:32.800000","2025-10-01 14:28:32.300000","2025-10-01 14:28:31.800000","2025-10-01 14:28:31.300000"]
 
 -- query 5
--- types	array(timestamp)	array(timestamp)
+-- types	array(timestamp(6))	array(timestamp(6))
 subday	mixed
-["2025-10-01 00:00:00.000","2025-10-01 12:00:00.000","2025-10-02 00:00:00.000"]	["2025-10-01 00:00:00.000","2025-10-01 12:00:00.000","2025-10-02 00:00:00.000"]
+["2025-10-01 00:00:00.000000","2025-10-01 12:00:00.000000","2025-10-02 00:00:00.000000"]	["2025-10-01 00:00:00.000000","2025-10-01 12:00:00.000000","2025-10-02 00:00:00.000000"]
 
 -- query 8
 -- types	array(date)	array(bigint)
@@ -44,3 +44,29 @@ default_desc	numeric_step	numeric_null
 -- types	array(date)
 value
 ["2025-10-01"]
+
+-- query 16
+-- types	array(timestamp(7))	array(timestamp(7))	array(timestamp(7))
+forward	reverse	same_endpoint
+["2024-01-01 00:00:00.0000001"]	["2024-01-01 00:00:00.0000002"]	["2024-01-01 00:00:00.0000002"]
+
+-- query 18
+-- types	bigint
+wrong_reverse
+NULL
+
+-- query 19
+-- types	array(timestamp(12))
+picosecond_step
+["1969-12-31 23:59:59.000000000000","1969-12-31 23:59:59.999999999999","1970-01-01 00:00:00.999999999998"]
+
+-- query 20
+-- types	bigint	bigint	bigint	bigint
+sequence_limit	sequence_over_limit	repeat_limit	repeat_over_limit
+10000	NULL	100000	NULL
+
+-- query 21
+-- types	boolean	boolean	array(timestamp(7))
+hit	nested_hit	intersection
+true	true	["1969-12-31 23:59:59.9999990"]
+false	false	[]

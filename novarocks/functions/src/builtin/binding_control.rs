@@ -173,9 +173,6 @@ impl<'a> ScalarCarriers<'a> {
             ScalarCarrierSource::DataTypes(types) => types.get(index),
         }
     }
-    pub(super) fn first(self) -> Option<&'a arrow_schema::DataType> {
-        self.get(0)
-    }
     pub(super) fn iter(self) -> impl Clone + ExactSizeIterator<Item = &'a arrow_schema::DataType> {
         (0..self.len()).map(move |index| self.get(index).expect("scalar carrier ordinal"))
     }

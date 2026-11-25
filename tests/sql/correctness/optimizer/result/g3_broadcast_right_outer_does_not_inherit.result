@@ -1,10 +1,6 @@
 -- query 10
 -- types	varchar
 Explain String
-RUNTIME FILTER GRAPH
-  runtime filter channel 1
-    producer binding 1, fragment = 2, node = 5, expr = (b.k)
-    consumer binding 1, fragment = 3, node = 8, expr = (a.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   STAGE PLACEMENT: singleton
@@ -46,8 +42,7 @@ PLAN FRAGMENT 3
     PARTITION: HASH_PARTITIONED (a.k)
 8:SCAN ${case_db}.g3_ro_left (alias=a) stats={rows=2}
      TABLE: ${case_db}.g3_ro_left
-     columns: k, v, _file, _pos
-     min-max stats
+     columns: k, v, _file, _pos, _spec_id, _partition
 PLAN FRAGMENT 4
   OUTPUT EXPRS: *
   STAGE PLACEMENT: scan-work
@@ -58,5 +53,4 @@ PLAN FRAGMENT 4
     PARTITION: HASH_PARTITIONED (b.k)
 9:SCAN ${case_db}.date_dim (alias=b) stats={rows=2}
      TABLE: ${case_db}.date_dim
-     columns: k, w, _file, _pos
-     min-max stats
+     columns: k, w, _file, _pos, _spec_id, _partition

@@ -1,93 +1,88 @@
 -- query 2
--- legacy
+-- types	array(row(integer, varchar(2)))
 result
-[{"col1":1,"col2":"1b"},{"col1":2,"col2":"2b"}]
+[[1,"1b"],[2,"2b"]]
 
 -- query 3
--- legacy
+-- types	array(row(integer, varchar(2)))
 result
-[{"col1":1,"col2":"1b"},{"col1":2,"col2":null},{"col1":null,"col2":"3b"}]
+[[1,"1b"],[2,null],[null,"3b"]]
 
 -- query 4
--- legacy
+-- types	array(row(integer, varchar(1), integer))
 result
-[{"col1":1,"col2":"a","col3":10},{"col1":2,"col2":"b","col3":20},{"col1":3,"col2":"c","col3":30}]
+[[1,"a",10],[2,"b",20],[3,"c",30]]
 
 -- query 5
--- legacy
+-- types	array(row(unknown, unknown))
 result
 []
 
--- query 6
--- legacy
-result
-[{"col1":1},{"col1":2},{"col1":3}]
-
 -- query 7
--- legacy
+-- types	array(row(unknown, integer))
 result
 NULL
 
 -- query 8
--- legacy
+-- types	array(row(integer, varchar(1)))
 result
-[{"col1":1,"col2":"a"},{"col1":null,"col2":"b"},{"col1":3,"col2":null}]
+[[1,"a"],[null,"b"],[3,null]]
 
 -- query 9
--- legacy
+-- types	integer
 id
 1
 
 -- query 12
--- legacy
+-- types	bigint	array(row(bigint, varchar))
 pk	_col1
-1	[{"col1":1,"col2":"a"},{"col1":2,"col2":"b"},{"col1":3,"col2":"c"}]
-2	[{"col1":10,"col2":"hello"},{"col1":20,"col2":"world"}]
-3	[{"col1":100,"col2":"single"}]
+1	[[1,"a"],[2,"b"],[3,"c"]]
+2	[[10,"hello"],[20,"world"]]
+3	[[100,"single"]]
 4	[]
-5	[{"col1":1,"col2":"a"},{"col1":2,"col2":"b"},{"col1":3,"col2":"c"},{"col1":4,"col2":"d"},{"col1":5,"col2":"e"}]
-6	[{"col1":null,"col2":null},{"col1":null,"col2":null},{"col1":null,"col2":null}]
-7	[{"col1":1,"col2":"x"},{"col1":null,"col2":null},{"col1":3,"col2":"z"},{"col1":null,"col2":null},{"col1":5,"col2":"w"}]
-8	[{"col1":999,"col2":"z"},{"col1":888,"col2":"y"},{"col1":777,"col2":"x"},{"col1":666,"col2":"w"},{"col1":555,"col2":"v"},{"col1":444,"col2":"u"},{"col1":333,"col2":"t"},{"col1":222,"col2":"s"},{"col1":111,"col2":"r"},{"col1":0,"col2":"q"}]
-9	[{"col1":1,"col2":"one"}]
-10	[{"col1":2,"col2":"two"},{"col1":4,"col2":"four"},{"col1":6,"col2":"six"},{"col1":8,"col2":"eight"},{"col1":10,"col2":"ten"},{"col1":12,"col2":"twelve"}]
-11	[{"col1":3,"col2":"three"},{"col1":6,"col2":"six"},{"col1":9,"col2":"nine"},{"col1":12,"col2":"twelve"},{"col1":15,"col2":"fifteen"}]
-12	[{"col1":null,"col2":null}]
-13	[{"col1":100,"col2":"a1"},{"col1":200,"col2":"b1"},{"col1":300,"col2":"c1"},{"col1":400,"col2":"d1"},{"col1":500,"col2":"e1"},{"col1":600,"col2":"f1"},{"col1":700,"col2":"g1"},{"col1":800,"col2":"h1"},{"col1":900,"col2":"i1"},{"col1":1000,"col2":"j1"},{"col1":1100,"col2":"k1"},{"col1":1200,"col2":"l1"}]
-14	[{"col1":-1,"col2":"neg_a"},{"col1":-2,"col2":"neg_b"},{"col1":-3,"col2":"neg_c"}]
-15	[{"col1":1,"col2":"short"},{"col1":2,"col2":"array"}]
-16	[{"col1":0,"col2":"zero"},{"col1":0,"col2":"zero"},{"col1":0,"col2":"zero"}]
-17	[{"col1":111,"col2":"str_111"},{"col1":222,"col2":"str_222"},{"col1":333,"col2":"str_333"},{"col1":444,"col2":"str_444"},{"col1":555,"col2":"str_555"}]
-18	[{"col1":1,"col2":"dup"},{"col1":1,"col2":"dup"},{"col1":1,"col2":"dup"}]
-19	[{"col1":7,"col2":"seven"},{"col1":8,"col2":"eight"},{"col1":9,"col2":"nine"},{"col1":10,"col2":"ten"},{"col1":11,"col2":"eleven"},{"col1":12,"col2":"twelve"},{"col1":13,"col2":"thirteen"},{"col1":14,"col2":"fourteen"},{"col1":15,"col2":"fifteen"}]
-20	[{"col1":42,"col2":"answer"}]
+5	[[1,"a"],[2,"b"],[3,"c"],[4,"d"],[5,"e"]]
+6	[[null,null],[null,null],[null,null]]
+7	[[1,"x"],[null,null],[3,"z"],[null,null],[5,"w"]]
+8	[[999,"z"],[888,"y"],[777,"x"],[666,"w"],[555,"v"],[444,"u"],[333,"t"],[222,"s"],[111,"r"],[0,"q"]]
+9	[[1,"one"]]
+10	[[2,"two"],[4,"four"],[6,"six"],[8,"eight"],[10,"ten"],[12,"twelve"]]
+11	[[3,"three"],[6,"six"],[9,"nine"],[12,"twelve"],[15,"fifteen"]]
+12	[[null,null]]
+13	[[100,"a1"],[200,"b1"],[300,"c1"],[400,"d1"],[500,"e1"],[600,"f1"],[700,"g1"],[800,"h1"],[900,"i1"],[1000,"j1"],[1100,"k1"],[1200,"l1"]]
+14	[[-1,"neg_a"],[-2,"neg_b"],[-3,"neg_c"]]
+15	[[1,"short"],[2,"array"]]
+16	[[0,"zero"],[0,"zero"],[0,"zero"]]
+17	[[111,"str_111"],[222,"str_222"],[333,"str_333"],[444,"str_444"],[555,"str_555"]]
+18	[[1,"dup"],[1,"dup"],[1,"dup"]]
+19	[[7,"seven"],[8,"eight"],[9,"nine"],[10,"ten"],[11,"eleven"],[12,"twelve"],[13,"thirteen"],[14,"fourteen"],[15,"fifteen"]]
+20	[[42,"answer"]]
 
 -- query 13
--- legacy
+-- types	bigint	array(row(bigint, varchar, double))
 pk	_col1
-1	[{"col1":1,"col2":"a","col3":1.1},{"col1":2,"col2":"b","col3":2.2},{"col1":3,"col2":"c","col3":3.3}]
-2	[{"col1":10,"col2":"hello","col3":10.5},{"col1":20,"col2":"world","col3":20.5}]
-3	[{"col1":100,"col2":"single","col3":99.9}]
+1	[[1,"a",1.1],[2,"b",2.2],[3,"c",3.3]]
+2	[[10,"hello",10.5],[20,"world",20.5]]
+3	[[100,"single",99.9]]
 4	[]
-5	[{"col1":1,"col2":"a","col3":1.1},{"col1":2,"col2":"b","col3":2.2},{"col1":3,"col2":"c","col3":3.3},{"col1":4,"col2":"d","col3":4.4},{"col1":5,"col2":"e","col3":5.5}]
-6	[{"col1":null,"col2":null,"col3":null},{"col1":null,"col2":null,"col3":null},{"col1":null,"col2":null,"col3":null}]
-7	[{"col1":1,"col2":"x","col3":1.1},{"col1":null,"col2":null,"col3":null},{"col1":3,"col2":"z","col3":3.3},{"col1":null,"col2":null,"col3":null},{"col1":5,"col2":"w","col3":5.5}]
-8	[{"col1":999,"col2":"z","col3":99.9},{"col1":888,"col2":"y","col3":88.8},{"col1":777,"col2":"x","col3":77.7},{"col1":666,"col2":"w","col3":66.6},{"col1":555,"col2":"v","col3":55.5},{"col1":444,"col2":"u","col3":44.4},{"col1":333,"col2":"t","col3":33.3},{"col1":222,"col2":"s","col3":22.2},{"col1":111,"col2":"r","col3":11.1},{"col1":0,"col2":"q","col3":0}]
-9	[{"col1":1,"col2":"one","col3":1}]
-10	[{"col1":2,"col2":"two","col3":2},{"col1":4,"col2":"four","col3":4},{"col1":6,"col2":"six","col3":6},{"col1":8,"col2":"eight","col3":8},{"col1":10,"col2":"ten","col3":10},{"col1":12,"col2":"twelve","col3":12}]
-11	[{"col1":3,"col2":"three","col3":3},{"col1":6,"col2":"six","col3":6},{"col1":9,"col2":"nine","col3":9},{"col1":12,"col2":"twelve","col3":12},{"col1":15,"col2":"fifteen","col3":15}]
-12	[{"col1":null,"col2":null,"col3":null}]
-13	[{"col1":100,"col2":"a1","col3":100.1},{"col1":200,"col2":"b1","col3":200.2},{"col1":300,"col2":"c1","col3":300.3},{"col1":400,"col2":"d1","col3":400.4},{"col1":500,"col2":"e1","col3":500.5},{"col1":600,"col2":"f1","col3":600.6},{"col1":700,"col2":"g1","col3":700.7},{"col1":800,"col2":"h1","col3":800.8},{"col1":900,"col2":"i1","col3":900.9},{"col1":1000,"col2":"j1","col3":1000.1},{"col1":1100,"col2":"k1","col3":1100.2},{"col1":1200,"col2":"l1","col3":1200.3}]
-14	[{"col1":-1,"col2":"neg_a","col3":-1.5},{"col1":-2,"col2":"neg_b","col3":-2.5},{"col1":-3,"col2":"neg_c","col3":-3.5}]
-15	[{"col1":1,"col2":"short","col3":1},{"col1":2,"col2":"array","col3":2}]
-16	[{"col1":0,"col2":"zero","col3":0},{"col1":0,"col2":"zero","col3":0},{"col1":0,"col2":"zero","col3":0}]
-17	[{"col1":111,"col2":"str_111","col3":111.1},{"col1":222,"col2":"str_222","col3":222.2},{"col1":333,"col2":"str_333","col3":333.3},{"col1":444,"col2":"str_444","col3":444.4},{"col1":555,"col2":"str_555","col3":555.5}]
-18	[{"col1":1,"col2":"dup","col3":1.1},{"col1":1,"col2":"dup","col3":1.1},{"col1":1,"col2":"dup","col3":1.1}]
-19	[{"col1":7,"col2":"seven","col3":7.7},{"col1":8,"col2":"eight","col3":8.8},{"col1":9,"col2":"nine","col3":9.9},{"col1":10,"col2":"ten","col3":10.1},{"col1":11,"col2":"eleven","col3":11.1},{"col1":12,"col2":"twelve","col3":12.1},{"col1":13,"col2":"thirteen","col3":13.1},{"col1":14,"col2":"fourteen","col3":14.1},{"col1":15,"col2":"fifteen","col3":15.1}]
-20	[{"col1":42,"col2":"answer","col3":42}]
+5	[[1,"a",1.1],[2,"b",2.2],[3,"c",3.3],[4,"d",4.4],[5,"e",5.5]]
+6	[[null,null,null],[null,null,null],[null,null,null]]
+7	[[1,"x",1.1],[null,null,null],[3,"z",3.3],[null,null,null],[5,"w",5.5]]
+8	[[999,"z",99.9],[888,"y",88.8],[777,"x",77.7],[666,"w",66.6],[555,"v",55.5],[444,"u",44.4],[333,"t",33.3],[222,"s",22.2],[111,"r",11.1],[0,"q",0.0]]
+9	[[1,"one",1.0]]
+10	[[2,"two",2.0],[4,"four",4.0],[6,"six",6.0],[8,"eight",8.0],[10,"ten",10.0],[12,"twelve",12.0]]
+11	[[3,"three",3.0],[6,"six",6.0],[9,"nine",9.0],[12,"twelve",12.0],[15,"fifteen",15.0]]
+12	[[null,null,null]]
+13	[[100,"a1",100.1],[200,"b1",200.2],[300,"c1",300.3],[400,"d1",400.4],[500,"e1",500.5],[600,"f1",600.6],[700,"g1",700.7],[800,"h1",800.8],[900,"i1",900.9],[1000,"j1",1000.1],[1100,"k1",1100.2],[1200,"l1",1200.3]]
+14	[[-1,"neg_a",-1.5],[-2,"neg_b",-2.5],[-3,"neg_c",-3.5]]
+15	[[1,"short",1.0],[2,"array",2.0]]
+16	[[0,"zero",0.0],[0,"zero",0.0],[0,"zero",0.0]]
+17	[[111,"str_111",111.1],[222,"str_222",222.2],[333,"str_333",333.3],[444,"str_444",444.4],[555,"str_555",555.5]]
+18	[[1,"dup",1.1],[1,"dup",1.1],[1,"dup",1.1]]
+19	[[7,"seven",7.7],[8,"eight",8.8],[9,"nine",9.9],[10,"ten",10.1],[11,"eleven",11.1],[12,"twelve",12.1],[13,"thirteen",13.1],[14,"fourteen",14.1],[15,"fifteen",15.1]]
+20	[[42,"answer",42.0]]
 
 -- query 14
--- legacy
+-- types	bigint	array(row(varchar, bigint))
 pk	_col1
 1	NULL
 2	NULL
@@ -111,151 +106,127 @@ pk	_col1
 20	NULL
 
 -- query 15
--- legacy
+-- types	bigint	array(row(bigint, varchar))
 pk	_col1
-1	[{"col1":1,"col2":"a"},{"col1":2,"col2":"b"},{"col1":3,"col2":"c"}]
-2	[{"col1":10,"col2":"hello"},{"col1":null,"col2":"world"},{"col1":30,"col2":null}]
-3	[{"col1":null,"col2":"single"},{"col1":null,"col2":null}]
+1	[[1,"a"],[2,"b"],[3,"c"]]
+2	[[10,"hello"],[null,"world"],[30,null]]
+3	[[null,"single"],[null,null]]
 4	[]
-5	[{"col1":1,"col2":"a"},{"col1":2,"col2":"b"},{"col1":3,"col2":"c"},{"col1":4,"col2":"d"},{"col1":5,"col2":"e"}]
-6	[{"col1":null,"col2":null},{"col1":null,"col2":null},{"col1":null,"col2":null}]
-7	[{"col1":1,"col2":"x"},{"col1":null,"col2":null},{"col1":3,"col2":"z"},{"col1":null,"col2":null},{"col1":5,"col2":"w"}]
-8	[{"col1":9,"col2":"z"},{"col1":8,"col2":"y"},{"col1":7,"col2":"x"},{"col1":6,"col2":"w"},{"col1":5,"col2":"v"},{"col1":4,"col2":"u"},{"col1":3,"col2":"t"},{"col1":2,"col2":"s"},{"col1":1,"col2":"r"},{"col1":0,"col2":"q"}]
-9	[{"col1":1,"col2":"one"}]
-10	[{"col1":2,"col2":"two"},{"col1":4,"col2":"four"},{"col1":6,"col2":"six"},{"col1":8,"col2":"eight"},{"col1":10,"col2":"ten"},{"col1":12,"col2":"twelve"}]
-11	[{"col1":3,"col2":"three"},{"col1":6,"col2":"six"},{"col1":9,"col2":"nine"},{"col1":12,"col2":"twelve"},{"col1":15,"col2":"fifteen"}]
-12	[{"col1":null,"col2":null}]
-13	[{"col1":100,"col2":"a1"},{"col1":200,"col2":"b1"},{"col1":300,"col2":"c1"},{"col1":400,"col2":"d1"},{"col1":500,"col2":"e1"},{"col1":600,"col2":"f1"},{"col1":700,"col2":"g1"},{"col1":800,"col2":"h1"},{"col1":900,"col2":"i1"},{"col1":1000,"col2":"j1"},{"col1":1100,"col2":"k1"},{"col1":1200,"col2":"l1"}]
-14	[{"col1":-1,"col2":"neg_a"},{"col1":-2,"col2":"neg_b"},{"col1":-3,"col2":"neg_c"}]
-15	[{"col1":1,"col2":"short"},{"col1":2,"col2":"array"}]
-16	[{"col1":0,"col2":"zero"},{"col1":0,"col2":"zero"},{"col1":0,"col2":"zero"}]
-17	[{"col1":111,"col2":"str_111"},{"col1":222,"col2":"str_222"},{"col1":333,"col2":"str_333"},{"col1":444,"col2":"str_444"},{"col1":555,"col2":"str_555"}]
-18	[{"col1":1,"col2":"dup"},{"col1":1,"col2":"dup"},{"col1":1,"col2":"dup"}]
-19	[{"col1":7,"col2":"seven"},{"col1":8,"col2":"eight"},{"col1":9,"col2":"nine"},{"col1":10,"col2":"ten"},{"col1":11,"col2":"eleven"},{"col1":12,"col2":"twelve"},{"col1":13,"col2":"thirteen"},{"col1":14,"col2":"fourteen"},{"col1":15,"col2":"fifteen"}]
-20	[{"col1":42,"col2":"answer"}]
+5	[[1,"a"],[2,"b"],[3,"c"],[4,"d"],[5,"e"]]
+6	[[null,null],[null,null],[null,null]]
+7	[[1,"x"],[null,null],[3,"z"],[null,null],[5,"w"]]
+8	[[9,"z"],[8,"y"],[7,"x"],[6,"w"],[5,"v"],[4,"u"],[3,"t"],[2,"s"],[1,"r"],[0,"q"]]
+9	[[1,"one"]]
+10	[[2,"two"],[4,"four"],[6,"six"],[8,"eight"],[10,"ten"],[12,"twelve"]]
+11	[[3,"three"],[6,"six"],[9,"nine"],[12,"twelve"],[15,"fifteen"]]
+12	[[null,null]]
+13	[[100,"a1"],[200,"b1"],[300,"c1"],[400,"d1"],[500,"e1"],[600,"f1"],[700,"g1"],[800,"h1"],[900,"i1"],[1000,"j1"],[1100,"k1"],[1200,"l1"]]
+14	[[-1,"neg_a"],[-2,"neg_b"],[-3,"neg_c"]]
+15	[[1,"short"],[2,"array"]]
+16	[[0,"zero"],[0,"zero"],[0,"zero"]]
+17	[[111,"str_111"],[222,"str_222"],[333,"str_333"],[444,"str_444"],[555,"str_555"]]
+18	[[1,"dup"],[1,"dup"],[1,"dup"]]
+19	[[7,"seven"],[8,"eight"],[9,"nine"],[10,"ten"],[11,"eleven"],[12,"twelve"],[13,"thirteen"],[14,"fourteen"],[15,"fifteen"]]
+20	[[42,"answer"]]
 
 -- query 16
--- legacy
+-- types	bigint	array(row(varchar, bigint))
 pk	_col1
-1	[{"col1":null,"col2":1},{"col1":null,"col2":2},{"col1":null,"col2":3}]
-2	[{"col1":null,"col2":10},{"col1":null,"col2":20}]
-3	[{"col1":null,"col2":100}]
+1	[[null,1],[null,2],[null,3]]
+2	[[null,10],[null,20]]
+3	[[null,100]]
 4	[]
-5	[{"col1":null,"col2":1},{"col1":null,"col2":2},{"col1":null,"col2":3},{"col1":null,"col2":4},{"col1":null,"col2":5}]
-6	[{"col1":null,"col2":null},{"col1":null,"col2":null},{"col1":null,"col2":null}]
-7	[{"col1":null,"col2":1},{"col1":null,"col2":null},{"col1":null,"col2":3},{"col1":null,"col2":null},{"col1":null,"col2":5}]
-8	[{"col1":null,"col2":999},{"col1":null,"col2":888},{"col1":null,"col2":777},{"col1":null,"col2":666},{"col1":null,"col2":555},{"col1":null,"col2":444},{"col1":null,"col2":333},{"col1":null,"col2":222},{"col1":null,"col2":111},{"col1":null,"col2":0}]
-9	[{"col1":null,"col2":1}]
-10	[{"col1":null,"col2":2},{"col1":null,"col2":4},{"col1":null,"col2":6},{"col1":null,"col2":8},{"col1":null,"col2":10},{"col1":null,"col2":12}]
-11	[{"col1":null,"col2":3},{"col1":null,"col2":6},{"col1":null,"col2":9},{"col1":null,"col2":12},{"col1":null,"col2":15}]
-12	[{"col1":null,"col2":null}]
-13	[{"col1":null,"col2":100},{"col1":null,"col2":200},{"col1":null,"col2":300},{"col1":null,"col2":400},{"col1":null,"col2":500},{"col1":null,"col2":600},{"col1":null,"col2":700},{"col1":null,"col2":800},{"col1":null,"col2":900},{"col1":null,"col2":1000},{"col1":null,"col2":1100},{"col1":null,"col2":1200}]
-14	[{"col1":null,"col2":-1},{"col1":null,"col2":-2},{"col1":null,"col2":-3}]
-15	[{"col1":null,"col2":1},{"col1":null,"col2":2}]
-16	[{"col1":null,"col2":0},{"col1":null,"col2":0},{"col1":null,"col2":0}]
-17	[{"col1":null,"col2":111},{"col1":null,"col2":222},{"col1":null,"col2":333},{"col1":null,"col2":444},{"col1":null,"col2":555}]
-18	[{"col1":null,"col2":1},{"col1":null,"col2":1},{"col1":null,"col2":1}]
-19	[{"col1":null,"col2":7},{"col1":null,"col2":8},{"col1":null,"col2":9},{"col1":null,"col2":10},{"col1":null,"col2":11},{"col1":null,"col2":12},{"col1":null,"col2":13},{"col1":null,"col2":14},{"col1":null,"col2":15}]
-20	[{"col1":null,"col2":42}]
+5	[[null,1],[null,2],[null,3],[null,4],[null,5]]
+6	[[null,null],[null,null],[null,null]]
+7	[[null,1],[null,null],[null,3],[null,null],[null,5]]
+8	[[null,999],[null,888],[null,777],[null,666],[null,555],[null,444],[null,333],[null,222],[null,111],[null,0]]
+9	[[null,1]]
+10	[[null,2],[null,4],[null,6],[null,8],[null,10],[null,12]]
+11	[[null,3],[null,6],[null,9],[null,12],[null,15]]
+12	[[null,null]]
+13	[[null,100],[null,200],[null,300],[null,400],[null,500],[null,600],[null,700],[null,800],[null,900],[null,1000],[null,1100],[null,1200]]
+14	[[null,-1],[null,-2],[null,-3]]
+15	[[null,1],[null,2]]
+16	[[null,0],[null,0],[null,0]]
+17	[[null,111],[null,222],[null,333],[null,444],[null,555]]
+18	[[null,1],[null,1],[null,1]]
+19	[[null,7],[null,8],[null,9],[null,10],[null,11],[null,12],[null,13],[null,14],[null,15]]
+20	[[null,42]]
 
 -- query 17
--- legacy
+-- types	bigint	array(row(bigint, varchar))
 pk	_col1
-1	[{"col1":100,"col2":"a"},{"col1":null,"col2":"b"},{"col1":null,"col2":"c"}]
-2	[{"col1":200,"col2":"hello"},{"col1":null,"col2":"world"}]
-3	[{"col1":300,"col2":"single"}]
+1	[[100,"a"],[null,"b"],[null,"c"]]
+2	[[200,"hello"],[null,"world"]]
+3	[[300,"single"]]
 4	[]
-5	[{"col1":400,"col2":"a"},{"col1":null,"col2":"b"},{"col1":null,"col2":"c"},{"col1":null,"col2":"d"},{"col1":null,"col2":"e"}]
-6	[{"col1":500,"col2":null},{"col1":null,"col2":null},{"col1":null,"col2":null}]
-7	[{"col1":600,"col2":"x"},{"col1":null,"col2":null},{"col1":null,"col2":"z"},{"col1":null,"col2":null},{"col1":null,"col2":"w"}]
-8	[{"col1":700,"col2":"z"},{"col1":null,"col2":"y"},{"col1":null,"col2":"x"},{"col1":null,"col2":"w"},{"col1":null,"col2":"v"},{"col1":null,"col2":"u"},{"col1":null,"col2":"t"},{"col1":null,"col2":"s"},{"col1":null,"col2":"r"},{"col1":null,"col2":"q"}]
-9	[{"col1":800,"col2":"one"}]
-10	[{"col1":900,"col2":"two"},{"col1":null,"col2":"four"},{"col1":null,"col2":"six"},{"col1":null,"col2":"eight"},{"col1":null,"col2":"ten"},{"col1":null,"col2":"twelve"}]
-11	[{"col1":1000,"col2":"three"},{"col1":null,"col2":"six"},{"col1":null,"col2":"nine"},{"col1":null,"col2":"twelve"},{"col1":null,"col2":"fifteen"}]
-12	[{"col1":1100,"col2":null}]
-13	[{"col1":1200,"col2":"a1"},{"col1":null,"col2":"b1"},{"col1":null,"col2":"c1"},{"col1":null,"col2":"d1"},{"col1":null,"col2":"e1"},{"col1":null,"col2":"f1"},{"col1":null,"col2":"g1"},{"col1":null,"col2":"h1"},{"col1":null,"col2":"i1"},{"col1":null,"col2":"j1"},{"col1":null,"col2":"k1"},{"col1":null,"col2":"l1"}]
-14	[{"col1":1300,"col2":"neg_a"},{"col1":null,"col2":"neg_b"},{"col1":null,"col2":"neg_c"}]
-15	[{"col1":1400,"col2":"short"},{"col1":null,"col2":"array"}]
-16	[{"col1":1500,"col2":"zero"},{"col1":null,"col2":"zero"},{"col1":null,"col2":"zero"}]
-17	[{"col1":1600,"col2":"str_111"},{"col1":null,"col2":"str_222"},{"col1":null,"col2":"str_333"},{"col1":null,"col2":"str_444"},{"col1":null,"col2":"str_555"}]
-18	[{"col1":1700,"col2":"dup"},{"col1":null,"col2":"dup"},{"col1":null,"col2":"dup"}]
-19	[{"col1":1800,"col2":"seven"},{"col1":null,"col2":"eight"},{"col1":null,"col2":"nine"},{"col1":null,"col2":"ten"},{"col1":null,"col2":"eleven"},{"col1":null,"col2":"twelve"},{"col1":null,"col2":"thirteen"},{"col1":null,"col2":"fourteen"},{"col1":null,"col2":"fifteen"}]
-20	[{"col1":1900,"col2":"answer"}]
+5	[[400,"a"],[null,"b"],[null,"c"],[null,"d"],[null,"e"]]
+6	[[500,null],[null,null],[null,null]]
+7	[[600,"x"],[null,null],[null,"z"],[null,null],[null,"w"]]
+8	[[700,"z"],[null,"y"],[null,"x"],[null,"w"],[null,"v"],[null,"u"],[null,"t"],[null,"s"],[null,"r"],[null,"q"]]
+9	[[800,"one"]]
+10	[[900,"two"],[null,"four"],[null,"six"],[null,"eight"],[null,"ten"],[null,"twelve"]]
+11	[[1000,"three"],[null,"six"],[null,"nine"],[null,"twelve"],[null,"fifteen"]]
+12	[[1100,null]]
+13	[[1200,"a1"],[null,"b1"],[null,"c1"],[null,"d1"],[null,"e1"],[null,"f1"],[null,"g1"],[null,"h1"],[null,"i1"],[null,"j1"],[null,"k1"],[null,"l1"]]
+14	[[1300,"neg_a"],[null,"neg_b"],[null,"neg_c"]]
+15	[[1400,"short"],[null,"array"]]
+16	[[1500,"zero"],[null,"zero"],[null,"zero"]]
+17	[[1600,"str_111"],[null,"str_222"],[null,"str_333"],[null,"str_444"],[null,"str_555"]]
+18	[[1700,"dup"],[null,"dup"],[null,"dup"]]
+19	[[1800,"seven"],[null,"eight"],[null,"nine"],[null,"ten"],[null,"eleven"],[null,"twelve"],[null,"thirteen"],[null,"fourteen"],[null,"fifteen"]]
+20	[[1900,"answer"]]
 
 -- query 18
--- legacy
+-- types	bigint	array(row(varchar, double))
 pk	_col1
-1	[{"col1":"x1","col2":1.1},{"col1":"x2","col2":2.2},{"col1":"x3","col2":3.3}]
-2	[{"col1":"y1","col2":10.5},{"col1":"y2","col2":20.5}]
-3	[{"col1":"single_element","col2":99.9}]
+1	[["x1",1.1],["x2",2.2],["x3",3.3]]
+2	[["y1",10.5],["y2",20.5]]
+3	[["single_element",99.9]]
 4	[]
-5	[{"col1":"a","col2":1.1},{"col1":"b","col2":2.2},{"col1":"c","col2":3.3},{"col1":"d","col2":4.4},{"col1":"e","col2":5.5},{"col1":"f","col2":null}]
-6	[{"col1":null,"col2":null},{"col1":null,"col2":null},{"col1":null,"col2":null}]
-7	[{"col1":"p","col2":1.1},{"col1":null,"col2":null},{"col1":"r","col2":3.3},{"col1":null,"col2":null},{"col1":"t","col2":5.5}]
-8	[{"col1":"a","col2":99.9},{"col1":"b","col2":88.8},{"col1":"c","col2":77.7},{"col1":"d","col2":66.6},{"col1":"e","col2":55.5},{"col1":"f","col2":44.4},{"col1":"g","col2":33.3},{"col1":"h","col2":22.2},{"col1":"i","col2":11.1},{"col1":"j","col2":0}]
-9	[{"col1":"one","col2":1}]
-10	[{"col1":"even1","col2":2},{"col1":"even2","col2":4},{"col1":"even3","col2":6},{"col1":"even4","col2":8},{"col1":"even5","col2":10},{"col1":"even6","col2":12}]
-11	[{"col1":"odd1","col2":3},{"col1":"odd2","col2":6},{"col1":"odd3","col2":9},{"col1":"odd4","col2":12},{"col1":"odd5","col2":15}]
-12	[{"col1":null,"col2":null}]
-13	[{"col1":"long1","col2":100.1},{"col1":"long2","col2":200.2},{"col1":"long3","col2":300.3},{"col1":"long4","col2":400.4},{"col1":"long5","col2":500.5},{"col1":"long6","col2":600.6},{"col1":"long7","col2":700.7},{"col1":"long8","col2":800.8},{"col1":"long9","col2":900.9},{"col1":"long10","col2":1000.1},{"col1":"long11","col2":1100.2},{"col1":"long12","col2":1200.3}]
-14	[{"col1":"neg1","col2":-1.5},{"col1":"neg2","col2":-2.5},{"col1":"neg3","col2":-3.5}]
-15	[{"col1":"a","col2":1},{"col1":"b","col2":2}]
-16	[{"col1":"z1","col2":0},{"col1":"z2","col2":0},{"col1":"z3","col2":0}]
-17	[{"col1":"s1","col2":111.1},{"col1":"s2","col2":222.2},{"col1":"s3","col2":333.3},{"col1":"s4","col2":444.4},{"col1":"s5","col2":555.5}]
-18	[{"col1":"d1","col2":1.1},{"col1":"d2","col2":1.1},{"col1":"d3","col2":1.1}]
-19	[{"col1":"n1","col2":7.7},{"col1":"n2","col2":8.8},{"col1":"n3","col2":9.9},{"col1":"n4","col2":10.1},{"col1":"n5","col2":11.1},{"col1":"n6","col2":12.1},{"col1":"n7","col2":13.1},{"col1":"n8","col2":14.1},{"col1":"n9","col2":15.1}]
-20	[{"col1":"fortytwo","col2":42}]
+5	[["a",1.1],["b",2.2],["c",3.3],["d",4.4],["e",5.5],["f",null]]
+6	[[null,null],[null,null],[null,null]]
+7	[["p",1.1],[null,null],["r",3.3],[null,null],["t",5.5]]
+8	[["a",99.9],["b",88.8],["c",77.7],["d",66.6],["e",55.5],["f",44.4],["g",33.3],["h",22.2],["i",11.1],["j",0.0]]
+9	[["one",1.0]]
+10	[["even1",2.0],["even2",4.0],["even3",6.0],["even4",8.0],["even5",10.0],["even6",12.0]]
+11	[["odd1",3.0],["odd2",6.0],["odd3",9.0],["odd4",12.0],["odd5",15.0]]
+12	[[null,null]]
+13	[["long1",100.1],["long2",200.2],["long3",300.3],["long4",400.4],["long5",500.5],["long6",600.6],["long7",700.7],["long8",800.8],["long9",900.9],["long10",1000.1],["long11",1100.2],["long12",1200.3]]
+14	[["neg1",-1.5],["neg2",-2.5],["neg3",-3.5]]
+15	[["a",1.0],["b",2.0]]
+16	[["z1",0.0],["z2",0.0],["z3",0.0]]
+17	[["s1",111.1],["s2",222.2],["s3",333.3],["s4",444.4],["s5",555.5]]
+18	[["d1",1.1],["d2",1.1],["d3",1.1]]
+19	[["n1",7.7],["n2",8.8],["n3",9.9],["n4",10.1],["n5",11.1],["n6",12.1],["n7",13.1],["n8",14.1],["n9",15.1]]
+20	[["fortytwo",42.0]]
 
 -- query 19
--- legacy
+-- types	bigint	array(row(bigint, varchar, double, decimal(10, 2)))
 pk	_col1
-1	[{"col1":1,"col2":"a","col3":1.1,"col4":10.50},{"col1":2,"col2":"b","col3":2.2,"col4":20.75},{"col1":3,"col2":"c","col3":3.3,"col4":30.25}]
-2	[{"col1":10,"col2":"hello","col3":10.5,"col4":100.00},{"col1":20,"col2":"world","col3":20.5,"col4":200.00}]
-3	[{"col1":100,"col2":"single","col3":99.9,"col4":999.99}]
+1	[[1,"a",1.1,"10.50"],[2,"b",2.2,"20.75"],[3,"c",3.3,"30.25"]]
+2	[[10,"hello",10.5,"100.00"],[20,"world",20.5,"200.00"]]
+3	[[100,"single",99.9,"999.99"]]
 4	[]
-5	[{"col1":1,"col2":"a","col3":1.1,"col4":1.11},{"col1":2,"col2":"b","col3":2.2,"col4":2.22},{"col1":3,"col2":"c","col3":3.3,"col4":3.33},{"col1":4,"col2":"d","col3":4.4,"col4":4.44},{"col1":5,"col2":"e","col3":5.5,"col4":5.55}]
-6	[{"col1":null,"col2":null,"col3":null,"col4":null},{"col1":null,"col2":null,"col3":null,"col4":null},{"col1":null,"col2":null,"col3":null,"col4":null}]
-7	[{"col1":1,"col2":"x","col3":1.1,"col4":11.11},{"col1":null,"col2":null,"col3":null,"col4":null},{"col1":3,"col2":"z","col3":3.3,"col4":33.33},{"col1":null,"col2":null,"col3":null,"col4":null},{"col1":5,"col2":"w","col3":5.5,"col4":55.55}]
-8	[{"col1":999,"col2":"z","col3":99.9,"col4":9.90},{"col1":888,"col2":"y","col3":88.8,"col4":8.80},{"col1":777,"col2":"x","col3":77.7,"col4":7.70},{"col1":666,"col2":"w","col3":66.6,"col4":6.60},{"col1":555,"col2":"v","col3":55.5,"col4":5.50},{"col1":444,"col2":"u","col3":44.4,"col4":4.40},{"col1":333,"col2":"t","col3":33.3,"col4":3.30},{"col1":222,"col2":"s","col3":22.2,"col4":2.20},{"col1":111,"col2":"r","col3":11.1,"col4":1.10},{"col1":0,"col2":"q","col3":0,"col4":0.00}]
-9	[{"col1":1,"col2":"one","col3":1,"col4":1.00}]
-10	[{"col1":2,"col2":"two","col3":2,"col4":2.00},{"col1":4,"col2":"four","col3":4,"col4":4.00},{"col1":6,"col2":"six","col3":6,"col4":6.00},{"col1":8,"col2":"eight","col3":8,"col4":8.00},{"col1":10,"col2":"ten","col3":10,"col4":10.00},{"col1":12,"col2":"twelve","col3":12,"col4":12.00}]
-11	[{"col1":3,"col2":"three","col3":3,"col4":3.00},{"col1":6,"col2":"six","col3":6,"col4":6.00},{"col1":9,"col2":"nine","col3":9,"col4":9.00},{"col1":12,"col2":"twelve","col3":12,"col4":12.00},{"col1":15,"col2":"fifteen","col3":15,"col4":15.00}]
-12	[{"col1":null,"col2":null,"col3":null,"col4":null}]
-13	[{"col1":100,"col2":"a1","col3":100.1,"col4":100.10},{"col1":200,"col2":"b1","col3":200.2,"col4":200.20},{"col1":300,"col2":"c1","col3":300.3,"col4":300.30},{"col1":400,"col2":"d1","col3":400.4,"col4":400.40},{"col1":500,"col2":"e1","col3":500.5,"col4":500.50},{"col1":600,"col2":"f1","col3":600.6,"col4":600.60},{"col1":700,"col2":"g1","col3":700.7,"col4":700.70},{"col1":800,"col2":"h1","col3":800.8,"col4":800.80},{"col1":900,"col2":"i1","col3":900.9,"col4":900.90},{"col1":1000,"col2":"j1","col3":1000.1,"col4":1000.10},{"col1":1100,"col2":"k1","col3":1100.2,"col4":1100.20},{"col1":1200,"col2":"l1","col3":1200.3,"col4":1200.30}]
-14	[{"col1":-1,"col2":"neg_a","col3":-1.5,"col4":-1.50},{"col1":-2,"col2":"neg_b","col3":-2.5,"col4":-2.50},{"col1":-3,"col2":"neg_c","col3":-3.5,"col4":-3.50}]
-15	[{"col1":1,"col2":"short","col3":1,"col4":1.00},{"col1":2,"col2":"array","col3":2,"col4":2.00}]
-16	[{"col1":0,"col2":"zero","col3":0,"col4":0.00},{"col1":0,"col2":"zero","col3":0,"col4":0.00},{"col1":0,"col2":"zero","col3":0,"col4":0.00}]
-17	[{"col1":111,"col2":"str_111","col3":111.1,"col4":111.11},{"col1":222,"col2":"str_222","col3":222.2,"col4":222.22},{"col1":333,"col2":"str_333","col3":333.3,"col4":333.33},{"col1":444,"col2":"str_444","col3":444.4,"col4":444.44},{"col1":555,"col2":"str_555","col3":555.5,"col4":555.55}]
-18	[{"col1":1,"col2":"dup","col3":1.1,"col4":1.11},{"col1":1,"col2":"dup","col3":1.1,"col4":1.11},{"col1":1,"col2":"dup","col3":1.1,"col4":1.11}]
-19	[{"col1":7,"col2":"seven","col3":7.7,"col4":7.70},{"col1":8,"col2":"eight","col3":8.8,"col4":8.80},{"col1":9,"col2":"nine","col3":9.9,"col4":9.90},{"col1":10,"col2":"ten","col3":10.1,"col4":10.10},{"col1":11,"col2":"eleven","col3":11.1,"col4":11.10},{"col1":12,"col2":"twelve","col3":12.1,"col4":12.10},{"col1":13,"col2":"thirteen","col3":13.1,"col4":13.10},{"col1":14,"col2":"fourteen","col3":14.1,"col4":14.10},{"col1":15,"col2":"fifteen","col3":15.1,"col4":15.10}]
-20	[{"col1":42,"col2":"answer","col3":42,"col4":42.00}]
-
--- query 20
--- legacy
-pk	_col1
-1	[{"col1":1},{"col1":2},{"col1":3}]
-2	[{"col1":10},{"col1":20}]
-3	[{"col1":100}]
-4	[]
-5	[{"col1":1},{"col1":2},{"col1":3},{"col1":4},{"col1":5}]
-6	[{"col1":null},{"col1":null},{"col1":null}]
-7	[{"col1":1},{"col1":null},{"col1":3},{"col1":null},{"col1":5}]
-8	[{"col1":999},{"col1":888},{"col1":777},{"col1":666},{"col1":555},{"col1":444},{"col1":333},{"col1":222},{"col1":111},{"col1":0}]
-9	[{"col1":1}]
-10	[{"col1":2},{"col1":4},{"col1":6},{"col1":8},{"col1":10},{"col1":12}]
-11	[{"col1":3},{"col1":6},{"col1":9},{"col1":12},{"col1":15}]
-12	[{"col1":null}]
-13	[{"col1":100},{"col1":200},{"col1":300},{"col1":400},{"col1":500},{"col1":600},{"col1":700},{"col1":800},{"col1":900},{"col1":1000},{"col1":1100},{"col1":1200}]
-14	[{"col1":-1},{"col1":-2},{"col1":-3}]
-15	[{"col1":1},{"col1":2}]
-16	[{"col1":0},{"col1":0},{"col1":0}]
-17	[{"col1":111},{"col1":222},{"col1":333},{"col1":444},{"col1":555}]
-18	[{"col1":1},{"col1":1},{"col1":1}]
-19	[{"col1":7},{"col1":8},{"col1":9},{"col1":10},{"col1":11},{"col1":12},{"col1":13},{"col1":14},{"col1":15}]
-20	[{"col1":42}]
+5	[[1,"a",1.1,"1.11"],[2,"b",2.2,"2.22"],[3,"c",3.3,"3.33"],[4,"d",4.4,"4.44"],[5,"e",5.5,"5.55"]]
+6	[[null,null,null,null],[null,null,null,null],[null,null,null,null]]
+7	[[1,"x",1.1,"11.11"],[null,null,null,null],[3,"z",3.3,"33.33"],[null,null,null,null],[5,"w",5.5,"55.55"]]
+8	[[999,"z",99.9,"9.90"],[888,"y",88.8,"8.80"],[777,"x",77.7,"7.70"],[666,"w",66.6,"6.60"],[555,"v",55.5,"5.50"],[444,"u",44.4,"4.40"],[333,"t",33.3,"3.30"],[222,"s",22.2,"2.20"],[111,"r",11.1,"1.10"],[0,"q",0.0,"0.00"]]
+9	[[1,"one",1.0,"1.00"]]
+10	[[2,"two",2.0,"2.00"],[4,"four",4.0,"4.00"],[6,"six",6.0,"6.00"],[8,"eight",8.0,"8.00"],[10,"ten",10.0,"10.00"],[12,"twelve",12.0,"12.00"]]
+11	[[3,"three",3.0,"3.00"],[6,"six",6.0,"6.00"],[9,"nine",9.0,"9.00"],[12,"twelve",12.0,"12.00"],[15,"fifteen",15.0,"15.00"]]
+12	[[null,null,null,null]]
+13	[[100,"a1",100.1,"100.10"],[200,"b1",200.2,"200.20"],[300,"c1",300.3,"300.30"],[400,"d1",400.4,"400.40"],[500,"e1",500.5,"500.50"],[600,"f1",600.6,"600.60"],[700,"g1",700.7,"700.70"],[800,"h1",800.8,"800.80"],[900,"i1",900.9,"900.90"],[1000,"j1",1000.1,"1000.10"],[1100,"k1",1100.2,"1100.20"],[1200,"l1",1200.3,"1200.30"]]
+14	[[-1,"neg_a",-1.5,"-1.50"],[-2,"neg_b",-2.5,"-2.50"],[-3,"neg_c",-3.5,"-3.50"]]
+15	[[1,"short",1.0,"1.00"],[2,"array",2.0,"2.00"]]
+16	[[0,"zero",0.0,"0.00"],[0,"zero",0.0,"0.00"],[0,"zero",0.0,"0.00"]]
+17	[[111,"str_111",111.1,"111.11"],[222,"str_222",222.2,"222.22"],[333,"str_333",333.3,"333.33"],[444,"str_444",444.4,"444.44"],[555,"str_555",555.5,"555.55"]]
+18	[[1,"dup",1.1,"1.11"],[1,"dup",1.1,"1.11"],[1,"dup",1.1,"1.11"]]
+19	[[7,"seven",7.7,"7.70"],[8,"eight",8.8,"8.80"],[9,"nine",9.9,"9.90"],[10,"ten",10.1,"10.10"],[11,"eleven",11.1,"11.10"],[12,"twelve",12.1,"12.10"],[13,"thirteen",13.1,"13.10"],[14,"fourteen",14.1,"14.10"],[15,"fifteen",15.1,"15.10"]]
+20	[[42,"answer",42.0,"42.00"]]
 
 -- query 21
--- legacy
+-- types	bigint
 pk
 1
 2
@@ -279,7 +250,7 @@ pk
 20
 
 -- query 22
--- legacy
+-- types	bigint
 pk
 1
 2
@@ -303,197 +274,173 @@ pk
 20
 
 -- query 23
--- legacy
+-- types	bigint	array(row(bigint, varchar(6)))
 pk	_col1
-1	[{"col1":1,"col2":"const1"},{"col1":2,"col2":"const2"},{"col1":3,"col2":"const3"}]
-2	[{"col1":10,"col2":"const1"},{"col1":20,"col2":"const2"},{"col1":null,"col2":"const3"}]
-3	[{"col1":100,"col2":"const1"},{"col1":null,"col2":"const2"},{"col1":null,"col2":"const3"}]
-4	[{"col1":null,"col2":"const1"},{"col1":null,"col2":"const2"},{"col1":null,"col2":"const3"}]
-5	[{"col1":1,"col2":"const1"},{"col1":2,"col2":"const2"},{"col1":3,"col2":"const3"},{"col1":4,"col2":null},{"col1":5,"col2":null}]
-6	[{"col1":null,"col2":"const1"},{"col1":null,"col2":"const2"},{"col1":null,"col2":"const3"}]
-7	[{"col1":1,"col2":"const1"},{"col1":null,"col2":"const2"},{"col1":3,"col2":"const3"},{"col1":null,"col2":null},{"col1":5,"col2":null}]
-8	[{"col1":999,"col2":"const1"},{"col1":888,"col2":"const2"},{"col1":777,"col2":"const3"},{"col1":666,"col2":null},{"col1":555,"col2":null},{"col1":444,"col2":null},{"col1":333,"col2":null},{"col1":222,"col2":null},{"col1":111,"col2":null},{"col1":0,"col2":null}]
-9	[{"col1":1,"col2":"const1"},{"col1":null,"col2":"const2"},{"col1":null,"col2":"const3"}]
-10	[{"col1":2,"col2":"const1"},{"col1":4,"col2":"const2"},{"col1":6,"col2":"const3"},{"col1":8,"col2":null},{"col1":10,"col2":null},{"col1":12,"col2":null}]
-11	[{"col1":3,"col2":"const1"},{"col1":6,"col2":"const2"},{"col1":9,"col2":"const3"},{"col1":12,"col2":null},{"col1":15,"col2":null}]
-12	[{"col1":null,"col2":"const1"},{"col1":null,"col2":"const2"},{"col1":null,"col2":"const3"}]
-13	[{"col1":100,"col2":"const1"},{"col1":200,"col2":"const2"},{"col1":300,"col2":"const3"},{"col1":400,"col2":null},{"col1":500,"col2":null},{"col1":600,"col2":null},{"col1":700,"col2":null},{"col1":800,"col2":null},{"col1":900,"col2":null},{"col1":1000,"col2":null},{"col1":1100,"col2":null},{"col1":1200,"col2":null}]
-14	[{"col1":-1,"col2":"const1"},{"col1":-2,"col2":"const2"},{"col1":-3,"col2":"const3"}]
-15	[{"col1":1,"col2":"const1"},{"col1":2,"col2":"const2"},{"col1":null,"col2":"const3"}]
-16	[{"col1":0,"col2":"const1"},{"col1":0,"col2":"const2"},{"col1":0,"col2":"const3"}]
-17	[{"col1":111,"col2":"const1"},{"col1":222,"col2":"const2"},{"col1":333,"col2":"const3"},{"col1":444,"col2":null},{"col1":555,"col2":null}]
-18	[{"col1":1,"col2":"const1"},{"col1":1,"col2":"const2"},{"col1":1,"col2":"const3"}]
-19	[{"col1":7,"col2":"const1"},{"col1":8,"col2":"const2"},{"col1":9,"col2":"const3"},{"col1":10,"col2":null},{"col1":11,"col2":null},{"col1":12,"col2":null},{"col1":13,"col2":null},{"col1":14,"col2":null},{"col1":15,"col2":null}]
-20	[{"col1":42,"col2":"const1"},{"col1":null,"col2":"const2"},{"col1":null,"col2":"const3"}]
+1	[[1,"const1"],[2,"const2"],[3,"const3"]]
+2	[[10,"const1"],[20,"const2"],[null,"const3"]]
+3	[[100,"const1"],[null,"const2"],[null,"const3"]]
+4	[[null,"const1"],[null,"const2"],[null,"const3"]]
+5	[[1,"const1"],[2,"const2"],[3,"const3"],[4,null],[5,null]]
+6	[[null,"const1"],[null,"const2"],[null,"const3"]]
+7	[[1,"const1"],[null,"const2"],[3,"const3"],[null,null],[5,null]]
+8	[[999,"const1"],[888,"const2"],[777,"const3"],[666,null],[555,null],[444,null],[333,null],[222,null],[111,null],[0,null]]
+9	[[1,"const1"],[null,"const2"],[null,"const3"]]
+10	[[2,"const1"],[4,"const2"],[6,"const3"],[8,null],[10,null],[12,null]]
+11	[[3,"const1"],[6,"const2"],[9,"const3"],[12,null],[15,null]]
+12	[[null,"const1"],[null,"const2"],[null,"const3"]]
+13	[[100,"const1"],[200,"const2"],[300,"const3"],[400,null],[500,null],[600,null],[700,null],[800,null],[900,null],[1000,null],[1100,null],[1200,null]]
+14	[[-1,"const1"],[-2,"const2"],[-3,"const3"]]
+15	[[1,"const1"],[2,"const2"],[null,"const3"]]
+16	[[0,"const1"],[0,"const2"],[0,"const3"]]
+17	[[111,"const1"],[222,"const2"],[333,"const3"],[444,null],[555,null]]
+18	[[1,"const1"],[1,"const2"],[1,"const3"]]
+19	[[7,"const1"],[8,"const2"],[9,"const3"],[10,null],[11,null],[12,null],[13,null],[14,null],[15,null]]
+20	[[42,"const1"],[null,"const2"],[null,"const3"]]
 
 -- query 24
--- legacy
+-- types	bigint	array(row(varchar(7), varchar))
 pk	_col1
-1	[{"col1":"const_a","col2":"a"},{"col1":"const_b","col2":"b"},{"col1":"const_c","col2":"c"}]
-2	[{"col1":"const_a","col2":"hello"},{"col1":"const_b","col2":"world"},{"col1":"const_c","col2":null}]
-3	[{"col1":"const_a","col2":"single"},{"col1":"const_b","col2":null},{"col1":"const_c","col2":null}]
-4	[{"col1":"const_a","col2":null},{"col1":"const_b","col2":null},{"col1":"const_c","col2":null}]
-5	[{"col1":"const_a","col2":"a"},{"col1":"const_b","col2":"b"},{"col1":"const_c","col2":"c"},{"col1":null,"col2":"d"},{"col1":null,"col2":"e"}]
-6	[{"col1":"const_a","col2":null},{"col1":"const_b","col2":null},{"col1":"const_c","col2":null}]
-7	[{"col1":"const_a","col2":"x"},{"col1":"const_b","col2":null},{"col1":"const_c","col2":"z"},{"col1":null,"col2":null},{"col1":null,"col2":"w"}]
-8	[{"col1":"const_a","col2":"z"},{"col1":"const_b","col2":"y"},{"col1":"const_c","col2":"x"},{"col1":null,"col2":"w"},{"col1":null,"col2":"v"},{"col1":null,"col2":"u"},{"col1":null,"col2":"t"},{"col1":null,"col2":"s"},{"col1":null,"col2":"r"},{"col1":null,"col2":"q"}]
-9	[{"col1":"const_a","col2":"one"},{"col1":"const_b","col2":null},{"col1":"const_c","col2":null}]
-10	[{"col1":"const_a","col2":"two"},{"col1":"const_b","col2":"four"},{"col1":"const_c","col2":"six"},{"col1":null,"col2":"eight"},{"col1":null,"col2":"ten"},{"col1":null,"col2":"twelve"}]
-11	[{"col1":"const_a","col2":"three"},{"col1":"const_b","col2":"six"},{"col1":"const_c","col2":"nine"},{"col1":null,"col2":"twelve"},{"col1":null,"col2":"fifteen"}]
-12	[{"col1":"const_a","col2":null},{"col1":"const_b","col2":null},{"col1":"const_c","col2":null}]
-13	[{"col1":"const_a","col2":"a1"},{"col1":"const_b","col2":"b1"},{"col1":"const_c","col2":"c1"},{"col1":null,"col2":"d1"},{"col1":null,"col2":"e1"},{"col1":null,"col2":"f1"},{"col1":null,"col2":"g1"},{"col1":null,"col2":"h1"},{"col1":null,"col2":"i1"},{"col1":null,"col2":"j1"},{"col1":null,"col2":"k1"},{"col1":null,"col2":"l1"}]
-14	[{"col1":"const_a","col2":"neg_a"},{"col1":"const_b","col2":"neg_b"},{"col1":"const_c","col2":"neg_c"}]
-15	[{"col1":"const_a","col2":"short"},{"col1":"const_b","col2":"array"},{"col1":"const_c","col2":null}]
-16	[{"col1":"const_a","col2":"zero"},{"col1":"const_b","col2":"zero"},{"col1":"const_c","col2":"zero"}]
-17	[{"col1":"const_a","col2":"str_111"},{"col1":"const_b","col2":"str_222"},{"col1":"const_c","col2":"str_333"},{"col1":null,"col2":"str_444"},{"col1":null,"col2":"str_555"}]
-18	[{"col1":"const_a","col2":"dup"},{"col1":"const_b","col2":"dup"},{"col1":"const_c","col2":"dup"}]
-19	[{"col1":"const_a","col2":"seven"},{"col1":"const_b","col2":"eight"},{"col1":"const_c","col2":"nine"},{"col1":null,"col2":"ten"},{"col1":null,"col2":"eleven"},{"col1":null,"col2":"twelve"},{"col1":null,"col2":"thirteen"},{"col1":null,"col2":"fourteen"},{"col1":null,"col2":"fifteen"}]
-20	[{"col1":"const_a","col2":"answer"},{"col1":"const_b","col2":null},{"col1":"const_c","col2":null}]
+1	[["const_a","a"],["const_b","b"],["const_c","c"]]
+2	[["const_a","hello"],["const_b","world"],["const_c",null]]
+3	[["const_a","single"],["const_b",null],["const_c",null]]
+4	[["const_a",null],["const_b",null],["const_c",null]]
+5	[["const_a","a"],["const_b","b"],["const_c","c"],[null,"d"],[null,"e"]]
+6	[["const_a",null],["const_b",null],["const_c",null]]
+7	[["const_a","x"],["const_b",null],["const_c","z"],[null,null],[null,"w"]]
+8	[["const_a","z"],["const_b","y"],["const_c","x"],[null,"w"],[null,"v"],[null,"u"],[null,"t"],[null,"s"],[null,"r"],[null,"q"]]
+9	[["const_a","one"],["const_b",null],["const_c",null]]
+10	[["const_a","two"],["const_b","four"],["const_c","six"],[null,"eight"],[null,"ten"],[null,"twelve"]]
+11	[["const_a","three"],["const_b","six"],["const_c","nine"],[null,"twelve"],[null,"fifteen"]]
+12	[["const_a",null],["const_b",null],["const_c",null]]
+13	[["const_a","a1"],["const_b","b1"],["const_c","c1"],[null,"d1"],[null,"e1"],[null,"f1"],[null,"g1"],[null,"h1"],[null,"i1"],[null,"j1"],[null,"k1"],[null,"l1"]]
+14	[["const_a","neg_a"],["const_b","neg_b"],["const_c","neg_c"]]
+15	[["const_a","short"],["const_b","array"],["const_c",null]]
+16	[["const_a","zero"],["const_b","zero"],["const_c","zero"]]
+17	[["const_a","str_111"],["const_b","str_222"],["const_c","str_333"],[null,"str_444"],[null,"str_555"]]
+18	[["const_a","dup"],["const_b","dup"],["const_c","dup"]]
+19	[["const_a","seven"],["const_b","eight"],["const_c","nine"],[null,"ten"],[null,"eleven"],[null,"twelve"],[null,"thirteen"],[null,"fourteen"],[null,"fifteen"]]
+20	[["const_a","answer"],["const_b",null],["const_c",null]]
 
 -- query 25
--- legacy
+-- types	bigint	array(row(bigint, decimal(10, 2)))
 pk	_col1
-1	[{"col1":1,"col2":10.50},{"col1":2,"col2":20.75},{"col1":3,"col2":30.25}]
-2	[{"col1":10,"col2":100.00},{"col1":20,"col2":200.00}]
-3	[{"col1":100,"col2":999.99}]
+1	[[1,"10.50"],[2,"20.75"],[3,"30.25"]]
+2	[[10,"100.00"],[20,"200.00"]]
+3	[[100,"999.99"]]
 4	[]
-5	[{"col1":1,"col2":1.11},{"col1":2,"col2":2.22},{"col1":3,"col2":3.33},{"col1":4,"col2":4.44},{"col1":5,"col2":5.55}]
-6	[{"col1":null,"col2":null},{"col1":null,"col2":null},{"col1":null,"col2":null}]
-7	[{"col1":1,"col2":11.11},{"col1":null,"col2":null},{"col1":3,"col2":33.33},{"col1":null,"col2":null},{"col1":5,"col2":55.55}]
-8	[{"col1":999,"col2":9.90},{"col1":888,"col2":8.80},{"col1":777,"col2":7.70},{"col1":666,"col2":6.60},{"col1":555,"col2":5.50},{"col1":444,"col2":4.40},{"col1":333,"col2":3.30},{"col1":222,"col2":2.20},{"col1":111,"col2":1.10},{"col1":0,"col2":0.00}]
-9	[{"col1":1,"col2":1.00}]
-10	[{"col1":2,"col2":2.00},{"col1":4,"col2":4.00},{"col1":6,"col2":6.00},{"col1":8,"col2":8.00},{"col1":10,"col2":10.00},{"col1":12,"col2":12.00}]
-11	[{"col1":3,"col2":3.00},{"col1":6,"col2":6.00},{"col1":9,"col2":9.00},{"col1":12,"col2":12.00},{"col1":15,"col2":15.00}]
-12	[{"col1":null,"col2":null}]
-13	[{"col1":100,"col2":100.10},{"col1":200,"col2":200.20},{"col1":300,"col2":300.30},{"col1":400,"col2":400.40},{"col1":500,"col2":500.50},{"col1":600,"col2":600.60},{"col1":700,"col2":700.70},{"col1":800,"col2":800.80},{"col1":900,"col2":900.90},{"col1":1000,"col2":1000.10},{"col1":1100,"col2":1100.20},{"col1":1200,"col2":1200.30}]
-14	[{"col1":-1,"col2":-1.50},{"col1":-2,"col2":-2.50},{"col1":-3,"col2":-3.50}]
-15	[{"col1":1,"col2":1.00},{"col1":2,"col2":2.00}]
-16	[{"col1":0,"col2":0.00},{"col1":0,"col2":0.00},{"col1":0,"col2":0.00}]
-17	[{"col1":111,"col2":111.11},{"col1":222,"col2":222.22},{"col1":333,"col2":333.33},{"col1":444,"col2":444.44},{"col1":555,"col2":555.55}]
-18	[{"col1":1,"col2":1.11},{"col1":1,"col2":1.11},{"col1":1,"col2":1.11}]
-19	[{"col1":7,"col2":7.70},{"col1":8,"col2":8.80},{"col1":9,"col2":9.90},{"col1":10,"col2":10.10},{"col1":11,"col2":11.10},{"col1":12,"col2":12.10},{"col1":13,"col2":13.10},{"col1":14,"col2":14.10},{"col1":15,"col2":15.10}]
-20	[{"col1":42,"col2":42.00}]
+5	[[1,"1.11"],[2,"2.22"],[3,"3.33"],[4,"4.44"],[5,"5.55"]]
+6	[[null,null],[null,null],[null,null]]
+7	[[1,"11.11"],[null,null],[3,"33.33"],[null,null],[5,"55.55"]]
+8	[[999,"9.90"],[888,"8.80"],[777,"7.70"],[666,"6.60"],[555,"5.50"],[444,"4.40"],[333,"3.30"],[222,"2.20"],[111,"1.10"],[0,"0.00"]]
+9	[[1,"1.00"]]
+10	[[2,"2.00"],[4,"4.00"],[6,"6.00"],[8,"8.00"],[10,"10.00"],[12,"12.00"]]
+11	[[3,"3.00"],[6,"6.00"],[9,"9.00"],[12,"12.00"],[15,"15.00"]]
+12	[[null,null]]
+13	[[100,"100.10"],[200,"200.20"],[300,"300.30"],[400,"400.40"],[500,"500.50"],[600,"600.60"],[700,"700.70"],[800,"800.80"],[900,"900.90"],[1000,"1000.10"],[1100,"1100.20"],[1200,"1200.30"]]
+14	[[-1,"-1.50"],[-2,"-2.50"],[-3,"-3.50"]]
+15	[[1,"1.00"],[2,"2.00"]]
+16	[[0,"0.00"],[0,"0.00"],[0,"0.00"]]
+17	[[111,"111.11"],[222,"222.22"],[333,"333.33"],[444,"444.44"],[555,"555.55"]]
+18	[[1,"1.11"],[1,"1.11"],[1,"1.11"]]
+19	[[7,"7.70"],[8,"8.80"],[9,"9.90"],[10,"10.10"],[11,"11.10"],[12,"12.10"],[13,"13.10"],[14,"14.10"],[15,"15.10"]]
+20	[[42,"42.00"]]
 
 -- query 26
--- legacy
+-- types	bigint	array(row(bigint, varchar))
 pk	zipped
-6	[{"col1":null,"col2":null},{"col1":null,"col2":null},{"col1":null,"col2":null}]
-7	[{"col1":1,"col2":"x"},{"col1":null,"col2":null},{"col1":3,"col2":"z"},{"col1":null,"col2":null},{"col1":5,"col2":"w"}]
-8	[{"col1":999,"col2":"z"},{"col1":888,"col2":"y"},{"col1":777,"col2":"x"},{"col1":666,"col2":"w"},{"col1":555,"col2":"v"},{"col1":444,"col2":"u"},{"col1":333,"col2":"t"},{"col1":222,"col2":"s"},{"col1":111,"col2":"r"},{"col1":0,"col2":"q"}]
-9	[{"col1":1,"col2":"one"}]
-10	[{"col1":2,"col2":"two"},{"col1":4,"col2":"four"},{"col1":6,"col2":"six"},{"col1":8,"col2":"eight"},{"col1":10,"col2":"ten"},{"col1":12,"col2":"twelve"}]
-11	[{"col1":3,"col2":"three"},{"col1":6,"col2":"six"},{"col1":9,"col2":"nine"},{"col1":12,"col2":"twelve"},{"col1":15,"col2":"fifteen"}]
-12	[{"col1":null,"col2":null}]
-13	[{"col1":100,"col2":"a1"},{"col1":200,"col2":"b1"},{"col1":300,"col2":"c1"},{"col1":400,"col2":"d1"},{"col1":500,"col2":"e1"},{"col1":600,"col2":"f1"},{"col1":700,"col2":"g1"},{"col1":800,"col2":"h1"},{"col1":900,"col2":"i1"},{"col1":1000,"col2":"j1"},{"col1":1100,"col2":"k1"},{"col1":1200,"col2":"l1"}]
-14	[{"col1":-1,"col2":"neg_a"},{"col1":-2,"col2":"neg_b"},{"col1":-3,"col2":"neg_c"}]
-15	[{"col1":1,"col2":"short"},{"col1":2,"col2":"array"}]
+6	[[null,null],[null,null],[null,null]]
+7	[[1,"x"],[null,null],[3,"z"],[null,null],[5,"w"]]
+8	[[999,"z"],[888,"y"],[777,"x"],[666,"w"],[555,"v"],[444,"u"],[333,"t"],[222,"s"],[111,"r"],[0,"q"]]
+9	[[1,"one"]]
+10	[[2,"two"],[4,"four"],[6,"six"],[8,"eight"],[10,"ten"],[12,"twelve"]]
+11	[[3,"three"],[6,"six"],[9,"nine"],[12,"twelve"],[15,"fifteen"]]
+12	[[null,null]]
+13	[[100,"a1"],[200,"b1"],[300,"c1"],[400,"d1"],[500,"e1"],[600,"f1"],[700,"g1"],[800,"h1"],[900,"i1"],[1000,"j1"],[1100,"k1"],[1200,"l1"]]
+14	[[-1,"neg_a"],[-2,"neg_b"],[-3,"neg_c"]]
+15	[[1,"short"],[2,"array"]]
 
 -- query 27
--- legacy
+-- types	bigint	array(row(varchar, double, decimal(10, 2)))
 pk	_col1
-1	[{"col1":"a","col2":1.1,"col3":10.50},{"col1":"b","col2":2.2,"col3":20.75},{"col1":"c","col2":3.3,"col3":30.25}]
-2	[{"col1":"hello","col2":10.5,"col3":100.00},{"col1":"world","col2":20.5,"col3":200.00}]
-3	[{"col1":"single","col2":99.9,"col3":999.99}]
+1	[["a",1.1,"10.50"],["b",2.2,"20.75"],["c",3.3,"30.25"]]
+2	[["hello",10.5,"100.00"],["world",20.5,"200.00"]]
+3	[["single",99.9,"999.99"]]
 4	[]
-5	[{"col1":"a","col2":1.1,"col3":1.11},{"col1":"b","col2":2.2,"col3":2.22},{"col1":"c","col2":3.3,"col3":3.33},{"col1":"d","col2":4.4,"col3":4.44},{"col1":"e","col2":5.5,"col3":5.55}]
-6	[{"col1":null,"col2":null,"col3":null},{"col1":null,"col2":null,"col3":null},{"col1":null,"col2":null,"col3":null}]
-7	[{"col1":"x","col2":1.1,"col3":11.11},{"col1":null,"col2":null,"col3":null},{"col1":"z","col2":3.3,"col3":33.33},{"col1":null,"col2":null,"col3":null},{"col1":"w","col2":5.5,"col3":55.55}]
-8	[{"col1":"z","col2":99.9,"col3":9.90},{"col1":"y","col2":88.8,"col3":8.80},{"col1":"x","col2":77.7,"col3":7.70},{"col1":"w","col2":66.6,"col3":6.60},{"col1":"v","col2":55.5,"col3":5.50},{"col1":"u","col2":44.4,"col3":4.40},{"col1":"t","col2":33.3,"col3":3.30},{"col1":"s","col2":22.2,"col3":2.20},{"col1":"r","col2":11.1,"col3":1.10},{"col1":"q","col2":0,"col3":0.00}]
-9	[{"col1":"one","col2":1,"col3":1.00}]
-10	[{"col1":"two","col2":2,"col3":2.00},{"col1":"four","col2":4,"col3":4.00},{"col1":"six","col2":6,"col3":6.00},{"col1":"eight","col2":8,"col3":8.00},{"col1":"ten","col2":10,"col3":10.00},{"col1":"twelve","col2":12,"col3":12.00}]
-11	[{"col1":"three","col2":3,"col3":3.00},{"col1":"six","col2":6,"col3":6.00},{"col1":"nine","col2":9,"col3":9.00},{"col1":"twelve","col2":12,"col3":12.00},{"col1":"fifteen","col2":15,"col3":15.00}]
-12	[{"col1":null,"col2":null,"col3":null}]
-13	[{"col1":"a1","col2":100.1,"col3":100.10},{"col1":"b1","col2":200.2,"col3":200.20},{"col1":"c1","col2":300.3,"col3":300.30},{"col1":"d1","col2":400.4,"col3":400.40},{"col1":"e1","col2":500.5,"col3":500.50},{"col1":"f1","col2":600.6,"col3":600.60},{"col1":"g1","col2":700.7,"col3":700.70},{"col1":"h1","col2":800.8,"col3":800.80},{"col1":"i1","col2":900.9,"col3":900.90},{"col1":"j1","col2":1000.1,"col3":1000.10},{"col1":"k1","col2":1100.2,"col3":1100.20},{"col1":"l1","col2":1200.3,"col3":1200.30}]
-14	[{"col1":"neg_a","col2":-1.5,"col3":-1.50},{"col1":"neg_b","col2":-2.5,"col3":-2.50},{"col1":"neg_c","col2":-3.5,"col3":-3.50}]
-15	[{"col1":"short","col2":1,"col3":1.00},{"col1":"array","col2":2,"col3":2.00}]
-16	[{"col1":"zero","col2":0,"col3":0.00},{"col1":"zero","col2":0,"col3":0.00},{"col1":"zero","col2":0,"col3":0.00}]
-17	[{"col1":"str_111","col2":111.1,"col3":111.11},{"col1":"str_222","col2":222.2,"col3":222.22},{"col1":"str_333","col2":333.3,"col3":333.33},{"col1":"str_444","col2":444.4,"col3":444.44},{"col1":"str_555","col2":555.5,"col3":555.55}]
-18	[{"col1":"dup","col2":1.1,"col3":1.11},{"col1":"dup","col2":1.1,"col3":1.11},{"col1":"dup","col2":1.1,"col3":1.11}]
-19	[{"col1":"seven","col2":7.7,"col3":7.70},{"col1":"eight","col2":8.8,"col3":8.80},{"col1":"nine","col2":9.9,"col3":9.90},{"col1":"ten","col2":10.1,"col3":10.10},{"col1":"eleven","col2":11.1,"col3":11.10},{"col1":"twelve","col2":12.1,"col3":12.10},{"col1":"thirteen","col2":13.1,"col3":13.10},{"col1":"fourteen","col2":14.1,"col3":14.10},{"col1":"fifteen","col2":15.1,"col3":15.10}]
-20	[{"col1":"answer","col2":42,"col3":42.00}]
+5	[["a",1.1,"1.11"],["b",2.2,"2.22"],["c",3.3,"3.33"],["d",4.4,"4.44"],["e",5.5,"5.55"]]
+6	[[null,null,null],[null,null,null],[null,null,null]]
+7	[["x",1.1,"11.11"],[null,null,null],["z",3.3,"33.33"],[null,null,null],["w",5.5,"55.55"]]
+8	[["z",99.9,"9.90"],["y",88.8,"8.80"],["x",77.7,"7.70"],["w",66.6,"6.60"],["v",55.5,"5.50"],["u",44.4,"4.40"],["t",33.3,"3.30"],["s",22.2,"2.20"],["r",11.1,"1.10"],["q",0.0,"0.00"]]
+9	[["one",1.0,"1.00"]]
+10	[["two",2.0,"2.00"],["four",4.0,"4.00"],["six",6.0,"6.00"],["eight",8.0,"8.00"],["ten",10.0,"10.00"],["twelve",12.0,"12.00"]]
+11	[["three",3.0,"3.00"],["six",6.0,"6.00"],["nine",9.0,"9.00"],["twelve",12.0,"12.00"],["fifteen",15.0,"15.00"]]
+12	[[null,null,null]]
+13	[["a1",100.1,"100.10"],["b1",200.2,"200.20"],["c1",300.3,"300.30"],["d1",400.4,"400.40"],["e1",500.5,"500.50"],["f1",600.6,"600.60"],["g1",700.7,"700.70"],["h1",800.8,"800.80"],["i1",900.9,"900.90"],["j1",1000.1,"1000.10"],["k1",1100.2,"1100.20"],["l1",1200.3,"1200.30"]]
+14	[["neg_a",-1.5,"-1.50"],["neg_b",-2.5,"-2.50"],["neg_c",-3.5,"-3.50"]]
+15	[["short",1.0,"1.00"],["array",2.0,"2.00"]]
+16	[["zero",0.0,"0.00"],["zero",0.0,"0.00"],["zero",0.0,"0.00"]]
+17	[["str_111",111.1,"111.11"],["str_222",222.2,"222.22"],["str_333",333.3,"333.33"],["str_444",444.4,"444.44"],["str_555",555.5,"555.55"]]
+18	[["dup",1.1,"1.11"],["dup",1.1,"1.11"],["dup",1.1,"1.11"]]
+19	[["seven",7.7,"7.70"],["eight",8.8,"8.80"],["nine",9.9,"9.90"],["ten",10.1,"10.10"],["eleven",11.1,"11.10"],["twelve",12.1,"12.10"],["thirteen",13.1,"13.10"],["fourteen",14.1,"14.10"],["fifteen",15.1,"15.10"]]
+20	[["answer",42.0,"42.00"]]
 
 -- query 28
--- legacy
+-- types	bigint	array(bigint)	array(varchar)	array(row(bigint, varchar, double))
 pk	int_array	str_array	_col3
-1	[1,2,3]	["a","b","c"]	[{"col1":1,"col2":"a","col3":1.1},{"col1":2,"col2":"b","col3":2.2},{"col1":3,"col2":"c","col3":3.3}]
-6	[null,null,null]	[null,null,null]	[{"col1":null,"col2":null,"col3":null},{"col1":null,"col2":null,"col3":null},{"col1":null,"col2":null,"col3":null}]
-7	[1,null,3,null,5]	["x",null,"z",null,"w"]	[{"col1":1,"col2":"x","col3":1.1},{"col1":null,"col2":null,"col3":null},{"col1":3,"col2":"z","col3":3.3},{"col1":null,"col2":null,"col3":null},{"col1":5,"col2":"w","col3":5.5}]
-12	[null]	[null]	[{"col1":null,"col2":null,"col3":null}]
-
--- query 29
--- legacy
-pk	conditional_zip
-1	[{"col1":"1","col2":"a"},{"col1":"2","col2":"b"},{"col1":"3","col2":"c"}]
-2	[{"col1":"10","col2":"hello"},{"col1":"20","col2":"world"}]
-3	[{"col1":"100","col2":"single"}]
-4	[]
-5	[{"col1":"1","col2":"a"},{"col1":"2","col2":"b"},{"col1":"3","col2":"c"},{"col1":"4","col2":"d"},{"col1":"5","col2":"e"}]
-6	[{"col1":null,"col2":null},{"col1":null,"col2":null},{"col1":null,"col2":null}]
-7	[{"col1":"x","col2":"1.1"},{"col1":null,"col2":null},{"col1":"z","col2":"3.3"},{"col1":null,"col2":null},{"col1":"w","col2":"5.5"}]
-8	[{"col1":"z","col2":"99.9"},{"col1":"y","col2":"88.8"},{"col1":"x","col2":"77.7"},{"col1":"w","col2":"66.6"},{"col1":"v","col2":"55.5"},{"col1":"u","col2":"44.4"},{"col1":"t","col2":"33.3"},{"col1":"s","col2":"22.2"},{"col1":"r","col2":"11.1"},{"col1":"q","col2":"0"}]
-9	[{"col1":"one","col2":"1"}]
-10	[{"col1":"two","col2":"2"},{"col1":"four","col2":"4"},{"col1":"six","col2":"6"},{"col1":"eight","col2":"8"},{"col1":"ten","col2":"10"},{"col1":"twelve","col2":"12"}]
-11	[{"col1":"3","col2":"3.00"},{"col1":"6","col2":"6.00"},{"col1":"9","col2":"9.00"},{"col1":"12","col2":"12.00"},{"col1":"15","col2":"15.00"}]
-12	[{"col1":null,"col2":null}]
-13	[{"col1":"100.1","col2":"100.10"},{"col1":"200.2","col2":"200.20"},{"col1":"300.3","col2":"300.30"},{"col1":"400.4","col2":"400.40"},{"col1":"500.5","col2":"500.50"},{"col1":"600.6","col2":"600.60"},{"col1":"700.7","col2":"700.70"},{"col1":"800.8","col2":"800.80"},{"col1":"900.9","col2":"900.90"},{"col1":"1000.1","col2":"1000.10"},{"col1":"1100.2","col2":"1100.20"},{"col1":"1200.3","col2":"1200.30"}]
-14	[{"col1":"-1.5","col2":"-1.50"},{"col1":"-2.5","col2":"-2.50"},{"col1":"-3.5","col2":"-3.50"}]
-15	[{"col1":"1","col2":"1.00"},{"col1":"2","col2":"2.00"}]
-16	[{"col1":"0","col2":"0.00"},{"col1":"0","col2":"0.00"},{"col1":"0","col2":"0.00"}]
-17	[{"col1":"111.1","col2":"111.11"},{"col1":"222.2","col2":"222.22"},{"col1":"333.3","col2":"333.33"},{"col1":"444.4","col2":"444.44"},{"col1":"555.5","col2":"555.55"}]
-18	[{"col1":"1.1","col2":"1.11"},{"col1":"1.1","col2":"1.11"},{"col1":"1.1","col2":"1.11"}]
-19	[{"col1":"7.7","col2":"7.70"},{"col1":"8.8","col2":"8.80"},{"col1":"9.9","col2":"9.90"},{"col1":"10.1","col2":"10.10"},{"col1":"11.1","col2":"11.10"},{"col1":"12.1","col2":"12.10"},{"col1":"13.1","col2":"13.10"},{"col1":"14.1","col2":"14.10"},{"col1":"15.1","col2":"15.10"}]
-20	[{"col1":"42","col2":"42.00"}]
+1	[1,2,3]	["a","b","c"]	[[1,"a",1.1],[2,"b",2.2],[3,"c",3.3]]
+6	[null,null,null]	[null,null,null]	[[null,null,null],[null,null,null],[null,null,null]]
+7	[1,null,3,null,5]	["x",null,"z",null,"w"]	[[1,"x",1.1],[null,null,null],[3,"z",3.3],[null,null,null],[5,"w",5.5]]
+12	[null]	[null]	[[null,null,null]]
 
 -- query 30
--- legacy
+-- types	bigint	array(row(bigint, varchar))
 pk	_col1
-1	[{"col1":1,"col2":null},{"col1":2,"col2":null},{"col1":3,"col2":null}]
-2	[{"col1":10,"col2":null},{"col1":20,"col2":null}]
-3	[{"col1":100,"col2":null}]
+1	[[1,null],[2,null],[3,null]]
+2	[[10,null],[20,null]]
+3	[[100,null]]
 4	[]
-5	[{"col1":1,"col2":null},{"col1":2,"col2":null},{"col1":3,"col2":null},{"col1":4,"col2":null},{"col1":5,"col2":null}]
-6	[{"col1":null,"col2":null},{"col1":null,"col2":null},{"col1":null,"col2":null}]
-7	[{"col1":1,"col2":null},{"col1":null,"col2":null},{"col1":3,"col2":null},{"col1":null,"col2":null},{"col1":5,"col2":null}]
-8	[{"col1":999,"col2":null},{"col1":888,"col2":null},{"col1":777,"col2":null},{"col1":666,"col2":null},{"col1":555,"col2":null},{"col1":444,"col2":null},{"col1":333,"col2":null},{"col1":222,"col2":null},{"col1":111,"col2":null},{"col1":0,"col2":null}]
-9	[{"col1":1,"col2":null}]
-10	[{"col1":2,"col2":null},{"col1":4,"col2":null},{"col1":6,"col2":null},{"col1":8,"col2":null},{"col1":10,"col2":null},{"col1":12,"col2":null}]
-11	[{"col1":3,"col2":"three"},{"col1":6,"col2":"six"},{"col1":9,"col2":"nine"},{"col1":12,"col2":"twelve"},{"col1":15,"col2":"fifteen"}]
-12	[{"col1":null,"col2":null}]
-13	[{"col1":100,"col2":"a1"},{"col1":200,"col2":"b1"},{"col1":300,"col2":"c1"},{"col1":400,"col2":"d1"},{"col1":500,"col2":"e1"},{"col1":600,"col2":"f1"},{"col1":700,"col2":"g1"},{"col1":800,"col2":"h1"},{"col1":900,"col2":"i1"},{"col1":1000,"col2":"j1"},{"col1":1100,"col2":"k1"},{"col1":1200,"col2":"l1"}]
-14	[{"col1":-1,"col2":"neg_a"},{"col1":-2,"col2":"neg_b"},{"col1":-3,"col2":"neg_c"}]
-15	[{"col1":1,"col2":"short"},{"col1":2,"col2":"array"}]
-16	[{"col1":0,"col2":"zero"},{"col1":0,"col2":"zero"},{"col1":0,"col2":"zero"}]
-17	[{"col1":111,"col2":"str_111"},{"col1":222,"col2":"str_222"},{"col1":333,"col2":"str_333"},{"col1":444,"col2":"str_444"},{"col1":555,"col2":"str_555"}]
-18	[{"col1":1,"col2":"dup"},{"col1":1,"col2":"dup"},{"col1":1,"col2":"dup"}]
-19	[{"col1":7,"col2":"seven"},{"col1":8,"col2":"eight"},{"col1":9,"col2":"nine"},{"col1":10,"col2":"ten"},{"col1":11,"col2":"eleven"},{"col1":12,"col2":"twelve"},{"col1":13,"col2":"thirteen"},{"col1":14,"col2":"fourteen"},{"col1":15,"col2":"fifteen"}]
-20	[{"col1":42,"col2":"answer"}]
+5	[[1,null],[2,null],[3,null],[4,null],[5,null]]
+6	[[null,null],[null,null],[null,null]]
+7	[[1,null],[null,null],[3,null],[null,null],[5,null]]
+8	[[999,null],[888,null],[777,null],[666,null],[555,null],[444,null],[333,null],[222,null],[111,null],[0,null]]
+9	[[1,null]]
+10	[[2,null],[4,null],[6,null],[8,null],[10,null],[12,null]]
+11	[[3,"three"],[6,"six"],[9,"nine"],[12,"twelve"],[15,"fifteen"]]
+12	[[null,null]]
+13	[[100,"a1"],[200,"b1"],[300,"c1"],[400,"d1"],[500,"e1"],[600,"f1"],[700,"g1"],[800,"h1"],[900,"i1"],[1000,"j1"],[1100,"k1"],[1200,"l1"]]
+14	[[-1,"neg_a"],[-2,"neg_b"],[-3,"neg_c"]]
+15	[[1,"short"],[2,"array"]]
+16	[[0,"zero"],[0,"zero"],[0,"zero"]]
+17	[[111,"str_111"],[222,"str_222"],[333,"str_333"],[444,"str_444"],[555,"str_555"]]
+18	[[1,"dup"],[1,"dup"],[1,"dup"]]
+19	[[7,"seven"],[8,"eight"],[9,"nine"],[10,"ten"],[11,"eleven"],[12,"twelve"],[13,"thirteen"],[14,"fourteen"],[15,"fifteen"]]
+20	[[42,"answer"]]
 
 -- query 31
--- legacy
+-- types	bigint	array(row(varchar, varchar))
 pk	_col1
-1	[{"col1":"1","col2":"a"},{"col1":"2","col2":"b"},{"col1":"3","col2":"c"}]
-2	[{"col1":"10","col2":"hello"},{"col1":"20","col2":"world"}]
-3	[{"col1":"100","col2":"single"}]
+1	[["1","a"],["2","b"],["3","c"]]
+2	[["10","hello"],["20","world"]]
+3	[["100","single"]]
 4	[]
-5	[{"col1":"1","col2":"a"},{"col1":"2","col2":"b"},{"col1":"3","col2":"c"},{"col1":"4","col2":"d"},{"col1":"5","col2":"e"}]
-6	[{"col1":null,"col2":null},{"col1":null,"col2":null},{"col1":null,"col2":null}]
-7	[{"col1":"1","col2":"x"},{"col1":null,"col2":null},{"col1":"3","col2":"z"},{"col1":null,"col2":null},{"col1":"5","col2":"w"}]
-8	[{"col1":"999","col2":"z"},{"col1":"888","col2":"y"},{"col1":"777","col2":"x"},{"col1":"666","col2":"w"},{"col1":"555","col2":"v"},{"col1":"444","col2":"u"},{"col1":"333","col2":"t"},{"col1":"222","col2":"s"},{"col1":"111","col2":"r"},{"col1":"0","col2":"q"}]
-9	[{"col1":"1","col2":"one"}]
-10	[{"col1":"2","col2":"two"},{"col1":"4","col2":"four"},{"col1":"6","col2":"six"},{"col1":"8","col2":"eight"},{"col1":"10","col2":"ten"},{"col1":"12","col2":"twelve"}]
-11	[{"col1":"3","col2":"three"},{"col1":"6","col2":"six"},{"col1":"9","col2":"nine"},{"col1":"12","col2":"twelve"},{"col1":"15","col2":"fifteen"}]
-12	[{"col1":null,"col2":null}]
-13	[{"col1":"100","col2":"a1"},{"col1":"200","col2":"b1"},{"col1":"300","col2":"c1"},{"col1":"400","col2":"d1"},{"col1":"500","col2":"e1"},{"col1":"600","col2":"f1"},{"col1":"700","col2":"g1"},{"col1":"800","col2":"h1"},{"col1":"900","col2":"i1"},{"col1":"1000","col2":"j1"},{"col1":"1100","col2":"k1"},{"col1":"1200","col2":"l1"}]
-14	[{"col1":"-1","col2":"neg_a"},{"col1":"-2","col2":"neg_b"},{"col1":"-3","col2":"neg_c"}]
-15	[{"col1":"1","col2":"short"},{"col1":"2","col2":"array"}]
-16	[{"col1":"0","col2":"zero"},{"col1":"0","col2":"zero"},{"col1":"0","col2":"zero"}]
-17	[{"col1":"111","col2":"str_111"},{"col1":"222","col2":"str_222"},{"col1":"333","col2":"str_333"},{"col1":"444","col2":"str_444"},{"col1":"555","col2":"str_555"}]
-18	[{"col1":"1","col2":"dup"},{"col1":"1","col2":"dup"},{"col1":"1","col2":"dup"}]
-19	[{"col1":"7","col2":"seven"},{"col1":"8","col2":"eight"},{"col1":"9","col2":"nine"},{"col1":"10","col2":"ten"},{"col1":"11","col2":"eleven"},{"col1":"12","col2":"twelve"},{"col1":"13","col2":"thirteen"},{"col1":"14","col2":"fourteen"},{"col1":"15","col2":"fifteen"}]
-20	[{"col1":"42","col2":"answer"}]
+5	[["1","a"],["2","b"],["3","c"],["4","d"],["5","e"]]
+6	[[null,null],[null,null],[null,null]]
+7	[["1","x"],[null,null],["3","z"],[null,null],["5","w"]]
+8	[["999","z"],["888","y"],["777","x"],["666","w"],["555","v"],["444","u"],["333","t"],["222","s"],["111","r"],["0","q"]]
+9	[["1","one"]]
+10	[["2","two"],["4","four"],["6","six"],["8","eight"],["10","ten"],["12","twelve"]]
+11	[["3","three"],["6","six"],["9","nine"],["12","twelve"],["15","fifteen"]]
+12	[[null,null]]
+13	[["100","a1"],["200","b1"],["300","c1"],["400","d1"],["500","e1"],["600","f1"],["700","g1"],["800","h1"],["900","i1"],["1000","j1"],["1100","k1"],["1200","l1"]]
+14	[["-1","neg_a"],["-2","neg_b"],["-3","neg_c"]]
+15	[["1","short"],["2","array"]]
+16	[["0","zero"],["0","zero"],["0","zero"]]
+17	[["111","str_111"],["222","str_222"],["333","str_333"],["444","str_444"],["555","str_555"]]
+18	[["1","dup"],["1","dup"],["1","dup"]]
+19	[["7","seven"],["8","eight"],["9","nine"],["10","ten"],["11","eleven"],["12","twelve"],["13","thirteen"],["14","fourteen"],["15","fifteen"]]
+20	[["42","answer"]]
 
 -- query 32
--- legacy
+-- types	bigint	bigint
 pk	zip_length
 1	3
 2	2
@@ -517,11 +464,11 @@ pk	zip_length
 20	1
 
 -- query 33
--- legacy
+-- types	array(row(integer, varchar(1)))
 _col0
-[{"col1":1,"col2":"a"},{"col1":2,"col2":"b"}]
+[[1,"a"],[2,"b"]]
 
 -- query 34
--- legacy
+-- types	bigint	array(row(integer, varchar(4)))
 cnt	_col1
-20	[{"col1":1,"col2":"test"}]
+20	[[1,"test"]]

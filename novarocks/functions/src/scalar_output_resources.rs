@@ -233,3 +233,17 @@ impl ScalarOutputResources {
         Ok(bytes)
     }
 }
+
+/// Independently built flat Arrow values reserve their actual buffer demand,
+/// Arrow's rounded validity capacity, and the shared custody metadata envelope.
+pub(crate) fn flat_arrow_output_peak(buffers: usize, rows: usize) -> Result<usize, KernelFailure> {
+    let valid_bytes = add(rows / 8, usize::from(!rows.is_multiple_of(8)))?;
+    let validity = add(valid_bytes, 63)? / 64 * 64;
+    let metadata = crate::arrow_result_custody::custody_type_metadata_upper_bound(1)?;
+    add(add(buffers, validity)?, metadata)
+}
+
+pub(crate) fn flat_utf8_output_peak(payload: usize, rows: usize) -> Result<usize, KernelFailure> {
+    let offsets = mul(add(rows, 1)?, size_of::<i32>())?;
+    flat_arrow_output_peak(add(payload, offsets)?, rows)
+}

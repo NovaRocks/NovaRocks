@@ -16,7 +16,7 @@
 // under the License.
 
 use arrow_array::{Array, ArrayRef, Date32Array, Int32Array, Int64Array, StringArray};
-use novarocks_type_contract::{FunctionValueType, SemanticParameterValue};
+use novarocks_type_contract::{FunctionValueType, SemanticParameterValue, TemporalType};
 use novarocks_value_arrays::decode::PreparedTemporalArray;
 
 use crate::builtin::temporal_output::TemporalOutputBuilder;
@@ -32,7 +32,68 @@ pub(super) struct PreparedTemporalCast {
     pair: Pair,
     facts: Facts,
     safe: bool,
-    lossless: bool,
+    lossless: Option<LosslessTemporalWiden>,
+}
+
+/// A same-family precision increase changes no temporal value, even when
+/// the exact result declaration uses a different Arrow carrier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LosslessTemporalWiden {
+    source: TemporalType,
+    target: TemporalType,
+}
+
+impl LosslessTemporalWiden {
+    pub(crate) fn bind(source: &FunctionValueType, target: &FunctionValueType) -> Option<Self> {
+        let source = source.value_type().temporal()?;
+        let target = target.value_type().temporal()?;
+        source
+            .is_lossless_widening_to(target)
+            .then_some(Self { source, target })
+    }
+
+    pub(crate) fn evaluate(
+        self,
+        argument: EvaluatedArgument<'_>,
+        selection: Selection<'_>,
+        nullable: bool,
+        inherited: &[RowDataError],
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<ArrayRef, KernelFailure> {
+        let source = PreparedTemporalArray::bind(self.source, argument.array().as_ref(), nullable)
+            .map_err(|_| invalid("temporal cast input differs from its frozen source"))?;
+        work.flush()?;
+        let mut output = TemporalOutputBuilder::new(Type::Temporal(self.target), selection.len())?;
+        work.flush()?;
+        let mut inherited = inherited.iter().peekable();
+        for (ordinal, logical_row) in selection.iter().enumerate() {
+            work.step()?;
+            if inherited
+                .next_if(|error| error.selected_ordinal() == ordinal)
+                .is_some()
+            {
+                output.null();
+                continue;
+            }
+            let row = argument.value_row(ordinal, logical_row);
+            let value = source
+                .value(row)
+                .map_err(|_| invalid("temporal cast encountered an invalid frozen carrier"))?;
+            match value {
+                Some(value) => output.temporal(self.target, value)?,
+                None => output.null(),
+            }
+        }
+        if inherited.next().is_some() {
+            return Err(invalid(
+                "temporal widening journal exceeds its selected domain",
+            ));
+        }
+        work.flush()?;
+        let output = output.finish();
+        work.flush()?;
+        Ok(output)
+    }
 }
 
 impl PreparedTemporalCast {
@@ -65,11 +126,20 @@ impl PreparedTemporalCast {
                 }
             }
         }
+        let lossless = if overload == value_conversion::TEMPORAL_WIDEN {
+            Some(
+                LosslessTemporalWiden::bind(source, contract.result_type()).ok_or_else(|| {
+                    invalid("temporal widening differs from its selected type pair")
+                })?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             pair,
             facts,
             safe,
-            lossless: overload == value_conversion::TEMPORAL_WIDEN,
+            lossless,
         })
     }
 
@@ -81,6 +151,9 @@ impl PreparedTemporalCast {
         errors: &mut Vec<RowDataError>,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<ArrayRef, KernelFailure> {
+        if let Some(lossless) = self.lossless {
+            return lossless.evaluate(argument, selection, nullable, &[], work);
+        }
         let source = Source::bind(self.pair.source, argument.array().as_ref(), nullable)?;
         work.flush()?;
         let mut output = TemporalOutputBuilder::new(self.pair.target, selection.len())?;
@@ -92,18 +165,6 @@ impl PreparedTemporalCast {
                 output.null();
                 continue;
             };
-            if self.lossless {
-                let Input::Temporal(value) = value else {
-                    return Err(invalid("temporal widening has a foreign selected source"));
-                };
-                let target = self
-                    .pair
-                    .target
-                    .temporal()
-                    .ok_or_else(|| invalid("temporal widening has no target declaration"))?;
-                output.temporal(target, value)?;
-                continue;
-            }
             if let Input::Text(text) = value {
                 for _ in text.as_bytes().chunks(32) {
                     work.step()?;
@@ -119,10 +180,7 @@ impl PreparedTemporalCast {
                     .source
                     .temporal()
                     .ok_or_else(|| invalid("text source has no temporal declaration"))?;
-                let mut text = String::new();
-                work.flush()?;
-                format(&mut text, ty, value, TemporalTextFormat::Cast)
-                    .map_err(|_| internal("validated temporal value failed text projection"))?;
+                let text = format_cast_text(ty, value, work)?;
                 output.text(&text)?;
                 work.flush()?;
                 continue;
@@ -158,6 +216,53 @@ impl PreparedTemporalCast {
         work.flush()?;
         Ok(output)
     }
+}
+
+/// The original dependency-free temporal-to-VARCHAR conversion, available
+/// to collection calls which consume individual elements.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TemporalTextCast(Pair);
+
+impl TemporalTextCast {
+    pub(super) fn bind(source: &FunctionValueType, target: &FunctionValueType) -> Option<Self> {
+        let pair = Pair::bind(source, target)?;
+        (pair.target == Type::Text && pair.source.temporal().is_some()).then_some(Self(pair))
+    }
+
+    pub(super) fn evaluate(
+        self,
+        array: &dyn Array,
+        row: usize,
+        nullable: bool,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Option<String>, KernelFailure> {
+        let source = Source::bind(self.0.source, array, nullable)?;
+        let Some(Input::Temporal(value)) = source.value(row)? else {
+            return Ok(None);
+        };
+        let ty = self
+            .0
+            .source
+            .temporal()
+            .ok_or_else(|| invalid("text source has no temporal declaration"))?;
+        format_cast_text(ty, value, work).map(Some)
+    }
+}
+
+// A single canonical temporal rendering includes fixed-width calendar/time,
+// fraction, offset and an installed IANA zone name.
+pub(super) const TEMPORAL_CAST_TEXT_SCRATCH: usize = 512;
+
+fn format_cast_text(
+    ty: novarocks_type_contract::TemporalType,
+    value: novarocks_type_contract::TemporalValue,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<String, KernelFailure> {
+    let mut text = String::new();
+    work.flush()?;
+    format(&mut text, ty, value, TemporalTextFormat::Cast)
+        .map_err(|_| internal("validated temporal value failed text projection"))?;
+    Ok(text)
 }
 
 enum Source<'a> {

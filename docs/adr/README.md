@@ -169,7 +169,7 @@ code-anchors:
 
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
-- [ADR-0266](ADR-0266-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
+- [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
 - [ADR-0264](ADR-0264-iceberg-rewrites-preserve-row-identity.md) — Iceberg OPTIMIZE 保留已分配的行身份，由 manifest list 为重写输出分配新范围，v3 缺 next-row-id 返回明确诊断（active。部分替代 ADR-0171 的重写 lineage 规则和 ADR-0174 的 P7a。原不可变 operation、依赖验证、产物归属和其余 vendor 补丁政策继续有效）
 - [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) — Iceberg 写类为何共用紧凑接收与 operation 账本，怎样选择建表位置、冻结追加条件并按精确对象清理（active；部分替代 lake publication ADR-0110、ADR-0171、ADR-0198、Iceberg ADR-0239 与维护 ADR-0243）
 - [ADR-0260](ADR-0260-iceberg-metadata-delete-proves-original-fields-on-each-round.md) — Iceberg 元数据 DELETE 如何在原读观察证明完全吸收，并按当轮最新文件与获胜快照解释原字段和计数（active；部分替代 ADR-0251）
@@ -336,11 +336,12 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
-- [ADR-0266](ADR-0266-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
-- [ADR-0263](ADR-0263-trino-scalar-values-and-publication-eligibility.md) — Trino 标量定型、UUID 呈现与受影响 MV 的发布资格（active；发布资格和旧定义格式由 ADR-0266 部分替代；标量定型、行错误、UUID 及会话准入继续有效）
+- [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
+- [ADR-0266](ADR-0266-array-scalar-overloads-and-host-admission.md) — 数组标量重载如何共用值关系、转换与宿主准入，以及与 Trino 484 的接口差异（active）
+- [ADR-0263](ADR-0263-trino-scalar-values-and-publication-eligibility.md) — Trino 标量定型、UUID 呈现与受影响 MV 的发布资格（active；发布资格和旧定义格式由 ADR-0267 部分替代；标量定型、行错误、UUID 及会话准入继续有效）
 - [ADR-0256](ADR-0256-temporal-calls-freeze-overloads-and-selected-row-effects.md) — 时态调用如何冻结重载、环境和选中行错误，并以实际发布验值完成 MV 切换（active）
 
-- [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — 聚合所选重载如何贯穿原行更新、状态交换和实际物化发布（active；第 4、5 条中的旧解释布局与结果语义重绑由 ADR-0266 部分替代；原重载、行域、结果及聚合状态交换继续有效）
+- [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — 聚合所选重载如何贯穿原行更新、状态交换和实际物化发布（active；第 4、5 条中的旧解释布局与结果语义重绑由 ADR-0267 部分替代；原重载、行域、结果及聚合状态交换继续有效）
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 集合调用、关系区间、MAP 键与复合成员判断如何保留各自的定型和执行事实（active）
 - [ADR-0265](ADR-0265-row-declarations-and-canonical-map-keys.md) — ROW 字段如何随原类型约束冻结，MAP 规范身份如何贯穿分组和分区，有序调用如何按行短路（active）
 
@@ -411,10 +412,10 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 
 ### map-semantics
 
-- [ADR-0263](ADR-0263-trino-scalar-values-and-publication-eligibility.md) — Trino 标量定型、UUID 呈现与受影响 MV 的发布资格（active；发布资格和旧定义格式由 ADR-0266 部分替代；标量定型、行错误、UUID 及会话准入继续有效）
+- [ADR-0263](ADR-0263-trino-scalar-values-and-publication-eligibility.md) — Trino 标量定型、UUID 呈现与受影响 MV 的发布资格（active；发布资格和旧定义格式由 ADR-0267 部分替代；标量定型、行错误、UUID 及会话准入继续有效）
 领域哲学：Map 键域在构造时成立，不能由写出路径或运行时字段放宽来补救。非空且唯一是值语义；构造拒绝与具有明确优先级的合并分开，唯一性复用 GROUP BY 规范键等价。实施覆盖必须如实记录，局部入口的校验不代表所有生产者已经收敛。
 
-- [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — MAP 聚合空结果、所选状态以及已发布聚合语义的准入（active；第 4、5 条中的旧解释布局与结果语义重绑由 ADR-0266 部分替代；原重载、行域、结果及聚合状态交换继续有效）
+- [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — MAP 聚合空结果、所选状态以及已发布聚合语义的准入（active；第 4、5 条中的旧解释布局与结果语义重绑由 ADR-0267 部分替代；原重载、行域、结果及聚合状态交换继续有效）
 - [ADR-0265](ADR-0265-row-declarations-and-canonical-map-keys.md) — MAP 键关系如何贯穿查找、规范身份、分组和分区（active）
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 构造、DDL 属性和聚合如何共用 MAP 键契约，查找如何沿普通等值（active；部分替代 ADR-0183 的作者及判重合同）
 - [ADR-0183](ADR-0183-map-keys-are-non-null-and-unique.md) — Map 键为何非空且唯一，构造拒绝为何与合并优先级分开（active；键域和合并规则保留，构造作者及判重合同见 ADR-0255）
@@ -558,7 +559,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：MV 领域拥有 D/L/P/C 的持久语义；provider 拥有准确物理事实、附着与提交。Frontend 拥有当前 MV refresh attempt 的准入、效果结算、query orchestration 与用户结果；StateStore 仅保存按湖上来源重建的 Accelerator，不承担 durable ledger。commit truth 使用 typed provider evidence，不从错误文本猜测，也不通过双 journal 或 aggregate facade 掩盖 owner。
 
-- [ADR-0266](ADR-0266-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
+- [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
 - [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) — MV 文档建表如何直接暂存于最终位置，全量刷新与重分区如何原子发布 delete、append 与文档（active）
 - [ADR-0232](ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md) — 维护与统计为何归原语句执行，取消为何保留原 Source 至真实退出，状态为何分别由统计、MV 系统关系与管理 API 提供（active；部分替代 ADR-0169/0111/0226，GC Accelerator 由 [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) 部分替代，Catalog 准入与三态 publication 保留）
 - [ADR-0226](ADR-0226-engine-metadata-through-typed-system-relations.md) — 引擎元数据为何通过原语句的类型化批快照进入独立系统关系，名称、只读、Provider与真实退出为何各守原所有者（active；旧 SHOW 保留条款由 ADR-0232 部分替代，类型化系统关系与真实退出保留，验证范围独立核对）

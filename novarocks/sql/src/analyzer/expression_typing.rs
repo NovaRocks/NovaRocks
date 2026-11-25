@@ -641,6 +641,7 @@ fn scalar_selection_error(
                         novarocks_type_contract::ValueTypeError::InvalidCharacterWidth { .. }
                     )
                     | FunctionBindingError::UnknownFunction
+                    | FunctionBindingError::OperatorNotFound
                     | FunctionBindingError::HiddenFunction
                     | FunctionBindingError::NoMatchingOverload
                     | FunctionBindingError::AmbiguousOverload

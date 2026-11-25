@@ -55,9 +55,19 @@ FROM ${case_db}.t_table_lifecycle
 ORDER BY k1;
 
 -- query 7
+SELECT count(*) AS matching_tables
+FROM information_schema.tables
+WHERE table_schema = '${case_db}'
+  AND table_name = 't_table_lifecycle'
+  AND table_type = 'BASE TABLE';
+
+-- query 8
 -- @skip_result_check=true
 DROP TABLE ${case_db}.t_table_lifecycle;
 
--- query 8
--- @expect_error=unknown table
-SELECT * FROM ${case_db}.t_table_lifecycle;
+-- query 9
+SELECT count(*) AS matching_tables
+FROM information_schema.tables
+WHERE table_schema = '${case_db}'
+  AND table_name = 't_table_lifecycle'
+  AND table_type = 'BASE TABLE';

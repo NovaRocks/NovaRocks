@@ -212,6 +212,7 @@ pub enum FunctionBindingError {
     UnknownOverload(FunctionOverloadId),
     DuplicateOverload(FunctionOverloadId),
     NoMatchingOverload,
+    OperatorNotFound,
     AmbiguousOverload,
     InvalidBinding(Box<str>),
     VariantTargetType(novarocks_type_contract::VariantTargetTypeError),
@@ -249,6 +250,9 @@ impl fmt::Display for FunctionBindingError {
                 identity.as_str()
             ),
             Self::NoMatchingOverload => formatter.write_str("no matching declared overload"),
+            Self::OperatorNotFound => {
+                formatter.write_str("no CAST operator for the selected element type")
+            }
             Self::AmbiguousOverload => {
                 formatter.write_str("multiple declared overloads match ambiguously")
             }
@@ -338,6 +342,7 @@ impl novarocks_failure_contract::FailureProjection for FunctionBindingError {
             Self::UnknownOverload(_) => (FailureClass::Invariant, 6),
             Self::DuplicateOverload(_) => (FailureClass::Invariant, 7),
             Self::NoMatchingOverload => (FailureClass::Data, 8),
+            Self::OperatorNotFound => (FailureClass::Data, 11),
             Self::AmbiguousOverload => (FailureClass::Data, 9),
             Self::InvalidBinding(_) => (FailureClass::Invariant, 10),
         };

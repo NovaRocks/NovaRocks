@@ -6,9 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
-  - id: ADR-0266
+  - id: ADR-0267
     scope: "MV publication eligibility and the definition format transition described under version evidence."
-    link: "ADR-0266-mv-publishes-bound-source-and-storage-facts.md"
+    link: "ADR-0267-mv-publishes-bound-source-and-storage-facts.md"
 date: 2026-11-24
 provenance:
   - "TRC-6d3 approved Obsidian snapshot 27ecea4c80eebe79fb4f4a5fe1355c934b7d3269"

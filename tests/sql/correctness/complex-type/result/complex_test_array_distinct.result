@@ -1,4 +1,14 @@
 -- query 6
--- legacy
+-- types	bigint
 _col0
 100000
+
+-- query 7
+-- types	bigint
+distinct_count
+4
+
+-- query 8
+-- types	array(double)
+first_representatives
+[-0.0,null,"NaN"]

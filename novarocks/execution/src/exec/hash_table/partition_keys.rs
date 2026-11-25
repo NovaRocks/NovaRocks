@@ -35,6 +35,7 @@ use novarocks_value_arrays::{
     control::ValueStructure,
     decode::{DecodedBytes, PreparedTemporalArray, ValueConversionContext},
     hash_eq::{ByteHashAlgorithm, NullHash, hash_row_observed},
+    hydrate::{HydrateOptions, HydrateProjection},
     reachability::ReachableRows,
 };
 
@@ -203,7 +204,7 @@ fn tuple_hashes_observed<const UNORDERED_MAP: bool>(
                 conversions,
                 owner,
                 checkpoint,
-                novarocks_value_arrays::hydrate::HydrateOptions::default(),
+                false,
             )?;
             request::<Option<u64>>(owner, normalized.rows.len())?;
             let mut compact = normalized
@@ -397,7 +398,7 @@ fn normalize_nested_selected(
     conversions: &mut ValueConversionContext,
     owner: &dyn InputConstructionOwner,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
-    options: novarocks_value_arrays::hydrate::HydrateOptions,
+    project_byte_layouts: bool,
 ) -> ExecutionResult<NormalizedNested> {
     use novarocks_functions::selected_copy::{self, CopyConstructionError, CopyIndexView};
     use novarocks_value_arrays::hydrate::HydratePlan;
@@ -482,7 +483,15 @@ fn normalize_nested_selected(
     let plan = HydratePlan::plan_with_options_and_storage_observed(
         &compact,
         ty.typed_binding(),
-        options,
+        HydrateOptions {
+            // Exchange ingress preserves wider physical child flags and the
+            // separately signed value binding. Rebuild the frozen carrier for
+            // the key codec after checking the selected logical values.
+            projection: HydrateProjection::PermissivePhysicalNullability {
+                project_byte_layouts,
+            },
+            ..HydrateOptions::default()
+        },
         conversions,
         &storage,
         &mut |_, _| false,
@@ -1015,14 +1024,14 @@ pub(crate) fn prepare_canonical_tuple<'a>(
     owner: &dyn InputConstructionOwner,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<CanonicalTupleBatch<'a>> {
-    prepare_canonical_tuple_with_options(
+    prepare_canonical_tuple_core(
         arrays,
         key_types,
         selected,
         conversions,
         owner,
         checkpoint,
-        novarocks_value_arrays::hydrate::HydrateOptions::default(),
+        false,
     )
 }
 
@@ -1036,28 +1045,25 @@ pub(crate) fn prepare_canonical_tuple_with_byte_layout_projection<'a>(
     owner: &dyn InputConstructionOwner,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<CanonicalTupleBatch<'a>> {
-    prepare_canonical_tuple_with_options(
+    prepare_canonical_tuple_core(
         arrays,
         key_types,
         selected,
         conversions,
         owner,
         checkpoint,
-        novarocks_value_arrays::hydrate::HydrateOptions {
-            projection: novarocks_value_arrays::hydrate::HydrateProjection::ExactByteLayouts,
-            ..Default::default()
-        },
+        true,
     )
 }
 
-fn prepare_canonical_tuple_with_options<'a>(
+fn prepare_canonical_tuple_core<'a>(
     arrays: &'a [ArrayRef],
     key_types: &[FunctionValueType],
     selected: &ReachableRows<'_>,
     conversions: &mut ValueConversionContext,
     owner: &dyn InputConstructionOwner,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
-    options: novarocks_value_arrays::hydrate::HydrateOptions,
+    project_byte_layouts: bool,
 ) -> ExecutionResult<CanonicalTupleBatch<'a>> {
     if arrays.len() != key_types.len() || arrays.is_empty() {
         return Err(invariant(ValueViolation::Layout));
@@ -1088,7 +1094,7 @@ fn prepare_canonical_tuple_with_options<'a>(
                 conversions,
                 owner,
                 checkpoint,
-                options,
+                project_byte_layouts,
             )?)
         } else {
             None
@@ -1317,6 +1323,79 @@ mod tests {
         .unwrap()
         .hashes
     }
+
+    #[test]
+    fn nested_keys_restore_exchange_nullable_flags_without_changing_identity() {
+        use arrow::buffer::OffsetBuffer;
+
+        let array = |field_name, nullable, values: ArrayRef| {
+            let row: ArrayRef = Arc::new(StructArray::new(
+                vec![Field::new(field_name, values.data_type().clone(), nullable)].into(),
+                vec![values],
+                None,
+            ));
+            Arc::new(ListArray::new(
+                Arc::new(Field::new_list_field(row.data_type().clone(), nullable)),
+                OffsetBuffer::new(vec![0, 1, 2].into()),
+                row,
+                None,
+            )) as ArrayRef
+        };
+        let frozen = array("", false, Arc::new(StringArray::from(vec!["a", "b"])));
+        let wire = array("", true, Arc::new(StringArray::from(vec!["a", "b"])));
+        let ty = FunctionValueType::new(frozen.data_type().clone(), false);
+        assert_eq!(
+            hashes(Arc::clone(&frozen), ty.clone(), &[0, 1]),
+            hashes(wire, ty.clone(), &[0, 1]),
+        );
+
+        let owner = owner();
+        let types = [ty];
+        let other_byte_layout = [array(
+            "",
+            true,
+            Arc::new(LargeStringArray::from(vec!["a", "b"])),
+        )];
+        let tuples = prepare_canonical_tuple_with_byte_layout_projection(
+            &other_byte_layout,
+            &types,
+            &ReachableRows::all(2),
+            &mut ValueConversionContext::default(),
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap()
+        .into_storage();
+        let (projected, _) = tuples
+            .view(&other_byte_layout)
+            .physical_component(0)
+            .unwrap();
+        assert_eq!(projected.to_data(), frozen.to_data());
+
+        let prepare = |input: &ArrayRef, rows: &[usize]| {
+            prepare_canonical_tuple(
+                std::slice::from_ref(input),
+                &types,
+                &ReachableRows::indices(2, rows),
+                &mut ValueConversionContext::default(),
+                owner.as_ref(),
+                &|| Ok(()),
+            )
+            .map(|_| ())
+        };
+        let invalid = array("", true, Arc::new(StringArray::from(vec![Some("a"), None])));
+        prepare(&invalid, &[0]).unwrap();
+        assert_eq!(
+            prepare(&invalid, &[0, 1]).unwrap_err().failure_fact(),
+            invariant(ValueViolation::RequiredNull).failure_fact(),
+        );
+        let wrong_name = array("changed", true, Arc::new(StringArray::from(vec!["a", "b"])));
+        assert_eq!(
+            prepare(&wrong_name, &[0, 1]).unwrap_err().failure_fact(),
+            invariant(ValueViolation::Layout).failure_fact(),
+        );
+    }
+
     #[test]
     fn native_integer_and_list_policy_matches_frozen_independent_vectors() {
         let expected = vec![

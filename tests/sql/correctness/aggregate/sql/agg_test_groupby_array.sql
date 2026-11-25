@@ -29,8 +29,12 @@ USE ${case_db};
 
 -- query 3
 USE ${case_db};
-with input as (SELECT transform(sequence(1, 2000000, 1), x -> CAST(x AS VARCHAR)) AS a UNION ALL SELECT ['A', 'B', 'C'] AS a)
-SELECT count(*) from (select a from input group by 1) AS t;
+WITH input AS (
+    SELECT array_agg(CAST(x AS VARCHAR) ORDER BY x) AS a
+    FROM TABLE(sequence(1, 2000000, 1)) AS series(x)
+    UNION ALL SELECT ARRAY['A', 'B', 'C'] AS a
+)
+SELECT count(*) FROM (SELECT a FROM input GROUP BY 1) AS t;
 
 -- query 4
 -- @skip_result_check=true

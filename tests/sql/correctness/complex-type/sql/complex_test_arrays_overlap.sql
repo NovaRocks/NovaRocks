@@ -32,7 +32,7 @@ s_1   Array<VARCHAR>,
 i_1   Array<BigInt>,
 f_1   Array<Double>,
 d_1   Array<DECIMAL(26, 2)>,
-d_2   Array<DECIMAL(4, 3)>,
+d_2   Array<DECIMAL(7, 3)>,
 d_3   Array<DECIMAL(25, 19)>,
 d_4   Array<DECIMAL(8, 5)> ,
 d_5   Array<DECIMAL(16, 3)>,
@@ -53,42 +53,42 @@ ROW(4, ['a', NULL, 'c', 'e', 'd'], [1.0, 2.0, 3.0, 4.0, 10.0], [1.0, 2.0, 3.0, 4
 ROW(3, NULL, [1.0, 2.0, 3.0, 4.0, 10.0], NULL, [40.0, 10.0, 1.1, 2.1, 3.2, 4.3, -10, -10, 100, 10.0, 20.0, 3.0], [4.0, 10.0, 1.1, -10, 100, 1.0, 20.0, 3.0, 2.1, 3.2, 4.3, -1], [40.0, 20.1, 3.2, 10.0, 10.1, -10, 100, -1, 10.0, 2.0, 30.0, 4.3], [4.0, 2.1, 3.2, 10.0, 20.0, 3.0, 1.1, -10, -100, 100, 10.0, 4.3], NULL, NULL, [[1, 2, 30, 4], [50, 2, 6, 4], [100, -10, 92, 8], [66, 40, 32, -100]], [['1', '20', '3', '4'], ['-1', 'a00', '-100', '100'], ['a', 'b0', 'c']], NULL, NULL);
 
 -- query 4
--- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(s_1, 1) from array_test order by pk;
 
 -- query 5
--- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(d_1, 3) from array_test order by pk;
 
 -- query 6
--- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(as_1, 100) from array_test order by pk;
 
 -- query 7
--- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(aas_1, -10) from array_test order by pk;
 
 -- query 8
--- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(NULL, -1) from array_test order by pk;
 
 -- query 9
--- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap([1.0,2.1,3.2,4.3], 1) from array_test order by pk;
 
 -- query 10
--- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(['a', 'b', 'c'], 1) from array_test order by pk;
 
 -- query 11
--- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap([[1,2,3], [2,3,4]], 3) from array_test order by pk;
 
@@ -97,38 +97,42 @@ USE ${case_db};
 select arrays_overlap(s_1, s_1) from array_test order by pk;
 
 -- query 13
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(s_1, i_1) from array_test order by pk;
 
 -- query 14
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(s_1, f_1) from array_test order by pk;
 
 -- query 15
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(s_1, d_3) from array_test order by pk;
 
 -- query 16
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(s_1, d_6) from array_test order by pk;
 
 -- query 17
--- @expect_error=No matching function with signature: arrays_overlap(array<varchar(65533)>, array<array<bigint(20)>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(s_1, ai_1) from array_test order by pk;
 
 -- query 18
--- @expect_error=No matching function with signature: arrays_overlap(array<varchar(65533)>, array<array<varchar(65533)>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(s_1, as_1) from array_test order by pk;
 
 -- query 19
--- @expect_error=No matching function with signature: arrays_overlap(array<varchar(65533)>, array<array<array<varchar(65533)>>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(s_1, aas_1) from array_test order by pk;
 
 -- query 20
--- @expect_error=No matching function with signature: arrays_overlap(array<varchar(65533)>, array<array<array<DECIMAL128(26,2)>>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(s_1, aad_1) from array_test order by pk;
 
@@ -137,6 +141,7 @@ USE ${case_db};
 select arrays_overlap(s_1, ['a', 'c', 'd']) from array_test order by pk;
 
 -- query 22
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(s_1, [4, 5, 2, null, 1]) from array_test order by pk;
 
@@ -153,6 +158,7 @@ USE ${case_db};
 select arrays_overlap(i_1, d_4) from array_test order by pk;
 
 -- query 26
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(i_1, ['a', 'c', 'd']) from array_test order by pk;
 
@@ -165,6 +171,7 @@ USE ${case_db};
 select arrays_overlap(i_1, NULL) from array_test order by pk;
 
 -- query 29
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(f_1, s_1) from array_test order by pk;
 
@@ -185,26 +192,27 @@ USE ${case_db};
 select arrays_overlap(f_1, d_5) from array_test order by pk;
 
 -- query 34
--- @expect_error=No matching function with signature: arrays_overlap(array<double>, array<array<bigint(20)>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(f_1, ai_1) from array_test order by pk;
 
 -- query 35
--- @expect_error=No matching function with signature: arrays_overlap(array<double>, array<array<varchar(65533)>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(f_1, as_1) from array_test order by pk;
 
 -- query 36
--- @expect_error=No matching function with signature: arrays_overlap(array<double>, array<array<array<varchar(65533)>>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(f_1, aas_1) from array_test order by pk;
 
 -- query 37
--- @expect_error=No matching function with signature: arrays_overlap(array<double>, array<array<array<DECIMAL128(26,2)>>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(f_1, aad_1) from array_test order by pk;
 
 -- query 38
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(f_1, ['a', 'c', 'd']) from array_test order by pk;
 
@@ -225,26 +233,27 @@ USE ${case_db};
 select arrays_overlap(d_1, d_2) from array_test order by pk;
 
 -- query 43
--- @expect_error=No matching function with signature: arrays_overlap(array<DECIMAL128(26,2)>, array<array<bigint(20)>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(d_1, ai_1) from array_test order by pk;
 
 -- query 44
--- @expect_error=No matching function with signature: arrays_overlap(array<DECIMAL128(26,2)>, array<array<varchar(65533)>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(d_1, as_1) from array_test order by pk;
 
 -- query 45
--- @expect_error=No matching function with signature: arrays_overlap(array<DECIMAL128(26,2)>, array<array<array<varchar(65533)>>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(d_1, aas_1) from array_test order by pk;
 
 -- query 46
--- @expect_error=No matching function with signature: arrays_overlap(array<DECIMAL128(26,2)>, array<array<array<DECIMAL128(26,2)>>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(d_1, aad_1) from array_test order by pk;
 
 -- query 47
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(d_1, ['a', 'c', 'd']) from array_test order by pk;
 
@@ -257,6 +266,7 @@ USE ${case_db};
 select arrays_overlap(d_1, NULL) from array_test order by pk;
 
 -- query 50
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(d_2, s_1) from array_test order by pk;
 
@@ -309,11 +319,12 @@ USE ${case_db};
 select arrays_overlap(d_5, d_6) from array_test order by pk;
 
 -- query 63
--- @expect_error=No matching function with signature: arrays_overlap(array<DECIMAL64(16,3)>, array<array<array<DECIMAL128(26,2)>>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(d_5, aad_1) from array_test order by pk;
 
 -- query 64
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(d_6, s_1) from array_test order by pk;
 
@@ -334,17 +345,17 @@ USE ${case_db};
 select arrays_overlap(d_6, d_6) from array_test order by pk;
 
 -- query 69
--- @expect_error=No matching function with signature: arrays_overlap(array<array<bigint(20)>>, array<varchar(65533)>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(ai_1, s_1) from array_test order by pk;
 
 -- query 70
--- @expect_error=No matching function with signature: arrays_overlap(array<array<bigint(20)>>, array<bigint(20)>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(ai_1, i_1) from array_test order by pk;
 
 -- query 71
--- @expect_error=No matching function with signature: arrays_overlap(array<array<bigint(20)>>, array<DECIMAL128(18,6)>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(ai_1, d_6) from array_test order by pk;
 
@@ -353,25 +364,27 @@ USE ${case_db};
 select arrays_overlap(ai_1, ai_1) from array_test order by pk;
 
 -- query 73
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(ai_1, as_1) from array_test order by pk;
 
 -- query 74
--- @expect_error=No matching function with signature: arrays_overlap(array<array<bigint(20)>>, array<array<array<varchar(65533)>>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(ai_1, aas_1) from array_test order by pk;
 
 -- query 75
--- @expect_error=No matching function with signature: arrays_overlap(array<array<bigint(20)>>, array<array<array<DECIMAL128(26,2)>>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(ai_1, aad_1) from array_test order by pk;
 
 -- query 76
--- @expect_error=No matching function with signature: arrays_overlap(array<array<varchar(65533)>>, array<varchar(65533)>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(as_1, s_1) from array_test order by pk;
 
 -- query 77
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(as_1, ai_1) from array_test order by pk;
 
@@ -380,22 +393,22 @@ USE ${case_db};
 select arrays_overlap(as_1, as_1) from array_test order by pk;
 
 -- query 79
--- @expect_error=No matching function with signature: arrays_overlap(array<array<varchar(65533)>>, array<array<array<varchar(65533)>>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(as_1, aas_1) from array_test order by pk;
 
 -- query 80
--- @expect_error=No matching function with signature: arrays_overlap(array<array<varchar(65533)>>, array<array<array<DECIMAL128(26,2)>>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(as_1, aad_1) from array_test order by pk;
 
 -- query 81
--- @expect_error=No matching function with signature: arrays_overlap(array<array<array<varchar(65533)>>>, array<varchar(65533)>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(aas_1, s_1) from array_test order by pk;
 
 -- query 82
--- @expect_error=No matching function with signature: arrays_overlap(array<array<array<varchar(65533)>>>, array<array<varchar(65533)>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(aas_1, as_1) from array_test order by pk;
 
@@ -404,31 +417,32 @@ USE ${case_db};
 select arrays_overlap(aas_1, aas_1) from array_test order by pk;
 
 -- query 84
--- @expect_error=No matching function with signature: arrays_overlap(array<array<array<DECIMAL128(26,2)>>>, array<varchar(65533)>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(aad_1, s_1) from array_test order by pk;
 
 -- query 85
--- @expect_error=No matching function with signature: arrays_overlap(array<array<array<DECIMAL128(26,2)>>>, array<double>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(aad_1, f_1) from array_test order by pk;
 
 -- query 86
--- @expect_error=No matching function with signature: arrays_overlap(array<array<array<DECIMAL128(26,2)>>>, array<DECIMAL128(26,2)>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(aad_1, d_1) from array_test order by pk;
 
 -- query 87
--- @expect_error=No matching function with signature: arrays_overlap(array<array<array<DECIMAL128(26,2)>>>, array<DECIMAL64(4,3)>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(aad_1, d_2) from array_test order by pk;
 
 -- query 88
--- @expect_error=No matching function with signature: arrays_overlap(array<array<array<DECIMAL128(26,2)>>>, array<array<varchar(65533)>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(aad_1, as_1) from array_test order by pk;
 
 -- query 89
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(aad_1, aas_1) from array_test order by pk;
 
@@ -437,12 +451,12 @@ USE ${case_db};
 select arrays_overlap(aad_1, aad_1) from array_test order by pk;
 
 -- query 91
--- @expect_error=No matching function with signature: arrays_overlap(array<array<array<DECIMAL128(26,2)>>>, array<varchar>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(aad_1, ['a', 'c', 'd']) from array_test order by pk;
 
 -- query 92
--- @expect_error=No matching function with signature: arrays_overlap(array<array<array<DECIMAL128(26,2)>>>, array<tinyint(4)>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap(aad_1, [4, 5, 2, null, 1]) from array_test order by pk;
 
@@ -459,11 +473,12 @@ USE ${case_db};
 select arrays_overlap([4, 5, 2, null, 1], f_1) from array_test order by pk;
 
 -- query 96
--- @expect_error=No matching function with signature: arrays_overlap(array<tinyint(4)>, array<array<array<DECIMAL128(26,2)>>>
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap([4, 5, 2, null, 1], aad_1) from array_test order by pk;
 
 -- query 97
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR,2
 USE ${case_db};
 select arrays_overlap([4, 5, 2, null, 1], ['a', 'c', 'd']) from array_test order by pk;
 

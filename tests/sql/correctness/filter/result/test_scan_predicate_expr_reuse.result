@@ -1,17 +1,17 @@
 -- query 1
--- legacy
+-- types	bigint	bigint	bigint	array(varchar)
 v1	v2	v3	v4
 10	10	10	["10","10","10","10","10"]
 
 -- query 2
--- legacy
+-- types	bigint	bigint	bigint	array(varchar)
 v1	v2	v3	v4
 1	1	1	["1","1","1","1","1"]
 2	2	2	["2","2","2","2","2"]
 3	3	3	["3","3","3","3","3"]
 
 -- query 3
--- legacy
+-- types	bigint	bigint	bigint	array(varchar)
 v1	v2	v3	v4
 5	5	5	["5","5","5","5","5"]
 10	10	10	["10","10","10","10","10"]
@@ -30,19 +30,19 @@ v1	v2	v3	v4
 9	9	9	["9","9","9","9","9"]
 
 -- query 5
--- legacy
+-- types	bigint	bigint	bigint	array(varchar)
 v1	v2	v3	v4
 10	10	10	["10","10","10","10","10"]
 
 -- query 6
--- legacy
+-- types	bigint	bigint	bigint	array(varchar)
 v1	v2	v3	v4
 1	1	1	["1","1","1","1","1"]
 2	2	2	["2","2","2","2","2"]
 3	3	3	["3","3","3","3","3"]
 
 -- query 7
--- legacy
+-- types	bigint	bigint	bigint	array(varchar)
 v1	v2	v3	v4
 5	5	5	["5","5","5","5","5"]
 10	10	10	["10","10","10","10","10"]
