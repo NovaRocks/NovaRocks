@@ -19,8 +19,8 @@ use super::*;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use novarocks_expression::testkit::call_scalar;
 use novarocks_functions::{
-    AggregateStateAllocator, EvaluatedArgument, KernelEvaluationControl, KernelFailure,
-    ScalarEvaluationInstance, ScalarResourceError, SelectedValues, Selection,
+    EvaluatedArgument, KernelEvaluationControl, KernelFailure, ScalarEvaluationInstance,
+    ScalarResourceError, SelectedValues, Selection,
 };
 use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority};
 use novarocks_types::{

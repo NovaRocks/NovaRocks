@@ -452,7 +452,12 @@ fn runtime_json_in_uses_constant_proof_and_keeps_later_rhs_errors() {
                 else {
                     continue;
                 };
-                assert!(unit.native_inlist(root.use_id).unwrap().uses_json_keys());
+                assert!(
+                    unit.recipes()
+                        .native_inlist(root.use_id)
+                        .unwrap()
+                        .uses_json_keys()
+                );
                 let [constant, dynamic] = values.as_slice() else {
                     panic!("expected one constant and one dynamic JSON operand");
                 };
