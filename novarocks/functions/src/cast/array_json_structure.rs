@@ -550,15 +550,14 @@ fn append_scalar(
                 _ => return Err(internal("JSON CAST scalar has a foreign VARCHAR result").into()),
             };
             if let (Some(limit), Some(text)) = (max_length, text) {
-                let mut width = 0;
-                for _ in text.chars() {
+                let limit = usize::try_from(limit).map_err(|_| KernelFailure::ResourceExhausted)?;
+                for (width, _) in text.chars().enumerate() {
                     work.step()?;
                     if width == limit {
                         return Err(CastFault::Data(
                             "JSON string exceeds the frozen VARCHAR length",
                         ));
                     }
-                    width += 1;
                 }
             }
             append_text(builder, text, work)?;
