@@ -745,17 +745,12 @@ fn original_revision_46_sender_package_is_refused_by_the_current_receiver() {
     let bytes = include_bytes!("fixtures/revision_46_constant_package.pb");
     let old = wire::FragmentPackage::decode(bytes.as_slice()).unwrap();
     assert_eq!(old.required.unwrap().plan_contract_revision, 46);
-    match refused(bytes) {
-        PackageDecodeError::Package(p::FragmentPackageError::Structure(errors)) => {
-            assert!(errors.to_string().contains("package.required"));
-            assert!(
-                errors
-                    .to_string()
-                    .contains("plan contract revision differs")
-            );
-        }
-        other => panic!("old package must reach the original package contract check: {other:?}"),
-    }
+    assert!(matches!(
+        refused(bytes),
+        PackageDecodeError::Wire(PackageWireError::InvalidSource(
+            "package contains a retired wire field"
+        ))
+    ));
 }
 
 #[test]

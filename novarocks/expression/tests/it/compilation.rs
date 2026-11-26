@@ -72,20 +72,21 @@ impl PureCompileControl for Control {
     }
 }
 fn policy() -> ConstantValidation {
-    novarocks_constant_contract::ConstantValidation::bounded(
-        novarocks_constant_contract::ConstantPolicy {
-            max_rows: 1024,
-            max_array_nodes: 4096,
-            max_logical_elements: 1_000_000,
-            max_retained_buffer_bytes: 16_777_216,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 16,
-            max_metadata_bytes: 1_048_576,
-            max_library_validation_work: 67_108_864,
-            max_library_validation_bytes: 67_108_864,
-        },
-    )
+    ConstantValidation::bounded(policy_fixture())
+}
+fn policy_fixture() -> novarocks_constant_contract::ConstantPolicy {
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 1024,
+        max_array_nodes: 4096,
+        max_logical_elements: 1_000_000,
+        max_retained_buffer_bytes: 16_777_216,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 16,
+        max_metadata_bytes: 1_048_576,
+        max_library_validation_work: 67_108_864,
+        max_library_validation_bytes: 67_108_864,
+    }
 }
 fn limits() -> UnitLimits {
     UnitLimits {
@@ -1243,7 +1244,7 @@ fn checked_sources_are_not_readmitted_under_a_different_caller_policy() {
         novarocks_constant_contract::ConstantPolicy {
             max_rows: 0,
             max_retained_buffer_bytes: 0,
-            ..policy()
+            ..policy_fixture()
         },
     );
     let p = compile_expr_set_pure(
