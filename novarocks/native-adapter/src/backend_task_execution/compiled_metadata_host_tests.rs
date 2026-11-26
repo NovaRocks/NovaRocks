@@ -553,7 +553,7 @@ fn project_metadata_real_pending_requalifies_one_original_compiler_body() {
                     pipeline_dop: NonZeroUsize::MIN,
                     root_sink_dop: Some(NonZeroUsize::MIN),
                     kernel_abi: KernelAbiVersion::CURRENT,
-                    constants: interpreter.constants,
+                    constants: novarocks_functions::ConstantValidation::INPUT_DERIVED,
                 },
                 creation,
                 &mut temporary,

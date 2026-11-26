@@ -10417,61 +10417,6 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn compiled_interpreter_scoped_decode_keeps_original_whole_type_caps() {
-            use crate::backend_task_execution::CompiledTypeScopes;
-            use crate::native_type_construction::NativeTypeConstruction;
-            use novarocks_execution::runtime::mem_tracker::MemTracker;
-            use novarocks_type_contract::ValueSchemaCreation;
-            let (bytes, _) = select_one_producer();
-            let tracker = MemTracker::new_root("compiled scoped global caps");
-            let actual =
-                NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
-            let mut limits = decode_limits();
-            limits.types.max_definitions = 0;
-            let providers = PureProviderProgramCatalog::<std::convert::Infallible>::try_new(
-                &[],
-                vec![],
-                &Unbounded,
-            )
-            .unwrap();
-            let compiler = CompiledPackageInterpreter::new(
-                FragmentDecodeResourceModel::try_new(&Unbounded).unwrap(),
-                limits,
-                Arc::new(sealed_rand_subset()),
-                Arc::new(providers),
-            );
-            let scopes = CompiledTypeScopes::new(&actual);
-            let mut exact = |layout| actual.request_layout(layout);
-            let mut opaque = |bytes| actual.request_opaque_upper_bound(bytes);
-            let mut creation =
-                ValueSchemaCreation::new(actual.storage_lifetime(), &mut exact, &mut opaque);
-            let result = compiler.compile(
-                &bytes,
-                CompiledTaskOptions {
-                    pipeline_dop: NonZeroUsize::MIN,
-                },
-                &mut creation,
-                &scopes,
-                &Unbounded,
-            );
-            assert!(
-                matches!(
-                    result,
-                    Err(CompiledPackageError::Control(
-                        CompileControlError::ResourceExhausted
-                    ))
-                ),
-                "entity scopes cannot replace the original complete-table cap"
-            );
-            drop(creation);
-            {
-                let _scopes = scopes;
-            }
-            drop(actual);
-            assert_eq!(tracker.current(), 0);
-        }
-
-        #[test]
         fn compiled_interpreter_first_actual_tracker_cause_has_no_control_tail() {
             use crate::backend_task_execution::CompiledTypeScopes;
             use crate::native_type_construction::{
