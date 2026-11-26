@@ -587,7 +587,7 @@ fn compare_scalar(
 fn signature_source_floor(
     function: &novarocks_expression_contract::BoundFunction,
     floor: &mut usize,
-    source: usize,
+    source: Option<usize>,
     facts: &mut ExpressionNamespaceWriteFacts,
     admission: &mut Admission<'_, '_>,
     work: &mut CompileCheckpoints<'_>,
@@ -731,6 +731,7 @@ fn prepare_core<'loan, 'source, 'control>(
         source: source_retained_bytes,
         limits,
     };
+    let source_invoice = limits.map(|_| source_retained_bytes);
     (|| {
         let count = unit_definitions(unit).len();
         let numeric = Arithmetic(admission.observed());
@@ -781,7 +782,7 @@ fn prepare_core<'loan, 'source, 'control>(
                 }
             }
         }
-        cap(source_floor, source_retained_bytes, work)?;
+        cap(source_floor, source_invoice, work)?;
         if !admission.observed() {
             facts = initial_facts(count)?;
         }
@@ -835,12 +836,12 @@ fn prepare_core<'loan, 'source, 'control>(
                 _ => 0,
             };
             source_floor = numeric.add(source_floor, owned)?;
-            cap(source_floor, source_retained_bytes, work)?;
+            cap(source_floor, source_invoice, work)?;
             if let ExprKind::FunctionCall { function, .. } = &node.kind {
                 signature_source_floor(
                     function,
                     &mut source_floor,
-                    source_retained_bytes,
+                    source_invoice,
                     &mut facts,
                     &mut admission,
                     work,
@@ -855,7 +856,7 @@ fn prepare_core<'loan, 'source, 'control>(
         }
         cap(
             numeric.add(source_floor, counts.max_lambda_id_bytes)?,
-            source_retained_bytes,
+            source_invoice,
             work,
         )?;
         facts.cumulative_work_upper_bound = admission.numeric(count_work(
@@ -1086,12 +1087,17 @@ fn prepare_core<'loan, 'source, 'control>(
                 let pool = pool.ok_or_else(|| {
                     shape("expression refers to an unknown original constant pool")
                 })?;
-                let retained =
-                    usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes).map_err(
-                        |_| shape("constant expression source retained extent is unrepresentable"),
-                    );
-                work.step()?;
-                cap(retained?, source_retained_bytes, work)?;
+                if let Some(source_invoice) = source_invoice {
+                    let retained =
+                        usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
+                            .map_err(|_| {
+                                shape(
+                                    "constant expression source retained extent is unrepresentable",
+                                )
+                            })?;
+                    work.step()?;
+                    cap(retained, source_invoice, work)?;
+                }
                 let ordinal_valid = u64::from(reference.ordinal) < pool.resource_facts().rows;
                 work.step()?;
                 if !ordinal_valid {

@@ -658,3 +658,34 @@ fn receiver_factory_flow_keeps_raw_argument_payload_in_the_same_retained_scope()
             .all(|weak| weak.upgrade().is_none())
     );
 }
+
+#[test]
+fn expression_constant_references_borrow_a_large_checked_pool_through_the_package() {
+    let data = "x".repeat(9 << 20);
+    let ty = p::ValueType::new(arrow::datatypes::DataType::Utf8, false);
+    let value = p::ConstantValue::from_utf8(
+        Arc::new(ty.try_to_field("exact").unwrap()),
+        ty,
+        &data,
+        novarocks_functions::ConstantValidation::INPUT_DERIVED,
+        CompilePhase::Validate,
+        &Control,
+    )
+    .unwrap();
+    let package = pair_with_constant(value, false);
+    let raw = encode_fragment_package(&package, &Control)
+        .unwrap()
+        .encode_to_vec();
+    let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
+    let decoded =
+        decode_fragment_package(&raw, &model, &PackageDecodeLimits::FROZEN, &Control).unwrap();
+    let pool = decoded
+        .constants()
+        .entries()
+        .get(&p::ConstantPoolId::new(u32::MAX))
+        .unwrap();
+    assert_eq!(
+        pool.value(0).unwrap().try_utf8().unwrap(),
+        Some(data.as_str())
+    );
+}

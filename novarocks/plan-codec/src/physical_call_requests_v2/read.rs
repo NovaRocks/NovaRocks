@@ -502,22 +502,24 @@ fn preflight<F: ReadFailure, W: RequestWire>(
         model.output_map_work = tree.cumulative_work_upper_bound;
     }
     observed(model.admit(limits, parent), w)?;
-    // Visit the loaned pool namespace once. Maximum individual backing is an
-    // alias-safe NECESSARY floor, not a complete host invoice or dedup upper.
-    let mut maximum_pool_backing = 0;
-    for pool in pools.entries().values() {
-        let retained = usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
-            .map_err(|_| resource())?;
-        maximum_pool_backing = maximum_pool_backing.max(add(
-            novarocks_physical_plan::ConstantPool::backing_allocation_layout().size(),
-            retained,
-        )?);
-        observed(
-            source_gate(invoice, add(model.known, maximum_pool_backing)?),
-            w,
-        )?;
+    // Only the explicit bounded fixture accepts a retained-source invoice.
+    // The production request links to the original, already owned pools.
+    if limits.is_some() {
+        let mut maximum_pool_backing = 0;
+        for pool in pools.entries().values() {
+            let retained = usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
+                .map_err(|_| resource())?;
+            maximum_pool_backing = maximum_pool_backing.max(add(
+                novarocks_physical_plan::ConstantPool::backing_allocation_layout().size(),
+                retained,
+            )?);
+            observed(
+                source_gate(invoice, add(model.known, maximum_pool_backing)?),
+                w,
+            )?;
+        }
+        model.known = add(model.known, maximum_pool_backing)?;
     }
-    model.known = add(model.known, maximum_pool_backing)?;
     for entry in source {
         if parent.is_some() {
             capture_arguments(entry, &mut model, limits, parent)?;

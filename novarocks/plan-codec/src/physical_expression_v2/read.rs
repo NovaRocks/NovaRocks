@@ -790,10 +790,12 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                 work.step()?;
                 work.flush()?;
                 let pool = pool.ok_or_else(|| shape("expression constant pool is unknown"))?;
-                let retained =
-                    usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
-                        .map_err(|_| shape("constant retained extent is unrepresentable"))?;
-                cap(retained, self.source_retained_bytes, work)?;
+                if admission.limits.is_some() {
+                    let retained =
+                        usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
+                            .map_err(|_| shape("constant retained extent is unrepresentable"))?;
+                    cap(retained, self.source_retained_bytes, work)?;
+                }
                 let verified = if let Some(captured) = captured {
                     captured?.ok_or_else(|| shape("expression constant pool is unknown"))?
                 } else {
