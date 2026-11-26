@@ -207,16 +207,21 @@ fn boxed<T>(output: Vec<T>, w: &mut CompileCheckpoints<'_>) -> Result<Box<[T]>, 
 
 #[derive(Clone, Copy)]
 enum Profile {
+    Derived,
     Receiving(Limits),
 }
-impl From<Limits> for Profile {
-    fn from(value: Limits) -> Self {
-        Self::Receiving(value)
+impl Profile {
+    fn from_limits(value: impl Into<Option<Limits>>) -> Self {
+        match value.into() {
+            Some(value) => Self::Receiving(value),
+            None => Self::Derived,
+        }
     }
 }
 impl Profile {
     fn remaining_work(self, used: usize) -> Result<Option<usize>, E> {
         match self {
+            Self::Derived => Ok(None),
             Self::Receiving(limits) => limits
                 .max_work
                 .checked_sub(used)
@@ -290,8 +295,7 @@ impl Model {
             add(self.source, size_of::<PreparedCallRequestsDecode<'_>>())?,
             self.facts.request_bytes_upper_bound,
         )?;
-        {
-            let Profile::Receiving(limits) = limits;
+        if let Profile::Receiving(limits) = limits {
             gate(self.facts.definition_count, limits.max_definitions)?;
             gate(self.facts.type_reference_count, limits.max_type_references)?;
             gate(
@@ -764,7 +768,7 @@ pub fn prepare_call_requests_decode<'loan>(
     types: &'loan DecodedTypeTable,
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
-    limits: Limits,
+    limits: impl Into<Option<Limits>>,
     control: &'loan dyn PureCompileControl,
 ) -> Result<PreparedCallRequestsDecode<'loan>, E> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
@@ -773,7 +777,7 @@ pub fn prepare_call_requests_decode<'loan>(
         CallRequestTypeOwner::Package(types),
         pools,
         source_retained_bytes,
-        limits.into(),
+        Profile::from_limits(limits),
         &mut None::<&mut Parent<'_, E>>,
         &mut work,
     );
@@ -787,7 +791,7 @@ pub(crate) fn prepare_call_requests_decode_in<'loan, 'control: 'loan>(
     types: &'loan DecodedTypeTable,
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
-    limits: Limits,
+    limits: impl Into<Option<Limits>>,
     admit: &mut CallRequestAdmit<'_>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedCallRequestsDecode<'loan>, E> {
@@ -796,7 +800,7 @@ pub(crate) fn prepare_call_requests_decode_in<'loan, 'control: 'loan>(
         CallRequestTypeOwner::Package(types),
         pools,
         source_retained_bytes,
-        limits.into(),
+        Profile::from_limits(limits),
         &mut Some(&mut |facts: &Facts| admit(facts).map_err(E::from)),
         work,
     )
@@ -807,7 +811,7 @@ pub fn prepare_call_requests_decode_with_creator_in<'loan, 'control: 'loan, H>(
     types: CallRequestTypeOwner<'loan>,
     pools: &'loan ConstantPools,
     original_source_bytes: usize,
-    limits: Limits,
+    limits: impl Into<Option<Limits>>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedCallRequestsDecode<'loan>, crate::host_projection_v2::ProjectionFailure<E, H>> {
@@ -816,7 +820,7 @@ pub fn prepare_call_requests_decode_with_creator_in<'loan, 'control: 'loan, H>(
         types,
         pools,
         original_source_bytes,
-        limits.into(),
+        Profile::from_limits(limits),
         creation,
         work,
     )
@@ -1077,7 +1081,7 @@ pub(crate) fn decode_unit_requests_in<H>(
     types: &DecodedTypeTable,
     pools: &ConstantPools,
     invoice: usize,
-    limits: Limits,
+    limits: impl Into<Option<Limits>>,
     observe: &mut CallRequestAdmit<'_>,
     mut creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
@@ -1110,7 +1114,7 @@ pub(crate) fn decode_unit_requests_in<H>(
         CallRequestTypeOwner::Package(types),
         pools,
         invoice,
-        limits.into(),
+        Profile::from_limits(limits),
         &mut Some(&mut admit),
         work,
     )?;

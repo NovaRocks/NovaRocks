@@ -166,3 +166,17 @@ fn observe_decode<H>(
     *previous = facts.allocation_request_bytes_upper_bound;
     Ok(())
 }
+
+/// Preserve the fragment's raw root-reference bound before unit decoding.
+pub(super) fn admit_fragment_roots(
+    previous: &mut usize,
+    count: usize,
+) -> Result<(), crate::physical_expression_v2::ExpressionCodecError> {
+    let count = previous
+        .checked_add(count)
+        .filter(|count| *count <= novarocks_type_contract::MAX_CONTROL_USE_REFERENCES)
+        .ok_or(novarocks_type_contract::ExpressionControlFlowError::TooManyItems)
+        .map_err(novarocks_expression_contract::UnitError::from)?;
+    *previous = count;
+    Ok(())
+}

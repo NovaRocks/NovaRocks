@@ -379,7 +379,7 @@ fn encode_fragment_package_structural_in<'s>(
     // upper bound and inline header join every later invoice once
     // (conservative: temporary requests are included).
     let requested = Cell::new(0usize);
-    let mut unit_totals = super::unit_totals::UnitProjectionTotals::default();
+    let mut unit_roots = 0;
     macro_rules! seen {
         ($field:ident) => {
             &mut |f: &_| {
@@ -518,15 +518,14 @@ fn encode_fragment_package_structural_in<'s>(
         &request_ids,
         package.constants(),
         source,
-        l.requests,
+        None,
         &mut |facts: &crate::physical_call_requests_v2::CallRequestProjectionFacts| {
-            unit_totals.requests_prefix(facts, l.requests)?;
             requested.set(requested.get().max(facts.request_bytes_upper_bound));
             Ok(())
         },
         work,
     )?;
-    unit_totals.requests_commit(call_requests_token.facts(), l.requests)?;
+
     let call_requests = call_requests_token.emit_in(seen!(request_bytes_upper_bound), work)?;
     source = grow(source, &requested, &call_requests)?;
     let (envelope, _) = prepare_fragment_envelope_encode_in(
@@ -565,9 +564,8 @@ fn encode_fragment_package_structural_in<'s>(
             package.parameters(),
             package.constants(),
             source,
-            l.expressions,
+            None,
             &mut |facts: &crate::physical_expression_v2::ExpressionNamespaceWriteFacts| {
-                unit_totals.expressions_prefix(facts, l.expressions, false)?;
                 requested.set(
                     requested
                         .get()
@@ -579,7 +577,6 @@ fn encode_fragment_package_structural_in<'s>(
         )?
         .emit_in(
             &mut |facts: &crate::physical_expression_v2::ExpressionNamespaceWriteFacts| {
-                unit_totals.expressions_prefix(facts, l.expressions, false)?;
                 requested.set(
                     requested
                         .get()
@@ -589,7 +586,7 @@ fn encode_fragment_package_structural_in<'s>(
             },
             work,
         )?;
-        unit_totals.expressions_commit(expressions.facts(), l.expressions, false)?;
+
         source = grow(source, &requested, &expressions)?;
         let context = NodeEncodeContext {
             values: &values,
@@ -607,7 +604,7 @@ fn encode_fragment_package_structural_in<'s>(
         )?
         .emit_in(seen!(allocation_request_bytes_upper_bound), work)?;
         if let Some(unit) = node.expressions.as_deref() {
-            unit_totals.roots(unit.roots().len())?;
+            super::unit_headers::admit_fragment_roots(&mut unit_roots, unit.roots().len())?;
             let _ = super::unit_headers::encode(
                 unit,
                 source,
@@ -674,12 +671,11 @@ fn encode_fragment_package_structural_in<'s>(
                 });
                 work.step()?;
             }
-            let (control, control_facts) = encode_expression_control_observed(
+            let (control, _) = encode_expression_control_observed(
                 unit.control_flow(),
                 source,
-                l.control,
+                None,
                 &mut |facts: &crate::physical_control_v2::ControlProjectionFacts| {
-                    unit_totals.control_prefix(facts, l.control)?;
                     requested.set(
                         requested
                             .get()
@@ -689,14 +685,13 @@ fn encode_fragment_package_structural_in<'s>(
                 },
                 work,
             )?;
-            unit_totals.control_commit(&control_facts, l.control)?;
+
             source = grow(source, &requested, &control)?;
-            let (claims, claim_facts) = crate::physical_semantics_v2::encode_expression_claims_in(
+            let (claims, _) = crate::physical_semantics_v2::encode_expression_claims_in(
                 unit,
                 source,
                 l.node,
                 &mut |facts: &crate::physical_node_v2::NodeProjectionFacts| {
-                    unit_totals.semantics_prefix(facts, l.node)?;
                     requested.set(
                         requested
                             .get()
@@ -706,24 +701,22 @@ fn encode_fragment_package_structural_in<'s>(
                 },
                 work,
             )?;
-            unit_totals.semantics_commit(&claim_facts, l.node)?;
+
             source = grow(source, &requested, &claims)?;
-            let (requests, request_facts) =
-                crate::physical_call_requests_v2::encode_unit_requests_in(
-                    unit,
-                    &types,
-                    &unit_request_ids,
-                    package.constants(),
-                    source,
-                    l.requests,
-                    &mut |facts: &crate::physical_call_requests_v2::CallRequestProjectionFacts| {
-                        unit_totals.requests_prefix(facts, l.requests)?;
-                        requested.set(requested.get().max(facts.request_bytes_upper_bound));
-                        Ok(())
-                    },
-                    work,
-                )?;
-            unit_totals.requests_commit(&request_facts, l.requests)?;
+            let (requests, _) = crate::physical_call_requests_v2::encode_unit_requests_in(
+                unit,
+                &types,
+                &unit_request_ids,
+                package.constants(),
+                source,
+                None,
+                &mut |facts: &crate::physical_call_requests_v2::CallRequestProjectionFacts| {
+                    requested.set(requested.get().max(facts.request_bytes_upper_bound));
+                    Ok(())
+                },
+                work,
+            )?;
+
             source = grow(source, &requested, &requests)?;
             encoded.expressions = Some(wire::ExpressionUnit {
                 ports,
@@ -738,12 +731,11 @@ fn encode_fragment_package_structural_in<'s>(
         source = add(source, requested.replace(0))?;
         nodes.push(encoded);
     }
-    let (calls, call_facts) = encode_frozen_calls_observed(
+    let (calls, _) = encode_frozen_calls_observed(
         package.calls(),
         source,
         l.node,
         &mut |facts: &crate::physical_node_v2::NodeProjectionFacts| {
-            unit_totals.semantics_prefix(facts, l.node)?;
             requested.set(
                 requested
                     .get()
@@ -753,7 +745,7 @@ fn encode_fragment_package_structural_in<'s>(
         },
         work,
     )?;
-    unit_totals.semantics_commit(&call_facts, l.node)?;
+
     source = grow(source, &requested, &calls)?;
     let (pruning, _) = encode_frozen_pruning_observed(
         package.pruning(),

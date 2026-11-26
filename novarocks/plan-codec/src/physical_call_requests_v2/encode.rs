@@ -20,7 +20,7 @@ use crate::{
     allocation_exit_v2::reserve_exit,
     borrowed_type_resources::{
         type_binding_prefix_work_upper_bound_in, verify_type_binding,
-        verify_type_binding_admitted_in,
+        verify_type_binding_optional_work_in,
     },
     physical_expression_v2::expression_tree_lookup_work,
     physical_node_v2 as resources,
@@ -141,23 +141,28 @@ impl<'parent, 'callback, H> Model<'parent, 'callback, H> {
         }
         Ok(())
     }
-    fn check(&mut self, limits: CallRequestProjectionLimits) -> Result<(), HostError<H>> {
-        admitted(self.facts.definition_count, limits.max_definitions)?;
-        admitted(self.facts.type_reference_count, limits.max_type_references)?;
-        admitted(
-            self.facts.request_bytes_upper_bound,
-            limits.max_request_bytes,
-        )?;
-        admitted(
-            self.facts.allocation_requests_upper_bound,
-            limits.max_allocation_requests,
-        )?;
+    fn check(&mut self, limits: Option<CallRequestProjectionLimits>) -> Result<(), HostError<H>> {
+        if limits.is_none() {
+            self.source = self.source.max(self.known);
+        }
         self.facts.coexisting_source_and_request_bytes_upper_bound =
             add(self.source, self.facts.request_bytes_upper_bound)?;
-        admitted(
-            self.facts.coexisting_source_and_request_bytes_upper_bound,
-            limits.max_coexisting_source_and_request_bytes,
-        )?;
+        if let Some(limits) = limits {
+            admitted(self.facts.definition_count, limits.max_definitions)?;
+            admitted(self.facts.type_reference_count, limits.max_type_references)?;
+            admitted(
+                self.facts.request_bytes_upper_bound,
+                limits.max_request_bytes,
+            )?;
+            admitted(
+                self.facts.allocation_requests_upper_bound,
+                limits.max_allocation_requests,
+            )?;
+            admitted(
+                self.facts.coexisting_source_and_request_bytes_upper_bound,
+                limits.max_coexisting_source_and_request_bytes,
+            )?;
+        }
         let owned = add(128, mul(32, add(self.items, self.facts.definition_count)?)?)?;
         let lookup = add(
             mul(self.facts.type_reference_count, self.type_roots)?,
@@ -169,13 +174,17 @@ impl<'parent, 'callback, H> Model<'parent, 'callback, H> {
         )?;
         self.facts.cumulative_work_upper_bound =
             add(add(owned, lookup)?, add(copies, self.delegated)?)?;
-        admitted(self.facts.cumulative_work_upper_bound, limits.max_work)?;
+        if let Some(limits) = limits {
+            admitted(self.facts.cumulative_work_upper_bound, limits.max_work)?;
+        }
         if self.source < self.known {
             return Err((shape("request source invoice omits original backing")).into());
         }
         if let Some(parent) = self.parent.as_deref_mut() {
             self.work_peak = self.work_peak.max(self.facts.cumulative_work_upper_bound);
-            admitted(self.work_peak, limits.max_work)?;
+            if let Some(limits) = limits {
+                admitted(self.work_peak, limits.max_work)?;
+            }
             let mut prefix = self.facts;
             prefix.cumulative_work_upper_bound = self.work_peak;
             parent(&prefix)?;
@@ -186,7 +195,7 @@ impl<'parent, 'callback, H> Model<'parent, 'callback, H> {
         &mut self,
         left: &FunctionValueType,
         right: &FunctionValueType,
-        limits: CallRequestProjectionLimits,
+        limits: Option<CallRequestProjectionLimits>,
     ) -> Result<(), HostError<H>> {
         if self.parent.is_some() {
             let prefix = type_binding_prefix_work_upper_bound_in(left, right, self.source)?;
@@ -202,7 +211,7 @@ impl<'parent, 'callback, H> Model<'parent, 'callback, H> {
         &mut self,
         left: &FunctionValueType,
         right: &FunctionValueType,
-        limits: CallRequestProjectionLimits,
+        limits: Option<CallRequestProjectionLimits>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<bool, HostError<H>> {
         self.comparison_prefix(left, right, limits)?;
@@ -210,12 +219,16 @@ impl<'parent, 'callback, H> Model<'parent, 'callback, H> {
         // Subtract actual accumulated work, not the replacement peak for this
         // same comparison. Retain that peak in the final prepared facts.
         let remaining = limits
-            .max_work
-            .checked_sub(self.facts.cumulative_work_upper_bound)
-            .ok_or_else(resource)?;
+            .map(|limits| {
+                limits
+                    .max_work
+                    .checked_sub(self.facts.cumulative_work_upper_bound)
+                    .ok_or_else(resource)
+            })
+            .transpose()?;
         let compared = if self.parent.is_some() {
             let base = self.delegated;
-            verify_type_binding_admitted_in::<HostError<H>>(
+            verify_type_binding_optional_work_in::<HostError<H>>(
                 left,
                 right,
                 self.source,
@@ -257,7 +270,7 @@ fn verify_id<H>(
     id: u32,
     expected: &FunctionValueType,
     model: &mut Model<'_, '_, H>,
-    limits: CallRequestProjectionLimits,
+    limits: Option<CallRequestProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), HostError<H>> {
     // Linear source lookup is admitted by Model before delegating. The
@@ -291,7 +304,7 @@ fn validate_constant<H>(
     expected: &FunctionValueType,
     pools: &ConstantPools,
     model: &mut Model<'_, '_, H>,
-    limits: CallRequestProjectionLimits,
+    limits: Option<CallRequestProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), HostError<H>> {
     // Address-only selection keeps original Field/backing/ordinal and avoids
@@ -342,7 +355,7 @@ fn capture_constant<H>(
     selected: &novarocks_physical_plan::ConstantValue,
     expected: &FunctionValueType,
     model: &mut Model<'_, '_, H>,
-    limits: CallRequestProjectionLimits,
+    limits: Option<CallRequestProjectionLimits>,
 ) -> Result<(), HostError<H>> {
     let backing = usize::try_from(
         selected
@@ -360,7 +373,7 @@ fn count_request_header<H, K>(
     ids: &CallRequestTypeIds<'_, K>,
     model: &mut Model<'_, '_, H>,
     owned_source: &mut usize,
-    limits: CallRequestProjectionLimits,
+    limits: Option<CallRequestProjectionLimits>,
 ) -> Result<(), HostError<H>> {
     model.items = add(model.items, request.arguments.len())?;
     *owned_source = add(
@@ -379,7 +392,7 @@ fn count_lambda_header<H>(
     parameters: &[u32],
     model: &mut Model<'_, '_, H>,
     owned_source: &mut usize,
-    limits: CallRequestProjectionLimits,
+    limits: Option<CallRequestProjectionLimits>,
 ) -> Result<(), HostError<H>> {
     model.facts.type_reference_count = add(
         model.facts.type_reference_count,
@@ -403,7 +416,7 @@ fn preflight<H, K: WireRequestKey>(
     ids: &[CallRequestTypeIds<'_, K>],
     pools: &ConstantPools,
     invoice: usize,
-    limits: CallRequestProjectionLimits,
+    limits: Option<CallRequestProjectionLimits>,
     parent: Option<&mut HostAdmit<'_, H>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<CallRequestProjectionFacts, HostError<H>> {
@@ -566,7 +579,7 @@ pub fn prepare_call_requests_encode<'loan, 'source>(
     type_ids: &'loan [CallRequestTypeIds<'loan>],
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
-    limits: CallRequestProjectionLimits,
+    limits: impl Into<Option<CallRequestProjectionLimits>>,
     control: &'loan dyn PureCompileControl,
 ) -> Result<PreparedCallRequestsEncode<'loan, 'source>, Error> {
     let mut w = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
@@ -576,7 +589,7 @@ pub fn prepare_call_requests_encode<'loan, 'source>(
         type_ids,
         pools,
         source_retained_bytes,
-        limits,
+        limits.into(),
         None,
         &mut w,
     )
@@ -671,7 +684,7 @@ pub fn prepare_call_requests_encode_in<'loan, 'source, 'control: 'loan>(
     type_ids: &'loan [CallRequestTypeIds<'loan>],
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
-    limits: CallRequestProjectionLimits,
+    limits: impl Into<Option<CallRequestProjectionLimits>>,
     admit: &mut CallRequestAdmit<'_>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedCallRequestsEncode<'loan, 'source>, Error> {
@@ -695,7 +708,7 @@ pub fn prepare_call_requests_encode_with_host_in<'loan, 'source, 'control: 'loan
     type_ids: &'loan [CallRequestTypeIds<'loan>],
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
-    limits: CallRequestProjectionLimits,
+    limits: impl Into<Option<CallRequestProjectionLimits>>,
     admit: &mut dyn FnMut(&CallRequestProjectionFacts) -> Result<(), AdmissionRefusal<H>>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedCallRequestsEncode<'loan, 'source>, HostError<H>> {
@@ -717,7 +730,7 @@ pub fn prepare_call_requests_encode_host_core<'loan, 'source, 'control: 'loan, H
     type_ids: &'loan [CallRequestTypeIds<'loan>],
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
-    limits: CallRequestProjectionLimits,
+    limits: impl Into<Option<CallRequestProjectionLimits>>,
     admit: &mut HostAdmit<'_, H>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedCallRequestsEncode<'loan, 'source>, HostError<H>> {
@@ -727,7 +740,7 @@ pub fn prepare_call_requests_encode_host_core<'loan, 'source, 'control: 'loan, H
         type_ids,
         pools,
         source_retained_bytes,
-        limits,
+        limits.into(),
         Some(admit),
         work,
     )?;
@@ -827,7 +840,7 @@ pub(crate) fn encode_unit_requests_in(
     ids: &[super::UnitRequestTypeIds<'_>],
     pools: &ConstantPools,
     invoice: usize,
-    limits: CallRequestProjectionLimits,
+    limits: impl Into<Option<CallRequestProjectionLimits>>,
     admit: &mut CallRequestAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(Vec<wire::UnitCallRequest>, CallRequestProjectionFacts), Error> {
@@ -837,7 +850,7 @@ pub(crate) fn encode_unit_requests_in(
         ids,
         pools,
         invoice,
-        limits,
+        limits.into(),
         Some(&mut |facts| {
             admit(facts).map_err(|cause| ProjectionFailure::Codec(Error::Control(cause)))
         }),

@@ -698,7 +698,7 @@ fn decode_fragment_package_factory_core<
     funding: &mut Option<&mut dyn crate::physical_type_v2::PackageTypeFundingScope<H>>,
 ) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
     let plan_limits = limits.admission.plan_limits;
-    let mut unit_totals = super::unit_totals::UnitProjectionTotals::default();
+    let mut unit_roots = 0;
 
     // L0: generated-layout byte admission, then the original Prost verdict.
     let prepared = prepare_package_wire_in(raw, model, limits.wire, &mut |_| Ok(()), work)?;
@@ -1082,7 +1082,7 @@ fn decode_fragment_package_factory_core<
             CallRequestTypeOwner::Package(&types),
             &pools,
             invoice,
-            limits.requests,
+            None,
             creator,
             work,
         )?;
@@ -1096,7 +1096,7 @@ fn decode_fragment_package_factory_core<
             &types,
             &pools,
             invoice,
-            limits.requests,
+            None,
             &mut |_| Ok(()),
             work,
         )?;
@@ -1107,7 +1107,7 @@ fn decode_fragment_package_factory_core<
             facts,
         )
     };
-    unit_totals.requests_commit(&request_facts, limits.requests)?;
+
     let (cuts, _) = decode_fragment_cuts_observed(
         cuts_wire,
         &types,
@@ -1223,10 +1223,13 @@ fn decode_fragment_package_factory_core<
         };
         admit_count(fragment_wire.nodes.len(), plan_limits.fragment_nodes)?;
         let mut nodes = BTreeMap::new();
+        let mut fragment_definitions = 0usize;
         for input in &fragment_wire.nodes {
             let raw_unit = input.expressions.as_ref();
             if let Some(unit) = raw_unit {
-                unit_totals.roots(unit.roots.len())?;
+                super::unit_headers::admit_fragment_roots(&mut unit_roots, unit.roots.len())?;
+                fragment_definitions = add(fragment_definitions, unit.definitions.len())?;
+                admit_count(fragment_definitions, plan_limits.fragment_expressions)?;
             }
             let expressions = decode_expression_definitions_in(
                 crate::physical_expression_v2::ExpressionDefinitionInput::new(
@@ -1239,11 +1242,11 @@ fn decode_fragment_package_factory_core<
                 &parameters,
                 &pools,
                 invoice,
-                limits.expressions,
-                &mut |facts| unit_totals.expressions_prefix(facts, limits.expressions, false),
+                None,
+                &mut |_| Ok(()),
                 work,
             )?;
-            unit_totals.expressions_commit(expressions.facts(), limits.expressions, false)?;
+
             invoice = invoice.max(expressions.retained_floor_observed(work)?);
             let materialization = prepare_expression_materialization_in(
                 &expressions,
@@ -1251,8 +1254,8 @@ fn decode_fragment_package_factory_core<
                 &aggregates,
                 &plan_limits,
                 invoice,
-                limits.expressions,
-                &mut |facts| unit_totals.expressions_prefix(facts, limits.expressions, true),
+                None,
+                &mut |_| Ok(()),
                 work,
             )?;
             if let Some(creator) = creation.as_deref_mut() {
@@ -1267,12 +1270,8 @@ fn decode_fragment_package_factory_core<
                     )
                     .map_err(ProjectionFailure::<PackageDecodeError, H>::Host)?;
             }
-            let materialized = materialize_expressions_in(
-                materialization,
-                &mut |facts| unit_totals.expressions_prefix(facts, limits.expressions, true),
-                work,
-            )?;
-            unit_totals.expressions_commit(materialized.facts(), limits.expressions, true)?;
+            let materialized = materialize_expressions_in(materialization, &mut |_| Ok(()), work)?;
+
             invoice = invoice.max(materialized.retained_invoice_floor()?);
             let context = NodeDecodeContext {
                 expressions: &expressions,
@@ -1309,8 +1308,8 @@ fn decode_fragment_package_factory_core<
                         &definitions,
                         control_wire,
                         invoice,
-                        limits.control,
-                        &mut |facts| unit_totals.control_prefix(facts, limits.control),
+                        None,
+                        &mut |_| Ok(()),
                         creator,
                         factory,
                         work,
@@ -1326,19 +1325,19 @@ fn decode_fragment_package_factory_core<
                         &definitions,
                         control_wire,
                         invoice,
-                        limits.control,
-                        &mut |facts| unit_totals.control_prefix(facts, limits.control),
+                        None,
+                        &mut |_| Ok(()),
                         work,
                     )?
                 };
-                unit_totals.control_commit(&flow_facts, limits.control)?;
+
                 invoice = add(invoice, flow_facts.allocation_request_bytes_upper_bound)?;
                 let (claims, claim_facts) =
                     crate::physical_semantics_v2::decode_expression_claims_in(
                         required(raw_unit.claims.as_ref(), "unit scalar claims are absent")?,
                         invoice,
                         limits.node,
-                        &mut |facts| unit_totals.semantics_prefix(facts, limits.node),
+                        &mut |_| Ok(()),
                         creation.as_deref_mut(),
                         work,
                     )
@@ -1348,7 +1347,7 @@ fn decode_fragment_package_factory_core<
                         }
                         ProjectionFailure::Host(error) => ProjectionFailure::Host(error),
                     })?;
-                unit_totals.semantics_commit(&claim_facts, limits.node)?;
+
                 invoice = add(invoice, claim_facts.allocation_request_bytes_upper_bound)?;
                 let (requests, storage, request_facts) =
                     crate::physical_call_requests_v2::decode_unit_requests_in(
@@ -1356,8 +1355,8 @@ fn decode_fragment_package_factory_core<
                         &types,
                         &pools,
                         invoice,
-                        limits.requests,
-                        &mut |facts| unit_totals.requests_prefix(facts, limits.requests),
+                        None,
+                        &mut |_| Ok(()),
                         creation.as_deref_mut(),
                         work,
                     )
@@ -1367,7 +1366,7 @@ fn decode_fragment_package_factory_core<
                         }
                         ProjectionFailure::Host(error) => ProjectionFailure::Host(error),
                     })?;
-                unit_totals.requests_commit(&request_facts, limits.requests)?;
+
                 invoice = add(invoice, request_facts.request_bytes_upper_bound)?;
                 let mut ports = Vec::new();
                 ports
@@ -1455,7 +1454,6 @@ fn decode_fragment_package_factory_core<
                     },
                     invoice,
                     limits.node,
-                    &mut unit_totals,
                     creation.as_deref_mut(),
                     factory,
                     work,
@@ -1546,14 +1544,14 @@ fn decode_fragment_package_factory_core<
     };
 
     // L8: components whose membership is the final Fragment.
-    let (calls, call_facts) = crate::physical_semantics_v2::decode_frozen_call_entries_observed(
+    let (calls, _) = crate::physical_semantics_v2::decode_frozen_call_entries_observed(
         calls_wire,
         invoice,
         limits.node,
-        &mut |facts| unit_totals.semantics_prefix(facts, limits.node),
+        &mut |_| Ok(()),
         work,
     )?;
-    unit_totals.semantics_commit(&call_facts, limits.node)?;
+
     let fragment = fragment
         .with_calls_in(calls, &mut |_| Ok(()), work)
         .map_err(SemanticsCodecError::from)?;

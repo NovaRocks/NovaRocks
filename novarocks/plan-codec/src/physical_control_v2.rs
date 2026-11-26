@@ -33,8 +33,10 @@ use novarocks_type_contract::{
     ControlOwnedResourceFacts, ControlResourceError, control_resource_add, control_resource_mul,
     expression_control_flow_edge_resource_facts, expression_control_flow_header_resource_facts,
 };
+use resources::Model;
+#[cfg(test)]
+use resources::unbounded;
 pub use resources::{ControlProjectionFacts, ControlProjectionLimits};
-use resources::{Model, unbounded};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlCodecError {
@@ -325,7 +327,7 @@ pub fn encode_expression_control(
     control: &dyn PureCompileControl,
 ) -> Result<wire::ExpressionControl, ControlCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let mut model = encode_model(roots, 0, unbounded())?;
+    let mut model = encode_model(roots, 0, None)?;
     let encoded = encode_in(roots, &mut model, &mut |_| Ok(()), false, &mut work);
     if let Err(ControlCodecError::Control(c)) = &encoded {
         return Err(c.clone().into());
@@ -340,7 +342,7 @@ pub fn encode_expression_control_pure_in(
     roots: &ExpressionControlFlow<ExprId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::ExpressionControl, ControlCodecError> {
-    let mut model = encode_model(roots, 0, unbounded())?;
+    let mut model = encode_model(roots, 0, None)?;
     encode_in(roots, &mut model, &mut |_| Ok(()), false, work).map(|encoded| encoded.0)
 }
 
@@ -349,15 +351,22 @@ pub fn encode_expression_control_pure_in(
 pub fn encode_expression_control_observed(
     flow: &ExpressionControlFlow<ExprId>,
     source_retained_bytes: usize,
-    limits: ControlProjectionLimits,
+    limits: impl Into<Option<ControlProjectionLimits>>,
     admit: &mut impl FnMut(&ControlProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(wire::ExpressionControl, ControlProjectionFacts), ControlCodecError> {
     // Borrow the actual immutable control owner. Unit root correspondence is
     // validated by its own constructor, never reconstructed as a second bank.
-    let mut model = encode_model(flow, source_retained_bytes, limits)?;
+    let limits = limits.into();
+    let floor = flow_source_floor(flow)?;
+    let source = if limits.is_none() {
+        source_retained_bytes.max(floor)
+    } else {
+        source_retained_bytes
+    };
+    let mut model = encode_model(flow, source, limits)?;
     model.gate(admit)?;
-    model.floor(flow_source_floor(flow)?)?;
+    model.floor(floor)?;
     encode_in(flow, &mut model, admit, true, work)
 }
 /// Necessary original backing only: stored public map headers, key/value
@@ -403,10 +412,13 @@ fn flow_source_floor(flow: &ExpressionControlFlow<ExprId>) -> Result<usize, Cont
 fn encode_model(
     roots: &ExpressionControlFlow<ExprId>,
     b: usize,
-    limits: ControlProjectionLimits,
+    limits: Option<ControlProjectionLimits>,
 ) -> Result<Model, ControlCodecError> {
     let f = roots;
-    let mut m = Model::new(f.regions().len(), f.use_reference_count(), b, limits);
+    let mut m = match limits {
+        Some(limits) => Model::new(f.regions().len(), f.use_reference_count(), b, limits),
+        None => Model::input_derived(f.regions().len(), f.use_reference_count(), b),
+    };
     m.resources
         .buffer::<wire::EvaluationRegion>(f.regions().len(), 1)?;
     m.resources
@@ -484,15 +496,9 @@ pub fn decode_expression_control(
     control: &dyn PureCompileControl,
 ) -> Result<ExpressionControlFlow<ExprId>, ControlCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    let result = decode_expression_control_core(
-        definitions,
-        input,
-        None,
-        unbounded(),
-        &mut |_| Ok(()),
-        &mut work,
-    )
-    .map(|(flow, _)| flow);
+    let result =
+        decode_expression_control_core(definitions, input, None, None, &mut |_| Ok(()), &mut work)
+            .map(|(flow, _)| flow);
     if matches!(result, Err(ControlCodecError::Control(_))) {
         return result;
     }
@@ -524,20 +530,6 @@ fn original_decode_header(input: &wire::ExpressionControl) -> Result<(), Control
         return Err(ExpressionControlFlowError::TooManyItems.into());
     }
     Ok(())
-}
-fn decode_model(
-    input: &wire::ExpressionControl,
-    b: usize,
-    limits: ControlProjectionLimits,
-) -> Result<Model, ControlCodecError> {
-    decode_parts_model(input, b, limits)
-}
-fn decode_parts_model(
-    input: &wire::ExpressionControl,
-    b: usize,
-    limits: ControlProjectionLimits,
-) -> Result<Model, ControlCodecError> {
-    decode_parts_model_core(input, b, Some(limits))
 }
 fn decode_parts_model_core(
     input: &wire::ExpressionControl,
@@ -572,7 +564,7 @@ pub fn decode_expression_control_observed(
     definitions: &[ExprNode],
     input: &wire::ExpressionControl,
     source_retained_bytes: usize,
-    limits: ControlProjectionLimits,
+    limits: impl Into<Option<ControlProjectionLimits>>,
     admit: &mut impl FnMut(&ControlProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(ExpressionControlFlow<ExprId>, ControlProjectionFacts), ControlCodecError> {
@@ -580,7 +572,7 @@ pub fn decode_expression_control_observed(
         definitions,
         input,
         Some(source_retained_bytes),
-        limits,
+        limits.into(),
         admit,
         work,
     )
@@ -589,11 +581,11 @@ fn decode_expression_control_core(
     definitions: &[ExprNode],
     input: &wire::ExpressionControl,
     source: Option<usize>,
-    limits: ControlProjectionLimits,
+    limits: Option<ControlProjectionLimits>,
     admit: &mut impl FnMut(&ControlProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(ExpressionControlFlow<ExprId>, ControlProjectionFacts), ControlCodecError> {
-    let mut model = decode_model(input, source.unwrap_or(0), limits)?;
+    let mut model = decode_parts_model_core(input, source.unwrap_or(0), limits)?;
     if source.is_none() {
         model.infer_input_source();
     }
@@ -661,7 +653,7 @@ pub(crate) fn decode_expression_control_with_creator_observed_in<
     definitions: &[ExprNode],
     input: &wire::ExpressionControl,
     source: usize,
-    limits: ControlProjectionLimits,
+    limits: impl Into<Option<ControlProjectionLimits>>,
     admit: &mut impl FnMut(&ControlProjectionFacts) -> Result<(), CompileControlError>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     factory: Option<&F>,
@@ -674,7 +666,7 @@ pub(crate) fn decode_expression_control_with_creator_observed_in<
     use novarocks_type_contract::{
         ExpressionControlCreationFailure as C, ValueSchemaScopeBeginFailure as B,
     };
-    let mut model = decode_model(input, source, limits)?;
+    let mut model = decode_parts_model_core(input, source, limits.into())?;
     model.gate(admit)?;
     let floor = control_source_floor(input)?;
     model.floor(floor)?;

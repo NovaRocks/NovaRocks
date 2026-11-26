@@ -35,7 +35,6 @@ mod encode;
 mod encode_error;
 mod unit_creation;
 mod unit_headers;
-mod unit_totals;
 pub use encode_error::PhysicalEncodeError;
 
 mod frozen_limits;

@@ -17,7 +17,7 @@
 
 //! Borrow the actual unit constructor's request facts and storage ports.
 //! No second DAG walk, scope identity, quota or guessed SDK geometry lives here.
-use super::{PackageDecodeError, unit_totals::UnitProjectionTotals};
+use super::PackageDecodeError;
 use crate::{
     host_projection_v2::ProjectionFailure as Failure,
     physical_expression_v2::ExpressionCodecError,
@@ -68,13 +68,11 @@ pub(super) fn construct<H, F: ValueSchemaCreationFactory<H>>(
     unit_limits: UnitLimits,
     source: usize,
     limits: NodeProjectionLimits,
-    totals: &mut UnitProjectionTotals,
     creation: Option<&mut ValueSchemaCreation<'_, H>>,
     factory: Option<&F>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(BoundExprSet, NodeProjectionFacts), ReceivingFailure<H>> {
     let mut model = Model::default();
-    totals.semantics_prefix(&model.numerical_facts(source, 0, limits)?, limits)?;
     let mut observe = |request| {
         match request {
             UnitConstructionRequest::Exact { layout, .. } => model.layout_request(layout, 1)?,
@@ -85,7 +83,6 @@ pub(super) fn construct<H, F: ValueSchemaCreationFactory<H>>(
                     add(model.delegated_work, facts.cumulative_work_upper_bound)?;
             }
         }
-        totals.semantics_prefix(&model.numerical_facts(source, 0, limits)?, limits)?;
         Ok::<_, ReceivingFailure<H>>(())
     };
     let unit = if let Some(factory) = factory {
@@ -136,6 +133,5 @@ pub(super) fn construct<H, F: ValueSchemaCreationFactory<H>>(
             .map_err(failure)?
     };
     let facts = model.numerical_facts(source, 0, limits)?;
-    totals.semantics_commit(&facts, limits)?;
     Ok((unit, facts))
 }

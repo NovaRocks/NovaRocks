@@ -159,6 +159,7 @@ impl Model {
         Ok(())
     }
 }
+#[cfg(test)]
 pub(super) fn unbounded() -> ControlProjectionLimits {
     ControlProjectionLimits {
         max_regions: usize::MAX,
