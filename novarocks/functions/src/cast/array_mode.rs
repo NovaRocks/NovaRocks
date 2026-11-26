@@ -18,7 +18,7 @@
 //! Explicit array conversion within the original prepared CAST recipe.
 //! Only conversion-authored row Data enters this boundary's TRY policy.
 use super::*;
-use crate::{SelectedValues, Selection, selected_copy};
+use crate::{SelectedValues, Selection, opaque_memory::OpaqueRetainedCharge, selected_copy};
 use arrow_array::{ArrayRef, ListArray, new_empty_array, new_null_array};
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use novarocks_type_contract::ArrayCastFailureMode;
@@ -450,6 +450,16 @@ pub(super) fn evaluate<'a>(
         }
         selected_copy::guarded_result_extent(recipe.result.data_type(), selection.len())
             .map_err(|e| e.into_kernel())?;
+        // Staged JSON leaf payloads remain alive while their final Arrow
+        // buffers are copied and adopted. Retire the staging charge last.
+        let mut json_staging = if recipe.body == CastBody::JsonStructure && !selection.is_empty() {
+            let host = allocator.ok_or_else(|| {
+                invalid("JSON CAST requires its original expression allocation scope")
+            })?;
+            Some(OpaqueRetainedCharge::try_new(Arc::clone(host))?)
+        } else {
+            None
+        };
         let mut arrays = reserve::<ArrayRef>(selection.len(), &mut work)?;
         let mut errors = reserve::<RowDataError>(selection.len(), &mut work)?;
         let mut choices = reserve::<(usize, usize)>(selection.len(), &mut work)?;
@@ -483,21 +493,34 @@ pub(super) fn evaluate<'a>(
                     recipe.body,
                     CastBody::ExplicitMap | CastBody::ExplicitRow { .. } | CastBody::JsonStructure
                 ) {
-                    let evaluate_row = match recipe.body {
-                        CastBody::ExplicitMap => super::map_mode::evaluate_row,
-                        CastBody::ExplicitRow { .. } => super::row_mode::evaluate_row,
-                        CastBody::JsonStructure => super::array_json::structure::evaluate_row,
-                        _ => unreachable!("validated structured CAST body"),
+                    let converted = if recipe.body == CastBody::JsonStructure {
+                        super::array_json::structure::evaluate_row(
+                            recipe,
+                            argument.array(),
+                            row,
+                            ordinal,
+                            json_staging
+                                .as_mut()
+                                .expect("selected JSON structure CAST has staging custody"),
+                            &mut work,
+                        )
+                    } else {
+                        let evaluate_row = match recipe.body {
+                            CastBody::ExplicitMap => super::map_mode::evaluate_row,
+                            CastBody::ExplicitRow { .. } => super::row_mode::evaluate_row,
+                            _ => unreachable!("validated structured CAST body"),
+                        };
+                        evaluate_row(
+                            recipe,
+                            argument.array(),
+                            row,
+                            ordinal,
+                            control,
+                            allocator,
+                            &mut work,
+                        )
                     };
-                    match evaluate_row(
-                        recipe,
-                        argument.array(),
-                        row,
-                        ordinal,
-                        control,
-                        allocator,
-                        &mut work,
-                    )? {
+                    match converted? {
                         Ok(value) => value,
                         Err(error) => {
                             if recipe.array_failure_mode != Some(ArrayCastFailureMode::OutputNull) {

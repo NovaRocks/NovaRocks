@@ -23,7 +23,8 @@ use crate::cast::{
 use crate::json_value::{self, Container, Kind, Node, ObservedError, Scalar};
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
-use crate::{DataFailureReason, KernelEvaluationControl, KernelFailure, RowDataError};
+use crate::opaque_memory::OpaqueRetainedCharge;
+use crate::{DataFailureReason, KernelFailure, RowDataError};
 use arrow_array::builder::{
     ArrayBuilder, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder, Int8Builder,
     Int16Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, ListBuilder, MapBuilder,
@@ -34,7 +35,7 @@ use arrow_schema::DataType;
 use novarocks_type_contract::{
     CharacterKind, CompileCheckpoints, FunctionValueType, ValueKind, ValueLogicalType, ValueTypeRef,
 };
-use std::{collections::HashMap, io::Write as _, sync::Arc};
+use std::{collections::HashMap, io::Write as _};
 
 #[derive(Clone, Copy)]
 enum Target {
@@ -170,15 +171,14 @@ pub(in crate::cast) fn evaluate_row(
     input: &ArrayRef,
     row: usize,
     ordinal: usize,
-    _control: &dyn KernelEvaluationControl,
-    _allocator: Option<&Arc<dyn crate::AggregateStateAllocator>>,
+    staging: &mut OpaqueRetainedCharge,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Result<ArrayRef, RowDataError>, KernelFailure> {
     let input = input
         .as_any()
         .downcast_ref::<LargeBinaryArray>()
         .ok_or_else(|| invalid("JSON structure CAST lost its LargeBinary source"))?;
-    match convert(input.value(row), &recipe.result, ordinal, work) {
+    match convert(input.value(row), &recipe.result, ordinal, staging, work) {
         Ok(value) => Ok(value),
         Err(CastFault::Outer(error)) => Err(error),
         Err(CastFault::Data(detail)) => Ok(Err(RowDataError::with_reason(
@@ -195,13 +195,14 @@ fn convert(
     raw: &[u8],
     target: &FunctionValueType,
     ordinal: usize,
+    staging: &mut OpaqueRetainedCharge,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Result<ArrayRef, RowDataError>, CastFault> {
     let root = Node::from_root(raw)?;
     root.validate(|| work.step())?;
     work.flush()?;
     let mut builder = make_builder(target.data_type(), 1);
-    append_value(root, target.value_type(), builder.as_mut(), work)?;
+    append_value(root, target.value_type(), builder.as_mut(), staging, work)?;
     work.flush()?;
     let value = builder.finish();
     work.flush()?;
@@ -222,20 +223,31 @@ fn append_value(
     node: Node<'_>,
     value: &ValueTypeRef,
     builder: &mut dyn ArrayBuilder,
+    staging: &mut OpaqueRetainedCharge,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<(), CastFault> {
     let target =
         target(value.kind()).ok_or_else(|| internal("JSON CAST lost its frozen value target"))?;
     if matches!(target, Target::Json) {
         let out = builder_as::<LargeBinaryBuilder>(builder)?;
+        let payload_bytes = node
+            .item_bytes()
+            .len()
+            .checked_add(1)
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        let staged_bytes = staging
+            .bytes()
+            .checked_add(payload_bytes)
+            .ok_or(KernelFailure::ResourceExhausted)?;
         let extent = out
             .values_slice()
             .len()
-            .checked_add(node.item_bytes().len())
-            .and_then(|size| size.checked_add(1))
+            .checked_add(payload_bytes)
             .ok_or(KernelFailure::ResourceExhausted)?;
         i64::try_from(extent).map_err(|_| KernelFailure::ResourceExhausted)?;
         work.flush()?;
+        let mut reservation = staging.reserve_operation(payload_bytes)?;
+        staging.reconcile_under_reservation(staged_bytes, &mut reservation)?;
         out.write_all(&[json_value::VERSION])
             .map_err(|_| internal("JSON CAST could not write its version byte"))?;
         for chunk in node.item_bytes().chunks(4096) {
@@ -260,7 +272,7 @@ fn append_value(
             let out = builder_as::<ListBuilder<Box<dyn ArrayBuilder>>>(builder)?;
             for entry in elements.entries() {
                 work.step()?;
-                append_value(entry?.value, item, out.values().as_mut(), work)?;
+                append_value(entry?.value, item, out.values().as_mut(), staging, work)?;
             }
             check_child_offset(out.values().len())?;
             work.flush()?;
@@ -279,14 +291,16 @@ fn append_value(
                     .key
                     .ok_or_else(|| internal("JSON object entry lost its key"))?;
                 append_json_scalar(key_type, Scalar::String(name), out.keys().as_mut(), work)?;
-                append_value(entry.value, value, out.values().as_mut(), work)?;
+                append_value(entry.value, value, out.values().as_mut(), staging, work)?;
             }
             check_child_offset(out.keys().len())?;
             work.flush()?;
             out.append(true).map_err(assembly_failure)?;
             Ok(())
         }
-        (Target::Row, ValueKind::Struct(fields), kind) => append_row(kind, fields, builder, work),
+        (Target::Row, ValueKind::Struct(fields), kind) => {
+            append_row(kind, fields, builder, staging, work)
+        }
         (_, _, Kind::Scalar(scalar)) => append_json_scalar(target, scalar, builder, work),
         _ => Err(CastFault::Data("Unexpected JSON shape for the cast target")),
     }
@@ -296,6 +310,7 @@ fn append_row(
     kind: Kind<'_>,
     fields: &[novarocks_type_contract::ValueField],
     builder: &mut dyn ArrayBuilder,
+    staging: &mut OpaqueRetainedCharge,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<(), CastFault> {
     let row = builder_as::<StructBuilder>(builder)?;
@@ -312,11 +327,17 @@ fn append_row(
                 .zip(elements.entries())
             {
                 work.step()?;
-                append_value(entry?.value, field.value_type(), builder.as_mut(), work)?;
+                append_value(
+                    entry?.value,
+                    field.value_type(),
+                    builder.as_mut(),
+                    staging,
+                    work,
+                )?;
             }
         }
         Kind::Object(members) if fields.first().is_some_and(|field| !field.name().is_empty()) => {
-            append_named_row(members, fields, row, work)?;
+            append_named_row(members, fields, row, staging, work)?;
         }
         _ => {
             return Err(CastFault::Data(
@@ -333,6 +354,7 @@ fn append_named_row(
     members: Container<'_>,
     fields: &[novarocks_type_contract::ValueField],
     row: &mut StructBuilder,
+    staging: &mut OpaqueRetainedCharge,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<(), CastFault> {
     let mut names = HashMap::new();
@@ -369,6 +391,7 @@ fn append_named_row(
                 entry.value,
                 fields[index].value_type(),
                 row.field_builders_mut()[index].as_mut(),
+                staging,
                 work,
             )?;
         }

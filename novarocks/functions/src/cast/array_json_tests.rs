@@ -424,7 +424,7 @@ fn selected_json_structure_body(
     let control = Control::default();
     let len = inputs.len();
     let host: Arc<dyn crate::AggregateStateAllocator> =
-        Arc::new(crate::UnaccountedAggregateStateAllocator);
+        Arc::new(crate::source_custody_direct_tests::Host::default());
     let charge = crate::opaque_memory::OpaqueRetainedCharge::try_new(Arc::clone(&host)).unwrap();
     let mut checkpoints = EvaluationCheckpoints::new(&control);
     let input: arrow_array::ArrayRef = Arc::new(arrow_array::LargeBinaryArray::from_iter(
