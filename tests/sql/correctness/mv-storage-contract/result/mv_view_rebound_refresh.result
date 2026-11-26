@@ -10,26 +10,32 @@ id
 1
 1
 
--- query 7
+-- query 9
+-- types	bigint
+id
+1
+1
+
+-- query 12
 -- types	bigint
 id
 2
 2
 
--- query 8
+-- query 13
 -- types	bigint
 id
 2
 2
 
--- query 11
+-- query 16
 -- types	bigint
 id
 2
 2
 3
 
--- query 12
+-- query 17
 -- types	bigint
 id
 2

@@ -23,7 +23,7 @@ CREATE MATERIALIZED VIEW target_mv WITH (refresh_policy = 'MANUAL') AS SELECT id
 
 -- query 2
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=1,full-refreshes=1,logical-rows=2,source=original,markers=clear
+-- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=1,table-commits=2,full-refreshes=1,logical-rows=2,source=original,markers=clear
 REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 3
@@ -34,35 +34,59 @@ SELECT id FROM source_view ORDER BY id;
 
 -- query 5
 -- @skip_result_check=true
-CREATE OR REPLACE VIEW source_view AS SELECT id FROM replacement;
+CREATE OR REPLACE VIEW source_view AS
+SELECT id FROM replacement WHERE IF(false, random() < 0e0, true);
 
 -- query 6
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=2,table-commits=4,full-refreshes=2,full-refresh-last=true,logical-rows=2,binding-changes=1,source=replacement,markers=clear
-REFRESH MATERIALIZED VIEW target_mv;
+-- @result_contains=MV refresh: InvalidDefinition
+-- @result_contains=Materialized view definition cannot use volatile function 'random'
+-- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=1,table-commits=2,full-refreshes=1,logical-rows=2,source=original,markers=clear
+EXPLAIN REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 7
-SELECT id FROM target_mv ORDER BY id;
+-- @expect_trino_error=VIEW_IS_STALE,USER_ERROR
+REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 8
-SELECT id FROM source_view ORDER BY id;
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=1,table-commits=3,full-refreshes=1,logical-rows=2,source=original,markers=invalid-definition-publication
+SELECT 1;
 
 -- query 9
--- @skip_result_check=true
-INSERT INTO replacement VALUES (3);
+SELECT id FROM target_mv ORDER BY id;
 
 -- query 10
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=3,table-commits=5,full-refreshes=2,append-last=true,logical-rows=3,binding-changes=1,source=replacement,markers=clear
-REFRESH MATERIALIZED VIEW target_mv;
+CREATE OR REPLACE VIEW source_view AS SELECT id FROM replacement;
 
 -- query 11
-SELECT id FROM target_mv ORDER BY id;
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=2,table-commits=5,full-refreshes=2,full-refresh-last=true,logical-rows=2,binding-changes=1,source=replacement,markers=clear
+REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 12
-SELECT id FROM source_view ORDER BY id;
+SELECT id FROM target_mv ORDER BY id;
 
 -- query 13
+SELECT id FROM source_view ORDER BY id;
+
+-- query 14
+-- @skip_result_check=true
+INSERT INTO replacement VALUES (3);
+
+-- query 15
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=3,table-commits=6,full-refreshes=2,append-last=true,logical-rows=3,binding-changes=1,source=replacement,markers=clear
+REFRESH MATERIALIZED VIEW target_mv;
+
+-- query 16
+SELECT id FROM target_mv ORDER BY id;
+
+-- query 17
+SELECT id FROM source_view ORDER BY id;
+
+-- query 18
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.target_mv;
