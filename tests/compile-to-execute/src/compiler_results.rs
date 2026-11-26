@@ -346,7 +346,7 @@ pub fn compile_options() -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        constants: policy(),
+        constants: policy().into(),
     }
 }
 pub fn compiler_results(

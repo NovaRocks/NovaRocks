@@ -32,7 +32,6 @@ use crate::physical_read_scan_v2::ReadScanProjectionLimits;
 use crate::physical_relation_v2::RelationProjectionLimits;
 use crate::physical_semantics_v2::ParameterProjectionLimits;
 use crate::physical_type_v2::PackageTypeProjectionLimits;
-use crate::physical_value_origin_v2::ValueOriginProjectionLimits;
 
 use crate::physical_writer_recipe_v2::WriterRecipeProjectionLimits;
 use crate::physical_writer_schema_v2::WriterSchemaProjectionLimits;

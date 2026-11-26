@@ -107,6 +107,7 @@ impl PreparedConstantNamespaceWrite<'_, '_, '_> {
         let result = self.emit_core(None, &mut work);
         finish(work, result)
     }
+    #[cfg(test)]
     pub(crate) fn emit_in(
         self,
         admit: &mut Admit<'_>,
@@ -275,6 +276,7 @@ pub fn prepare_constant_namespace_write<'pool, 'table, 'control>(
     finish(work, result)
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_constant_namespace_write_in<'pool, 'table, 'control>(
     pools: &'pool ConstantPools,
     bindings: &[ConstantRecordTypeIds],

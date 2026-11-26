@@ -376,11 +376,12 @@ impl PreparedTaskValueObservation {
         records: &[(novarocks_physical_plan::ConstantPoolId, usize)],
         program: &novarocks_local_program::LocalProgram,
     ) {
+        use novarocks_expression_contract::ExprKind;
         use novarocks_failpoint::observation_marker::{
             TASK_CONSTANT_IPC_RECORD, TASK_VALUES_BACKING, TASK_VALUES_SOURCE,
         };
         use novarocks_local_program::ProgramNodeKind;
-        use novarocks_physical_plan::{ConstantReference, ExprKind, NodeId, NodeKind};
+        use novarocks_physical_plan::{ConstantReference, NodeId, NodeKind};
         let fragment = package.fragment();
         let fragment_id = fragment.id().get();
         for &(id, body_bytes) in records {

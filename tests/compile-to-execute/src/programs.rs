@@ -363,7 +363,7 @@ fn programs_with_original_frozen_reads(
                     kernel_abi: KernelAbiVersion::CURRENT,
                     // The package carries the statement's source policy. These
                     // are the host's fixture admission limits.
-                    constants: policy(),
+                    constants: policy().into(),
                 },
                 &Control,
             )

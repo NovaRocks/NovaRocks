@@ -685,6 +685,7 @@ fn prepare_record_core<'pool, 'control, H>(
 mod binding_resources;
 mod namespace;
 mod write_namespace;
+#[cfg(test)]
 pub(crate) use namespace::prepare_constant_namespace_in;
 pub use namespace::{
     ConstantNamespaceProjectionLimits, ConstantNamespaceResourceFacts, PreparedConstantNamespace,
@@ -695,6 +696,7 @@ pub use namespace::{
     prepare_constant_namespace_with_creator_in, prepare_constant_namespace_with_factory_in,
 };
 
+#[cfg(test)]
 pub(crate) use write_namespace::prepare_constant_namespace_write_in;
 
 pub use crate::ipc_schema_v2::ConstantWriteRequest;

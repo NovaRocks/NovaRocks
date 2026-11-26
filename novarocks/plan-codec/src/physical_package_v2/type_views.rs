@@ -154,6 +154,7 @@ fn input_contribution(
 }
 impl<'source, 'control, const N: usize> SourceInputPrefix<'source, 'control, N> {
     #[cfg(test)]
+    #[cfg(test)]
     pub(crate) fn new_in(
         requests: [SourceInputReserve<'source>; N],
         budget: &mut TypeViewBudget<'source, 'control, '_>,

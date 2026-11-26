@@ -738,6 +738,27 @@ fn prior_plan_contract_revision_is_refused_by_the_original_package_constructor()
 }
 
 #[test]
+fn original_revision_46_sender_package_is_refused_by_the_current_receiver() {
+    // Emitted by the original cv_package fixture at 2cc1ed48f62e.
+    // Includes the removed original call request and package source-policy
+    // fields. Keep the original bytes, including the old field numbers.
+    let bytes = include_bytes!("fixtures/revision_46_constant_package.pb");
+    let old = wire::FragmentPackage::decode(bytes.as_slice()).unwrap();
+    assert_eq!(old.required.unwrap().plan_contract_revision, 46);
+    match refused(bytes) {
+        PackageDecodeError::Package(p::FragmentPackageError::Structure(errors)) => {
+            assert!(errors.to_string().contains("package.required"));
+            assert!(
+                errors
+                    .to_string()
+                    .contains("plan contract revision differs")
+            );
+        }
+        other => panic!("old package must reach the original package contract check: {other:?}"),
+    }
+}
+
+#[test]
 fn absent_required_components_are_refused_without_defaults() {
     let package = rich_package();
     type PackageMutation = fn(&mut wire::FragmentPackage);

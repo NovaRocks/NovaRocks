@@ -528,6 +528,7 @@ impl TypeDecodeModel {
         self.work = add(self.work, profile.work)?;
         Ok(())
     }
+    #[cfg(test)]
     pub(super) fn facts(
         &self,
         limits: PackageTypeProjectionLimits,

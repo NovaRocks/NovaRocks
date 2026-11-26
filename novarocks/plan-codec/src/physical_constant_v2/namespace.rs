@@ -887,6 +887,7 @@ pub fn prepare_constant_namespace<'raw, 'table, 'control>(
     finish(work, result)
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_constant_namespace_in<'raw, 'table, 'control>(
     records: &'raw [wire::IpcConstantPool],
     types: &'table DecodedTypeTable,
