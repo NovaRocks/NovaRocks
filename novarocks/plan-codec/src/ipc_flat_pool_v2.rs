@@ -369,6 +369,7 @@ pub(crate) fn prepare_flat_pool_write_pure_in<'pool, 'control>(
     pool: &'pool ConstantPool,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedPureFlatPoolWriter<'pool, 'control>, TypeCodecError> {
+    validate_pure_pool_source(pool, work)?;
     let (prepared, _) = prepare_from_input(
         pool,
         |field, work| {
@@ -385,14 +386,10 @@ pub(crate) fn prepare_flat_pool_write_pure_in<'pool, 'control>(
     })
 }
 
-fn prepare_from_input<'pool, H>(
-    pool: &'pool ConstantPool,
-    preflight_schema: impl FnOnce(
-        &arrow::datatypes::Field,
-        &mut CompileCheckpoints<'_>,
-    ) -> Result<ipc_schema_v2::SchemaPreflight, HostError<H>>,
+pub(crate) fn validate_pure_pool_source(
+    pool: &ConstantPool,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(Prepared<'pool>, ipc_schema_v2::SchemaPreflight), HostError<H>> {
+) -> Result<(), TypeCodecError> {
     work.flush()?;
     if pool.source_owner().is_none() {
         novarocks_constant_contract::validate_pure_borrowed_source_in(pool.field(), work).map_err(
@@ -406,6 +403,18 @@ fn prepare_from_input<'pool, H>(
             },
         )?;
     }
+    Ok(())
+}
+
+fn prepare_from_input<'pool, H>(
+    pool: &'pool ConstantPool,
+    preflight_schema: impl FnOnce(
+        &arrow::datatypes::Field,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<ipc_schema_v2::SchemaPreflight, HostError<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(Prepared<'pool>, ipc_schema_v2::SchemaPreflight), HostError<H>> {
+    work.flush()?;
     if !(LOCKED_FAMILY
         && LOCKED_TOOLCHAIN
         && arrow::ARROW_VERSION == crate::resource_source_model::LOCKED_ARROW_VERSION

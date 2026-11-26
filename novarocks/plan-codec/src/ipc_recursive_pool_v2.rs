@@ -157,6 +157,7 @@ pub(crate) fn prepare_recursive_pool_write_pure_in<'pool, 'control>(
     pool: &'pool ConstantPool,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedPureRecursivePoolWriter<'pool, 'control>, TypeCodecError> {
+    ipc_flat_pool_v2::validate_pure_pool_source(pool, work)?;
     let (prepared, _) = prepare_from_input(
         pool,
         |field, work| {
@@ -182,18 +183,6 @@ fn prepare_from_input<'pool, H>(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(Prepared<'pool>, ipc_schema_v2::SchemaPreflight), HostError<H>> {
     work.flush()?;
-    if pool.source_owner().is_none() {
-        novarocks_constant_contract::validate_pure_borrowed_source_in(pool.field(), work).map_err(
-            |error| match error {
-                novarocks_constant_contract::ConstantError::Control(cause) => {
-                    TypeCodecError::Control(cause)
-                }
-                _ => TypeCodecError::ResourceSource(
-                    "pure borrowed pool has no original metadata custody",
-                ),
-            },
-        )?;
-    }
     if !(LOCKED_FAMILY
         && LOCKED_TOOLCHAIN
         && arrow::ARROW_VERSION == crate::resource_source_model::LOCKED_ARROW_VERSION
