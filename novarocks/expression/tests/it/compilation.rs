@@ -1787,7 +1787,7 @@ fn full_types_and_shared_float_bits_keep_original_backing_and_reject_retagging()
 }
 
 #[test]
-fn shared_constant_backing_is_bounded_once_and_independent_backings_are_charged() {
+fn compiled_unit_keeps_shared_and_independent_large_constant_backings() {
     use arrow::array::BinaryArray;
     let payload = vec![7u8; 9 * 1024 * 1024];
     let make = || {
@@ -1805,7 +1805,7 @@ fn shared_constant_backing_is_bounded_once_and_independent_backings_are_charged(
     let b = make();
     let mut pools = ConstantPools::empty();
     pools.insert(ConstantPoolId::new(1), a.clone()).unwrap();
-    pools.insert(ConstantPoolId::new(2), b).unwrap();
+    pools.insert(ConstantPoolId::new(2), b.clone()).unwrap();
     let unit = |pool_ids: &[u32]| {
         let mut builder = builder();
         for &pool in pool_ids {
@@ -1842,7 +1842,7 @@ fn shared_constant_backing_is_bounded_once_and_independent_backings_are_charged(
         };
         assert_eq!(value.pool().backing_identity(), a.backing_identity());
     }
-    let e = compile(
+    let independent = compile(
         &unit(&[1, 2]),
         &pools,
         &SemanticParameters::default(),
@@ -1852,14 +1852,23 @@ fn shared_constant_backing_is_bounded_once_and_independent_backings_are_charged(
         },
         &Control::good(),
     )
-    .unwrap_err();
-    assert!(matches!(
-        e,
-        ExprCompileError::Expressions(ExpressionsCompileError::Expression(
-            StaticExpressionError::TooManyBytes
-        ))
-    ));
-    assert_eq!(e.failure_fact().class(), FailureClass::Resource);
+    .unwrap();
+    drop(pools);
+    assert_ne!(a.backing_identity(), b.backing_identity());
+    assert_eq!(independent.definitions().nodes().len(), 2);
+    for (node, source) in independent.definitions().nodes().iter().zip([a, b]) {
+        let StaticExprKind::Constant(value) = node.kind() else {
+            panic!("constant")
+        };
+        assert_eq!(value.pool().backing_identity(), source.backing_identity());
+        let array = value
+            .pool()
+            .array()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(array.value(value.ordinal() as usize), payload.as_slice());
+    }
 }
 
 #[test]

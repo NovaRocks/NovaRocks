@@ -190,7 +190,6 @@ enum ProgramReason {
     LayoutTypedProjectionRequiresOwner = 208,
     LayoutAllocationModel = 209,
     StaticValuesSchemaMismatch = 220,
-    StaticValuesTooManyBytes = 221,
     StaticValuesNoDynamicCell = 222,
     StaticValuesCellOutOfRange = 223,
     StaticValuesCellOrder = 224,
@@ -321,11 +320,7 @@ impl FailureProjection for StaticValuesError {
                 FailureClass::Invariant,
                 ProgramReason::StaticValuesSchemaMismatch as u16,
             ),
-            Self::TooManyBytes => limit(
-                ProgramReason::StaticValuesTooManyBytes as u16,
-                ResourceDimension::Bytes,
-                crate::values::MAX_STATIC_VALUES_BACKING_BYTES,
-            ),
+            Self::Resource(source) => source.failure_fact(),
             Self::NoDynamicCell => fact(
                 FailureClass::Invariant,
                 ProgramReason::StaticValuesNoDynamicCell as u16,
@@ -667,11 +662,6 @@ impl FailureProjection for LocalProgramCompileError {
                 300,
                 ResourceDimension::Items,
                 novarocks_expression::MAX_STATIC_EXPRESSIONS,
-            ),
-            Self::TooManyConstantBytes => limit(
-                5,
-                ResourceDimension::Bytes,
-                novarocks_expression::MAX_STATIC_EXPRESSION_DYNAMIC_BYTES,
             ),
             Self::InvalidExpression => LocalProgramError::InvalidExpression.failure_fact(),
             Self::MissingSink => fact(

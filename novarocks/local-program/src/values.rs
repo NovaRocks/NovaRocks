@@ -35,10 +35,6 @@ use novarocks_type_contract::{
 use crate::{ProgramRootRef, StaticLayout};
 use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
 
-/// Historical policy for ordinary SQL VALUES backing. System relations use
-/// StaticBatchSequence and do not inherit this independent policy.
-pub const MAX_STATIC_VALUES_BACKING_BYTES: usize = 16 * 1024 * 1024;
-
 #[derive(Clone, Debug)]
 pub struct StaticValues {
     backing: ValuesBacking,
@@ -168,7 +164,7 @@ pub enum StaticValuesBacking<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StaticValuesError {
     SchemaMismatch,
-    TooManyBytes,
+    Resource(LayoutResourceError),
     /// A cell-backed Values has no dynamic cell; an all-constant one is a batch.
     NoDynamicCell,
     /// A dynamic cell names a row or column outside the Values shape.
@@ -186,7 +182,14 @@ impl fmt::Display for StaticValuesError {
     }
 }
 
-impl std::error::Error for StaticValuesError {}
+impl std::error::Error for StaticValuesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Resource(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Pure construction preserves structural diagnostics and the caller's original
 /// interruption separately. Neither branch grants backing memory admission.
@@ -279,7 +282,7 @@ impl StaticValues {
             Err(ValuesCompileError::Control(_)) => {
                 unreachable!("pure values have no compile control")
             }
-            Err(ValuesCompileError::Resource(_)) => Err(StaticValuesError::TooManyBytes),
+            Err(ValuesCompileError::Resource(source)) => Err(StaticValuesError::Resource(source)),
         }
     }
 
@@ -312,9 +315,8 @@ impl StaticValues {
         creation: &mut ValueSchemaCreation<'_, H>,
         mut work: Option<&mut CompileCheckpoints<'_>>,
     ) -> Result<Self, ValuesCreationFailure<H>> {
-        // Arrow's existing schema equality and retained-size traversal remain
-        // opaque. These observations neither change their admission semantics
-        // nor claim an internal quantum, unique ownership, or a MEM grant.
+        // Bracket the opaque Arrow schema check and retained-size traversal
+        // with the original control. Retained bytes describe the backing.
         if let Some(work) = &mut work {
             work.flush()?;
         }
@@ -329,16 +331,6 @@ impl StaticValues {
             work.flush()?;
         }
         let retained_bytes = batch.get_array_memory_size();
-        if let Some(work) = &mut work {
-            work.flush()?;
-        }
-        let too_many_bytes = retained_bytes > MAX_STATIC_VALUES_BACKING_BYTES;
-        if let Some(work) = &mut work {
-            work.step()?;
-        }
-        if too_many_bytes {
-            return Err(StaticValuesError::TooManyBytes.into());
-        }
         if let Some(work) = &mut work {
             work.flush()?;
         }
@@ -470,8 +462,7 @@ impl StaticValues {
             work.flush()?;
             retained_bytes = retained_bytes
                 .checked_add(bytes)
-                .filter(|total| *total <= MAX_STATIC_VALUES_BACKING_BYTES)
-                .ok_or(StaticValuesError::TooManyBytes)?;
+                .ok_or(LayoutResourceError::Arithmetic)?;
         }
         work.flush()?;
         let storage = creation
@@ -667,7 +658,17 @@ mod tests {
         let mut opaque = |_: usize| Ok::<_, Refusal>(());
         let mut creation =
             ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
-        let (batch, layout) = batch_and_layout();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+        let text = "x".repeat(17 * 1024 * 1024);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::StringArray::from(vec![
+                text.as_str(),
+            ]))],
+        )
+        .unwrap();
+        assert!(batch.get_array_memory_size() > 16 * 1024 * 1024);
+        let layout = StaticLayout::try_new(schema, Arc::from([SlotId::new(7)])).unwrap();
         assert!(matches!(
             StaticValues::try_new_with_creator(
                 batch,
@@ -747,9 +748,9 @@ mod tests {
         (batch, layout)
     }
     // Entry, schema equality before/after, retained traversal before/after,
-    // one structural step, the actual independent batch-holder request before
-    // allocation, construction completion, and the caller's final boundary.
-    const BATCH_COMPILE_CHECKPOINTS: &[u32] = &[0, 0, 0, 0, 0, 1, 0, 0, 0];
+    // the actual independent batch-holder request before allocation,
+    // construction completion, and the caller's final boundary.
+    const BATCH_COMPILE_CHECKPOINTS: &[u32] = &[0, 0, 0, 0, 0, 0, 0, 0];
 
     #[test]
     fn compile_values_observe_opaque_boundaries_preserving_backing_and_legacy_charge() {
@@ -803,7 +804,7 @@ mod tests {
             requests[0].0,
             arc_layout(Layout::new::<StaticValueBatchBacking>()).unwrap()
         );
-        assert_eq!(requests[0].1.as_slice(), &BATCH_COMPILE_CHECKPOINTS[..7]);
+        assert_eq!(requests[0].1.as_slice(), &BATCH_COMPILE_CHECKPOINTS[..6]);
     }
     #[test]
     fn compile_values_refuse_every_boundary_with_original_cause_and_no_recheck() {

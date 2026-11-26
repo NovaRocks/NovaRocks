@@ -474,6 +474,85 @@ fn values_cast_cells_run_through_a_projection_with_exact_values_and_nulls() {
 }
 
 #[test]
+fn values_large_batch_and_cells_execute_with_actual_backing_and_nulls() {
+    use arrow::array::StringArray;
+
+    // Keep each original pool under the fixture's existing admission.
+    // Selecting the same large constant for multiple rows copies each cell
+    // into the materialized column, which exceeds 16 MiB in both modes.
+    let text = "x".repeat(768 * 1024);
+    let strings = pool(
+        Arc::new(StringArray::from(vec![Some(text.as_str()), None])),
+        true,
+    );
+    let integers = pool(Arc::new(Int64Array::from(vec![11])), false);
+    let cast_source = pool(Arc::new(Int8Array::from(vec![7])), false);
+    let types = [strings.value_type().clone(), integers.value_type().clone()];
+
+    for dynamic in [false, true] {
+        let mut rows = vec![vec![Cell::Constant(0, 0), Cell::Constant(1, 0)]; 24];
+        rows.push(vec![
+            Cell::Constant(0, 1),
+            if dynamic {
+                Cell::Cast(2, 0)
+            } else {
+                Cell::Constant(1, 0)
+            },
+        ]);
+        let program = values_program_with_sources(
+            &rows,
+            vec![strings.clone(), integers.clone(), cast_source.clone()],
+            &types,
+        );
+        let ProgramNodeKind::Values { values } = program.graph().nodes()[0].kind() else {
+            panic!("the first local node is the Values source");
+        };
+        assert_eq!(values.num_rows(), rows.len());
+        assert_eq!(values.layout().schema().fields().len(), 2);
+        assert!(values.retained_bytes() > 16 * 1024 * 1024);
+        assert_eq!(values.batch().is_none(), dynamic);
+        assert_eq!(values.dynamic_cells().len(), usize::from(dynamic));
+        if let Some(cell) = values.dynamic_cells().first() {
+            assert_eq!((cell.row, cell.column), (24, 1));
+        }
+
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("large Values backing");
+        tracker.install_limit_once(128 * 1024 * 1024).unwrap();
+        let chunks = super::family_fixture::run_with_tracker(&program, tracker.clone());
+        let mut seen_rows = 0;
+        for chunk in &chunks {
+            let batch = chunk.record_batch();
+            let strings = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let integers = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
+            assert!(batch.schema().field(0).is_nullable());
+            assert!(!batch.schema().field(1).is_nullable());
+            for (string, integer) in strings.iter().zip(integers.iter()) {
+                let last = seen_rows == 24;
+                assert_eq!(string, (!last).then_some(text.as_str()));
+                assert_eq!(integer, Some(if last && dynamic { 7 } else { 11 }));
+                seen_rows += 1;
+            }
+        }
+        assert_eq!(seen_rows, rows.len());
+        if dynamic {
+            assert!(
+                tracker.peak() > 0,
+                "runtime cell assembly reports its real allocation"
+            );
+        }
+    }
+}
+
+#[test]
 fn values_failing_cell_is_a_typed_required_error_of_its_own_root() {
     let rows = vec![
         vec![

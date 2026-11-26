@@ -115,8 +115,8 @@ pub use sink::{
 };
 pub use typed_channels::*;
 pub use values::{
-    MAX_STATIC_VALUES_BACKING_BYTES, StaticValueBatch, StaticValues, StaticValuesBacking,
-    StaticValuesCell, StaticValuesError, ValuesCompileError, ValuesCreationFailure,
+    StaticValueBatch, StaticValues, StaticValuesBacking, StaticValuesCell, StaticValuesError,
+    ValuesCompileError, ValuesCreationFailure,
 };
 pub use writer_preparation::{
     PreparedWriterAggregateCall, PreparedWriterAggregateCalls, PreparedWriterCallsError,

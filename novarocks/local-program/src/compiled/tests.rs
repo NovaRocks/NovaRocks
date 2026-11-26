@@ -941,62 +941,78 @@ fn final_owner_definition_budget_counts_actual_unit_table_positions() {
 }
 
 #[test]
-fn final_owner_constant_backing_budget_deduplicates_only_the_original_array_arc() {
-    let value = crate::test_support::utf8(&"x".repeat(9 * 1024 * 1024));
-    let first = crate::test_support::constant_unit(
-        std::slice::from_ref(&value),
-        &[(0, novarocks_type_contract::EvaluationDemand::Value)],
-    );
-    let alias = crate::test_support::constant_unit(
-        std::slice::from_ref(&value),
-        &[(0, novarocks_type_contract::EvaluationDemand::Value)],
-    );
-    let second_value = crate::test_support::utf8(&"x".repeat(9 * 1024 * 1024));
-    assert!(!Arc::ptr_eq(
-        value.pool().array(),
-        second_value.pool().array()
-    ));
-    let second = crate::test_support::constant_unit(
-        std::slice::from_ref(&second_value),
-        &[(0, novarocks_type_contract::EvaluationDemand::Value)],
-    );
-    let owner = Arc::downgrade(second_value.pool().array());
-    drop(second_value);
-    let mut shared = checked(false, true, false);
-    shared.units = vec![first.clone(), alias];
-    let accepted = finish(
-        shared,
+fn final_owner_constant_backing_keeps_shared_and_independent_sources() {
+    fn constant(
+        unit: &novarocks_expression::CompiledExprSet,
+    ) -> &novarocks_functions::ConstantValue {
+        let [definition] = unit.definitions().nodes() else {
+            panic!("expected one constant definition");
+        };
+        let novarocks_expression::StaticExprKind::Constant(value) = definition.kind() else {
+            panic!("expected a constant");
+        };
+        value
+    }
+
+    let text = "x".repeat(9 * 1024 * 1024);
+    let shared = crate::test_support::utf8(&text);
+    let independent = crate::test_support::utf8(&text);
+    let shared_source = Arc::downgrade(shared.pool().array());
+    let independent_source = Arc::downgrade(independent.pool().array());
+    assert!(!shared_source.ptr_eq(&independent_source));
+    let mut fixture = checked(false, true, false);
+    fixture.units = [&shared, &shared, &independent]
+        .into_iter()
+        .map(|value| {
+            crate::test_support::constant_unit(
+                std::slice::from_ref(value),
+                &[(0, novarocks_type_contract::EvaluationDemand::Value)],
+            )
+        })
+        .collect();
+    let program = finish(
+        fixture,
         operators(false, u32::MAX),
         &allowed(),
         CompiledProgramFacts::default(),
         &Control::default(),
     )
     .unwrap();
-    assert_eq!(accepted.units().len(), 2);
-    let mut independent = checked(false, true, false);
-    independent.units = vec![first, second];
-    let error = match finish(
-        independent,
-        operators(false, u32::MAX),
-        &allowed(),
-        CompiledProgramFacts::default(),
-        &Control::default(),
-    ) {
-        Ok(_) => panic!("expected the original fragment resource limit"),
-        Err(error) => error,
-    };
-    assert_eq!(error, LocalProgramCompileError::TooManyConstantBytes);
-    use novarocks_failure_contract::{FailureClass, FailureProjection, ResourceDimension};
-    assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+
+    assert_eq!(program.units().len(), 3);
+    let keep = program.units()[2].clone();
+    let from_shared = constant(&program.units()[0]);
+    let from_alias = constant(&program.units()[1]);
+    let from_independent = constant(&keep);
     assert_eq!(
-        error.failure_fact().resource().unwrap().dimension,
-        ResourceDimension::Bytes
+        from_shared.pool().backing_identity(),
+        shared.pool().backing_identity()
     );
     assert_eq!(
-        error.failure_fact().resource().unwrap().limit,
-        Some(novarocks_expression::MAX_STATIC_EXPRESSION_DYNAMIC_BYTES as u64)
+        from_alias.pool().backing_identity(),
+        shared.pool().backing_identity()
     );
-    assert!(owner.upgrade().is_none());
+    assert_eq!(
+        from_independent.pool().backing_identity(),
+        independent.pool().backing_identity()
+    );
+    for value in [from_shared, from_independent] {
+        let arrow = value
+            .pool()
+            .array()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(arrow.value(value.ordinal() as usize), text);
+    }
+
+    drop(shared);
+    drop(independent);
+    drop(program);
+    assert!(shared_source.upgrade().is_none());
+    assert!(independent_source.upgrade().is_some());
+    drop(keep);
+    assert!(independent_source.upgrade().is_none());
 }
 
 #[test]
