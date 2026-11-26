@@ -97,8 +97,8 @@ CREATE TABLE ${case_db}.t1 (
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t1 (v1, v2, v3, v4, v5, v6, v7)
 SELECT v1, v2, v3, v4,
-row_number() OVER (ORDER BY v1, v2, v3, v4) as v5,
-row_number() OVER (PARTITION BY v1 ORDER BY v2, v3, v4) as v6,
+row_number() OVER (ORDER BY v1 NULLS FIRST, v2 NULLS FIRST, v3, v4) as v5,
+row_number() OVER (PARTITION BY v1 ORDER BY v2 NULLS FIRST, v3, v4) as v6,
 1 as v7
 FROM ${case_db}.t0;
 

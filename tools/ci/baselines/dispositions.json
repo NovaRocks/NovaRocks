@@ -42,16 +42,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:analytic/analytic_test_array_agg_over_window",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.aggregate/array_agg/derived-v1; owner B9, I1, I5; remove after capability repair and native verification",
-      "owner": "B9, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:analytic/analytic_test_minmax_by_window_function",
       "failure": {
         "class": "error_code",
