@@ -514,7 +514,7 @@ fn values_large_batch_and_cells_execute_with_actual_backing_and_nulls() {
         assert_eq!(values.batch().is_none(), dynamic);
         assert_eq!(values.dynamic_cells().len(), usize::from(dynamic));
         if let Some(cell) = values.dynamic_cells().first() {
-            assert_eq!((cell.row, cell.column), (repeated_rows, 1));
+            assert_eq!((cell.row, cell.column), (repeated_rows as u32, 1));
         }
 
         let tracker = crate::runtime::mem_tracker::MemTracker::new_root("large Values backing");
