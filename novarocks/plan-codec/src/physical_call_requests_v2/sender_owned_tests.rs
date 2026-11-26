@@ -436,7 +436,7 @@ fn caller_sender_actual_captured_type_and_cv_prefix_refuse_before_pending_flush(
     let types = encode_type_table_sources(&f.roots, &[], types_limits(), &c).unwrap();
     let mut initial =
         Model::<std::convert::Infallible>::new(SOURCE, &types, &f.pools, None).unwrap();
-    initial.check(limits()).unwrap();
+    initial.check(Some(limits())).unwrap();
     let initial_work = initial.facts.cumulative_work_upper_bound;
     // Exercise the actual captured loan helpers at a caller-owned pending
     // tail. This private seam is not a complete Package publication proof.
@@ -468,11 +468,11 @@ fn caller_sender_actual_captured_type_and_cv_prefix_refuse_before_pending_flush(
                     &int(),
                     &f.pools,
                     &mut model,
-                    limits(),
+                    Some(limits()),
                     &mut work,
                 )
             } else {
-                verify_id(&types, 0, &int(), &mut model, limits(), &mut work)
+                verify_id(&types, 0, &int(), &mut model, Some(limits()), &mut work)
             };
             assert!(matches!(
                 finish(work, outcome.map_err(ProjectionFailure::without_host)),

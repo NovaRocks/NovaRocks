@@ -394,14 +394,14 @@ fn caller_scope_package_admission_charges_nested_field_lookups_linearly() {
         .map(|value| nested_fields(value.ty.data_type()))
         .sum();
     assert!(nested >= 2, "the fixture carries {nested} nested fields");
-    let admission = decode_limits().admission;
-    assert!(admission.source_retained_bytes >= 2 * 1024 * 1024 * 1024);
+    let source = 2 * 1024 * 1024 * 1024;
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let mut peak = 0usize;
-    let readmitted = p::FragmentPackage::try_new_in(
+    let readmitted = p::FragmentPackage::try_new_input_derived_in(
         package.clone().into_input(),
-        admission,
+        decode_limits().plan_limits,
+        source,
         &mut |facts| {
             peak = peak.max(facts.cumulative_work_upper_bound);
             Ok(())
@@ -417,7 +417,6 @@ fn caller_scope_package_admission_charges_nested_field_lookups_linearly() {
     );
     // Linear: far below the about 2 * source^2 a source-sized key charged
     // for each nested field.
-    let source = admission.source_retained_bytes;
     let per_field_quadratic = source.saturating_mul(2).saturating_mul(source);
     assert!(peak < per_field_quadratic / 1024, "peak work {peak}");
 }

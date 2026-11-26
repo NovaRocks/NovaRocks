@@ -169,8 +169,6 @@ pub fn encode_limits() -> PackageEncodeLimits {
     }
 }
 
-const GIB: usize = 1024 * 1024 * 1024;
-
 /// Generous receiver limits built from the sender's test limits where the
 /// same component limit type serves both directions.
 pub fn decode_limits() -> PackageDecodeLimits {
@@ -198,14 +196,6 @@ pub fn decode_limits() -> PackageDecodeLimits {
         scans: e.scans,
         writers: e.writers,
         writer_schema: e.writer_schema,
-        admission: p::FragmentPackageAdmission {
-            plan_limits: p::PlanLimits::FROZEN,
-            source_retained_bytes: 2 * GIB,
-            property_projection_limits: p::PropertyProofProjectionLimits {
-                max_request_bytes: 512 * 1024 * 1024,
-                max_coexisting_bytes: 4 * GIB,
-                max_projection_work: usize::MAX / 4,
-            },
-        },
+        plan_limits: p::PlanLimits::FROZEN,
     }
 }

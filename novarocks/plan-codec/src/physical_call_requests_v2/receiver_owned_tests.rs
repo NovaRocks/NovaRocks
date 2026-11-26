@@ -301,7 +301,7 @@ fn caller_request_receiver_root_and_captured_dictionary_numeric_refusal_precedes
             model.value(
                 CallRequestTypeOwner::Package(&t),
                 42,
-                l.into(),
+                Profile::from_limits(l),
                 &mut Some(&mut |_| Ok(())),
                 &mut work
             ),

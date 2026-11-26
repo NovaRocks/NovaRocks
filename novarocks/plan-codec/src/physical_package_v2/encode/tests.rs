@@ -171,16 +171,8 @@ fn whole_sender_output_passes_generated_preflight_and_is_deterministic() {
 }
 
 #[test]
-fn whole_sender_preserves_component_limit_and_control() {
+fn whole_sender_preserves_original_control() {
     for (_name, package) in fixtures() {
-        let mut tight = encode_limits();
-        tight.definition_sources.max_values = package.fragment().values().len() - 1;
-        assert!(matches!(
-            encode_fragment_package(&package, &tight, &Control::default()),
-            Err(PackageEncodeError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        ));
         // Representative control: the caller's cause stays primary at the entry,
         // in the middle and at the final footer of the one Encode scope.
         let control = Control::default();

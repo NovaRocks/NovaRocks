@@ -545,7 +545,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
                 Arc::new(Field::new("body", DataType::Int64, false)),
                 int(),
                 Int64Array::from(vec![42]).to_data(),
-                request(Box::default()).constant_policy,
+                novarocks_constant_contract::ConstantValidation::INPUT_DERIVED,
                 CompilePhase::Validate,
                 &Setup,
             )
@@ -733,7 +733,7 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
         .with_calls_observed(vec![], &Setup)
         .unwrap();
     let mut pools = p::ConstantPools::empty();
-    let policy = request(Box::default()).constant_policy;
+    let policy = novarocks_constant_contract::ConstantValidation::INPUT_DERIVED;
     let pool = novarocks_constant_contract::ConstantPool::try_new(
         Arc::new(Field::new("original\0pool", DataType::Int64, true)),
         nullable,
@@ -807,7 +807,7 @@ pub(in crate::physical_package_v2) fn values_package(
         Arc::new(Field::new("cells", DataType::Int64, false)),
         int(),
         Int64Array::from_iter_values(0..16).to_data(),
-        request(Box::default()).constant_policy,
+        novarocks_constant_contract::ConstantValidation::INPUT_DERIVED,
         CompilePhase::Validate,
         &Setup,
     )

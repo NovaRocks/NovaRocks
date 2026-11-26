@@ -42,7 +42,6 @@ pub struct ClaimAuthor {
     )]
     selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
-    constant_policy: ConstantValidation,
     decimal_policy: DecimalOverflowPolicy,
     expected_result_type: Option<FunctionValueType>,
     #[expect(
@@ -84,7 +83,7 @@ impl ClaimAuthor {
         arguments: Vec<FunctionArgument>,
         shape: ControlShape,
         expected_result_type: Option<FunctionValueType>,
-        constant_policy: ConstantValidation,
+        _constant_policy: ConstantValidation,
     ) -> Self {
         let FunctionResultType::Scalar(result) = &bound.selected.result_type else {
             panic!("scalar owner")
@@ -95,7 +94,6 @@ impl ClaimAuthor {
             function,
             selected,
             arguments,
-            constant_policy,
             decimal_policy: DecimalOverflowPolicy::ReportError,
             expected_result_type,
             shape,
@@ -107,7 +105,7 @@ impl ClaimAuthor {
         functions: &PureEngineFunctionCatalog,
         name: &str,
         arguments: Vec<FunctionArgument>,
-        constant_policy: ConstantValidation,
+        _constant_policy: ConstantValidation,
         control: &dyn PureCompileControl,
     ) -> Self {
         let bound = resolve(functions, name, &arguments, None, control);
@@ -140,7 +138,6 @@ impl ClaimAuthor {
             function,
             selected,
             arguments,
-            constant_policy,
             decimal_policy: DecimalOverflowPolicy::ReportError,
             expected_result_type: None,
             shape: ControlShape::Eager,

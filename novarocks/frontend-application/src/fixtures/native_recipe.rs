@@ -480,12 +480,12 @@ impl RecipeRoot {
             .map_err(|error| refused(&error))?;
         // Full-plan extraction proves exact fragment coverage and preserves
         // the original plan's version/result/constants/parameters/metadata.
-        let mut packages = p::extract_fragment_packages(
+        let mut packages = p::extract_fragment_packages_input_derived(
             plan,
             &BTreeMap::new(),
             &BTreeMap::new(),
             &[(id, pruning)].into(),
-            &[(id, *carrier.admission())].into(),
+            carrier.plan_limits(),
             control,
         )
         .map_err(|error| match error {

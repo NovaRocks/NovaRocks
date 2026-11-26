@@ -77,7 +77,7 @@ impl CompiledPackage {
         &self,
     ) -> novarocks_frontend_application::CompiledPackageCarrier {
         novarocks_frontend_application::CompiledPackageCarrier::new(
-            self.decode_limits.admission,
+            self.decode_limits.plan_limits,
             PackageEncodeLimits::FROZEN,
             Arc::clone(&self.decode_model),
             self.decode_limits.wire,

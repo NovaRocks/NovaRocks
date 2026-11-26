@@ -265,7 +265,6 @@ pub(crate) fn encode_empty_values_exchange_program_for_test(
         return Err("empty two-core fixture retained unexpected Provider access".into());
     }
     let mut pruning = BTreeMap::new();
-    let mut admissions = BTreeMap::new();
     for &id in plan.fragments().keys() {
         let frozen_pruning = p::FrozenFragmentPruning::try_new(id, Vec::new(), control).map_err(
             |error| match error {
@@ -276,14 +275,13 @@ pub(crate) fn encode_empty_values_exchange_program_for_test(
             },
         )?;
         pruning.insert(id, frozen_pruning);
-        admissions.insert(id, *carrier.admission());
     }
-    let packages = p::extract_fragment_packages(
+    let packages = p::extract_fragment_packages_input_derived(
         plan,
         &BTreeMap::new(),
         &BTreeMap::new(),
         &pruning,
-        &admissions,
+        carrier.plan_limits(),
         control,
     )
     .map_err(|error| match error {
@@ -637,8 +635,13 @@ fn encode_static_packages(
         }
         (Some(_), Some(facts)) => author_frozen_writes(plan, facts.session, control)?,
     };
-    let packages =
-        extract_checked_packages(&candidate, encodings, &writes, carrier.admission(), control)?;
+    let packages = extract_checked_packages(
+        &candidate,
+        encodings,
+        &writes,
+        carrier.plan_limits(),
+        control,
+    )?;
     let submission = compiled_plan_submission_facts(&candidate, &topology)?;
     let provenance = mint_native_encoding_provenance();
     let native = NativeFragmentAttachment::for_completed_plan(
@@ -1987,7 +1990,7 @@ mod tests {
             completed.candidate(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &FROZEN_PACKAGE_ADMISSION,
+            FROZEN_PACKAGE_ADMISSION.plan_limits,
             &control,
         )
         .unwrap();
@@ -2007,7 +2010,7 @@ mod tests {
         let expected = model.preflight(&bytes, receiver, &control).unwrap_err();
         assert!(matches!(expected, ResourceModelError::Limit(_)));
         let carrier = CompiledPackageCarrier::new(
-            FROZEN_PACKAGE_ADMISSION,
+            FROZEN_PACKAGE_ADMISSION.plan_limits,
             PackageEncodeLimits::FROZEN,
             model,
             receiver,
@@ -2166,13 +2169,13 @@ mod tests {
             completed.candidate(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &FROZEN_PACKAGE_ADMISSION,
+            FROZEN_PACKAGE_ADMISSION.plan_limits,
             &control,
         )
         .unwrap();
         let model = Arc::new(FragmentDecodeResourceModel::try_new(&control).unwrap());
         let carrier = CompiledPackageCarrier::new(
-            FROZEN_PACKAGE_ADMISSION,
+            FROZEN_PACKAGE_ADMISSION.plan_limits,
             PackageEncodeLimits::FROZEN,
             Arc::clone(&model),
             PackageDecodeLimits::FROZEN.wire,
@@ -2276,13 +2279,13 @@ mod tests {
             completed.candidate(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &FROZEN_PACKAGE_ADMISSION,
+            FROZEN_PACKAGE_ADMISSION.plan_limits,
             &control,
         )
         .unwrap();
         let model = Arc::new(FragmentDecodeResourceModel::try_new(&control).unwrap());
         let carrier = CompiledPackageCarrier::new(
-            FROZEN_PACKAGE_ADMISSION,
+            FROZEN_PACKAGE_ADMISSION.plan_limits,
             PackageEncodeLimits::FROZEN,
             Arc::clone(&model),
             PackageDecodeLimits::FROZEN.wire,
@@ -2327,7 +2330,7 @@ mod tests {
                 receiver.max_field_occurrences =
                     production.usage.field_occurrences.checked_sub(1).unwrap();
                 let limited_carrier = CompiledPackageCarrier::new(
-                    FROZEN_PACKAGE_ADMISSION,
+                    FROZEN_PACKAGE_ADMISSION.plan_limits,
                     PackageEncodeLimits::FROZEN,
                     Arc::clone(&model),
                     receiver,
@@ -2580,7 +2583,7 @@ mod tests {
             &candidate,
             &BTreeMap::new(),
             &BTreeMap::from([(ordinal, recipe)]),
-            &FROZEN_PACKAGE_ADMISSION,
+            FROZEN_PACKAGE_ADMISSION.plan_limits,
             &control,
         )
         .unwrap_or_else(|error| panic!("wide INSERT checked package extraction: {error:#?}"));

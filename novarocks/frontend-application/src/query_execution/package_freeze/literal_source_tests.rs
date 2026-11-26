@@ -85,7 +85,7 @@ fn assert_checked_packages_for_source(sql: &str, owner: SqlAuthoredPhysicalPlan)
         &candidate,
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
-        &novarocks_plan_codec::physical_package_v2::PackageDecodeLimits::FROZEN.admission,
+        novarocks_plan_codec::physical_package_v2::PackageDecodeLimits::FROZEN.plan_limits,
         &control,
     )
     .unwrap_or_else(|error| panic!("real literal package extraction for {sql}: {error:#?}"));

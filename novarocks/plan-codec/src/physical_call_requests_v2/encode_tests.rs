@@ -212,7 +212,7 @@ fn prepare_unit_token<'a, 's>(
         ids,
         pools,
         invoice,
-        limits,
+        Some(limits),
         None,
         &mut work,
     )

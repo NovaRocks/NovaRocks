@@ -31,9 +31,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use novarocks_connector_contract::ConnectorWriteRecipeDraft;
+#[cfg(test)]
+use novarocks_physical_plan::FragmentPackageAdmission;
 use novarocks_physical_plan::{
-    FragmentId, FragmentPackage, FragmentPackageAdmission, FrozenFragmentPruning,
-    ProviderReadOccurrenceId, WriteTargetOrdinal, extract_fragment_packages_input_derived,
+    FragmentId, FragmentPackage, FrozenFragmentPruning, PlanLimits, ProviderReadOccurrenceId,
+    WriteTargetOrdinal, extract_fragment_packages_input_derived,
 };
 #[cfg(test)]
 use novarocks_plan_codec::physical_package_v2::PackageDecodeLimits;
@@ -55,12 +57,11 @@ use crate::query_execution::provider_read_facts::FrozenReadEncoding;
 /// Host-owned configuration of the compiled package carrier.
 ///
 /// Structural ceilings and the immutable generated receiver model are supplied
-/// by the one startup composition; none grants runtime capacity or defaults
-/// here. The statement constant policy is not part of it: each plan is packaged
-/// with the policy its own statement was compiled with.
+/// by the one startup composition. The statement owner grants capacity for
+/// actual package creation.
 #[derive(Clone)]
 pub struct CompiledPackageCarrier {
-    admission: FragmentPackageAdmission,
+    plan_limits: PlanLimits,
     limits: PackageEncodeLimits,
     receiver_model: Arc<FragmentDecodeResourceModel>,
     receiver_limits: DecodeProjectionLimits,
@@ -68,13 +69,13 @@ pub struct CompiledPackageCarrier {
 
 impl CompiledPackageCarrier {
     pub fn new(
-        admission: FragmentPackageAdmission,
+        plan_limits: PlanLimits,
         limits: PackageEncodeLimits,
         receiver_model: Arc<FragmentDecodeResourceModel>,
         receiver_limits: DecodeProjectionLimits,
     ) -> Self {
         Self {
-            admission,
+            plan_limits,
             limits,
             receiver_model,
             receiver_limits,
@@ -97,16 +98,15 @@ impl CompiledPackageCarrier {
     ) -> Self {
         let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
         Self::new(
-            admission,
+            admission.plan_limits,
             limits,
             Arc::new(FragmentDecodeResourceModel::try_new(&control).expect("test package model")),
             PackageDecodeLimits::FROZEN.wire,
         )
     }
 
-    /// The admission every fragment's checked package is constructed under.
-    pub const fn admission(&self) -> &FragmentPackageAdmission {
-        &self.admission
+    pub const fn plan_limits(&self) -> PlanLimits {
+        self.plan_limits
     }
 
     /// The limits every package is encoded under.
@@ -118,7 +118,7 @@ impl CompiledPackageCarrier {
 impl fmt::Debug for CompiledPackageCarrier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompiledPackageCarrier")
-            .field("admission", &self.admission)
+            .field("plan_limits", &self.plan_limits)
             .field("limits", &self.limits)
             .field("receiver_limits", &self.receiver_limits)
             .finish_non_exhaustive()
@@ -231,14 +231,14 @@ pub(crate) fn freeze_fragment_packages(
     candidate: &CompletedPhysicalPlanCandidate,
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
     writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
-
     admission: &FragmentPackageAdmission,
     limits: &PackageEncodeLimits,
     control: &dyn PureCompileControl,
 ) -> Result<BTreeMap<FragmentId, Vec<u8>>, PackageFreezeError> {
-    let packages = extract_checked_packages(candidate, encodings, writes, admission, control)?;
+    let packages =
+        extract_checked_packages(candidate, encodings, writes, admission.plan_limits, control)?;
     let carrier = CompiledPackageCarrier::new(
-        *admission,
+        admission.plan_limits,
         *limits,
         Arc::new(FragmentDecodeResourceModel::try_new(control)?),
         PackageDecodeLimits::FROZEN.wire,
@@ -257,8 +257,7 @@ pub(crate) fn extract_checked_packages(
     candidate: &CompletedPhysicalPlanCandidate,
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
     writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
-
-    admission: &FragmentPackageAdmission,
+    plan_limits: PlanLimits,
     control: &dyn PureCompileControl,
 ) -> Result<BTreeMap<FragmentId, FragmentPackage>, PackageFreezeError> {
     let plan = candidate.plan();
@@ -276,20 +275,13 @@ pub(crate) fn extract_checked_packages(
         })?;
         pruning.insert(id, table);
     }
-    extract_fragment_packages_input_derived(
-        plan,
-        &scans,
-        writes,
-        &pruning,
-        admission.plan_limits,
-        control,
-    )
-    .map_err(|error| match error {
-        novarocks_physical_plan::FragmentPackageExtractionError::Control(cause) => {
-            PackageFreezeError::Control(cause)
-        }
-        other => PackageFreezeError::Extraction(format!("{other:?}")),
-    })
+    extract_fragment_packages_input_derived(plan, &scans, writes, &pruning, plan_limits, control)
+        .map_err(|error| match error {
+            novarocks_physical_plan::FragmentPackageExtractionError::Control(cause) => {
+                PackageFreezeError::Control(cause)
+            }
+            other => PackageFreezeError::Extraction(format!("{other:?}")),
+        })
 }
 
 /// The exact wire bytes of one checked package.

@@ -68,6 +68,8 @@ fn limits() -> Limits {
         max_work: 512 * 1024 * 1024,
     }
 }
+use novarocks_constant_contract::ConstantPolicy;
+
 fn pool_policy() -> ConstantPolicy {
     ConstantPolicy {
         max_rows: 16,

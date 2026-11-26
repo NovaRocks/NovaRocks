@@ -440,10 +440,11 @@ pub fn decode_public_source_schemas_with_creator_in<H>(
     defs: &[wire::PublicSourceSchemaFactsDefinition],
     schemas: &DecodedSchemas<'_, '_>,
     original_source_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     creation: &mut ValueSchemaCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedPublicSourceSchemas, ProjectionFailure<Error, H>> {
+    let limits = limits.into();
     decode_core::<H, crate::value_type_table::resources::NoFactory>(
         defs,
         schemas,
@@ -460,9 +461,10 @@ pub fn decode_public_source_schemas_pure_in(
     defs: &[wire::PublicSourceSchemaFactsDefinition],
     schemas: &DecodedSchemas<'_, '_>,
     original_source_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedPublicSourceSchemas, Error> {
+    let limits = limits.into();
     decode_core::<std::convert::Infallible, crate::value_type_table::resources::NoFactory>(
         defs,
         schemas,
@@ -480,10 +482,11 @@ pub fn decode_public_source_schemas_with_factory_in<H, F: ValueSchemaCreationFac
     defs: &[wire::PublicSourceSchemaFactsDefinition],
     schemas: &DecodedSchemas<'_, '_>,
     original_source_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     factory: &F,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedPublicSourceSchemas, ProjectionFailure<Error, H>> {
+    let limits = limits.into();
     decode_core(
         defs,
         schemas,
@@ -499,7 +502,7 @@ fn begin<'a, H, F: ValueSchemaCreationFactory<H>>(
     model: &mut Model,
     source: usize,
     count: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<F::Scope<'a>>, ProjectionFailure<Error, H>> {
     let Some(factory) = factory else {
@@ -526,7 +529,7 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
     defs: &[wire::PublicSourceSchemaFactsDefinition],
     schemas: &DecodedSchemas<'_, '_>,
     original_source_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     mut creation: Option<&mut dyn ValueSchemaCreationScope<H>>,
     factory: Option<&F>,
     work: &mut CompileCheckpoints<'_>,

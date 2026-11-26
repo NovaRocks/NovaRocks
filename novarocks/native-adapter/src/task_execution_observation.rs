@@ -337,6 +337,134 @@ fn resolve_observer(
         }
     }
 }
+/// The exact TaskProtocol observation for one preparation. It only renders
+/// facts emitted by the decoder and its prepared LocalProgram.
+#[cfg(novarocks_dev_controls)]
+pub(crate) struct PreparedTaskValueObservation {
+    identity: TaskIdentity,
+    observer: Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
+}
+
+#[cfg(novarocks_dev_controls)]
+impl PreparedTaskValueObservation {
+    pub(crate) fn resolve(
+        controls: Option<&crate::test_observation_controls::NativeObservationControls>,
+        identity: TaskIdentity,
+    ) -> Option<Self> {
+        Some(Self {
+            identity,
+            observer: task_observer(controls?, identity)?,
+        })
+    }
+
+    fn emit(&self, marker: &str, fragment: u32, facts: std::fmt::Arguments<'_>) {
+        let execution = self.identity.query_execution_id();
+        self.observer.observe(&format!(
+            "{marker} execution_id={}:{}:{} stage={} task={} backend={} fragment={fragment} {facts}",
+            execution.query_id().high(),
+            execution.query_id().low(),
+            execution.attempt_id().get(),
+            self.identity.stage_id().get(),
+            self.identity.task_id().get(),
+            self.identity.backend_process_id(),
+        ));
+    }
+
+    pub(crate) fn emit_values(
+        &self,
+        package: &novarocks_physical_plan::FragmentPackage,
+        records: &[(novarocks_physical_plan::ConstantPoolId, usize)],
+        program: &novarocks_local_program::LocalProgram,
+    ) {
+        use novarocks_failpoint::observation_marker::{
+            TASK_CONSTANT_IPC_RECORD, TASK_VALUES_BACKING, TASK_VALUES_SOURCE,
+        };
+        use novarocks_local_program::ProgramNodeKind;
+        use novarocks_physical_plan::{ConstantReference, ExprKind, NodeId, NodeKind};
+        let fragment = package.fragment();
+        let fragment_id = fragment.id().get();
+        for &(id, body_bytes) in records {
+            if let Some(pool) = package.constants().entries().get(&id) {
+                self.emit(
+                    TASK_CONSTANT_IPC_RECORD,
+                    fragment_id,
+                    format_args!(
+                        "pool_id={} rows={} retained_bytes={} body_bytes={body_bytes}",
+                        id.get(),
+                        pool.array().len(),
+                        pool.resource_facts().retained_buffer_capacity_bytes
+                    ),
+                );
+            }
+        }
+        for node in program.graph().nodes() {
+            let ProgramNodeKind::Values { values } = node.kind() else {
+                continue;
+            };
+            let [source] = node.physical_sources() else {
+                continue;
+            };
+            let source = NodeId::new(source.get());
+            let Some(physical) = fragment.nodes().get(&source) else {
+                continue;
+            };
+            let NodeKind::Values { rows } = &physical.kind else {
+                continue;
+            };
+            let backing = match values.backing() {
+                novarocks_local_program::StaticValuesBacking::Batch(_) => "batch",
+                novarocks_local_program::StaticValuesBacking::Cells { .. } => "cells",
+            };
+            let columns = values.layout().schema().fields().len();
+            self.emit(
+                TASK_VALUES_BACKING,
+                fragment_id,
+                format_args!(
+                    "node_id={} backing={backing} rows={} columns={columns} retained_bytes={}",
+                    source.get(),
+                    values.num_rows(),
+                    values.retained_bytes()
+                ),
+            );
+            for column in 0..columns {
+                // Retain the exact original ordinal sequence. One event per
+                // contiguous run keeps sequential literal pools compact.
+                let references = rows.iter().map(|row| {
+                    let root = fragment.root_expression(source, *row.get(column)?)?;
+                    match &root.kind {
+                        ExprKind::Constant(reference) => Some(*reference),
+                        _ => None,
+                    }
+                });
+                let mut run: Option<(ConstantReference, u32)> = None;
+                for next in references.chain(std::iter::once(None)) {
+                    if let (Some((first, length)), Some(next)) = (&mut run, next)
+                        && first.pool == next.pool
+                        && first.ordinal.checked_add(*length) == Some(next.ordinal)
+                        && let Some(increased) = length.checked_add(1)
+                    {
+                        *length = increased;
+                        continue;
+                    }
+                    if let Some((first, length)) = run.take() {
+                        self.emit(
+                            TASK_VALUES_SOURCE,
+                            fragment_id,
+                            format_args!(
+                                "node_id={} column={column} pool_id={} first_ordinal={} length={length}",
+                                source.get(),
+                                first.pool.get(),
+                                first.ordinal,
+                            ),
+                        );
+                    }
+                    run = next.map(|first| (first, 1));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(novarocks_dev_controls)]
 fn task_observer(
     controls: &crate::test_observation_controls::NativeObservationControls,

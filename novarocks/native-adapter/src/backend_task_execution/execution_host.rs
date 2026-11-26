@@ -887,6 +887,13 @@ impl NativeTaskExecutionHost {
         )
         .map_err(|error| native_type_construction_failure_to_host(&error))?;
         let type_scopes = super::compiled_package::CompiledTypeScopes::new(&type_creation);
+        #[cfg(novarocks_dev_controls)]
+        let type_scopes = type_scopes.with_value_observation(
+            crate::task_execution_observation::PreparedTaskValueObservation::resolve(
+                self.queries.observation_controls().as_deref(),
+                identity,
+            ),
+        );
         let mut request = |layout| type_creation.request_layout(layout);
         let mut opaque = |bytes| type_creation.request_opaque_upper_bound(bytes);
         let mut creation = novarocks_type_contract::ValueSchemaCreation::new(

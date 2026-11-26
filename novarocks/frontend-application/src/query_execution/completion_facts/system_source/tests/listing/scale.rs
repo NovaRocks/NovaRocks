@@ -265,7 +265,7 @@ async fn round_trip(rows: usize, padding_bytes: usize) {
         &completed,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &FROZEN_PACKAGE_ADMISSION,
+        FROZEN_PACKAGE_ADMISSION.plan_limits,
         &control,
     )
     .unwrap();

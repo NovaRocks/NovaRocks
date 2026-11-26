@@ -49,7 +49,7 @@ pub use system_relation::SystemRelationError;
 
 pub use binding_sources::BindingSourceLimits;
 pub use decode::{
-    PackageDecodeError, PackageDecodeLimits, decode_fragment_package,
+    ConstantRecordObserver, PackageDecodeError, PackageDecodeLimits, decode_fragment_package,
     decode_fragment_package_with_creator, decode_fragment_package_with_factory,
     decode_fragment_package_with_factory_and_funding, decode_fragment_package_with_type_host,
 };

@@ -270,7 +270,7 @@ const fn frozen_decode_limits() -> PackageDecodeLimits {
         scans: encode.scans,
         writers: encode.writers,
         writer_schema: encode.writer_schema,
-        admission: frozen_package_admission(),
+        plan_limits: p::PlanLimits::FROZEN,
     }
 }
 

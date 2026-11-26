@@ -114,7 +114,7 @@ use std::{
 };
 
 /// Host-authored receiving envelopes; none of these is on the wire and no
-/// default exists. `admission.plan_limits` is the one structural PlanLimits
+/// default exists. `plan_limits` is the one structural PlanLimits
 /// for the owned expression arena, the Fragment and the Package.
 #[derive(Clone, Debug)]
 pub struct PackageDecodeLimits {
@@ -136,7 +136,7 @@ pub struct PackageDecodeLimits {
     pub scans: ReadScanProjectionLimits,
     pub writers: WriterRecipeProjectionLimits,
     pub writer_schema: WriterSchemaProjectionLimits,
-    pub admission: p::FragmentPackageAdmission,
+    pub plan_limits: p::PlanLimits,
 }
 
 #[derive(Debug)]
@@ -577,7 +577,7 @@ pub(crate) fn decode_fragment_package_core<H>(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
     decode_fragment_package_factory_core::<H, crate::value_type_table::resources::NoFactory>(
-        raw, model, limits, creation, None, work, &mut None,
+        raw, model, limits, creation, None, work, &mut None, None,
     )
 }
 
@@ -603,6 +603,7 @@ pub fn decode_fragment_package_with_factory<
         Some(factory),
         &mut work,
         &mut None,
+        None,
     );
     if matches!(
         &result,
@@ -617,6 +618,11 @@ pub fn decode_fragment_package_with_factory<
 
 /// The existing receiver with the caller's actual creator and narrow original
 /// Arrow/source tail funding. Other namespaces retain their existing responsibility.
+/// Observation of a checked record's actual IPC body. The original bound
+/// constant pools still own their array backings and resource receipts.
+pub type ConstantRecordObserver<'a> =
+    dyn FnMut(novarocks_constant_contract::ConstantPoolId, usize) + 'a;
+
 pub fn decode_fragment_package_with_factory_and_funding<
     H,
     F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
@@ -628,6 +634,7 @@ pub fn decode_fragment_package_with_factory_and_funding<
     factory: &F,
     control: &dyn PureCompileControl,
     funding: &mut dyn crate::physical_type_v2::PackageTypeFundingScope<H>,
+    constant_records: Option<&mut ConstantRecordObserver<'_>>,
 ) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = decode_fragment_package_factory_core(
@@ -638,6 +645,7 @@ pub fn decode_fragment_package_with_factory_and_funding<
         Some(factory),
         &mut work,
         &mut Some(funding),
+        constant_records,
     );
     if matches!(
         &result,
@@ -662,7 +670,16 @@ pub fn decode_fragment_package_with_type_host<
     let result = decode_fragment_package_factory_core::<
         G::HostError,
         crate::value_type_table::resources::NoFactory,
-    >(raw, model, limits, None, None, &mut work, &mut Some(host));
+    >(
+        raw,
+        model,
+        limits,
+        None,
+        None,
+        &mut work,
+        &mut Some(host),
+        None,
+    );
     if matches!(
         &result,
         Err(ProjectionFailure::Host(_) | ProjectionFailure::Codec(PackageDecodeError::Control(_)))
@@ -684,8 +701,9 @@ fn decode_fragment_package_factory_core<
     factory: Option<&F>,
     work: &mut CompileCheckpoints<'_>,
     funding: &mut Option<&mut dyn crate::physical_type_v2::PackageTypeFundingScope<H>>,
+    constant_records: Option<&mut ConstantRecordObserver<'_>>,
 ) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
-    let plan_limits = limits.admission.plan_limits;
+    let plan_limits = limits.plan_limits;
     let mut unit_roots = 0;
 
     // L0: generated-layout byte admission, then the original Prost verdict.
@@ -1018,6 +1036,11 @@ fn decode_fragment_package_factory_core<
             &mut |_| Ok(()),
             work,
         )?;
+        if let Some(observe) = constant_records {
+            for (pool, body_bytes) in prepared.checked_record_body_bytes() {
+                observe(pool, body_bytes);
+            }
+        }
         let (pools, facts) =
             prepared.materialize_with_factory_in(factory, &mut |_| Ok(()), work)?;
         (
@@ -1053,7 +1076,7 @@ fn decode_fragment_package_factory_core<
     };
     validate_json_constants_in(&pools, work)?;
     invoice = add(add(invoice, pool_requests)?, size_of_val(&pools))?;
-    let (requests, request_storage, request_facts) = if let Some(creator) = creation.as_deref_mut()
+    let (requests, request_storage, _) = if let Some(creator) = creation.as_deref_mut()
     {
         let prepared = prepare_call_requests_decode_with_creator_in(
             fragment_wire.call_requests.as_ref(),

@@ -108,27 +108,20 @@ fn folds_date_format_and_utf8_to_date32_through_real_kernels() {
 }
 
 #[test]
-fn date_format_keeps_a_successful_output_that_exceeds_the_optional_fold_limit() {
+fn date_format_folds_representable_output_with_input_derived_validation() {
     const FORMAT: &str = "builtin.scalar/date_format/v1";
     let sql = format!(
         "SELECT date_format(TIMESTAMP '2024-09-01 12:00:00.000', '{}')",
         "%M".repeat(96)
     );
     let expected = "September".repeat(96);
-    let small_policy = novarocks_constant_contract::ConstantValidation::bounded(
-        novarocks_constant_contract::ConstantPolicy {
-            max_retained_buffer_bytes: 512,
-            ..sql_fixture_constant_policy()
-        },
-    );
-
     let fold = Arc::new(FoldProbe::default());
     let control = fold.control();
     let owner = table_free_request_with_constant_policy(
         &sql,
         session(Default::default(), true),
         &control,
-        small_policy,
+        novarocks_functions::ConstantValidation::INPUT_DERIVED,
     )
     .try_into_completion()
     .unwrap();
@@ -142,20 +135,11 @@ fn date_format_keeps_a_successful_output_that_exceeds_the_optional_fold_limit() 
         .iter()
         .find(|receipt| receipt.is_call(FORMAT))
         .unwrap();
-    assert!(attempted.result.is_none());
-    assert!(expression_sources(&owner).any(|(_, _, node)| {
+    assert_eq!(text(attempted.result.as_ref().unwrap()), expected);
+    assert!(!expression_sources(&owner).any(|(_, _, node)| {
         matches!(&node.kind, ExprKind::FunctionCall { function, .. }
             if function.function_id.as_str() == FORMAT)
     }));
-
-    let normal = Arc::new(FoldProbe::default());
-    compile(&sql, &normal);
-    let receipts = normal.receipts.lock().unwrap();
-    let fully_folded = receipts
-        .iter()
-        .find(|receipt| receipt.is_call(FORMAT))
-        .unwrap();
-    assert_eq!(text(fully_folded.result.as_ref().unwrap()), expected);
 }
 
 fn decimal_coefficient(value: &ConstantValue) -> i128 {
