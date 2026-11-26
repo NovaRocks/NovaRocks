@@ -62,7 +62,7 @@ pub enum PureKernelAbi {
 pub enum PureCallLifecycle {
     Scalar,
     Aggregate,
-    AggregateWindow,
+    AggregateWindow { distinct: bool, ordered: bool },
     Window,
     Table,
 }
@@ -87,8 +87,10 @@ impl PureCallLifecycle {
             ) | (
                 Self::Aggregate,
                 PureKernelAbi::AggregateV1 | PureKernelAbi::AggregateWindowV1
-            ) | (Self::AggregateWindow, PureKernelAbi::AggregateWindowV1)
-                | (Self::Window, PureKernelAbi::WindowV1)
+            ) | (
+                Self::AggregateWindow { .. },
+                PureKernelAbi::AggregateWindowV1
+            ) | (Self::Window, PureKernelAbi::WindowV1)
                 | (Self::Table, PureKernelAbi::TableV1)
         )
     }
@@ -305,7 +307,7 @@ impl PureOverloadDeclaration<'_> {
         // Aggregate requests retain ORDER channels after the logical prefix.
         // Scalar/window/table argument lists retain exactly their logical N.
         let valid_count = match lifecycle {
-            PureCallLifecycle::Aggregate | PureCallLifecycle::AggregateWindow => {
+            PureCallLifecycle::Aggregate | PureCallLifecycle::AggregateWindow { .. } => {
                 logical_argument_count <= selected.argument_types.len()
             }
             _ => logical_argument_count == selected.argument_types.len(),
@@ -412,9 +414,18 @@ pub trait PureFunctionMetadataOwner:
         &self,
         selected: &FunctionBindingSelection,
         logical_argument_count: usize,
-        _lifecycle: PureCallLifecycle,
+        lifecycle: PureCallLifecycle,
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
+        if matches!(
+            lifecycle,
+            PureCallLifecycle::AggregateWindow { distinct: true, .. }
+                | PureCallLifecycle::AggregateWindow { ordered: true, .. }
+        ) {
+            return Err(FunctionBindingError::UnavailableImplementation(
+                selected.overload.clone(),
+            ));
+        }
         self.admit_selected_profile_observed(selected, logical_argument_count, control)
     }
     /// An owner with semantic dependencies supplies its original checker.

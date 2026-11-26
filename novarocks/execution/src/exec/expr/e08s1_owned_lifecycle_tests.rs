@@ -66,7 +66,10 @@ fn e08s1_selected_loan_checks_actual_five_lifecycles_without_preparing_a_value()
         ),
         (
             &aggregate,
-            Lifecycle::AggregateWindow,
+            Lifecycle::AggregateWindow {
+                distinct: false,
+                ordered: false,
+            },
             PureKernelAbi::AggregateWindowV1,
         ),
         (&window, Lifecycle::Window, PureKernelAbi::WindowV1),
@@ -125,11 +128,18 @@ fn e08s1_actual_selected_lifecycle_retains_three_compile_causes_and_original_has
             calls: AtomicUsize::new(0),
         };
         original
-            .admit_bound_lifecycle_observed(&binding, Lifecycle::AggregateWindow, &control)
+            .admit_bound_lifecycle_observed(
+                &binding,
+                Lifecycle::AggregateWindow {
+                    distinct: false,
+                    ordered: false,
+                },
+                &control,
+            )
             .unwrap();
         assert_eq!(control.calls.load(Ordering::Relaxed), 0);
         assert!(
-            matches!(scoped.admit_bound_lifecycle_observed(&binding, Lifecycle::AggregateWindow, &control),
+            matches!(scoped.admit_bound_lifecycle_observed(&binding, Lifecycle::AggregateWindow { distinct: false, ordered: false }, &control),
             Err(FunctionBindingError::Control(actual)) if actual == cause)
         );
         assert_eq!(control.calls.load(Ordering::Relaxed), 1);

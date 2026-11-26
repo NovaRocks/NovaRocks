@@ -25,24 +25,22 @@ fn approximate_aggregate_availability_uses_the_exact_selected_profile() {
     use novarocks_sql_testkit::try_sql_source_with_declared_fields;
 
     let fields = [Field::new("k", DataType::Int64, false)];
-    for (sql, overload) in [
-        (
-            "SELECT approx_distinct(k, 0.01) FROM t",
-            "explicit-error-hll-v1",
-        ),
-        (
-            "SELECT approx_percentile(k, 1, 0.5, 0.01) FROM t",
-            "bigint-accuracy-v1",
-        ),
-        ("SELECT approx_distinct(ARRAY[k]) FROM t", "default-hll-v1"),
+    for sql in [
+        "SELECT approx_distinct(k, DOUBLE '0.01') FROM t",
+        "SELECT approx_distinct(ARRAY[k]) FROM t",
     ] {
-        let failure = try_sql_source_with_declared_fields(sql, &fields).unwrap_err();
-        let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = failure else {
-            panic!("expected typed aggregate profile refusal: {failure:?}");
-        };
-        assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
-        assert!(error.message().contains(overload), "{error}");
+        try_sql_source_with_declared_fields(sql, &fields).unwrap();
     }
+    let failure = try_sql_source_with_declared_fields(
+        "SELECT approx_percentile(k, 1, 0.5, 0.01) FROM t",
+        &fields,
+    )
+    .unwrap_err();
+    let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = failure else {
+        panic!("expected typed four-argument percentile refusal: {failure:?}");
+    };
+    assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
+    assert!(error.message().contains("bigint-accuracy-v1"), "{error}");
 }
 
 #[test]
@@ -233,7 +231,7 @@ mod fold_frontiers {
             ),
             (
                 "SELECT count(DISTINCT 1) OVER ()",
-                AnalyzeErrorKind::UnsupportedExpression,
+                AnalyzeErrorKind::UnavailableImplementation,
             ),
         ] {
             let error = analyze(sql, &probe).unwrap_err();
@@ -528,4 +526,134 @@ mod fold_frontiers {
         .unwrap();
         assert!(probe.receipts.lock().unwrap().is_empty());
     }
+}
+
+#[test]
+fn aggregate_windows_use_exact_owner_and_original_modifiers() {
+    use novarocks_sql::{
+        analyze_error::AnalyzeErrorKind,
+        compiler::{SqlCompileError, SqlCompileProgressError},
+    };
+    use novarocks_sql_testkit::try_sql_source_with_declared_fields;
+
+    let fields = [
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Utf8, true),
+        Field::new("b", DataType::Boolean, true),
+        Field::new("x", DataType::Float64, true),
+    ];
+    for sql in [
+        "SELECT count_if(b) OVER (ORDER BY k), bool_and(b) OVER (ORDER BY k), every(b) OVER (ORDER BY k) FROM t",
+        "SELECT var_pop(x) OVER (ORDER BY k), stddev_pop(x) OVER (ORDER BY k) FROM t",
+        "SELECT min(v) OVER (ORDER BY k), array_agg(v ORDER BY k) OVER (ORDER BY k) FROM t",
+        "SELECT array_agg(DISTINCT v ORDER BY v) OVER (ORDER BY k) FROM t",
+        "SELECT listagg(DISTINCT v, '|') WITHIN GROUP (ORDER BY v) OVER (ORDER BY k) FROM t",
+    ] {
+        try_sql_source_with_declared_fields(sql, &fields)
+            .unwrap_or_else(|failure| panic!("{sql}: {failure:?}"));
+    }
+
+    for (sql, kind, overload) in [
+        (
+            "SELECT map_agg(k, v) OVER (ORDER BY k) FROM t",
+            AnalyzeErrorKind::UnavailableImplementation,
+            "map_agg",
+        ),
+        (
+            "SELECT min(k, 2) OVER (ORDER BY k) FROM t",
+            AnalyzeErrorKind::UnavailableImplementation,
+            "min",
+        ),
+        (
+            "SELECT count_if(DISTINCT b) OVER (ORDER BY k) FROM t",
+            AnalyzeErrorKind::UnavailableImplementation,
+            "count_if",
+        ),
+        (
+            "SELECT bool_and(b ORDER BY k) OVER (ORDER BY k) FROM t",
+            AnalyzeErrorKind::UnavailableImplementation,
+            "bool_and",
+        ),
+        (
+            "SELECT array_agg(DISTINCT v ORDER BY k) FROM t",
+            AnalyzeErrorKind::ExpressionNotInDistinct,
+            "",
+        ),
+        (
+            "SELECT array_agg(DISTINCT v ORDER BY k) OVER (ORDER BY k) FROM t",
+            AnalyzeErrorKind::ExpressionNotInDistinct,
+            "",
+        ),
+        (
+            "SELECT listagg(DISTINCT v, '|') WITHIN GROUP (ORDER BY k) FROM t",
+            AnalyzeErrorKind::ExpressionNotInDistinct,
+            "",
+        ),
+        (
+            "SELECT listagg(DISTINCT v, '|') WITHIN GROUP (ORDER BY k) OVER (ORDER BY k) FROM t",
+            AnalyzeErrorKind::ExpressionNotInDistinct,
+            "",
+        ),
+    ] {
+        let failure = try_sql_source_with_declared_fields(sql, &fields).unwrap_err();
+        let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = failure else {
+            panic!("expected typed analysis failure for {sql}: {failure:?}");
+        };
+        assert_eq!(error.kind(), kind, "{sql}: {error}");
+        assert!(error.message().contains(overload), "{sql}: {error}");
+    }
+}
+
+#[test]
+fn mixed_window_freezes_one_node_with_independent_function_order_roots() {
+    use novarocks_physical_plan::{AggregatePhase, NodeKind};
+    use novarocks_sql_testkit::try_sql_source_with_declared_fields;
+    use std::sync::Arc;
+
+    let list = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+    let fields = [
+        Field::new("p", DataType::Int64, false),
+        Field::new("k", DataType::Int32, false),
+        Field::new("v", DataType::Utf8, true),
+        Field::new("a", list, true),
+    ];
+    let source = try_sql_source_with_declared_fields(
+        "SELECT min_by(v,k) OVER w, lag(a,1,ARRAY[-k]) OVER w, \
+         array_agg(v ORDER BY k DESC NULLS FIRST) OVER w \
+         FROM t WINDOW w AS (PARTITION BY p ORDER BY k)",
+        &fields,
+    )
+    .unwrap();
+    let windows = source
+        .plan()
+        .fragments()
+        .values()
+        .flat_map(|fragment| fragment.nodes().values())
+        .filter_map(|node| match &node.kind {
+            NodeKind::Window(window) => Some(window),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [window] = windows.as_slice() else {
+        panic!("expected all three calls in one native Window node");
+    };
+    assert_eq!(window.calls.len(), 3);
+    let array = window
+        .calls
+        .iter()
+        .find(|call| call.binding.function_id.as_str() == "builtin.aggregate/array_agg/v1")
+        .unwrap();
+    let [value] = array.arguments.as_ref() else {
+        panic!("exactly one logical aggregate argument");
+    };
+    let [key] = array.order_by.as_ref() else {
+        panic!("one independently bound function order key");
+    };
+    assert_ne!(*value, key.expr);
+    let state = array.aggregate_binding.as_ref().unwrap();
+    assert_eq!(state.phase, AggregatePhase::Single);
+    let source = state.state_interpretation.as_ref().unwrap();
+    assert_eq!(source.order_keys.len(), 1);
+    assert!(!source.order_keys[0].ascending);
+    assert!(source.order_keys[0].nulls_first);
 }

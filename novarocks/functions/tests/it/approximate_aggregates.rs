@@ -53,24 +53,24 @@ fn select(name: &str, types: &[DataType]) -> ResolvedFunctionBinding {
 }
 
 #[test]
-fn approximate_aggregates_distinct_installed_and_declared_only_contracts() {
+fn approximate_aggregates_distinct_installed_overloads_share_state_formats() {
     let catalog = builtin_engine_function_catalog();
     for (input, state, default, explicit) in [
         (
             DataType::Null,
-            "unknown-v1",
+            "unknown-v2",
             "unknown-v1",
             "unknown-error-v1",
         ),
         (
             DataType::Boolean,
-            "boolean-set-v1",
+            "boolean-set-v2",
             "boolean-v1",
             "boolean-error-v1",
         ),
         (
             DataType::Int64,
-            "hll-xxhash64-p11-v1",
+            "hll-xxhash64-parameterized-v2",
             "default-hll-v1",
             "explicit-error-hll-v1",
         ),
@@ -106,21 +106,24 @@ fn approximate_aggregates_distinct_installed_and_declared_only_contracts() {
             epsilon.selected.overload.as_str(),
             format!("builtin.aggregate/approx_distinct/{explicit}")
         );
-        assert!(
-            catalog
-                .definition_by_id(&epsilon.function_id)
-                .unwrap()
-                .is_declared_only_pure_overload(&epsilon.selected.overload)
-        );
-        assert!(
-            catalog
-                .pure_overload_declaration_observed(
-                    &epsilon.function_id,
-                    epsilon.kind,
-                    &epsilon.selected.overload,
-                    &Control
-                )
-                .is_err()
+        catalog
+            .pure_overload_declaration_observed(
+                &epsilon.function_id,
+                epsilon.kind,
+                &epsilon.selected.overload,
+                &Control,
+            )
+            .unwrap()
+            .admit_selected_lifecycle_observed(
+                &epsilon.selected,
+                2,
+                PureCallLifecycle::Aggregate,
+                &Control,
+            )
+            .unwrap();
+        assert_eq!(
+            epsilon.selected.aggregate.unwrap().state_format.as_str(),
+            state
         );
     }
 }

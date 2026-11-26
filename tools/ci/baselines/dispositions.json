@@ -12,16 +12,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:aggregate/agg_test_approx_top_k",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.aggregate/approx_top_k/derived-v1; owner B9, I1, I5; remove after capability repair and native verification",
-      "owner": "B9, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:aggregate/agg_test_array_agg",
       "failure": {
         "class": "error_code",

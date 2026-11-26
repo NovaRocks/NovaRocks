@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact MIN/MAX fixed-width and UTF-8 owners. MIN/MAX OVER folds each frame
-//! through the same fixed-width kernel; a UTF-8 state retains heap and has no
-//! inline window state, so its OVER form is refused by name.
+//! Exact MIN/MAX fixed-width and UTF-8 owners, including window frames.
 
 use super::aggregate_extrema_dispatch::{ExtremaState, PreparedExtrema};
 use super::aggregate_extrema_utf8::Utf8ExtremaKernel;
-use super::aggregate_window_adapter::InlineAggregateWindowKernel;
+use super::aggregate_window_adapter::{InlineAggregateWindowKernel, TrackedWindowOwner};
 use super::{
     aggregate_extrema::{ExtremaKernel, ExtremaOperation, supported_type},
     catalogue::BuiltinAggregateResolver,
@@ -159,11 +157,6 @@ impl ExtremaOwner {
         }
     }
 }
-fn has_inline_window_state(selected: &FunctionBindingSelection) -> bool {
-    !matches!(selected.argument_types.first(),
-        Some(FunctionArgumentType::Value(source)) if source.data_type() == &DataType::Utf8)
-}
-
 impl InlineAggregateWindowKernel for PreparedExtrema {
     fn copy_state(&self, state: &ExtremaState) -> Result<ExtremaState, KernelFailure> {
         match (self, state) {
@@ -182,15 +175,11 @@ impl PureAggregateWindowImplementation for ExtremaOwner {
         contract: Arc<WindowCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure> {
-        if !has_inline_window_state(contract.call().selected()) {
-            control
-                .checkpoint(CompilePhase::FunctionSpecialization, 0)
-                .map_err(compile_failure)?;
-            return Err(invalid(
-                "MIN/MAX OVER a UTF-8 value has no inline window state",
-            ));
+        if matches!(aggregate.as_ref(), PreparedExtrema::Utf8(_)) {
+            TrackedWindowOwner::Utf8Extrema(aggregate).prepare(contract, control)
+        } else {
+            super::aggregate_window_adapter::prepare(aggregate, contract, control)
         }
-        super::aggregate_window_adapter::prepare(aggregate, contract, control)
     }
 }
 
@@ -275,8 +264,13 @@ impl PureFunctionMetadataOwner for ExtremaOwner {
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         self.admit_selected_profile_observed(selected, logical_argument_count, control)?;
-        if lifecycle != PureCallLifecycle::AggregateWindow {
+        let PureCallLifecycle::AggregateWindow { distinct, ordered } = lifecycle else {
             return Ok(());
+        };
+        if distinct || ordered {
+            return Err(FunctionBindingError::UnavailableImplementation(
+                selected.overload.clone(),
+            ));
         }
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         work.step()?;
@@ -286,15 +280,8 @@ impl PureFunctionMetadataOwner for ExtremaOwner {
                 "MIN/MAX window admission requires one exact value channel".into(),
             ));
         }
-        let supported = has_inline_window_state(selected);
         work.finish()?;
-        if supported {
-            Ok(())
-        } else {
-            Err(FunctionBindingError::UnavailableImplementation(
-                selected.overload.clone(),
-            ))
-        }
+        Ok(())
     }
 }
 impl FunctionEffectOwner for ExtremaOwner {

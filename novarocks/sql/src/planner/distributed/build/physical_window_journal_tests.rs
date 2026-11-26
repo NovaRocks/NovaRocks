@@ -18,8 +18,7 @@
 use super::super::contract_lowering::original_emission_test_observer::OriginalWindowEmission;
 use super::super::{
     contract_lowering::lowered_window_table_source_tests::{
-        assert_window_unavailable, finish, integer, observe_window_emission, policy,
-        window_fixture, window_source,
+        finish, integer, observe_window_emission, policy, window_fixture, window_source,
     },
     lowered_draft::SqlSourceJournalError,
 };
@@ -202,7 +201,7 @@ fn window_journal_nonzero_cv_and_order_share_original_pool_and_frame_author() {
         kind: SqlExprKind::Constant(pool.value(ordinal).unwrap()),
         value_type: ty.clone(),
     };
-    let (plan, binding) = window_fixture(
+    let (plan, _) = window_fixture(
         vec![value(1)],
         vec![SortItem {
             expr: value(2),
@@ -270,7 +269,7 @@ fn window_journal_nonzero_cv_and_order_share_original_pool_and_frame_author() {
         Ok(())
     });
     assert_eq!(seen, 1);
-    assert_window_unavailable(result, &binding);
+    result.unwrap();
 }
 
 #[test]
@@ -437,7 +436,6 @@ fn window_journal_foreign_owner_refuses_before_request_and_direct_component_stay
 
 #[test]
 fn window_journal_wide_order_channels_observe_real_comparison_quantum() {
-    // Static installed ARRAY_AGG binding only: no ORDER runtime capability claim.
     let orders = (0..320)
         .map(|_| SortItem {
             expr: integer(41),
@@ -445,7 +443,7 @@ fn window_journal_wide_order_channels_observe_real_comparison_quantum() {
             nulls_first: false,
         })
         .collect();
-    let (plan, binding) = window_fixture(vec![integer(7)], orders);
+    let (plan, _) = window_fixture(vec![integer(7)], orders);
     let control = Control::default();
     let mut seen = 0;
     let result = observe_window_emission(&plan, &control, |entry, _| {
@@ -486,5 +484,5 @@ fn window_journal_wide_order_channels_observe_real_comparison_quantum() {
         Ok(())
     });
     assert_eq!(seen, 1);
-    assert_window_unavailable(result, &binding);
+    result.unwrap();
 }

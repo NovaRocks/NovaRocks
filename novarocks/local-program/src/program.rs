@@ -408,6 +408,8 @@ pub struct StaticWindowFunction {
     pub frozen_aggregate: Option<Arc<crate::FrozenAggregateSelection>>,
     pub kind: WindowFunctionKind,
     pub args: Vec<ProgramRootRef>,
+    pub function_order_by: Vec<ProgramRootRef>,
+    pub state_interpretation: Option<novarocks_type_contract::AggregateStateInterpretation>,
     pub return_type: DataType,
     pub aggregate_binding: Option<(Arc<str>, ResolvedAggregateSignature)>,
     pub frame: Option<WindowFrame>,
@@ -959,7 +961,7 @@ impl ProgramNodeKind {
                 }
                 for function in functions {
                     visit(None, Value)?;
-                    for id in &function.args {
+                    for id in function.args.iter().chain(&function.function_order_by) {
                         visit(Some(*id), Value)?;
                     }
                 }

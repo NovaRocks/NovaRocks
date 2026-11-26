@@ -460,7 +460,7 @@ fn approx_distinct_final_consumes_multiple_nonempty_filtered_partial_states() {
     );
     assert_eq!(
         partial.binding.state_format.as_str(),
-        "novarocks/approx_distinct/hll-xxhash64-p11-v1"
+        "novarocks/approx_distinct/hll-xxhash64-parameterized-v2"
     );
     assert_eq!(
         final_call.binding.state_format,
@@ -551,4 +551,72 @@ fn approx_distinct_final_consumes_multiple_nonempty_filtered_partial_states() {
             .value(0),
         4
     );
+}
+
+#[test]
+fn approx_distinct_explicit_precision_requires_the_original_fixed_value_for_both_splits() {
+    use novarocks_local_program::{ProgramCallSite, ProgramStateTemplate};
+
+    for (expression, distributed) in [
+        ("2.3E-2", true),
+        ("DOUBLE '0.023'", false),
+        ("CAST(k AS DOUBLE)", false),
+        ("DOUBLE '-1'", false),
+        ("CAST(NULL AS DOUBLE)", false),
+    ] {
+        let sql = format!(
+            "SELECT approx_distinct(k, {expression}) FILTER (WHERE k > 0) FROM fixture.source"
+        );
+        let source = sql_source(&sql, DataType::Int64);
+        let programs = programs_with_catalogue(&source, &installed_builtin_owner_catalogue());
+        let nodes = aggregates(source.plan()).collect::<Vec<_>>();
+        if distributed {
+            assert_eq!(nodes.len(), 2, "{sql}");
+            assert!(
+                nodes.iter().any(|(_, _, calls)| {
+                    matches!(calls[0].binding.phase, AggregatePhase::Partial { .. })
+                }),
+                "{sql}"
+            );
+            assert!(
+                nodes.iter().any(|(_, _, calls)| {
+                    matches!(calls[0].binding.phase, AggregatePhase::Final { .. })
+                }),
+                "{sql}"
+            );
+        } else {
+            let [(fragment, node, [call])] = nodes.as_slice() else {
+                panic!("expected one Single aggregate for {sql}");
+            };
+            assert_eq!(call.binding.phase, AggregatePhase::Single, "{sql}");
+            let program = &programs[&fragment.id()];
+            let node = local_aggregate(program, node).local_id().unwrap();
+            let Some(ProgramStateTemplate::Aggregate { kernel, .. }) =
+                program.state_template(ProgramCallSite::Aggregate { node, call: 0 })
+            else {
+                panic!("expected prepared Single aggregate for {sql}");
+            };
+            assert!(kernel.local_stages().is_none(), "{sql}");
+        }
+    }
+}
+
+#[test]
+fn dynamic_approx_distinct_keeps_a_distinct_peer_in_single_execution() {
+    for (group_column, group_by) in [("", ""), ("k % 2, ", " GROUP BY k % 2")] {
+        let sql = format!(
+            "SELECT {group_column}count(DISTINCT k), approx_distinct(k, CAST(k AS DOUBLE)) FROM fixture.source{group_by}"
+        );
+        let source = sql_source(&sql, DataType::Int64);
+        let programs = programs_with_catalogue(&source, &installed_builtin_owner_catalogue());
+        let nodes = aggregates(source.plan()).collect::<Vec<_>>();
+        let [(fragment, node, [_, approximate])] = nodes.as_slice() else {
+            panic!("expected one Single aggregate with two calls for {sql}");
+        };
+        assert_eq!(approximate.binding.phase, AggregatePhase::Single, "{sql}");
+        assert!(matches!(
+            local_aggregate(&programs[&fragment.id()], node).kind(),
+            ProgramNodeKind::Aggregate { .. }
+        ));
+    }
 }

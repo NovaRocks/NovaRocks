@@ -16,10 +16,11 @@
 // under the License.
 
 //! One real immutable owner for the installed ARRAY family aggregate identity.
-//! Producer DISTINCT/ORDER facts survive all phases; aggregate OVER is not installed.
+//! Producer DISTINCT/ORDER facts survive all phases and public ARRAY OVER.
 
 use super::{
-    aggregate_array::{ArrayKernel, Operation, validate_contract},
+    aggregate_array::{ArrayKernel, Operation, supported, validate_contract},
+    aggregate_window_adapter::{TrackedWindowOwner, admit_frame_modifiers},
     catalogue::BuiltinAggregateResolver,
 };
 use crate::kernel_control::{compile_failure, invalid};
@@ -50,12 +51,15 @@ pub(super) fn definition(
     resolver: Arc<BuiltinAggregateResolver>,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
     let owner = Arc::new(ArrayOwner::new(name, declaration, resolver)?);
-    FunctionDefinition::try_new_pure_aggregate(name, FunctionVisibility::Public, owner).map_err(
-        |error| FunctionCatalogError::InvalidStableIdentity {
-            subject: "builtin ARRAY family aggregate pure owner",
-            value: error.to_string().into(),
-        },
-    )
+    let definition = if matches!(owner.operation, Operation::Array) {
+        FunctionDefinition::try_new_pure_aggregate_window(name, FunctionVisibility::Public, owner)
+    } else {
+        FunctionDefinition::try_new_pure_aggregate(name, FunctionVisibility::Public, owner)
+    };
+    definition.map_err(|error| FunctionCatalogError::InvalidStableIdentity {
+        subject: "builtin ARRAY family aggregate pure owner",
+        value: error.to_string().into(),
+    })
 }
 struct ArrayOwner {
     resolver: Arc<BuiltinAggregateResolver>,
@@ -98,7 +102,11 @@ impl ArrayOwner {
             .map(|overload| PureImplementationDeclaration {
                 overload: overload.identity.clone(),
                 implementation: implementation.clone(),
-                abi: PureKernelAbi::AggregateV1,
+                abi: if name == "array_agg" {
+                    PureKernelAbi::AggregateWindowV1
+                } else {
+                    PureKernelAbi::AggregateV1
+                },
             })
             .collect();
         Ok(Self {
@@ -202,6 +210,56 @@ impl PureFunctionMetadataOwner for ArrayOwner {
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration] {
         &self.implementations
     }
+    fn admit_selected_lifecycle_profile_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        lifecycle: PureCallLifecycle,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        self.admit_selected_profile_observed(selected, logical_argument_count, control)?;
+        let PureCallLifecycle::AggregateWindow { distinct, ordered } = lifecycle else {
+            return Ok(());
+        };
+        if !matches!(self.operation, Operation::Array) {
+            return Err(FunctionBindingError::UnavailableImplementation(
+                selected.overload.clone(),
+            ));
+        }
+        self.declaration.effect_declaration(&selected.overload)?;
+        admit_frame_modifiers(selected, logical_argument_count, distinct, ordered, control)?;
+        let (Some(FunctionArgumentType::Value(argument)), FunctionResultType::Scalar(result)) =
+            (selected.argument_types.first(), &selected.result_type)
+        else {
+            return Err(FunctionBindingError::InvalidBinding(
+                "ARRAY window requires its exact value and List result".into(),
+            ));
+        };
+        if logical_argument_count != 1
+            || !crate::control_values::supports_indexed_result(argument.data_type())
+            || !crate::control_values::supports_indexed_result(result.data_type())
+        {
+            return Err(FunctionBindingError::UnavailableImplementation(
+                selected.overload.clone(),
+            ));
+        }
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        for (ordinal, argument) in selected.argument_types.iter().enumerate() {
+            let FunctionArgumentType::Value(argument) = argument else {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "ARRAY window requires exact Value arguments".into(),
+                ));
+            };
+            let json_payload = (ordinal == 0 && !distinct).then_some(argument.value_type());
+            if !supported(argument.data_type(), json_payload, &mut || work.step())? {
+                return Err(FunctionBindingError::UnavailableImplementation(
+                    selected.overload.clone(),
+                ));
+            }
+        }
+        work.finish()?;
+        Ok(())
+    }
 }
 impl FunctionEffectOwner for ArrayOwner {
     type Error = FunctionBindingError;
@@ -260,6 +318,17 @@ impl PureAggregateImplementation for ArrayOwner {
             checked.require_binding_author(self.resolver.as_ref(), input)
         })
         .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+
+impl PureAggregateWindowImplementation for ArrayOwner {
+    fn prepare_aggregate_window(
+        &self,
+        aggregate: Arc<ArrayKernel>,
+        contract: Arc<WindowCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure> {
+        TrackedWindowOwner::Array(aggregate).prepare(contract, control)
     }
 }
 

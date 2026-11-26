@@ -75,6 +75,7 @@ FROM ${case_db}.filter_two_phase GROUP BY g;
 -- @result_contains=SCAN ${case_db}.filter_two_phase
 EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT g, approx_distinct(x) FILTER (WHERE keep_row) AS kept,
+       approx_distinct(x, 2.3E-2) FILTER (WHERE keep_row) AS explicit_kept,
        approx_distinct(x % 2 = 0) FILTER (WHERE keep_row) AS kept_boolean,
        approx_distinct(x) FILTER (WHERE false) AS empty_count
 FROM ${case_db}.filter_two_phase GROUP BY g;
@@ -82,6 +83,7 @@ FROM ${case_db}.filter_two_phase GROUP BY g;
 -- query 8
 -- @be_log_be_count_at_least=NOVAROCKS_CONNECTOR_SCAN_FIRST_CHUNK,2
 SELECT g, approx_distinct(x) FILTER (WHERE keep_row) AS kept,
+       approx_distinct(x, 2.3E-2) FILTER (WHERE keep_row) AS explicit_kept,
        approx_distinct(x % 2 = 0) FILTER (WHERE keep_row) AS kept_boolean,
        approx_distinct(x) FILTER (WHERE false) AS empty_count
 FROM ${case_db}.filter_two_phase GROUP BY g;
@@ -89,8 +91,9 @@ FROM ${case_db}.filter_two_phase GROUP BY g;
 -- query 9
 -- @explain_contains=HASH AGGREGATE (SINGLE,
 -- @explain_not_contains=HASH AGGREGATE (LOCAL,
-WITH SESSION disable_optimizer_rules = 'SplitAggregateRule'
+WITH SESSION disable_optimizer_rules = 'SplitAggregateRule', pipeline_dop = 1
 SELECT g, approx_distinct(x) FILTER (WHERE keep_row) AS kept,
+       approx_distinct(x, 2.3E-2) FILTER (WHERE keep_row) AS explicit_kept,
        approx_distinct(x % 2 = 0) FILTER (WHERE keep_row) AS kept_boolean,
        approx_distinct(x) FILTER (WHERE false) AS empty_count
 FROM ${case_db}.filter_two_phase GROUP BY g;
@@ -102,6 +105,13 @@ SELECT g, count(DISTINCT x) FILTER (WHERE keep_row) AS kept,
 FROM ${case_db}.filter_two_phase GROUP BY g;
 
 -- query 11
+-- @explain_contains=HASH AGGREGATE (SINGLE,
+-- @explain_not_contains=HASH AGGREGATE (LOCAL,
+SELECT g, approx_distinct(x, IF(keep_row, DOUBLE '0.023', DOUBLE '-1'))
+           FILTER (WHERE keep_row) AS dynamic_kept
+FROM ${case_db}.filter_two_phase GROUP BY g;
+
+-- query 12
 -- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.filter_two_phase;

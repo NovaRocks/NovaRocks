@@ -22,21 +22,60 @@ mod sketch;
 
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_scalar::{BinaryResultBuilder, ScalarWork};
-use crate::kernel_control::{KernelControlObservation, invalid};
+use crate::kernel_control::{KernelControlObservation, invalid, invalid_function_argument};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
-    AggregateCallContract, AggregateStateAllocator, AggregateStateMemoryPolicy, FunctionValueType,
+    AggregateCallContract, AggregateKernelPhase, AggregateStateAllocator,
+    AggregateStateMemoryPolicy, FunctionArgument, FunctionBindingRequest, FunctionValueType,
     KernelEvaluationControl, KernelFailure, PreparedAggregateKernel, SelectedAggregateMergeInput,
     SelectedAggregateUpdateInput,
 };
-use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, builder::Int64Builder};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, builder::Int64Builder,
+};
 use arrow_schema::DataType;
 use hash::HashProfile;
+use novarocks_constant_contract::ConstantError;
 use novarocks_type_contract::{CompilePhase, PureCompileControl};
 use sketch::Sketch;
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+const DEFAULT_ACCURACY: f64 = 0.023;
+const DEFAULT_PRECISION: u8 = 11;
+const MIN_ACCURACY: f64 = 0.004_062_5;
+const MAX_ACCURACY: f64 = 0.26;
+
+fn precision_for_accuracy(accuracy: f64) -> Option<u8> {
+    if !(MIN_ACCURACY..=MAX_ACCURACY).contains(&accuracy) {
+        return None;
+    }
+    let buckets = (1.0816 / (accuracy * accuracy)).ceil() as u32;
+    Some(buckets.next_power_of_two().trailing_zeros() as u8)
+}
+
+/// SQL/physical phase eligibility consumes the exact original static input.
+/// Invalid or NULL accuracy leaves the row-domain decision to Single.
+// Design: ADR-0275 (docs/adr/ADR-0275-approximate-distinct-freezes-precision-for-split.md)
+pub fn fixed_distinct_precision(
+    logical_arity: usize,
+    accuracy: Option<&FunctionArgument>,
+) -> Result<Option<u8>, ConstantError> {
+    match (logical_arity, accuracy) {
+        (1, None) => Ok(Some(DEFAULT_PRECISION)),
+        (
+            2,
+            Some(FunctionArgument::Value {
+                value_type,
+                constant: Some(value),
+            }),
+        ) if value_type.data_type() == &DataType::Float64 => Ok(value
+            .try_f64_bits()?
+            .and_then(|bits| precision_for_accuracy(f64::from_bits(bits)))),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ApproxProfile {
     Unknown,
     Boolean,
@@ -52,11 +91,11 @@ impl ApproxProfile {
         }
     }
 
-    fn new_state(self, allocator: &HostAggregateAllocator) -> State {
+    fn new_state(&self) -> State {
         match self {
             Self::Unknown => State::Unknown,
             Self::Boolean => State::Boolean(0),
-            Self::Hash(_) => State::Hash(Sketch::new(allocator.clone())),
+            Self::Hash(_) => State::Hash(None),
         }
     }
 }
@@ -64,7 +103,7 @@ impl ApproxProfile {
 enum State {
     Unknown,
     Boolean(u8),
-    Hash(Sketch<HostAggregateAllocator>),
+    Hash(Option<Sketch<HostAggregateAllocator>>),
     Failed,
 }
 
@@ -75,9 +114,71 @@ pub(crate) struct ApproxDistinctState {
 
 #[derive(Debug)]
 pub(crate) struct ApproxDistinctKernel {
-    pub(super) contract: Arc<AggregateCallContract>,
-    pub(super) profile: ApproxProfile,
+    contract: Arc<AggregateCallContract>,
+    profile: ApproxProfile,
+    arity: u8,
+    fixed_precision: Option<u8>,
 }
+
+impl ApproxDistinctKernel {
+    pub(super) fn prepare(
+        contract: Arc<AggregateCallContract>,
+        request: FunctionBindingRequest<'_>,
+    ) -> Result<Self, KernelFailure> {
+        let logical_arity = request.logical_argument_count;
+        let profile = contract
+            .logical_argument_types()
+            .next()
+            .and_then(ApproxProfile::prepare)
+            .ok_or_else(|| invalid("approx_distinct requires its installed input profile"))?;
+        if !(1..=2).contains(&logical_arity)
+            || contract.logical_argument_types().len() != logical_arity
+            || request.arguments.len() != logical_arity
+        {
+            return Err(invalid(
+                "approx_distinct requires its exact unordered argument shape",
+            ));
+        }
+        let fixed_precision = fixed_distinct_precision(logical_arity, request.arguments.get(1))
+            .map_err(|_| {
+                invalid("approx_distinct accuracy differs from its exact constant carrier")
+            })?;
+        if contract.phase() != AggregateKernelPhase::Single && fixed_precision.is_none() {
+            return Err(invalid(
+                "approx_distinct stages require fixed legal accuracy",
+            ));
+        }
+        Ok(Self {
+            contract,
+            profile,
+            arity: logical_arity as u8,
+            fixed_precision,
+        })
+    }
+
+    fn phase_precision(&self) -> Result<u8, KernelFailure> {
+        self.fixed_precision.ok_or_else(|| {
+            invalid("approx_distinct has no fixed precision for merging or emitting state")
+        })
+    }
+}
+
+fn first_precision(arity: u8, fixed: Option<u8>, accuracy: f64) -> Result<u8, KernelFailure> {
+    let precision = if arity == 1 {
+        DEFAULT_PRECISION
+    } else {
+        precision_for_accuracy(accuracy).ok_or_else(|| {
+            invalid_function_argument("Max standard error must be in [0.0040625, 0.26]")
+        })?
+    };
+    if fixed.is_some_and(|expected| expected != precision) {
+        return Err(invalid(
+            "approx_distinct runtime accuracy disagrees with its fixed precision",
+        ));
+    }
+    Ok(precision)
+}
+
 pub(super) fn observed<T>(
     control: &dyn KernelEvaluationControl,
     f: impl FnOnce(&mut ScalarWork<'_, '_>) -> Result<T, KernelFailure>,
@@ -99,7 +200,9 @@ impl PreparedAggregateKernel for ApproxDistinctKernel {
     }
 
     fn supports_local_stages(&self) -> bool {
-        !self.contract.distinct() && self.contract.order_keys().is_empty()
+        self.fixed_precision.is_some()
+            && !self.contract.distinct()
+            && self.contract.order_keys().is_empty()
     }
     fn clone_for_local_phase(
         &self,
@@ -109,9 +212,12 @@ impl PreparedAggregateKernel for ApproxDistinctKernel {
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 0)
             .map_err(crate::kernel_control::compile_failure)?;
+        self.phase_precision()?;
         Ok(Arc::new(Self {
             contract,
-            profile: self.profile,
+            profile: self.profile.clone(),
+            arity: self.arity,
+            fixed_precision: self.fixed_precision,
         }))
     }
 
@@ -138,7 +244,7 @@ impl PreparedAggregateKernel for ApproxDistinctKernel {
                 HostAggregateAllocator::try_new(allocator.ok_or_else(|| {
                     invalid("approx_distinct requires its host state allocator")
                 })?)?;
-            let value = self.profile.new_state(&allocator);
+            let value = self.profile.new_state();
             Ok(ApproxDistinctState { allocator, value })
         })
     }
@@ -146,7 +252,7 @@ impl PreparedAggregateKernel for ApproxDistinctKernel {
     fn retained_bytes(&self, state: &Self::State) -> usize {
         state.allocator.metadata_bytes()
             + match &state.value {
-                State::Hash(sketch) => sketch.retained_bytes(),
+                State::Hash(Some(sketch)) => sketch.retained_bytes(),
                 _ => 0,
             }
     }
@@ -160,7 +266,7 @@ impl PreparedAggregateKernel for ApproxDistinctKernel {
             work.step()?;
             if !std::ptr::eq(input.contract(), self.contract.as_ref())
                 || !self.contract.phase().consumes_logical_arguments()
-                || input.logical_arguments().len() != 1
+                || input.logical_arguments().len() != usize::from(self.arity)
                 || !input.order_arguments().is_empty()
             {
                 return Err(invalid(
@@ -179,37 +285,76 @@ impl PreparedAggregateKernel for ApproxDistinctKernel {
         control: &dyn KernelEvaluationControl,
     ) -> Result<(), KernelFailure> {
         let result = observed(control, |work| {
+            if matches!(state.value, State::Failed) {
+                return Err(KernelFailure::InstanceFailed);
+            }
             let row = input
                 .selection()
                 .row(ordinal)
                 .ok_or_else(|| invalid("approx_distinct update ordinal is not selected"))?;
-            let argument = input.logical_arguments()[0];
-            let input = argument.array();
-            let index = argument.value_row(ordinal, row);
+            let arguments = input.logical_arguments();
+            let value = arguments[0];
+            let array = value.array();
+            let index = value.value_row(ordinal, row);
             work.step()?;
-            if index >= input.len() {
+            if index >= array.len() {
                 return Err(invalid(
                     "approx_distinct selected value address is out of bounds",
                 ));
             }
-            match (&mut state.value, self.profile) {
-                (State::Unknown, ApproxProfile::Unknown)
-                    if input.data_type() == &DataType::Null => {}
+            // UNKNOWN has Arrow's NullArray carrier with no validity
+            // bitmap. Its logical rows contribute nothing.
+            if matches!(state.value, State::Unknown) {
+                return if array.data_type() == &DataType::Null {
+                    Ok(())
+                } else {
+                    Err(invalid("approx_distinct UNKNOWN carrier mismatch"))
+                };
+            }
+            if array.is_null(index) {
+                return Ok(());
+            }
+            let accuracy = if let Some(accuracy) = arguments.get(1) {
+                let array = accuracy
+                    .array()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| invalid("approx_distinct accuracy requires a DOUBLE carrier"))?;
+                let index = accuracy.value_row(ordinal, row);
+                if index >= array.len() {
+                    return Err(invalid(
+                        "approx_distinct accuracy address exceeds its selected array",
+                    ));
+                }
+                if array.is_null(index) {
+                    return Ok(());
+                }
+                array.value(index)
+            } else {
+                DEFAULT_ACCURACY
+            };
+            match (&mut state.value, &self.profile) {
                 (State::Boolean(bits), ApproxProfile::Boolean) => {
-                    let array = input
+                    let array = array
                         .as_any()
                         .downcast_ref::<BooleanArray>()
                         .ok_or_else(|| invalid("approx_distinct BOOLEAN carrier mismatch"))?;
-                    if !array.is_null(index) {
-                        *bits |= 1 << u8::from(array.value(index));
-                    }
+                    *bits |= 1 << u8::from(array.value(index));
                 }
-                (State::Hash(sketch), ApproxProfile::Hash(profile)) => {
-                    if let Some(hash) = profile.hash(input.as_ref(), index, work)? {
-                        sketch.add_hash(hash, work)?;
+                (State::Hash(current), ApproxProfile::Hash(profile)) => {
+                    if current.is_none() {
+                        let precision =
+                            first_precision(self.arity, self.fixed_precision, accuracy)?;
+                        *current = Some(Sketch::new(precision, state.allocator.clone()));
                     }
+                    let sketch = current
+                        .as_mut()
+                        .expect("first contribution establishes precision");
+                    let hash = profile.hash(array.as_ref(), index, work)?.ok_or_else(|| {
+                        invalid("approx_distinct contribution contains an unexpected NULL")
+                    })?;
+                    sketch.add_hash(hash, work)?;
                 }
-                (State::Failed, _) => return Err(KernelFailure::InstanceFailed),
                 _ => {
                     return Err(invalid(
                         "approx_distinct cannot update a foreign state profile",
@@ -270,21 +415,30 @@ impl PreparedAggregateKernel for ApproxDistinctKernel {
                 ));
             }
             let payload = array.value(index);
-            match (&mut state.value, self.profile) {
-                (State::Unknown, ApproxProfile::Unknown) if payload == b"NU\x01" => Ok(()),
+            let precision = self.phase_precision()?;
+            match (&mut state.value, &self.profile) {
+                (State::Unknown, ApproxProfile::Unknown) => {
+                    if payload == [b'N', b'U', 2, self.arity, precision] {
+                        Ok(())
+                    } else {
+                        Err(invalid("approx_distinct UNKNOWN state format mismatch"))
+                    }
+                }
                 (State::Boolean(bits), ApproxProfile::Boolean) => {
-                    let [b'N', b'B', 1, value] = payload else {
+                    let [b'N', b'B', 2, arity, actual_precision, value] = payload else {
                         return Err(invalid("approx_distinct BOOLEAN state format mismatch"));
                     };
-                    if *value > 3 {
-                        return Err(invalid("approx_distinct BOOLEAN state bit set is invalid"));
+                    if *arity != self.arity || *actual_precision != precision || *value > 3 {
+                        return Err(invalid(
+                            "approx_distinct BOOLEAN state is invalid for this call",
+                        ));
                     }
                     *bits |= *value;
                     Ok(())
                 }
-                (State::Hash(sketch), ApproxProfile::Hash(profile)) => {
-                    sketch.merge(payload, profile.transport_profile(), work)
-                }
+                (State::Hash(current), ApproxProfile::Hash(profile)) => current
+                    .get_or_insert_with(|| Sketch::new(precision, state.allocator.clone()))
+                    .merge(payload, self.arity, profile.transport_profile(), work),
                 (State::Failed, _) => Err(KernelFailure::InstanceFailed),
                 _ => Err(invalid("approx_distinct has a foreign merge profile")),
             }
@@ -309,16 +463,27 @@ impl PreparedAggregateKernel for ApproxDistinctKernel {
                     "approx_distinct final phase cannot emit intermediate state",
                 ));
             }
+            let precision = self.phase_precision()?;
             let mut output = BinaryResultBuilder::new();
             for state in states {
                 work.step()?;
-                match (&state.value, self.profile) {
-                    (State::Unknown, ApproxProfile::Unknown) => output.append_value(b"NU\x01")?,
-                    (State::Boolean(bits), ApproxProfile::Boolean) => {
-                        output.append_value([b'N', b'B', 1, *bits])?
+                match (&state.value, &self.profile) {
+                    (State::Unknown, ApproxProfile::Unknown) => {
+                        output.append_value([b'N', b'U', 2, self.arity, precision])?;
                     }
-                    (State::Hash(sketch), ApproxProfile::Hash(profile)) => {
-                        let bytes = sketch.encode(profile.transport_profile(), work)?;
+                    (State::Boolean(bits), ApproxProfile::Boolean) => {
+                        output.append_value([b'N', b'B', 2, self.arity, precision, *bits])?;
+                    }
+                    (State::Hash(current), ApproxProfile::Hash(profile)) => {
+                        let bytes = if let Some(sketch) = current {
+                            sketch.encode(self.arity, profile.transport_profile(), work)?
+                        } else {
+                            Sketch::new(precision, state.allocator.clone()).encode(
+                                self.arity,
+                                profile.transport_profile(),
+                                work,
+                            )?
+                        };
                         work.flush()?;
                         output.append_value(&bytes)?;
                     }
@@ -351,10 +516,11 @@ impl PreparedAggregateKernel for ApproxDistinctKernel {
             let mut output = Int64Builder::with_capacity(states.len());
             for state in states {
                 work.step()?;
-                let result = match (&state.value, self.profile) {
+                let result = match (&state.value, &self.profile) {
                     (State::Unknown, ApproxProfile::Unknown) => 0,
                     (State::Boolean(bits), ApproxProfile::Boolean) => i64::from(bits.count_ones()),
-                    (State::Hash(sketch), ApproxProfile::Hash(_)) => sketch.estimate(work)?,
+                    (State::Hash(Some(sketch)), ApproxProfile::Hash(_)) => sketch.estimate(work)?,
+                    (State::Hash(None), ApproxProfile::Hash(_)) => 0,
                     (State::Failed, _) => return Err(KernelFailure::InstanceFailed),
                     _ => {
                         return Err(invalid(
@@ -370,87 +536,5 @@ impl PreparedAggregateKernel for ApproxDistinctKernel {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow_array::Int64Array;
-    use std::{alloc::Layout, ptr::NonNull};
-
-    struct Host;
-    impl AggregateStateAllocator for Host {
-        fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
-            NonNull::new(unsafe { std::alloc::alloc(layout) })
-                .ok_or(KernelFailure::ResourceExhausted)
-        }
-
-        unsafe fn release(&self, pointer: NonNull<u8>, layout: Layout) {
-            unsafe { std::alloc::dealloc(pointer.as_ptr(), layout) }
-        }
-    }
-
-    #[test]
-    fn approx_distinct_sparse_and_dense_merge_match_single_with_fixed_accuracy_sample() {
-        let profile = HashProfile::Int64;
-        let allocator = HostAggregateAllocator::try_new(Arc::new(Host)).unwrap();
-        let mut work = ScalarWork::new(None);
-        let mut variance = 0.0;
-        for group in 0..32 {
-            let values = Int64Array::from_iter_values((1..=8192).map(|value| group * 8192 + value));
-            let mut single = Sketch::new(allocator.clone());
-            let mut merged = Sketch::new(allocator.clone());
-            for partition in [0..64, 64..4096, 4096..8192] {
-                let mut partial = Sketch::new(allocator.clone());
-                for row in partition {
-                    let hash = profile.hash(&values, row, &mut work).unwrap().unwrap();
-                    single.add_hash(hash, &mut work).unwrap();
-                    partial.add_hash(hash, &mut work).unwrap();
-                }
-                let bytes = partial
-                    .encode(profile.transport_profile(), &mut work)
-                    .unwrap();
-                merged
-                    .merge(&bytes, profile.transport_profile(), &mut work)
-                    .unwrap();
-            }
-            let estimate = single.estimate(&mut work).unwrap();
-            assert_eq!(estimate, merged.estimate(&mut work).unwrap());
-            assert_eq!(
-                single
-                    .encode(profile.transport_profile(), &mut work)
-                    .unwrap()
-                    .as_slice(),
-                merged
-                    .encode(profile.transport_profile(), &mut work)
-                    .unwrap()
-                    .as_slice(),
-            );
-            variance += (estimate as f64 / 8192.0 - 1.0).powi(2);
-        }
-        let rmse = (variance / 32.0).sqrt();
-        assert!(rmse <= 0.046, "fixed-sample relative RMSE {rmse}");
-    }
-
-    #[test]
-    fn approx_distinct_uses_the_full_hash_and_rejects_foreign_state() {
-        let profile = HashProfile::Int64;
-        let allocator = HostAggregateAllocator::try_new(Arc::new(Host)).unwrap();
-        let mut sketch = Sketch::new(allocator);
-        let mut work = ScalarWork::new(None);
-        for hash in [0, 0, u64::MAX, 1 << 63] {
-            sketch.add_hash(hash, &mut work).unwrap();
-        }
-        assert_eq!(sketch.estimate(&mut work).unwrap(), 3);
-        let bytes = sketch
-            .encode(profile.transport_profile(), &mut work)
-            .unwrap();
-        assert!(
-            sketch
-                .merge(&bytes, HashProfile::Date.transport_profile(), &mut work)
-                .is_err()
-        );
-        assert!(
-            sketch
-                .merge(&[1, 2, 0, 0, 0, 0], profile.transport_profile(), &mut work)
-                .is_err()
-        );
-    }
-}
+#[path = "approx_distinct_kernel_tests.rs"]
+mod tests;

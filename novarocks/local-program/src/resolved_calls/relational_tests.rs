@@ -1218,6 +1218,8 @@ pub(crate) fn window_program(
                             WindowFunctionKind::FirstValue
                         },
                         args: vec![crate::test_support::root(0, 0)],
+                        function_order_by: vec![],
+                        state_interpretation: None,
                         return_type: DataType::Int64,
                         aggregate_binding: aggregate
                             .then(|| (Arc::from("alias"), resolved_signature(owner))),
@@ -1249,6 +1251,8 @@ fn prepared_window_graph(frame: Option<WindowFrame>) -> Result<Fixture, LocalPro
                     frozen_aggregate: None,
                     kind: WindowFunctionKind::Prepared,
                     args: vec![crate::test_support::root(0, 0)],
+                    function_order_by: vec![],
+                    state_interpretation: None,
                     return_type: DataType::Int64,
                     aggregate_binding: None,
                     frame,

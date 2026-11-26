@@ -157,6 +157,42 @@ fn replacement(
     }
     Ok(Some(replacement))
 }
+impl Utf8ExtremaKernel {
+    /// Retain the actual frame winner under the original input source owner.
+    /// Compare its physical UTF-8 bytes exactly as ordinary MIN/MAX does.
+    pub(super) fn window_candidate(
+        &self,
+        source: &ArrayRef,
+        candidate: usize,
+        current: Option<usize>,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Option<usize>, KernelFailure> {
+        let source = source
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| internal("UTF8 MIN/MAX window has a foreign source carrier"))?;
+        work.step()?;
+        if source.is_null(candidate) {
+            return Ok(current);
+        }
+        if let Some(current) = current {
+            let order = compare(
+                source.value(candidate).as_bytes(),
+                source.value(current).as_bytes(),
+                work,
+            )?;
+            let better = match self.operation {
+                ExtremaOperation::Min => Ordering::Less,
+                ExtremaOperation::Max => Ordering::Greater,
+            };
+            if order != better {
+                return Ok(Some(current));
+            }
+        }
+        Ok(Some(candidate))
+    }
+}
+
 impl PreparedAggregateKernel for Utf8ExtremaKernel {
     fn supports_local_stages(&self) -> bool {
         true

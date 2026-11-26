@@ -22,8 +22,7 @@
 //! membership, and each function's SQL definition.
 
 use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
-use std::cmp::Ordering;
-use std::sync::Arc;
+use std::{cmp::Ordering, num::NonZeroU32, sync::Arc};
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
 use arrow::record_batch::RecordBatch;
@@ -550,26 +549,51 @@ fn drive(
     batch: &RecordBatch,
     step: usize,
 ) -> Vec<crate::exec::chunk::ChunkBatchProjection> {
+    drive_with_output_rows(
+        program,
+        batch,
+        step,
+        novarocks_spi::connector::ENGINE_OUTPUT_POLICY.max_rows,
+    )
+}
+
+fn tracked_operator(
+    program: &Arc<LocalProgram>,
+    output_rows: NonZeroU32,
+) -> Box<dyn crate::exec::pipeline::operator::Operator> {
     let (node, _) = analytic(program);
-    let input = &program.graph().nodes()[match program.graph().nodes()[node.index()].kind() {
-        ProgramNodeKind::Analytic { input, .. } => input.index(),
-        _ => unreachable!(),
-    }];
-    let schema = ChunkSchema::from_compiled_layout(input.output_layout()).unwrap();
-    let factory = CompiledWindowProcessorFactory::try_new(
+    let factory = CompiledWindowProcessorFactory::try_new_with_output_batch_rows(
         Arc::clone(program),
         node,
         Arc::new(RuntimeErrorState::default()),
+        output_rows,
     )
     .unwrap();
     let mut operator = factory.create(1, 0);
     let tracker = crate::runtime::mem_tracker::MemTracker::new_root("window oracle construction");
     tracker.install_limit_once(64 * 1024 * 1024).unwrap();
     operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
-        tracker,
+        Arc::clone(&tracker),
         Arc::new(RuntimeErrorState::default()),
     ));
+    operator.set_mem_tracker(tracker);
     operator.prepare().unwrap();
+    operator
+}
+
+fn drive_with_output_rows(
+    program: &Arc<LocalProgram>,
+    batch: &RecordBatch,
+    step: usize,
+    output_rows: NonZeroU32,
+) -> Vec<crate::exec::chunk::ChunkBatchProjection> {
+    let (node, _) = analytic(program);
+    let input = &program.graph().nodes()[match program.graph().nodes()[node.index()].kind() {
+        ProgramNodeKind::Analytic { input, .. } => input.index(),
+        _ => unreachable!(),
+    }];
+    let schema = ChunkSchema::from_compiled_layout(input.output_layout()).unwrap();
+    let mut operator = tracked_operator(program, output_rows);
     let state = RuntimeState::default();
     let mut processor = TestDriver::new(operator.as_mut(), &state);
     let mut output = Vec::new();
@@ -965,3 +989,133 @@ mod compiled_window_whole_invocation_order_tests;
 
 #[path = "compiled_window_memory_binding_tests.rs"]
 mod memory_binding_tests;
+
+#[test]
+fn compiled_window_owned_partition_uses_batch_target_across_closed_partitions() {
+    let rows = vec![
+        vec![Some(1), Some(1), Some(10)],
+        vec![Some(1), Some(2), None],
+        vec![Some(1), Some(3), Some(30)],
+        vec![Some(2), Some(1), Some(40)],
+        vec![Some(2), Some(2), Some(50)],
+        vec![Some(2), Some(3), Some(60)],
+        vec![Some(3), Some(1), Some(70)],
+    ];
+    let shape = Shape {
+        partition: vec![P],
+        order: vec![key(O, true, false)],
+        calls: vec![Call::window(
+            "lag",
+            &[Arg::Column(X), Arg::Constant(1), Arg::Constant(-1)],
+        )],
+    };
+    let catalogue = installed_catalog();
+    let program = compile(package(&rows, 3, &shape, &catalogue, 1), &catalogue, 1);
+    let (_, schema) = analytic(&program);
+    let input = sorted_input(&rows, &shape, schema);
+    let output = drive_with_output_rows(&program, &input, rows.len(), NonZeroU32::new(2).unwrap());
+    assert_eq!(
+        output.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+        [2, 2, 2, 1]
+    );
+    assert_eq!(table(&output), oracle(&rows, &shape));
+}
+
+#[test]
+fn compiled_window_late_required_failure_in_one_closed_group_withholds_prefix() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+
+    let rows = vec![
+        vec![Some(1), Some(10), Some(1)],
+        vec![Some(2), Some(20), Some(-1)],
+        vec![Some(3), Some(30), Some(1)],
+    ];
+    let shape = Shape {
+        partition: vec![P],
+        order: vec![key(O, true, false)],
+        calls: vec![Call::window(
+            "lag",
+            &[Arg::Column(O), Arg::Column(X), Arg::Constant(-1)],
+        )],
+    };
+    let catalogue = installed_catalog();
+    let program = compile(package(&rows, 3, &shape, &catalogue, 1), &catalogue, 1);
+    let (node, schema) = analytic(&program);
+    let input = sorted_input(&rows, &shape, schema);
+    let ProgramNodeKind::Analytic { input: parent, .. } =
+        program.graph().nodes()[node.index()].kind()
+    else {
+        unreachable!();
+    };
+    let layout = program.graph().nodes()[parent.index()].output_layout();
+    let schema = ChunkSchema::from_compiled_layout(layout).unwrap();
+    let input = Chunk::try_new_with_chunk_schema(input, schema).unwrap();
+    let mut operator = tracked_operator(&program, NonZeroU32::new(1).unwrap());
+    let state = RuntimeState::default();
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
+    let error = processor.input_without_output(input).unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Data, "{error}");
+    assert!(
+        error.to_string().contains("must be non-negative"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compiled_window_owned_partition_subdivides_true_by_arrival_batches() {
+    use novarocks_functions::FunctionKind;
+
+    let rows = vec![
+        vec![Some(1), Some(1), Some(10)],
+        vec![Some(1), Some(2), Some(20)],
+        vec![Some(1), Some(3), Some(30)],
+        vec![Some(2), Some(1), Some(40)],
+        vec![Some(2), Some(2), Some(50)],
+    ];
+    let shape = Shape {
+        partition: vec![P],
+        order: vec![key(O, true, false)],
+        calls: vec![
+            Call::aggregate("min_by", &[Arg::Column(X), Arg::Column(O)]).framed(
+                WindowFrameUnits::Rows,
+                WindowBound::UnboundedPreceding,
+                WindowBound::CurrentRow,
+            ),
+            Call::window(
+                "lag",
+                &[Arg::Column(X), Arg::Constant(1), Arg::Constant(-1)],
+            ),
+        ],
+    };
+    let actual =
+        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
+    let catalogue = super::window_fixture::window_catalog_from_actual(
+        &[
+            ("min_by", FunctionKind::Aggregate),
+            ("lag", FunctionKind::Window),
+        ],
+        &actual,
+    );
+    let program = compile(package(&rows, 3, &shape, &catalogue, 1), &catalogue, 1);
+    let (_, schema) = analytic(&program);
+    let input = sorted_input(&rows, &shape, schema);
+    let output = drive_with_output_rows(&program, &input, 3, NonZeroU32::new(2).unwrap());
+    assert_eq!(
+        output.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+        [2, 1, 2]
+    );
+    let results = table(&output)
+        .into_iter()
+        .map(|row| [row[3].clone(), row[4].clone()])
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        [
+            [int(Some(10)), int(Some(-1))],
+            [int(Some(10)), int(Some(10))],
+            [int(Some(10)), int(Some(20))],
+            [int(Some(40)), int(Some(-1))],
+            [int(Some(40)), int(Some(40))],
+        ]
+    );
+}

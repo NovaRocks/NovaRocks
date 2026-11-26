@@ -692,6 +692,59 @@ pub(crate) fn resolve_sql_aggregate_call(
     })
 }
 
+pub(crate) fn resolve_sql_aggregate_window_call(
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    name: &str,
+    distinct: bool,
+    args: &[crate::analysis::TypedExpr],
+    order_by: &[crate::analysis::SortItem],
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+    use novarocks_functions::PureCallLifecycle;
+
+    bind_aggregate_arguments(args, order_by, constant_policy, control, |request| {
+        let logical = catalog.resolve_aggregate_binding(
+            name,
+            request.logical_argument_count,
+            &request.arguments[..request.logical_argument_count],
+            control,
+        )?;
+        let lifecycle = PureCallLifecycle::AggregateWindow {
+            distinct,
+            ordered: !order_by.is_empty(),
+        };
+        if order_by.is_empty() {
+            catalog.admit_bound_lifecycle_observed(&logical, lifecycle, control)?;
+            return Ok(logical);
+        }
+        let selected = catalog
+            .resolve_aggregate_binding(
+                name,
+                request.logical_argument_count,
+                request.arguments,
+                control,
+            )
+            .map_err(|error| match error {
+                FunctionBindingError::NoMatchingOverload => {
+                    FunctionBindingError::UnavailableImplementation(
+                        logical.selected.overload.clone(),
+                    )
+                }
+                error => error,
+            })?;
+        if selected.function_id != logical.function_id
+            || selected.selected.overload != logical.selected.overload
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "function ORDER BY changed the selected aggregate window overload".into(),
+            ));
+        }
+        catalog.admit_bound_lifecycle_observed(&selected, lifecycle, control)?;
+        Ok(selected)
+    })
+}
+
 enum PublicAggregateTarget<'a> {
     Named(&'a str),
     Distinct(DistinctAggregate),

@@ -10106,12 +10106,13 @@ impl<'a> ContractLoweringVisitor<'a> {
         self.work.flush()?;
         let aggregate_binding = aggregate_source
             .map(|aggregate| {
-                lower_resolved_aggregate_binding(
+                lower_captured_aggregate_binding(
                     aggregate,
-                    selected,
                     window.args.len(),
                     window.function_order_by.len(),
+                    selected,
                     AggregatePhase::Single,
+                    &mut self.work,
                 )
             })
             .transpose()?;
@@ -10137,6 +10138,14 @@ impl<'a> ContractLoweringVisitor<'a> {
             ignore_nulls: window.ignore_nulls,
             aggregate_binding: aggregate_binding.map(Box::new),
             source: LoweredWindowSourceEntry {
+                lifecycle: if aggregate_source.is_some() {
+                    novarocks_functions::PureCallLifecycle::AggregateWindow {
+                        distinct: window.distinct,
+                        ordered: !window.function_order_by.is_empty(),
+                    }
+                } else {
+                    novarocks_functions::PureCallLifecycle::Window
+                },
                 captured,
                 canonical_operational: canonical,
                 arguments: source_arguments,
@@ -12413,48 +12422,6 @@ fn bound_function_from_selection(
         argument_types: selected.argument_types.clone(),
         result_type: full_source_type(result_type),
     }
-}
-
-fn lower_resolved_aggregate_binding(
-    resolved: &novarocks_functions::ResolvedFunctionBinding,
-    selected: &novarocks_functions::FunctionBindingSelection,
-    logical_argument_count: usize,
-    order_by_count: usize,
-    phase: AggregatePhase,
-) -> Result<AggregateBinding, ContractLoweringError> {
-    if resolved.kind != novarocks_physical_plan::FunctionKind::Aggregate
-        || resolved.logical_argument_count != logical_argument_count
-        || selected.argument_types.len() != logical_argument_count + order_by_count
-    {
-        return Err(ContractLoweringError::InvalidWindow {
-            detail: "aggregate window binding arity or kind is inconsistent".to_string(),
-        });
-    }
-    let novarocks_functions::FunctionResultType::Scalar(result_type) = &selected.result_type else {
-        return Err(ContractLoweringError::InvalidWindow {
-            detail: "canonical aggregate window selection carries a relation result".into(),
-        });
-    };
-    let aggregate =
-        selected
-            .aggregate
-            .as_ref()
-            .ok_or_else(|| ContractLoweringError::InvalidWindow {
-                detail: "aggregate window binding lacks state metadata".to_string(),
-            })?;
-    Ok(AggregateBinding {
-        state_interpretation: None,
-        state_argument_contract: aggregate.state_argument_contract,
-        function: bound_function_from_selection(resolved, selected, result_type),
-        phase,
-        logical_argument_count: u32::try_from(logical_argument_count).map_err(|_| {
-            ContractLoweringError::InvalidWindow {
-                detail: "aggregate window logical argument count exceeds u32".to_string(),
-            }
-        })?,
-        intermediate_type: aggregate.intermediate_type.clone(),
-        state_format: aggregate.state_format.clone(),
-    })
 }
 
 fn expression_is_replica_deterministic(expression: &TypedExpr) -> bool {

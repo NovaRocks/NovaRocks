@@ -2619,7 +2619,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
         }
 
-        if name == "count_if" && is_distinct {
+        if name == "count_if" && is_distinct && func.window.is_none() {
             return Err(AnalyzeError::invalid_query_shape(
                 "Unexpected input '(', the most similar input is {<EOF>, ';'}.",
                 func.span,
@@ -2676,7 +2676,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         func.span,
                     ));
                 }
-                Some(resolve_aggregate_function_call_with_order(
+                let binding = resolve_aggregate_function_call_with_order(
                     self.function_catalog,
                     &name,
                     is_distinct,
@@ -2687,23 +2687,13 @@ impl<'a> super::AnalyzerContext<'a> {
                     self.constant_policy,
                     self.control,
                     self.purpose,
-                )?)
+                    AggregateCallSite::Window,
+                )?;
+                Some(self.with_aggregate_state_source(binding, is_distinct, &func_order_by)?)
             };
-            if is_distinct && (window_only || !aggregate_window_supports_distinct(&name)) {
+            if window_only && (is_distinct || !func_order_by.is_empty()) {
                 return Err(AnalyzeError::unsupported_expression(
-                    format!("{name} DISTINCT is not supported with OVER clause"),
-                    func.span,
-                ));
-            }
-            if !func_order_by.is_empty() && !aggregate_window_supports_function_order_by(&name) {
-                return Err(AnalyzeError::unsupported_expression(
-                    format!("{name} ORDER BY is not supported with OVER clause"),
-                    func.span,
-                ));
-            }
-            if aggregate_binding.is_some() && !is_supported_aggregate_window_function(&name) {
-                return Err(AnalyzeError::unsupported_expression(
-                    format!("aggregate function {name} is not supported with OVER clause"),
+                    format!("{name} does not support aggregate modifiers with OVER"),
                     func.span,
                 ));
             }
@@ -2771,17 +2761,17 @@ impl<'a> super::AnalyzerContext<'a> {
                         novarocks_functions::FunctionArgumentType::Lambda { .. } => None,
                     }),
             )?;
-            // OVER is authored here; aggregate presence alone is not an OVER ABI.
-            let lifecycle = if aggregate_binding.is_some() {
-                novarocks_functions::PureCallLifecycle::AggregateWindow
-            } else {
-                novarocks_functions::PureCallLifecycle::Window
-            };
-            self.function_catalog
-                .admit_bound_lifecycle_observed(binding.resolved(), lifecycle, self.control)
-                .map_err(|error| {
-                    AnalyzeError::function_binding(error).at_type_mismatch(func.span)
-                })?;
+            if window_only {
+                self.function_catalog
+                    .admit_bound_lifecycle_observed(
+                        binding.resolved(),
+                        novarocks_functions::PureCallLifecycle::Window,
+                        self.control,
+                    )
+                    .map_err(|error| {
+                        AnalyzeError::function_binding(error).at_type_mismatch(func.span)
+                    })?;
+            }
             let result = match &binding.selected.result_type {
                 novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
                 novarocks_functions::FunctionResultType::Relation(_) => {
@@ -2830,6 +2820,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 self.constant_policy,
                 self.control,
                 self.purpose,
+                AggregateCallSite::Group,
             )?);
         } else {
             if matches!(name.as_str(), "variant_get" | "try_variant_get") {
@@ -2956,37 +2947,11 @@ impl<'a> super::AnalyzerContext<'a> {
 
         if is_aggregate_function(self.function_catalog, &name) {
             // Aggregate function
-            let mut signature =
-                bound_aggregate.expect("catalog-classified aggregate must be resolved");
-            {
-                use novarocks_type_contract::{
-                    AggregateStateInterpretation, AggregateStateOrderKey, CompileCheckpoints,
-                    CompilePhase,
-                };
-                let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Validate)
-                    .map_err(AnalyzeError::control)?;
-                let mut keys = Vec::new();
-                keys.try_reserve_exact(func_order_by.len()).map_err(|_| {
-                    AnalyzeError::control(
-                        novarocks_type_contract::CompileControlError::ResourceExhausted,
-                    )
-                })?;
-                for key in &func_order_by {
-                    keys.push(AggregateStateOrderKey {
-                        ascending: key.asc,
-                        nulls_first: key.nulls_first,
-                    });
-                    work.step().map_err(AnalyzeError::control)?;
-                }
-                work.flush().map_err(AnalyzeError::control)?;
-                signature = signature.with_aggregate_state_source(AggregateStateInterpretation {
-                    distinct: is_distinct,
-                    order_keys: novarocks_type_contract::AggregateStateOrderKeys::from_pure_boxed(
-                        keys.into_boxed_slice(),
-                    ),
-                });
-                work.finish().map_err(AnalyzeError::control)?;
-            }
+            let signature = self.with_aggregate_state_source(
+                bound_aggregate.expect("catalog-classified aggregate must be resolved"),
+                is_distinct,
+                &func_order_by,
+            )?;
             self.observe_argument_types(
                 self.described_arguments(&args_typed),
                 signature
@@ -3148,6 +3113,37 @@ impl<'a> super::AnalyzerContext<'a> {
                 binding: bound.binding,
             },
         })
+    }
+
+    fn with_aggregate_state_source(
+        &self,
+        binding: crate::binding::SqlFunctionBinding,
+        distinct: bool,
+        order_by: &[SortItem],
+    ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
+        use novarocks_type_contract::{
+            AggregateStateInterpretation, AggregateStateOrderKey, AggregateStateOrderKeys,
+            CompileCheckpoints, CompileControlError, CompilePhase,
+        };
+        let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Validate)
+            .map_err(AnalyzeError::control)?;
+        let mut keys = Vec::new();
+        keys.try_reserve_exact(order_by.len())
+            .map_err(|_| AnalyzeError::control(CompileControlError::ResourceExhausted))?;
+        for key in order_by {
+            keys.push(AggregateStateOrderKey {
+                ascending: key.asc,
+                nulls_first: key.nulls_first,
+            });
+            work.step().map_err(AnalyzeError::control)?;
+        }
+        work.finish().map_err(AnalyzeError::control)?;
+        Ok(
+            binding.with_aggregate_state_source(AggregateStateInterpretation {
+                distinct,
+                order_keys: AggregateStateOrderKeys::from_pure_boxed(keys.into_boxed_slice()),
+            }),
+        )
     }
 
     /// Extract ORDER BY clauses from within function arguments (e.g. array_agg(x ORDER BY y)).
@@ -4376,6 +4372,7 @@ pub(super) fn resolve_aggregate_function_call(
         constant_policy,
         control,
         super::QueryAnalysisPurpose::Ordinary,
+        AggregateCallSite::Group,
     )
 }
 
@@ -4438,6 +4435,11 @@ fn approximate_aggregate_target(
     }
 }
 
+enum AggregateCallSite {
+    Group,
+    Window,
+}
+
 fn resolve_aggregate_function_call_with_order(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
@@ -4449,51 +4451,64 @@ fn resolve_aggregate_function_call_with_order(
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
     purpose: super::QueryAnalysisPurpose,
+    site: AggregateCallSite,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
     let arg_types = args
         .iter()
         .map(|argument| argument.value_type.data_type().clone())
         .collect::<Vec<_>>();
-    crate::functions::resolve_sql_aggregate_call(
-        function_catalog,
-        name,
-        distinct,
-        args,
-        function_order_by,
-        constant_policy,
-        control,
-    )
-    .map(|binding| crate::binding::SqlFunctionBinding::new(binding, decimal_overflow_policy))
-    .map_err(|error| {
-        if let novarocks_functions::FunctionBindingError::Control(error) = error {
-            return AnalyzeError::control(error);
-        }
-        if matches!(
-            error,
-            novarocks_functions::FunctionBindingError::UnavailableImplementation(_)
-        ) {
-            return AnalyzeError::function_binding(error).at_type_mismatch(span);
-        }
-        if purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition
-            && args.is_empty()
-            && matches!(name, "avg" | "min")
-            && matches!(
+    let binding = match site {
+        AggregateCallSite::Window => crate::functions::resolve_sql_aggregate_window_call(
+            function_catalog,
+            name,
+            distinct,
+            args,
+            function_order_by,
+            constant_policy,
+            control,
+        ),
+        AggregateCallSite::Group => crate::functions::resolve_sql_aggregate_call(
+            function_catalog,
+            name,
+            distinct,
+            args,
+            function_order_by,
+            constant_policy,
+            control,
+        ),
+    };
+    binding
+        .map(|binding| crate::binding::SqlFunctionBinding::new(binding, decimal_overflow_policy))
+        .map_err(|error| {
+            if let novarocks_functions::FunctionBindingError::Control(error) = error {
+                return AnalyzeError::control(error);
+            }
+            if matches!(
                 error,
-                novarocks_functions::FunctionBindingError::NoMatchingOverload
-            )
-        {
-            return AnalyzeError::unknown_function(
-                format!("Unexpected parameters () for function {name}"),
-                span,
-            );
-        }
-        let message = format!("cannot bind aggregate `{name}` for {arg_types:?}: {error}");
-        if error == novarocks_functions::FunctionBindingError::NoMatchingOverload {
-            AnalyzeError::unknown_function(message, span)
-        } else {
-            AnalyzeError::type_mismatch(message, span)
-        }
-    })
+                novarocks_functions::FunctionBindingError::UnavailableImplementation(_)
+            ) {
+                return AnalyzeError::function_binding(error).at_type_mismatch(span);
+            }
+            if purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition
+                && args.is_empty()
+                && matches!(name, "avg" | "min")
+                && matches!(
+                    error,
+                    novarocks_functions::FunctionBindingError::NoMatchingOverload
+                )
+            {
+                return AnalyzeError::unknown_function(
+                    format!("Unexpected parameters () for function {name}"),
+                    span,
+                );
+            }
+            let message = format!("cannot bind aggregate `{name}` for {arg_types:?}: {error}");
+            if error == novarocks_functions::FunctionBindingError::NoMatchingOverload {
+                AnalyzeError::unknown_function(message, span)
+            } else {
+                AnalyzeError::type_mismatch(message, span)
+            }
+        })
 }
 
 fn analyzer_aggregate_alias(name: &str) -> Option<&'static str> {

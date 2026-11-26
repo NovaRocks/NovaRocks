@@ -1228,7 +1228,6 @@ fn default_fixture(
     default: FunctionValueType,
     overflow: DecimalOverflowPolicy,
 ) -> Fixture {
-    let offset = cv(Some(1), false);
     Fixture::with_arguments(
         name,
         vec![
@@ -1237,8 +1236,8 @@ fn default_fixture(
                 constant: None,
             },
             FunctionArgument::Value {
-                value_type: offset.value_type().clone(),
-                constant: Some(offset),
+                value_type: FunctionValueType::new(DataType::Int64, false),
+                constant: None,
             },
             FunctionArgument::Value {
                 value_type: default,
@@ -1250,18 +1249,18 @@ fn default_fixture(
 }
 
 #[test]
-fn installed_lead_lag_i32_text_defaults_keep_bounds_nulls_and_existing_null_targets() {
+fn installed_lead_lag_text_defaults_keep_bounds_nulls_and_existing_null_targets() {
     let source: ArrayRef = Arc::new(StringArray::from(vec![
         Some("a"),
         None,
         Some("c"),
         Some("d"),
     ]));
-    let defaults: ArrayRef = Arc::new(Int32Array::from(vec![
-        Some(i32::MIN),
-        Some(i32::MAX),
+    let defaults: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("-2147483648"),
+        Some("2147483647"),
         None,
-        Some(6),
+        Some("6"),
     ]));
     let frames = whole_frames(4);
     let peers = [WindowRowRange { start: 0, end: 4 }];
@@ -1345,13 +1344,13 @@ fn installed_lead_lag_i32_text_defaults_keep_bounds_nulls_and_existing_null_targ
 }
 
 #[test]
-fn three_arguments_convert_complete_defaults_and_only_replace_missing_targets() {
+fn three_arguments_select_current_default_and_never_replace_existing_null_targets() {
     let source: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(10), None, Some(30)]));
-    let defaults: ArrayRef = Arc::new(StringArray::from(vec![
-        Some("101"),
-        Some("bad"),
-        Some("303"),
-        Some("404"),
+    let defaults: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(101),
+        None,
+        Some(303),
+        Some(404),
     ]));
     let offset: ArrayRef = Arc::new(Int64Array::from(vec![1]));
     let peers = [WindowRowRange { start: 0, end: 4 }];
@@ -1430,19 +1429,23 @@ fn three_arguments_convert_complete_defaults_and_only_replace_missing_targets() 
             }
         }
     }
-    // I64-to-Utf8 conversion uses the original Arrow formatter. A real NULL
-    // target remains NULL; the default only serves an absent target.
+    // String defaults also follow current-row coordinates.
     let text: ArrayRef = Arc::new(StringArray::from(vec![
         Some("a"),
         None,
         Some("c"),
         Some("d"),
     ]));
-    let numbers: ArrayRef = Arc::new(Int64Array::from(vec![i64::MIN, 2, 3, i64::MAX]));
+    let text_defaults: ArrayRef = Arc::new(StringArray::from(vec![
+        "-9223372036854775808",
+        "2",
+        "3",
+        "9223372036854775807",
+    ]));
     let fixture = default_fixture(
         "lead",
         ty(&text, true),
-        ty(&numbers, false),
+        ty(&text_defaults, false),
         DecimalOverflowPolicy::OutputNull,
     );
     let prepared = fixture
@@ -1451,7 +1454,7 @@ fn three_arguments_convert_complete_defaults_and_only_replace_missing_targets() 
     let args = [
         EvaluatedArgument::Column(&text),
         EvaluatedArgument::Scalar(&offset),
-        EvaluatedArgument::Column(&numbers),
+        EvaluatedArgument::Column(&text_defaults),
     ];
     let mut part = WindowEvaluationPartition::begin(
         prepared.clone(),
@@ -1477,7 +1480,7 @@ fn three_arguments_convert_complete_defaults_and_only_replace_missing_targets() 
 #[test]
 fn default_complete_setup_and_selected_copy_preserve_every_original_control_prefix() {
     let source: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
-    let defaults: ArrayRef = Arc::new(StringArray::from(vec!["5", "bad", "9"]));
+    let defaults: ArrayRef = Arc::new(Int64Array::from(vec![5_i64, 0, 9]));
     let offset: ArrayRef = Arc::new(Int64Array::from(vec![1]));
     let args = [
         EvaluatedArgument::Column(&source),
@@ -1571,15 +1574,14 @@ fn default_complete_setup_and_selected_copy_preserve_every_original_control_pref
 fn complete_default_logical_addresses_and_required_child_errors_remain_original() {
     let source: ArrayRef = Arc::new(Int64Array::from(vec![5, 6, 7, 8]));
     let offset: ArrayRef = Arc::new(Int64Array::from(vec![1]));
-    let default_pool: ArrayRef = Arc::new(StringArray::from(vec!["bad", "19", "bad"]));
+    let default_pool: ArrayRef = Arc::new(Int64Array::from(vec![-1_i64, 19, -2]));
     let default_cv = constant(default_pool, false, 1);
-    let scalar: ArrayRef = Arc::new(StringArray::from(vec!["27"]));
-    let sliced: ArrayRef =
-        Arc::new(StringArray::from(vec!["bad", "31", "32", "33", "34", "bad"]).slice(1, 4));
-    let compact_values: ArrayRef = Arc::new(StringArray::from(vec!["41", "42", "43", "44"]));
+    let scalar: ArrayRef = Arc::new(Int64Array::from(vec![27_i64]));
+    let sliced: ArrayRef = Arc::new(Int64Array::from(vec![-1_i64, 31, 32, 33, 34, -2]).slice(1, 4));
+    let compact_values: ArrayRef = Arc::new(Int64Array::from(vec![41_i64, 42, 43, 44]));
     let compact = SelectedValues::try_new(
         Selection::all(4),
-        &DataType::Utf8,
+        &DataType::Int64,
         compact_values,
         Box::default(),
     )
@@ -1595,7 +1597,7 @@ fn complete_default_logical_addresses_and_required_child_errors_remain_original(
         let fixture = default_fixture(
             "lead",
             ty(&source, false),
-            FunctionValueType::new(DataType::Utf8, false),
+            FunctionValueType::new(DataType::Int64, false),
             DecimalOverflowPolicy::OutputNull,
         );
         let prepared = fixture
@@ -1626,7 +1628,7 @@ fn complete_default_logical_addresses_and_required_child_errors_remain_original(
             vec![Some(6), Some(7), Some(8), Some(expected)]
         );
     }
-    let nulls: ArrayRef = Arc::new(arrow_array::NullArray::new(4));
+    let nulls: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>; 4]));
     let fixture = default_fixture(
         "lead",
         ty(&source, false),
@@ -1661,15 +1663,11 @@ fn complete_default_logical_addresses_and_required_child_errors_remain_original(
         vec![Some(6), Some(7), Some(8), None]
     );
 
-    let bad_values: ArrayRef = Arc::new(StringArray::from(vec![
-        Some("1"),
-        Some("2"),
-        Some("3"),
-        None,
-    ]));
+    let bad_values: ArrayRef =
+        Arc::new(Int64Array::from(vec![Some(1_i64), Some(2), Some(3), None]));
     let required = SelectedValues::try_new(
         Selection::all(4),
-        &DataType::Utf8,
+        &DataType::Int64,
         bad_values,
         vec![RowDataError::new(3, "required default child")].into(),
     )
@@ -1677,7 +1675,7 @@ fn complete_default_logical_addresses_and_required_child_errors_remain_original(
     let fixture = default_fixture(
         "lead",
         ty(&source, false),
-        FunctionValueType::new(DataType::Utf8, true),
+        FunctionValueType::new(DataType::Int64, true),
         DecimalOverflowPolicy::OutputNull,
     );
     let prepared = fixture
@@ -1704,7 +1702,9 @@ fn complete_default_logical_addresses_and_required_child_errors_remain_original(
 #[test]
 fn three_argument_wide_required_setup_and_output_sample_real_quantum_without_type_retag() {
     let source: ArrayRef = Arc::new(StringArray::from(vec!["a"; 320]));
-    let defaults: ArrayRef = Arc::new(Int64Array::from((0_i64..320).collect::<Vec<_>>()));
+    let defaults: ArrayRef = Arc::new(StringArray::from_iter_values(
+        (0..320).map(|row| row.to_string()),
+    ));
     let offset: ArrayRef = Arc::new(Int64Array::from(vec![1]));
     let fixture = default_fixture(
         "lead",
@@ -1765,7 +1765,7 @@ fn three_argument_wide_required_setup_and_output_sample_real_quantum_without_typ
         let quantum = trace
             .iter()
             .position(|units| *units == 256)
-            .expect("actual required conversion or selected copy crosses its quantum");
+            .expect("actual required setup or selected copy crosses its quantum");
         for at in [0, quantum, trace.len() - 1] {
             for cause in causes() {
                 let control = Control {
@@ -1793,20 +1793,20 @@ fn three_argument_wide_required_setup_and_output_sample_real_quantum_without_typ
 
 #[test]
 fn installed_numeric_defaults_keep_safe_nulls_float_bits_and_original_window_latch() {
-    use arrow_array::{Float32Array, Float64Array};
+    use arrow_array::Float32Array;
     let source_i64: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(10), None, Some(30)]));
-    let defaults_f64: ArrayRef = Arc::new(Float64Array::from(vec![101.9, f64::NAN, 303.9, 404.9]));
+    let defaults_i64: ArrayRef = Arc::new(Int64Array::from(vec![101_i64, 0, 303, 404]));
     let source_f32: ArrayRef = Arc::new(Float32Array::from(vec![
         Some(-0.0),
         None,
         Some(7.5),
         Some(f32::INFINITY),
     ]));
-    let defaults_i64: ArrayRef = Arc::new(Int64Array::from(vec![
-        (1_i64 << 54) + (1_i64 << 30) + 1,
-        202,
-        303,
-        404,
+    let defaults_f32: ArrayRef = Arc::new(Float32Array::from(vec![
+        f32::from_bits(0x5a80_0001),
+        202.0,
+        303.0,
+        404.0,
     ]));
     let offset: ArrayRef = Arc::new(Int64Array::from(vec![1]));
     let peers = [WindowRowRange { start: 0, end: 4 }];
@@ -1814,7 +1814,7 @@ fn installed_numeric_defaults_keep_safe_nulls_float_bits_and_original_window_lat
     let rows = [0, 1, 3];
     let selection = Selection::try_sparse(4, &rows).unwrap();
     for name in NAMES {
-        for (source, defaults) in [(&source_i64, &defaults_f64), (&source_f32, &defaults_i64)] {
+        for (source, defaults) in [(&source_i64, &defaults_i64), (&source_f32, &defaults_f32)] {
             for policy in [
                 DecimalOverflowPolicy::OutputNull,
                 DecimalOverflowPolicy::ReportError,
@@ -1867,8 +1867,7 @@ fn installed_numeric_defaults_keep_safe_nulls_float_bits_and_original_window_lat
                     );
                 }
                 partition.finish(&Control::default()).unwrap();
-                // Both actual setup and selected output run through the original
-                // lifecycle host. The leaf's numeric cast has no new policy.
+                // Both actual setup and selected output use the original lifecycle.
                 for setup in [true, false] {
                     let baseline = Control::default();
                     if setup {
@@ -1947,40 +1946,156 @@ fn admit_offset_profile(
 }
 
 #[test]
-fn lead_lag_static_default_admission_matches_original_recipe_profiles() {
+fn installed_three_argument_lag_lead_copy_array_and_decimal_domains() {
+    use arrow_array::{Decimal128Array, ListArray, types::Int64Type};
+
+    let lists = |values| ListArray::from_iter_primitive::<Int64Type, _, _>(values);
+    let source: ArrayRef = Arc::new(lists([
+        Some(vec![Some(1), None]),
+        None,
+        Some(vec![Some(3)]),
+    ]));
+    let defaults: ArrayRef = Arc::new(lists([
+        Some(vec![Some(-1)]),
+        Some(vec![Some(-2)]),
+        Some(vec![Some(-3)]),
+    ]));
+    let offset: ArrayRef = Arc::new(Int64Array::from(vec![0_i64, 1, 1]));
+    let peers = [WindowRowRange { start: 0, end: 3 }];
+    let frames = whole_frames(3);
+    for name in NAMES {
+        let fixture = default_fixture(
+            name,
+            ty(&source, true),
+            ty(&defaults, false),
+            DecimalOverflowPolicy::ReportError,
+        );
+        for ignore in [false, true] {
+            let prepared = fixture
+                .prepare(options(ignore), &CompileControl::default())
+                .unwrap();
+            let args = [
+                EvaluatedArgument::Column(&source),
+                EvaluatedArgument::Column(&offset),
+                EvaluatedArgument::Column(&defaults),
+            ];
+            let mut partition = WindowEvaluationPartition::begin(
+                prepared.clone(),
+                geometry(&prepared, &args, &peers, &frames),
+                &Control::default(),
+            )
+            .unwrap();
+            let expected = match (name, ignore) {
+                ("lead", _) => lists([
+                    Some(vec![Some(1), None]),
+                    Some(vec![Some(3)]),
+                    Some(vec![Some(-3)]),
+                ]),
+                ("lag", false) => {
+                    lists([Some(vec![Some(1), None]), Some(vec![Some(1), None]), None])
+                }
+                ("lag", true) => lists([
+                    Some(vec![Some(1), None]),
+                    Some(vec![Some(1), None]),
+                    Some(vec![Some(1), None]),
+                ]),
+                _ => unreachable!(),
+            };
+            let all = partition
+                .evaluate(Selection::all(3), 3, &Control::default())
+                .unwrap();
+            assert_eq!(
+                all.values().as_any().downcast_ref::<ListArray>().unwrap(),
+                &expected
+            );
+            let one = partition
+                .evaluate(
+                    Selection::try_sparse(3, &[2]).unwrap(),
+                    1,
+                    &Control::default(),
+                )
+                .unwrap();
+            assert_eq!(
+                one.values().as_any().downcast_ref::<ListArray>().unwrap(),
+                &expected.slice(2, 1)
+            );
+            partition.finish(&Control::default()).unwrap();
+        }
+    }
+
+    let decimal = |values: Vec<Option<i128>>| {
+        Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(38, 2)
+                .unwrap(),
+        ) as ArrayRef
+    };
+    let wide = 10_i128.pow(32);
+    let source = decimal(vec![Some(wide), None, Some(-wide)]);
+    let defaults = decimal(vec![Some(101), Some(202), Some(303)]);
+    let offset: ArrayRef = Arc::new(Int64Array::from(vec![0_i64, i64::MAX, 1]));
+    let fixture = default_fixture(
+        "lag",
+        ty(&source, true),
+        ty(&defaults, false),
+        DecimalOverflowPolicy::ReportError,
+    );
+    let prepared = fixture
+        .prepare(options(false), &CompileControl::default())
+        .unwrap();
+    let arguments = [
+        EvaluatedArgument::Column(&source),
+        EvaluatedArgument::Column(&offset),
+        EvaluatedArgument::Column(&defaults),
+    ];
+    let mut partition = WindowEvaluationPartition::begin(
+        prepared.clone(),
+        geometry(&prepared, &arguments, &peers, &frames),
+        &Control::default(),
+    )
+    .unwrap();
+    let output = partition
+        .evaluate(Selection::all(3), 3, &Control::default())
+        .unwrap();
+    let selected = output
+        .values()
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(selected.data_type(), &DataType::Decimal128(38, 2));
+    assert_eq!(
+        selected.iter().collect::<Vec<_>>(),
+        [Some(wide), Some(202), None]
+    );
+}
+
+#[test]
+fn lead_lag_static_default_admission_requires_common_supported_type() {
     for name in NAMES {
         for (value, default, supported) in [
-            (DataType::Int64, DataType::Utf8, true),
-            (DataType::Utf8, DataType::Int64, true),
-            (DataType::Utf8, DataType::Int32, true),
-            (DataType::Utf8, DataType::Int8, false),
-            (DataType::Utf8, DataType::Int16, false),
-            (DataType::Int32, DataType::Float64, true),
-            (DataType::Boolean, DataType::Boolean, false),
+            (DataType::Int64, DataType::Utf8, false),
+            (DataType::Utf8, DataType::Int64, false),
+            (DataType::Utf8, DataType::Int32, false),
+            (DataType::Int32, DataType::Float64, false),
+            (DataType::Int64, DataType::Null, false),
+            (DataType::Boolean, DataType::Boolean, true),
+            (DataType::Int8, DataType::Int8, true),
             (
-                DataType::Decimal128(10, 2),
-                DataType::Decimal128(10, 2),
+                DataType::Decimal128(38, 7),
+                DataType::Decimal128(38, 7),
+                true,
+            ),
+            (
+                DataType::Decimal128(38, 7),
+                DataType::Decimal128(38, 6),
                 false,
             ),
-            (DataType::Utf8, DataType::Float64, false),
         ] {
             let fixture = default_fixture(
                 name,
                 FunctionValueType::new(value, false),
                 FunctionValueType::new(default, true),
                 DecimalOverflowPolicy::ReportError,
-            );
-            let FunctionArgumentType::Value(default) = &fixture.selected.argument_types[2] else {
-                panic!("the actual selected default type");
-            };
-            let FunctionResultType::Scalar(target) = &fixture.selected.result_type else {
-                panic!("the actual selected result type");
-            };
-            assert_eq!(
-                crate::builtin::window_default::DefaultValueRecipe::supports_profile(
-                    default, target
-                ),
-                supported
             );
             let admission = admit_offset_profile(&fixture, &CompileControl::default());
             if supported {
@@ -2006,7 +2121,7 @@ fn lead_lag_static_default_admission_matches_original_recipe_profiles() {
 #[test]
 fn installed_lead_lag_select_native_json_defaults_and_preserve_sql_null() {
     use crate::json_value::test_array;
-    use arrow_array::{LargeBinaryArray, NullArray};
+    use arrow_array::LargeBinaryArray;
     use novarocks_type_contract::ValueLogicalType;
 
     let json = FunctionValueType::try_with_logical_type(
@@ -2023,7 +2138,7 @@ fn installed_lead_lag_select_native_json_defaults_and_preserve_sql_null() {
         Some(r#"{"default":4}"#),
     ]));
     let scalar: ArrayRef = Arc::new(test_array(&[Some("null")]));
-    let sql_null: ArrayRef = Arc::new(NullArray::new(1));
+    let sql_null: ArrayRef = Arc::new(test_array(&[None]));
     let offset = cv(Some(1), false);
     let peers = [WindowRowRange { start: 0, end: 4 }];
     let frames = whole_frames(4);
@@ -2055,7 +2170,7 @@ fn installed_lead_lag_select_native_json_defaults_and_preserve_sql_null() {
             ),
             (
                 EvaluatedArgument::Scalar(&sql_null),
-                FunctionValueType::new(DataType::Null, true),
+                json.clone(),
                 None,
                 None,
             ),
@@ -2150,7 +2265,7 @@ fn lead_lag_static_admission_keeps_every_original_control_refusal() {
     let fixture = default_fixture(
         "lead",
         FunctionValueType::new(DataType::Boolean, false),
-        FunctionValueType::new(DataType::Boolean, false),
+        FunctionValueType::new(DataType::Int64, false),
         DecimalOverflowPolicy::ReportError,
     );
     let baseline = CompileControl::default();
@@ -2194,4 +2309,63 @@ fn lead_lag_static_admission_keeps_every_original_control_refusal() {
         ),
         Err(FunctionBindingError::InvalidBinding(_))
     ));
+}
+
+#[test]
+fn three_argument_offset_error_precedes_optional_completion_callback() {
+    let values: ArrayRef = Arc::new(Int64Array::from(vec![10, 20]));
+    let defaults: ArrayRef = Arc::new(Int64Array::from(vec![-1, -2]));
+    let fixture = Fixture::with_arguments(
+        "lag",
+        vec![
+            FunctionArgument::Value {
+                value_type: ty(&values, false),
+                constant: None,
+            },
+            FunctionArgument::Value {
+                value_type: FunctionValueType::new(DataType::Int64, true),
+                constant: None,
+            },
+            FunctionArgument::Value {
+                value_type: ty(&defaults, false),
+                constant: None,
+            },
+        ],
+        DecimalOverflowPolicy::ReportError,
+    );
+    let kernel = fixture
+        .prepare(options(false), &CompileControl::default())
+        .unwrap();
+    let peers = [WindowRowRange { start: 0, end: 2 }];
+    let frames = whole_frames(2);
+    let fail = |values_for_offset: [Option<i64>; 2], control: &Control| {
+        let offset: ArrayRef = Arc::new(Int64Array::from(values_for_offset.to_vec()));
+        let arguments = [
+            EvaluatedArgument::Column(&values),
+            EvaluatedArgument::Column(&offset),
+            EvaluatedArgument::Column(&defaults),
+        ];
+        let input = geometry(&kernel, &arguments, &peers, &frames);
+        Arc::clone(&kernel)
+            .begin_partition(input, control)
+            .err()
+            .expect("the original offset must fail during setup")
+    };
+    for invalid in [None, Some(-1)] {
+        let first = Control::default();
+        let expected = fail([invalid, Some(0)], &first);
+        assert_eq!(expected.failure_fact().reason(), INVALID_FUNCTION_ARGUMENT);
+        let trace = first.trace.lock().unwrap().clone();
+        let late = Control::default();
+        assert_eq!(fail([Some(0), invalid], &late), expected);
+        // The first valid offset accrues one work unit without crossing a
+        // checkpoint. The later Data error preempts optional completion.
+        assert_eq!(*late.trace.lock().unwrap(), trace);
+        let later_refusal = Control {
+            trace: Mutex::default(),
+            refusal: Some((trace.len(), KernelFailure::Cancelled)),
+        };
+        assert_eq!(fail([Some(0), invalid], &later_refusal), expected);
+        assert_eq!(*later_refusal.trace.lock().unwrap(), trace);
+    }
 }

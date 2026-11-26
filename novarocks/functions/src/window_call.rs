@@ -327,30 +327,39 @@ impl<'input, 'call, 'a, 'selection> WindowOutputProjection<'input, 'call, 'a, 's
         capacity: usize,
         control: &dyn KernelEvaluationControl,
     ) -> Result<(), KernelFailure> {
-        let observation = crate::kernel_control::KernelControlObservation::new(control);
-        observation.finish(self.validate_result_observed(result, capacity, &observation))
-    }
-    fn validate_result_observed(
-        self,
-        result: &SelectedValues<'_>,
-        capacity: usize,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<(), KernelFailure> {
-        control.checkpoint(0)?;
-        if result.values().len() > capacity {
-            return Err(internal("window output exceeds its host row grant"));
-        }
-        validate_argument_observed(
-            EvaluatedArgument::SelectedColumn(result),
+        validate_window_result(
+            self.input.contract,
             self.selection,
-            self.input.contract.result_type(),
+            result,
+            capacity,
             control,
         )
-        .map_err(|failure| match failure {
-            KernelFailure::InvalidProgram(diagnostic) => KernelFailure::Internal(diagnostic),
-            failure => failure,
-        })
     }
+}
+
+pub(crate) fn validate_window_result(
+    contract: &WindowCallContract,
+    selection: Selection<'_>,
+    result: &SelectedValues<'_>,
+    capacity: usize,
+    control: &dyn KernelEvaluationControl,
+) -> Result<(), KernelFailure> {
+    let observation = crate::kernel_control::KernelControlObservation::new(control);
+    observation.checkpoint(0)?;
+    if result.values().len() > capacity {
+        return Err(internal("window output exceeds its host row grant"));
+    }
+    let validated = validate_argument_observed(
+        EvaluatedArgument::SelectedColumn(result),
+        selection,
+        contract.result_type(),
+        &observation,
+    )
+    .map_err(|failure| match failure {
+        KernelFailure::InvalidProgram(diagnostic) => KernelFailure::Internal(diagnostic),
+        failure => failure,
+    });
+    observation.finish(validated)
 }
 
 #[cfg(test)]
