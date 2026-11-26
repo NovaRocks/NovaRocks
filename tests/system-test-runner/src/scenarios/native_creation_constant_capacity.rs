@@ -600,14 +600,41 @@ fn capture_baseline_contract(
             return creation_merge(Err(error.into()), recorded);
         }
     };
-    let [row] = output.rows.as_slice() else {
-        bail!("baseline EXPLAIN CONTRACT must return one plan row");
-    };
-    let [TrinoValue::Text(plan)] = row.as_slice() else {
-        bail!("baseline EXPLAIN CONTRACT must return one text column");
-    };
-    fs::write(&path, plan)?;
-    check_baseline_values(plan, case)
+    let rows = baseline_contract_rows(&output)?;
+    write_record(
+        &path.with_extension("baseline-contract-rows.json"),
+        &json!({
+            "query_id": output.query_id, "pages": output.pages,
+            "columns": output.columns, "rows": rows
+        }),
+    )?;
+    let plan = rows.join("\n");
+    fs::write(&path, &plan)?;
+    check_baseline_values(&plan, case)
+}
+
+fn baseline_contract_rows(output: &StatementResult) -> Result<Vec<&str>> {
+    ensure!(
+        output.is_result_set()
+            && output.columns.len() == 1
+            && matches!(
+                output.columns[0].type_signature.raw_type.as_str(),
+                "varchar" | "char"
+            ),
+        "baseline EXPLAIN CONTRACT must return one text column"
+    );
+    ensure!(
+        !output.rows.is_empty(),
+        "baseline EXPLAIN CONTRACT returned no plan rows"
+    );
+    output
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Text(line)] => Ok(line.as_str()),
+            _ => bail!("baseline EXPLAIN CONTRACT returned a non-text plan row"),
+        })
+        .collect()
 }
 
 fn check_baseline_values(plan: &str, case: Case) -> Result<()> {
@@ -688,6 +715,38 @@ fn check_baseline_values(plan: &str, case: Case) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn baseline_contract_collects_original_rows_and_checks_values() {
+        use novarocks_test_trino_client::{Column, TypeSignature};
+
+        let lines = [
+            "PHYSICAL PLAN version=baseline",
+            "    VALUES stats={rows=1, cpu=0} [fragment=1, node=0]",
+            "      rows=[[n0:r0]]",
+            "      n0:e3 = builtin.scalar/rpad/v1#fixture",
+        ];
+        let mut result = StatementResult {
+            columns: vec![Column {
+                name: "Explain String".into(),
+                type_name: "varchar".into(),
+                type_signature: TypeSignature::simple("varchar"),
+            }],
+            rows: lines
+                .iter()
+                .map(|line| vec![TrinoValue::Text((*line).into())])
+                .collect(),
+            query_id: "baseline-explain".into(),
+            pages: 2,
+            update_type: None,
+            update_count: None,
+        };
+        let observed = baseline_contract_rows(&result).unwrap();
+        assert_eq!(observed, lines);
+        check_baseline_values(&observed.join("\n"), Case::Fold).unwrap();
+        result.rows[1][0] = TrinoValue::Null;
+        assert!(baseline_contract_rows(&result).is_err());
+    }
 
     #[test]
     fn generation_preserves_exact_query_sizes_and_default_overlay() {
