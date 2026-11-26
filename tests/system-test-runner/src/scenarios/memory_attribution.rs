@@ -41,7 +41,9 @@ const OBSERVATION_QUERIES: [&str; 2] = [
 ];
 const CANCELLATION_QUERY: &str =
     "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v";
-const REGEXP_CANCELLATION_QUERY: &str = "SELECT sum(regexp_count(rpad('', 8192, CASE WHEN i <= BIGINT '50000' THEN 'a' ELSE 'b' END), 'a+a+a+a+a+a+z')) FROM TABLE(sequence(1, 100000)) AS t(i)";
+// Keep an individual search active across the marker poll and Trino DELETE.
+// More short rows increase batch size without widening that cancellation window.
+const REGEXP_CANCELLATION_QUERY: &str = "SELECT sum(regexp_count(rpad('', 262144, CASE WHEN i <= BIGINT '64' THEN 'a' ELSE 'b' END), 'a+a+a+a+a+a+z')) FROM TABLE(sequence(1, 128)) AS t(i)";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![Box::new(ObservationFamilies::default())]
@@ -380,21 +382,30 @@ fn await_regexp_exit(
             .lines()
             .filter(same_task)
             .find(|line| line.contains(REGEXP_SEARCH_STOPPED));
-        if let (Some(prepared), Some(stopped)) = (prepared, stopped) {
+        if let Some(prepared) = prepared {
             let stage = marker_field(prepared, "stage=")?.parse::<u32>()?;
             let task = marker_field(prepared, "task=")?.parse::<u32>()?;
             let stage_field = format!("stage={stage} ");
             let task_id_field = format!("task={task} ");
             // Worker emits the retained terminal only after the original
             // accepted Task's physical payload is destroyed.
-            let retired = log.lines().any(|line| {
+            let terminal = log.lines().find(|line| {
                 line.contains(TASK_TERMINAL_RETAINED)
                     && line.contains(&execution_field)
                     && line.contains(&stage_field)
                     && line.contains(&task_id_field)
-                    && marker_field(line, "state=").is_ok_and(|state| state == "ABORTED")
             });
-            if retired {
+            if let Some(terminal) = terminal {
+                let state = marker_field(terminal, "state=")?;
+                ensure!(
+                    state == "ABORTED",
+                    "regexp Task {task_key} in execution {execution} retired as {state}"
+                );
+                let stopped = stopped.with_context(|| {
+                    format!(
+                        "regexp Task {task_key} in execution {execution} was aborted without observing a stop inside the search"
+                    )
+                })?;
                 return Ok((stage, task, marker_field(stopped, "offset=")?.parse()?));
             }
         }

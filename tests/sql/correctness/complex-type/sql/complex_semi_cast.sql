@@ -58,6 +58,7 @@ FROM ${case_db}.row_util;
 INSERT INTO ${case_db}.t1 (k1) SELECT idx from ${case_db}.row_util order by idx limit 1000;
 
 -- query 2
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR,1
 -- CastStringToArray: IN with cast from string literal
 select count(1) from ${case_db}.t1 where c_int > 0 AND (
     c_array_int in (cast('[10, 11,12,13]' as array<INT>))
@@ -90,6 +91,7 @@ select count(1) from ${case_db}.t1 where (
 );
 
 -- query 7
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR,1
 -- CastArrayExpr: mixed string/int cast for IN
 select count(1) from ${case_db}.t1 where (
     c_array_int in (cast(['1', 11, 12, 13] as array<int>))
@@ -97,6 +99,7 @@ select count(1) from ${case_db}.t1 where (
 );
 
 -- query 8
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR,1
 -- CastArrayExpr element access
 select count(1) from ${case_db}.t1 where
     c_int =cast(['1', 11, 12, 13] as array<int>)[1]
@@ -110,7 +113,8 @@ select count(1) from ${case_db}.t1 where (
 );
 
 -- query 10
--- CastMapExpr: cast from string key map
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR,1
+-- CastMapExpr: heterogeneous values are rejected before the MAP cast
 select count(1) from ${case_db}.t1 where
     c_int > 0 and (
     c_map in (cast (MAP(ARRAY[0, 1, 2], ARRAY['10', 11, 12]) as map<int, int>))
@@ -118,6 +122,7 @@ select count(1) from ${case_db}.t1 where
 );
 
 -- query 11
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR,1
 -- CastMapExpr element access
 select count(1) from ${case_db}.t1 where
     c_int = cast (MAP(ARRAY[0, 1, 2], ARRAY['10', 11, 12]) as map<int, int>)[0]

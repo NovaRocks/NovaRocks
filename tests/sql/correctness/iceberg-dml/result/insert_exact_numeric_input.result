@@ -89,7 +89,7 @@ d
 1
 
 -- query 21
--- legacy
+-- types	decimal(5, 2)
 d
 1.00
 

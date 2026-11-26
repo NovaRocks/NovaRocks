@@ -1,43 +1,43 @@
 -- query 8
--- legacy
+-- types	map(integer, array(varchar))	map(integer, array(varchar))
 map2	map2
-{0:["1","2"]}	{0:["1","2"]}
-{1:[]}	{1:[]}
+{"0":["1","2"]}	{"0":["1","2"]}
+{"1":[]}	{"1":[]}
 {}	{}
 
 -- query 9
--- legacy
+-- types	map(varchar, map(integer, varchar))	map(varchar, map(integer, varchar))
 map3	map3
-{"1":{1:"abc"}}	{"1":{1:"abc"}}
+{"1":{"1":"abc"}}	{"1":{"1":"abc"}}
 {}	{}
-{"3":{3:"a33c"}}	{"3":{3:"a33c"}}
+{"3":{"3":"a33c"}}	{"3":{"3":"a33c"}}
 
 -- query 10
--- legacy
+-- types	map(integer, row(c integer, b varchar))	map(integer, row(c integer, b varchar))
 map5	map5
-{0:{"c":1,"b":"a"}}	{0:{"c":1,"b":"a"}}
+{"0":[1,"a"]}	{"0":[1,"a"]}
 {}	{}
 {}	{}
 {}	{}
 {}	{}
-{3:{"c":3,"b":"a"}}	{3:{"c":3,"b":"a"}}
+{"3":[3,"a"]}	{"3":[3,"a"]}
 
 -- query 11
--- legacy
+-- types	map(integer, varchar)	map(integer, varchar)
 map0	map0
-{0:"ab"}	{0:"ab"}
+{"0":"ab"}	{"0":"ab"}
 {}	{}
-{3:""}	{3:""}
+{"3":""}	{"3":""}
 
 -- query 12
--- legacy
+-- types	map(decimal(16, 3), varchar)	map(decimal(16, 3), varchar)
 map1	map1
-{0.000:"ab"}	{0.000:"ab"}
+{"0.000":"ab"}	{"0.000":"ab"}
 {}	{}
 {}	{}
 {}	{}
 {}	{}
-{3.000:""}	{3.000:""}
+{"3.000":""}	{"3.000":""}
 
 -- query 16
 -- legacy

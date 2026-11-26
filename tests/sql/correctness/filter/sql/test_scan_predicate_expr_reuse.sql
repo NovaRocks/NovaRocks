@@ -82,11 +82,11 @@ CREATE TABLE t0 (
     v9 VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO t0 VALUES
-ROW(1,[1],[1],[1],row(1,row(1)),row(1,row([1])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[1, 2]),json_parse('{"a":{"b":1}}'),json_parse('{"a":1,"b":[1]}')),
-ROW(2,[2],[2],[2],row(2,row(2)),row(2,row([2])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[2, 2]),json_parse('{"a":{"b":2}}'),json_parse('{"a":1,"b":[1]}')),
-ROW(3,[3],[3],[3],row(3,row(3)),row(3,row([3])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[3, 2]),json_parse('{"a":{"b":3}}'),json_parse('{"a":1,"b":[1]}')),
-ROW(4,[4],[4],[4],row(4,row(4)),row(4,row([4])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[4, 2]),json_parse('{"a":{"b":4}}'),json_parse('{"a":1,"b":[1]}')),
-ROW(5,[5],[5],[5],row(5,row(5)),row(5,row([5])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[5, 2]),json_parse('{"a":{"b":5}}'),json_parse('{"a":1,"b":[1]}'));
+ROW(1,[1],[1],[1],row(1,row(1)),row(1,row([1])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[1, 2]),'{"a":{"b":1}}','{"a":1,"b":[1]}'),
+ROW(2,[2],[2],[2],row(2,row(2)),row(2,row([2])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[2, 2]),'{"a":{"b":2}}','{"a":1,"b":[1]}'),
+ROW(3,[3],[3],[3],row(3,row(3)),row(3,row([3])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[3, 2]),'{"a":{"b":3}}','{"a":1,"b":[1]}'),
+ROW(4,[4],[4],[4],row(4,row(4)),row(4,row([4])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[4, 2]),'{"a":{"b":4}}','{"a":1,"b":[1]}'),
+ROW(5,[5],[5],[5],row(5,row(5)),row(5,row([5])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[5, 2]),'{"a":{"b":5}}','{"a":1,"b":[1]}');
 SELECT k FROM t0 WHERE v1[1] = v2[1] ORDER BY k;
 
 -- query 10

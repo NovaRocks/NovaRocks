@@ -48,7 +48,8 @@ source_4 as (
 select product.product_id, product.price from (
     select product from source_3
     union all
-    select product from source_4
+    select CAST(ROW(product.product_id, product.price) AS ROW(product_id VARCHAR, price INT))
+    from source_4
 ) t order by product.product_id;
 
 -- query 3

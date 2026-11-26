@@ -36,7 +36,6 @@ CREATE TABLE ${case_db}.struct_test (
   s1 ROW(c0 DECIMAL(16, 3), c1 varchar(30)),
   s2 ROW(c0 int, c1 array<VARCHAR>),
   s3 ROW(c0 VARCHAR, c1 map<int, varchar(30)>),
-  s4 ROW(c0 int, c1 json),
   s5 ROW(c0 INT, c1 ROW(c INT, b VARCHAR))
 ) WITH (format_version = 3);
 
@@ -50,29 +49,29 @@ INSERT INTO ${case_db}.struct_test (pk, s0) VALUES ROW(7, row(3, '', null, null)
 -- query 4
 -- @skip_result_check=true
 INSERT INTO ${case_db}.struct_test VALUES
-  (0, row(0,'ab'), row(0,'ab'), row(0,['1','2']), row('1',MAP(ARRAY[1], ARRAY['abc'])), row(1,json_object('name':'abc','age':23)), row(0, row(1,'a')));
+  (0, row(0,'ab'), row(0,'ab'), row(0,['1','2']), row('1',MAP(ARRAY[1], ARRAY['abc'])), row(0, row(1,'a')));
 
 -- query 5
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; s3 inner map '' key coerces to null int -> dropped that entry
 INSERT INTO ${case_db}.struct_test VALUES
-  (1, row(1, null), row(null,''), row(1,[]), row('11',MAP(ARRAY[1], ARRAY['abc'])), row(null,json_object('name':null)), row(null, row(null,null)));
+  (1, row(1, null), row(null,''), row(1,[]), row('11',MAP(ARRAY[1], ARRAY['abc'])), row(null, row(null,null)));
 
 -- query 6
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; s3 inner map had a single null key, dropped it (empty map)
 INSERT INTO ${case_db}.struct_test VALUES
-  ROW(2, row(null,null), row(null,null), row(null,null), row(null,map()), row(null,null), row(null, row(null,null)));
+  ROW(2, row(null,null), row(null,null), row(null,null), row(null,map()), row(null, row(null,null)));
 
 -- query 7
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; s3 inner map had a trailing null key, dropped it (kept the non-null entry)
 INSERT INTO ${case_db}.struct_test VALUES
-  (3, row(3,''), row(3,''), row(3,['3',null, null,null]), row('3',MAP(ARRAY[3], ARRAY['a33c'])), row(null,json_object('name':'abc','age':23)), row(null, row(3,'a')));
+  (3, row(3,''), row(3,''), row(3,['3',null, null,null]), row('3',MAP(ARRAY[3], ARRAY['a33c'])), row(null, row(3,'a')));
 
 -- query 8
 -- @skip_result_check=true
-INSERT INTO ${case_db}.struct_test VALUES ROW(4, null, null, null, null, null, null);
+INSERT INTO ${case_db}.struct_test VALUES ROW(4, null, null, null, null, null);
 
 -- ========== INNER JOIN (ON syntax, same type) ==========
 
@@ -188,9 +187,13 @@ ORDER BY t.pk;
 -- ========== FE error: <=> cross-type struct comparison ==========
 
 -- query 25
--- @expect_error=does not support binary predicate operation
-SELECT t.s4, s.s5
-FROM ${case_db}.struct_test t CROSS JOIN ${case_db}.struct_test s WHERE s.s4  IS NOT DISTINCT FROM  t.s5
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR,1
+WITH json_rows(s4) AS (
+    VALUES CAST(ROW(1, JSON '1') AS ROW(c0 INTEGER, c1 JSON))
+)
+SELECT s.s4, t.s5
+FROM ${case_db}.struct_test t CROSS JOIN json_rows s
+WHERE s.s4 IS NOT DISTINCT FROM t.s5
 ORDER BY t.pk;
 
 -- ========== FE error: non-equality comparison on struct ==========
@@ -235,10 +238,12 @@ WHERE s2 IN (SELECT s0 FROM ${case_db}.struct_test s)
 ORDER BY t.pk;
 
 -- query 31
--- @order_sensitive=true
-SELECT s4 FROM ${case_db}.struct_test t
-WHERE s4 IN (SELECT s1 FROM ${case_db}.struct_test s)
-ORDER BY t.pk;
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR,1
+WITH json_rows(s4) AS (
+    VALUES CAST(ROW(1, JSON '1') AS ROW(c0 INTEGER, c1 JSON))
+)
+SELECT s4 FROM json_rows
+WHERE s4 IN (SELECT s1 FROM ${case_db}.struct_test);
 
 -- query 32
 -- @order_sensitive=true

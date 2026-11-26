@@ -104,8 +104,8 @@ CREATE TABLE array_data_type_1
 -- @skip_result_check=true
 USE ${case_db};
 insert into array_data_type_1 values
-ROW(1, ['2020-11-11', '2021-11-11', '2022-01-01'], [1.23, 1.35, 2.7894], ['a', 'b'], ['sss', 'eee', 'fff'], [['a', 'b']]),
-ROW(2, ['2020-01-11', null, '2022-11-01'], [2.23, 2.35, 3.7894], ['aa', null], ['ssss', 'eeee', null], [['a', null], null]),
+ROW(1, [TIMESTAMP '2020-11-11 00:00:00', TIMESTAMP '2021-11-11 00:00:00', TIMESTAMP '2022-01-01 00:00:00'], [1.23, 1.35, 2.7894], ['a', 'b'], ['sss', 'eee', 'fff'], [['a', 'b']]),
+ROW(2, [TIMESTAMP '2020-01-11 00:00:00', null, TIMESTAMP '2022-11-01 00:00:00'], [2.23, 2.35, 3.7894], ['aa', null], ['ssss', 'eeee', null], [['a', null], null]),
 ROW(3, null, null, null, null, null);
 
 -- query 16
@@ -131,6 +131,7 @@ USE ${case_db};
 select * from array_data_type_1 where transform(c5, (x) -> concat(x, 'a')) = c4;
 
 -- query 21
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 select c6[0] = ['a'] from array_data_type_1;
 
@@ -208,6 +209,7 @@ select count([CAST(if(c2 is null, c1 + c2, 0) as DECIMAL(38,0)) + if(c1 is null,
 
 -- name: testEmptyArray
 -- query 34
+-- @expect_trino_error=AMBIGUOUS_FUNCTION_CALL,USER_ERROR,2
 USE ${case_db};
 with t0 as (
     select c1 from (values ROW([])) as t(c1)
@@ -217,6 +219,7 @@ concat(c1, [1])
 from t0;
 
 -- query 35
+-- @expect_trino_error=AMBIGUOUS_FUNCTION_CALL,USER_ERROR,2
 USE ${case_db};
 with t0 as (
     select c1 from (values ROW([])) as t(c1)
@@ -231,11 +234,13 @@ select concat(c1, [[]])
 from (select c1 from (values ROW([])) as t(c1)) t;
 
 -- query 37
+-- @expect_trino_error=AMBIGUOUS_FUNCTION_CALL,USER_ERROR,2
 USE ${case_db};
 select concat(c1, [[1]])
 from (select c1 from (values ROW([])) as t(c1)) t;
 
 -- query 38
+-- @expect_trino_error=AMBIGUOUS_FUNCTION_CALL,USER_ERROR,2
 USE ${case_db};
 select concat(c1, [[1]])
 from (select c1 from (values ROW([[]])) as t(c1)) t;
@@ -246,11 +251,13 @@ select concat(c1, [MAP(ARRAY['a'], ARRAY[1])])
 from (select c1 from (values ROW([map()])) as t(c1)) t;
 
 -- query 40
+-- @expect_trino_error=AMBIGUOUS_FUNCTION_CALL,USER_ERROR,2
 USE ${case_db};
 select concat(c1, [MAP(ARRAY['a'], ARRAY[1])])
 from (select c1 from (values ROW([])) as t(c1)) t;
 
 -- query 41
+-- @expect_trino_error=AMBIGUOUS_FUNCTION_CALL,USER_ERROR,2
 USE ${case_db};
 select concat(c1, [CAST(ROW(1,2,3) AS ROW(a INTEGER,b INTEGER,c INTEGER))])
 from (select c1 from (values ROW([])) as t(c1)) t;
