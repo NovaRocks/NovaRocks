@@ -27,7 +27,6 @@ use novarocks_expression_contract::{ExprId, ExprKind, UnaryOperator};
 use novarocks_functions::ConstantValue;
 use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlCompileControl};
 use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
-use novarocks_sql_testkit::sql_fixture_constant_policy;
 use novarocks_type_contract::{ArgumentControl, CompilePhase, OperatorFunction, ValueLogicalType};
 use std::sync::Arc;
 
