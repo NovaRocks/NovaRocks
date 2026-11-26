@@ -585,6 +585,11 @@ fn aggregate_windows_use_exact_owner_and_original_modifiers() {
             "",
         ),
         (
+            r#"SELECT array_agg(DISTINCT JSON '{"x":1}') OVER (ORDER BY k) FROM t"#,
+            AnalyzeErrorKind::UnavailableImplementation,
+            "array_agg/derived-v1",
+        ),
+        (
             "SELECT listagg(DISTINCT v, '|') WITHIN GROUP (ORDER BY k) FROM t",
             AnalyzeErrorKind::ExpressionNotInDistinct,
             "",

@@ -2501,7 +2501,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 .collect();
         }
 
-        if name == "array_agg" && is_distinct {
+        if name == "array_agg" && is_distinct && func.window.is_none() {
             if args_typed
                 .first()
                 .is_some_and(is_non_groupable_map_constructor)
@@ -3185,7 +3185,11 @@ impl<'a> super::AnalyzerContext<'a> {
                         ob.span,
                     ));
                 }
-                let (asc, nulls_first) = super::helpers::sort_item_flags(ob);
+                let (asc, nulls_first) = if func.window.is_some() {
+                    super::helpers::window_sort_item_flags(ob)
+                } else {
+                    super::helpers::sort_item_flags(ob)
+                };
                 items.push(SortItem {
                     expr: typed,
                     asc,
@@ -3232,7 +3236,7 @@ impl<'a> super::AnalyzerContext<'a> {
         for ob in spec.order_by.iter().flat_map(|order| &order.items) {
             self.check_control()?;
             let typed = self.analyze_expr(&ob.sort_key, scope)?;
-            let (asc, nulls_first) = super::helpers::sort_item_flags(ob);
+            let (asc, nulls_first) = super::helpers::window_sort_item_flags(ob);
             order_by.push(SortItem {
                 expr: typed,
                 asc,

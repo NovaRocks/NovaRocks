@@ -559,7 +559,7 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(123456789012345678901234567890.123456789) over(partition by v1 order by v2) as arr_basic
+  array_agg(123456789012345678901234567890.12345678) over(partition by v1 order by v2) as arr_basic
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -916,4 +916,5 @@ CROSS JOIN UNNEST(concat(
 )) AS fingerprints(fingerprint_value);
 
 -- query 71
--- @skip_result_check=true
+-- @expect_trino_error=INVALID_LITERAL,USER_ERROR
+SELECT array_agg(123456789012345678901234567890.123456789) OVER () FROM (VALUES 1) t(id);

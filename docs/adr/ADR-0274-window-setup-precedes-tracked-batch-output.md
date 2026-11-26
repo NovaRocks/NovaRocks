@@ -27,6 +27,7 @@ code-anchors:
 | Execution | 原算子保管源批次和分区续体。宿主按 pipeline 行目标及列的真实偏移形态选取可发射前缀。实际写出使用同一查询 allocator。 |
 
 OVER 的排序决定帧。函数内排序决定送给聚合的帧内次序。两套根分别求值，并按原调用的 Value 使用点和效果校验。
+窗口的两处排序均按 Trino 484 冻结 NULL 顺序。省略 NULL 位置时，升序和降序均采用 `NULLS LAST`。
 
 ## 考虑过的选项
 

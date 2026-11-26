@@ -1747,7 +1747,7 @@ fn test_explain_keeps_nested_cte_anchor_inside_subquery() {
 fn window_reuses_ordering_through_derived_table() {
     let plan = parse_analyze_and_plan(
         "SELECT sum(o_custkey) OVER \
-                    (ORDER BY o_orderkey ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+                    (ORDER BY o_orderkey NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
                     AS running_sum \
              FROM (SELECT o_orderkey, o_custkey FROM orders ORDER BY o_orderkey) s",
     )
@@ -1768,7 +1768,7 @@ fn window_reuses_ordering_through_derived_table() {
 fn window_reuses_ordering_through_derived_table_column_alias_project() {
     let plan = parse_analyze_and_plan(
         "SELECT sum(ok) OVER \
-                    (ORDER BY ok ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+                    (ORDER BY ok NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
                     AS running_sum \
              FROM (SELECT o_orderkey FROM orders ORDER BY o_orderkey) s(ok)",
     )

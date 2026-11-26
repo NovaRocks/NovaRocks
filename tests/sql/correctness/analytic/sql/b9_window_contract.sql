@@ -119,6 +119,15 @@ SELECT lag(ARRAY[seq], 0, ARRAY[CAST(value AS INTEGER)]) OVER (ORDER BY seq)
 FROM (VALUES (1, '1'), (2, 'invalid')) t(seq, value);
 
 -- query 12
+SELECT seq,
+       row_number() OVER (ORDER BY k) AS sorted_position,
+       array_join(array_agg(v ORDER BY k ASC) OVER (), ',') AS ascending_values,
+       array_join(array_agg(v ORDER BY k DESC) OVER (), ',') AS descending_values,
+       array_join(array_agg(v ORDER BY k NULLS FIRST) OVER (), ',') AS explicit_first
+FROM (VALUES (1, CAST(NULL AS INTEGER), 'n'), (2, 1, 'a'), (3, 2, 'b')) t(seq, k, v)
+ORDER BY seq;
+
+-- query 13
 -- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.b9_mixed;
