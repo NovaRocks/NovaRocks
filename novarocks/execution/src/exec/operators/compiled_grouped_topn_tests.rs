@@ -539,6 +539,7 @@ fn fixture_with_source_parameters(
         .collect();
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([121; 16]).unwrap(),
+        &fixture_sources,
     )
     .with_constant_pools(constants)
     .with_semantic_parameters(parameters);

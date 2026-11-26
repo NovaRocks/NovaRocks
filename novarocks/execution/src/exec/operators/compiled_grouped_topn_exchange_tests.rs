@@ -363,6 +363,7 @@ fn plan(
     let (first, first_output) = grouped_stage(&mut inner, partial, &states, &bounds, limit, 20);
     let mut result = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([123; 16]).unwrap(),
+        &fixture_sources,
     )
     .with_semantic_parameters(parameters.clone());
     result.add_fragment(source).unwrap();

@@ -38,7 +38,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use bytes::Bytes;
 use novarocks_connector_contract::*;
 use novarocks_expression_contract::{ExprKind, RootScope};
-use novarocks_functions::ConstantValidation;
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
@@ -303,6 +302,7 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
 
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([7; 16]).unwrap(),
+        &fixture_sources,
     );
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {

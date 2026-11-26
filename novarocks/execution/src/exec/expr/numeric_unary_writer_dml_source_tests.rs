@@ -403,7 +403,7 @@ fn wide_collect_true_source() -> (
         &functions,
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         None,
-        FROZEN_CONSTANT_POLICY,
+        FROZEN_CONSTANT_POLICY.into(),
         control.clone(),
     ))
     .unwrap_or_else(|e| panic!("collect1024 phase=analyze: {e:#?}"))
@@ -533,7 +533,7 @@ fn wide_collect_true_source() -> (
 fn wide_collect_true_actual_theta_plan_freezes_with_production_limits() {
     use novarocks_physical_plan::{UnpivotConstant, extract_fragment_packages};
     use novarocks_plan_codec::physical_package_v2::{
-        FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits, PackageEncodeLimits,
+        FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits, PackageEncodeLimits,
         decode_fragment_package, encode_fragment_package,
     };
     use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;

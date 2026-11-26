@@ -490,6 +490,7 @@ fn plan_with_cells(
 
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([8; 16]).unwrap(),
+        &fixture_sources,
     )
     .with_constant_pools(constants);
     plan.add_fragment(producer).unwrap();
@@ -2134,6 +2135,7 @@ mod statistics {
 
         let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
             PlanVersionId::try_new([8; 16]).unwrap(),
+            &fixture_sources,
         )
         .with_semantic_parameters(parameters);
         for (id, pool) in pools() {

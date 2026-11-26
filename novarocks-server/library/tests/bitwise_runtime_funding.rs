@@ -31,9 +31,7 @@ use novarocks_execution::runtime::scalar_memory::{
     test_support::{RuntimeScalarFrameForTest, RuntimeScalarWrapperForTest},
 };
 use novarocks_expression::ScalarCallFailure;
-use novarocks_functions::{
-    ConstantPool, ConstantValidation, EvaluatedArgument, SelectedValues, Selection,
-};
+use novarocks_functions::{ConstantPool, EvaluatedArgument, SelectedValues, Selection};
 use novarocks_memory::lane::global_store;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,

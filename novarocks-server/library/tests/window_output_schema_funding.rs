@@ -29,9 +29,9 @@ use novarocks_execution::{
 };
 use novarocks_expression_contract::{BoundFunction, LegacyBindingMetadata, PhysicalCallRequest};
 use novarocks_functions::{
-    CallArgumentUses, CallEffectInput, ConstantValidation, EngineFunctionCatalogBuilder,
-    FunctionBindingRequest, FunctionKind, FunctionResultType, InstalledPureKernel,
-    PureCallPreparation, PureEngineFunctionCatalog, ScopedRelationalEffects, WindowCallOptions,
+    CallArgumentUses, CallEffectInput, EngineFunctionCatalogBuilder, FunctionBindingRequest,
+    FunctionKind, FunctionResultType, InstalledPureKernel, PureCallPreparation,
+    PureEngineFunctionCatalog, ScopedRelationalEffects, WindowCallOptions,
 };
 use novarocks_memory::{
     AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TeardownEvidence, TopUpPolicy,
@@ -82,20 +82,6 @@ fn binding(bytes: u64) -> QueryMemoryBinding {
         account,
     )
     .unwrap()
-}
-fn constants() -> ConstantValidation {
-    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    })
 }
 
 fn functions() -> PureEngineFunctionCatalog {

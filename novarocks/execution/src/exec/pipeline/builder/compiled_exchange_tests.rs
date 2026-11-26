@@ -29,7 +29,6 @@ use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_expression_contract::{ExprKind, RootScope};
-use novarocks_functions::ConstantValidation;
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
@@ -261,6 +260,7 @@ fn plan_with_local_nullability(
 
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([73; 16]).unwrap(),
+        &fixture_sources,
     );
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
@@ -1280,6 +1280,7 @@ fn drop_distribution_key_project_plan(
 
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([73; 16]).unwrap(),
+        &fixture_sources,
     );
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();

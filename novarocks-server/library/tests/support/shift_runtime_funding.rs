@@ -32,9 +32,9 @@ use novarocks_expression_contract::{
     PhysicalCallRequest, RootScope,
 };
 use novarocks_functions::{
-    CallArgumentUses, CallEffectInput, ConstantValidation, EngineFunctionCatalogBuilder,
-    FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionResultType,
-    InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog, ScopedExpressionEffects,
+    CallArgumentUses, CallEffectInput, EngineFunctionCatalogBuilder, FunctionArgument,
+    FunctionBindingRequest, FunctionKind, FunctionResultType, InstalledPureKernel,
+    PureCallPreparation, PureEngineFunctionCatalog, ScopedExpressionEffects,
 };
 use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_native_adapter::backend_task_execution::node_test_support::NativeNodePreparation;
@@ -61,20 +61,6 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
         Ok(())
     }
-}
-fn constants() -> ConstantValidation {
-    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    })
 }
 fn functions_for_names(names: &[&str]) -> PureEngineFunctionCatalog {
     let actual = novarocks_functions::builtin::catalogue::builtin_engine_function_catalog();

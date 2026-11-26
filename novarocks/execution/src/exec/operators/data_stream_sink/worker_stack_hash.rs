@@ -82,7 +82,7 @@ fn site(program: &LocalProgram) -> ProgramRootRef {
 fn compile(package: FragmentPackage) -> (Arc<LocalProgram>, ProgramRootRef) {
     let program = super::super::conditional_compiled_selection::compile_checked(
         Arc::new(package),
-        novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+        novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY.into(),
     );
     assert_eq!(program.graph().nodes().len(), 2);
     let site = site(&program);

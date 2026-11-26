@@ -305,7 +305,6 @@ pub(crate) struct MvWriteFinishInput {
     pub(crate) access: Option<FinalPlanRuntimeAccess<FrozenProviderRead>>,
     pub(crate) session: Arc<ConnectorWriteSession>,
     pub(crate) carrier: CompiledPackageCarrier,
-    pub(crate) constant_policy: novarocks_functions::ConstantValidation,
     pub(crate) options: novarocks_proto_codec::lifecycle::QueryOptions,
     pub(crate) control: SqlCompileControl,
 }

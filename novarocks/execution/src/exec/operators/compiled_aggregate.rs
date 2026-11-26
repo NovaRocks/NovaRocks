@@ -1472,6 +1472,7 @@ mod failure_latch_tests {
         let output = definition.nodes()[&node].output.clone();
         let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
             PlanVersionId::try_new([101; 16]).unwrap(),
+            &fixture_sources,
         )
         .with_semantic_parameters(parameters.clone());
         plan.add_fragment(definition).unwrap();
@@ -2274,6 +2275,7 @@ mod schema_prepare_tests {
         let mut builder =
             crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
                 PlanVersionId::try_new([191; 16]).unwrap(),
+                &fixture_sources,
             )
             .with_semantic_parameters(parameters.clone());
         builder.add_fragment(fragment).unwrap();

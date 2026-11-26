@@ -5199,6 +5199,7 @@ mod tests {
             let mut plan =
                 crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
                     PlanVersionId::try_new([29; 16]).unwrap(),
+                    &fixture_sources,
                 )
                 .with_semantic_parameters(parameters.clone());
             let mut consumer =

@@ -443,6 +443,7 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
 
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([83; 16]).unwrap(),
+        &fixture_sources,
     );
     plan.add_fragment(source).unwrap();
     plan.add_fragment(partial).unwrap();

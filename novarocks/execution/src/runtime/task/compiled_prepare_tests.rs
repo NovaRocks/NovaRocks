@@ -124,7 +124,6 @@ fn instance(
 
 pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgram> {
     use novarocks_connector_contract::PureProviderProgramCatalog;
-    use novarocks_functions::ConstantValidation;
     use novarocks_local_compiler::{
         LocalCompileOptions, compile_fragment, validate_fragment_providers,
     };

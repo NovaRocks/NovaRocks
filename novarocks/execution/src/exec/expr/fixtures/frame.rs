@@ -67,7 +67,6 @@ fn finish_fixture_units(
     source_pools: novarocks_physical_plan::ConstantPools,
 ) -> novarocks_physical_plan::ConstantPools {
     let mut constants = source_pools;
-    let policy = options(1).constants;
     if !authors.is_empty() {
         register_call_requests(builder.unit(author_node).unwrap(), authors, &mut constants);
     }

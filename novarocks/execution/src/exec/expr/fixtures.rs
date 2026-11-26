@@ -21,7 +21,6 @@ use arrow::{
     array::{BooleanArray, Int64Array},
     record_batch::RecordBatch,
 };
-use novarocks_functions::ConstantValidation;
 use novarocks_local_compiler::LocalCompileOptions;
 use novarocks_local_program::{
     KernelAbiVersion, LocalProgram, ProgramNodeId, ProgramNodeKind, ProgramRootRef,

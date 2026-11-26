@@ -20,7 +20,7 @@
 
 use std::{alloc::Layout, collections::BTreeMap};
 
-use novarocks_constant_contract::{ConstantValidation, ConstantValue};
+use novarocks_constant_contract::ConstantValue;
 use novarocks_functions::{FunctionArgument, FunctionBindingRequest, MAX_CALL_EFFECT_ARGUMENTS};
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 use {

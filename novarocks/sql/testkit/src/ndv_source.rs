@@ -41,7 +41,6 @@ use novarocks_sql::planning::dml::DmlStatisticsEvidence;
 use novarocks_types::schema::ColumnDef;
 use std::sync::Arc;
 
-use novarocks_functions::ConstantValidation;
 use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
