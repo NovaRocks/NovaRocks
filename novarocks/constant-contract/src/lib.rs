@@ -3672,12 +3672,12 @@ fn factory_preflight(
             return Err(ConstantError::offset_extent(payload, extent_limit));
         }
     }
-    let mut pending = vec![(field.data_type(), 1u64, 1u32)];
+    let mut pending = vec![(field.data_type(), 1u64, 1u32, 0u32)];
     let mut nodes = 0;
     let mut elements = 0;
     let mut bytes = payload;
     let mut max_depth = 1;
-    while let Some((data_type, len, depth)) = pending.pop() {
+    while let Some((data_type, len, depth, dictionary_depth)) = pending.pop() {
         work.step()?;
         nodes = checked_add(nodes, 1)?;
         elements = checked_add(elements, len)?;
@@ -3696,6 +3696,13 @@ fn factory_preflight(
             u64::from(depth),
             u64::from(validation.shape.depth),
             "constant factory depth limit exceeded",
+        )?;
+        let dictionary_depth =
+            dictionary_depth + u32::from(matches!(data_type, DataType::Dictionary(_, _)));
+        limit(
+            u64::from(dictionary_depth),
+            u64::from(validation.shape.dictionary_depth),
+            "constant dictionary depth limit exceeded",
         )?;
         let layout = arrow_data::layout(data_type);
         for buffer in &layout.buffers {
@@ -3729,7 +3736,7 @@ fn factory_preflight(
         macro_rules! push {
             ($child:expr, $child_len:expr) => {{
                 work.step()?;
-                pending.push(($child, $child_len, depth + 1));
+                pending.push(($child, $child_len, depth + 1, dictionary_depth));
             }};
         }
         match data_type {

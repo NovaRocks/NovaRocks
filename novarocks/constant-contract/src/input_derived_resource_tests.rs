@@ -290,3 +290,27 @@ fn input_derived_preflight_keeps_metadata_and_reports_actual_offset_extent() {
         assert!(!error.is_local_allocation_failure());
     }
 }
+
+#[test]
+fn input_derived_null_factory_rejects_excess_dictionary_depth_before_building() {
+    let control = Control(AtomicBool::new(false));
+    let carrier = (0..9).fold(DataType::Int64, |values, _| {
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(values))
+    });
+    let field = Field::new("dictionary", carrier.clone(), true);
+    let ty = FunctionValueType::new(carrier, true);
+    assert!(matches!(
+        preflight_scalar_construction(
+            &field,
+            &ty,
+            0,
+            true,
+            ConstantValidation::INPUT_DERIVED,
+            CompilePhase::Decode,
+            &control,
+        ),
+        Err(ConstantError::Limit(
+            "constant dictionary depth limit exceeded"
+        ))
+    ));
+}

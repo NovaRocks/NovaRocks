@@ -422,6 +422,7 @@ fn empty_recipe<E: super::PoolFailure>(
     ty: &DataType,
     root: bool,
     depth: u32,
+    dictionary_depth: u32,
     validation: ConstantValidation,
     recipe: &mut CollectionRecipe,
     observer: &mut super::PoolObserver<'_, E>,
@@ -438,6 +439,12 @@ fn empty_recipe<E: super::PoolFailure>(
         novarocks_type_contract::MAX_VALUE_TYPE_DEPTH as u64,
         "empty collection intrinsic depth exceeded",
     )?;
+    let dictionary_depth = dictionary_depth + u32::from(matches!(ty, DataType::Dictionary(_, _)));
+    limit(
+        u64::from(dictionary_depth),
+        u64::from(validation.shape.dictionary_depth),
+        "constant dictionary depth limit exceeded",
+    )?;
     recipe.nodes = checked_add(recipe.nodes, 1)?;
     optional_limit(
         recipe.nodes,
@@ -453,6 +460,7 @@ fn empty_recipe<E: super::PoolFailure>(
             empty_child_type(ty, index),
             false,
             depth + 1,
+            dictionary_depth,
             validation,
             recipe,
             observer,
@@ -640,6 +648,7 @@ fn empty_collection_data<E: super::PoolFailure>(
         field.data_type(),
         true,
         1,
+        0,
         validation,
         &mut recipe,
         observer,
