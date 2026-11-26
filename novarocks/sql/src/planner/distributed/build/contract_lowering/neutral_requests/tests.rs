@@ -65,17 +65,15 @@ impl PureCompileControl for Control {
 fn assert_request(
     owner: &SqlAuthoredPhysicalPlan,
     original: FunctionBindingRequest<'_>,
-    policy: ConstantValidation,
     actual: &PhysicalCallRequest,
     work: &mut CompileCheckpoints<'_>,
 ) {
-    assert_request_in_pools(owner.plan().constants(), original, policy, actual, work);
+    assert_request_in_pools(owner.plan().constants(), original, actual, work);
 }
 
 fn assert_request_in_pools(
     pools: &novarocks_physical_plan::ConstantPools,
     original: FunctionBindingRequest<'_>,
-    policy: ConstantValidation,
     actual: &PhysicalCallRequest,
     work: &mut CompileCheckpoints<'_>,
 ) {
@@ -87,7 +85,6 @@ fn assert_request_in_pools(
         actual.expected_result_type.as_ref(),
         original.expected_result_type
     );
-    assert_eq!(actual.constant_policy, policy);
     assert_eq!(actual.arguments.len(), original.arguments.len());
     for (expected, actual) in original.arguments.iter().zip(&actual.arguments) {
         match (expected, actual) {
@@ -163,13 +160,7 @@ fn assert_expression_requests(owner: &SqlAuthoredPhysicalPlan) {
                         .unwrap();
                     let canonical = entry.canonical_operational().unwrap();
                     let actual = unit.requests().get(&source.id).unwrap();
-                    assert_request(
-                        owner,
-                        canonical.request(),
-                        entry.captured().constant_policy(),
-                        actual,
-                        &mut work,
-                    );
+                    assert_request(owner, canonical.request(), actual, &mut work);
                     calls += 1;
                 }
             }
@@ -186,7 +177,6 @@ fn assert_expression_requests(owner: &SqlAuthoredPhysicalPlan) {
                     assert_request(
                         owner,
                         entry.canonical_operational().request(),
-                        entry.captured().constant_policy(),
                         actual,
                         &mut work,
                     );
@@ -383,7 +373,6 @@ fn neutral_sql_lambda_window_order_and_left_table_keep_distinct_original_channel
                             assert_request_in_pools(
                                 output.pools(),
                                 source.canonical_operational().unwrap().request(),
-                                source.captured().constant_policy(),
                                 actual,
                                 work,
                             );
@@ -409,7 +398,6 @@ fn neutral_sql_lambda_window_order_and_left_table_keep_distinct_original_channel
                             assert_request_in_pools(
                                 output.pools(),
                                 emission.canonical().request(),
-                                emission.captured().constant_policy(),
                                 actual,
                                 work,
                             );
@@ -492,7 +480,6 @@ fn neutral_sql_lambda_window_order_and_left_table_keep_distinct_original_channel
     assert_request(
         &owner,
         entry.canonical_operational().request(),
-        entry.captured().constant_policy(),
         actual,
         &mut work,
     );
@@ -556,13 +543,7 @@ fn neutral_sql_partial_final_own_literal_requests_survive_fragment_pool_projecti
                     );
                     request
                 };
-                assert_request(
-                    &owner,
-                    original,
-                    entry.captured().constant_policy(),
-                    actual,
-                    &mut work,
-                );
+                assert_request(&owner, original, actual, &mut work);
                 for argument in &actual.arguments {
                     if let StaticFunctionArgument::Value {
                         value_type,
@@ -642,13 +623,7 @@ fn neutral_sql_writer_final_keeps_own_capture_and_omissions_are_not_calls() {
                     updates += 1;
                     entry.canonical().unwrap().request()
                 };
-                assert_request(
-                    &owner,
-                    request,
-                    entry.captured().constant_policy(),
-                    actual,
-                    &mut work,
-                );
+                assert_request(&owner, request, actual, &mut work);
             }
             // Each actual call ordinal is present exactly once. Empty/sparse
             // auxiliary channels cannot become a fabricated neutral call.

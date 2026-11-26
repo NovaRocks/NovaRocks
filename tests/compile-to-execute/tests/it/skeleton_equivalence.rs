@@ -327,11 +327,6 @@ fn compare_requests(
     right_pools: &ConstantPools,
 ) -> Result<(), String> {
     same(
-        "constant policy",
-        &left.constant_policy,
-        &right.constant_policy,
-    )?;
-    same(
         "logical argument count",
         &left.logical_argument_count,
         &right.logical_argument_count,

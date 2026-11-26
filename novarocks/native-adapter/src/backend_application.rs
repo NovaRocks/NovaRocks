@@ -2111,7 +2111,6 @@ mod tests {
         // admission with a small package bound, and a sealed RAND-only subset.
         let mut limits = novarocks_plan_codec::physical_package_v2::test_support::decode_limits();
         limits.wire.max_input_bytes = 64;
-        let constants = limits.constant_policy;
         let metadata = test_execution_function_set();
         let mut builder = EngineFunctionCatalogBuilder::new();
         builder

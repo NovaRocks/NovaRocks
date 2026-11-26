@@ -24,7 +24,7 @@ use novarocks_execution::runtime::kernel_memory::{
 use novarocks_memory::{
     Account, AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, OWNER_METADATA_BYTES,
 };
-use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
+use novarocks_plan_codec::physical_package_v2::test_support::types_projection_limits;
 use novarocks_proto_models::{
     physical_package_v2 as package, physical_type_v2 as wire, plan, value_type as logical,
 };
@@ -255,7 +255,7 @@ fn type_materialization_real_pending_requalifies_without_replaying_the_original_
         novarocks_plan_codec::physical_type_v2::decode_package_type_table_with_host_observed(
             &source,
             4096,
-            decode_limits().types,
+            types_projection_limits(),
             &mut |_| Ok(()),
             &mut work,
             &mut scope,

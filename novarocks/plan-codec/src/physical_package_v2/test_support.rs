@@ -17,7 +17,11 @@
 
 //! Explicit profiles for tests that exercise bounded component APIs.
 
-use crate::resource_preflight_v2::DecodeProjectionLimits;
+use crate::{
+    physical_node_v2::NodeProjectionLimits,
+    physical_properties_v2::PhysicalPropertyProjectionLimits,
+    physical_type_v2::PackageTypeProjectionLimits, resource_preflight_v2::DecodeProjectionLimits,
+};
 use novarocks_functions::ConstantPolicy;
 use novarocks_physical_plan as p;
 
@@ -75,5 +79,36 @@ pub fn decode_limits() -> PackageDecodeLimits {
             max_wire_depth: 100,
         },
         plan_limits: p::PlanLimits::FROZEN,
+    }
+}
+
+pub fn types_projection_limits() -> PackageTypeProjectionLimits {
+    PackageTypeProjectionLimits {
+        max_definitions: 1_000_000,
+        max_expanded_nodes: 1_000_000,
+        max_string_bytes: 64 * MIB,
+        max_allocation_requests: 1_000_000,
+        max_allocation_request_bytes: REQUEST,
+        max_coexisting_source_and_request_bytes: COEXIST,
+        max_work: WORK,
+    }
+}
+
+pub fn node_projection_limits() -> NodeProjectionLimits {
+    NodeProjectionLimits {
+        max_input_nodes: 100_000,
+        max_value_references: 100_000,
+        max_list_items: 1_000_000,
+        max_allocation_requests: 1_000_000,
+        max_allocation_request_bytes: REQUEST,
+        max_coexisting_source_and_request_bytes: COEXIST,
+        max_work: WORK,
+        properties: PhysicalPropertyProjectionLimits {
+            max_value_references: 100_000,
+            max_allocation_requests: 1_000_000,
+            max_allocation_request_bytes: REQUEST,
+            max_coexisting_source_and_request_bytes: COEXIST,
+            max_work: WORK,
+        },
     }
 }

@@ -8978,7 +8978,9 @@ pub(crate) mod tests {
             PropertyProofProjectionLimits, extract_fragment_packages,
         };
         use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
-        use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
+        use novarocks_plan_codec::physical_package_v2::test_support::{
+            decode_limits, types_projection_limits,
+        };
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
         use novarocks_sql::compiler::{
             DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
@@ -9211,7 +9213,7 @@ pub(crate) mod tests {
         ) {
             use crate::native_type_construction::{NativeTypeConstruction, NativeTypeFactory};
             use novarocks_execution::runtime::mem_tracker::MemTracker;
-            use novarocks_plan_codec::physical_constant_v2::prepare_constant_namespace_with_factory_in;
+            use novarocks_plan_codec::physical_constant_v2::prepare_constant_namespace_input_derived_with_factory_in;
             use novarocks_plan_codec::physical_package_v2::prepare_package_wire_in;
             use novarocks_plan_codec::physical_type_v2::decode_package_type_table_with_factory_in;
             use novarocks_type_contract::{CompileCheckpoints, ValueSchemaCreation};
@@ -9257,7 +9259,7 @@ pub(crate) mod tests {
                 .request_opaque_upper_bound(usage.peak_requested_heap_bytes_upper)
                 .unwrap();
             let wire = prepared.materialize_in(&mut |_| Ok(()), &mut work).unwrap();
-            let mut source = usage
+            let source = usage
                 .input_bytes
                 .checked_add(usage.root_inline_bytes)
                 .unwrap()
@@ -9271,37 +9273,29 @@ pub(crate) mod tests {
             let types = decode_package_type_table_with_factory_in(
                 &wire,
                 source,
-                decode_limits().types,
+                types_projection_limits(),
                 &mut creator,
                 &type_factory,
                 &mut work,
             )
             .unwrap();
-            source = source
-                .checked_add(types.creation_request_bytes_upper_bound().unwrap())
-                .unwrap()
-                .checked_add(std::mem::size_of_val(&types))
-                .unwrap();
             let factory = NativeTypeFactory::new(&actual);
-            let mut limits = decode_limits().constants;
-            if let Some(cap) = cap {
-                limits.max_new_allocation_request_bytes = cap;
-            }
-            let result = prepare_constant_namespace_with_factory_in(
+            let mut admit = |facts: &novarocks_plan_codec::physical_constant_v2::ConstantNamespaceResourceFacts| {
+                if cap.is_some_and(|limit| facts.new_allocation_request_bytes_upper_bound > limit) {
+                    return Err(CompileControlError::ResourceExhausted.into());
+                }
+                Ok(())
+            };
+            let result = prepare_constant_namespace_input_derived_with_factory_in(
                 &wire.constants,
                 &types,
-                source,
                 types.source_metadata_namespace(),
-                decode_limits().constant_policy,
-                decode_limits().constant_records,
-                limits,
-                &decode_limits().verifier,
                 &factory,
-                &mut |_| Ok(()),
+                &mut admit,
                 &mut work,
             )
             .and_then(|prepared| {
-                prepared.materialize_with_factory_in(&factory, &mut |_| Ok(()), &mut work)
+                prepared.materialize_with_factory_in(&factory, &mut admit, &mut work)
             });
             let quoted = factory.construction_request_bytes_upper_bound();
             {
@@ -9319,7 +9313,7 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn candidate_pool_namespace_keeps_one_cumulative_cap_and_source_invoice() {
+        fn candidate_pool_namespace_reports_original_request_facts_and_keeps_caller_refusal() {
             use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
             use novarocks_plan_codec::physical_constant_v2::PhysicalConstantCodecError;
             let (result, tracker, quoted) = candidate_pool_namespace_audit(None);
@@ -9522,7 +9516,7 @@ pub(crate) mod tests {
         #[test]
         fn candidate_logical_scopes_classified_actual_requests_equal_the_sole_completed_model_once()
         {
-            let audit = candidate_type_fee_audit(decode_limits().types);
+            let audit = candidate_type_fee_audit(types_projection_limits());
             let completed = audit.verdict.unwrap();
             assert!(
                 audit.original_creator_bytes > 0,
@@ -9547,9 +9541,9 @@ pub(crate) mod tests {
         fn candidate_logical_scopes_keep_the_original_near_boundary_cumulative_allocation_cap() {
             use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
             use novarocks_plan_codec::physical_type_v2::TypeCodecError;
-            let baseline = candidate_type_fee_audit(decode_limits().types);
+            let baseline = candidate_type_fee_audit(types_projection_limits());
             let completed = baseline.verdict.unwrap();
-            let mut limits = decode_limits().types;
+            let mut limits = types_projection_limits();
             limits.max_allocation_request_bytes = completed.checked_sub(1).unwrap();
             let refused = candidate_type_fee_audit(limits);
             assert!(matches!(
@@ -10324,7 +10318,7 @@ pub(crate) mod tests {
                 decode_package_type_table_with_factory_in(
                     &wire,
                     source,
-                    decode_limits().types,
+                    types_projection_limits(),
                     &mut creation,
                     &factory,
                     &mut work,

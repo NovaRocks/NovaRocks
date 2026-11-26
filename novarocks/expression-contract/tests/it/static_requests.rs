@@ -425,7 +425,6 @@ fn static_requests_keep_original_none_some_constraint_and_reference_address() {
                 retained.request().arguments,
                 retained.arguments.as_ref()
             ));
-            assert_eq!(retained.constant_policy, policy());
             assert!(
                 matches!(retained.arguments[0], FunctionArgument::Value { constant: actual, .. } if actual == constant)
             );
