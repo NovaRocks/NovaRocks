@@ -161,6 +161,7 @@ impl Fixture {
             Arc::new(Field::new("actual-source", DataType::Int32, false)),
             ty.clone(),
             Int32Array::from(vec![77, -9]).to_data(),
+            policy,
             CompilePhase::Validate,
             &control,
         )
@@ -190,7 +191,6 @@ impl Fixture {
             arguments,
             uses: [Some(ExpressionUseId::new(42))],
             parameters: SemanticParameters::try_new([]).unwrap(),
-            policy,
         }
     }
     fn context(&self) -> ExpressionEffectContext {
