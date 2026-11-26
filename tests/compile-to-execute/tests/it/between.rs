@@ -370,18 +370,6 @@ fn between_actual_after_original_control_codec_roundtrip_and_invalid_four_use_re
         ("SELECT k NOT BETWEEN 1 AND 5 FROM fixture.source", true),
     ] {
         let source = sql_source(sql, DataType::Int64);
-        let policy = novarocks_functions::ConstantPolicy {
-            max_rows: 64,
-            max_array_nodes: 1024,
-            max_logical_elements: 4096,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        };
         let mut seen = 0;
         for unit in source
             .plan()

@@ -68,7 +68,6 @@ impl KernelEvaluationControl for Control {
 
 fn source_packages(
     source: &SqlAuthoredPhysicalPlan,
-    policy: novarocks_functions::ConstantPolicy,
 ) -> BTreeMap<novarocks_physical_plan::FragmentId, Arc<novarocks_physical_plan::FragmentPackage>> {
     use novarocks_physical_plan::{
         FragmentPackageAdmission, FrozenFragmentPruning, PlanLimits, PropertyProofProjectionLimits,
@@ -188,23 +187,11 @@ fn check_array_source(
             }
         }
         assert_eq!(indexes, 1);
-        let policy = novarocks_functions::ConstantPolicy {
-            max_rows: 64,
-            max_array_nodes: 1024,
-            max_logical_elements: 4096,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        };
         let functions = installed_builtin_owner_catalogue();
         let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
         let mut producer = None;
         let mut failures = vec![];
-        for package in source_packages(&source, policy).into_values() {
+        for package in source_packages(&source).into_values() {
             let encoded = encode_fragment_package(&package, &Control)
                 .unwrap()
                 .encode_to_vec();

@@ -791,7 +791,7 @@ fn metadata_cv_source_cross_entry(functions: &Arc<PureEngineFunctionCatalog>, sp
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
         Arc::clone(functions),
-        policy(),
+        novarocks_functions::ConstantValidation::bounded(policy()),
         control.clone(),
         novarocks_physical_plan::PipelineDopDomain {
             min: 1,
