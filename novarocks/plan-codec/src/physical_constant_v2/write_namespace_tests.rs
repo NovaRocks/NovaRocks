@@ -585,3 +585,112 @@ fn input_derived_namespace_writer_preserves_first_stream_layout_refusal() {
     assert!(refused);
     assert!(matches!(result, Err(ProjectionFailure::Host(cause)) if Arc::ptr_eq(&cause, &refusal)));
 }
+
+#[test]
+fn input_derived_namespace_factory_retains_only_live_array_aliases() {
+    use novarocks_type_contract::{
+        ValueSchemaCreationFactory, ValueSchemaCreationScope, ValueSchemaScopeBeginFailure,
+        ValueTypeStorageHold, ValueTypeStorageLifetime,
+        owned_resources::{
+            layout::arc_layout, metadata_materialization::MaterializedFieldNamespace,
+        },
+    };
+    use std::{
+        alloc::Layout,
+        convert::Infallible,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Hold {
+        live: Arc<AtomicUsize>,
+        bytes: AtomicUsize,
+    }
+    impl ValueTypeStorageHold for Hold {}
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.live
+                .fetch_sub(self.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+    struct Scope(Arc<Hold>);
+    impl ValueSchemaCreationScope<Infallible> for Scope {
+        fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+            ValueTypeStorageLifetime::held(self.0.clone())
+        }
+        fn request_layout(&mut self, layout: Layout) -> Result<(), Infallible> {
+            self.observe_opaque_upper_bound(layout.size())
+        }
+        fn observe_opaque_upper_bound(&mut self, bytes: usize) -> Result<(), Infallible> {
+            self.0.bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.0.live.fetch_add(bytes, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    struct Factory(Arc<AtomicUsize>);
+    impl ValueSchemaCreationFactory<Infallible> for Factory {
+        type Scope<'a> = Scope;
+
+        fn begin_scope(&self) -> Result<Scope, Infallible> {
+            let bytes = arc_layout(Layout::new::<Hold>()).unwrap().size();
+            self.0.fetch_add(bytes, Ordering::Relaxed);
+            Ok(Scope(Arc::new(Hold {
+                live: self.0.clone(),
+                bytes: AtomicUsize::new(bytes),
+            })))
+        }
+        fn begin_scope_observed<O>(
+            &self,
+            observe: &mut dyn FnMut(Layout) -> Result<(), O>,
+        ) -> Result<Scope, ValueSchemaScopeBeginFailure<O, Infallible>> {
+            observe(arc_layout(Layout::new::<Hold>()).unwrap())
+                .map_err(ValueSchemaScopeBeginFailure::Observer)?;
+            self.begin_scope()
+                .map_err(ValueSchemaScopeBeginFailure::Creator)
+        }
+    }
+
+    let array = Int32Array::from(vec![Some(42), None]);
+    let field = Arc::new(Field::new("original", DataType::Int32, true));
+    let value_type = FunctionValueType::new(DataType::Int32, true);
+    let pool = pool_with(Arc::new(array), field.clone(), value_type.clone());
+    let table = encoded_fixture_types(&[(0, &value_type)], &[(0, &field)]);
+    let types = decode_fixture_types(&table, &[(0, field.clone())]);
+    let records = [encode(&pool, 0, 0, 0)];
+    let factory = Factory(Arc::new(AtomicUsize::new(0)));
+    let control = Control::good(CompilePhase::Decode);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let metadata = MaterializedFieldNamespace::from_original_loans(Arc::from([]));
+    let prepared = prepare_constant_namespace_input_derived_with_factory_in(
+        &records,
+        &types,
+        Some(&metadata),
+        &factory,
+        &mut |_| Ok(()),
+        &mut work,
+    )
+    .unwrap();
+    let (pools, _) = prepared
+        .materialize_with_factory_in(&factory, &mut |_| Ok(()), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+
+    let pool = &pools.entries()[&ConstantPoolId::new(0)];
+    assert!(Arc::ptr_eq(
+        pool.field_ref(),
+        types.source_field(0).unwrap()
+    ));
+    let projection = pool.array_projection();
+    let alias = projection.clone();
+    let before = factory.0.load(Ordering::Relaxed);
+    drop(pools);
+    drop(types);
+    let remaining = factory.0.load(Ordering::Relaxed);
+    assert!(remaining > 0 && remaining < before);
+    drop(projection);
+    assert_eq!(factory.0.load(Ordering::Relaxed), remaining);
+    let array = alias.array().as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(array.value(0), 42);
+    assert!(array.is_null(1));
+    drop(alias);
+    assert_eq!(factory.0.load(Ordering::Relaxed), 0);
+}
