@@ -413,3 +413,158 @@ fn write_namespace_near_over_requests_work_and_all_control_prefixes() {
         false,
     );
 }
+
+#[test]
+fn input_derived_namespace_materializes_records_past_old_volume_limits() {
+    use novarocks_constant_contract::ConstantValidation;
+    use novarocks_type_contract::{
+        ValueSchemaCreation, ValueTypeStorageLifetime,
+        owned_resources::metadata_materialization::MaterializedFieldNamespace,
+    };
+
+    const LARGE_BODY: usize = 17 * 1024 * 1024;
+    const FLAT_ROWS: usize = 4097;
+    const LIST_ITEMS: i32 = 65537;
+    let payload = vec![0x47; LARGE_BODY];
+    let mut binary = BinaryBuilder::with_capacity(FLAT_ROWS, LARGE_BODY);
+    binary.append_value(&payload);
+    for _ in 1..FLAT_ROWS {
+        binary.append_null();
+    }
+    let item_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let list = ListArray::new(
+        item_field,
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, LIST_ITEMS, LIST_ITEMS])),
+        Arc::new(Int32Array::from_iter_values(0..LIST_ITEMS)),
+        Some(NullBuffer::from(vec![true, false])),
+    );
+    let encode_control = Control::good(CompilePhase::Encode);
+    let make_pool = |array: &dyn Array| {
+        let field = Arc::new(Field::new("original", array.data_type().clone(), true));
+        let value_type = FunctionValueType::new(array.data_type().clone(), true);
+        ConstantPool::try_new(
+            field,
+            value_type,
+            array.to_data(),
+            ConstantValidation::INPUT_DERIVED,
+            CompilePhase::Encode,
+            &encode_control,
+        )
+        .unwrap()
+    };
+    let flat = make_pool(&binary.finish());
+    let recursive = make_pool(&list);
+    let fields = [
+        (0, Arc::clone(flat.field_ref())),
+        (1, Arc::clone(recursive.field_ref())),
+    ];
+    let fields_ref = [(0, &fields[0].1), (1, &fields[1].1)];
+    let values = [(0, flat.value_type()), (1, recursive.value_type())];
+    let table = encoded_fixture_types(&values, &fields_ref);
+    let mut pools = novarocks_physical_plan::ConstantPools::empty();
+    pools.insert(ConstantPoolId::new(0), flat.clone()).unwrap();
+    pools.insert(ConstantPoolId::new(1), recursive.clone()).unwrap();
+
+    let mut work = CompileCheckpoints::try_new(&encode_control, CompilePhase::Encode).unwrap();
+    let mut layouts = Vec::new();
+    let records = encode_constant_namespace_input_derived_in(
+        &pools,
+        &[binding(0, 0, 0), binding(1, 1, 1)],
+        &table,
+        &mut |request| {
+            if let ConstantWriteRequest::Layout(layout) = request {
+                layouts.push(layout);
+            }
+            Ok::<_, std::convert::Infallible>(())
+        },
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    assert_eq!(records[0].id, 0);
+    assert!(records[0].arrow_ipc.len() > LARGE_BODY);
+    assert!(layouts.iter().any(|layout| layout.size() == records[0].arrow_ipc.capacity()));
+
+    let decoded_types = decode_fixture_types(&table, &fields);
+    let decode_control = Control::good(CompilePhase::Decode);
+    let mut work = CompileCheckpoints::try_new(&decode_control, CompilePhase::Decode).unwrap();
+    let mut exact = |_: std::alloc::Layout| Ok::<_, std::convert::Infallible>(());
+    let mut opaque = |_: usize| Ok::<_, std::convert::Infallible>(());
+    let mut creation =
+        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
+    let metadata = MaterializedFieldNamespace::from_original_loans(Arc::from([]));
+    let prepared = prepare_constant_namespace_input_derived_with_creator_in(
+        &records,
+        &decoded_types,
+        Some(&metadata),
+        &mut creation,
+        &mut |_| Ok(()),
+        &mut work,
+    )
+    .unwrap();
+    let bodies = prepared.checked_record_body_bytes().collect::<Vec<_>>();
+    assert_eq!(bodies[0].0, ConstantPoolId::new(0));
+    assert!(bodies[0].1 >= LARGE_BODY && bodies[0].1 < records[0].arrow_ipc.len());
+    assert_eq!(bodies[1].0, ConstantPoolId::new(1));
+    assert!(bodies[1].1 >= LIST_ITEMS as usize * 4);
+    let decoded = prepared
+        .materialize_with_creator_in(&mut creation, &mut |_| Ok(()), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+
+    let flat = &decoded.entries()[&ConstantPoolId::new(0)];
+    assert!(Arc::ptr_eq(flat.field_ref(), decoded_types.source_field(0).unwrap()));
+    let binary = flat.array().as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(binary.len(), FLAT_ROWS);
+    assert_eq!(binary.null_count(), FLAT_ROWS - 1);
+    assert_eq!(binary.value(0), payload.as_slice());
+    let recursive = &decoded.entries()[&ConstantPoolId::new(1)];
+    let list = recursive.array().as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(list.value_length(0), LIST_ITEMS);
+    assert!(list.is_null(1));
+    let items = list.values().as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(items.value(0), 0);
+    assert_eq!(items.value(LIST_ITEMS as usize - 1), LIST_ITEMS - 1);
+}
+
+#[test]
+fn input_derived_namespace_writer_preserves_first_stream_layout_refusal() {
+    use novarocks_constant_contract::ConstantValidation;
+
+    let control = Control::good(CompilePhase::Encode);
+    let array = BinaryArray::from(vec![Some(&vec![5; 1024 * 1024][..])]);
+    let field = Arc::new(Field::new("data", DataType::Binary, true));
+    let value_type = FunctionValueType::new(DataType::Binary, true);
+    let original = ConstantPool::try_new(
+        Arc::clone(&field),
+        value_type.clone(),
+        array.to_data(),
+        ConstantValidation::INPUT_DERIVED,
+        CompilePhase::Encode,
+        &control,
+    )
+    .unwrap();
+    let table = encoded_fixture_types(&[(0, &value_type)], &[(0, &field)]);
+    let mut pools = novarocks_physical_plan::ConstantPools::empty();
+    pools.insert(ConstantPoolId::new(0), original).unwrap();
+    let refusal = Arc::new("original allocation refusal");
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let mut refused = false;
+    let result = encode_constant_namespace_input_derived_in(
+        &pools,
+        &[binding(0, 0, 0)],
+        &table,
+        &mut |request| {
+            assert!(!refused, "creator called after its first refusal");
+            if matches!(request, ConstantWriteRequest::Layout(layout) if layout.size() > 1024 * 1024) {
+                refused = true;
+                Err(Arc::clone(&refusal))
+            } else {
+                Ok(())
+            }
+        },
+        &mut work,
+    );
+    assert!(refused);
+    assert!(matches!(result, Err(ProjectionFailure::Host(cause)) if Arc::ptr_eq(&cause, &refusal)));
+}

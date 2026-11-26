@@ -21,9 +21,13 @@ use super::{
     binding_resources::{
         preflight_constant_binding_resources, preflight_constant_binding_resources_in,
     },
-    finish, prepare_constant_record_write, prepare_constant_record_write_in,
+    finish, prepare_constant_record_write, prepare_constant_record_write_in, recursive,
 };
-use crate::physical_type_v2::EncodedTypeTable;
+use crate::{
+    host_projection_v2::ProjectionFailure, ipc_flat_pool_v2::encode_flat_pool_input_derived_in,
+    ipc_recursive_pool_v2::encode_recursive_pool_input_derived_in,
+    ipc_schema_v2::ConstantWriteRequest, physical_type_v2::EncodedTypeTable,
+};
 use arrow::datatypes::Field;
 use novarocks_physical_plan::{ConstantPoolId, ConstantPools};
 use novarocks_proto_models::physical_package_v2 as wire;
@@ -291,6 +295,91 @@ pub(crate) fn prepare_constant_namespace_write_in<'pool, 'table, 'control>(
         Some(admit),
         work,
     )
+}
+
+/// Encode the original pools under the active creator's individual requests.
+pub fn encode_constant_namespace_input_derived_in<H>(
+    pools: &ConstantPools,
+    bindings: &[ConstantRecordTypeIds],
+    types: &EncodedTypeTable<'_>,
+    request: &mut dyn FnMut(ConstantWriteRequest) -> Result<(), H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<wire::IpcConstantPool>, ProjectionFailure<Error, H>> {
+    let count = pools.entries().len();
+    if bindings.len() != count {
+        return Err(
+            shape("constant namespace writer requires one binding per original pool").into(),
+        );
+    }
+    let layout = Layout::array::<wire::IpcConstantPool>(count)
+        .map_err(|_| shape("constant namespace writer record layout is unrepresentable"))?;
+    let mut output = Vec::new();
+    work.flush().map_err(Error::from)?;
+    if layout.size() != 0 {
+        request(ConstantWriteRequest::Layout(layout)).map_err(ProjectionFailure::Host)?;
+        let reserved = output.try_reserve_exact(count);
+        crate::allocation_exit_v2::reserve_exit::<Error>(reserved, work)?;
+    }
+    for ((id, pool), binding) in pools.entries().iter().zip(bindings) {
+        work.step().map_err(Error::from)?;
+        if *id != binding.pool {
+            return Err(shape(
+                "constant namespace writer binding order differs from original pools",
+            )
+            .into());
+        }
+        let ty = types
+            .value_type_observed(binding.value_type_id, work)
+            .map_err(Error::from)?
+            .ok_or_else(|| {
+                shape("constant namespace writer references an unknown source value type")
+            })?;
+        let field = types
+            .source_field_observed(binding.field_id, work)
+            .map_err(Error::from)?
+            .ok_or_else(|| shape("constant namespace writer references an unknown source Field"))?;
+        if ty.nullable() != pool.value_type().nullable()
+            || ty.logical_type() != pool.value_type().logical_type()
+            || !arrow_data_types_exact_borrowed_observed(
+                pool.value_type().data_type(),
+                ty.data_type(),
+                || work.step().map_err(Error::from),
+            )?
+        {
+            return Err(shape(
+                "constant namespace writer source value type differs from original pool",
+            )
+            .into());
+        }
+        if !Arc::ptr_eq(pool.field_ref(), field)
+            && !arrow_fields_exact_borrowed_observed(pool.field(), field, || {
+                work.step().map_err(Error::from)
+            })?
+        {
+            return Err(
+                shape("constant namespace writer source Field differs from original pool").into(),
+            );
+        }
+        let mut authorize = |operation| request(operation).map_err(ProjectionFailure::Host);
+        let arrow_ipc = if recursive(pool.field().data_type()) {
+            encode_recursive_pool_input_derived_in(pool, &mut authorize, work)
+        } else {
+            encode_flat_pool_input_derived_in(pool, &mut authorize, work)
+        }
+        .map_err(|error| match error {
+            ProjectionFailure::Codec(cause) => ProjectionFailure::Codec(Error::from(cause)),
+            ProjectionFailure::Host(cause) => ProjectionFailure::Host(cause),
+        })?;
+        output.push(wire::IpcConstantPool {
+            id: id.get(),
+            value_type_id: Some(binding.value_type_id),
+            source_field_id: Some(binding.field_id),
+            compression: wire::IpcCompression::Uncompressed as i32,
+            arrow_ipc,
+        });
+    }
+    work.flush().map_err(Error::from)?;
+    Ok(output)
 }
 
 fn prepare_core<'pool, 'table, 'control>(

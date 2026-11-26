@@ -51,6 +51,29 @@ pub struct ConstantNamespaceProjectionLimits {
     pub max_cumulative_library_work: usize,
 }
 
+type SourceMetadata =
+    novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace;
+
+#[derive(Clone, Copy)]
+struct BoundedNamespace<'a> {
+    source: usize,
+    policy: ConstantPolicy,
+    record_limits: ConstantDecodeProjectionLimits,
+    limits: ConstantNamespaceProjectionLimits,
+    verifier: &'a VerifierOptions,
+}
+impl<'a> BoundedNamespace<'a> {
+    fn record(
+        self,
+    ) -> (
+        ConstantPolicy,
+        ConstantDecodeProjectionLimits,
+        &'a VerifierOptions,
+    ) {
+        (self.policy, self.record_limits, self.verifier)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ConstantNamespaceResourceFacts {
     pub record_count: usize,
@@ -148,30 +171,32 @@ type Admit<'a, E = CompileControlError> =
     dyn FnMut(&ConstantNamespaceResourceFacts) -> Result<(), E> + 'a;
 fn gate_parent<E: From<CompileControlError>>(
     facts: &ConstantNamespaceResourceFacts,
-    limits: ConstantNamespaceProjectionLimits,
+    limits: Option<ConstantNamespaceProjectionLimits>,
     admit: &mut Admit<'_, E>,
 ) -> Result<(), E> {
-    for (actual, maximum) in [
-        (facts.record_count, limits.max_records),
-        (
-            facts.preparation_request_bytes,
-            limits.max_preparation_request_bytes,
-        ),
-        (
-            facts.new_allocation_request_bytes_upper_bound,
-            limits.max_new_allocation_request_bytes,
-        ),
-        (
-            facts.coexisting_source_and_request_bytes_upper_bound,
-            limits.max_coexisting_source_and_request_bytes,
-        ),
-        (
-            facts.cumulative_library_work_upper_bound,
-            limits.max_cumulative_library_work,
-        ),
-    ] {
-        if actual > maximum {
-            return Err(CompileControlError::ResourceExhausted.into());
+    if let Some(limits) = limits {
+        for (actual, maximum) in [
+            (facts.record_count, limits.max_records),
+            (
+                facts.preparation_request_bytes,
+                limits.max_preparation_request_bytes,
+            ),
+            (
+                facts.new_allocation_request_bytes_upper_bound,
+                limits.max_new_allocation_request_bytes,
+            ),
+            (
+                facts.coexisting_source_and_request_bytes_upper_bound,
+                limits.max_coexisting_source_and_request_bytes,
+            ),
+            (
+                facts.cumulative_library_work_upper_bound,
+                limits.max_cumulative_library_work,
+            ),
+        ] {
+            if actual > maximum {
+                return Err(CompileControlError::ResourceExhausted.into());
+            }
         }
     }
     admit(facts)
@@ -227,7 +252,7 @@ fn with_child(
     Ok(facts)
 }
 
-use super::borrowed_reader::{PreparedReader, prepare_reader_from_sources_observed};
+use super::borrowed_reader::{PreparedReader, prepare_reader_from_sources_profile_observed};
 
 use super::record_scopes::{
     ConstantRecordConstructionFacts, ConstantRecordScopes, ScopedPreparedConstantRecord,
@@ -338,9 +363,20 @@ pub struct PreparedConstantNamespace<'raw, 'table, 'control> {
     facts: ConstantNamespaceResourceFacts,
     control: &'control dyn PureCompileControl,
     preparation_storage: ValueTypeStorageLifetime,
-    limits: ConstantNamespaceProjectionLimits,
+    limits: Option<ConstantNamespaceProjectionLimits>,
 }
 impl PreparedConstantNamespace<'_, '_, '_> {
+    /// Each body's extent comes from the accepted record geometry.
+    pub fn checked_record_body_bytes(&self) -> impl Iterator<Item = (ConstantPoolId, usize)> + '_ {
+        self.records.iter().map(|record| {
+            let bytes = match &record.reader {
+                PreparedRecordReader::Original { reader, .. } => reader.body_bytes(),
+                PreparedRecordReader::Scoped { reader, .. } => reader.body_bytes(),
+            };
+            (record.id, bytes)
+        })
+    }
+
     pub const fn facts(&self) -> &ConstantNamespaceResourceFacts {
         &self.facts
     }
@@ -438,7 +474,7 @@ impl PreparedConstantNamespace<'_, '_, '_> {
             factory,
             marker: std::marker::PhantomData,
         };
-        self.materialize_core(Some(&mut capture), None, Some(&mapped), Some(limits), work)
+        self.materialize_core(Some(&mut capture), None, Some(&mapped), limits, work)
     }
     fn materialize_core<E: NamespaceFailure, F: ValueSchemaCreationFactory<E>>(
         mut self,
@@ -481,9 +517,6 @@ impl PreparedConstantNamespace<'_, '_, '_> {
                     )
                     .into());
                 }
-                let limits = limits.ok_or_else(|| {
-                    E::from(shape("constant namespace factory limits are absent"))
-                })?;
                 let parent = admit
                     .as_deref_mut()
                     .ok_or_else(|| E::from(shape("constant namespace factory parent is absent")))?;
@@ -561,9 +594,7 @@ impl PreparedConstantNamespace<'_, '_, '_> {
                         )?;
                         gate_parent(
                             &self.facts,
-                            limits.ok_or_else(|| {
-                                E::from(shape("constant namespace factory limits are absent"))
-                            })?,
+                            limits,
                             admit.as_deref_mut().ok_or_else(|| {
                                 E::from(shape("constant namespace factory parent is absent"))
                             })?,
@@ -599,9 +630,6 @@ impl PreparedConstantNamespace<'_, '_, '_> {
                             E::from(shape(
                                 "scoped constant namespace requires its original parent",
                             ))
-                        })?;
-                        let limits = limits.ok_or_else(|| {
-                            E::from(shape("scoped constant namespace limits are absent"))
                         })?;
                         let base = self.facts;
                         let mut complete = base;
@@ -843,11 +871,13 @@ pub fn prepare_constant_namespace<'raw, 'table, 'control>(
     let result = prepare_core::<_, crate::value_type_table::resources::NoFactory>(
         records,
         types,
-        source_retained_bytes,
-        policy,
-        record_limits,
-        limits,
-        verifier,
+        Some(BoundedNamespace {
+            source: source_retained_bytes,
+            policy,
+            record_limits,
+            limits,
+            verifier,
+        }),
         None,
         None,
         None,
@@ -871,11 +901,13 @@ pub(crate) fn prepare_constant_namespace_in<'raw, 'table, 'control>(
     prepare_core::<_, crate::value_type_table::resources::NoFactory>(
         records,
         types,
-        source_retained_bytes,
-        policy,
-        record_limits,
-        limits,
-        verifier,
+        Some(BoundedNamespace {
+            source: source_retained_bytes,
+            policy,
+            record_limits,
+            limits,
+            verifier,
+        }),
         Some(&mut |facts| admit(facts).map_err(Error::from)),
         None,
         None,
@@ -912,11 +944,13 @@ pub fn prepare_constant_namespace_with_creator_in<'raw, 'table, 'control, H>(
             prepare_core::<_, crate::value_type_table::resources::NoFactory>(
                 records,
                 types,
-                source_retained_bytes,
-                policy,
-                record_limits,
-                limits,
-                verifier,
+                Some(BoundedNamespace {
+                    source: source_retained_bytes,
+                    policy,
+                    record_limits,
+                    limits,
+                    verifier,
+                }),
                 Some(&mut |facts| {
                     admit(facts).map_err(|error| match error {
                         crate::host_projection_v2::AdmissionRefusal::Control(cause) => cause.into(),
@@ -971,17 +1005,112 @@ pub fn prepare_constant_namespace_with_factory_in<
     prepare_core(
         records,
         types,
-        source_retained_bytes,
-        policy,
-        record_limits,
-        limits,
-        verifier,
+        Some(BoundedNamespace {
+            source: source_retained_bytes,
+            policy,
+            record_limits,
+            limits,
+            verifier,
+        }),
         Some(&mut |facts| admit(facts).map_err(map_admission)),
         None,
         Some(&mapped),
         source_metadata,
         work,
     )
+}
+
+/// Prepare borrowed records using their actual source storage and checked geometry.
+pub fn prepare_constant_namespace_input_derived_in<'raw, 'table, 'control>(
+    records: &'raw [wire::IpcConstantPool],
+    types: &'table DecodedTypeTable,
+    admit: &mut Admit<'_>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedConstantNamespace<'raw, 'table, 'control>, Error> {
+    prepare_core::<_, crate::value_type_table::resources::NoFactory>(
+        records,
+        types,
+        None,
+        Some(&mut |facts| admit(facts).map_err(Error::from)),
+        None,
+        None,
+        None,
+        work,
+    )
+}
+
+pub fn prepare_constant_namespace_input_derived_with_creator_in<'raw, 'table, 'control, H>(
+    records: &'raw [wire::IpcConstantPool],
+    types: &'table DecodedTypeTable,
+    source_metadata: Option<&SourceMetadata>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    admit: &mut dyn FnMut(
+        &ConstantNamespaceResourceFacts,
+    ) -> Result<(), crate::host_projection_v2::AdmissionRefusal<H>>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedConstantNamespace<'raw, 'table, 'control>, HostFailure<H>> {
+    creation.with_error_mapping(
+        crate::host_projection_v2::ProjectionFailure::Host,
+        |mapped| {
+            prepare_core::<_, crate::value_type_table::resources::NoFactory>(
+                records,
+                types,
+                None,
+                Some(&mut |facts| admit(facts).map_err(map_admission)),
+                Some(NamespaceCreation {
+                    creation: mapped,
+                    metadata: source_metadata,
+                }),
+                None,
+                None,
+                work,
+            )
+        },
+    )
+}
+
+pub fn prepare_constant_namespace_input_derived_with_factory_in<
+    'raw,
+    'table,
+    'control,
+    H,
+    F: ValueSchemaCreationFactory<H>,
+>(
+    records: &'raw [wire::IpcConstantPool],
+    types: &'table DecodedTypeTable,
+    source_metadata: Option<&SourceMetadata>,
+    factory: &F,
+    admit: &mut dyn FnMut(
+        &ConstantNamespaceResourceFacts,
+    ) -> Result<(), crate::host_projection_v2::AdmissionRefusal<H>>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedConstantNamespace<'raw, 'table, 'control>, HostFailure<H>> {
+    let mapped = MappedNamespaceFactory {
+        factory,
+        marker: std::marker::PhantomData,
+    };
+    prepare_core(
+        records,
+        types,
+        None,
+        Some(&mut |facts| admit(facts).map_err(map_admission)),
+        None,
+        Some(&mapped),
+        source_metadata,
+        work,
+    )
+}
+
+fn visible_record_storage(
+    records: &[wire::IpcConstantPool],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<usize, Error> {
+    let mut extent = mem::size_of_val(records);
+    for record in records {
+        extent = add(extent, record.arrow_ipc.capacity())?;
+        work.step()?;
+    }
+    Ok(extent)
 }
 
 #[expect(
@@ -991,11 +1120,7 @@ pub fn prepare_constant_namespace_with_factory_in<
 fn prepare_core<'raw, 'table, 'control, E: NamespaceFailure, F: ValueSchemaCreationFactory<E>>(
     records: &'raw [wire::IpcConstantPool],
     types: &'table DecodedTypeTable,
-    source_retained_bytes: usize,
-    policy: ConstantPolicy,
-    record_limits: ConstantDecodeProjectionLimits,
-    limits: ConstantNamespaceProjectionLimits,
-    verifier: &VerifierOptions,
+    bounded: Option<BoundedNamespace<'_>>,
     mut admit: Option<&mut Admit<'_, E>>,
     mut creation: Option<NamespaceCreation<'_, '_, E>>,
     factory: Option<&F>,
@@ -1003,6 +1128,11 @@ fn prepare_core<'raw, 'table, 'control, E: NamespaceFailure, F: ValueSchemaCreat
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedConstantNamespace<'raw, 'table, 'control>, E> {
     (|| {
+        let limits = bounded.map(|profile| profile.limits);
+        let source_retained_bytes = match bounded {
+            Some(profile) => profile.source,
+            None => visible_record_storage(records, work)?,
+        };
         let mut facts = if let Some(parent) = &mut admit {
             if !LOCKED_FAMILY || !LOCKED_TOOLCHAIN {
                 return Err(shape("constant namespace source model drift").into());
@@ -1021,21 +1151,21 @@ fn prepare_core<'raw, 'table, 'control, E: NamespaceFailure, F: ValueSchemaCreat
             gate_parent(&known, limits, *parent)?;
             known
         } else {
-            initial_facts(records.len(), source_retained_bytes, limits, work)?
+            initial_facts(
+                records.len(),
+                source_retained_bytes,
+                limits.expect("the legacy plain constructor supplies its explicit profile"),
+                work,
+            )?
         };
-        let mut visible_source = Layout::array::<wire::IpcConstantPool>(records.len())
-            .map_err(|_| shape("constant namespace source layout is unrepresentable"))?
-            .size();
-        for record in records {
-            visible_source = add(visible_source, record.arrow_ipc.capacity())?;
-            work.step()?;
+        if bounded.is_some() {
+            cap(
+                visible_record_storage(records, work)?,
+                source_retained_bytes,
+                "constant namespace source invoice excludes retained record storage",
+                work,
+            )?;
         }
-        cap(
-            visible_source,
-            source_retained_bytes,
-            "constant namespace source invoice excludes retained record storage",
-            work,
-        )?;
         work.flush()?;
         if let Some(creator) = creation.as_mut() {
             let layout = Layout::array::<PreparedRecord<'_, '_, '_>>(records.len())
@@ -1077,9 +1207,15 @@ fn prepare_core<'raw, 'table, 'control, E: NamespaceFailure, F: ValueSchemaCreat
         let reserved = prepared.try_reserve_exact(records.len());
         crate::allocation_exit_v2::reserve_exit::<Error>(reserved, work)?;
         for record in records {
+            let record_source =
+                bounded.map_or(record.arrow_ipc.capacity(), |profile| profile.source);
             if let Some(factory) = factory {
                 let base = facts;
-                let live_source = add(source_retained_bytes, facts.preparation_request_bytes)?;
+                let live_source = if bounded.is_some() {
+                    add(record_source, facts.preparation_request_bytes)?
+                } else {
+                    record.arrow_ipc.capacity()
+                };
                 let parent = admit
                     .as_deref_mut()
                     .ok_or_else(|| E::from(shape("constant namespace factory parent is absent")))?;
@@ -1088,7 +1224,7 @@ fn prepare_core<'raw, 'table, 'control, E: NamespaceFailure, F: ValueSchemaCreat
                 record_sources_captured_observed(
                     record,
                     types,
-                    source_retained_bytes,
+                    bounded.map(|profile| profile.source),
                     &mut |value_type, field, work| {
                         let reader = super::record_scopes::prepare_profile(
                             record,
@@ -1100,9 +1236,9 @@ fn prepare_core<'raw, 'table, 'control, E: NamespaceFailure, F: ValueSchemaCreat
                                     "constant namespace factory source metadata is absent",
                                 ))
                             })?,
-                            source_retained_bytes,
+                            record_source,
                             live_source,
-                            Some((policy, record_limits, verifier)),
+                            bounded.map(BoundedNamespace::record),
                             factory,
                             &mut |child| {
                                 completed = with_scoped_child(base, child)?;
@@ -1136,17 +1272,19 @@ fn prepare_core<'raw, 'table, 'control, E: NamespaceFailure, F: ValueSchemaCreat
             }
             if let Some(parent) = &mut admit {
                 let base = facts;
-                let live_source = add(source_retained_bytes, facts.preparation_request_bytes)
-                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                let live_source = if bounded.is_some() {
+                    add(record_source, facts.preparation_request_bytes)
+                        .map_err(|_| CompileControlError::ResourceExhausted)?
+                } else {
+                    record.arrow_ipc.capacity()
+                };
                 let mut snapshot = IpcReaderProgressFacts::default();
                 let (reader, source) = prepare_record_reader_observed(
                     record,
                     types,
-                    source_retained_bytes,
+                    bounded.map(|profile| profile.source),
                     live_source,
-                    policy,
-                    record_limits,
-                    verifier,
+                    bounded.map(BoundedNamespace::record),
                     &mut |progress| {
                         snapshot.geometry_scratch_request_bytes = snapshot
                             .geometry_scratch_request_bytes
@@ -1196,6 +1334,10 @@ fn prepare_core<'raw, 'table, 'control, E: NamespaceFailure, F: ValueSchemaCreat
                 work.step()?;
                 continue;
             }
+            let profile =
+                bounded.expect("the legacy plain constructor supplies its explicit profile");
+            let (policy, record_limits, verifier) = profile.record();
+            let limits = profile.limits;
             let (value_type, field) = record_sources(record, types, source_retained_bytes, work)?;
             let live_source = add(source_retained_bytes, facts.preparation_request_bytes)?;
             work.flush()?;
@@ -1347,11 +1489,13 @@ pub fn decode_constant_namespace(
 fn prepare_record_reader_observed<'raw, 'table, 'control, E: NamespaceFailure>(
     record: &'raw wire::IpcConstantPool,
     types: &'table DecodedTypeTable,
-    original_source: usize,
+    original_source: Option<usize>,
     live_source: usize,
-    policy: ConstantPolicy,
-    limits: ConstantDecodeProjectionLimits,
-    verifier: &VerifierOptions,
+    profile: Option<(
+        ConstantPolicy,
+        ConstantDecodeProjectionLimits,
+        &VerifierOptions,
+    )>,
     admit: &mut dyn FnMut(&IpcReaderProgressFacts) -> Result<(), E>,
     mut creation: Option<&mut NamespaceCreation<'_, '_, E>>,
     work: &mut CompileCheckpoints<'control>,
@@ -1370,14 +1514,12 @@ fn prepare_record_reader_observed<'raw, 'table, 'control, E: NamespaceFailure>(
         &mut |value_type, field, work| {
             let original_field = field.field();
             let prepared = if let Some(creator) = creation.as_mut() {
-                let prepared = prepare_reader_from_sources_observed(
+                let prepared = prepare_reader_from_sources_profile_observed(
                     record,
                     value_type,
                     original_field,
                     live_source,
-                    policy,
-                    limits,
-                    verifier,
+                    profile,
                     admit,
                     Some(&mut |layout| creator.creation.request_layout(layout)),
                     work,
@@ -1386,7 +1528,7 @@ fn prepare_record_reader_observed<'raw, 'table, 'control, E: NamespaceFailure>(
                     novarocks_constant_contract::ConstantSourceOwner::try_new_with_creator_in(
                         original_field,
                         creator.metadata.ok_or_else(||shape("constant source metadata is missing its original creator namespace"))?,
-                        original_source,
+                        original_source.unwrap_or_else(|| record.arrow_ipc.capacity()),
                         field.storage_lifetime(),
                         creator.creation,
                         work,
@@ -1395,14 +1537,12 @@ fn prepare_record_reader_observed<'raw, 'table, 'control, E: NamespaceFailure>(
                 (prepared, Some(source))
             } else {
                 (
-                    prepare_reader_from_sources_observed(
+                    prepare_reader_from_sources_profile_observed(
                         record,
                         value_type,
                         original_field,
                         live_source,
-                        policy,
-                        limits,
-                        verifier,
+                        profile,
                         admit,
                         None,
                         work,

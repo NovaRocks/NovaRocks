@@ -203,6 +203,10 @@ pub(crate) struct PreparedFlatReader<'a, 'f, 'v, 'c> {
     parts: PreparedParts<'v>,
 }
 impl PreparedFlatReader<'_, '_, '_, '_> {
+    pub(crate) fn body_bytes(&self) -> usize {
+        self.stream.batch_body().len()
+    }
+
     pub(crate) fn facts(&self) -> &FlatReaderResourceFacts {
         &self.parts.facts
     }

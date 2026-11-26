@@ -87,6 +87,10 @@ pub(crate) struct PreparedRecursiveReader<'a, 'f, 'v, 'c> {
     parts: PreparedRecursiveParts<'v>,
 }
 impl PreparedRecursiveReader<'_, '_, '_, '_> {
+    pub(crate) fn body_bytes(&self) -> usize {
+        self.stream.body.len()
+    }
+
     pub(crate) fn facts(&self) -> &RecursiveReaderResourceFacts {
         &self.parts.facts
     }
@@ -96,7 +100,6 @@ impl PreparedRecursiveReader<'_, '_, '_, '_> {
     pub(crate) fn geometry_scratch_request_count(&self) -> usize {
         self.stream.checked.scratch_request_count
     }
-    #[cfg(test)]
     #[cfg(test)]
     pub(crate) fn materialize_in(
         self,
@@ -449,7 +452,7 @@ fn preflight_profile_core<'a, 'f, E: ReaderGeometryFailure>(
             )
         } else {
             crate::ipc_schema_v2::verify_single_field_schema_input_derived_with_host_in(
-                schema, expected, source, &mut host, work,
+                schema, expected, &mut host, work,
             )
             .map(|_| ())
         };

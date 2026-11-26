@@ -41,6 +41,65 @@ mod verify;
 // dictionary/type payloads fit within the same source-derived cover.
 const MAX_SCHEMA_VERIFIER_DEPTH: usize = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 3;
 
+/// Requests from the original IPC writer to the active construction scope.
+#[derive(Clone, Copy, Debug)]
+pub enum ConstantWriteRequest {
+    Layout(std::alloc::Layout),
+    OpaqueUpperBound(usize),
+}
+pub(crate) type WriteRequest<'a, H> =
+    dyn FnMut(ConstantWriteRequest) -> Result<(), HostError<H>> + 'a;
+
+// Keep the current F9 schema shape while using the actual metadata representation.
+const CONSTANT_SCHEMA_SHAPE: IpcSchemaProjectionLimits = IpcSchemaProjectionLimits {
+    max_field_occurrences: 4096,
+    max_type_occurrences: 4096,
+    max_string_bytes: 65536,
+    max_flatbuffer_bytes: (1usize << 31) - 1,
+};
+
+/// Read source extent and count the exact walker topology before heap scratch.
+fn checked_field_source(
+    field: &Field,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(usize, usize), TypeCodecError> {
+    use novarocks_type_contract::{
+        MAX_VALUE_TYPE_NODES, owned_resources::arrow_metadata,
+        validate_value_type_structure_with_scratch_observed,
+    };
+    let mut bytes = 0usize;
+    let mut type_nodes = 0usize;
+    work.flush()?;
+    let mut add_field = |field: &Field, work: &mut CompileCheckpoints<'_>| {
+        bytes = checked_add(bytes, std::mem::size_of::<Field>())?;
+        bytes = checked_add(bytes, field.name().capacity())?;
+        let map = arrow_metadata::retained_backing_upper_bound(field.metadata().len())
+            .map_err(|_| TypeCodecError::ResourceSource("IPC schema metadata storage model"))?;
+        bytes = checked_add(bytes, map)?;
+        for (key, value) in field.metadata() {
+            bytes = checked_add(bytes, checked_add(key.capacity(), value.capacity())?)?;
+            work.step()?;
+        }
+        Ok::<_, TypeCodecError>(())
+    };
+    add_field(field, work)?;
+    let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+    validate_value_type_structure_with_scratch_observed(
+        field.data_type(),
+        &mut scratch,
+        |event| {
+            match event {
+                ValueTypeVisit::Field(child) => add_field(child, work)?,
+                ValueTypeVisit::TypeNode(_) => type_nodes = checked_add(type_nodes, 1)?,
+                ValueTypeVisit::ChildEdge(_) => {}
+            }
+            work.step().map_err(TypeCodecError::from)
+        },
+    )?;
+    work.flush()?;
+    Ok((bytes, type_nodes))
+}
+
 /// Caller-resolved admission, with no implicit application policy.
 #[derive(Clone, Copy, Debug)]
 pub struct IpcSchemaProjectionLimits {
@@ -568,8 +627,65 @@ fn encode_schema_policy_core<H>(
         } else {
             preflight_writer_policy_core(field, limits, None, work)?
         };
+        emit_checked_schema(field, facts, admission.is_some(), None, work)
+    })()
+}
+
+pub(crate) fn preflight_constant_schema_in<H>(
+    field: &Field,
+    request: &mut WriteRequest<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<SchemaPreflight, HostError<H>> {
+    let (source, type_nodes) = checked_field_source(field, work)?;
+    let prefix = writer_resources::prefix_initial(field, source, type_nodes)?;
+    // This covers the two original preflight walkers before either reserves.
+    request(ConstantWriteRequest::OpaqueUpperBound(prefix.request_bytes))?;
+    let facts = preflight_writer_policy_core::<std::convert::Infallible>(
+        field,
+        Some(CONSTANT_SCHEMA_SHAPE),
+        None,
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)?;
+    let resources = writer_resources::allocation_facts(facts, prefix, Some(work))?;
+    let already_requested = checked_add(checked_mul(facts.backing, 2)?, prefix.request_bytes)?;
+    let auxiliary = resources
+        .request_bytes
+        .checked_sub(already_requested)
+        .ok_or(TypeCodecError::InvalidShape(
+            "IPC schema allocation model omits primary backing",
+        ))?;
+    work.flush()?;
+    request(ConstantWriteRequest::OpaqueUpperBound(auxiliary))?;
+    Ok(facts)
+}
+
+pub(crate) fn emit_constant_schema_with_requests_in<H>(
+    field: &Field,
+    facts: SchemaPreflight,
+    request: &mut WriteRequest<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<u8>, HostError<H>> {
+    emit_checked_schema(field, facts, true, Some(request), work)
+}
+
+fn emit_checked_schema<H>(
+    field: &Field,
+    facts: SchemaPreflight,
+    observed: bool,
+    mut request: Option<&mut WriteRequest<'_, H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<u8>, HostError<H>> {
+    (|| {
         let capacity = facts.backing;
         work.flush()?;
+        if let Some(request) = request.as_deref_mut() {
+            request(ConstantWriteRequest::Layout(
+                std::alloc::Layout::array::<u8>(capacity).map_err(|_| {
+                    TypeCodecError::InvalidShape("IPC schema backing layout is unrepresentable")
+                })?,
+            ))?;
+        }
         let mut backing = Vec::new();
         backing.try_reserve_exact(capacity).map_err(|_| {
             TypeCodecError::Control(novarocks_type_contract::CompileControlError::ResourceExhausted)
@@ -628,8 +744,15 @@ fn encode_schema_policy_core<H>(
         };
         verify_message(builder.finished_data(), field, &verifier, work)?;
         work.flush()?;
-        let output = if admission.is_some() {
+        let output = if observed {
             let bytes = builder.finished_data();
+            if let Some(request) = request {
+                request(ConstantWriteRequest::Layout(
+                    std::alloc::Layout::array::<u8>(bytes.len()).map_err(|_| {
+                        TypeCodecError::InvalidShape("IPC schema output layout is unrepresentable")
+                    })?,
+                ))?;
+            }
             let mut output = Vec::new();
             output.try_reserve_exact(bytes.len()).map_err(|_| {
                 TypeCodecError::Control(
@@ -856,12 +979,19 @@ pub(crate) fn verify_single_field_schema_with_host_in<H>(
 pub(crate) fn verify_single_field_schema_input_derived_with_host_in<H>(
     metadata: &[u8],
     expected: &Field,
-    source: usize,
     admit: &mut HostSchemaAdmit<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<novarocks_arrow_ipc_frame::VerifierOptions, ProjectionFailure<TypeCodecError, H>> {
+    let (source, _) = checked_field_source(expected, work)?;
     verify_single_field_schema_profile_with_host_in(
-        metadata, expected, None, None, source, None, admit, work,
+        metadata,
+        expected,
+        Some(CONSTANT_SCHEMA_SHAPE),
+        None,
+        source,
+        None,
+        admit,
+        work,
     )
 }
 fn verify_single_field_schema_profile_with_host_in<H>(
