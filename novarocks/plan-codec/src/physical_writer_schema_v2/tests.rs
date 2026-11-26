@@ -873,7 +873,7 @@ fn writer_count_all_known_non_name_limits_precede_pending_255_callback() {
                 work.step().unwrap();
             }
             assert!(matches!(
-                count.facts(128, 1, under(admitted, axis), &mut work),
+                count.facts(128, 1, Some(under(admitted, axis)), &mut work),
                 Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
             assert_eq!(c.trace(), vec![(CompilePhase::Encode, 0)], "axis {axis}");
@@ -1076,7 +1076,7 @@ fn parent_base() -> Model {
 fn projection(base: Model, node: NodeProjectionLimits) -> WriterSchemaProjection {
     WriterSchemaProjection {
         source: SOURCE,
-        limits: limits(),
+        limits: Some(limits()),
         parent: WriterSchemaNodeAdmission {
             base,
             values: 2,
@@ -1741,7 +1741,7 @@ fn writer_schema_captured_comparison_prefix_numeric_first_and_final_peak() {
             let mut count = Count::new(1);
             count.admit = Some(&mut callback);
             count.model.delegated_work = delegated;
-            let result = count.comparison_prefix(&ty, &ty, SOURCE, 1, limits());
+            let result = count.comparison_prefix(&ty, &ty, SOURCE, 1, Some(limits()));
             assert!(matches!(
                 finish(work, result),
                 Err(Error::Control(CompileControlError::ResourceExhausted))

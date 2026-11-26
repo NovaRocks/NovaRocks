@@ -45,7 +45,7 @@ type Error = TopNNodeCodecError;
 #[derive(Clone, Copy, Debug)]
 pub struct TopNNodeProjectionLimits<N = NodeProjectionLimits> {
     pub node: N,
-    pub binding: BindingProjectionLimits,
+    pub binding: Option<BindingProjectionLimits>,
 }
 impl<N: Into<Option<NodeProjectionLimits>>> TopNNodeProjectionLimits<N> {
     fn capture_node_profile(self) -> TopNNodeProjectionLimits<Option<NodeProjectionLimits>> {

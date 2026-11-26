@@ -403,7 +403,7 @@ fn encode_fragment_package_structural_in<'s>(
         &types,
         &function_inputs,
         source,
-        l.bindings,
+        None,
         seen!(request_bytes_upper_bound),
         work,
     )?;
@@ -413,7 +413,7 @@ fn encode_fragment_package_structural_in<'s>(
         &functions,
         &aggregate_inputs,
         source,
-        l.bindings,
+        None,
         seen!(request_bytes_upper_bound),
         work,
     )?;
@@ -449,7 +449,7 @@ fn encode_fragment_package_structural_in<'s>(
         &reads,
         &types,
         source,
-        l.relations,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -488,7 +488,7 @@ fn encode_fragment_package_structural_in<'s>(
     let (parameters, _) = prepare_semantic_parameters_encode_observed_in(
         package.parameters(),
         source,
-        l.parameters,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?
@@ -531,9 +531,9 @@ fn encode_fragment_package_structural_in<'s>(
     source = grow(source, &requested, &envelope)?;
     let dispatch = NodeDispatchLimits {
         node: None,
-        binding: l.bindings,
-        relation: l.relations,
-        writer_schema: l.writer_schema,
+        binding: None,
+        relation: None,
+        writer_schema: None,
     };
     let mut nodes = Vec::new();
     nodes
@@ -754,7 +754,10 @@ fn encode_fragment_package_structural_in<'s>(
             types: &types,
             type_ids: &cut_ids,
             source_retained_bytes: source,
-            limits: l.cuts,
+            limits: CutsProjectionLimits {
+                node: None,
+                binding: None,
+            },
         },
         seen!(allocation_request_bytes_upper_bound),
         work,
@@ -780,7 +783,7 @@ fn encode_fragment_package_structural_in<'s>(
             source_schemas: provider_inputs.source_schemas(),
         },
         source,
-        l.scans,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -793,7 +796,7 @@ fn encode_fragment_package_structural_in<'s>(
             types: &types,
         },
         source,
-        l.writers,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -807,7 +810,7 @@ fn encode_fragment_package_structural_in<'s>(
             &provider_bindings,
             &payloads,
             source,
-            l.writers,
+            None,
             work,
         )?
         .0

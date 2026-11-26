@@ -207,7 +207,7 @@ pub(crate) fn preflight_collection_binding_copies(
     a: &MaterializedAggregateBindings<'_, '_, '_>,
     parent: CollectionProjection<'_>,
     dependency: usize,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<AggregateNodeProjectionFacts, Error> {
     preflight_collection_binding_copies_core(calls, e, a, parent, dependency, limits, None, w)
@@ -218,7 +218,7 @@ pub(crate) fn preflight_collection_binding_copies_in<'parent>(
     a: &MaterializedAggregateBindings<'_, '_, '_>,
     parent: CollectionProjection<'_>,
     dependency: usize,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     admit: &'parent mut NodeAdmit<'parent>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<AggregateNodeProjectionFacts, Error> {
@@ -239,7 +239,7 @@ pub(crate) fn preflight_collection_binding_copies_core<'parent>(
     a: &MaterializedAggregateBindings<'_, '_, '_>,
     parent: CollectionProjection<'_>,
     dependency: usize,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     admit: Option<&'parent mut NodeAdmit<'parent>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<AggregateNodeProjectionFacts, Error> {

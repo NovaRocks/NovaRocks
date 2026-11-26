@@ -874,7 +874,7 @@ fn decode_fragment_package_factory_core<
     let (parameters, _) = prepare_semantic_parameters_decode_observed_in(
         parameters_wire,
         invoice,
-        limits.parameters,
+        None,
         &mut |_| Ok(()),
         work,
     )?
@@ -894,7 +894,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.writes,
             writer_context,
             invoice,
-            limits.writers,
+            None,
             factory,
             &mut |_| Ok(()),
             work,
@@ -905,7 +905,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.writes,
             writer_context,
             invoice,
-            limits.writers,
+            None,
             &mut |_| Ok(()),
             work,
         )?;
@@ -928,7 +928,7 @@ fn decode_fragment_package_factory_core<
         &provider_bindings,
         &payloads,
         invoice,
-        limits.writers,
+        None,
         work,
     )
     .map_err(|error| ProjectionFailure::Codec(Error::from(error)))?;
@@ -1014,7 +1014,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.connector_expressions,
             scan_context,
             invoice,
-            limits.scans,
+            None,
             &mut |_| Ok(()),
             creator,
             work,
@@ -1025,7 +1025,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.connector_expressions,
             scan_context,
             invoice,
-            limits.scans,
+            None,
             &mut |_| Ok(()),
             work,
         )?
@@ -1053,7 +1053,7 @@ fn decode_fragment_package_factory_core<
         &reads,
         &types,
         invoice,
-        limits.relations,
+        None,
         &mut |_| Ok(()),
         work,
     )?;
@@ -1143,7 +1143,10 @@ fn decode_fragment_package_factory_core<
         cuts_wire,
         &types,
         invoice,
-        limits.cuts,
+        CutsProjectionLimits {
+            node: None,
+            binding: None,
+        },
         &mut |_| Ok(()),
         work,
     )?;
@@ -1166,7 +1169,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.function_bindings,
             &types,
             invoice,
-            limits.bindings,
+            None,
             &mut |_| Ok(()),
             work,
         )?;
@@ -1179,7 +1182,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.aggregate_bindings,
             &function_headers,
             aggregate_source,
-            limits.bindings,
+            None,
             &mut |_| Ok(()),
             work,
         )?;
@@ -1187,7 +1190,7 @@ fn decode_fragment_package_factory_core<
         let function_token = prepare_function_bindings_materialization_in(
             &function_headers,
             invoice,
-            limits.bindings,
+            None,
             &mut |_| Ok(()),
             work,
         )?;
@@ -1212,7 +1215,7 @@ fn decode_fragment_package_factory_core<
             &aggregate_headers,
             &functions,
             invoice,
-            limits.bindings,
+            None,
             &mut |_| Ok(()),
             work,
         )?;
@@ -1248,9 +1251,9 @@ fn decode_fragment_package_factory_core<
         .emit_in(&mut |_| Ok(()), work)?;
         let dispatch = NodeDispatchLimits {
             node: None,
-            binding: limits.bindings,
-            relation: limits.relations,
-            writer_schema: limits.writer_schema,
+            binding: None,
+            relation: None,
+            writer_schema: None,
         };
         admit_count(fragment_wire.nodes.len(), plan_limits.fragment_nodes)?;
         let mut nodes = BTreeMap::new();

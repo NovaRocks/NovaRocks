@@ -210,8 +210,8 @@ const fn frozen_encode_limits() -> PackageEncodeLimits {
             max_work: WORK,
         },
         cuts: CutsProjectionLimits {
-            node: node(),
-            binding: bindings(),
+            node: Some(node()),
+            binding: Some(bindings()),
         },
         scans: ReadScanProjectionLimits {
             max_scans: 100_000,

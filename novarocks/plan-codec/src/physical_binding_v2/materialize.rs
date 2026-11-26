@@ -308,7 +308,7 @@ impl<'parent> Model<'parent> {
         base: resources::Model,
         values: usize,
         node_limits: impl Into<Option<resources::NodeProjectionLimits>>,
-        binding_limits: BindingProjectionLimits,
+        binding_limits: impl Into<Option<BindingProjectionLimits>> + Copy,
     ) -> Result<(), Error> {
         let node_limits = node_limits.into();
         if self
@@ -342,7 +342,7 @@ impl<'parent> Model<'parent> {
         base: resources::Model,
         values: usize,
         node_limits: impl Into<Option<resources::NodeProjectionLimits>>,
-        binding_limits: BindingProjectionLimits,
+        binding_limits: impl Into<Option<BindingProjectionLimits>> + Copy,
         admit: &'parent mut resources::NodeAdmit<'parent>,
     ) -> Result<(), Error> {
         if self
@@ -599,7 +599,7 @@ impl Model<'_> {
     pub(crate) fn count_owned_type_clone_admitted(
         &mut self,
         source: &FunctionValueType,
-        limits: BindingProjectionLimits,
+        limits: impl Into<Option<BindingProjectionLimits>>,
         admit: &mut impl FnMut(&resources::NodeProjectionFacts) -> Result<(), CompileControlError>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {

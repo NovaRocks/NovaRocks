@@ -44,7 +44,7 @@ type Error = TableFunctionNodeCodecError;
 #[derive(Clone, Copy, Debug)]
 pub struct TableFunctionNodeProjectionLimits<N = NodeProjectionLimits> {
     pub node: N,
-    pub binding: BindingProjectionLimits,
+    pub binding: Option<BindingProjectionLimits>,
 }
 impl<N: Into<Option<NodeProjectionLimits>>> TableFunctionNodeProjectionLimits<N> {
     fn capture_node_profile(

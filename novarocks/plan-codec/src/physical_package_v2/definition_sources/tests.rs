@@ -1626,8 +1626,8 @@ fn project(
                 type_ids: &cut_ids,
                 source_retained_bytes: SOURCE,
                 limits: CutsProjectionLimits {
-                    node: node_limits(),
-                    binding: binding_limits(),
+                    node: Some(node_limits()),
+                    binding: Some(binding_limits()),
                 },
             },
             &mut |f: &NodeProjectionFacts| {

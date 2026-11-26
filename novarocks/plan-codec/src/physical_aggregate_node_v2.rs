@@ -51,7 +51,7 @@ pub(crate) use collections::{
 #[derive(Clone, Copy, Debug)]
 pub struct AggregateNodeProjectionLimits<N = NodeProjectionLimits> {
     pub node: N,
-    pub binding: BindingProjectionLimits,
+    pub binding: Option<BindingProjectionLimits>,
 }
 impl<N: Into<Option<NodeProjectionLimits>>> AggregateNodeProjectionLimits<N> {
     fn capture_node_profile(self) -> AggregateNodeProjectionLimits<Option<NodeProjectionLimits>> {

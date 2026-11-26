@@ -51,8 +51,8 @@ type Error = TableWriteNodeCodecError;
 #[derive(Clone, Copy, Debug)]
 pub struct TableWriteNodeProjectionLimits<N = NodeProjectionLimits> {
     pub node: N,
-    pub binding: BindingProjectionLimits,
-    pub schema: WriterSchemaProjectionLimits,
+    pub binding: Option<BindingProjectionLimits>,
+    pub schema: Option<WriterSchemaProjectionLimits>,
 }
 impl<N: Into<Option<NodeProjectionLimits>>> TableWriteNodeProjectionLimits<N> {
     fn capture_node_profile(self) -> TableWriteNodeProjectionLimits<Option<NodeProjectionLimits>> {

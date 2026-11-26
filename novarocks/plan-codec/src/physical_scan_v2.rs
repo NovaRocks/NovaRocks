@@ -37,15 +37,19 @@ use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError, CompilePhase};
 
 #[derive(Clone, Copy, Debug)]
-pub struct ScanProjectionLimits<N = NodeProjectionLimits> {
+pub struct ScanProjectionLimits<N = NodeProjectionLimits, R = RelationProjectionLimits> {
     pub node: N,
-    pub relation: RelationProjectionLimits,
+    pub relation: R,
 }
-impl<N: Into<Option<NodeProjectionLimits>>> ScanProjectionLimits<N> {
-    fn capture_node_profile(self) -> ScanProjectionLimits<Option<NodeProjectionLimits>> {
+impl<N: Into<Option<NodeProjectionLimits>>, R: Into<Option<RelationProjectionLimits>>>
+    ScanProjectionLimits<N, R>
+{
+    fn capture_node_profile(
+        self,
+    ) -> ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>> {
         ScanProjectionLimits {
             node: self.node.into(),
-            relation: self.relation,
+            relation: self.relation.into(),
         }
     }
 }
@@ -131,7 +135,7 @@ fn physical_model(
     input: &p::PhysicalNode,
     body: &Physical<'_>,
     source: usize,
-    limits: ScanProjectionLimits<Option<NodeProjectionLimits>>,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     source_work: SourceWork,
     admit: &mut Option<&mut NodeAdmit<'_>>,
     work: &mut CompileCheckpoints<'_>,
@@ -216,7 +220,7 @@ fn prepare_encode(
     values: &EncodedValues<'_, '_, '_>,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    limits: ScanProjectionLimits<Option<NodeProjectionLimits>>,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScanNodeProjectionFacts, Error> {
     prepare_encode_core(
@@ -236,7 +240,7 @@ fn prepare_encode_core(
     values: &EncodedValues<'_, '_, '_>,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    limits: ScanProjectionLimits<Option<NodeProjectionLimits>>,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     mut admit: Option<&mut NodeAdmit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScanNodeProjectionFacts, Error> {
@@ -354,7 +358,7 @@ fn prepare_decode<'namespace, 'loan, 'wire, 'control>(
     relations: &'namespace DecodedRelations<'loan, 'wire, 'control>,
     expressions: &DecodedExpressions<'loan, 'wire, 'control>,
     source: usize,
-    limits: ScanProjectionLimits<Option<NodeProjectionLimits>>,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ReadPreparation<'namespace, 'loan, 'wire, 'control>, Error> {
     prepare_decode_core(input, relations, expressions, source, limits, None, work)
@@ -364,7 +368,7 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
     relations: &'namespace DecodedRelations<'loan, 'wire, 'control>,
     expressions: &DecodedExpressions<'loan, 'wire, 'control>,
     source: usize,
-    limits: ScanProjectionLimits<Option<NodeProjectionLimits>>,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     mut admit: Option<&mut NodeAdmit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ReadPreparation<'namespace, 'loan, 'wire, 'control>, Error> {
@@ -595,7 +599,7 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
         None => model.facts(source, values.count(), limits.node, work)?,
     };
     let mut relation_limits = limits.relation;
-    if let Some(node_limits) = limits.node {
+    if let (Some(node_limits), Some(relation_limits)) = (limits.node, relation_limits.as_mut()) {
         let remaining = node_limits
             .max_work
             .checked_sub(prefix.cumulative_work_upper_bound)
@@ -662,7 +666,7 @@ fn emit_encode(
     relations: &EncodedRelations<'_, '_, '_>,
     values: &EncodedValues<'_, '_, '_>,
     source: usize,
-    limits: ScanProjectionLimits<Option<NodeProjectionLimits>>,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::PhysicalNode, Error> {
     let body = physical(input)?;
@@ -709,7 +713,7 @@ fn emit_decode(
     expressions: &DecodedExpressions<'_, '_, '_>,
     prepared: ReadPreparation<'_, '_, '_, '_>,
     source: usize,
-    limits: ScanProjectionLimits<Option<NodeProjectionLimits>>,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(p::PhysicalNode, ScanNodeProjectionFacts), Error> {
     emit_decode_core(input, expressions, prepared, source, limits, None, work)
@@ -719,7 +723,7 @@ fn emit_decode_core(
     expressions: &DecodedExpressions<'_, '_, '_>,
     prepared: ReadPreparation<'_, '_, '_, '_>,
     source: usize,
-    limits: ScanProjectionLimits<Option<NodeProjectionLimits>>,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     admit: Option<&mut NodeAdmit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(p::PhysicalNode, ScanNodeProjectionFacts), Error> {
@@ -794,7 +798,7 @@ pub struct PreparedScanNodeEncode<'node, 'namespace, 'loan, 'source, 'control> {
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source: usize,
-    limits: ScanProjectionLimits<Option<NodeProjectionLimits>>,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     facts: ScanNodeProjectionFacts,
 }
 impl PreparedScanNodeEncode<'_, '_, '_, '_, '_> {
@@ -855,7 +859,7 @@ pub struct PreparedScanNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     prepared: ReadPreparation<'namespace, 'loan, 'wire, 'control>,
     source: usize,
-    limits: ScanProjectionLimits<Option<NodeProjectionLimits>>,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
 }
 impl PreparedScanNodeDecode<'_, '_, '_, '_, '_> {
     pub fn facts(&self) -> &ScanNodeProjectionFacts {
@@ -972,7 +976,10 @@ pub fn prepare_scan_node_encode_in<'node, 'namespace, 'loan, 'source, 'control>(
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source: usize,
-    limits: ScanProjectionLimits<impl Into<Option<NodeProjectionLimits>>>,
+    limits: ScanProjectionLimits<
+        impl Into<Option<NodeProjectionLimits>>,
+        impl Into<Option<RelationProjectionLimits>>,
+    >,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedScanNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
@@ -1002,7 +1009,10 @@ pub fn prepare_scan_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
     relations: &'namespace DecodedRelations<'loan, 'wire, 'control>,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     source: usize,
-    limits: ScanProjectionLimits<impl Into<Option<NodeProjectionLimits>>>,
+    limits: ScanProjectionLimits<
+        impl Into<Option<NodeProjectionLimits>>,
+        impl Into<Option<RelationProjectionLimits>>,
+    >,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedScanNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {

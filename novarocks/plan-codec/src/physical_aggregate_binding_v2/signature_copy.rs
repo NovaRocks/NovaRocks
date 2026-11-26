@@ -58,7 +58,7 @@ fn header(
 pub(crate) fn preflight_aggregate_binding_copy(
     source: &AggregateBinding,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>> + Copy,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
     preflight_aggregate_binding_copy_counts(source, model, limits, work)?;
@@ -68,24 +68,24 @@ pub(crate) fn preflight_aggregate_binding_copy(
 pub(crate) fn preflight_aggregate_binding_copy_counts(
     source: &AggregateBinding,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>> + Copy,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
-    counts_core(source, model, limits, None, work)
+    counts_core(source, model, limits.into(), None, work)
 }
 pub(crate) fn preflight_aggregate_binding_copy_counts_in(
     source: &AggregateBinding,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>> + Copy,
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
-    counts_core(source, model, limits, Some(admit), work)
+    counts_core(source, model, limits.into(), Some(admit), work)
 }
 fn counts_core(
     source: &AggregateBinding,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     mut admit: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
@@ -111,24 +111,24 @@ fn counts_core(
 pub(crate) fn preflight_aggregate_binding_copy_types(
     source: &AggregateBinding,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>> + Copy,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
-    types_core(source, model, limits, None, work)
+    types_core(source, model, limits.into(), None, work)
 }
 pub(crate) fn preflight_aggregate_binding_copy_types_in(
     source: &AggregateBinding,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>> + Copy,
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
-    types_core(source, model, limits, Some(admit), work)
+    types_core(source, model, limits.into(), Some(admit), work)
 }
 fn types_core(
     source: &AggregateBinding,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     admit: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {

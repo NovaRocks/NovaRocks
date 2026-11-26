@@ -653,9 +653,9 @@ fn relation_limits() -> RelationProjectionLimits {
 fn dispatch_limits() -> NodeDispatchLimits {
     NodeDispatchLimits {
         node: limits(),
-        binding: binding_limits(),
+        binding: Some(binding_limits()),
         relation: relation_limits(),
-        writer_schema: WriterSchemaProjectionLimits {
+        writer_schema: Some(WriterSchemaProjectionLimits {
             max_fields: 8,
             max_name_bytes: 1024,
             max_type_references: 16,
@@ -663,7 +663,7 @@ fn dispatch_limits() -> NodeDispatchLimits {
             max_allocation_request_bytes: 65536,
             max_coexisting_source_and_request_bytes: COEX,
             max_work: 64 << 20,
-        },
+        }),
     }
 }
 fn finish<T>(

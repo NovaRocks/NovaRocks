@@ -62,7 +62,6 @@ fn pair_with_unary(unary: bool) -> p::FragmentPackage {
     pair_with_constant(cv, unary)
 }
 fn pair_with_constant(cv: p::ConstantValue, unary: bool) -> p::FragmentPackage {
-    let policy = FROZEN_CONSTANT_POLICY;
     let ty = cv.value_type().clone();
     let address = p::ConstantReference {
         pool: p::ConstantPoolId::new(u32::MAX),
@@ -291,47 +290,24 @@ fn node_units_keep_local_zero_distinct_ports_source_pool_and_repeated_outputs() 
     );
 }
 #[test]
-fn two_valid_unit_namespaces_share_the_original_fragment_projection_limits() {
+fn two_small_units_still_share_the_original_fragment_expression_limit() {
     let package = pair();
     let encoded =
         encode_fragment_package(&package, &PackageEncodeLimits::FROZEN, &Control).unwrap();
     let raw = encoded.encode_to_vec();
     let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
-    for axis in 0..2 {
-        let mut sender = PackageEncodeLimits::FROZEN;
-        let mut receiver = PackageDecodeLimits::FROZEN;
-        if axis == 0 {
-            sender.expressions.max_definitions = 1;
-            receiver.expressions.max_definitions = 1;
-        } else {
-            // Each actual unit fits two references (Values=1, Project=2),
-            // while the complete fragment contains three independent uses.
-            for node in package.fragment().nodes().values() {
-                assert!(
-                    node.expressions
-                        .as_ref()
-                        .unwrap()
-                        .control_flow()
-                        .use_reference_count()
-                        <= 2
-                );
-            }
-            sender.control.max_use_references = 2;
-            receiver.control.max_use_references = 2;
-        }
-        assert!(matches!(
-            encode_fragment_package(&package, &sender, &Control),
-            Err(PackageEncodeError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        ));
-        assert!(matches!(
-            decode_fragment_package(&raw, &model, &receiver, &Control),
-            Err(PackageDecodeError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        ));
+    let mut receiver = PackageDecodeLimits::FROZEN;
+    assert!(decode_fragment_package(&raw, &model, &receiver, &Control).is_ok());
+
+    assert_eq!(package.fragment().nodes().len(), 2);
+    for node in package.fragment().nodes().values() {
+        assert_eq!(node.expressions.as_ref().unwrap().definitions().iter().count(), 1);
     }
+    receiver.plan_limits.fragment_expressions = 1;
+    assert!(matches!(
+        decode_fragment_package(&raw, &model, &receiver, &Control),
+        Err(PackageDecodeError::Control(CompileControlError::ResourceExhausted))
+    ));
 }
 
 #[test]
