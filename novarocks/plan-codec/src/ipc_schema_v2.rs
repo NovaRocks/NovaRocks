@@ -44,7 +44,9 @@ const MAX_SCHEMA_VERIFIER_DEPTH: usize = novarocks_type_contract::MAX_VALUE_TYPE
 /// Requests from the original IPC writer to the active construction scope.
 #[derive(Clone, Copy, Debug)]
 pub enum ConstantWriteRequest {
+    /// The next reserve uses this exact allocation layout.
     Layout(std::alloc::Layout),
+    /// Aggregate scratch requests inside the pinned writer operation.
     OpaqueUpperBound(usize),
 }
 pub(crate) type WriteRequest<'a, H> =
@@ -65,7 +67,7 @@ fn checked_field_source(
 ) -> Result<(usize, usize), TypeCodecError> {
     use novarocks_type_contract::{
         MAX_VALUE_TYPE_NODES, owned_resources::arrow_metadata,
-        validate_value_type_structure_with_scratch_observed,
+        validate_arrow_layout_structure_with_scratch_observed,
     };
     let mut bytes = 0usize;
     let mut type_nodes = 0usize;
@@ -83,8 +85,10 @@ fn checked_field_source(
         Ok::<_, TypeCodecError>(())
     };
     add_field(field, work)?;
+    work.flush()?;
     let mut scratch = [None; MAX_VALUE_TYPE_NODES];
-    validate_value_type_structure_with_scratch_observed(
+    work.flush()?;
+    validate_arrow_layout_structure_with_scratch_observed(
         field.data_type(),
         &mut scratch,
         |event| {
