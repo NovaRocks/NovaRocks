@@ -142,7 +142,7 @@ fn canonical_constant_creator_cases() {
     use arrow::array::{ListArray, NullArray, StructArray};
     use arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use arrow::datatypes::Field;
-    use novarocks_functions::{ConstantPool, ConstantValidation};
+    use novarocks_functions::ConstantPool;
 
     for (finite, bufferless) in [(false, false), (true, false), (false, true)] {
         let drops = Arc::new(AtomicUsize::new(0));

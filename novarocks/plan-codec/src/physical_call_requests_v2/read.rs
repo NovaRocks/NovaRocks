@@ -504,7 +504,7 @@ fn preflight<F: ReadFailure, W: RequestWire>(
     observed(model.admit(limits, parent), w)?;
     // Only the explicit bounded fixture accepts a retained-source invoice.
     // The production request links to the original, already owned pools.
-    if limits.is_some() {
+    if matches!(limits, Profile::Receiving(_)) {
         let mut maximum_pool_backing = 0;
         for pool in pools.entries().values() {
             let retained = usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
