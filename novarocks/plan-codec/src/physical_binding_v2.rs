@@ -162,7 +162,7 @@ pub struct BindingProjectionLimits {
     pub max_coexisting_source_and_request_bytes: usize,
     pub max_work: usize,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BindingProjectionFacts {
     pub definition_count: usize,
     pub type_reference_count: usize,

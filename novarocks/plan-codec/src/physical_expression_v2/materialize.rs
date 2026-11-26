@@ -183,7 +183,7 @@ pub struct PreparedExpressionMaterialization<'loan, 'headers, 'wire, 'control> {
     functions: &'loan MaterializedFunctionBindings<'headers, 'wire>,
     aggregates: &'loan MaterializedAggregateBindings<'loan, 'headers, 'wire>,
     facts: Facts,
-    limits: Limits,
+    limits: Option<Limits>,
     source_invoice: usize,
     retained_bytes: usize,
 }
@@ -217,7 +217,7 @@ fn function<'a>(
 fn list<T>(
     model: &mut MaterializationModel,
     n: usize,
-    l: BindingProjectionLimits,
+    l: Option<BindingProjectionLimits>,
 ) -> Result<(), Error> {
     model.items = add(model.items, n)?;
     model.request::<T>(n, 2)?;
@@ -228,7 +228,7 @@ fn list<T>(
 fn check_model(
     model: &mut MaterializationModel,
     refs: usize,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     admission: &mut Admission<'_, '_>,
 ) -> Result<(), Error> {
     model.check(limits)?;
@@ -248,7 +248,7 @@ fn parent_gate(
 fn clone_preflight(
     source: &FunctionValueType,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     refs: usize,
     admission: &mut Admission<'_, '_>,
     work: &mut CompileCheckpoints<'_>,
@@ -268,7 +268,7 @@ fn type_root_preflight(
     types: &DecodedTypeTable,
     id: u32,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     refs: usize,
     admission: &mut Admission<'_, '_>,
     work: &mut CompileCheckpoints<'_>,
@@ -314,7 +314,9 @@ fn preflight(
     // Count and the original Fragment limit are known before any output walk.
     cap(n, plan_limits.fragment_expressions)?;
     let refs = expressions.facts().expression_reference_count;
-    cap(refs, limits.max_expression_references)?;
+    if let Some(limits) = limits {
+        cap(refs, limits.max_expression_references)?;
+    }
     // These three floor authors contain only checked numerical operations.
     // The caller-owned path must lift their known overflow before any later
     // namespace observation; Plain keeps its original error and trace.
@@ -342,7 +344,7 @@ fn preflight(
             aggregates.definitions().len(),
         )?,
     )?)?;
-    let bl = binding_limits(limits);
+    let bl = limits.map(binding_limits);
     check_model(&mut model, refs, bl, admission)?;
     if admission.observed() {
         w.step()?;
@@ -505,7 +507,7 @@ pub fn prepare_expression_materialization<'loan, 'headers, 'wire, 'control>(
     let mut admission = Admission {
         parent: None,
         source: source_retained_bytes,
-        limits,
+        limits: Some(limits),
     };
     let result = prepare_core(
         expressions,
@@ -517,13 +519,15 @@ pub fn prepare_expression_materialization<'loan, 'headers, 'wire, 'control>(
     );
     finish(w, result)
 }
+/// Passing None derives a checked owned-layout model from the original
+/// namespaces. The fragment expression limit and caller admission still apply.
 pub fn prepare_expression_materialization_in<'loan, 'headers, 'wire, 'control>(
     expressions: &'loan DecodedExpressions<'headers, 'wire, 'control>,
     functions: &'loan MaterializedFunctionBindings<'headers, 'wire>,
     aggregates: &'loan MaterializedAggregateBindings<'loan, 'headers, 'wire>,
     plan_limits: &'loan p::PlanLimits,
     source_retained_bytes: usize,
-    limits: Limits,
+    limits: impl Into<Option<Limits>>,
     admit: &mut Admit<'_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedExpressionMaterialization<'loan, 'headers, 'wire, 'control>, Error> {
@@ -531,7 +535,7 @@ pub fn prepare_expression_materialization_in<'loan, 'headers, 'wire, 'control>(
     let mut admission = Admission {
         parent: Some(admit),
         source: source_retained_bytes,
-        limits,
+        limits: limits.into(),
     };
     prepare_core(
         expressions,

@@ -653,10 +653,10 @@ pub(crate) fn verify_scalar_signature(
     left: &BoundFunction,
     right: &BoundFunction,
     source: usize,
-    max_work: usize,
+    max_work: impl Into<Option<usize>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<VerifiedSignature, BindingCodecError> {
-    let result = verify_signature_inner(left, right, source, max_work, None, work);
+    let result = verify_signature_inner(left, right, source, max_work.into(), None, work);
     if matches!(&result, Err(BindingCodecError::Control(_))) {
         return result;
     }
@@ -668,11 +668,11 @@ pub(crate) fn verify_scalar_signature_admitted(
     left: &BoundFunction,
     right: &BoundFunction,
     source: usize,
-    max_work: usize,
+    max_work: impl Into<Option<usize>>,
     admit: &mut dyn FnMut(usize) -> Result<(), BindingCodecError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<VerifiedSignature, BindingCodecError> {
-    let result = verify_signature_inner(left, right, source, max_work, Some(admit), work);
+    let result = verify_signature_inner(left, right, source, max_work.into(), Some(admit), work);
     if matches!(&result, Err(BindingCodecError::Control(_))) {
         return result;
     }
@@ -683,7 +683,7 @@ fn verify_signature_inner(
     left: &BoundFunction,
     right: &BoundFunction,
     source: usize,
-    max_work: usize,
+    max_work: Option<usize>,
     mut admit: Option<&mut dyn FnMut(usize) -> Result<(), BindingCodecError>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<VerifiedSignature, BindingCodecError> {
@@ -695,7 +695,7 @@ fn verify_signature_inner(
         |bound: usize,
          parent: &mut Option<&mut dyn FnMut(usize) -> Result<(), BindingCodecError>>| {
             if let Some(parent) = parent.as_mut() {
-                if bound > max_work {
+                if max_work.is_some_and(|max_work| bound > max_work) {
                     return Err(CompileControlError::ResourceExhausted.into());
                 }
                 parent(bound)?;
@@ -726,7 +726,7 @@ fn verify_signature_inner(
             "binding source invoice omits original signature roots",
         ));
     }
-    if max_work == 0 {
+    if max_work == Some(0) {
         return Err(invalid("binding signature work exceeds its envelope"));
     }
     if same {
@@ -760,7 +760,7 @@ fn verify_signature_inner(
         gate(bound, &mut admit)?;
         work.step()?;
     }
-    if bound > max_work {
+    if max_work.is_some_and(|max_work| bound > max_work) {
         return Err(invalid("binding signature work exceeds its envelope"));
     }
     let mut facts = VerifiedSignature {
@@ -788,8 +788,12 @@ fn verify_signature_inner(
     let mut compare =
         |left: &FunctionValueType, right: &FunctionValueType| -> Result<bool, BindingCodecError> {
             let remaining = max_work
-                .checked_sub(facts.work)
-                .ok_or_else(|| invalid("binding signature work exceeds its envelope"))?;
+                .map(|max_work| {
+                    max_work
+                        .checked_sub(facts.work)
+                        .ok_or_else(|| invalid("binding signature work exceeds its envelope"))
+                })
+                .transpose()?;
             let base = facts.work;
             let compared = if let Some(parent) = admit.as_mut() {
                 crate::borrowed_type_resources::verify_type_binding_admitted(
@@ -799,7 +803,7 @@ fn verify_signature_inner(
                     remaining,
                     &mut |prefix| {
                         let total = add(base, prefix.work_upper_bound())?;
-                        if total > max_work {
+                        if max_work.is_some_and(|max_work| total > max_work) {
                             return Err(CompileControlError::ResourceExhausted.into());
                         }
                         parent(total)

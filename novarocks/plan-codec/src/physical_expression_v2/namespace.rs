@@ -122,7 +122,7 @@ pub struct PreparedExpressionNamespaceWrite<'loan, 'source, 'control> {
     facts: ExpressionNamespaceWriteFacts,
     control: &'control dyn PureCompileControl,
     source_retained_bytes: usize,
-    limits: ExpressionProjectionLimits,
+    limits: Option<ExpressionProjectionLimits>,
 }
 /// The private DTO and the original immutable source loans form one emission.
 /// Borrowing this owner never clones a type, signature or constant backing.
@@ -381,9 +381,12 @@ pub(super) fn bytes<T>(count: usize) -> Result<usize, Error> {
 }
 pub(super) fn cap(
     actual: usize,
-    limit: usize,
+    limit: impl Into<Option<usize>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
+    let Some(limit) = limit.into() else {
+        return Ok(());
+    };
     let allowed = actual <= limit;
     work.step()?;
     if !allowed {
@@ -393,9 +396,12 @@ pub(super) fn cap(
 }
 pub(super) fn check(
     facts: &ExpressionNamespaceWriteFacts,
-    limits: ExpressionProjectionLimits,
+    limits: Option<ExpressionProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
+    let Some(limits) = limits else {
+        return Ok(());
+    };
     cap(facts.definition_count, limits.max_definitions, work)?;
     cap(facts.type_reference_count, limits.max_type_references, work)?;
     cap(
@@ -441,13 +447,13 @@ pub(super) fn vector<T>(
 pub(super) fn charge(
     facts: &mut ExpressionNamespaceWriteFacts,
     value: usize,
-    limits: ExpressionProjectionLimits,
+    limits: Option<ExpressionProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
     facts.cumulative_work_upper_bound = add(facts.cumulative_work_upper_bound, value)?;
     cap(
         facts.cumulative_work_upper_bound,
-        limits.max_cumulative_work,
+        limits.map(|limits| limits.max_cumulative_work),
         work,
     )
 }
@@ -481,7 +487,7 @@ pub(super) fn compare_types(
         )?;
         cap(
             facts.cumulative_work_upper_bound,
-            admission.limits.max_cumulative_work,
+            admission.limits.map(|limits| limits.max_cumulative_work),
             work,
         )?;
         Ok(verified)
@@ -515,7 +521,7 @@ pub(super) fn preflight_types(
         )?;
         cap(
             facts.cumulative_work_upper_bound,
-            admission.limits.max_cumulative_work,
+            admission.limits.map(|limits| limits.max_cumulative_work),
             work,
         )?;
         Ok(verified)
@@ -568,7 +574,7 @@ fn compare_scalar(
         )?;
         cap(
             facts.cumulative_work_upper_bound,
-            admission.limits.max_cumulative_work,
+            admission.limits.map(|limits| limits.max_cumulative_work),
             work,
         )?;
         Ok(verified)
@@ -661,7 +667,7 @@ pub fn prepare_expression_definitions<'loan, 'source, 'control>(
         parameters,
         pools,
         source_retained_bytes,
-        limits,
+        Some(limits),
         control,
         None,
         &mut work,
@@ -672,6 +678,8 @@ pub fn prepare_expression_definitions<'loan, 'source, 'control>(
     clippy::too_many_arguments,
     reason = "The namespace boundary keeps original inputs, frozen limits, admission, and caller checkpoints explicit."
 )]
+/// Passing None derives checked projection facts from the original definitions
+/// and borrowed namespaces, with admission supplied by the caller.
 pub fn prepare_expression_definitions_in<'loan, 'source, 'control>(
     unit: Option<ExpressionDefinitionSource<'loan>>,
     inputs: &'loan [ExpressionTypeIds<'source>],
@@ -681,7 +689,7 @@ pub fn prepare_expression_definitions_in<'loan, 'source, 'control>(
     parameters: &'loan SemanticParameters,
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
-    limits: ExpressionProjectionLimits,
+    limits: impl Into<Option<ExpressionProjectionLimits>>,
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedExpressionNamespaceWrite<'loan, 'source, 'control>, Error> {
@@ -694,7 +702,7 @@ pub fn prepare_expression_definitions_in<'loan, 'source, 'control>(
         parameters,
         pools,
         source_retained_bytes,
-        limits,
+        limits.into(),
         work.control(),
         Some(admit),
         work,
@@ -713,7 +721,7 @@ fn prepare_core<'loan, 'source, 'control>(
     parameters: &'loan SemanticParameters,
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
-    limits: ExpressionProjectionLimits,
+    limits: Option<ExpressionProjectionLimits>,
     control: &'control dyn PureCompileControl,
     parent: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
@@ -736,7 +744,7 @@ fn prepare_core<'loan, 'source, 'control>(
             facts = admission.numeric(initial_facts(count))?;
             admission.gate(&mut facts)?;
         }
-        cap(count, limits.max_definitions, work)?;
+        cap(count, limits.map(|limits| limits.max_definitions), work)?;
         let same_count = count == inputs.len();
         work.step()?;
         if !same_count {
@@ -779,7 +787,7 @@ fn prepare_core<'loan, 'source, 'control>(
         }
         cap(
             facts.cumulative_work_upper_bound,
-            limits.max_cumulative_work,
+            limits.map(|limits| limits.max_cumulative_work),
             work,
         )?;
         let mut counts = KindCounts::default();
