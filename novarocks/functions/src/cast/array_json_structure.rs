@@ -178,7 +178,16 @@ pub(in crate::cast) fn evaluate_row(
         .as_any()
         .downcast_ref::<LargeBinaryArray>()
         .ok_or_else(|| invalid("JSON structure CAST lost its LargeBinary source"))?;
-    match convert(input.value(row), &recipe.result, ordinal, staging, work) {
+    let previous_bytes = staging.bytes();
+    let converted = convert(input.value(row), &recipe.result, ordinal, staging, work);
+    if matches!(&converted, Ok(Err(_)) | Err(CastFault::Data(_)))
+        && staging.bytes() != previous_bytes
+    {
+        // The failed row's builders have already been destroyed.
+        let mut no_growth = staging.reserve_operation(0)?;
+        staging.reconcile_under_reservation(previous_bytes, &mut no_growth)?;
+    }
+    match converted {
         Ok(value) => Ok(value),
         Err(CastFault::Outer(error)) => Err(error),
         Err(CastFault::Data(detail)) => Ok(Err(RowDataError::with_reason(
