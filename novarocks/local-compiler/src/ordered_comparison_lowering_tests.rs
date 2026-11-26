@@ -446,7 +446,6 @@ fn rand_operand_fixture(
         Some(&selected),
         Some(request),
         &[call],
-        options().constants,
     )
     .unwrap();
     Fixture {

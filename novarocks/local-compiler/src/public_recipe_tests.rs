@@ -124,14 +124,7 @@ fn arithmetic_fixture(
             Box::from([value]),
         )
         .unwrap();
-    seal_units(
-        &mut builder,
-        &functions(),
-        None,
-        None,
-        &[],
-        options().constants,
-    )?;
+    seal_units(&mut builder, &functions(), None, None, &[])?;
     let fragment = builder.finish_definition(
         NodeId::new(0),
         FragmentSink::Result,
