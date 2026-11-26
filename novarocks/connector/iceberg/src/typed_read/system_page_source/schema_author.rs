@@ -724,7 +724,6 @@ fn private_value(
             let semantic_matches = match value.kind() {
                 ValueKind::String => *primitive == PrimitiveType::String,
                 ValueKind::Binary => *primitive == PrimitiveType::Binary,
-                ValueKind::Nominal(ValueLogicalType::Json) => *primitive == PrimitiveType::String,
                 ValueKind::Scalar(scalar) => scalar == layout,
                 _ => false,
             };

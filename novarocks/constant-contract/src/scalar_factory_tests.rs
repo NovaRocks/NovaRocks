@@ -325,20 +325,23 @@ fn byte_factories_build_each_exact_offset_or_view_carrier_without_domain_downgra
             assert!(cv.try_utf8().is_err());
         }
     }
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
-    let cv = ConstantValue::from_utf8(
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let cv = ConstantValue::from_binary(
         field(&json),
         json.clone(),
-        "{\"x\":1}",
+        b"\x01\x20",
         policy(),
         CompilePhase::Validate,
         &Control::default(),
     )
     .unwrap();
     assert_eq!(cv.value_type(), &json);
-    assert_eq!(cv.try_utf8().unwrap(), Some("{\"x\":1}"));
+    assert_eq!(cv.try_binary().unwrap(), Some(b"\x01\x20".as_slice()));
     let variant = FunctionValueType::try_with_logical_type(
         DataType::LargeBinary,
         false,

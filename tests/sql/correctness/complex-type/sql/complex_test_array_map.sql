@@ -127,7 +127,7 @@ WITH "CTE" AS (
 -- query 13
 USE ${case_db};
 with t1 as (
- select parse_json('[{"open_id": "aaa", "num": 1},{"open_id": "bbb", "num": 2},{"open_id": "ccc", "num": 3}]') as price_list
+ select json_parse('[{"open_id": "aaa", "num": 1},{"open_id": "bbb", "num": 2},{"open_id": "ccc", "num": 3}]') as price_list
 ),t2 as (
  select price_list,transform(cast(price_list as array<json>), x -> get_json_string(x,'$.open_id')) as  fields
  from t1  

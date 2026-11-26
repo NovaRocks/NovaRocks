@@ -15,20 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Retained JSON_OBJECT SQL/package/Frame boundary properties for F3.
+//! JSON_OBJECT SQL/package/Frame boundary properties.
 //!
 //! SQL owns binding and type facts; LocalCompiler and Frame consume the actual
-//! frozen packages. Expected strings below follow the explicit input pairs:
-//! JSON text is parsed and its object keys are ordered, while ordinary text is
-//! quoted. No legacy evaluator or differential harness supplies expected values.
+//! frozen packages. FORMAT JSON parses text and preserves object member order.
+//! Unformatted text becomes a JSON string.
 
 use novarocks_expression::testkit::PassThroughCallHost;
-use novarocks_expression::{EvaluationInput, ExprEvaluationFailure, StaticExprKind};
+use novarocks_expression::{EvaluationInput, StaticExprKind};
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, StringArray};
+use arrow::array::{Array, ArrayRef, LargeBinaryArray, StringArray};
 use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
+use novarocks_functions::json_value::{self, JsonWork};
 use novarocks_functions::{
     KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope,
     Selection,
@@ -39,8 +39,11 @@ use novarocks_type_contract::{
 
 use novarocks_sql_testkit::sql_source_with_declared_fields;
 
+const JSON_OBJECT: &str = "builtin.scalar/__json_object_null/v1";
+
 fn result() -> FunctionValueType {
-    FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap()
+    FunctionValueType::try_with_logical_type(DataType::LargeBinary, false, ValueLogicalType::Json)
+        .unwrap()
 }
 
 #[derive(Default)]
@@ -55,8 +58,24 @@ impl KernelEvaluationControl for FrameControl {
     }
 }
 
+impl JsonWork for FrameControl {
+    type Reservation = ();
+
+    fn step(&mut self) -> Result<(), KernelFailure> {
+        self.checkpoint(1)
+    }
+
+    fn reserve(&mut self, _: usize) -> Result<Self::Reservation, KernelFailure> {
+        Ok(())
+    }
+
+    fn reserve_output(&mut self, _: usize) -> Result<(), KernelFailure> {
+        Ok(())
+    }
+}
+
 #[test]
-fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_data() {
+fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_selected_row_errors() {
     use novarocks_expression::CompiledExpressionInstance;
     use novarocks_expression_contract::ExprKind;
     use novarocks_functions::testkit::installed_builtin_owner_catalogue;
@@ -65,7 +84,6 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
 
     {
         for scenario in 0..5 {
-            let complex_key = matches!(scenario, 1..=3);
             let mut fields = vec![
                 Field::new("k", DataType::Utf8, true),
                 Field::new("v", DataType::Utf8, true),
@@ -75,10 +93,16 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                 fields.push(Field::new("id", DataType::Int32, true));
             }
             let sql = match scenario {
-                0 => "SELECT json_object(k: v) AS j FROM t",
-                1 => "SELECT json_object([n]: v) AS j FROM t",
-                2 => "SELECT json_object(NULL: json_object([n]: v)) AS j FROM t",
-                3 | 4 => "SELECT json_object([[id, n]][IF(id = 2, NULL, 1)]: v) AS j FROM t",
+                0 => "SELECT JSON_OBJECT(KEY k VALUE v FORMAT JSON RETURNING JSON) AS j FROM t",
+                1 => {
+                    "SELECT JSON_OBJECT(KEY CAST(n AS VARCHAR) VALUE v FORMAT JSON RETURNING JSON) AS j FROM t"
+                }
+                2 => {
+                    "SELECT JSON_OBJECT(KEY CAST(NULL AS VARCHAR) VALUE JSON_OBJECT(KEY CAST(n AS VARCHAR) VALUE v FORMAT JSON RETURNING JSON) RETURNING JSON) AS j FROM t"
+                }
+                3 | 4 => {
+                    "SELECT JSON_OBJECT(KEY CAST((ARRAY[ARRAY[id, n]][IF(id = 2, NULL, 1)])[1] AS VARCHAR) VALUE v RETURNING JSON) AS j FROM t"
+                }
                 _ => unreachable!(),
             };
             let source = sql_source_with_declared_fields(sql, &fields);
@@ -90,12 +114,18 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                     let ExprKind::FunctionCall { function, args } = &expression.kind else {
                         continue;
                     };
-                    if function.function_id.as_str() != "builtin.scalar/json_object/v1" {
+                    if function.function_id.as_str() != JSON_OBJECT {
                         continue;
                     }
                     assert_eq!(expression.ty, result());
                     assert_eq!(function.result_type, expression.ty);
                     assert_eq!(args.len(), 2);
+                    let key = &unit.definition(args[0]).unwrap().ty;
+                    let value = &unit.definition(args[1]).unwrap().ty;
+                    assert_eq!(key.data_type(), &DataType::Utf8);
+                    assert_eq!(key.logical_type(), ValueLogicalType::Physical);
+                    assert_eq!(value.data_type(), &DataType::LargeBinary);
+                    assert_eq!(value.logical_type(), ValueLogicalType::Json);
                     let request = unit.requests().get(id).unwrap();
                     assert_eq!(request.logical_argument_count, 2);
                     assert_eq!(request.arguments.len(), 2);
@@ -113,7 +143,8 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                     )
                     .unwrap();
                 }
-                let mut accesses = 0;
+                let mut array_accesses = 0;
+                let mut key_accesses = 0;
                 for fragment in source.plan().fragments().values() {
                     for (_source_node, unit, _, expression) in
                         novarocks_sql_testkit::unit_definitions(fragment)
@@ -126,8 +157,13 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                         {
                             continue;
                         }
-                        accesses += 1;
                         assert_eq!(args.len(), 2);
+                        if expression.ty.data_type() == &DataType::Int64 {
+                            key_accesses += 1;
+                            assert!(expression.ty.nullable());
+                            continue;
+                        }
+                        array_accesses += 1;
                         assert_eq!(
                             expression.ty.data_type(),
                             &DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
@@ -177,7 +213,11 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                         }
                     }
                 }
-                assert_eq!(accesses, 1, "real nested List subscript is present");
+                assert_eq!(array_accesses, 1, "real nested List subscript is present");
+                assert_eq!(
+                    key_accesses, 1,
+                    "string key reads the nested List's first value"
+                );
             }
 
             let programs = compiler_results(&source, &installed_builtin_owner_catalogue());
@@ -191,9 +231,7 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                     let Some(call) = unit.calls().get(use_id) else {
                         continue;
                     };
-                    if call.call_contract().function_id().as_str()
-                        != "builtin.scalar/json_object/v1"
-                    {
+                    if call.call_contract().function_id().as_str() != JSON_OBJECT {
                         continue;
                     }
                     assert_eq!(call.call_contract().logical_argument_count(), 2);
@@ -205,6 +243,10 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                         call.call_contract().effects().null_behavior,
                         novarocks_type_contract::FunctionNullBehavior::CalledOnNull
                     );
+                    assert_eq!(
+                        call.call_contract().effects().own_row_error,
+                        novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
+                    );
                     assert_eq!(unit.control_flow().uses()[use_id].arguments.len(), 2);
                     let flow = unit.control_flow();
                     let arena = unit.definitions();
@@ -213,7 +255,7 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                     else {
                         panic!("real JSON producer");
                     };
-                    let key_slot = if complex_key || scenario == 4 {
+                    let key_slot = if scenario != 0 {
                         None
                     } else {
                         assert!(
@@ -228,29 +270,41 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                             ),
                         )
                     };
-                    let value_use = if scenario == 2 {
+                    let json_use = if scenario == 2 {
                         let inner = flow.uses()[use_id].arguments[1];
                         flow.uses()[&inner].arguments[1]
                     } else {
                         flow.uses()[use_id].arguments[1]
                     };
-                    let value = if scenario == 2 {
-                        let StaticExprKind::BoundCall { args: inner, .. } =
-                            arena.node(args[1]).unwrap().kind()
-                        else {
-                            panic!("required original inner call");
-                        };
-                        inner[1]
+                    let expected_value_owner = if scenario < 3 {
+                        "builtin.scalar/__json_read_text/v1"
                     } else {
-                        args[1]
+                        "builtin.scalar/json_scalar/v1"
+                    };
+                    assert_eq!(
+                        unit.calls()[&json_use]
+                            .call_contract()
+                            .function_id()
+                            .as_str(),
+                        expected_value_owner
+                    );
+                    let json_value = &flow.uses()[&json_use];
+                    let [value_use] = &json_value.arguments[..] else {
+                        panic!("the JSON value conversion reads one input");
                     };
                     assert!(
-                        matches!(arena.node(value).unwrap().kind(), StaticExprKind::Input),
+                        matches!(
+                            arena
+                                .node(flow.uses()[value_use].definition)
+                                .unwrap()
+                                .kind(),
+                            StaticExprKind::Input
+                        ),
                         "real value Input"
                     );
                     let value_slot =
                         novarocks_test_compile_to_execute::programs::project_input_slot_for_use(
-                            &program, site, value_use,
+                            &program, site, *value_use,
                         );
                     assert!(
                         producer
@@ -296,7 +350,15 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                         vec![Some("a"), None, Some("b")]
                     } else {
                         assert_eq!(*slot, value_slot, "the real ordered value channel");
-                        vec![Some("{\"z\":2,\"a\":1}"), None, Some("ordinary text")]
+                        vec![
+                            Some("{\"z\":2,\"a\":1}"),
+                            None,
+                            Some(if scenario < 3 {
+                                "\"ordinary text\""
+                            } else {
+                                "ordinary text"
+                            }),
+                        ]
                     })) as ArrayRef,
                     other => panic!("exact authored input {other:?}"),
                 })
@@ -312,71 +374,74 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                 Some(tracker.clone()),
             )
             .unwrap();
-            let rows: &[usize] = if scenario == 4 { &[1] } else { &[0, 2] };
-            let selection = Selection::try_sparse(3, rows).unwrap();
-            let output = frame.evaluate(
-                EvaluationInput::Batch {
-                    batch: &batch,
-                    source: None,
-                },
-                ScalarInvocationScope::new(selection, selection),
-                ScalarInvocationActivation::Activated,
-                &FrameControl,
-                &mut PassThroughCallHost,
-            );
-            if complex_key {
-                let error = output.unwrap_err();
-                let ExprEvaluationFailure::Data(data) = &error else {
-                    panic!("whole-call complex-key Data: {error:?}")
-                };
-                let data = data.clone();
-                drop(error);
-                assert_eq!(
-                    data.message(),
-                    "json_object key does not support complex type"
-                );
-                assert_eq!(data.source_row(0), Some(0));
-                assert_eq!(data.source_row(1), Some(2));
-                assert!(matches!(
-                    frame.evaluate(
-                        EvaluationInput::Batch {
-                            batch: &batch,
-                            source: None
-                        },
-                        ScalarInvocationScope::new(selection, selection),
-                        ScalarInvocationActivation::Activated,
-                        &FrameControl,
-                        &mut PassThroughCallHost,
-                    ),
-                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
-                ));
-                drop(frame);
-                assert!(
-                    tracker.outstanding() > 0,
-                    "Data retains actual host funding"
-                );
-                drop(data);
+            let rows: &[usize] = if matches!(scenario, 1 | 4) {
+                &[1, 2]
             } else {
-                let output = output.unwrap();
-                assert!(output.errors().is_empty());
-                let text = output
-                    .values()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                if scenario == 4 {
-                    assert_eq!(text.len(), 1);
-                    assert!(
-                        text.is_null(0),
-                        "a NULL nested index yields a successful NULL key"
+                &[0, 2]
+            };
+            let selection = Selection::try_sparse(3, rows).unwrap();
+            let output = frame
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &FrameControl,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
+            assert_eq!(output.selection(), selection);
+            let expected = match scenario {
+                0 => [
+                    Some(r#"{"a":{"z":2,"a":1}}"#),
+                    Some(r#"{"b":"ordinary text"}"#),
+                ],
+                1 => [None, Some(r#"{"3":"ordinary text"}"#)],
+                2 => [None, None],
+                3 => [
+                    Some(r#"{"1":"{\"z\":2,\"a\":1}"}"#),
+                    Some(r#"{"3":"ordinary text"}"#),
+                ],
+                4 => [None, Some(r#"{"3":"ordinary text"}"#)],
+                _ => unreachable!(),
+            };
+            let expected_error_rows: &[usize] = match scenario {
+                0 | 3 => &[],
+                1 | 4 => &[1],
+                2 => &[0, 2],
+                _ => unreachable!(),
+            };
+            assert_eq!(output.errors().len(), expected_error_rows.len());
+            for (error, source_row) in output.errors().iter().zip(expected_error_rows) {
+                assert_eq!(selection.row(error.selected_ordinal()), Some(*source_row));
+                assert_eq!(error.message(), "Null key is not valid in JSON_OBJECT");
+            }
+            let values = output
+                .values()
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            assert_eq!(values.len(), expected.len());
+            for (row, expected) in expected.iter().enumerate() {
+                if let Some(expected) = expected {
+                    assert!(!values.is_null(row));
+                    assert_eq!(
+                        json_value::format(values.value(row), &mut FrameControl).unwrap(),
+                        *expected
                     );
                 } else {
-                    assert_eq!(text.value(0), "{\"a\": {\"a\": 1, \"z\": 2}}");
-                    assert_eq!(text.value(1), "{\"b\": \"ordinary text\"}");
+                    assert!(values.is_null(row));
                 }
-                let alias = output.values().slice(if scenario == 4 { 0 } else { 1 }, 1);
-                drop(output);
-                drop(frame);
+            }
+            let alias = expected
+                .iter()
+                .position(Option::is_some)
+                .map(|row| output.values().slice(row, 1));
+            drop(output);
+            drop(frame);
+            if let Some(alias) = alias {
                 assert!(
                     tracker.outstanding() > 0,
                     "independent Arrow alias retains actual host funding"

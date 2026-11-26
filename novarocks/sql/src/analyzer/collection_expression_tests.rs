@@ -80,9 +80,12 @@ fn json_list_target() -> novarocks_type_contract::FunctionValueType {
         FunctionValueType, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
         ValueTypeStorageLifetime,
     };
-    let item =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let item = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let value = ValueTypeRef::try_new(
         ValueKind::List(item.value_type().clone()),
         true,
@@ -92,8 +95,8 @@ fn json_list_target() -> novarocks_type_contract::FunctionValueType {
     let layout = ValueLayout::try_from_normalized_arrow(
         DataType::List(std::sync::Arc::new(Field::new(
             "item",
-            DataType::Utf8,
-            true,
+            item.data_type().clone(),
+            item.nullable(),
         ))),
         ValueTypeStorageLifetime::pure(),
     )
@@ -151,7 +154,7 @@ fn null_child_arrays_cast_to_the_complete_json_list_declaration() {
         );
         let item = actual.value_type.child_at(0).unwrap();
         assert_eq!(item.logical_type(), ValueLogicalType::Json);
-        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(item.data_type(), &DataType::LargeBinary);
         assert!(item.nullable());
         assert!(!actual.value_type.nullable());
         let ExprKind::Cast { expr, target, .. } = &actual.kind else {

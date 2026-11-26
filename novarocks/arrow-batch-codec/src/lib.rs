@@ -21,10 +21,12 @@
 //! precede opaque Arrow work; they do not grant capacity or create retention.
 
 pub mod construction;
+mod json_cells;
 pub mod record_geometry;
 
 mod recipe;
 mod unit;
+pub use json_cells::{JsonCellObserver, visit_json_cells};
 pub use recipe::{BatchRecipe, DictionarySlot, RecipeField, RepresentationPolicy};
 pub use unit::{CodecError, DecodeKind, DecodeMessage, UnitObserver, decode_unit, encode_unit};
 

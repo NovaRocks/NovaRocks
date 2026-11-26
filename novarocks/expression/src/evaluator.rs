@@ -59,6 +59,7 @@ pub struct CompiledExpressionInstance {
     /// role is consulted by the evaluator, including for an empty scope.
     input: RootScope,
     instances: BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
+    json_constants: novarocks_functions::native_inlist::JsonConstantKeyCache,
     has_invocation_data: bool,
     effects: BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     failed: bool,
@@ -634,6 +635,7 @@ impl CompiledExpressionInstance {
             root,
             input,
             instances: BTreeMap::new(),
+            json_constants: Default::default(),
             has_invocation_data,
             effects,
             failed: false,
@@ -823,6 +825,7 @@ impl CompiledExpressionInstance {
             selection,
             activation,
             &mut self.instances,
+            &mut self.json_constants,
             self.allocator.as_ref(),
             &self.effects,
             work,

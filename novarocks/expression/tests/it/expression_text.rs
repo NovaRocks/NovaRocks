@@ -967,12 +967,15 @@ fn trino_json_literal_validation_precedes_try_conversion() {
             "{text}"
         );
     }
+    let converted = constant("TRY_CAST(JSON '1e2' AS VARCHAR)", &context);
+    assert!(converted.batch.errors.is_empty());
     assert_eq!(
-        constant("TRY_CAST(JSON '1e2' AS VARCHAR)", &context)
-            .batch
-            .values
-            .to_data(),
-        StringArray::from(vec!["1.0E2"]).to_data(),
+        converted.batch.result_type,
+        FunctionValueType::new(DataType::Utf8, true)
+    );
+    assert_eq!(
+        converted.batch.values.to_data(),
+        StringArray::from(vec!["1.0E2"]).to_data()
     );
 }
 

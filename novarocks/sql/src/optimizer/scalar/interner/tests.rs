@@ -250,14 +250,13 @@ fn full_types_metadata_and_nullability_are_exact_even_in_the_same_bucket() {
     let physical = forced(
         &mut arena,
         column(),
-        FunctionValueType::new(DataType::Utf8, false),
+        FunctionValueType::new(DataType::LargeBinary, false),
         &control,
     )
     .unwrap();
-    let mut json = FunctionValueType::new(DataType::Utf8, false);
-    json = novarocks_type_contract::FunctionValueType::try_with_logical_type(
-        json.data_type().clone(),
-        json.nullable(),
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
         novarocks_type_contract::ValueLogicalType::Json,
     )
     .unwrap();

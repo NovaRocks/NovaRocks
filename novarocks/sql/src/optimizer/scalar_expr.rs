@@ -1473,10 +1473,7 @@ mod intrinsic_error_consumer_tests {
         let arguments = args
             .iter()
             .map(|id| FunctionArgument::Value {
-                value_type: FunctionValueType::new(
-                    arena.data_type(*id).clone(),
-                    arena.nullable(*id),
-                ),
+                value_type: arena.value_type(*id).clone(),
                 constant: None,
             })
             .collect::<Vec<_>>();
@@ -1519,10 +1516,7 @@ mod intrinsic_error_consumer_tests {
                 ),
                 volatility,
             },
-            novarocks_type_contract::FunctionValueType::new(
-                output.data_type().clone(),
-                output.nullable(),
-            ),
+            output,
         )
     }
 
@@ -1705,7 +1699,7 @@ mod intrinsic_error_consumer_tests {
             ScalarNode::ColumnRef(ColumnId(2)),
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
-        let total = actual_call(&mut arena, "parse_json", vec![text]);
+        let total = actual_call(&mut arena, "__json_try_read_text", vec![text]);
         let raises = actual_call(&mut arena, "assert_true", vec![boolean]);
         assert!(!can_fail(&arena, total));
         assert!(can_fail(&arena, raises));
@@ -1714,7 +1708,7 @@ mod intrinsic_error_consumer_tests {
         let ScalarNode::FunctionCall { name, .. } = &mut renamed else {
             unreachable!()
         };
-        *name = "parse_json".into();
+        *name = "__json_try_read_text".into();
         let renamed = arena.intern(renamed, arena.value_type(raises).clone());
         assert!(can_fail(&arena, renamed));
     }
@@ -1726,7 +1720,7 @@ mod intrinsic_error_consumer_tests {
             ScalarNode::ColumnRef(ColumnId(1)),
             FunctionValueType::new(DataType::Utf8, true),
         );
-        let total = actual_call(&mut arena, "parse_json", vec![text]);
+        let total = actual_call(&mut arena, "__json_try_read_text", vec![text]);
         assert!(!can_fail(&arena, total));
         let mut node = arena.node(total).clone();
         let ScalarNode::FunctionCall { binding, name, .. } = &mut node else {
@@ -1807,7 +1801,7 @@ mod intrinsic_error_consumer_tests {
             ScalarNode::ColumnRef(ColumnId(2)),
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
-        let total = actual_call(&mut arena, "parse_json", vec![text]);
+        let total = actual_call(&mut arena, "__json_try_read_text", vec![text]);
         let raises = actual_call(&mut arena, "assert_true", vec![boolean]);
         let order = |expr| SortKey {
             expr,
@@ -2167,7 +2161,7 @@ mod intrinsic_cast_effect_tests {
 #[cfg(test)]
 mod selected_boolean_consumer_tests {
     use super::*;
-    use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, BooleanArray, Int64Array, LargeBinaryArray};
     use novarocks_functions::{ConstantPool, ConstantValue};
     use novarocks_type_contract::{
         CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
@@ -2241,7 +2235,7 @@ mod selected_boolean_consumer_tests {
             ),
             (
                 constant(
-                    Arc::new(StringArray::from(vec!["null"])),
+                    Arc::new(LargeBinaryArray::from(vec![b"\x01\x20".as_slice()])),
                     ValueLogicalType::Json,
                     0,
                 ),
@@ -2351,7 +2345,7 @@ mod selected_boolean_consumer_tests {
                 0,
             ),
             constant(
-                Arc::new(StringArray::from(vec!["true"])),
+                Arc::new(LargeBinaryArray::from(vec![b"\x01\x42\x01".as_slice()])),
                 ValueLogicalType::Json,
                 0,
             ),

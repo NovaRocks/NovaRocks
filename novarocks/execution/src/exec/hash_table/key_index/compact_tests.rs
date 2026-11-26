@@ -1199,9 +1199,12 @@ fn nominal_byte_fixture(
     second: &[u8],
 ) -> (Vec<ArrayRef>, Vec<FunctionValueType>, Vec<usize>) {
     use novarocks_type_contract::ValueLogicalType;
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let hll = FunctionValueType::try_with_logical_type(
         if dictionary {
             DataType::LargeBinary
@@ -1216,25 +1219,21 @@ fn nominal_byte_fixture(
         let codes = Int32Array::from(vec![2, 0, 1]);
         (
             vec![
-                Arc::new(
-                    DictionaryArray::<Int32Type>::try_new(
-                        codes,
-                        Arc::new(StringArray::from(vec![Some("[1]"), None, Some("[2]")])),
-                    )
-                    .unwrap(),
-                ),
-                // The frozen dictionary vocabulary is string-only. HLL uses
-                // its legal wider plain carrier with the same logical rows.
+                Arc::new(json_array(&[Some("[2]"), Some("[1]"), None])),
+                // The original dictionary path belongs to the textual key.
+                // The nominal keys keep their exact binary payloads.
                 Arc::new(LargeBinaryArray::from(vec![
                     Some(second),
                     Some(first),
                     None,
                 ])),
-                Arc::new(StringViewArray::from(vec![
-                    Some("beta"),
-                    Some("alpha"),
-                    None,
-                ])),
+                Arc::new(
+                    DictionaryArray::<Int32Type>::try_new(
+                        codes,
+                        Arc::new(StringArray::from(vec![Some("alpha"), None, Some("beta")])),
+                    )
+                    .unwrap(),
+                ),
                 Arc::new(BinaryViewArray::from(vec![
                     Some(b"B".as_slice()),
                     Some(b"A".as_slice()),
@@ -1252,7 +1251,7 @@ fn nominal_byte_fixture(
     } else {
         (
             vec![
-                Arc::new(StringArray::from(vec![Some("[1]"), None, Some("[2]")])),
+                Arc::new(json_array(&[Some("[1]"), None, Some("[2]")])),
                 Arc::new(BinaryArray::from(vec![Some(first), None, Some(second)])),
                 Arc::new(StringArray::from(vec![Some("alpha"), None, Some("beta")])),
                 Arc::new(BinaryArray::from(vec![
@@ -1272,7 +1271,12 @@ fn nominal_byte_fixture(
     }
 }
 fn assert_nominal_byte_export(exported: &ExportedKeys, first: &[u8], second: &[u8], null: bool) {
-    let mut strings = vec![Some("[2]"), Some("[1]"), Some("[1]")];
+    let documents = json_array(&[Some("[1]"), Some("[2]")]);
+    let mut json = vec![
+        Some(documents.value(1)),
+        Some(documents.value(0)),
+        Some(documents.value(0)),
+    ];
     let mut hll = vec![Some(second), Some(first), Some(first)];
     let mut physical_text = vec![Some("beta"), Some("alpha"), Some("alpha")];
     let mut physical_bytes = vec![
@@ -1281,7 +1285,7 @@ fn assert_nominal_byte_export(exported: &ExportedKeys, first: &[u8], second: &[u
         Some(b"A".as_slice()),
     ];
     if null {
-        strings.push(None);
+        json.push(None);
         hll.push(None);
         physical_text.push(None);
         physical_bytes.push(None);
@@ -1289,11 +1293,11 @@ fn assert_nominal_byte_export(exported: &ExportedKeys, first: &[u8], second: &[u
     assert_eq!(
         exported.arrays()[0]
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeBinaryArray>()
             .unwrap()
             .iter()
             .collect::<Vec<_>>(),
-        strings
+        json
     );
     let actual_hll = match exported.arrays()[1].data_type() {
         DataType::Binary => exported.arrays()[1]
@@ -1418,15 +1422,8 @@ fn nominal_raw_bytes_preserve_legal_domains_cross_carriers_dictionaries_and_both
                             panic!("nominal bytes require an explicit raw-storage loan")
                         };
                         assert_eq!(*logical_binding, &types[column]);
-                        assert_eq!(
-                            raw.data_type(),
-                            if column == 0 {
-                                &DataType::Utf8View
-                            } else {
-                                &DataType::BinaryView
-                            }
-                        );
-                        assert_eq!(admitted.is_utf8(), column == 0);
+                        assert_eq!(raw.data_type(), &DataType::BinaryView);
+                        assert!(!admitted.is_utf8());
                     } else {
                         let KeyReadValues::Bytes { array, binding, .. } = page.values() else {
                             panic!("ordinary byte values retain their original view binding")
@@ -1621,9 +1618,12 @@ fn nominal_raw_byte_compaction_retains_the_actual_old_creator_until_the_last_buf
         }
     }
     let (owner, tracker) = owner_with_tracker();
-    let ty =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let ty = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let spec = KeySpec::new(
         std::slice::from_ref(&ty),
         &[NullPolicy::Equal],
@@ -1634,9 +1634,9 @@ fn nominal_raw_byte_compaction_retains_the_actual_old_creator_until_the_last_buf
     let mut index =
         KeyIndex::new(spec, IndexPurpose::KeyIds, tracker.clone(), owner.as_ref()).unwrap();
     let keys = input(
-        &[Arc::new(StringArray::from(vec![
-            "{\"message\":\"the private raw JSON view retains its original creator\"}",
-        ]))],
+        &[Arc::new(json_array(&[Some(
+            r#"{"message":"the private raw JSON view retains its original creator"}"#,
+        )]))],
         std::slice::from_ref(&ty),
         &[0],
         owner.as_ref(),
@@ -1672,5 +1672,5 @@ fn nominal_raw_byte_compaction_retains_the_actual_old_creator_until_the_last_buf
     let exported = index
         .export_keys(&[KeyId(0)], &[ty], owner.as_ref(), &CopyControl)
         .unwrap();
-    assert_eq!(exported.arrays()[0].data_type(), &DataType::Utf8);
+    assert_eq!(exported.arrays()[0].data_type(), &DataType::LargeBinary);
 }

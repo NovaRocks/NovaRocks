@@ -795,7 +795,7 @@ pub(crate) mod tests {
         let mut value = String::with_capacity(10_000);
         value.push_str("value");
         metadata.insert("provider".into(), value);
-        let field = Field::new("json", DataType::Utf8, true).with_metadata(metadata.clone());
+        let field = Field::new("json", DataType::LargeBinary, true).with_metadata(metadata.clone());
         let schema = Schema::new_with_metadata(vec![field], metadata);
         let facts =
             ConnectorReadPublicFacts::try_new(source(), None, schema, vec![ValueLogicalType::Json])
@@ -814,22 +814,20 @@ pub(crate) mod tests {
             facts.matches_value_type(
                 0,
                 &FunctionValueType::try_with_logical_type(
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     true,
                     ValueLogicalType::Json
                 )
                 .unwrap()
             )
         );
-        assert!(!facts.matches_value_type(0, &FunctionValueType::new(DataType::Utf8, true)));
-        let field =
-            Field::new("v", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
-                String,
-                String,
-            >::from([(
+        assert!(!facts.matches_value_type(0, &FunctionValueType::new(DataType::LargeBinary, true)));
+        let field = Field::new("v", DataType::LargeBinary, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
                 novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
                 "json".into(),
-            )]));
+            )]),
+        );
         assert!(
             ConnectorReadPublicFacts::try_new(
                 source(),

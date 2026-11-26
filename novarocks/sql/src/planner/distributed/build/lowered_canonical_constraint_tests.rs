@@ -97,13 +97,13 @@ fn explicit_json_text_casts_keep_their_target_and_original_scalar_sources() {
     // with a real table added for this catalog/statistics/provider driver.
     for (sql, nested) in [
         (
-            "SELECT array_agg(JSON_OBJECT('2': 3)) AS j, array_agg(CAST(JSON_OBJECT('2': 3) AS VARCHAR)) AS s FROM orders",
+            "SELECT array_agg(JSON_OBJECT('2' VALUE 3 RETURNING JSON)) AS j, array_agg(CAST(JSON_OBJECT('2' VALUE 3 RETURNING JSON) AS VARCHAR)) AS s FROM orders",
             false,
         ),
         (
             "SELECT CAST(concat(
-                ARRAY[json_object('k': order_key), json_object('m': order_key)],
-                ARRAY[json_object('n': order_key), json_object('p': order_key)]
+                ARRAY[JSON_OBJECT('k' VALUE order_key RETURNING JSON), JSON_OBJECT('m' VALUE order_key RETURNING JSON)],
+                ARRAY[JSON_OBJECT('n' VALUE order_key RETURNING JSON), JSON_OBJECT('p' VALUE order_key RETURNING JSON)]
              ) AS ARRAY(VARCHAR)) AS s FROM orders",
             true,
         ),
@@ -168,7 +168,7 @@ fn explicit_json_text_casts_keep_their_target_and_original_scalar_sources() {
                                 );
                             };
                             let item = value_type.child_at(0).unwrap();
-                            assert_eq!(item.data_type(), &DataType::Utf8);
+                            assert_eq!(item.data_type(), &DataType::LargeBinary);
                             assert_eq!(item.logical_type(), ValueLogicalType::Json);
                         }
                         assert_loan_prefixes(&owner, fragment, unit_node, source);
@@ -191,7 +191,7 @@ fn explicit_json_text_casts_keep_their_target_and_original_scalar_sources() {
                 let DataType::List(item) = source.ty.data_type() else {
                     panic!("original array source");
                 };
-                assert_eq!(item.data_type(), &DataType::Utf8);
+                assert_eq!(item.data_type(), &DataType::LargeBinary);
                 assert_eq!(
                     source.ty.child_at(0).unwrap().logical_type(),
                     ValueLogicalType::Json
@@ -235,7 +235,7 @@ fn explicit_json_text_casts_keep_their_target_and_original_scalar_sources() {
                     };
                     assert_eq!(
                         function.function_id.as_str(),
-                        "builtin.scalar/json_object/v1"
+                        "builtin.scalar/__json_object_null/v1"
                     );
                     assert_eq!(function.result_type, original.ty);
                     let receipt =
@@ -334,7 +334,7 @@ fn typed_empty_array_retains_independent_unknown_owner_and_outer_json_cast() {
                     panic!("outer JSON list target");
                 };
                 assert_eq!(item.name(), "item");
-                assert_eq!(item.data_type(), &DataType::Utf8);
+                assert_eq!(item.data_type(), &DataType::LargeBinary);
                 assert!(item.is_nullable());
                 assert!(item.metadata().is_empty());
                 assert_eq!(

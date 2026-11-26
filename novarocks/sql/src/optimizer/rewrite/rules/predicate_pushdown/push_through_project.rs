@@ -969,7 +969,8 @@ mod tests {
         };
         for (name, input_type, expected_change) in [
             ("assert_true", DataType::Boolean, false),
-            ("parse_json", DataType::Utf8, true),
+            ("json_parse", DataType::Utf8, false),
+            ("__json_try_read_text", DataType::Utf8, true),
         ] {
             let mut arena = ScalarArena::new();
             let scan = scan_opt(&mut arena, &[("a", col_id(1))]);
@@ -1026,10 +1027,7 @@ mod tests {
                     ),
                     volatility,
                 },
-                novarocks_type_contract::FunctionValueType::new(
-                    output.data_type().clone(),
-                    output.nullable(),
-                ),
+                output,
             );
             let Operator::LogicalProject(proj) = &mut project.op else {
                 unreachable!()

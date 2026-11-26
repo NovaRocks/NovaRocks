@@ -84,10 +84,8 @@ fn reason(gate: &str) -> &str {
         "array_wildcard" => "array wildcard subscripts",
         "explicit_array_type" => "explicit ARRAY lengths",
         "function_processing_mode" => "function processing modes",
-        "json_constructor" => "SQL/JSON constructor",
         "json_exists" => "JSON_EXISTS is not supported",
         "json_value" => "JSON_VALUE is not supported",
-        "json_serialize" => "JSON_SERIALIZE is not supported",
         "json_query_profile" => "JSON_QUERY only supports its plain two-argument profile",
         "json_table" => "JSON_TABLE is not supported",
         "match" => "MATCH predicates",
@@ -197,6 +195,24 @@ fn parsed_trino_queries_reach_their_declared_analyzer_capability_gate() {
                 );
             }
             "interval_type" => assert_interval_type(source),
+            "json_constructor" => {
+                let input = if source.contains("ENCODING") {
+                    "CAST(NULL AS VARBINARY)"
+                } else {
+                    "CAST(NULL AS VARCHAR)"
+                };
+                let ty = FunctionValueType::try_with_logical_type(
+                    DataType::LargeBinary,
+                    true,
+                    novarocks_type_contract::ValueLogicalType::Json,
+                )
+                .unwrap();
+                assert_single_analyzed_type(&source.replacen('?', input, 1), ty);
+            }
+            "json_serialize" => assert_single_analyzed_type(
+                &source.replacen('?', "CAST(NULL AS VARCHAR)", 1),
+                FunctionValueType::new(DataType::Utf8, true),
+            ),
             "interval_value_expression" => {
                 let typed = source.replacen('?', "DATE '2000-01-02'", 1).replacen(
                     '?',
@@ -315,18 +331,14 @@ fn assert_unknown_table_function(source: &str, owner: &str) {
     assert_eq!(actual_span, function.name.span, "{owner}");
 }
 
-fn assert_single_analyzed_type(source: &str, data_type: DataType, nullable: bool) {
+fn assert_single_analyzed_type(source: &str, value_type: FunctionValueType) {
     let query = parse_query(source).unwrap_or_else(|error| panic!("{source}: {error:?}"));
     let (resolved, _, _) =
         analyze(&query, &NoCatalog, "default").unwrap_or_else(|error| panic!("{source}: {error}"));
     let [field] = resolved.output_columns.as_slice() else {
         panic!("{source}: expected one resolved field");
     };
-    assert_eq!(
-        field.value_type,
-        FunctionValueType::new(data_type, nullable),
-        "{source}"
-    );
+    assert_eq!(field.value_type, value_type, "{source}");
 }
 
 #[test]
@@ -359,7 +371,7 @@ fn relation_grammar_cases_use_the_first_actual_table_free_analyzer_owner() {
                 unknown += 1;
             }
             "feature_absent" => {
-                assert_single_analyzed_type(&source, DataType::Int32, true);
+                assert_single_analyzed_type(&source, FunctionValueType::new(DataType::Int32, true));
                 absent += 1;
             }
             gate => {

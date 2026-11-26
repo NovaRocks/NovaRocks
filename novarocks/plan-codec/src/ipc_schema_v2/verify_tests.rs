@@ -460,7 +460,7 @@ fn dictionary_and_nested_nominal_fields_verify_without_carrier_retagging() {
         true,
     ));
     let json = Arc::new(
-        Field::new("json", DataType::Utf8, true).with_metadata(HashMap::from([
+        Field::new("json", DataType::LargeBinary, true).with_metadata(HashMap::from([
             (
                 novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
                 "json".to_owned(),

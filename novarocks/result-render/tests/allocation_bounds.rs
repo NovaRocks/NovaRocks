@@ -28,6 +28,9 @@ use novarocks_result_render::{ArrowTrinoJsonEncoder, BoundedClientRowEncoder, Re
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
+#[path = "support/native_json.rs"]
+mod native_json_fixture;
+use native_json_fixture::native_json;
 struct Probe;
 // The test harness runs independent probes concurrently. Both admission and
 // counters belong to the calling thread; process counters would contaminate
@@ -170,8 +173,9 @@ fn root_contract_schema_is_borrowed_through_actual_encoder_exit() {
     drop(encoder);
     assert!(weak.upgrade().is_none());
 }
-fn probe(schema: Arc<ClientRenderSchema>, batch: RecordBatch) {
+fn probe(schema: Arc<ClientRenderSchema>, batch: RecordBatch, expected_allocations: usize) {
     let mut out = vec![0; V::SEGMENT_BYTES];
+    let expected_capacity = ArrowTrinoJsonEncoder::scratch_capacity_bound_for_schema(&schema);
     start();
     let result = ArrowTrinoJsonEncoder::try_new(schema, batch);
     let (allocated, calls, maximum) = stop();
@@ -179,7 +183,8 @@ fn probe(schema: Arc<ClientRenderSchema>, batch: RecordBatch) {
     let cap = e.scratch_capacity_bytes();
     assert!(cap < 2 * 1024 * 1024);
     assert!(allocated <= cap);
-    assert_eq!(calls, 3);
+    assert_eq!(calls, expected_allocations);
+    assert_eq!(cap, expected_capacity);
     assert!(maximum <= cap);
     let initial = cap;
     start();
@@ -208,13 +213,14 @@ fn fixed_actual_capacity_and_zero_turn_allocations() {
         Arc::new(StringArray::from(vec![value.as_str()])),
         f(N::String, P::TrinoValue),
     );
-    probe(schema, batch);
-    let text = format!("{{\"k\":\"{}\"}}", "a\\\"".repeat(30000));
+    probe(schema, batch, 3);
+    let text = format!("{{\"k\":\"{}\"}}", "a\\\"".repeat(400_000));
+    let value = native_json(&text);
     let (schema, batch) = prepare(
-        Arc::new(StringArray::from(vec![text.as_str()])),
+        Arc::new(LargeBinaryArray::from(vec![value.as_slice()])),
         f(N::Json, P::TrinoValue),
     );
-    probe(schema, batch);
+    probe(schema, batch, 4);
     let array = Arc::new(BinaryArray::from(vec![vec![0xff; 200000].as_slice()])) as ArrayRef;
     let child = Arc::new(Field::new("item", array.data_type().clone(), true));
     let array = ListArray::new(
@@ -230,7 +236,7 @@ fn fixed_actual_capacity_and_zero_turn_allocations() {
             P::TrinoValue,
         ),
     );
-    probe(schema, batch);
+    probe(schema, batch, 3);
 }
 #[test]
 fn temporal_and_variant_trino_values_do_not_allocate() {
@@ -264,7 +270,7 @@ fn temporal_and_variant_trino_values_do_not_allocate() {
         P::TrinoValue,
     );
     let (schema, batch) = prepare(Arc::new(array), render);
-    probe(schema, batch);
+    probe(schema, batch, 3);
     {
         let mut value = vec![12 << 2];
         value.extend_from_slice(&1i64.to_le_bytes());
@@ -275,20 +281,34 @@ fn temporal_and_variant_trino_values_do_not_allocate() {
             Arc::new(LargeBinaryArray::from(vec![data.as_slice()])),
             f(N::Variant, P::TrinoValue),
         );
-        probe(schema, batch);
+        probe(schema, batch, 3);
     }
 }
 #[test]
 fn input_backing_remains_until_actual_encoder_exit() {
-    let array = Arc::new(StringArray::from(vec!["x".repeat(200000)])) as ArrayRef;
-    let weak = Arc::downgrade(&array);
-    let (schema, batch) = prepare(array, f(N::String, P::TrinoValue));
-    let mut e = ArrowTrinoJsonEncoder::try_new(schema, batch).unwrap();
-    e.step(&mut [0; 100]).unwrap();
-    e.cancel();
-    assert!(weak.upgrade().is_some(), "cancel is not physical release");
-    drop(e);
-    assert!(weak.upgrade().is_none());
+    let text = "x".repeat(200_000);
+    let doc = native_json(&format!("\"{text}\""));
+    let inputs: [(ArrayRef, N); 2] = [
+        (Arc::new(StringArray::from(vec![text])), N::String),
+        (
+            Arc::new(LargeBinaryArray::from(vec![doc.as_slice()])),
+            N::Json,
+        ),
+    ];
+    for (array, kind) in inputs {
+        let weak = Arc::downgrade(&array);
+        let (schema, batch) = prepare(array, f(kind, P::TrinoValue));
+        let mut e = ArrowTrinoJsonEncoder::try_new(schema, batch).unwrap();
+        let turn = e.step(&mut [0; 100]).unwrap();
+        assert_ne!(turn.status, RenderTurnStatus::InputComplete);
+        e.cancel();
+        let mut output = [0u8; 100];
+        assert!(e.step(&mut output).is_err());
+        assert_eq!(output, [0; 100]);
+        assert!(weak.upgrade().is_some(), "cancel is not physical release");
+        drop(e);
+        assert!(weak.upgrade().is_none());
+    }
 }
 
 #[test]
@@ -306,7 +326,7 @@ fn maximum_native_depth_keeps_fixed_capacity() {
         render = f(N::List(Box::new(render)), P::TrinoValue);
     }
     let (schema, batch) = prepare(array, render);
-    probe(schema, batch);
+    probe(schema, batch, 3);
 }
 
 #[test]
@@ -435,11 +455,8 @@ fn legacy_interval_map_validation_reuses_admitted_scratch_across_turns() {
     assert!(allocated <= encoder.scratch_capacity_bytes());
     assert_eq!(encoder.scratch_capacity_bytes(), scratch);
     assert_eq!(
-        scratch,
-        ArrowTrinoJsonEncoder::scratch_capacity_bound_bytes()
-    );
-    assert!(
-        encoder.scratch_capacity_bytes() <= ArrowTrinoJsonEncoder::scratch_capacity_bound_bytes()
+        ArrowTrinoJsonEncoder::scratch_capacity_bound_bytes() - scratch,
+        novarocks_functions::json_value::TextCursor::<()>::preallocated_scratch_bytes()
     );
     let mut out = [0; 32 * 1024];
     let mut turns = 0;

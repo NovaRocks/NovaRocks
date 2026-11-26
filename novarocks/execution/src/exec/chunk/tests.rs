@@ -121,7 +121,7 @@ fn typed_chunk_zero_channels_retains_positive_row_count() {
 
 #[test]
 fn typed_chunk_normalizes_actual_arrays_and_shares_semantics_and_payload() {
-    use arrow::array::{Array, ArrayRef, ListArray, StringArray};
+    use arrow::array::{Array, ArrayRef, ListArray};
     use arrow::buffer::OffsetBuffer;
     use novarocks_type_contract::{
         ValueKind, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
@@ -135,10 +135,10 @@ fn typed_chunk_normalizes_actual_arrays_and_shares_semantics_and_payload() {
     .unwrap();
     let list = ValueTypeRef::try_new(ValueKind::List(item.clone()), true, storage.clone()).unwrap();
     let item_field = Arc::new(field_with_logical_type(
-        Field::new("foreign_element", DataType::Utf8, true),
+        Field::new("foreign_element", DataType::LargeBinary, true),
         LogicalType::Json,
     ));
-    let values: ArrayRef = Arc::new(StringArray::from(vec![Some("{}"), None]));
+    let values: ArrayRef = Arc::new(super::typed_fixture::json_array(&[Some("{}"), None]));
     let array: ArrayRef = Arc::new(
         ListArray::try_new(
             item_field.clone(),

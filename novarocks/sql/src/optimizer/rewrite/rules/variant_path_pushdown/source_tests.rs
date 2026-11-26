@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use arrow::array::{Array, StringArray};
+use arrow::array::{Array, ArrayData, LargeBinaryArray, StringArray};
 use novarocks_functions::{ConstantPool, ConstantValue, FunctionArgument};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
@@ -31,13 +31,14 @@ impl PureCompileControl for Control {
     }
 }
 
-fn selected_text(value: &str, sentinel: &str, logical: ValueLogicalType) -> ConstantValue {
-    let ty = FunctionValueType::try_with_logical_type(DataType::Utf8, false, logical).unwrap();
+fn selected_constant(ty: FunctionValueType, data: ArrayData) -> ConstantValue {
     let field = ty.try_to_field("original_variant_argument").unwrap();
     let mut metadata = field.metadata().clone();
-    metadata.insert("provider.unknown".to_string(), "original-field-metadata".to_string());
+    metadata.insert(
+        "provider.unknown".to_string(),
+        "original-field-metadata".to_string(),
+    );
     let field = Arc::new(field.with_metadata(metadata));
-    let data = StringArray::from(vec![sentinel, value, "unused-tail"]).to_data();
     ConstantPool::try_new(
         field,
         ty,
@@ -52,7 +53,10 @@ fn selected_text(value: &str, sentinel: &str, logical: ValueLogicalType) -> Cons
 }
 
 fn physical_text(value: &str, sentinel: &str) -> ConstantValue {
-    selected_text(value, sentinel, ValueLogicalType::Physical)
+    selected_constant(
+        FunctionValueType::new(DataType::Utf8, false),
+        StringArray::from(vec![sentinel, value, "unused-tail"]).to_data(),
+    )
 }
 
 fn constant_expr(value: &ConstantValue) -> TypedExpr {
@@ -304,7 +308,21 @@ fn variant_source_debug_preserves_legacy_manifest_without_retained_backing() {
 fn variant_source_nominal_json_nonmatch_and_full_type_mismatch_keep_original_boundaries() {
     let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
     let (scan, column) = scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
-    let json_path = selected_text("\"$.a\"", "UNUSED_JSON", ValueLogicalType::Json);
+    let json_type = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let json_path = selected_constant(
+        json_type,
+        LargeBinaryArray::from(vec![
+            b"\x01\x44\x01x".as_slice(),
+            b"\x01\x44\x03$.a".as_slice(),
+            b"\x01\x44\x01y".as_slice(),
+        ])
+        .to_data(),
+    );
     let target = physical_text("bigint", "UNUSED_TARGET");
     let (plan, changed) = rewrite(
         project_calls(scan, vec![call(&column, &json_path, &target)], &factory),
@@ -312,7 +330,10 @@ fn variant_source_nominal_json_nonmatch_and_full_type_mismatch_keep_original_bou
     );
     assert!(!changed);
     assert!(scan_from_plan(&plan).variant_columns.is_empty());
-    assert_eq!(json_path.value_type().logical_type(), ValueLogicalType::Json);
+    assert_eq!(
+        json_path.value_type().logical_type(),
+        ValueLogicalType::Json
+    );
 
     // The original interner rejects an inconsistent CV before the rewrite can
     // inspect it. Do not manufacture an admitted malformed arena to bypass it.
@@ -321,7 +342,7 @@ fn variant_source_nominal_json_nonmatch_and_full_type_mismatch_keep_original_bou
     let error = arena
         .intern_observed(
             crate::optimizer::scalar::ScalarNode::Constant(json_path),
-            FunctionValueType::new(DataType::Utf8, false),
+            FunctionValueType::new(DataType::LargeBinary, false),
             &Control,
         )
         .unwrap_err();

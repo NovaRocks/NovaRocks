@@ -1,12 +1,18 @@
--- query 5
+-- query 9
 -- types	integer	varchar	varchar
 id	name	meta
 1	alice	{"k":"v"}
 2	bob	{"k":"v"}
 
--- query 7
+-- query 11
 -- types	integer	varchar	varchar
 id	name	meta
 1	alice	{"k":"v"}
 2	bob	{"k":"v"}
 3	charlie	{"k":"v"}
+4	dana	{"w":1,"w":2}
+
+-- query 12
+-- types	bigint
+rejected_targets
+0

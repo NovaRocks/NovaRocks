@@ -329,12 +329,17 @@ fn long_view(index: u32, prefix: u8) -> u128 {
 
 #[test]
 fn source_attributes_never_reauthor_complete_type_and_timezone_presence_is_exact() {
-    let array: ArrayRef = Arc::new(StringArray::from(vec!["{\"v\":7}"]));
+    let array: ArrayRef = Arc::new(arrow_array::LargeBinaryArray::from(vec![
+        b"\x01\x20".as_slice(),
+    ]));
     let input = resource_input(array.as_ref(), 0);
-    let plain = Field::new("source", DataType::Utf8, true);
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let plain = Field::new("source", DataType::LargeBinary, true);
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let labelled = plain.clone().with_metadata(HashMap::from([(
         novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
         "json".to_owned(),
@@ -355,13 +360,13 @@ fn source_attributes_never_reauthor_complete_type_and_timezone_presence_is_exact
     }
     checked(
         &labelled,
-        &FunctionValueType::new(DataType::Utf8, true),
+        &FunctionValueType::new(DataType::LargeBinary, true),
         input,
         policy(),
     );
     ordinary(
         &plain,
-        &FunctionValueType::new(DataType::Utf8, false),
+        &FunctionValueType::new(DataType::LargeBinary, false),
         input,
         policy(),
     );

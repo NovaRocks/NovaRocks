@@ -117,7 +117,7 @@ fn assert_variant_wrapper_is_unsupported(
 
 #[test]
 fn original_encoder_keeps_variant_constants_and_mixed_multiline_syntax() {
-    let sql = r#"VALUES (1 + 2, parse_json('{"a":1}')), (NULL, parse_json('null')), (7, NULL)"#;
+    let sql = r#"VALUES (1 + 2, json_parse('{"a":1}')), (NULL, json_parse('null')), (7, NULL)"#;
     let (shaped, constants) = shape(sql);
     let constants = constants.unwrap();
     let columns = columns();
@@ -165,7 +165,7 @@ fn ordinary_binary_bytes_do_not_establish_variant() {
 #[test]
 fn mixed_source_reports_the_original_first_syntax_error() {
     let (query, constants) = shape(
-        "VALUES (original_first_column, parse_json('{}')), (unreachable_later_column, parse_json('null'))",
+        "VALUES (original_first_column, json_parse('{}')), (unreachable_later_column, json_parse('null'))",
     );
     let actual = analyze(query, constants).unwrap_err();
     let (query, constants) =
@@ -191,7 +191,7 @@ fn original_control_refusal_stops_before_the_next_variant_encoder() {
     let control = Refusal(std::sync::Mutex::new(0));
     let columns = columns();
     let error = shape_insert_source_with_constants(
-        &parse_query("VALUES (1, parse_json('{}')), (2, parse_json('{'))"),
+        &parse_query("VALUES (1, json_parse('{}')), (2, json_parse('{'))"),
         &[],
         &columns,
         &columns,
@@ -207,7 +207,7 @@ fn original_control_refusal_stops_before_the_next_variant_encoder() {
 fn constant_occurrences_follow_the_original_insert_column_mapping() {
     let columns = columns();
     let (query, constants) = shape_insert_source_with_constants(
-        &parse_query("VALUES (parse_json('42'), 7), (NULL, 8)"),
+        &parse_query("VALUES (json_parse('42'), 7), (NULL, 8)"),
         &["v".into(), "id".into()],
         &columns,
         &columns,
@@ -228,7 +228,7 @@ fn constant_occurrences_follow_the_original_insert_column_mapping() {
         constants[0].value().try_binary().unwrap(),
         Some(expected.as_slice())
     );
-    let (ordered, _) = shape("VALUES (7, parse_json('42')), (8, NULL)");
+    let (ordered, _) = shape("VALUES (7, json_parse('42')), (8, NULL)");
     assert!(query.body.syntax_eq(&ordered.body));
     assert_variant_wrapper_is_unsupported(query, Some(constants));
 }
@@ -237,21 +237,21 @@ fn constant_occurrences_follow_the_original_insert_column_mapping() {
 fn all_original_select_nested_and_union_leaves_keep_encoded_constants() {
     let columns = vec![columns().remove(1)];
     for (sql, expected_occurrences) in [
-        ("VALUES (parse_json('42'))", 1),
-        ("SELECT parse_json(('42'))", 1),
-        ("VALUES (CAST(parse_json('42') AS VARIANT))", 1),
+        ("VALUES (json_parse('42'))", 1),
+        ("SELECT json_parse(('42'))", 1),
+        ("VALUES (CAST(json_parse('42') AS VARIANT))", 1),
         // The preserved explicit source cast and target wrapper are distinct
         // occurrences borrowing the same original encoded constant.
-        ("SELECT CAST(parse_json('42') AS VARIANT)", 2),
-        ("SELECT ((CAST(parse_json('42') AS VARIANT)))", 2),
-        ("VALUES (parse_json(CAST('42' AS VARCHAR)))", 1),
-        ("SELECT parse_json(CAST('42' AS VARCHAR))", 1),
+        ("SELECT CAST(json_parse('42') AS VARIANT)", 2),
+        ("SELECT ((CAST(json_parse('42') AS VARIANT)))", 2),
+        ("VALUES (json_parse(CAST('42' AS VARCHAR)))", 1),
+        ("SELECT json_parse(CAST('42' AS VARCHAR))", 1),
         (
-            "(SELECT parse_json('42')) UNION ALL (SELECT parse_json('null'))",
+            "(SELECT json_parse('42')) UNION ALL (SELECT json_parse('null'))",
             2,
         ),
         (
-            "VALUES (parse_json('42')) UNION ALL SELECT parse_json('null')",
+            "VALUES (json_parse('42')) UNION ALL SELECT json_parse('null')",
             2,
         ),
     ] {
@@ -276,8 +276,8 @@ fn all_original_select_nested_and_union_leaves_keep_encoded_constants() {
         assert_eq!(constants.len(), expected_occurrences);
         if matches!(
             sql,
-            "SELECT CAST(parse_json('42') AS VARIANT)"
-                | "SELECT ((CAST(parse_json('42') AS VARIANT)))"
+            "SELECT CAST(json_parse('42') AS VARIANT)"
+                | "SELECT ((CAST(json_parse('42') AS VARIANT)))"
         ) {
             assert_eq!(
                 constants[0].value().pool().backing_identity(),
@@ -291,9 +291,9 @@ fn all_original_select_nested_and_union_leaves_keep_encoded_constants() {
 fn nary_and_parenthesized_union_constants_keep_original_order_and_source_paths() {
     let columns = vec![columns().remove(1)];
     for sql in [
-        "SELECT parse_json('42') UNION ALL SELECT parse_json('null') UNION ALL SELECT parse_json('{\"a\":1}')",
-        "(SELECT parse_json('42') UNION ALL SELECT parse_json('null')) UNION ALL SELECT parse_json('{\"a\":1}')",
-        "SELECT parse_json('42') UNION ALL (SELECT parse_json('null') UNION ALL SELECT parse_json('{\"a\":1}'))",
+        "SELECT json_parse('42') UNION ALL SELECT json_parse('null') UNION ALL SELECT json_parse('{\"a\":1}')",
+        "(SELECT json_parse('42') UNION ALL SELECT json_parse('null')) UNION ALL SELECT json_parse('{\"a\":1}')",
+        "SELECT json_parse('42') UNION ALL (SELECT json_parse('null') UNION ALL SELECT json_parse('{\"a\":1}'))",
     ] {
         let (query, constants) = shape_insert_source_with_constants(
             &parse_query(sql),
@@ -325,7 +325,7 @@ fn nary_and_parenthesized_union_constants_keep_original_order_and_source_paths()
 #[test]
 fn select_filter_having_and_distinct_keep_the_original_inner_owner() {
     let source =
-        parse_query("SELECT DISTINCT parse_json('42') AS v WHERE false HAVING v IS NOT NULL");
+        parse_query("SELECT DISTINCT json_parse('42') AS v WHERE false HAVING v IS NOT NULL");
     let columns = vec![columns().remove(1)];
     let (query, constants) = shape_insert_source_with_constants(
         &source,

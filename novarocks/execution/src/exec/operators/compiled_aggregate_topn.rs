@@ -273,7 +273,9 @@ mod key_index_tests {
         RuntimeOrderNullOrder, RuntimeOrderSortDirection,
     };
     use arrow::{
-        array::{ArrayRef, DictionaryArray, Int32Array, Int64Array, StringArray},
+        array::{
+            ArrayRef, DictionaryArray, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray,
+        },
         datatypes::{DataType, Int32Type, Schema},
     };
     use novarocks_failure_contract::FailureProjection;
@@ -502,21 +504,33 @@ mod key_index_tests {
     fn production_typed_page_leaf_preserves_full_nominal_contract_and_original_control_failure() {
         let tracker = MemTracker::new_root("K TopN nominal source");
         let construction = owner(tracker.clone());
-        let json = FunctionValueType::try_with_logical_type(
-            DataType::Utf8,
+        // LARGEINT is ordered. UUID shares its physical carrier and still
+        // needs to be rejected by the complete declaration check.
+        let uuid = FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
             true,
-            novarocks_type_contract::ValueLogicalType::Json,
+            novarocks_type_contract::ValueLogicalType::Uuid,
         )
         .unwrap();
-        let arrays: [ArrayRef; 1] = [Arc::new(StringArray::from(vec![Some("[1]"), None]))];
-        let (table, ids) = index(&[json], &arrays, construction.as_ref(), &tracker);
+        let largeint = FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            true,
+            novarocks_type_contract::ValueLogicalType::LargeInt,
+        )
+        .unwrap();
+        assert_eq!(uuid.data_type(), largeint.data_type());
+        let arrays: [ArrayRef; 1] = [Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [Some([1u8; 16].as_slice()), None].into_iter(),
+                16,
+            )
+            .unwrap(),
+        )];
+        let (table, ids) = index(&[uuid], &arrays, construction.as_ref(), &tracker);
         let read = table.read_keys(&ids, construction.as_ref(), &Pass).unwrap();
         let host =
             OrderedTopNAllocationHost::new(MemTracker::new_root("K TopN nominal ordered owner"));
-        let contract = order(
-            FunctionValueType::new(DataType::Utf8, true),
-            RuntimeOrderNullOrder::Last,
-        );
+        let contract = order(largeint, RuntimeOrderNullOrder::Last);
         let mut boundary = OwnedAggregateTopNBoundaryState::try_new_owned(
             NonZeroU32::new(1).unwrap(),
             contract,

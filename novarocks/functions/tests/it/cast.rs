@@ -942,9 +942,12 @@ mod standard_conversion {
             ),
             Err(CastPrepareError::Illegal),
         ));
-        let json =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap();
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let array = physical(
             DataType::List(Arc::new(arrow_schema::Field::new(
                 "item",

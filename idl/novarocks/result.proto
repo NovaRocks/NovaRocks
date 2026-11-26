@@ -35,7 +35,8 @@ enum RenderTypeKind {
   DATE = 11;
   TIME = 12;
   TIMESTAMP = 13;
-  JSON = 14;
+  reserved 14;
+  reserved "JSON";
   VARIANT = 15;
   OPAQUE = 16;
   LIST = 17;
@@ -45,6 +46,7 @@ enum RenderTypeKind {
   VARCHAR = 21;
   TEMPORAL = 22;
   UUID = 23;
+  NATIVE_JSON = 24;
 }
 enum RenderTimeUnit {
   RENDER_TIME_UNIT_UNSPECIFIED = 0;
@@ -146,12 +148,14 @@ enum ScalarTypeKind {
   SCALAR_DATE = 10;
   SCALAR_TIME_MICROS = 11;
   SCALAR_TIMESTAMP = 12;
-  SCALAR_JSON = 13;
+  reserved 13;
+  reserved "SCALAR_JSON";
   SCALAR_VARIANT = 14;
   SCALAR_OPAQUE = 15;
   SCALAR_LIST = 16;
   SCALAR_MAP = 17;
   SCALAR_STRUCT = 18;
+  SCALAR_NATIVE_JSON = 19;
 }
 enum ScalarTimestampUnit {
   SCALAR_TIMESTAMP_UNIT_UNSPECIFIED = 0;

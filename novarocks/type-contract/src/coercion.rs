@@ -183,7 +183,7 @@ fn integer_decimal_precision(data_type: &DataType) -> u8 {
 
 fn logical_storage_matches(logical: crate::ValueLogicalType, storage: &DataType) -> bool {
     match logical {
-        crate::ValueLogicalType::Json => matches!(storage, DataType::Utf8 | DataType::LargeUtf8),
+        crate::ValueLogicalType::Json => matches!(storage, DataType::LargeBinary),
         crate::ValueLogicalType::Hll
         | crate::ValueLogicalType::Bitmap
         | crate::ValueLogicalType::Object
@@ -515,12 +515,14 @@ mod tests {
 
     #[test]
     fn reconstruction_preserves_main_logical_domain_and_nullability() {
-        let tagged = Arc::new(Field::new("item", DataType::Utf8, false).with_metadata(
-            std::collections::HashMap::<String, String>::from([(
-                crate::NR_LOGICAL_TYPE_KEY.to_string(),
-                "json".to_string(),
-            )]),
-        ));
+        let tagged = Arc::new(
+            Field::new("item", DataType::LargeBinary, false).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    crate::NR_LOGICAL_TYPE_KEY.to_string(),
+                    "json".to_string(),
+                )]),
+            ),
+        );
         let left = DataType::List(Arc::clone(&tagged));
         // Identical carriers retain the existing exact object shape.
         assert_eq!(wider_type(&left, &left), left);
@@ -530,7 +532,7 @@ mod tests {
         assert_eq!(
             wider_type(&left, &right),
             DataType::List(Arc::new(
-                Field::new("item", DataType::Utf8, true).with_metadata(
+                Field::new("item", DataType::LargeBinary, true).with_metadata(
                     std::collections::HashMap::<String, String>::from([(
                         crate::NR_LOGICAL_TYPE_KEY.to_string(),
                         "json".to_string()

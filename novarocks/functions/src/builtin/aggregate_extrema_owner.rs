@@ -475,9 +475,6 @@ impl ExtremaOwner {
                         ValueLogicalType::Physical => {
                             source.data_type() != &DataType::FixedSizeBinary(16)
                         }
-                        // The installed resolver and original extrema kernel keep
-                        // this nominal tag while comparing the original UTF-8 bytes.
-                        ValueLogicalType::Json => source.data_type() == &DataType::Utf8,
                         _ => false,
                     });
             work.step().map_err(compile_failure)?;

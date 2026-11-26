@@ -801,7 +801,7 @@ mod tests {
                 FunctionValueType::new(DataType::LargeUtf8, false),
                 FunctionValueType::new(DataType::Int64, false),
                 FunctionValueType::try_with_logical_type(
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     false,
                     ValueLogicalType::Json,
                 )

@@ -114,9 +114,9 @@ pub(super) fn prepare(
 fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str); 7] {
     [
         (
-            nominal(DataType::Utf8, nullable, ValueLogicalType::Json),
-            ty(DataType::Utf8, nullable),
-            value_conversion::JSON_TEXT,
+            nominal(DataType::LargeBinary, nullable, ValueLogicalType::Variant),
+            ty(DataType::LargeBinary, nullable),
+            value_conversion::OPAQUE_BINARY,
         ),
         (
             ty(DataType::Int64, nullable),
@@ -145,7 +145,7 @@ fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str
         ),
         (
             ty(DataType::Null, true),
-            nominal(DataType::Utf8, true, ValueLogicalType::Json),
+            nominal(DataType::LargeBinary, true, ValueLogicalType::Json),
             value_conversion::NULL_LIFT,
         ),
     ]
@@ -165,10 +165,6 @@ fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_implementation_re
         owner.binding_declaration()
     );
     let expected = [
-        (
-            value_conversion::JSON_TEXT,
-            "builtin.scalar/value_domain_conversion/json_text_same_structure/selected-v1",
-        ),
         (
             value_conversion::OPAQUE_BINARY,
             "builtin.scalar/value_domain_conversion/opaque_to_binary_same_structure/selected-v1",
@@ -361,17 +357,17 @@ fn every_conversion_fresh_frozen_keeps_full_source_target_policy_scope_and_canon
 }
 
 #[test]
-fn nested_json_recipe_uses_the_exact_source_owned_fields_and_only_removes_json_identity() {
+fn nested_opaque_recipe_uses_the_exact_source_owned_fields_and_only_removes_opaque_identity() {
     let source_field = Arc::new(
-        Field::new("actual_child", DataType::Utf8, false).with_metadata(HashMap::from([
-            (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
+        Field::new("actual_child", DataType::LargeBinary, false).with_metadata(HashMap::from([
+            (NR_LOGICAL_TYPE_KEY.to_owned(), "variant".to_owned()),
             ("provider_id".to_owned(), "173".to_owned()),
         ])),
     );
     let mut metadata = source_field.metadata().clone();
     metadata.remove(NR_LOGICAL_TYPE_KEY);
     let target_field = Arc::new(source_field.as_ref().clone().with_metadata(metadata));
-    let key = Arc::new(Field::new("actual_key", DataType::Utf8, false));
+    let key = Arc::new(Field::new("actual_key", DataType::LargeBinary, false));
     let source_entries = Arc::new(
         Field::new(
             "actual_entries",
@@ -418,7 +414,7 @@ fn nested_json_recipe_uses_the_exact_source_owned_fields_and_only_removes_json_i
         assert_eq!(prepared.contract().result_type(), &target);
         assert_eq!(
             prepared.contract().selected().overload.as_str(),
-            value_conversion::JSON_TEXT
+            value_conversion::OPAQUE_BINARY
         );
     }
     let target = ty(
@@ -443,8 +439,12 @@ fn source_carriers_cannot_author_nominal_domains_or_bypass_the_explicit_target()
         (ty(DataType::UInt32, false), large(false)),
         (large(false), ty(DataType::Int8, false)),
         (
-            nominal(DataType::Utf8, false, ValueLogicalType::Json),
+            nominal(DataType::LargeBinary, false, ValueLogicalType::Json),
             large(false),
+        ),
+        (
+            nominal(DataType::LargeBinary, false, ValueLogicalType::Json),
+            ty(DataType::LargeBinary, false),
         ),
         (ty(DataType::Null, true), ty(DataType::Int64, false)),
     ] {
@@ -662,10 +662,10 @@ impl KernelEvaluationControl for EvaluationControl {
 #[test]
 fn null_lift_prepares_complete_target_but_only_an_empty_strict_active_mask_is_valid() {
     let source = ty(DataType::Null, true);
-    let json = nominal(DataType::Utf8, true, ValueLogicalType::Json);
+    let json = nominal(DataType::LargeBinary, true, ValueLogicalType::Json);
     let nested = ty(
         DataType::List(Arc::new(
-            Field::new("json_child", DataType::Utf8, true).with_metadata(HashMap::from([(
+            Field::new("json_child", DataType::LargeBinary, true).with_metadata(HashMap::from([(
                 NR_LOGICAL_TYPE_KEY.to_owned(),
                 "json".to_owned(),
             )])),
@@ -781,20 +781,20 @@ fn largeint_decimal_effects_refine_exact_range_and_freeze_overflow_policy() {
 }
 
 fn conversion_compile_profiles() -> Vec<(FunctionValueType, FunctionValueType)> {
-    let json = Arc::new(
-        Field::new("actual_json", DataType::Utf8, true).with_metadata(HashMap::from([
-            (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
+    let variant = Arc::new(
+        Field::new("actual_variant", DataType::LargeBinary, true).with_metadata(HashMap::from([
+            (NR_LOGICAL_TYPE_KEY.to_owned(), "variant".to_owned()),
             ("provider_id".to_owned(), "731".to_owned()),
         ])),
     );
-    let mut metadata = json.metadata().clone();
+    let mut metadata = variant.metadata().clone();
     metadata.remove(NR_LOGICAL_TYPE_KEY);
-    let text = Arc::new(json.as_ref().clone().with_metadata(metadata));
+    let binary = Arc::new(variant.as_ref().clone().with_metadata(metadata));
     vec![
         (ty(DataType::Int64, true), large(true)),
         (
-            ty(DataType::List(json), true),
-            ty(DataType::List(text), true),
+            ty(DataType::List(variant), true),
+            ty(DataType::List(binary), true),
         ),
     ]
 }

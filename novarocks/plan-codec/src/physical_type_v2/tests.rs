@@ -303,7 +303,7 @@ fn fixed_binary_sixteen_preserves_three_explicit_root_identities_without_inferen
 #[allow(deprecated)]
 fn normalized_value_layout_strips_encoding_and_source_metadata_preserving_union_order() {
     let json = Arc::new(
-        Field::new("json", DataType::Utf8, true).with_metadata(HashMap::from([
+        Field::new("json", DataType::LargeBinary, true).with_metadata(HashMap::from([
             (NR_LOGICAL_TYPE_KEY.into(), "json".into()),
             ("provider".into(), "authored".into()),
         ])),
@@ -380,7 +380,7 @@ fn normalized_value_layout_strips_encoding_and_source_metadata_preserving_union_
 fn complete_scalar_logical_domains_and_temporal_facts_survive_public_table_apis() {
     let mut values = Vec::new();
     for (logical, carrier) in [
-        (ValueLogicalType::Json, DataType::Utf8),
+        (ValueLogicalType::Json, DataType::LargeBinary),
         (ValueLogicalType::Variant, DataType::LargeBinary),
         (ValueLogicalType::Hll, DataType::Binary),
         (ValueLogicalType::Bitmap, DataType::Binary),

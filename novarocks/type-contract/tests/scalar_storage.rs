@@ -266,11 +266,12 @@ fn temporal_units_and_timezone_facts_are_not_normalized() {
 fn semantic_identity_is_declared_even_when_physical_storage_is_shared() {
     // Physical compatibility is deliberately not a proof of Json/opaque
     // logical identity. The runtime must compare its original logical facts.
-    let string = ScalarSchema::try_new(scalar(S::String, true)).unwrap();
+    let variant = ScalarSchema::try_new(scalar(S::Variant, true)).unwrap();
     let json = ScalarSchema::try_new(scalar(S::Json, true)).unwrap();
-    assert_ne!(string, json);
-    assert!(matches(string.field(), D::Utf8, true));
-    assert!(matches(json.field(), D::Utf8, true));
+    assert_ne!(variant, json);
+    assert!(matches(variant.field(), D::LargeBinary, true));
+    assert!(matches(json.field(), D::LargeBinary, true));
+    assert!(!matches(json.field(), D::Utf8, true));
     for opaque in [
         ScalarOpaqueType::Hll,
         ScalarOpaqueType::Bitmap,

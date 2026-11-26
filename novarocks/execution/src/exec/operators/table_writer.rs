@@ -2670,7 +2670,9 @@ pub(crate) mod tests {
             DataType::Boolean => Arc::new(arrow::array::BooleanArray::from(vec![true])),
             DataType::Int32 => Arc::new(Int32Array::from(vec![1])),
             DataType::Int64 => Arc::new(Int64Array::from(vec![1])),
-            DataType::Utf8 => Arc::new(arrow::array::StringArray::from(vec!["{}"])),
+            DataType::LargeBinary => Arc::new(arrow::array::LargeBinaryArray::from(vec![
+                b"\x01\x80\x01\x00".as_slice(),
+            ])),
             _ => panic!(
                 "the writer lifecycle fixture declares only its original scalar source types"
             ),

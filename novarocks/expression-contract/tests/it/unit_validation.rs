@@ -537,8 +537,9 @@ fn uuid_is_not_a_numeric_largeint_domain() {
 #[test]
 fn comparison_refuses_equal_carriers_with_different_root_domains() {
     let json =
-        ValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap();
-    let plain = ValueType::new(DataType::Utf8, true);
+        ValueType::try_with_logical_type(DataType::LargeBinary, true, ValueLogicalType::Json)
+            .unwrap();
+    let plain = ValueType::new(DataType::LargeBinary, true);
     assert!(!binary_valid(
         json.clone(),
         BinaryOperator::Eq,

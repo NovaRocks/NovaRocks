@@ -25,7 +25,7 @@ use crate::planner::distributed::build::lowered_draft::{
     CheckedExpressionLogicalSourceEntry, SqlSourceJournalError,
 };
 use crate::planner::payload::PlanProjectNode;
-use arrow::array::{Array, StringArray};
+use arrow::array::{Array, FixedSizeBinaryArray};
 use novarocks_constant_contract::ConstantPool;
 use novarocks_functions::{FunctionArgument, FunctionResultType};
 use novarocks_type_contract::{
@@ -63,16 +63,25 @@ impl PureCompileControl for Control {
 fn policy() -> novarocks_functions::ConstantPolicy {
     crate::constant::test_constant_policy()
 }
-fn json(nullable: bool) -> ValueType {
-    ValueType::try_with_logical_type(DataType::Utf8, nullable, ValueLogicalType::Json).unwrap()
+fn largeint(nullable: bool) -> ValueType {
+    ValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        nullable,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap()
 }
-fn selected_json() -> TypedExpr {
-    let ty = json(false);
-    let field = Arc::new(ty.try_to_field("original_json").unwrap());
+fn selected_largeint() -> TypedExpr {
+    let ty = largeint(false);
+    let field = Arc::new(ty.try_to_field("original_largeint").unwrap());
     let pool = ConstantPool::try_new(
         field,
         ty.clone(),
-        StringArray::from(vec!["unused", "{\"kept\":7}"]).to_data(),
+        FixedSizeBinaryArray::try_from_iter(
+            [0_i128.to_be_bytes(), 7_i128.to_be_bytes()].into_iter(),
+        )
+        .unwrap()
+        .to_data(),
         policy(),
         CompilePhase::Validate,
         &Control::default(),
@@ -235,7 +244,7 @@ fn source_constant(
 fn conversion_journal_constant_input_preserves_original_none_and_full_binding_loans() {
     // A typed emitter fixture: this is the actual conversion producer, not a
     // reconstruction of an original SQL invocation from physical constants.
-    let input = selected_json();
+    let input = selected_largeint();
     let ExprKind::Constant(original) = &input.kind else {
         unreachable!()
     };
@@ -255,7 +264,7 @@ fn conversion_journal_constant_input_preserves_original_none_and_full_binding_lo
     else {
         unreachable!()
     };
-    assert_eq!(value_type, &json(false));
+    assert_eq!(value_type, &largeint(false));
     assert!(constant.is_none());
     let projection_control = Control::default();
     let mut projection_work =
@@ -267,7 +276,7 @@ fn conversion_journal_constant_input_preserves_original_none_and_full_binding_lo
     projection_work.finish().unwrap();
     assert!(
         matches!(&projected[0], FunctionArgument::Value { value_type, constant: None }
-        if value_type == &json(false))
+        if value_type == &largeint(false))
     );
     let actual = source_constant(&owner, unit_node, receipt.arguments()[0]);
     assert_eq!(actual.ordinal(), 1);
@@ -276,10 +285,16 @@ fn conversion_journal_constant_input_preserves_original_none_and_full_binding_lo
         actual.pool().field_ref(),
         original.pool().field_ref()
     ));
-    assert_eq!(actual.try_utf8().unwrap(), Some("{\"kept\":7}"));
+    assert_eq!(actual.try_largeint().unwrap(), Some(7));
     let binding = receipt.captured().binding();
     assert_eq!(binding.function_id.as_str(), CONVERSION);
-    assert!(binding.selected.overload.as_str().contains("json"));
+    assert!(
+        binding
+            .selected
+            .overload
+            .as_str()
+            .contains("largeint_to_utf8_text")
+    );
     assert_eq!(
         binding.decimal_overflow_policy(),
         DecimalOverflowPolicy::ReportError
@@ -309,7 +324,7 @@ fn conversion_journal_constant_input_preserves_original_none_and_full_binding_lo
 #[test]
 fn conversion_journal_intermediate_call_is_separate_from_following_cast() {
     let owner = finish(cast_to_bounded_varchar(
-        selected_json(),
+        selected_largeint(),
         DecimalOverflowPolicy::OutputNull,
     ));
     let (fragment, unit_node, source) = conversion(&owner);
@@ -346,9 +361,9 @@ fn conversion_journal_intermediate_call_is_separate_from_following_cast() {
 
 #[test]
 fn conversion_journal_identity_and_null_fastpaths_have_no_phantom_source() {
-    let target = json(false);
+    let target = largeint(false);
     let owner = finish(cast(
-        selected_json(),
+        selected_largeint(),
         target.clone(),
         DecimalOverflowPolicy::ReportError,
     ));
@@ -377,7 +392,7 @@ fn conversion_journal_identity_and_null_fastpaths_have_no_phantom_source() {
     let expression = cast(
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Null),
-            value_type: json(true),
+            value_type: largeint(true),
         },
         ValueType::new(DataType::Utf8, true),
         DecimalOverflowPolicy::ReportError,
@@ -415,17 +430,17 @@ fn conversion_journal_lambda_scope_matches_the_actual_intermediate_emission() {
     // or installed higher-order invocation capability claim.
     let parameter = TypedExpr {
         kind: ExprKind::LambdaParamRef {
-            name: "json_arg".into(),
+            name: "largeint_arg".into(),
             slot_id: 11,
         },
-        value_type: json(false),
+        value_type: largeint(false),
     };
     let expression = TypedExpr {
         kind: ExprKind::LambdaFunction {
             params: vec![crate::analysis::LambdaParam {
-                name: "json_arg".into(),
+                name: "largeint_arg".into(),
                 slot_id: 11,
-                value_type: json(false),
+                value_type: largeint(false),
             }],
             body: novarocks_parser::ast::AstBox::new(cast(
                 parameter,
@@ -486,7 +501,7 @@ fn conversion_journal_lambda_scope_matches_the_actual_intermediate_emission() {
 #[test]
 fn conversion_journal_foreign_missing_and_each_loan_callback_preserve_original_control() {
     let owner = finish(cast(
-        selected_json(),
+        selected_largeint(),
         ValueType::new(DataType::Utf8, false),
         DecimalOverflowPolicy::OutputNull,
     ));
@@ -545,7 +560,7 @@ fn conversion_journal_foreign_missing_and_each_loan_callback_preserve_original_c
 #[test]
 fn conversion_emission_capture_and_record_stop_at_every_actual_control_refusal() {
     let source = project(cast(
-        selected_json(),
+        selected_largeint(),
         ValueType::new(DataType::Utf8, false),
         DecimalOverflowPolicy::ReportError,
     ));

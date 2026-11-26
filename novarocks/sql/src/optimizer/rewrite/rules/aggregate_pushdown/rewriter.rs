@@ -842,19 +842,19 @@ mod tests {
 
         for (name, source) in [
             (
-                "min",
+                "any_value",
                 FunctionValueType::try_with_logical_type(
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     false,
                     ValueLogicalType::Json,
                 )
                 .unwrap(),
             ),
             (
-                "min",
+                "any_value",
                 FunctionValueType::new(
                     DataType::List(Arc::new(
-                        Field::new("item", DataType::Utf8, false).with_metadata(
+                        Field::new("item", DataType::LargeBinary, false).with_metadata(
                             std::collections::HashMap::<String, String>::from([
                                 ("nr_logical_type".into(), "json".into()),
                                 ("provider.field-id".into(), "71".into()),

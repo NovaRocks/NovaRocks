@@ -1140,8 +1140,12 @@ mod tests {
                 ValueLogicalType::Percentile,
             )
             .unwrap(),
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                false,
+                ValueLogicalType::Json,
+            )
+            .unwrap(),
         ] {
             let arguments = [theta_value_argument(value_type.clone())];
             let request = theta_value_request(&arguments);

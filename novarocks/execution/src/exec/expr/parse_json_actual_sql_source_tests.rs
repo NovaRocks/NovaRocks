@@ -20,8 +20,11 @@ use arrow::datatypes::DataType;
 use novarocks_expression_contract::ExprKind;
 use novarocks_physical_plan::StaticFunctionArgument;
 
-use novarocks_type_contract::{FunctionArgumentType, FunctionValueType, ValueLogicalType};
-const SQL: &str = "SELECT parse_json('[1,2,3]') AS parsed";
+use novarocks_type_contract::{
+    CharacterKind, CharacterType, FunctionArgumentType, FunctionValueType, ValueKind, ValueLayout,
+    ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
+};
+const SQL: &str = "SELECT json_parse('[1,2,3]') AS parsed";
 fn check() {
     let source = super::sql_test_source::sql_source_with_declared_fields(SQL, &[]);
     let mut count = 0;
@@ -30,7 +33,7 @@ fn check() {
             let ExprKind::FunctionCall { function, args } = &node.kind else {
                 continue;
             };
-            if function.function_id.as_str() != "builtin.scalar/parse_json/v1" {
+            if function.function_id.as_str() != "builtin.scalar/json_parse/v1" {
                 continue;
             }
             let request = unit.requests().get(id).unwrap();
@@ -40,15 +43,26 @@ fn check() {
             let StaticFunctionArgument::Value { value_type, .. } = &request.arguments[0] else {
                 panic!("original Value channel")
             };
-            assert_eq!(value_type, &FunctionValueType::new(DataType::Utf8, false));
+            let storage = ValueTypeStorageLifetime::pure();
+            let literal = ValueTypeRef::try_new(
+                ValueKind::BoundedCharacter(CharacterType::new(CharacterKind::Varchar, 7).unwrap()),
+                false,
+                storage.clone(),
+            )
+            .unwrap();
+            let layout = ValueLayout::try_new(&DataType::Utf8, storage).unwrap();
+            assert_eq!(
+                value_type,
+                &FunctionValueType::try_from_value(literal, layout).unwrap()
+            );
             assert_eq!(
                 function.argument_types.as_ref(),
                 [FunctionArgumentType::Value(value_type.clone())]
             );
             assert_eq!(&unit.definition(args[0]).unwrap().ty, value_type);
             let result = FunctionValueType::try_with_logical_type(
-                DataType::Utf8,
-                true,
+                DataType::LargeBinary,
+                false,
                 ValueLogicalType::Json,
             )
             .unwrap();

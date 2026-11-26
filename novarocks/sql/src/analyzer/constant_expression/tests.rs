@@ -106,7 +106,7 @@ fn required_constant_implicit_targets_do_not_use_general_cast_admission() {
     ] {
         assert!(syntax(sql, target).is_err(), "{sql}");
     }
-    for sql in ["JSON '1'", "parse_json('1')", "CAST(NULL AS json)"] {
+    for sql in ["JSON '1'", "json_parse('1')", "CAST(NULL AS json)"] {
         let Err(SqlCompileError::Analyze(error)) = syntax(sql, Varchar) else {
             panic!("{sql}: expected nominal JSON implicit type refusal");
         };
@@ -309,7 +309,10 @@ fn required_implicit_coercion_uses_semantic_kind_not_encoded_layout() {
         )
         .is_ok()
     );
-    let nominal_json = binding(ValueKind::Nominal(ValueLogicalType::Json), DataType::Utf8);
+    let nominal_json = binding(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        DataType::LargeBinary,
+    );
     assert!(
         validate_target(
             &nominal_json,
@@ -433,15 +436,13 @@ fn required_array_target_checks_semantic_children_before_carrier_casts() {
     use novarocks_type_contract::{
         ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
     };
-    for child_kind in [
-        ValueKind::Nominal(ValueLogicalType::Json),
-        ValueKind::Scalar(DataType::Int32),
+    for (child_kind, child_carrier) in [
+        (
+            ValueKind::Nominal(ValueLogicalType::Json),
+            DataType::LargeBinary,
+        ),
+        (ValueKind::Scalar(DataType::Int32), DataType::Int32),
     ] {
-        let child_carrier = if matches!(&child_kind, ValueKind::Scalar(DataType::Int32)) {
-            DataType::Int32
-        } else {
-            DataType::Utf8
-        };
         let storage = ValueTypeStorageLifetime::pure();
         let child = ValueTypeRef::try_new(child_kind, true, storage.clone()).unwrap();
         let value = ValueTypeRef::try_new(ValueKind::List(child), false, storage.clone()).unwrap();

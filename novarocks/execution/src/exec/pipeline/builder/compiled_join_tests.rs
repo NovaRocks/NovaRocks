@@ -1847,7 +1847,7 @@ fn join_nested_fixture_slot(
         if json {
             ValueKind::Nominal(ValueLogicalType::Json)
         } else {
-            ValueKind::String
+            ValueKind::Binary
         },
         child_nullable,
         storage.clone(),
@@ -1855,7 +1855,11 @@ fn join_nested_fixture_slot(
     .unwrap();
     let semantic =
         ValueTypeRef::try_new(ValueKind::List(child), root_nullable, storage.clone()).unwrap();
-    let dtype = DataType::List(Arc::new(Field::new("item", DataType::Utf8, child_nullable)));
+    let dtype = DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::LargeBinary,
+        child_nullable,
+    )));
     let binding = TypedValueBinding::try_new(
         semantic,
         ValueLayout::try_new(&dtype, storage.clone()).unwrap(),
@@ -1872,7 +1876,7 @@ fn join_nested_fixture_slot(
 }
 
 fn join_nested_fixture_source(id: u32, json: bool) -> crate::exec::chunk::Chunk {
-    use arrow::array::{ArrayRef, ListArray, StringArray};
+    use arrow::array::{ArrayRef, LargeBinaryArray, ListArray};
     use arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use arrow::datatypes::Field;
     use novarocks_type_contract::ValueTypeStorageLifetime;
@@ -1884,9 +1888,12 @@ fn join_nested_fixture_source(id: u32, json: bool) -> crate::exec::chunk::Chunk 
         .unwrap(),
     );
     let array: ArrayRef = Arc::new(ListArray::new(
-        Arc::new(Field::new("item", DataType::Utf8, true)),
+        Arc::new(Field::new("item", DataType::LargeBinary, true)),
         OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
-        Arc::new(StringArray::from(vec![Some("1"), None])),
+        Arc::new(LargeBinaryArray::from(vec![
+            Some(b"\x01\x4a\x01\x00\x00\x00".as_slice()),
+            None,
+        ])),
         None,
     ));
     let batch =
@@ -3681,9 +3688,8 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
     ] {
         let fixture_sources =
             crate::exec::operators::family_fixture::constant_sources::Sources::new();
-        // The SQL projection has already normalized each JSON once. The
-        // hash owner consumes ordinary Utf8 canonical keys, not JSON text.
-        let json = FunctionValueType::new(DataType::Utf8, true);
+        // Exercise the Binary key carrier after the canonical projection.
+        let key_type = FunctionValueType::new(DataType::Binary, true);
         let boolean = FunctionValueType::new(DataType::Boolean, true);
         let mut builder =
             crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
@@ -3694,13 +3700,17 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
         let literal = |value: Option<&str>| {
             value.map_or(
                 crate::exec::operators::family_fixture::constant_sources::null(),
-                |text| crate::exec::operators::family_fixture::constant_sources::utf8(text.into()),
+                |key| {
+                    crate::exec::operators::family_fixture::constant_sources::binary(
+                        key.as_bytes().into(),
+                    )
+                },
             )
         };
         let l = values(
             &mut builder,
             left,
-            std::slice::from_ref(&json),
+            std::slice::from_ref(&key_type),
             &lhs.iter()
                 .map(|value| vec![literal(*value)])
                 .collect::<Vec<_>>(),
@@ -3709,7 +3719,7 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
         let r = values(
             &mut builder,
             right,
-            std::slice::from_ref(&json),
+            std::slice::from_ref(&key_type),
             &rhs.iter()
                 .map(|value| vec![literal(*value)])
                 .collect::<Vec<_>>(),
@@ -3718,12 +3728,12 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
         let probe = builder
             .unit(join)
             .unwrap()
-            .add(None, json.clone(), ExprKind::Value(l))
+            .add(None, key_type.clone(), ExprKind::Value(l))
             .unwrap();
         let build = builder
             .unit(join)
             .unwrap()
-            .add(None, json.clone(), ExprKind::Value(r))
+            .add(None, key_type.clone(), ExprKind::Value(r))
             .unwrap();
         let probe = builder
             .unit(join)
@@ -3788,11 +3798,11 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
             },
             fields: Box::from([
                 ResultField {
-                    domain: crate::test_result_domain::result_value_domain(&json),
+                    domain: crate::test_result_domain::result_value_domain(&key_type),
                     name: "j".into(),
                     alias: None,
                     value: l,
-                    ty: json,
+                    ty: key_type,
                 },
                 ResultField {
                     domain: crate::test_result_domain::result_value_domain(&boolean),

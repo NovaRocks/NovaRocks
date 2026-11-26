@@ -108,20 +108,20 @@ fn whole_data_project(node: &OptimizedOperatorNode) -> bool {
         let ScalarNode::FunctionCall { binding, .. } = arena.node(item.expr) else {
             return false;
         };
-        if binding.function_id.as_str() != "builtin.scalar/json_object/v1" {
+        if binding.function_id.as_str() != "builtin.scalar/__json_object_null/v1" {
             return false;
         }
-        assert!(binding.declared_scalar_invocation_data);
+        assert!(!binding.declared_scalar_invocation_data);
         assert_eq!(
             binding.semantics.intrinsic_row_error,
-            FunctionIntrinsicRowError::NoRowError
+            FunctionIntrinsicRowError::MayRaise
         );
         assert_eq!(
             binding.admitted_execution_abi,
-            Some(PureKernelAbi::ScalarInvocationV1)
+            Some(PureKernelAbi::ScalarV1)
         );
         assert!(crate::optimizer::scalar_expr::can_fail(arena, item.expr));
-        assert_eq!(arena.data_type(item.expr), &DataType::Utf8);
+        assert_eq!(arena.data_type(item.expr), &DataType::LargeBinary);
         true
     })
 }
@@ -159,7 +159,7 @@ fn c16_p1_json_object_real_sql_pruning_and_filter_rules_preserve_whole_data_for_
                 "ORDER BY id"
             };
             let sql = format!(
-                "SELECT id FROM (SELECT id, JSON_OBJECT(KEY IF(id = 2, NULL, ARRAY[id, n]) VALUE n) AS unused_error FROM t) s {suffix}"
+                "SELECT id FROM (SELECT id, JSON_OBJECT(KEY IF(id = 2, NULL, CAST(n AS VARCHAR)) VALUE n RETURNING JSON) AS unused_error FROM t) s {suffix}"
             );
             let output = compile(&sql);
             assert!(
@@ -186,13 +186,13 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_fo
                 let ScalarNode::FunctionCall { binding, args, .. } = arena.node(item.expr) else {
                     continue;
                 };
-                if binding.function_id.as_str() != "builtin.scalar/json_object/v1" {
+                if binding.function_id.as_str() != "builtin.scalar/__json_object_null/v1" {
                     continue;
                 }
                 assert!(whole_data_project(node));
                 let ScalarNode::FunctionCall {
                     binding,
-                    args: access,
+                    args: key_access,
                     ..
                 } = arena.node(args[0])
                 else {
@@ -202,13 +202,27 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_fo
                     binding.function_id.as_str(),
                     OperatorFunction::ArraySubscript.function_id_text()
                 );
+                assert_eq!(key_access.len(), 2);
+                assert_eq!(arena.data_type(args[0]), &DataType::Utf8);
+                let ScalarNode::FunctionCall {
+                    binding,
+                    args: access,
+                    ..
+                } = arena.node(key_access[0])
+                else {
+                    panic!("nested key's actual inner array access");
+                };
+                assert_eq!(
+                    binding.function_id.as_str(),
+                    OperatorFunction::ArraySubscript.function_id_text()
+                );
                 assert_eq!(access.len(), 2);
                 let inner = DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
                     "item",
-                    DataType::Int64,
+                    DataType::Utf8,
                     true,
                 )));
-                assert_eq!(arena.data_type(args[0]), &inner);
+                assert_eq!(arena.data_type(key_access[0]), &inner);
                 assert!(arena.nullable(args[0]));
                 assert_eq!(
                     arena.data_type(access[0]),
@@ -259,7 +273,7 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_fo
                 "ORDER BY id"
             };
             let sql = format!(
-                "SELECT id FROM (SELECT id, JSON_OBJECT(KEY ARRAY[ARRAY[id, n]][IF(id = 2, NULL, 1)] VALUE n) AS unused_error FROM t) s {suffix}"
+                "SELECT id FROM (SELECT id, JSON_OBJECT(KEY ARRAY[ARRAY[CAST(id AS VARCHAR), CAST(n AS VARCHAR)]][IF(id = 2, NULL, 1)][1] VALUE n RETURNING JSON) AS unused_error FROM t) s {suffix}"
             );
             let output = compile_with_id_type(&sql, DataType::Int32);
             assert_eq!(check(&output.optimized_tree), 1);

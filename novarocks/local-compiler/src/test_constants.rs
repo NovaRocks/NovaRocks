@@ -66,6 +66,7 @@ scalar!(i64, from_i64, i64);
 scalar!(f64_bits, from_f64_bits, u64);
 scalar!(boolean, from_boolean, bool);
 scalar!(utf8, from_utf8, &str);
+scalar!(binary, from_binary, &[u8]);
 pub(crate) fn null(
     pools: &mut ConstantPools,
     ty: &FunctionValueType,

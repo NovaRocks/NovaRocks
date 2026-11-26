@@ -4326,39 +4326,43 @@ mod tests {
         use novarocks_physical_plan::ResultValueDomain as D;
         use novarocks_result_contract::ScalarValueType as V;
         for (sql, domain, value) in [
-            ("select json_object('k': 1) as j", D::Json, V::Json),
             (
-                "select coalesce(json_object('k': 1), null) as j",
+                "select json_object('k': 1 RETURNING JSON) as j",
                 D::Json,
                 V::Json,
             ),
             (
-                "select if(true, json_object('k': 1), null) as j",
+                "select coalesce(json_object('k': 1 RETURNING JSON), null) as j",
                 D::Json,
                 V::Json,
             ),
             (
-                "select case when true then json_object('k': 1) else null end as j",
+                "select if(true, json_object('k': 1 RETURNING JSON), null) as j",
                 D::Json,
                 V::Json,
             ),
             (
-                "with q as (select json_object('k': 1) as j) select j from q",
+                "select case when true then json_object('k': 1 RETURNING JSON) else null end as j",
                 D::Json,
                 V::Json,
             ),
             (
-                "select cast(json_object('k': 1) as varchar) as j",
+                "with q as (select json_object('k': 1 RETURNING JSON) as j) select j from q",
+                D::Json,
+                V::Json,
+            ),
+            (
+                "select cast(json_object('k': 1 RETURNING JSON) as varchar) as j",
                 D::Plain,
                 V::String,
             ),
             (
-                "select coalesce(cast(json_object('k': 1) as varchar), 'plain') as j",
+                "select coalesce(cast(json_object('k': 1 RETURNING JSON) as varchar), 'plain') as j",
                 D::Plain,
                 V::String,
             ),
             (
-                "select json_object('k': 1) as j union all select null",
+                "select json_object('k': 1 RETURNING JSON) as j union all select null",
                 D::Json,
                 V::Json,
             ),

@@ -1085,9 +1085,12 @@ mod tests {
         use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 
         let mut source = output_column(701, "payload");
-        source.value_type =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap();
+        source.value_type = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let projected = project_requested_output_columns(
             &[source.clone()],
             &[source.clone()],

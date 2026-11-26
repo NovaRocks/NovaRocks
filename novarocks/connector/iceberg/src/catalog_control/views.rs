@@ -1962,7 +1962,7 @@ mod declaration_tests {
             ),
         ];
         for (carrier, domain) in [
-            (DataType::Utf8, ValueLogicalType::Json),
+            (DataType::LargeBinary, ValueLogicalType::Json),
             (DataType::Binary, ValueLogicalType::Hll),
             (DataType::Binary, ValueLogicalType::Bitmap),
             (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),

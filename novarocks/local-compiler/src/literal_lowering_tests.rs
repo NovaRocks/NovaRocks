@@ -220,11 +220,15 @@ fn cases(nullable: bool) -> Vec<ScalarCase> {
         -1234
     );
     case!(
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap(),
-        from_utf8("{\"x\":17}"),
-        try_utf8,
-        "{\"x\":17}"
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json
+        )
+        .unwrap(),
+        from_binary(b"\x01\x80\x01\x00"),
+        try_binary,
+        b"\x01\x80\x01\x00".as_slice()
     );
     case!(
         FunctionValueType::try_with_logical_type(

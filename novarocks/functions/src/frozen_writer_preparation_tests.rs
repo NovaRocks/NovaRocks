@@ -211,27 +211,27 @@ fn frozen_writer_preparation_preserves_each_original_control_prefix_without_tail
 }
 
 #[test]
-fn frozen_writer_rejects_same_carrier_json_text_and_keeps_independent_complete_equal_input() {
+fn frozen_writer_rejects_plain_binary_for_json_and_keeps_independent_complete_equal_input() {
     let json = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         true,
         novarocks_type_contract::ValueLogicalType::Json,
     )
     .unwrap();
     let source = Source::with_type(json);
     let equal = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         true,
         novarocks_type_contract::ValueLogicalType::Json,
     )
     .unwrap();
-    let text = FunctionValueType::new(DataType::Utf8, true);
-    assert_eq!(equal.data_type(), text.data_type());
+    let binary = FunctionValueType::new(DataType::LargeBinary, true);
+    assert_eq!(equal.data_type(), binary.data_type());
     let mut good = source.loan();
     good.actual_input_type = &equal;
     prepare_frozen_writer_aggregate(&source.catalog, good, &Control::default()).unwrap();
     let mut wrong = source.loan();
-    wrong.actual_input_type = &text;
+    wrong.actual_input_type = &binary;
     assert!(matches!(
         prepare_frozen_writer_aggregate(&source.catalog, wrong, &Control::default()),
         Err(FunctionSpecializationFailure::InvalidInput(_))

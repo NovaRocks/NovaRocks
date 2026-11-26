@@ -56,7 +56,7 @@ impl PlannerTableProvider for SourceCatalog {
             TableDef,
         };
         let columns = vec![
-            column("j", DataType::Utf8, Some(SqlType::Json)),
+            column("j", DataType::LargeBinary, Some(SqlType::Json)),
             column("h", DataType::Binary, Some(SqlType::Hll)),
             column("b", DataType::Binary, Some(SqlType::Bitmap)),
             column("v", DataType::LargeBinary, Some(SqlType::Variant)),
@@ -64,13 +64,13 @@ impl PlannerTableProvider for SourceCatalog {
             column("raw", DataType::FixedSizeBinary(16), None),
             column(
                 "ja",
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true))),
                 Some(SqlType::Array(Box::new(SqlType::Json))),
             ),
             column(
                 "ja_meta",
                 DataType::List(Arc::new(
-                    Field::new("source_item", DataType::Utf8, false).with_metadata(
+                    Field::new("source_item", DataType::LargeBinary, false).with_metadata(
                         std::collections::HashMap::<String, String>::from([(
                             "provider".to_string(),
                             "retained-source".to_string(),
@@ -311,7 +311,7 @@ fn typed_empty_array_uses_the_original_unknown_constructor_and_complete_json_cas
         let DataType::List(item) = expression.value_type.data_type() else {
             panic!("JSON list");
         };
-        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(item.data_type(), &DataType::LargeBinary);
         assert!(item.is_nullable());
         assert!(item.metadata().as_arc().is_none());
     }
@@ -383,9 +383,12 @@ fn conflicting_catalog_tag_is_rejected_without_carrier_guess() {
 fn scope_padding_preserves_source_and_parameter_domains_without_retagging_factory() {
     let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
     let mut scope = AnalyzerScope::new(factory.clone());
-    let ty =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let ty = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let id = scope.add_column(Some("t"), "j", ty.clone());
     scope.mark_all_nullable();
     assert_eq!(
@@ -399,7 +402,7 @@ fn scope_padding_preserves_source_and_parameter_domains_without_retagging_factor
 fn assignment_common_owner_preserves_complete_same_domain_and_null_sources() {
     let control = crate::optimizer::test_optimizer_control();
     for (carrier, logical) in [
-        (DataType::Utf8, ValueLogicalType::Json),
+        (DataType::LargeBinary, ValueLogicalType::Json),
         (DataType::Binary, ValueLogicalType::Hll),
         (DataType::Binary, ValueLogicalType::Bitmap),
         (DataType::LargeBinary, ValueLogicalType::Variant),
@@ -423,12 +426,12 @@ fn assignment_common_owner_preserves_complete_same_domain_and_null_sources() {
     }
     let left = column(
         "nested",
-        DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+        DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, false))),
         Some(SqlType::Array(Box::new(SqlType::Json))),
     );
     let right = column(
         "nested",
-        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true))),
         Some(SqlType::Array(Box::new(SqlType::Json))),
     );
     let left = helpers::column_value_type(&left, control).unwrap();
@@ -450,7 +453,7 @@ fn case_union_and_values_use_the_same_authored_source_domains() {
     for sql in [
         "SELECT CASE WHEN TRUE THEN j ELSE NULL END FROM source",
         "SELECT j FROM source UNION ALL SELECT NULL",
-        "VALUES (parse_json('{}')),(NULL)",
+        "VALUES (json_parse('{}')),(NULL)",
     ] {
         assert_eq!(
             analyze(sql).output_columns[0].value_type.logical_type(),
@@ -463,7 +466,7 @@ fn case_union_and_values_use_the_same_authored_source_domains() {
 #[test]
 fn scalar_aggregate_and_window_outputs_are_complete_selected_owner_facts() {
     for sql in [
-        "SELECT parse_json('{}')",
+        "SELECT json_parse('{}')",
         "SELECT array_agg(j) FROM source",
         "SELECT first_value(j) OVER () FROM source",
     ] {
@@ -868,7 +871,7 @@ fn mixed_case_requires_explicit_conversion_and_arrays_keep_the_original_json_sou
         assert_eq!(args.len(), 1);
         assert!(matches!(args[0].kind, ExprKind::ColumnRef { .. }));
         assert_eq!(args[0].value_type.logical_type(), ValueLogicalType::Json);
-        assert_eq!(args[0].value_type.data_type(), &DataType::Utf8);
+        assert_eq!(args[0].value_type.data_type(), &DataType::LargeBinary);
         let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
         else {
             panic!("ARRAY scalar")
@@ -955,21 +958,44 @@ impl crate::compiler::SqlFunctionCatalog for MissingConversionPort {
 #[test]
 fn internal_value_conversion_preserves_the_supplied_catalog_boundary() {
     let control = crate::compiler::SqlCompileControl::unbounded();
-    let error = super::value_conversion::convert_value_domain_with_catalog(
-        &MissingConversionPort,
-        projection("SELECT j FROM source"),
-        FunctionValueType::new(DataType::Utf8, false),
-        novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-        crate::constant::test_constant_policy(),
-        &control,
-    )
-    .unwrap_err();
+    let convert = |catalog: &dyn crate::compiler::SqlFunctionCatalog, source: &str| {
+        super::value_conversion::convert_value_domain_with_catalog(
+            catalog,
+            projection(source),
+            FunctionValueType::new(DataType::Utf8, false),
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            crate::constant::test_constant_policy(),
+            &control,
+        )
+    };
+    let builtin = crate::functions::builtin_sql_function_catalog();
+    let converted = convert(builtin, "SELECT i FROM source").unwrap();
+    let ExprKind::FunctionCall { binding, args, .. } = &converted.kind else {
+        panic!("expected the installed value-domain conversion");
+    };
+    assert_eq!(
+        binding.function_id.as_str(),
+        "builtin.scalar/value_domain_conversion/v1"
+    );
+    assert_eq!(
+        args[0].value_type.logical_type(),
+        ValueLogicalType::LargeInt
+    );
+    assert_eq!(
+        converted.value_type,
+        FunctionValueType::new(DataType::Utf8, false)
+    );
+
+    let error = convert(&MissingConversionPort, "SELECT i FROM source").unwrap_err();
     assert!(error.to_string().contains("binding declaration"), "{error}");
+
+    let error = convert(builtin, "SELECT j FROM source").unwrap_err();
+    assert_eq!(error.message(), "no matching declared overload");
 }
 
 #[test]
 fn scalar_text_arguments_require_explicit_json_conversion() {
-    for name in ["parse_json", "length"] {
+    for name in ["json_parse", "length"] {
         let query = novarocks_parser::parser::parse_query(&format!("SELECT {name}(j) FROM source"))
             .unwrap();
         let error = super::analyze(&query, &SourceCatalog, "default").unwrap_err();
@@ -1200,7 +1226,7 @@ fn aggregate_and_value_conversion_adapters_preserve_binding_control() {
             column: "json_source".into(),
         },
         value_type: FunctionValueType::try_with_logical_type(
-            DataType::Utf8,
+            DataType::LargeBinary,
             true,
             ValueLogicalType::Json,
         )
@@ -1278,7 +1304,7 @@ fn variant_get_text_admission_preserves_parse_json_and_original_union_common_typ
     use novarocks_functions::FunctionArgumentType;
     for (sql, expected_source) in [
         (
-            r#"SELECT variant_get(parse_json('{"a":1}'),'$.a','bigint')"#,
+            r#"SELECT variant_get(json_parse('{"a":1}'),'$.a','bigint')"#,
             ValueLogicalType::Json,
         ),
         (
@@ -1287,12 +1313,12 @@ fn variant_get_text_admission_preserves_parse_json_and_original_union_common_typ
         ),
         (
             r#"WITH source_values AS (
-            SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
-            UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
-            UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
-            UNION ALL SELECT 4, parse_json('{"a":1.5}')
+            SELECT 1 AS id, json_parse('{"a":1,"b":"x"}') AS v
+            UNION ALL SELECT 2, json_parse('{"a":99,"b":"y"}')
+            UNION ALL SELECT 3, json_parse('{"b":"no-a"}')
+            UNION ALL SELECT 4, json_parse('{"a":1.5}')
             UNION ALL SELECT 5, NULL
-            UNION ALL SELECT 6, parse_json('{"a":"abc"}')
+            UNION ALL SELECT 6, json_parse('{"a":"abc"}')
         ) SELECT id, try_variant_get(v, '$.a', 'bigint') FROM source_values ORDER BY id"#,
             ValueLogicalType::Json,
         ),
@@ -1305,7 +1331,12 @@ fn variant_get_text_admission_preserves_parse_json_and_original_union_common_typ
         let ExprKind::FunctionCall { args, binding, .. } = &expression.kind else {
             panic!("original scalar")
         };
-        assert_eq!(args[0].value_type.data_type(), &DataType::Utf8);
+        let expected_carrier = if expected_source == ValueLogicalType::Json {
+            DataType::LargeBinary
+        } else {
+            DataType::Utf8
+        };
+        assert_eq!(args[0].value_type.data_type(), &expected_carrier);
         assert_eq!(args[0].value_type.logical_type(), expected_source);
         assert_eq!(
             binding.selected.argument_types[0],

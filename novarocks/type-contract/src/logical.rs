@@ -93,7 +93,7 @@ impl ValueLogicalType {
     pub fn validate_carrier(self, data_type: &DataType) -> Result<(), ValueTypeError> {
         let valid = match self {
             Self::Physical => true,
-            Self::Json => matches!(data_type, DataType::Utf8),
+            Self::Json => matches!(data_type, DataType::LargeBinary),
             Self::Variant => matches!(data_type, DataType::LargeBinary),
             Self::Hll | Self::Bitmap | Self::Object | Self::Percentile => {
                 matches!(data_type, DataType::Binary | DataType::LargeBinary)
@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn logical_domains_require_explicit_identity_and_exact_carriers() {
         for (logical, carrier) in [
-            (ValueLogicalType::Json, DataType::Utf8),
+            (ValueLogicalType::Json, DataType::LargeBinary),
             (ValueLogicalType::Variant, DataType::LargeBinary),
             (ValueLogicalType::Hll, DataType::Binary),
             (ValueLogicalType::Bitmap, DataType::Binary),
@@ -656,12 +656,29 @@ mod tests {
                 FunctionValueType::try_with_logical_type(DataType::Int64, false, logical).is_err()
             );
         }
+        assert!(
+            ValueLogicalType::Json
+                .validate_carrier(&DataType::Utf8)
+                .is_err()
+        );
+        assert!(
+            ValueLogicalType::Json
+                .validate_carrier(&DataType::Binary)
+                .is_err()
+        );
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let variant = FunctionValueType::try_with_logical_type(
             DataType::LargeBinary,
             false,
             ValueLogicalType::Variant,
         )
         .unwrap();
+        assert!(!json.same_value_domain(&variant));
         let object = FunctionValueType::try_with_logical_type(
             DataType::LargeBinary,
             false,
@@ -682,7 +699,7 @@ mod tests {
     #[test]
     fn nested_logical_identity_survives_nullable_widening() {
         let field = |nullable, label: Option<&str>| {
-            let field = Field::new("item", DataType::Utf8, nullable);
+            let field = Field::new("item", DataType::LargeBinary, nullable);
             match label {
                 None => field,
                 Some(label) => {
@@ -702,7 +719,11 @@ mod tests {
                 crate::ValueTypeRef::try_new(crate::ValueKind::List(child), true, storage.clone())
                     .unwrap();
             let layout = crate::ValueLayout::try_new(
-                &DataType::List(Arc::new(Field::new("item", DataType::Utf8, nullable))),
+                &DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::LargeBinary,
+                    nullable,
+                ))),
                 storage,
             )
             .unwrap();
@@ -710,7 +731,7 @@ mod tests {
         };
         let actual_value = declared_list(false, crate::ValueKind::Nominal(ValueLogicalType::Json));
         let expected_value = declared_list(true, crate::ValueKind::Nominal(ValueLogicalType::Json));
-        let plain_value = declared_list(true, crate::ValueKind::String);
+        let plain_value = declared_list(true, crate::ValueKind::Binary);
         let fits = |actual: &FunctionValueType, expected: &FunctionValueType| {
             actual
                 .fits_physical_binding_observed::<ValueTypeError>(expected, || Ok(()))
@@ -730,8 +751,14 @@ mod tests {
         let plain = DataType::List(Arc::new(field(true, None)));
         assert!(!preserves_nested_logical_identity(&actual, &plain));
         assert!(!preserves_nested_logical_identity(&plain, &actual));
-        assert!(!preserves_nested_logical_identity(&actual, &DataType::Utf8));
-        assert!(preserves_nested_logical_identity(&plain, &DataType::Utf8));
+        assert!(!preserves_nested_logical_identity(
+            &actual,
+            &DataType::LargeBinary
+        ));
+        assert!(preserves_nested_logical_identity(
+            &plain,
+            &DataType::LargeBinary
+        ));
     }
 
     #[test]
@@ -841,14 +868,12 @@ mod tests {
     }
 
     fn identity_field(label: Option<&str>) -> Arc<Field> {
-        let field =
-            Field::new("item", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
-                String,
-                String,
-            >::from([(
+        let field = Field::new("item", DataType::LargeBinary, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
                 "provider.field.id".into(),
                 "73".into(),
-            )]));
+            )]),
+        );
         Arc::new(match label {
             Some(label) => {
                 let mut metadata = field.metadata().clone();

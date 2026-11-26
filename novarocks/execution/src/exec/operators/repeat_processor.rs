@@ -875,7 +875,7 @@ mod typed_owner_tests {
         runtime_state::RuntimeErrorState,
         task::{ExecutionFailure, ExecutionFailureCause},
     };
-    use arrow::array::{Array, ListArray, StringArray};
+    use arrow::array::{Array, LargeBinaryArray, ListArray};
     use arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use novarocks_type_contract::{
         FunctionValueType, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
@@ -887,7 +887,11 @@ mod typed_owner_tests {
         let child = ValueTypeRef::try_new(kind, child_nullable, storage.clone()).unwrap();
         let value =
             ValueTypeRef::try_new(ValueKind::List(child), root_nullable, storage.clone()).unwrap();
-        let carrier = DataType::List(Arc::new(Field::new("", DataType::Utf8, child_nullable)));
+        let carrier = DataType::List(Arc::new(Field::new(
+            "",
+            DataType::LargeBinary,
+            child_nullable,
+        )));
         FunctionValueType::try_from_value(value, ValueLayout::try_new(&carrier, storage).unwrap())
             .unwrap()
     }
@@ -921,6 +925,11 @@ mod typed_owner_tests {
             ),
         )
     }
+    const DOCUMENTS: [&[u8]; 2] = [
+        b"\x01\x80\x08\x01\x01n\x4a\x01\x00\x00\x00",
+        b"\x01\x80\x08\x01\x01n\x4a\x02\x00\x00\x00",
+    ];
+
     fn source(kind: ValueKind) -> Chunk {
         let ty = list_type(kind, false, false);
         let DataType::List(field) = ty.data_type() else {
@@ -929,7 +938,7 @@ mod typed_owner_tests {
         let array = ListArray::try_new(
             field.clone(),
             OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2])),
-            Arc::new(StringArray::from(vec!["{\"n\":1}", "{\"n\":2}"])),
+            Arc::new(LargeBinaryArray::from(DOCUMENTS.to_vec())),
             None,
         )
         .unwrap();
@@ -1002,12 +1011,9 @@ mod typed_owner_tests {
         let values = actual
             .values()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeBinaryArray>()
             .unwrap();
-        assert_eq!(
-            (values.value(0), values.value(1)),
-            ("{\"n\":1}", "{\"n\":2}")
-        );
+        assert_eq!([values.value(0), values.value(1)], DOCUMENTS);
         for (chunk, group) in [(&nulled, 4), (&kept, 7)] {
             let schema = chunk.chunk_schema();
             let slot = &schema.slots()[0];
@@ -1239,7 +1245,7 @@ mod typed_owner_tests {
             op.as_mut(),
             &RuntimeState::default(),
         )
-        .input_and_collect(source(ValueKind::String))
+        .input_and_collect(source(ValueKind::Binary))
         .unwrap_err();
         assert!(matches!(error.cause(), ExecutionFailureCause::Construction(
             ConstructionFailure::InvalidSource(detail)) if detail.contains("complete declared type")));

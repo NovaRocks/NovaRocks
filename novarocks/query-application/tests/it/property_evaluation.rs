@@ -613,9 +613,13 @@ fn ddl_property_user_errors_do_not_consume_later_or_duplicate_expressions() {
 fn ddl_property_port_contract_and_original_failures_are_not_scope_data_errors() {
     let expression = parse_expression("original_value").unwrap();
     let declarations = [declaration("p", Type::Varchar, Value::Null)];
-    // A real JSON constant has the same UTF8 carrier, but is not VARCHAR.
+    // An admitted JSON constant must preserve its own complete domain.
     let json = constant(
-        Arc::new(StringArray::from(vec![Some("0"), Some("1")])),
+        Arc::new(arrow::array::LargeBinaryArray::from(vec![
+            b"\x01\x20"
+                .as_slice();
+            2
+        ])),
         ValueLogicalType::Json,
     );
     let mut port = Port::new(vec![Call {
@@ -634,17 +638,18 @@ fn ddl_property_port_contract_and_original_failures_are_not_scope_data_errors() 
     assert!(error.user_error().is_none());
     port.exhausted();
     let json_child = FunctionValueType::try_with_logical_type(
-        arrow::datatypes::DataType::Utf8,
+        arrow::datatypes::DataType::LargeBinary,
         true,
         ValueLogicalType::Json,
     )
     .unwrap()
     .try_to_field("item")
     .unwrap();
-    let mut builder = ListBuilder::new(StringBuilder::new()).with_field(json_child);
-    builder.values().append_value("0");
+    let mut builder =
+        ListBuilder::new(arrow::array::LargeBinaryBuilder::new()).with_field(json_child);
+    builder.values().append_value(b"\x01\x20");
     builder.append(true);
-    builder.values().append_value("1");
+    builder.values().append_value(b"\x01\x80\x01\x00");
     builder.append(true);
     let json_list = constant(Arc::new(builder.finish()), ValueLogicalType::Physical);
     let mut port = Port::new(vec![Call {

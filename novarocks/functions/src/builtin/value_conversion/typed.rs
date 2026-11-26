@@ -54,37 +54,21 @@ pub(super) fn domains_preserved(a: &ValueTypeRef, b: &ValueTypeRef) -> bool {
     })
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum SameShapeConversion {
-    JsonText,
-    OpaqueBinary,
-}
-impl SameShapeConversion {
-    fn domain_pair(
-        self,
-        source: novarocks_type_contract::ValueLogicalType,
-        target: novarocks_type_contract::ValueLogicalType,
-    ) -> Option<bool> {
-        use novarocks_type_contract::ValueLogicalType as D;
-        match self {
-            Self::JsonText => super::json_domain_pair(source, target),
-            Self::OpaqueBinary if source == target => Some(false),
-            Self::OpaqueBinary
-                if matches!(
-                    source,
-                    D::Hll | D::Bitmap | D::Object | D::Percentile | D::Variant
-                ) && target == D::Physical =>
-            {
-                Some(true)
-            }
-            _ => None,
-        }
-    }
-    fn changed_kind(self) -> ValueKind {
-        match self {
-            Self::JsonText => ValueKind::String,
-            Self::OpaqueBinary => ValueKind::Binary,
-        }
+fn opaque_binary_pair(
+    source: novarocks_type_contract::ValueLogicalType,
+    target: novarocks_type_contract::ValueLogicalType,
+) -> Option<bool> {
+    use novarocks_type_contract::ValueLogicalType as D;
+    if source == target {
+        Some(false)
+    } else if matches!(
+        source,
+        D::Hll | D::Bitmap | D::Object | D::Percentile | D::Variant
+    ) && target == D::Physical
+    {
+        Some(true)
+    } else {
+        None
     }
 }
 
@@ -93,7 +77,6 @@ impl SameShapeConversion {
 pub(super) fn same_shape_pair(
     source: &FunctionValueType,
     target: &FunctionValueType,
-    mode: SameShapeConversion,
     observe: &mut impl FnMut() -> Result<(), FunctionBindingError>,
 ) -> Result<Option<bool>, FunctionBindingError> {
     same_shape_node(
@@ -102,7 +85,6 @@ pub(super) fn same_shape_pair(
         target.value_type(),
         target.data_type(),
         true,
-        mode,
         observe,
     )
 }
@@ -110,29 +92,25 @@ pub(super) fn same_shape_pair(
 pub(super) fn same_shape_intermediate_with_construction<E>(
     source: &FunctionValueType,
     target: &FunctionValueType,
-    mode: SameShapeConversion,
     creation: &mut super::super::scalar_construction::ScalarConstruction<'_, E>,
 ) -> Result<FunctionValueType, super::super::scalar_construction::OwnerFailure<E>> {
     use novarocks_type_contract::ValueField;
     let no_match = || FunctionBindingError::NoMatchingOverload;
-    let Some(changed) = mode.domain_pair(source.logical_type(), target.logical_type()) else {
+    let Some(changed) = opaque_binary_pair(source.logical_type(), target.logical_type()) else {
         return Err(no_match().into());
     };
     let storage = creation.storage();
     let kind = if changed {
-        if matches!(mode, SameShapeConversion::OpaqueBinary)
-            && !matches!(target.value_type().kind(), ValueKind::Binary)
-        {
+        if !matches!(target.value_type().kind(), ValueKind::Binary) {
             return Err(no_match().into());
         }
-        mode.changed_kind()
+        ValueKind::Binary
     } else {
         match (source.value_type().kind(), target.value_type().kind()) {
             (ValueKind::List(_), ValueKind::List(_)) => ValueKind::List(
                 same_shape_intermediate_with_construction(
                     &creation.child(source, 0)?.ok_or_else(no_match)?,
                     &creation.child(target, 0)?.ok_or_else(no_match)?,
-                    mode,
                     creation,
                 )?
                 .value_type()
@@ -145,7 +123,6 @@ pub(super) fn same_shape_intermediate_with_construction<E>(
                 item: same_shape_intermediate_with_construction(
                     &creation.child(source, 0)?.ok_or_else(no_match)?,
                     &creation.child(target, 0)?.ok_or_else(no_match)?,
-                    mode,
                     creation,
                 )?
                 .value_type()
@@ -171,7 +148,6 @@ pub(super) fn same_shape_intermediate_with_construction<E>(
                         let item = same_shape_intermediate_with_construction(
                             &creation.child(source, index)?.ok_or_else(no_match)?,
                             &creation.child(target, right)?.ok_or_else(no_match)?,
-                            mode,
                             creation,
                         )?;
                         Ok(ValueField::from_borrowed_name_with_construction(
@@ -189,7 +165,6 @@ pub(super) fn same_shape_intermediate_with_construction<E>(
                 key: same_shape_intermediate_with_construction(
                     &creation.child(source, 0)?.ok_or_else(no_match)?,
                     &creation.child(target, 0)?.ok_or_else(no_match)?,
-                    mode,
                     creation,
                 )?
                 .value_type()
@@ -197,7 +172,6 @@ pub(super) fn same_shape_intermediate_with_construction<E>(
                 value: same_shape_intermediate_with_construction(
                     &creation.child(source, 1)?.ok_or_else(no_match)?,
                     &creation.child(target, 1)?.ok_or_else(no_match)?,
-                    mode,
                     creation,
                 )?
                 .value_type()
@@ -227,7 +201,6 @@ fn same_shape_node(
     b: &ValueTypeRef,
     bl: &DataType,
     root: bool,
-    mode: SameShapeConversion,
     observe: &mut impl FnMut() -> Result<(), FunctionBindingError>,
 ) -> Result<Option<bool>, FunctionBindingError> {
     observe()?;
@@ -238,7 +211,7 @@ fn same_shape_node(
         ValueKind::Nominal(domain) => *domain,
         _ => novarocks_type_contract::ValueLogicalType::Physical,
     };
-    let Some(mut changed) = mode.domain_pair(domain(a), domain(b)) else {
+    let Some(mut changed) = opaque_binary_pair(domain(a), domain(b)) else {
         return Ok(None);
     };
     match (a.kind(), b.kind(), al, bl) {
@@ -296,7 +269,7 @@ fn same_shape_node(
         ) else {
             return Ok(None);
         };
-        let Some(child) = same_shape_node(a, al, b, bl, false, mode, observe)? else {
+        let Some(child) = same_shape_node(a, al, b, bl, false, observe)? else {
             return Ok(None);
         };
         changed |= child;

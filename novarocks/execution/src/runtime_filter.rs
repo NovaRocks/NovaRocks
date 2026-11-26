@@ -1645,11 +1645,11 @@ mod typed_channel_identity_tests {
     use novarocks_functions::FunctionValueType;
     #[test]
     fn membership_channel_keeps_complete_semantics_separate_from_physical_artifact_digest() {
-        let text = FunctionValueType::new(DataType::Utf8, true);
-        let json = FunctionValueType::try_with_logical_type(
-            DataType::Utf8,
+        let binary = FunctionValueType::new(DataType::FixedSizeBinary(16), true);
+        let uuid = FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
             true,
-            novarocks_type_contract::ValueLogicalType::Json,
+            novarocks_type_contract::ValueLogicalType::Uuid,
         )
         .unwrap();
         let construct = |value| {
@@ -1661,21 +1661,21 @@ mod typed_channel_identity_tests {
             )
             .unwrap()
         };
-        let text = construct(text);
-        let json = construct(json);
-        assert_eq!(text.canonical_bytes(), json.canonical_bytes());
-        assert_eq!(text.digest(), json.digest());
+        let binary = construct(binary);
+        let uuid = construct(uuid);
+        assert_eq!(binary.canonical_bytes(), uuid.canonical_bytes());
+        assert_eq!(binary.digest(), uuid.digest());
         assert_ne!(
-            RuntimeFilterExecutionContract::Membership(text.clone()),
-            RuntimeFilterExecutionContract::Membership(json.clone())
+            RuntimeFilterExecutionContract::Membership(binary.clone()),
+            RuntimeFilterExecutionContract::Membership(uuid.clone())
         );
         assert_eq!(
-            json.value_type().unwrap().logical_type(),
-            novarocks_type_contract::ValueLogicalType::Json
+            uuid.value_type().unwrap().logical_type(),
+            novarocks_type_contract::ValueLogicalType::Uuid
         );
         assert_eq!(
-            construct(FunctionValueType::new(DataType::Utf8, true)),
-            text
+            construct(FunctionValueType::new(DataType::FixedSizeBinary(16), true)),
+            binary
         );
     }
 }

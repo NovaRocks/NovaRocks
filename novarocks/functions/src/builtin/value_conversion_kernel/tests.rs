@@ -129,12 +129,12 @@ fn large(values: &[Option<i128>]) -> ArrayRef {
     }
     Arc::new(builder.finish())
 }
-fn json_field(name: &str, json: bool) -> Arc<Field> {
+fn opaque_field(name: &str, opaque: bool) -> Arc<Field> {
     let mut metadata = HashMap::from([("provider.fact".to_owned(), "keep-original".to_owned())]);
-    if json {
-        metadata.insert(NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned());
+    if opaque {
+        metadata.insert(NR_LOGICAL_TYPE_KEY.to_owned(), "variant".to_owned());
     }
-    Arc::new(Field::new(name, DataType::Utf8, true).with_metadata(metadata))
+    Arc::new(Field::new(name, DataType::LargeBinary, true).with_metadata(metadata))
 }
 
 #[test]
@@ -255,10 +255,13 @@ fn largeint_signed_range_null_and_direct_float_rounding_use_independent_expected
 }
 
 #[test]
-fn json_changed_metadata_only_preserves_five_container_shapes_bytes_offsets_and_nulls() {
-    let source_field = json_field("actual-item", true);
-    let target_field = json_field("actual-item", false);
-    let values: ArrayRef = Arc::new(StringArray::from(vec![Some(" { \"a\": 1 } "), None]));
+fn opaque_changed_metadata_only_preserves_five_container_shapes_bytes_offsets_and_nulls() {
+    let source_field = opaque_field("actual-item", true);
+    let target_field = opaque_field("actual-item", false);
+    let values: ArrayRef = Arc::new(arrow_array::LargeBinaryArray::from(vec![
+        Some(&b"opaque original"[..]),
+        None,
+    ]));
     let list: ArrayRef = Arc::new(
         ListArray::try_new(
             Arc::clone(&source_field),
@@ -347,22 +350,28 @@ fn json_changed_metadata_only_preserves_five_container_shapes_bytes_offsets_and_
         assert_eq!(original.nulls(), output.nulls());
         assert_eq!(original.buffers(), output.buffers());
     }
-    let source_type =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let source_type = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Variant,
+    )
+    .unwrap();
     let output = run(
         &source_type,
-        &physical(DataType::Utf8, true),
+        &physical(DataType::LargeBinary, true),
         EvaluatedArgument::Column(&values),
         Selection::all(2),
     );
-    let output = output.as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(output.value(0), " { \"a\": 1 } ");
+    let output = output
+        .as_any()
+        .downcast_ref::<arrow_array::LargeBinaryArray>()
+        .unwrap();
+    assert_eq!(output.value(0), b"opaque original");
     assert!(output.is_null(1));
 }
 
 #[test]
-fn json_sparse_conversion_preserves_typed_uuid_and_explicitly_decoded_plain_sibling() {
+fn opaque_sparse_conversion_preserves_typed_uuid_and_explicitly_decoded_plain_sibling() {
     let dictionary_values: ArrayRef = Arc::new(StringArray::from(
         (0..128).map(|i| format!("v{i}")).collect::<Vec<_>>(),
     ));
@@ -387,8 +396,8 @@ fn json_sparse_conversion_preserves_typed_uuid_and_explicitly_decoded_plain_sibl
         )])),
     );
     let uuid = large(&[Some(-1), Some(0)]);
-    let source_field = json_field("json", true);
-    let target_field = json_field("json", false);
+    let source_field = opaque_field("json", true);
+    let target_field = opaque_field("json", false);
     let array: ArrayRef = Arc::new(
         StructArray::try_new(
             vec![
@@ -398,7 +407,10 @@ fn json_sparse_conversion_preserves_typed_uuid_and_explicitly_decoded_plain_sibl
             ]
             .into(),
             vec![
-                Arc::new(StringArray::from(vec!["unused", "selected"])),
+                Arc::new(arrow_array::LargeBinaryArray::from(vec![
+                    &b"unused"[..],
+                    &b"selected"[..],
+                ])),
                 Arc::new(dictionary),
                 uuid,
             ],
@@ -428,10 +440,10 @@ fn json_sparse_conversion_preserves_typed_uuid_and_explicitly_decoded_plain_sibl
         output
             .column(0)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<arrow_array::LargeBinaryArray>()
             .unwrap()
             .value(0),
-        "selected"
+        b"selected"
     );
     let output_plain = output
         .column(1)
@@ -546,10 +558,10 @@ fn conversion_constant_nonzero_pool_ordinal_scalar_and_selected_column_keep_orig
 fn conversion_actual_compile_metadata_quantum_and_runtime_rows_preserve_every_original_refusal_prefix()
  {
     let fields = (0..320)
-        .map(|i| json_field(&format!("f{i}"), true))
+        .map(|i| opaque_field(&format!("f{i}"), true))
         .collect::<Vec<_>>();
     let target_fields = (0..320)
-        .map(|i| json_field(&format!("f{i}"), false))
+        .map(|i| opaque_field(&format!("f{i}"), false))
         .collect::<Vec<_>>();
     let source_type = physical(DataType::Struct(fields.into()), true);
     let target = physical(DataType::Struct(target_fields.into()), true);
@@ -692,9 +704,12 @@ fn conversion_concrete_classes_and_required_error_journal_are_checked_before_suc
 #[test]
 fn null_lift_has_real_empty_wrapper_target_and_rejects_nonempty_active_domain_without_fallback() {
     let source = physical(DataType::Null, true);
-    let target =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let target = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let input: ArrayRef = Arc::new(arrow_array::NullArray::new(3));
     let rows = [];
     let empty = Selection::try_sparse(3, &rows).unwrap();
@@ -703,7 +718,7 @@ fn null_lift_has_real_empty_wrapper_target_and_rejects_nonempty_active_domain_wi
     let output = instance
         .evaluate(empty, &arguments, &Control::default())
         .unwrap();
-    assert_eq!(output.values().data_type(), &DataType::Utf8);
+    assert_eq!(output.values().data_type(), &DataType::LargeBinary);
     assert!(output.values().is_empty());
     assert!(output.errors().is_empty());
     assert_eq!(instance.contract().result_type(), &target);

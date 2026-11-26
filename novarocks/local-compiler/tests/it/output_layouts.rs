@@ -253,16 +253,23 @@ fn literal_project_outputs_keep_declared_carrier_nullability_and_nominal_type() 
             from_binary(&binary)
         ));
     }
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let variant = FunctionValueType::try_with_logical_type(
         DataType::LargeBinary,
         false,
         ValueLogicalType::Variant,
     )
     .unwrap();
-    values.push(checked_value!(json, from_utf8("{\"value\":42}")));
+    // v1 object with one `value` member carrying INTEGER 42.
+    values.push(checked_value!(
+        json,
+        from_binary(b"\x01\x80\x0c\x01\x05value\x4a\x2a\x00\x00\x00")
+    ));
     values.push(checked_value!(variant, from_binary(&[0, 0xff, 0x32, 0x80])));
     literal_results(with_typed_nulls(values));
 }
@@ -323,7 +330,6 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
     // This independent installed manifest covers every implementation
     // of the original hidden definition, without claiming a Server catalogue.
     for stem in [
-        "json_text_same_structure",
         "opaque_to_binary_same_structure",
         "signed_to_largeint",
         "boolean_to_largeint",

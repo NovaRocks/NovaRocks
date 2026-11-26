@@ -51,7 +51,7 @@ ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id,v) VALUES (s.id,NULL);
 
 -- query 6
 -- @expect_error=Iceberg Variant writes are not supported
-INSERT INTO iru9_variant_mutations_${uuid0}.iru9_${uuid0}.t_v3_variant_mut VALUES ROW(20,parse_json('{"a":20}'));
+INSERT INTO iru9_variant_mutations_${uuid0}.iru9_${uuid0}.t_v3_variant_mut VALUES ROW(20,json_parse('{"a":20}'));
 
 -- query 7
 -- @skip_result_check=true
@@ -86,7 +86,7 @@ grep -E '^IRU9_(EMPTY_REGION_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
 -- query 13
 -- @expect_error=Iceberg Variant writes are not supported
 INSERT INTO iru9_variant_mutations_${uuid0}.iru9_${uuid0}.t_v3_variant_part_mut
-VALUES ROW(4,'us',parse_json('{"a":4}'));
+VALUES ROW(4,'us',json_parse('{"a":4}'));
 
 -- query 14
 -- @skip_result_check=true

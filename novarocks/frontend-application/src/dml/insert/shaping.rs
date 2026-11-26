@@ -331,7 +331,7 @@ fn shape_body(
                     };
                     // This original source cast and the outer target are two
                     // real expressions. Both borrow the same encoded value;
-                    // ordinary inner parse_json retains its Json declaration.
+                    // ordinary inner json_parse retains its Json declaration.
                     let mut path = constants.path.clone();
                     path.push(
                         novarocks_sql::compiler::SqlConstantQueryStep::SelectFromDerived {
@@ -528,7 +528,17 @@ fn constrain_literal_in(
             }
         }
         ast::Expr::Literal(value) => {
-            if matches!(target.data_type(), DataType::Binary | DataType::LargeBinary)
+            if matches!(
+                target.value_type().kind(),
+                novarocks_type_contract::ValueKind::Binary
+                    | novarocks_type_contract::ValueKind::Nominal(
+                        novarocks_type_contract::ValueLogicalType::Variant
+                            | novarocks_type_contract::ValueLogicalType::Bitmap
+                            | novarocks_type_contract::ValueLogicalType::Hll
+                            | novarocks_type_contract::ValueLogicalType::Object
+                            | novarocks_type_contract::ValueLogicalType::Percentile
+                    ),
+            ) && matches!(target.data_type(), DataType::Binary | DataType::LargeBinary)
                 && let ast::LiteralKind::String(text) = &value.kind
             {
                 value.kind =
@@ -599,7 +609,7 @@ fn constrain_literal_in(
                         )?;
                     }
                 }
-                ("parse_json", DataType::LargeBinary)
+                ("json_parse", DataType::LargeBinary)
                     if target.logical_type()
                         == novarocks_type_contract::ValueLogicalType::Variant =>
                 {
@@ -655,7 +665,7 @@ fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
         return Ok(None);
     };
     if !plain_function(function)
-        || !printer::print_object_name(&function.name).eq_ignore_ascii_case("parse_json")
+        || !printer::print_object_name(&function.name).eq_ignore_ascii_case("json_parse")
         || function.arguments.len() != 1
     {
         return Ok(None);
@@ -684,8 +694,10 @@ fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
     let Some(text) = string_literal(&function.arguments[0].value) else {
         return Ok(None);
     };
+    // The Variant byte encoder retains its original duplicate-member and
+    // numeric policies until its native JSON conversion is installed.
     let bytes = novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(text)
-        .map_err(|error| format!("parse_json failed: {error}"))?;
+        .map_err(|error| format!("json_parse failed: {error}"))?;
     Ok(Some(bytes))
 }
 
@@ -1320,7 +1332,7 @@ mod typed_write_source_tests {
         )
         .unwrap();
         let columns = vec![ColumnDef::from_value_type("p".into(), target, None).unwrap()];
-        let mut source = query("SELECT CAST(parse_json('{\"a\":1}') AS VARIANT) AS p");
+        let mut source = query("SELECT CAST(json_parse('{\"a\":1}') AS VARIANT) AS p");
         let constants = capture_typed_write_constants(
             &mut source,
             &[],

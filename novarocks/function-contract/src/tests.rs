@@ -149,7 +149,8 @@ fn matches(
 fn value_argument_matching_keeps_recursive_nominal_domains_on_identical_layouts() {
     use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime};
     let list = |domain| {
-        let child = FunctionValueType::try_with_logical_type(DataType::Utf8, true, domain).unwrap();
+        let child =
+            FunctionValueType::try_with_logical_type(DataType::LargeBinary, true, domain).unwrap();
         let storage = ValueTypeStorageLifetime::pure();
         let semantic = ValueTypeRef::try_new(
             ValueKind::List(child.value_type().clone()),
@@ -158,7 +159,7 @@ fn value_argument_matching_keeps_recursive_nominal_domains_on_identical_layouts(
         )
         .unwrap();
         let layout = ValueLayout::try_new(
-            &DataType::List(Arc::new(Field::new("", DataType::Utf8, true))),
+            &DataType::List(Arc::new(Field::new("", DataType::LargeBinary, true))),
             storage,
         )
         .unwrap();

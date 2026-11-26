@@ -691,7 +691,7 @@ fn string_substring_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_s
                     true,
                 ),
                 FunctionValueType::try_with_logical_type(
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     true,
                     ValueLogicalType::Json,
                 )

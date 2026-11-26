@@ -4315,8 +4315,8 @@ mod terminal_signal_tests {
         use crate::runtime::runtime_state::RuntimeErrorState;
         use crate::runtime::task::{ExecutionFailure, PipelineOperation};
         use arrow::array::{
-            Array, ArrayData, ArrayRef, DictionaryArray, Int32Array, LargeStringArray, ListArray,
-            StringArray,
+            Array, ArrayData, ArrayRef, DictionaryArray, Int32Array, LargeBinaryArray,
+            LargeStringArray, ListArray, StringArray,
         };
         use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
         use arrow::datatypes::{Field, Int32Type};
@@ -4374,36 +4374,49 @@ mod terminal_signal_tests {
         }
         fn source() -> Chunk {
             let storage = ValueTypeStorageLifetime::pure();
-            let array: ArrayRef = Arc::new(
+            let text: ArrayRef = Arc::new(
                 [Some("{}"), None, Some("{}")]
                     .into_iter()
                     .collect::<DictionaryArray<Int32Type>>(),
             );
-            let value = ValueTypeRef::try_new(
-                ValueKind::Nominal(ValueLogicalType::Json),
-                true,
-                storage.clone(),
-            )
-            .unwrap();
-            let binding = TypedValueBinding::try_new(
-                value,
-                ValueLayout::try_new(array.data_type(), storage.clone()).unwrap(),
-            )
-            .unwrap();
-            let slot = ChunkSlotSchema::try_new_typed(
-                SlotId::new(1),
-                Arc::new(Field::new("payload", array.data_type().clone(), true)),
-                binding,
+            let json: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+                Some(&[1, 0x80, 1, 0][..]),
                 None,
-                storage.clone(),
-            )
-            .unwrap();
+                Some(&[1, 0x80, 1, 0][..]),
+            ]));
+            let slots = [
+                (1, "payload", &text, ValueKind::String),
+                (
+                    2,
+                    "document",
+                    &json,
+                    ValueKind::Nominal(ValueLogicalType::Json),
+                ),
+            ]
+            .into_iter()
+            .map(|(slot, name, array, kind)| {
+                let value = ValueTypeRef::try_new(kind, true, storage.clone()).unwrap();
+                let binding = TypedValueBinding::try_new(
+                    value,
+                    ValueLayout::try_new(array.data_type(), storage.clone()).unwrap(),
+                )
+                .unwrap();
+                ChunkSlotSchema::try_new_typed(
+                    SlotId::new(slot),
+                    Arc::new(Field::new(name, array.data_type().clone(), true)),
+                    binding,
+                    None,
+                    storage.clone(),
+                )
+                .unwrap()
+            })
+            .collect();
             Chunk::try_new_typed_with_columns_owned_observed::<
                 crate::runtime::task::ExecutionFailure,
                 _,
             >(
-                Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap()),
-                vec![array],
+                Arc::new(ChunkSchema::try_new_typed(slots, storage.clone()).unwrap()),
+                vec![text, json],
                 3,
                 storage,
                 |_| Ok(()),
@@ -4677,7 +4690,7 @@ mod terminal_signal_tests {
             );
             assert_eq!(retained.record_batch().column(0).null_count(), 1);
             assert_eq!(
-                retained.chunk_schema().slots()[0]
+                retained.chunk_schema().slots()[1]
                     .field_schema()
                     .logical_type(),
                 Some(ValueLogicalType::Json)
@@ -4685,6 +4698,14 @@ mod terminal_signal_tests {
             assert!(matches!(
                 source.record_batch().column(0).data_type(),
                 arrow::datatypes::DataType::Dictionary(_, _)
+            ));
+            assert_eq!(
+                retained.record_batch().column(1).data_type(),
+                &arrow::datatypes::DataType::LargeBinary
+            );
+            assert!(Arc::ptr_eq(
+                retained.record_batch().column(1),
+                source.record_batch().column(1),
             ));
             let clone = retained.clone();
             let scope = factory.begin_input_construction(&retained).unwrap();

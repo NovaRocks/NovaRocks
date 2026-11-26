@@ -39,11 +39,8 @@ pub fn primitive_to_arrow_type(primitive: PrimitiveType) -> Option<DataType> {
         PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
         PrimitiveType::Binary | PrimitiveType::Varbinary => DataType::Binary,
         PrimitiveType::Hll | PrimitiveType::Object | PrimitiveType::Percentile => DataType::Binary,
-        PrimitiveType::Char
-        | PrimitiveType::Varchar
-        | PrimitiveType::Json
-        | PrimitiveType::Function => DataType::Utf8,
-        PrimitiveType::Variant => DataType::LargeBinary,
+        PrimitiveType::Char | PrimitiveType::Varchar | PrimitiveType::Function => DataType::Utf8,
+        PrimitiveType::Json | PrimitiveType::Variant => DataType::LargeBinary,
         PrimitiveType::DecimalV2 => {
             DataType::Decimal128(LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE)
         }
@@ -122,7 +119,7 @@ mod tests {
             (PrimitiveType::Varchar, Some(DataType::Utf8)),
             (PrimitiveType::Binary, Some(DataType::Binary)),
             (PrimitiveType::Varbinary, Some(DataType::Binary)),
-            (PrimitiveType::Json, Some(DataType::Utf8)),
+            (PrimitiveType::Json, Some(DataType::LargeBinary)),
             (PrimitiveType::Hll, Some(DataType::Binary)),
             (PrimitiveType::Object, Some(DataType::Binary)),
             (PrimitiveType::Percentile, Some(DataType::Binary)),

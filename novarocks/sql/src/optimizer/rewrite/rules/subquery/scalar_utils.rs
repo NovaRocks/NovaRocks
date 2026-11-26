@@ -1098,9 +1098,12 @@ mod tests {
     #[test]
     fn observed_recursive_remap_preserves_full_json_domain_and_first_none_short_circuit() {
         use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
-        let json =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap();
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let mut arena = ScalarArena::new();
         let source = arena.intern(
             ScalarNode::ColumnRef(ColumnId::new_for_test(1)),

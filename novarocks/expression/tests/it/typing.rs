@@ -246,7 +246,7 @@ fn literal_typing_preserves_date_json_and_exact_temporal_values() {
         novarocks_expression::typing::LiteralValue::Int(1)
     );
     assert_eq!(date.value_type.data_type(), &DataType::Date32);
-    let NodeTyping::Literal(LiteralEmission::Direct(json)) = literal(
+    let NodeTyping::Literal(LiteralEmission::Constant { value_type, value }) = literal(
         LiteralSyntax::TypedString {
             name: "json",
             value: r#"{"b":1, "a":2}"#,
@@ -254,13 +254,27 @@ fn literal_typing_preserves_date_json_and_exact_temporal_values() {
         &mut work,
     )
     .unwrap() else {
-        panic!("expected direct JSON");
+        panic!("expected an admitted JSON constant");
     };
-    assert_eq!(json.value_type.logical_type(), ValueLogicalType::Json);
-    assert_eq!(
-        json.value,
-        novarocks_expression::typing::LiteralValue::String(r#"{"b":1, "a":2}"#.into())
-    );
+    assert_eq!(value_type.logical_type(), ValueLogicalType::Json);
+    assert_eq!(value_type.data_type(), &DataType::LargeBinary);
+    assert!(!value_type.nullable());
+    assert_eq!(value.value_type(), &value_type);
+    assert_eq!(value.pool().array().data_type(), &DataType::LargeBinary);
+    use novarocks_functions::json_value::{Kind, Node, Scalar};
+    let json = Node::from_root(value.try_binary().unwrap().unwrap()).unwrap();
+    let Kind::Object(object) = json.kind().unwrap() else {
+        panic!("expected a JSON object");
+    };
+    let members = object.entries().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(members.len(), 2);
+    for (member, (key, digit)) in members.iter().zip([("b", 1), ("a", 2)]) {
+        assert_eq!(member.key, Some(key));
+        let Kind::Scalar(Scalar::Integer(integer)) = member.value.kind().unwrap() else {
+            panic!("expected a JSON integer");
+        };
+        assert_eq!(integer, digit);
+    }
     let NodeTyping::Literal(LiteralEmission::Constant { value_type, value }) = literal(
         LiteralSyntax::TypedString {
             name: "TIME",

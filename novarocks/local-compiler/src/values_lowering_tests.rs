@@ -22,7 +22,7 @@ use crate::values::lower_values;
 use crate::{
     FragmentCompileError, LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
-use arrow_array::{Float32Array, StringArray};
+use arrow_array::{Float32Array, LargeBinaryArray, StringArray};
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_local_program::{
     KernelAbiVersion, LocalProgram, ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId,
@@ -318,13 +318,19 @@ fn values_materialize_real_rows_columns_selected_ordinals_float_bits_and_json() 
         false,
         ValueLogicalType::Physical,
     );
-    let strings = checked_pool(
-        Arc::new(StringArray::from(vec!["{}", "{\"x\":1}", "null", "[2]"])),
+    let documents = [
+        b"\x01\x80\x01\x00".as_slice(),
+        b"\x01\x80\x08\x01\x01x\x4a\x01\x00\x00\x00".as_slice(),
+        b"\x01\x20".as_slice(),
+        b"\x01\x60\x06\x01\x4a\x02\x00\x00\x00".as_slice(),
+    ];
+    let json = checked_pool(
+        Arc::new(LargeBinaryArray::from(documents.to_vec())),
         false,
         ValueLogicalType::Json,
     );
     let package = build(
-        &[integers.clone(), floats.clone(), strings.clone()],
+        &[integers.clone(), floats.clone(), json.clone()],
         &[
             vec![(0, 3), (1, 0), (2, 1)],
             vec![(0, 1), (1, 1), (2, 2)],
@@ -361,11 +367,11 @@ fn values_materialize_real_rows_columns_selected_ordinals_float_bits_and_json() 
     let column = batch
         .column(2)
         .as_any()
-        .downcast_ref::<StringArray>()
+        .downcast_ref::<LargeBinaryArray>()
         .unwrap();
     assert_eq!(
         column.iter().collect::<Vec<_>>(),
-        vec![Some("{\"x\":1}"), Some("null"), Some("[2]")]
+        vec![Some(documents[1]), Some(documents[2]), Some(documents[3])]
     );
     assert_eq!(batch.schema().field(0).name(), "alias-0");
     assert_eq!(
@@ -394,7 +400,7 @@ fn values_materialize_real_rows_columns_selected_ordinals_float_bits_and_json() 
                 [
                     integers.backing_identity(),
                     floats.backing_identity(),
-                    strings.backing_identity()
+                    json.backing_identity()
                 ]
                 .contains(&value.pool().backing_identity())
             );
@@ -848,7 +854,7 @@ fn actual_empty_values_keep_nested_nominal_binding_after_source_and_program_drop
     let data_type = DataType::Struct(
         vec![Field::new(
             "payload",
-            DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, true))),
+            DataType::LargeList(Arc::new(Field::new("item", DataType::LargeBinary, true))),
             false,
         )]
         .into(),

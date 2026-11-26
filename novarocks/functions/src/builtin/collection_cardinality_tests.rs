@@ -242,9 +242,12 @@ fn fixed(values: &[i128]) -> ArrayRef {
     Arc::new(builder.finish())
 }
 fn rich_list(dict_id: i64, ordered: bool) -> ArrayRef {
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let large = FunctionValueType::try_with_logical_type(
         DataType::FixedSizeBinary(16),
         false,
@@ -286,7 +289,7 @@ fn rich_list(dict_id: i64, ordered: bool) -> ArrayRef {
     let values: ArrayRef = Arc::new(StructArray::new(
         fields,
         vec![
-            Arc::new(StringArray::from(vec![
+            Arc::new(crate::json_value::test_array(&[
                 Some("{}"),
                 None,
                 Some("[]"),

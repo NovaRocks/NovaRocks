@@ -112,6 +112,7 @@ enum ScalarKind {
 
 enum NominalValue {
   NOMINAL_VALUE_UNSPECIFIED = 0;
+  // In plan contract revision 45 and later, JSON uses native v1 in LargeBinary.
   NOMINAL_VALUE_JSON = 1;
   NOMINAL_VALUE_VARIANT = 2;
   NOMINAL_VALUE_HLL = 3;

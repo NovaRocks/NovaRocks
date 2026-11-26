@@ -81,7 +81,7 @@ fn encode_field(field: &ScalarField, nodes: &mut Vec<wire::ScalarField>) -> u32 
             ty.time_zone = timezone.clone();
             K::ScalarTimestamp
         }
-        S::Json => K::ScalarJson,
+        S::Json => K::ScalarNativeJson,
         S::Variant => K::ScalarVariant,
         S::Opaque(kind) => {
             ty.opaque_kind = match kind {
@@ -431,7 +431,7 @@ fn decode_field(
                 .map(|zone| copy_string(zone, path))
                 .transpose()?,
         },
-        K::ScalarJson => S::Json,
+        K::ScalarNativeJson => S::Json,
         K::ScalarVariant => S::Variant,
         K::ScalarOpaque => S::Opaque(match wire::OpaqueKind::try_from(ty.opaque_kind) {
             Ok(wire::OpaqueKind::Hll) => O::Hll,
@@ -530,6 +530,19 @@ mod tests {
         let raw = encoded.encode_to_vec();
         let wire = wire::ScalarSchema::decode(raw.as_slice()).unwrap();
         assert_eq!(decode(&wire).unwrap(), expected);
+    }
+
+    #[test]
+    fn native_json_uses_its_own_scalar_kind() {
+        let expected = schema(S::Json);
+        let mut encoded = encode_scalar_schema(&expected);
+        assert_eq!(
+            encoded.field_nodes[0].value_type.as_ref().unwrap().kind,
+            wire::ScalarTypeKind::ScalarNativeJson as i32
+        );
+        assert_eq!(decode(&encoded).unwrap(), expected);
+        encoded.field_nodes[0].value_type.as_mut().unwrap().kind = 13;
+        assert!(decode(&encoded).is_err());
     }
 
     #[test]
@@ -648,7 +661,7 @@ mod tests {
         let mut absent = base.clone();
         absent.field_nodes[0].value_type = None;
         assert!(decode(&absent).is_err());
-        for kind in [0, 19, -1, i32::MAX] {
+        for kind in [0, 20, -1, i32::MAX] {
             let mut wire = base.clone();
             wire.field_nodes[0].value_type.as_mut().unwrap().kind = kind;
             assert!(decode(&wire).is_err());

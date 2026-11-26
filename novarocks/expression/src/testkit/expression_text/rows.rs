@@ -412,20 +412,15 @@ fn evaluate(
         input_columns: batch.num_columns(),
         input_rows: batch.num_rows(),
     };
-    let needs_allocator = compiled.calls().values().any(|call| {
-        matches!(
-            call.prepared(),
-            PreparedPureKernel::OrderedRegexp(_) | PreparedPureKernel::HigherOrder(_)
-        )
-    });
-    let allocator = needs_allocator.then(|| {
-        let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
-            Arc::new(crate::testkit::CountingAllocator::new(usize::MAX));
-        host
-    });
-    let mut instance =
-        CompiledExpressionInstance::try_new_with_allocator(compiled, root, control, allocator)
-            .map_err(|cause| TextError::Instance(Box::new(cause)))?;
+    let allocator: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+        Arc::new(crate::testkit::CountingAllocator::new(usize::MAX));
+    let mut instance = CompiledExpressionInstance::try_new_with_allocator(
+        compiled,
+        root,
+        control,
+        Some(allocator),
+    )
+    .map_err(|cause| TextError::Instance(Box::new(cause)))?;
     let selection = Selection::all(batch.num_rows());
     let result = instance
         .evaluate(

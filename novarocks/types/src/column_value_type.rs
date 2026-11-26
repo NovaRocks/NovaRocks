@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn explicit_roots_are_authored_without_carrier_inference() {
         for (carrier, declaration, expected) in [
-            (DataType::Utf8, SqlType::Json, ValueLogicalType::Json),
+            (DataType::LargeBinary, SqlType::Json, ValueLogicalType::Json),
             (
                 DataType::LargeBinary,
                 SqlType::Variant,
@@ -230,7 +230,7 @@ mod tests {
     fn frozen_value_domain_roundtrips_without_carrier_inference() {
         for (carrier, domain) in [
             (DataType::Utf8, ValueLogicalType::Physical),
-            (DataType::Utf8, ValueLogicalType::Json),
+            (DataType::LargeBinary, ValueLogicalType::Json),
             (DataType::LargeBinary, ValueLogicalType::Variant),
             (DataType::Binary, ValueLogicalType::Hll),
             (DataType::Binary, ValueLogicalType::Bitmap),
@@ -244,7 +244,7 @@ mod tests {
                 ColumnDef::from_value_type("value".into(), original.clone(), None).unwrap();
             assert_eq!(frozen.declared_value_type().unwrap(), original);
         }
-        let child = Field::new("source_item", DataType::Utf8, false).with_metadata(
+        let child = Field::new("source_item", DataType::LargeBinary, false).with_metadata(
             std::collections::HashMap::<String, String>::from([
                 (NR_LOGICAL_TYPE_KEY.into(), "json".into()),
                 ("provider.id".into(), "73".into()),
@@ -268,7 +268,7 @@ mod tests {
     }
     #[test]
     fn declared_children_separate_semantics_layout_and_provider_facts() {
-        let item = Field::new("provider_element", DataType::Utf8, false).with_metadata(
+        let item = Field::new("provider_element", DataType::LargeBinary, false).with_metadata(
             std::collections::HashMap::<String, String>::from([(
                 "provider.id".into(),
                 "37".into(),
@@ -358,7 +358,7 @@ mod tests {
             }
         }
         let fields = (0..320)
-            .map(|i| Arc::new(Field::new(format!("c{i}"), DataType::Utf8, true)))
+            .map(|i| Arc::new(Field::new(format!("c{i}"), DataType::LargeBinary, true)))
             .collect::<Vec<_>>();
         let declarations = (0..320)
             .map(|i| (format!("c{i}"), SqlType::Json))

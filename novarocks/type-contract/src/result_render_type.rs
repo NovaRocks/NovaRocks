@@ -106,6 +106,8 @@ pub fn render_field_matches_declaration(
 fn render_exact_declarations_match(render: &RenderField, value: &ValueTypeRef) -> bool {
     use NativeRenderType as R;
     match (&render.native_type, value.kind()) {
+        (R::Json, ValueKind::Nominal(ValueLogicalType::Json)) => true,
+        (R::Json, _) | (_, ValueKind::Nominal(ValueLogicalType::Json)) => false,
         (R::Uuid, ValueKind::Nominal(ValueLogicalType::Uuid)) => true,
         (R::Uuid, _) | (_, ValueKind::Nominal(ValueLogicalType::Uuid)) => false,
         (R::BoundedCharacter(render), ValueKind::BoundedCharacter(declared)) => render == declared,
@@ -168,9 +170,8 @@ fn render_carrier_matches(
         | (R::Float32, D::Float32)
         | (R::Float64, D::Float64)
         | (R::String | R::BoundedCharacter(_), D::Utf8 | D::LargeUtf8)
-        | (R::Json, D::Utf8)
         | (R::Binary | R::Opaque(_), D::Binary)
-        | (R::Variant, D::LargeBinary)
+        | (R::Json | R::Variant, D::LargeBinary)
         | (R::Date, D::Date32) => true,
         (
             R::Decimal {

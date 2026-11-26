@@ -424,10 +424,6 @@ pub(crate) fn validate_expression_types<'a, H>(
             if let Some(input) = definitions.get((*expr).get() as usize)
                 && *cast_mode == novarocks_type_contract::TrinoCastMode::Implicit
                 && !novarocks_type_contract::is_null_list_to_json_cast(&input.ty, &expression.ty)
-                && !novarocks_type_contract::is_default_json_structure_cast(
-                    &input.ty,
-                    &expression.ty,
-                )
                 && !novarocks_type_contract::preserves_value_domains_observed(
                     input.ty.value_type(),
                     expression.ty.value_type(),

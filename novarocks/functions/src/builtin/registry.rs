@@ -1193,7 +1193,6 @@ fn register_json_fns(m: &mut HashMap<String, Vec<Signature>>) {
         (&["json_length"], TypeSpec::Int64),
         (
             &[
-                "json_query",
                 "json_extract",
                 "get_json_string",
                 "get_variant_string",
@@ -1212,15 +1211,14 @@ fn register_json_fns(m: &mut HashMap<String, Vec<Signature>>) {
         }
     }
 
-    // json_object(key, value, ...) and json_array(value, ...) take values of
-    // unrelated types, which is why their tail is a wildcard and not a
-    // repeated variable.
-    for name in ["json_object", "json_array"] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Json),
-        );
+    add(
+        m,
+        "json_query",
+        Signature::new(vec![TypeSpec::AnyType, TypeSpec::Utf8], TypeSpec::Json),
+    );
+
+    for &(function, name) in super::json_sql::FUNCTIONS {
+        add(m, name, function.signature());
     }
 
     // One document in, one answer out.
@@ -1233,13 +1231,8 @@ fn register_json_fns(m: &mut HashMap<String, Vec<Signature>>) {
     }
     add(
         m,
-        "parse_json",
-        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Json),
-    );
-    add(
-        m,
         crate::json_canonical::FUNCTION_NAME,
-        Signature::new(vec![TypeSpec::Json], TypeSpec::Utf8),
+        Signature::new(vec![TypeSpec::Json], TypeSpec::Binary),
     );
 }
 

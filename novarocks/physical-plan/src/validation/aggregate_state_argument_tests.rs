@@ -74,16 +74,16 @@ fn set_argument(binding: &mut crate::AggregateBinding, value: crate::ValueType) 
 
 #[test]
 fn state_contract_only_relaxes_logical_value_root_nullability() {
-    let a = binding(crate::ValueType::new(arrow_schema::DataType::Utf8, false));
+    let a = binding(crate::ValueType::new(
+        arrow_schema::DataType::LargeBinary,
+        false,
+    ));
     let mut b = a.clone();
     let nullable = argument(&b).with_nullable(true).unwrap();
     set_argument(&mut b, nullable);
     assert!(matches(&a, &b));
     assert!(!a.function.signature_matches(&b.function));
-    let wide = binding(crate::ValueType::new(
-        arrow_schema::DataType::LargeUtf8,
-        false,
-    ));
+    let wide = binding(crate::ValueType::new(arrow_schema::DataType::Binary, false));
     assert!(
         !matches(&a, &wide),
         "root-null admission does not rewrite physical offset width"
@@ -98,7 +98,7 @@ fn state_contract_only_relaxes_logical_value_root_nullability() {
     set_argument(
         &mut nominal,
         crate::ValueType::try_with_logical_type(
-            arrow_schema::DataType::Utf8,
+            arrow_schema::DataType::LargeBinary,
             true,
             novarocks_type_contract::ValueLogicalType::Json,
         )
@@ -120,9 +120,9 @@ fn state_contract_only_relaxes_logical_value_root_nullability() {
     assert!(!matches(&order_a, &order_b));
     let lambda = |nullable| FunctionArgumentType::Lambda {
         parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
-            crate::ValueType::new(arrow_schema::DataType::Utf8, nullable),
+            crate::ValueType::new(arrow_schema::DataType::LargeBinary, nullable),
         ])),
-        result_type: crate::ValueType::new(arrow_schema::DataType::Utf8, false),
+        result_type: crate::ValueType::new(arrow_schema::DataType::LargeBinary, false),
     };
     let mut lambda_a = a.clone();
     let mut lambda_b = a.clone();
@@ -234,7 +234,7 @@ fn state_contract_preserves_nested_nominal_domain_when_carriers_are_identical() 
     let layout = DataType::Struct(
         vec![Arc::new(Field::new(
             "payload",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true))),
             false,
         ))]
         .into(),
@@ -275,42 +275,69 @@ fn special_string_map_profile_cannot_accept_nested_json_by_arrow_shape() {
         ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
     };
     let storage = ValueTypeStorageLifetime::pure();
-    let semantic = ValueTypeRef::try_new(
-        ValueKind::Map {
-            key: ValueTypeRef::try_new(ValueKind::String, false, storage.clone()).unwrap(),
-            value: ValueTypeRef::try_new(
-                ValueKind::Nominal(ValueLogicalType::Json),
+    let layout = |value_type| {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", value_type, false),
+                    ]
+                    .into(),
+                ),
                 false,
-                storage.clone(),
+            )),
+            false,
+        )
+    };
+    let binding = |kind, carrier| {
+        let semantic = ValueTypeRef::try_new(
+            ValueKind::Map {
+                key: ValueTypeRef::try_new(ValueKind::String, false, storage.clone()).unwrap(),
+                value: ValueTypeRef::try_new(kind, false, storage.clone()).unwrap(),
+            },
+            false,
+            storage.clone(),
+        )
+        .unwrap();
+        crate::ValueType::try_from_value(
+            semantic,
+            ValueLayout::try_new(&layout(carrier), storage.clone()).unwrap(),
+        )
+        .unwrap()
+    };
+    let nominal = binding(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        DataType::LargeBinary,
+    );
+    let constrained = binding(
+        ValueKind::BoundedCharacter(
+            novarocks_type_contract::CharacterType::new(
+                novarocks_type_contract::CharacterKind::Varchar,
+                7,
             )
             .unwrap(),
-        },
-        false,
-        storage.clone(),
-    )
-    .unwrap();
-    let layout = DataType::Map(
-        Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Field::new("key", DataType::Utf8, false),
-                    Field::new("value", DataType::Utf8, false),
-                ]
-                .into(),
-            ),
-            false,
-        )),
-        false,
+        ),
+        DataType::Utf8,
     );
-    let nominal =
-        crate::ValueType::try_from_value(semantic, ValueLayout::try_new(&layout, storage).unwrap())
-            .unwrap();
     let constant = crate::UnpivotConstant::Utf8Map(crate::ConstantReference {
         pool: crate::ConstantPoolId::new(0),
         ordinal: 0,
     });
+    let text_map = crate::ValueType::new(layout(DataType::Utf8), false);
+    assert!(super::super::node::unpivot_collection_binding_matches(
+        &constant, &text_map
+    ));
     assert!(super::super::node::unpivot_collection_carrier_matches(
+        &constant,
+        constrained.data_type()
+    ));
+    assert!(!super::super::node::unpivot_collection_binding_matches(
+        &constant,
+        &constrained
+    ));
+    assert!(!super::super::node::unpivot_collection_carrier_matches(
         &constant,
         nominal.data_type()
     ));

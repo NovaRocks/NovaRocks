@@ -18,8 +18,8 @@
 use super::*;
 use arrow::{
     array::{
-        ArrayRef, Decimal128Array, Float64Array, Int64Array, IntervalMonthDayNanoArray, NullArray,
-        StringArray, StringViewArray, TimestampNanosecondArray,
+        ArrayRef, Decimal128Array, Float64Array, Int64Array, IntervalMonthDayNanoArray,
+        LargeBinaryArray, NullArray, StringArray, StringViewArray, TimestampNanosecondArray,
     },
     datatypes::{DataType, IntervalUnit, Schema, TimeUnit},
     ipc::{
@@ -388,6 +388,7 @@ fn actual_reader_scalar_bits_interval_and_nonzero_ordinal_preserve_source_arc() 
 
 #[test]
 fn actual_reader_exact_empty_timezone_and_nominal_metadata_retain_source_author() {
+    let document = b"\x01\x80\x08\x01\x01x\x4a\x01\x00\x00\x00".as_slice();
     let cases: [(ArrayRef, FunctionValueType, HashMap<String, String>); 2] = [
         (
             Arc::new(TimestampNanosecondArray::from(vec![Some(-71), None]).with_timezone("")),
@@ -398,9 +399,13 @@ fn actual_reader_exact_empty_timezone_and_nominal_metadata_retain_source_author(
             HashMap::from([("provider".into(), "unchanged".into())]),
         ),
         (
-            Arc::new(StringArray::from(vec![Some("{\"x\":1}"), None])),
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap(),
+            Arc::new(LargeBinaryArray::from(vec![Some(document), None])),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Json,
+            )
+            .unwrap(),
             HashMap::from([
                 (NR_LOGICAL_TYPE_KEY.into(), "json".into()),
                 ("provider".into(), "unchanged".into()),
@@ -419,10 +424,7 @@ fn actual_reader_exact_empty_timezone_and_nominal_metadata_retain_source_author(
         assert_eq!(pool.value_type(), &ty);
         assert_eq!(pool.field().metadata(), field.metadata());
         if ty.logical_type() == ValueLogicalType::Json {
-            assert_eq!(
-                pool.value(0).unwrap().try_utf8().unwrap(),
-                Some("{\"x\":1}")
-            );
+            assert_eq!(pool.value(0).unwrap().try_binary().unwrap(), Some(document));
         } else {
             assert_eq!(
                 pool.array().data_type(),

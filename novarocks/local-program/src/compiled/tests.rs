@@ -739,14 +739,14 @@ fn exchange_wire_rejects_nested_nullability_nominal_and_width_changes() {
         )
     };
     let json = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         false,
         novarocks_type_contract::ValueLogicalType::Json,
     )
     .unwrap();
     for (source, destination) in [
         (nested(false), nested(true)),
-        (json, FunctionValueType::new(DataType::Utf8, true)),
+        (json, FunctionValueType::new(DataType::LargeBinary, true)),
         (
             FunctionValueType::new(DataType::Int32, false),
             FunctionValueType::new(DataType::Int64, true),
@@ -1440,27 +1440,27 @@ fn final_owner_checks_unmapped_runtime_fields_with_a_canonical_value_subset() {
     assert_eq!(graph_error, LocalProgramError::InvalidExpression);
 
     // Retain the carrier-mismatch case above. This second actual input has an
-    // unmapped UTF8 column, so JSON differs only in its complete nominal facts.
-    let utf8 = FunctionValueType::new(DataType::Utf8, false);
+    // unmapped LargeBinary column, so JSON differs only in its complete nominal facts.
+    let binary = FunctionValueType::new(DataType::LargeBinary, false);
     let json = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         false,
         novarocks_type_contract::ValueLogicalType::Json,
     )
     .unwrap();
-    assert_eq!(utf8.data_type(), json.data_type());
-    assert_eq!(utf8.nullable(), json.nullable());
-    assert_ne!(utf8, json);
+    assert_eq!(binary.data_type(), json.data_type());
+    assert_eq!(binary.nullable(), json.nullable());
+    assert_ne!(binary, json);
     let nominal_schema = Arc::new(Schema::new(vec![
         Field::new("physical_first", DataType::Int64, false),
-        Field::new("physical_unmapped", DataType::Utf8, false),
+        Field::new("physical_unmapped", DataType::LargeBinary, false),
     ]));
     let nominal_input = StaticLayout::try_new_typed_for_compile(
         nominal_schema.clone(),
         Arc::from([SlotId::new(10), SlotId::new(20)]),
         vec![
             (ty.typed_binding().clone(), None),
-            (utf8.typed_binding().clone(), None),
+            (binary.typed_binding().clone(), None),
         ],
         novarocks_type_contract::ValueTypeStorageLifetime::pure(),
         |_| Ok(()),
@@ -1472,17 +1472,19 @@ fn final_owner_checks_unmapped_runtime_fields_with_a_canonical_value_subset() {
             nominal_schema,
             vec![
                 Arc::new(Int64Array::from(vec![7])),
-                Arc::new(arrow_array::StringArray::from(vec!["{}"])),
+                Arc::new(arrow_array::LargeBinaryArray::from(vec![
+                    b"\x01\x20".as_slice(),
+                ])),
             ],
         )
         .unwrap(),
         nominal_input.clone(),
     )
     .unwrap();
-    let nominal_scope = scope_layout(DataType::Utf8);
+    let nominal_scope = scope_layout(DataType::LargeBinary);
     let plain_unit = crate::test_support::read_unit(
         &nominal_scope,
-        &[ty.clone(), utf8.clone()],
+        &[ty.clone(), binary.clone()],
         &[(ValueId::new(10), ty.clone())],
         &[(0, EvaluationDemand::Value)],
     );
@@ -1509,19 +1511,23 @@ fn final_owner_checks_unmapped_runtime_fields_with_a_canonical_value_subset() {
         graph: nominal_graph.clone(),
         units: vec![plain_unit.clone()],
         calls: vec![],
-        channels: [(0, 0, ty.clone()), (0, 1, utf8.clone()), (1, 0, ty.clone())]
-            .into_iter()
-            .map(|(node, ordinal, ty)| {
-                (
-                    ProgramChannelSite::Layout {
-                        node: ProgramNodeId::new(node),
-                        role: ProgramChannelLayoutRole::NodeOutput,
-                        ordinal,
-                    },
-                    ty,
-                )
-            })
-            .collect(),
+        channels: [
+            (0, 0, ty.clone()),
+            (0, 1, binary.clone()),
+            (1, 0, ty.clone()),
+        ]
+        .into_iter()
+        .map(|(node, ordinal, ty)| {
+            (
+                ProgramChannelSite::Layout {
+                    node: ProgramNodeId::new(node),
+                    role: ProgramChannelLayoutRole::NodeOutput,
+                    ordinal,
+                },
+                ty,
+            )
+        })
+        .collect(),
     };
     finish(
         nominal_fixture(),
@@ -1543,7 +1549,7 @@ fn final_owner_checks_unmapped_runtime_fields_with_a_canonical_value_subset() {
     assert_eq!(scope.columns()[0].ordinal, 0);
     assert_eq!(scope.columns()[0].ty, ty);
     assert_eq!(scope.ordinal_type(1), Some(&json));
-    assert_eq!(plain_unit.scopes()[0].ordinal_type(1), Some(&utf8));
+    assert_eq!(plain_unit.scopes()[0].ordinal_type(1), Some(&binary));
     let mut actual = nominal_fixture();
     actual.units = vec![foreign_nominal.clone()];
     let error = match finish(

@@ -28,7 +28,7 @@ use crate::{
     KernelEvaluationControl, KernelFailure, ScalarCallContract, ScalarCallInput, SelectedValues,
 };
 use allocator_api2::vec::Vec as HostVec;
-use arrow_array::{Array, ArrayRef, StringArray, builder::StringBuilder};
+use arrow_array::{Array, ArrayRef, LargeBinaryArray, builder::BinaryBuilder};
 use arrow_schema::DataType;
 use novarocks_type_contract::{ArgumentControl, ValueLogicalType};
 use std::sync::Arc;
@@ -43,9 +43,9 @@ pub(super) fn original_native_profile(selected: &FunctionBindingSelection, count
     count == 1
         && selected.aggregate.is_none()
         && source.logical_type() == ValueLogicalType::Json
-        && source.data_type() == &DataType::Utf8
+        && source.data_type() == &DataType::LargeBinary
         && target.logical_type() == ValueLogicalType::Physical
-        && target.data_type() == &DataType::Utf8
+        && target.data_type() == &DataType::Binary
         && target.nullable() == source.nullable()
 }
 pub(super) fn validate_profile(
@@ -60,7 +60,7 @@ pub(super) fn validate_profile(
         )
     {
         return Err(invalid(
-            "JSON canonical key requires one exact Json/Utf8 input and matching-nullability plain Utf8 output",
+            "JSON canonical key requires one exact Json/LargeBinary input and matching-nullability plain Binary output",
         ));
     }
     observe()
@@ -86,9 +86,9 @@ pub(super) fn evaluate<'a>(
     let source = argument
         .array()
         .as_any()
-        .downcast_ref::<StringArray>()
+        .downcast_ref::<LargeBinaryArray>()
         .ok_or_else(|| {
-            internal("JSON canonical input carrier differs from its frozen Utf8 declaration")
+            internal("JSON canonical input carrier differs from its frozen LargeBinary declaration")
         })?;
     let selection = input.selection();
     let mut keys: HostVec<Option<JsonCanonicalKey>, _> = HostVec::new_in(allocator.clone());
@@ -100,7 +100,7 @@ pub(super) fn evaluate<'a>(
         let row = argument.value_row(ordinal, row);
         if row >= source.len() {
             return Err(invalid(
-                "JSON canonical selected input address is outside Utf8",
+                "JSON canonical selected input address is outside LargeBinary",
             ));
         }
         let key = if source.is_null(row) {
@@ -120,7 +120,7 @@ pub(super) fn evaluate<'a>(
     }
     let offsets = mul(add(selection.len(), 1)?, size_of::<i32>())?;
     let validity = add(add(selection.len(), 7)? / 8, 63)? / 64 * 64;
-    // StringBuilder::with_capacity reserves exact values/offsets capacities;
+    // BinaryBuilder::with_capacity reserves exact values/offsets capacities;
     // lazy validity is rounded to64 bytes. finish resets one i32 offset. The
     // existing custody author covers the original/wrapping metadata overlap.
     let peak = add(
@@ -133,11 +133,11 @@ pub(super) fn evaluate<'a>(
     let charge = OpaqueRetainedCharge::try_new(Arc::clone(host))?;
     let mut reservation = charge.reserve_operation(peak)?;
     control.checkpoint(0)?;
-    let mut builder = StringBuilder::with_capacity(selection.len(), total);
+    let mut builder = BinaryBuilder::with_capacity(selection.len(), total);
     for key in &keys {
         control.checkpoint(1)?;
         match key {
-            Some(key) => builder.append_value(key.as_str()),
+            Some(key) => builder.append_value(key.as_bytes()),
             None => builder.append_null(),
         }
     }

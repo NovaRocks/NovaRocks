@@ -198,10 +198,19 @@ fn actual_unpivot_cv_refuses_declared_source_and_output_domain_drift() {
             .to_string()
             .contains("materialized constant source type")
     );
-    let ty =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
-    let json = cv(Arc::new(StringArray::from(vec!["{}"])), ty, 0);
+    let ty = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let json = cv(
+        Arc::new(arrow::array::LargeBinaryArray::from(vec![
+            b"\x01\x80\x01\x00".as_slice(),
+        ])),
+        ty,
+        0,
+    );
     let mut nominal = Fixture::new(json);
     assert!(nominal.construct(&Control::good()).is_ok());
     nominal.output[1].value_type =
@@ -351,18 +360,21 @@ fn actual_unpivot_cv_controls_preserve_success_ordinary_tail_and_wide_type_quant
 fn actual_unpivot_passthrough_and_value_outputs_preserve_complete_domains_and_nullable_or() {
     let fixture = Fixture::new(text(vec![Some("label")], 0));
     let original = fixture.construct(&Control::good()).unwrap();
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let uuid = FunctionValueType::try_with_logical_type(
         DataType::FixedSizeBinary(16),
         false,
         ValueLogicalType::Uuid,
     )
     .unwrap();
-    let physical_utf8 = FunctionValueType::new(DataType::Utf8, false);
+    let physical_binary = FunctionValueType::new(DataType::LargeBinary, false);
     let physical_fixed = FunctionValueType::new(DataType::FixedSizeBinary(16), false);
-    for (source, wrong) in [(json, physical_utf8), (uuid, physical_fixed)] {
+    for (source, wrong) in [(json, physical_binary), (uuid, physical_fixed)] {
         // Actual value role permits only the existing per-output nullable OR.
         let mut input = fixture.input.clone();
         input[0].value_type = source.clone();

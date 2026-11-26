@@ -31,7 +31,7 @@ _col0
 -- query 10
 -- types	row(col1 integer, col2 array(json))
 _col0
-[1,["{\"star\": \"rocks\"}","{\"star\": \"rocks\"}"]]
+[1,["{\"star\":\"rocks\"}","{\"star\":\"rocks\"}"]]
 
 -- query 11
 -- types	row(star varchar(10), length integer, numbers array(integer), nest row(col1 integer, col2 integer, col3 integer))

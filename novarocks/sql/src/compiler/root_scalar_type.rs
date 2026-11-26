@@ -82,7 +82,7 @@ enum Kind {
 
 fn kind(value: &ValueTypeRef, layout: &D) -> Result<Kind, String> {
     Ok(match (value.kind(), layout) {
-        (ValueKind::Nominal(V::Json), D::Utf8) => Kind::Leaf(S::Json),
+        (ValueKind::Nominal(V::Json), D::LargeBinary) => Kind::Leaf(S::Json),
         (ValueKind::Nominal(V::Variant), D::LargeBinary) => Kind::Leaf(S::Variant),
         (ValueKind::Nominal(V::LargeInt), D::FixedSizeBinary(16)) => Kind::Leaf(S::LargeInt),
         (ValueKind::Nominal(V::Hll), D::Binary) => Kind::Leaf(S::Opaque(O::Hll)),
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn complete_nominal_domains_require_their_original_value_author() {
         for (domain, layout, expected) in [
-            (V::Json, D::Utf8, S::Json),
+            (V::Json, D::LargeBinary, S::Json),
             (V::Variant, D::LargeBinary, S::Variant),
             (V::LargeInt, D::FixedSizeBinary(16), S::LargeInt),
             (V::Hll, D::Binary, S::Opaque(O::Hll)),
@@ -439,7 +439,7 @@ mod tests {
             ),
             false,
         );
-        let first = list(&nominal(V::Json, D::Utf8, false), true);
+        let first = list(&nominal(V::Json, D::LargeBinary, false), true);
         let value = typed(
             ValueKind::Struct(
                 vec![

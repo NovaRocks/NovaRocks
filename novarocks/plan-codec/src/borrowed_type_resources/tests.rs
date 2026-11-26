@@ -161,7 +161,7 @@ fn borrowed_type_binding_checks_nested_nominal_semantics_before_publication() {
             if json {
                 ValueKind::Nominal(ValueLogicalType::Json)
             } else {
-                ValueKind::String
+                ValueKind::Binary
             },
             true,
             storage.clone(),
@@ -174,16 +174,16 @@ fn borrowed_type_binding_checks_nested_nominal_semantics_before_publication() {
         )
         .unwrap();
         let layout = ValueLayout::try_new(
-            &DataType::Struct(vec![Field::new("payload", DataType::Utf8, true)].into()),
+            &DataType::Struct(vec![Field::new("payload", DataType::LargeBinary, true)].into()),
             storage,
         )
         .unwrap();
         FunctionValueType::try_from_value(semantic, layout).unwrap()
     };
     let json = author(true);
-    let text = author(false);
-    assert_eq!(json.data_type(), text.data_type());
-    every_boundary(&json, &text, SOURCE, WORK, Some(false));
+    let binary = author(false);
+    assert_eq!(json.data_type(), binary.data_type());
+    every_boundary(&json, &binary, SOURCE, WORK, Some(false));
     every_boundary(&json, &author(true), SOURCE, WORK, Some(true));
 }
 
@@ -605,7 +605,7 @@ fn independent_deep_owners_cover_foreign_equal_and_mismatching_comparison_work()
             if json {
                 ValueKind::Nominal(ValueLogicalType::Json)
             } else {
-                ValueKind::String
+                ValueKind::Binary
             },
             true,
             storage.clone(),
@@ -635,7 +635,7 @@ fn independent_deep_owners_cover_foreign_equal_and_mismatching_comparison_work()
                             "source-role",
                             DataType::Dictionary(
                                 Box::new(DataType::Int8),
-                                Box::new(DataType::Utf8),
+                                Box::new(DataType::LargeBinary),
                             ),
                             true,
                         ))),

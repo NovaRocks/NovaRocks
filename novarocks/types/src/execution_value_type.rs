@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn declarations_author_root_domains_without_guessing_equal_carriers() {
         for (declaration, carrier, domain) in [
-            (SqlType::Json, DataType::Utf8, ValueLogicalType::Json),
+            (SqlType::Json, DataType::LargeBinary, ValueLogicalType::Json),
             (
                 SqlType::Uuid,
                 DataType::FixedSizeBinary(16),
@@ -465,7 +465,11 @@ mod tests {
             vec![
                 Field::new(
                     "documents",
-                    DataType::LargeList(Arc::new(Field::new("element", DataType::Utf8, true))),
+                    DataType::LargeList(Arc::new(Field::new(
+                        "element",
+                        DataType::LargeBinary,
+                        true,
+                    ))),
                     false,
                 ),
                 Field::new("uuid", DataType::FixedSizeBinary(16), false),
@@ -516,7 +520,7 @@ mod tests {
                             Field::new(
                                 value,
                                 DataType::List(Arc::new(
-                                    Field::new(item, DataType::Utf8, true).with_metadata(
+                                    Field::new(item, DataType::LargeBinary, true).with_metadata(
                                         std::collections::HashMap::<String, String>::from([
                                             (
                                                 novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
@@ -667,7 +671,8 @@ mod tests {
     fn independently_retained_nested_semantics_keep_the_author_storage_alive() {
         let exits = Arc::new(AtomicUsize::new(0));
         let declaration = SqlType::Struct(vec![("json".into(), SqlType::Json)]);
-        let carrier = DataType::Struct(vec![Field::new("json", DataType::Utf8, true)].into());
+        let carrier =
+            DataType::Struct(vec![Field::new("json", DataType::LargeBinary, true)].into());
         let binding = execution_value_type_from_declaration(
             &declaration,
             &carrier,
@@ -695,7 +700,7 @@ mod tests {
     #[test]
     fn inverse_projection_preserves_nested_domains_and_exact_parameter_roundtrips() {
         let domains = [
-            (SqlType::Json, DataType::Utf8),
+            (SqlType::Json, DataType::LargeBinary),
             (SqlType::Uuid, DataType::FixedSizeBinary(16)),
             (SqlType::LargeInt, DataType::FixedSizeBinary(16)),
             (SqlType::Variant, DataType::LargeBinary),
@@ -774,17 +779,16 @@ mod tests {
 
     #[test]
     fn inverse_projection_never_adopts_an_annotation_or_an_equal_carrier_domain() {
-        let carrier =
-            DataType::Struct(
-                vec![Field::new("v", DataType::Utf8, true).with_metadata(
-                    std::collections::HashMap::<String, String>::from([(
-                        novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
-                        "json".into(),
-                    )]),
-                )]
-                .into(),
-            );
-        let plain = SqlType::Struct(vec![("v".into(), SqlType::String)]);
+        let carrier = DataType::Struct(
+            vec![Field::new("v", DataType::LargeBinary, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
+                    "json".into(),
+                )]),
+            )]
+            .into(),
+        );
+        let plain = SqlType::Struct(vec![("v".into(), SqlType::Binary)]);
         let json = SqlType::Struct(vec![("v".into(), SqlType::Json)]);
         let plain_binding = bind(&plain, &carrier, false);
         let json_binding = bind(&json, &carrier, false);
@@ -933,7 +937,7 @@ mod projection_observer_tests {
         let name = "semantic_name_".repeat(40);
         let layout = DataType::Struct(
             vec![
-                Field::new(name.clone(), DataType::Utf8, false).with_metadata(
+                Field::new(name.clone(), DataType::LargeBinary, false).with_metadata(
                     std::collections::HashMap::<String, String>::from([(
                         "provider.attribute".into(),
                         "original bytes".into(),

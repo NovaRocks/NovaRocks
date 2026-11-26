@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact binding and lifecycle for the shared original PARSE_JSON core.
+//! Exact selected kernels for SQL JSON parsing, construction and serialization.
 
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ use novarocks_type_contract::{
     PureCompileControl,
 };
 
-use super::catalogue::BuiltinScalarResolver;
+use super::{catalogue::BuiltinScalarResolver, json_sql::JsonFunction, json_sql_selected};
 use crate::kernel_control::{compile_failure, invalid};
 use crate::{
     CallEffectInput, FunctionBindingDeclaration, FunctionBindingError, FunctionBindingRequest,
@@ -37,13 +37,20 @@ use crate::{
     ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-/// Original parse failures are successful NULL, independently of throw policy.
-pub(super) fn effects() -> FunctionEffectDeclaration {
+pub(super) fn effects(operation: JsonFunction) -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
-        own_row_error: FunctionIntrinsicRowError::NoRowError,
+        own_row_error: if operation.may_raise() {
+            FunctionIntrinsicRowError::MayRaise
+        } else {
+            FunctionIntrinsicRowError::NoRowError
+        },
         failure_behavior: FunctionFailureBehavior::Propagate,
-        null_behavior: FunctionNullBehavior::Strict,
+        null_behavior: if operation.constructs() {
+            FunctionNullBehavior::CalledOnNull
+        } else {
+            FunctionNullBehavior::Strict
+        },
         argument_control: ArgumentControl::Eager,
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects::NONE,
@@ -52,30 +59,38 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
 }
 
 pub(super) fn definition(
+    operation: JsonFunction,
     declaration: FunctionBindingDeclaration,
     resolver: BuiltinScalarResolver,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
-    let owner = Arc::new(ParseJsonOwner::new(declaration, resolver)?);
-    FunctionDefinition::try_new_pure_scalar("parse_json", FunctionVisibility::Public, owner)
-        .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
+    let owner = Arc::new(ParseJsonOwner::new(operation, declaration, resolver)?);
+    let visibility = if operation.public() {
+        FunctionVisibility::Public
+    } else {
+        FunctionVisibility::Hidden
+    };
+    FunctionDefinition::try_new_pure_scalar(operation.name(), visibility, owner).map_err(|error| {
+        FunctionCatalogError::InvalidStableIdentity {
             subject: "builtin parse_json pure owner",
             value: error.to_string().into(),
-        })
+        }
+    })
 }
 
 struct ParseJsonOwner {
+    operation: JsonFunction,
     resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
 impl ParseJsonOwner {
     fn new(
+        operation: JsonFunction,
         declaration: FunctionBindingDeclaration,
         resolver: BuiltinScalarResolver,
     ) -> Result<Self, FunctionCatalogError> {
-        let function = "builtin.scalar/parse_json/v1";
-        let expected = effects();
-        if declaration.function_id().as_str() != function
+        let expected = effects(operation);
+        if declaration.function_id() != &operation.function_id()
             || declaration.kind() != FunctionKind::Scalar
             || declaration.overloads().len() != 1
             || declaration.overloads().iter().any(|overload| {
@@ -87,8 +102,10 @@ impl ParseJsonOwner {
                 value: declaration.function_id().as_str().into(),
             });
         }
-        let implementation =
-            PureImplementationId::try_new("builtin.scalar/parse_json/selected-v1")?;
+        let implementation = PureImplementationId::try_new(format!(
+            "builtin.scalar/{}/native-json-v1",
+            operation.name()
+        ))?;
         let implementations = declaration
             .overloads()
             .iter()
@@ -99,6 +116,7 @@ impl ParseJsonOwner {
             })
             .collect();
         Ok(Self {
+            operation,
             resolver: Arc::new(resolver),
             declaration,
             implementations,
@@ -106,7 +124,7 @@ impl ParseJsonOwner {
     }
 
     fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
+        let base = effects(self.operation);
         CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,
@@ -171,16 +189,44 @@ impl PureFunctionMetadataOwner for ParseJsonOwner {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         work.step()?;
         self.declaration.effect_declaration(&selected.overload)?;
-        let supported =
-            super::parse_json_selected::original_native_profile(selected, logical_argument_count);
-        work.finish()?;
-        if supported {
-            Ok(())
-        } else {
-            Err(FunctionBindingError::UnavailableImplementation(
+        if selected.aggregate.is_some() || selected.argument_types.len() != logical_argument_count {
+            return Err(FunctionBindingError::UnavailableImplementation(
                 selected.overload.clone(),
-            ))
+            ));
         }
+        self.operation.check_arguments(
+            selected
+                .argument_types
+                .iter()
+                .map(|argument| match argument {
+                    crate::FunctionArgumentType::Value(value) => Some(value),
+                    _ => None,
+                }),
+            &mut work,
+        )?;
+        let crate::FunctionResultType::Scalar(result) = &selected.result_type else {
+            return Err(FunctionBindingError::UnavailableImplementation(
+                selected.overload.clone(),
+            ));
+        };
+        let result_matches = if self.operation.returns_json() {
+            super::json_sql::is_json(result)
+        } else {
+            result.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+                && result.data_type()
+                    == &if self.operation == JsonFunction::Format {
+                        arrow_schema::DataType::Utf8
+                    } else {
+                        arrow_schema::DataType::Binary
+                    }
+        };
+        work.finish()?;
+        if !result_matches {
+            return Err(FunctionBindingError::UnavailableImplementation(
+                selected.overload.clone(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -248,6 +294,7 @@ impl PureScalarImplementation for ParseJsonOwner {
 
 #[derive(Debug)]
 struct PreparedParseJson {
+    operation: JsonFunction,
     contract: Arc<ScalarCallContract>,
 }
 impl PreparedScalarKernel for PreparedParseJson {
@@ -263,24 +310,21 @@ impl PreparedScalarKernel for PreparedParseJson {
         std::mem::size_of::<ParseJsonInstance>()
     }
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
-        Err(invalid(
-            "parse_json requires its actual scalar allocation host",
-        ))
+        Err(invalid("JSON requires its actual scalar allocation host"))
     }
     fn create_instance_with_allocator(
         &self,
         allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
     ) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
-        let host = allocator
-            .ok_or_else(|| invalid("parse_json requires its actual scalar allocation host"))?;
+        let host =
+            allocator.ok_or_else(|| invalid("JSON requires its actual scalar allocation host"))?;
         if host.opaque_allocation_host().is_none() {
-            return Err(invalid(
-                "parse_json requires its actual scalar allocation host",
-            ));
+            return Err(invalid("JSON requires its actual scalar allocation host"));
         }
         let allocator =
             crate::aggregate_host_allocator::HostAggregateAllocator::try_new(Arc::clone(&host))?;
         Ok(Box::new(ParseJsonInstance {
+            operation: self.operation,
             allocator,
             host,
             failed: false,
@@ -288,6 +332,7 @@ impl PreparedScalarKernel for PreparedParseJson {
     }
 }
 struct ParseJsonInstance {
+    operation: JsonFunction,
     allocator: crate::aggregate_host_allocator::HostAggregateAllocator,
     host: Arc<dyn crate::AggregateStateAllocator>,
     failed: bool,
@@ -301,8 +346,13 @@ impl ScalarKernelInstance for ParseJsonInstance {
         if self.failed {
             return Err(KernelFailure::InstanceFailed);
         }
-        let result =
-            super::parse_json_selected::evaluate(input, control, &self.allocator, &self.host);
+        let result = json_sql_selected::evaluate(
+            self.operation,
+            input,
+            control,
+            &self.allocator,
+            &self.host,
+        );
         if result.is_err() {
             self.failed = true;
         }
@@ -336,8 +386,7 @@ impl ParseJsonOwner {
                 && input.proof_scope != input.context.proof_scope()
         {
             return Err(FunctionBindingError::InvalidBinding(
-                "parse_json has no environment dependencies and requires an exact proof scope"
-                    .into(),
+                "JSON has no environment dependencies and requires an exact proof scope".into(),
             )
             .into());
         }
@@ -379,20 +428,29 @@ impl ParseJsonOwner {
             || !input.environment.is_empty()
         {
             return Err(invalid(
-                "parse_json preparation differs from its exact checked call",
+                "JSON preparation differs from its exact checked call",
             ));
         }
         work.flush().map_err(compile_failure)?;
         validate().map_err(|error| match error {
             FunctionBindingError::Control(error) => compile_failure(error),
-            _ => invalid("parse_json preparation has a stale selected binding"),
+            _ => invalid("JSON preparation has a stale selected binding"),
         })?;
-        super::parse_json_selected::validate_profile(&contract, || {
-            work.step().map_err(compile_failure)
+        self.admit_selected_profile_observed(
+            input.selected,
+            input.request.logical_argument_count,
+            control,
+        )
+        .map_err(|error| match error {
+            FunctionBindingError::Control(error) => compile_failure(error),
+            _ => invalid("JSON preparation has an unsupported selected profile"),
         })?;
         work.finish().map_err(compile_failure)?;
         // The prepared object retains the same canonical contract. Its body is
         // a static pure implementation and needs no live resolver or authority.
-        Ok(Arc::new(PreparedParseJson { contract }))
+        Ok(Arc::new(PreparedParseJson {
+            operation: self.operation,
+            contract,
+        }))
     }
 }

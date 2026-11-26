@@ -215,7 +215,7 @@ impl Fixture {
             (
                 4,
                 FunctionValueType::try_with_logical_type(
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     true,
                     ValueLogicalType::Json,
                 )

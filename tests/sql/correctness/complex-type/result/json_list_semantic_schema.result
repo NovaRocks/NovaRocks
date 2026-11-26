@@ -1,12 +1,12 @@
 -- query 1
 -- types	array(json)	array(varchar)
 json_values	string_values
-["{\"2:3\": null}"]	["{\"2:3\": null}"]
+["{\"2:3\":null}"]	["{\"2:3\": null}"]
 
 -- query 2
 -- types	array(json)	array(varchar)
 json_values	string_values
-["{\"k\": 2}","{\"k\": 1}"]	["{\"k\": 2}","{\"k\": 1}"]
+["{\"k\":2}","{\"k\":1}"]	["{\"k\": 2}","{\"k\": 1}"]
 
 -- query 4
 -- types	array(json)	array(varchar)
@@ -16,7 +16,7 @@ json_values	string_values
 -- query 5
 -- types	array(json)
 json_values
-["{\"key\": \"value2\"}","{\"key\": \"value1\"}"]
+["{\"key\":\"value2\"}","{\"key\":\"value1\"}"]
 
 -- query 6
 -- types	array(json)

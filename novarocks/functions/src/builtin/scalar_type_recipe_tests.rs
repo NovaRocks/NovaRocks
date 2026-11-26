@@ -28,9 +28,12 @@ impl PureCompileControl for Control {
     }
 }
 fn source_map() -> FunctionValueType {
-    let key =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let key = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let value = FunctionValueType::new(DataType::Int64, true);
     let source = declared_map(&key, &value, false).unwrap();
     let DataType::Map(entries, _) = source.data_type() else {
@@ -108,9 +111,12 @@ fn fixed_map_key_result_replays_complete_domain_and_child_null_recipe() {
         .unwrap_err();
     assert!(error.to_string().contains("result type:"), "{error}");
 
-    let item =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let item = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let storage = ValueTypeStorageLifetime::pure();
     let semantics = ValueTypeRef::try_new(
         ValueKind::List(item.value_type().clone()),
@@ -121,7 +127,7 @@ fn fixed_map_key_result_replays_complete_domain_and_child_null_recipe() {
     let layout = ValueLayout::try_new(
         &DataType::List(Arc::new(arrow_schema::Field::new(
             "item",
-            DataType::Utf8,
+            DataType::LargeBinary,
             false,
         ))),
         storage,
@@ -411,7 +417,7 @@ fn dynamic_named_arguments() -> [FunctionArgument; 2] {
         },
         FunctionArgument::Value {
             value_type: FunctionValueType::try_with_logical_type(
-                DataType::Utf8,
+                DataType::LargeBinary,
                 false,
                 ValueLogicalType::Json,
             )
@@ -443,9 +449,12 @@ fn dynamic_created_validation_retains_original_named_and_map_value_domains() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let named = dynamic_named_arguments();
     let key = FunctionValueType::new(DataType::Utf8, false);
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let map = [
         FunctionArgument::Value {
             value_type: declared_list(&key, false).unwrap(),
@@ -682,9 +691,12 @@ fn round_created_validation_preserves_declared_scale_and_real_wrapper_loan() {
 #[test]
 fn dynamic_created_empty_array_keeps_independent_unknown_declaration_and_real_creator() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
-    let item =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let item = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let expected = declared_list(&item, false).unwrap();
     let request = FunctionBindingRequest {
         arguments: &[],
@@ -753,9 +765,12 @@ fn dynamic_created_empty_array_keeps_independent_unknown_declaration_and_real_cr
 #[test]
 fn borrowed_aggregate_created_validation_uses_original_recipe_without_expected_backing() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     for (name, source) in [
         ("count", FunctionValueType::new(DataType::Int64, false)),
         ("array_agg", json),
@@ -803,10 +818,13 @@ fn borrowed_aggregate_created_validation_uses_original_recipe_without_expected_b
 #[test]
 fn borrowed_conversion_created_validation_keeps_exact_domains_and_original_control() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
-    let source =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
-    let target = FunctionValueType::new(DataType::Utf8, false);
+    let source = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Variant,
+    )
+    .unwrap();
+    let target = FunctionValueType::new(DataType::LargeBinary, false);
     let args = arguments(&source);
     let req = FunctionBindingRequest {
         expected_result_type: Some(&target),

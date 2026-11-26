@@ -287,7 +287,7 @@ mod refresh_property_facade_tests {
                 columns: if table == "logical_domains" {
                     use novarocks_types::schema::SqlType;
                     [
-                        ("doc", DataType::Utf8, Some(SqlType::Json)),
+                        ("doc", DataType::LargeBinary, Some(SqlType::Json)),
                         (
                             "variant_value",
                             DataType::LargeBinary,
@@ -929,18 +929,25 @@ mod refresh_property_facade_tests {
         ));
     }
 
-    fn cv_utf8(logical: novarocks_type_contract::ValueLogicalType, metadata: &str) -> TypedExpr {
-        use arrow::array::{Array, StringArray};
-        let ty =
-            FunctionValueType::try_from_legacy_declared_projection(DataType::Utf8, false, logical)
-                .expect("valid temporary legacy value projection");
-        let field = arrow::datatypes::Field::new("selected", DataType::Utf8, false).with_metadata(
-            std::collections::HashMap::from([("source".into(), metadata.into())]),
-        );
+    fn cv_large_binary(
+        logical: novarocks_type_contract::ValueLogicalType,
+        metadata: &str,
+    ) -> TypedExpr {
+        use arrow::array::{Array, LargeBinaryArray};
+        let ty = FunctionValueType::try_from_legacy_declared_projection(
+            DataType::LargeBinary,
+            false,
+            logical,
+        )
+        .unwrap();
+        let field =
+            arrow::datatypes::Field::new("selected", DataType::LargeBinary, false).with_metadata(
+                std::collections::HashMap::from([("source".into(), metadata.into())]),
+            );
         let pool = novarocks_functions::ConstantPool::try_new(
             std::sync::Arc::new(field),
             ty.clone(),
-            StringArray::from(vec!["\"same\""]).to_data(),
+            LargeBinaryArray::from(vec![b"\x01\x44\x04same".as_slice()]).to_data(),
             crate::constant::test_constant_policy(),
             CompilePhase::LowerProgram,
             crate::optimizer::test_optimizer_control(),
@@ -956,8 +963,8 @@ mod refresh_property_facade_tests {
     fn refresh_identity_rejects_full_cv_root_field_metadata_and_logical_disagreement() {
         use novarocks_type_contract::ValueLogicalType;
         let same = cv_refresh_input(
-            cv_utf8(ValueLogicalType::Physical, "a"),
-            cv_utf8(ValueLogicalType::Physical, "b"),
+            cv_large_binary(ValueLogicalType::Physical, "a"),
+            cv_large_binary(ValueLogicalType::Physical, "b"),
         );
         assert!(
             same.refresh_property(crate::optimizer::test_optimizer_control())
@@ -969,8 +976,8 @@ mod refresh_property_facade_tests {
         );
         {
             let (left, right) = (
-                cv_utf8(ValueLogicalType::Physical, "a"),
-                cv_utf8(ValueLogicalType::Json, "a"),
+                cv_large_binary(ValueLogicalType::Physical, "a"),
+                cv_large_binary(ValueLogicalType::Json, "a"),
             );
             let input = cv_refresh_input(left, right);
             assert!(matches!(
@@ -3451,18 +3458,12 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
             reject_unsupported_expr(&node.trim_source)?;
         }
         Expr::JsonObject(node) => {
-            if !crate::analyzer::is_supported_json_object_profile(node) {
-                return Err(projection_filter_error());
-            }
             for member in &node.members {
                 reject_unsupported_expr(&member.key)?;
                 reject_unsupported_expr(&member.value)?;
             }
         }
         Expr::JsonArray(node) => {
-            if !crate::analyzer::is_supported_json_array_profile(node) {
-                return Err(projection_filter_error());
-            }
             for element in &node.elements {
                 reject_unsupported_expr(&element.value)?;
             }
@@ -3475,10 +3476,9 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
             reject_unsupported_expr(&node.path_invocation.input_expression)?;
         }
 
-        Expr::JsonConstructor(_)
-        | Expr::JsonExists(_)
-        | Expr::JsonValue(_)
-        | Expr::JsonSerialize(_) => return Err(projection_filter_error()),
+        Expr::JsonConstructor(node) => reject_unsupported_expr(&node.expression)?,
+        Expr::JsonSerialize(node) => reject_unsupported_expr(&node.expression)?,
+        Expr::JsonExists(_) | Expr::JsonValue(_) => return Err(projection_filter_error()),
 
         Expr::Subquery(_) | Expr::Exists(_) | Expr::Unique(_) | Expr::WindowOperation(_) => {
             return Err(projection_filter_error());

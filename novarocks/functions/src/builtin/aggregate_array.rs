@@ -24,6 +24,7 @@ use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
+use novarocks_type_contract::{ValueLogicalType, ValueTypeRef};
 use std::sync::Arc;
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Operation {
@@ -322,9 +323,11 @@ impl PreparedAggregateKernel for ArrayKernel {
 }
 fn supported(
     ty: &DataType,
+    json_payload: Option<&ValueTypeRef>,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<bool, KernelFailure> {
     work.step().map_err(compile_failure)?;
+    let child = |index| json_payload.and_then(|value| value.child_type_at(index));
     Ok(match ty {
         DataType::Null
         | DataType::Boolean
@@ -338,20 +341,23 @@ fn supported(
         | DataType::Date32
         | DataType::Timestamp(..)
         | DataType::Decimal128(..) => true,
+        DataType::LargeBinary => {
+            json_payload.and_then(ValueTypeRef::domain) == Some(ValueLogicalType::Json)
+        }
         DataType::FixedSizeBinary(16) => true,
-        DataType::List(item) => supported(item.data_type(), work)?,
+        DataType::List(item) => supported(item.data_type(), child(0), work)?,
         DataType::Struct(fields) => {
             let mut all = !fields.is_empty();
-            for field in fields {
-                all &= supported(field.data_type(), work)?;
+            for (index, field) in fields.iter().enumerate() {
+                all &= supported(field.data_type(), child(index), work)?;
             }
             all
         }
         DataType::Map(entries, _) => {
             if let DataType::Struct(fields) = entries.data_type() {
                 fields.len() == 2
-                    && supported(fields[0].data_type(), work)?
-                    && supported(fields[1].data_type(), work)?
+                    && supported(fields[0].data_type(), child(0), work)?
+                    && supported(fields[1].data_type(), child(1), work)?
             } else {
                 false
             }
@@ -383,11 +389,16 @@ pub(super) fn validate_contract(
             "array_unique_agg has no installed ordered state profile",
         ));
     }
-    for arg in arguments {
+    for (index, arg) in arguments.iter().enumerate() {
         let FunctionArgumentType::Value(value) = arg else {
             return Err(invalid("ARRAY aggregate requires canonical value channels"));
         };
-        if !supported(value.data_type(), work)? {
+        // The value channel may carry JSON bytes across partial and final
+        // aggregation. Order and distinct still require their existing domains.
+        let json_payload =
+            (index == 0 && matches!(operation, Operation::Array) && !receipt.distinct)
+                .then_some(value.value_type());
+        if !supported(value.data_type(), json_payload, work)? {
             return Err(invalid(&format!(
                 "{} has no installed ARRAY input profile for {:?}",
                 contract.call().function_id().as_str(),

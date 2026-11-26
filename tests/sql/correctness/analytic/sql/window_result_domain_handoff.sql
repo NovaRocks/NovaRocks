@@ -31,15 +31,15 @@ SELECT id,
        variant_get(next_variant, '$', 'bigint') AS next_variant
 FROM (
   SELECT id,
-         first_value(CAST(variant_get(parse_json(CAST(id AS VARCHAR)), '$') AS VARIANT)) OVER (ORDER BY id) AS first_variant,
-         lead(CAST(variant_get(parse_json(CAST(id AS VARCHAR)), '$') AS VARIANT), 1, CAST(NULL AS VARIANT)) OVER (ORDER BY id) AS next_variant
+         first_value(CAST(variant_get(json_parse(CAST(id AS VARCHAR)), '$') AS VARIANT)) OVER (ORDER BY id) AS first_variant,
+         lead(CAST(variant_get(json_parse(CAST(id AS VARCHAR)), '$') AS VARIANT), 1, CAST(NULL AS VARIANT)) OVER (ORDER BY id) AS next_variant
   FROM ${case_db}.window_result_domains
 ) window_values ORDER BY id;
 
 -- query 4
 -- @order_sensitive=true
 SELECT id,
-       lead(parse_json('{"a": 2}'), 1, parse_json('{}')) OVER (ORDER BY id) AS next_json
+       lead(json_parse('{"a": 2}'), 1, json_parse('{}')) OVER (ORDER BY id) AS next_json
 FROM ${case_db}.window_result_domains ORDER BY id;
 
 -- query 5

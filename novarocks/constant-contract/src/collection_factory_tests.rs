@@ -653,12 +653,15 @@ fn empty_collection_preserves_explicit_nested_nominal_binding_without_annotation
     use novarocks_type_contract::{
         ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
     };
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let field = Arc::new(Field::new(
         "explicit",
-        DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+        DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, false))),
         true,
     ));
     let semantic = ValueTypeRef::try_new(
@@ -683,7 +686,7 @@ fn empty_collection_preserves_explicit_nested_nominal_binding_without_annotation
         ValueLogicalType::Json
     );
     assert!(field.metadata().is_empty());
-    assert!(value.pool().data().child_data()[0].data_type() == &DataType::Utf8);
+    assert!(value.pool().data().child_data()[0].data_type() == &DataType::LargeBinary);
     assert_eq!(value.pool().data().child_data()[0].len(), 0);
     assert!(!value.is_null_observed(PHASE, &Control::default()).unwrap());
 }

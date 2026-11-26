@@ -26,6 +26,8 @@ use arrow::array::*;
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, Timelike};
+use novarocks_functions::KernelFailure;
+use novarocks_functions::json_value::{JsonError, JsonWork, TextCursor, TextEvent};
 use novarocks_result_contract::{
     CharacterKind, CharacterType, ClientRenderSchema, FrozenRootOutput, NativeRenderType as N,
     RenderField, RenderTimeUnit, RootOutputContract, RootProfileV1 as V,
@@ -33,14 +35,14 @@ use novarocks_result_contract::{
 use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
-#[path = "json_cursor.rs"]
-mod json_cursor;
 #[path = "legacy_map_key.rs"]
 mod legacy_map_key;
+#[path = "utf8.rs"]
+mod utf8;
 use legacy_map_key::LegacyMapKeys;
 #[path = "variant_cursor.rs"]
 mod variant_cursor;
-use json_cursor::{JsonCursor, Utf8};
+use utf8::Utf8;
 use variant_cursor::{Collection, VariantView};
 
 fn error(kind: E) -> RenderError {
@@ -171,15 +173,15 @@ enum Mode {
     Json,
     RawUtf8,
     Base64,
+    NativeJson { escape: bool },
 }
 struct Stream {
     source: Source,
     at: usize,
     mode: Mode,
-    pending: [u8; 8],
+    pending: [u8; 6],
     pending_at: usize,
     pending_len: usize,
-    json: Option<JsonCursor>,
     utf8: Option<Utf8>,
     character: Option<(CharacterType, u32)>,
 }
@@ -189,13 +191,17 @@ impl Stream {
             source,
             at: 0,
             mode,
-            pending: [0; 8],
+            pending: [0; 6],
             pending_at: 0,
             pending_len: 0,
-            json: None,
             utf8: None,
             character: None,
         }
+    }
+
+    fn queue_json_escape(&mut self, byte: u8) {
+        self.pending_at = 0;
+        self.pending_len = trino_json::escape_byte(byte, &mut self.pending);
     }
 }
 #[derive(Clone)]
@@ -314,6 +320,7 @@ fn stream_next(
     data: &[u8],
     b: &mut Budget,
     elements: &mut usize,
+    mut native_json: Option<&mut TextCursor>,
 ) -> Result<Poll, RenderError> {
     loop {
         if stream.pending_at < stream.pending_len {
@@ -322,14 +329,34 @@ fn stream_next(
             b.scan(1);
             return Ok(Poll::Byte(byte));
         }
-        if stream.json.is_some() && b.cells == V::CELLS_PER_TURN {
-            return Ok(Poll::Yield);
+        if let Mode::NativeJson { escape } = stream.mode {
+            if !b.room(4096) || b.cells == V::CELLS_PER_TURN {
+                return Ok(Poll::Yield);
+            }
+            let event = native_json
+                .as_deref_mut()
+                .ok_or_else(invalid)?
+                .advance(
+                    data,
+                    &mut JsonRenderWork {
+                        budget: b,
+                        prepaid_scratch: 0,
+                    },
+                )
+                .map_err(native_json_error)?;
+            match event {
+                TextEvent::EnteredItem => {
+                    b.cell();
+                    count_element(elements)?;
+                }
+                TextEvent::Byte(byte) if !escape => return Ok(Poll::Byte(byte)),
+                TextEvent::Byte(byte) => stream.queue_json_escape(byte),
+                TextEvent::Done => return Ok(Poll::Done),
+            }
+            continue;
         }
 
         if stream.at == data.len() {
-            if let Some(j) = &mut stream.json {
-                j.finish()?;
-            }
             if let Some(u) = stream.utf8 {
                 u.finish()?;
             }
@@ -371,21 +398,6 @@ fn stream_next(
             Mode::Json | Mode::RawUtf8 => {
                 b.scan(1);
                 stream.at += 1;
-                if let Some(j) = &mut stream.json
-                    && j.feed(c)?
-                {
-                    // Cell capacity was reserved before feed. Never rewind a
-                    // byte after the parser has accepted its state transition.
-                    if !b.cell() {
-                        return Err(error(E::CursorInvariant));
-                    }
-                    *elements = elements
-                        .checked_add(1)
-                        .ok_or_else(|| error(E::ArithmeticOverflow))?;
-                    if *elements > V::MAX_ELEMENTS_PER_ROW {
-                        return Err(extent_error(E::ElementLimit, *elements));
-                    }
-                }
                 if let Some(u) = &mut stream.utf8 {
                     u.feed(c)?;
                 }
@@ -397,13 +409,56 @@ fn stream_next(
                 if matches!(stream.mode, Mode::RawUtf8) {
                     return Ok(Poll::Byte(c));
                 }
-                let mut escaped = [0; 6];
-                let count = trino_json::escape_byte(c, &mut escaped);
-                stream.pending[..count].copy_from_slice(&escaped[..count]);
-                stream.pending_len = count;
+                stream.queue_json_escape(c);
             }
+            Mode::NativeJson { .. } => unreachable!("native JSON uses the document cursor"),
         }
     }
+}
+
+fn native_json_error(cause: JsonError) -> RenderError {
+    match cause {
+        JsonError::Value(_) | JsonError::InvalidText(_) | JsonError::Depth => error(E::InvalidJson),
+        JsonError::Host(KernelFailure::ResourceExhausted) => error(E::WorkStackLimit),
+        JsonError::Host(_) => invalid(),
+    }
+}
+
+struct JsonRenderWork<'a> {
+    budget: &'a mut Budget,
+    prepaid_scratch: usize,
+}
+
+impl JsonWork for JsonRenderWork<'_> {
+    type Reservation = ();
+
+    fn step(&mut self) -> Result<(), KernelFailure> {
+        self.budget.scan(1);
+        Ok(())
+    }
+
+    fn reserve(&mut self, bytes: usize) -> Result<(), KernelFailure> {
+        self.prepaid_scratch = self
+            .prepaid_scratch
+            .checked_sub(bytes)
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        Ok(())
+    }
+
+    fn reserve_output(&mut self, _bytes: usize) -> Result<(), KernelFailure> {
+        // The caller already owns the stage or supplied output slice.
+        Err(KernelFailure::ResourceExhausted)
+    }
+}
+
+fn count_element(elements: &mut usize) -> Result<(), RenderError> {
+    *elements = elements
+        .checked_add(1)
+        .ok_or_else(|| error(E::ArithmeticOverflow))?;
+    if *elements > V::MAX_ELEMENTS_PER_ROW {
+        return Err(extent_error(E::ElementLimit, *elements));
+    }
+    Ok(())
 }
 struct Budget {
     work: usize,
@@ -496,6 +551,7 @@ struct CellCursor {
     escaped_at: usize,
     escaped_len: usize,
     stack: Vec<EncodeStep>,
+    native_json: Option<TextCursor>,
     elements: usize,
     legacy_keys: Option<(ArrayRef, usize, usize, Path)>,
 }
@@ -507,6 +563,7 @@ impl CellCursor {
             escaped_at: 0,
             escaped_len: 0,
             stack: Vec::with_capacity(CELL_TASK_CAPACITY),
+            native_json: None,
             elements: 0,
             legacy_keys: None,
         }
@@ -541,14 +598,7 @@ impl CellCursor {
         self.push(EncodeStep::Atom(Atom::literal(b)))
     }
     fn element(&mut self) -> Result<(), RenderError> {
-        self.elements = self
-            .elements
-            .checked_add(1)
-            .ok_or_else(|| error(E::ArithmeticOverflow))?;
-        if self.elements > V::MAX_ELEMENTS_PER_ROW {
-            return Err(extent_error(E::ElementLimit, self.elements));
-        }
-        Ok(())
+        count_element(&mut self.elements)
     }
     fn quoted(&mut self, source: Source, mode: Mode, quote: u8) -> Result<(), RenderError> {
         self.literal(&[quote])?;
@@ -601,7 +651,13 @@ impl CellCursor {
                 let data = source.data()?;
                 let mut n = 0;
                 while n < limit && b.room(4096) {
-                    match stream_next(stream, data, b, &mut self.elements)? {
+                    match stream_next(
+                        stream,
+                        data,
+                        b,
+                        &mut self.elements,
+                        self.native_json.as_mut(),
+                    )? {
                         Poll::Byte(byte) => {
                             if let Some(out) = output.as_deref_mut() {
                                 out[n] = byte;
@@ -677,7 +733,13 @@ impl CellCursor {
             if let Some(EncodeStep::Stream(stream)) = self.stack.last_mut() {
                 let source = stream.source.clone();
                 b.scan(source.metadata_work());
-                match stream_next(stream, source.data()?, b, &mut self.elements)? {
+                match stream_next(
+                    stream,
+                    source.data()?,
+                    b,
+                    &mut self.elements,
+                    self.native_json.as_mut(),
+                )? {
                     Poll::Done => {
                         self.stack.pop();
                         continue;
@@ -1301,8 +1363,13 @@ fn unit_matches(unit: RenderTimeUnit, u: &TimeUnit) -> bool {
 fn validate_field(f: &RenderField, d: &DataType, nested: bool) -> Result<(), RenderError> {
     if let DataType::Dictionary(k, v) = d {
         if matches!(k.as_ref(), DataType::Int32)
-            && matches!(v.as_ref(), DataType::Utf8 | DataType::LargeUtf8)
-            && matches!(f.native_type, N::String | N::Json | N::BoundedCharacter(_))
+            && matches!(
+                (&f.native_type, v.as_ref()),
+                (
+                    N::String | N::BoundedCharacter(_),
+                    DataType::Utf8 | DataType::LargeUtf8
+                ) | (N::Json, DataType::LargeBinary)
+            )
         {
             return Ok(());
         }
@@ -1322,10 +1389,10 @@ fn validate_field(f: &RenderField, d: &DataType, nested: bool) -> Result<(), Ren
         | (N::LargeInt | N::Uuid, DataType::FixedSizeBinary(16))
         | (N::Float32, DataType::Float32)
         | (N::Float64, DataType::Float64)
-        | (N::String | N::Json | N::BoundedCharacter(_), DataType::Utf8 | DataType::LargeUtf8)
+        | (N::String | N::BoundedCharacter(_), DataType::Utf8 | DataType::LargeUtf8)
         | (N::Binary, DataType::Binary | DataType::LargeBinary)
         | (N::Opaque(_), DataType::Binary)
-        | (N::Variant, DataType::LargeBinary)
+        | (N::Json | N::Variant, DataType::LargeBinary)
         | (N::Date, DataType::Date32) => true,
         (
             N::Decimal {
@@ -1567,13 +1634,23 @@ impl ArrowClientRowEncoder {
             }
         }
         let legacy_keys = LegacyMapKeys::for_schema(&schema)?;
+        let mut cursor = CellCursor::new();
+        if schema_contains_json(&schema) {
+            cursor.native_json = Some(
+                TextCursor::with_preallocated_scratch(&mut JsonRenderWork {
+                    budget: &mut Budget::new(),
+                    prepaid_scratch: TextCursor::<()>::preallocated_scratch_bytes(),
+                })
+                .map_err(native_json_error)?,
+            );
+        }
         Ok(Self {
             schema,
             legacy_keys,
             batch,
             stage: Box::new([0; V::SMALL_ROW_BYTES]),
             lengths: Box::new([0; V::MAX_COLUMNS]),
-            cursor: CellCursor::new(),
+            cursor,
             phase: Phase::Small,
             row: 0,
             column: 0,
@@ -1923,6 +2000,11 @@ impl BoundedClientRowEncoder for ArrowClientRowEncoder {
             + size_of::<[u32; V::MAX_COLUMNS]>()
             + self.cursor.stack.capacity() * size_of::<EncodeStep>()
             + self
+                .cursor
+                .native_json
+                .as_ref()
+                .map_or(0, TextCursor::scratch_capacity_bytes)
+            + self
                 .legacy_keys
                 .as_ref()
                 .map_or(0, |keys| keys.scratch_capacity())
@@ -1932,15 +2014,39 @@ impl BoundedClientRowEncoder for ArrowClientRowEncoder {
 /// All encoder allocations are fixed before the first turn. The stack refuses
 /// an additional task before its original allocation could grow.
 pub(super) const fn scratch_capacity_bound_bytes() -> usize {
-    basic_scratch_capacity_bound_bytes() + LegacyMapKeys::scratch_capacity_bound()
+    basic_scratch_capacity_bound_bytes()
+        + LegacyMapKeys::scratch_capacity_bound()
+        + TextCursor::<()>::preallocated_scratch_bytes()
 }
 
 pub(super) fn scratch_capacity_bound_for_schema(schema: &ClientRenderSchema) -> usize {
-    if LegacyMapKeys::required_for(schema) {
-        scratch_capacity_bound_bytes()
+    let legacy = if LegacyMapKeys::required_for(schema) {
+        LegacyMapKeys::scratch_capacity_bound()
     } else {
-        basic_scratch_capacity_bound_bytes()
+        0
+    };
+    let native_json = if schema_contains_json(schema) {
+        TextCursor::<()>::preallocated_scratch_bytes()
+    } else {
+        0
+    };
+    basic_scratch_capacity_bound_bytes() + legacy + native_json
+}
+
+fn schema_contains_json(schema: &ClientRenderSchema) -> bool {
+    fn field_contains_json(field: &RenderField) -> bool {
+        match &field.native_type {
+            N::Json => true,
+            N::List(child) => field_contains_json(child),
+            N::Map { key, value } => field_contains_json(key) || field_contains_json(value),
+            N::Struct(fields) => fields.iter().any(|field| field_contains_json(&field.field)),
+            _ => false,
+        }
     }
+    schema
+        .columns()
+        .iter()
+        .any(|column| field_contains_json(&column.field))
 }
 
 const fn basic_scratch_capacity_bound_bytes() -> usize {

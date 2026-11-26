@@ -317,7 +317,7 @@ fn canonical_hidden_array_literal_materializes_common_width_and_keeps_null_and_n
         assert!(matches!(call(second).2[0].kind, ExprKind::ColumnRef { .. }));
     }
     let source = SourceCatalog {
-        carrier: DataType::Utf8,
+        carrier: DataType::LargeBinary,
         logical: Some(SqlType::Json),
         nullable: false,
     };

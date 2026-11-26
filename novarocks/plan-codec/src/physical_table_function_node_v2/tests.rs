@@ -234,9 +234,12 @@ impl Fixture {
         ));
         let structure = FunctionValueType::new(DataType::Struct(vec![field.clone()].into()), true);
         assert_eq!(field.metadata()["unknown.tag"], "original");
-        let json =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let roots = vec![
             (0, value.clone()),
             (7, dict.clone()),

@@ -216,7 +216,7 @@ fn sql_call_dependency_loan_empty_array_keeps_unknown_source_and_outer_json_targ
             panic!("outer complete JSON target")
         };
         assert_eq!(item.name(), "item");
-        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(item.data_type(), &DataType::LargeBinary);
         assert!(item.is_nullable());
         let child = cast.ty.child_at(0).unwrap();
         assert_eq!(child.logical_type(), ValueLogicalType::Json);

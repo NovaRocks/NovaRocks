@@ -246,8 +246,8 @@ fn setop_exact_remap_preserves_order_positions_full_type_and_inverse() {
 #[test]
 fn setop_exact_remap_rejects_same_carrier_root_domain_substitution() {
     assert_refused(
-        nominal(DataType::Utf8, ValueLogicalType::Json),
-        physical(DataType::Utf8, true),
+        nominal(DataType::LargeBinary, ValueLogicalType::Json),
+        physical(DataType::LargeBinary, true),
     );
     assert_refused(
         nominal(DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
@@ -307,9 +307,9 @@ fn setop_exact_remap_success_and_ordinary_decline_preserve_every_control_prefix(
 
     let ordinary = || {
         Fixture::new(
-            nominal(DataType::Utf8, ValueLogicalType::Json),
-            nominal(DataType::Utf8, ValueLogicalType::Json),
-            physical(DataType::Utf8, true),
+            nominal(DataType::LargeBinary, ValueLogicalType::Json),
+            nominal(DataType::LargeBinary, ValueLogicalType::Json),
+            physical(DataType::LargeBinary, true),
         )
     };
     let declining = Control::default();

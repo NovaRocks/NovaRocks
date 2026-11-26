@@ -181,7 +181,19 @@ impl CellCursor {
                 })?;
                 self.literal(b"[")?;
             }
-            N::String | N::Json | N::Binary | N::BoundedCharacter(_) => {
+            N::Json => {
+                self.native_json.as_mut().ok_or_else(invalid)?.reset();
+                let stream =
+                    Stream::new(Source::array(array, row), Mode::NativeJson { escape: !key });
+                if !key {
+                    self.literal(b"\"")?;
+                }
+                self.push(EncodeStep::Stream(stream))?;
+                if !key {
+                    self.literal(b"\"")?;
+                }
+            }
+            N::String | N::Binary | N::BoundedCharacter(_) => {
                 let mut stream = Stream::new(
                     Source::array(array, row),
                     if matches!(field.native_type, N::Binary) {
@@ -192,9 +204,6 @@ impl CellCursor {
                         Mode::Json
                     },
                 );
-                if matches!(field.native_type, N::Json) {
-                    stream.json = Some(JsonCursor::new(path.depth as usize));
-                }
                 if !matches!(field.native_type, N::Binary) {
                     stream.utf8 = Some(Utf8::default());
                 }

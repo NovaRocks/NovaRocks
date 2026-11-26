@@ -97,6 +97,80 @@ impl KernelEvaluationControl for Control {
         panic!("IN never waits")
     }
 }
+
+#[test]
+fn json_membership_prepares_only_demanded_probes_and_reuses_literal_backing() {
+    use super::{JsonConstantKeyCache, JsonProbeKeys, json_array, json_host, key_allocator};
+    use arrow_array::LargeBinaryArray;
+    use arrow_schema::Field;
+    use novarocks_constant_contract::{ConstantPolicy, ConstantValue};
+    use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueLogicalType};
+
+    let json_null = b"\x01\x20".as_slice();
+    let invalid_unused = b"null".as_slice();
+    let input: ArrayRef = Arc::new(LargeBinaryArray::from(vec![json_null, invalid_unused]));
+    let control = Control {
+        trace: Mutex::new(Vec::new()),
+        fail: None,
+    };
+    let mut probe = JsonProbeKeys::prepare(&input, None, &control).unwrap();
+    let before = control.trace.lock().unwrap().len();
+    assert!(probe.prepare_at(0, &control).unwrap().is_some());
+    let after = control.trace.lock().unwrap().len();
+    assert!(after > before);
+    assert!(probe.prepare_at(0, &control).unwrap().is_some());
+    assert_eq!(control.trace.lock().unwrap().len(), after);
+    assert!(probe.keys[1].is_none());
+
+    let fvt = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let original = ConstantValue::from_binary(
+        Arc::new(Field::new("candidate", DataType::LargeBinary, false)),
+        fvt,
+        json_null,
+        ConstantPolicy {
+            max_rows: 4,
+            max_array_nodes: 4,
+            max_logical_elements: 4,
+            max_retained_buffer_bytes: 1024,
+            max_type_depth: 4,
+            max_type_nodes: 4,
+            max_dictionary_depth: 1,
+            max_metadata_bytes: 1024,
+            max_library_validation_work: 16384,
+            max_library_validation_bytes: 16384,
+        },
+        CompilePhase::Validate,
+        crate::binding_test_control(),
+    )
+    .unwrap();
+    let allocator = key_allocator(json_host(None)).unwrap();
+    let mut cache = JsonConstantKeyCache::default();
+    assert!(
+        cache
+            .get_or_prepare(&original, json_array(&input).unwrap(), &allocator, &control)
+            .unwrap()
+            .is_some()
+    );
+    let after_first = control.trace.lock().unwrap().len();
+    assert!(
+        cache
+            .get_or_prepare(
+                &original.clone(),
+                json_array(&input).unwrap(),
+                &allocator,
+                &control,
+            )
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(control.trace.lock().unwrap().len(), after_first + 1);
+}
+
 fn invoke(control: &dyn KernelEvaluationControl) -> Result<BooleanArray, InError<KernelFailure>> {
     let mut units = 0u32;
     let mut observe = |event| {
@@ -707,9 +781,12 @@ fn inlist_json_profile_preserves_nominal_evidence_and_rejects_plain_text_mixing(
             Ok(())
         }
     }
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let plain = FunctionValueType::new(DataType::Utf8, true);
     let boolean = FunctionValueType::new(DataType::Boolean, true);
     let recipe =
@@ -740,7 +817,7 @@ fn json_inlist_required_data_effects_are_shared_by_owned_and_borrowed_profiles()
     };
     let result = FunctionValueType::new(DataType::Boolean, true);
     for (carrier, logical, required) in [
-        (DataType::Utf8, ValueLogicalType::Json, true),
+        (DataType::LargeBinary, ValueLogicalType::Json, true),
         (DataType::Utf8, ValueLogicalType::Physical, false),
         (DataType::Int64, ValueLogicalType::Physical, false),
     ] {

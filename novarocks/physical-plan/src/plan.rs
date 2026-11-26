@@ -127,7 +127,7 @@ impl ResultValueDomain {
         use arrow_schema::DataType as D;
         match self {
             Self::Plain => true,
-            Self::Json => matches!(data_type, D::Utf8 | D::LargeUtf8),
+            Self::Json => matches!(data_type, D::LargeBinary),
             Self::Variant => matches!(data_type, D::LargeBinary),
             Self::Hll | Self::Bitmap | Self::Object | Self::Percentile => {
                 matches!(data_type, D::Binary | D::LargeBinary)

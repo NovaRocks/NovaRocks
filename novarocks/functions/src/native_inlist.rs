@@ -16,6 +16,8 @@
 // under the License.
 //! IN prepares its equality domain and assembles the ordered membership result.
 //! Scheduling stays with the caller, which supplies materialized, error-free inputs.
+use crate::aggregate_host_allocator::HostAggregateAllocator;
+use crate::json_canonical::{JsonCanonicalKey, key_allocator, normalize_json_key_in};
 use crate::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
 use crate::selected_copy::{CopyError, fixed_interleave_extent};
 use crate::{
@@ -25,8 +27,9 @@ use crate::{
     UnaccountedAggregateStateAllocator,
 };
 use arrow_array::builder::BooleanBuilder;
-use arrow_array::{Array, ArrayRef, BooleanArray, StringArray};
+use arrow_array::{Array, ArrayRef, BooleanArray, LargeBinaryArray};
 use arrow_schema::DataType;
+use novarocks_constant_contract::{ConstantBackingIdentity, ConstantValue};
 use novarocks_type_contract::{ExpressionEffects, KeyRelation, arrow_data_types_exact_observed};
 use std::{convert::Infallible, sync::Arc};
 #[derive(Clone, Copy, Debug)]
@@ -340,6 +343,116 @@ fn append_equalities_observed<E>(
     Ok(())
 }
 
+/// Each selected probe is normalized once in its original activation frame.
+pub struct JsonProbeKeys {
+    values: ArrayRef,
+    keys: allocator_api2::vec::Vec<Option<Option<JsonCanonicalKey>>, HostAggregateAllocator>,
+}
+
+impl JsonProbeKeys {
+    pub fn prepare(
+        values: &ArrayRef,
+        host: Option<Arc<dyn AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, KernelFailure> {
+        json_array(values)?;
+        let allocator = key_allocator(json_host(host))?;
+        let mut keys = allocator_api2::vec::Vec::new_in(allocator.clone());
+        keys.try_reserve_exact(values.len())
+            .map_err(|_| allocator.take_failure())?;
+        for _ in 0..values.len() {
+            control.checkpoint(1)?;
+            keys.push(None);
+        }
+        Ok(Self {
+            values: Arc::clone(values),
+            keys,
+        })
+    }
+
+    fn prepare_at(
+        &mut self,
+        parent: usize,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<&Option<JsonCanonicalKey>, KernelFailure> {
+        let allocator = self.keys.allocator().clone();
+        let key = self
+            .keys
+            .get_mut(parent)
+            .ok_or_else(|| contract("IN JSON parent exceeds the original probe"))?;
+        if key.is_none() {
+            *key = Some(json_key_at(
+                json_array(&self.values)?,
+                parent,
+                &allocator,
+                control,
+            )?);
+        }
+        Ok(key.as_ref().expect("prepared original probe"))
+    }
+}
+
+type ConstantKeyId = (ConstantBackingIdentity, u32);
+type ConstantKeys = hashbrown::HashMap<
+    ConstantKeyId,
+    Option<JsonCanonicalKey>,
+    std::hash::RandomState,
+    HostAggregateAllocator,
+>;
+
+/// Lazily admitted by the original expression root instance when it first
+/// demands a candidate backed by an exact immutable constant.
+#[derive(Default)]
+pub struct JsonConstantKeyCache {
+    keys: Option<ConstantKeys>,
+}
+
+impl JsonConstantKeyCache {
+    fn get_or_prepare(
+        &mut self,
+        constant: &ConstantValue,
+        values: &LargeBinaryArray,
+        allocator: &HostAggregateAllocator,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<&Option<JsonCanonicalKey>, KernelFailure> {
+        let keys = self.keys.get_or_insert_with(|| {
+            ConstantKeys::with_hasher_in(std::hash::RandomState::new(), allocator.clone())
+        });
+        let id = (constant.pool().backing_identity(), constant.ordinal());
+        control.checkpoint(1)?;
+        if !keys.contains_key(&id) {
+            let key = json_key_at(values, 0, allocator, control)?;
+            keys.try_reserve(1)
+                .map_err(|_| keys.allocator().take_failure())?;
+            keys.insert(id, key);
+        }
+        Ok(keys.get(&id).expect("cached original constant"))
+    }
+}
+
+fn json_host(host: Option<Arc<dyn AggregateStateAllocator>>) -> Arc<dyn AggregateStateAllocator> {
+    host.unwrap_or_else(|| Arc::new(UnaccountedAggregateStateAllocator))
+}
+
+fn json_array(values: &ArrayRef) -> Result<&LargeBinaryArray, KernelFailure> {
+    values
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .ok_or_else(|| contract("IN JSON operand is not LargeBinary"))
+}
+
+fn json_key_at(
+    values: &LargeBinaryArray,
+    row: usize,
+    allocator: &HostAggregateAllocator,
+    control: &dyn KernelEvaluationControl,
+) -> Result<Option<JsonCanonicalKey>, KernelFailure> {
+    if values.is_null(row) {
+        return Ok(None);
+    }
+    normalize_json_key_in(values.value(row), allocator.clone(), control).map(Some)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MembershipEquality {
     Comparison(PreparedComparisonRecipe),
@@ -354,7 +467,7 @@ impl MembershipEquality {
             Self::Comparison(_) => {}
             Self::Composite(recipe) => effects.may_raise_row_error = recipe.may_raise_row_error(),
             Self::Json => {
-                // Malformed logical JSON is the original atomic invocation Data failure.
+                // Key preparation and comparison follow the guarded fallible path.
                 effects.may_raise_row_error = true;
                 effects.may_raise_invocation_data = true;
             }
@@ -592,7 +705,7 @@ impl PreparedNativeInListRecipe {
             }
             work.flush()?;
             let equality = if source.logical_type() == ValueLogicalType::Json
-                && source.data_type() == &DataType::Utf8
+                && source.data_type() == &DataType::LargeBinary
             {
                 MembershipEquality::Json
             } else if composite {
@@ -795,16 +908,20 @@ impl PreparedNativeInListRecipe {
             MembershipEquality::Json => {
                 let left = input
                     .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| InError::Operation(contract("IN JSON source is not Utf8")))?;
+                    .downcast_ref::<LargeBinaryArray>()
+                    .ok_or_else(|| {
+                        InError::Operation(contract("IN JSON source is not LargeBinary"))
+                    })?;
                 let right = candidate
                     .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| InError::Operation(contract("IN JSON candidate is not Utf8")))?;
+                    .downcast_ref::<LargeBinaryArray>()
+                    .ok_or_else(|| {
+                        InError::Operation(contract("IN JSON candidate is not LargeBinary"))
+                    })?;
                 // Direct evaluation outside a Task uses the process heap as
                 // before. The Task caller supplies its actual Frame allocator.
                 let host = host.unwrap_or_else(|| Arc::new(UnaccountedAggregateStateAllocator));
-                let normalize = |values: &StringArray, row| {
+                let normalize = |values: &LargeBinaryArray, row| {
                     if values.is_null(row) {
                         Ok(None)
                     } else {
@@ -817,11 +934,11 @@ impl PreparedNativeInListRecipe {
                     }
                 };
                 append_equalities_observed(&mut builder, input.len(), observer, |row| {
-                    // SQL NULL cannot hide a demanded invalid logical JSON value.
+                    // The demanded candidate is evaluated even when the probe is SQL NULL.
                     let left = normalize(left, row)?;
                     let right = normalize(right, row_index(row, candidate.len()))?;
                     Ok(match (left, right) {
-                        (Some(left), Some(right)) => Some(left.as_bytes() == right.as_bytes()),
+                        (Some(left), Some(right)) => Some(left.equals_observed(&right, &control)?),
                         _ => None,
                     })
                 })?;
@@ -837,8 +954,94 @@ impl PreparedNativeInListRecipe {
         })
     }
 
+    pub fn uses_json_keys(&self) -> bool {
+        matches!(self.equality, MembershipEquality::Json)
+    }
+
+    pub fn json_equalities_observed<E>(
+        &self,
+        probe: &mut JsonProbeKeys,
+        candidate: &ArrayRef,
+        parents: &[usize],
+        proven_constant: Option<(&ConstantValue, &mut JsonConstantKeyCache)>,
+        host: Option<Arc<dyn AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+        observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
+    ) -> Result<MembershipEqualities, InError<E>> {
+        if !self.uses_json_keys() || (candidate.len() != parents.len() && candidate.len() != 1) {
+            return Err(InError::Operation(contract(
+                "IN JSON candidate differs from its exact membership recipe",
+            )));
+        }
+        let candidate = json_array(candidate).map_err(InError::Operation)?;
+        let control = KernelControlObservation::new(control);
+        control.checkpoint(0).map_err(InError::Operation)?;
+        let mut nullable = candidate.null_count() != 0;
+        for &parent in parents {
+            observe(observer, InObservation::Step)?;
+            let key = probe
+                .prepare_at(parent, &control)
+                .map_err(InError::Operation)?;
+            nullable |= key.is_none();
+        }
+        observe(observer, InObservation::OpaqueBoundary)?;
+        let bytes = boolean_buffer_bytes(parents.len(), nullable).map_err(InError::Operation)?;
+        let reservation = host
+            .as_ref()
+            .filter(|_| bytes != 0)
+            .map(|host| OpaqueRetainedCharge::try_new(Arc::clone(host))?.reserve_operation(bytes))
+            .transpose()
+            .map_err(InError::Operation)?;
+        let mut builder = BooleanBuilder::with_capacity(parents.len());
+        if !parents.is_empty() {
+            let allocator = key_allocator(json_host(host)).map_err(InError::Operation)?;
+            let direct;
+            let known = if let Some((constant, cache)) = proven_constant {
+                Some(
+                    cache
+                        .get_or_prepare(constant, candidate, &allocator, &control)
+                        .map_err(InError::Operation)?,
+                )
+            } else if candidate.len() == 1 {
+                direct =
+                    json_key_at(candidate, 0, &allocator, &control).map_err(InError::Operation)?;
+                Some(&direct)
+            } else {
+                None
+            };
+            append_equalities_observed(&mut builder, parents.len(), observer, |row| {
+                // The demanded right operand is normalized even for SQL NULL
+                // probes. A hit does not alter any later candidate's demand.
+                let dynamic;
+                let right = if let Some(key) = known {
+                    key.as_ref()
+                } else {
+                    dynamic = json_key_at(candidate, row, &allocator, &control)?;
+                    dynamic.as_ref()
+                };
+                let left = probe.keys[parents[row]].as_ref().and_then(Option::as_ref);
+                match (left, right) {
+                    (Some(left), Some(right)) => left.equals_observed(right, &control).map(Some),
+                    _ => Ok(None),
+                }
+            })?;
+        }
+        control.checkpoint(0).map_err(InError::Operation)?;
+        observe(observer, InObservation::OpaqueBoundary)?;
+        Ok(MembershipEqualities {
+            array: builder.finish(),
+            errors: Vec::new(),
+            _errors_reservation: None,
+            _reservation: reservation,
+        })
+    }
+
     pub fn requires_comparison_allocator(&self) -> bool {
-        matches!(&self.equality, MembershipEquality::Composite(recipe) if recipe.requires_allocator())
+        match &self.equality {
+            MembershipEquality::Json => true,
+            MembershipEquality::Composite(recipe) => recipe.requires_allocator(),
+            MembershipEquality::Comparison(_) => false,
+        }
     }
 
     pub fn negated(&self) -> bool {

@@ -177,7 +177,7 @@ fn json_in_subquery_authors_a_null_aware_hash_mark_with_canonical_keys() {
                 assert!(!value_equal_keys[0].null_safe);
                 for key in [value_equal_keys[0].left, value_equal_keys[0].right] {
                     let ty = &fragment.root_expression(node.id, key).unwrap().ty;
-                    assert_eq!(ty.data_type(), &arrow::datatypes::DataType::Utf8);
+                    assert_eq!(ty.data_type(), &arrow::datatypes::DataType::Binary);
                     assert_eq!(
                         ty.logical_type(),
                         novarocks_type_contract::ValueLogicalType::Physical

@@ -174,14 +174,21 @@ fn diagnostic_selects_nonzero_ordinal_and_exact_largeint_without_unused_pool_out
 #[test]
 fn diagnostic_keeps_typed_null_json_and_provider_metadata() {
     let metadata = HashMap::from([("provider.id".to_owned(), "42".to_owned())]);
-    let ty = FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-        .unwrap();
+    let ty = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let p = typed_pool(
-        Arc::new(StringArray::from(vec![Some("{\"x\":1}"), None])),
+        Arc::new(arrow_array::LargeBinaryArray::from(vec![
+            Some(b"\x01\x20".as_slice()),
+            None,
+        ])),
         ty.clone(),
         metadata,
     );
-    assert_eq!(diagnostic(&p.value(0).unwrap()), "{\"x\":1}");
+    assert_eq!(diagnostic(&p.value(0).unwrap()), "0120");
     assert_eq!(diagnostic(&p.value(1).unwrap()), "NULL");
     assert_eq!(p.value_type(), &ty);
     assert_eq!(p.field().metadata().get("provider.id").unwrap(), "42");

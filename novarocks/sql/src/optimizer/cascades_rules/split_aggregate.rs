@@ -720,20 +720,21 @@ mod tests {
         let sources = [
             ("count", FunctionValueType::new(DataType::Int64, false)),
             ("count", FunctionValueType::new(DataType::Int64, true)),
+            ("min", FunctionValueType::new(DataType::Utf8, false)),
             (
-                "min",
+                "any_value",
                 FunctionValueType::try_with_logical_type(
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     false,
                     ValueLogicalType::Json,
                 )
                 .unwrap(),
             ),
             (
-                "min",
+                "any_value",
                 FunctionValueType::new(
                     DataType::List(Arc::new(
-                        Field::new("item", DataType::Utf8, false).with_metadata(
+                        Field::new("item", DataType::LargeBinary, false).with_metadata(
                             std::collections::HashMap::<String, String>::from([
                                 ("nr_logical_type".into(), "json".into()),
                                 ("provider.field-id".into(), "71".into()),
@@ -776,6 +777,10 @@ mod tests {
                 .clone();
             if name == "count" {
                 assert_eq!(state, FunctionValueType::new(DataType::Int64, false));
+            } else if name == "any_value" {
+                let nullable_source = source.with_nullable(true).unwrap();
+                assert_eq!(result, nullable_source);
+                assert_eq!(state, nullable_source);
             }
             let input = OutputColumn {
                 column_id: ColumnId(2),
@@ -842,6 +847,10 @@ mod tests {
                     &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
+            if name == "any_value" {
+                assert!(alternative.is_empty());
+                continue;
+            }
             assert_eq!(
                 alternative.len(),
                 1,

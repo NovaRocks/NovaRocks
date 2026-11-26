@@ -862,9 +862,9 @@ mod tests {
                             ("provider".to_owned(), annotation.to_owned()),
                         ])),
                         if logical.is_empty() {
-                            Field::new("payload", DataType::Utf8, false)
+                            Field::new("payload", DataType::LargeBinary, false)
                         } else {
-                            Field::new("payload", DataType::Utf8, false).with_metadata(
+                            Field::new("payload", DataType::LargeBinary, false).with_metadata(
                                 std::collections::HashMap::<String, String>::from([(
                                     NR_LOGICAL_TYPE_KEY.to_owned(),
                                     logical.to_owned(),
@@ -1004,7 +1004,7 @@ mod tests {
                 "unknown".to_owned(),
             )]));
         assert!(FunctionValueType::try_from_field(&unknown).is_err());
-        let item = Field::new("provider_item", DataType::Utf8, false).with_metadata(
+        let item = Field::new("provider_item", DataType::LargeBinary, false).with_metadata(
             std::collections::HashMap::<String, String>::from([
                 (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
                 ("provider.field_id".to_owned(), "91".to_owned()),

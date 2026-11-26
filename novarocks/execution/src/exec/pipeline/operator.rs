@@ -432,7 +432,9 @@ pub(crate) fn dictionary_carrier_stats(
 mod typed_input_construction_tests {
     use super::*;
     use crate::exec::chunk::{ArrayNormalizationStep, ArrayPathStep, ChunkSchema, ChunkSlotSchema};
-    use arrow::array::{Array, ArrayRef, DictionaryArray, Int32Array, StringArray, StructArray};
+    use arrow::array::{
+        Array, ArrayRef, DictionaryArray, Int32Array, LargeBinaryArray, StringArray, StructArray,
+    };
     use arrow::datatypes::{Field, Int32Type};
     use novarocks_type_contract::{
         TypedValueBinding, ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
@@ -571,12 +573,18 @@ mod typed_input_construction_tests {
                 .collect::<DictionaryArray<Int32Type>>(),
         );
         let sibling: ArrayRef = Arc::new(Int32Array::from(vec![7, 8]));
+        let document: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+            Some(&[1, 0x80, 1, 0][..]),
+            None,
+        ]));
         let fields = vec![
             Arc::new(Field::new("payload", dictionary.data_type().clone(), true)),
             Arc::new(Field::new("row", DataType::Int32, false)),
+            Arc::new(Field::new("document", DataType::LargeBinary, true)),
         ];
-        let array: ArrayRef =
-            Arc::new(StructArray::try_new(fields.into(), vec![dictionary, sibling], None).unwrap());
+        let array: ArrayRef = Arc::new(
+            StructArray::try_new(fields.into(), vec![dictionary, sibling, document], None).unwrap(),
+        );
         let json = ValueTypeRef::try_new(
             ValueKind::Nominal(ValueLogicalType::Json),
             true,
@@ -588,8 +596,13 @@ mod typed_input_construction_tests {
         let value = ValueTypeRef::try_new(
             ValueKind::Struct(
                 vec![
-                    ValueField::new("payload", json, pure.clone()),
+                    ValueField::new(
+                        "payload",
+                        ValueTypeRef::try_new(ValueKind::String, true, pure.clone()).unwrap(),
+                        pure.clone(),
+                    ),
                     ValueField::new("row", row, pure.clone()),
+                    ValueField::new("document", json, pure.clone()),
                 ]
                 .into_boxed_slice(),
             ),
@@ -680,6 +693,16 @@ mod typed_input_construction_tests {
             .downcast_ref::<StructArray>()
             .unwrap();
         assert!(Arc::ptr_eq(array.column(1), original.column(1)));
+        assert!(Arc::ptr_eq(array.column(2), original.column(2)));
+        assert_eq!(
+            result.chunk_schema().slots()[0]
+                .typed_binding()
+                .value_type()
+                .child_type_at(2)
+                .unwrap()
+                .domain(),
+            Some(ValueLogicalType::Json),
+        );
         assert!(
             result.chunk_schema().slots()[0]
                 .typed_binding()

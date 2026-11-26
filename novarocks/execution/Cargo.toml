@@ -44,7 +44,6 @@ novarocks-spi.workspace = true
 novarocks-type-contract.workspace = true
 novarocks-value-arrays.workspace = true
 once_cell.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
 prometheus.workspace = true

@@ -505,7 +505,7 @@ CREATE TABLE test_array_sortby (
     array_varchar ARRAY<VARCHAR(100)>,
     array_datetime ARRAY<TIMESTAMP(6)>,
     array_date ARRAY<DATE>,
-    -- Iceberg persists JSON as STRING; readback has the STRING domain.
+    -- Persist JSON source text as VARCHAR for parsing after the Iceberg scan.
     array_json ARRAY<VARCHAR>
 ) WITH (format_version = 3);
 
@@ -668,6 +668,6 @@ WHERE id = 1;
 
 -- query 60
 USE ${case_db};
-SELECT array_agg(parse_json(array_json[ordinal]) ORDER BY ordinal) AS parsed_json_values
+SELECT array_agg(json_parse(array_json[ordinal]) ORDER BY ordinal) AS parsed_json_values
 FROM test_array_sortby CROSS JOIN (VALUES (1), (2)) AS positions(ordinal)
 WHERE id = 1;

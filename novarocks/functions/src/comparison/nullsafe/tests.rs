@@ -405,8 +405,12 @@ fn capability_is_static_exact_and_does_not_expand_from_null_only_data_or_nominal
         );
     }
     for source in [
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap(),
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
         FunctionValueType::try_with_logical_type(
             DataType::FixedSizeBinary(16),
             true,

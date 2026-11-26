@@ -502,13 +502,7 @@ fn partition_value_slots_preserve_same_name_case_and_generated_name_collisions()
         IcebergSystemTableType::Entries,
     ] {
         let output_schema = system_relation_schema(kind, &schema, &specs).unwrap();
-        let columns = match kind {
-            IcebergSystemTableType::Files => files_columns(&output_schema, &rows, &schema).unwrap(),
-            IcebergSystemTableType::Entries => {
-                entries_columns(&output_schema, &rows, &schema).unwrap()
-            }
-            _ => unreachable!(),
-        };
+        let columns = manifest_file_columns(&output_schema, &rows).unwrap();
         let partition = columns[output_schema.index_of("partition").unwrap()]
             .as_any()
             .downcast_ref::<StructArray>()

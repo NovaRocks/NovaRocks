@@ -671,7 +671,7 @@ fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
                     true,
                 ),
                 FunctionValueType::try_with_logical_type(
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     true,
                     ValueLogicalType::Json,
                 )

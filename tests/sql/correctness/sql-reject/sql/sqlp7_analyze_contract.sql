@@ -162,32 +162,26 @@ SELECT JSON_EXISTS('{"a":1}', 'lax $.a');
 SELECT JSON_VALUE('{"a":1}', 'lax $.a');
 
 -- query 40
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT JSON_SERIALIZE('[]');
+SELECT JSON_SERIALIZE('[]') AS document;
 
 -- query 41
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 SELECT JSON_QUERY('{"a":1}', 'lax $.a' WITH UNCONDITIONAL ARRAY WRAPPER);
 
 -- query 42
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT JSON_OBJECT('a' : NULL ABSENT ON NULL);
+SELECT JSON_OBJECT('a' : NULL ABSENT ON NULL) AS document;
 
 -- query 43
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT JSON_OBJECT('a' : 1 WITH UNIQUE KEYS);
+SELECT JSON_OBJECT('a' : 1 WITH UNIQUE KEYS) AS document;
 
 -- query 44
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT JSON_OBJECT('a' : 1 RETURNING varchar);
+SELECT JSON_OBJECT('a' : 1 RETURNING varchar) AS document;
 
 -- query 45
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT JSON_OBJECT('a' : 'null' FORMAT JSON);
+SELECT JSON_OBJECT('a' : 'null' FORMAT JSON) AS document;
 
 -- query 46
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT JSON_ARRAY(1 RETURNING varchar);
+SELECT JSON_ARRAY(1 RETURNING varchar) AS document;
 
 -- query 47
 SELECT TIMESTAMP '2020-01-01 00:00:00' AT TIME ZONE 'UTC';

@@ -313,9 +313,12 @@ fn lambda(parameters: usize) -> TypedExpr {
         ),
         false,
     );
-    let result_type =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let result_type = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     TypedExpr {
         kind: crate::analysis::ExprKind::LambdaFunction {
             params: (0..parameters)
@@ -361,9 +364,12 @@ fn logical_capture_result_loan_and_order_channels_preserve_original_request_spli
         column(ty(DataType::Int64, false)),
         column(ty(DataType::Utf8, true)),
     ];
-    let result =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let result = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let selected = binding(&args, result.clone(), 1);
     let captured =
         capture_logical_call_arguments(&selected, 1, &args, policy(), &Control::default()).unwrap();

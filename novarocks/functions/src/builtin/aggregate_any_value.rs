@@ -564,19 +564,22 @@ mod failure_tests {
         );
         assert!(!matches_nullable_source(&source, &wrong_child_null, &mut work).unwrap());
         let json = FunctionValueType::try_with_logical_type(
-            DataType::Utf8,
+            DataType::LargeBinary,
             false,
             novarocks_type_contract::ValueLogicalType::Json,
         )
         .unwrap();
-        let text = FunctionValueType::new(DataType::Utf8, true);
-        assert!(!matches_nullable_source(&json, &text, &mut work).unwrap());
-        let json_child =
-            super::super::signature::declared_struct(vec![("value".into(), json)], false).unwrap();
-        let text_child =
-            super::super::signature::declared_struct(vec![("value".into(), text)], true).unwrap();
-        assert_eq!(json_child.data_type(), text_child.data_type());
-        assert!(!matches_nullable_source(&json_child, &text_child, &mut work).unwrap());
+        let binary = FunctionValueType::new(DataType::LargeBinary, true);
+        assert!(!matches_nullable_source(&json, &binary, &mut work).unwrap());
+        let json_child = super::super::signature::declared_struct(
+            vec![("value".into(), json.with_nullable(true).unwrap())],
+            false,
+        )
+        .unwrap();
+        let binary_child =
+            super::super::signature::declared_struct(vec![("value".into(), binary)], true).unwrap();
+        assert_eq!(json_child.data_type(), binary_child.data_type());
+        assert!(!matches_nullable_source(&json_child, &binary_child, &mut work).unwrap());
         assert!(
             matches_nullable_binary(&FunctionValueType::new(DataType::Binary, true), &mut work)
                 .unwrap()

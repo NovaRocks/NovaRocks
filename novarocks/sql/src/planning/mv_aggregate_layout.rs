@@ -412,7 +412,7 @@ mod tests {
     fn mv_ddl_uses_authored_domains_instead_of_carrier_guesses() {
         use novarocks_type_contract::ValueLogicalType;
         let cases = [
-            (DataType::Utf8, ValueLogicalType::Json, SqlType::Json),
+            (DataType::LargeBinary, ValueLogicalType::Json, SqlType::Json),
             (
                 DataType::LargeBinary,
                 ValueLogicalType::Variant,

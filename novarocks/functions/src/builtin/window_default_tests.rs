@@ -415,7 +415,7 @@ fn typed_null_identity_logical_domain_and_empty_partition_are_truthful() {
         assert!(actual.get_array_memory_size() <= r.retained_upper_bound(3).unwrap());
     }
     let json = FunctionValueType::try_from_legacy_declared_projection(
-        DataType::Utf8,
+        DataType::LargeBinary,
         false,
         ValueLogicalType::Json,
     )
@@ -426,14 +426,15 @@ fn typed_null_identity_logical_domain_and_empty_partition_are_truthful() {
         .expect("valid function nullability declaration");
     let r = recipe(&json, &target);
     assert_eq!(r.source_type().logical_type(), ValueLogicalType::Json);
-    let source: ArrayRef = Arc::new(StringArray::from(vec!["{}", "[1]"]));
-    assert_eq!(
-        strings(
-            &r.evaluate_complete(EvaluatedArgument::Column(&source), 2, &Control::default())
-                .unwrap()
-        ),
-        vec![Some("{}"), Some("[1]")]
-    );
+    let source: ArrayRef = Arc::new(crate::json_value::test_array(&[Some("{}"), Some("[1]")]));
+    let prepared = r
+        .prepare_partition(EvaluatedArgument::Column(&source), 2, &Control::default())
+        .unwrap()
+        .unwrap();
+    assert!(matches!(prepared, super::PartitionDefault::Borrowed(_)));
+    assert!(Arc::ptr_eq(prepared.argument().array(), &source));
+    assert_eq!(prepared.retained_bytes(), 0);
+    assert_eq!(r.retained_upper_bound(2).unwrap(), 0);
     let empty: ArrayRef = Arc::new(Int64Array::from(Vec::<i64>::new()));
     let r = recipe(&ty(DataType::Int64, false), &ty(DataType::Utf8, true));
     let out = r
@@ -453,7 +454,7 @@ fn unsupported_nominal_and_nonnullable_targets_refuse_without_rebinding() {
         (ty(DataType::LargeUtf8, true), ty(DataType::Int64, true)),
         (
             FunctionValueType::try_from_legacy_declared_projection(
-                DataType::Utf8,
+                DataType::LargeBinary,
                 true,
                 ValueLogicalType::Json,
             )
@@ -463,7 +464,7 @@ fn unsupported_nominal_and_nonnullable_targets_refuse_without_rebinding() {
         (
             ty(DataType::Utf8, true),
             FunctionValueType::try_from_legacy_declared_projection(
-                DataType::Utf8,
+                DataType::LargeBinary,
                 true,
                 ValueLogicalType::Json,
             )

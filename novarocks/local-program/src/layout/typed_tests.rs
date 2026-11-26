@@ -46,7 +46,7 @@ fn list_json() -> TypedValueBinding {
     .unwrap();
     let root = ValueTypeRef::try_new(ValueKind::List(item), false, storage.clone()).unwrap();
     let layout = ValueLayout::try_new(
-        &DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        &DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true))),
         storage,
     )
     .unwrap();

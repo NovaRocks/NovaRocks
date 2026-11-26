@@ -477,7 +477,7 @@ mod tests {
             )]));
         let values = vec![
             FunctionValueType::try_from_legacy_declared_projection(
-                DataType::Utf8,
+                DataType::LargeBinary,
                 true,
                 ValueLogicalType::Json,
             )
@@ -521,7 +521,7 @@ mod tests {
     #[test]
     fn opaque_state_recipe_does_not_adopt_visible_logical_domain() {
         let value = FunctionValueType::try_from_legacy_declared_projection(
-            DataType::Utf8,
+            DataType::LargeBinary,
             true,
             ValueLogicalType::Json,
         )

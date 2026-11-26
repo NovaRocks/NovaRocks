@@ -448,7 +448,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "join_row_key",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    ("json_array", BuiltinDisposition::Unavailable),
     (
         "json_exists",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
@@ -460,10 +459,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "json_length",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "json_object",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
@@ -594,10 +589,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     ("nvl", BuiltinDisposition::Unavailable),
-    (
-        "parse_json",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
     ("percent_rank", BuiltinDisposition::WindowBoundary),
     ("percentile_approx", BuiltinDisposition::AggregateBoundary),
     (
@@ -895,16 +886,32 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
 ];
 
 pub fn builtin_disposition(name: &str) -> Option<BuiltinDisposition> {
-    BUILTIN_DISPOSITIONS
+    builtin_dispositions()
         .binary_search_by_key(&name, |(name, _)| *name)
         .ok()
-        .map(|index| BUILTIN_DISPOSITIONS[index].1)
+        .map(|index| builtin_dispositions()[index].1)
 }
 
 /// Borrow the complete source-audited disposition manifest in canonical order.
 /// This is declaration inventory; it does not install a CPU implementation.
 pub fn builtin_dispositions() -> &'static [(&'static str, BuiltinDisposition)] {
-    BUILTIN_DISPOSITIONS
+    static ALL: std::sync::LazyLock<Vec<(&str, BuiltinDisposition)>> =
+        std::sync::LazyLock::new(|| {
+            let mut declarations = BUILTIN_DISPOSITIONS.to_vec();
+            declarations.extend(super::json_sql::FUNCTIONS.iter().map(|(operation, name)| {
+                (
+                    *name,
+                    BuiltinDisposition::InstalledScalar(if operation.may_raise() {
+                        FunctionIntrinsicRowError::MayRaise
+                    } else {
+                        FunctionIntrinsicRowError::NoRowError
+                    }),
+                )
+            }));
+            declarations.sort_unstable_by_key(|(name, _)| *name);
+            declarations
+        });
+    &ALL
 }
 
 #[cfg(test)]

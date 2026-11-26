@@ -139,3 +139,11 @@ SELECT contains_sequence(
     ARRAY[MAP(ARRAY['c', 'd'], ARRAY[3, 4])],
     CAST(ARRAY[MAP(ARRAY['c', 'd'], ARRAY[3, 4])] AS ARRAY(MAP(VARCHAR, INTEGER)))
 );
+
+-- query 13
+WITH doc AS (
+    SELECT CAST(ARRAY[json_scalar(DATE '2024-02-29')] AS JSON) AS v
+)
+SELECT CAST(v AS ARRAY(JSON))[1] IN (json_scalar(DATE '2024-02-29')) AS same_date,
+       CAST(v AS ARRAY(JSON))[1] IN (JSON '"2024-02-29"') AS same_string
+FROM doc;

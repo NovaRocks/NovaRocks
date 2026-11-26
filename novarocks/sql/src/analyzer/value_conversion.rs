@@ -212,7 +212,6 @@ pub(super) fn cast_to_value_type(
         .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
         .map_err(AnalyzeError::control)?;
     if carrier_cast
-        || novarocks_type_contract::is_default_json_structure_cast(&source.value_type, &target)
         || novarocks_type_contract::is_null_list_to_json_cast(&source.value_type, &target)
     {
         // This exact existing intrinsic consumes the complete target,
@@ -571,9 +570,12 @@ mod checked_constant_tests {
             &control(None),
         )
         .unwrap();
-        let target =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap();
+        let target = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let output = convert_value_domain_with_catalog(
             crate::functions::builtin_sql_function_catalog(),
             TypedExpr {
@@ -592,7 +594,7 @@ mod checked_constant_tests {
             panic!("materialized NULL retains the checked owner");
         };
         assert_eq!(value.value_type(), &output.value_type);
-        assert_eq!(value.try_utf8().unwrap(), None);
+        assert_eq!(value.try_binary().unwrap(), None);
         assert!(value.pool().field_ref().metadata().as_arc().is_none());
         assert!(value.pool().source_metadata_namespace().is_none());
     }

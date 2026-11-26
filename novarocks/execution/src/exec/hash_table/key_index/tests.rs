@@ -57,6 +57,8 @@ use novarocks_value_arrays::{
 };
 use std::{alloc::Layout, cell::Cell, sync::Arc};
 
+use crate::exec::chunk::typed_fixture::json_array;
+
 fn owner() -> Box<dyn InputConstructionOwner> {
     owner_with_tracker().0
 }
@@ -1060,17 +1062,17 @@ fn sliced_dictionary_keeps_logical_null_and_repeated_occurrence_coordinates() {
     assert_eq!(result.hash(0).unwrap(), result.hash(3).unwrap());
 }
 #[test]
-fn nominal_json_and_string_with_the_same_arrow_carrier_are_distinct_domains() {
+fn nominal_json_and_physical_bytes_with_the_same_arrow_carrier_are_distinct_domains() {
     let owner = owner();
-    let string = FunctionValueType::new(DataType::Utf8, false);
+    let bytes = FunctionValueType::new(DataType::LargeBinary, false);
     let json = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         false,
         novarocks_type_contract::ValueLogicalType::Json,
     )
     .unwrap();
-    let spec = KeySpec::new(&[string], &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
-    let array: ArrayRef = Arc::new(StringArray::from(vec!["{}"]));
+    let spec = KeySpec::new(&[bytes], &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    let array: ArrayRef = Arc::new(json_array(&[Some("{}")]));
     let page = input(&[array], &[json], &[0], owner.as_ref());
     assert!(
         PreparedKeyBatch::new(
@@ -2613,10 +2615,10 @@ fn owned_byte_page_directory_grows_with_published_pages_instead_of_representativ
 #[test]
 fn owned_byte_page_retains_actual_nullable_binding_and_rejects_another_nominal_domain() {
     let (owner, tracker) = owner_with_tracker();
-    let required = FunctionValueType::new(DataType::Utf8, false);
-    let nullable = FunctionValueType::new(DataType::Utf8, true);
+    let required = FunctionValueType::new(DataType::LargeBinary, false);
+    let nullable = FunctionValueType::new(DataType::LargeBinary, true);
     let keys = input(
-        &[Arc::new(StringArray::from(vec![None, Some("{}")]))],
+        &[Arc::new(json_array(&[None, Some("{}")]))],
         &[nullable],
         &[0, 1],
         owner.as_ref(),
@@ -2648,13 +2650,13 @@ fn owned_byte_page_retains_actual_nullable_binding_and_rejects_another_nominal_d
     assert!(pages[0].binding().nullable());
     assert!(pages[0].array().is_null(0));
     let json = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         false,
         novarocks_type_contract::ValueLogicalType::Json,
     )
     .unwrap();
     let other = input(
-        &[Arc::new(StringArray::from(vec!["{}", "{}"]))],
+        &[Arc::new(json_array(&[Some("{}"), Some("{}")]))],
         std::slice::from_ref(&json),
         &[0, 1],
         owner.as_ref(),

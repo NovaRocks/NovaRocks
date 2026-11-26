@@ -42,7 +42,6 @@ fn rejects(schema: &ScalarSchema, value: V<'_>, expected: E) {
 fn variable_value<'a>(ty: &T, text: &'a str) -> V<'a> {
     match ty {
         T::String => V::String(text),
-        T::Json => V::Json(text),
         T::Binary => V::Binary(text.as_bytes()),
         T::Variant => V::Variant(text.as_bytes()),
         T::Opaque(kind) => V::Opaque {
@@ -241,7 +240,7 @@ fn float_sign_nan_payload_and_infinity_bits_survive_without_text_conversion() {
 fn variable_bytes_preserve_utf8_binary_variant_and_each_opaque_identity() {
     let raw = [0, 0xff, 0x80, b'\'', b'\\'];
     let text = "雪\0'\\";
-    let json = "{\"v\":\"雪\"}";
+    let json = b"\x01\x80\x08\x01\x01v\x44\x03\xe9\x9b\xaa";
     for (ty, value, declaration, payload) in [
         (
             T::String,
@@ -252,8 +251,8 @@ fn variable_bytes_preserve_utf8_binary_variant_and_each_opaque_identity() {
         (
             T::Json,
             V::Json(json),
-            [12, 0, 0, 0, 0, 0, 0, 0],
-            json.as_bytes(),
+            [18, 0, 0, 0, 0, 0, 0, 0],
+            json.as_slice(),
         ),
         (
             T::Binary,
@@ -353,7 +352,7 @@ fn exact_64k_record_obeys_turn_quantum_and_never_writes_output_suffix() {
 fn every_variable_leaf_limit_is_inclusive_and_empty_value_is_present() {
     let exact = "x".repeat(65_512);
     let oversized = "x".repeat(65_513);
-    for ty in [T::String, T::Json, T::Binary, T::Variant, T::Opaque(O::Hll)] {
+    for ty in [T::String, T::Binary, T::Variant, T::Opaque(O::Hll)] {
         let schema = make_schema(ty.clone(), false);
         let cursor = ScalarLeafCursor::try_new(&schema, variable_value(&ty, &exact)).unwrap();
         assert_eq!(cursor.rows(), 1);
@@ -365,6 +364,54 @@ fn every_variable_leaf_limit_is_inclusive_and_empty_value_is_present() {
         assert_eq!(encoded.len(), 24);
         assert_eq!(encoded[13], 0, "empty bytes are neither NULL nor absent");
         assert_eq!(&encoded[8..12], &[0, 0, 0, 0]);
+    }
+}
+
+#[test]
+fn native_json_scalar_frame_preserves_its_marker_and_exact_record_limit() {
+    let schema = make_schema(T::Json, false);
+    let json_string = |len: usize| {
+        // The tested lengths use exactly three ULEB128 bytes.
+        let bytes = len - 5;
+        let mut payload = vec![
+            1,
+            0x44,
+            (bytes as u8 & 0x7f) | 0x80,
+            ((bytes >> 7) as u8 & 0x7f) | 0x80,
+            (bytes >> 14) as u8,
+        ];
+        payload.resize(len, b'x');
+        payload
+    };
+    let exact = json_string(65_512);
+    let over = json_string(65_513);
+    assert_eq!(
+        ScalarLeafCursor::try_new(&schema, V::Json(&exact))
+            .unwrap()
+            .encoded_len(),
+        65_536
+    );
+    rejects(&schema, V::Json(&over), E::ValueLimit);
+    rejects(&schema, V::Json(&[]), E::MalformedRecord);
+    let json_null = [1, 0x20];
+    assert_eq!(
+        V::decode(&schema, &golden([18, 0, 0, 0, 0, 0, 0, 0], &json_null)).unwrap(),
+        V::Json(&json_null)
+    );
+    for (tag, bytes) in [
+        (12, json_null.as_slice()),
+        (18, b"null".as_slice()),
+        (18, &[1]),
+        (18, &[1, 0x42]),
+        (18, &[1, 0x80, 2, 0]),
+        (18, &[1, 0x20, 0x20]),
+        (18, &[1, 0xff]),
+        (18, &[1, 0x44, 0x80, 0]),
+    ] {
+        assert_eq!(
+            V::decode(&schema, &golden([tag, 0, 0, 0, 0, 0, 0, 0], bytes)),
+            Err(E::MalformedRecord)
+        );
     }
 }
 
@@ -395,7 +442,7 @@ fn absent_and_null_are_distinct_and_frozen_nullability_is_enforced() {
 #[test]
 fn semantic_type_width_precision_unit_and_opaque_mismatches_refuse() {
     for (ty, value) in [
-        (T::String, V::Json("same")),
+        (T::String, V::Json(&[1, 0x20])),
         (T::Json, V::String("same")),
         (T::Binary, V::Variant(b"same")),
         (T::Variant, V::Binary(b"same")),
@@ -708,7 +755,7 @@ fn decoder_variable_results_borrow_exact_original_payload_and_preserve_identity(
     let raw = [0xff, 0, 0x80, b'\\'];
     let cases = [
         (T::String, [7, 0, 0, 0, 0, 0, 0, 0], text.as_bytes()),
-        (T::Json, [12, 0, 0, 0, 0, 0, 0, 0], b"{\"v\":1}".as_slice()),
+        (T::Json, [18, 0, 0, 0, 0, 0, 0, 0], &[1, 0x20]),
         (T::Binary, [8, 0, 0, 0, 0, 0, 0, 0], raw.as_slice()),
         (T::Variant, [13, 0, 0, 0, 0, 0, 0, 0], raw.as_slice()),
         (T::Opaque(O::Hll), [14, 0, 0, 0, 0, 0, 0, 1], raw.as_slice()),
@@ -733,8 +780,10 @@ fn decoder_variable_results_borrow_exact_original_payload_and_preserve_identity(
         let schema = make_schema(ty.clone(), false);
         let decoded = V::decode(&schema, &record).unwrap();
         let bytes = match (&ty, decoded) {
-            (T::String, V::String(value)) | (T::Json, V::Json(value)) => value.as_bytes(),
-            (T::Binary, V::Binary(value)) | (T::Variant, V::Variant(value)) => value,
+            (T::String, V::String(value)) => value.as_bytes(),
+            (T::Json, V::Json(value))
+            | (T::Binary, V::Binary(value))
+            | (T::Variant, V::Variant(value)) => value,
             (T::Opaque(expected), V::Opaque { kind, bytes }) => {
                 assert_eq!(kind, *expected);
                 bytes
@@ -816,7 +865,7 @@ fn decoder_rejects_each_malformed_declaration_and_incomplete_or_extra_record() {
 fn decoder_checks_utf8_boolean_fixed_width_nullability_and_length_before_payload() {
     for (ty, declaration) in [
         (T::String, [7, 0, 0, 0, 0, 0, 0, 0]),
-        (T::Json, [12, 0, 0, 0, 0, 0, 0, 0]),
+        (T::Json, [18, 0, 0, 0, 0, 0, 0, 0]),
     ] {
         assert_eq!(
             V::decode(

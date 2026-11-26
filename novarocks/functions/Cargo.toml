@@ -64,6 +64,7 @@ novarocks-type-contract.workspace = true
 novarocks-value-arrays.workspace = true
 novarocks-function-contract.workspace = true
 novarocks-constant-contract.workspace = true
+novarocks-json-value-format.workspace = true
 num-traits.workspace = true
 rand.workspace = true
 ryu.workspace = true

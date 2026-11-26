@@ -38,8 +38,9 @@ use novarocks_expression_contract::{
     BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootScope, ValueId,
 };
 use novarocks_functions::{
-    EvaluatedArgument, FunctionArgument, PureEngineFunctionCatalog, ScalarInvocationActivation,
-    ScalarInvocationScope, Selection, testkit::installed_builtin_owner_catalogue,
+    EvaluatedArgument, FunctionArgument, PreparedPureKernel, PureEngineFunctionCatalog,
+    ScalarInvocationActivation, ScalarInvocationScope, Selection, builtin::json_sql::JsonFunction,
+    testkit::installed_builtin_owner_catalogue,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, ControlShape, EvaluationDemand, FunctionValueType,
@@ -47,11 +48,11 @@ use novarocks_type_contract::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 
-fn assert_profiled_json_call(unit: &CompiledExprSet) {
+fn assert_selected_json_parse(unit: &CompiledExprSet) {
+    let parse = JsonFunction::Parse.function_id();
     assert!(unit.calls().values().any(|call| matches!(
         call.prepared(),
-        novarocks_functions::PreparedPureKernel::ScalarInvocation(kernel)
-            if kernel.invocation_resource_profile().is_some(),
+        PreparedPureKernel::Scalar(kernel) if kernel.contract().function_id() == &parse,
     )));
 }
 
@@ -234,32 +235,28 @@ fn runtime_scalar_memory_required_helper_missing_binding_fails_root_without_scal
 }
 
 #[test]
-fn runtime_invocation_memory_actual_sql_compiler_project_common_helper_and_lossless_data() {
+fn runtime_json_parse_empty_demand_constructs_no_call_instance() {
     let catalogue = installed_builtin_owner_catalogue();
-    let (port, schema) = nullable_port(&[("k", DataType::Utf8), ("v", DataType::Utf8)]);
+    let (port, schema) = nullable_port(&[("v", DataType::Utf8)]);
     let mut builder = unit_draft();
-    let key = input(&mut builder, &port.values[0]);
-    let value = input(&mut builder, &port.values[1]);
+    let value = input(&mut builder, &port.values[0]);
     let mut authors = BTreeMap::new();
     let owner = ClaimAuthor::with_exact_eager_binding(
         &catalogue,
-        "json_object",
-        vec![argument(&port.values[0].1), argument(&port.values[1].1)],
+        "json_parse",
+        vec![argument(&port.values[0].1)],
         fixture_constant_policy(),
         &Control,
     );
-    let call = add_call(&mut builder, &mut authors, owner, vec![key, value]);
+    let call = add_call(&mut builder, &mut authors, owner, vec![value]);
     let root = builder
         .root(call, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let unit = compile(builder, port, schema.clone(), &catalogue, &authors);
-    assert_profiled_json_call(&unit);
+    assert_selected_json_parse(&unit);
     let full = RecordBatch::try_new(
         schema,
-        vec![
-            Arc::new(StringArray::from(vec![Some("a"), None, Some("b")])),
-            Arc::new(StringArray::from(vec!["[1,2]", "unused", "ordinary text"])),
-        ],
+        vec![Arc::new(StringArray::from(vec!["[1,2]", "{]", "null"]))],
     )
     .unwrap();
     let empty = full.slice(0, 0);
@@ -282,35 +279,21 @@ fn runtime_invocation_memory_actual_sql_compiler_project_common_helper_and_lossl
 }
 
 #[test]
-fn runtime_invocation_memory_actual_sql_ordered_filter_or_scan_suppresses_and_maps_selected_data() {
+fn runtime_json_parse_ordered_filter_suppresses_unused_call_before_instance_creation() {
     let catalogue = installed_builtin_owner_catalogue();
-    let (port, schema) = nullable_port(&[
-        ("n", DataType::Int64),
-        ("flag", DataType::Boolean),
-        ("v", DataType::Utf8),
-    ]);
+    let (port, schema) = nullable_port(&[("flag", DataType::Boolean), ("v", DataType::Utf8)]);
     let mut builder = unit_draft();
-    let number = input(&mut builder, &port.values[0]);
-    let flag = input(&mut builder, &port.values[1]);
-    let value = input(&mut builder, &port.values[2]);
+    let flag = input(&mut builder, &port.values[0]);
+    let value = input(&mut builder, &port.values[1]);
     let mut authors = BTreeMap::new();
-    let array_owner = ClaimAuthor::with_exact_eager_binding(
-        &catalogue,
-        "__array_literal",
-        vec![argument(&port.values[0].1)],
-        fixture_constant_policy(),
-        &Control,
-    );
-    let array_type = array_owner.result();
-    let array = add_call(&mut builder, &mut authors, array_owner, vec![number]);
     let json_owner = ClaimAuthor::with_exact_eager_binding(
         &catalogue,
-        "json_object",
-        vec![argument(&array_type), argument(&port.values[2].1)],
+        "json_parse",
+        vec![argument(&port.values[1].1)],
         fixture_constant_policy(),
         &Control,
     );
-    let json = add_call(&mut builder, &mut authors, json_owner, vec![array, value]);
+    let json = add_call(&mut builder, &mut authors, json_owner, vec![value]);
     let condition = builder
         .add(
             None,
@@ -327,13 +310,12 @@ fn runtime_invocation_memory_actual_sql_ordered_filter_or_scan_suppresses_and_ma
             .unwrap()
     });
     let unit = compile(builder, port, schema.clone(), &catalogue, &authors);
-    assert_profiled_json_call(&unit);
+    assert_selected_json_parse(&unit);
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int64Array::from(vec![1, 2, 3])),
             Arc::new(BooleanArray::from(vec![false; 3])),
-            Arc::new(StringArray::from(vec!["unused"; 3])),
+            Arc::new(StringArray::from(vec!["{]"; 3])),
         ],
     )
     .unwrap();

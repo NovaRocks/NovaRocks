@@ -115,7 +115,7 @@ impl novarocks_failure_contract::FailureProjection for RenderError {
             RenderErrorKind::Cancelled => (FailureClass::Control, 107),
             RenderErrorKind::InvalidValue => (FailureClass::Data, 108),
             RenderErrorKind::InvalidUtf8 => (FailureClass::Data, 109),
-            RenderErrorKind::InvalidJson => (FailureClass::Data, 110),
+            RenderErrorKind::InvalidJson => (FailureClass::Invariant, 110),
             RenderErrorKind::InvalidVariant => (FailureClass::Data, 111),
             RenderErrorKind::CursorInvariant => (FailureClass::Invariant, 112),
             RenderErrorKind::WorkStackLimit => (FailureClass::Resource, 113),

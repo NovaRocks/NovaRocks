@@ -362,9 +362,12 @@ mod tests {
         use super::*;
         use crate::{FunctionValueType, ValueTypeStorageLifetime};
 
-        let json =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let inner = ValueTypeRef::try_new(
             ValueKind::List(json.value_type().clone()),
             true,

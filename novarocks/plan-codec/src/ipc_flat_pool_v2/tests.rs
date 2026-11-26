@@ -696,10 +696,14 @@ fn actual_flat_writer_exact_timezone_and_nominal_metadata_use_original_source() 
             );
         }
     }
+    let document = b"\x01\x80\x08\x01\x01v\x4a\x07\x00\x00\x00".as_slice();
     for labelled in [false, true] {
-        let ty =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
+        let ty = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let mut metadata = HashMap::from([
             ("provider-field-id".into(), "2147483647".into()),
             ("custom".into(), "unchanged".into()),
@@ -707,9 +711,10 @@ fn actual_flat_writer_exact_timezone_and_nominal_metadata_use_original_source() 
         if labelled {
             metadata.insert(NR_LOGICAL_TYPE_KEY.into(), "json".into());
         }
-        let field = Arc::new(Field::new("original", DataType::Utf8, true).with_metadata(metadata));
+        let field =
+            Arc::new(Field::new("original", DataType::LargeBinary, true).with_metadata(metadata));
         let original = pool_with(
-            Arc::new(StringArray::from(vec![Some("{\"v\":7}"), None])),
+            Arc::new(LargeBinaryArray::from(vec![Some(document), None])),
             field,
             ty,
         );
@@ -727,8 +732,8 @@ fn actual_flat_writer_exact_timezone_and_nominal_metadata_use_original_source() 
             labelled
         );
         assert_eq!(
-            decoded.value(0).unwrap().try_utf8().unwrap(),
-            Some("{\"v\":7}")
+            decoded.value(0).unwrap().try_binary().unwrap(),
+            Some(document)
         );
     }
 }

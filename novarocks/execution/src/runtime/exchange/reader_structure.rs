@@ -42,7 +42,7 @@ pub(super) fn model_error(cause: ReaderStructureFailure<ExchangeFailure>) -> Exc
 mod tests {
     use super::*;
     use crate::exec::pipeline::operator::InputConstructionFactory;
-    use arrow::array::{DictionaryArray, Int32Array, StringArray};
+    use arrow::array::{DictionaryArray, Int32Array, LargeBinaryArray, StringArray};
     use arrow::datatypes::{Field, Int32Type};
     use novarocks_type_contract::{
         TypedValueBinding, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
@@ -57,22 +57,22 @@ mod tests {
             panic!("unit construction does not wait")
         }
     }
-    fn declaration() -> ChunkSchemaRef {
+    fn declaration(logical: ValueLogicalType) -> ChunkSchemaRef {
         let pure = ValueTypeStorageLifetime::pure();
-        let value = ValueTypeRef::try_new(
-            ValueKind::Nominal(ValueLogicalType::Json),
-            false,
-            pure.clone(),
-        )
-        .unwrap();
+        let (kind, carrier) = match logical {
+            ValueLogicalType::Json => (ValueKind::Nominal(logical), DataType::LargeBinary),
+            ValueLogicalType::Physical => (ValueKind::String, DataType::Utf8),
+            _ => unreachable!("fixture supports only JSON and text"),
+        };
+        let value = ValueTypeRef::try_new(kind, false, pure.clone()).unwrap();
         let binding = TypedValueBinding::try_new(
             value,
-            ValueLayout::try_new(&DataType::Utf8, pure.clone()).unwrap(),
+            ValueLayout::try_new(&carrier, pure.clone()).unwrap(),
         )
         .unwrap();
         let slot = crate::exec::chunk::ChunkSlotSchema::try_new_typed(
             SlotId::new(9),
-            Arc::new(Field::new("json", DataType::Utf8, false)),
+            Arc::new(Field::new("document", carrier, false)),
             binding,
             None,
             pure.clone(),
@@ -104,7 +104,7 @@ mod tests {
             )
             .unwrap(),
         );
-        // Source names, IDs and metadata never author the receiver's JSON domain.
+        // Source names, IDs and metadata never author the receiver's domain.
         #[expect(
             deprecated,
             reason = "fixture exercises noncanonical source dictionary IDs"
@@ -114,6 +114,15 @@ mod tests {
                 "novarocks.logical_type".to_owned(),
                 "bitmap".to_owned(),
             )]));
+        make_unit(expected, factory, field, array)
+    }
+
+    fn make_unit(
+        expected: &ChunkSchemaRef,
+        factory: &dyn InputConstructionFactory,
+        field: Field,
+        array: ArrayRef,
+    ) -> (Arc<online_unit::ExchangeRecipe>, Vec<u8>) {
         let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap();
         let owner = factory.begin_typed_construction(expected).unwrap();
         let chunk = materialize_chunk_for_wire_meta(
@@ -132,12 +141,44 @@ mod tests {
         (recipe, bytes)
     }
     #[test]
-    fn reader_source_attributes_never_author_json_and_last_schema_keeps_finite_header_only() {
-        let tracker = MemTracker::new_root("reader finite prepared schema");
+    fn reader_source_attributes_never_author_json_and_exact_carrier_reuses_prepared_schema() {
+        let tracker = MemTracker::new_root("reader exact JSON prepared schema");
         let (factory, error_weak) = factory(tracker.clone());
         let factory_weak = Arc::downgrade(&factory);
-        let expected = declaration();
-        let (recipe, source) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
+        let expected = declaration(ValueLogicalType::Json);
+        let null_document = b"\x01\x20".as_slice();
+        let wire_field = Field::new("wire", DataType::LargeBinary, false).with_metadata(
+            HashMap::from([("novarocks.logical_type".to_owned(), "bitmap".to_owned())]),
+        );
+        let (recipe, source) = make_unit(
+            &expected,
+            factory.as_ref(),
+            wire_field.clone(),
+            Arc::new(LargeBinaryArray::from(vec![null_document])),
+        );
+        let (old_recipe, old_bytes) = unit(
+            &declaration(ValueLogicalType::Physical),
+            factory.as_ref(),
+            vec!["null"],
+            0,
+        );
+        assert_ne!(recipe.value.digest(), old_recipe.value.digest());
+        assert!(online_unit::decode(&recipe, &old_bytes, &expected, factory.as_ref()).is_err());
+        drop(old_recipe);
+        let (_, bad_bytes) = make_unit(
+            &expected,
+            factory.as_ref(),
+            wire_field,
+            Arc::new(LargeBinaryArray::from(vec![b"null".as_slice()])),
+        );
+        let wrong_value =
+            online_unit::decode(&recipe, &bad_bytes, &expected, factory.as_ref()).unwrap_err();
+        assert!(
+            wrong_value
+                .to_string()
+                .contains("Invalid native JSON version")
+        );
+        drop(wrong_value);
         let chunks = online_unit::decode(&recipe, &source, &expected, factory.as_ref()).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].len(), 1);
@@ -150,6 +191,8 @@ mod tests {
         assert!(!slot.typed_binding().nullable());
         assert!(slot.field().metadata().as_arc().is_none());
         let schema = chunks[0].chunk_schema_ref();
+        assert!(Arc::ptr_eq(&schema, &expected));
+        assert!(tracker.current() > 0);
         drop(chunks);
         drop(recipe);
         drop(source);
@@ -157,7 +200,7 @@ mod tests {
         drop(factory);
         assert!(factory_weak.upgrade().is_none());
         assert!(error_weak.upgrade().is_none());
-        assert!(tracker.current() > 0);
+        assert_eq!(tracker.current(), 0);
         assert!(matches!(
             schema.slots()[0].typed_binding().value_type().kind(),
             ValueKind::Nominal(ValueLogicalType::Json)
@@ -166,11 +209,140 @@ mod tests {
         assert_eq!(tracker.current(), 0);
     }
     #[test]
+    fn reader_checks_reachable_json_roots_in_nullable_row_array_map() {
+        use arrow::array::{Array, ListArray, MapArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        use novarocks_functions::json_value::JsonValueError;
+        use novarocks_type_contract::ValueField;
+        use std::error::Error as _;
+
+        let tracker = MemTracker::new_root("reader nested JSON");
+        let (factory, _) = factory(tracker);
+        let json_null = b"\x01\x20".as_slice();
+        let damaged = b"\x01\x42".as_slice();
+        let docs = Arc::new(LargeBinaryArray::from(vec![json_null, damaged, json_null]));
+        let keys = Arc::new(StringArray::from(vec!["k"; docs.len()]));
+        let entries = StructArray::new(
+            vec![
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(Field::new("value", DataType::LargeBinary, true)),
+            ]
+            .into(),
+            vec![keys, docs],
+            None,
+        );
+        let entries_field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
+        let storage = ValueTypeStorageLifetime::pure();
+        let value =
+            |kind, nullable| ValueTypeRef::try_new(kind, nullable, storage.clone()).unwrap();
+        let json = value(ValueKind::Nominal(ValueLogicalType::Json), true);
+        let map = value(
+            ValueKind::Map {
+                key: value(ValueKind::String, false),
+                value: json,
+            },
+            true,
+        );
+        let list = value(ValueKind::List(map), true);
+        let row = value(
+            ValueKind::Struct(Box::from([ValueField::new("docs", list, storage.clone())])),
+            true,
+        );
+
+        let validity = |valid| Some(vec![true, valid, true].into());
+        for (row_valid, list_valid, map_valid) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let maps = MapArray::new(
+                entries_field.clone(),
+                OffsetBuffer::from_lengths([1, 1, 1]),
+                entries.clone(),
+                validity(map_valid),
+                false,
+            );
+            let lists = ListArray::new(
+                Arc::new(Field::new("item", maps.data_type().clone(), true)),
+                OffsetBuffer::from_lengths([1, 1, 1]),
+                Arc::new(maps),
+                validity(list_valid),
+            );
+            let rows = StructArray::new(
+                vec![Arc::new(Field::new(
+                    "docs",
+                    lists.data_type().clone(),
+                    true,
+                ))]
+                .into(),
+                vec![Arc::new(lists)],
+                validity(row_valid),
+            );
+            let carrier = rows.data_type();
+            let layout = ValueLayout::try_new(carrier, storage.clone()).unwrap();
+            let binding = TypedValueBinding::try_new(row.clone(), layout).unwrap();
+            let slot = crate::exec::chunk::ChunkSlotSchema::try_new_typed(
+                SlotId::new(9),
+                Arc::new(Field::new("document", carrier.clone(), true)),
+                binding,
+                None,
+                storage.clone(),
+            )
+            .unwrap();
+            let expected = Arc::new(
+                crate::exec::chunk::ChunkSchema::try_new_typed(vec![slot], storage.clone())
+                    .unwrap(),
+            );
+            let wire = Field::new("wire", carrier.clone(), true);
+            let (recipe, bytes) = make_unit(&expected, factory.as_ref(), wire, Arc::new(rows));
+            let result = online_unit::decode(&recipe, &bytes, &expected, factory.as_ref());
+            if row_valid && list_valid && map_valid {
+                let error = result.unwrap_err();
+                assert!(matches!(error, ExchangeFailure::Source(_)));
+                let cause = std::iter::successors(error.source(), |cause| (*cause).source())
+                    .find_map(|cause| cause.downcast_ref::<JsonValueError>());
+                assert_eq!(cause, Some(&JsonValueError::Extent));
+            } else {
+                let chunks = result.unwrap();
+                let [chunk] = chunks.as_slice() else {
+                    panic!("expected one decoded exchange chunk");
+                };
+                assert_eq!(
+                    chunk.chunk_schema().slots()[0].typed_binding().value_type(),
+                    &row
+                );
+                let rows = chunk
+                    .record_batch()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                let lists = rows.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+                let maps = lists.values().as_any().downcast_ref::<MapArray>().unwrap();
+                let docs = maps
+                    .values()
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .unwrap();
+                assert_eq!(
+                    (rows.is_valid(1), lists.is_valid(1), maps.is_valid(1)),
+                    (row_valid, list_valid, map_valid)
+                );
+                assert_eq!(
+                    [docs.value(0), docs.value(1), docs.value(2)],
+                    [json_null, damaged, json_null]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn reader_array_projection_keeps_dictionary_body_without_pinning_array_group_in_schema() {
         let tracker = MemTracker::new_root("reader per-unit array header");
         let (factory, error_weak) = factory(tracker.clone());
         let factory_weak = Arc::downgrade(&factory);
-        let expected = declaration();
+        let expected = declaration(ValueLogicalType::Physical);
         let (recipe, source) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
         let mut chunks =
             online_unit::decode(&recipe, &source, &expected, factory.as_ref()).unwrap();
@@ -200,6 +372,7 @@ mod tests {
             "{}"
         );
         drop(projection);
+        // The decoded dictionary schema retains its finite paid header.
         assert!(tracker.current() > 0);
         assert!(
             tracker.current() < array_and_schema,
@@ -212,7 +385,7 @@ mod tests {
     fn reader_last_real_buffer_alias_keeps_body_responsibility_after_chunk_exit() {
         let tracker = MemTracker::new_root("reader actual Buffer alias exit");
         let (factory, error_weak) = factory(tracker.clone());
-        let expected = declaration();
+        let expected = declaration(ValueLogicalType::Physical);
         let (recipe, bytes) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
         let mut chunks = online_unit::decode(&recipe, &bytes, &expected, factory.as_ref()).unwrap();
         let array = chunks.remove(0).columns()[0].clone();
@@ -527,7 +700,7 @@ mod tests {
     fn reader_each_unit_has_complete_dictionary_and_last_projection_releases_its_group() {
         let tracker = MemTracker::new_root("reader independent full dictionary units");
         let (factory, error_weak) = factory(tracker.clone());
-        let expected = declaration();
+        let expected = declaration(ValueLogicalType::Physical);
         let (recipe, first) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
         let (_, second) = unit(&expected, factory.as_ref(), vec!["{}", "[]"], 1);
         let first = online_unit::decode(&recipe, &first, &expected, factory.as_ref()).unwrap();
@@ -564,7 +737,7 @@ mod tests {
     fn reader_schema_message_is_rejected_and_malformed_metadata_keeps_original_source() {
         let tracker = MemTracker::new_root("unexpected online schema");
         let (factory, _) = factory(tracker.clone());
-        let expected = declaration();
+        let expected = declaration(ValueLogicalType::Physical);
         let recipe = online_unit::prepare_recipe(&expected, &[], factory.as_ref()).unwrap();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
@@ -625,7 +798,7 @@ mod tests {
     fn reader_first_unit_recipe_allocation_refusal_rolls_back_without_publication() {
         let tracker = MemTracker::new_root("reader first unit recipe refusal");
         let (factory, _) = factory(tracker.clone());
-        let expected = declaration();
+        let expected = declaration(ValueLogicalType::Physical);
         let (recipe, bytes) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
         let baseline = tracker.current();
         tracker.install_limit_once(baseline + 1).unwrap();

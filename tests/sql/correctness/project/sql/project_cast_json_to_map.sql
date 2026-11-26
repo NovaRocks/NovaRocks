@@ -40,18 +40,18 @@ ROW(6, '{"1":1, "2":true, "3":null, "4":[5,6,7], "5":{"k51":"v51","k52":"v52"}}'
 -- query 3
 -- @order_sensitive=true
 -- A nonobject shape fails; a JSON null input produces SQL NULL.
-SELECT c1, TRY_CAST(PARSE_JSON(c2) AS MAP(VARCHAR, JSON)) AS m
+SELECT c1, TRY_CAST(json_parse(c2) AS MAP(VARCHAR, JSON)) AS m
 FROM ${case_db}.t_cast_json_to_map ORDER BY c1;
 
 -- query 4
 -- @order_sensitive=true
-SELECT c1, TRY_CAST(PARSE_JSON(c2) AS MAP(INTEGER, JSON)) AS m
+SELECT c1, TRY_CAST(json_parse(c2) AS MAP(INTEGER, JSON)) AS m
 FROM ${case_db}.t_cast_json_to_map ORDER BY c1;
 
 -- query 5
 -- @order_sensitive=true
 -- Conversion to VARCHAR fails for JSON containers, while scalar JSON null becomes SQL NULL.
-SELECT c1, TRY_CAST(PARSE_JSON(c2) AS MAP(VARCHAR, VARCHAR)) AS m
+SELECT c1, TRY_CAST(json_parse(c2) AS MAP(VARCHAR, VARCHAR)) AS m
 FROM ${case_db}.t_cast_json_to_map
 UNION ALL
 SELECT 7, CAST(JSON '{"1":1,"2":true,"3":null}' AS MAP(VARCHAR, VARCHAR))
@@ -59,7 +59,7 @@ ORDER BY c1;
 
 -- query 6
 -- @order_sensitive=true
-SELECT c1, TRY_CAST(PARSE_JSON(c2) AS MAP(INTEGER, VARCHAR)) AS m
+SELECT c1, TRY_CAST(json_parse(c2) AS MAP(INTEGER, VARCHAR)) AS m
 FROM ${case_db}.t_cast_json_to_map
 UNION ALL
 SELECT 7, CAST(JSON '{"1":1,"2":true,"3":null}' AS MAP(INTEGER, VARCHAR))
@@ -68,7 +68,7 @@ ORDER BY c1;
 -- query 7
 -- @order_sensitive=true
 -- A bad child fails the entire MAP. Preserve the valid array and SQL NULL values independently.
-SELECT c1, TRY_CAST(PARSE_JSON(c2) AS MAP(VARCHAR, ARRAY(INTEGER))) AS m
+SELECT c1, TRY_CAST(json_parse(c2) AS MAP(VARCHAR, ARRAY(INTEGER))) AS m
 FROM ${case_db}.t_cast_json_to_map
 UNION ALL
 SELECT 7, CAST(JSON '{"1":null,"2":null,"3":null,"4":[5,6,7],"5":null}' AS MAP(VARCHAR, ARRAY(INTEGER)))
@@ -77,7 +77,7 @@ ORDER BY c1;
 -- query 8
 -- @order_sensitive=true
 -- ROW accepts an array of exact arity or an object with matching field names.
-SELECT c1, TRY_CAST(PARSE_JSON(c2) AS MAP(VARCHAR, ROW(k51 VARCHAR, k52 VARCHAR))) AS m
+SELECT c1, TRY_CAST(json_parse(c2) AS MAP(VARCHAR, ROW(k51 VARCHAR, k52 VARCHAR))) AS m
 FROM ${case_db}.t_cast_json_to_map
 UNION ALL
 SELECT 7, CAST(JSON '{"1":null,"2":null,"3":null,"4":[5,6],"5":{"k51":"v51","k52":"v52"}}'
@@ -86,7 +86,7 @@ ORDER BY c1;
 
 -- query 9
 -- @order_sensitive=true
-SELECT c1, TRY_CAST(PARSE_JSON(c2) AS MAP(VARCHAR, MAP(VARCHAR, VARCHAR))) AS m
+SELECT c1, TRY_CAST(json_parse(c2) AS MAP(VARCHAR, MAP(VARCHAR, VARCHAR))) AS m
 FROM ${case_db}.t_cast_json_to_map
 UNION ALL
 SELECT 7, CAST(JSON '{"1":null,"2":null,"3":null,"4":null,"5":{"k51":"v51","k52":"v52"}}'
@@ -95,12 +95,12 @@ ORDER BY c1;
 
 -- query 10
 -- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
-SELECT CAST(PARSE_JSON(c2) AS MAP(VARCHAR, JSON))
+SELECT CAST(json_parse(c2) AS MAP(VARCHAR, JSON))
 FROM ${case_db}.t_cast_json_to_map WHERE c1 = 1;
 
 -- query 11
 -- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
-SELECT CAST(PARSE_JSON(c2) AS MAP(VARCHAR, ARRAY(INTEGER)))
+SELECT CAST(json_parse(c2) AS MAP(VARCHAR, ARRAY(INTEGER)))
 FROM ${case_db}.t_cast_json_to_map WHERE c1 = 6;
 
 -- query 12

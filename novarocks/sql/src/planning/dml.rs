@@ -5490,7 +5490,7 @@ mod tests {
         use crate::compiler::*;
         use novarocks_physical_plan::ResultValueDomain as Domain;
         for (sql, expected, width) in [
-            ("select parse_json('{}') as v", Domain::Json, None),
+            ("select json_parse('{}') as v", Domain::Json, None),
             (
                 "select cast('x' AS VARCHAR(8)) as v",
                 Domain::Plain,

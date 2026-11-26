@@ -558,11 +558,14 @@ fn values_program(fields: Vec<Field>) -> TypedFixture {
     expression_types(calls, false)
 }
 #[test]
-fn explicit_json_root_identity_is_required_without_inferring_it_from_plain_utf8() {
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
-    let field = Field::new("json", DataType::Utf8, true).with_metadata(HashMap::from([(
+fn explicit_json_root_identity_is_required_without_inferring_it_from_plain_binary() {
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let field = Field::new("json", DataType::LargeBinary, true).with_metadata(HashMap::from([(
         novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
         "json".into(),
     )]));
@@ -571,7 +574,10 @@ fn explicit_json_root_identity_is_required_without_inferring_it_from_plain_utf8(
     assert_eq!(
         check_channels(
             source,
-            vec![(output(0), FunctionValueType::new(DataType::Utf8, true))],
+            vec![(
+                output(0),
+                FunctionValueType::new(DataType::LargeBinary, true)
+            )],
             &Control::default()
         )
         .unwrap_err(),
@@ -579,10 +585,13 @@ fn explicit_json_root_identity_is_required_without_inferring_it_from_plain_utf8(
     );
     // An unlabeled carrier permits an explicitly supplied logical fact; no
     // fallback fabricates that fact or replaces the caller's typed table.
-    let source = values_program(vec![Field::new("unlabeled", DataType::Utf8, true)]);
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let source = values_program(vec![Field::new("unlabeled", DataType::LargeBinary, true)]);
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let checked = check_channels(source, vec![(output(0), json)], &Control::default()).unwrap();
     assert_eq!(
         checked.channel_type(output(0)).unwrap().logical_type(),
@@ -777,19 +786,27 @@ fn schema_channel_positions_use_an_independent_checked_definition_budget() {
 fn actual_join_side_and_scope_layouts_keep_separate_explicit_logical_domains() {
     use ProgramChannelLayoutRole as Role;
     let left = StaticLayout::try_new(
-        Arc::new(Schema::new(vec![Field::new("left", DataType::Utf8, true)])),
+        Arc::new(Schema::new(vec![Field::new(
+            "left",
+            DataType::LargeBinary,
+            true,
+        )])),
         Arc::from([SlotId::new(1)]),
     )
     .unwrap();
     let right = StaticLayout::try_new(
-        Arc::new(Schema::new(vec![Field::new("right", DataType::Utf8, true)])),
+        Arc::new(Schema::new(vec![Field::new(
+            "right",
+            DataType::LargeBinary,
+            true,
+        )])),
         Arc::from([SlotId::new(2)]),
     )
     .unwrap();
     let joined = StaticLayout::try_new(
         Arc::new(Schema::new(vec![
-            Field::new("left", DataType::Utf8, true),
-            Field::new("right", DataType::Utf8, true),
+            Field::new("left", DataType::LargeBinary, true),
+            Field::new("right", DataType::LargeBinary, true),
         ])),
         Arc::from([SlotId::new(1), SlotId::new(2)]),
     )
@@ -797,7 +814,7 @@ fn actual_join_side_and_scope_layouts_keep_separate_explicit_logical_domains() {
     let values = |layout: &StaticLayout| {
         let batch = RecordBatch::try_new(
             layout.schema().clone(),
-            vec![new_null_array(&DataType::Utf8, 1)],
+            vec![new_null_array(&DataType::LargeBinary, 1)],
         )
         .unwrap();
         StaticValues::try_new(batch, layout.clone()).unwrap()
@@ -858,10 +875,13 @@ fn actual_join_side_and_scope_layouts_keep_separate_explicit_logical_domains() {
         .unwrap(),
         false,
     );
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
-    let plain = FunctionValueType::new(DataType::Utf8, true);
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let plain = FunctionValueType::new(DataType::LargeBinary, true);
     let channels = vec![
         (output(0), json.clone()),
         (output(1), plain.clone()),

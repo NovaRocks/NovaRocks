@@ -1179,21 +1179,21 @@ select array_agg([1,2]) from ss;
 
 -- query 281
 USE ${case_db};
-select array_agg(JSON_OBJECT('2:3': NULL)) from ss;
+select array_agg(JSON_OBJECT('2:3' VALUE NULL RETURNING JSON)) from ss;
 
 -- query 282
 -- @expect_error=can't rewrite distinct to group by on (json).
 -- @expect_sql_code=sql.analyze.invalid_argument
 -- @expect_sql_phase=Analyze
 USE ${case_db};
-select array_agg(distinct JSON_OBJECT('2:3': NULL)) from ss;
+select array_agg(distinct JSON_OBJECT('2:3' VALUE NULL RETURNING JSON)) from ss;
 
 -- query 283
 -- @expect_error=can't rewrite distinct to group by on (array<json>).
 -- @expect_sql_code=sql.analyze.invalid_argument
 -- @expect_sql_phase=Analyze
 USE ${case_db};
-select array_agg(distinct [JSON_OBJECT('2:3': NULL)]) from ss;
+select array_agg(distinct [JSON_OBJECT('2:3' VALUE NULL RETURNING JSON)]) from ss;
 
 -- query 284
 USE ${case_db};

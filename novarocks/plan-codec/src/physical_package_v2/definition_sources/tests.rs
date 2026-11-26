@@ -817,9 +817,28 @@ pub(in crate::physical_package_v2) fn values_package(
     rows: usize,
     columns: usize,
 ) -> p::FragmentPackage {
+    let pool = novarocks_constant_contract::ConstantPool::try_new(
+        Arc::new(Field::new("cells", DataType::Int64, false)),
+        int(),
+        Int64Array::from_iter_values(0..16).to_data(),
+        request(Box::default()).constant_policy,
+        CompilePhase::Validate,
+        &Setup,
+    )
+    .unwrap();
+    values_package_with_pool(rows, columns, pool)
+}
+
+pub(in crate::physical_package_v2) fn values_package_with_pool(
+    rows: usize,
+    columns: usize,
+    pool: p::ConstantPool,
+) -> p::FragmentPackage {
     let source = p::NodeId::new(0);
     let pool_id = p::ConstantPoolId::new(0);
-    let pool_rows = 16;
+    let pool_rows = pool.array().len();
+    let pool_value_type = pool.value_type().clone();
+    let value_type = &pool_value_type;
     let cell = |row: usize, column: usize| p::ExprId::new((row * columns + column) as u32);
     let arena = (0..rows)
         .flat_map(|row| {
@@ -827,7 +846,7 @@ pub(in crate::physical_package_v2) fn values_package(
                 id: cell(row, column),
 
                 lambda_scope: None,
-                ty: int(),
+                ty: value_type.clone(),
                 kind: novarocks_expression_contract::ExprKind::Constant(p::ConstantReference {
                     pool: pool_id,
                     ordinal: ((row * columns + column) % pool_rows) as u32,
@@ -854,7 +873,7 @@ pub(in crate::physical_package_v2) fn values_package(
                         *id,
                         p::ValueDef {
                             id: *id,
-                            ty: int(),
+                            ty: value_type.clone(),
                             origin: p::ValueOrigin::NodeOutput {
                                 node: source,
                                 output_ordinal: ordinal as u32,
@@ -903,15 +922,6 @@ pub(in crate::physical_package_v2) fn values_package(
         .with_calls_observed(vec![], &Setup)
         .unwrap();
     let mut pools = p::ConstantPools::empty();
-    let pool = novarocks_constant_contract::ConstantPool::try_new(
-        Arc::new(Field::new("cells", DataType::Int64, false)),
-        int(),
-        Int64Array::from_iter_values(0..pool_rows as i64).to_data(),
-        request(Box::default()).constant_policy,
-        CompilePhase::Validate,
-        &Setup,
-    )
-    .unwrap();
     pools.insert(pool_id, pool).unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
@@ -932,7 +942,7 @@ pub(in crate::physical_package_v2) fn values_package(
                         name: format!("c{i}").into(),
                         alias: None,
                         value: *value,
-                        ty: int(),
+                        ty: value_type.clone(),
                     })
                     .collect(),
             }),

@@ -453,7 +453,7 @@ pub fn comparison_common_value_type(
 ///
 /// This shares `wider_type` rather than defining another carrier promotion
 /// algorithm. It preserves the selected source's field facts and permits only
-/// the explicitly declared JSON/text and LARGEINT/signed-integer domain pairs.
+/// the explicitly declared LARGEINT/signed-integer domain pair.
 /// It does not authorize runtime casts or supply decimal conversion policy.
 pub fn wider_comparison_value_type(
     left: &FunctionValueType,
@@ -608,18 +608,6 @@ fn common_value_core<E>(
             {
                 carrier = right.data_type().clone();
                 ValueLogicalType::LargeInt
-            }
-            (ValueLogicalType::Json, ValueLogicalType::Physical)
-                if right.data_type() == &DataType::Utf8 =>
-            {
-                carrier = DataType::Utf8;
-                ValueLogicalType::Physical
-            }
-            (ValueLogicalType::Physical, ValueLogicalType::Json)
-                if left.data_type() == &DataType::Utf8 =>
-            {
-                carrier = DataType::Utf8;
-                ValueLogicalType::Physical
             }
             _ => {
                 return Err(crate::ValueConstructionFailure::Rule(format!(
@@ -930,13 +918,10 @@ mod value_tests {
             );
             assert_eq!(wider_comparison_value_type(left, right).unwrap(), expected);
         }
-        let json = value(DataType::Utf8, ValueLogicalType::Json, false);
+        let json = value(DataType::LargeBinary, ValueLogicalType::Json, false);
         let text = physical(DataType::Utf8, true);
-        assert_eq!(
-            comparison_common_value_type(&json, &text).unwrap(),
-            Some(text.clone())
-        );
-        assert_eq!(wider_comparison_value_type(&text, &json).unwrap(), text);
+        assert!(comparison_common_value_type(&json, &text).is_err());
+        assert!(wider_comparison_value_type(&text, &json).is_err());
         assert!(
             wider_comparison_value_type(&large, &physical(DataType::Decimal128(20, 0), true))
                 .is_err()
@@ -976,7 +961,7 @@ mod value_tests {
 
     #[test]
     fn null_copies_full_decided_source_and_only_joins_nullability() {
-        let source = value(DataType::Utf8, ValueLogicalType::Json, false);
+        let source = value(DataType::LargeBinary, ValueLogicalType::Json, false);
         let null = physical(DataType::Null, true);
         let mut expected = source.clone();
         expected = expected
@@ -993,7 +978,7 @@ mod value_tests {
         let list = physical(
             DataType::List(field(
                 "actual",
-                DataType::Utf8,
+                DataType::LargeBinary,
                 ValueLogicalType::Json,
                 false,
             )),
@@ -1008,11 +993,16 @@ mod value_tests {
 
     #[test]
     fn nested_common_uses_canonical_layout_and_complete_declared_domain() {
-        let left_item = field("source_item", DataType::Utf8, ValueLogicalType::Json, false);
+        let left_item = field(
+            "source_item",
+            DataType::LargeBinary,
+            ValueLogicalType::Json,
+            false,
+        );
         let right_item = field(
             "other_item",
-            DataType::Utf8,
-            ValueLogicalType::Physical,
+            DataType::LargeBinary,
+            ValueLogicalType::Json,
             true,
         );
         let left = physical(DataType::List(left_item.clone()), false);
@@ -1028,12 +1018,12 @@ mod value_tests {
             };
             assert_eq!(item.name(), "item");
             assert!(item.is_nullable());
+            assert_eq!(item.data_type(), &DataType::LargeBinary);
             assert!(item.metadata().is_empty());
             assert_eq!(
                 result.child_at(0).unwrap().logical_type(),
-                ValueLogicalType::Physical
+                ValueLogicalType::Json
             );
-            assert!(!item.metadata().contains_key(crate::NR_LOGICAL_TYPE_KEY));
             assert!(result.nullable());
         }
         assert_eq!(
@@ -1160,7 +1150,12 @@ mod value_tests {
                         ValueLogicalType::Physical,
                         false,
                     ),
-                    field("actual_value", DataType::Utf8, ValueLogicalType::Json, true),
+                    field(
+                        "actual_value",
+                        DataType::LargeBinary,
+                        ValueLogicalType::Json,
+                        true,
+                    ),
                 ]
                 .into(),
             ),
@@ -1184,8 +1179,8 @@ mod value_tests {
                             ),
                             field(
                                 "actual_value",
-                                DataType::Utf8,
-                                ValueLogicalType::Physical,
+                                DataType::LargeBinary,
+                                ValueLogicalType::Json,
                                 true,
                             ),
                         ]
@@ -1209,10 +1204,11 @@ mod value_tests {
             panic!("expected entries")
         };
         assert_eq!(children[1].name(), "value");
+        assert_eq!(children[1].data_type(), &DataType::LargeBinary);
         assert!(children[1].metadata().is_empty());
         assert_eq!(
             result.child_at(1).unwrap().logical_type(),
-            ValueLogicalType::Physical
+            ValueLogicalType::Json
         );
     }
 }

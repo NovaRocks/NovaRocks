@@ -360,8 +360,12 @@ fn string_translate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_s
                 ))),
                 true,
             ),
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Json,
+            )
+            .unwrap(),
         ] {
             assert!(
                 prepared_for_test_with_policy(
@@ -490,8 +494,12 @@ fn string_translate_actual_profile_preserves_independent_first_duplicate_delete_
             FunctionValueType::new(DataType::LargeUtf8, true),
             FunctionValueType::new(DataType::Binary, true),
             FunctionValueType::new(DataType::Int64, true),
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Json,
+            )
+            .unwrap(),
         ] {
             let mut wrong = sources();
             wrong[i] = ty;

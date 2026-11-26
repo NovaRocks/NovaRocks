@@ -40,10 +40,6 @@ use crate::{
 fn implementation_pairs() -> &'static [(&'static str, &'static str)] {
     &[
         (
-            value_conversion::JSON_TEXT,
-            "builtin.scalar/value_domain_conversion/json_text_same_structure/selected-v1",
-        ),
-        (
             value_conversion::OPAQUE_BINARY,
             "builtin.scalar/value_domain_conversion/opaque_to_binary_same_structure/selected-v1",
         ),

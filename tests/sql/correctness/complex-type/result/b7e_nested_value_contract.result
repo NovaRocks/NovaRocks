@@ -38,3 +38,8 @@ id	original_row	matched
 -- types	boolean	boolean	boolean
 forward	reverse	identical
 false	false	true
+
+-- query 13
+-- types	boolean	boolean
+same_date	same_string
+true	false

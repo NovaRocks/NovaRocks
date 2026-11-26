@@ -29,6 +29,7 @@ pub(super) fn evaluate_row(
     row: usize,
     ordinal: usize,
     control: &dyn KernelEvaluationControl,
+    allocator: Option<&Arc<dyn crate::AggregateStateAllocator>>,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Result<ArrayRef, RowDataError>, KernelFailure> {
     let source = input
@@ -52,8 +53,13 @@ pub(super) fn evaluate_row(
     for (child, source) in children.iter().zip(source.columns()) {
         work.step()?;
         work.flush()?;
-        let selected =
-            child.evaluate_selected(EvaluatedArgument::Column(source), selection, &[], control)?;
+        let selected = child.evaluate_selected_scoped(
+            EvaluatedArgument::Column(source),
+            selection,
+            &[],
+            control,
+            allocator,
+        )?;
         if let Some(error) = selected.errors().first() {
             return Ok(Err(error.with_selected_ordinal(ordinal)));
         }

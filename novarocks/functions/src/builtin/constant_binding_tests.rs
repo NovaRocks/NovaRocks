@@ -185,8 +185,12 @@ fn direct_family_gate_rejects_complete_source_domain_and_nullable_mismatch() {
     let (_, resolver) = super::dynamic_definition_parts("named_struct").unwrap();
     for source in [
         FunctionValueType::new(DataType::Utf8, true),
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap(),
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
     ] {
         let args = [
             FunctionArgument::Value {

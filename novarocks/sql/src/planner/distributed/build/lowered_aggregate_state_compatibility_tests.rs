@@ -19,7 +19,7 @@ use super::lowered_partial_aggregate_canonical_tests::{chain, entry};
 use super::*;
 use crate::planner::distributed::build::physical_aggregate_requests::author_physical_aggregate_merge_request_observed;
 
-fn repeated_chain(name: &str, ty: ValueType) -> PhysicalPlanNode {
+fn typed_chain(name: &str, ty: ValueType, repeat_input: bool) -> PhysicalPlanNode {
     let mut input = column(
         7,
         "original_nonnullable",
@@ -30,7 +30,12 @@ fn repeated_chain(name: &str, ty: ValueType) -> PhysicalPlanNode {
     // The source channel exists even for nested carriers without a fabricated
     // runtime literal; these tests verify the actual structural source owner.
     let child = values(vec![input.clone()], vec![]);
-    chain(name, vec![reference(&input)], vec![], repeat(child, &input))
+    let child = if repeat_input {
+        repeat(child, &input)
+    } else {
+        child
+    };
+    chain(name, vec![reference(&input)], vec![], child)
 }
 
 fn assert_actual_root_widening(owner: &SqlAuthoredPhysicalPlan, original: &ValueType) {
@@ -196,7 +201,7 @@ fn assert_actual_root_widening(owner: &SqlAuthoredPhysicalPlan, original: &Value
 fn state_compat_count_and_min_repeat_keep_actual_partial_nullable_and_final_original_request() {
     for name in ["count", "min"] {
         let original = ValueType::new(DataType::Int64, false);
-        let source = repeated_chain(name, original.clone());
+        let source = typed_chain(name, original.clone(), true);
         let owner = authored(&source, &Control::default()).unwrap();
         assert_actual_root_widening(&owner, &original);
         let partial = entry(&owner, true);
@@ -409,37 +414,63 @@ fn assert_original_root_widening(
 }
 
 #[test]
-fn state_compat_min_preserves_nested_metadata_and_nominal_json_beyond_root_nullable() {
+fn state_compat_min_preserves_nested_metadata_beyond_root_nullable() {
+    let nested = nested_type(true, "original");
+    let source = typed_chain("min", nested.clone(), true);
+    let (result, calls) = observe_original_min(&source, &Control::default(), |view, work| {
+        assert_original_root_widening(&view, &nested, work)
+    });
+    assert_eq!(calls, 1);
+    assert_min_carrier_refusal(result);
+
+    let original = ValueType::new(DataType::Utf8, false);
+    let source = typed_chain("min", original.clone(), true);
+    let owner = authored(&source, &Control::default()).unwrap();
+    assert_actual_root_widening(&owner, &original);
+    let state = original.with_nullable(true).unwrap();
+    let final_entry = entry(&owner, false);
+    assert_eq!(final_entry.source().binding.intermediate_type, state);
+    assert_eq!(final_entry.source().binding.function.result_type, state);
+}
+
+#[test]
+fn state_compat_any_value_preserves_nominal_json() {
     let json = ValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         false,
         novarocks_type_contract::ValueLogicalType::Json,
     )
     .unwrap();
-    for original in [nested_type(true, "original"), json] {
-        let source = repeated_chain("min", original.clone());
-        if matches!(original.data_type(), DataType::Struct(_)) {
-            let (result, calls) =
-                observe_original_min(&source, &Control::default(), |view, work| {
-                    assert_original_root_widening(&view, &original, work)
-                });
-            assert_eq!(calls, 1);
-            assert_min_carrier_refusal(result);
-        } else {
-            // Keep the genuine supported Json UTF8 Partial/Final owner,
-            // merge request and original checked state-graph assertions.
-            let owner = authored(&source, &Control::default()).unwrap();
-            assert_actual_root_widening(&owner, &original);
-            let final_entry = entry(&owner, false);
-            let mut state = original.clone();
-            state = state.with_nullable(true).unwrap();
-            assert_eq!(final_entry.source().binding.intermediate_type, state);
-            assert_eq!(final_entry.source().binding.function.result_type, state);
-        }
+    let source = typed_chain("any_value", json.clone(), false);
+    let owner = authored(&source, &Control::default()).unwrap();
+    let partial = entry(&owner, true);
+    let final_entry = entry(&owner, false);
+    let AggregatePhase::Partial { sequence } = partial.phase() else {
+        unreachable!()
+    };
+    assert_eq!(final_entry.phase(), AggregatePhase::Final { sequence });
+    assert!(
+        partial
+            .captured()
+            .logical_identity()
+            .same_revision(final_entry.captured().logical_identity())
+    );
+    let state = json.with_nullable(true).unwrap();
+    for entry in [partial, final_entry] {
+        let canonical = entry.canonical().unwrap();
+        assert!(canonical.belongs_to(entry.captured()));
+        assert_eq!(
+            entry.source().binding.state_argument_contract,
+            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature
+        );
+        assert_eq!(value(&entry.captured().request().arguments[0]).0, &json);
+        assert_eq!(value(&canonical.request().arguments[0]).0, &json);
+        assert_eq!(entry.source().binding.intermediate_type, state);
+        assert_eq!(entry.source().binding.function.result_type, state);
     }
 }
 
-fn replace_final_logical_source(plan: &mut PhysicalPlanNode, ty: ValueType) {
+fn replace_final_logical_source(plan: &mut PhysicalPlanNode, name: &str, ty: ValueType) {
     let mut input = column(
         7,
         "independent_final_logical_source",
@@ -448,7 +479,7 @@ fn replace_final_logical_source(plan: &mut PhysicalPlanNode, ty: ValueType) {
     );
     input.value_type = ty;
     let replacement = aggregate(
-        "min",
+        name,
         vec![reference(&input)],
         vec![],
         values(vec![input], vec![]),
@@ -467,8 +498,8 @@ fn replace_final_logical_source(plan: &mut PhysicalPlanNode, ty: ValueType) {
 #[test]
 fn state_compat_nested_drift_and_nominal_drift_still_refuse_original_state_domain() {
     for final_type in [nested_type(false, "original"), nested_type(true, "foreign")] {
-        let mut source = repeated_chain("min", nested_type(true, "original"));
-        replace_final_logical_source(&mut source, final_type);
+        let mut source = typed_chain("min", nested_type(true, "original"), true);
+        replace_final_logical_source(&mut source, "min", final_type);
         assert!(matches!(
             authored(&source, &Control::default()),
             Err(ContractLoweringError::InvalidAggregate {
@@ -476,11 +507,16 @@ fn state_compat_nested_drift_and_nominal_drift_still_refuse_original_state_domai
             })
         ));
     }
-    let mut source = repeated_chain("min", ValueType::new(DataType::Utf8, false));
+    let mut source = typed_chain(
+        "any_value",
+        ValueType::new(DataType::LargeBinary, false),
+        false,
+    );
     replace_final_logical_source(
         &mut source,
+        "any_value",
         ValueType::try_with_logical_type(
-            DataType::Utf8,
+            DataType::LargeBinary,
             false,
             novarocks_type_contract::ValueLogicalType::Json,
         )
@@ -488,7 +524,7 @@ fn state_compat_nested_drift_and_nominal_drift_still_refuse_original_state_domai
     );
     let Err(ContractLoweringError::Validation(errors)) = authored(&source, &Control::default())
     else {
-        panic!("same Utf8 storage cannot lend a different nominal state")
+        panic!("same LargeBinary storage cannot lend a different nominal state")
     };
     assert!(
         errors.errors().iter().any(|error| error.message()
@@ -643,7 +679,7 @@ fn state_compat_stateformat_result_logical_count_phase_and_orphan_remain_exact()
 
 #[test]
 fn state_compat_actual_repeat_lowerer_and_stateformat_refusal_keep_every_original_control_prefix() {
-    let good = repeated_chain("count", ValueType::new(DataType::Int64, false));
+    let good = typed_chain("count", ValueType::new(DataType::Int64, false), true);
     let mut bad = good.clone();
     mutate_final_binding(&mut bad, |binding| {
         binding.selected.aggregate.as_mut().unwrap().state_format =

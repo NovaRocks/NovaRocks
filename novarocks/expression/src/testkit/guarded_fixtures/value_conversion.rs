@@ -97,7 +97,6 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
     for stem in [
         "array_common_coercion",
         "operator_decimal_float_coercion",
-        "json_text_same_structure",
         "opaque_to_binary_same_structure",
         "signed_to_largeint",
         "boolean_to_largeint",

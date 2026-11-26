@@ -98,9 +98,9 @@ fn selected(
 fn pairs() -> Vec<(&'static str, FunctionValueType, FunctionValueType)> {
     vec![
         (
-            JSON_TEXT,
-            logical(DataType::Utf8, false, ValueLogicalType::Json),
-            physical(DataType::Utf8, false),
+            OPAQUE_BINARY,
+            logical(DataType::LargeBinary, false, ValueLogicalType::Variant),
+            physical(DataType::LargeBinary, false),
         ),
         (
             SIGNED_LARGEINT,
@@ -181,7 +181,7 @@ fn exact_conversion_never_searches_other_pairs_or_widens_explicit_target() {
     );
     assert!(selected(&catalog, SIGNED_LARGEINT, &arguments, &target, &control()).is_ok());
     for overload in [
-        JSON_TEXT,
+        OPAQUE_BINARY,
         LARGEINT_SIGNED,
         LARGEINT_FLOAT,
         NULL_LIFT,
@@ -320,7 +320,7 @@ fn exact_conversion_old_validation_still_refuses_signature_drift_before_pair_wal
         ValueLogicalType::LargeInt,
     ));
     let mut wrong_overload = selected;
-    wrong_overload.overload = FunctionOverloadId::try_new(JSON_TEXT).unwrap();
+    wrong_overload.overload = FunctionOverloadId::try_new(OPAQUE_BINARY).unwrap();
     for drifted in [wrong_argument, wrong_result, wrong_overload] {
         let baseline = control();
         let error = ValueConversionResolver
@@ -347,13 +347,13 @@ fn exact_conversion_old_validation_still_refuses_signature_drift_before_pair_wal
     }
 }
 
-fn json_pair(fields: usize) -> (FunctionValueType, FunctionValueType) {
+fn opaque_pair(fields: usize) -> (FunctionValueType, FunctionValueType) {
     let source = (0..fields)
         .map(|index| {
             Arc::new(
-                Field::new(format!("c{index}"), DataType::Utf8, true).with_metadata(
+                Field::new(format!("c{index}"), DataType::LargeBinary, true).with_metadata(
                     std::collections::HashMap::<String, String>::from([
-                        (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
+                        (NR_LOGICAL_TYPE_KEY.to_owned(), "variant".to_owned()),
                         ("provider-id".to_owned(), "retained".to_owned()),
                     ]),
                 ),
@@ -363,7 +363,7 @@ fn json_pair(fields: usize) -> (FunctionValueType, FunctionValueType) {
     let target = (0..fields)
         .map(|index| {
             Arc::new(
-                Field::new(format!("c{index}"), DataType::Utf8, true).with_metadata(
+                Field::new(format!("c{index}"), DataType::LargeBinary, true).with_metadata(
                     std::collections::HashMap::<String, String>::from([(
                         "provider-id".to_owned(),
                         "retained".to_owned(),
@@ -379,11 +379,11 @@ fn json_pair(fields: usize) -> (FunctionValueType, FunctionValueType) {
 }
 
 #[test]
-fn exact_conversion_json_preserves_nested_annotations_and_field_identity() {
-    let (source, target) = json_pair(2);
+fn exact_conversion_opaque_preserves_nested_annotations_and_field_identity() {
+    let (source, target) = opaque_pair(2);
     let catalog = catalog();
     let arguments = [value(source)];
-    selected(&catalog, JSON_TEXT, &arguments, &target, &control()).unwrap();
+    selected(&catalog, OPAQUE_BINARY, &arguments, &target, &control()).unwrap();
     let DataType::Struct(fields) = target.data_type() else {
         unreachable!()
     };
@@ -403,7 +403,7 @@ fn exact_conversion_json_preserves_nested_annotations_and_field_identity() {
             ),
             true,
         );
-    assert!(selected(&catalog, JSON_TEXT, &arguments, &decorated, &control()).is_ok());
+    assert!(selected(&catalog, OPAQUE_BINARY, &arguments, &decorated, &control()).is_ok());
     for changed in [
         fields[0].as_ref().clone().with_name("foreign"),
         fields[0].as_ref().clone().with_nullable(false),
@@ -412,7 +412,7 @@ fn exact_conversion_json_preserves_nested_annotations_and_field_identity() {
             DataType::Struct(vec![Arc::new(changed), fields[1].clone()].into()),
             true,
         );
-        assert!(selected(&catalog, JSON_TEXT, &arguments, &bad, &control()).is_err());
+        assert!(selected(&catalog, OPAQUE_BINARY, &arguments, &bad, &control()).is_err());
     }
 }
 
@@ -454,7 +454,7 @@ fn exact_conversion_success_and_ordinary_refusals_keep_every_original_control_pr
         true,
     );
     assert_prefixes(
-        |control| selected(&catalog, JSON_TEXT, &arguments, &target, control),
+        |control| selected(&catalog, OPAQUE_BINARY, &arguments, &target, control),
         false,
     );
     let narrowed = physical(DataType::Int64, false);
@@ -470,12 +470,12 @@ fn exact_conversion_success_and_ordinary_refusals_keep_every_original_control_pr
 }
 
 #[test]
-fn exact_conversion_wide_json_has_real_256_work_and_sampled_primary_refusals() {
+fn exact_conversion_wide_opaque_has_real_256_work_and_sampled_primary_refusals() {
     let catalog = catalog();
-    let (source, target) = json_pair(320);
+    let (source, target) = opaque_pair(320);
     let arguments = [value(source)];
     let baseline = control();
-    selected(&catalog, JSON_TEXT, &arguments, &target, &baseline).unwrap();
+    selected(&catalog, OPAQUE_BINARY, &arguments, &target, &baseline).unwrap();
     let trace = baseline.trace();
     let quantum = trace.iter().position(|(_, units)| *units == 256).unwrap();
     let samples = [1, quantum + 1, trace.len()];
@@ -486,7 +486,8 @@ fn exact_conversion_wide_json_has_real_256_work_and_sampled_primary_refusals() {
             CompileControlError::ResourceExhausted,
         ] {
             let refusing = Control::new(Some(stop), cause.clone());
-            let error = selected(&catalog, JSON_TEXT, &arguments, &target, &refusing).unwrap_err();
+            let error =
+                selected(&catalog, OPAQUE_BINARY, &arguments, &target, &refusing).unwrap_err();
             assert_eq!(error.control_error(), Some(cause));
             assert_eq!(refusing.trace(), trace[..stop]);
         }

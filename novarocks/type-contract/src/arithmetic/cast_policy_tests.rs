@@ -233,16 +233,15 @@ fn observed_cast_policy_preserves_arrow_dictionary_compatibility_and_metadata_re
     );
     let retag = |tag: &str| {
         DataType::List(Arc::new(
-            Field::new("item", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
-                String,
-                String,
-            >::from([(
-                crate::NR_LOGICAL_TYPE_KEY.into(),
-                tag.into(),
-            )])),
+            Field::new("item", DataType::LargeBinary, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    crate::NR_LOGICAL_TYPE_KEY.into(),
+                    tag.into(),
+                )]),
+            ),
         ))
     };
-    let plain = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+    let plain = DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true)));
     let json = retag("json");
     assert_ne!(plain, json);
     assert!(decimal_error_policy_cast_supported(

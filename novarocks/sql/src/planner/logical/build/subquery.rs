@@ -71,6 +71,11 @@ fn project_mark_key(
     else {
         return Err("JSON key normalization binding is not scalar".into());
     };
+    if value_type.data_type() != &arrow::datatypes::DataType::Binary
+        || value_type.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+    {
+        return Err("JSON key normalization binding must produce ordinary Binary".into());
+    }
     let value_type = value_type.clone();
     let column_id = factory.create(None, name.clone(), value_type.clone());
     let mut items = if preserve_input {

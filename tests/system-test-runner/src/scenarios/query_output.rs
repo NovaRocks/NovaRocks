@@ -18,11 +18,14 @@
 //! Public typed layout, strict single-statement admission and explicit effects.
 //! MySQL packet sequencing and negotiated batches have no Trino carrier.
 
-use crate::actors::sql::{self, SqlSession};
-use crate::actors::trino_protocol::TrinoClient;
+use super::connector::{create_catalog, create_warehouse, with_cleanup};
+use crate::actors::sql::{self, SqlSession, TrinoValue};
+use crate::actors::trino_protocol::{RawResponse, TrinoClient};
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::TestClusterOwner;
+use novarocks_result_contract::RootProfileV1;
+use serde_json::{Value, json};
 
 const TWO_ROW_QUERY: &str =
     "SELECT v FROM (SELECT CAST(1 AS BIGINT) AS v UNION ALL SELECT CAST(2 AS BIGINT)) t ORDER BY v";
@@ -76,29 +79,7 @@ impl Scenario for TypedLayout {
             r#"SELECT ROW(7 AS "id", CAST(NULL AS INTEGER), 9) AS payload,
                 MAP(ARRAY[MAP(ARRAY[2, 1], ARRAY['a"b', 'x=y,{z}'])], ARRAY[7]) AS keyed"#,
         )?;
-        let mut columns = None;
-        let mut rows = Vec::new();
-        for page in &pages {
-            let value = page.json()?;
-            ensure!(
-                page.status == 200 && value.get("error").is_none(),
-                "ROW/MAP result page failed: {value}"
-            );
-            if let Some(page_columns) = value.get("columns") {
-                if let Some(previous) = &columns {
-                    ensure!(
-                        previous == page_columns,
-                        "result metadata changed between pages"
-                    );
-                } else {
-                    columns = Some(page_columns.clone());
-                }
-            }
-            if let Some(data) = value.get("data").and_then(|data| data.as_array()) {
-                rows.extend(data.iter().cloned());
-            }
-        }
-        let columns = columns.context("ROW/MAP result omitted column metadata")?;
+        let (columns, rows) = read_typed_pages(&pages, "ROW/MAP")?;
         ensure!(
             columns[0]["type"] == "row(id integer, integer, integer)"
                 && columns[0]["typeSignature"]["rawType"] == "row"
@@ -111,23 +92,199 @@ impl Scenario for TypedLayout {
             "ROW field declarations changed: {columns}"
         );
         ensure!(
-            rows == [serde_json::json!([[7, null, 9], {"{2=a\"b, 1=x=y,{z}}": 7}])],
+            rows == [json!([[7, null, 9], {"{2=a\"b, 1=x=y,{z}}": 7}])],
             "ROW/MAP result changed its field positions or key text: {rows:?}"
         );
-        let terminal = pages
-            .last()
-            .context("ROW/MAP result omitted its terminal page")?;
-        ensure!(
-            terminal.next_uri()?.is_none() && terminal.json()?["stats"]["state"] == "FINISHED",
-            "ROW/MAP result did not reach its original terminal page"
-        );
         context.action("verified anonymous ROW declarations and MAP key text on raw Trino pages");
+        native_json_fixture(context, &mut session)?;
         let deadline = context.deadline();
         context
             .handle()
             .await_query_execution_resource_convergence(&baseline, deadline)?;
         Ok(())
     }
+}
+
+fn read_typed_pages(pages: &[RawResponse], label: &str) -> Result<(Value, Vec<Value>)> {
+    let mut columns = None;
+    let mut rows = Vec::new();
+    for page in pages {
+        let value = page.json()?;
+        ensure!(
+            page.status == 200 && value.get("error").is_none(),
+            "{label} result page failed (HTTP {}): {:?}",
+            page.status,
+            value.get("error")
+        );
+        if let Some(page_columns) = value.get("columns") {
+            if let Some(previous) = &columns {
+                ensure!(
+                    previous == page_columns,
+                    "{label} metadata changed between pages"
+                );
+            } else {
+                columns = Some(page_columns.clone());
+            }
+        }
+        if let Some(data) = value.get("data").and_then(Value::as_array) {
+            rows.extend(data.iter().cloned());
+        }
+    }
+    let terminal = pages
+        .last()
+        .with_context(|| format!("{label} omitted its terminal page"))?;
+    ensure!(
+        terminal.next_uri()?.is_none() && terminal.json()?["stats"]["state"] == "FINISHED",
+        "{label} did not reach its original terminal page"
+    );
+    Ok((
+        columns.with_context(|| format!("{label} omitted column metadata"))?,
+        rows,
+    ))
+}
+
+fn native_json_fixture(context: &mut ScenarioContext, session: &mut SqlSession) -> Result<()> {
+    const CATALOG: &str = "native_json_output";
+    let schema = format!("{CATALOG}.fixture");
+    let table = format!("{schema}.numbers");
+    let warehouse = create_warehouse(context, "native-json-output")?;
+    let result = (|| -> Result<()> {
+        create_catalog(session, CATALOG, &warehouse)?;
+        session.execute(format!("CREATE SCHEMA {schema}"))?;
+        session.execute(format!("CREATE TABLE {table} (n BIGINT NOT NULL)"))?;
+        // Each commit supplies an independent scan split to the live BE roster.
+        for n in 1..=9 {
+            sql::expect_update_count(
+                &session.execute(format!("INSERT INTO {table} VALUES (BIGINT '{n}')"))?,
+                1,
+            )?;
+        }
+        let counts = sql::integer_column(&session.execute(format!(
+            "SELECT record_count FROM {schema}.\"numbers$files\""
+        ))?)?;
+        ensure!(
+            counts == [1; 9],
+            "expected nine single-row JSON source files"
+        );
+        native_json_pages(context, session, &table)
+    })();
+    let cleanup = session
+        .execute(format!("DROP CATALOG IF EXISTS {CATALOG}"))
+        .map(|_| ())
+        .context("drop the native JSON fixture catalog");
+    with_cleanup(result, cleanup)
+}
+
+fn native_json_pages(
+    context: &mut ScenarioContext,
+    session: &mut SqlSession,
+    table: &str,
+) -> Result<()> {
+    // The document itself makes the row exceed a Native root segment.
+    let wide = RootProfileV1::SEGMENT_BYTES;
+    let sql = format!(
+        r#"WITH source AS (
+               SELECT n, n % 3 AS bucket,
+                      CASE n
+                          WHEN 1 THEN CAST(NULL AS JSON)
+                          WHEN 2 THEN JSON 'null'
+                          WHEN 3 THEN json_parse(concat(rpad('', 1024, '['), CAST(n AS VARCHAR), rpad('', 1024, ']')))
+                          WHEN 8 THEN CAST(rpad(CAST(n AS VARCHAR), {wide}, 'q') AS JSON)
+                          ELSE json_parse(concat('{{"b":', CAST(n AS VARCHAR), ',"a":1,"a":2}}'))
+                      END AS doc
+               FROM {table}
+           ), grouped AS (
+               SELECT bucket, array_agg(doc ORDER BY n) AS documents
+               FROM source GROUP BY bucket
+           )
+           SELECT bucket, documents[1] AS direct, documents AS nested
+           FROM grouped ORDER BY bucket"#
+    );
+    let root = context.scenario_root().join("native-json-http");
+    let client = TrinoClient::new(
+        context.trino_port(),
+        context.sql_user(),
+        context.deadline(),
+        &root,
+    )?;
+    let plan = session.execute(format!(
+        "EXPLAIN WITH SESSION explain_detail = 'CONTRACT' {sql}"
+    ))?;
+    let mut plan_text = String::new();
+    for row in &plan.rows {
+        let [TrinoValue::Text(line)] = row.as_slice() else {
+            anyhow::bail!("unexpected native JSON EXPLAIN row: {row:?}");
+        };
+        plan_text.push_str(line);
+        plan_text.push('\n');
+    }
+    std::fs::write(root.join("source-plan.txt"), &plan_text)?;
+    ensure!(
+        plan_text.contains("EDGE GRAPH"),
+        "native JSON source plan has no Exchange"
+    );
+    let before = native_json_exchange_metrics(context, &root, "before")?;
+    let pages = client.execute(&sql)?;
+    let after = native_json_exchange_metrics(context, &root, "after")?;
+    let (columns, rows) = read_typed_pages(&pages, "native JSON")?;
+    ensure!(
+        columns[1]["type"] == "json"
+            && columns[1]["typeSignature"] == json!({"rawType":"json", "arguments":[]})
+            && columns[2]["type"] == "array(json)"
+            && columns[2]["typeSignature"]["arguments"][0]
+                == json!({"kind":"TYPE", "value":{"rawType":"json", "arguments":[]}}),
+        "unexpected native JSON column declarations: {columns}"
+    );
+    let object = |n| format!(r#"{{"b":{n},"a":1,"a":2}}"#);
+    let depth = format!("{}3{}", "[".repeat(1024), "]".repeat(1024));
+    let large_document = format!("\"8{}\"", "q".repeat(wide - 1));
+    let expected = [
+        json!([0, depth, [depth, object(6), object(9)]]),
+        json!([1, null, [null, object(4), object(7)]]),
+        json!([2, "null", ["null", object(5), large_document]]),
+    ];
+    ensure!(
+        rows == expected,
+        "native JSON values differ across direct and aggregate array fields (expected three ordered buckets)"
+    );
+    let senders = before
+        .iter()
+        .zip(&after)
+        .filter(|(before, after)| after.0 > before.0 && after.1 > before.1)
+        .count();
+    ensure!(
+        senders >= 2,
+        "native JSON query lacks observed distributed Task and exchange receipts: {before:?} -> {after:?}"
+    );
+    context.action("verified native JSON text, SQL NULL and JSON null through actual distributed Tasks and exchange");
+    Ok(())
+}
+
+fn native_json_exchange_metrics(
+    context: &mut ScenarioContext,
+    root: &std::path::Path,
+    phase: &str,
+) -> Result<Vec<(f64, u64)>> {
+    let handle = context.handle();
+    (0..handle.be_count())
+        .map(|index| {
+            let text = handle.backend_prometheus_text(index)?;
+            std::fs::write(root.join(format!("be-{index}-{phase}.prom")), &text)?;
+            let mut samples = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("novarocks_exchange_shuffle_bytes_total "));
+            let bytes = samples
+                .next()
+                .context("BE exchange bytes metric missing")?
+                .parse()?;
+            ensure!(
+                samples.next().is_none(),
+                "duplicate BE exchange bytes metric"
+            );
+            let tasks = handle.backend_task_execution_tasks_created(index)?;
+            Ok((tasks, bytes))
+        })
+        .collect()
 }
 
 impl Scenario for SingleStatementEffects {

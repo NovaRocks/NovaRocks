@@ -173,7 +173,7 @@ fn nested(child_nullable: bool, json: bool, dictionary_id: i64, annotation: &str
                 if json {
                     ValueKind::Nominal(ValueLogicalType::Json)
                 } else {
-                    ValueKind::String
+                    ValueKind::Binary
                 },
                 true,
                 storage.clone(),
@@ -196,7 +196,7 @@ fn nested(child_nullable: bool, json: bool, dictionary_id: i64, annotation: &str
                 "provider.annotation".into(),
                 annotation.into(),
             )])),
-            Field::new("payload", DataType::Utf8, true),
+            Field::new("payload", DataType::LargeBinary, true),
         ]
         .into(),
     );
@@ -257,12 +257,12 @@ fn static_comparisons_keep_nullsafe_domains_and_type_only_checks() {
                 for (left, right) in [
                     (
                         ValueType::try_with_logical_type(
-                            DataType::Utf8,
+                            DataType::LargeBinary,
                             false,
                             ValueLogicalType::Json,
                         )
                         .unwrap(),
-                        ValueType::new(DataType::Utf8, false),
+                        ValueType::new(DataType::LargeBinary, false),
                     ),
                     (
                         ValueType::try_with_logical_type(
@@ -426,8 +426,12 @@ fn static_unary_null_predicates_preserve_value_demand_and_reject_narrowing() {
                 for input in [
                     boolean(true),
                     integer(true),
-                    ValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                        .unwrap(),
+                    ValueType::try_with_logical_type(
+                        DataType::LargeBinary,
+                        false,
+                        ValueLogicalType::Json,
+                    )
+                    .unwrap(),
                 ] {
                     let (unit, definition) = run(input.clone(), boolean(false)).unwrap();
                     assert_eq!(unit.definition(definition).unwrap().ty, boolean(false));
@@ -465,8 +469,12 @@ fn static_unary_null_predicates_preserve_value_demand_and_reject_narrowing() {
             type_error(run(boolean(true), boolean(false)), "unary expression types");
             for unsupported in [
                 ValueType::new(DataType::Utf8, false),
-                ValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                    .unwrap(),
+                ValueType::try_with_logical_type(
+                    DataType::LargeBinary,
+                    false,
+                    ValueLogicalType::Json,
+                )
+                .unwrap(),
             ] {
                 type_error(run(unsupported, boolean(false)), "unary expression types");
             }
@@ -555,7 +563,7 @@ fn cast_json_list_type(child_nullable: bool, root_nullable: bool) -> ValueType {
     let layout = ValueLayout::try_new(
         &DataType::List(Arc::new(Field::new(
             "declared-item",
-            DataType::Utf8,
+            DataType::LargeBinary,
             child_nullable,
         ))),
         storage,
@@ -701,59 +709,71 @@ fn null_list_json_cast_checks_live_and_unused_definitions_and_full_types() {
 }
 
 #[test]
-fn checked_nonempty_utf8_constant_cannot_gain_json_identity_in_live_or_unused_cast() {
+fn checked_nonempty_list_constant_cannot_gain_json_identity_in_live_or_unused_cast() {
     use arrow_array::{
-        Array,
-        builder::{ListBuilder, StringBuilder},
+        Array, ArrayRef,
+        builder::{LargeBinaryBuilder, ListBuilder, StringBuilder},
     };
     use novarocks_constant_contract::{
         ConstantPool, ConstantPoolId, ConstantPools, ConstantReference,
     };
-    let mut builder = ListBuilder::new(StringBuilder::new()).with_field(Arc::new(Field::new(
+    let mut utf8 = ListBuilder::new(StringBuilder::new()).with_field(Arc::new(Field::new(
         "declared-item",
         DataType::Utf8,
         true,
     )));
-    builder.values().append_value("original nonempty UTF8");
-    builder.append(true);
-    let array = builder.finish();
-    let source = ValueType::new(array.data_type().clone(), false);
+    utf8.values().append_value("original nonempty UTF8");
+    utf8.append(true);
+    let mut binary = ListBuilder::new(LargeBinaryBuilder::new()).with_field(Arc::new(Field::new(
+        "declared-item",
+        DataType::LargeBinary,
+        true,
+    )));
+    binary.values().append_value(b"\x01\x20");
+    binary.append(true);
     let target = cast_json_list_type(true, true);
-    assert_eq!(source.data_type(), target.data_type());
-    let control = Control::good();
-    let pool = ConstantPool::try_new(
-        Arc::new(Field::new(
-            "original_utf8_list",
-            array.data_type().clone(),
-            false,
-        )),
-        source.clone(),
-        array.to_data(),
-        policy(),
-        CompilePhase::Validate,
-        &control,
-    )
-    .unwrap();
-    let reference = ConstantReference {
-        pool: ConstantPoolId::new(4),
-        ordinal: 0,
-    };
-    let mut pools = ConstantPools::empty();
-    pools.insert(reference.pool, pool).unwrap();
-    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
-    let original = pools.resolve_source_observed(reference, &mut work).unwrap();
-    assert_eq!(original.value_type(), &source);
-    work.finish().unwrap();
-    for unused in [false, true] {
-        type_error(
-            checked_array_cast(
-                original.value_type().clone(),
-                target.clone(),
-                ExprKind::Constant(reference),
-                TrinoCastMode::Implicit,
-                unused,
-            ),
-            "carrier CAST cannot establish or erase a logical identity",
-        );
+    let arrays: [(ArrayRef, bool); 2] = [
+        (Arc::new(utf8.finish()), false),
+        (Arc::new(binary.finish()), true),
+    ];
+    for (array, same_carrier) in arrays {
+        let source = ValueType::new(array.data_type().clone(), false);
+        assert_eq!(source.data_type() == target.data_type(), same_carrier);
+        let control = Control::good();
+        let pool = ConstantPool::try_new(
+            Arc::new(Field::new(
+                "original_list",
+                array.data_type().clone(),
+                false,
+            )),
+            source.clone(),
+            array.to_data(),
+            policy(),
+            CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let reference = ConstantReference {
+            pool: ConstantPoolId::new(4),
+            ordinal: 0,
+        };
+        let mut pools = ConstantPools::empty();
+        pools.insert(reference.pool, pool).unwrap();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let original = pools.resolve_source_observed(reference, &mut work).unwrap();
+        assert_eq!(original.value_type(), &source);
+        work.finish().unwrap();
+        for unused in [false, true] {
+            type_error(
+                checked_array_cast(
+                    original.value_type().clone(),
+                    target.clone(),
+                    ExprKind::Constant(reference),
+                    TrinoCastMode::Implicit,
+                    unused,
+                ),
+                "carrier CAST cannot establish or erase a logical identity",
+            );
+        }
     }
 }

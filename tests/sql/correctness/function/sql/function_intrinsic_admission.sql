@@ -17,7 +17,7 @@
 
 -- Independent admission and authoritative lowering controls; no storage dependency.
 -- query 1
-SELECT lower('A') AS lowercase, parse_json('{') IS NULL AS caught_parse;
+SELECT lower('A') AS lowercase, TRY(json_parse('{')) IS NULL AS caught_parse;
 
 -- query 2
 SELECT every(TRUE) AS all_true, max_by(1,2) AS winning_value;
@@ -74,6 +74,24 @@ FROM (VALUES (CAST(NULL AS SMALLINT), 0), (SMALLINT '7', 0)) AS t(x, divisor);
 SELECT NULLIF(ARRAY[1, NULL], ARRAY[BIGINT '1', NULL]) AS result;
 
 -- query 16
+SELECT typeof(JSON_OBJECT('k' VALUE 1)) AS default_json_type,
+       typeof(JSON_OBJECT('k' VALUE 1 RETURNING JSON)) AS native_json_type,
+       JSON_ARRAY(1, CAST(NULL AS BIGINT)) AS array_text,
+       JSON_OBJECT('k' VALUE CAST(NULL AS BIGINT)) AS object_text;
+
+-- query 17
+SELECT JSON_SERIALIZE(JSON '"abc"' RETURNING VARCHAR(3)) AS shortened,
+       to_hex(JSON_SERIALIZE(JSON '1' RETURNING VARBINARY FORMAT JSON ENCODING UTF16)) AS encoded;
+
+-- query 18
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT JSON_OBJECT('k' VALUE JSON '{"a":1,"a":2}' WITH UNIQUE KEYS);
+
+-- query 19
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT parse_json('1');
+
+-- query 20
 -- A malformed predicate body is rejected before row pruning.
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT map_filter(map(ARRAY[1], ARRAY[10]), (k, v) -> NULL) WHERE FALSE;

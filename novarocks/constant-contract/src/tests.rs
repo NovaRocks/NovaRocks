@@ -424,16 +424,16 @@ fn compact_nested_null_does_not_expand_the_validation_or_equality_walk() {
 #[test]
 fn scalar_factories_do_not_guess_json_or_decimal_precision() {
     let ty = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         false,
         novarocks_type_contract::ValueLogicalType::Json,
     )
     .unwrap();
-    let field = Arc::new(Field::new("literal", DataType::Utf8, false));
-    let json = ConstantValue::from_utf8(
+    let field = Arc::new(Field::new("literal", DataType::LargeBinary, false));
+    let json = ConstantValue::from_binary(
         field,
         ty,
-        "{}",
+        b"\x01\x20",
         policy(),
         CompilePhase::Validate,
         &Control::good(),
@@ -443,7 +443,7 @@ fn scalar_factories_do_not_guess_json_or_decimal_precision() {
         json.value_type().logical_type(),
         novarocks_type_contract::ValueLogicalType::Json
     );
-    assert_eq!(json.try_utf8().unwrap(), Some("{}"));
+    assert_eq!(json.try_binary().unwrap(), Some(b"\x01\x20".as_slice()));
     let ty = FunctionValueType::new(DataType::Decimal128(2, 0), false);
     let field = Arc::new(Field::new("literal", ty.data_type().clone(), false));
     let error = ConstantValue::from_decimal128(

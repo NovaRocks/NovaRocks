@@ -18,12 +18,12 @@
 //! Actual host-owned ARRAY graphs, constructor refusal and failed-state latch.
 use super::*;
 
-use arrow_array::StringArray;
+use arrow_array::{LargeBinaryArray, StringArray};
 
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
     EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
-    SemanticParameters,
+    SemanticParameters, ValueKind, ValueLayout, ValueTypeStorageLifetime,
 };
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
 struct Compile;
@@ -303,11 +303,47 @@ fn assert_failed(kernel: &ArrayKernel, state: &ArrayState) {
 }
 #[test]
 fn array_actual_owner_all_four_phases_keep_original_nested_state_codec() {
-    for name in ["array_agg", "array_agg_distinct"] {
-        let single = kernel(name, AggregateKernelPhase::Single);
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let jsons: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(Field::new("item", DataType::LargeBinary, true)),
+        OffsetBuffer::new(vec![0_i32, 3].into()),
+        Arc::new(LargeBinaryArray::from(vec![
+            Some(&[0x01, 0x20][..]),
+            None,
+            Some(&[0x01, 0x44, 0x01, b'x'][..]),
+        ])),
+        None,
+    ));
+    let storage = ValueTypeStorageLifetime::pure();
+    let json_list = FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(
+            ValueKind::List(json.value_type().clone()),
+            false,
+            storage.clone(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(jsons.data_type(), storage).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        json_list.child_at(0).unwrap().logical_type(),
+        ValueLogicalType::Json
+    );
+    for (name, source, values) in [
+        ("array_agg", source_type(), nested()),
+        ("array_agg_distinct", source_type(), nested()),
+        ("array_agg", json_list, jsons),
+    ] {
+        let kernel = |phase| kernel_source(name, source.clone(), phase, true).unwrap();
+        let single = kernel(AggregateKernelPhase::Single);
         let host = Arc::new(Host::default());
         let mut original = new_state(&single, host.clone());
-        update(&single, &mut original, &nested(), &Control::default()).unwrap();
+        update(&single, &mut original, &values, &Control::default()).unwrap();
         assert_eq!(
             single.retained_bytes(&original),
             host.ledger.lock().unwrap().bytes
@@ -315,18 +351,20 @@ fn array_actual_owner_all_four_phases_keep_original_nested_state_codec() {
         let expected = single
             .build_final(std::iter::once(&original), &Control::default())
             .unwrap();
-        let partial = kernel(name, AggregateKernelPhase::Partial);
+        let expected = expected.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(expected.values().to_data(), values.to_data());
+        let partial = kernel(AggregateKernelPhase::Partial);
         let wire = partial
             .build_intermediate(std::iter::once(&original), &Control::default())
             .unwrap();
-        let middle = kernel(name, AggregateKernelPhase::Intermediate);
+        let middle = kernel(AggregateKernelPhase::Intermediate);
         let mut state = new_state(&middle, host.clone());
         merge(&middle, &mut state, &wire, &Control::default()).unwrap();
         let again = middle
             .build_intermediate(std::iter::once(&state), &Control::default())
             .unwrap();
         assert_eq!(wire.to_data(), again.to_data());
-        let last = kernel(name, AggregateKernelPhase::Final);
+        let last = kernel(AggregateKernelPhase::Final);
         let mut final_state = new_state(&last, host.clone());
         merge(&last, &mut final_state, &again, &Control::default()).unwrap();
         let actual = last

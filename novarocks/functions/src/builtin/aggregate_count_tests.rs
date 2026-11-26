@@ -421,7 +421,7 @@ fn installed_count_dictionary_uses_explicit_typed_source_and_selected_logical_nu
         "other exact call token must be refused"
     );
     let wrong = FunctionValueType::try_with_logical_type(
-        arrow_schema::DataType::Utf8,
+        arrow_schema::DataType::LargeBinary,
         true,
         ValueLogicalType::Json,
     )

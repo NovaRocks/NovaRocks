@@ -80,33 +80,43 @@ fn is_parse(result: Result<Option<String>, LeafError>) {
 
 #[test]
 fn json_leaf_profile_requires_authored_domains_and_successful_null_declarations() {
+    use super::super::{CastPrepareError, PreparedCastRecipe};
+    use novarocks_type_contract::TrinoCastMode;
     let json = |nullable| {
-        FunctionValueType::try_with_logical_type(DataType::Utf8, nullable, ValueLogicalType::Json)
-            .unwrap()
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            nullable,
+            ValueLogicalType::Json,
+        )
+        .unwrap()
     };
     let text = |nullable| FunctionValueType::new(DataType::Utf8, nullable);
-    assert_eq!(
-        profile(&json(false), &text(true)),
-        Some(Operation::JsonToVarchar)
-    );
-    assert_eq!(
-        profile(&json(false), &text(false)),
-        None,
-        "JSON null succeeds as SQL NULL"
-    );
-    assert_eq!(
-        profile(&text(false), &json(false)),
-        Some(Operation::VarcharToJson)
-    );
-    assert_eq!(profile(&text(true), &json(false)), None);
-    assert_eq!(profile(&text(true), &text(true)), None);
-    assert_eq!(profile(&json(true), &json(true)), None);
-    assert_eq!(
-        profile(
+    let prepare = |source: &FunctionValueType, target: &FunctionValueType| {
+        PreparedCastRecipe::try_new_trino(
+            source,
+            target,
+            TrinoCastMode::Explicit,
+            crate::binding_test_control(),
+        )
+    };
+    assert!(prepare(&json(false), &text(true)).is_ok());
+    assert!(matches!(
+        prepare(&json(false), &text(false)),
+        Err(CastPrepareError::TypeMismatch)
+    ));
+    assert!(prepare(&text(false), &json(false)).is_ok());
+    assert!(matches!(
+        prepare(&text(true), &json(false)),
+        Err(CastPrepareError::TypeMismatch)
+    ));
+    assert!(prepare(&text(true), &text(true)).unwrap().is_identity());
+    assert!(prepare(&json(true), &json(true)).unwrap().is_identity());
+    assert!(
+        prepare(
             &FunctionValueType::new(DataType::Binary, false),
             &json(true)
-        ),
-        None
+        )
+        .is_err()
     );
 }
 
@@ -393,10 +403,10 @@ fn every_observation_refusal_keeps_original_outer_source_without_a_later_footer(
     }
 }
 
-impl PureCompileControl for Control {
+impl novarocks_type_contract::PureCompileControl for Control {
     fn checkpoint(
         &self,
-        _phase: CompilePhase,
+        _phase: novarocks_type_contract::CompilePhase,
         _units: u32,
     ) -> Result<(), novarocks_type_contract::CompileControlError> {
         Ok(())
@@ -413,17 +423,33 @@ fn selected_json_structure_body(
 
     let control = Control::default();
     let len = inputs.len();
-    let input: arrow_array::ArrayRef = Arc::new(arrow_array::StringArray::from(inputs));
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let host: Arc<dyn crate::AggregateStateAllocator> =
+        Arc::new(crate::source_custody_direct_tests::Host::default());
+    let charge = crate::opaque_memory::OpaqueRetainedCharge::try_new(Arc::clone(&host)).unwrap();
+    let mut checkpoints = EvaluationCheckpoints::new(&control);
+    let input: arrow_array::ArrayRef = Arc::new(arrow_array::LargeBinaryArray::from_iter(
+        inputs.into_iter().map(|value| {
+            value.map(|text| {
+                let mut work =
+                    crate::builtin::json_sql_selected::RowWork::new(&mut checkpoints, &charge);
+                crate::json_value::parse(text, &mut work).unwrap()
+            })
+        }),
+    ));
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let recipe = PreparedCastRecipe::try_new_trino(&json, target, mode, &control).unwrap();
     let selected = recipe
-        .evaluate_selected(
+        .evaluate_selected_scoped(
             EvaluatedArgument::Column(&input),
             Selection::all(len),
             &[],
             &control,
+            Some(&host),
         )
         .unwrap();
     (Arc::clone(selected.values()), selected.errors().into())
@@ -474,12 +500,15 @@ fn json_structure_array_cast_preserves_neighbor_rows_and_wraps_the_conversion_er
 #[test]
 fn json_structure_row_cast_preserves_members_and_distinguishes_json_null() {
     use crate::builtin::signature::declared_struct;
-    use arrow_array::{Array, Int32Array, StringArray, StructArray};
+    use arrow_array::{Array, Int32Array, LargeBinaryArray, StructArray};
     use novarocks_type_contract::TrinoCastMode;
 
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let target = declared_struct(
         vec![
             ("a".into(), FunctionValueType::new(DataType::Int32, true)),
@@ -515,11 +544,27 @@ fn json_structure_row_cast_preserves_members_and_distinguishes_json_null() {
     let payloads = result
         .column(1)
         .as_any()
-        .downcast_ref::<StringArray>()
+        .downcast_ref::<LargeBinaryArray>()
         .unwrap();
     assert_eq!(integers.values()[..3], [7, 8, 9]);
-    assert_eq!(payloads.value(0), "null");
-    assert_eq!(payloads.value(1), r#"{"key":1,"key":2}"#);
+    assert!(matches!(
+        crate::json_value::Node::from_root(payloads.value(0))
+            .unwrap()
+            .kind()
+            .unwrap(),
+        crate::json_value::Kind::Null
+    ));
+    let item = crate::json_value::Node::from_root(payloads.value(1)).unwrap();
+    let crate::json_value::Kind::Object(members) = item.kind().unwrap() else {
+        panic!("expected copied JSON object")
+    };
+    assert_eq!(members.len(), 2);
+    for (entry, value) in members.entries().zip([1, 2]) {
+        let entry = entry.unwrap();
+        assert_eq!(entry.key, Some("key"));
+        assert!(matches!(entry.value.kind().unwrap(),
+            crate::json_value::Kind::Scalar(crate::json_value::Scalar::Integer(actual)) if actual == value));
+    }
     assert!(payloads.is_null(2));
     assert!(result.is_null(3));
     assert!(result.is_null(4));
@@ -560,9 +605,12 @@ fn json_structure_check_map_keys_after_conversion_and_reject_unsupported_leaf_ty
     assert!(result.is_null(1));
     assert_eq!(result.value_length(2), 0);
 
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let date_array = declared_list(&FunctionValueType::new(DataType::Date32, true), true).unwrap();
     assert_eq!(
         PreparedCastRecipe::try_new_trino(

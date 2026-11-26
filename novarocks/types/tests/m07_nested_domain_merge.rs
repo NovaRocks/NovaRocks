@@ -83,28 +83,37 @@ fn assert_domain(field: &Field, expected: Option<LogicalType>) {
 
 #[test]
 fn list_same_json_domain_survives_nullability_merge() {
-    let left = list(logical("item", DataType::Utf8, false, LogicalType::Json));
-    let right = list(logical("item", DataType::Utf8, true, LogicalType::Json));
+    let left = list(logical(
+        "item",
+        DataType::LargeBinary,
+        false,
+        LogicalType::Json,
+    ));
+    let right = list(logical(
+        "item",
+        DataType::LargeBinary,
+        true,
+        LogicalType::Json,
+    ));
     for merged in [wider_type(&left, &right), wider_type(&right, &left)] {
-        assert_eq!(item(&merged).data_type(), &DataType::Utf8);
+        assert_eq!(item(&merged).data_type(), &DataType::LargeBinary);
         assert!(item(&merged).is_nullable());
         assert_domain(item(&merged), Some(LogicalType::Json));
     }
 }
 
 #[test]
-fn json_domain_survives_supported_string_storage_coercion() {
-    let wide = list(logical(
+fn legacy_text_carriers_cannot_author_json_during_merge() {
+    let old = list(logical("item", DataType::Utf8, false, LogicalType::Json));
+    let native = list(logical(
         "item",
-        DataType::LargeUtf8,
-        false,
+        DataType::LargeBinary,
+        true,
         LogicalType::Json,
     ));
-    let narrow = list(logical("item", DataType::Utf8, true, LogicalType::Json));
-    for merged in [wider_type(&wide, &narrow), wider_type(&narrow, &wide)] {
-        assert_eq!(item(&merged).data_type(), &DataType::Utf8);
+    for merged in [wider_type(&old, &native), wider_type(&native, &old)] {
         assert!(item(&merged).is_nullable());
-        assert_domain(item(&merged), Some(LogicalType::Json));
+        assert_eq!(item(&merged).metadata()[NR_LOGICAL_TYPE_KEY], "invalid");
     }
 }
 
@@ -136,7 +145,7 @@ fn physical_null_is_neutral_in_either_operand_order() {
         )]),
     ));
     for (storage, domain) in [
-        (DataType::Utf8, LogicalType::Json),
+        (DataType::LargeBinary, LogicalType::Json),
         (DataType::Binary, LogicalType::Bitmap),
     ] {
         let value = list(logical("item", storage.clone(), false, domain));
@@ -149,13 +158,18 @@ fn physical_null_is_neutral_in_either_operand_order() {
 }
 
 #[test]
-fn json_and_plain_string_do_not_manufacture_a_json_domain() {
-    let json = list(logical("item", DataType::Utf8, false, LogicalType::Json));
-    let plain = list(Field::new("item", DataType::Utf8, true));
+fn json_and_plain_binary_do_not_erase_a_json_domain() {
+    let json = list(logical(
+        "item",
+        DataType::LargeBinary,
+        false,
+        LogicalType::Json,
+    ));
+    let plain = list(Field::new("item", DataType::LargeBinary, true));
     for merged in [wider_type(&json, &plain), wider_type(&plain, &json)] {
-        assert_eq!(item(&merged).data_type(), &DataType::Utf8);
+        assert_eq!(item(&merged).data_type(), &DataType::LargeBinary);
         assert!(item(&merged).is_nullable());
-        assert_domain(item(&merged), None);
+        assert_eq!(item(&merged).metadata()[NR_LOGICAL_TYPE_KEY], "invalid");
     }
     let hll = list(logical("item", DataType::Binary, false, LogicalType::Hll));
     let bitmap = list(logical("item", DataType::Binary, true, LogicalType::Bitmap));
@@ -169,7 +183,7 @@ fn struct_name_alignment_preserves_reordered_domains_and_left_order() {
         vec![
             Arc::new(logical(
                 "document",
-                DataType::Utf8,
+                DataType::LargeBinary,
                 false,
                 LogicalType::Json,
             )),
@@ -203,7 +217,7 @@ fn struct_positional_merge_preserves_left_names_and_exact_domains() {
         vec![
             Arc::new(logical(
                 "left_json",
-                DataType::Utf8,
+                DataType::LargeBinary,
                 false,
                 LogicalType::Json,
             )),
@@ -220,7 +234,7 @@ fn struct_positional_merge_preserves_left_names_and_exact_domains() {
         vec![
             Arc::new(logical(
                 "right_json",
-                DataType::Utf8,
+                DataType::LargeBinary,
                 true,
                 LogicalType::Json,
             )),
@@ -246,7 +260,7 @@ fn map_key_and_value_merge_domains_independently_without_changing_flags() {
         true,
     );
     let right = map(
-        logical("new_key", DataType::Utf8, false, LogicalType::Json),
+        logical("new_key", DataType::LargeBinary, false, LogicalType::Json),
         logical("new_value", DataType::Binary, true, LogicalType::Object),
         false,
         false,
@@ -255,7 +269,7 @@ fn map_key_and_value_merge_domains_independently_without_changing_flags() {
     let actual = map_fields(&merged);
     assert_eq!(actual[0].name(), "key");
     assert_eq!(actual[1].name(), "value");
-    assert_eq!(actual[0].data_type(), &DataType::Utf8);
+    assert_eq!(actual[0].data_type(), &DataType::LargeBinary);
     assert!(!actual[0].is_nullable());
     assert!(actual[1].is_nullable());
     assert_domain(&actual[0], Some(LogicalType::Json));
@@ -265,13 +279,13 @@ fn map_key_and_value_merge_domains_independently_without_changing_flags() {
 #[test]
 fn map_conflicting_value_does_not_clear_the_unrelated_key_domain() {
     let left = map(
-        logical("key", DataType::Utf8, false, LogicalType::Json),
+        logical("key", DataType::LargeBinary, false, LogicalType::Json),
         logical("value", DataType::Binary, false, LogicalType::Hll),
         false,
         false,
     );
     let right = map(
-        logical("key", DataType::Utf8, true, LogicalType::Json),
+        logical("key", DataType::LargeBinary, true, LogicalType::Json),
         logical("value", DataType::Binary, true, LogicalType::Bitmap),
         false,
         true,
@@ -292,7 +306,7 @@ fn recursive_list_struct_map_keeps_only_the_surviving_leaf_domain() {
                     "nested",
                     map(
                         Field::new("key", DataType::Int32, false),
-                        logical("value", DataType::Utf8, nullable, LogicalType::Json),
+                        logical("value", DataType::LargeBinary, nullable, LogicalType::Json),
                         false,
                         false,
                     ),
@@ -317,7 +331,7 @@ fn recursive_list_struct_map_keeps_only_the_surviving_leaf_domain() {
 
 #[test]
 fn rebuilt_fields_drop_provider_decoration_but_equal_type_fast_path_is_unchanged() {
-    let decorated = logical("item", DataType::Utf8, false, LogicalType::Json).with_metadata(
+    let decorated = logical("item", DataType::LargeBinary, false, LogicalType::Json).with_metadata(
         std::collections::HashMap::<String, String>::from([
             (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
             ("PARQUET:field_id".to_owned(), "71".to_owned()),
@@ -329,7 +343,12 @@ fn rebuilt_fields_drop_provider_decoration_but_equal_type_fast_path_is_unchanged
         item(&wider_type(&left, &left)).metadata()["PARQUET:field_id"],
         "71"
     );
-    let right = list(logical("item", DataType::Utf8, true, LogicalType::Json));
+    let right = list(logical(
+        "item",
+        DataType::LargeBinary,
+        true,
+        LogicalType::Json,
+    ));
     assert_domain(item(&wider_type(&left, &right)), Some(LogicalType::Json));
     assert_domain(
         item(&undecorated_nested_type(&left)),
@@ -348,24 +367,34 @@ fn rebuilt_fields_drop_provider_decoration_but_equal_type_fast_path_is_unchanged
 
 #[test]
 fn recognized_markers_use_existing_normalization_but_invalid_storage_is_not_propagated() {
-    let canonical = list(logical("item", DataType::Utf8, false, LogicalType::Json));
-    let normalized = list(Field::new("item", DataType::Utf8, true).with_metadata(
-        std::collections::HashMap::<String, String>::from([(
+    let canonical = list(logical(
+        "item",
+        DataType::LargeBinary,
+        false,
+        LogicalType::Json,
+    ));
+    let normalized = list(
+        Field::new("item", DataType::LargeBinary, true).with_metadata(std::collections::HashMap::<
+            String,
+            String,
+        >::from([(
             NR_LOGICAL_TYPE_KEY.to_owned(),
             " JSON ".to_owned(),
-        )]),
-    ));
+        )])),
+    );
     assert_domain(
         item(&wider_type(&canonical, &normalized)),
         Some(LogicalType::Json),
     );
-    for marker in ["unknown", "hll"] {
-        let invalid = list(Field::new("item", DataType::Utf8, true).with_metadata(
-            std::collections::HashMap::<String, String>::from([(
-                NR_LOGICAL_TYPE_KEY.to_owned(),
-                marker.to_owned(),
-            )]),
-        ));
+    for marker in ["unknown", "uuid"] {
+        let invalid = list(
+            Field::new("item", DataType::LargeBinary, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    NR_LOGICAL_TYPE_KEY.to_owned(),
+                    marker.to_owned(),
+                )]),
+            ),
+        );
         let widened = wider_type(&canonical, &invalid);
         assert_eq!(item(&widened).metadata()[NR_LOGICAL_TYPE_KEY], "invalid");
     }

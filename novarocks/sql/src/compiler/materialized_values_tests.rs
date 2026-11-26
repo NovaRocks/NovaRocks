@@ -106,15 +106,19 @@ fn expression_loan_matches_only_the_actual_owned_occurrence() {
 fn actual_analyzer_preserves_encoded_json_null_and_original_sql_null() {
     let control = SqlCompileControl::unbounded();
     let policy = crate::constant::test_constant_policy();
-    use arrow::array::{Array, StringArray};
+    use arrow::array::{Array, LargeBinaryArray};
     use arrow::datatypes::{DataType, Field};
     use novarocks_type_contract::TrinoCastMode;
 
     let value = ConstantValue::from_scalar_array(
-        Arc::new(Field::new("json", DataType::Utf8, false)),
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap(),
-        StringArray::from(vec!["null"]).to_data(),
+        Arc::new(Field::new("json", DataType::LargeBinary, false)),
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
+        LargeBinaryArray::from(vec![b"\x01\x20".as_slice()]).to_data(),
         policy,
         CompilePhase::Validate,
         &control,
@@ -144,7 +148,7 @@ fn actual_analyzer_preserves_encoded_json_null_and_original_sql_null() {
         panic!("checked constant")
     };
     assert_eq!(value.pool().backing_identity(), identity);
-    assert_eq!(value.try_utf8().unwrap(), Some("null"));
+    assert_eq!(value.try_binary().unwrap(), Some(b"\x01\x20".as_slice()));
     assert_eq!(
         values.rows[0][1].value_type.logical_type(),
         ValueLogicalType::Json

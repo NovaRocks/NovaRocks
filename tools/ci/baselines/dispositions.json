@@ -162,16 +162,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:complex-type/json_list_semantic_schema",
-      "failure": {
-        "class": "error_code",
-        "code": "query.execution.unsupported"
-      },
-      "reason": "Unsupported compiled cast from: List(Field { data_type: Null, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification Native b722 and TST-G9b1 c30 both refuse unchanged step 4; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:cte/cte_multi_alias",
       "failure": {
         "class": "error_code",

@@ -41,24 +41,24 @@ grep -E '^IRU9_(EMPTY_INT_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
 -- Numeric narrowing (1.5) truncates per Spark CAST semantics
 -- (IV3-6 cast-semantics decision 2026-06-11).
 WITH source_values AS (
-  SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
-  UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
-  UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
-  UNION ALL SELECT 4, parse_json('{"a":1.5}')
+  SELECT 1 AS id, json_parse('{"a":1,"b":"x"}') AS v
+  UNION ALL SELECT 2, json_parse('{"a":99,"b":"y"}')
+  UNION ALL SELECT 3, json_parse('{"b":"no-a"}')
+  UNION ALL SELECT 4, json_parse('{"a":1.5}')
   UNION ALL SELECT 5, NULL
-  UNION ALL SELECT 6, parse_json('{"a":"abc"}')
+  UNION ALL SELECT 6, json_parse('{"a":"abc"}')
 )
 SELECT id, try_variant_get(v, '$.a', 'bigint') FROM source_values ORDER BY id;
 
 -- query 4
 -- strict extraction; row 4 truncates (1.5 -> 1), not an error.
 WITH source_values AS (
-  SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
-  UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
-  UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
-  UNION ALL SELECT 4, parse_json('{"a":1.5}')
+  SELECT 1 AS id, json_parse('{"a":1,"b":"x"}') AS v
+  UNION ALL SELECT 2, json_parse('{"a":99,"b":"y"}')
+  UNION ALL SELECT 3, json_parse('{"b":"no-a"}')
+  UNION ALL SELECT 4, json_parse('{"a":1.5}')
   UNION ALL SELECT 5, NULL
-  UNION ALL SELECT 6, parse_json('{"a":"abc"}')
+  UNION ALL SELECT 6, json_parse('{"a":"abc"}')
 )
 SELECT id, variant_get(v, '$.a', 'bigint') FROM source_values WHERE id <= 4 ORDER BY id;
 
@@ -66,24 +66,24 @@ SELECT id, variant_get(v, '$.a', 'bigint') FROM source_values WHERE id <= 4 ORDE
 -- strict extraction over a genuinely unconvertible row must fail.
 -- @expect_error=cast
 WITH source_values AS (
-  SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
-  UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
-  UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
-  UNION ALL SELECT 4, parse_json('{"a":1.5}')
+  SELECT 1 AS id, json_parse('{"a":1,"b":"x"}') AS v
+  UNION ALL SELECT 2, json_parse('{"a":99,"b":"y"}')
+  UNION ALL SELECT 3, json_parse('{"b":"no-a"}')
+  UNION ALL SELECT 4, json_parse('{"a":1.5}')
   UNION ALL SELECT 5, NULL
-  UNION ALL SELECT 6, parse_json('{"a":"abc"}')
+  UNION ALL SELECT 6, json_parse('{"a":"abc"}')
 )
 SELECT variant_get(v, '$.a', 'bigint') FROM source_values WHERE id = 6;
 
 -- query 6
 -- WHERE usage through the PR-4 pushdown target shape.
 WITH source_values AS (
-  SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
-  UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
-  UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
-  UNION ALL SELECT 4, parse_json('{"a":1.5}')
+  SELECT 1 AS id, json_parse('{"a":1,"b":"x"}') AS v
+  UNION ALL SELECT 2, json_parse('{"a":99,"b":"y"}')
+  UNION ALL SELECT 3, json_parse('{"b":"no-a"}')
+  UNION ALL SELECT 4, json_parse('{"a":1.5}')
   UNION ALL SELECT 5, NULL
-  UNION ALL SELECT 6, parse_json('{"a":"abc"}')
+  UNION ALL SELECT 6, json_parse('{"a":"abc"}')
 )
 SELECT id FROM source_values WHERE try_variant_get(v, '$.a', 'bigint') = 99 ORDER BY id;
 
@@ -93,12 +93,12 @@ SET SESSION disable_optimizer_rules = 'VariantPathPushdown';
 -- query 8
 -- Same result with the rewrite disabled.
 WITH source_values AS (
-  SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
-  UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
-  UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
-  UNION ALL SELECT 4, parse_json('{"a":1.5}')
+  SELECT 1 AS id, json_parse('{"a":1,"b":"x"}') AS v
+  UNION ALL SELECT 2, json_parse('{"a":99,"b":"y"}')
+  UNION ALL SELECT 3, json_parse('{"b":"no-a"}')
+  UNION ALL SELECT 4, json_parse('{"a":1.5}')
   UNION ALL SELECT 5, NULL
-  UNION ALL SELECT 6, parse_json('{"a":"abc"}')
+  UNION ALL SELECT 6, json_parse('{"a":"abc"}')
 )
 SELECT id FROM source_values WHERE try_variant_get(v, '$.a', 'bigint') = 99 ORDER BY id;
 
@@ -108,36 +108,36 @@ SET SESSION disable_optimizer_rules = '';
 -- query 10
 -- 2-arg form returns variant; display via variant_typeof.
 WITH source_values AS (
-  SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
-  UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
-  UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
-  UNION ALL SELECT 4, parse_json('{"a":1.5}')
+  SELECT 1 AS id, json_parse('{"a":1,"b":"x"}') AS v
+  UNION ALL SELECT 2, json_parse('{"a":99,"b":"y"}')
+  UNION ALL SELECT 3, json_parse('{"b":"no-a"}')
+  UNION ALL SELECT 4, json_parse('{"a":1.5}')
   UNION ALL SELECT 5, NULL
-  UNION ALL SELECT 6, parse_json('{"a":"abc"}')
+  UNION ALL SELECT 6, json_parse('{"a":"abc"}')
 )
 SELECT id, variant_typeof(variant_get(v, '$.a')) FROM source_values WHERE id <= 2 ORDER BY id;
 
 -- query 11
 -- try_ predicate usage across missing-path / NULL rows.
 WITH source_values AS (
-  SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
-  UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
-  UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
-  UNION ALL SELECT 4, parse_json('{"a":1.5}')
+  SELECT 1 AS id, json_parse('{"a":1,"b":"x"}') AS v
+  UNION ALL SELECT 2, json_parse('{"a":99,"b":"y"}')
+  UNION ALL SELECT 3, json_parse('{"b":"no-a"}')
+  UNION ALL SELECT 4, json_parse('{"a":1.5}')
   UNION ALL SELECT 5, NULL
-  UNION ALL SELECT 6, parse_json('{"a":"abc"}')
+  UNION ALL SELECT 6, json_parse('{"a":"abc"}')
 )
 SELECT id FROM source_values WHERE try_variant_get(v, '$.a', 'bigint') > 5 ORDER BY id;
 
 -- query 12
 -- string extraction.
 WITH source_values AS (
-  SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
-  UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
-  UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
-  UNION ALL SELECT 4, parse_json('{"a":1.5}')
+  SELECT 1 AS id, json_parse('{"a":1,"b":"x"}') AS v
+  UNION ALL SELECT 2, json_parse('{"a":99,"b":"y"}')
+  UNION ALL SELECT 3, json_parse('{"b":"no-a"}')
+  UNION ALL SELECT 4, json_parse('{"a":1.5}')
   UNION ALL SELECT 5, NULL
-  UNION ALL SELECT 6, parse_json('{"a":"abc"}')
+  UNION ALL SELECT 6, json_parse('{"a":"abc"}')
 )
 SELECT id, variant_get(v, '$.b', 'string') FROM source_values WHERE id <= 3 ORDER BY id;
 

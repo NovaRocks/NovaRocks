@@ -26,9 +26,7 @@
 
 use super::binding_control;
 mod typed;
-use novarocks_type_contract::{
-    CompileCheckpoints, PureCompileControl, is_default_json_structure_cast,
-};
+use novarocks_type_contract::{CompileCheckpoints, PureCompileControl};
 use std::sync::Arc;
 
 use arrow_schema::DataType;
@@ -75,8 +73,6 @@ pub fn temporal_write_assignment_matches(
 pub const OPERATOR_DECIMAL_FLOAT_COERCION: &str =
     "builtin.scalar/value_domain_conversion/operator_decimal_float_coercion/v1";
 
-pub(super) const JSON_TEXT: &str =
-    "builtin.scalar/value_domain_conversion/json_text_same_structure/v1";
 pub(super) const OPAQUE_BINARY: &str =
     "builtin.scalar/value_domain_conversion/opaque_to_binary_same_structure/v1";
 pub(super) const SIGNED_LARGEINT: &str =
@@ -166,7 +162,6 @@ pub fn temporal_cast_dependencies(
 }
 
 const AUTOMATIC_OVERLOADS: &[&str] = &[
-    JSON_TEXT,
     OPAQUE_BINARY,
     SIGNED_LARGEINT,
     BOOLEAN_LARGEINT,
@@ -188,8 +183,8 @@ const AUTOMATIC_OVERLOADS: &[&str] = &[
 
 /// Base effects of the hidden value conversions. Overflow NULL is a
 /// result of the signed narrowing overload, not suppression of a child,
-/// control, resource, contract or lifecycle failure. JSON bytes are preserved;
-/// signed integers extend exactly; floats use the existing i128 `as` rounding;
+/// control, resource, contract or lifecycle failure. Opaque byte values share
+/// their original carrier; signed integers extend exactly; floats use the existing i128 `as` rounding;
 /// text parse failure is an original successful NULL, never a row error.
 pub(super) fn effects() -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
@@ -248,7 +243,6 @@ pub(super) fn definition_parts()
         value: error.to_string().into(),
     };
     let overloads = [
-        (JSON_TEXT, "Json->PhysicalUtf8, or identical List/LargeList/FixedSizeList/Struct/Map shape with Json fields->PhysicalUtf8; preserve all other field facts", "explicit exact target; NULL preserved; JSON bytes unchanged"),
         (OPAQUE_BINARY, "Hll/Bitmap/Object/Percentile/Variant->PhysicalBinary, or identical container shape with those opaque children->PhysicalBinary", "explicit exact target; original bytes and NULL preserved; no inverse domain establishment"),
         (SIGNED_LARGEINT, "Physical(Int8|Int16|Int32|Int64)->LargeInt(FixedSizeBinary16)", "explicit exact LargeInt target; signed i128 extension; NULL preserved"),
         (BOOLEAN_LARGEINT, "Physical Boolean->LargeInt(FixedSizeBinary16)", "explicit exact target; false is zero, true is one; NULL preserved"),
@@ -410,9 +404,6 @@ pub(super) fn assignment_domains_authorized_with_construction<E>(
     target: &FunctionValueType,
     creation: &mut super::scalar_construction::ScalarConstruction<'_, E>,
 ) -> Result<bool, super::scalar_construction::Failure<E>> {
-    if is_default_json_structure_cast(source, target) {
-        return Ok(true);
-    }
     match conversion_intermediate_type_with_construction(source, target, creation) {
         Ok(_) => Ok(true),
         Err(super::scalar_construction::OwnerFailure::Binding(_)) => Ok(false),
@@ -483,23 +474,7 @@ pub(super) fn conversion_intermediate_type_with_construction<E>(
         // new conversion family is authorized by this composition.
         creation.value(DataType::Int64, true, ValueLogicalType::Physical)?
     } else {
-        match typed::same_shape_intermediate_with_construction(
-            source,
-            target,
-            typed::SameShapeConversion::JsonText,
-            creation,
-        ) {
-            Ok(value) => value,
-            Err(super::scalar_construction::OwnerFailure::Binding(
-                FunctionBindingError::NoMatchingOverload,
-            )) => typed::same_shape_intermediate_with_construction(
-                source,
-                target,
-                typed::SameShapeConversion::OpaqueBinary,
-                creation,
-            )?,
-            Err(error) => return Err(error),
-        }
+        typed::same_shape_intermediate_with_construction(source, target, creation)?
     };
     recipe_family(source, &intermediate)?;
     if intermediate.logical_type() != target.logical_type()
@@ -582,19 +557,10 @@ fn pair_matches(id: &str, source: &FunctionValueType, target: &FunctionValueType
             && temporal_cast_overload(source, target, safe) == Some(id);
     }
     match id {
-        JSON_TEXT | OPAQUE_BINARY => typed::same_shape_pair(
-            source,
-            target,
-            if id == JSON_TEXT {
-                typed::SameShapeConversion::JsonText
-            } else {
-                typed::SameShapeConversion::OpaqueBinary
-            },
-            &mut || Ok(()),
-        )
-        .ok()
-        .flatten()
-        .is_some_and(|changed| changed),
+        OPAQUE_BINARY => typed::same_shape_pair(source, target, &mut || Ok(()))
+            .ok()
+            .flatten()
+            .is_some_and(|changed| changed),
         SIGNED_LARGEINT => {
             source.logical_type() == ValueLogicalType::Physical
                 && signed(source.data_type())
@@ -683,16 +649,6 @@ pub(super) fn operator_decimal_float_types(
         _ => return None,
     };
     Some((precision, scale as u8, width))
-}
-
-fn json_domain_pair(source: ValueLogicalType, target: ValueLogicalType) -> Option<bool> {
-    if source == ValueLogicalType::Json && target == ValueLogicalType::Physical {
-        Some(true)
-    } else if source == target {
-        Some(false)
-    } else {
-        None
-    }
 }
 
 fn input_pair_observed<'a>(
@@ -799,20 +755,13 @@ fn pair_matches_observed(
             || work.step().map_err(FunctionBindingError::from),
         );
     }
-    if id != JSON_TEXT && id != OPAQUE_BINARY {
+    if id != OPAQUE_BINARY {
         return Ok(pair_matches(id, source, target));
     }
-    Ok(typed::same_shape_pair(
-        source,
-        target,
-        if id == JSON_TEXT {
-            typed::SameShapeConversion::JsonText
-        } else {
-            typed::SameShapeConversion::OpaqueBinary
-        },
-        &mut || work.step().map_err(Into::into),
-    )?
-    .is_some_and(|changed| changed))
+    Ok(
+        typed::same_shape_pair(source, target, &mut || work.step().map_err(Into::into))?
+            .is_some_and(|changed| changed),
+    )
 }
 
 #[cfg(test)]
@@ -824,18 +773,6 @@ mod tests;
 /// their own exact selected/source contract before selecting this operation.
 pub fn share_same_structure_keep(array: &arrow_array::ArrayRef) -> arrow_array::ArrayRef {
     Arc::clone(array)
-}
-
-/// The existing default same-carrier JSON-to-text CAST, including unchanged
-/// container layouts. The family matcher still owns all logical child changes;
-/// equal carriers alone cannot authorize the operation or narrow NULLs.
-pub fn is_default_json_text_keep(source: &FunctionValueType, target: &FunctionValueType) -> bool {
-    (!source.nullable() || target.nullable())
-        && arrow_data_types_exact(source.data_type(), target.data_type())
-        && pair_matches(JSON_TEXT, source, target)
-}
-pub fn is_default_json_text_keep_overload(overload: &FunctionOverloadId) -> bool {
-    overload.as_str() == JSON_TEXT
 }
 
 /// The current default host's exact original opaque CAST leaf. Other opaque
@@ -861,7 +798,7 @@ pub fn is_default_percentile_binary_keep_overload(overload: &FunctionOverloadId)
 
 /// These exact installed conversions reuse the original default scalar CAST.
 /// The caller must first validate the complete frozen request and selection.
-/// Opaque or JSON structure conversions do not enter this dispatch by carrier.
+/// Opaque structure conversions do not enter this dispatch by carrier.
 pub fn is_default_scalar_carrier_cast_overload(overload: &FunctionOverloadId) -> bool {
     matches!(
         overload.as_str(),

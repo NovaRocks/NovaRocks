@@ -511,8 +511,8 @@ fn merge_nested_semantic_domain_ignores_annotations_but_preserves_input_carrier_
                 value.into(),
             );
         }
-        let payload =
-            arrow_schema::Field::new("payload", DataType::Utf8, nullable).with_metadata(metadata);
+        let payload = arrow_schema::Field::new("payload", DataType::LargeBinary, nullable)
+            .with_metadata(metadata);
         let nested =
             arrow_schema::Field::new("nested", DataType::Struct(vec![payload].into()), false);
         FunctionValueType::from_legacy_declared_projection(
@@ -527,7 +527,10 @@ fn merge_nested_semantic_domain_ignores_annotations_but_preserves_input_carrier_
         let DataType::Struct(inner) = outer[0].data_type() else {
             unreachable!();
         };
-        let payload: ArrayRef = Arc::new(arrow_array::StringArray::from(vec!["one", "two"]));
+        let payload: ArrayRef = Arc::new(arrow_array::LargeBinaryArray::from(vec![
+            b"\x01\x44\x03one".as_slice(),
+            b"\x01\x44\x03two".as_slice(),
+        ]));
         let nested: ArrayRef = Arc::new(arrow_array::StructArray::new(
             inner.clone(),
             vec![payload],

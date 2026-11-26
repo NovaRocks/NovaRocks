@@ -221,17 +221,19 @@ fn typed_root_cursor_keeps_the_actual_input_type_owner_and_rejects_another_schem
             storage.clone(),
         )
         .unwrap(),
-        ValueLayout::try_new(&DataType::Utf8, storage.clone()).unwrap(),
+        ValueLayout::try_new(&DataType::LargeBinary, storage.clone()).unwrap(),
     )
     .unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new(
         "incoming",
-        DataType::Utf8,
+        DataType::LargeBinary,
         false,
     )]));
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(StringArray::from(vec!["{}"]))],
+        vec![Arc::new(LargeBinaryArray::from(vec![
+            b"\x01\x80\x01\x00".as_slice(),
+        ]))],
     )
     .unwrap();
     let contract = Arc::new(RootOutputContract::new(

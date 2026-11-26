@@ -2412,7 +2412,7 @@ mod schema_prepare_tests {
     #[test]
     fn compiled_aggregate_local_prepared_intermediate_preserves_nested_json_and_phase_nulls() {
         let json = FunctionValueType::try_with_logical_type(
-            DataType::Utf8,
+            DataType::LargeBinary,
             true,
             novarocks_type_contract::ValueLogicalType::Json,
         )

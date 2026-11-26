@@ -86,17 +86,16 @@ pub struct WholeInvocationResourceProfile {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WholeInvocationSource {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained as the isolated I3 source model for historical JSON_OBJECT evidence."
+        )
+    )]
     JsonObject,
 }
 impl WholeInvocationResourceProfile {
-    pub(crate) fn json_object(
-        prepared: std::sync::Weak<dyn crate::PreparedInvocationScalarKernel>,
-    ) -> Self {
-        Self {
-            source: WholeInvocationSource::JsonObject,
-            prepared,
-        }
-    }
     /// The original bounded diagnostic potentially created during preparation.
     /// The qualified Runtime controller's refusals themselves are bare enums.
     pub fn preparation_prefix(&self) -> WholeInvocationRequestFacts {
@@ -353,7 +352,7 @@ pub(crate) struct JsonObjectInvocationResources {
 }
 
 struct BorrowedArguments<'a>(&'a [EvaluatedArgument<'a>]);
-impl crate::json_object_core::JsonObjectArguments for BorrowedArguments<'_> {
+impl crate::json_object_resources::JsonObjectArguments for BorrowedArguments<'_> {
     fn len(&self) -> usize {
         self.0.len()
     }
@@ -616,23 +615,61 @@ mod tests {
         }
     }
 
-    fn prepare_original_json(types: &[DataType]) -> Arc<dyn crate::PreparedInvocationScalarKernel> {
+    // Exercise the profile's exact owner check and the generic invocation
+    // latch without installing a whole-invocation SQL JSON_OBJECT.
+    #[derive(Debug)]
+    struct ProfileFixture {
+        prepared: Arc<dyn crate::PreparedScalarKernel>,
+        profile: WholeInvocationResourceProfile,
+    }
+    impl crate::PreparedInvocationScalarKernel for ProfileFixture {
+        fn contract(&self) -> &Arc<crate::ScalarCallContract> {
+            self.prepared.contract()
+        }
+        fn instance_retained_upper_bound(&self) -> usize {
+            size_of::<ProfileInstance>() + self.prepared.instance_retained_upper_bound()
+        }
+        fn instance_inline_allocation_bytes(&self) -> usize {
+            size_of::<ProfileInstance>() + self.prepared.instance_inline_allocation_bytes()
+        }
+        fn invocation_resource_profile(&self) -> Option<WholeInvocationResourceProfile> {
+            Some(self.profile.clone())
+        }
+        fn create_instance_with_allocator(
+            &self,
+            host: Arc<dyn crate::AggregateStateAllocator>,
+        ) -> Result<Box<dyn crate::InvocationScalarKernelInstance>, KernelFailure> {
+            Ok(Box::new(ProfileInstance(
+                self.prepared.create_instance_with_allocator(Some(host))?,
+            )))
+        }
+    }
+    struct ProfileInstance(Box<dyn crate::ScalarKernelInstance>);
+    impl crate::InvocationScalarKernelInstance for ProfileInstance {
+        fn evaluate<'a>(
+            &mut self,
+            input: crate::ScalarCallInput<'_, 'a>,
+            control: &dyn KernelEvaluationControl,
+        ) -> Result<crate::SelectedValues<'a>, crate::ScalarInvocationFailure> {
+            self.0.evaluate(input, control).map_err(Into::into)
+        }
+        fn retained_bytes(&self) -> usize {
+            size_of::<Self>() + self.0.retained_bytes()
+        }
+    }
+
+    fn prepare_profile_fixture() -> Arc<dyn crate::PreparedInvocationScalarKernel> {
         use crate::*;
         use novarocks_type_contract::{
             CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
             ExpressionEffectContext, ExpressionUseId, SemanticParameters,
         };
         let catalog = crate::builtin::catalogue::builtin_engine_function_catalog();
-        let definition = catalog
-            .definition("json_object", FunctionKind::Scalar)
-            .unwrap();
-        let arguments: Vec<_> = types
-            .iter()
-            .map(|t| FunctionArgument::Value {
-                value_type: FunctionValueType::new(t.clone(), true),
-                constant: None,
-            })
-            .collect();
+        let definition = catalog.definition("upper", FunctionKind::Scalar).unwrap();
+        let arguments = [FunctionArgument::Value {
+            value_type: ty(DataType::Utf8, true),
+            constant: None,
+        }];
         let request = FunctionBindingRequest {
             expected_result_type: None,
             arguments: &arguments,
@@ -650,9 +687,7 @@ mod tests {
             region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         };
-        let uses: Vec<_> = (0..types.len())
-            .map(|i| Some(ExpressionUseId::new(42 + i as u32)))
-            .collect();
+        let uses = [Some(ExpressionUseId::new(42))];
         let parameters = SemanticParameters::try_new([]).unwrap();
         let prepared = catalog
             .prepare_fresh_selected(
@@ -676,10 +711,16 @@ mod tests {
             )
             .unwrap()
             .into_prepared();
-        let PreparedPureKernel::ScalarInvocation(prepared) = prepared else {
-            panic!("original installed JSONObject must retain its whole-invocation ABI");
+        let PreparedPureKernel::Scalar(prepared) = prepared else {
+            panic!("installed UPPER must provide a selected scalar contract");
         };
-        prepared
+        Arc::new_cyclic(|owner: &std::sync::Weak<ProfileFixture>| ProfileFixture {
+            prepared,
+            profile: WholeInvocationResourceProfile {
+                source: WholeInvocationSource::JsonObject,
+                prepared: owner.clone(),
+            },
+        })
     }
 
     #[test]
@@ -709,7 +750,7 @@ mod tests {
                 self.original.create_instance_with_allocator(host)
             }
         }
-        let original = prepare_original_json(&[DataType::Utf8]);
+        let original = prepare_profile_fixture();
         let profile = original.invocation_resource_profile().unwrap();
         let foreign: Arc<dyn crate::PreparedInvocationScalarKernel> = Arc::new(ForeignPrepared {
             original,
@@ -756,7 +797,7 @@ mod tests {
 
     #[test]
     fn invocation_scalar_resources_public_profile_preserves_early_failure_and_latch() {
-        let prepared = prepare_original_json(&[DataType::Utf8]);
+        let prepared = prepare_profile_fixture();
         let profile = prepared.invocation_resource_profile().unwrap();
         let prefix = profile.preparation_prefix();
         assert_eq!(
@@ -819,7 +860,7 @@ mod tests {
 
     #[test]
     fn invocation_scalar_resources_public_profile_refusal_does_not_call_or_fail_instance() {
-        let prepared = prepare_original_json(&[DataType::Utf8]);
+        let prepared = prepare_profile_fixture();
         let host = Arc::new(RequestHost {
             typed: AtomicUsize::new(0),
             opaque: AtomicUsize::new(0),
@@ -862,120 +903,11 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert_eq!(text.value(0), "{\"key\": null}");
+        assert_eq!(text.value(0), "KEY");
         drop(output);
         drop(instance);
         assert_eq!(host.typed.load(Ordering::Relaxed), 0);
         assert_eq!(host.opaque.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn invocation_scalar_resources_complete_functions_geometry_covers_original_whole_evaluate() {
-        let rows = [2, 8];
-        let key: ArrayRef = Arc::new(StringArray::from(vec!["key"]));
-        let value: ArrayRef = Arc::new(StringArray::from(vec!["{\"z\":[2,1],\"a\":\"µ\"}"; 9]));
-        let empty: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
-        // Complex source metadata must produce a bounded contract cause,
-        // rather than a whole-call Data String that retains its complete Debug.
-        let unsupported_item = DataType::Struct(
-            vec![Arc::new(Field::new(
-                "field\0µ".repeat(100),
-                DataType::Utf8,
-                true,
-            ))]
-            .into(),
-        );
-        let unsupported: ArrayRef = Arc::new(LargeListArray::new(
-            Arc::new(Field::new("item", unsupported_item.clone(), true)),
-            OffsetBuffer::new(ScalarBuffer::from(vec![0i64, 0])),
-            new_empty_array(&unsupported_item),
-            None,
-        ));
-        for (arguments, selection, activation, contract_failure) in [
-            (
-                vec![
-                    EvaluatedArgument::Scalar(&key),
-                    EvaluatedArgument::Column(&value),
-                ],
-                Selection::try_sparse(9, &rows).unwrap(),
-                ScalarInvocationActivation::Activated,
-                false,
-            ),
-            (
-                vec![
-                    EvaluatedArgument::Scalar(&key),
-                    EvaluatedArgument::Column(&empty),
-                ],
-                Selection::all(0),
-                ScalarInvocationActivation::Activated,
-                false,
-            ),
-            (
-                vec![
-                    EvaluatedArgument::Scalar(&key),
-                    EvaluatedArgument::Column(&empty),
-                ],
-                Selection::all(0),
-                ScalarInvocationActivation::ValidateOnly,
-                false,
-            ),
-            (
-                vec![EvaluatedArgument::Scalar(&unsupported)],
-                Selection::try_sparse(9, &rows).unwrap(),
-                ScalarInvocationActivation::Activated,
-                true,
-            ),
-        ] {
-            let types: Vec<_> = arguments
-                .iter()
-                .map(|a| a.array().data_type().clone())
-                .collect();
-            let prepared = prepare_original_json(&types);
-            let host = Arc::new(RequestHost {
-                typed: AtomicUsize::new(0),
-                opaque: AtomicUsize::new(0),
-            });
-            let mut instance =
-                crate::InvocationScalarEvaluationInstance::instantiate_with_allocator(
-                    prepared,
-                    Some(host.clone()),
-                )
-                .unwrap();
-            let control = ProbeControl::default();
-            let (bound, preparation) = measured(|| {
-                instance
-                    .invocation_resource_profile()
-                    .expect("installed positive source")
-                    .requests_for(&instance, selection, &arguments, activation, &control)
-            });
-            assert_eq!(preparation, (0, 0, 0, 0));
-            let facts = bound.unwrap();
-            assert_eq!(
-                facts.requires_host_callback(),
-                activation == ScalarInvocationActivation::Activated
-            );
-            let bound = facts.geometry;
-            let (result, actual) =
-                measured(|| instance.evaluate(selection, &arguments, activation, &control));
-            assert!(actual.0 > 0 && actual.1 > 0);
-            assert!(actual.0 <= bound.requested_bytes, "{actual:?} > {bound:?}");
-            assert!(actual.1 <= bound.requests, "{actual:?} > {bound:?}");
-            assert!(actual.2 <= bound.peak_bytes, "{actual:?} > {bound:?}");
-            if contract_failure {
-                assert!(
-                    matches!(&result, Err(crate::ScalarInvocationFailure::Kernel(cause))
-                    if novarocks_failure_contract::FailureProjection::failure_fact(cause).class()
-                        == novarocks_failure_contract::FailureClass::Invariant
-                        && cause.to_string().len() <= crate::MAX_ROW_ERROR_MESSAGE_BYTES)
-                );
-            } else {
-                assert!(result.is_ok(), "{result:?}");
-            }
-            drop(result);
-            drop(instance);
-            assert_eq!(host.typed.load(Ordering::Relaxed), 0);
-            assert_eq!(host.opaque.load(Ordering::Relaxed), 0);
-        }
     }
 
     #[test]
@@ -1264,10 +1196,13 @@ mod tests {
     #[test]
     fn invocation_scalar_resources_constant_reuses_root_identity_nullability_and_pool_ordinal() {
         use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueLogicalType};
-        let array: ArrayRef = Arc::new(StringArray::from(vec![None, Some("{}")]));
-        let actual =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
+        let array: ArrayRef = Arc::new(crate::json_value::test_array(&[None, Some("{}")]));
+        let actual = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let field = Arc::new(actual.try_to_field("checked-json").unwrap());
         let pool = crate::ConstantPool::try_new(
             field,
@@ -1293,7 +1228,7 @@ mod tests {
         let selection = Selection::try_sparse(1000, &[3, 67, 999]).unwrap();
         let mut nonnullable = actual.clone();
         nonnullable = nonnullable.with_nullable(false).unwrap();
-        for expected in [ty(DataType::Utf8, true), nonnullable] {
+        for expected in [ty(DataType::LargeBinary, true), nonnullable] {
             let resources = invocation_input_resources(
                 false,
                 ScalarInvocationActivation::Activated,
@@ -1380,195 +1315,6 @@ mod tests {
                 assert!(message.starts_with("unsupported scalar type: LargeList"));
             }
             drop(result);
-        }
-    }
-    #[test]
-    fn invocation_scalar_resources_constant_view_covers_real_whole_call_and_preserves_rejections() {
-        use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueLogicalType};
-        fn pool(values: &[&str], ty: FunctionValueType) -> crate::ConstantPool {
-            let raw: ArrayRef = Arc::new(StringArray::from(values.to_vec()));
-            crate::ConstantPool::try_new(
-                Arc::new(ty.try_to_field("original").unwrap()),
-                ty,
-                raw.to_data(),
-                crate::ConstantPolicy {
-                    max_rows: 3,
-                    max_array_nodes: 8,
-                    max_logical_elements: 64,
-                    max_retained_buffer_bytes: 4096,
-                    max_type_depth: 8,
-                    max_type_nodes: 32,
-                    max_dictionary_depth: 2,
-                    max_metadata_bytes: 4096,
-                    max_library_validation_work: 65536,
-                    max_library_validation_bytes: 65536,
-                },
-                CompilePhase::Validate,
-                crate::binding_test_control(),
-            )
-            .unwrap()
-        }
-        let physical = ty(DataType::Utf8, true);
-        let key_pool = pool(&["not-selected", "chosen", "future"], physical.clone());
-        let value_pool = pool(&["999", "[1,2]", "0"], physical.clone());
-        let key = key_pool.value(1).unwrap();
-        let value = value_pool.value(1).unwrap();
-        let key_array =
-            crate::array_projection::normalize_execution_array(key_pool.array()).unwrap();
-        let value_array =
-            crate::array_projection::normalize_execution_array(value_pool.array()).unwrap();
-        let key_view = crate::CanonicalConstantView::from_authored_projection(&key, &key_array);
-        let value_view =
-            crate::CanonicalConstantView::from_authored_projection(&value, &value_array);
-        let arguments = [
-            EvaluatedArgument::ConstantView(key_view),
-            EvaluatedArgument::ConstantView(value_view),
-        ];
-        let rows = [2, 7];
-        for (selection, activation) in [
-            (Selection::all(4), ScalarInvocationActivation::Activated),
-            (
-                Selection::try_sparse(8, &rows).unwrap(),
-                ScalarInvocationActivation::Activated,
-            ),
-            (Selection::all(0), ScalarInvocationActivation::Activated),
-            (Selection::all(0), ScalarInvocationActivation::ValidateOnly),
-        ] {
-            let host = Arc::new(RequestHost {
-                typed: AtomicUsize::new(0),
-                opaque: AtomicUsize::new(0),
-            });
-            let mut instance =
-                crate::InvocationScalarEvaluationInstance::instantiate_with_allocator(
-                    prepare_original_json(&[DataType::Utf8, DataType::Utf8]),
-                    Some(host.clone()),
-                )
-                .unwrap();
-            let profile = instance
-                .invocation_resource_profile()
-                .expect("actual installed JSONObject profile");
-            let control = ProbeControl::default();
-            let (facts, preparation) = measured(|| {
-                profile.requests_for(&instance, selection, &arguments, activation, &control)
-            });
-            assert_eq!(preparation, (0, 0, 0, 0));
-            let facts = facts.unwrap();
-            assert_eq!(
-                facts.requires_host_callback(),
-                activation == ScalarInvocationActivation::Activated
-            );
-            assert!(!instance.is_failed());
-            let (output, actual) =
-                measured(|| instance.evaluate(selection, &arguments, activation, &control));
-            let output = output.unwrap();
-            assert!(actual.0 > 0 && actual.1 > 0);
-            assert!(actual.0 <= facts.bytes(), "{actual:?} > {facts:?}");
-            assert!(actual.1 <= facts.requests(), "{actual:?} > {facts:?}");
-            assert!(actual.2 <= facts.peak_bytes(), "{actual:?} > {facts:?}");
-            assert_eq!(
-                output.selection().iter().collect::<Vec<_>>(),
-                selection.iter().collect::<Vec<_>>()
-            );
-            let text = output
-                .values()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            // Only ordinal1 participates: the explicit key is "chosen" and
-            // the independently specified JSON array [1,2] normalizes spacing.
-            assert_eq!(
-                text.iter().collect::<Vec<_>>(),
-                vec![Some("{\"chosen\": [1, 2]}"); selection.len()]
-            );
-            assert!(output.errors().is_empty());
-            drop(output);
-            drop(instance);
-            assert_eq!(host.typed.load(Ordering::Relaxed), 0);
-            assert_eq!(host.opaque.load(Ordering::Relaxed), 0);
-        }
-        assert_eq!(key.ordinal(), 1);
-        assert_eq!(value.ordinal(), 1);
-        assert_eq!(key.pool().backing_identity(), key_pool.backing_identity());
-        assert_eq!(
-            value.pool().backing_identity(),
-            value_pool.backing_identity()
-        );
-        assert_ne!(key_pool.backing_identity(), value_pool.backing_identity());
-        let json =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
-        let json_pool = pool(&["0", "{}", "1"], json);
-        let json_value = json_pool.value(1).unwrap();
-        let json_array =
-            crate::array_projection::normalize_execution_array(json_pool.array()).unwrap();
-        let shortened = value_array.slice(0, 2);
-        for (view, contract, message) in [
-            (
-                crate::CanonicalConstantView::from_authored_projection(&json_value, &json_array),
-                None,
-                "constant argument differs from its exact logical type or nullability",
-            ),
-            (
-                crate::CanonicalConstantView::from_authored_projection(&value, &shortened),
-                Some(crate::EvaluationContractError::ArgumentLength),
-                "evaluated argument length differs from its explicit shape",
-            ),
-        ] {
-            let host = Arc::new(RequestHost {
-                typed: AtomicUsize::new(0),
-                opaque: AtomicUsize::new(0),
-            });
-            let mut instance =
-                crate::InvocationScalarEvaluationInstance::instantiate_with_allocator(
-                    prepare_original_json(&[DataType::Utf8]),
-                    Some(host.clone()),
-                )
-                .unwrap();
-            let arguments = [EvaluatedArgument::ConstantView(view)];
-            let control = ProbeControl::default();
-            let facts = instance
-                .invocation_resource_profile()
-                .unwrap()
-                .requests_for(
-                    &instance,
-                    Selection::all(4),
-                    &arguments,
-                    ScalarInvocationActivation::Activated,
-                    &control,
-                )
-                .unwrap();
-            assert!(
-                !facts.requires_host_callback(),
-                "the real validator must reject before the original body"
-            );
-            assert!(
-                !instance.is_failed(),
-                "numerical preparation never latches an instance"
-            );
-            let error = instance
-                .evaluate(
-                    Selection::all(4),
-                    &arguments,
-                    ScalarInvocationActivation::Activated,
-                    &control,
-                )
-                .unwrap_err();
-            let crate::ScalarInvocationFailure::Kernel(cause) = error else {
-                panic!("invalid constant view must fail on the outer kernel channel");
-            };
-            if let Some(contract) = contract {
-                crate::kernel_control::test_contract::exact(&cause, contract);
-                assert_eq!(cause.to_string(), message);
-            } else {
-                assert!(
-                    matches!(cause, KernelFailure::InvalidProgram(ref diagnostic)
-                    if diagnostic.message() == message)
-                );
-            }
-            assert!(instance.is_failed());
-            drop(instance);
-            assert_eq!(host.typed.load(Ordering::Relaxed), 0);
-            assert_eq!(host.opaque.load(Ordering::Relaxed), 0);
         }
     }
 }

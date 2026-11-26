@@ -2251,9 +2251,12 @@ mod tests {
         };
         let list = |domain, child_nullable| {
             let storage = ValueTypeStorageLifetime::pure();
-            let child =
-                FunctionValueType::try_with_logical_type(DataType::Utf8, child_nullable, domain)
-                    .unwrap();
+            let child = FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                child_nullable,
+                domain,
+            )
+            .unwrap();
             let semantic = ValueTypeRef::try_new(
                 ValueKind::List(child.value_type().clone()),
                 false,
@@ -2263,7 +2266,7 @@ mod tests {
             let layout = ValueLayout::try_new(
                 &DataType::List(std::sync::Arc::new(Field::new(
                     "item",
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     child_nullable,
                 ))),
                 storage,

@@ -63,6 +63,7 @@ pub struct ConstantWriteProjectionLimits {
 #[derive(Debug)]
 pub enum PhysicalConstantCodecError {
     InvalidShape(&'static str),
+    JsonValue(novarocks_functions::json_value::JsonValueError),
     Control(CompileControlError),
     Type(TypeCodecError),
     Reader(FlatReaderError),
@@ -72,6 +73,7 @@ impl fmt::Display for PhysicalConstantCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidShape(message) => f.write_str(message),
+            Self::JsonValue(error) => write!(f, "invalid JSON constant: {error}"),
             Self::Control(error) => error.fmt(f),
             Self::Type(error) => error.fmt(f),
             Self::Reader(error) => error.fmt(f),
@@ -82,6 +84,7 @@ impl fmt::Display for PhysicalConstantCodecError {
 impl std::error::Error for PhysicalConstantCodecError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::JsonValue(source) => Some(source),
             Self::Control(source) => Some(source),
             Self::Type(source) => Some(source),
             Self::Reader(source) => Some(source),

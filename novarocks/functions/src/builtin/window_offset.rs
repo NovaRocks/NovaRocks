@@ -18,7 +18,7 @@
 //! LEAD/LAG selected values from one complete original partition.
 //! Offsets come from the exact BIGINT argument or the default of one.
 
-use super::window_default::DefaultValueRecipe;
+use super::window_default::{DefaultValueRecipe, PartitionDefault};
 use crate::kernel_control::{
     KernelControlObservation, internal, invalid, invalid_function_argument,
 };
@@ -48,7 +48,7 @@ struct OffsetPartition<'a> {
     prepared: Arc<PreparedOffset>,
     input: WindowPartitionInput<'a>,
     addresses: Box<[Option<u64>]>,
-    defaults: Option<ArrayRef>,
+    defaults: Option<PartitionDefault<'a>>,
     retained: usize,
     closed: bool,
 }
@@ -130,13 +130,13 @@ impl PreparedWindowKernel for PreparedOffset {
             let defaults = match &self.default {
                 Some(recipe) => {
                     work.flush()?;
-                    let converted = recipe.evaluate_complete(
+                    let defaults = recipe.prepare_partition(
                         input.full_input().logical_arguments()[2],
                         rows,
                         control,
                     )?;
                     work.flush()?;
-                    Some(converted)
+                    defaults
                 }
                 None => None,
             };
@@ -235,8 +235,8 @@ impl PreparedWindowKernel for PreparedOffset {
                 work.step()?;
             }
             // Full required setup and format refusal precede output demand.
-            // Source output is copied only on demand; the required converted
-            // default partition remains explicitly retained above.
+            // Source output is copied only on demand. The prepared default
+            // either keeps the input loan or owns the converted partition.
             copy_plan(source, &addresses, &mut work)?;
             drop(positions);
             drop(prefix);
@@ -254,7 +254,7 @@ impl PreparedWindowKernel for PreparedOffset {
                     bytes.checked_add(
                         defaults
                             .as_ref()
-                            .map_or(0, |array| array.get_array_memory_size()),
+                            .map_or(0, PartitionDefault::retained_bytes),
                     )
                 })
                 .ok_or(KernelFailure::ResourceExhausted)?;
@@ -316,26 +316,31 @@ impl WindowKernelPartition for OffsetPartition<'_> {
                 let copied: ArrayRef =
                     copied.map_err(|_| internal("window offset Arrow take failed"))?;
                 let copied = if let Some(defaults) = &self.defaults {
+                    let borrowed = matches!(defaults, PartitionDefault::Borrowed(_));
+                    let defaults = defaults.argument();
                     let mut default_indices = reserve::<Option<u64>>(selection.len(), &mut work)?;
                     let mut use_default = reserve::<bool>(selection.len(), &mut work)?;
                     for row in selection.iter() {
-                        default_indices.push(Some(
-                            u64::try_from(row).map_err(|_| KernelFailure::ResourceExhausted)?,
-                        ));
                         // A NULL source at an existing target remains NULL.
-                        use_default.push(self.addresses[row].is_none());
+                        let missing = self.addresses[row].is_none();
+                        let address = if !borrowed || missing {
+                            Some(
+                                u64::try_from(defaults.value_row(row, row))
+                                    .map_err(|_| KernelFailure::ResourceExhausted)?,
+                            )
+                        } else {
+                            None
+                        };
+                        default_indices.push(address);
+                        use_default.push(missing);
                         work.step()?;
                     }
-                    copy_plan(
-                        crate::EvaluatedArgument::Column(defaults),
-                        &default_indices,
-                        &mut work,
-                    )?;
+                    copy_plan(defaults, &default_indices, &mut work)?;
                     work.flush()?;
                     let default_indices = UInt64Array::from(default_indices);
                     work.flush()?;
                     let selected_defaults =
-                        arrow_select::take::take(defaults.as_ref(), &default_indices, None);
+                        arrow_select::take::take(defaults.array().as_ref(), &default_indices, None);
                     work.flush()?;
                     let selected_defaults = selected_defaults
                         .map_err(|_| internal("window offset default Arrow take failed"))?;

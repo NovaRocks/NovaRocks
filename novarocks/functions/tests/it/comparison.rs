@@ -556,12 +556,8 @@ fn byte_profiles_and_nonzero_constant_compact_slice_addresses_are_independent() 
 fn unsupported_domains_and_bad_selected_addresses_refuse_before_null_short_circuit() {
     let physical = ty(DataType::Utf8, true);
     for logical in [ValueLogicalType::Json, ValueLogicalType::Variant] {
-        let data_type = if logical == ValueLogicalType::Json {
-            DataType::Utf8
-        } else {
-            DataType::LargeBinary
-        };
-        let value = FunctionValueType::try_with_logical_type(data_type, true, logical).unwrap();
+        let value =
+            FunctionValueType::try_with_logical_type(DataType::LargeBinary, true, logical).unwrap();
         assert_eq!(
             PreparedComparisonRecipe::try_new(
                 ComparisonOperator::Eq,
@@ -682,13 +678,22 @@ fn unsupported_domains_and_bad_selected_addresses_refuse_before_null_short_circu
         ),
         Err(KernelFailure::InvalidProgram(_))
     ));
-    let json = constant(correct.clone(), false, ValueLogicalType::Json, 0);
+    let native: ArrayRef = Arc::new(LargeBinaryArray::from(vec![b"\x01\x20".as_slice()]));
+    let json = constant(native.clone(), false, ValueLogicalType::Json, 0);
+    let binary = ty(DataType::LargeBinary, true);
+    let binary_comparison = PreparedComparisonRecipe::try_new(
+        ComparisonOperator::Eq,
+        &binary,
+        &binary,
+        &CompileControl::default(),
+    )
+    .unwrap();
     assert!(matches!(
-        prepared.compare_rows(
+        binary_comparison.compare_rows(
             EvaluatedArgument::Constant(&json),
             0,
             0,
-            EvaluatedArgument::Scalar(&correct),
+            EvaluatedArgument::Scalar(&native),
             0,
             0,
             &Control::default()

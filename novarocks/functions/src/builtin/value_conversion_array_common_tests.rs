@@ -190,9 +190,12 @@ fn common_family_is_exact_only_hidden_and_replayable_without_auto_resolution() {
             .validate_selected(&selected, request(&args, &wrong), &control)
             .is_err()
     );
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let text = FunctionValueType::new(DataType::Utf8, true);
     let json_args = [argument(json)];
     assert!(

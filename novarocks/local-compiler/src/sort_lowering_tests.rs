@@ -19,7 +19,7 @@ use super::values_lowering_tests::{build, checked_pool, compile_options, provide
 use super::*;
 use crate::sort::lower_sort;
 use crate::{FragmentCompileError, compile_fragment};
-use arrow_array::StringArray;
+use arrow_array::LargeBinaryArray;
 use novarocks_local_program::{LocalSortMode, PartitionRank, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{NullOrdering, SortDirection, SortExpr, SortMode, TopNPhase};
 use novarocks_type_contract::ValueLogicalType;
@@ -261,7 +261,11 @@ fn global_sort_public_compile_preserves_keys_occurrences_channels_and_inactive_f
 #[test]
 fn global_sort_downstream_project_filter_limit_keep_original_ordered_source() {
     let pool = checked_pool(
-        Arc::new(StringArray::from(vec![Some("{}"), None, Some("[1]")])),
+        Arc::new(LargeBinaryArray::from(vec![
+            Some(b"\x01\x80\x01\x00".as_slice()),
+            None,
+            Some(b"\x01\x60\x06\x01\x4a\x01\x00\x00\x00".as_slice()),
+        ])),
         true,
         ValueLogicalType::Json,
     );
@@ -294,7 +298,7 @@ fn global_sort_downstream_project_filter_limit_keep_original_ordered_source() {
     for node in program.graph().nodes() {
         assert_eq!(
             node.output_layout().schema().field(0).data_type(),
-            &DataType::Utf8
+            &DataType::LargeBinary
         );
     }
     assert!(program.units().iter().flat_map(|unit|unit.types().iter()).any(|ty| matches!(ty,novarocks_type_contract::FunctionArgumentType::Value(ty) if ty.logical_type()==ValueLogicalType::Json && ty.nullable())));

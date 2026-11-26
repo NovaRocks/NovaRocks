@@ -379,6 +379,7 @@ pub(super) struct Frame<K = ExpressionUseId> {
     boolean: Option<BooleanRows>,
     temporal: Option<TemporalValues>,
     membership: Option<novarocks_functions::native_inlist::InRows>,
+    json_probe: Option<novarocks_functions::native_inlist::JsonProbeKeys>,
     _body_memory: Option<BodyFrameMemory>,
 }
 impl<K> Frame<K> {
@@ -520,6 +521,7 @@ impl<K> Frame<K> {
             boolean,
             temporal,
             membership: None,
+            json_probe: None,
             _body_memory: body_memory,
         })
     }
@@ -874,6 +876,10 @@ impl<K> Frame<K> {
         batch_rows: usize,
         work: &mut Work<'_, '_, impl Sized>,
         allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+        proven_constant: Option<(
+            &novarocks_functions::ConstantValue,
+            &mut novarocks_functions::native_inlist::JsonConstantKeyCache,
+        )>,
     ) -> Result<(), KernelFailure> {
         use novarocks_functions::native_inlist::InRows;
         let ordinal = self
@@ -917,6 +923,17 @@ impl<K> Frame<K> {
                 output.values(),
                 &mut |event| in_event(event, work),
             ))?);
+            if recipe.uses_json_keys() {
+                work.flush()?;
+                if let Some(host) = work.scalar_host.as_deref() {
+                    host.validate_frame_allocator(allocator)?;
+                }
+                self.json_probe = Some(novarocks_functions::native_inlist::JsonProbeKeys::prepare(
+                    output.values(),
+                    allocator.cloned(),
+                    work.control,
+                )?);
+            }
             self.children.push(Child {
                 ordinals: child.ordinals,
                 ordinal_storage: child.ordinal_storage,
@@ -942,12 +959,19 @@ impl<K> Frame<K> {
             work.step()?;
         }
         let selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
-        let left = duplicate_child(&self.children[0], work)?;
-        let left =
-            between_comparison_operand(left, &parents, &self.rows, selection, batch_rows, work)?;
+        let left = if self.json_probe.is_none() {
+            let left = duplicate_child(&self.children[0], work)?;
+            Some(between_comparison_operand(
+                left, &parents, &self.rows, selection, batch_rows, work,
+            )?)
+        } else {
+            None
+        };
         let right =
             between_comparison_operand(right, &parents, &self.rows, selection, batch_rows, work)?;
-        let left = left.materialize(selection, expected.data_type(), work)?;
+        let left = left
+            .map(|left| left.materialize(selection, expected.data_type(), work))
+            .transpose()?;
         let right = right.materialize(selection, expected.data_type(), work)?;
         let state = self
             .membership
@@ -963,13 +987,26 @@ impl<K> Frame<K> {
             host.validate_frame_allocator(allocator)?;
         }
         let control = work.control;
-        let equalities = in_observed(recipe.membership_equalities_observed(
-            left.values(),
-            right.values(),
-            allocator.cloned(),
-            control,
-            &mut |event| in_event(event, work),
-        ))?;
+        let equalities = if let Some(probe) = self.json_probe.as_mut() {
+            in_observed(recipe.json_equalities_observed(
+                probe,
+                right.values(),
+                &parents,
+                proven_constant,
+                allocator.cloned(),
+                control,
+                &mut |event| in_event(event, work),
+            ))?
+        } else {
+            let left = left.as_ref().ok_or_else(|| internal("missing IN probe"))?;
+            in_observed(recipe.membership_equalities_observed(
+                left.values(),
+                right.values(),
+                allocator.cloned(),
+                control,
+                &mut |event| in_event(event, work),
+            ))?
+        };
         in_observed(
             equalities
                 .apply_to_selected_observed(state, &parents, &mut |event| in_event(event, work)),
@@ -1145,6 +1182,10 @@ impl<K> Frame<K> {
         batch_rows: usize,
         work: &mut Work<'_, '_, impl Sized>,
         allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+        proven_constant: Option<(
+            &novarocks_functions::ConstantValue,
+            &mut novarocks_functions::native_inlist::JsonConstantKeyCache,
+        )>,
     ) -> Result<(), KernelFailure> {
         if shape == ControlShape::OrderedNull {
             return self.attach_ordered_null(child, batch_rows, work);
@@ -1158,7 +1199,14 @@ impl<K> Frame<K> {
             return self.attach_null_if(child, prepared, batch_rows, work, allocator);
         }
         if let ControlShape::Membership { .. } = shape {
-            return self.attach_membership(child, recipes, batch_rows, work, allocator);
+            return self.attach_membership(
+                child,
+                recipes,
+                batch_rows,
+                work,
+                allocator,
+                proven_constant,
+            );
         }
         if let ControlShape::Between { negated } = shape {
             return self.attach_between(child, recipes, negated, batch_rows, work);
@@ -1742,7 +1790,13 @@ fn complete_node<'a, R, K: Ord + Clone>(
                     work,
                 )?)
             } else {
-                OwnedValue::from_selected(evaluate_cast(recipe, &child, local_selection, work)?)
+                OwnedValue::from_selected(evaluate_cast(
+                    recipe,
+                    &child,
+                    local_selection,
+                    allocator,
+                    work,
+                )?)
             }
         }
         CompletionKind::Arithmetic => {
@@ -1956,6 +2010,7 @@ pub(super) fn evaluate_tree<'a, R>(
     selection: Selection<'a>,
     activation: novarocks_functions::ScalarInvocationActivation,
     instances: &mut BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
+    json_constants: &mut novarocks_functions::native_inlist::JsonConstantKeyCache,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     work: &mut Work<'_, '_, R>,
@@ -2061,6 +2116,7 @@ pub(super) fn evaluate_tree<'a, R>(
         needs_original,
         source_captured: false,
         source_custody: None,
+        json_constants,
         root_domain: domain,
         root_reuse: Rc::new(RefCell::new(super::mapped::ScopedMap::new())),
     };
@@ -2093,6 +2149,7 @@ struct TreeDriver<'s, 'input> {
     needs_original: BTreeSet<ExpressionUseId>,
     source_captured: bool,
     source_custody: Option<input_source::CapturedInputSource>,
+    json_constants: &'s mut novarocks_functions::native_inlist::JsonConstantKeyCache,
     root_domain: Arc<input_source::ActualInvocationDomain>,
     root_reuse: ReuseCache,
 }
@@ -2905,6 +2962,14 @@ impl TreeDriver<'_, '_> {
                     .for_use(invocation.context)
                     .map_err(|_| invalid("child effects differ from actual occurrence"))?
                     .permits_boolean_reordering();
+                let proven_constant = if matches!(shape, ControlShape::Membership { .. })
+                    && parent.next > 1
+                    && let StaticExprKind::Constant(constant) = definition.kind()
+                {
+                    Some((constant, &mut *self.json_constants))
+                } else {
+                    None
+                };
                 parent.attach(
                     Child {
                         ordinals: frame.parent_ordinals,
@@ -2924,6 +2989,7 @@ impl TreeDriver<'_, '_> {
                     batch_rows,
                     work,
                     allocator,
+                    proven_constant,
                 )?;
             } else {
                 return Ok(value);
@@ -3578,10 +3644,17 @@ fn evaluate_cast<'a>(
     recipe: &novarocks_functions::PreparedCastRecipe,
     child: &Value<'_>,
     selection: Selection<'a>,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     work.flush()?;
-    recipe.evaluate_selected(child.argument()?, selection, child.errors(), work.control)
+    recipe.evaluate_selected_scoped(
+        child.argument()?,
+        selection,
+        child.errors(),
+        work.control,
+        allocator,
+    )
 }
 
 // Pure values from ordered, separately evaluated source occurrences. Scheduling

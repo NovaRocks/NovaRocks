@@ -5,6 +5,10 @@ domain: [sql-compiler, join-execution, sql-language]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0273
+    scope: "JSON representation, equality and normalization in items 2 and 3, and JSON depth and key details of item 7."
+    link: "ADR-0273-native-json-values-and-binary-membership-keys.md"
 date: 2026-11-06
 provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/1283"
@@ -20,6 +24,9 @@ code-anchors:
   - "novarocks/expression/src/evaluator/utf8_inlist.rs (utf8_equality_observed)"
   - "novarocks/types/src/value/variant.rs (format_variant_timestamp)"
 ---
+
+[ADR-0273](ADR-0273-native-json-values-and-binary-membership-keys.md) 接续第 2、3 条的 JSON 值表示和比较，
+以及第 7 条的 JSON 深度与键处理。下文记录 Trino 483 的原裁决。第 4 至 6 条和 Variant 的 UTC 呈现继续有效。
 
 ## 问题
 

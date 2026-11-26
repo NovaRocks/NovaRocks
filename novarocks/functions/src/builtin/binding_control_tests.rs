@@ -76,17 +76,17 @@ fn conversion_pair() -> (FunctionValueType, FunctionValueType) {
     let source = (0..320)
         .map(|i| {
             Arc::new(
-                Field::new(format!("c{i}"), DataType::Utf8, true).with_metadata(
+                Field::new(format!("c{i}"), DataType::LargeBinary, true).with_metadata(
                     std::collections::HashMap::<String, String>::from([(
                         NR_LOGICAL_TYPE_KEY.to_string(),
-                        "json".to_string(),
+                        "variant".to_string(),
                     )]),
                 ),
             )
         })
         .collect::<Vec<_>>();
     let target = (0..320)
-        .map(|i| Arc::new(Field::new(format!("c{i}"), DataType::Utf8, true)))
+        .map(|i| Arc::new(Field::new(format!("c{i}"), DataType::LargeBinary, true)))
         .collect::<Vec<_>>();
     (
         FunctionValueType::from_legacy_declared_projection(DataType::Struct(source.into()), true),

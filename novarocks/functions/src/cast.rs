@@ -50,10 +50,11 @@ pub(crate) use f3_scalar::{decimal_integral_coefficient, decimal_overflow_error}
 
 mod f3_array;
 
-mod array_json;
-pub use array_json::validate_trino_json_literal;
+pub(crate) mod array_json;
 mod array_mode;
 mod array_text;
+mod json_input;
+mod json_mode;
 pub(crate) mod map_mode;
 mod row_mode;
 #[path = "cast/selected.rs"]
@@ -436,7 +437,7 @@ enum CastBody {
     ArrayLeaf(trino_array_leaf::Leaf),
     ArrayText,
     ArrayDateText,
-    ArrayJson(array_json::Operation),
+    NativeJson(json_mode::Operation),
     JsonStructure,
     Trino(trino::Scalar),
     ExtendedScalar(f3_scalar::Body),
@@ -622,7 +623,7 @@ impl PreparedCastRecipe {
         self.source.nullable()
             || matches!(
                 self.body,
-                CastBody::ArrayJson(array_json::Operation::JsonToVarchar) | CastBody::JsonStructure
+                CastBody::NativeJson(json_mode::Operation::From(_)) | CastBody::JsonStructure
             )
             || (self.trino_mode == Some(TrinoCastMode::Try) && self.conversion_may_raise())
     }
@@ -1246,6 +1247,10 @@ impl PreparedCastRecipe {
                 | CastBody::JsonStructure
                 | CastBody::ArrayNull
                 | CastBody::TemporalWiden(_)
+                | CastBody::NativeJson(
+                    json_mode::Operation::To
+                        | json_mode::Operation::From(json_mode::Target::Varchar(_))
+                )
         )
     }
     pub fn evaluate_selected_array<'a>(
@@ -1255,6 +1260,17 @@ impl PreparedCastRecipe {
         inherited: &[RowDataError],
         control: &dyn KernelEvaluationControl,
     ) -> Result<crate::SelectedValues<'a>, KernelFailure> {
+        self.evaluate_selected_array_scoped(argument, selection, inherited, control, None)
+    }
+
+    fn evaluate_selected_array_scoped<'a>(
+        &self,
+        argument: EvaluatedArgument<'_>,
+        selection: crate::Selection<'a>,
+        inherited: &[RowDataError],
+        control: &dyn KernelEvaluationControl,
+        allocator: Option<&std::sync::Arc<dyn crate::AggregateStateAllocator>>,
+    ) -> Result<crate::SelectedValues<'a>, KernelFailure> {
         match self.body {
             CastBody::ExplicitArray
             | CastBody::ExplicitMap
@@ -1262,8 +1278,11 @@ impl PreparedCastRecipe {
             | CastBody::JsonStructure
             | CastBody::ArrayNull
             | CastBody::TemporalWiden(_) => {
-                array_mode::evaluate(self, argument, selection, inherited, control)
+                array_mode::evaluate(self, argument, selection, inherited, control, allocator)
             }
+            CastBody::NativeJson(operation) => json_mode::evaluate_variable(
+                self, operation, argument, selection, inherited, control, allocator,
+            ),
             CastBody::Collection => {
                 self.evaluate_collection(argument, selection, inherited, control)
             }
@@ -1285,10 +1304,23 @@ impl PreparedCastRecipe {
         inherited: &[RowDataError],
         control: &dyn KernelEvaluationControl,
     ) -> Result<crate::SelectedValues<'a>, KernelFailure> {
+        self.evaluate_selected_scoped(argument, selection, inherited, control, None)
+    }
+
+    /// Evaluate with the original expression-frame allocator when this exact CAST
+    /// recipe owns variable native JSON values or text.
+    pub fn evaluate_selected_scoped<'a>(
+        &self,
+        argument: EvaluatedArgument<'_>,
+        selection: crate::Selection<'a>,
+        inherited: &[RowDataError],
+        control: &dyn KernelEvaluationControl,
+        allocator: Option<&std::sync::Arc<dyn crate::AggregateStateAllocator>>,
+    ) -> Result<crate::SelectedValues<'a>, KernelFailure> {
         if self.is_identity() {
-            array_mode::evaluate(self, argument, selection, inherited, control)
+            array_mode::evaluate(self, argument, selection, inherited, control, allocator)
         } else if self.uses_selected_array() {
-            self.evaluate_selected_array(argument, selection, inherited, control)
+            self.evaluate_selected_array_scoped(argument, selection, inherited, control, allocator)
         } else {
             selected::evaluate(self, argument, selection, inherited, control)
         }
@@ -1306,6 +1338,17 @@ impl PreparedCastRecipe {
         )
     }
 
+    fn uses_native_json_conversion(&self) -> bool {
+        match &self.children {
+            CastChildren::None => {
+                matches!(self.body, CastBody::NativeJson(_) | CastBody::JsonStructure)
+            }
+            CastChildren::Array(child) => child.uses_native_json_conversion(),
+            CastChildren::Map(children) => children.iter().any(Self::uses_native_json_conversion),
+            CastChildren::Row(children) => children.iter().any(Self::uses_native_json_conversion),
+        }
+    }
+
     fn conversion_may_raise(&self) -> bool {
         match self.body {
             CastBody::ExplicitArray => {
@@ -1317,16 +1360,9 @@ impl PreparedCastRecipe {
             CastBody::ExplicitMap => true,
             CastBody::ExplicitRow { may_raise } => may_raise,
             CastBody::ArrayNull => false,
+            CastBody::NativeJson(operation) => operation.may_raise(&self.source),
             CastBody::ArrayLeaf(leaf) => leaf.may_fail(),
-            CastBody::ArrayJson(array_json::Operation::VarcharToJson)
-                if self.trino_mode.is_some() =>
-            {
-                false
-            }
-            CastBody::ArrayText
-            | CastBody::ArrayDateText
-            | CastBody::ArrayJson(_)
-            | CastBody::JsonStructure => true,
+            CastBody::ArrayText | CastBody::ArrayDateText | CastBody::JsonStructure => true,
             CastBody::SelectedArray(f3_array::Body::ArrowScalar) => self.trino_mode.is_none(),
             CastBody::SelectedArray(
                 f3_array::Body::Structure
@@ -1412,6 +1448,27 @@ impl PreparedCastRecipe {
             }
         }
     }
+    /// Write one prepared JSON-to-VARCHAR row directly into the caller's
+    /// already admitted output. JSON null and row errors remain distinct.
+    pub(crate) fn with_json_varchar_row<T>(
+        &self,
+        argument: EvaluatedArgument<'_>,
+        ordinal: usize,
+        logical_row: usize,
+        work: &mut crate::builtin::json_sql_selected::RowWork<'_, '_>,
+        emit: impl FnOnce(
+            &str,
+            &mut crate::builtin::json_sql_selected::RowWork<'_, '_>,
+        ) -> Result<T, KernelFailure>,
+    ) -> Result<Option<T>, crate::builtin::json_sql_selected::RowFailure> {
+        let CastBody::NativeJson(json_mode::Operation::From(json_mode::Target::Varchar(max))) =
+            self.body
+        else {
+            return Err(invalid("JSON VARCHAR row requires its prepared CAST body").into());
+        };
+        json_mode::with_varchar_row(self, argument, ordinal, logical_row, max, work, emit)
+    }
+
     /// The host excludes inherited errors before this selected-row operation.
     /// Both the actual address and concrete scalar carrier are checked before NULL.
     pub fn evaluate_row(
@@ -1429,10 +1486,10 @@ impl PreparedCastRecipe {
                     "array CAST requires its actual selected invocation",
                 ));
             }
-            if let CastBody::ArrayJson(operation) = self.body {
-                return array_mode::evaluate_json(
+            if let CastBody::NativeJson(json_mode::Operation::From(target)) = self.body {
+                return json_mode::evaluate_fixed(
                     self,
-                    operation,
+                    target,
                     argument,
                     ordinal,
                     logical_row,

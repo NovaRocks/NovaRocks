@@ -15,17 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Original SQL metadata and root reachability for the F3 JSON_OBJECT cases.
+//! SQL JSON_OBJECT result metadata and throwing projection reachability.
 
 use arrow::datatypes::{DataType, Field};
-use novarocks_functions::FunctionArgumentType;
-use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
-use serde_json::{Value, json};
+use novarocks_functions::{FunctionArgumentType, builtin::json_sql::JsonFunction};
+use novarocks_type_contract::ValueLogicalType;
 
 use crate::exec::expr::sql_test_source::sql_source_with_declared_fields;
 
-// Only the declared input schema is needed by this SQL metadata test. The
-// original five-row fixture's values are not evaluated to author these facts.
 fn declared_fields() -> Vec<Field> {
     [
         ("id", DataType::Int32),
@@ -41,48 +38,39 @@ fn declared_fields() -> Vec<Field> {
     .collect()
 }
 
-fn type_metadata(ty: &FunctionValueType) -> Value {
-    let field = match ty.data_type() {
-        DataType::List(field) => {
-            json!({"name":field.name(), "nullable":field.is_nullable(), "data_type":format!("{:?}",field.data_type()), "metadata":field.metadata()})
-        }
-        _ => Value::Null,
-    };
-    json!({"physical_type":format!("{:?}",ty.data_type()),"nullable":ty.nullable(),"logical_type":format!("{:?}",ty.logical_type()),"field":field})
-}
-const ORIGINAL_SQL: &[(usize, &str)] = &[
+const SQL_CASES: &[(usize, &str)] = &[
     (
         4,
-        r#"SELECT id, json_object(k: v, 'n': n, 'b': flag, 'day': day, 'amount': amount, 'dup': v, 'dup': n) AS object_value
+        r#"SELECT id, JSON_OBJECT(k VALUE v, 'n' VALUE n, 'b' VALUE flag, 'day' VALUE day, 'amount' VALUE amount, 'dup' VALUE v, 'dup' VALUE n RETURNING JSON) AS object_value
 FROM t ORDER BY id;"#,
     ),
     (
         5,
-        r#"SELECT id, json_object(k: NULL) AS odd_tail FROM t ORDER BY id;"#,
+        r#"SELECT id, JSON_OBJECT(k VALUE NULL) AS odd_tail FROM t ORDER BY id;"#,
     ),
     (
         6,
-        r#"SELECT id, json_object(k: [id, n]) AS debug_value FROM t ORDER BY id;"#,
+        r#"SELECT id, JSON_OBJECT(k VALUE CAST(ARRAY[id, n] AS JSON) FORMAT JSON RETURNING JSON) AS debug_value FROM t ORDER BY id;"#,
     ),
     (
         7,
-        r#"SELECT id, json_object(k: v, 'n': n) AS selected_value FROM t WHERE id IN (1, 3, 5) ORDER BY id;"#,
+        r#"SELECT id, JSON_OBJECT(k VALUE v, 'n' VALUE n RETURNING JSON) AS selected_value FROM t WHERE id IN (1, 3, 5) ORDER BY id;"#,
     ),
     (
         8,
-        r#"SELECT id, json_object(k: v) AS empty_value FROM t WHERE id < 0 ORDER BY id;"#,
+        r#"SELECT id, JSON_OBJECT(k VALUE v RETURNING JSON) AS empty_value FROM t WHERE id < 0 ORDER BY id;"#,
     ),
     (
         9,
-        r#"SELECT json_object(IF(id = 2, NULL, [id, n]): n) AS complex_key FROM t WHERE id = 1;"#,
+        r#"SELECT JSON_OBJECT(IF(id = 2, NULL, k) VALUE n RETURNING JSON) AS nullable_key FROM t WHERE id = 2;"#,
     ),
     (
         10,
-        r#"SELECT id FROM (SELECT id, json_object(IF(id = 2, NULL, [id, n]): n) AS unused_error FROM t) s ORDER BY id;"#,
+        r#"SELECT id FROM (SELECT id, JSON_OBJECT(IF(id = 2, NULL, k) VALUE n RETURNING JSON) AS unused_error FROM t) s ORDER BY id;"#,
     ),
     (
         11,
-        r#"SELECT id FROM (SELECT id, json_object(IF(id = 2, NULL, [id, n]): n) AS unused_error FROM t) s WHERE id = 2 ORDER BY id;"#,
+        r#"SELECT id FROM (SELECT id, JSON_OBJECT(IF(id = 2, NULL, k) VALUE n RETURNING JSON) AS unused_error FROM t) s WHERE id = 2 ORDER BY id;"#,
     ),
 ];
 
@@ -113,49 +101,75 @@ fn ancestors(
     seen
 }
 #[test]
-fn json_object_legacy_native_oracle_original_sql_metadata_and_error_preservation() {
+fn json_object_native_sql_metadata_and_error_preservation() {
     use novarocks_expression_contract::ExprKind;
-    use novarocks_physical_plan::NodeKind;
+    use novarocks_physical_plan::{NodeKind, ResultValueDomain};
 
     let fields = declared_fields();
-    let mut records = Vec::new();
-    for (query, sql) in ORIGINAL_SQL {
+    let object = JsonFunction::Object {
+        null_on_null: true,
+        unique: false,
+    }
+    .function_id();
+    for (query, sql) in SQL_CASES {
         let source = sql_source_with_declared_fields(sql, &fields);
         let plan = source.plan();
         let result = plan.result_port().unwrap();
         let live = ancestors(plan, (result.fragment, result.output.node));
         let mut owners = Vec::new();
-        let mut call_metadata = Vec::new();
         for fragment in plan.fragments().values() {
             for (_source_node, unit, id, expr) in super::sql_test_source::unit_definitions(fragment)
             {
                 let ExprKind::FunctionCall { function, .. } = &expr.kind else {
                     continue;
                 };
-                if function.function_id.as_str() != "builtin.scalar/json_object/v1" {
+                if function.function_id != object {
                     continue;
                 }
                 assert_eq!(expr.ty.logical_type(), ValueLogicalType::Json);
-                assert_eq!(expr.ty.data_type(), &DataType::Utf8);
+                assert_eq!(expr.ty.data_type(), &DataType::LargeBinary);
                 assert_eq!(function.result_type, expr.ty);
+                let arguments = &function.argument_types;
+                let (keys, values) = arguments.split_at(arguments.len() / 2);
+                assert!(!keys.is_empty());
+                assert_eq!(keys.len(), values.len());
+                for key in keys {
+                    let FunctionArgumentType::Value(key) = key else {
+                        panic!("expected character key value");
+                    };
+                    assert_eq!(key.data_type(), &DataType::Utf8);
+                }
+                for value in values {
+                    let FunctionArgumentType::Value(value) = value else {
+                        panic!("expected JSON member value");
+                    };
+                    assert_eq!(value.logical_type(), ValueLogicalType::Json);
+                    assert_eq!(value.data_type(), &DataType::LargeBinary);
+                }
                 assert!(
                     live.contains(&(fragment.id(), _source_node.id)),
-                    "original throwing use remains root-reachable"
+                    "throwing JSON call remains root-reachable"
                 );
                 let NodeKind::Project { expressions } = &fragment.nodes()[&_source_node.id].kind
                 else {
-                    panic!("original throwing projection owner")
+                    panic!("expected JSON projection owner")
                 };
-                assert!(
-                    expressions
-                        .iter()
-                        .any(|(root, _)| unit.root(*root).unwrap().definition == *id)
-                );
-                call_metadata.push(json!({"result_type":type_metadata(&function.result_type),"argument_types":function.argument_types.iter().map(|a| match a { FunctionArgumentType::Value(v) => type_metadata(v), _ => panic!("original value channel") }).collect::<Vec<_>>()}));
+                assert!(expressions.iter().any(|(root, _)| {
+                    let uses = unit.control_flow().uses();
+                    let mut pending = vec![unit.root_use(*root).unwrap()];
+                    while let Some(use_id) = pending.pop() {
+                        let occurrence = &uses[&use_id];
+                        if occurrence.definition == *id {
+                            return true;
+                        }
+                        pending.extend(occurrence.arguments.iter().copied());
+                    }
+                    false
+                }));
                 owners.push((fragment.id(), _source_node.id));
             }
         }
-        assert!(!owners.is_empty(), "original JSON call is not pruned");
+        assert!(!owners.is_empty(), "throwing JSON projection must remain");
         if *query == 11 {
             let filters = live
                 .iter()
@@ -196,14 +210,23 @@ fn json_object_legacy_native_oracle_original_sql_metadata_and_error_preservation
             6 => &["id", "debug_value"],
             7 => &["id", "selected_value"],
             8 => &["id", "empty_value"],
-            9 => &["complex_key"],
+            9 => &["nullable_key"],
             10 | 11 => &["id"],
             _ => unreachable!(),
         };
         assert_eq!(headers, expected);
-        records.push(json!({"query":query,"sql":sql,"headers":headers,"fields":format!("{:?}",result.fields),"full_plan":format!("{plan:#?}"),"reachable_json_project_count":owners.len(),"call_metadata":call_metadata}));
-    }
-    if let Ok(path) = std::env::var("C16_ORIGINAL_SQL_OUT") {
-        std::fs::write(path, serde_json::to_string_pretty(&json!({"mode":"CompiledPackage","fold":"NoOp original source fixture","queries":records})).unwrap()+"\n").unwrap();
+        let field = result.fields.last().unwrap();
+        match query {
+            4 | 6 | 7 | 8 | 9 => {
+                assert_eq!(field.domain, ResultValueDomain::Json);
+                assert_eq!(field.ty.logical_type(), ValueLogicalType::Json);
+                assert_eq!(field.ty.data_type(), &DataType::LargeBinary);
+            }
+            5 => {
+                assert_eq!(field.domain, ResultValueDomain::Plain);
+                assert_eq!(field.ty.data_type(), &DataType::Utf8);
+            }
+            _ => {}
+        }
     }
 }

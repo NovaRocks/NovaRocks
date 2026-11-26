@@ -194,7 +194,7 @@ fn fresh_and_frozen_keep_exact_full_types_nullable_policy_and_selected_arc() {
             for value in [
                 FunctionValueType::new(DataType::Int64, nullable),
                 FunctionValueType::try_with_logical_type(
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     nullable,
                     ValueLogicalType::Json,
                 )
@@ -426,8 +426,12 @@ fn actual_arity_lambda_and_full_domain_forgery_are_rejected() {
     let mut wrong = selected.clone();
     let mut revised = wrong.argument_types.to_vec();
     revised[1] = FunctionArgumentType::Value(
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap(),
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
     );
     wrong.argument_types =
         novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(revised.into_boxed_slice());

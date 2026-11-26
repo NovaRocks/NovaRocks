@@ -20490,7 +20490,7 @@ mod logical_projection_tests {
     #[test]
     fn contract_decoration_projection_preserves_all_declared_root_domains() {
         for source in [
-            semantic(DataType::Utf8, ValueLogicalType::Json),
+            semantic(DataType::LargeBinary, ValueLogicalType::Json),
             semantic(DataType::LargeBinary, ValueLogicalType::Variant),
             semantic(DataType::Binary, ValueLogicalType::Hll),
             semantic(DataType::LargeBinary, ValueLogicalType::Bitmap),
@@ -20512,7 +20512,7 @@ mod logical_projection_tests {
     #[test]
     fn contract_full_source_type_keeps_nested_names_metadata_and_lambda_domains() {
         let source_shape = DataType::List(Arc::new(
-            Field::new("provider_item", DataType::Utf8, true).with_metadata(
+            Field::new("provider_item", DataType::LargeBinary, true).with_metadata(
                 std::collections::HashMap::<String, String>::from([
                     (NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string()),
                     ("iceberg.field.id".to_string(), "19".to_string()),
@@ -20536,6 +20536,7 @@ mod logical_projection_tests {
             panic!("list projection");
         };
         assert_eq!(field.name(), "item");
+        assert_eq!(field.data_type(), &DataType::LargeBinary);
         assert!(field.is_nullable());
         assert!(field.metadata().is_empty());
         assert_eq!(
@@ -20549,7 +20550,7 @@ mod logical_projection_tests {
         assert_eq!(projected, source);
         assert_eq!(projected.logical_type(), ValueLogicalType::Physical);
         projected.validate().unwrap();
-        let json = semantic(DataType::Utf8, ValueLogicalType::Json);
+        let json = semantic(DataType::LargeBinary, ValueLogicalType::Json);
         let variant = semantic(DataType::LargeBinary, ValueLogicalType::Variant);
         let lambda = FunctionArgumentType::Lambda {
             parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(

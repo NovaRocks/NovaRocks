@@ -2004,6 +2004,124 @@ fn lead_lag_static_default_admission_matches_original_recipe_profiles() {
 }
 
 #[test]
+fn installed_lead_lag_select_native_json_defaults_and_preserve_sql_null() {
+    use crate::json_value::test_array;
+    use arrow_array::{LargeBinaryArray, NullArray};
+    use novarocks_type_contract::ValueLogicalType;
+
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let values: ArrayRef = Arc::new(test_array(&[Some("1"), None, Some("3"), Some("4")]));
+    let defaults: ArrayRef = Arc::new(test_array(&[
+        Some("null"),
+        Some(r#"{"unused":2}"#),
+        Some(r#"{"unused":3}"#),
+        Some(r#"{"default":4}"#),
+    ]));
+    let scalar: ArrayRef = Arc::new(test_array(&[Some("null")]));
+    let sql_null: ArrayRef = Arc::new(NullArray::new(1));
+    let offset = cv(Some(1), false);
+    let peers = [WindowRowRange { start: 0, end: 4 }];
+    let frames = whole_frames(4);
+
+    for name in NAMES {
+        let forged = default_fixture(
+            name,
+            json.clone(),
+            FunctionValueType::new(DataType::LargeBinary, true),
+            DecimalOverflowPolicy::ReportError,
+        );
+        assert!(matches!(
+            admit_offset_profile(&forged, &CompileControl::default()),
+            Err(FunctionBindingError::UnavailableImplementation(overload))
+                if overload == forged.selected.overload
+        ));
+        for (default, default_type, first, last) in [
+            (
+                EvaluatedArgument::Column(&defaults),
+                json.clone(),
+                Some("null"),
+                Some(r#"{"default":4}"#),
+            ),
+            (
+                EvaluatedArgument::Scalar(&scalar),
+                json.clone(),
+                Some("null"),
+                Some("null"),
+            ),
+            (
+                EvaluatedArgument::Scalar(&sql_null),
+                FunctionValueType::new(DataType::Null, true),
+                None,
+                None,
+            ),
+        ] {
+            let fixture = default_fixture(
+                name,
+                json.clone(),
+                default_type,
+                DecimalOverflowPolicy::ReportError,
+            );
+            admit_offset_profile(&fixture, &CompileControl::default()).unwrap();
+            let prepared = fixture
+                .prepare(options(false), &CompileControl::default())
+                .unwrap();
+            assert_eq!(prepared.contract().result_type(), &json);
+            let arguments = [
+                EvaluatedArgument::Column(&values),
+                EvaluatedArgument::Constant(&offset),
+                default,
+            ];
+            let mut partition = WindowEvaluationPartition::begin(
+                prepared.clone(),
+                geometry(&prepared, &arguments, &peers, &frames),
+                &Control::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                partition.retained_bytes().unwrap(),
+                partition.retained_upper_bound()
+            );
+            let expected = if name == "lead" {
+                [None, Some("3"), Some("4"), last]
+            } else {
+                [first, Some("1"), None, Some("3")]
+            };
+            let all = partition
+                .evaluate(Selection::all(4), 4, &Control::default())
+                .unwrap();
+            assert!(all.errors().is_empty());
+            assert_eq!(
+                all.values()
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .unwrap(),
+                &test_array(&expected),
+            );
+            let selected = partition
+                .evaluate(
+                    Selection::try_sparse(4, &[0, 3]).unwrap(),
+                    2,
+                    &Control::default(),
+                )
+                .unwrap();
+            assert_eq!(
+                selected
+                    .values()
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .unwrap(),
+                &test_array(&[expected[0], expected[3]]),
+            );
+        }
+    }
+}
+
+#[test]
 fn lead_lag_without_default_keep_nested_source_admission() {
     let nested = FunctionValueType::new(
         DataType::Struct(vec![Arc::new(Field::new("original", DataType::Int32, false))].into()),

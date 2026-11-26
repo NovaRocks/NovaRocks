@@ -18,6 +18,7 @@
 //! Original selected-owner fixture migrated from resolved_calls expression tests.
 use super::*;
 use arrow::array::{BooleanArray, Int64Array};
+use novarocks_expression_contract::UnitError;
 use novarocks_functions::*;
 use std::sync::{
     Mutex,
@@ -1233,7 +1234,7 @@ fn seal_type_only_fixture(
     mut b: BoundExprSetBuilder,
     inputs: [(ExprId, ValueType); 2],
     ports: Vec<ExprPort>,
-) -> (BoundExprSet, Arc<Owner>) {
+) -> Result<(BoundExprSet, Arc<Owner>), UnitError> {
     let mut owner = Owner::for_overload(TYPE_ONLY);
     let [(first, first_type), (second, second_type)] = inputs;
     owner.explicit_type_only = Some([first_type.clone(), second_type.clone()]);
@@ -1288,7 +1289,7 @@ fn seal_type_only_fixture(
         .unwrap();
     let c = Control::good();
     let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Validate).unwrap();
-    let sealed = b.seal(ports, &mut work).unwrap();
+    let sealed = b.seal(ports, &mut work)?;
     assert_eq!(sealed.uses().len(), 1);
     let claims = sealed
         .uses()
@@ -1307,7 +1308,7 @@ fn seal_type_only_fixture(
         .collect();
     let unit = sealed.finish(claims, &mut work).unwrap();
     work.finish().unwrap();
-    (unit, owner)
+    Ok((unit, owner))
 }
 
 pub(super) fn type_only_fixture(
@@ -1315,13 +1316,13 @@ pub(super) fn type_only_fixture(
     arguments: [(ExprId, ValueType); 2],
     ports: Vec<ExprPort>,
 ) -> (BoundExprSet, PureEngineFunctionCatalog) {
-    let (unit, owner) = seal_type_only_fixture(builder, arguments, ports);
+    let (unit, owner) = seal_type_only_fixture(builder, arguments, ports).unwrap();
     (unit, catalog(owner))
 }
 
-fn compile_type_only_hidden_native_profile(
-    kind: &str,
-) -> Result<Arc<CompiledExprSet>, ExprCompileError> {
+type HiddenNativeFixture = (BoundExprSet, Arc<Owner>, Vec<(ValueId, ValueType)>);
+
+fn type_only_hidden_native_fixture(kind: &str) -> Result<HiddenNativeFixture, UnitError> {
     let mut b = builder();
     let input_type = match kind {
         "in_float" => FunctionValueType::new(DataType::Float64, false),
@@ -1329,10 +1330,12 @@ fn compile_type_only_hidden_native_profile(
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
             false,
         ),
-        "like_json" | "between_json" => {
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap()
-        }
+        "like_json" | "between_json" => FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
         _ => unreachable!(),
     };
     let mut ports = vec![
@@ -1378,7 +1381,14 @@ fn compile_type_only_hidden_native_profile(
         vec![ExprPort {
             values: ports.clone().into_boxed_slice(),
         }],
-    );
+    )?;
+    Ok((unit, owner, ports))
+}
+
+fn compile_type_only_hidden_native_profile(
+    kind: &str,
+) -> Result<Arc<CompiledExprSet>, ExprCompileError> {
+    let (unit, owner, ports) = type_only_hidden_native_fixture(kind).unwrap();
     let catalogue = catalog(owner.clone());
     let c = Control::good();
     let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
@@ -1416,8 +1426,15 @@ fn check_type_only_hidden_native_profile_refusal(kind: &str) {
 }
 
 #[test]
-fn type_only_hidden_json_like_keeps_the_original_profile_refusal() {
-    check_type_only_hidden_native_profile_refusal("like_json");
+fn type_only_hidden_json_like_is_rejected_by_the_unit_verifier() {
+    let Err(error) = type_only_hidden_native_fixture("like_json") else {
+        panic!("a JSON operand is not UTF-8 text");
+    };
+    assert!(matches!(
+        error,
+        UnitError::Invalid { definition: Some(_), root: None, message }
+            if message.ends_with("LIKE operands must use a UTF-8 type")
+    ));
 }
 #[test]
 fn type_only_hidden_float_in_compiles_without_evaluating_arguments() {

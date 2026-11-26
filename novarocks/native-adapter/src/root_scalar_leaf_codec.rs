@@ -57,6 +57,7 @@ pub enum NativeScalarLeafError {
     LogicalMetadata,
     UnsupportedContainer,
     ScratchLimit,
+    MalformedJson,
     Leaf(ScalarLeafError),
     ChangedInput,
     Failed,
@@ -71,6 +72,7 @@ impl std::fmt::Display for NativeScalarLeafError {
             Self::LogicalMetadata => "scalar leaf logical metadata differs from its frozen facts",
             Self::UnsupportedContainer => "scalar container value requires the container cursor",
             Self::ScratchLimit => "scalar leaf cursor exceeds its prepaid scratch capacity",
+            Self::MalformedJson => "scalar leaf contains a malformed native JSON root",
             Self::Leaf(error) => return std::fmt::Display::fmt(error, f),
             Self::ChangedInput => "scalar leaf input changed during emission",
             Self::Failed => "Native scalar leaf cursor is failed",
@@ -446,14 +448,20 @@ fn validate_field_preflight(
 }
 fn dictionary_type(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Dictionary(key, value)
-        if key.as_ref() == &DataType::Int32 && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8))
+        if key.as_ref() == &DataType::Int32
+            && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8 | DataType::LargeBinary))
 }
 fn carrier_preflight_matches(expected: &ScalarField, actual: &DataType, nullable: bool) -> bool {
-    if dictionary_type(actual) {
+    if let DataType::Dictionary(_, value) = actual
+        && dictionary_type(actual)
+    {
         expected.nullable == nullable
             && matches!(
-                expected.value_type,
-                ScalarValueType::String | ScalarValueType::Json
+                (&expected.value_type, value.as_ref()),
+                (
+                    ScalarValueType::String,
+                    DataType::Utf8 | DataType::LargeUtf8
+                ) | (ScalarValueType::Json, DataType::LargeBinary)
             )
     } else if let ScalarValueType::Timestamp { unit, timezone } = &expected.value_type {
         let DataType::Timestamp(actual_unit, actual_zone) = actual else {
@@ -505,6 +513,9 @@ fn validate_empty_carrier(
             DataType::LargeUtf8 => {
                 exact::<LargeStringArray>(dictionary.values().as_ref()).map(|_| ())
             }
+            DataType::LargeBinary => {
+                exact::<LargeBinaryArray>(dictionary.values().as_ref()).map(|_| ())
+            }
             _ => Err(NativeScalarLeafError::Type),
         };
     }
@@ -525,9 +536,9 @@ fn validate_empty_carrier(
         S::Float64 => carrier!(Float64Array),
         S::Decimal { bits: 128, .. } => carrier!(Decimal128Array),
         S::Decimal { bits: 256, .. } => carrier!(Decimal256Array),
-        S::String | S::Json => carrier!(StringArray),
+        S::String => carrier!(StringArray),
         S::Binary | S::Opaque(_) => carrier!(BinaryArray),
-        S::Variant => carrier!(LargeBinaryArray),
+        S::Json | S::Variant => carrier!(LargeBinaryArray),
         S::Date => carrier!(Date32Array),
         S::TimeMicros => carrier!(Time64MicrosecondArray),
         S::Timestamp {
@@ -584,28 +595,26 @@ pub(crate) fn borrow_leaf_at<'a>(
         if key >= values.len() {
             return Err(NativeScalarLeafError::Type);
         }
-        let text = match values.data_type() {
-            DataType::Utf8 => {
+        return match (&expected.value_type, values.data_type()) {
+            (S::String, DataType::Utf8) => {
                 let values = exact::<StringArray>(values.as_ref())?;
-                if values.is_null(key) {
-                    return Ok(V::Null);
-                }
-                values.value(key)
+                Ok(if values.is_valid(key) {
+                    V::String(values.value(key))
+                } else {
+                    V::Null
+                })
             }
-            DataType::LargeUtf8 => {
+            (S::String, DataType::LargeUtf8) => {
                 let values = exact::<LargeStringArray>(values.as_ref())?;
-                if values.is_null(key) {
-                    return Ok(V::Null);
-                }
-                values.value(key)
+                Ok(if values.is_valid(key) {
+                    V::String(values.value(key))
+                } else {
+                    V::Null
+                })
             }
-            _ => return Err(NativeScalarLeafError::Type),
+            (S::Json, DataType::LargeBinary) => borrow_leaf_at(expected, values.as_ref(), key),
+            _ => Err(NativeScalarLeafError::Type),
         };
-        return Ok(if matches!(expected.value_type, S::Json) {
-            V::Json(text)
-        } else {
-            V::String(text)
-        });
     }
     macro_rules! selected {
         ($ty:ty, $value:ident, $expression:expr) => {{
@@ -694,7 +703,12 @@ pub(crate) fn borrow_leaf_at<'a>(
         ),
         S::String => selected!(StringArray, a, V::String(a.value(index))),
         S::Binary => selected!(BinaryArray, a, V::Binary(a.value(index))),
-        S::Json => selected!(StringArray, a, V::Json(a.value(index))),
+        S::Json => selected!(LargeBinaryArray, a, {
+            let bytes = a.value(index);
+            novarocks_functions::json_value::Node::from_root(bytes)
+                .map_err(|_| NativeScalarLeafError::MalformedJson)?;
+            V::Json(bytes)
+        }),
         S::Variant => selected!(LargeBinaryArray, a, V::Variant(a.value(index))),
         S::Opaque(kind) => selected!(
             BinaryArray,
@@ -746,6 +760,7 @@ impl novarocks_execution_contract::failure::FailureProjection for NativeScalarLe
             Self::LogicalMetadata => (FailureClass::Invariant, 404),
             Self::UnsupportedContainer => (FailureClass::Invariant, 405),
             Self::ScratchLimit => (FailureClass::Resource, 406),
+            Self::MalformedJson => (FailureClass::Invariant, 410),
             Self::Leaf(cause) => return cause.failure_fact(),
             Self::ChangedInput => (FailureClass::Invariant, 408),
             Self::Failed => (FailureClass::Invariant, 409),
@@ -778,18 +793,16 @@ mod tests {
     }
     #[test]
     fn empty_dictionary_does_not_select_retained_values_and_requires_logical_facts() {
-        let values: ArrayRef =
-            Arc::new(StringArray::from(vec!["x".repeat(
-                novarocks_result_contract::ScalarProfileV1::SINGLE_VALUE_BYTES + 1,
-            )]));
+        let unused = "x".repeat(novarocks_result_contract::ScalarProfileV1::SINGLE_VALUE_BYTES + 1);
+        let values: ArrayRef = Arc::new(StringArray::from(vec![unused]));
         let dictionary: ArrayRef = Arc::new(
             DictionaryArray::<Int32Type>::try_new(Int32Array::from(Vec::<i32>::new()), values)
                 .unwrap(),
         );
-        let source = chunk(Arc::clone(&dictionary), Some(ValueLogicalType::Json), None);
+        let source = chunk(dictionary, None, None);
         let mut cursor = NativeScalarLeafEncoder::try_validate_empty(
             &source,
-            schema(ScalarValueType::Json, true),
+            schema(ScalarValueType::String, true),
             NativeScalarLeafEncoder::scratch_capacity_bytes(),
         )
         .unwrap();
@@ -800,7 +813,17 @@ mod tests {
         assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
         assert_eq!(cursor.encoded_len(), Some(0));
         assert_eq!(output, [0xa5; 32]);
-        let untrusted = chunk(dictionary, None, None);
+        let binary: ArrayRef = Arc::new(LargeBinaryArray::from(Vec::<Option<&[u8]>>::new()));
+        let json = chunk(Arc::clone(&binary), Some(ValueLogicalType::Json), None);
+        assert!(
+            NativeScalarLeafEncoder::try_validate_empty(
+                &json,
+                schema(ScalarValueType::Json, true),
+                NativeScalarLeafEncoder::scratch_capacity_bytes(),
+            )
+            .is_ok()
+        );
+        let untrusted = chunk(binary, None, None);
         assert!(matches!(
             NativeScalarLeafEncoder::try_validate_empty(
                 &untrusted,
@@ -972,7 +995,7 @@ mod tests {
             );
             assert!(validate_to_completion(&plain, &schema(ScalarValueType::String, true)).is_ok());
             let json = chunk(
-                Arc::new(StringArray::from(vec!["{}"])),
+                Arc::new(LargeBinaryArray::from(vec![b"\x01\x80\x01\x00".as_slice()])),
                 Some(ValueLogicalType::Json),
                 Some(annotation),
             );
@@ -1321,17 +1344,29 @@ mod tests {
             BorrowedScalarLeaf::decode(&expected, &wire).unwrap(),
             BorrowedScalarLeaf::Variant(&[0xff, 0x00])
         );
+        let json_bytes = b"\x01\x80\x0a\x01\x03key\x4a\xff\xff\xff\xff";
         let json = chunk(
-            Arc::new(StringArray::from(vec![" {\"key\": 1} "])),
+            Arc::new(LargeBinaryArray::from(vec![json_bytes.as_slice()])),
             Some(ValueLogicalType::Json),
             None,
         );
         let expected = schema(ScalarValueType::Json, true);
         let wire = encode(&json, Arc::clone(&expected), 1);
-        assert_eq!(&wire[SCALAR_LEAF_HEADER_BYTES..], b" {\"key\": 1} ");
+        assert_eq!(&wire[SCALAR_LEAF_HEADER_BYTES..], json_bytes);
         assert_eq!(
             BorrowedScalarLeaf::decode(&expected, &wire).unwrap(),
-            BorrowedScalarLeaf::Json(" {\"key\": 1} ")
+            BorrowedScalarLeaf::Json(json_bytes)
+        );
+        let truncated = chunk(
+            Arc::new(LargeBinaryArray::from(vec![
+                &json_bytes[..json_bytes.len() - 1],
+            ])),
+            Some(ValueLogicalType::Json),
+            None,
+        );
+        assert_eq!(
+            validate_to_completion(&truncated, &expected),
+            Err(NativeScalarLeafError::MalformedJson)
         );
     }
     #[test]

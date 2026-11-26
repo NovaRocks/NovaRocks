@@ -116,11 +116,10 @@ pub(crate) fn lower_semantic_create_table_columns(
             Ok(TableColumnDef {
                 name: column.name.clone(),
                 nullable: column.nullable.unwrap_or(true),
-                default: column
-                    .default
-                    .as_ref()
-                    .map(|value| lower_semantic_default_literal(value, &column.data_type))
-                    .transpose()?,
+                default: lower_semantic_default_literal(
+                    column.default.as_ref(),
+                    &column.data_type,
+                )?,
                 data_type: column.data_type.clone(),
             })
         })
@@ -128,9 +127,14 @@ pub(crate) fn lower_semantic_create_table_columns(
 }
 
 fn lower_semantic_default_literal(
-    literal: &CommandLiteral,
+    literal: Option<&CommandLiteral>,
     data_type: &SqlType,
-) -> Result<DefaultLiteral, String> {
+) -> Result<Option<DefaultLiteral>, String> {
+    let Some(literal) = literal.filter(|_| !contains_json_leaf(data_type)) else {
+        // Preserve the declaration for the Provider's actual-target admission.
+        // A JSON target cannot store a default, so there is no default to lower.
+        return Ok(None);
+    };
     let lowered = match literal {
         CommandLiteral::Null => DefaultLiteral::Null,
         CommandLiteral::Bool(value) => DefaultLiteral::Bool(*value),
@@ -146,7 +150,17 @@ fn lower_semantic_default_literal(
         }
     };
     validate_typed_default_literal(&lowered, data_type)?;
-    Ok(lowered)
+    Ok(Some(lowered))
+}
+
+fn contains_json_leaf(data_type: &SqlType) -> bool {
+    match data_type {
+        SqlType::Json => true,
+        SqlType::Array(element) => contains_json_leaf(element),
+        SqlType::Map(key, value) => contains_json_leaf(key) || contains_json_leaf(value),
+        SqlType::Struct(fields) => fields.iter().any(|(_, field)| contains_json_leaf(field)),
+        _ => false,
+    }
 }
 
 fn mutation_instance_id(catalog: &str) -> Result<ConnectorInstanceId, String> {
@@ -784,10 +798,7 @@ pub(crate) fn lower_semantic_iceberg_schema_change(
                 parent,
                 name,
                 data_type: data_type.clone(),
-                default: default
-                    .as_ref()
-                    .map(|value| lower_semantic_default_literal(value, data_type))
-                    .transpose()?,
+                default: lower_semantic_default_literal(default.as_ref(), data_type)?,
                 position: lower_semantic_add_position(position, true)?,
             })
         }
@@ -1045,11 +1056,6 @@ fn lower_typed_string_default(value: &str, data_type: &SqlType) -> Result<Defaul
                 "invalid boolean DEFAULT `{other}` (expected true/false/0/1)"
             )),
         },
-        SqlType::Json => {
-            serde_json::from_str::<serde_json::Value>(value)
-                .map_err(|error| format!("invalid JSON DEFAULT literal: {error}"))?;
-            Ok(DefaultLiteral::String(value.to_string()))
-        }
         SqlType::Date => Ok(DefaultLiteral::Date(parse_date_string_to_days(value)?)),
         SqlType::DateTime => Ok(DefaultLiteral::DateTime(parse_datetime_string_to_micros(
             value,
@@ -1154,10 +1160,7 @@ fn validate_typed_default_literal(
         (DefaultLiteral::Bool(_), SqlType::Boolean)
         | (DefaultLiteral::Int(_), SqlType::BigInt)
         | (DefaultLiteral::Float(_), SqlType::Float | SqlType::Double)
-        | (
-            DefaultLiteral::String(_),
-            SqlType::String | SqlType::BoundedCharacter(_) | SqlType::Json,
-        )
+        | (DefaultLiteral::String(_), SqlType::String | SqlType::BoundedCharacter(_))
         | (DefaultLiteral::Binary(_), SqlType::Binary | SqlType::Bitmap | SqlType::Hll)
         | (DefaultLiteral::Date(_), SqlType::Date)
         | (DefaultLiteral::DateTime(_), SqlType::DateTime | SqlType::DateTimeNs) => {}
@@ -1773,6 +1776,51 @@ mod tests {
                 bytes::Bytes::from_static(&[0xCA, 0xFE])
             ))
         );
+    }
+
+    #[test]
+    fn json_create_and_alter_defaults_leave_the_provider_declaration_intact() {
+        use super::{IcebergSchemaChange, SqlType};
+        use novarocks_spi::connector::ConnectorDataType;
+        use novarocks_sql::semantic::command::{
+            ColumnPositionSql, CommandLiteral, IcebergSchemaSqlChange, TableColumnSqlCommand,
+        };
+
+        for (data_type, expected) in [
+            (SqlType::Json, ConnectorDataType::Json),
+            (
+                SqlType::Array(Box::new(SqlType::Json)),
+                ConnectorDataType::Array(Box::new(ConnectorDataType::Json)),
+            ),
+        ] {
+            let raw = Some(CommandLiteral::String("not-a-json".into()));
+            let columns = super::lower_semantic_create_table_columns(&[TableColumnSqlCommand {
+                name: "payload".into(),
+                data_type: data_type.clone(),
+                nullable: None,
+                default: raw.clone(),
+                comment: None,
+            }])
+            .expect("the provider settles whether the declaration is used");
+            let column = super::connector_column(&columns[0]).unwrap();
+            assert_eq!(column.data_type, expected);
+            assert_eq!(column.default, None);
+
+            let add =
+                super::lower_semantic_iceberg_schema_change(&IcebergSchemaSqlChange::AddColumn {
+                    path: vec!["payload".into()],
+                    data_type: data_type.clone(),
+                    nullable: None,
+                    default: raw,
+                    position: ColumnPositionSql::Default,
+                })
+                .unwrap();
+            assert!(matches!(
+                add,
+                IcebergSchemaChange::AddColumn { data_type: actual, default: None, .. }
+                    if actual == data_type
+            ));
+        }
     }
 
     #[test]

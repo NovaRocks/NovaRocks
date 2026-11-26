@@ -360,7 +360,8 @@ fn scope_full_type_width_and_missing_combined_layout_are_rejected() {
         .is_err()
     );
     let nominal =
-        ValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap();
+        ValueType::try_with_logical_type(DataType::LargeBinary, true, ValueLogicalType::Json)
+            .unwrap();
     let schema = Arc::new(Schema::new(vec![nominal.try_to_field("nominal").unwrap()]));
     let canonical: Arc<[ScopeColumn]> = Arc::from([ScopeColumn {
         value: values[0].0,
@@ -388,7 +389,7 @@ fn scope_full_type_width_and_missing_combined_layout_are_rejected() {
             Arc::from([ScopeColumn {
                 value: values[0].0,
                 ordinal: 0,
-                ty: ValueType::new(DataType::Utf8, true),
+                ty: ValueType::new(DataType::LargeBinary, true),
             }]),
             ValueTypeStorageLifetime::pure(),
             &mut work,
@@ -1637,7 +1638,7 @@ fn each_intrinsic_recipe_keeps_its_actual_full_types_and_use_site() {
 
 #[test]
 fn full_types_and_shared_float_bits_keep_original_backing_and_reject_retagging() {
-    use arrow::array::{Float32Array, StringArray};
+    use arrow::array::{Float32Array, LargeBinaryArray};
     let floats = [0x8000_0000u32, 0x7fc0_0042];
     let ty = ValueType::new(DataType::Float32, false);
     let source = ConstantPool::try_new(
@@ -1650,11 +1651,12 @@ fn full_types_and_shared_float_bits_keep_original_backing_and_reject_retagging()
     )
     .unwrap();
     let json_type =
-        ValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap();
+        ValueType::try_with_logical_type(DataType::LargeBinary, true, ValueLogicalType::Json)
+            .unwrap();
     let json = ConstantPool::try_new(
         Arc::new(json_type.try_to_field("json").unwrap()),
         json_type.clone(),
-        Arc::new(StringArray::from(vec![None, Some("null")])).to_data(),
+        Arc::new(LargeBinaryArray::from(vec![None, Some(&[0x01, 0x20][..])])).to_data(),
         policy(),
         CompilePhase::Validate,
         &Control::good(),
@@ -1746,8 +1748,9 @@ fn full_types_and_shared_float_bits_keep_original_backing_and_reject_retagging()
             .unwrap()
     );
     for wrong in [
-        ValueType::new(DataType::Utf8, true),
-        ValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json).unwrap(),
+        ValueType::new(DataType::LargeBinary, true),
+        ValueType::try_with_logical_type(DataType::LargeBinary, false, ValueLogicalType::Json)
+            .unwrap(),
     ] {
         let e = compile(
             &make(ty.clone(), wrong),
@@ -1946,17 +1949,21 @@ mod resolved;
 
 #[test]
 fn nested_nominal_types_keep_original_fields_and_ignore_only_nonsemantic_source_attributes() {
-    use arrow::array::{StringArray, StructArray};
+    use arrow::array::{LargeBinaryArray, StructArray};
     use std::collections::HashMap;
     let field = Arc::new(
-        Field::new("json", DataType::Utf8, true).with_metadata(HashMap::from([
+        Field::new("json", DataType::LargeBinary, true).with_metadata(HashMap::from([
             (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
             ("provider".to_owned(), "source".to_owned()),
         ])),
     );
+    let empty_object = &[0x01, 0x80, 0x01, 0x00][..];
     let array = Arc::new(StructArray::new(
         vec![field.clone()].into(),
-        vec![Arc::new(StringArray::from(vec![Some("null"), Some("{}")]))],
+        vec![Arc::new(LargeBinaryArray::from(vec![
+            &[0x01, 0x20][..],
+            empty_object,
+        ]))],
         None,
     ));
     let declare = |layout: &DataType, json| {
@@ -1964,7 +1971,7 @@ fn nested_nominal_types_keep_original_fields_and_ignore_only_nonsemantic_source_
         let kind = if json {
             ValueKind::Nominal(ValueLogicalType::Json)
         } else {
-            ValueKind::String
+            ValueKind::Binary
         };
         let child = ValueField::new(
             "json",
@@ -2045,10 +2052,10 @@ fn nested_nominal_types_keep_original_fields_and_ignore_only_nonsemantic_source_
             .unwrap()
             .column(0)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<LargeBinaryArray>()
             .unwrap()
             .value(1),
-        "{}"
+        empty_object
     );
     let attributes_only = DataType::Struct(
         vec![Arc::new(field.as_ref().clone().with_metadata(
@@ -2478,7 +2485,8 @@ fn late_scope_clone_shares_source_columns_and_retains_only_their_original_owner(
     }]);
     let source_pointer = columns.as_ptr();
     let nominal =
-        ValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap();
+        ValueType::try_with_logical_type(DataType::LargeBinary, true, ValueLogicalType::Json)
+            .unwrap();
     let ordinal_types: Arc<[ValueType]> = Arc::from([int(false), nominal.clone()]);
     let ordinal_pointer = ordinal_types.as_ptr();
     let c = Control::good();
@@ -3535,7 +3543,11 @@ fn null_list_json_carrier_compiles_live_and_unused_with_the_implicit_mode() {
     let result = ValueType::try_from_value(
         ValueTypeRef::try_new(ValueKind::List(item), true, storage.clone()).unwrap(),
         ValueLayout::try_new(
-            &DataType::List(Arc::new(Field::new("result-item", DataType::Utf8, true))),
+            &DataType::List(Arc::new(Field::new(
+                "result-item",
+                DataType::LargeBinary,
+                true,
+            ))),
             storage,
         )
         .unwrap(),

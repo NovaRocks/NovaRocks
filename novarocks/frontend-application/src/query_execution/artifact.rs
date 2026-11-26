@@ -2153,14 +2153,12 @@ mod tests {
             (D::Object, DataType::Binary),
             (D::Percentile, DataType::Binary),
             (D::Variant, DataType::LargeBinary),
-            (D::Json, DataType::Utf8),
+            (D::Json, DataType::LargeBinary),
             (D::Plain, DataType::Binary),
             (D::Plain, DataType::Utf8),
         ] {
-            // JSON presentation validates JSON bytes; the frozen domain does
-            // not turn an arbitrary UTF8 fixture into a valid JSON document.
             let bytes: &[u8] = if domain == D::Json {
-                b"\"nonempty\""
+                b"\x01\x44\x08nonempty"
             } else {
                 b"nonempty"
             };
@@ -2209,6 +2207,8 @@ mod tests {
             } else {
                 let expected: &[u8] = if matches!(result.columns[0].data_type(), DataType::Binary) {
                     b"bm9uZW1wdHk="
+                } else if domain == D::Json {
+                    b"\"nonempty\""
                 } else {
                     bytes
                 };
@@ -2241,67 +2241,56 @@ mod tests {
     }
 
     #[test]
-    fn string_dictionary_ipc_preserves_selected_nulls_payload_and_full_binding() {
+    fn root_ipc_preserves_selected_nulls_payload_and_full_binding() {
         use crate::query_execution::attempt_plan_facts::{PlanOutputColumn, declared_test_value};
-        use arrow::array::{ArrayRef, DictionaryArray, Int32Array, LargeStringArray, StringArray};
+        use arrow::array::{
+            ArrayRef, DictionaryArray, Int32Array, LargeBinaryArray, LargeStringArray, StringArray,
+        };
         use arrow::datatypes::{DataType, Int32Type};
         use novarocks_physical_plan::ResultValueDomain as D;
-        for large in [false, true] {
-            for domain in [D::Plain, D::Json] {
-                // JSON's installed declaration is UTF8; a LargeUTF8 source has
-                // its own exact layout rather than borrowing that declaration.
-                if large && domain == D::Json {
-                    continue;
-                }
-                let (a, b) = if domain == D::Json {
-                    ("{}", "[]")
+        for (domain, carrier) in [
+            (D::Plain, DataType::Utf8),
+            (D::Plain, DataType::LargeUtf8),
+            (D::Json, DataType::LargeBinary),
+        ] {
+            let (array, first, last): (ArrayRef, &[u8], &[u8]) = if domain == D::Json {
+                let values = LargeBinaryArray::from(vec![
+                    Some(b"\x01\x60\x01\x00".as_slice()),
+                    None,
+                    None,
+                    Some(b"\x01\x80\x01\x00".as_slice()),
+                ]);
+                (Arc::new(values), b"[]", b"{}")
+            } else {
+                let values: ArrayRef = if carrier == DataType::LargeUtf8 {
+                    Arc::new(LargeStringArray::from(vec![Some("a"), None, Some("b")]))
                 } else {
-                    ("a", "b")
+                    Arc::new(StringArray::from(vec![Some("a"), None, Some("b")]))
                 };
-                let values: ArrayRef = if large {
-                    Arc::new(LargeStringArray::from(vec![Some(a), None, Some(b)]))
-                } else {
-                    Arc::new(StringArray::from(vec![Some(a), None, Some(b)]))
-                };
-                let array: ArrayRef = Arc::new(
-                    DictionaryArray::<Int32Type>::try_new(
-                        Int32Array::from(vec![Some(2), None, Some(1), Some(0)]),
-                        values,
-                    )
-                    .unwrap(),
-                );
-                let ty = declared_test_value(
-                    if large {
-                        DataType::LargeUtf8
-                    } else {
-                        DataType::Utf8
-                    },
-                    true,
-                    domain,
+                let array = DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(vec![Some(2), None, Some(1), Some(0)]),
+                    values,
                 )
                 .unwrap();
-                let chunk = typed_result_chunk(array, &ty);
-                let expected = super::build_expected_output_schema(&[PlanOutputColumn {
-                    name: "declared".into(),
-                    ty: ty.clone(),
-                }])
-                .unwrap();
-                let payload = encode_declared_exchange_unit(&chunk, &expected.chunk_schema);
-                let decoded = test_decode_root_chunk(&payload, &expected.chunk_schema).unwrap();
-                let original = decoded.record_batch().column(0).clone();
-                let result = expected.into_query_result(vec![decoded]).unwrap();
-                assert_eq!(result.columns[0].value_type(), &ty);
-                assert_shared_payload(&original.to_data(), &result.batches[0].column(0).to_data());
-                assert_eq!(
-                    render_test_cells(&result, domain).unwrap(),
-                    vec![
-                        Some(b.as_bytes().to_vec()),
-                        None,
-                        None,
-                        Some(a.as_bytes().to_vec())
-                    ]
-                );
-            }
+                (Arc::new(array), b"b", b"a")
+            };
+            let ty = declared_test_value(carrier, true, domain).unwrap();
+            let chunk = typed_result_chunk(array, &ty);
+            let expected = super::build_expected_output_schema(&[PlanOutputColumn {
+                name: "declared".into(),
+                ty: ty.clone(),
+            }])
+            .unwrap();
+            let payload = encode_declared_exchange_unit(&chunk, &expected.chunk_schema);
+            let decoded = test_decode_root_chunk(&payload, &expected.chunk_schema).unwrap();
+            let original = decoded.record_batch().column(0).clone();
+            let result = expected.into_query_result(vec![decoded]).unwrap();
+            assert_eq!(result.columns[0].value_type(), &ty);
+            assert_shared_payload(&original.to_data(), &result.batches[0].column(0).to_data());
+            assert_eq!(
+                render_test_cells(&result, domain).unwrap(),
+                vec![Some(first.to_vec()), None, None, Some(last.to_vec())]
+            );
         }
     }
 

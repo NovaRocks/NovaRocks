@@ -128,6 +128,39 @@ mod tests {
     }
 
     #[test]
+    fn iceberg_ctas_hands_root_and_nested_json_to_provider_schema_admission() {
+        use novarocks_spi::connector::ConnectorDataType;
+
+        let sources = [
+            typed(
+                "root",
+                ValueKind::Nominal(ValueLogicalType::Json),
+                DataType::LargeBinary,
+                false,
+                Domain::Json,
+            ),
+            typed(
+                "items",
+                ValueKind::List(nominal(ValueLogicalType::Json, true)),
+                DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true))),
+                true,
+                Domain::Plain,
+            ),
+        ];
+        let columns = source_columns_to_table_column_defs(&sources).unwrap();
+        let connector = columns
+            .iter()
+            .map(crate::catalog_application::statement::connector_column)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(connector[0].data_type, ConnectorDataType::Json);
+        assert_eq!(
+            connector[1].data_type,
+            ConnectorDataType::Array(Box::new(ConnectorDataType::Json))
+        );
+    }
+
+    #[test]
     fn m07_ctas_refuses_private_domains_before_the_arrow_inverse_can_erase_them() {
         for (domain, logical) in [
             (Domain::Object, ValueLogicalType::Object),
@@ -372,7 +405,7 @@ mod tests {
     #[test]
     fn ctas_complete_nominal_declarations_reach_ddl_and_writer_separately() {
         let declarations = [
-            (ValueLogicalType::Json, DataType::Utf8, SqlType::Json),
+            (ValueLogicalType::Json, DataType::LargeBinary, SqlType::Json),
             (
                 ValueLogicalType::Variant,
                 DataType::LargeBinary,
@@ -409,7 +442,7 @@ mod tests {
         let nominal = typed(
             "v",
             ValueKind::List(nominal(ValueLogicalType::Json, false)),
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, false))),
             true,
             Domain::Plain,
         );

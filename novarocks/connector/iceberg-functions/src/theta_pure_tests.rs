@@ -760,8 +760,12 @@ fn theta_pure_nominal_domains_and_distinct_order_stale_selection_refuse_precisel
     );
     let catalog = catalog();
     for source in [
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .expect("valid temporary legacy value projection"),
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .expect("valid temporary legacy value projection"),
         FunctionValueType::new(DataType::Time64(TimeUnit::Nanosecond), false),
         FunctionValueType::new(DataType::Timestamp(TimeUnit::Millisecond, None), false),
         FunctionValueType::new(

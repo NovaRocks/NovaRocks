@@ -17,26 +17,25 @@
 
 //! Conversion of an original typed JSON value to a frozen SQL structure.
 
-use super::{
-    LeafError, Reader, Scalar, consume_value, decode_string, number_text, numeric, validate,
-};
 use crate::cast::{
     CastPrepareError, CastRowResult, PreparedCastRecipe, SignedWidth, map_mode, trino,
 };
+use crate::json_value::{self, Container, Kind, Node, ObservedError, Scalar};
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
-use crate::{DataFailureReason, KernelEvaluationControl, KernelFailure, RowDataError};
+use crate::opaque_memory::OpaqueRetainedCharge;
+use crate::{DataFailureReason, KernelFailure, RowDataError};
 use arrow_array::builder::{
     ArrayBuilder, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder, Int8Builder,
-    Int16Builder, Int32Builder, Int64Builder, ListBuilder, MapBuilder, StringBuilder,
-    StructBuilder, make_builder,
+    Int16Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, ListBuilder, MapBuilder,
+    StringBuilder, StructBuilder, make_builder,
 };
-use arrow_array::{Array, ArrayRef, ListArray, MapArray, StringArray, StructArray};
+use arrow_array::{Array, ArrayRef, LargeBinaryArray, ListArray, MapArray, StructArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     CharacterKind, CompileCheckpoints, FunctionValueType, ValueKind, ValueLogicalType, ValueTypeRef,
 };
-use std::{collections::HashMap, ops::Range};
+use std::{collections::HashMap, io::Write as _};
 
 #[derive(Clone, Copy)]
 enum Target {
@@ -114,7 +113,8 @@ pub(in crate::cast) fn validate_target(
                 validate_target(member.value_type(), field.data_type(), work)?;
             }
         }
-        (Target::Json | Target::Varchar(_), _, DataType::Utf8)
+        (Target::Json, _, DataType::LargeBinary)
+        | (Target::Varchar(_), _, DataType::Utf8)
         | (Target::Boolean, _, DataType::Boolean)
         | (
             Target::Numeric(_),
@@ -142,11 +142,26 @@ impl From<KernelFailure> for CastFault {
         Self::Outer(error)
     }
 }
-impl From<LeafError> for CastFault {
-    fn from(error: LeafError) -> Self {
+impl From<json_value::JsonValueError> for CastFault {
+    fn from(error: json_value::JsonValueError) -> Self {
+        Self::Outer(internal(&error.to_string()))
+    }
+}
+
+impl From<ObservedError<KernelFailure>> for CastFault {
+    fn from(error: ObservedError<KernelFailure>) -> Self {
         match error {
-            LeafError::Outer(error) => Self::Outer(error),
-            _ => Self::Data("Invalid JSON value for the cast target"),
+            ObservedError::Value(error) => error.into(),
+            ObservedError::Control(error) => error.into(),
+        }
+    }
+}
+
+impl From<trino::ConversionFailure> for CastFault {
+    fn from(error: trino::ConversionFailure) -> Self {
+        match error {
+            trino::ConversionFailure::Outer(error) => Self::Outer(error),
+            _ => Self::Data("Cannot convert JSON scalar to the requested type"),
         }
     }
 }
@@ -156,14 +171,23 @@ pub(in crate::cast) fn evaluate_row(
     input: &ArrayRef,
     row: usize,
     ordinal: usize,
-    _control: &dyn KernelEvaluationControl,
+    staging: &mut OpaqueRetainedCharge,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Result<ArrayRef, RowDataError>, KernelFailure> {
     let input = input
         .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| invalid("JSON structure CAST lost its UTF-8 source"))?;
-    match convert(input.value(row), &recipe.result, ordinal, work) {
+        .downcast_ref::<LargeBinaryArray>()
+        .ok_or_else(|| invalid("JSON structure CAST lost its LargeBinary source"))?;
+    let previous_bytes = staging.bytes();
+    let converted = convert(input.value(row), &recipe.result, ordinal, staging, work);
+    if matches!(&converted, Ok(Err(_)) | Err(CastFault::Data(_)))
+        && staging.bytes() != previous_bytes
+    {
+        // The failed row's builders have already been destroyed.
+        let mut no_growth = staging.reserve_operation(0)?;
+        staging.reconcile_under_reservation(previous_bytes, &mut no_growth)?;
+    }
+    match converted {
         Ok(value) => Ok(value),
         Err(CastFault::Outer(error)) => Err(error),
         Err(CastFault::Data(detail)) => Ok(Err(RowDataError::with_reason(
@@ -177,28 +201,21 @@ pub(in crate::cast) fn evaluate_row(
 }
 
 fn convert(
-    raw: &str,
+    raw: &[u8],
     target: &FunctionValueType,
     ordinal: usize,
+    staging: &mut OpaqueRetainedCharge,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Result<ArrayRef, RowDataError>, CastFault> {
-    // Preserve the original JSON validation, including opaque child values
-    // and the existing raw-input depth rule. No object map collapses members.
-    validate(raw, work)?;
-    let mut reader = Reader { raw, at: 0, work };
-    reader.work.flush()?;
+    let root = Node::from_root(raw)?;
+    root.validate(|| work.step())?;
+    work.flush()?;
     let mut builder = make_builder(target.data_type(), 1);
-    append_value(&mut reader, target.value_type(), builder.as_mut())?;
-    reader.space()?;
-    if reader.at != raw.len() {
-        return Err(CastFault::Data(
-            "Unexpected trailing token after JSON value",
-        ));
-    }
-    reader.work.flush()?;
+    append_value(root, target.value_type(), builder.as_mut(), staging, work)?;
+    work.flush()?;
     let value = builder.finish();
-    reader.work.flush()?;
-    if has_duplicate_map_key(target, &value, reader.work)? {
+    work.flush()?;
+    if has_duplicate_map_key(target, &value, work)? {
         return Ok(Err(map_mode::duplicate_map_key_error(ordinal)));
     }
     Ok(Ok(value))
@@ -212,206 +229,124 @@ fn builder_as<T: 'static>(builder: &mut dyn ArrayBuilder) -> Result<&mut T, Kern
 }
 
 fn append_value(
-    reader: &mut Reader<'_, '_, '_>,
+    node: Node<'_>,
     value: &ValueTypeRef,
     builder: &mut dyn ArrayBuilder,
+    staging: &mut OpaqueRetainedCharge,
+    work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<(), CastFault> {
-    reader.space()?;
-    reader.work.flush()?;
     let target =
         target(value.kind()).ok_or_else(|| internal("JSON CAST lost its frozen value target"))?;
     if matches!(target, Target::Json) {
-        let start = reader.at;
-        consume_value(reader)?;
-        return append_text(builder, Some(&reader.raw[start..reader.at]), reader.work);
+        let out = builder_as::<LargeBinaryBuilder>(builder)?;
+        let payload_bytes = node
+            .item_bytes()
+            .len()
+            .checked_add(1)
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        let staged_bytes = staging
+            .bytes()
+            .checked_add(payload_bytes)
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        let extent = out
+            .values_slice()
+            .len()
+            .checked_add(payload_bytes)
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        i64::try_from(extent).map_err(|_| KernelFailure::ResourceExhausted)?;
+        work.flush()?;
+        let mut reservation = staging.reserve_operation(payload_bytes)?;
+        staging.reconcile_under_reservation(staged_bytes, &mut reservation)?;
+        out.write_all(&[json_value::VERSION])
+            .map_err(|_| internal("JSON CAST could not write its version byte"))?;
+        for chunk in node.item_bytes().chunks(4096) {
+            work.step()?;
+            out.write_all(chunk)
+                .map_err(|_| internal("JSON CAST could not write its selected item"))?;
+        }
+        out.append_value([]);
+        return Ok(());
     }
-    if reader.byte() == Some(b'n') {
-        reader.literal(b"null")?;
+    let kind = node.kind_observed(|| work.step())?;
+    if matches!(kind, Kind::Null) {
         if !value.nullable() {
             return Err(CastFault::Data(
                 "JSON null cannot populate a required field",
             ));
         }
-        return append_null(value, builder, reader.work);
+        return append_null(value, builder, work);
     }
-    match (target, value.kind()) {
-        (Target::Array, ValueKind::List(item)) => {
-            if reader.byte() != Some(b'[') {
-                return Err(CastFault::Data("Expected a JSON array"));
-            }
-            reader.require(b'[')?;
-            reader.space()?;
+    match (target, value.kind(), kind) {
+        (Target::Array, ValueKind::List(item), Kind::Array(elements)) => {
             let out = builder_as::<ListBuilder<Box<dyn ArrayBuilder>>>(builder)?;
-            if reader.byte() != Some(b']') {
-                loop {
-                    append_value(reader, item, out.values().as_mut())?;
-                    if !next_member(reader, b']')? {
-                        break;
-                    }
-                }
+            for entry in elements.entries() {
+                work.step()?;
+                append_value(entry?.value, item, out.values().as_mut(), staging, work)?;
             }
-            reader.require(b']')?;
             check_child_offset(out.values().len())?;
-            reader.work.flush()?;
+            work.flush()?;
             out.append(true);
             Ok(())
         }
-        (Target::Map, ValueKind::Map { key, value }) => {
-            if reader.byte() != Some(b'{') {
-                return Err(CastFault::Data("Expected a JSON object for MAP"));
-            }
-            reader.require(b'{')?;
-            reader.space()?;
+        (Target::Map, ValueKind::Map { key, value }, Kind::Object(members)) => {
             let out =
                 builder_as::<MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>>(builder)?;
-            if reader.byte() != Some(b'}') {
-                loop {
-                    let (token, decoded_bytes) = member_name(reader)?;
-                    let target = self::target(key.kind())
-                        .ok_or_else(|| internal("JSON CAST lost its frozen MAP key type"))?;
-                    let name = Scalar::String {
-                        token,
-                        decoded_bytes,
-                    };
-                    append_scalar(
-                        target,
-                        read_scalar(reader, name, target)?,
-                        out.keys().as_mut(),
-                        reader.work,
-                    )?;
-                    append_value(reader, value, out.values().as_mut())?;
-                    if !next_member(reader, b'}')? {
-                        break;
-                    }
-                }
+            let key_type = self::target(key.kind())
+                .ok_or_else(|| internal("JSON CAST lost its frozen MAP key type"))?;
+            for entry in members.entries() {
+                work.step()?;
+                let entry = entry?;
+                let name = entry
+                    .key
+                    .ok_or_else(|| internal("JSON object entry lost its key"))?;
+                append_json_scalar(key_type, Scalar::String(name), out.keys().as_mut(), work)?;
+                append_value(entry.value, value, out.values().as_mut(), staging, work)?;
             }
-            reader.require(b'}')?;
             check_child_offset(out.keys().len())?;
-            reader.work.flush()?;
+            work.flush()?;
             out.append(true).map_err(assembly_failure)?;
             Ok(())
         }
-        (Target::Row, ValueKind::Struct(fields)) => append_row(reader, fields, builder),
-        _ => {
-            if matches!(reader.byte(), Some(b'[' | b'{')) {
-                return Err(CastFault::Data(
-                    "Expected a JSON scalar for the cast target",
-                ));
-            }
-            let scalar = reader.scalar()?;
-            let value = read_scalar(reader, scalar, target)?;
-            append_scalar(target, value, builder, reader.work)
+        (Target::Row, ValueKind::Struct(fields), kind) => {
+            append_row(kind, fields, builder, staging, work)
         }
+        (_, _, Kind::Scalar(scalar)) => append_json_scalar(target, scalar, builder, work),
+        _ => Err(CastFault::Data("Unexpected JSON shape for the cast target")),
     }
-}
-
-fn member_name(reader: &mut Reader<'_, '_, '_>) -> Result<(Range<usize>, usize), LeafError> {
-    reader.space()?;
-    let name = reader.string_token()?;
-    reader.space()?;
-    reader.require(b':')?;
-    reader.space()?;
-    Ok(name)
-}
-
-fn next_member(reader: &mut Reader<'_, '_, '_>, close: u8) -> Result<bool, LeafError> {
-    reader.space()?;
-    if reader.byte() == Some(close) {
-        return Ok(false);
-    }
-    reader.require(b',')?;
-    reader.space()?;
-    Ok(true)
 }
 
 fn append_row(
-    reader: &mut Reader<'_, '_, '_>,
+    kind: Kind<'_>,
     fields: &[novarocks_type_contract::ValueField],
     builder: &mut dyn ArrayBuilder,
+    staging: &mut OpaqueRetainedCharge,
+    work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<(), CastFault> {
     let row = builder_as::<StructBuilder>(builder)?;
-    match reader.byte() {
-        Some(b'[') => {
-            reader.require(b'[')?;
-            reader.space()?;
-            for (index, (field, builder)) in fields.iter().zip(row.field_builders_mut()).enumerate()
-            {
-                reader.work.step()?;
-                if reader.byte() == Some(b']') {
-                    return Err(CastFault::Data(
-                        "JSON array length differs from ROW field count",
-                    ));
-                }
-                if index != 0 {
-                    reader.require(b',')?;
-                }
-                append_value(reader, field.value_type(), builder.as_mut())?;
-                reader.space()?;
-            }
-            if reader.byte() != Some(b']') {
+    match kind {
+        Kind::Array(elements) => {
+            if fields.len() != elements.len() {
                 return Err(CastFault::Data(
                     "JSON array length differs from ROW field count",
                 ));
             }
-            reader.require(b']')?;
+            for ((field, builder), entry) in fields
+                .iter()
+                .zip(row.field_builders_mut())
+                .zip(elements.entries())
+            {
+                work.step()?;
+                append_value(
+                    entry?.value,
+                    field.value_type(),
+                    builder.as_mut(),
+                    staging,
+                    work,
+                )?;
+            }
         }
-        Some(b'{') if fields.first().is_some_and(|field| !field.name().is_empty()) => {
-            reader.require(b'{')?;
-            reader.space()?;
-            reader.work.flush()?;
-            let mut names = HashMap::new();
-            names
-                .try_reserve(fields.len())
-                .map_err(|_| KernelFailure::ResourceExhausted)?;
-            let mut seen = crate::cast::array_mode::reserve(fields.len(), reader.work)?;
-            seen.resize(fields.len(), false);
-            for (index, field) in fields.iter().enumerate() {
-                for _ in field.name().as_bytes().chunks(32) {
-                    reader.work.step()?;
-                }
-                reader.work.flush()?;
-                names.insert(field.name(), index);
-            }
-            if reader.byte() != Some(b'}') {
-                loop {
-                    let (token, bytes) = member_name(reader)?;
-                    let name = decode_string(&reader.raw[token], bytes, reader.work)?;
-                    reader.work.flush()?;
-                    // Like Trino, fold the incoming JSON member. The target
-                    // keeps the exact SQL field name that analysis declared.
-                    let folded = name.to_lowercase();
-                    reader.work.flush()?;
-                    if let Some(&index) = names.get(folded.as_str()) {
-                        if seen[index] {
-                            return Err(CastFault::Data("Duplicate JSON field for ROW cast"));
-                        }
-                        seen[index] = true;
-                        append_value(
-                            reader,
-                            fields[index].value_type(),
-                            row.field_builders_mut()[index].as_mut(),
-                        )?;
-                    } else {
-                        consume_value(reader)?;
-                    }
-                    if !next_member(reader, b'}')? {
-                        break;
-                    }
-                }
-            }
-            reader.require(b'}')?;
-            for (index, present) in seen.into_iter().enumerate() {
-                reader.work.step()?;
-                if !present {
-                    let value = fields[index].value_type();
-                    if !value.nullable() {
-                        return Err(CastFault::Data(
-                            "Missing JSON member for a required ROW field",
-                        ));
-                    }
-                    append_null(value, row.field_builders_mut()[index].as_mut(), reader.work)?;
-                }
-            }
+        Kind::Object(members) if fields.first().is_some_and(|field| !field.name().is_empty()) => {
+            append_named_row(members, fields, row, staging, work)?;
         }
         _ => {
             return Err(CastFault::Data(
@@ -419,8 +354,69 @@ fn append_row(
             ));
         }
     }
-    reader.work.flush()?;
+    work.flush()?;
     row.append(true);
+    Ok(())
+}
+
+fn append_named_row(
+    members: Container<'_>,
+    fields: &[novarocks_type_contract::ValueField],
+    row: &mut StructBuilder,
+    staging: &mut OpaqueRetainedCharge,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<(), CastFault> {
+    let mut names = HashMap::new();
+    work.flush()?;
+    names
+        .try_reserve(fields.len())
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    let mut seen = crate::cast::array_mode::reserve(fields.len(), work)?;
+    seen.resize(fields.len(), false);
+    for (index, field) in fields.iter().enumerate() {
+        for _ in field.name().as_bytes().chunks(32) {
+            work.step()?;
+        }
+        work.flush()?;
+        names.insert(field.name(), index);
+    }
+    for entry in members.entries() {
+        let entry = entry?;
+        let name = entry
+            .key
+            .ok_or_else(|| internal("JSON object entry lost its key"))?;
+        for _ in name.as_bytes().chunks(32) {
+            work.step()?;
+        }
+        work.flush()?;
+        // Trino folds the incoming member, retaining the exact SQL field name.
+        let folded = name.to_lowercase();
+        if let Some(&index) = names.get(folded.as_str()) {
+            if seen[index] {
+                return Err(CastFault::Data("Duplicate JSON field for ROW cast"));
+            }
+            seen[index] = true;
+            append_value(
+                entry.value,
+                fields[index].value_type(),
+                row.field_builders_mut()[index].as_mut(),
+                staging,
+                work,
+            )?;
+        }
+    }
+    for (index, present) in seen.into_iter().enumerate() {
+        work.step()?;
+        if !present {
+            let value = fields[index].value_type();
+            if !value.nullable() {
+                return Err(CastFault::Data(
+                    "Missing JSON member for a required ROW field",
+                ));
+            }
+            append_null(value, row.field_builders_mut()[index].as_mut(), work)?;
+        }
+    }
     Ok(())
 }
 
@@ -457,53 +453,48 @@ fn append_null(
     Ok(())
 }
 
-fn read_scalar(
-    reader: &mut Reader<'_, '_, '_>,
-    value: Scalar,
+fn append_json_scalar(
     target: Target,
-) -> Result<CastRowResult, CastFault> {
-    use CastRowResult as R;
-
-    let converted = match (value, target) {
-        (
-            Scalar::String {
-                token,
-                decoded_bytes,
-            },
-            target,
-        ) => {
-            let text = decode_string(&reader.raw[token], decoded_bytes, reader.work)?;
-            match target {
-                Target::Varchar(_) => Some(R::Text(text)),
-                Target::Boolean => numeric::converted(trino::parse_boolean(&text).map(R::Boolean))?,
-                Target::Numeric(target) => {
-                    numeric::converted(trino::parse_number(&text, target, reader.work))?
+    value: Scalar<'_>,
+    builder: &mut dyn ArrayBuilder,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<(), CastFault> {
+    let converted = match target {
+        Target::Boolean => CastRowResult::Boolean(trino::json_boolean_cast(value, work)?),
+        Target::Numeric(target) => trino::json_number_cast(value, target, work)?,
+        Target::Varchar(max) => {
+            let mut scratch = json_value::FixedText::<256>::new();
+            let text = match value {
+                Scalar::String(text) => text,
+                _ => {
+                    json_value::write_scalar_cast(&mut scratch, value, work).map_err(|error| {
+                        match error {
+                            json_value::JsonError::Host(error) => CastFault::Outer(error),
+                            _ => CastFault::Data("Cannot convert JSON scalar to VARCHAR"),
+                        }
+                    })?;
+                    scratch.as_str()
                 }
-                _ => None,
+            };
+            if let Some(max) = max {
+                for (width, _) in text.chars().enumerate() {
+                    work.step()?;
+                    if width == max as usize {
+                        return Err(CastFault::Data(
+                            "JSON string exceeds the frozen VARCHAR length",
+                        ));
+                    }
+                }
             }
+            return append_text(builder, Some(text), work);
         }
-        (Scalar::Boolean(value), Target::Varchar(_)) => Some(R::Text(super::copy_text(
-            if value { "true" } else { "false" },
-            reader.work,
-        )?)),
-        (Scalar::Boolean(value), Target::Boolean) => Some(R::Boolean(value)),
-        (Scalar::Boolean(value), Target::Numeric(target)) => numeric::converted(
-            trino::parse_number(if value { "1" } else { "0" }, target, reader.work),
-        )?,
-        (Scalar::Number(token), target) => {
-            let raw = &reader.raw[token];
-            match target {
-                Target::Varchar(_) => Some(R::Text(number_text(raw, reader.work)?)),
-                Target::Boolean => Some(R::Boolean(numeric::nonzero(raw, reader.work)?)),
-                Target::Numeric(target) => numeric::convert(raw, target, reader.work)?,
-                _ => None,
-            }
+        _ => {
+            return Err(CastFault::Data(
+                "Expected a JSON scalar for the cast target",
+            ));
         }
-        _ => None,
     };
-    converted.ok_or(CastFault::Data(
-        "Cannot convert JSON scalar to the requested type",
-    ))
+    append_scalar(target, converted, builder, work)
 }
 
 fn append_scalar(
@@ -543,26 +534,10 @@ fn append_scalar(
         Target::Numeric(Real) => insert!(Float32Builder, R::Float32, |value| value),
         Target::Numeric(Double) => insert!(Float64Builder, R::Float64, |value| value),
         Target::Numeric(Decimal(..)) => insert!(Decimal128Builder, R::Decimal128, |value| value),
-        Target::Varchar(max_length) => {
-            let text = match &value {
-                R::Text(text) => Some(text.as_str()),
-                R::Null => None,
-                _ => return Err(internal("JSON CAST scalar has a foreign VARCHAR result").into()),
-            };
-            if let (Some(limit), Some(text)) = (max_length, text) {
-                let limit = usize::try_from(limit).map_err(|_| KernelFailure::ResourceExhausted)?;
-                for (width, _) in text.chars().enumerate() {
-                    work.step()?;
-                    if width == limit {
-                        return Err(CastFault::Data(
-                            "JSON string exceeds the frozen VARCHAR length",
-                        ));
-                    }
-                }
-            }
-            append_text(builder, text, work)?;
+        Target::Varchar(_) if matches!(value, R::Null) => append_text(builder, None, work)?,
+        Target::Json if matches!(value, R::Null) => {
+            builder_as::<LargeBinaryBuilder>(builder)?.append_null()
         }
-        Target::Json if matches!(value, R::Null) => append_text(builder, None, work)?,
         _ => return Err(internal("JSON CAST scalar has a foreign target").into()),
     }
     Ok(())

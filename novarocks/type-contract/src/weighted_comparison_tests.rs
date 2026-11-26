@@ -24,7 +24,7 @@ fn author(json: bool) -> FunctionValueType {
         if json {
             ValueKind::Nominal(ValueLogicalType::Json)
         } else {
-            ValueKind::String
+            ValueKind::Binary
         },
         true,
         storage.clone(),
@@ -51,7 +51,10 @@ fn author(json: bool) -> FunctionValueType {
                     name,
                     DataType::List(Arc::new(Field::new(
                         "provider-item",
-                        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                        DataType::Dictionary(
+                            Box::new(DataType::Int8),
+                            Box::new(DataType::LargeBinary),
+                        ),
                         true,
                     ))),
                     true,

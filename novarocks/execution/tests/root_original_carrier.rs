@@ -19,7 +19,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arrow::array::{Array, ArrayRef, DictionaryArray, ListArray, StringArray, StructArray};
+use arrow::array::{
+    Array, ArrayRef, DictionaryArray, LargeBinaryArray, ListArray, StringArray, StructArray,
+};
 use arrow::datatypes::{DataType, Field, Fields, Int32Type};
 use arrow::record_batch::RecordBatch;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -237,6 +239,31 @@ impl RootResultSession for OriginalSession {
     }
 }
 
+fn json_documents() -> LargeBinaryArray {
+    use novarocks_functions::{
+        KernelFailure,
+        json_value::{JsonWork, parse},
+    };
+    struct Work;
+    impl JsonWork for Work {
+        type Reservation = ();
+        fn step(&mut self) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+        fn reserve(&mut self, _: usize) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+        fn reserve_output(&mut self, _: usize) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+    }
+    LargeBinaryArray::from_iter_values(
+        ["{}", r#"{"x":1}"#, "[]"]
+            .into_iter()
+            .map(|text| parse(text, &mut Work).unwrap()),
+    )
+}
+
 fn source_chunk() -> Chunk {
     let dictionary: ArrayRef = Arc::new(
         [Some("alpha"), None, Some("omega")]
@@ -249,7 +276,7 @@ fn source_chunk() -> Chunk {
         Some(vec![Some(11)]),
     ]));
     let json_field = field_with_logical_type(
-        Field::new("document", DataType::Utf8, false).with_metadata(HashMap::from([(
+        Field::new("document", DataType::LargeBinary, false).with_metadata(HashMap::from([(
             "nested_origin".to_string(),
             "catalog-json-field".to_string(),
         )])),
@@ -260,15 +287,7 @@ fn source_chunk() -> Chunk {
         json_field,
     ]);
     let nested: ArrayRef = Arc::new(
-        StructArray::try_new(
-            nested_fields,
-            vec![
-                list,
-                Arc::new(StringArray::from(vec!["{}", "{\"x\":1}", "[]"])),
-            ],
-            None,
-        )
-        .unwrap(),
+        StructArray::try_new(nested_fields, vec![list, Arc::new(json_documents())], None).unwrap(),
     );
     let arrays = vec![dictionary, nested];
     let fields = [
@@ -442,7 +461,7 @@ fn ordinary_receiver_still_hydrates_dictionary_and_records_profile() {
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
             true,
         ),
-        Field::new("document", DataType::Utf8, false),
+        Field::new("document", DataType::LargeBinary, false),
     ]));
     let declarations = [
         FunctionValueType::new(DataType::Utf8, true),

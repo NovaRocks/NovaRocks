@@ -2327,7 +2327,7 @@ mod call_policy_tests {
         let fields = [("payload", true, true)];
         let layout = DataType::Struct(
             vec![
-                arrow::datatypes::Field::new("payload", DataType::Utf8, true).with_metadata(
+                arrow::datatypes::Field::new("payload", DataType::LargeBinary, true).with_metadata(
                     std::collections::HashMap::<String, String>::from([(
                         "provider-key".into(),
                         "source-only".into(),
@@ -2340,7 +2340,8 @@ mod call_policy_tests {
         let widened = crate::test_value_types::string_structure(&fields, true);
         assert!(validate_group_output_relation(&input, &widened, &control).is_ok());
         assert!(validate_group_output_relation(&widened, &input, &control).is_err());
-        let text = crate::test_value_types::string_structure(&[("payload", true, false)], true);
-        assert!(validate_group_output_relation(&input, &text, &control).is_err());
+        let binary = FunctionValueType::new(layout, true);
+        assert_eq!(input.data_type(), binary.data_type());
+        assert!(validate_group_output_relation(&input, &binary, &control).is_err());
     }
 }

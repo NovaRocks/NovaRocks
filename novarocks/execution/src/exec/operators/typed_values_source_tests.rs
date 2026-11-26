@@ -18,7 +18,7 @@ use super::*;
 use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::task::{ExecutionFailure, ExecutionFailureCause, PipelineOperation};
-use arrow::array::StringArray;
+use arrow::array::LargeBinaryArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use novarocks_local_program::StaticLayout;
@@ -45,13 +45,13 @@ fn values(zero_columns: bool) -> StaticValues {
             storage.clone(),
         )
         .unwrap(),
-        ValueLayout::try_new(&DataType::Utf8, storage.clone()).unwrap(),
+        ValueLayout::try_new(&DataType::LargeBinary, storage.clone()).unwrap(),
     )
     .unwrap();
     let schema = Arc::new(Schema::new(if zero_columns {
         Vec::<Field>::new()
     } else {
-        vec![Field::new("value", DataType::Utf8, false)]
+        vec![Field::new("value", DataType::LargeBinary, false)]
     }));
     let layout = StaticLayout::try_new_typed_for_compile(
         schema.clone(),
@@ -80,7 +80,10 @@ fn values(zero_columns: bool) -> StaticValues {
     } else {
         RecordBatch::try_new(
             schema,
-            vec![Arc::new(StringArray::from(vec!["{\"v\":1}", "null"])) as ArrayRef],
+            vec![Arc::new(LargeBinaryArray::from(vec![
+                b"\x01\x80\x08\x01\x01v\x4a\x01\x00\x00\x00".as_slice(),
+                b"\x01\x20".as_slice(),
+            ])) as ArrayRef],
         )
         .unwrap()
     };

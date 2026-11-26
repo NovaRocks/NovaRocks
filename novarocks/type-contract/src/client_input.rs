@@ -300,13 +300,16 @@ mod tests {
         assert!(
             ValidatedClientInputTypes::try_new(
                 json.clone(),
-                input(ValueKind::Nominal(V::Json), D::Utf8, true)
+                input(ValueKind::Nominal(V::Json), D::LargeBinary, true)
             )
             .is_ok()
         );
         assert!(
-            ValidatedClientInputTypes::try_new(json, input(ValueKind::String, D::Utf8, true))
-                .is_err()
+            ValidatedClientInputTypes::try_new(
+                json,
+                input(ValueKind::Binary, D::LargeBinary, true)
+            )
+            .is_err()
         );
         let binary = contract(field(N::Binary, false));
         assert!(
@@ -372,15 +375,21 @@ mod tests {
         ));
         for (name, kind, nullable, valid) in [
             ("payload", ValueKind::Nominal(V::Json), false, true),
-            ("payload", ValueKind::String, false, false),
+            ("payload", ValueKind::Binary, false, false),
             ("renamed", ValueKind::Nominal(V::Json), false, false),
             ("payload", ValueKind::Nominal(V::Json), true, false),
         ] {
             let storage = ValueTypeStorageLifetime::pure();
             let child = ValueTypeRef::try_new(kind, nullable, storage.clone()).unwrap();
             let kind = ValueKind::Struct(vec![ValueField::new(name, child, storage)].into());
-            let layout =
-                D::Struct(vec![Arc::new(arrow_schema::Field::new(name, D::Utf8, nullable))].into());
+            let layout = D::Struct(
+                vec![Arc::new(arrow_schema::Field::new(
+                    name,
+                    D::LargeBinary,
+                    nullable,
+                ))]
+                .into(),
+            );
             assert_eq!(
                 ValidatedClientInputTypes::try_new(expected.clone(), input(kind, layout, true))
                     .is_ok(),
@@ -395,7 +404,7 @@ mod tests {
         let storage = ValueTypeStorageLifetime::held(Arc::new(Hold(released.clone())));
         let binding = TypedValueBinding::try_new(
             ValueTypeRef::try_new(ValueKind::Nominal(V::Json), true, storage.clone()).unwrap(),
-            ValueLayout::try_new(&D::Utf8, storage.clone()).unwrap(),
+            ValueLayout::try_new(&D::LargeBinary, storage.clone()).unwrap(),
         )
         .unwrap();
         let source = owner(binding.clone());
@@ -404,7 +413,7 @@ mod tests {
         assert!(proof.is_for(&expected, &source));
         assert!(!proof.is_for(
             &expected,
-            &input(ValueKind::Nominal(V::Json), D::Utf8, true)
+            &input(ValueKind::Nominal(V::Json), D::LargeBinary, true)
         ));
         assert!(!proof.is_for(&contract(field(N::Json, true)), &source));
         let shared = owner(binding);
@@ -412,7 +421,7 @@ mod tests {
         assert!(rebound.is_for(&expected, &shared));
         assert!(
             proof
-                .rebind_shared(input(ValueKind::Nominal(V::Json), D::Utf8, true))
+                .rebind_shared(input(ValueKind::Nominal(V::Json), D::LargeBinary, true))
                 .is_none()
         );
         drop(rebound);

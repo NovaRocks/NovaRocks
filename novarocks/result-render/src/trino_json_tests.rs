@@ -244,7 +244,10 @@ fn scalar_type_values_and_nulls_follow_trino() {
         Arc::new(StringArray::from(vec![Some("a\"\n中文"), None])),
         Arc::new(BinaryArray::from(vec![Some([0, 255].as_slice()), None])),
         Arc::new(Date32Array::from(vec![Some(0), None])),
-        Arc::new(StringArray::from(vec![Some("{\"k\":true}"), None])),
+        Arc::new(LargeBinaryArray::from(vec![
+            Some(b"\x01\x80\x05\x01\x01k\x42\x01".as_slice()),
+            None,
+        ])),
     ];
     let types = vec![
         N::Boolean,
@@ -819,7 +822,7 @@ fn nulls_of_every_supported_native_family_are_json_null() {
         (N::String, D::Utf8),
         (N::Binary, D::Binary),
         (N::Date, D::Date32),
-        (N::Json, D::Utf8),
+        (N::Json, D::LargeBinary),
         (N::Variant, D::LargeBinary),
     ];
     for (unit, arrow) in [

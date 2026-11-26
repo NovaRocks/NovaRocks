@@ -50,6 +50,27 @@ pub(super) struct DefaultValueRecipe {
     conversion: Conversion,
 }
 
+pub(super) enum PartitionDefault<'a> {
+    Borrowed(EvaluatedArgument<'a>),
+    Converted(ArrayRef),
+}
+
+impl PartitionDefault<'_> {
+    pub(super) fn argument(&self) -> EvaluatedArgument<'_> {
+        match self {
+            Self::Borrowed(input) => *input,
+            Self::Converted(values) => EvaluatedArgument::Column(values),
+        }
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Borrowed(_) => 0,
+            Self::Converted(values) => values.get_array_memory_size(),
+        }
+    }
+}
+
 fn numeric(ty: &DataType) -> bool {
     matches!(
         ty,
@@ -91,8 +112,19 @@ fn default_profile(
     source: &FunctionValueType,
     target: &FunctionValueType,
 ) -> Result<DefaultProfile, UnsupportedDefaultProfile> {
-    if !target.nullable() || !(numeric(target.data_type()) || target.data_type() == &DataType::Utf8)
+    if !target.nullable() {
+        return Err(UnsupportedDefaultProfile::Target);
+    }
+    if target.logical_type() == ValueLogicalType::Json
+        && target.data_type() == &DataType::LargeBinary
     {
+        return match (source.logical_type(), source.data_type()) {
+            (ValueLogicalType::Json, DataType::LargeBinary) => Ok(DefaultProfile::Identity),
+            (ValueLogicalType::Physical, DataType::Null) => Ok(DefaultProfile::Null),
+            _ => Err(UnsupportedDefaultProfile::Conversion),
+        };
+    }
+    if !(numeric(target.data_type()) || target.data_type() == &DataType::Utf8) {
         return Err(UnsupportedDefaultProfile::Target);
     }
     if let Some(supported) = NumericDefaultRecipe::profile_supported(source, target) {
@@ -187,6 +219,9 @@ impl DefaultValueRecipe {
     /// not an allocation grant or a bound on temporary cast/take coexistence,
     /// Arc headers, private Bytes owners, or installed host accounting.
     pub(super) fn retained_upper_bound(&self, rows: usize) -> Result<usize, KernelFailure> {
+        if self.target.logical_type() == ValueLogicalType::Json {
+            return Ok(0);
+        }
         if let Conversion::Numeric(recipe) = &self.conversion {
             return recipe.retained_upper_bound(rows);
         }
@@ -243,6 +278,30 @@ impl DefaultValueRecipe {
             Layout::array::<u8>(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
         }
         Ok(total)
+    }
+
+    pub(super) fn prepare_partition<'a>(
+        &self,
+        input: EvaluatedArgument<'a>,
+        rows: usize,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Option<PartitionDefault<'a>>, KernelFailure> {
+        if self.target.logical_type() == ValueLogicalType::Json {
+            control.checkpoint(0)?;
+            validate_argument_observed(input, Selection::all(rows), &self.source, control)?;
+            // The complete default remains owned by the input. A physical
+            // null default uses the same missing-target path as an omitted one.
+            return match self.conversion {
+                Conversion::Identity => Ok(Some(PartitionDefault::Borrowed(input))),
+                Conversion::Null => Ok(None),
+                _ => Err(internal(
+                    "window JSON default conversion differs from its profile",
+                )),
+            };
+        }
+        self.evaluate_complete(input, rows, control)
+            .map(PartitionDefault::Converted)
+            .map(Some)
     }
 
     pub(super) fn evaluate_complete(

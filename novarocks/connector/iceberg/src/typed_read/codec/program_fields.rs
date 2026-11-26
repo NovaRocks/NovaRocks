@@ -1301,11 +1301,14 @@ mod tests {
         );
         let mut logical = original.logical_types().to_vec();
         logical[4] = ValueLogicalType::Json;
-        rejected(
-            &relation,
-            &columns,
-            &public(arrow.fields().iter().cloned().collect(), logical),
+        let mut json_in_place_of_text = arrow.fields().to_vec();
+        json_in_place_of_text[4] = Arc::new(
+            json_in_place_of_text[4]
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::LargeBinary),
         );
+        rejected(&relation, &columns, &public(json_in_place_of_text, logical));
     }
 
     #[test]
@@ -1581,7 +1584,7 @@ mod tests {
                     .iter()
                     .position(|field| field.name() == "file_path")
                     .expect("the accepted Files schema has a physical UTF-8 path");
-                let fields = fields.fields().to_vec();
+                let mut fields = fields.fields().to_vec();
                 let mut logical = fields
                     .iter()
                     .map(|field| {
@@ -1591,11 +1594,16 @@ mod tests {
                         )
                     })
                     .collect::<Vec<_>>();
-                // The accepted public Files schema has no private JSON
-                // metrics column. Its real UTF-8 path must remain physical;
-                // the same carrier cannot authorize an invented JSON domain.
+                // The frozen Files path only accepts its authored UTF-8
+                // declaration, including against a valid native JSON type.
                 assert_eq!(logical[at], ValueLogicalType::Physical);
                 logical[at] = ValueLogicalType::Json;
+                fields[at] = Arc::new(
+                    fields[at]
+                        .as_ref()
+                        .clone()
+                        .with_data_type(DataType::LargeBinary),
+                );
                 rejected(
                     &relation,
                     &columns,

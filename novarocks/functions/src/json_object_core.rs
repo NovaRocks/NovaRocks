@@ -25,6 +25,7 @@ use crate::aggregate_scalar::{
 };
 use crate::aggregate_scalar_debug::{ScalarDebugFailure, ScalarDebugObserver, ScalarDebugRoot};
 use crate::decimal256_digits::fixed_digits;
+use crate::json_object_resources::JsonObjectArguments;
 use crate::parse_json_core::{JsonRenderMessages, ParseJsonFailure, ParseJsonObserver};
 use arrow_array::{ArrayRef, builder::StringBuilder};
 use std::{convert::Infallible, sync::Arc};
@@ -131,26 +132,6 @@ impl novarocks_failure_contract::FailureProjection for JsonObjectFailure<Infalli
             Self::Outer(source) => source.failure_fact(),
             Self::Control(never) => match *never {},
         }
-    }
-}
-
-pub trait JsonObjectArguments {
-    fn len(&self) -> usize;
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    fn array(&self, argument: usize) -> &ArrayRef;
-    fn value_row(&self, argument: usize, ordinal: usize, batch_row: usize) -> usize;
-}
-impl JsonObjectArguments for [ArrayRef] {
-    fn len(&self) -> usize {
-        <[ArrayRef]>::len(self)
-    }
-    fn array(&self, argument: usize) -> &ArrayRef {
-        &self[argument]
-    }
-    fn value_row(&self, _: usize, _: usize, batch_row: usize) -> usize {
-        batch_row
     }
 }
 

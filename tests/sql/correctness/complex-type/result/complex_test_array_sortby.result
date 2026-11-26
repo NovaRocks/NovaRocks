@@ -304,4 +304,4 @@ _col0
 -- query 60
 -- types	array(json)
 parsed_json_values
-["{\"key\": \"value1\"}","{\"key\": \"value2\"}"]
+["{\"key\":\"value1\"}","{\"key\":\"value2\"}"]

@@ -119,9 +119,14 @@ pub(crate) fn iceberg_type(
                 ))
             })
         }
-        ConnectorDataType::String
-        | ConnectorDataType::BoundedCharacter(_)
-        | ConnectorDataType::Json => primitive(PrimitiveType::String),
+        ConnectorDataType::String | ConnectorDataType::BoundedCharacter(_) => {
+            primitive(PrimitiveType::String)
+        }
+        ConnectorDataType::Json => Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg tables do not support JSON columns",
+        )
+        .with_public_failure_detail()),
         ConnectorDataType::Binary | ConnectorDataType::Bitmap | ConnectorDataType::Hll => {
             primitive(PrimitiveType::Binary)
         }
@@ -471,6 +476,26 @@ mod tests {
             list_type.element_field.field_type.as_ref(),
             &Type::Primitive(PrimitiveType::Fixed(16))
         );
+    }
+
+    #[test]
+    fn iceberg_type_distinguishes_json_from_explicit_text_storage() {
+        let mut next_id = 1;
+        assert!(matches!(
+            iceberg_type(&ConnectorDataType::String, FormatVersion::V3, &mut next_id).unwrap(),
+            Type::Primitive(PrimitiveType::String)
+        ));
+        for data_type in [
+            ConnectorDataType::Json,
+            ConnectorDataType::Array(Box::new(ConnectorDataType::Json)),
+        ] {
+            let error = iceberg_type(&data_type, FormatVersion::V3, &mut next_id).unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            assert_eq!(
+                error.message(),
+                "Iceberg tables do not support JSON columns"
+            );
+        }
     }
 
     #[test]

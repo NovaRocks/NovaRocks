@@ -457,8 +457,12 @@ fn uninhabited_key_map_lookup_returns_typed_null_for_column_scalar_and_compact_p
     for value in [
         FunctionValueType::new(DataType::Null, true),
         FunctionValueType::new(DataType::Int32, false),
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap(),
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
         FunctionValueType::try_with_logical_type(
             DataType::FixedSizeBinary(16),
             true,

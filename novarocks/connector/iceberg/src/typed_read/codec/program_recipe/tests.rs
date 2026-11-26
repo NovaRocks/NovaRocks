@@ -791,6 +791,12 @@ fn complete_public_field_name_null_carrier_field_id_and_nominal_mutations_refuse
     wrong
         .domains
         .insert(0, novarocks_type_contract::ValueLogicalType::Json);
+    wrong.fields[0] = Arc::new(
+        wrong.fields[0]
+            .as_ref()
+            .clone()
+            .with_data_type(DataType::LargeBinary),
+    );
     assert_provider(&wrong.build(), ConnectorCodecErrorKind::InconsistentFields);
 }
 

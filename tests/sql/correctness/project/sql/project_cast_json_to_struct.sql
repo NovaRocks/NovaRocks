@@ -24,55 +24,55 @@
 
 -- query 1
 -- Array JSON → struct with positional mapping, exact match
-select cast(PARSE_JSON('[1,2,3]') as ROW(col1 int, col2 int, col3 int));
+select cast(json_parse('[1,2,3]') as ROW(col1 int, col2 int, col3 int));
 
 -- query 2
 -- A JSON array must have exactly the declared ROW arity.
 -- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
-select cast(PARSE_JSON('[1,2,3]') as ROW(col1 int, col2 int));
+select cast(json_parse('[1,2,3]') as ROW(col1 int, col2 int));
 
 -- query 3
 -- A missing positional JSON member fails the ROW cast.
 -- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
-select cast(PARSE_JSON('[1,2,3]') as ROW(col1 int, col2 int, col3 int, col4 int));
+select cast(json_parse('[1,2,3]') as ROW(col1 int, col2 int, col3 int, col4 int));
 
 -- query 4
 -- A bad field fails the enclosing ROW cast.
 -- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
-select cast(PARSE_JSON('[1,   2,    3, "a"]') as ROW(col1 int, col2 int, col3 int, col4 int));
+select cast(json_parse('[1,   2,    3, "a"]') as ROW(col1 int, col2 int, col3 int, col4 int));
 
 -- query 5
 -- Float values cast into double struct fields
-select cast(PARSE_JSON('[1.1, 2.2, 3.3]') as ROW(col1 double, col2 double, col3 double));
+select cast(json_parse('[1.1, 2.2, 3.3]') as ROW(col1 double, col2 double, col3 double));
 
 -- query 6
 -- The last numeric field uses the same JSON-to-INTEGER conversion.
-select cast(PARSE_JSON('[1.1, 2.2, 3.3]') as ROW(col1 double, col2 double, col3 int));
+select cast(json_parse('[1.1, 2.2, 3.3]') as ROW(col1 double, col2 double, col3 int));
 
 -- query 7
 -- Object JSON → struct with named field mapping (reordered)
-select cast(PARSE_JSON('{"star": "rocks", "number": 1}') as ROW(number int, star varchar));
+select cast(json_parse('{"star": "rocks", "number": 1}') as ROW(number int, star varchar));
 
 -- query 8
 -- Object JSON → struct: field not found in JSON → null
-select cast(PARSE_JSON('{"star": "rocks", "number": 1}') as ROW(number int, not_found varchar));
+select cast(json_parse('{"star": "rocks", "number": 1}') as ROW(number int, not_found varchar));
 
 -- query 9
 -- Object JSON with array field → array<int> in struct
-select cast(PARSE_JSON('{"star": "rocks", "number": [1, 2, 3]}') as ROW(number array<int>, not_found varchar));
+select cast(json_parse('{"star": "rocks", "number": [1, 2, 3]}') as ROW(number array<int>, not_found varchar));
 
 -- query 10
 -- Array JSON → struct where second element is array<json>
-select cast(PARSE_JSON('[1, [{"star": "rocks"}, {"star": "rocks"}]]') as ROW(col1 int, col2 array<json>));
+select cast(json_parse('[1, [{"star": "rocks"}, {"star": "rocks"}]]') as ROW(col1 int, col2 array<json>));
 
 -- query 11
 -- Deeply nested struct: object JSON with nested array and nested struct
-select cast(PARSE_JSON('{"star" : "rocks", "length": 5, "numbers": [1, 4, 7], "nest": [1, 2, 3]}') as ROW(star varchar(10), length int, numbers array<int>, nest ROW(col1 int, col2 int, col3 int)));
+select cast(json_parse('{"star" : "rocks", "length": 5, "numbers": [1, 4, 7], "nest": [1, 2, 3]}') as ROW(star varchar(10), length int, numbers array<int>, nest ROW(col1 int, col2 int, col3 int)));
 
 -- query 12
 -- Array of structs: each element is a complex struct with nested array and nested struct
-select cast(PARSE_JSON('[{"star" : "rocks", "length": 5, "numbers": [1, 4, 7], "nest": [1, 2, 3]}, {"star" : "rockses", "length": 33, "numbers": [2, 5, 9], "nest": [3, 6, 9]}]') as array<ROW(star varchar(10), length int, numbers array<int>, nest ROW(col1 int, col2 int, col3 int))>);
+select cast(json_parse('[{"star" : "rocks", "length": 5, "numbers": [1, 4, 7], "nest": [1, 2, 3]}, {"star" : "rockses", "length": 33, "numbers": [2, 5, 9], "nest": [3, 6, 9]}]') as array<ROW(star varchar(10), length int, numbers array<int>, nest ROW(col1 int, col2 int, col3 int))>);
 
 -- query 13
 -- TRY_CAST makes the entire failed ROW SQL NULL.
-SELECT TRY_CAST(PARSE_JSON('[1, 2, 3, "a"]') AS ROW(col1 INT, col2 INT, col3 INT, col4 INT));
+SELECT TRY_CAST(json_parse('[1, 2, 3, "a"]') AS ROW(col1 INT, col2 INT, col3 INT, col4 INT));

@@ -1043,7 +1043,7 @@ mod tests {
                 assert!(!is_ordered_filter_flat_payload_type(&ty), "{ty:?}");
             }
             for (data_type, logical) in [
-                (DataType::Utf8, ValueLogicalType::Json),
+                (DataType::LargeBinary, ValueLogicalType::Json),
                 (DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
             ] {
                 let ty = V::try_with_logical_type(data_type, nullable, logical).unwrap();
@@ -1062,21 +1062,24 @@ mod tests {
     #[test]
     fn complete_domain_and_original_canonical_are_paired_without_semantic_inference() {
         use novarocks_type_contract::{FunctionValueType as V, ValueLogicalType};
-        let canonical =
-            FilterMembershipSchema::try_new(&DataType::Utf8, FilterNullSemantics::NeverMatches)
-                .unwrap();
-        let text = StaticFilterContract::membership_from_canonical(
-            canonical.clone(),
-            V::new(DataType::Utf8, false),
+        let canonical = FilterMembershipSchema::try_new(
+            &DataType::FixedSizeBinary(16),
+            FilterNullSemantics::NeverMatches,
         )
         .unwrap();
-        let json = StaticFilterContract::membership_from_canonical(
+        let bytes = StaticFilterContract::membership_from_canonical(
             canonical.clone(),
-            V::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json).unwrap(),
+            V::new(DataType::FixedSizeBinary(16), false),
+        )
+        .unwrap();
+        let uuid = StaticFilterContract::membership_from_canonical(
+            canonical.clone(),
+            V::try_with_logical_type(DataType::FixedSizeBinary(16), false, ValueLogicalType::Uuid)
+                .unwrap(),
         )
         .unwrap();
         assert_ne!(
-            text, json,
+            bytes, uuid,
             "equal artifact bytes do not author complete execution domains"
         );
         assert!(matches!(
@@ -1367,7 +1370,7 @@ mod aggregate_topn_key_tests {
                     .unwrap()
             ));
             assert!(!is_aggregate_topn_key_type(
-                &V::try_with_logical_type(DataType::Utf8, nullable, L::Json).unwrap()
+                &V::try_with_logical_type(DataType::LargeBinary, nullable, L::Json).unwrap()
             ));
         }
     }

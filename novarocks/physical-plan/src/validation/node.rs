@@ -943,12 +943,14 @@ pub(crate) fn validate_node_semantics(
                                 fragment
                                     .root_expression(node.id, *id)
                                     .is_some_and(|expression| {
-                                        *expression.ty.data_type() == DataType::Utf8
+                                        *expression.ty.data_type() == DataType::Binary
+                                        && expression.ty.logical_type()
+                                            == novarocks_type_contract::ValueLogicalType::Physical
                                     })
                             })
                     });
                 if !supported {
-                    errors.push(ValidationError::new(path, "left mark hash join requires one null-aware Utf8 key, a right build and singleton or broadcast placement"));
+                    errors.push(ValidationError::new(path, "left mark hash join requires one null-aware Binary key, a right build and singleton or broadcast placement"));
                 }
             }
             let keys = condition.keys();

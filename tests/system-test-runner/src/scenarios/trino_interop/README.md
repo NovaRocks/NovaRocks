@@ -4,7 +4,7 @@
 
 - `trino-interop/encoding-conformance`：Spark SQL 写普通 Iceberg 类型；同一原 Spark JVM 内的 Iceberg 1.11 GenericRecord 作者补写 Spark 3.5 SQL 无法表达的 TIME、Variant。两端读取同一张表、相同逐列 SQL，保留双方每次 HTTP 头、原始 JSON body、输入 SQL、能力组合和命令退出。时间能力声明与不声明各一次；Variant 的三组能力在双方实际读取能力成立时运行。
 - `trino-interop/official-cli`：镜像内 `/usr/bin/trino` 走 host 网络访问原 FE，验证超过 1 MiB 的 96 行结果、`--catalog`/`--schema`、USE 和 `sql_mode` 在下一条语句生效、DDL `updateType`、可从 SQL 构造的 LargeInt/宽 Decimal D13 拒绝，以及对原 CLI PID 的 SIGINT。中断必须同时观察原查询活跃数回落和 `client_cancel` 结算恰好增加一次；原 FE/BE 全量结果资源收束由 System 原有 `await_idle` 另行确认。
-- `trino-interop/jdbc-probe`：使用声明的 JDBC 驱动，以只读方式挂载到镜像的 `/probe/trino-jdbc.jar`，通过镜像 Java 的源码模式运行探针。连接启用 `validateConnection=true`，让建立连接与 `isValid` 真正验证 `HEAD /v1/statement`；随后通过 `TrinoConnection.getServerVersion()` 要求 `/v1/info` 返回非空版本，不接受 SQL 回退。随后用两种 `explicitPrepare` 设置核对参数、结果类型和精度，执行重复绑定查询，并向原 REST fixture 中的独占表插入后读回。成功记录连接校验和两种执行方式。
+- `trino-interop/jdbc-probe` 使用声明的 JDBC 驱动，以只读方式挂载到镜像的 `/probe/trino-jdbc.jar`，通过镜像 Java 的源码模式运行探针。连接启用 `validateConnection=true`，让建立连接与 `isValid` 验证 `HEAD /v1/statement`。用 `TrinoConnection.getServerVersion()` 核对 `/v1/info` 返回非空版本。检查 JSON 列的 JDBC 类型与 Java 类、重复键和顺序、嵌套数组、SQL NULL 及 JSON null。随后用两种 `explicitPrepare` 设置核对参数、结果类型和精度，执行重复绑定查询，并向原 REST fixture 中的独占表插入后读回。成功记录连接、JSON 结果和两种执行方式。
 
 G1a 对签名相同的列逐值比较：JSON 数字用十进制解析，字符串字节不做规范化，浮点 JSON 必须带小数点或指数。map 键按精确字符串比较，array/row/map/Variant 递归检查 JSON 类型。签名相同而值不同不能登记成未来任务。G1b 只接收场景内 `DIFFERENCE_OWNERS` 明确登记的类型差异或拒绝；该表目前仅允许 TRC-6c 的时间类型边界。
 

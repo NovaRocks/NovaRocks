@@ -173,7 +173,7 @@ fn borrowed_read_preserves_original_logical_and_structural_error_categories() {
         assert_eq!(actual.kind(), expected.kind());
         assert_eq!(actual.to_string(), expected.to_string());
     }
-    let schema = Schema::new(vec![Field::new("j", DataType::Utf8, true)]);
+    let schema = Schema::new(vec![Field::new("j", DataType::LargeBinary, true)]);
     let logical = vec![ValueLogicalType::Json];
     let actual = invoke(
         &schema,
@@ -188,7 +188,7 @@ fn borrowed_read_preserves_original_logical_and_structural_error_categories() {
         actual.matches_value_type(
             0,
             &FunctionValueType::try_from_legacy_declared_projection(
-                DataType::Utf8,
+                DataType::LargeBinary,
                 true,
                 ValueLogicalType::Json
             )

@@ -90,6 +90,9 @@ impl StaticPlanInterpreter {
 /// be represented by the descriptor or the closed carrier manifest.
 /// Epoch 18 combines explicit cast contexts, guarded TRY, typed row failures,
 /// bounded characters, and the exact hash key match relation.
+/// Native JSON bytes replace the text carrier with plan revision 46, new
+/// root-result descriptor discriminants, and a changed sealed function catalog.
+/// Those exact inputs separate the compatibility islands under epoch 18.
 /// Epoch 16 carries exact Exchange route failure stops in the existing
 /// refusal envelope. Epoch-15 senders treat this observation as a new Task
 /// failure, so they cannot share the same island.

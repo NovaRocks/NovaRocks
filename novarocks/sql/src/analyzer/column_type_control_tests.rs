@@ -95,7 +95,11 @@ fn check_prefixes<T>(trace: &Trace, operation: impl Fn(&Control) -> Result<T, An
 #[test]
 fn column_type_source_domains_and_scope_keep_complete_authored_fields() {
     for (carrier, declaration, logical) in [
-        (DataType::Utf8, Some(SqlType::Json), ValueLogicalType::Json),
+        (
+            DataType::LargeBinary,
+            Some(SqlType::Json),
+            ValueLogicalType::Json,
+        ),
         (
             DataType::FixedSizeBinary(16),
             Some(SqlType::LargeInt),
@@ -135,7 +139,7 @@ fn column_type_source_domains_and_scope_keep_complete_authored_fields() {
         }
     }
 
-    let item = Field::new("provider_item", DataType::Utf8, false).with_metadata(
+    let item = Field::new("provider_item", DataType::LargeBinary, false).with_metadata(
         std::collections::HashMap::<String, String>::from([(
             "provider".into(),
             "kept-exactly".into(),
@@ -200,7 +204,7 @@ fn column_type_invalid_catalog_declaration_observes_ordinary_tail_without_public
 #[test]
 fn column_type_full_value_validator_preserves_early_and_completed_ordinary_tails() {
     let valid = FunctionValueType::try_from_legacy_declared_projection(
-        DataType::Utf8,
+        DataType::LargeBinary,
         false,
         ValueLogicalType::Json,
     )

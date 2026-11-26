@@ -1318,9 +1318,12 @@ mod bridge_tests {
             ValueLogicalType::Uuid,
         )
         .unwrap();
-        let result =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
+        let result = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let mut arena = ScalarArena::new();
         let body = arena.intern(ScalarNode::ColumnRef(ColumnId(702)), result.clone());
         let lambda = arena.intern(

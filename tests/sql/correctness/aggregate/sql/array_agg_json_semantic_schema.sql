@@ -15,7 +15,7 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- JSON and VARCHAR retain equal bytes and distinct frozen child domains.
+-- Native JSON renders objects and VARCHAR preserves its original whitespace.
 WITH q AS (SELECT JSON '{"2:3": null}' AS j, '{"2:3": null}' AS s)
 SELECT array_agg(j) AS json_values,
        array_agg(CAST(s AS VARCHAR)) AS string_values FROM q;

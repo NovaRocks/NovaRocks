@@ -85,6 +85,30 @@ impl ConstantValue {
         Ok(Some(text?))
     }
 
+    /// Borrow the selected bytes without erasing their declared logical domain.
+    /// NULL and non-binary terminal carriers return None.
+    pub fn binary_observed(
+        &self,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Option<&[u8]>, ConstantError> {
+        let mut work = CompileCheckpoints::try_new(control, phase)?;
+        let value = match selected_row(self, &mut work)? {
+            Some(row)
+                if matches!(
+                    row.data.data_type(),
+                    DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+                ) =>
+            {
+                work.step()?;
+                Some(variable_bytes(row)?)
+            }
+            _ => None,
+        };
+        work.finish()?;
+        Ok(value)
+    }
+
     /// Read only the selected terminal Int64 carrier, without casts or
     /// temporal reinterpretation. NULL and every other carrier return None.
     pub fn int64_observed(
@@ -393,16 +417,21 @@ mod tests {
 
     #[test]
     fn carrier_read_does_not_change_or_infer_source_logical_identity() {
-        let array = StringArray::from(vec!["{\"a\":1}"]);
-        let value_type =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap();
-        let field = Arc::new(Field::new("literal", DataType::Utf8, false).with_metadata(
-            std::collections::HashMap::<String, String>::from([(
-                NR_LOGICAL_TYPE_KEY.into(),
-                "json".into(),
-            )]),
-        ));
+        let array = arrow_array::LargeBinaryArray::from(vec![b"\x01\x20".as_slice()]);
+        let value_type = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
+        let field = Arc::new(
+            Field::new("literal", DataType::LargeBinary, false).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    NR_LOGICAL_TYPE_KEY.into(),
+                    "json".into(),
+                )]),
+            ),
+        );
         let json = ConstantPool::try_new(
             field,
             value_type.clone(),
@@ -415,7 +444,19 @@ mod tests {
         .value(0)
         .unwrap();
         let plain = pool(Arc::new(array), false).value(0).unwrap();
-        assert_eq!(text(&json), text(&plain));
+        assert_eq!(
+            json.binary_observed(CompilePhase::Validate, &Control::good())
+                .unwrap(),
+            Some(b"\x01\x20".as_slice())
+        );
+        assert_eq!(
+            json.binary_observed(CompilePhase::Validate, &Control::good())
+                .unwrap(),
+            plain
+                .binary_observed(CompilePhase::Validate, &Control::good())
+                .unwrap()
+        );
+        assert_eq!(text(&json), None);
         assert_eq!(json.value_type(), &value_type);
         assert_eq!(
             plain.value_type().logical_type(),

@@ -81,8 +81,12 @@ fn types() -> DecodedTypeTable {
         (0, FunctionValueType::new(DataType::Int64, false)),
         (
             u32::MAX,
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Json,
+            )
+            .unwrap(),
         ),
         (
             7,

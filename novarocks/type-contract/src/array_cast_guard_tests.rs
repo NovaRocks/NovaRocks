@@ -50,7 +50,12 @@ fn array(value: ValueTypeRef, layout: DataType, nullable: bool) -> FunctionValue
     .unwrap()
 }
 fn list(json: bool, child_nullable: bool, root_nullable: bool) -> FunctionValueType {
-    array(item(json, child_nullable), DataType::Utf8, root_nullable)
+    let carrier = if json {
+        DataType::LargeBinary
+    } else {
+        DataType::Utf8
+    };
+    array(item(json, child_nullable), carrier, root_nullable)
 }
 fn check(
     source: &FunctionValueType,
@@ -120,9 +125,10 @@ fn nested_json_domain_guard_is_recursive_and_try_needs_nullable_root() {
         ValueTypeRef::try_new(ValueKind::List(item(true, false)), false, storage.clone()).unwrap();
     let text_inner =
         ValueTypeRef::try_new(ValueKind::List(item(false, false)), false, storage).unwrap();
-    let physical = DataType::List(Arc::new(Field::new("inner", DataType::Utf8, false)));
-    let json = array(json_inner, physical.clone(), true);
-    let text = array(text_inner, physical, true);
+    let json_layout = DataType::List(Arc::new(Field::new("inner", DataType::LargeBinary, false)));
+    let text_layout = DataType::List(Arc::new(Field::new("inner", DataType::Utf8, false)));
+    let json = array(json_inner, json_layout, true);
+    let text = array(text_inner, text_layout, true);
     assert!(!check(&json, &text, ArrayCastFailureMode::ReportError));
     let storage = ValueTypeStorageLifetime::pure();
     let nullable_text_inner =
@@ -199,7 +205,7 @@ fn domain_guard_preserves_each_original_observation_refusal() {
 fn explicit_domain_exceptions_do_not_grant_non_array_mode() {
     let json_scalar = FunctionValueType::try_from_value(
         item(true, false),
-        ValueLayout::try_new(&DataType::Utf8, ValueTypeStorageLifetime::pure()).unwrap(),
+        ValueLayout::try_new(&DataType::LargeBinary, ValueTypeStorageLifetime::pure()).unwrap(),
     )
     .unwrap();
     let text_scalar = FunctionValueType::new(DataType::Utf8, true);

@@ -191,10 +191,10 @@ fn validate_staged_columns(
     table: &ConnectorTableIdentity,
     columns: &[ConnectorColumnDefinition],
 ) -> Result<(), ConnectorError> {
-    crate::commit::validation::deny_variant_column_definitions(
-        columns,
-        &format!("{}.{}", table.namespace, table.table),
-    )?;
+    use crate::commit::validation::{NewColumnDomain, deny_column_definitions};
+    let name = format!("{}.{}", table.namespace, table.table);
+    deny_column_definitions(columns, &name, NewColumnDomain::Variant)?;
+    deny_column_definitions(columns, &name, NewColumnDomain::Json)?;
     super::catalog_mutation::validate_create_column_names(columns)
 }
 

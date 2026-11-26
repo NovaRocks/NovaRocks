@@ -3471,7 +3471,6 @@ dependencies = [
  "rand 0.8.8",
  "roaring 0.10.12",
  "serde",
- "serde_json",
  "sha2 0.10.9",
  "tokio",
  "tokio-util",
@@ -3685,6 +3684,7 @@ dependencies = [
  "novarocks-constant-contract",
  "novarocks-failure-contract",
  "novarocks-function-contract",
+ "novarocks-json-value-format",
  "novarocks-type-contract",
  "novarocks-value-arrays",
  "num-traits",
@@ -3698,6 +3698,10 @@ dependencies = [
  "sha2 0.10.9",
  "xxhash-rust",
 ]
+
+[[package]]
+name = "novarocks-json-value-format"
+version = "0.1.0"
 
 [[package]]
 name = "novarocks-local-compiler"
@@ -4023,6 +4027,7 @@ name = "novarocks-result-contract"
 version = "0.1.0"
 dependencies = [
  "novarocks-failure-contract",
+ "novarocks-json-value-format",
 ]
 
 [[package]]
@@ -4162,7 +4167,6 @@ dependencies = [
  "novarocks-user-error",
  "recursive",
  "serde",
- "serde_json",
  "sha2 0.10.9",
  "tracing",
 ]

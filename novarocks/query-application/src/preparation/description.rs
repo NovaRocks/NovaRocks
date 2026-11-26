@@ -592,7 +592,10 @@ mod tests {
     async fn m07_completed_output_preserves_exact_producer_domains() {
         use novarocks_type_contract::ValueLogicalType as T;
         for (sql, domain) in [
-            ("select json_object('k': 1) as value", T::Json),
+            (
+                "select JSON_OBJECT(KEY 'k' VALUE 1 RETURNING JSON) as value",
+                T::Json,
+            ),
             ("select cast(null as uuid) as value", T::Uuid),
             ("select cast(null as varbinary) as value", T::Physical),
             ("select cast(JSON '7' as varchar(8)) as value", T::Physical),
@@ -623,7 +626,7 @@ mod tests {
         use novarocks_type_contract::{ValueKind, ValueLogicalType as L};
         let completed = crate::completed_plan_fixture::completed_literal_query(
             [42; 16],
-            "select [parse_json('{}')] as nested",
+            "select [json_parse('{}')] as nested",
         )
         .await;
         let output = OutputContract::from_completed_plan(

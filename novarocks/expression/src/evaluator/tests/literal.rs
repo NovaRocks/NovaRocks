@@ -429,15 +429,18 @@ fn actual_compiled_literal_offset_view_and_nominal_bytes_keep_payload_and_typed_
             }
         }));
     }
-    let json_type =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap();
+    let json_type = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     cases.push(literal_case(
-        checked_value!(json_type, from_utf8("{\"value\":42}")),
+        checked_value!(json_type, from_binary(b"\x01\x80\x01\x00")),
         |array, rows| {
-            let values = array.as_any().downcast_ref::<StringArray>().unwrap();
+            let values = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
             for row in 0..rows {
-                assert_eq!(values.value(row), "{\"value\":42}");
+                assert_eq!(values.value(row), b"\x01\x80\x01\x00");
             }
         },
     ));

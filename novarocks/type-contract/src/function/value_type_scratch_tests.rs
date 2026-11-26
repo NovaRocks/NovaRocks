@@ -66,7 +66,7 @@ fn invalid_declared_root_is_rejected_before_a_binding_exists() {
 #[test]
 fn shared_nested_fields_keep_original_law_and_exact_borrowed_occurrence_events() {
     let shared = Arc::new(
-        Field::new("json", DataType::Utf8, true).with_metadata(HashMap::from([
+        Field::new("json", DataType::LargeBinary, true).with_metadata(HashMap::from([
             (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
             ("provider".to_owned(), "same-original-field".to_owned()),
         ])),

@@ -176,13 +176,17 @@ fn keep_source(actual: &ConstantValue, pool: &ConstantPool, ordinal: u32) {
 
 fn declared_json_list(nullable: bool, child_nullable: bool) -> FunctionValueType {
     let child = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         child_nullable,
         ValueLogicalType::Json,
     )
     .unwrap();
     let layout = FunctionValueType::new(
-        DataType::List(Arc::new(Field::new("item", DataType::Utf8, child_nullable))),
+        DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::LargeBinary,
+            child_nullable,
+        ))),
         nullable,
     );
     let value = novarocks_type_contract::ValueTypeRef::try_new(
@@ -278,7 +282,7 @@ fn physical_call_request_never_turns_reference_type_or_address_errors_into_nonco
 fn physical_call_request_lambda_keeps_nested_field_names_metadata_logical_tags_and_body_result_type()
  {
     let item = Arc::new(
-        Field::new("actual_json_item", DataType::Utf8, true).with_metadata(HashMap::from([
+        Field::new("actual_json_item", DataType::LargeBinary, true).with_metadata(HashMap::from([
             ("nr_logical_type".into(), "json".into()),
             ("provider.id".into(), "53".into()),
         ])),
@@ -439,9 +443,12 @@ fn physical_call_request_wide_lambda_observes_real_parameter_quantum_and_exact_o
             )
         })
         .collect();
-    let result =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let result = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let node = source(
         result.clone(),
         ExprKind::Lambda {

@@ -26,11 +26,14 @@ impl PureCompileControl for Control {
 }
 #[test]
 fn container_identity_requires_complete_nominal_semantics() {
-    let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap();
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let source = declared_list(&json, false).unwrap();
-    let plain = declared_list(&FunctionValueType::new(DataType::Utf8, true), true).unwrap();
+    let plain = declared_list(&FunctionValueType::new(DataType::LargeBinary, true), true).unwrap();
     assert_eq!(source.data_type(), plain.data_type());
     assert_eq!(
         PreparedCastRecipe::try_new(

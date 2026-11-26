@@ -545,7 +545,7 @@ fn fingerprint_fixed_vectors_distinguish_zero_sign_and_ignore_nan_payload() {
 }
 
 #[test]
-fn content_bytes_are_carrier_independent_and_json_stays_original_text() {
+fn content_bytes_are_carrier_independent_and_json_stays_original_bytes() {
     let expected = vec![
         0x72d1c5e413ad10642e9b4bd70271c2c9,
         0xffee988d572cc7360d9827fe527dc164,
@@ -616,12 +616,15 @@ fn content_bytes_are_carrier_independent_and_json_stays_original_text() {
         );
     }
     let json = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         false,
         novarocks_type_contract::ValueLogicalType::Json,
     )
     .unwrap();
-    let array: ArrayRef = Arc::new(StringArray::from(vec!["{\"a\":1}", "{\"a\": 1}"]));
+    let array: ArrayRef = Arc::new(json_array(&[
+        Some(r#"{"a":1,"b":2}"#),
+        Some(r#"{"b":2,"a":1}"#),
+    ]));
     let ids = fingerprints(&[array], &[json], &[0, 1]);
     assert_ne!(ids[0], ids[1]);
 }
@@ -923,15 +926,16 @@ fn one_content_index_matches_original_and_dictionary_string_carriers() {
 }
 
 #[test]
-fn content_json_classes_keep_original_text_in_storage_and_export() {
+fn content_json_classes_keep_original_bytes_in_storage_and_export() {
     let (owner, tracker) = owner_with_tracker();
     let ty = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
+        DataType::LargeBinary,
         false,
         novarocks_type_contract::ValueLogicalType::Json,
     )
     .unwrap();
-    let array: ArrayRef = Arc::new(StringArray::from(vec!["{\"a\":1}", "{\"a\": 1}"]));
+    let documents = json_array(&[Some(r#"{"a":1,"b":2}"#), Some(r#"{"b":2,"a":1}"#)]);
+    let array: ArrayRef = Arc::new(documents.clone());
     let spec = KeySpec::with_equalities(
         std::slice::from_ref(&ty),
         &[KeyEquality::ResultContent],
@@ -961,10 +965,10 @@ fn content_json_classes_keep_original_text_in_storage_and_export() {
         .unwrap();
     let actual = exported.arrays()[0]
         .as_any()
-        .downcast_ref::<StringArray>()
+        .downcast_ref::<LargeBinaryArray>()
         .unwrap();
-    assert_eq!(actual.value(0), "{\"a\": 1}");
-    assert_eq!(actual.value(1), "{\"a\":1}");
+    assert_eq!(actual.value(0), documents.value(1));
+    assert_eq!(actual.value(1), documents.value(0));
 }
 
 #[test]

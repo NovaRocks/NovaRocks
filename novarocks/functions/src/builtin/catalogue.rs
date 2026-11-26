@@ -535,6 +535,13 @@ impl BuiltinAggregateResolver {
         {
             return Err(FunctionBindingError::NoMatchingOverload);
         }
+        if matches!(name, "min" | "max")
+            && arguments
+                .value_type(0)
+                .is_some_and(|value| value.logical_type() == ValueLogicalType::Json)
+        {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        }
         if let Some(overload) = selected
             && !builtin_identity_matches(
                 overload.as_str(),
@@ -995,6 +1002,11 @@ fn scalar_result_nullable_from_types(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<bool, FunctionBindingError> {
     Ok(match name {
+        name if let Some(operation) = super::json_sql::JsonFunction::from_name(name) => {
+            !operation.constructs()
+                && (operation.null_on_error()
+                    || first_value.is_some_and(FunctionValueType::nullable))
+        }
         // Invalid JSON and integer negation overflow are required Data failures.
         "__json_canonical_key" | super::negation_owner::NAME => {
             first_value.is_some_and(FunctionValueType::nullable)
@@ -1137,12 +1149,16 @@ pub(super) fn binding_resolution_error(error: ResolveError) -> FunctionBindingEr
 }
 
 fn builtin_fixed_result_domain(function_id: &FunctionId) -> Option<ValueLogicalType> {
+    if let Some(name) = function_id
+        .as_str()
+        .strip_prefix("builtin.scalar/")
+        .and_then(|identity| identity.strip_suffix("/v1"))
+        && let Some(operation) = super::json_sql::JsonFunction::from_name(name)
+    {
+        return operation.returns_json().then_some(ValueLogicalType::Json);
+    }
     match function_id.as_str() {
-        "builtin.scalar/parse_json/v1"
-        | "builtin.scalar/json_object/v1"
-        | "builtin.scalar/json_array/v1"
-        | "builtin.scalar/to_json/v1"
-        | "builtin.scalar/json_query/v1" => Some(ValueLogicalType::Json),
+        "builtin.scalar/json_query/v1" => Some(ValueLogicalType::Json),
         "builtin.scalar/hll_hash/v1" => Some(ValueLogicalType::Hll),
         "builtin.scalar/to_bitmap/v1"
         | "builtin.scalar/bitmap_or/v1"
@@ -1286,6 +1302,9 @@ impl BuiltinScalarResolver {
         let carriers = ScalarCarriers::from_values(ScalarTypes::from_values(argument_types));
         validate_builtin_selected_domain(&self.canonical_name, carriers, work)?;
         let name = self.canonical_name.as_ref();
+        if let Some(operation) = super::json_sql::JsonFunction::from_name(name) {
+            operation.check_arguments(argument_types.iter().map(Some), work)?;
+        }
         if matches!(
             name,
             "slice"
@@ -1431,7 +1450,7 @@ impl BuiltinScalarResolver {
             };
             if !matches!(
                 (document.logical_type(), document.data_type()),
-                (ValueLogicalType::Json, DataType::Utf8)
+                (ValueLogicalType::Json, DataType::LargeBinary)
                     | (ValueLogicalType::Variant, DataType::LargeBinary)
             ) {
                 return Err(FunctionBindingError::NoMatchingOverload);
@@ -2729,7 +2748,7 @@ fn bind_dynamic_scalar_result_with_creation<H>(
             let document = value(0)?;
             let admitted = match document.logical_type() {
                 ValueLogicalType::Variant => document.data_type() == &DataType::LargeBinary,
-                ValueLogicalType::Json => document.data_type() == &DataType::Utf8,
+                ValueLogicalType::Json => document.data_type() == &DataType::LargeBinary,
                 ValueLogicalType::Physical => {
                     matches!(document.data_type(), DataType::Utf8 | DataType::Null)
                 }
@@ -3231,10 +3250,11 @@ fn scalar_overload_effects(
         name if let Some(operation) = TrinoByteOp::from_name(name) => {
             Some(super::string_binary::trino_effects(operation, signature))
         }
-        "parse_json" => Some(super::parse_json_owner::effects()),
+        name if let Some(operation) = super::json_sql::JsonFunction::from_name(name) => {
+            Some(super::parse_json_owner::effects(operation))
+        }
         "__json_canonical_key" => Some(super::json_canonical_owner::effects()),
         crate::native_like::ESCAPE_FUNCTION_NAME => Some(super::like_escape_owner::effects()),
-        "json_object" => Some(super::json_object_owner::effects()),
         "chr" | "codepoint" => Some(super::string_measure_owner::codepoint_effects()),
         name if super::string_measure_owner::operation(name).is_some() => {
             Some(super::string_measure_owner::effects())
@@ -3672,9 +3692,32 @@ pub fn contribute_builtin_functions(
                 .iter()
                 .any(|overload| overload.identity == id)
             {
-                let shape =
-                    typed.public_signature(builtin_fixed_result_domain(declaration.function_id()));
-                public_signatures.push((id, vec![shape]));
+                let shapes =
+                    match name.as_str() {
+                        "json_parse" => owned_public_signatures(&[("varchar(x)", "json")]),
+                        "json_scalar" => owned_public_signatures(&[
+                            ("unknown", "json"),
+                            ("boolean", "json"),
+                            ("tinyint", "json"),
+                            ("smallint", "json"),
+                            ("integer", "json"),
+                            ("bigint", "json"),
+                            ("real", "json"),
+                            ("double", "json"),
+                            ("decimal(p,s)", "json"),
+                            ("varchar(x)", "json"),
+                            ("char(x)", "json"),
+                            ("date", "json"),
+                            ("time(p)", "json"),
+                            ("time(p) with time zone", "json"),
+                            ("timestamp(p)", "json"),
+                            ("timestamp(p) with time zone", "json"),
+                        ]),
+                        _ => vec![typed.public_signature(builtin_fixed_result_domain(
+                            declaration.function_id(),
+                        ))],
+                    };
+                public_signatures.push((id, shapes));
             }
         }
         if name == "array_sort" {
@@ -3711,14 +3754,15 @@ pub fn contribute_builtin_functions(
             name if let Some(operation) = TrinoByteOp::from_name(name) => {
                 super::string_binary::trino_definition(operation, name, declaration, resolver)?
             }
-            "parse_json" => super::parse_json_owner::definition(declaration, resolver)?,
+            name if let Some(operation) = super::json_sql::JsonFunction::from_name(name) => {
+                super::parse_json_owner::definition(operation, declaration, resolver)?
+            }
             "__json_canonical_key" => {
                 super::json_canonical_owner::definition(declaration, resolver)?
             }
             crate::native_like::ESCAPE_FUNCTION_NAME => {
                 super::like_escape_owner::definition(declaration, resolver)?
             }
-            "json_object" => super::json_object_owner::definition(declaration, resolver)?,
             name if super::string_measure_owner::operation(name).is_some() => {
                 super::string_measure_owner::definition(name, declaration, resolver)?
             }
@@ -4947,9 +4991,9 @@ mod tests {
                 Own::NoRowError,
             ),
             (
-                "parse_json",
+                "json_parse",
                 vec![value_argument(DataType::Utf8, true, None)],
-                Own::NoRowError,
+                Own::MayRaise,
             ),
             (
                 "assert_true",
@@ -5420,9 +5464,12 @@ mod aggregate_recipe_tests {
     }
     #[test]
     fn ordered_array_state_and_topk_preserve_complete_nominal_argument_children() {
-        let json =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-                .unwrap();
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let args = [
             value(json.clone()),
             value(FunctionValueType::new(DataType::Int64, false)),
@@ -5479,9 +5526,12 @@ mod aggregate_recipe_tests {
     }
     #[test]
     fn aggregate_replay_rejects_nominal_and_nested_nullability_drift() {
-        let json =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
         let args = [
             value(json.clone()),
             value(FunctionValueType::new(DataType::Int64, false)),
@@ -5499,7 +5549,7 @@ mod aggregate_recipe_tests {
             .validate_selected(&selected, request, &Control)
             .unwrap();
         let erased = [
-            value(FunctionValueType::new(DataType::Utf8, true)),
+            value(FunctionValueType::new(DataType::LargeBinary, true)),
             value(FunctionValueType::new(DataType::Int64, false)),
         ];
         let drift = FunctionBindingRequest {
@@ -5525,7 +5575,7 @@ mod aggregate_recipe_tests {
             novarocks_type_contract::ValueLayout::try_new(
                 &DataType::List(Arc::new(arrow_schema::Field::new(
                     "item",
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     false,
                 ))),
                 novarocks_type_contract::ValueTypeStorageLifetime::pure(),

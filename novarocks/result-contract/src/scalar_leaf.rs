@@ -31,6 +31,8 @@ pub(crate) const ABSENT: u8 = 2;
 pub(crate) const CONTAINER_LIST: u8 = 15;
 pub(crate) const CONTAINER_MAP: u8 = 16;
 pub(crate) const CONTAINER_STRUCT: u8 = 17;
+// Tag 12 was the retired UTF-8 JSON leaf.
+const NATIVE_JSON: u8 = 18;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScalarLeafError {
@@ -89,7 +91,9 @@ pub enum BorrowedScalarLeaf<'a> {
         ticks: i64,
         unit: ScalarTimestampUnit,
     },
-    Json(&'a str),
+    /// The original v1 native document bytes, bounded by this record.
+    /// A typed consumer opens the document through the native JSON value reader.
+    Json(&'a [u8]),
     Variant(&'a [u8]),
     Opaque {
         kind: ScalarOpaqueType,
@@ -186,7 +190,7 @@ impl<'a> BorrowedScalarLeaf<'a> {
                 ticks: i64::from_le_bytes(payload.try_into().unwrap()),
                 unit: *unit,
             },
-            T::Json => Self::Json(std::str::from_utf8(payload).map_err(|_| malformed)?),
+            T::Json => Self::Json(payload),
             T::Variant => Self::Variant(payload),
             T::Opaque(kind) => Self::Opaque {
                 kind: *kind,
@@ -339,7 +343,7 @@ impl<'a> ScalarLeafCursor<'a> {
             T::Date => (9, 32, 0, 0, 0, 0),
             T::TimeMicros => (10, 64, 0, 0, 1, 0),
             T::Timestamp { unit, .. } => (11, 64, 0, 0, timestamp_unit(*unit), 0),
-            T::Json => (12, 0, 0, 0, 0, 0),
+            T::Json => (NATIVE_JSON, 0, 0, 0, 0, 0),
             T::Variant => (13, 0, 0, 0, 0, 0),
             T::Opaque(kind) => (14, 0, 0, 0, 0, opaque_kind(*kind)),
             // Container records carry their payload through ScalarRecordWriter;
@@ -417,9 +421,8 @@ impl<'a> ScalarLeafCursor<'a> {
                 }
                 cursor.set_fixed(&coefficient_le);
             }
-            (V::String(bytes), T::String) | (V::Json(bytes), T::Json) => {
-                cursor.set_variable(bytes.as_bytes())?
-            }
+            (V::String(bytes), T::String) => cursor.set_variable(bytes.as_bytes())?,
+            (V::Json(bytes), T::Json) => cursor.set_variable(native_json_payload(bytes)?)?,
             (V::Binary(bytes), T::Binary) | (V::Variant(bytes), T::Variant) => {
                 cursor.set_variable(bytes)?
             }
@@ -521,6 +524,12 @@ impl<'a> ScalarLeafCursor<'a> {
             complete: position == end,
         })
     }
+}
+
+/// Check the version and exact root-item extent within the admitted frame.
+pub(crate) fn native_json_payload(bytes: &[u8]) -> Result<&[u8], ScalarLeafError> {
+    novarocks_json_value_format::root_item(bytes).map_err(|_| ScalarLeafError::MalformedRecord)?;
+    Ok(bytes)
 }
 fn timestamp_unit(unit: ScalarTimestampUnit) -> u8 {
     match unit {

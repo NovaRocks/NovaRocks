@@ -39,7 +39,7 @@ insert into ${case_db}.row_util select row_number() over() as idx from ${case_db
 CREATE TABLE ${case_db}.t1 (
     k1 bigint ,
     c_int bigint ,
-    c_json JSON ,
+    c_json VARCHAR ,
     c_array_int ARRAY<INT> ,
     c_map MAP<INT, INT> ,
     c_struct ROW(k1 INT, k2 INT)
@@ -65,22 +65,22 @@ select count(1) from ${case_db}.t1 where c_int > 0 AND (
 );
 
 -- query 3
--- CastJsonToArray: IN with cast from parse_json
+-- CastJsonToArray: IN with cast from json_parse
 select count(1) from ${case_db}.t1 where
-    c_array_int in (cast(parse_json('[10, 11,12,13]') as array<INT>))
-    OR c_array_int in (cast(parse_json('[20, 21,22,23]') as array<INT>));
+    c_array_int in (cast(json_parse('[10, 11,12,13]') as array<INT>))
+    OR c_array_int in (cast(json_parse('[20, 21,22,23]') as array<INT>));
 
 -- query 4
 -- CastJsonToArray element access: subscript on cast json array
 select count(1) from ${case_db}.t1 where
-    c_int in (cast(parse_json('[10, 11,12,13]') as array<INT>)[1])
-    OR c_int in (cast(parse_json('[20, 21,22,23]') as array<INT>)[1]);
+    c_int in (cast(json_parse('[10, 11,12,13]') as array<INT>)[1])
+    OR c_int in (cast(json_parse('[20, 21,22,23]') as array<INT>)[1]);
 
 -- query 5
 -- CastJsonToStruct: IN/NOT IN with cast from json
 select count(1) from ${case_db}.t1 where
-    c_struct in (cast(parse_json('[10, 11]') as ROW(k1 INT, k2 INT)))
-    OR c_struct not in (cast(parse_json('[20, 21]') as ROW(k1 INT, k2 INT)));
+    c_struct in (cast(json_parse('[10, 11]') as ROW(k1 INT, k2 INT)))
+    OR c_struct not in (cast(json_parse('[20, 21]') as ROW(k1 INT, k2 INT)));
 
 -- query 6
 -- CastArrayExpr: IN with array literal, NOT IN with array literal

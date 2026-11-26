@@ -378,19 +378,23 @@ fn record_flat_bits_sparse_ids_and_original_unlabelled_logical_field_roundtrip()
     assert_eq!(actual.value(1).to_bits(), bits[1]);
     assert!(actual.is_null(2));
     assert_eq!(actual.value(3).to_bits(), bits[3]);
-    let array: ArrayRef = Arc::new(StringArray::from(vec![
-        Some("{\"a\":1}"),
+    let array: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+        Some(b"\x01\x42\x01".as_slice()),
         None,
-        Some("null"),
+        Some(b"\x01\x20".as_slice()),
     ]));
     let field = Arc::new(
-        Field::new("json", DataType::Utf8, true).with_metadata(HashMap::from([(
+        Field::new("json", DataType::LargeBinary, true).with_metadata(HashMap::from([(
             "provider".into(),
             "not-a-logical-tag".into(),
         )])),
     );
-    let ty = FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-        .unwrap();
+    let ty = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let original = pool_with(array, field, ty);
     let output = roundtrip(&original, 0, 0, u32::MAX);
     assert_eq!(output.value_type().logical_type(), ValueLogicalType::Json);
@@ -629,21 +633,25 @@ fn record_field_value_pair_and_ipc_schema_mismatches_do_not_retag_or_reauthor() 
             .is_err()
         );
     }
-    let array: ArrayRef = Arc::new(StringArray::from(vec!["null"]));
+    let array: ArrayRef = Arc::new(LargeBinaryArray::from(vec![b"\x01\x20".as_slice()]));
     let field = Arc::new(
-        Field::new("json", DataType::Utf8, true)
+        Field::new("json", DataType::LargeBinary, true)
             .with_metadata(HashMap::from([(NR_LOGICAL_TYPE_KEY.into(), "json".into())])),
     );
     let original = pool_with(
         array,
         Arc::clone(&field),
-        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-            .unwrap(),
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
     );
     let record = encode(&original, 0, 0, 0);
     let plain_types = types(
         Arc::clone(&field),
-        FunctionValueType::new(DataType::Utf8, true),
+        FunctionValueType::new(DataType::LargeBinary, true),
         0,
         0,
     );
@@ -669,7 +677,7 @@ fn record_field_value_pair_and_ipc_schema_mismatches_do_not_retag_or_reauthor() 
             .map(String::as_str),
         Some("json")
     );
-    assert_eq!(plain.value_type().data_type(), &DataType::Utf8);
+    assert_eq!(plain.value_type().data_type(), &DataType::LargeBinary);
     let json_types = types(field, original.value_type().clone(), 0, 0);
     let (_, json) = decode_constant_record(
         &record,
