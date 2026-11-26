@@ -783,6 +783,35 @@ pub(super) fn for_module(
             "tests/system-test-runner/fixtures/trino_query_probe.py".into(),
         ]);
     }
+    use super::native_creation::constant_capacity::{DEFAULT_FOLD, DEFAULT_STATIC, LARGE_STATIC};
+    if matches!(name, DEFAULT_STATIC | DEFAULT_FOLD | LARGE_STATIC) {
+        declaration.impact.paths.extend([
+            "novarocks/constant-contract/**".into(),
+            "novarocks/arrow-batch-codec/**".into(),
+            "novarocks/local-compiler/**".into(),
+            "novarocks/physical-plan/**".into(),
+            "novarocks/functions/**".into(),
+            "novarocks/workload-control/**".into(),
+            "novarocks-server/**".into(),
+            "tools/ci/fixtures/system-scenarios-base.toml".into(),
+            "tests/system-test-runner/src/scenarios/native_creation_constant_capacity.rs".into(),
+            "tests/system-test-runner/src/scenarios/native_creation_constant_markers.rs".into(),
+            "tests/system-test-runner/src/scenarios/query_lifecycle.rs".into(),
+            "tests/system-test-runner/src/scenarios/task_evidence.rs".into(),
+        ]);
+        declaration.basis = Some(match name {
+            DEFAULT_STATIC => {
+                "Fresh managed 1FE+3BE at default query and Client window limits. Generates the 990,000-unit ASCII and alternating 8,193-row SQL inputs, checks typed row bags, exact statement and Task evidence, and original resource/role cleanup."
+            }
+            DEFAULT_FOLD => {
+                "Independent managed 1FE+3BE at the same defaults. Generates a one-row rpad workload with a 9 MiB result before short projection, checks the typed Trino row, original Native Task exit, and resource/role cleanup."
+            }
+            LARGE_STATIC => {
+                "Fresh managed 1FE+3BE generates a 9 MiB literal and six 3 MiB literals. Uses only its own FE query and Client window overlay, verifies typed Trino rows and linked IPC/Values evidence on an exact released Task, and checks resource/role cleanup."
+            }
+            _ => unreachable!(),
+        });
+    }
     let env: &[(&str, &str)] = match module {
         "query_tool" => &[("NOVA_CI_ARTIFACT_RECEIPT", "file-content")],
         "paimon" => &[
@@ -884,7 +913,12 @@ pub(super) fn for_module(
         }
     }
     if explicit {
-        let (reason, detail) = if compatibility {
+        let (reason, detail) = if name == LARGE_STATIC {
+            (
+                "cost",
+                "Generates and transports two large static VALUES inputs with an isolated FE capacity overlay.",
+            )
+        } else if compatibility {
             (
                 "variant-binary",
                 "Requires compatible or alternate-island server artifacts across the complete distributed lifecycle.",

@@ -59,6 +59,9 @@ use super::query_lifecycle::{
     await_token_scoped_marker, resource_snapshot,
 };
 
+#[path = "native_creation_constant_capacity.rs"]
+pub(super) mod constant_capacity;
+
 #[path = "raw_creation_controls.rs"]
 mod raw_creation_controls;
 
@@ -80,14 +83,16 @@ const CREATES_FROZEN: &str = "novarocks_task_creates_frozen_total";
 const CREATE_PAYLOADS_RETAINED: &str = "novarocks_task_create_payloads_retained";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![
+    let mut scenarios: Vec<Box<dyn Scenario>> = vec![
         Box::new(FrozenReplayAndMembership::default()),
         Box::new(CreationPayloadLifetime::default()),
         Box::new(FixedPlanRecovery::default()),
         Box::new(NormalCloseRetainedAdmission { byte_corpus: false }),
         Box::new(NormalCloseRetainedAdmission { byte_corpus: true }),
         Box::new(AcceptedPreparationControlRaces),
-    ]
+    ];
+    scenarios.extend(constant_capacity::scenarios());
+    scenarios
 }
 
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
