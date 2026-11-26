@@ -657,13 +657,15 @@ fn data_file(path: &str, region: &str, records: u64, size: u64) -> DataFile {
 /// the second holds one file that has already been deleted, so `$files` and
 /// `$entries` must disagree about it.
 async fn build_warehouse(dir: &Path, binding: IcebergReadBinding) -> Warehouse {
-    build_warehouse_with_deletes(dir, binding, false).await
+    build_warehouse_with_manifests(dir, binding, FormatVersion::V2, false, None).await
 }
 
-async fn build_warehouse_with_deletes(
+async fn build_warehouse_with_manifests(
     dir: &Path,
     binding: IcebergReadBinding,
+    version: FormatVersion,
     with_deletes: bool,
+    existing: Option<DataFile>,
 ) -> Warehouse {
     let location = format!("file://{}", dir.display());
     std::fs::create_dir_all(dir.join("metadata")).expect("metadata dir");
@@ -674,21 +676,33 @@ async fn build_warehouse_with_deletes(
     let spec = identity_spec(&schema, 0, "region");
     let file_io = crate::fs_io::build_file_io_for_location(&location, binding);
 
+    let data_writer = |path: &str| {
+        let builder = ManifestWriterBuilder::new(
+            file_io.new_output(path).expect("manifest output"),
+            Some(SNAPSHOT_ID),
+            Arc::new(schema.clone()),
+            spec.clone(),
+        );
+        match version {
+            FormatVersion::V2 => builder.build_v2_data(),
+            FormatVersion::V3 => builder.build_v3_data(),
+            FormatVersion::V1 => unreachable!("the fixture uses v2 or v3 manifests"),
+        }
+    };
     let mut manifests = Vec::new();
     let live_path = format!("{location}/metadata/live.avro");
-    let mut writer = ManifestWriterBuilder::new(
-        file_io.new_output(&live_path).expect("manifest output"),
-        Some(SNAPSHOT_ID),
-        Arc::new(schema.clone()),
-        spec.clone(),
-    )
-    .build_v2_data();
+    let mut writer = data_writer(&live_path);
     writer
         .add_file(data_file("data/a.parquet", "east", 10, 1_024), 1)
         .expect("add file");
     writer
         .add_file(data_file("data/b.parquet", "west", 20, 2_048), 1)
         .expect("add file");
+    if let Some(file) = existing {
+        writer
+            .add_existing_file(file, SNAPSHOT_ID - 1, 1, Some(1))
+            .expect("carry the existing file");
+    }
     if with_deletes {
         writer
             .add_file(data_file("data/d.parquet", "east", 15, 1_536), 1)
@@ -700,13 +714,7 @@ async fn build_warehouse_with_deletes(
     manifests.push(manifest);
 
     let removed_path = format!("{location}/metadata/removed.avro");
-    let mut writer = ManifestWriterBuilder::new(
-        file_io.new_output(&removed_path).expect("manifest output"),
-        Some(SNAPSHOT_ID),
-        Arc::new(schema.clone()),
-        spec.clone(),
-    )
-    .build_v2_data();
+    let mut writer = data_writer(&removed_path);
     writer
         .add_delete_file(data_file("data/c.parquet", "east", 5, 512), 1, Some(1))
         .expect("delete file");
@@ -795,17 +803,27 @@ async fn build_warehouse_with_deletes(
     }
 
     let manifest_list_path = format!("{location}/metadata/snap-{SNAPSHOT_ID}.avro");
-    let mut list_writer = ManifestListWriter::v2(
-        file_io
-            .new_output(&manifest_list_path)
-            .expect("manifest list output")
-            .writer()
-            .await
-            .expect("manifest list writer"),
-        SNAPSHOT_ID,
-        None,
-        SNAPSHOT_SEQUENCE_NUMBER,
-    );
+    let output = file_io
+        .new_output(&manifest_list_path)
+        .expect("manifest list output")
+        .writer()
+        .await
+        .expect("manifest list writer");
+    let row_range = (version == FormatVersion::V3).then(|| {
+        manifests
+            .iter()
+            .filter(|manifest| manifest.content == crate::iceberg::spec::ManifestContentType::Data)
+            .map(|manifest| {
+                manifest.added_rows_count.unwrap() + manifest.existing_rows_count.unwrap()
+            })
+            .sum()
+    });
+    let mut list_writer = match row_range {
+        Some(_) => {
+            ManifestListWriter::v3(output, SNAPSHOT_ID, None, SNAPSHOT_SEQUENCE_NUMBER, Some(0))
+        }
+        None => ManifestListWriter::v2(output, SNAPSHOT_ID, None, SNAPSHOT_SEQUENCE_NUMBER),
+    };
     list_writer
         .add_manifests(manifests.into_iter())
         .expect("add manifests");
@@ -823,14 +841,17 @@ async fn build_warehouse_with_deletes(
                 if with_deletes { "3" } else { "2" }.to_string(),
             )]),
         })
-        .with_schema_id(0)
-        .build();
+        .with_schema_id(0);
+    let snapshot = match row_range {
+        Some(rows) => snapshot.with_row_range(0, rows).build(),
+        None => snapshot.build(),
+    };
     let metadata = TableMetadataBuilder::new(
         schema,
         spec.into_unbound(),
         SortOrder::unsorted_order(),
         location.clone(),
-        FormatVersion::V2,
+        version,
         HashMap::new(),
     )
     .expect("metadata builder")
@@ -862,7 +883,15 @@ async fn build_warehouse_with_deletes(
     .expect("metadata")
     .metadata;
 
-    let metadata_location = format!("{location}/metadata/00001-frozen.metadata.json");
+    write_warehouse_metadata(dir, metadata)
+}
+
+fn write_warehouse_metadata(dir: &Path, metadata: TableMetadata) -> Warehouse {
+    std::fs::create_dir_all(dir.join("metadata")).expect("metadata dir");
+    let metadata_location = format!(
+        "file://{}/metadata/00001-frozen.metadata.json",
+        dir.display()
+    );
     std::fs::write(
         dir.join("metadata/00001-frozen.metadata.json"),
         serde_json::to_vec(&metadata).expect("metadata json"),
@@ -1178,70 +1207,135 @@ fn history_marks_the_current_ancestor() {
 }
 
 #[test]
-fn manifests_reads_only_the_metadata_and_list_and_reports_partition_summaries() {
-    let (runtime, binding, mut context) = runtime_and_binding();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
-    for name in ["live.avro", "removed.avro"] {
-        std::fs::remove_file(dir.path().join("metadata").join(name)).unwrap();
+fn manifests_reads_only_metadata_and_v2_or_v3_list_with_all_six_counts() {
+    for version in [FormatVersion::V2, FormatVersion::V3] {
+        let (runtime, binding, mut context) = runtime_and_binding();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing = data_file("data/existing.parquet", "east", 11, 512);
+        let warehouse = runtime.block_on(build_warehouse_with_manifests(
+            dir.path(),
+            binding.clone(),
+            version,
+            false,
+            Some(existing),
+        ));
+        for name in ["live.avro", "removed.avro"] {
+            std::fs::remove_file(dir.path().join("metadata").join(name)).unwrap();
+        }
+        let reference = reference(
+            &warehouse,
+            IcebergSystemTableType::Manifests,
+            Some(SNAPSHOT_ID),
+        );
+        let split = super::super::IcebergReadSplit::SystemRelation(
+            SystemRelationSplit::try_new(reference.clone()).unwrap(),
+        );
+        let scan = SystemTableScan::from_metadata(reference, &warehouse.metadata).unwrap();
+        assert_eq!(scan.format_version(), version);
+        let schema = scan.source_schema();
+
+        let spawner = GatedFileIoSpawner::closed(runtime.handle().clone());
+        let task_operations =
+            route_reads_through(&mut context, spawner.clone(), runtime.handle().clone());
+        let provider = provider(&binding, &context);
+        let budget = ConnectorPollBudget::new();
+        let stream = provider
+            .create_page_stream(&scan, &split, scan.columns(), &budget)
+            .unwrap();
+        assert_eq!(spawner.started(), 0);
+        spawner.release(64);
+        let pages = drain_driven(DrivenStream::new(&runtime, stream, budget)).unwrap();
+        assert_eq!(
+            spawner.started(),
+            4,
+            "{version:?}: only a stat and range read for metadata and list"
+        );
+        assert_eq!(task_operations.live_operations(), 0);
+
+        assert_eq!(pages.len(), 1);
+        let columns = &pages[0];
+        assert_eq!(columns[0].len(), 2);
+        let integers = |name| int_column(columns, schema.index_of(name).unwrap());
+        let longs = |name| long_column(columns, schema.index_of(name).unwrap());
+        assert_eq!(integers("content"), [Some(0), Some(0)]);
+        assert_eq!(integers("partition_spec_id"), [Some(0), Some(0)]);
+        assert_eq!(integers("added_data_files_count"), [Some(2), Some(0)]);
+        assert_eq!(longs("added_rows_count"), [Some(30), Some(0)]);
+        assert_eq!(integers("existing_data_files_count"), [Some(1), Some(0)]);
+        assert_eq!(longs("existing_rows_count"), [Some(11), Some(0)]);
+        assert_eq!(integers("deleted_data_files_count"), [Some(0), Some(1)]);
+        assert_eq!(longs("deleted_rows_count"), [Some(0), Some(5)]);
+
+        let summaries = columns[schema.index_of("partition_summaries").unwrap()]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("partition summaries list");
+        let first = summaries.value(0);
+        let first = first
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("summary struct");
+        assert_eq!(first.num_columns(), 4);
+        let lower = first
+            .column_by_name("lower_bound")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("lower bound");
+        assert_eq!(lower.value(0), "east");
     }
-    let reference = reference(
-        &warehouse,
-        IcebergSystemTableType::Manifests,
-        Some(SNAPSHOT_ID),
-    );
-    let schema = system_relation_schema(
-        IcebergSystemTableType::Manifests,
-        warehouse.metadata.current_schema(),
-        &[],
-    )
-    .expect("schema");
+}
 
-    let spawner = GatedFileIoSpawner::closed(runtime.handle().clone());
-    let task_operations =
-        route_reads_through(&mut context, spawner.clone(), runtime.handle().clone());
-    let provider = provider(&binding, &context);
-    spawner.release(64);
-    let pages = single_backend_pages(&runtime, &provider, &reference, &all_columns(&schema))
-        .expect("pages");
-    assert_eq!(
-        spawner.started(),
-        4,
-        "stat and range read for metadata and list"
-    );
-    assert_eq!(task_operations.live_operations(), 0);
-
-    let columns = &pages[0];
-    assert_eq!(columns[0].len(), 2);
-    assert_eq!(int_column(columns, 0), vec![Some(0), Some(0)]);
-    assert_eq!(
-        int_column(columns, 3),
-        vec![Some(0), Some(0)],
-        "both manifests use the table's only partition spec"
-    );
-
-    assert_eq!(int_column(columns, 5), vec![Some(2), Some(0)]);
-    assert_eq!(long_column(columns, 6), vec![Some(30), Some(0)]);
-    assert_eq!(int_column(columns, 9), vec![Some(0), Some(1)]);
-
-    let summaries = columns[11]
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .expect("partition summaries list");
-    let first = summaries.value(0);
-    let first = first
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .expect("summary struct");
-    assert_eq!(first.num_columns(), 4);
-    let lower = first
-        .column(2)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("lower bound");
-    // The bound is decoded through the partition field's own type, not
-    // printed as raw bytes.
-    assert_eq!(lower.value(0), "east");
+#[test]
+fn manifests_with_no_snapshot_reads_metadata_only_and_v1_refuses_before_io() {
+    for version in [FormatVersion::V2, FormatVersion::V1] {
+        let (runtime, binding, mut context) = runtime_and_binding();
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = TableMetadataBuilder::new(
+            test_schema(),
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            format!("file://{}", dir.path().display()),
+            version,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let warehouse = write_warehouse_metadata(dir.path(), metadata);
+        let reference = reference(&warehouse, IcebergSystemTableType::Manifests, None);
+        let split = super::super::IcebergReadSplit::SystemRelation(
+            SystemRelationSplit::try_new(reference.clone()).unwrap(),
+        );
+        let scan = SystemTableScan::from_metadata(reference, &warehouse.metadata).unwrap();
+        let spawner = GatedFileIoSpawner::closed(runtime.handle().clone());
+        let task_operations =
+            route_reads_through(&mut context, spawner.clone(), runtime.handle().clone());
+        let provider = provider(&binding, &context);
+        let budget = ConnectorPollBudget::new();
+        let result = provider.create_page_stream(&scan, &split, scan.columns(), &budget);
+        assert_eq!(spawner.started(), 0);
+        if version == FormatVersion::V1 {
+            let error = result.err().expect("BE refuses a frozen v1 Manifests scan");
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            assert!(error.message().contains("format version 2 or 3"));
+        } else {
+            spawner.release(64);
+            let stream = result.unwrap();
+            assert!(
+                drain_driven(DrivenStream::new(&runtime, stream, budget))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                spawner.started(),
+                2,
+                "stat and range read for metadata only"
+            );
+        }
+        assert_eq!(task_operations.live_operations(), 0);
+    }
 }
 
 #[test]
@@ -2562,8 +2656,50 @@ fn a_files_split_stream_reads_nothing_until_polled_then_reads_its_one_manifest()
     let first = runtime.block_on(narrow.next()).unwrap().unwrap();
     assert_eq!(first.position_count(), 1);
     assert_eq!(first.channel_count(), 1);
+    let (_, columns) = first.into_columns().unwrap();
+    assert_eq!(
+        string_column(&columns, 0),
+        [Some("data/a.parquet".to_owned())]
+    );
     assert_eq!(narrow.metrics().completed_positions, 1);
     runtime.block_on(narrow.close()).unwrap();
     assert_eq!(task_operations.live_operations(), 0);
     assert_eq!(spawner.started(), 2);
+}
+
+#[test]
+fn zero_column_manifest_streams_count_exactly_their_visible_rows() {
+    let (runtime, binding, context) = runtime_and_binding();
+    let dir = tempfile::tempdir().unwrap();
+    let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
+    let provider = IcebergSystemTableProvider::new(binding, context, NonZeroUsize::new(1).unwrap());
+    for (relation, expected) in [
+        (IcebergSystemTableType::Files, [2, 0]),
+        (IcebergSystemTableType::Entries, [2, 1]),
+    ] {
+        let reference = reference(&warehouse, relation, Some(SNAPSHOT_ID));
+        let splits = manifest_splits(&runtime, &provider, &reference).unwrap();
+        assert_eq!(splits.len(), expected.len());
+        for (split, expected) in splits.into_iter().zip(expected) {
+            let budget = ConnectorPollBudget::new();
+            let stream = provider
+                .create_page_stream(
+                    &split.scan,
+                    &super::super::IcebergReadSplit::SystemManifest(split.split),
+                    &[],
+                    &budget,
+                )
+                .unwrap();
+            let mut stream = DrivenStream::new(&runtime, stream, budget);
+            let mut positions = 0;
+            while let Some(page) = stream.next_page().unwrap() {
+                assert_eq!(page.channel_count(), 0);
+                assert_eq!(page.position_count(), 1);
+                positions += page.position_count();
+            }
+            assert_eq!(positions, expected, "{relation:?}");
+            assert_eq!(stream.metrics().completed_positions, expected as u64);
+            stream.close().unwrap();
+        }
+    }
 }
