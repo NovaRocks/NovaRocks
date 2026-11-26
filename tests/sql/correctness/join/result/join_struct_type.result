@@ -1,114 +1,114 @@
 -- query 9
--- legacy
+-- types	row(c0 integer, c1 varchar)	row(c0 integer, c1 varchar)
 s0	s0
-{"c0":0,"c1":"ab"}	{"c0":0,"c1":"ab"}
-{"c0":3,"c1":""}	{"c0":3,"c1":""}
+[0,"ab"]	[0,"ab"]
+[3,""]	[3,""]
 
 -- query 10
--- legacy
+-- types	row(c0 decimal(16, 3), c1 varchar)	row(c0 decimal(16, 3), c1 varchar)
 s1	s1
-{"c0":0.000,"c1":"ab"}	{"c0":0.000,"c1":"ab"}
-{"c0":3.000,"c1":""}	{"c0":3.000,"c1":""}
+["0.000","ab"]	["0.000","ab"]
+["3.000",""]	["3.000",""]
 
 -- query 11
--- legacy
+-- types	row(c0 integer, c1 array(varchar))	row(c0 integer, c1 array(varchar))
 s2	s2
-{"c0":0,"c1":["1","2"]}	{"c0":0,"c1":["1","2"]}
-{"c0":1,"c1":[]}	{"c0":1,"c1":[]}
+[0,["1","2"]]	[0,["1","2"]]
+[1,[]]	[1,[]]
 
 -- query 12
--- legacy
+-- types	row(c0 integer, c1 row(c integer, b varchar))	row(c0 integer, c1 row(c integer, b varchar))
 s5	s5
-{"c0":0,"c1":{"c":1,"b":"a"}}	{"c0":0,"c1":{"c":1,"b":"a"}}
+[0,[1,"a"]]	[0,[1,"a"]]
 
 -- query 13
--- legacy
+-- types	row(c0 integer, c1 varchar)	row(c0 integer, c1 varchar)
 s0	s0
-{"c0":0,"c1":"ab"}	{"c0":0,"c1":"ab"}
-{"c0":3,"c1":""}	{"c0":3,"c1":""}
+[0,"ab"]	[0,"ab"]
+[3,""]	[3,""]
 
 -- query 14
--- legacy
+-- types	row(c0 decimal(16, 3), c1 varchar)	row(c0 decimal(16, 3), c1 varchar)
 s1	s1
-{"c0":0.000,"c1":"ab"}	{"c0":0.000,"c1":"ab"}
-{"c0":3.000,"c1":""}	{"c0":3.000,"c1":""}
+["0.000","ab"]	["0.000","ab"]
+["3.000",""]	["3.000",""]
 
 -- query 15
--- legacy
+-- types	row(c0 integer, c1 array(varchar))	row(c0 integer, c1 array(varchar))
 s2	s2
-{"c0":0,"c1":["1","2"]}	{"c0":0,"c1":["1","2"]}
-{"c0":1,"c1":[]}	{"c0":1,"c1":[]}
+[0,["1","2"]]	[0,["1","2"]]
+[1,[]]	[1,[]]
 
 -- query 16
--- legacy
+-- types	row(c0 varchar, c1 map(integer, varchar))	row(c0 varchar, c1 map(integer, varchar))
 s3	s3
-{"c0":"1","c1":{1:"abc"}}	{"c0":"1","c1":{1:"abc"}}
-{"c0":"11","c1":{1:"abc"}}	{"c0":"11","c1":{1:"abc"}}
-{"c0":"3","c1":{3:"a33c"}}	{"c0":"3","c1":{3:"a33c"}}
+["1",{"1":"abc"}]	["1",{"1":"abc"}]
+["11",{"1":"abc"}]	["11",{"1":"abc"}]
+["3",{"3":"a33c"}]	["3",{"3":"a33c"}]
 
 -- query 18
--- legacy
+-- types	row(c0 integer, c1 varchar)	row(c0 integer, c1 varchar)
 s0	s0
-{"c0":0,"c1":"ab"}	{"c0":0,"c1":"ab"}
-{"c0":1,"c1":null}	{"c0":1,"c1":null}
-{"c0":null,"c1":null}	{"c0":null,"c1":null}
-{"c0":3,"c1":""}	{"c0":3,"c1":""}
+[0,"ab"]	[0,"ab"]
+[1,null]	[1,null]
+[null,null]	[null,null]
+[3,""]	[3,""]
 NULL	NULL
 
 -- query 19
--- legacy
+-- types	row(c0 decimal(16, 3), c1 varchar)	row(c0 decimal(16, 3), c1 varchar)
 s1	s1
-{"c0":0.000,"c1":"ab"}	{"c0":0.000,"c1":"ab"}
-{"c0":null,"c1":""}	{"c0":null,"c1":""}
-{"c0":null,"c1":null}	{"c0":null,"c1":null}
-{"c0":3.000,"c1":""}	{"c0":3.000,"c1":""}
+["0.000","ab"]	["0.000","ab"]
+[null,""]	[null,""]
+[null,null]	[null,null]
+["3.000",""]	["3.000",""]
 NULL	NULL
 
 -- query 20
--- legacy
+-- types	row(c0 integer, c1 row(c integer, b varchar))	row(c0 integer, c1 row(c integer, b varchar))
 s5	s5
-{"c0":0,"c1":{"c":1,"b":"a"}}	{"c0":0,"c1":{"c":1,"b":"a"}}
-{"c0":null,"c1":{"c":null,"b":null}}	{"c0":null,"c1":{"c":null,"b":null}}
-{"c0":null,"c1":{"c":null,"b":null}}	{"c0":null,"c1":{"c":null,"b":null}}
-{"c0":null,"c1":{"c":null,"b":null}}	{"c0":null,"c1":{"c":null,"b":null}}
-{"c0":null,"c1":{"c":null,"b":null}}	{"c0":null,"c1":{"c":null,"b":null}}
-{"c0":null,"c1":{"c":3,"b":"a"}}	{"c0":null,"c1":{"c":3,"b":"a"}}
+[0,[1,"a"]]	[0,[1,"a"]]
+[null,[null,null]]	[null,[null,null]]
+[null,[null,null]]	[null,[null,null]]
+[null,[null,null]]	[null,[null,null]]
+[null,[null,null]]	[null,[null,null]]
+[null,[3,"a"]]	[null,[3,"a"]]
 NULL	NULL
 
 -- query 21
--- legacy
+-- types	row(c0 integer, c1 varchar)	row(c0 integer, c1 varchar)
 s0	s0
-{"c0":0,"c1":"ab"}	{"c0":0,"c1":"ab"}
-{"c0":1,"c1":null}	{"c0":1,"c1":null}
-{"c0":null,"c1":null}	{"c0":null,"c1":null}
-{"c0":3,"c1":""}	{"c0":3,"c1":""}
+[0,"ab"]	[0,"ab"]
+[1,null]	[1,null]
+[null,null]	[null,null]
+[3,""]	[3,""]
 NULL	NULL
 
 -- query 22
--- legacy
+-- types	row(c0 decimal(16, 3), c1 varchar)	row(c0 decimal(16, 3), c1 varchar)
 s1	s1
-{"c0":0.000,"c1":"ab"}	{"c0":0.000,"c1":"ab"}
-{"c0":null,"c1":""}	{"c0":null,"c1":""}
-{"c0":null,"c1":null}	{"c0":null,"c1":null}
-{"c0":3.000,"c1":""}	{"c0":3.000,"c1":""}
+["0.000","ab"]	["0.000","ab"]
+[null,""]	[null,""]
+[null,null]	[null,null]
+["3.000",""]	["3.000",""]
 NULL	NULL
 
 -- query 23
--- legacy
+-- types	row(c0 integer, c1 array(varchar))	row(c0 integer, c1 array(varchar))
 s2	s2
-{"c0":0,"c1":["1","2"]}	{"c0":0,"c1":["1","2"]}
-{"c0":1,"c1":[]}	{"c0":1,"c1":[]}
-{"c0":null,"c1":null}	{"c0":null,"c1":null}
-{"c0":3,"c1":["3",null,null,null]}	{"c0":3,"c1":["3",null,null,null]}
+[0,["1","2"]]	[0,["1","2"]]
+[1,[]]	[1,[]]
+[null,null]	[null,null]
+[3,["3",null,null,null]]	[3,["3",null,null,null]]
 NULL	NULL
 
 -- query 24
--- legacy
+-- types	row(c0 varchar, c1 map(integer, varchar))	row(c0 varchar, c1 map(integer, varchar))
 s3	s3
-{"c0":"1","c1":{1:"abc"}}	{"c0":"1","c1":{1:"abc"}}
-{"c0":"11","c1":{1:"abc"}}	{"c0":"11","c1":{1:"abc"}}
-{"c0":null,"c1":{}}	{"c0":null,"c1":{}}
-{"c0":"3","c1":{3:"a33c"}}	{"c0":"3","c1":{3:"a33c"}}
+["1",{"1":"abc"}]	["1",{"1":"abc"}]
+["11",{"1":"abc"}]	["11",{"1":"abc"}]
+[null,{}]	[null,{}]
+["3",{"3":"a33c"}]	["3",{"3":"a33c"}]
 NULL	NULL
 
 -- query 27
@@ -123,10 +123,6 @@ NULL
 -- query 29
 -- legacy
 s5
-
--- query 31
--- legacy
-s4
 
 -- query 32
 -- legacy

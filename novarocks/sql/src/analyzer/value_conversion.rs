@@ -109,6 +109,13 @@ pub(super) fn cast_with_trino_mode(
 
     super::helpers::validate_value_type(&source.value_type, control)?;
     super::helpers::validate_value_type(&target, control)?;
+    if mode == novarocks_type_contract::TrinoCastMode::Implicit
+        && target.logical_type() == novarocks_type_contract::ValueLogicalType::Json
+        && matches!(&source.kind, ExprKind::Literal(LiteralValue::Null))
+    {
+        // SQL NULL carries the selected JSON type without creating a JSON item.
+        return typed_null_conversion(source, target, constant_policy, control);
+    }
     if source.value_type.value_type().temporal().is_some()
         || target.value_type().temporal().is_some()
     {
