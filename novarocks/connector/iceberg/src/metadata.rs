@@ -3419,7 +3419,10 @@ mod plan_splits_pruning_tests {
                     request,
                 )
                 .await;
-                assert!(matches!(outcome, CatalogOutcome::KnownCommitted { .. }), "{outcome:?}");
+                assert!(
+                    matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                    "{outcome:?}"
+                );
             }
 
             for (alias, expected_column) in [
@@ -3439,13 +3442,17 @@ mod plan_splits_pruning_tests {
                 };
                 let preparation = metadata.prepare_table(request.clone()).await.unwrap();
                 let observed = with_pure_schema_creation(&request.context, |creation| {
-                    metadata.create_prepared_table(preparation, creation).map_err(metadata_creation_error)
+                    metadata
+                        .create_prepared_table(preparation, creation)
+                        .map_err(metadata_creation_error)
                 });
                 if let Some(column) = expected_column {
                     let observed = observed.unwrap();
                     assert!(observed.schema().field_with_name(column).is_ok());
                 } else {
-                    let Err(error) = observed else { panic!("format-v1 manifests alias is unsupported") };
+                    let Err(error) = observed else {
+                        panic!("format-v1 manifests alias is unsupported")
+                    };
                     assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
                     let message = error.to_string();
                     assert!(message.contains("iceberg-rust 0.11"), "{message}");

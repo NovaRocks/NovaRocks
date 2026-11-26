@@ -47,9 +47,12 @@ SELECT p."partition".region AS region, p.data.id.min AS min_id, p.data.id.max AS
  ORDER BY region;
 
 -- query 7
+SELECT * FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metapart_${uuid0}$partitions" LIMIT 0;
+
+-- query 8
 -- @skip_result_check=true
 DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metapart_${uuid0};
 
--- query 8
+-- query 9
 -- @skip_result_check=true
 DROP SCHEMA iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0};

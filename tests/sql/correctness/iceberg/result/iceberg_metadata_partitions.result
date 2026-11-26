@@ -13,3 +13,7 @@ total_records
 region	min_id	max_id
 eu	3	3
 us	1	2
+
+-- query 7
+-- types	row(region varchar)	bigint	bigint	bigint	row(id row(min integer, max integer, null_count bigint, nan_count bigint))
+partition	record_count	file_count	total_size	data
