@@ -22,7 +22,7 @@ use super::*;
 use arrow_schema::{DataType, Field};
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{
-    ConstantValidation, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
+    EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
     InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
     PureImplementationId, PureKernelAbi,
 };

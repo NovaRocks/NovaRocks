@@ -1251,7 +1251,7 @@ fn final_owner_rechecks_actual_unit_input_scope_against_its_real_project_input()
             ports: &[empty_scope],
             all_ports: None,
         },
-        crate::test_support::policy(),
+        novarocks_functions::ConstantValidation::bounded(crate::test_support::policy()),
         &crate::test_support::actual_rng_catalogue(),
         &mut work,
     )

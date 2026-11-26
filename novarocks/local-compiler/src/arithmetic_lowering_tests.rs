@@ -22,8 +22,8 @@ use super::*;
 use crate::test_units::PureUnitFixture;
 use arrow_schema::DataType;
 use novarocks_functions::{
-    ArithmeticPrepareError, ConstantValidation, EngineFunctionCatalogBuilder, FunctionId,
-    FunctionKind, FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
+    ArithmeticPrepareError, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
+    FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
 };
 use novarocks_local_program::{

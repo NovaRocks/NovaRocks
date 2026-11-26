@@ -24,9 +24,9 @@ use arrow_array::{Array, ListArray};
 use arrow_schema::{DataType, Field};
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{
-    ConstantPool, ConstantValidation, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
-    FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    ConstantPool, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
+    InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
+    PureImplementationId, PureKernelAbi,
 };
 use novarocks_local_program::{
     AssertRowsMode, KernelAbiVersion, LocalOperatorId, LocalOperatorOrigin,

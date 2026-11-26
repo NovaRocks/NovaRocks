@@ -26,11 +26,10 @@ use novarocks_expression_contract::{
 use super::*;
 use arrow_schema::DataType;
 use novarocks_functions::{
-    CallEffectInput, ConstantValidation, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
-    InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, PurePreparationSource,
-    ScopedExpressionEffects,
+    CallEffectInput, EngineFunctionCatalogBuilder, FunctionArgument, FunctionBindingRequest,
+    FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType, InstalledPureKernel,
+    PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
+    PureImplementationId, PureKernelAbi, PurePreparationSource, ScopedExpressionEffects,
 };
 use novarocks_local_program::{KernelAbiVersion, ProgramNodeKind};
 use novarocks_physical_plan::{

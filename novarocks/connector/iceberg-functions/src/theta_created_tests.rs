@@ -495,22 +495,6 @@ impl WriterFixture {
         }
     }
 }
-fn writer_constant_policy() -> novarocks_functions::ConstantPolicy {
-    // There are no ConstantValues or pool sources in this genuine request.
-    // Its original caller loans a zero-source policy, never a default grant.
-    novarocks_functions::ConstantPolicy {
-        max_rows: 0,
-        max_array_nodes: 0,
-        max_logical_elements: 0,
-        max_retained_buffer_bytes: 0,
-        max_type_depth: 0,
-        max_type_nodes: 0,
-        max_dictionary_depth: 0,
-        max_metadata_bytes: 0,
-        max_library_validation_work: 0,
-        max_library_validation_bytes: 0,
-    }
-}
 fn prepare_writer(
     source: &WriterFixture,
     phase: novarocks_functions::AggregateKernelPhase,

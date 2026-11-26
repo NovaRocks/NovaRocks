@@ -23,10 +23,10 @@ use novarocks_failure_contract::{FailureClass, FailureProjection};
 use super::*;
 use arrow_schema::DataType;
 use novarocks_functions::{
-    CallEffectInput, ConstantValidation, EngineFunctionCatalogBuilder, FunctionArgumentType,
-    FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId, InstalledPureKernel,
-    PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
+    CallEffectInput, EngineFunctionCatalogBuilder, FunctionArgumentType, FunctionBindingRequest,
+    FunctionId, FunctionKind, FunctionOverloadId, InstalledPureKernel, PureCallPreparation,
+    PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    ScopedExpressionEffects,
 };
 use novarocks_local_program::{KernelAbiVersion, ProgramNodeKind, ProgramRootRef};
 use novarocks_physical_plan::{

@@ -256,7 +256,6 @@ fn with_actual_call<R>(
         CallEffectInput<'_>,
         Arc<novarocks_functions::FunctionBindingSelection>,
         &novarocks_type_contract::CallEffects,
-        &ConstantValidation,
     ) -> R,
 ) -> R {
     let project = program
@@ -314,19 +313,13 @@ fn with_actual_call<R>(
         decimal_overflow_policy: frozen.decimal_overflow_policy,
         proof_scope: frozen.effects.proof_scope,
     };
-    body(
-        input,
-        selected.clone(),
-        &frozen.effects,
-        &original.constant_policy,
-    )
+    body(input, selected.clone(), &frozen.effects)
 }
 fn preparation(
     functions: &PureEngineFunctionCatalog,
     input: CallEffectInput<'_>,
     selected: Arc<novarocks_functions::FunctionBindingSelection>,
     effects: &novarocks_type_contract::CallEffects,
-    policy: &ConstantValidation,
     scope: &mut Scope,
     control: &dyn PureCompileControl,
 ) -> Result<novarocks_functions::PureCallSpecialization, CheckedCallPreparationFailure<FirstH>> {
@@ -396,7 +389,7 @@ fn actual_public_frozen_preparation_uses_one_completed_signature_author_and_no_s
         &FixtureControl,
     )
     .unwrap();
-    let late = with_actual_call(&source, &program, |input, selected, effects, policy| {
+    let late = with_actual_call(&source, &program, |input, selected, effects| {
         let pure = functions
             .prepare_frozen(
                 input,
@@ -436,7 +429,6 @@ fn actual_public_frozen_preparation_uses_one_completed_signature_author_and_no_s
             input,
             selected,
             effects,
-            policy,
             &mut scope,
             observations.as_ref(),
         )
@@ -472,7 +464,7 @@ fn actual_public_frozen_preparation_primary_h_preserves_each_request_prefix() {
         &FixtureControl,
     )
     .unwrap();
-    with_actual_call(&source, &program, |input, selected, effects, policy| {
+    with_actual_call(&source, &program, |input, selected, effects| {
         let good = Factory::new();
         let mut scope = good.begin_scope().unwrap();
         good.observations.start();
@@ -481,7 +473,6 @@ fn actual_public_frozen_preparation_primary_h_preserves_each_request_prefix() {
             input,
             selected.clone(),
             effects,
-            policy,
             &mut scope,
             good.observations.as_ref(),
         )
@@ -505,7 +496,6 @@ fn actual_public_frozen_preparation_primary_h_preserves_each_request_prefix() {
                 input,
                 selected.clone(),
                 effects,
-                policy,
                 &mut scope,
                 factory.observations.as_ref(),
             );
@@ -553,7 +543,7 @@ fn actual_public_frozen_preparation_control_prefixes_have_no_creator_or_footer_t
         &FixtureControl,
     )
     .unwrap();
-    with_actual_call(&source, &program, |input, selected, effects, policy| {
+    with_actual_call(&source, &program, |input, selected, effects| {
         let good = Factory::new();
         let mut scope = good.begin_scope().unwrap();
         good.observations.start();
@@ -562,7 +552,6 @@ fn actual_public_frozen_preparation_control_prefixes_have_no_creator_or_footer_t
             input,
             selected.clone(),
             effects,
-            policy,
             &mut scope,
             good.observations.as_ref(),
         )
@@ -584,7 +573,6 @@ fn actual_public_frozen_preparation_control_prefixes_have_no_creator_or_footer_t
                             input,
                             selected.clone(),
                             effects,
-                            policy,
                             &mut scope,
                             factory.observations.as_ref()
                         )
@@ -726,7 +714,7 @@ fn materialize_created_request<'a>(
         source,
         pools,
         &mut work,
-        Some((factory, &source.constant_policy)),
+        Some((factory, &ConstantValidation::INPUT_DERIVED)),
     )
 }
 fn assert_materialized_source(
@@ -741,7 +729,6 @@ fn assert_materialized_source(
         actual.expected_result_type.unwrap(),
         source.expected_result_type.as_ref().unwrap()
     ));
-    assert_eq!(materialized.constant_policy(), source.constant_policy);
     let (
         A::Value {
             value_type: expected,
@@ -1032,7 +1019,7 @@ fn original_request_header_gates_and_pending_control_precede_lazy_scope_creation
         *factory.observations.request_stop.lock().unwrap() = Some(2);
         assert!(
             matches!(crate::original_requests::materialize_call_request_created(
-            &source, &pools, &mut work, Some((&factory, &source.constant_policy)),
+            &source, &pools, &mut work, Some((&factory, &ConstantValidation::INPUT_DERIVED)),
         ), Err(F::Control(actual)) if actual == cause)
         );
         assert_eq!(factory.observations.next_scope.load(Ordering::SeqCst), 0);

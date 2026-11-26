@@ -30,7 +30,7 @@ use novarocks_expression_contract::{
     BoundFunction, ExprKind, PhysicalCallRequest, RootOrdinal, RootScope,
 };
 use novarocks_functions::{
-    ConstantValidation, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
+    EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
     InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
     PureImplementationId, PureKernelAbi,
 };

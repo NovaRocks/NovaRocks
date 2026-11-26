@@ -29,9 +29,9 @@ use bytes::Bytes;
 use novarocks_connector_contract::*;
 use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
 use novarocks_functions::{
-    ComparisonOperator, ConstantValidation, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
-    FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    ComparisonOperator, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
+    InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
+    PureImplementationId, PureKernelAbi,
 };
 use novarocks_local_program::{
     BindingRequirement, CompiledScanInput, KernelAbiVersion, LocalProgram, ProgramNodeId,

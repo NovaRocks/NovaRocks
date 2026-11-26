@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::fragment_fixture::{
-    compile, empty_values, numeric_catalogue, options, output_value, package,
-};
+use super::fragment_fixture::{compile, empty_values, numeric_catalogue, output_value, package};
 use arrow_schema::DataType;
 use novarocks_constant_contract::ConstantPools;
 use novarocks_expression::testkit::HarnessControl;
@@ -81,7 +79,6 @@ fn set_operation(kind: SetOperationKind, shared: bool) -> Arc<FragmentPackage> {
         ]),
         Default::default(),
         ConstantPools::empty(),
-        options().constants,
     )
 }
 

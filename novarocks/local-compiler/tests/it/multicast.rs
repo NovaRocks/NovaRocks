@@ -37,7 +37,7 @@ use novarocks_type_contract::{
     PartitionCountParameterId, PartitionHashAlgorithm, PartitionSpaceId,
 };
 
-use super::fragment_fixture::{ADMISSION, DOP, compile, empty_values, numeric_catalogue, options};
+use super::fragment_fixture::{ADMISSION, DOP, compile, empty_values, numeric_catalogue};
 
 const PRODUCER: FragmentId = FragmentId::new(1);
 const RECEIVER: NodeId = NodeId::new(7);

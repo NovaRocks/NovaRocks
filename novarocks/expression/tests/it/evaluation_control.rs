@@ -48,28 +48,27 @@ use std::{
     time::Duration,
 };
 
-const SQL_LITERAL_POLICY: ConstantValidation =
-    novarocks_constant_contract::ConstantValidation::bounded(
-        novarocks_constant_contract::ConstantPolicy {
-            max_rows: 64,
-            max_array_nodes: 1024,
-            max_logical_elements: 4096,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        },
-    );
+const SQL_LITERAL_FIXTURE: novarocks_constant_contract::ConstantPolicy =
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 64,
+        max_array_nodes: 1024,
+        max_logical_elements: 4096,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 20,
+        max_library_validation_bytes: 1 << 20,
+    };
+const SQL_LITERAL_POLICY: ConstantValidation = ConstantValidation::bounded(SQL_LITERAL_FIXTURE);
 
 const VALUES_POLICY: ConstantValidation = novarocks_constant_contract::ConstantValidation::bounded(
     novarocks_constant_contract::ConstantPolicy {
         max_rows: 16,
         max_array_nodes: 128,
         max_logical_elements: 1024,
-        ..SQL_LITERAL_POLICY
+        ..SQL_LITERAL_FIXTURE
     },
 );
 

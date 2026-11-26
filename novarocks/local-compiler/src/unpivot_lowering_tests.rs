@@ -24,8 +24,8 @@ use arrow_array::{Array, ListArray, MapArray, StringArray, StructArray};
 use arrow_schema::{DataType, Field};
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{
-    ConstantError, ConstantPool, ConstantValidation, EngineFunctionCatalogBuilder, FunctionId,
-    FunctionKind, FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
+    ConstantError, ConstantPool, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
+    FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
 };
 use novarocks_local_program::{

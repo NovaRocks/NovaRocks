@@ -24,9 +24,9 @@ use arrow_schema::{DataType, Field};
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_expression_contract::RootScope;
 use novarocks_functions::{
-    ConstantPool, ConstantValidation, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
-    FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    ConstantPool, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
+    InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
+    PureImplementationId, PureKernelAbi,
 };
 use novarocks_local_program::{KernelAbiVersion, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{

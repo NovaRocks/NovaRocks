@@ -22,7 +22,7 @@ use novarocks_expression::testkit::{
 };
 use novarocks_expression_contract::ExprId;
 use novarocks_functions::{
-    ConstantValidation, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
+    EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
     InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
     PureImplementationId, PureKernelAbi,
 };
@@ -143,7 +143,6 @@ pub(super) fn package(
     fields: Box<[ResultField]>,
     parameters: SemanticParameters,
     constants: ConstantPools,
-    policy: ConstantValidation,
 ) -> Arc<FragmentPackage> {
     let fragment_id = builder.id();
     let result = ResultPort {

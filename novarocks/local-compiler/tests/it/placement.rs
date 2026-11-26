@@ -16,7 +16,7 @@
 // under the License.
 
 use super::fragment_fixture::{
-    ADMISSION, DOP, compile, empty_values, numeric_catalogue, options, output_value, seal_units,
+    ADMISSION, DOP, compile, empty_values, numeric_catalogue, output_value, seal_units,
 };
 use arrow_schema::DataType;
 use novarocks_expression::testkit::HarnessControl;

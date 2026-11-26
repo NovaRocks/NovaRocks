@@ -187,7 +187,6 @@ fn cast_fixture(
             fields,
             SemanticParameters::default(),
             source_pools,
-            constants,
         ),
     )
 }
@@ -298,7 +297,6 @@ fn nullsafe_fixture(ty: FunctionValueType) -> (PureEngineFunctionCatalog, Arc<Fr
             fields,
             SemanticParameters::try_new([]).unwrap(),
             source_pools,
-            constants,
         ),
     )
 }

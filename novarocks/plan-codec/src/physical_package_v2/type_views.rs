@@ -1139,7 +1139,7 @@ mod tests {
         );
         assert!(
             budget.facts().allocation_request_bytes_upper_bound
-                >= size_of::<TypeOccurrenceRow<'_>>() * views.occurrences().len()
+                >= std::mem::size_of_val(views.occurrences())
         );
         work.finish().unwrap();
     }

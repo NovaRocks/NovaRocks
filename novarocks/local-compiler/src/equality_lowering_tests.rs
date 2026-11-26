@@ -161,7 +161,6 @@ fn seal_units(
     selected: Option<&Arc<FunctionBindingSelection>>,
     request: Option<FunctionBindingRequest<'_>>,
     rand_definitions: &[ExprId],
-    policy: ConstantValidation,
 ) -> Result<(), FixtureError> {
     if let Some(selected) = selected {
         let declaration = functions
@@ -523,7 +522,6 @@ fn fixture(
         rand_selected.as_ref(),
         rand_request,
         &rand_definitions,
-        options().constants,
     )?;
     let fragment = builder.finish_definition(
         NodeId::new(0),
