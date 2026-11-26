@@ -618,9 +618,9 @@ fn mixed_window_freezes_one_node_with_independent_function_order_roots() {
         Field::new("a", list, true),
     ];
     let source = try_sql_source_with_declared_fields(
-        "SELECT min_by(v,k) OVER w, lag(a,1,ARRAY[-k]) OVER w, \
-         array_agg(v ORDER BY k DESC NULLS FIRST) OVER w \
-         FROM t WINDOW w AS (PARTITION BY p ORDER BY k)",
+        "SELECT min_by(v,k) OVER (PARTITION BY p ORDER BY k), \
+         lag(a,1,ARRAY[-k]) OVER (PARTITION BY p ORDER BY k), \
+         array_agg(v ORDER BY k DESC NULLS FIRST) OVER (PARTITION BY p ORDER BY k) FROM t",
         &fields,
     )
     .unwrap();

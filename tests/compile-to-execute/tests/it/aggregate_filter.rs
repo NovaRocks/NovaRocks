@@ -412,7 +412,16 @@ fn single_only_aggregate_keeps_original_update_channels_with_a_mergeable_peer() 
 
 #[test]
 fn approx_distinct_final_consumes_multiple_nonempty_filtered_partial_states() {
-    use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array};
+    assert_approx_distinct_multiple_filtered_partials(false);
+}
+
+#[test]
+fn approx_distinct_fixed_accuracy_consumes_multiple_nonempty_filtered_partial_states() {
+    assert_approx_distinct_multiple_filtered_partials(true);
+}
+
+fn assert_approx_distinct_multiple_filtered_partials(explicit_accuracy: bool) {
+    use arrow::array::{Array, ArrayRef, BinaryArray, Float64Array, Int64Array};
     use novarocks_functions::{
         AggregateStateColumn, EvaluatedArgument, KernelEvaluationControl, KernelFailure,
         SelectedAggregateMergeInput, SelectedAggregateUpdateInput, Selection,
@@ -431,8 +440,9 @@ fn approx_distinct_final_consumes_multiple_nonempty_filtered_partial_states() {
         }
     }
 
+    let arguments = if explicit_accuracy { "k, 2.3E-2" } else { "k" };
     let source = sql_source(
-        "SELECT approx_distinct(k) FILTER (WHERE k > 0) FROM fixture.source",
+        &format!("SELECT approx_distinct({arguments}) FILTER (WHERE k > 0) FROM fixture.source"),
         DataType::Int64,
     );
     let plan = source.plan();
@@ -495,12 +505,17 @@ fn approx_distinct_final_consumes_multiple_nonempty_filtered_partial_states() {
         .unwrap();
         states.push(&Control).unwrap();
         let values: ArrayRef = Arc::new(Int64Array::from(values.to_vec()));
-        let arguments = [EvaluatedArgument::Column(&values)];
+        let accuracy: ArrayRef = Arc::new(Float64Array::from(vec![0.023; 3]));
+        let sources = [
+            EvaluatedArgument::Column(&values),
+            EvaluatedArgument::Column(&accuracy),
+        ];
+        let arguments = &sources[..1 + usize::from(explicit_accuracy)];
         let selected = Selection::try_sparse(3, &[0, 2]).unwrap();
         let input = SelectedAggregateUpdateInput::try_new(
             update.contract(),
             selected,
-            &arguments,
+            arguments,
             &[],
             &Control,
         )

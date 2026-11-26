@@ -130,7 +130,8 @@ fn approximate_aggregates_distinct_installed_overloads_share_state_formats() {
 
 use arrow_array::types::Float64Type;
 use arrow_array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int64Array, ListArray, MapArray, StringArray,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int64Array, ListArray, MapArray,
+    StringArray,
 };
 use arrow_schema::Field;
 use novarocks_functions::{
@@ -236,6 +237,70 @@ fn evaluate(
         .prepare_update_batch(&mapping, input, &Control)?
         .run(&Control)?;
     states.emit(&[0], 1, &Control)
+}
+
+#[test]
+fn approximate_aggregates_distinct_uses_first_selected_contribution_accuracy() {
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT;
+
+    let inputs: &[ArrayRef] = &[
+        Arc::new(Int64Array::from(vec![
+            Some(10),
+            None,
+            Some(11),
+            Some(12),
+            Some(13),
+            Some(14),
+            Some(15),
+        ])),
+        Arc::new(Float64Array::from(vec![
+            Some(-1.0),
+            Some(-1.0),
+            None,
+            Some(0.023),
+            Some(f64::NAN),
+            Some(-1.0),
+            None,
+        ])),
+    ];
+    let value = evaluate("approx_distinct", inputs, &[1, 2, 3, 4, 5, 6]).unwrap();
+    let result = value.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(result.value(0), 3);
+
+    // Selecting the invalid row before any eligible contribution is an error
+    // with the same installed overload.
+    let failure = evaluate("approx_distinct", inputs, &[0, 3, 4]).unwrap_err();
+    assert_eq!(failure.failure_fact().reason(), INVALID_FUNCTION_ARGUMENT);
+}
+
+#[test]
+fn approximate_aggregates_distinct_boolean_ignores_non_null_accuracy_value() {
+    let inputs: &[ArrayRef] = &[
+        Arc::new(BooleanArray::from(vec![
+            Some(false),
+            Some(true),
+            None,
+            Some(true),
+            Some(false),
+        ])),
+        Arc::new(Float64Array::from(vec![
+            None,
+            Some(f64::NAN),
+            Some(-1.0),
+            None,
+            Some(-1.0),
+        ])),
+    ];
+    for (rows, expected) in [
+        (&[0, 2, 3][..], 0),
+        (&[0, 1, 2, 3][..], 1),
+        (&[0, 1, 2, 3, 4][..], 2),
+    ] {
+        let value = evaluate("approx_distinct", inputs, rows).unwrap();
+        let result = value.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(result.value(0), expected);
+    }
 }
 
 #[test]

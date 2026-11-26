@@ -31,9 +31,10 @@ use novarocks_type_contract::{WindowBound, WindowFrameUnits};
 
 use super::family_fixture::try_run;
 use super::window_fixture::{Arg, Call, Key, Shape, compile, installed_catalog, package};
-use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::operators::compiled_window::CompiledWindowProcessorFactory;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
 type Row = Vec<Option<i64>>;
@@ -557,28 +558,50 @@ fn drive(
     )
 }
 
-fn tracked_operator(
+fn unprepared_window_operator(
     program: &Arc<LocalProgram>,
     output_rows: NonZeroU32,
+    tracker: Arc<MemTracker>,
+    state: &RuntimeState,
 ) -> Box<dyn crate::exec::pipeline::operator::Operator> {
     let (node, _) = analytic(program);
+    let error = state.error_state();
     let factory = CompiledWindowProcessorFactory::try_new_with_output_batch_rows(
         Arc::clone(program),
         node,
-        Arc::new(RuntimeErrorState::default()),
+        Arc::clone(&error),
         output_rows,
     )
     .unwrap();
     let mut operator = factory.create(1, 0);
-    let tracker = crate::runtime::mem_tracker::MemTracker::new_root("window oracle construction");
-    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
     operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
         Arc::clone(&tracker),
-        Arc::new(RuntimeErrorState::default()),
+        error,
     ));
     operator.set_mem_tracker(tracker);
+    operator.bind_runtime_state(state).unwrap();
+    operator
+}
+
+fn tracked_operator(
+    program: &Arc<LocalProgram>,
+    output_rows: NonZeroU32,
+    state: &RuntimeState,
+) -> Box<dyn crate::exec::pipeline::operator::Operator> {
+    let tracker = MemTracker::new_root("window oracle construction");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    let mut operator = unprepared_window_operator(program, output_rows, tracker, state);
     operator.prepare().unwrap();
     operator
+}
+
+fn window_input_schema(program: &LocalProgram) -> ChunkSchemaRef {
+    let (node, _) = analytic(program);
+    let nodes = program.graph().nodes();
+    let ProgramNodeKind::Analytic { input, .. } = nodes[node.index()].kind() else {
+        unreachable!();
+    };
+    ChunkSchema::from_compiled_layout(nodes[input.index()].output_layout()).unwrap()
 }
 
 fn drive_with_output_rows(
@@ -587,14 +610,9 @@ fn drive_with_output_rows(
     step: usize,
     output_rows: NonZeroU32,
 ) -> Vec<crate::exec::chunk::ChunkBatchProjection> {
-    let (node, _) = analytic(program);
-    let input = &program.graph().nodes()[match program.graph().nodes()[node.index()].kind() {
-        ProgramNodeKind::Analytic { input, .. } => input.index(),
-        _ => unreachable!(),
-    }];
-    let schema = ChunkSchema::from_compiled_layout(input.output_layout()).unwrap();
-    let mut operator = tracked_operator(program, output_rows);
+    let schema = window_input_schema(program);
     let state = RuntimeState::default();
+    let mut operator = tracked_operator(program, output_rows, &state);
     let mut processor = TestDriver::new(operator.as_mut(), &state);
     let mut output = Vec::new();
     let mut offset = 0;
@@ -1040,18 +1058,11 @@ fn compiled_window_late_required_failure_in_one_closed_group_withholds_prefix() 
     };
     let catalogue = installed_catalog();
     let program = compile(package(&rows, 3, &shape, &catalogue, 1), &catalogue, 1);
-    let (node, schema) = analytic(&program);
+    let (_, schema) = analytic(&program);
     let input = sorted_input(&rows, &shape, schema);
-    let ProgramNodeKind::Analytic { input: parent, .. } =
-        program.graph().nodes()[node.index()].kind()
-    else {
-        unreachable!();
-    };
-    let layout = program.graph().nodes()[parent.index()].output_layout();
-    let schema = ChunkSchema::from_compiled_layout(layout).unwrap();
-    let input = Chunk::try_new_with_chunk_schema(input, schema).unwrap();
-    let mut operator = tracked_operator(&program, NonZeroU32::new(1).unwrap());
+    let input = Chunk::try_new_with_chunk_schema(input, window_input_schema(&program)).unwrap();
     let state = RuntimeState::default();
+    let mut operator = tracked_operator(&program, NonZeroU32::new(1).unwrap(), &state);
     let mut processor = TestDriver::new(operator.as_mut(), &state);
     let error = processor.input_without_output(input).unwrap_err();
     assert_eq!(error.failure_fact().class(), FailureClass::Data, "{error}");
@@ -1118,4 +1129,267 @@ fn compiled_window_owned_partition_subdivides_true_by_arrival_batches() {
             [int(Some(40)), int(Some(40))],
         ]
     );
+}
+
+fn failing_mixed_windows(rows: &[Row], calls: Vec<Call>) -> (Arc<LocalProgram>, Chunk) {
+    use novarocks_functions::FunctionKind;
+    let shape = Shape {
+        partition: vec![P],
+        order: vec![key(O, true, false)],
+        calls,
+    };
+    let actual =
+        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
+    let catalogue = super::window_fixture::window_catalog_from_actual(
+        &[
+            ("min_by", FunctionKind::Aggregate),
+            ("lag", FunctionKind::Window),
+        ],
+        &actual,
+    );
+    let program = compile(package(rows, 3, &shape, &catalogue, 1), &catalogue, 1);
+    let (_, schema) = analytic(&program);
+    let batch = sorted_input(rows, &shape, schema);
+    let input = Chunk::try_new_with_chunk_schema(batch, window_input_schema(&program)).unwrap();
+    (program, input)
+}
+
+#[test]
+fn compiled_window_mixed_required_faults_follow_original_call_order() {
+    use crate::runtime::task::ExecutionFailureCause;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_functions::KernelFailure;
+
+    let rows = [
+        vec![Some(1), Some(1), Some(-2)],
+        vec![Some(1), Some(2), Some(1)],
+    ];
+    for by_first in [true, false] {
+        let by = Call::aggregate("min_by", &[Arg::Overflowing(X), Arg::Column(O)]);
+        let offset = Call::window("lag", &[Arg::Column(O), Arg::Column(X), Arg::Constant(99)]);
+        let calls = if by_first {
+            vec![by, offset]
+        } else {
+            vec![offset, by]
+        };
+        let (program, input) = failing_mixed_windows(&rows, calls);
+        let state = RuntimeState::default();
+        let mut operator = tracked_operator(&program, NonZeroU32::new(1).unwrap(), &state);
+        let mut driver = TestDriver::new(operator.as_mut(), &state);
+        driver.input_without_output(input).unwrap();
+        driver.signal_eos().unwrap();
+        let failure = driver.advance_to_boundary().unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        match (by_first, failure.cause()) {
+            (true, ExecutionFailureCause::RequiredRow(row)) => {
+                assert_eq!(row.batch_row(), 0);
+                assert!(
+                    row.error()
+                        .message()
+                        .to_string()
+                        .contains("Arithmetic overflow")
+                );
+            }
+            (false, ExecutionFailureCause::Kernel(KernelFailure::Source(_))) => {
+                assert!(failure.to_string().contains("offset must be non-negative"));
+            }
+            (_, cause) => panic!("unexpected mixed window failure: {cause:?}"),
+        }
+        assert_eq!(driver.advance_to_boundary().unwrap_err(), failure);
+        assert_eq!(state.error(), Some(failure));
+    }
+}
+
+#[test]
+fn compiled_window_mixed_layout_failure_keeps_actual_by_output_ordinal() {
+    use crate::exec::chunk::ChunkSlotSchema;
+    use crate::exec::pipeline::operator::{
+        ConstructionFailure, InputConstructionFactory, InputConstructionOwner,
+    };
+    use crate::runtime::task::ExecutionFailureCause;
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_functions::{WindowInvocationPhase, WindowInvocationScope};
+    use novarocks_local_program::StaticLayout;
+
+    // A test-only bad output declaration. The original typed input,
+    // LocalProgram, BY carrier producer and output validator still execute.
+    struct OutputSchemaFixture {
+        original: Arc<dyn InputConstructionFactory>,
+        schema: ChunkSchemaRef,
+    }
+    impl InputConstructionFactory for OutputSchemaFixture {
+        fn observe_input_work(&self, units: usize) -> Result<(), ConstructionFailure> {
+            self.original.observe_input_work(units)
+        }
+        fn begin_typed_construction(
+            &self,
+            schema: &ChunkSchema,
+        ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+            self.original.begin_typed_construction(schema)
+        }
+        fn begin_compiled_layout_construction(
+            &self,
+            layout: &StaticLayout,
+        ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+            self.original.begin_compiled_layout_construction(layout)
+        }
+        fn create_compiled_chunk_schema(
+            &self,
+            _: &StaticLayout,
+        ) -> Result<ChunkSchemaRef, ConstructionFailure> {
+            Ok(Arc::clone(&self.schema))
+        }
+    }
+
+    let rows = [
+        vec![Some(1), Some(1), Some(31)],
+        vec![Some(1), Some(2), Some(32)],
+    ];
+    for by_first in [true, false] {
+        let by = Call::aggregate("min_by", &[Arg::Column(X), Arg::Column(O)]);
+        let offset = Call::window(
+            "lag",
+            &[Arg::Column(X), Arg::Constant(1), Arg::Constant(99)],
+        );
+        let calls = if by_first {
+            vec![by, offset]
+        } else {
+            vec![offset, by]
+        };
+        let call_ordinal = usize::from(!by_first);
+        let output_ordinal = 3 + call_ordinal;
+        let (program, input) = failing_mixed_windows(&rows, calls);
+        let (node, _) = analytic(&program);
+        let declared = ChunkSchema::from_compiled_layout(
+            program.graph().nodes()[node.index()].output_layout(),
+        )
+        .unwrap();
+        let mut slots = declared.slots().to_vec();
+        let slot = &slots[output_ordinal];
+        slots[output_ordinal] = ChunkSlotSchema::new_with_field(
+            slot.slot_id(),
+            Field::new(slot.name(), DataType::Int32, slot.nullable()),
+            None,
+            None,
+        );
+        let state = RuntimeState::default();
+        let tracker = MemTracker::new_root("original BY output layout fixture");
+        tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+        let original = super::aggregate_fixture::runtime_construction_factory(
+            Arc::clone(&tracker),
+            state.error_state(),
+        );
+        let mut operator =
+            unprepared_window_operator(&program, NonZeroU32::new(1).unwrap(), tracker, &state);
+        operator.set_construction_factory(Arc::new(OutputSchemaFixture {
+            original,
+            schema: Arc::new(ChunkSchema::try_new(slots).unwrap()),
+        }));
+        operator.prepare().unwrap();
+        let mut driver = TestDriver::new(operator.as_mut(), &state);
+        driver.input_without_output(input).unwrap();
+        driver.signal_eos().unwrap();
+        let failure = driver.advance_to_boundary().unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        let ExecutionFailureCause::WindowInvocationData(cause) = failure.cause() else {
+            panic!("expected original BY output validation failure: {failure}");
+        };
+        assert_eq!(cause.phase(), WindowInvocationPhase::OutputValidation);
+        assert_eq!(cause.scope(), WindowInvocationScope::CompleteInvocation);
+        assert_eq!(cause.call_ordinal(), call_ordinal);
+        assert_eq!(cause.output_ordinal(), Some(output_ordinal));
+        assert_eq!(cause.frame_ordinal(), None);
+        assert_eq!(cause.invocation_rows(), rows.len());
+        assert_eq!(
+            cause.window_contract().call().function_id().as_str(),
+            "builtin.aggregate/min_by/v1",
+        );
+    }
+}
+
+#[test]
+fn compiled_window_later_owned_batch_refusal_cancel_and_last_arrow_alias() {
+    use crate::runtime::task::ExecutionFailure;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_functions::KernelFailure;
+
+    let rows = [
+        vec![Some(1), Some(1), Some(10)],
+        vec![Some(1), Some(2), Some(20)],
+        vec![Some(1), Some(3), Some(30)],
+        vec![Some(1), Some(4), Some(40)],
+    ];
+    let shape = Shape {
+        partition: vec![P],
+        order: vec![key(O, true, false)],
+        calls: vec![Call::window(
+            "lag",
+            &[Arg::Column(X), Arg::Constant(1), Arg::Constant(99)],
+        )],
+    };
+    let catalogue = installed_catalog();
+    let program = compile(package(&rows, 3, &shape, &catalogue, 1), &catalogue, 1);
+    let (_, schema) = analytic(&program);
+    let batch = sorted_input(&rows, &shape, schema);
+    let input_schema = window_input_schema(&program);
+    for cancel in [false, true] {
+        let state = RuntimeState::default();
+        let tracker = MemTracker::new_root("late owned window batch");
+        let mut operator = unprepared_window_operator(
+            &program,
+            NonZeroU32::new(2).unwrap(),
+            Arc::clone(&tracker),
+            &state,
+        );
+        operator.prepare().unwrap();
+        let mut driver = TestDriver::new(operator.as_mut(), &state);
+        driver
+            .input_without_output(
+                Chunk::try_new_with_chunk_schema(batch.clone(), Arc::clone(&input_schema)).unwrap(),
+            )
+            .unwrap();
+        driver.signal_eos().unwrap();
+        let first = driver.advance_to_boundary().unwrap();
+        assert!(matches!(first.next, NextStep::Runnable));
+        let first = first.output.unwrap();
+        assert_eq!(first.len(), 2);
+        let payload = first.record_batch().column(3).to_data().buffers()[0].clone();
+        drop(first);
+        assert_eq!(payload.typed_data::<i64>(), &[99, 10]);
+
+        let original = if cancel {
+            let original = ExecutionFailure::from(KernelFailure::Cancelled);
+            state.error_state().set_error(original.clone());
+            Some(original)
+        } else {
+            tracker.install_limit_once(tracker.current()).unwrap();
+            None
+        };
+        let failure = driver.advance_to_boundary().unwrap_err();
+        assert_eq!(
+            failure.failure_fact().class(),
+            if cancel {
+                FailureClass::Control
+            } else {
+                FailureClass::Resource
+            },
+        );
+        if let Some(original) = original {
+            assert_eq!(failure, original);
+        }
+        assert_eq!(driver.advance_to_boundary().unwrap_err(), failure);
+        drop(driver);
+        operator.begin_exit().unwrap();
+        drop(operator);
+        drop(failure);
+        drop(state);
+        assert!(
+            tracker.current() > 0,
+            "published Arrow alias keeps its actual charge"
+        );
+        assert_eq!(payload.typed_data::<i64>(), &[99, 10]);
+        drop(payload);
+        assert_eq!(tracker.current(), 0);
+    }
 }

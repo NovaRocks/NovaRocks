@@ -28,4 +28,4 @@ seq	same_value	observed_member_order
 -- query 10
 -- types	bigint	bigint	boolean
 num_rows	partitions	verified
-18	6	true
+24588	6	true

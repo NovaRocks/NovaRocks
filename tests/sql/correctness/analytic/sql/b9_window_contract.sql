@@ -18,13 +18,17 @@
 
 -- query 1
 SELECT seq,
-       array_join(array_agg(v ORDER BY k) OVER growing, ',') AS ordered_values,
-       array_join(array_agg(DISTINCT v) OVER growing, ',') AS distinct_values,
-       array_join(array_agg(DISTINCT v ORDER BY v) OVER growing, ',') AS distinct_ordered,
-       listagg(v, '|') WITHIN GROUP (ORDER BY k) OVER growing AS ordered_text,
-       listagg(DISTINCT v, '|') WITHIN GROUP (ORDER BY v) OVER growing AS distinct_ordered_text
+       array_join(array_agg(v ORDER BY k)
+           OVER (ORDER BY seq ROWS UNBOUNDED PRECEDING), ',') AS ordered_values,
+       array_join(array_agg(DISTINCT v)
+           OVER (ORDER BY seq ROWS UNBOUNDED PRECEDING), ',') AS distinct_values,
+       array_join(array_agg(DISTINCT v ORDER BY v)
+           OVER (ORDER BY seq ROWS UNBOUNDED PRECEDING), ',') AS distinct_ordered,
+       listagg(v, '|') WITHIN GROUP (ORDER BY k)
+           OVER (ORDER BY seq ROWS UNBOUNDED PRECEDING) AS ordered_text,
+       listagg(DISTINCT v, '|') WITHIN GROUP (ORDER BY v)
+           OVER (ORDER BY seq ROWS UNBOUNDED PRECEDING) AS distinct_ordered_text
 FROM (VALUES (1, 'b', 2), (2, 'b', 1), (3, 'a', 3)) t(seq, v, k)
-WINDOW growing AS (ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
 ORDER BY seq;
 
 -- query 2
@@ -40,12 +44,14 @@ SELECT listagg(DISTINCT v, ',') WITHIN GROUP (ORDER BY k, seq) OVER (
 FROM (VALUES (1, 'b', 2), (2, 'b', 1), (3, 'a', 1)) t(seq, v, k);
 
 -- query 4
-SELECT seq, count_if(p) OVER w AS n, bool_and(p) OVER w AS both_values,
-       every(p) OVER w AS every_value, var_pop(x) OVER w AS variance,
-       stddev_pop(x) OVER w AS deviation
+SELECT seq,
+       count_if(p) OVER (ORDER BY seq ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) AS n,
+       bool_and(p) OVER (ORDER BY seq ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) AS both_values,
+       every(p) OVER (ORDER BY seq ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) AS every_value,
+       var_pop(x) OVER (ORDER BY seq ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) AS variance,
+       stddev_pop(x) OVER (ORDER BY seq ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) AS deviation
 FROM (VALUES (1, true, DOUBLE '4'), (2, NULL, DOUBLE '2'),
              (3, false, DOUBLE '8')) t(seq, p, x)
-WINDOW w AS (ORDER BY seq ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING)
 ORDER BY seq;
 
 -- query 5
@@ -84,22 +90,23 @@ FROM (VALUES (1, JSON '{"a":1,"b":2}'), (2, JSON '{"b":2,"a":1}')) t(seq, j);
 -- query 9
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.b9_mixed (
-    part_id INTEGER, seq INTEGER, v VARCHAR, sort_key INTEGER, a ARRAY(INTEGER)
+    part_id INTEGER, subpart INTEGER, seq INTEGER, v VARCHAR, sort_key INTEGER, a ARRAY(INTEGER)
 ) WITH (format_version = 3, partitioning = ARRAY['part_id']);
+-- 24,588 rows exceed three 8,192-row output batches. Each frame stays small.
 INSERT INTO ${case_db}.b9_mixed
-SELECT p, seq, v, k, ARRAY[seq]
+SELECT p, CAST(subpart AS INTEGER), seq, v, k, ARRAY[seq]
 FROM (VALUES 1, 2, 3, 4, 5, 6) partitions(p)
+CROSS JOIN TABLE(sequence(1, 1366)) groups_per_partition(subpart)
 CROSS JOIN (VALUES (1, 'b', 2), (2, 'a', 1), (3, 'c', 3)) payload(seq, v, k);
 
 -- query 10
 -- @explain_contains=WINDOW
 -- @be_log_be_count_at_least=NOVAROCKS_CONNECTOR_SCAN_FIRST_CHUNK,2
 WITH observed AS (
-    SELECT part_id, seq, min_by(v, seq) OVER w AS lowest,
-           lag(a, 1, ARRAY[-seq]) OVER w AS prior,
-           array_join(array_agg(v ORDER BY sort_key) OVER w, ',') AS items
+    SELECT part_id, seq, min_by(v, seq) OVER (PARTITION BY part_id, subpart ORDER BY seq) AS lowest,
+           lag(a, 1, ARRAY[-seq]) OVER (PARTITION BY part_id, subpart ORDER BY seq) AS prior,
+           array_join(array_agg(v ORDER BY sort_key) OVER (PARTITION BY part_id, subpart ORDER BY seq), ',') AS items
     FROM ${case_db}.b9_mixed
-    WINDOW w AS (PARTITION BY part_id ORDER BY seq)
 )
 SELECT count(*) AS num_rows, count(DISTINCT part_id) AS partitions,
        bool_and(lowest = 'b' AND prior[1] = IF(seq = 1, -1, seq - 1)

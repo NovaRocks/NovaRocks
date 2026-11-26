@@ -115,3 +115,45 @@ FROM ${case_db}.filter_two_phase GROUP BY g;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.filter_two_phase;
+
+-- query 13
+-- @skip_result_check=true
+CREATE TABLE ${case_db}.approx_distinct_vectors (
+    part_id INTEGER, g INTEGER, x BIGINT
+) WITH (format_version = 3, partitioning = ARRAY['part_id']);
+INSERT INTO ${case_db}.approx_distinct_vectors
+SELECT CAST((x - 1) % 6 AS INTEGER), 7, x
+FROM TABLE(sequence(1, 8192)) AS vector(x);
+
+-- query 14
+-- @explain_contains=HASH AGGREGATE (LOCAL,
+-- @explain_contains=HASH AGGREGATE (GLOBAL,
+-- @be_log_be_count_at_least=NOVAROCKS_CONNECTOR_SCAN_FIRST_CHUNK,2
+SELECT g, approx_distinct(IF(x <= 4, x), 2.6E-1) AS crossing_low,
+       approx_distinct(IF(x <= 251, x)) AS sparse_default,
+       approx_distinct(IF(x <= 252, x)) AS crossing_default,
+       approx_distinct(IF(x <= 252, x), 2.3E-2) AS crossing_explicit,
+       approx_distinct(IF(x <= 8191, x), 4.0625E-3) AS sparse_high,
+       approx_distinct(x, 2.6E-1) AS dense_low,
+       approx_distinct(x) AS dense_default,
+       approx_distinct(x, 4.0625E-3) AS crossing_high
+FROM ${case_db}.approx_distinct_vectors GROUP BY g;
+
+-- query 15
+-- @explain_contains=HASH AGGREGATE (SINGLE,
+-- @explain_not_contains=HASH AGGREGATE (LOCAL,
+WITH SESSION disable_optimizer_rules = 'SplitAggregateRule', pipeline_dop = 1
+SELECT g, approx_distinct(IF(x <= 4, x), 2.6E-1) AS crossing_low,
+       approx_distinct(IF(x <= 251, x)) AS sparse_default,
+       approx_distinct(IF(x <= 252, x)) AS crossing_default,
+       approx_distinct(IF(x <= 252, x), 2.3E-2) AS crossing_explicit,
+       approx_distinct(IF(x <= 8191, x), 4.0625E-3) AS sparse_high,
+       approx_distinct(x, 2.6E-1) AS dense_low,
+       approx_distinct(x) AS dense_default,
+       approx_distinct(x, 4.0625E-3) AS crossing_high
+FROM ${case_db}.approx_distinct_vectors GROUP BY g;
+
+-- query 16
+-- @cleanup=true
+-- @skip_result_check=true
+DROP TABLE IF EXISTS ${case_db}.approx_distinct_vectors;

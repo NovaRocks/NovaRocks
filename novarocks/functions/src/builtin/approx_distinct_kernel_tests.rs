@@ -16,8 +16,9 @@
 // under the License.
 
 use super::*;
+use crate::opaque_memory::OpaqueAllocationHost;
 use arrow_array::Int64Array;
-use std::{alloc::Layout, ptr::NonNull};
+use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
 
 struct Host;
 impl AggregateStateAllocator for Host {
@@ -297,4 +298,144 @@ fn approx_distinct_sketch_has_fixed_precision_neutral_empty_and_exact_origin() {
                 .is_err()
         );
     }
+}
+
+struct PromotionBudget {
+    limit: usize,
+    live: usize,
+    high_water: usize,
+    refused: Option<(usize, usize)>,
+}
+
+struct PromotionHost(Mutex<PromotionBudget>);
+
+impl OpaqueAllocationHost for PromotionHost {
+    fn reserve_opaque(&self, bytes: usize) -> Result<(), KernelFailure> {
+        let mut budget = self.0.lock().unwrap();
+        let next = budget
+            .live
+            .checked_add(bytes)
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        if next > budget.limit {
+            budget.refused = Some((budget.live, bytes));
+            return Err(KernelFailure::ResourceExhausted);
+        }
+        budget.live = next;
+        budget.high_water = budget.high_water.max(next);
+        Ok(())
+    }
+
+    fn release_opaque(&self, bytes: usize) {
+        let mut budget = self.0.lock().unwrap();
+        budget.live = budget
+            .live
+            .checked_sub(bytes)
+            .expect("release one actual grant");
+    }
+}
+
+impl AggregateStateAllocator for PromotionHost {
+    fn opaque_allocation_host(&self) -> Option<&dyn OpaqueAllocationHost> {
+        Some(self)
+    }
+
+    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
+        self.reserve_opaque(layout.size())?;
+        let allocation = Host.allocate(layout);
+        if allocation.is_err() {
+            self.release_opaque(layout.size());
+        }
+        allocation
+    }
+
+    unsafe fn release(&self, pointer: NonNull<u8>, layout: Layout) {
+        // SAFETY: the original allocation used this exact block and Layout.
+        unsafe { Host.release(pointer, layout) };
+        self.release_opaque(layout.size());
+    }
+}
+
+struct CancelWithDenseBacking<'a> {
+    host: &'a PromotionHost,
+    sparse_stock: usize,
+}
+
+impl KernelEvaluationControl for CancelWithDenseBacking<'_> {
+    fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+        if self.host.0.lock().unwrap().live > self.sparse_stock {
+            Err(KernelFailure::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+        panic!("approx_distinct promotion never waits");
+    }
+}
+
+#[test]
+fn approx_distinct_sketch_accounts_sparse_and_dense_coexistence_and_refunds() {
+    let host = Arc::new(PromotionHost(Mutex::new(PromotionBudget {
+        limit: usize::MAX,
+        live: 0,
+        high_water: 0,
+        refused: None,
+    })));
+    let allocator = HostAggregateAllocator::try_new_with_journal(host.clone()).unwrap();
+    let allocator_stock = host.0.lock().unwrap().live;
+    let precision = 4;
+    let dense_bytes = 1 << precision;
+    let mut sketch = Sketch::new(precision, allocator.clone());
+    sketch.add_hash(0, &mut ScalarWork::new(None)).unwrap();
+    let sparse_bytes = sketch.retained_bytes();
+    let sparse_stock = allocator_stock + sparse_bytes;
+    assert_eq!(host.0.lock().unwrap().live, sparse_stock);
+
+    // Each representation fits alone. Reserving dense backing while the
+    // original sparse entries are still live must exceed this budget.
+    host.0.lock().unwrap().limit = sparse_stock.max(allocator_stock + dense_bytes);
+    let second_bucket = 1 << 63;
+    assert_eq!(
+        sketch.add_hash(second_bucket, &mut ScalarWork::new(None)),
+        Err(KernelFailure::ResourceExhausted)
+    );
+    {
+        let budget = host.0.lock().unwrap();
+        assert_eq!(budget.refused, Some((sparse_stock, dense_bytes)));
+        assert_eq!(budget.live, sparse_stock);
+    }
+    assert_eq!(sketch.retained_bytes(), sparse_bytes);
+    assert_eq!(sketch.estimate(&mut ScalarWork::new(None)).unwrap(), 1);
+
+    // A real grant followed by cancellation refunds only the uncommitted
+    // replacement. The original sparse state remains available.
+    host.0.lock().unwrap().limit = sparse_stock + dense_bytes;
+    let cancellation = CancelWithDenseBacking {
+        host: &host,
+        sparse_stock,
+    };
+    let mut observed = EvaluationCheckpoints::new(&cancellation);
+    assert_eq!(
+        sketch.add_hash(second_bucket, &mut ScalarWork::new(Some(&mut observed))),
+        Err(KernelFailure::Cancelled)
+    );
+    {
+        let budget = host.0.lock().unwrap();
+        assert_eq!(budget.high_water, sparse_stock + dense_bytes);
+        assert_eq!(budget.live, sparse_stock);
+    }
+    assert_eq!(sketch.retained_bytes(), sparse_bytes);
+    assert_eq!(sketch.estimate(&mut ScalarWork::new(None)).unwrap(), 1);
+
+    sketch
+        .add_hash(second_bucket, &mut ScalarWork::new(None))
+        .unwrap();
+    assert_eq!(sketch.retained_bytes(), dense_bytes);
+    assert_eq!(sketch.estimate(&mut ScalarWork::new(None)).unwrap(), 2);
+    assert_eq!(host.0.lock().unwrap().live, allocator_stock + dense_bytes);
+    drop(sketch);
+    assert_eq!(host.0.lock().unwrap().live, allocator_stock);
+    drop(allocator);
+    assert_eq!(host.0.lock().unwrap().live, 0);
 }

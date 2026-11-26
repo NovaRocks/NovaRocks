@@ -42,3 +42,13 @@ g	kept	kept_boolean	empty_count
 -- types	integer	bigint
 g	dynamic_kept
 7	6
+
+-- query 14
+-- types	integer	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
+g	crossing_low	sparse_default	crossing_default	crossing_explicit	sparse_high	dense_low	dense_default	crossing_high
+7	5	251	247	247	8191	6342	8237	8238
+
+-- query 15
+-- types	integer	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
+g	crossing_low	sparse_default	crossing_default	crossing_explicit	sparse_high	dense_low	dense_default	crossing_high
+7	5	251	247	247	8191	6342	8237	8238

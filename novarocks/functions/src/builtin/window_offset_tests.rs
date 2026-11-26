@@ -2356,8 +2356,12 @@ fn three_argument_offset_error_precedes_optional_completion_callback() {
         let expected = fail([invalid, Some(0)], &first);
         assert_eq!(expected.failure_fact().reason(), INVALID_FUNCTION_ARGUMENT);
         let trace = first.trace.lock().unwrap().clone();
+        let assert_same_data_error = |actual: KernelFailure| {
+            assert_eq!(actual.failure_fact(), expected.failure_fact());
+            assert_eq!(actual.to_string(), expected.to_string());
+        };
         let late = Control::default();
-        assert_eq!(fail([Some(0), invalid], &late), expected);
+        assert_same_data_error(fail([Some(0), invalid], &late));
         // The first valid offset accrues one work unit without crossing a
         // checkpoint. The later Data error preempts optional completion.
         assert_eq!(*late.trace.lock().unwrap(), trace);
@@ -2365,7 +2369,7 @@ fn three_argument_offset_error_precedes_optional_completion_callback() {
             trace: Mutex::default(),
             refusal: Some((trace.len(), KernelFailure::Cancelled)),
         };
-        assert_eq!(fail([Some(0), invalid], &later_refusal), expected);
+        assert_same_data_error(fail([Some(0), invalid], &later_refusal));
         assert_eq!(*later_refusal.trace.lock().unwrap(), trace);
     }
 }

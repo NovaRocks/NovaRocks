@@ -503,3 +503,71 @@ impl novarocks_failure_contract::FailureProjection for WindowBatchConcatFailure 
 pub(super) fn invalid_batch(message: &str) -> KernelFailure {
     KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(message))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+    use crate::runtime::mem_tracker::MemTracker;
+    use arrow::array::{ListArray, NullArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_types::SlotId;
+
+    #[test]
+    fn compiled_window_cursor_splits_cumulative_i32_offsets_across_groups() {
+        // NullArray has no per-entry backing. Each selected list is valid on
+        // its own, while the two lists cannot share an i32-offset output.
+        let width = i32::MAX / 2 + 1;
+        let item = Arc::new(Field::new("item", DataType::Null, true));
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(0),
+                Field::new("lists", DataType::List(Arc::clone(&item)), true),
+                None,
+                None,
+            )])
+            .unwrap(),
+        );
+        let tracker = MemTracker::new_root("window offset prefix fixture");
+        let mut control = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));
+        control.bind_mem_tracker(Arc::clone(&tracker));
+        let host = control.allocator().unwrap();
+        let mut groups =
+            WindowInvocationScratch::try_with_capacity(2, Arc::clone(&host), &control).unwrap();
+        for _ in 0..2 {
+            let array: ArrayRef = Arc::new(ListArray::new(
+                Arc::clone(&item),
+                OffsetBuffer::new(vec![0, width].into()),
+                Arc::new(NullArray::new(width as usize)),
+                None,
+            ));
+            let source = Chunk::try_new_with_columns(Arc::clone(&schema), vec![array]).unwrap();
+            let calls = WindowInvocationScratch::try_new(Arc::clone(&host), &control).unwrap();
+            groups
+                .try_push(
+                    Some(PreparedWindowOutput {
+                        calls,
+                        source,
+                        argument_storage: ValueTypeStorageLifetime::pure(),
+                    }),
+                    &control,
+                )
+                .unwrap();
+        }
+        let arrival_ends = WindowInvocationScratch::try_new(Arc::clone(&host), &control).unwrap();
+        let mut cursor = WindowBatchCursor::new(groups, arrival_ends, None, true);
+        let output = [OutputSource::Input(0)];
+        assert_eq!(
+            cursor.prefix(2, &output, &schema, &host, &control).unwrap(),
+            1,
+        );
+        cursor.group = 1;
+        assert_eq!(
+            cursor.prefix(2, &output, &schema, &host, &control).unwrap(),
+            1,
+        );
+        drop(cursor);
+        assert_eq!(tracker.current(), 0);
+    }
+}
