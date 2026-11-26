@@ -17,6 +17,7 @@
 
 //! Constant admission owns declaration, value and diagnostic SDK boundaries.
 use super::ConstantError;
+use arrow_buffer::MutableBufferError;
 use arrow_schema::ArrowError;
 use novarocks_failure_contract::{
     FailureClass, FailureFact, FailureProjection, FailureReason, SharedFailureCause, domain,
@@ -191,6 +192,67 @@ impl FailureProjection for ConstantOffsetExtentFailure {
     }
 }
 
+#[derive(Debug)]
+struct ConstantMutableBufferFailure {
+    requested: usize,
+    source: MutableBufferError,
+}
+
+impl fmt::Display for ConstantMutableBufferFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl Error for ConstantMutableBufferFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl FailureProjection for ConstantMutableBufferFailure {
+    fn failure_fact(&self) -> FailureFact {
+        use novarocks_failure_contract::{
+            RepresentationBoundary, RepresentationFacts, RepresentationLayout, ResourceDimension,
+            ResourceFacts,
+        };
+
+        let (reason, required, limit) = match self.source {
+            MutableBufferError::AllocationError(layout) => {
+                return fact(FailureClass::Resource, 8).with_resource(ResourceFacts {
+                    request_scope: None,
+                    constraint_scope: None,
+                    dimension: ResourceDimension::Bytes,
+                    requested: u64::try_from(layout.size()).ok(),
+                    required_growth: None,
+                    limit: None,
+                    live: None,
+                    committed: None,
+                });
+            }
+            MutableBufferError::LayoutError => {
+                let align = arrow_buffer::alloc::ALIGNMENT;
+                (
+                    14,
+                    u64::try_from(self.requested).ok(),
+                    u64::try_from((isize::MAX as usize) & !(align - 1)).ok(),
+                )
+            }
+            MutableBufferError::LengthOverflow => (15, None, u64::try_from(usize::MAX).ok()),
+        };
+        fact(FailureClass::Representation, reason).with_representation(RepresentationFacts {
+            boundary: RepresentationBoundary::SingleOutput,
+            layout: RepresentationLayout {
+                domain: domain::CONSTANT,
+                code: NonZeroU16::new(3).unwrap(),
+            },
+            required,
+            extent_limit: limit,
+            representable_prefix: None,
+        })
+    }
+}
+
 impl ConstantError {
     /// A value or its constituent extent cannot be represented by its original carrier.
     pub fn offset_extent(required: u64, extent_limit: u64) -> Self {
@@ -200,9 +262,27 @@ impl ConstantError {
         })
     }
 
-    /// True for a concrete fallible reserve failure at constant construction.
+    /// Project a local Arrow buffer construction failure using the requested byte length.
+    pub fn arrow_buffer_allocation(bytes: usize, source: MutableBufferError) -> Self {
+        Self::from_domain(ConstantMutableBufferFailure {
+            requested: bytes,
+            source,
+        })
+    }
+
+    /// True for a concrete fallible allocation failure at constant construction.
     pub fn is_local_allocation_failure(&self) -> bool {
-        matches!(self, Self::Source(source) if source.downcast_ref::<ConstantAllocationFailure>().is_some())
+        let Self::Source(source) = self else {
+            return false;
+        };
+        source.downcast_ref::<ConstantAllocationFailure>().is_some()
+            || matches!(
+                source.downcast_ref::<ConstantMutableBufferFailure>(),
+                Some(ConstantMutableBufferFailure {
+                    source: MutableBufferError::AllocationError(_),
+                    ..
+                })
+            )
     }
 
     pub(crate) fn allocation(source: std::collections::TryReserveError) -> Self {
@@ -234,5 +314,55 @@ impl FailureProjection for crate::ConstantTableError {
             E::SourceTypeMismatch(_) => ConstantTableReason::SourceTypeMismatch,
         };
         fact(FailureClass::Invariant, reason as u16)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_buffer::{MutableBuffer, alloc::ALIGNMENT};
+    use novarocks_failure_contract::RepresentationBoundary;
+    use std::alloc::Layout;
+
+    #[test]
+    fn mutable_buffer_allocation_failure_retains_actual_layout_request() {
+        let layout = Layout::from_size_align(256, ALIGNMENT).unwrap();
+        let failure = ConstantError::arrow_buffer_allocation(
+            256,
+            MutableBufferError::AllocationError(layout),
+        );
+        let fact = failure.failure_fact();
+        assert!(failure.is_local_allocation_failure());
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(fact.resource().unwrap().requested, Some(256));
+        assert!(fact.representation().is_none());
+    }
+
+    #[test]
+    fn mutable_buffer_layout_error_retains_requested_extent_and_alignment_limit() {
+        let limit = (isize::MAX as usize) & !(ALIGNMENT - 1);
+        let bytes = limit + 1;
+        let source = MutableBuffer::try_from_len_zeroed(bytes).unwrap_err();
+        assert_eq!(source, MutableBufferError::LayoutError);
+        let failure = ConstantError::arrow_buffer_allocation(bytes, source);
+        let fact = failure.failure_fact();
+        assert!(!failure.is_local_allocation_failure());
+        assert_eq!(fact.class(), FailureClass::Representation);
+        let representation = fact.representation().unwrap();
+        assert_eq!(
+            representation.boundary,
+            RepresentationBoundary::SingleOutput
+        );
+        assert_eq!(representation.required, Some(bytes as u64));
+        assert_eq!(representation.extent_limit, Some(limit as u64));
+    }
+
+    #[test]
+    fn mutable_buffer_length_overflow_does_not_infer_a_required_extent() {
+        let failure = ConstantError::arrow_buffer_allocation(0, MutableBufferError::LengthOverflow);
+        let fact = failure.failure_fact();
+        assert!(!failure.is_local_allocation_failure());
+        assert_eq!(fact.class(), FailureClass::Representation);
+        assert_eq!(fact.representation().unwrap().required, None);
     }
 }
