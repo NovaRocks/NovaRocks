@@ -1689,6 +1689,11 @@ pub(crate) fn build_table_metadata(
         projection,
     } = input;
     let metadata = loaded.table.metadata();
+    if metadata_table_type == Some(MetadataTableType::Manifests) {
+        crate::typed_read::system_table::require_supported_manifests_format(
+            metadata.format_version(),
+        )?;
+    }
     let (definition_schema, projected_snapshot, snapshot_source) = match projection {
         TableMetadataProjection::Current => (
             metadata.current_schema().clone(),
@@ -1863,6 +1868,18 @@ pub(crate) fn build_table_metadata(
         Some(read) => (read, Some(execution_schema)),
         None => (execution_schema, None),
     };
+    let derived_view = if payload.metadata_table_type == Some(MetadataTableType::Files) {
+        Some(crate::metadata_partitions_view::definition(
+            descriptor.instance_id.as_str(),
+            &request.table.namespace,
+            &table_name,
+            metadata,
+            &execution_schema,
+            creation,
+        )?)
+    } else {
+        None
+    };
     let observed_source = creation.arc(
         crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts {
             access: Arc::new(crate::loaded_table::IcebergAttemptTableAccess::freeze(loaded.clone())),
@@ -1879,7 +1896,7 @@ pub(crate) fn build_table_metadata(
             observed_source,
             creation,
         )?;
-    ConnectorTableMetadata::try_new_with_read_projection(
+    let observation = ConnectorTableMetadata::try_new_with_read_projection(
         novarocks_spi::connector::ConnectorTableMetadataHeader {
             identity: ConnectorTableIdentity {
                 instance_id: descriptor.instance_id.clone(),
@@ -1939,8 +1956,13 @@ pub(crate) fn build_table_metadata(
                 None => Ok(false),
             }
         },
-    )
-    .map(|metadata| metadata.with_source_read_facts(source_facts))
+    )?
+    .with_source_read_facts(source_facts);
+    Ok(if let Some(view) = derived_view {
+        observation.with_derived_view(view)
+    } else {
+        observation
+    })
 }
 
 enum CatalogTemporalLayoutError {
@@ -3353,6 +3375,83 @@ mod plan_splits_pruning_tests {
             foreign.namespace.instance_id = ConnectorInstanceId::parse("foreign").unwrap();
             let error = metadata.namespace_exists_async(foreign).await.unwrap_err();
             assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        });
+    }
+
+    #[test]
+    fn format_v1_manifests_alias_is_rejected_at_observation() {
+        use crate::catalog::CatalogNamespaceName;
+        use crate::catalog::catalog_request::CatalogPublicationRequest;
+        use crate::catalog::error::CatalogOutcome;
+        use crate::iceberg::TableCreation;
+
+        let (executor, _warehouse, metadata) = provider();
+        executor.block_on(async {
+            let namespace = CatalogNamespaceName::new("legacy_alias");
+            for request in [
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: namespace.clone(),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+                CatalogPublicationRequest::CreateTable {
+                    namespace,
+                    creation: TableCreation::builder()
+                        .name("t".into())
+                        .schema(
+                            Schema::builder()
+                                .with_fields([Arc::new(NestedField::required(
+                                    1,
+                                    "id",
+                                    Type::Primitive(PrimitiveType::Long),
+                                ))])
+                                .build()
+                                .unwrap(),
+                        )
+                        .format_version(FormatVersion::V1)
+                        .build(),
+                    no_op_if_exists: false,
+                },
+            ] {
+                let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                    &metadata.runtime,
+                    metadata.incarnation,
+                    request,
+                )
+                .await;
+                assert!(matches!(outcome, CatalogOutcome::KnownCommitted { .. }), "{outcome:?}");
+            }
+
+            for (alias, expected_column) in [
+                ("t$manifests", None),
+                ("t$files", Some("file_path")),
+                ("t$entries", Some("data_file")),
+                ("t$snapshots", Some("snapshot_id")),
+            ] {
+                let request = ConnectorTableRequest {
+                    table: ConnectorTableIdentity {
+                        instance_id: metadata.descriptor.instance_id.clone(),
+                        namespace: "legacy_alias".into(),
+                        table: alias.into(),
+                    },
+                    resolution: ConnectorTableResolution::ProviderReadAlias,
+                    context: context(),
+                };
+                let preparation = metadata.prepare_table(request.clone()).await.unwrap();
+                let observed = with_pure_schema_creation(&request.context, |creation| {
+                    metadata.create_prepared_table(preparation, creation).map_err(metadata_creation_error)
+                });
+                if let Some(column) = expected_column {
+                    let observed = observed.unwrap();
+                    assert!(observed.schema().field_with_name(column).is_ok());
+                } else {
+                    let Err(error) = observed else { panic!("format-v1 manifests alias is unsupported") };
+                    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+                    let message = error.to_string();
+                    assert!(message.contains("iceberg-rust 0.11"), "{message}");
+                    assert!(message.contains("B6c-2"), "{message}");
+                }
+            }
         });
     }
 

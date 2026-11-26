@@ -20,6 +20,7 @@ use crate::planning::catalog::MetadataTableKind;
 use novarocks_parser::ast;
 use novarocks_types::naming::TableIdentity;
 use novarocks_types::schema::CatalogTable;
+use std::sync::Arc;
 
 pub(crate) mod memory;
 mod view;
@@ -37,6 +38,15 @@ pub enum TableLookupMode {
 pub struct ResolvedAnalyzerTable {
     pub(crate) catalog: CatalogTable,
     pub(crate) planner: TableDef,
+    pub(crate) derived_view: Option<Arc<SqlDerivedView>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SqlDerivedView {
+    pub(crate) identity: TableIdentity,
+    pub(crate) binding: crate::binding::SqlTableBindingId,
+    pub(crate) raw_sql: Arc<str>,
+    pub(crate) columns: Arc<[SqlViewColumn]>,
 }
 
 impl ResolvedAnalyzerTable {
@@ -54,6 +64,7 @@ impl ResolvedAnalyzerTable {
         Self {
             catalog: table,
             planner,
+            derived_view: None,
         }
     }
 }

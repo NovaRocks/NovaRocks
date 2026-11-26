@@ -78,6 +78,7 @@ pub mod metadata_batch_reader;
 pub mod metadata_context;
 pub mod metadata_factory;
 mod metadata_json;
+mod metadata_partitions_view;
 pub mod metadata_read;
 mod parquet_metrics;
 mod partition_row;

@@ -46,7 +46,7 @@ use crate::typed_read::{
     IcebergReadSplit, IcebergRuntimeRelation, IcebergSplit, IcebergSplitParams,
     IcebergSystemTableReference, IcebergSystemTableReferenceParams, IcebergSystemTableType,
     IcebergTableHandle, IcebergTableHandleParams, IcebergVisibilityDifferenceRows,
-    ParquetFileDecryptionData, SystemManifestSplit, SystemManifestSplitParams, SystemRelationSplit,
+    ParquetFileDecryptionData, SystemManifestSplit, SystemRelationSplit, SystemTableScan,
     TableChangesChangeType, TableChangesFunctionHandle, TableChangesFunctionHandleParams,
     TableChangesSplit, TableChangesSplitParams, TrinoManifestContent, TrinoManifestFile,
     TrinoManifestFileParams,
@@ -68,7 +68,7 @@ impl IcebergReadWireCodec {
         value: &IcebergRuntimeRelation,
         execution: IcebergReadExecution,
     ) -> Result<Bytes, ConnectorCodecError> {
-        let mut raw = encode_relation(value);
+        let mut raw = encode_relation(value)?;
         raw.execution = Some(dto::IcebergReadExecution {
             max_read_rows: Some(execution.sizing.max_read_rows),
             max_read_bytes: Some(execution.sizing.max_read_bytes),
@@ -302,6 +302,7 @@ enum Schema {
     TableFunction,
     ChangeWindowHandle,
     SystemTable,
+    SystemTableScan,
     Insert,
     Merge,
     ReadTable,
@@ -484,6 +485,14 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             3 | 4 => singular(Scalar),
             _ => return None,
         },
+        SystemTableScan => match field {
+            1 => singular(Message(SystemTable)),
+            2 | 6 => singular(Varint),
+            3 => singular(Scalar),
+            4 => repeated(MapI32String),
+            5 => repeated(PackedVarint),
+            _ => return None,
+        },
         Insert => match field {
             1 => singular(Message(Name)),
             2 | 3 => singular(Scalar),
@@ -500,7 +509,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             10 => oneof(Message(Table)),
             11 => oneof(Message(TableFunction)),
             12 => oneof(Message(ChangeWindowHandle)),
-            13 => oneof(Message(SystemTable)),
+            13 => oneof(Message(SystemTableScan)),
             15 => oneof(Message(Merge)),
             _ => return None,
         },
@@ -561,11 +570,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
         },
         ManifestSplit => match field {
             1 => singular(Message(Manifest)),
-            2 | 3 | 5..=7 => singular(Scalar),
-            4 => repeated(MapI32String),
-            8 => singular(Varint),
             9 => singular(Message(SystemTable)),
-            10 => repeated(PackedVarint),
             _ => return None,
         },
         RelationSplit => match field {
@@ -2000,6 +2005,115 @@ fn decode_system_table(
     finish_decode(result, context)
 }
 
+fn encode_system_scan(
+    scan: &SystemTableScan,
+) -> Result<dto::IcebergSystemTableScan, ConnectorCodecError> {
+    let error = |error: serde_json::Error| {
+        codec_error(
+            "system_scan",
+            ConnectorCodecErrorKind::InvalidValue,
+            error.to_string(),
+        )
+    };
+    let mut partition_spec_jsons = std::collections::BTreeMap::new();
+    for (id, spec) in scan.partition_specs() {
+        partition_spec_jsons.insert(*id, serde_json::to_string(spec).map_err(error)?);
+    }
+    Ok(dto::IcebergSystemTableScan {
+        reference: Some(encode_system_table(scan.reference())),
+        format_version: scan.format_version() as u32,
+        table_schema_json: serde_json::to_string(scan.table_schema()).map_err(error)?,
+        partition_spec_jsons,
+        partition_slot_field_ids: scan.partitions().field_ids(),
+        table_has_variant_history: scan.table_has_variant_history(),
+    })
+}
+
+fn decode_system_scan(
+    raw: &dto::IcebergSystemTableScan,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<SystemTableScan, ConnectorCodecError> {
+    use crate::iceberg::spec::FormatVersion;
+    use crate::typed_read::system_table::{parse_partition_spec, parse_table_schema};
+
+    let reference = decode_system_table(
+        raw.reference.as_ref().ok_or_else(|| {
+            codec_error(
+                "system_scan.reference",
+                ConnectorCodecErrorKind::MissingField,
+                "Iceberg system scan requires a frozen reference",
+            )
+        })?,
+        context,
+    )?;
+    let format_version = match raw.format_version {
+        1 => FormatVersion::V1,
+        2 => FormatVersion::V2,
+        3 => FormatVersion::V3,
+        _ => {
+            return Err(codec_error(
+                "system_scan.format_version",
+                ConnectorCodecErrorKind::InvalidValue,
+                "Iceberg system scan has an unknown format version",
+            ));
+        }
+    };
+    if reference.system_table_type() == IcebergSystemTableType::Manifests
+        && format_version == FormatVersion::V1
+    {
+        return Err(codec_error(
+            "system_scan.format_version",
+            ConnectorCodecErrorKind::InvalidValue,
+            "Iceberg manifests scan requires format version 2 or 3",
+        ));
+    }
+
+    context
+        .ledger()
+        .charge_retained(raw.table_schema_json.len())?;
+    let table_schema = observe_opaque(context, || parse_table_schema(&raw.table_schema_json))?
+        .map_err(|error| domain_error("system_scan.table_schema", error))?;
+    if raw.partition_spec_jsons.len() > crate::typed_read::table_handle::MAX_PARTITION_SPECS {
+        return Err(codec_error(
+            "system_scan.partition_specs",
+            ConnectorCodecErrorKind::Capacity,
+            "Iceberg system scan exceeds the partition-spec count limit",
+        ));
+    }
+    let mut specs = Vec::new();
+    for (&spec_id, json) in &raw.partition_spec_jsons {
+        context.ledger().charge_retained(json.len())?;
+        let spec = observe_opaque(context, || parse_partition_spec(json))?
+            .map_err(|error| domain_error("system_scan.partition_specs", error))?;
+        if spec_id != spec.spec_id() {
+            return Err(codec_error(
+                "system_scan.partition_specs",
+                ConnectorCodecErrorKind::InvalidValue,
+                "Iceberg partition spec ID differs from its frozen key",
+            ));
+        }
+        specs.push(spec);
+    }
+    let scan = observe_opaque(context, || {
+        SystemTableScan::from_facts(
+            reference,
+            format_version,
+            table_schema,
+            specs,
+            raw.table_has_variant_history,
+        )
+    })?
+    .map_err(|error| domain_error("system_scan", error))?;
+    if raw.partition_slot_field_ids != scan.partitions().field_ids() {
+        return Err(codec_error(
+            "system_scan.partition_slot_field_ids",
+            ConnectorCodecErrorKind::InvalidValue,
+            "Iceberg partition slots differ from the frozen schema and specs",
+        ));
+    }
+    Ok(scan)
+}
+
 fn encode_insert_handle(value: &IcebergInsertTableHandle) -> dto::IcebergInsertTableHandle {
     dto::IcebergInsertTableHandle {
         schema_table_name: Some(encode_schema_name(value.schema_table_name())),
@@ -2091,7 +2205,9 @@ fn decode_merge(
     finish_decode(result, context)
 }
 
-fn encode_relation(value: &IcebergRuntimeRelation) -> dto::IcebergReadTablePayload {
+fn encode_relation(
+    value: &IcebergRuntimeRelation,
+) -> Result<dto::IcebergReadTablePayload, ConnectorCodecError> {
     let relation = match value {
         IcebergRuntimeRelation::Table(value) => {
             dto::iceberg_read_table_payload::Relation::Table(encode_table(value))
@@ -2103,16 +2219,16 @@ fn encode_relation(value: &IcebergRuntimeRelation) -> dto::IcebergReadTablePaylo
             dto::iceberg_read_table_payload::Relation::ChangeWindow(encode_change_window(value))
         }
         IcebergRuntimeRelation::SystemTable(value) => {
-            dto::iceberg_read_table_payload::Relation::SystemTable(encode_system_table(value))
+            dto::iceberg_read_table_payload::Relation::SystemTable(encode_system_scan(value)?)
         }
         IcebergRuntimeRelation::MergeTable(value) => {
             dto::iceberg_read_table_payload::Relation::MergeTable(encode_merge(value))
         }
     };
-    dto::IcebergReadTablePayload {
+    Ok(dto::IcebergReadTablePayload {
         relation: Some(relation),
         execution: None,
-    }
+    })
 }
 
 fn decode_execution(
@@ -2198,7 +2314,7 @@ fn decode_relation(
             IcebergRuntimeRelation::ChangeWindow(decode_change_window(value, context)?),
         ),
         dto::iceberg_read_table_payload::Relation::SystemTable(value) => Ok(
-            IcebergRuntimeRelation::SystemTable(decode_system_table(value, context)?),
+            IcebergRuntimeRelation::SystemTable(decode_system_scan(value, context)?),
         ),
         dto::iceberg_read_table_payload::Relation::MergeTable(value) => Ok(
             IcebergRuntimeRelation::MergeTable(decode_merge(value, context)?),
@@ -2695,19 +2811,7 @@ fn decode_manifest(
 fn encode_files_split(value: &SystemManifestSplit) -> dto::SystemManifestSplit {
     dto::SystemManifestSplit {
         reference: Some(encode_system_table(value.reference())),
-        table_has_variant_history: value.table_has_variant_history(),
         manifest: Some(encode_manifest(value.manifest())),
-        table_schema_json: value.table_schema_json().to_string(),
-        metadata_table_schema_json: value.metadata_table_schema_json().to_string(),
-        partition_spec_jsons: value
-            .partition_spec_jsons()
-            .iter()
-            .map(|(key, value)| (*key, value.clone()))
-            .collect(),
-        partition_column_type_json: value.partition_column_type_json().map(str::to_string),
-        bounds_column_type_json: value.bounds_column_type_json().map(str::to_string),
-        encryption_key_id: value.encryption_key_id().map(str::to_string),
-        partition_slot_field_ids: value.partition_slot_field_ids().to_vec(),
     }
 }
 
@@ -2715,58 +2819,28 @@ fn decode_files_split(
     raw: &dto::SystemManifestSplit,
     context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<SystemManifestSplit, ConnectorCodecError> {
-    // Existing serde/domain/library operations remain opaque inside this boundary.
-    context.flush_compile_control()?;
-    let result = (|| {
-        {
-            let opaque_arguments = (SystemManifestSplitParams {
-                reference: decode_system_table(
-                    raw.reference.as_ref().ok_or_else(|| {
-                        codec_error(
-                            "manifest_split.reference",
-                            ConnectorCodecErrorKind::MissingField,
-                            "Iceberg manifest split requires a frozen reference",
-                        )
-                    })?,
-                    context,
-                )?,
-                table_has_variant_history: raw.table_has_variant_history,
-                manifest: decode_manifest(
-                    raw.manifest.as_ref().ok_or_else(|| {
-                        codec_error(
-                            "files_split.manifest",
-                            ConnectorCodecErrorKind::MissingField,
-                            "Iceberg files split requires a manifest",
-                        )
-                    })?,
-                    context,
-                )?,
-                table_schema_json: copy_string(&raw.table_schema_json, context)?,
-                metadata_table_schema_json: copy_string(&raw.metadata_table_schema_json, context)?,
-                partition_spec_jsons: copy_i32_string_map(&raw.partition_spec_jsons, context)?,
-                partition_slot_field_ids: copy_slice(&raw.partition_slot_field_ids, context)?,
-                partition_column_type_json: raw
-                    .partition_column_type_json
-                    .as_deref()
-                    .map(|value| copy_string(value, context))
-                    .transpose()?,
-                bounds_column_type_json: raw
-                    .bounds_column_type_json
-                    .as_deref()
-                    .map(|value| copy_string(value, context))
-                    .transpose()?,
-                encryption_key_id: raw
-                    .encryption_key_id
-                    .as_deref()
-                    .map(|value| copy_string(value, context))
-                    .transpose()?,
-            },);
-            observe_opaque(context, || SystemManifestSplit::try_new(opaque_arguments.0))?
-        }
-        .map_err(|error| domain_error("files_split", error))
-    })();
-    context.observe_compile_step()?;
-    finish_decode(result, context)
+    let reference = decode_system_table(
+        raw.reference.as_ref().ok_or_else(|| {
+            codec_error(
+                "manifest_split.reference",
+                ConnectorCodecErrorKind::MissingField,
+                "Iceberg manifest split requires a frozen reference",
+            )
+        })?,
+        context,
+    )?;
+    let manifest = decode_manifest(
+        raw.manifest.as_ref().ok_or_else(|| {
+            codec_error(
+                "manifest_split.manifest",
+                ConnectorCodecErrorKind::MissingField,
+                "Iceberg manifest split requires a manifest",
+            )
+        })?,
+        context,
+    )?;
+    SystemManifestSplit::try_new(reference, manifest)
+        .map_err(|error| domain_error("manifest_split", error))
 }
 
 fn encode_split(
@@ -3105,7 +3179,7 @@ mod tests {
             decode_with(ConnectorCodecCategory::ReadColumn, &payload).unwrap();
         assert_eq!(decoded, column);
 
-        let relation = IcebergRuntimeRelation::SystemTable(
+        let relation = IcebergRuntimeRelation::SystemTable(SystemTableScan::empty_for_test(
             IcebergSystemTableReference::try_new(IcebergSystemTableReferenceParams {
                 schema_table_name: SchemaTableName::try_new("db", "events").unwrap(),
                 system_table_type: IcebergSystemTableType::Files,
@@ -3114,14 +3188,14 @@ mod tests {
                 snapshot_id: Some(11),
             })
             .unwrap(),
-        );
+        ));
         let payload = IcebergReadWireCodec.encode_private(&relation).unwrap();
         let decoded: IcebergRuntimeRelation =
             decode_with(ConnectorCodecCategory::ReadTable, &payload).unwrap();
         match decoded {
             IcebergRuntimeRelation::SystemTable(value) => {
-                assert_eq!(value.snapshot_id(), Some(11));
-                assert_eq!(value.schema_table_name().table_name(), "events");
+                assert_eq!(value.reference().snapshot_id(), Some(11));
+                assert_eq!(value.reference().schema_table_name().table_name(), "events");
             }
             _ => panic!("expected system table relation"),
         }
@@ -3305,11 +3379,6 @@ mod tests {
             "spec-id":0,"fields":[{"field-id":1000,"source-id":1,"name":"p","transform":"identity"}]
         }))
         .unwrap();
-        let partition = crate::partition_row::UnifiedPartitionRow::of(
-            &table_schema,
-            std::slice::from_ref(&spec),
-        )
-        .unwrap();
         let manifest = TrinoManifestFile::try_new(TrinoManifestFileParams {
             path: "s3://warehouse/db/t/metadata/m0.avro".into(),
             length: 1024,
@@ -3335,25 +3404,56 @@ mod tests {
             IcebergSystemTableType::Files,
             IcebergSystemTableType::Entries,
         ] {
-            splits.push(IcebergReadSplit::SystemManifest(
-                SystemManifestSplit::try_new(SystemManifestSplitParams {
-                    reference: reference(kind),
-                    table_has_variant_history: true,
-                    manifest: manifest.clone(),
-                    table_schema_json: serde_json::to_string(&table_schema).unwrap(),
-                    metadata_table_schema_json: "{}".into(),
-                    partition_spec_jsons: [(spec.spec_id(), serde_json::to_string(&spec).unwrap())]
-                        .into(),
-                    partition_column_type_json: Some(
-                        crate::typed_read::derived_row_type_json(&partition.arrow_type().unwrap())
-                            .unwrap(),
-                    ),
-                    partition_slot_field_ids: partition.field_ids(),
-                    bounds_column_type_json: None,
-                    encryption_key_id: None,
-                })
-                .unwrap(),
-            ));
+            let scan = SystemTableScan::from_facts(
+                reference(kind),
+                crate::iceberg::spec::FormatVersion::V3,
+                table_schema.clone(),
+                [spec.clone()],
+                true,
+            )
+            .unwrap();
+            let mut raw = encode_system_scan(&scan).unwrap();
+            assert_eq!(raw.partition_slot_field_ids, vec![1000]);
+            let mut ledger = ConnectorDecodeLedger::new(limits());
+            let table_header = header(ConnectorCodecCategory::ReadTable);
+            raw.partition_slot_field_ids[0] = 9999;
+            let error = decode_system_scan(
+                &raw,
+                &mut ConnectorDecodeContext::new(&table_header, &mut ledger),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
+            assert_eq!(
+                error.path().to_string(),
+                "system_scan.partition_slot_field_ids"
+            );
+            let relation = IcebergRuntimeRelation::SystemTable(scan);
+            let table_wire = IcebergReadWireCodec.encode_private(&relation).unwrap();
+            let IcebergRuntimeRelation::SystemTable(decoded) =
+                decode_with(ConnectorCodecCategory::ReadTable, &table_wire).unwrap()
+            else {
+                panic!("expected metadata scan");
+            };
+            assert_eq!(decoded.reference(), &reference(kind));
+            assert_eq!(decoded.partitions().field_ids(), vec![1000]);
+            assert!(decoded.table_has_variant_history());
+            for path in [manifest.path(), "s3://warehouse/db/t/metadata/m1.avro"] {
+                let mut descriptor = manifest.to_proto();
+                descriptor.path = path.to_owned();
+                let split = SystemManifestSplit::try_new(
+                    reference(kind),
+                    TrinoManifestFile::from_proto(&descriptor).unwrap(),
+                )
+                .unwrap();
+                assert!(decoded.validate_manifest(&split).is_ok());
+                let payload = encode_files_split(&split).encode_to_vec();
+                assert!(
+                    !payload
+                        .windows(raw.table_schema_json.len())
+                        .any(|window| { window == raw.table_schema_json.as_bytes() })
+                );
+                splits.push(IcebergReadSplit::SystemManifest(split));
+            }
         }
         for split in splits {
             let payload = IcebergReadWireCodec.encode_private(&split).unwrap();
@@ -3386,12 +3486,6 @@ mod tests {
                 ) => {
                     assert_eq!(before.reference(), after.reference());
                     assert_eq!(before.manifest(), after.manifest());
-                    assert!(after.table_has_variant_history());
-                    assert_eq!(before.partition_slot_field_ids(), &[1000]);
-                    assert_eq!(
-                        before.partition_slot_field_ids(),
-                        after.partition_slot_field_ids()
-                    );
                 }
                 _ => panic!("metadata work unit kind changed"),
             }
@@ -4011,7 +4105,7 @@ mod compile_control_tests {
             IcebergRuntimeRelation::Table(table),
             IcebergRuntimeRelation::TableFunction(table_function),
             IcebergRuntimeRelation::ChangeWindow(window),
-            IcebergRuntimeRelation::SystemTable(system),
+            IcebergRuntimeRelation::SystemTable(SystemTableScan::empty_for_test(system)),
             IcebergRuntimeRelation::MergeTable(merge),
         ]
     }

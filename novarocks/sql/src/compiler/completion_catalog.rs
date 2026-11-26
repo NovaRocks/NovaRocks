@@ -2311,6 +2311,7 @@ mod tests {
                 hidden_columns: Vec::new(),
             },
             planner,
+            derived_view: None,
         };
         assert!(matches!(
             CatalogRelationFact::resolved(need, table),

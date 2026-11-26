@@ -137,6 +137,7 @@ impl IcebergTypedProviderFactory {
         &self,
         request: &ConnectorRequestContext,
         reader_policy: ConnectorPageSourceProviderOptions,
+        resources: ConnectorExecutionResources,
     ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError>
     where
         P: ProviderReadRuntime<
@@ -153,9 +154,14 @@ impl IcebergTypedProviderFactory {
             request.deadline(),
         )?;
         let options = apply_reader_policy(self.options.clone(), reader_policy);
-        Ok(Arc::new(IcebergPageSourceProvider::new(
-            binding, context, options,
-        )))
+        Ok(Arc::new(
+            IcebergPageSourceProvider::with_execution_resources(
+                binding,
+                context,
+                options,
+                Some(resources),
+            ),
+        ))
     }
 }
 
@@ -176,7 +182,7 @@ where
         options: ConnectorPageSourceProviderOptions,
     ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError> {
         resources.checkpoint()?;
-        self.create_page_source_provider_unadmitted(request, options)
+        self.create_page_source_provider_unadmitted(request, options, resources)
     }
 }
 

@@ -32,3 +32,8 @@ NULL	[null]	NULL	{"1":null}
 -- types	boolean	boolean	boolean
 some_true	all_true	all_true_alias
 true	false	false
+
+-- query 9
+-- types	varchar	varchar	varchar	varchar
+least_uuid	greatest_uuid	least_bytes	greatest_bytes
+7fffffff-ffff-ffff-ffff-ffffffffffff	80000000-0000-0000-0000-000000000000	7FFF	80

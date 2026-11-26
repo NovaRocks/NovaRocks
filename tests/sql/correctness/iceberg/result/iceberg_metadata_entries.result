@@ -12,3 +12,8 @@ true
 -- types	boolean
 has_added
 true
+
+-- query 8
+-- types	bigint	bigint
+records	metrics_rows
+2	2

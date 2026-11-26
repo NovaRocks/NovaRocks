@@ -84,7 +84,9 @@ mod scope;
 mod subquery_rewrite;
 
 pub mod iceberg_metadata;
-mod iceberg_partitions;
+#[cfg(test)]
+#[path = "iceberg_partitions_tests.rs"]
+mod iceberg_metadata_partitions_tests;
 pub mod iceberg_ref;
 pub(crate) mod mv_lineage;
 

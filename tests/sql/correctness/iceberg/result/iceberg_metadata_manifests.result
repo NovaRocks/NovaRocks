@@ -2,3 +2,13 @@
 -- types	boolean	boolean
 has_manifests	has_added
 true	true
+
+-- query 9
+-- types	boolean
+has_snapshots
+true
+
+-- query 10
+-- types	boolean
+has_files
+true

@@ -57,13 +57,17 @@ FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0}
 GROUP BY k ORDER BY key_rows DESC;
 
 -- query 8
+SELECT p.record_count, typeof(p.data.k.min) AS uuid_stat_type
+FROM iceberg_compat_${suite_uuid0}.${case_db}."java_uuid_rejected_${uuid0}$partitions" p;
+
+-- query 9
 -- @skip_result_check=true
 DELETE FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} WHERE id IN (1,3);
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} EXECUTE add_equality_delete(columns => ARRAY['id'], rows => ARRAY[ROW(2)]);
 
--- query 9
+-- query 10
 SELECT COUNT(*) AS remaining_rows FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0};
 
--- query 10
+-- query 11
 -- @skip_result_check=true
 DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} ;

@@ -7,3 +7,9 @@ n_partitions
 -- types	bigint
 total_records
 3
+
+-- query 6
+-- types	varchar	integer	integer
+region	min_id	max_id
+eu	3	3
+us	1	2

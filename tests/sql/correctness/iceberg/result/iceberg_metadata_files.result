@@ -13,3 +13,9 @@ total_records
 part_region	records
 eu	1
 us	1
+
+-- query 8
+-- types	integer	integer	varchar
+lower_id	upper_id	metrics_type
+1	1	json
+2	2	json

@@ -152,7 +152,9 @@ pub(crate) fn byte_source(
 pub(super) struct OutputCursor {
     planner: PrefixPlanner<'static>,
     policy: ScanOutputPolicy,
+    source_array_bytes: u64,
     temporal: Option<TemporalOutput>,
+    page_resources: Option<novarocks_spi::connector::ConnectorExecutionResources>,
 }
 
 struct TemporalOutput {
@@ -185,7 +187,9 @@ impl OutputCursor {
         Ok(Self {
             planner,
             policy,
+            source_array_bytes: 0,
             temporal: None,
+            page_resources: None,
         })
     }
 
@@ -207,6 +211,16 @@ impl OutputCursor {
             });
         }
         Ok(self)
+    }
+
+    pub(super) fn with_page_resources(
+        mut self,
+        resources: Option<novarocks_spi::connector::ConnectorExecutionResources>,
+        source_array_bytes: u64,
+    ) -> Self {
+        self.page_resources = resources;
+        self.source_array_bytes = source_array_bytes;
+        self
     }
 
     pub(super) const fn is_exhausted(&self) -> bool {
@@ -254,6 +268,29 @@ impl OutputCursor {
         }
         .map_err(value_failure)?;
         let rows = prefix.rows();
+        let output_reservation = self
+            .page_resources
+            .as_ref()
+            .map(|resources| {
+                use novarocks_spi::connector::ConnectorResourceClass;
+                // Arrow can retain the input buffer in a slice. Include the
+                // decoded prefix's actual backing and wrapper size along with
+                // the output planner's estimate before copying or aliasing it.
+                let bytes = u64::try_from(prefix.new_column_bytes())
+                    .ok()
+                    .and_then(|bytes| bytes.checked_add(self.source_array_bytes))
+                    .ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::ResourceExhausted,
+                            "Iceberg output charge is out of range",
+                        )
+                    })?;
+                (bytes != 0)
+                    .then(|| resources.try_reserve(ConnectorResourceClass::ReaderOutput, bytes))
+                    .transpose()
+            })
+            .transpose()?
+            .flatten();
         let columns = prefix
             .build_observed(
                 &mut |_| context.check_active().map_err(map_file_error),
@@ -281,7 +318,16 @@ impl OutputCursor {
         } else {
             columns
         };
-        let page = SourcePage::try_new(rows, columns)?;
+        let page = match output_reservation {
+            Some(reservation) => {
+                let bytes = columns
+                    .iter()
+                    .map(|column| column.get_array_memory_size() as u64)
+                    .sum();
+                SourcePage::try_new_accounted(rows, columns, reservation.into_output(bytes)?)?
+            }
+            None => SourcePage::try_new(rows, columns)?,
+        };
         let physical_logical_bytes = prefix.logical_bytes();
         let constructed_column_bytes = prefix.new_column_bytes();
         self.planner.advance(rows).map_err(value_error)?;

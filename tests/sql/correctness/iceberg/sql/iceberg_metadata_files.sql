@@ -55,5 +55,13 @@ SELECT f."partition".region AS part_region, sum(record_count) AS records
   ORDER BY part_region;
 
 -- query 8
+-- @be_log_be_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN,2
+SELECT f.lower_bounds."1" AS lower_id, f.upper_bounds."1" AS upper_id,
+       typeof(f.readable_metrics) AS metrics_type
+  FROM iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0}."t_${uuid0}$files" AS f
+ WHERE f.content = 0
+ ORDER BY lower_id;
+
+-- query 9
 -- @skip_result_check=true
 DROP SCHEMA iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0};

@@ -413,7 +413,10 @@ impl SplitOperations {
 /// Rows a split holds in memory once it is loaded, handed out a page at a
 /// time. Nothing here reads: every byte was loaded before the first page.
 pub(crate) trait MaterializedPages: Send + Unpin + 'static {
-    fn next_page(&mut self) -> Result<Option<SourcePage>, ConnectorError>;
+    fn poll_next_page(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<SourcePage>, ConnectorError>>;
 
     fn is_exhausted(&self) -> bool;
 
@@ -432,6 +435,7 @@ pub(crate) struct MaterializedPageStream<M> {
     step: MaterializedStep<M>,
     budget: ConnectorPollBudget,
     spending: Option<BudgetConsume>,
+    page_in_progress: bool,
     operations: SplitOperations,
 }
 
@@ -454,6 +458,7 @@ impl<M: MaterializedPages> MaterializedPageStream<M> {
             step: MaterializedStep::Loading(load),
             budget: budget.clone(),
             spending: None,
+            page_in_progress: false,
             operations,
         }
     }
@@ -478,12 +483,24 @@ impl<M: MaterializedPages> Stream for MaterializedPageStream<M> {
                     if pages.is_exhausted() {
                         return Poll::Ready(None);
                     }
-                    let spending = this.spending.get_or_insert_with(|| this.budget.consume(1));
-                    if Pin::new(spending).poll(cx).is_pending() {
-                        return Poll::Pending;
+                    if !this.page_in_progress {
+                        let spending = this.spending.get_or_insert_with(|| this.budget.consume(1));
+                        if Pin::new(spending).poll(cx).is_pending() {
+                            return Poll::Pending;
+                        }
+                        this.spending = None;
+                        this.page_in_progress = true;
                     }
-                    this.spending = None;
-                    return Poll::Ready(pages.next_page().transpose());
+                    return match pages.poll_next_page(cx) {
+                        Poll::Pending => Poll::Pending,
+                        Poll::Ready(result) => {
+                            this.page_in_progress = false;
+                            if result.is_err() {
+                                this.step = MaterializedStep::Ended;
+                            }
+                            Poll::Ready(result.transpose())
+                        }
+                    };
                 }
                 MaterializedStep::Ended => return Poll::Ready(None),
             }
