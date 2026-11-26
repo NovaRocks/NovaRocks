@@ -216,7 +216,7 @@ fn large_borrowed_alias_and_literal_are_refused_by_the_streamed_line_budget() {
         novarocks_constant_contract::ConstantPolicy {
             max_logical_elements: 16 << 20,
             max_retained_buffer_bytes: 32 << 20,
-            ..checked::policy()
+            ..checked::policy_fixture()
         },
     );
     let ty = ValueType::new(DataType::Utf8, false);

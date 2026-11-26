@@ -683,7 +683,7 @@ mod tests {
         use arrow::array::{Array, Int64Array};
         use arrow::datatypes::{DataType, Field};
         use novarocks_execution_contract::failure::{FailureClass, FailureProjection, domain};
-        use novarocks_physical_plan::{ConstantError, ConstantPool, ConstantValidation, ValueType};
+        use novarocks_physical_plan::{ConstantError, ConstantPool, ValueType};
         use novarocks_sql::compiler::{SqlCompileError, SqlCompileProgressError};
         let source = ConstantPool::try_new(
             Arc::new(Field::new("value", DataType::Int64, false)),

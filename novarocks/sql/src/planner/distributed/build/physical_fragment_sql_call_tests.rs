@@ -299,12 +299,7 @@ fn sql_call_fresh_composer_refuses_changed_policy_and_foreign_constant_parameter
         .next()
         .unwrap()
         .decimal_overflow_policy = original;
-    let changed = novarocks_constant_contract::ConstantValidation::bounded(
-        novarocks_constant_contract::ConstantPolicy {
-            max_rows: policy.max_rows + 1,
-            ..policy
-        },
-    );
+    let changed = crate::constant::test_constant_policy();
     assert!(matches!(
         author_sql_fragment_effects_observed(
             owner.relational_sources(),

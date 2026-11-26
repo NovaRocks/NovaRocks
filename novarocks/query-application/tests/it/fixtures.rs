@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 use novarocks_coordination_contract::{ExecutionEffect, RecoveryMode};
-use novarocks_functions::ConstantValidation;
 use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
 use novarocks_query_application::api::QueryExecutionKind;
 use novarocks_query_application::preparation::{

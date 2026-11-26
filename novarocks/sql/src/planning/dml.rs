@@ -5305,7 +5305,7 @@ mod tests {
         let constant_policy = novarocks_constant_contract::ConstantValidation::bounded(
             novarocks_constant_contract::ConstantPolicy {
                 max_rows: 73,
-                ..crate::constant::test_constant_policy()
+                ..crate::constant::test_constant_fixture()
             },
         );
         for (session_mode, sql, expected) in [

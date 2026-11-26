@@ -69,20 +69,21 @@ impl PureCompileControl for Control {
     }
 }
 fn policy() -> ConstantValidation {
-    novarocks_constant_contract::ConstantValidation::bounded(
-        novarocks_constant_contract::ConstantPolicy {
-            max_rows: 8,
-            max_array_nodes: 32,
-            max_logical_elements: 4096,
-            max_retained_buffer_bytes: 4 << 20,
-            max_type_depth: 16,
-            max_type_nodes: 64,
-            max_dictionary_depth: 4,
-            max_metadata_bytes: 65536,
-            max_library_validation_work: 64 << 20,
-            max_library_validation_bytes: 64 << 20,
-        },
-    )
+    ConstantValidation::bounded(policy_fixture())
+}
+fn policy_fixture() -> novarocks_constant_contract::ConstantPolicy {
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 8,
+        max_array_nodes: 32,
+        max_logical_elements: 4096,
+        max_retained_buffer_bytes: 4 << 20,
+        max_type_depth: 16,
+        max_type_nodes: 64,
+        max_dictionary_depth: 4,
+        max_metadata_bytes: 65536,
+        max_library_validation_work: 64 << 20,
+        max_library_validation_bytes: 64 << 20,
+    }
 }
 fn refusal_policy() -> ConstantValidation {
     novarocks_constant_contract::ConstantValidation::bounded(
@@ -95,7 +96,7 @@ fn refusal_policy() -> ConstantValidation {
             max_metadata_bytes: 0,
             max_library_validation_work: 0,
             max_library_validation_bytes: 0,
-            ..policy()
+            ..policy_fixture()
         },
     )
 }

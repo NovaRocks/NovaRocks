@@ -438,7 +438,6 @@ fn push(
 #[cfg(test)]
 pub(in crate::planner::distributed::build) fn transfer_component_request_for_test(
     request: FunctionBindingRequest<'_>,
-    _policy: ConstantValidation,
     work: &mut CompileCheckpoints<'_>,
     register: &mut impl FnMut(
         &ConstantValue,

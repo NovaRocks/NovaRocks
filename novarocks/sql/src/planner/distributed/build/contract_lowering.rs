@@ -20278,7 +20278,7 @@ mod tests {
         let caps = novarocks_constant_contract::ConstantValidation::bounded(
             novarocks_constant_contract::ConstantPolicy {
                 max_rows: 4096,
-                ..crate::constant::test_constant_policy()
+                ..crate::constant::test_constant_fixture()
             },
         );
         let control = crate::compiler::SqlCompileControl::unbounded();

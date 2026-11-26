@@ -549,7 +549,7 @@ fn syntax_constructor_policy_limits_are_exact_at_boundary_and_refuse_one_below()
     let low = novarocks_constant_contract::ConstantValidation::bounded(
         novarocks_constant_contract::ConstantPolicy {
             max_rows: 0,
-            ..exact
+            ..policy()
         },
     );
     let baseline = Control::new(None);

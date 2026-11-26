@@ -429,7 +429,6 @@ fn seal_fixture_units(
             &sealed,
             pools,
             &parameters,
-            policy(),
             DecimalOverflowPolicy::OutputNull,
             &mut work,
         )

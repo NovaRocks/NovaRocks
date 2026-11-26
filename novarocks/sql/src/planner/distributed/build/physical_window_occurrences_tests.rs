@@ -210,7 +210,6 @@ fn finish(mut builder: FragmentBuilder, root: NodeId, external: &ConstantPools) 
             &sealed,
             &pools,
             &parameters,
-            policy(),
             DecimalOverflowPolicy::OutputNull,
             &mut work,
         )

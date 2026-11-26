@@ -249,7 +249,7 @@ fn logical_capture_cv_keeps_nonzero_ordinal_raw_bits_field_and_backing_without_r
     let zero = novarocks_constant_contract::ConstantValidation::bounded(
         novarocks_constant_contract::ConstantPolicy {
             max_rows: 0,
-            ..policy()
+            ..crate::constant::test_constant_fixture()
         },
     );
     let captured =
@@ -464,7 +464,7 @@ fn logical_capture_small_success_and_ordinary_tails_keep_every_original_control_
     let zero = novarocks_constant_contract::ConstantValidation::bounded(
         novarocks_constant_contract::ConstantPolicy {
             max_rows: 0,
-            ..policy()
+            ..crate::constant::test_constant_fixture()
         },
     );
     assert!(matches!(
@@ -552,7 +552,7 @@ fn authored_move_keeps_actual_none_and_original_binding_without_constant_admissi
     let zero = novarocks_constant_contract::ConstantValidation::bounded(
         novarocks_constant_contract::ConstantPolicy {
             max_rows: 0,
-            ..policy()
+            ..crate::constant::test_constant_fixture()
         },
     );
     let captured = move_authored_call_arguments_observed(
@@ -719,7 +719,7 @@ fn authored_move_preserves_original_cv_ordinal_field_and_backing_under_zero_admi
     let zero = novarocks_constant_contract::ConstantValidation::bounded(
         novarocks_constant_contract::ConstantPolicy {
             max_rows: 0,
-            ..policy()
+            ..crate::constant::test_constant_fixture()
         },
     );
     let captured = move_authored_call_arguments_observed(

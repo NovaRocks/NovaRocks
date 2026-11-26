@@ -21,7 +21,7 @@ use arrow::{
     array::{Array, StringArray},
     datatypes::DataType,
 };
-use novarocks_constant_contract::{ConstantError, ConstantPool};
+use novarocks_constant_contract::{ConstantError, ConstantPool, ConstantValidation};
 use novarocks_failure_contract::FailureProjection;
 use novarocks_parser::ast::AstBox;
 use novarocks_type_contract::DecimalOverflowPolicy;

@@ -260,7 +260,7 @@ fn optional_fold_declines_values_that_exceed_the_constant_pool_limit() {
     let policy = novarocks_constant_contract::ConstantValidation::bounded(
         novarocks_constant_contract::ConstantPolicy {
             max_retained_buffer_bytes: 256,
-            ..test_constant_policy()
+            ..crate::constant::test_constant_fixture()
         },
     );
     let control = test_optimizer_control();

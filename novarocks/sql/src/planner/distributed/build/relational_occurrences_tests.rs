@@ -349,7 +349,6 @@ fn seal_function_node(
         &sealed,
         pools,
         &parameters,
-        checked::policy(),
         DecimalOverflowPolicy::ReportError,
         &mut work,
     )

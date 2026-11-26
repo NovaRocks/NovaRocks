@@ -25,7 +25,7 @@ use arrow::{
     },
     datatypes::Field,
 };
-use novarocks_constant_contract::{ConstantPool, ConstantValidation, ConstantValue};
+use novarocks_constant_contract::{ConstantPool, ConstantValue};
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_parser::{SYNTHETIC, Span, ast::Expr, parser::parse_expression};
 use novarocks_query_application::{
