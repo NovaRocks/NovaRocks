@@ -171,7 +171,7 @@ impl PreparedWindowKernel for PreparedOffset {
         input: WindowPartitionInput<'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<Box<dyn WindowKernelPartition + 'a>, KernelFailure> {
-        Ok(self.begin_offset_partition(input, None, control)?)
+        self.begin_offset_partition(input, None, control)
     }
 }
 

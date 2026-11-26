@@ -2682,12 +2682,11 @@ impl<'a> super::AnalyzerContext<'a> {
                     is_distinct,
                     &args_typed,
                     &func_order_by,
-                    func.span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
                     self.constant_policy,
                     self.control,
                     self.purpose,
-                    AggregateCallSite::Window,
+                    AggregateCallSite::Window(func.span),
                 )?;
                 Some(self.with_aggregate_state_source(binding, is_distinct, &func_order_by)?)
             };
@@ -2815,12 +2814,11 @@ impl<'a> super::AnalyzerContext<'a> {
                 is_distinct,
                 &args_typed,
                 &func_order_by,
-                func.span,
                 self.sql_semantics.sql_mode().decimal_overflow_policy(),
                 self.constant_policy,
                 self.control,
                 self.purpose,
-                AggregateCallSite::Group,
+                AggregateCallSite::Group(func.span),
             )?);
         } else {
             if matches!(name.as_str(), "variant_get" | "try_variant_get") {
@@ -4371,12 +4369,11 @@ pub(super) fn resolve_aggregate_function_call(
         false,
         args,
         &[],
-        span,
         decimal_overflow_policy,
         constant_policy,
         control,
         super::QueryAnalysisPurpose::Ordinary,
-        AggregateCallSite::Group,
+        AggregateCallSite::Group(span),
     )
 }
 
@@ -4440,8 +4437,8 @@ fn approximate_aggregate_target(
 }
 
 enum AggregateCallSite {
-    Group,
-    Window,
+    Group(Span),
+    Window(Span),
 }
 
 fn resolve_aggregate_function_call_with_order(
@@ -4450,7 +4447,6 @@ fn resolve_aggregate_function_call_with_order(
     distinct: bool,
     args: &[TypedExpr],
     function_order_by: &[SortItem],
-    span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
@@ -4461,24 +4457,30 @@ fn resolve_aggregate_function_call_with_order(
         .iter()
         .map(|argument| argument.value_type.data_type().clone())
         .collect::<Vec<_>>();
-    let binding = match site {
-        AggregateCallSite::Window => crate::functions::resolve_sql_aggregate_window_call(
-            function_catalog,
-            name,
-            distinct,
-            args,
-            function_order_by,
-            constant_policy,
-            control,
+    let (binding, span) = match site {
+        AggregateCallSite::Window(span) => (
+            crate::functions::resolve_sql_aggregate_window_call(
+                function_catalog,
+                name,
+                distinct,
+                args,
+                function_order_by,
+                constant_policy,
+                control,
+            ),
+            span,
         ),
-        AggregateCallSite::Group => crate::functions::resolve_sql_aggregate_call(
-            function_catalog,
-            name,
-            distinct,
-            args,
-            function_order_by,
-            constant_policy,
-            control,
+        AggregateCallSite::Group(span) => (
+            crate::functions::resolve_sql_aggregate_call(
+                function_catalog,
+                name,
+                distinct,
+                args,
+                function_order_by,
+                constant_policy,
+                control,
+            ),
+            span,
         ),
     };
     binding

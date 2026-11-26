@@ -130,6 +130,9 @@ fn public_overloads_follow_the_trino_collection_string_and_aggregate_owners() {
         ),
         ("date_add", "varchar(x), bigint, date", "date"),
         ("approx_distinct", "T", "bigint"),
+        ("approx_distinct", "T, double", "bigint"),
+        ("approx_distinct", "boolean, double", "bigint"),
+        ("approx_distinct", "unknown, double", "bigint"),
     ] {
         assert!(
             catalog
@@ -140,11 +143,6 @@ fn public_overloads_follow_the_trino_collection_string_and_aggregate_owners() {
             "missing public signature {name}({arguments}) -> {result}",
         );
     }
-    assert!(
-        !catalog
-            .public_function_overloads()
-            .any(|row| row.name == "approx_distinct" && row.argument_types.ends_with(", double"))
-    );
 }
 
 #[test]

@@ -2227,7 +2227,7 @@ mod schema_prepare_tests {
         let catalogue = if name == "count" {
             aggregate_fixture::extrema_catalog()
         } else {
-            aggregate_catalog(&[(name, PureKernelAbi::AggregateV1)])
+            aggregate_catalog(&[(name, PureKernelAbi::AggregateWindowV1)])
         };
         let mut bound = bind(&catalogue, name, std::slice::from_ref(&argument));
         // These are the fixture call's original lexical options. The state
