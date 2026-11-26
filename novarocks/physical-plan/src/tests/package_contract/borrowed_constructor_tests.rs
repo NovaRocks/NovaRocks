@@ -320,19 +320,13 @@ fn borrowed_package_keeps_original_requests_constants_and_pruning_error_order() 
         )),
     );
     let mut unused = input.clone();
-    let original_policy = parameter_unit(&input.fragment)
-        .requests()
-        .values()
-        .next()
-        .unwrap()
-        .constant_policy;
     let array = arrow_array::Int64Array::from(vec![7, 9]);
     let value_type = ty(DataType::Int64, false);
     let pool = crate::ConstantPool::try_new(
         Arc::new(value_type.try_to_field("original").unwrap()),
         value_type,
         arrow_array::Array::to_data(&array),
-        original_policy,
+        crate::tests::constant_fixture::policy(),
         CompilePhase::Validate,
         &Control,
     )
@@ -480,23 +474,13 @@ use crate::{PlanLimits, UnpivotConstant};
 use arrow_array::ArrayRef;
 use arrow_array::builder::{Int32Builder, ListBuilder, MapBuilder, StringBuilder};
 use arrow_schema::Field;
-fn original_pool(
-    array: ArrayRef,
-    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
-) -> crate::ConstantPool {
+fn original_pool(array: ArrayRef) -> crate::ConstantPool {
     let value_type = ty(array.data_type().clone(), false);
-    let input = parameter_input(1, fixture_constants);
-    let original_policy = parameter_unit(&input.fragment)
-        .requests()
-        .values()
-        .next()
-        .unwrap()
-        .constant_policy;
     crate::ConstantPool::try_new(
         Arc::new(value_type.try_to_field("selected").unwrap()),
         value_type,
         array.to_data(),
-        original_policy,
+        crate::tests::constant_fixture::policy(),
         CompilePhase::Validate,
         &Control,
     )
@@ -643,16 +627,8 @@ fn borrowed_complete_list_and_map_packages_keep_resource_stage_on_original_decod
         map.append(true).unwrap();
     }
     for (pool_id, backing, is_map) in [
-        (
-            0,
-            original_pool(Arc::new(list.finish()), &mut fixture_constants),
-            false,
-        ),
-        (
-            u32::MAX,
-            original_pool(Arc::new(map.finish()), &mut fixture_constants),
-            true,
-        ),
+        (0, original_pool(Arc::new(list.finish())), false),
+        (u32::MAX, original_pool(Arc::new(map.finish())), true),
     ] {
         let address = crate::ConstantReference {
             pool: crate::ConstantPoolId::new(pool_id),

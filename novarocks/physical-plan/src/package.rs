@@ -1191,7 +1191,6 @@ mod parameter_preallocation_review_tests {
     }
     #[test]
     fn extraction_additional_items_do_not_count_unit_owned_environment_again() {
-        let policy = crate::tests::constant_fixture::policy();
         let reference = SemanticParameterRef {
             id: SemanticParameterId::new(0),
             expected_key: SemanticParameterKey::TimeZone,

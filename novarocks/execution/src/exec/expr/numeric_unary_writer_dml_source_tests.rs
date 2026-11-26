@@ -533,8 +533,8 @@ fn wide_collect_true_source() -> (
 fn wide_collect_true_actual_theta_plan_freezes_with_production_limits() {
     use novarocks_physical_plan::{UnpivotConstant, extract_fragment_packages};
     use novarocks_plan_codec::physical_package_v2::{
-        PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits,
-        decode_fragment_package, encode_fragment_package,
+        PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits, decode_fragment_package,
+        encode_fragment_package,
     };
     use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
     use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
