@@ -1114,10 +1114,6 @@ fn visible_record_storage(
     Ok(extent)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The internal composer keeps source, policy, limits, creator, admission, and progress owners distinct."
-)]
 fn prepare_core<'raw, 'table, 'control, E: NamespaceFailure, F: ValueSchemaCreationFactory<E>>(
     records: &'raw [wire::IpcConstantPool],
     types: &'table DecodedTypeTable,
