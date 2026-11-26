@@ -594,15 +594,14 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
         }
         None => model.facts(source, values.count(), limits.node, work)?,
     };
-    let remaining = limits
-        .node
-        .max_work
-        .checked_sub(prefix.cumulative_work_upper_bound)
-        .ok_or_else(|| invalid("Scan relation has no remaining work envelope"))?;
-    let relation_limits = RelationProjectionLimits {
-        max_work: limits.relation.max_work.min(remaining),
-        ..limits.relation
-    };
+    let mut relation_limits = limits.relation;
+    if let Some(node_limits) = limits.node {
+        let remaining = node_limits
+            .max_work
+            .checked_sub(prefix.cumulative_work_upper_bound)
+            .ok_or_else(|| invalid("Scan relation has no remaining work envelope"))?;
+        relation_limits.max_work = relation_limits.max_work.min(remaining);
+    }
     let relation = if let Some(callback) = admit.as_mut() {
         let base = model;
         let mut update = |child: &crate::physical_relation_v2::RelationProjectionFacts| {

@@ -397,7 +397,14 @@ impl<'parent> Model<'parent> {
     fn node_projection_model(
         &mut self,
         work_ceiling: usize,
-    ) -> Result<(resources::Model, usize, resources::NodeProjectionLimits), Error> {
+    ) -> Result<
+        (
+            resources::Model,
+            usize,
+            Option<resources::NodeProjectionLimits>,
+        ),
+        Error,
+    > {
         let parent = self
             .node_admission
             .as_mut()

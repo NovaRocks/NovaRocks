@@ -55,9 +55,10 @@ pub(crate) fn header(
 pub(crate) fn preflight_scalar_signature_copy(
     source: &BoundFunction,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
+    let limits = limits.into();
     preflight_scalar_signature_copy_counts(source, model, limits, work)?;
     preflight_scalar_signature_copy_types(source, model, limits, work)
 }
@@ -68,44 +69,45 @@ pub(crate) fn preflight_scalar_signature_copy(
 pub(crate) fn preflight_scalar_signature_copy_counts(
     source: &BoundFunction,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
-    preflight_scalar_signature_copy_counts_core(source, model, limits, None, work)
+    preflight_scalar_signature_copy_counts_core(source, model, limits.into(), None, work)
 }
 /// Same collection/type authors, borrowing a containing binding admission.
 pub(crate) fn preflight_scalar_signature_copy_in(
     source: &BoundFunction,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     admit: &mut super::owner_admission::Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
+    let limits = limits.into();
     preflight_scalar_signature_copy_counts_in(source, model, limits, admit, work)?;
     preflight_scalar_signature_copy_types_in(source, model, limits, admit, work)
 }
 pub(crate) fn preflight_scalar_signature_copy_counts_in(
     source: &BoundFunction,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     admit: &mut super::owner_admission::Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
-    preflight_scalar_signature_copy_counts_core(source, model, limits, Some(admit), work)
+    preflight_scalar_signature_copy_counts_core(source, model, limits.into(), Some(admit), work)
 }
 pub(crate) fn preflight_scalar_signature_copy_types_in(
     source: &BoundFunction,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     admit: &mut super::owner_admission::Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
-    preflight_scalar_signature_copy_types_core(source, model, limits, Some(admit), work)
+    preflight_scalar_signature_copy_types_core(source, model, limits.into(), Some(admit), work)
 }
 fn preflight_scalar_signature_copy_counts_core(
     source: &BoundFunction,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     mut admit: Option<&mut super::owner_admission::Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
@@ -139,15 +141,15 @@ fn scalar_collection_counts(
 pub(crate) fn preflight_scalar_signature_copy_types(
     source: &BoundFunction,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
-    preflight_scalar_signature_copy_types_core(source, model, limits, None, work)
+    preflight_scalar_signature_copy_types_core(source, model, limits.into(), None, work)
 }
 fn preflight_scalar_signature_copy_types_core(
     source: &BoundFunction,
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     mut admit: Option<&mut super::owner_admission::Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
@@ -169,7 +171,7 @@ fn preflight_scalar_signature_copy_types_core(
 fn preflight_argument_counts(
     arguments: &[FunctionArgumentType],
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     mut admit: Option<&mut super::owner_admission::Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
@@ -200,7 +202,7 @@ fn preflight_argument_counts(
 fn preflight_argument_types(
     arguments: &[FunctionArgumentType],
     model: &mut MaterializationModel,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     mut admit: Option<&mut super::owner_admission::Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
@@ -359,7 +361,7 @@ fn preflight_table_signature_copy_counts_core(
     if let Some(parent) = admit.as_mut() {
         parent(&model.facts)?;
     }
-    preflight_argument_counts(&source.argument_types, model, limits, admit, work)?;
+    preflight_argument_counts(&source.argument_types, model, Some(limits), admit, work)?;
     Ok(())
 }
 fn table_collection_counts(
@@ -404,7 +406,7 @@ fn preflight_table_signature_copy_types_core(
     preflight_argument_types(
         &source.argument_types,
         model,
-        limits,
+        Some(limits),
         admit.as_deref_mut(),
         work,
     )?;
