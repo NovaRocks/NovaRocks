@@ -181,7 +181,7 @@ impl WriterSchemaProjectionLimits {
 pub(crate) struct WriterSchemaNodeAdmission {
     pub(crate) base: Model,
     pub(crate) values: usize,
-    pub(crate) limits: NodeProjectionLimits,
+    pub(crate) limits: Option<NodeProjectionLimits>,
 }
 impl WriterSchemaNodeAdmission {
     /// Commit one completed contribution before lending this same node to the
@@ -199,13 +199,21 @@ impl WriterSchemaNodeAdmission {
             resources::add(merged.delegated_work, child.cumulative_work_upper_bound)?;
         Ok(merged)
     }
-    fn remaining(self, source: usize, child: WriterSchemaProjectionFacts) -> Result<usize, Error> {
+    fn remaining(
+        self,
+        source: usize,
+        child: WriterSchemaProjectionFacts,
+    ) -> Result<Option<usize>, Error> {
         let merged = self.merge(child)?;
         let facts = merged.numerical_facts(source, self.values, self.limits)?;
         self.limits
-            .max_work
-            .checked_sub(facts.cumulative_work_upper_bound)
-            .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+            .map(|limits| {
+                limits
+                    .max_work
+                    .checked_sub(facts.cumulative_work_upper_bound)
+                    .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+            })
+            .transpose()
     }
 }
 #[derive(Clone, Copy)]
@@ -265,7 +273,7 @@ impl<'a> Count<'a> {
             facts.cumulative_work_upper_bound = self.work_peak;
         }
         if let Some(parent) = self.parent {
-            parent.remaining(source, facts)?;
+            let _ = parent.remaining(source, facts)?;
         }
         if let Some(admit) = self.admit.as_mut() {
             admit(&facts)?;
@@ -365,7 +373,9 @@ impl<'a> Count<'a> {
             .checked_sub(f.cumulative_work_upper_bound)
             .ok_or(CompileControlError::ResourceExhausted)?;
         Ok(match self.parent {
-            Some(parent) => child.min(parent.remaining(source, f)?),
+            Some(parent) => parent
+                .remaining(source, f)?
+                .map_or(child, |limit| child.min(limit)),
             None => child,
         })
     }

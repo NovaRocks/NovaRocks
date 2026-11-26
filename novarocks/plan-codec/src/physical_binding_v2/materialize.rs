@@ -206,7 +206,7 @@ pub(crate) struct Model<'parent> {
 /// Only the sole Node model authors the composed axes and work formula.
 struct NodeAdmission<'parent> {
     base: resources::Model,
-    limits: resources::NodeProjectionLimits,
+    limits: Option<resources::NodeProjectionLimits>,
     values: usize,
     peak: usize,
     admit: Option<&'parent mut resources::NodeAdmit<'parent>>,
@@ -216,7 +216,7 @@ impl NodeAdmission<'_> {
         &self,
         base: resources::Model,
         values: usize,
-        limits: resources::NodeProjectionLimits,
+        limits: Option<resources::NodeProjectionLimits>,
     ) -> bool {
         let counts = |model: resources::Model| {
             [
@@ -228,24 +228,8 @@ impl NodeAdmission<'_> {
                 model.delegated_work,
             ]
         };
-        let envelope = |l: resources::NodeProjectionLimits| {
-            [
-                l.max_input_nodes,
-                l.max_value_references,
-                l.max_list_items,
-                l.max_allocation_requests,
-                l.max_allocation_request_bytes,
-                l.max_coexisting_source_and_request_bytes,
-                l.max_work,
-                l.properties.max_value_references,
-                l.properties.max_allocation_requests,
-                l.properties.max_allocation_request_bytes,
-                l.properties.max_coexisting_source_and_request_bytes,
-                l.properties.max_work,
-            ]
-        };
         self.values == values
-            && envelope(self.limits) == envelope(limits)
+            && self.limits == limits
             && counts(base)
                 .into_iter()
                 .zip(counts(self.base))
@@ -323,9 +307,10 @@ impl<'parent> Model<'parent> {
         &mut self,
         base: resources::Model,
         values: usize,
-        node_limits: resources::NodeProjectionLimits,
+        node_limits: impl Into<Option<resources::NodeProjectionLimits>>,
         binding_limits: BindingProjectionLimits,
     ) -> Result<(), Error> {
+        let node_limits = node_limits.into();
         if self
             .node_admission
             .as_ref()
@@ -356,7 +341,7 @@ impl<'parent> Model<'parent> {
         &mut self,
         base: resources::Model,
         values: usize,
-        node_limits: resources::NodeProjectionLimits,
+        node_limits: impl Into<Option<resources::NodeProjectionLimits>>,
         binding_limits: BindingProjectionLimits,
         admit: &'parent mut resources::NodeAdmit<'parent>,
     ) -> Result<(), Error> {

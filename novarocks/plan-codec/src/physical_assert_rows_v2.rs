@@ -138,7 +138,7 @@ fn prepare_encode(
     input: &p::PhysicalNode,
     values: &impl Values,
     source: usize,
-    l: AssertRowsNodeProjectionLimits,
+    l: Option<AssertRowsNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
     mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<AssertRowsNodeProjectionFacts, Error> {
@@ -241,15 +241,20 @@ fn prepare_encode(
     {
         if parent.is_some() {
             let pf = properties::properties_encode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(pf, l.properties)?;
+            properties::check_properties_numerical_facts(pf, l.map(|limits| limits.properties))?;
             model.property(pf)?;
             gate(&model, known, &mut parent)?;
-            properties::preflight_encode_observed(property, source, l.properties, w)?;
+            properties::preflight_encode_observed(
+                property,
+                source,
+                l.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_encode_observed(
                 property,
                 source,
-                l.properties,
+                l.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -290,7 +295,7 @@ fn prepare_decode(
     input: &wire::PhysicalNode,
     values: &impl Values,
     source: usize,
-    l: AssertRowsNodeProjectionLimits,
+    l: Option<AssertRowsNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
     mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<AssertRowsNodeProjectionFacts, Error> {
@@ -392,15 +397,20 @@ fn prepare_decode(
     {
         if parent.is_some() {
             let pf = properties::properties_decode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(pf, l.properties)?;
+            properties::check_properties_numerical_facts(pf, l.map(|limits| limits.properties))?;
             model.property(pf)?;
             gate(&model, known, &mut parent)?;
-            properties::preflight_decode_observed(property, source, l.properties, w)?;
+            properties::preflight_decode_observed(
+                property,
+                source,
+                l.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_decode_observed(
                 property,
                 source,
-                l.properties,
+                l.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -484,7 +494,7 @@ fn copy_boxed_text(input: &str, work: &mut CompileCheckpoints<'_>) -> Result<Box
 fn emit_encode(
     input: &p::PhysicalNode,
     source: usize,
-    limits: AssertRowsNodeProjectionLimits,
+    limits: Option<AssertRowsNodeProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::PhysicalNode, Error> {
     let p::NodeKind::AssertOneRow(assertion) = &input.kind else {
@@ -552,7 +562,7 @@ fn emit_encode(
 fn emit_decode(
     input: &wire::PhysicalNode,
     source: usize,
-    limits: AssertRowsNodeProjectionLimits,
+    limits: Option<AssertRowsNodeProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<p::PhysicalNode, Error> {
     let Some(wire::physical_node::Kind::AssertOneRow(assertion)) = input.kind.as_ref() else {
@@ -618,7 +628,7 @@ pub struct PreparedAssertRowsNodeEncode<'node, 'namespace, 'loan, 'source, 'cont
     input: &'node p::PhysicalNode,
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     source: usize,
-    limits: AssertRowsNodeProjectionLimits,
+    limits: Option<AssertRowsNodeProjectionLimits>,
     facts: AssertRowsNodeProjectionFacts,
 }
 impl PreparedAssertRowsNodeEncode<'_, '_, '_, '_, '_> {
@@ -655,6 +665,7 @@ pub fn prepare_assert_rows_node_encode<'node, 'namespace, 'loan, 'source, 'contr
     source_retained_bytes: usize,
     limits: AssertRowsNodeProjectionLimits,
 ) -> Result<PreparedAssertRowsNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = Some(limits);
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = prepare_encode(input, values, source_retained_bytes, limits, &mut w, None);
     let facts = finish(w, result)?;
@@ -671,10 +682,11 @@ pub fn prepare_assert_rows_node_encode_in<'node, 'namespace, 'loan, 'source, 'co
     input: &'node p::PhysicalNode,
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     source_retained_bytes: usize,
-    limits: AssertRowsNodeProjectionLimits,
+    limits: impl Into<Option<AssertRowsNodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedAssertRowsNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(values.original_control(), work.control()) {
         return Err(invalid(
             "node caller does not borrow the original controller",
@@ -702,7 +714,7 @@ pub struct PreparedAssertRowsNodeDecode<'node, 'namespace, 'loan, 'wire, 'contro
     input: &'node wire::PhysicalNode,
     values: &'namespace DecodedValues<'loan, 'wire, 'control>,
     source: usize,
-    limits: AssertRowsNodeProjectionLimits,
+    limits: Option<AssertRowsNodeProjectionLimits>,
     facts: AssertRowsNodeProjectionFacts,
 }
 impl PreparedAssertRowsNodeDecode<'_, '_, '_, '_, '_> {
@@ -739,6 +751,7 @@ pub fn prepare_assert_rows_node_decode<'node, 'namespace, 'loan, 'wire, 'control
     source_retained_bytes: usize,
     limits: AssertRowsNodeProjectionLimits,
 ) -> Result<PreparedAssertRowsNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = Some(limits);
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Decode)?;
     let result = prepare_decode(input, values, source_retained_bytes, limits, &mut w, None);
     let facts = finish(w, result)?;
@@ -755,10 +768,11 @@ pub fn prepare_assert_rows_node_decode_in<'node, 'namespace, 'loan, 'wire, 'cont
     input: &'node wire::PhysicalNode,
     values: &'namespace DecodedValues<'loan, 'wire, 'control>,
     source_retained_bytes: usize,
-    limits: AssertRowsNodeProjectionLimits,
+    limits: impl Into<Option<AssertRowsNodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedAssertRowsNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(values.original_control(), work.control()) {
         return Err(invalid(
             "node caller does not borrow the original controller",
@@ -788,6 +802,7 @@ pub fn encode_assert_rows_node(
     source_retained_bytes: usize,
     limits: AssertRowsNodeProjectionLimits,
 ) -> Result<(wire::PhysicalNode, AssertRowsNodeProjectionFacts), Error> {
+    let limits = Some(limits);
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = (|| {
         let facts = prepare_encode(input, values, source_retained_bytes, limits, &mut w, None)?;
@@ -803,6 +818,7 @@ pub fn decode_assert_rows_node(
     source_retained_bytes: usize,
     limits: AssertRowsNodeProjectionLimits,
 ) -> Result<(p::PhysicalNode, AssertRowsNodeProjectionFacts), Error> {
+    let limits = Some(limits);
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Decode)?;
     let result = (|| {
         let facts = prepare_decode(input, values, source_retained_bytes, limits, &mut w, None)?;

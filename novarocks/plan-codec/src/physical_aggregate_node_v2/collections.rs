@@ -24,7 +24,7 @@ pub(crate) fn node_gate(
     model: &Model,
     source: usize,
     values: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     admit: &mut Option<&mut NodeAdmit<'_>>,
 ) -> Result<AggregateNodeProjectionFacts, Error> {
     match admit {
@@ -36,7 +36,7 @@ pub(crate) fn node_facts(
     model: &Model,
     source: usize,
     values: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     admit: &mut Option<&mut NodeAdmit<'_>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<AggregateNodeProjectionFacts, Error> {
@@ -56,7 +56,7 @@ pub(crate) struct CollectionProjection<'model> {
     pub(crate) known: usize,
     pub(crate) source: usize,
     pub(crate) values: usize,
-    pub(crate) limits: NodeProjectionLimits,
+    pub(crate) limits: Option<NodeProjectionLimits>,
 }
 
 pub(crate) fn encode_collection_lookup_work(

@@ -114,7 +114,7 @@ fn prepare_encode<'source>(
     values: &EncodedValues<'_, 'source, '_>,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    l: ChangeEventNodeProjectionLimits,
+    l: Option<ChangeEventNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
     mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<
@@ -235,15 +235,20 @@ fn prepare_encode<'source>(
     {
         if parent.is_some() {
             let pf = properties::properties_encode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(pf, l.properties)?;
+            properties::check_properties_numerical_facts(pf, l.map(|limits| limits.properties))?;
             model.property(pf)?;
             gate(&model, known, &mut parent)?;
-            properties::preflight_encode_observed(property, source, l.properties, w)?;
+            properties::preflight_encode_observed(
+                property,
+                source,
+                l.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_encode_observed(
                 property,
                 source,
-                l.properties,
+                l.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -309,7 +314,7 @@ fn prepare_decode(
     input: &wire::PhysicalNode,
     expressions: &DecodedExpressions<'_, '_, '_>,
     source: usize,
-    l: ChangeEventNodeProjectionLimits,
+    l: Option<ChangeEventNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
     mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<ChangeEventNodeProjectionFacts, Error> {
@@ -493,15 +498,20 @@ fn prepare_decode(
     {
         if parent.is_some() {
             let pf = properties::properties_decode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(pf, l.properties)?;
+            properties::check_properties_numerical_facts(pf, l.map(|limits| limits.properties))?;
             model.property(pf)?;
             gate(&model, known, &mut parent)?;
-            properties::preflight_decode_observed(property, source, l.properties, w)?;
+            properties::preflight_decode_observed(
+                property,
+                source,
+                l.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_decode_observed(
                 property,
                 source,
-                l.properties,
+                l.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -584,7 +594,7 @@ fn emit_encode(
     input: &p::PhysicalNode,
     type_sources: Option<&OriginalValueTypeSourceIndex<'_>>,
     source: usize,
-    limits: ChangeEventNodeProjectionLimits,
+    limits: Option<ChangeEventNodeProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::PhysicalNode, Error> {
     let (inputs, required_inputs, output_properties, output) =
@@ -638,7 +648,7 @@ fn emit_decode(
     input: &wire::PhysicalNode,
     expressions: &DecodedExpressions<'_, '_, '_>,
     source: usize,
-    limits: ChangeEventNodeProjectionLimits,
+    limits: Option<ChangeEventNodeProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<p::PhysicalNode, Error> {
     let (inputs, required_inputs, output_properties, output) =
@@ -712,7 +722,7 @@ pub struct PreparedChangeEventNodeEncode<'node, 'namespace, 'loan, 'source, 'con
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source: usize,
-    limits: ChangeEventNodeProjectionLimits,
+    limits: Option<ChangeEventNodeProjectionLimits>,
     facts: ChangeEventNodeProjectionFacts,
     type_sources: Option<OriginalValueTypeSourceIndex<'source>>,
 }
@@ -768,6 +778,7 @@ pub fn prepare_change_event_node_encode<'node, 'namespace, 'loan, 'source, 'cont
     source_retained_bytes: usize,
     limits: ChangeEventNodeProjectionLimits,
 ) -> Result<PreparedChangeEventNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = prepare_encode(
         input,
@@ -795,10 +806,11 @@ pub fn prepare_change_event_node_encode_in<'node, 'namespace, 'loan, 'source, 'c
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source_retained_bytes: usize,
-    limits: ChangeEventNodeProjectionLimits,
+    limits: impl Into<Option<ChangeEventNodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedChangeEventNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(values.original_control(), work.control()) {
         return Err(invalid(
             "node caller does not borrow the original controller",
@@ -828,7 +840,7 @@ pub struct PreparedChangeEventNodeDecode<'node, 'namespace, 'loan, 'wire, 'contr
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     source: usize,
-    limits: ChangeEventNodeProjectionLimits,
+    limits: Option<ChangeEventNodeProjectionLimits>,
     facts: ChangeEventNodeProjectionFacts,
 }
 impl PreparedChangeEventNodeDecode<'_, '_, '_, '_, '_> {
@@ -871,6 +883,7 @@ pub fn prepare_change_event_node_decode<'node, 'namespace, 'loan, 'wire, 'contro
     source_retained_bytes: usize,
     limits: ChangeEventNodeProjectionLimits,
 ) -> Result<PreparedChangeEventNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = Some(limits);
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let result = prepare_decode(
@@ -895,10 +908,11 @@ pub fn prepare_change_event_node_decode_in<'node, 'namespace, 'loan, 'wire, 'con
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     source_retained_bytes: usize,
-    limits: ChangeEventNodeProjectionLimits,
+    limits: impl Into<Option<ChangeEventNodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedChangeEventNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(expressions.original_control(), work.control()) {
         return Err(invalid(
             "node caller does not borrow the original controller",
@@ -928,6 +942,7 @@ pub fn encode_change_event_node(
     source_retained_bytes: usize,
     limits: ChangeEventNodeProjectionLimits,
 ) -> Result<(wire::PhysicalNode, ChangeEventNodeProjectionFacts), Error> {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = (|| {
         let (facts, type_sources) = prepare_encode(
@@ -956,6 +971,7 @@ pub fn decode_change_event_node(
     source_retained_bytes: usize,
     limits: ChangeEventNodeProjectionLimits,
 ) -> Result<(p::PhysicalNode, ChangeEventNodeProjectionFacts), Error> {
+    let limits = Some(limits);
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let result = (|| {

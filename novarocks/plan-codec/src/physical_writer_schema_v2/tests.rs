@@ -1080,7 +1080,7 @@ fn projection(base: Model, node: NodeProjectionLimits) -> WriterSchemaProjection
         parent: WriterSchemaNodeAdmission {
             base,
             values: 2,
-            limits: node,
+            limits: Some(node),
         },
     }
 }
@@ -1141,7 +1141,7 @@ fn writer_observed_two_schemas_accumulate_same_node_without_type_value_or_source
             let admission = WriterSchemaNodeAdmission {
                 base: parent_base(),
                 values: 2,
-                limits: parent_limits(),
+                limits: Some(parent_limits()),
             };
             let after_first = admission.merge(first).unwrap();
             c.arm(None);
@@ -1394,7 +1394,7 @@ fn writer_observed_parent_remaining_limits_original_borrowed_metadata_visits() {
             let whole = WriterSchemaNodeAdmission {
                 base: parent_base(),
                 values: 2,
-                limits: parent_limits(),
+                limits: Some(parent_limits()),
             }
             .merge(first)
             .unwrap()
@@ -1514,7 +1514,7 @@ fn writer_schema_parent_prefix_replacement_exact_replay_and_actual_callbacks() {
             let merged = WriterSchemaNodeAdmission {
                 base: parent_base(),
                 values: 2,
-                limits: parent_limits(),
+                limits: Some(parent_limits()),
             }
             .merge(f)
             .unwrap();
@@ -1700,7 +1700,7 @@ fn writer_schema_captured_comparison_prefix_numeric_first_and_final_peak() {
             let final_node = WriterSchemaNodeAdmission {
                 base: parent_base(),
                 values: 2,
-                limits: parent_limits(),
+                limits: Some(parent_limits()),
             }
             .merge(f)
             .unwrap()

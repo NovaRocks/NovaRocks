@@ -1407,7 +1407,7 @@ fn aggregate_collection_counts_preserve_parent_work_once_across_batches() {
                                 known,
                                 source: SOURCE,
                                 values: v.count(),
-                                limits: limits().node,
+                                limits: Some(limits().node),
                             };
                             if receiving {
                                 parent.count_decode(&raw_calls[i..i + 1], d, &mut w)?;
@@ -1427,7 +1427,7 @@ fn aggregate_collection_counts_preserve_parent_work_once_across_batches() {
                             known,
                             source: SOURCE,
                             values: v.count(),
-                            limits: limits().node,
+                            limits: Some(limits().node),
                         };
                         if receiving {
                             parent.count_decode(raw_calls, d, &mut w)?;
@@ -1549,7 +1549,7 @@ fn aggregate_collection_parent_tighter_gates_preserve_work_and_nested_capacity_e
                         known,
                         source: SOURCE,
                         values: v.count(),
-                        limits: l,
+                        limits: Some(l),
                     };
                     if receiving {
                         parent.count_decode(&b.calls, d, &mut w)?;
@@ -1622,7 +1622,7 @@ fn aggregate_collection_parent_tighter_gates_preserve_work_and_nested_capacity_e
                 known,
                 source: SOURCE,
                 values: v.count(),
-                limits: limits().node,
+                limits: Some(limits().node),
             }
             .count_decode(&over, d, &mut w);
             finish(w, result)

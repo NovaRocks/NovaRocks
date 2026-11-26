@@ -40,7 +40,7 @@ fn prepare_encode(
     input: &p::PhysicalNode,
     values: &impl Values,
     source: usize,
-    l: RepeatNodeProjectionLimits,
+    l: Option<RepeatNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
     mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<RepeatNodeProjectionFacts, Error> {
@@ -146,15 +146,20 @@ fn prepare_encode(
     {
         if parent.is_some() {
             let pf = properties::properties_encode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(pf, l.properties)?;
+            properties::check_properties_numerical_facts(pf, l.map(|limits| limits.properties))?;
             model.property(pf)?;
             gate(&model, known, &mut parent)?;
-            properties::preflight_encode_observed(property, source, l.properties, w)?;
+            properties::preflight_encode_observed(
+                property,
+                source,
+                l.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_encode_observed(
                 property,
                 source,
-                l.properties,
+                l.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -200,7 +205,7 @@ fn prepare_decode(
     input: &wire::PhysicalNode,
     values: &impl Values,
     source: usize,
-    l: RepeatNodeProjectionLimits,
+    l: Option<RepeatNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
     mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<RepeatNodeProjectionFacts, Error> {
@@ -316,15 +321,20 @@ fn prepare_decode(
     {
         if parent.is_some() {
             let pf = properties::properties_decode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(pf, l.properties)?;
+            properties::check_properties_numerical_facts(pf, l.map(|limits| limits.properties))?;
             model.property(pf)?;
             gate(&model, known, &mut parent)?;
-            properties::preflight_decode_observed(property, source, l.properties, w)?;
+            properties::preflight_decode_observed(
+                property,
+                source,
+                l.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_decode_observed(
                 property,
                 source,
-                l.properties,
+                l.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -381,7 +391,7 @@ pub struct PreparedRepeatNodeEncode<'node, 'namespace, 'loan, 'source, 'control>
     input: &'node p::PhysicalNode,
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     source: usize,
-    limits: RepeatNodeProjectionLimits,
+    limits: Option<RepeatNodeProjectionLimits>,
     facts: RepeatNodeProjectionFacts,
 }
 impl PreparedRepeatNodeEncode<'_, '_, '_, '_, '_> {
@@ -418,6 +428,7 @@ pub fn prepare_repeat_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
     source_retained_bytes: usize,
     limits: RepeatNodeProjectionLimits,
 ) -> Result<PreparedRepeatNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = Some(limits);
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = prepare_encode(input, values, source_retained_bytes, limits, &mut w, None);
     let facts = finish(w, result)?;
@@ -434,10 +445,11 @@ pub fn prepare_repeat_node_encode_in<'node, 'namespace, 'loan, 'source, 'control
     input: &'node p::PhysicalNode,
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     source_retained_bytes: usize,
-    limits: RepeatNodeProjectionLimits,
+    limits: impl Into<Option<RepeatNodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedRepeatNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(values.original_control(), work.control()) {
         return Err(invalid(
             "node caller does not borrow the original controller",
@@ -465,7 +477,7 @@ pub struct PreparedRepeatNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     input: &'node wire::PhysicalNode,
     values: &'namespace DecodedValues<'loan, 'wire, 'control>,
     source: usize,
-    limits: RepeatNodeProjectionLimits,
+    limits: Option<RepeatNodeProjectionLimits>,
     facts: RepeatNodeProjectionFacts,
 }
 impl PreparedRepeatNodeDecode<'_, '_, '_, '_, '_> {
@@ -502,6 +514,7 @@ pub fn prepare_repeat_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     source_retained_bytes: usize,
     limits: RepeatNodeProjectionLimits,
 ) -> Result<PreparedRepeatNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = Some(limits);
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Decode)?;
     let result = prepare_decode(input, values, source_retained_bytes, limits, &mut w, None);
     let facts = finish(w, result)?;
@@ -518,10 +531,11 @@ pub fn prepare_repeat_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
     input: &'node wire::PhysicalNode,
     values: &'namespace DecodedValues<'loan, 'wire, 'control>,
     source_retained_bytes: usize,
-    limits: RepeatNodeProjectionLimits,
+    limits: impl Into<Option<RepeatNodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedRepeatNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(values.original_control(), work.control()) {
         return Err(invalid(
             "node caller does not borrow the original controller",
@@ -551,6 +565,7 @@ pub fn encode_repeat_node(
     source_retained_bytes: usize,
     limits: RepeatNodeProjectionLimits,
 ) -> Result<(wire::PhysicalNode, RepeatNodeProjectionFacts), Error> {
+    let limits = Some(limits);
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = (|| {
         let facts = prepare_encode(input, values, source_retained_bytes, limits, &mut w, None)?;
@@ -566,6 +581,7 @@ pub fn decode_repeat_node(
     source_retained_bytes: usize,
     limits: RepeatNodeProjectionLimits,
 ) -> Result<(p::PhysicalNode, RepeatNodeProjectionFacts), Error> {
+    let limits = Some(limits);
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Decode)?;
     let result = (|| {
         let facts = prepare_decode(input, values, source_retained_bytes, limits, &mut w, None)?;
@@ -577,7 +593,7 @@ pub fn decode_repeat_node(
 fn emit_encode(
     input: &p::PhysicalNode,
     source: usize,
-    l: RepeatNodeProjectionLimits,
+    l: Option<RepeatNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::PhysicalNode, Error> {
     let p::NodeKind::Repeat {
@@ -634,7 +650,7 @@ fn emit_encode(
 fn emit_decode(
     input: &wire::PhysicalNode,
     source: usize,
-    l: RepeatNodeProjectionLimits,
+    l: Option<RepeatNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<p::PhysicalNode, Error> {
     let Some(wire::physical_node::Kind::Repeat(repeat)) = input.kind.as_ref() else {

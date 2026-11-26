@@ -42,9 +42,19 @@ use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 
 type Error = TableFunctionNodeCodecError;
 #[derive(Clone, Copy, Debug)]
-pub struct TableFunctionNodeProjectionLimits {
-    pub node: NodeProjectionLimits,
+pub struct TableFunctionNodeProjectionLimits<N = NodeProjectionLimits> {
+    pub node: N,
     pub binding: BindingProjectionLimits,
+}
+impl<N: Into<Option<NodeProjectionLimits>>> TableFunctionNodeProjectionLimits<N> {
+    fn capture_node_profile(
+        self,
+    ) -> TableFunctionNodeProjectionLimits<Option<NodeProjectionLimits>> {
+        TableFunctionNodeProjectionLimits {
+            node: self.node.into(),
+            binding: self.binding,
+        }
+    }
 }
 struct Physical<'a> {
     function: &'a p::BoundTableFunction,
@@ -100,7 +110,7 @@ fn properties_encode(
     source: &p::PhysicalNode,
     values: &EncodedValues<'_, '_, '_>,
     source_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     model: &mut Model,
     admit: &mut Option<&mut NodeAdmit<'_>>,
     work: &mut CompileCheckpoints<'_>,
@@ -112,15 +122,23 @@ fn properties_encode(
     {
         if admit.is_some() {
             let facts = properties::properties_encode_numerical_facts_in(property, source_bytes)?;
-            properties::check_properties_numerical_facts(facts, limits.properties)?;
+            properties::check_properties_numerical_facts(
+                facts,
+                limits.map(|limits| limits.properties),
+            )?;
             model.property(facts)?;
             node_gate(model, source_bytes, values.count(), limits, admit)?;
-            properties::preflight_encode_observed(property, source_bytes, limits.properties, work)?;
+            properties::preflight_encode_observed(
+                property,
+                source_bytes,
+                limits.map(|limits| limits.properties),
+                work,
+            )?;
         } else {
             model.property(properties::preflight_encode_observed(
                 property,
                 source_bytes,
-                limits.properties,
+                limits.map(|limits| limits.properties),
                 work,
             )?)?;
         }
@@ -163,7 +181,7 @@ fn prepare_encode(
     values: &EncodedValues<'_, '_, '_>,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source_bytes: usize,
-    limits: TableFunctionNodeProjectionLimits,
+    limits: TableFunctionNodeProjectionLimits<Option<NodeProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(u32, NodeProjectionFacts), Error> {
     prepare_encode_core(
@@ -181,7 +199,7 @@ fn prepare_encode_core<'parent>(
     values: &EncodedValues<'_, '_, '_>,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source_bytes: usize,
-    limits: TableFunctionNodeProjectionLimits,
+    limits: TableFunctionNodeProjectionLimits<Option<NodeProjectionLimits>>,
     mut admit: Option<&'parent mut NodeAdmit<'parent>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(u32, NodeProjectionFacts), Error> {
@@ -357,7 +375,7 @@ fn prepare_decode<'a>(
     expressions: &DecodedExpressions<'_, '_, '_>,
     functions: &'a MaterializedFunctionBindings<'_, '_>,
     source_bytes: usize,
-    limits: TableFunctionNodeProjectionLimits,
+    limits: TableFunctionNodeProjectionLimits<Option<NodeProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ReadPreparation<'a>, Error> {
     prepare_decode_core(
@@ -375,7 +393,7 @@ fn prepare_decode_core<'a, 'parent>(
     expressions: &DecodedExpressions<'_, '_, '_>,
     functions: &'a MaterializedFunctionBindings<'_, '_>,
     source_bytes: usize,
-    limits: TableFunctionNodeProjectionLimits,
+    limits: TableFunctionNodeProjectionLimits<Option<NodeProjectionLimits>>,
     mut admit: Option<&'parent mut NodeAdmit<'parent>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ReadPreparation<'a>, Error> {
@@ -510,7 +528,10 @@ fn prepare_decode_core<'a, 'parent>(
     {
         if admit.is_some() {
             let facts = properties::properties_decode_numerical_facts_in(property, source_bytes)?;
-            properties::check_properties_numerical_facts(facts, limits.node.properties)?;
+            properties::check_properties_numerical_facts(
+                facts,
+                limits.node.map(|limits| limits.properties),
+            )?;
             model.property(facts)?;
             node_gate(
                 &model,
@@ -522,14 +543,14 @@ fn prepare_decode_core<'a, 'parent>(
             properties::preflight_decode_observed(
                 property,
                 source_bytes,
-                limits.node.properties,
+                limits.node.map(|limits| limits.properties),
                 work,
             )?;
         } else {
             model.property(properties::preflight_decode_observed(
                 property,
                 source_bytes,
-                limits.node.properties,
+                limits.node.map(|limits| limits.properties),
                 work,
             )?)?;
         }
@@ -688,7 +709,7 @@ fn emit_encode(
     source: &p::PhysicalNode,
     binding: u32,
     source_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::PhysicalNode, Error> {
     let body = physical(source)?;
@@ -739,7 +760,7 @@ fn emit_decode(
     source: &wire::PhysicalNode,
     function: &p::BoundTableFunction,
     source_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<p::PhysicalNode, Error> {
     let body = raw(source)?;
@@ -791,7 +812,7 @@ pub struct PreparedTableFunctionNodeEncode<'node, 'namespace, 'loan, 'source, 'c
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     binding: u32,
     source_bytes: usize,
-    limits: TableFunctionNodeProjectionLimits,
+    limits: TableFunctionNodeProjectionLimits<Option<NodeProjectionLimits>>,
     facts: NodeProjectionFacts,
 }
 impl PreparedTableFunctionNodeEncode<'_, '_, '_, '_, '_> {
@@ -840,6 +861,7 @@ pub fn prepare_table_function_node_encode<'node, 'namespace, 'loan, 'source, 'co
     source_retained_bytes: usize,
     limits: TableFunctionNodeProjectionLimits,
 ) -> Result<PreparedTableFunctionNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Encode)?;
     let result = prepare_encode(
@@ -875,10 +897,11 @@ pub(crate) fn prepare_table_function_node_encode_in<
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source_retained_bytes: usize,
-    limits: TableFunctionNodeProjectionLimits,
+    limits: TableFunctionNodeProjectionLimits<impl Into<Option<NodeProjectionLimits>>>,
     admit: &'parent mut NodeAdmit<'parent>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedTableFunctionNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let (binding, facts) = prepare_encode_core(
         source,
         values,
@@ -904,7 +927,7 @@ pub struct PreparedTableFunctionNodeDecode<'node, 'namespace, 'loan, 'wire, 'con
     functions: &'namespace MaterializedFunctionBindings<'loan, 'wire>,
     function: &'namespace p::BoundTableFunction,
     source_bytes: usize,
-    limits: TableFunctionNodeProjectionLimits,
+    limits: TableFunctionNodeProjectionLimits<Option<NodeProjectionLimits>>,
     facts: NodeProjectionFacts,
 }
 impl PreparedTableFunctionNodeDecode<'_, '_, '_, '_, '_> {
@@ -957,6 +980,7 @@ pub fn prepare_table_function_node_decode<'node, 'namespace, 'loan, 'wire, 'cont
     source_retained_bytes: usize,
     limits: TableFunctionNodeProjectionLimits,
 ) -> Result<PreparedTableFunctionNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let result = prepare_decode(
@@ -992,10 +1016,11 @@ pub(crate) fn prepare_table_function_node_decode_in<
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     functions: &'namespace MaterializedFunctionBindings<'loan, 'wire>,
     source_retained_bytes: usize,
-    limits: TableFunctionNodeProjectionLimits,
+    limits: TableFunctionNodeProjectionLimits<impl Into<Option<NodeProjectionLimits>>>,
     admit: &'parent mut NodeAdmit<'parent>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedTableFunctionNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let prepared = prepare_decode_core(
         source,
         expressions,

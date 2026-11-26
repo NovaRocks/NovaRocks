@@ -138,7 +138,7 @@ fn prepare_encode(
     values: &EncodedValues<'_, '_, '_>,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    l: SimpleNodeProjectionLimits,
+    l: Option<SimpleNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
     mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<SimpleNodeProjectionFacts, Error> {
@@ -257,15 +257,20 @@ fn prepare_encode(
     {
         if parent.is_some() {
             let pf = properties::properties_encode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(pf, l.properties)?;
+            properties::check_properties_numerical_facts(pf, l.map(|limits| limits.properties))?;
             model.property(pf)?;
             gate(&model, known, &mut parent)?;
-            properties::preflight_encode_observed(property, source, l.properties, w)?;
+            properties::preflight_encode_observed(
+                property,
+                source,
+                l.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_encode_observed(
                 property,
                 source,
-                l.properties,
+                l.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -346,7 +351,7 @@ fn prepare_decode(
     input: &wire::PhysicalNode,
     expressions: &DecodedExpressions<'_, '_, '_>,
     source: usize,
-    l: SimpleNodeProjectionLimits,
+    l: Option<SimpleNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
     mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<SimpleNodeProjectionFacts, Error> {
@@ -482,15 +487,20 @@ fn prepare_decode(
     {
         if parent.is_some() {
             let pf = properties::properties_decode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(pf, l.properties)?;
+            properties::check_properties_numerical_facts(pf, l.map(|limits| limits.properties))?;
             model.property(pf)?;
             gate(&model, known, &mut parent)?;
-            properties::preflight_decode_observed(property, source, l.properties, w)?;
+            properties::preflight_decode_observed(
+                property,
+                source,
+                l.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_decode_observed(
                 property,
                 source,
-                l.properties,
+                l.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -638,7 +648,7 @@ fn decode_root_ordinals(
 fn emit_encode(
     input: &p::PhysicalNode,
     source: usize,
-    l: SimpleNodeProjectionLimits,
+    l: Option<SimpleNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::PhysicalNode, Error> {
     let (inputs, required_inputs, output_properties, output) = encode_header(input, source, l, w)?;
@@ -754,7 +764,7 @@ fn emit_encode(
 fn emit_decode(
     input: &wire::PhysicalNode,
     source: usize,
-    l: SimpleNodeProjectionLimits,
+    l: Option<SimpleNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<p::PhysicalNode, Error> {
     let (inputs, required_inputs, output_properties, output) = decode_header(input, source, l, w)?;
@@ -850,7 +860,7 @@ pub struct PreparedSimpleNodeEncode<'node, 'namespace, 'loan, 'source, 'control>
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source: usize,
-    limits: SimpleNodeProjectionLimits,
+    limits: Option<SimpleNodeProjectionLimits>,
     facts: SimpleNodeProjectionFacts,
 }
 impl PreparedSimpleNodeEncode<'_, '_, '_, '_, '_> {
@@ -893,6 +903,7 @@ pub fn prepare_simple_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
     source_retained_bytes: usize,
     limits: SimpleNodeProjectionLimits,
 ) -> Result<PreparedSimpleNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = prepare_encode(
         input,
@@ -919,10 +930,11 @@ pub fn prepare_simple_node_encode_in<'node, 'namespace, 'loan, 'source, 'control
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source_retained_bytes: usize,
-    limits: SimpleNodeProjectionLimits,
+    limits: impl Into<Option<SimpleNodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedSimpleNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(values.original_control(), work.control()) {
         return Err(invalid(
             "node caller does not borrow the original controller",
@@ -951,7 +963,7 @@ pub struct PreparedSimpleNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     source: usize,
-    limits: SimpleNodeProjectionLimits,
+    limits: Option<SimpleNodeProjectionLimits>,
     facts: SimpleNodeProjectionFacts,
 }
 impl PreparedSimpleNodeDecode<'_, '_, '_, '_, '_> {
@@ -988,6 +1000,7 @@ pub fn prepare_simple_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     source_retained_bytes: usize,
     limits: SimpleNodeProjectionLimits,
 ) -> Result<PreparedSimpleNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = Some(limits);
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let result = prepare_decode(
@@ -1012,10 +1025,11 @@ pub fn prepare_simple_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     source_retained_bytes: usize,
-    limits: SimpleNodeProjectionLimits,
+    limits: impl Into<Option<SimpleNodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedSimpleNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(expressions.original_control(), work.control()) {
         return Err(invalid(
             "node caller does not borrow the original controller",
@@ -1045,6 +1059,7 @@ pub fn encode_simple_node(
     source_retained_bytes: usize,
     limits: SimpleNodeProjectionLimits,
 ) -> Result<(wire::PhysicalNode, SimpleNodeProjectionFacts), Error> {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = (|| {
         let facts = prepare_encode(
@@ -1067,6 +1082,7 @@ pub fn decode_simple_node(
     source_retained_bytes: usize,
     limits: SimpleNodeProjectionLimits,
 ) -> Result<(p::PhysicalNode, SimpleNodeProjectionFacts), Error> {
+    let limits = Some(limits);
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let result = (|| {

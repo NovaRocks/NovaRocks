@@ -49,9 +49,17 @@ pub(crate) use collections::{
 };
 
 #[derive(Clone, Copy, Debug)]
-pub struct AggregateNodeProjectionLimits {
-    pub node: NodeProjectionLimits,
+pub struct AggregateNodeProjectionLimits<N = NodeProjectionLimits> {
+    pub node: N,
     pub binding: BindingProjectionLimits,
+}
+impl<N: Into<Option<NodeProjectionLimits>>> AggregateNodeProjectionLimits<N> {
+    fn capture_node_profile(self) -> AggregateNodeProjectionLimits<Option<NodeProjectionLimits>> {
+        AggregateNodeProjectionLimits {
+            node: self.node.into(),
+            binding: self.binding,
+        }
+    }
 }
 fn completed<T>(r: Result<T, Error>, w: &mut CompileCheckpoints<'_>) -> Result<T, Error> {
     if matches!(&r, Err(Error::Control(_))) {
@@ -162,7 +170,7 @@ fn prepare_encode(
     values: &EncodedValues<'_, '_, '_>,
     e: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    l: AggregateNodeProjectionLimits,
+    l: AggregateNodeProjectionLimits<Option<NodeProjectionLimits>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<AggregateNodeProjectionFacts, Error> {
     prepare_encode_core(input, values, e, source, l, None, w)
@@ -202,7 +210,7 @@ fn prepare_encode_core<'parent>(
     values: &EncodedValues<'_, '_, '_>,
     e: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    l: AggregateNodeProjectionLimits,
+    l: AggregateNodeProjectionLimits<Option<NodeProjectionLimits>>,
     mut admit: Option<&'parent mut NodeAdmit<'parent>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<AggregateNodeProjectionFacts, Error> {
@@ -276,15 +284,23 @@ fn prepare_encode_core<'parent>(
         if admit.is_some() {
             let property_facts =
                 properties::properties_encode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(property_facts, l.node.properties)?;
+            properties::check_properties_numerical_facts(
+                property_facts,
+                l.node.map(|limits| limits.properties),
+            )?;
             model.property(property_facts)?;
             node_gate(&model, source, values.count(), l.node, &mut admit)?;
-            properties::preflight_encode_observed(property, source, l.node.properties, w)?;
+            properties::preflight_encode_observed(
+                property,
+                source,
+                l.node.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_encode_observed(
                 property,
                 source,
-                l.node.properties,
+                l.node.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -311,7 +327,7 @@ fn prepare_decode(
     e: &DecodedExpressions<'_, '_, '_>,
     a: &MaterializedAggregateBindings<'_, '_, '_>,
     source: usize,
-    l: AggregateNodeProjectionLimits,
+    l: AggregateNodeProjectionLimits<Option<NodeProjectionLimits>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<AggregateNodeProjectionFacts, Error> {
     prepare_decode_core(input, e, a, source, l, None, w)
@@ -359,7 +375,7 @@ fn prepare_decode_core<'parent>(
     e: &DecodedExpressions<'_, '_, '_>,
     a: &MaterializedAggregateBindings<'_, '_, '_>,
     source: usize,
-    l: AggregateNodeProjectionLimits,
+    l: AggregateNodeProjectionLimits<Option<NodeProjectionLimits>>,
     mut admit: Option<&'parent mut NodeAdmit<'parent>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<AggregateNodeProjectionFacts, Error> {
@@ -450,15 +466,23 @@ fn prepare_decode_core<'parent>(
         if admit.is_some() {
             let property_facts =
                 properties::properties_decode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(property_facts, l.node.properties)?;
+            properties::check_properties_numerical_facts(
+                property_facts,
+                l.node.map(|limits| limits.properties),
+            )?;
             base.property(property_facts)?;
             node_gate(&base, source, e.values().count(), l.node, &mut admit)?;
-            properties::preflight_decode_observed(property, source, l.node.properties, w)?;
+            properties::preflight_decode_observed(
+                property,
+                source,
+                l.node.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             base.property(properties::preflight_decode_observed(
                 property,
                 source,
-                l.node.properties,
+                l.node.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -507,7 +531,7 @@ fn emit_encode(
     input: &p::PhysicalNode,
     e: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    l: AggregateNodeProjectionLimits,
+    l: AggregateNodeProjectionLimits<Option<NodeProjectionLimits>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::PhysicalNode, Error> {
     let (inputs, required_inputs, output_properties, output) =
@@ -535,7 +559,7 @@ fn emit_decode(
     e: &DecodedExpressions<'_, '_, '_>,
     a: &MaterializedAggregateBindings<'_, '_, '_>,
     source: usize,
-    l: AggregateNodeProjectionLimits,
+    l: AggregateNodeProjectionLimits<Option<NodeProjectionLimits>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<p::PhysicalNode, Error> {
     let (inputs, required_inputs, output_properties, output) =
@@ -567,7 +591,7 @@ pub struct PreparedAggregateNodeEncode<'node, 'namespace, 'loan, 'source, 'contr
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source: usize,
-    limits: AggregateNodeProjectionLimits,
+    limits: AggregateNodeProjectionLimits<Option<NodeProjectionLimits>>,
     facts: AggregateNodeProjectionFacts,
 }
 impl PreparedAggregateNodeEncode<'_, '_, '_, '_, '_> {
@@ -609,6 +633,7 @@ pub fn prepare_aggregate_node_encode<'node, 'namespace, 'loan, 'source, 'control
     source_retained_bytes: usize,
     limits: AggregateNodeProjectionLimits,
 ) -> Result<PreparedAggregateNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let r = prepare_encode(
         input,
@@ -642,10 +667,11 @@ pub(crate) fn prepare_aggregate_node_encode_in<
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source_retained_bytes: usize,
-    limits: AggregateNodeProjectionLimits,
+    limits: AggregateNodeProjectionLimits<impl Into<Option<NodeProjectionLimits>>>,
     admit: &'parent mut NodeAdmit<'parent>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedAggregateNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let facts = prepare_encode_core(
         input,
         values,
@@ -669,7 +695,7 @@ pub struct PreparedAggregateNodeDecode<'node, 'namespace, 'loan, 'wire, 'control
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     aggregates: &'namespace MaterializedAggregateBindings<'namespace, 'loan, 'wire>,
     source: usize,
-    limits: AggregateNodeProjectionLimits,
+    limits: AggregateNodeProjectionLimits<Option<NodeProjectionLimits>>,
     facts: AggregateNodeProjectionFacts,
 }
 impl PreparedAggregateNodeDecode<'_, '_, '_, '_, '_> {
@@ -719,6 +745,7 @@ pub fn prepare_aggregate_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     source_retained_bytes: usize,
     limits: AggregateNodeProjectionLimits,
 ) -> Result<PreparedAggregateNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let mut w = CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let r = prepare_decode(
         input,
@@ -752,10 +779,11 @@ pub(crate) fn prepare_aggregate_node_decode_in<
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     aggregates: &'namespace MaterializedAggregateBindings<'namespace, 'loan, 'wire>,
     source_retained_bytes: usize,
-    limits: AggregateNodeProjectionLimits,
+    limits: AggregateNodeProjectionLimits<impl Into<Option<NodeProjectionLimits>>>,
     admit: &'parent mut NodeAdmit<'parent>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedAggregateNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let facts = prepare_decode_core(
         input,
         expressions,
@@ -781,6 +809,7 @@ pub fn encode_aggregate_node(
     source_retained_bytes: usize,
     limits: AggregateNodeProjectionLimits,
 ) -> Result<(wire::PhysicalNode, AggregateNodeProjectionFacts), Error> {
+    let limits = limits.capture_node_profile();
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let r = (|| {
         let facts = prepare_encode(
@@ -805,6 +834,7 @@ pub fn decode_aggregate_node(
     source_retained_bytes: usize,
     limits: AggregateNodeProjectionLimits,
 ) -> Result<(p::PhysicalNode, AggregateNodeProjectionFacts), Error> {
+    let limits = limits.capture_node_profile();
     let mut w = CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let r = (|| {
         let facts = prepare_decode(

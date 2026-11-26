@@ -43,9 +43,17 @@ use novarocks_type_contract::{CompileCheckpoints, CompilePhase, OrderedCompariso
 type Error = TopNNodeCodecError;
 
 #[derive(Clone, Copy, Debug)]
-pub struct TopNNodeProjectionLimits {
-    pub node: NodeProjectionLimits,
+pub struct TopNNodeProjectionLimits<N = NodeProjectionLimits> {
+    pub node: N,
     pub binding: BindingProjectionLimits,
+}
+impl<N: Into<Option<NodeProjectionLimits>>> TopNNodeProjectionLimits<N> {
+    fn capture_node_profile(self) -> TopNNodeProjectionLimits<Option<NodeProjectionLimits>> {
+        TopNNodeProjectionLimits {
+            node: self.node.into(),
+            binding: self.binding,
+        }
+    }
 }
 fn completed<T>(r: Result<T, Error>, w: &mut CompileCheckpoints<'_>) -> Result<T, Error> {
     if matches!(&r, Err(Error::Control(_))) {
@@ -207,7 +215,7 @@ fn prepare_encode(
     values: &EncodedValues<'_, '_, '_>,
     e: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    l: TopNNodeProjectionLimits,
+    l: TopNNodeProjectionLimits<Option<NodeProjectionLimits>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<TopNNodeProjectionFacts, Error> {
     prepare_encode_core(input, values, e, source, l, None, w)
@@ -254,7 +262,7 @@ fn prepare_encode_core<'parent>(
     values: &EncodedValues<'_, '_, '_>,
     e: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    l: TopNNodeProjectionLimits,
+    l: TopNNodeProjectionLimits<Option<NodeProjectionLimits>>,
     mut admit: Option<&'parent mut NodeAdmit<'parent>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<TopNNodeProjectionFacts, Error> {
@@ -330,15 +338,23 @@ fn prepare_encode_core<'parent>(
         if admit.is_some() {
             let property_facts =
                 properties::properties_encode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(property_facts, l.node.properties)?;
+            properties::check_properties_numerical_facts(
+                property_facts,
+                l.node.map(|limits| limits.properties),
+            )?;
             model.property(property_facts)?;
             node_gate(&model, source, values.count(), l.node, &mut admit)?;
-            properties::preflight_encode_observed(property, source, l.node.properties, w)?;
+            properties::preflight_encode_observed(
+                property,
+                source,
+                l.node.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_encode_observed(
                 property,
                 source,
-                l.node.properties,
+                l.node.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -369,7 +385,7 @@ fn prepare_decode(
     e: &DecodedExpressions<'_, '_, '_>,
     a: &MaterializedAggregateBindings<'_, '_, '_>,
     source: usize,
-    l: TopNNodeProjectionLimits,
+    l: TopNNodeProjectionLimits<Option<NodeProjectionLimits>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<TopNNodeProjectionFacts, Error> {
     prepare_decode_core(input, e, a, source, l, None, w)
@@ -427,7 +443,7 @@ fn prepare_decode_core<'parent>(
     e: &DecodedExpressions<'_, '_, '_>,
     a: &MaterializedAggregateBindings<'_, '_, '_>,
     source: usize,
-    l: TopNNodeProjectionLimits,
+    l: TopNNodeProjectionLimits<Option<NodeProjectionLimits>>,
     mut admit: Option<&'parent mut NodeAdmit<'parent>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<TopNNodeProjectionFacts, Error> {
@@ -523,15 +539,23 @@ fn prepare_decode_core<'parent>(
         if admit.is_some() {
             let property_facts =
                 properties::properties_decode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(property_facts, l.node.properties)?;
+            properties::check_properties_numerical_facts(
+                property_facts,
+                l.node.map(|limits| limits.properties),
+            )?;
             model.property(property_facts)?;
             node_gate(&model, source, e.values().count(), l.node, &mut admit)?;
-            properties::preflight_decode_observed(property, source, l.node.properties, w)?;
+            properties::preflight_decode_observed(
+                property,
+                source,
+                l.node.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_decode_observed(
                 property,
                 source,
-                l.node.properties,
+                l.node.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -583,7 +607,7 @@ fn emit_encode(
     input: &p::PhysicalNode,
     e: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    l: TopNNodeProjectionLimits,
+    l: TopNNodeProjectionLimits<Option<NodeProjectionLimits>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::PhysicalNode, Error> {
     let (inputs, required_inputs, output_properties, output) =
@@ -628,7 +652,7 @@ fn emit_decode(
     input: &wire::PhysicalNode,
     a: &MaterializedAggregateBindings<'_, '_, '_>,
     source: usize,
-    l: TopNNodeProjectionLimits,
+    l: TopNNodeProjectionLimits<Option<NodeProjectionLimits>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<p::PhysicalNode, Error> {
     let (inputs, required_inputs, output_properties, output) =
@@ -670,7 +694,7 @@ pub struct PreparedTopNNodeEncode<'node, 'namespace, 'loan, 'source, 'control> {
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source: usize,
-    limits: TopNNodeProjectionLimits,
+    limits: TopNNodeProjectionLimits<Option<NodeProjectionLimits>>,
     facts: TopNNodeProjectionFacts,
 }
 impl PreparedTopNNodeEncode<'_, '_, '_, '_, '_> {
@@ -710,6 +734,7 @@ pub fn prepare_topn_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
     source_retained_bytes: usize,
     limits: TopNNodeProjectionLimits,
 ) -> Result<PreparedTopNNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let r = prepare_encode(
         input,
@@ -736,10 +761,11 @@ pub(crate) fn prepare_topn_node_encode_in<'node, 'namespace, 'loan, 'source, 'co
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source_retained_bytes: usize,
-    limits: TopNNodeProjectionLimits,
+    limits: TopNNodeProjectionLimits<impl Into<Option<NodeProjectionLimits>>>,
     admit: &'parent mut NodeAdmit<'parent>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedTopNNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let facts = prepare_encode_core(
         input,
         values,
@@ -763,7 +789,7 @@ pub struct PreparedTopNNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     aggregates: &'namespace MaterializedAggregateBindings<'namespace, 'loan, 'wire>,
     source: usize,
-    limits: TopNNodeProjectionLimits,
+    limits: TopNNodeProjectionLimits<Option<NodeProjectionLimits>>,
     facts: TopNNodeProjectionFacts,
 }
 impl PreparedTopNNodeDecode<'_, '_, '_, '_, '_> {
@@ -803,6 +829,7 @@ pub fn prepare_topn_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     source_retained_bytes: usize,
     limits: TopNNodeProjectionLimits,
 ) -> Result<PreparedTopNNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let mut w = CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let r = prepare_decode(
         input,
@@ -829,10 +856,11 @@ pub(crate) fn prepare_topn_node_decode_in<'node, 'namespace, 'loan, 'wire, 'cont
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     aggregates: &'namespace MaterializedAggregateBindings<'namespace, 'loan, 'wire>,
     source_retained_bytes: usize,
-    limits: TopNNodeProjectionLimits,
+    limits: TopNNodeProjectionLimits<impl Into<Option<NodeProjectionLimits>>>,
     admit: &'parent mut NodeAdmit<'parent>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedTopNNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let facts = prepare_decode_core(
         input,
         expressions,
@@ -858,6 +886,7 @@ pub fn encode_topn_node(
     source_retained_bytes: usize,
     limits: TopNNodeProjectionLimits,
 ) -> Result<(wire::PhysicalNode, TopNNodeProjectionFacts), Error> {
+    let limits = limits.capture_node_profile();
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let r = (|| {
         let facts = prepare_encode(
@@ -882,6 +911,7 @@ pub fn decode_topn_node(
     source_retained_bytes: usize,
     limits: TopNNodeProjectionLimits,
 ) -> Result<(p::PhysicalNode, TopNNodeProjectionFacts), Error> {
+    let limits = limits.capture_node_profile();
     let mut w = CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let r = (|| {
         let facts = prepare_decode(

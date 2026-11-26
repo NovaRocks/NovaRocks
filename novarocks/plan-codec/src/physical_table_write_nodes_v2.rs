@@ -49,10 +49,19 @@ use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 type Error = TableWriteNodeCodecError;
 #[derive(Clone, Copy, Debug)]
-pub struct TableWriteNodeProjectionLimits {
-    pub node: NodeProjectionLimits,
+pub struct TableWriteNodeProjectionLimits<N = NodeProjectionLimits> {
+    pub node: N,
     pub binding: BindingProjectionLimits,
     pub schema: WriterSchemaProjectionLimits,
+}
+impl<N: Into<Option<NodeProjectionLimits>>> TableWriteNodeProjectionLimits<N> {
+    fn capture_node_profile(self) -> TableWriteNodeProjectionLimits<Option<NodeProjectionLimits>> {
+        TableWriteNodeProjectionLimits {
+            node: self.node.into(),
+            binding: self.binding,
+            schema: self.schema,
+        }
+    }
 }
 /// Ordered original type roots, separate from the values a target reads.
 #[derive(Clone, Copy, Debug)]
@@ -144,7 +153,7 @@ fn binding<'a>(
 fn parent(
     model: Model,
     values: usize,
-    l: TableWriteNodeProjectionLimits,
+    l: TableWriteNodeProjectionLimits<Option<NodeProjectionLimits>>,
     source: usize,
 ) -> WriterSchemaProjection {
     WriterSchemaProjection {
@@ -161,7 +170,7 @@ fn merge_schema(
     model: &mut Model,
     f: schema::WriterSchemaProjectionFacts,
     values: usize,
-    l: TableWriteNodeProjectionLimits,
+    l: TableWriteNodeProjectionLimits<Option<NodeProjectionLimits>>,
 ) -> Result<(), Error> {
     *model = WriterSchemaNodeAdmission {
         base: *model,
@@ -209,19 +218,9 @@ fn wire_distribution_refs(
 }
 fn distribution_limits(
     f: properties::PhysicalPropertyProjectionFacts,
-    l: properties::PhysicalPropertyProjectionLimits,
+    limits: Option<properties::PhysicalPropertyProjectionLimits>,
 ) -> Result<(), Error> {
-    check_cap(f.value_reference_count, l.max_value_references)?;
-    check_cap(f.allocation_requests_upper_bound, l.max_allocation_requests)?;
-    check_cap(
-        f.allocation_request_bytes_upper_bound,
-        l.max_allocation_request_bytes,
-    )?;
-    check_cap(
-        f.coexisting_source_and_request_bytes_upper_bound,
-        l.max_coexisting_source_and_request_bytes,
-    )?;
-    check_cap(f.cumulative_work_upper_bound, l.max_work)
+    Ok(properties::check_properties_numerical_facts(f, limits)?)
 }
 fn base(
     inputs: usize,
@@ -510,7 +509,10 @@ fn prepare_encode(
     values: &EncodedValues<'_, '_, '_>,
     e: &EncodedExpressions<'_, '_, '_>,
     ids: TableWriteTypeIds<'_>,
-    projection: (usize, TableWriteNodeProjectionLimits),
+    projection: (
+        usize,
+        TableWriteNodeProjectionLimits<Option<NodeProjectionLimits>>,
+    ),
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<TableWriteNodeProjectionFacts, Error> {
     prepare_encode_core(n, values, e, ids, projection, None, w)
@@ -520,7 +522,10 @@ fn prepare_encode_core(
     values: &EncodedValues<'_, '_, '_>,
     e: &EncodedExpressions<'_, '_, '_>,
     ids: TableWriteTypeIds<'_>,
-    projection: (usize, TableWriteNodeProjectionLimits),
+    projection: (
+        usize,
+        TableWriteNodeProjectionLimits<Option<NodeProjectionLimits>>,
+    ),
     mut admit: Option<&mut NodeAdmit<'_>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<TableWriteNodeProjectionFacts, Error> {
@@ -611,13 +616,18 @@ fn prepare_encode_core(
         } else {
             properties::properties_encode_numerical_facts(prop, source)?
         };
-        distribution_limits(f, l.node.properties)?;
+        distribution_limits(f, l.node.map(|limits| limits.properties))?;
         m.property(f)?;
         match admit.as_mut() {
             Some(callback) => m.admit_in(source, values.count(), l.node, &mut **callback)?,
             None => m.numerical_facts(source, values.count(), l.node)?,
         };
-        properties::preflight_encode_observed(prop, source, l.node.properties, w)?;
+        properties::preflight_encode_observed(
+            prop,
+            source,
+            l.node.map(|limits| limits.properties),
+            w,
+        )?;
         match admit.as_mut() {
             Some(callback) => m.admit_in(source, values.count(), l.node, &mut **callback)?,
             None => m.numerical_facts(source, values.count(), l.node)?,
@@ -640,7 +650,7 @@ fn prepare_encode_core(
             } else {
                 properties::distribution_encode_numerical_facts(&t.required_distribution, source)?
             };
-            distribution_limits(f, l.node.properties)?;
+            distribution_limits(f, l.node.map(|limits| limits.properties))?;
             // Model::property deliberately retains its conservative two-pass
             // bound even though distribution emission now uses the sole body.
             m.property(f)?;
@@ -651,7 +661,7 @@ fn prepare_encode_core(
             properties::preflight_distribution_encode_observed(
                 &t.required_distribution,
                 source,
-                l.node.properties,
+                l.node.map(|limits| limits.properties),
                 w,
             )?;
             let f = if let Some(callback) = admit.as_mut() {
@@ -849,7 +859,7 @@ fn prepare_decode(
     e: &DecodedExpressions<'_, '_, '_>,
     a: &MaterializedAggregateBindings<'_, '_, '_>,
     source: usize,
-    l: TableWriteNodeProjectionLimits,
+    l: TableWriteNodeProjectionLimits<Option<NodeProjectionLimits>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<TableWriteNodeProjectionFacts, Error> {
     prepare_decode_core(n, e, a, source, l, None, w)
@@ -859,7 +869,7 @@ fn prepare_decode_core(
     e: &DecodedExpressions<'_, '_, '_>,
     a: &MaterializedAggregateBindings<'_, '_, '_>,
     source: usize,
-    l: TableWriteNodeProjectionLimits,
+    l: TableWriteNodeProjectionLimits<Option<NodeProjectionLimits>>,
     mut admit: Option<&mut NodeAdmit<'_>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<TableWriteNodeProjectionFacts, Error> {
@@ -1015,13 +1025,18 @@ fn prepare_decode_core(
         } else {
             properties::properties_decode_numerical_facts(prop, source)?
         };
-        distribution_limits(f, l.node.properties)?;
+        distribution_limits(f, l.node.map(|limits| limits.properties))?;
         m.property(f)?;
         match admit.as_mut() {
             Some(callback) => m.admit_in(source, e.values().count(), l.node, &mut **callback)?,
             None => m.numerical_facts(source, e.values().count(), l.node)?,
         };
-        properties::preflight_decode_observed(prop, source, l.node.properties, w)?;
+        properties::preflight_decode_observed(
+            prop,
+            source,
+            l.node.map(|limits| limits.properties),
+            w,
+        )?;
         properties::validate_properties_source_observed(prop, w)?;
         match admit.as_mut() {
             Some(callback) => m.admit_in(source, e.values().count(), l.node, &mut **callback)?,
@@ -1042,7 +1057,7 @@ fn prepare_decode_core(
             } else {
                 properties::distribution_decode_numerical_facts(d, source)?
             };
-            distribution_limits(f, l.node.properties)?;
+            distribution_limits(f, l.node.map(|limits| limits.properties))?;
             m.property(f)?;
             match admit.as_mut() {
                 Some(callback) => {
@@ -1050,7 +1065,12 @@ fn prepare_decode_core(
                 }
                 None => m.numerical_facts(source, e.values().count(), l.node)?,
             };
-            properties::preflight_distribution_decode_observed(d, source, l.node.properties, w)?;
+            properties::preflight_distribution_decode_observed(
+                d,
+                source,
+                l.node.map(|limits| limits.properties),
+                w,
+            )?;
             properties::validate_distribution_source_observed(d, w)?;
             let f = if let Some(callback) = admit.as_mut() {
                 schema::preflight_targets_decode_in(
@@ -1330,7 +1350,10 @@ fn emit_encode(
     values: &EncodedValues<'_, '_, '_>,
     e: &EncodedExpressions<'_, '_, '_>,
     ids: TableWriteTypeIds<'_>,
-    projection: (usize, TableWriteNodeProjectionLimits),
+    projection: (
+        usize,
+        TableWriteNodeProjectionLimits<Option<NodeProjectionLimits>>,
+    ),
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::PhysicalNode, Error> {
     let (source, l) = projection;
@@ -1407,7 +1430,7 @@ fn emit_decode(
     e: &DecodedExpressions<'_, '_, '_>,
     a: &MaterializedAggregateBindings<'_, '_, '_>,
     source: usize,
-    l: TableWriteNodeProjectionLimits,
+    l: TableWriteNodeProjectionLimits<Option<NodeProjectionLimits>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<p::PhysicalNode, Error> {
     let (inputs, required_inputs, output_properties, output) = decode_header(n, source, l.node, w)?;
@@ -1497,7 +1520,7 @@ pub struct PreparedTableWriteNodeEncode<'node, 'namespace, 'loan, 'source, 'cont
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     type_ids: TableWriteTypeIds<'node>,
     source: usize,
-    limits: TableWriteNodeProjectionLimits,
+    limits: TableWriteNodeProjectionLimits<Option<NodeProjectionLimits>>,
     facts: TableWriteNodeProjectionFacts,
 }
 impl PreparedTableWriteNodeEncode<'_, '_, '_, '_, '_> {
@@ -1527,6 +1550,7 @@ pub fn prepare_table_write_node_encode<'node, 'namespace, 'loan, 'source, 'contr
     source_retained_bytes: usize,
     limits: TableWriteNodeProjectionLimits,
 ) -> Result<PreparedTableWriteNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let r = prepare_encode(
         input,
@@ -1552,7 +1576,7 @@ pub struct PreparedTableWriteNodeDecode<'node, 'namespace, 'loan, 'wire, 'contro
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     aggregates: &'namespace MaterializedAggregateBindings<'namespace, 'loan, 'wire>,
     source: usize,
-    limits: TableWriteNodeProjectionLimits,
+    limits: TableWriteNodeProjectionLimits<Option<NodeProjectionLimits>>,
     facts: TableWriteNodeProjectionFacts,
 }
 impl PreparedTableWriteNodeDecode<'_, '_, '_, '_, '_> {
@@ -1581,6 +1605,7 @@ pub fn prepare_table_write_node_decode<'node, 'namespace, 'loan, 'wire, 'control
     source_retained_bytes: usize,
     limits: TableWriteNodeProjectionLimits,
 ) -> Result<PreparedTableWriteNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let mut w = CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let r = prepare_decode(
         input,
@@ -1608,6 +1633,7 @@ pub fn encode_table_write_node(
     source_retained_bytes: usize,
     limits: TableWriteNodeProjectionLimits,
 ) -> Result<(wire::PhysicalNode, TableWriteNodeProjectionFacts), Error> {
+    let limits = limits.capture_node_profile();
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let r = (|| {
         let facts = prepare_encode(
@@ -1639,6 +1665,7 @@ pub fn decode_table_write_node(
     source_retained_bytes: usize,
     limits: TableWriteNodeProjectionLimits,
 ) -> Result<(p::PhysicalNode, TableWriteNodeProjectionFacts), Error> {
+    let limits = limits.capture_node_profile();
     let mut w = CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let r = (|| {
         let facts = prepare_decode(
@@ -1670,10 +1697,11 @@ pub fn prepare_table_write_node_encode_in<'node, 'namespace, 'loan, 'source, 'co
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     type_ids: TableWriteTypeIds<'node>,
     source: usize,
-    limits: TableWriteNodeProjectionLimits,
+    limits: TableWriteNodeProjectionLimits<impl Into<Option<NodeProjectionLimits>>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedTableWriteNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let facts = prepare_encode_core(
         input,
         values,
@@ -1698,10 +1726,11 @@ pub fn prepare_table_write_node_decode_in<'node, 'namespace, 'loan, 'wire, 'cont
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     aggregates: &'namespace MaterializedAggregateBindings<'namespace, 'loan, 'wire>,
     source: usize,
-    limits: TableWriteNodeProjectionLimits,
+    limits: TableWriteNodeProjectionLimits<impl Into<Option<NodeProjectionLimits>>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedTableWriteNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let facts = prepare_decode_core(
         input,
         expressions,
