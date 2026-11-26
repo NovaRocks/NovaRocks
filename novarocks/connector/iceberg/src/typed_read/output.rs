@@ -268,7 +268,7 @@ impl OutputCursor {
         }
         .map_err(value_failure)?;
         let rows = prefix.rows();
-        let output_reservation = self
+        let mut output_reservation = self
             .page_resources
             .as_ref()
             .map(|resources| {
@@ -279,21 +279,26 @@ impl OutputCursor {
                 let bytes = u64::try_from(prefix.new_column_bytes())
                     .ok()
                     .and_then(|bytes| bytes.checked_add(self.source_array_bytes))
-                    .ok_or_else(|| {
-                        ConnectorError::new(
-                            ConnectorErrorKind::ResourceExhausted,
-                            "Iceberg output charge is out of range",
-                        )
-                    })?;
+                    .ok_or_else(output_charge_out_of_range)?;
                 (bytes != 0)
                     .then(|| resources.try_reserve(ConnectorResourceClass::ReaderOutput, bytes))
                     .transpose()
             })
             .transpose()?
             .flatten();
+        let mut observed_bytes = self.source_array_bytes;
         let columns = prefix
             .build_observed(
-                &mut |_| context.check_active().map_err(map_file_error),
+                &mut |layout| {
+                    context.check_active().map_err(map_file_error)?;
+                    if let Some(reservation) = &mut output_reservation {
+                        observed_bytes = observed_bytes
+                            .checked_add(layout.pad_to_align().size() as u64)
+                            .ok_or_else(output_charge_out_of_range)?;
+                        reservation.try_grow(observed_bytes.saturating_sub(reservation.bytes()))?;
+                    }
+                    Ok(())
+                },
                 &mut work,
             )
             .map_err(value_failure)?;
@@ -318,12 +323,23 @@ impl OutputCursor {
         } else {
             columns
         };
-        let page = match output_reservation {
-            Some(reservation) => {
-                let bytes = columns
-                    .iter()
-                    .map(|column| column.get_array_memory_size() as u64)
-                    .sum();
+        let output_bytes = output_reservation
+            .as_mut()
+            .map(|reservation| {
+                // The prefix estimate excludes wrappers. Settle the exact
+                // retained Arrow capacity, including the final temporal carrier,
+                // before transferring custody to the page.
+                let bytes = columns.iter().try_fold(0_u64, |bytes, column| {
+                    bytes
+                        .checked_add(column.get_array_memory_size() as u64)
+                        .ok_or_else(output_charge_out_of_range)
+                })?;
+                reservation.try_grow(bytes.saturating_sub(reservation.bytes()))?;
+                Ok::<_, ConnectorError>(bytes)
+            })
+            .transpose()?;
+        let page = match output_reservation.zip(output_bytes) {
+            Some((reservation, bytes)) => {
                 SourcePage::try_new_accounted(rows, columns, reservation.into_output(bytes)?)?
             }
             None => SourcePage::try_new(rows, columns)?,
@@ -341,6 +357,13 @@ fn value_failure(failure: ValueFailure<ConnectorError>) -> ConnectorError {
         ValueFailure::Caller(error) => error,
         ValueFailure::Value(error) => value_error(error),
     }
+}
+
+fn output_charge_out_of_range() -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::ResourceExhausted,
+        "Iceberg output charge is out of range",
+    )
 }
 
 fn value_error(error: ValueError) -> ConnectorError {
