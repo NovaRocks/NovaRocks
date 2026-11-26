@@ -454,6 +454,13 @@ fn extract_preserves_field_domain_binding_and_interval_capability() {
         ("day_of_year(DATE '2024-03-01')", 61),
         ("hour(TIME '13:54:11')", 13),
         ("EXTRACT(TIMEZONE_MINUTE FROM TIME '02:00:00-03:45')", -45),
+        ("year(INTERVAL '25' MONTH)", 2),
+        ("hour(INTERVAL '36' HOUR)", 36),
+        ("EXTRACT(HOUR FROM INTERVAL '36' HOUR)", 36),
+        (
+            "EXTRACT(SECOND FROM INTERVAL '-0 23:59:59.999999999999' DAY TO SECOND(12))",
+            -59,
+        ),
         (
             "EXTRACT(MONTH FROM TIMESTAMP '2024-03-01 00:15:00+13:00')",
             3,
@@ -470,6 +477,7 @@ fn extract_preserves_field_domain_binding_and_interval_capability() {
     }
     for sql in [
         "EXTRACT(HOUR FROM DATE '2024-01-01')",
+        "EXTRACT(HOUR FROM INTERVAL '1500' MINUTE)",
         "EXTRACT(YEAR FROM INTERVAL '25' MONTH)",
         "EXTRACT(DAY_OF_MONTH FROM INTERVAL '1' DAY)",
     ] {
@@ -485,19 +493,16 @@ fn extract_preserves_field_domain_binding_and_interval_capability() {
         );
     }
     for sql in [
-        "year(INTERVAL '25' MONTH)",
+        "hour(INTERVAL '36' HOUR)",
         "EXTRACT(HOUR FROM INTERVAL '36' HOUR)",
     ] {
+        let typed = compile(sql, &[], &context);
         assert!(
-            matches!(
-                type_expression_text(sql, &[], &context, &HarnessControl),
-                Err(TextError::Typing {
-                    cause: TypingError::Binding(
-                        novarocks_functions::FunctionBindingError::UnavailableImplementation(_)
-                    ),
-                    ..
-                })
-            ),
+            typed.unit().definitions().iter().any(|definition| matches!(
+                &definition.kind,
+                ExprKind::FunctionCall { function, .. }
+                    if function.overload.as_str() == "builtin.scalar/hour/interval_day_time/v1"
+            )),
             "{sql}"
         );
     }
