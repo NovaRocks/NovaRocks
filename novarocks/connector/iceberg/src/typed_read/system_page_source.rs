@@ -714,10 +714,11 @@ mod entry_columns;
 mod entry_pages;
 mod entry_view;
 mod schema_author;
+pub(crate) use schema_author::{
+    output_columns, publish_read_schema_from_facts, row as metadata_row_value, value_for_primitive,
+};
 #[cfg(test)]
-pub(crate) use schema_author::publish_read_schema;
-pub(crate) use schema_author::{output_columns, row as metadata_row_value, value_for_primitive};
-pub(crate) use schema_author::{publish_read_schema_from_facts, publish_read_schema_with_metadata};
+pub(crate) use schema_author::{publish_read_schema, publish_read_schema_with_metadata};
 
 // ---------------------------------------------------------------------------
 // Frozen-metadata I/O

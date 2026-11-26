@@ -747,6 +747,7 @@ pub(crate) fn publish_read_schema(
 }
 
 /// The production author borrows the complete metadata generation.
+#[cfg(test)]
 pub(crate) fn publish_read_schema_with_metadata(
     kind: IcebergSystemTableType,
     requested: &[&IcebergColumnHandle],
