@@ -147,7 +147,14 @@ fn bytes<T>(n: usize) -> Result<usize, Error> {
         .map(|layout| layout.size())
         .map_err(|_| invalid("value allocation layout is unrepresentable"))
 }
-fn cap(n: usize, max: usize, w: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
+fn cap(
+    n: usize,
+    max: impl Into<Option<usize>>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<(), Error> {
+    let Some(max) = max.into() else {
+        return Ok(());
+    };
     let admitted = n <= max;
     w.step()?;
     if admitted {
@@ -249,17 +256,18 @@ impl Model {
         &self,
         n: usize,
         source: usize,
-        l: ValueProjectionLimits,
+        l: Option<ValueProjectionLimits>,
     ) -> Result<ValueProjectionFacts, Error> {
         let coexist = add(source, self.bytes)?;
         let work = add(self.work, add(mul(self.bytes, 4)?, self.requests)?)?;
-        if n > l.max_definitions
-            || self.references > l.max_origin_references
-            || self.requests > l.max_allocation_requests
-            || self.bytes > l.max_allocation_request_bytes
-            || coexist > l.max_coexisting_source_and_request_bytes
-            || work > l.max_work
-        {
+        if l.is_some_and(|l| {
+            n > l.max_definitions
+                || self.references > l.max_origin_references
+                || self.requests > l.max_allocation_requests
+                || self.bytes > l.max_allocation_request_bytes
+                || coexist > l.max_coexisting_source_and_request_bytes
+                || work > l.max_work
+        }) {
             return Err(CompileControlError::ResourceExhausted.into());
         }
         Ok(ValueProjectionFacts {
@@ -275,16 +283,20 @@ impl Model {
         &self,
         n: usize,
         source: usize,
-        l: ValueProjectionLimits,
+        l: Option<ValueProjectionLimits>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<ValueProjectionFacts, Error> {
-        cap(self.references, l.max_origin_references, w)?;
-        cap(self.requests, l.max_allocation_requests, w)?;
-        cap(self.bytes, l.max_allocation_request_bytes, w)?;
+        cap(self.references, l.map(|l| l.max_origin_references), w)?;
+        cap(self.requests, l.map(|l| l.max_allocation_requests), w)?;
+        cap(self.bytes, l.map(|l| l.max_allocation_request_bytes), w)?;
         let coexist = add(source, self.bytes)?;
-        cap(coexist, l.max_coexisting_source_and_request_bytes, w)?;
+        cap(
+            coexist,
+            l.map(|l| l.max_coexisting_source_and_request_bytes),
+            w,
+        )?;
         let work = add(self.work, add(mul(self.bytes, 4)?, self.requests)?)?;
-        cap(work, l.max_work, w)?;
+        cap(work, l.map(|l| l.max_work), w)?;
         Ok(ValueProjectionFacts {
             definition_count: n,
             origin_reference_count: self.references,
@@ -317,7 +329,7 @@ impl Admission<'_, '_> {
         model: &Model,
         n: usize,
         source: usize,
-        limits: ValueProjectionLimits,
+        limits: Option<ValueProjectionLimits>,
     ) -> Result<(), Error> {
         if self.observed() {
             let facts = self.numeric(model.numerical_facts(n, source, limits))?;
@@ -334,7 +346,7 @@ impl Admission<'_, '_> {
         previous: &mut Option<ValueOriginProjectionFacts>,
         n: usize,
         source: usize,
-        limits: ValueProjectionLimits,
+        limits: Option<ValueProjectionLimits>,
     ) -> Result<(), CompileControlError> {
         let delta = |next: usize, previous: usize| {
             next.checked_sub(previous)
@@ -388,7 +400,7 @@ impl Admission<'_, '_> {
         model: &Model,
         n: usize,
         source: usize,
-        limits: ValueProjectionLimits,
+        limits: Option<ValueProjectionLimits>,
     ) -> Result<(), CompileControlError> {
         match self.gate(model, n, source, limits) {
             Ok(()) => Ok(()),
@@ -401,7 +413,7 @@ impl Admission<'_, '_> {
         model: &Model,
         n: usize,
         source: usize,
-        limits: ValueProjectionLimits,
+        limits: Option<ValueProjectionLimits>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<ValueProjectionFacts, Error> {
         self.gate(model, n, source, limits)?;
@@ -685,7 +697,7 @@ pub fn encode_values<'loan, 'source, 'control>(
         payloads,
         types,
         source,
-        limits,
+        Some(limits),
         &mut Admission { parent: None },
         &mut w,
     );
@@ -693,13 +705,14 @@ pub fn encode_values<'loan, 'source, 'control>(
 }
 /// Project the original Value sources on the caller's exact payload meter.
 /// The caller owns entry/footer and the truthful union source invoice. Prefix
-/// facts replace this child's prior contribution; they are not allocation grants.
+/// facts replace this child's prior contribution. Passing None derives
+/// requests and work from the exact value, type and payload sources.
 pub fn encode_values_observed_in<'loan, 'source, 'control>(
     inputs: &'loan [ValueSource<'source>],
     payloads: &'loan EncodedConnectorPayloads<'source, 'control>,
     types: &'loan EncodedTypeTable<'source>,
     source: usize,
-    limits: ValueProjectionLimits,
+    limits: impl Into<Option<ValueProjectionLimits>>,
     admit: &mut ParentAdmission<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedValues<'loan, 'source, 'control>, Error> {
@@ -708,7 +721,7 @@ pub fn encode_values_observed_in<'loan, 'source, 'control>(
         payloads,
         types,
         source,
-        limits,
+        limits.into(),
         &mut Admission {
             parent: Some(admit),
         },
@@ -721,16 +734,16 @@ fn encode_core<'loan, 'source, 'control>(
     payloads: &'loan EncodedConnectorPayloads<'source, 'control>,
     types: &'loan EncodedTypeTable<'source>,
     source: usize,
-    l: ValueProjectionLimits,
+    l: Option<ValueProjectionLimits>,
     admission: &mut Admission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedValues<'loan, 'source, 'control>, Error> {
     same_control(payloads.original_control(), w)?;
-    if admission.observed() && inputs.len() > l.max_definitions {
+    if admission.observed() && l.is_some_and(|l| inputs.len() > l.max_definitions) {
         return Err(CompileControlError::ResourceExhausted.into());
     }
     if !admission.observed() {
-        cap(inputs.len(), l.max_definitions, w)?;
+        cap(inputs.len(), l.map(|l| l.max_definitions), w)?;
     }
     let root = admission.numeric(bytes::<ValueSource<'_>>(inputs.len()))?;
     let mut model = Model::default();
@@ -759,9 +772,9 @@ fn encode_core<'loan, 'source, 'control>(
         if source < payload_header {
             return Err(invalid("value source invoice omits original backing"));
         }
-        cap(inputs.len(), l.max_definitions, w)?;
+        cap(inputs.len(), l.map(|l| l.max_definitions), w)?;
     }
-    cap(model.work, l.max_work, w)?;
+    cap(model.work, l.map(|l| l.max_work), w)?;
     floor(source, root, w)?;
     floor(source, payloads.retained_floor_observed(w)?, w)?;
     let mut individual = 0usize;
@@ -786,13 +799,17 @@ fn encode_core<'loan, 'source, 'control>(
         let bound = types
             .value_type_observed(input.value_type_id, w)?
             .ok_or_else(|| invalid("value type ID is unknown"))?;
-        let remaining = l.max_work.checked_sub(model.work).ok_or_else(|| {
-            if admission.observed() {
-                CompileControlError::ResourceExhausted.into()
-            } else {
-                invalid("value work envelope exhausted")
-            }
-        })?;
+        let remaining = l
+            .map(|l| {
+                l.max_work.checked_sub(model.work).ok_or_else(|| {
+                    if admission.observed() {
+                        CompileControlError::ResourceExhausted.into()
+                    } else {
+                        invalid("value work envelope exhausted")
+                    }
+                })
+            })
+            .transpose()?;
         let checked = if admission.observed() {
             let base = model.work;
             verify_type_binding_admitted::<Error>(
@@ -820,7 +837,7 @@ fn encode_core<'loan, 'source, 'control>(
                 &original.origin,
                 payloads,
                 source,
-                l.origins,
+                l.map(|l| l.origins),
                 &mut |facts| {
                     admission.origin_prefix(
                         &mut model,
@@ -838,12 +855,12 @@ fn encode_core<'loan, 'source, 'control>(
                 &original.origin,
                 payloads,
                 source,
-                l.origins,
+                l.map(|l| l.origins),
                 w,
             )?)?;
         }
         admission.gate(&model, inputs.len(), source, l)?;
-        cap(model.work, l.max_work, w)?;
+        cap(model.work, l.map(|l| l.max_work), w)?;
         w.step()?;
     }
     let facts = admission.complete(&model, inputs.len(), source, l, w)?;
@@ -855,12 +872,18 @@ fn encode_core<'loan, 'source, 'control>(
                 &input.source.origin,
                 payloads,
                 source,
-                l.origins,
+                l.map(|l| l.origins),
                 &mut |_| admission.gate_control(&model, inputs.len(), source, l),
                 w,
             )?
         } else {
-            origins::encode_observed(&input.source.origin, payloads, source, l.origins, w)?
+            origins::encode_observed(
+                &input.source.origin,
+                payloads,
+                source,
+                l.map(|l| l.origins),
+                w,
+            )?
         };
         output.push(wire::ValueDefinition {
             id: input.source.id.get(),
@@ -892,20 +915,21 @@ pub fn decode_values<'loan, 'wire, 'control>(
         payloads,
         types,
         source,
-        limits,
+        Some(limits),
         &mut Admission { parent: None },
         &mut w,
     );
     finish(result, w)
 }
 /// Materialize through the original type/origin owners without a private scope.
-/// This namespace is not a certified Fragment or Package.
+/// Passing None derives requests and work from the exact received value,
+/// type and payload namespaces. Full Fragment validation remains separate.
 pub fn decode_values_observed_in<'loan, 'wire, 'control>(
     defs: &'wire [wire::ValueDefinition],
     payloads: &'loan DecodedConnectorPayloads<'wire, 'control>,
     types: &'loan DecodedTypeTable,
     source: usize,
-    limits: ValueProjectionLimits,
+    limits: impl Into<Option<ValueProjectionLimits>>,
     admit: &mut ParentAdmission<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedValues<'loan, 'wire, 'control>, Error> {
@@ -914,7 +938,7 @@ pub fn decode_values_observed_in<'loan, 'wire, 'control>(
         payloads,
         types,
         source,
-        limits,
+        limits.into(),
         &mut Admission {
             parent: Some(admit),
         },
@@ -927,16 +951,16 @@ fn decode_core<'loan, 'wire, 'control>(
     payloads: &'loan DecodedConnectorPayloads<'wire, 'control>,
     types: &'loan DecodedTypeTable,
     source: usize,
-    l: ValueProjectionLimits,
+    l: Option<ValueProjectionLimits>,
     admission: &mut Admission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedValues<'loan, 'wire, 'control>, Error> {
     same_control(payloads.original_control(), w)?;
-    if admission.observed() && defs.len() > l.max_definitions {
+    if admission.observed() && l.is_some_and(|l| defs.len() > l.max_definitions) {
         return Err(CompileControlError::ResourceExhausted.into());
     }
     if !admission.observed() {
-        cap(defs.len(), l.max_definitions, w)?;
+        cap(defs.len(), l.map(|l| l.max_definitions), w)?;
     }
     let mut model = Model::default();
     admission.numeric(model.request(admission.numeric(bytes::<usize>(defs.len()))?))?;
@@ -967,9 +991,9 @@ fn decode_core<'loan, 'wire, 'control>(
         if source < payload_header {
             return Err(invalid("value source invoice omits original backing"));
         }
-        cap(defs.len(), l.max_definitions, w)?;
+        cap(defs.len(), l.map(|l| l.max_definitions), w)?;
     }
-    cap(model.work, l.max_work, w)?;
+    cap(model.work, l.map(|l| l.max_work), w)?;
     floor(source, bytes::<wire::ValueDefinition>(defs.len())?, w)?;
     floor(source, payloads.retained_floor_observed(w)?, w)?;
     for def in defs {
@@ -1013,7 +1037,7 @@ fn decode_core<'loan, 'wire, 'control>(
                 original,
                 payloads,
                 source,
-                l.origins,
+                l.map(|l| l.origins),
                 &mut |facts| {
                     admission.origin_prefix(&mut model, facts, &mut previous, defs.len(), source, l)
                 },
@@ -1024,12 +1048,12 @@ fn decode_core<'loan, 'wire, 'control>(
                 origin(def, w)?,
                 payloads,
                 source,
-                l.origins,
+                l.map(|l| l.origins),
                 w,
             )?)?;
         }
         admission.gate(&model, defs.len(), source, l)?;
-        cap(model.work, l.max_work, w)?;
+        cap(model.work, l.map(|l| l.max_work), w)?;
         w.step()?;
     }
     let facts = admission.complete(&model, defs.len(), source, l, w)?;
@@ -1045,12 +1069,12 @@ fn decode_core<'loan, 'wire, 'control>(
                 origin(def, w)?,
                 payloads,
                 source,
-                l.origins,
+                l.map(|l| l.origins),
                 &mut |_| admission.gate_control(&model, defs.len(), source, l),
                 w,
             )?
         } else {
-            origins::decode_observed(origin(def, w)?, payloads, source, l.origins, w)?
+            origins::decode_observed(origin(def, w)?, payloads, source, l.map(|l| l.origins), w)?
         };
         output.push(p::ValueDef {
             id: p::ValueId::new(def.id),

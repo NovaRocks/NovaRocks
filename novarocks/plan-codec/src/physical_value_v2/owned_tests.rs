@@ -129,6 +129,12 @@ fn fixture(
 
 #[test]
 fn observed_values_preserve_sparse_original_namespaces_and_independent_request_layout() {
+    for caps in [Some(limits()), None] {
+        check_original_value_namespace_geometry(caps);
+    }
+}
+
+fn check_original_value_namespace_geometry(caps: Option<ValueProjectionLimits>) {
     fixture(
         |control, value, inputs, payloads, decoded_payloads, types, decoded_types| {
             control.arm(None);
@@ -139,7 +145,7 @@ fn observed_values_preserve_sparse_original_namespaces_and_independent_request_l
                 payloads,
                 types,
                 SOURCE,
-                limits(),
+                caps,
                 &mut |f| {
                     prefixes.push(*f);
                     Ok(())
@@ -180,7 +186,7 @@ fn observed_values_preserve_sparse_original_namespaces_and_independent_request_l
                 decoded_payloads,
                 decoded_types,
                 SOURCE,
-                limits(),
+                caps,
                 &mut |f| {
                     prefixes.push(*f);
                     Ok(())
