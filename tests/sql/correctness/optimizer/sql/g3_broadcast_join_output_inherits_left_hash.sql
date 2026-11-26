@@ -39,7 +39,7 @@ ANALYZE ${case_db}.g3_bj_small;
 -- Window keyed on a.k must add a ShuffleAgg HASH EXCHANGE above the
 -- Broadcast output instead of reusing the ShuffleJoin source directly.
 EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
-SELECT a.k, a.v, b.w, ROW_NUMBER() OVER (PARTITION BY a.k ORDER BY a.v) AS rn
+SELECT a.k, a.v, b.w, ROW_NUMBER() OVER (PARTITION BY a.k ORDER BY a.v NULLS FIRST) AS rn
 FROM ${case_db}.g3_bj_left  a
 INNER JOIN ${case_db}.g3_bj_right b ON a.k = b.k
 INNER JOIN ${case_db}.g3_bj_small s ON a.k = s.s;

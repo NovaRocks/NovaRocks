@@ -38,7 +38,7 @@ ANALYZE ${case_db}.g3_ro_left;
 ANALYZE ${case_db}.date_dim;
 SET SESSION disable_optimizer_rules = 'JoinCommutativity';
 EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
-SELECT a.k, b.w, ROW_NUMBER() OVER (PARTITION BY a.k ORDER BY a.v) AS rn
+SELECT a.k, b.w, ROW_NUMBER() OVER (PARTITION BY a.k ORDER BY a.v NULLS FIRST) AS rn
 FROM ${case_db}.g3_ro_left a
 RIGHT OUTER JOIN ${case_db}.date_dim b ON a.k = b.k;
 SET SESSION disable_optimizer_rules = '';
