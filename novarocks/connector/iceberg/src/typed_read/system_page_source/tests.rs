@@ -2519,6 +2519,8 @@ fn every_single_backend_stream_emits_what_its_page_source_emits() {
 
 #[test]
 fn a_files_split_stream_reads_nothing_until_polled_then_reads_its_one_manifest() {
+    use futures::StreamExt as _;
+
     let (runtime, binding, mut context) = runtime_and_binding();
     let dir = tempfile::tempdir().expect("tempdir");
     let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
