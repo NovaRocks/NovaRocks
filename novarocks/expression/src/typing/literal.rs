@@ -375,3 +375,105 @@ fn infer_decimal_literal_type(s: &str) -> Result<DataType, TypingError> {
     let scale = scale as i8;
     Ok(DataType::Decimal128(precision, scale))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typing::TypingContext;
+    use novarocks_type_contract::{DecimalOverflowPolicy, PureCompileControl};
+
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn json_literal_types_past_the_retired_parser_scratch_limit() {
+        use std::cell::Cell;
+
+        struct Scratch<'a> {
+            current: &'a Cell<usize>,
+            bytes: usize,
+        }
+        impl Drop for Scratch<'_> {
+            fn drop(&mut self) {
+                self.current.set(self.current.get() - self.bytes);
+            }
+        }
+
+        struct LegacyScratch<'a>(&'a Cell<usize>);
+        impl<'a> JsonWork for LegacyScratch<'a> {
+            type Reservation = Scratch<'a>;
+
+            fn step(&mut self) -> Result<(), KernelFailure> {
+                Ok(())
+            }
+
+            fn reserve(&mut self, bytes: usize) -> Result<Self::Reservation, KernelFailure> {
+                let next = self
+                    .0
+                    .get()
+                    .checked_add(bytes)
+                    .filter(|&next| next <= 32 << 20)
+                    .ok_or(KernelFailure::ResourceExhausted)?;
+                self.0.set(next);
+                Ok(Scratch {
+                    current: self.0,
+                    bytes,
+                })
+            }
+
+            fn reserve_output(&mut self, _: usize) -> Result<(), KernelFailure> {
+                Ok(())
+            }
+        }
+
+        let content = format!("[{}[]]", "[],".repeat(262_143));
+        assert_eq!(content.len(), 786_433);
+        let current = Cell::new(0);
+        let mut old = LegacyScratch(&current);
+        assert!(matches!(
+            json_value::parse(&content, &mut old),
+            Err(JsonError::Host(KernelFailure::ResourceExhausted))
+        ));
+        assert_eq!(current.get(), 0);
+
+        let catalog =
+            novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
+                .unwrap();
+        let context = TypingContext {
+            catalog: &catalog,
+            constant_policy: ConstantValidation::INPUT_DERIVED,
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+        };
+        let mut compile =
+            CompileCheckpoints::try_new(&Control, CompilePhase::FunctionSpecialization).unwrap();
+        let LiteralEmission::Constant { value_type, value } = type_literal(
+            &context,
+            LiteralSyntax::TypedString {
+                name: "JSON",
+                value: &content,
+            },
+            &mut compile,
+        )
+        .unwrap() else {
+            panic!("typed JSON retains its original constant")
+        };
+        assert_eq!(value_type.logical_type(), ValueLogicalType::Json);
+        assert_eq!(value_type.data_type(), &DataType::LargeBinary);
+        let bytes = value.try_binary().unwrap().unwrap();
+        assert_eq!(
+            json_value::format(
+                bytes,
+                &mut LiteralJsonWork {
+                    compile: &mut compile
+                }
+            )
+            .unwrap(),
+            content
+        );
+        compile.finish().unwrap();
+    }
+}
