@@ -20,7 +20,7 @@
 //! inline window state, so its OVER form is refused by name.
 
 use super::aggregate_extrema_dispatch::{ExtremaState, PreparedExtrema};
-use super::aggregate_extrema_utf8::Utf8ExtremaKernel;
+use super::aggregate_extrema_utf8::BytesExtremaKernel;
 use super::aggregate_window_adapter::InlineAggregateWindowKernel;
 use super::{
     aggregate_extrema::{ExtremaKernel, ExtremaOperation, supported_type},
@@ -159,9 +159,16 @@ impl ExtremaOwner {
         }
     }
 }
-fn has_inline_window_state(selected: &FunctionBindingSelection) -> bool {
-    !matches!(selected.argument_types.first(),
-        Some(FunctionArgumentType::Value(source)) if source.data_type() == &DataType::Utf8)
+fn unsupported_window_input(selected: &FunctionBindingSelection) -> Option<&'static str> {
+    let Some(FunctionArgumentType::Value(source)) = selected.argument_types.first() else {
+        return None;
+    };
+    match (source.data_type(), source.logical_type()) {
+        (DataType::Utf8, _) => Some("MIN/MAX OVER a UTF-8 value has no inline window state"),
+        (DataType::Binary, _) => Some("MIN/MAX OVER a VARBINARY value has no inline window state"),
+        (_, ValueLogicalType::Uuid) => Some("MIN/MAX OVER a UUID value is unsupported"),
+        _ => None,
+    }
 }
 
 impl InlineAggregateWindowKernel for PreparedExtrema {
@@ -182,13 +189,11 @@ impl PureAggregateWindowImplementation for ExtremaOwner {
         contract: Arc<WindowCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure> {
-        if !has_inline_window_state(contract.call().selected()) {
+        if let Some(message) = unsupported_window_input(contract.call().selected()) {
             control
                 .checkpoint(CompilePhase::FunctionSpecialization, 0)
                 .map_err(compile_failure)?;
-            return Err(invalid(
-                "MIN/MAX OVER a UTF-8 value has no inline window state",
-            ));
+            return Err(invalid(message));
         }
         super::aggregate_window_adapter::prepare(aggregate, contract, control)
     }
@@ -286,7 +291,7 @@ impl PureFunctionMetadataOwner for ExtremaOwner {
                 "MIN/MAX window admission requires one exact value channel".into(),
             ));
         }
-        let supported = has_inline_window_state(selected);
+        let supported = unsupported_window_input(selected).is_none();
         work.finish()?;
         if supported {
             Ok(())
@@ -466,17 +471,19 @@ impl ExtremaOwner {
                 return Err(invalid("MIN/MAX requires its selected value channel"));
             };
             let temporal = source.value_type().temporal();
+            let variable_width = matches!(source.data_type(), DataType::Utf8 | DataType::Binary);
             let supported = temporal.is_some()
-                || ((supported_type(source.data_type()) || source.data_type() == &DataType::Utf8)
-                    && match source.logical_type() {
-                        ValueLogicalType::LargeInt => {
-                            source.data_type() == &DataType::FixedSizeBinary(16)
-                        }
-                        ValueLogicalType::Physical => {
-                            source.data_type() != &DataType::FixedSizeBinary(16)
-                        }
-                        _ => false,
-                    });
+                || match source.logical_type() {
+                    ValueLogicalType::LargeInt | ValueLogicalType::Uuid => {
+                        source.data_type() == &DataType::FixedSizeBinary(16)
+                    }
+                    ValueLogicalType::Physical => {
+                        variable_width
+                            || (supported_type(source.data_type())
+                                && source.data_type() != &DataType::FixedSizeBinary(16))
+                    }
+                    _ => false,
+                };
             work.step().map_err(compile_failure)?;
             if !supported {
                 return Err(invalid(
@@ -514,8 +521,8 @@ impl ExtremaOwner {
                 ));
             }
             work.flush().map_err(compile_failure)?;
-            let prepared = if source.data_type() == &DataType::Utf8 {
-                PreparedExtrema::Utf8(Utf8ExtremaKernel {
+            let prepared = if variable_width {
+                PreparedExtrema::Bytes(BytesExtremaKernel {
                     contract,
                     operation: self.operation,
                 })

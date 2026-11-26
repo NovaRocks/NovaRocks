@@ -963,6 +963,264 @@ fn aggregate_extrema_split_phases_distinct_idempotence_and_unsupported_options()
 struct Storage([MaybeUninit<u8>; size_of::<InstalledExtremaState>()]);
 
 #[test]
+fn aggregate_extrema_uuid_and_varbinary_keep_unsigned_order_across_all_phases() {
+    use arrow_array::{BinaryArray, builder::FixedSizeBinaryBuilder};
+
+    let mut low_uuid = [0xff; 16];
+    low_uuid[0] = 0x7f;
+    let mut middle_uuid = [0; 16];
+    middle_uuid[0] = 0x80;
+    let mut high_uuid = [0xff; 16];
+    high_uuid[0] = 0x80;
+    let zero_uuid = [0; 16];
+    // The middle VARBINARY is a strict prefix of the high value. The high
+    // value also crosses the old (irrelevant here) one-MiB copy threshold.
+    let mut high_binary = vec![0xff; (1 << 20) + 11];
+    high_binary[0] = 0x80;
+
+    let uuid_type = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::Uuid,
+    )
+    .unwrap();
+    for (source_type, [low, middle, high, extra]) in [
+        (
+            uuid_type,
+            [
+                low_uuid.as_slice(),
+                middle_uuid.as_slice(),
+                high_uuid.as_slice(),
+                zero_uuid.as_slice(),
+            ],
+        ),
+        (
+            FunctionValueType::new(DataType::Binary, true),
+            [b"\x7f\xff", b"\x80", high_binary.as_slice(), b""],
+        ),
+    ] {
+        let uuid = source_type.logical_type() == ValueLogicalType::Uuid;
+        let values = [
+            Some(middle),
+            None,
+            Some(low),
+            Some(high),
+            Some(middle),
+            None,
+            Some(extra),
+        ];
+        let input: ArrayRef = if uuid {
+            let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), 16);
+            for value in values {
+                if let Some(value) = value {
+                    builder.append_value(value).unwrap();
+                } else {
+                    builder.append_null();
+                }
+            }
+            Arc::new(builder.finish())
+        } else {
+            Arc::new(BinaryArray::from(values.to_vec()))
+        };
+        let read = |output: &ArrayRef, expected: &[Option<&[u8]>]| {
+            assert_eq!(output.data_type(), source_type.data_type());
+            assert_eq!(output.len(), expected.len());
+            for (row, expected) in expected.iter().enumerate() {
+                let actual = (!output.is_null(row)).then(|| {
+                    if uuid {
+                        output
+                            .as_any()
+                            .downcast_ref::<FixedSizeBinaryArray>()
+                            .unwrap()
+                            .value(row)
+                    } else {
+                        output
+                            .as_any()
+                            .downcast_ref::<BinaryArray>()
+                            .unwrap()
+                            .value(row)
+                    }
+                });
+                assert_eq!(actual, *expected, "result row {row}");
+            }
+        };
+        for (name, first, second, merged, final_value) in [
+            ("min", low, middle, low, extra),
+            ("max", middle, high, high, high),
+        ] {
+            let fixture = Fixture::new(
+                name,
+                source_type.clone(),
+                DecimalOverflowPolicy::ReportError,
+            );
+            let control = RuntimeControl::default();
+            let mut carried = None;
+            for phase in [
+                AggregateKernelPhase::Single,
+                AggregateKernelPhase::Partial,
+                AggregateKernelPhase::Intermediate,
+                AggregateKernelPhase::Final,
+            ] {
+                let prepared = fixture.prepare(phase, &CompileControl::default()).unwrap();
+                let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
+                    panic!("installed UUID/VARBINARY aggregate");
+                };
+                assert_eq!(handle.contract().intermediate_type(), &source_type);
+                assert_eq!(handle.contract().final_type(), &source_type);
+                if uuid {
+                    assert_eq!(
+                        handle.memory_policy(),
+                        AggregateStateMemoryPolicy::FixedZero
+                    );
+                } else {
+                    assert!(matches!(
+                        handle.memory_policy(),
+                        AggregateStateMemoryPolicy::BoundedRetained { .. }
+                    ));
+                }
+                let mut storage: [Storage; 5] = std::array::from_fn(|_| {
+                    Storage([MaybeUninit::uninit(); size_of::<InstalledExtremaState>()])
+                });
+                let mut states = storage
+                    .each_mut()
+                    .map(|item| handle.initialize_in(&mut item.0, &control).unwrap());
+                if phase.consumes_logical_arguments() {
+                    let args = [EvaluatedArgument::Column(&input)];
+                    let selected = SelectedAggregateUpdateInput::try_new(
+                        handle.contract(),
+                        Selection::all(values.len()),
+                        &args,
+                        &[],
+                        &control,
+                    )
+                    .unwrap();
+                    let groups = if phase == AggregateKernelPhase::Single {
+                        &[0; 7]
+                    } else {
+                        &[0, 0, 0, 1, 1, 2, 4]
+                    };
+                    handle
+                        .prepare_update_batch(&mut states, groups, selected, &control)
+                        .unwrap()
+                        .run(&control)
+                        .unwrap();
+                } else {
+                    let source: &ArrayRef = carried.as_ref().unwrap();
+                    let selected = SelectedAggregateMergeInput::try_new(
+                        handle.contract(),
+                        Selection::all(source.len()),
+                        EvaluatedArgument::Column(source),
+                        &control,
+                    )
+                    .unwrap();
+                    let groups: &[usize] = if phase == AggregateKernelPhase::Intermediate {
+                        &[0, 0, 1, 2, 3]
+                    } else {
+                        &[0, 1, 2, 0]
+                    };
+                    handle
+                        .prepare_merge_batch(&mut states, groups, selected, &control)
+                        .unwrap()
+                        .run(&control)
+                        .unwrap();
+                }
+                let expected: &[Option<&[u8]>] = match phase {
+                    AggregateKernelPhase::Single => &[Some(final_value), None],
+                    AggregateKernelPhase::Partial => {
+                        &[Some(first), Some(second), None, None, Some(extra)]
+                    }
+                    AggregateKernelPhase::Intermediate => &[Some(merged), None, None, Some(extra)],
+                    AggregateKernelPhase::Final => &[Some(final_value), None, None],
+                };
+                let groups: Vec<_> = (0..expected.len()).collect();
+                let output = handle
+                    .emit(&states, &groups, groups.len(), &control)
+                    .unwrap();
+                read(&output, expected);
+                if phase != AggregateKernelPhase::Single {
+                    carried = Some(output);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn aggregate_extrema_uuid_and_varbinary_do_not_expand_window_or_top_n() {
+    let control = CompileControl::default();
+    for source in [
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            true,
+            ValueLogicalType::Uuid,
+        )
+        .unwrap(),
+        FunctionValueType::new(DataType::Binary, true),
+    ] {
+        for name in ["min", "max"] {
+            let fixture = Fixture::new(name, source.clone(), DecimalOverflowPolicy::ReportError);
+            let declaration = fixture
+                .catalog
+                .metadata()
+                .pure_overload_declaration_observed(
+                    &fixture.id,
+                    FunctionKind::Aggregate,
+                    &fixture.selected.overload,
+                    &control,
+                )
+                .unwrap();
+            assert!(matches!(
+                declaration.admit_selected_lifecycle_observed(
+                    &fixture.selected,
+                    1,
+                    PureCallLifecycle::AggregateWindow,
+                    &control,
+                ),
+                Err(FunctionBindingError::UnavailableImplementation(overload))
+                    if overload == fixture.selected.overload
+            ));
+
+            let mut args = fixture.args.clone();
+            args.push(FunctionArgument::Value {
+                value_type: ty(false),
+                constant: None,
+            });
+            let request = FunctionBindingRequest {
+                arguments: &args,
+                logical_argument_count: args.len(),
+                expected_result_type: None,
+            };
+            let bound = fixture
+                .catalog
+                .metadata()
+                .resolve_bound_user(name, FunctionKind::Aggregate, request, &control)
+                .unwrap();
+            assert_eq!(
+                bound.selected.overload.as_str(),
+                format!("builtin.aggregate/{name}/top-n-v1")
+            );
+            let selected = Arc::new(bound.selected);
+            let uses = [Some(ExpressionUseId::new(1)), Some(ExpressionUseId::new(2))];
+            let mut input = fixture.input();
+            input.selected = &selected;
+            input.request = request;
+            input.argument_uses = crate::CallArgumentUses::SelectedChannels(&uses);
+            assert!(matches!(
+                fixture.catalog.prepare_fresh(
+                    input,
+                    selected.clone(),
+                    fixture.options(AggregateKernelPhase::Single),
+                    &control,
+                ),
+                Err(FunctionSpecializationFailure::Kernel(
+                    KernelFailure::InvalidProgram(_)
+                ))
+            ));
+        }
+    }
+}
+
+#[test]
 fn aggregate_extrema_temporal_partial_merge_keeps_the_actual_zoned_winner() {
     use novarocks_type_contract::{
         TemporalCarrier, TemporalMicros, TemporalPrecision, TimeZoneKey, ValueKind, ValueLayout,
@@ -1270,12 +1528,6 @@ fn aggregate_extrema_complete_source_binding_stale_domains_and_metadata_refuse()
         }
         for ty in [
             FunctionValueType::new(DataType::FixedSizeBinary(16), true),
-            FunctionValueType::try_with_logical_type(
-                DataType::FixedSizeBinary(16),
-                true,
-                ValueLogicalType::Uuid,
-            )
-            .unwrap(),
             FunctionValueType::from_legacy_declared_projection(
                 DataType::List(Arc::new(
                     Field::new("item", DataType::Int64, true).with_metadata(
@@ -1645,7 +1897,7 @@ fn installed_extrema_dispatch_borrowed_output_keeps_actual_prefix_and_typed_iter
 #[test]
 fn installed_extrema_dispatch_counts_actual_heap_and_refuses_a_foreign_private_state() {
     use crate::builtin::aggregate_extrema_dispatch::{ExtremaState, PreparedExtrema};
-    use crate::builtin::aggregate_extrema_utf8::Utf8ExtremaKernel;
+    use crate::builtin::aggregate_extrema_utf8::BytesExtremaKernel;
     let fixed = Fixture::new("min", ty(true), DecimalOverflowPolicy::ReportError);
     let kernel = PreparedExtrema::Fixed(fixed.kernel(AggregateKernelPhase::Single));
     let text = Fixture::new(
@@ -1653,11 +1905,11 @@ fn installed_extrema_dispatch_counts_actual_heap_and_refuses_a_foreign_private_s
         FunctionValueType::new(DataType::Utf8, true),
         DecimalOverflowPolicy::ReportError,
     );
-    let leaf = Utf8ExtremaKernel {
+    let leaf = BytesExtremaKernel {
         contract: text.kernel(AggregateKernelPhase::Single).contract,
         operation: ExtremaOperation::Min,
     };
-    let wrong = ExtremaState::Utf8(leaf.create_state(&RuntimeControl::default()).unwrap());
+    let wrong = ExtremaState::Bytes(leaf.create_state(&RuntimeControl::default()).unwrap());
     assert_eq!(
         kernel.retained_bytes(&wrong),
         0,
@@ -1695,7 +1947,7 @@ fn installed_extrema_dispatch_counts_actual_heap_and_refuses_a_foreign_private_s
         .prepare_update(input, &RuntimeControl::default())
         .unwrap();
     let baseline = RuntimeControl::default();
-    let mut state = ExtremaState::Utf8(leaf.create_state(&RuntimeControl::default()).unwrap());
+    let mut state = ExtremaState::Bytes(leaf.create_state(&RuntimeControl::default()).unwrap());
     assert!(matches!(
         kernel.update_row(&mut state, &prepared, 0, &baseline),
         Err(KernelFailure::InvalidProgram(_))
@@ -1704,7 +1956,7 @@ fn installed_extrema_dispatch_counts_actual_heap_and_refuses_a_foreign_private_s
     for at in 0..trace.len() {
         for cause in causes() {
             let mut state =
-                ExtremaState::Utf8(leaf.create_state(&RuntimeControl::default()).unwrap());
+                ExtremaState::Bytes(leaf.create_state(&RuntimeControl::default()).unwrap());
             let control = RuntimeControl {
                 trace: Mutex::default(),
                 refusal: Some((at, cause.clone())),

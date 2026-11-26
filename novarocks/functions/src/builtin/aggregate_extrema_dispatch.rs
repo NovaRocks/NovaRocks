@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! One installed MIN/MAX owner dispatches exact fixed and UTF-8 lifecycle kernels.
+//! One installed MIN/MAX owner dispatches exact fixed and variable-width lifecycle kernels.
 //! The enum is an implementation detail, not a second signature or state arena.
 
 use super::aggregate_extrema::{ExtremaKernel, ExtremaValue};
-use super::aggregate_extrema_utf8::{Utf8ExtremaKernel, Utf8ExtremaState};
+use super::aggregate_extrema_utf8::{BytesExtremaKernel, BytesExtremaState};
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
@@ -32,12 +32,12 @@ use std::{alloc::Layout, sync::Arc};
 #[derive(Debug)]
 pub(super) enum PreparedExtrema {
     Fixed(ExtremaKernel),
-    Utf8(Utf8ExtremaKernel),
+    Bytes(BytesExtremaKernel),
 }
 
 pub(super) enum ExtremaState {
     Fixed(Option<ExtremaValue>),
-    Utf8(Utf8ExtremaState),
+    Bytes(BytesExtremaState),
 }
 
 fn wrong_state(control: &dyn KernelEvaluationControl) -> Result<(), KernelFailure> {
@@ -116,7 +116,7 @@ impl PreparedAggregateKernel for PreparedExtrema {
                 contract,
                 operation: kernel.operation,
             }),
-            Self::Utf8(kernel) => Self::Utf8(Utf8ExtremaKernel {
+            Self::Bytes(kernel) => Self::Bytes(BytesExtremaKernel {
                 contract,
                 operation: kernel.operation,
             }),
@@ -128,13 +128,13 @@ impl PreparedAggregateKernel for PreparedExtrema {
     fn contract(&self) -> &Arc<AggregateCallContract> {
         match self {
             Self::Fixed(k) => k.contract(),
-            Self::Utf8(k) => k.contract(),
+            Self::Bytes(k) => k.contract(),
         }
     }
     fn memory_policy(&self) -> AggregateStateMemoryPolicy {
         match self {
             Self::Fixed(k) => k.memory_policy(),
-            Self::Utf8(k) => k.memory_policy(),
+            Self::Bytes(k) => k.memory_policy(),
         }
     }
     fn create_state(
@@ -143,7 +143,7 @@ impl PreparedAggregateKernel for PreparedExtrema {
     ) -> Result<Self::State, KernelFailure> {
         match self {
             Self::Fixed(k) => k.create_state(control).map(ExtremaState::Fixed),
-            Self::Utf8(k) => k.create_state(control).map(ExtremaState::Utf8),
+            Self::Bytes(k) => k.create_state(control).map(ExtremaState::Bytes),
         }
     }
     fn prepare_update<'a>(
@@ -153,7 +153,7 @@ impl PreparedAggregateKernel for PreparedExtrema {
     ) -> Result<Self::PreparedUpdateBatch<'a>, KernelFailure> {
         match self {
             Self::Fixed(k) => k.prepare_update(input, control),
-            Self::Utf8(k) => k.prepare_update(input, control),
+            Self::Bytes(k) => k.prepare_update(input, control),
         }
     }
     fn prepare_merge<'a>(
@@ -163,7 +163,7 @@ impl PreparedAggregateKernel for PreparedExtrema {
     ) -> Result<Self::PreparedMergeBatch<'a>, KernelFailure> {
         match self {
             Self::Fixed(k) => k.prepare_merge(input, control),
-            Self::Utf8(k) => k.prepare_merge(input, control),
+            Self::Bytes(k) => k.prepare_merge(input, control),
         }
     }
     fn update_row<'a>(
@@ -177,7 +177,7 @@ impl PreparedAggregateKernel for PreparedExtrema {
             (Self::Fixed(k), ExtremaState::Fixed(state)) => {
                 k.update_row(state, input, ordinal, control)
             }
-            (Self::Utf8(k), ExtremaState::Utf8(state)) => {
+            (Self::Bytes(k), ExtremaState::Bytes(state)) => {
                 k.update_row(state, input, ordinal, control)
             }
             _ => wrong_state(control),
@@ -194,7 +194,7 @@ impl PreparedAggregateKernel for PreparedExtrema {
             (Self::Fixed(k), ExtremaState::Fixed(state)) => {
                 k.merge_row(state, input, ordinal, control)
             }
-            (Self::Utf8(k), ExtremaState::Utf8(state)) => {
+            (Self::Bytes(k), ExtremaState::Bytes(state)) => {
                 k.merge_row(state, input, ordinal, control)
             }
             _ => wrong_state(control),
@@ -217,9 +217,9 @@ impl PreparedAggregateKernel for PreparedExtrema {
                 })?;
                 k.build_intermediate(states.into_iter(), control)
             }
-            Self::Utf8(k) => {
+            Self::Bytes(k) => {
                 let states = borrowed_states(states, control, |s| match s {
-                    ExtremaState::Utf8(s) => Some(s),
+                    ExtremaState::Bytes(s) => Some(s),
                     _ => None,
                 })?;
                 k.build_intermediate(states.into_iter(), control)
@@ -243,9 +243,9 @@ impl PreparedAggregateKernel for PreparedExtrema {
                 })?;
                 k.build_final(states.into_iter(), control)
             }
-            Self::Utf8(k) => {
+            Self::Bytes(k) => {
                 let states = borrowed_states(states, control, |s| match s {
-                    ExtremaState::Utf8(s) => Some(s),
+                    ExtremaState::Bytes(s) => Some(s),
                     _ => None,
                 })?;
                 k.build_final(states.into_iter(), control)
@@ -257,7 +257,7 @@ impl PreparedAggregateKernel for PreparedExtrema {
         // Mutation and emission explicitly reject a mismatched private state.
         match state {
             ExtremaState::Fixed(_) => 0,
-            ExtremaState::Utf8(state) => state.retained_bytes(),
+            ExtremaState::Bytes(state) => state.retained_bytes(),
         }
     }
 }
