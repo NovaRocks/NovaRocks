@@ -469,7 +469,12 @@ pub fn preflight_record_batch_with_profile<'a, W: GeometryWork + ?Sized>(
             Ok::<_, W::Error>((length(node.length())?, length(node.null_count())?))
         };
         for field in expected {
-            validate_field_nodes(field, Some(rows), &mut next, work)?;
+            validate_field_nodes(
+                field,
+                Some((rows, "recursive IPC root node length differs from batch")),
+                &mut next,
+                work,
+            )?;
         }
         require(
             nodes.next().is_none(),
@@ -490,6 +495,7 @@ pub fn preflight_record_batch_with_profile<'a, W: GeometryWork + ?Sized>(
             return Err(CompileControlError::ResourceExhausted.into());
         }
         if limits.is_none() {
+            work.flush()?;
             work.geometry_request(scratch, true)?;
         }
         work.geometry_request(scratch, false)?;
@@ -567,7 +573,7 @@ pub fn preflight_record_batch_with_profile<'a, W: GeometryWork + ?Sized>(
 }
 fn validate_field_nodes<W: GeometryWork + ?Sized>(
     field: &Field,
-    expected_rows: Option<usize>,
+    expected_rows: Option<(usize, &'static str)>,
     next: &mut impl FnMut() -> Result<(usize, usize), W::Error>,
     work: &mut W,
 ) -> Result<(), W::Error> {
@@ -577,15 +583,21 @@ fn validate_field_nodes<W: GeometryWork + ?Sized>(
         "recursive IPC node NULL count exceeds its rows",
         work,
     )?;
-    require(
-        expected_rows.is_none_or(|expected| expected == rows),
-        "recursive IPC field length differs from its declaration",
-        work,
-    )?;
+    if let Some((expected, message)) = expected_rows {
+        require(expected == rows, message, work)?;
+    }
     match field.data_type() {
         DataType::Struct(fields) => {
             for child in fields {
-                validate_field_nodes(child, Some(rows), next, work)?;
+                validate_field_nodes(
+                    child,
+                    Some((
+                        rows,
+                        "recursive IPC Struct child length differs from parent",
+                    )),
+                    next,
+                    work,
+                )?;
             }
         }
         DataType::List(child) | DataType::LargeList(child) | DataType::Map(child, _) => {
