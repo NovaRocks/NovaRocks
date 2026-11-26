@@ -443,7 +443,7 @@ fn finish_topn_reduction(
         )
         .map_err(|error| error.to_string())?;
 
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(partial).unwrap();
     plan.add_fragment(final_stage).unwrap();

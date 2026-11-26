@@ -523,7 +523,6 @@ fn prepare_writer(
     novarocks_functions::prepare_frozen_writer_aggregate_with_creator_in(
         &source.catalog,
         source.loan(phase),
-        &writer_constant_policy(),
         scope,
         control,
     )
@@ -611,7 +610,6 @@ fn theta_created_writer_uses_original_full_uuid_phase_null_and_namespace_contrac
     let prepared = novarocks_functions::prepare_frozen_writer_aggregate_with_creator_in(
         &nullable_source.catalog,
         good,
-        &writer_constant_policy(),
         &mut scope,
         &Control::default(),
     )
@@ -640,7 +638,6 @@ fn theta_created_writer_uses_original_full_uuid_phase_null_and_namespace_contrac
             novarocks_functions::prepare_frozen_writer_aggregate_with_creator_in(
                 &source.catalog,
                 wrong,
-                &writer_constant_policy(),
                 &mut scope,
                 &Control::default(),
             ),
@@ -659,7 +656,6 @@ fn theta_created_writer_uses_original_full_uuid_phase_null_and_namespace_contrac
         novarocks_functions::prepare_frozen_writer_aggregate_with_creator_in(
             &source.catalog,
             wrong,
-            &writer_constant_policy(),
             &mut scope,
             &Control::default(),
         ),

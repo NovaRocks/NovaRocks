@@ -308,7 +308,6 @@ fn frozen_writer_checked_count_borrows_its_original_owner_without_type_requests(
     let prepared = prepare_frozen_writer_aggregate_with_creator_in(
         &source.catalog,
         good,
-        &policy,
         &mut scope,
         &Control::default(),
     )
@@ -329,7 +328,6 @@ fn frozen_writer_checked_count_borrows_its_original_owner_without_type_requests(
         &source.catalog,
         source.loan(),
         Arc::from([]),
-        &policy,
         &mut scope,
         &Control::default(),
     )
@@ -353,7 +351,6 @@ fn frozen_writer_checked_preserves_phase_nullability_and_foreign_namespace_refus
                 prepare_frozen_writer_aggregate_with_creator_in(
                     &source.catalog,
                     wrong,
-                    &policy,
                     &mut scope,
                     &Control::default()
                 )
@@ -371,7 +368,6 @@ fn frozen_writer_checked_preserves_phase_nullability_and_foreign_namespace_refus
             prepare_frozen_writer_aggregate_with_creator_in(
                 &source.catalog,
                 wrong,
-                &policy,
                 &mut scope,
                 &Control::default()
             )
@@ -390,7 +386,6 @@ fn frozen_writer_checked_preserves_phase_nullability_and_foreign_namespace_refus
             prepare_frozen_writer_aggregate_with_creator_in(
                 &required.catalog,
                 wrong,
-                &policy,
                 &mut scope,
                 &Control::default()
             )
@@ -408,7 +403,6 @@ fn frozen_writer_checked_preserves_phase_nullability_and_foreign_namespace_refus
         prepare_frozen_writer_aggregate_with_creator_in(
             &source.catalog,
             wrong,
-            &policy,
             &mut scope,
             &Control::default()
         )
@@ -426,7 +420,6 @@ fn frozen_writer_checked_preserves_each_actual_control_prefix_without_tail() {
     prepare_frozen_writer_aggregate_with_creator_in(
         &source.catalog,
         source.loan(),
-        &policy,
         &mut scope,
         &baseline,
     )
@@ -449,7 +442,6 @@ fn frozen_writer_checked_preserves_each_actual_control_prefix_without_tail() {
                 prepare_frozen_writer_aggregate_with_creator_in(
                     &source.catalog,
                     source.loan(),
-                    &policy,
                     &mut scope,
                     &control,
                 )

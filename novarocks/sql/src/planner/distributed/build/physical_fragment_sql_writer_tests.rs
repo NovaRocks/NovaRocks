@@ -102,7 +102,7 @@ fn scopes<'a>(
     fragment: &'a Fragment,
     occurrences: &AuthoredPhysicalOccurrences<'_>,
 ) -> (
-    ConstantPolicy,
+    ConstantValidation,
     BTreeMap<PhysicalCallSite, PhysicalRelationalCallSourceScope<'a>>,
 ) {
     let control = Control::default();
@@ -144,7 +144,7 @@ fn input<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     fragment: &'a Fragment,
     occurrences: &'a AuthoredPhysicalOccurrences<'a>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     relational: &'a BTreeMap<PhysicalCallSite, PhysicalRelationalCallSourceScope<'a>>,
     expressions: &'a BTreeMap<novarocks_physical_plan::NodeId, NodeExpressionEffects>,
 ) -> PhysicalFragmentEffectsInput<'a> {

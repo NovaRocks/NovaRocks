@@ -128,7 +128,7 @@ pub fn grouped_state_topn_key_supported(
 /// Revision 45 executes collection lambda claims and requires the original
 /// higher-order overload to own NULL control.
 /// Revision 46 replaces the SQL JSON UTF-8 carrier with native JSON v1.
-pub const PLAN_CONTRACT_REVISION: u32 = 46;
+pub const PLAN_CONTRACT_REVISION: u32 = 47;
 
 #[cfg(test)]
 mod tests;

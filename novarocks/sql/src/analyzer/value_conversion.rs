@@ -101,7 +101,7 @@ pub(super) fn cast_with_trino_mode(
     span: Span,
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
     settings: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn PureCompileControl,
     forbid_time_dependencies: bool,
 ) -> Result<TypedExpr, AnalyzeError> {
@@ -172,7 +172,7 @@ pub(super) fn cast_to_value_type(
     span: Span,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     super::helpers::validate_value_type(&source.value_type, control)?;
@@ -261,7 +261,7 @@ pub(super) fn coerce_array_common_argument(
     source: TypedExpr,
     target: &FunctionValueType,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     control
@@ -315,7 +315,7 @@ pub(super) fn convert_value_domain_with_catalog(
     source: TypedExpr,
     target: FunctionValueType,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     control
@@ -388,7 +388,7 @@ pub(super) fn convert_value_domain_with_catalog(
 /// syntax shape until their admitted construction boundary.
 pub(super) fn constant_is_null(
     source: &TypedExpr,
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<bool, AnalyzeError> {
     match &source.kind {
@@ -409,7 +409,7 @@ pub(super) fn constant_is_null(
 fn typed_null_conversion(
     source: TypedExpr,
     mut target: FunctionValueType,
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     target = target

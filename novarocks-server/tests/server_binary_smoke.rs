@@ -137,18 +137,6 @@ provider = "sqlite"
 cluster_id = "server-binary-smoke"
 path = "{}"
 
-[runtime.frontend_constant_policy]
-# Frozen compiled-package constant policy (ADR-0185); no deployment override.
-max_rows = 4096
-max_array_nodes = 4096
-max_logical_elements = 65536
-max_retained_buffer_bytes = 8388608
-max_type_depth = 64
-max_type_nodes = 4096
-max_dictionary_depth = 8
-max_metadata_bytes = 65536
-max_library_validation_work = 33554432
-max_library_validation_bytes = 33554432
 "#,
                 log_dir.display(),
                 state_store.display(),

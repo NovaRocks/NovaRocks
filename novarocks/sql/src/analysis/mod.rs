@@ -382,7 +382,7 @@ impl Clone for TypedExpr {
 
 pub(crate) fn function_argument(
     expr: &TypedExpr,
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<novarocks_functions::FunctionArgument, novarocks_functions::FunctionBindingError> {
     use novarocks_functions::FunctionArgument;
@@ -496,7 +496,7 @@ pub(crate) fn resolve_function_binding(
     name: &str,
     args: &[TypedExpr],
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, novarocks_functions::FunctionBindingError> {
     let arguments = args

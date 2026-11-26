@@ -236,7 +236,6 @@ impl Fixture {
             self.selected.clone(),
             frozen,
             self.options(),
-            &self.policy,
             scope,
             control,
         )
@@ -347,16 +346,9 @@ fn abs_checked_loan_keeps_exact_original_input_catalogue_registered_owner_and_po
     let mut scope = Scope::new(&control);
     let checked = fixture
         .catalog
-        .check_call_effect_input_with_creator_in(
-            fixture.input(),
-            &fixture.policy,
-            &mut scope,
-            &control,
-        )
+        .check_call_effect_input_with_creator_in(fixture.input(), &mut scope, &control)
         .unwrap();
-    checked
-        .require_input(fixture.input(), &fixture.policy)
-        .unwrap();
+    checked.require_input(fixture.input()).unwrap();
     let other = Fixture::new();
     assert!(checked.require_catalog(&other.catalog).is_err());
     let definition = fixture
@@ -450,18 +442,8 @@ fn abs_checked_loan_keeps_exact_original_input_catalogue_registered_owner_and_po
             12 => input.proof_scope = CallProofScope::Unconditional,
             _ => unreachable!(),
         }
-        assert!(
-            checked.require_input(input, &fixture.policy).is_err(),
-            "fault {fault}"
-        );
+        assert!(checked.require_input(input).is_err(), "fault {fault}");
     }
-    let mut other_policy = fixture.policy;
-    other_policy.max_rows -= 1;
-    assert!(
-        checked
-            .require_input(fixture.input(), &other_policy)
-            .is_err()
-    );
     // The loan does not certify refinement: legitimate original ABS proof/env
     // guards still execute after successful full signature admission.
     let mut invalid = fixture.input();
@@ -474,7 +456,6 @@ fn abs_checked_loan_keeps_exact_original_input_catalogue_registered_owner_and_po
                 fixture.selected.clone(),
                 None,
                 fixture.options(),
-                &fixture.policy,
                 &mut scope,
                 &control
             )
@@ -488,12 +469,7 @@ fn abs_checked_mint_only_after_original_footer_and_primary_h_has_no_callback_tai
     let mut scope = Scope::new(&good);
     fixture
         .catalog
-        .check_call_effect_input_with_creator_in(
-            fixture.input(),
-            &fixture.policy,
-            &mut scope,
-            &good,
-        )
+        .check_call_effect_input_with_creator_in(fixture.input(), &mut scope, &good)
         .unwrap();
     let trace = good.events();
     assert!(
@@ -551,7 +527,6 @@ fn abs_checked_mint_only_after_original_footer_and_primary_h_has_no_callback_tai
     assert!(matches!(
         fixture.catalog.check_call_effect_input_with_creator_in(
             fixture.input(),
-            &fixture.policy,
             &mut scope,
             &control
         ),

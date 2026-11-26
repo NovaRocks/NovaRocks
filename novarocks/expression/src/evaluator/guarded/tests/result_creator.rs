@@ -142,7 +142,7 @@ fn canonical_constant_creator_cases() {
     use arrow::array::{ListArray, NullArray, StructArray};
     use arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use arrow::datatypes::Field;
-    use novarocks_functions::{ConstantPolicy, ConstantPool};
+    use novarocks_functions::{ConstantPool, ConstantValidation};
 
     for (finite, bufferless) in [(false, false), (true, false), (false, true)] {
         let drops = Arc::new(AtomicUsize::new(0));
@@ -189,18 +189,20 @@ fn canonical_constant_creator_cases() {
         } else {
             pure
         };
-        let policy = ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        };
+        let policy = novarocks_constant_contract::ConstantValidation::bounded(
+            novarocks_constant_contract::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        );
         let pool = ConstantPool::try_new(
             Arc::new(Field::new("original", raw.data_type().clone(), false)),
             ty.clone(),
@@ -401,18 +403,20 @@ fn canonical_root_source_annotations_need_no_wrapper_host() {
             )]),
         ),
     );
-    let policy = novarocks_functions::ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    };
+    let policy = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 128,
+            max_logical_elements: 1024,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        },
+    );
     let pool = novarocks_functions::ConstantPool::try_new(
         field,
         ty.clone(),

@@ -58,7 +58,6 @@ pub enum CapabilityRefusal {
 #[derive(Debug)]
 pub enum InvariantRefusal {
     MissingOverflow(novarocks_expression_contract::ExprId),
-    ConstantPolicy,
     Source(&'static str),
 }
 
@@ -180,9 +179,7 @@ impl fmt::Display for CallAuthorError {
             Self::Capability(CapabilityRefusal::Effects(detail)) => {
                 write!(formatter, "package call effects: {detail}")
             }
-            Self::Capability(CapabilityRefusal::Unsupported(detail)) => {
-                formatter.write_str(detail)
-            }
+            Self::Capability(CapabilityRefusal::Unsupported(detail)) => formatter.write_str(detail),
             Self::Capability(CapabilityRefusal::Primitive { source, cast }) => match cast {
                 Some((from, to)) => write!(formatter, "package cast {from:?} to {to:?}: {source}"),
                 None => source.fmt(formatter),
@@ -190,9 +187,6 @@ impl fmt::Display for CallAuthorError {
             Self::Invariant(InvariantRefusal::MissingOverflow(definition)) => write!(
                 formatter,
                 "call definition {definition:?} has no decimal overflow policy"
-            ),
-            Self::Invariant(InvariantRefusal::ConstantPolicy) => formatter.write_str(
-                "package call effects: InvalidSource(\"SQL expression occurrence changes its original captured policy\")",
             ),
             Self::Invariant(InvariantRefusal::Source(detail)) => formatter.write_str(detail),
         }

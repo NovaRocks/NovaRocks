@@ -2232,7 +2232,6 @@ impl PureEngineFunctionCatalog {
         selected: Arc<FunctionBindingSelection>,
         frozen: &CallEffects,
         options: PureCallPreparation,
-        constant_policy: &crate::ConstantPolicy,
         creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
         control: &dyn PureCompileControl,
     ) -> Result<PureCallSpecialization, CheckedCallPreparationFailure<H>> {
@@ -2243,7 +2242,7 @@ impl PureEngineFunctionCatalog {
             Some(frozen),
             options,
             control,
-            Some((creation, constant_policy)),
+            Some(creation),
         )
     }
     fn prepare(
@@ -2394,10 +2393,7 @@ fn prepare_selected_with_creation<H>(
     frozen: Option<&CallEffects>,
     options: PureCallPreparation,
     control: &dyn PureCompileControl,
-    mut creation: Option<(
-        &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
-        &crate::ConstantPolicy,
-    )>,
+    mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
 ) -> Result<PureCallSpecialization, CheckedCallPreparationFailure<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
     let result: Result<PureCallSpecialization, CheckedCallPreparationFailure<H>> = (|| {
@@ -2415,9 +2411,8 @@ fn prepare_selected_with_creation<H>(
         // consumers. Owner refinement below still validates its own facts.
         work.flush()?;
         let checked = match creation.as_mut() {
-            Some((scope, policy)) => Some(catalog.check_call_effect_input_with_creator_in(
+            Some(scope) => Some(catalog.check_call_effect_input_with_creator_in(
                 input,
-                policy,
                 &mut **scope,
                 control,
             )?),
@@ -2518,7 +2513,6 @@ impl EngineFunctionCatalog {
         selected: Arc<FunctionBindingSelection>,
         frozen: Option<&CallEffects>,
         options: PureCallPreparation,
-        constant_policy: &crate::ConstantPolicy,
         creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
         control: &dyn PureCompileControl,
     ) -> Result<PureCallSpecialization, CheckedCallPreparationFailure<H>> {
@@ -2529,7 +2523,7 @@ impl EngineFunctionCatalog {
             frozen,
             options,
             control,
-            Some((creation, constant_policy)),
+            Some(creation),
         )
     }
 }

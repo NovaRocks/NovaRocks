@@ -115,10 +115,12 @@ fn date_format_keeps_a_successful_output_that_exceeds_the_optional_fold_limit() 
         "%M".repeat(96)
     );
     let expected = "September".repeat(96);
-    let small_policy = novarocks_functions::ConstantPolicy {
-        max_retained_buffer_bytes: 512,
-        ..sql_fixture_constant_policy()
-    };
+    let small_policy = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_retained_buffer_bytes: 512,
+            ..sql_fixture_constant_policy()
+        },
+    );
 
     let fold = Arc::new(FoldProbe::default());
     let control = fold.control();
@@ -387,9 +389,6 @@ fn public_sql_map_float_probe_keeps_nullable_try_cast_before_optional_folding() 
             ValueLogicalType::Physical
         );
         assert!(result.fields[0].ty.nullable());
-        owner
-            .require_statement_constant_policy(sql_fixture_constant_policy())
-            .unwrap();
         for fragment in owner.plan().fragments().values() {
             fragment
                 .calls()

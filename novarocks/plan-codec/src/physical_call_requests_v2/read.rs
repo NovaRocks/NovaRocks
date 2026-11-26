@@ -30,8 +30,7 @@ use crate::{
 };
 use novarocks_expression_contract::PhysicalCallRequest;
 use novarocks_physical_plan::{
-    ConstantPolicy, ConstantPoolId, ConstantPools, ConstantReference, PhysicalCallSite,
-    StaticFunctionArgument,
+    ConstantPoolId, ConstantPools, ConstantReference, PhysicalCallSite, StaticFunctionArgument,
 };
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
@@ -166,42 +165,6 @@ fn relation_definition(input: &wire::OriginalCallRequest) -> Result<PhysicalCall
     }
 }
 
-pub(crate) fn policy(input: Option<&wire::SourceConstantPolicy>) -> Result<ConstantPolicy, E> {
-    let p = input.ok_or_else(|| invalid("call request constant policy is absent"))?;
-    Ok(ConstantPolicy {
-        max_rows: required(p.max_rows, "constant policy max_rows is absent")?,
-        max_array_nodes: required(
-            p.max_array_nodes,
-            "constant policy max_array_nodes is absent",
-        )?,
-        max_logical_elements: required(
-            p.max_logical_elements,
-            "constant policy max_logical_elements is absent",
-        )?,
-        max_retained_buffer_bytes: required(
-            p.max_retained_buffer_bytes,
-            "constant policy max_retained_buffer_bytes is absent",
-        )?,
-        max_type_depth: required(p.max_type_depth, "constant policy max_type_depth is absent")?,
-        max_type_nodes: required(p.max_type_nodes, "constant policy max_type_nodes is absent")?,
-        max_dictionary_depth: required(
-            p.max_dictionary_depth,
-            "constant policy max_dictionary_depth is absent",
-        )?,
-        max_metadata_bytes: required(
-            p.max_metadata_bytes,
-            "constant policy max_metadata_bytes is absent",
-        )?,
-        max_library_validation_work: required(
-            p.max_library_validation_work,
-            "constant policy max_library_validation_work is absent",
-        )?,
-        max_library_validation_bytes: required(
-            p.max_library_validation_bytes,
-            "constant policy max_library_validation_bytes is absent",
-        )?,
-    })
-}
 fn reference(input: &wire::ConstantReference) -> Result<ConstantReference, E> {
     Ok(ConstantReference {
         pool: ConstantPoolId::new(required(
@@ -569,9 +532,6 @@ fn preflight<F: ReadFailure, W: RequestWire>(
         if !valid {
             return Err(invalid("request logical argument count exceeds actual channels").into());
         }
-        let p = policy(entry.constant_policy());
-        w.step()?;
-        p?;
         if parent.is_none() {
             capture_arguments(entry, &mut model, limits, parent)?;
         }
@@ -988,15 +948,12 @@ fn decode_core<W: RequestWire>(
         );
         work.step()?;
         let logical_argument_count = usize::try_from(logical?).map_err(|_| resource())?;
-        let constant_policy = policy(entry.constant_policy());
-        work.step()?;
         output.push((
             key?,
             PhysicalCallRequest {
                 arguments: boxed(arguments, work)?,
                 logical_argument_count,
                 expected_result_type,
-                constant_policy: constant_policy?,
             },
         ));
         work.step()?;
@@ -1074,7 +1031,6 @@ pub trait RequestWire {
     fn arguments(&self) -> &Vec<wire::OriginalFunctionArgument>;
     fn logical_argument_count(&self) -> Option<u32>;
     fn expected_result_value_type_id(&self) -> Option<u32>;
-    fn constant_policy(&self) -> Option<&wire::SourceConstantPolicy>;
 }
 impl RequestWire for wire::OriginalCallRequest {
     type Key = PhysicalCallSite;
@@ -1090,9 +1046,6 @@ impl RequestWire for wire::OriginalCallRequest {
     }
     fn expected_result_value_type_id(&self) -> Option<u32> {
         self.expected_result_value_type_id
-    }
-    fn constant_policy(&self) -> Option<&wire::SourceConstantPolicy> {
-        self.constant_policy.as_ref()
     }
 }
 impl RequestWire for wire::UnitCallRequest {
@@ -1112,9 +1065,6 @@ impl RequestWire for wire::UnitCallRequest {
     }
     fn expected_result_value_type_id(&self) -> Option<u32> {
         self.expected_result_value_type_id
-    }
-    fn constant_policy(&self) -> Option<&wire::SourceConstantPolicy> {
-        self.constant_policy.as_ref()
     }
 }
 type DecodedUnitRequests = (

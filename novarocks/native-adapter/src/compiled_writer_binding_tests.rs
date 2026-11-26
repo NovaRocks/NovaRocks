@@ -549,19 +549,20 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
         .unwrap();
 
     // Explicit fixture admission; these values are not production defaults.
-    let constants = novarocks_functions::ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    };
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([6; 16]).unwrap(), constants);
+    let constants =
+        novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 128,
+            max_logical_elements: 1024,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        });
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([6; 16]).unwrap());
     plan.insert_constant_pool(
         pool,
         ConstantPool::try_new(

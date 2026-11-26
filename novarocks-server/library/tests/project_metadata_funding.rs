@@ -34,7 +34,7 @@ use novarocks_execution::runtime::{
 };
 use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_functions::{
-    ConstantPolicy, EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
+    ConstantValidation, EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
     PureEngineFunctionCatalog,
 };
 use novarocks_memory::{
@@ -86,8 +86,8 @@ fn binding(bytes: u64) -> QueryMemoryBinding {
     )
     .unwrap()
 }
-fn constants() -> ConstantPolicy {
-    ConstantPolicy {
+fn constants() -> ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 16,
         max_array_nodes: 128,
         max_logical_elements: 1024,
@@ -98,7 +98,7 @@ fn constants() -> ConstantPolicy {
         max_metadata_bytes: 1 << 20,
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
-    }
+    })
 }
 fn interpreter() -> CompiledPackageInterpreter<std::convert::Infallible> {
     let providers = novarocks_connector_contract::PureProviderProgramCatalog::<
@@ -110,7 +110,6 @@ fn interpreter() -> CompiledPackageInterpreter<std::convert::Infallible> {
         decode_limits(),
         Arc::new(functions()),
         Arc::new(providers),
-        constants(),
     )
 }
 fn json() -> FunctionValueType {
@@ -237,7 +236,7 @@ fn source(ty: FunctionValueType, label_bytes: usize) -> Vec<u8> {
             required: RequiredContracts::default(),
             fragment,
             constants: ConstantPools::empty(),
-            statement_constant_policy: constants(),
+
             pruning: FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
             cuts: FragmentCuts::default(),
             result: Some(result),

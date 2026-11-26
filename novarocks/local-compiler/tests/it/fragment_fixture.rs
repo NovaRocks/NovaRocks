@@ -22,7 +22,7 @@ use novarocks_expression::testkit::{
 };
 use novarocks_expression_contract::ExprId;
 use novarocks_functions::{
-    ConstantPolicy, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
+    ConstantValidation, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
     InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
     PureImplementationId, PureKernelAbi,
 };
@@ -110,18 +110,20 @@ pub(super) fn options() -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        constants: ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        },
+        constants: novarocks_functions::ConstantValidation::bounded(
+            novarocks_functions::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        ),
     }
 }
 pub(super) const ADMISSION: FragmentPackageAdmission = FragmentPackageAdmission {
@@ -141,7 +143,7 @@ pub(super) fn package(
     fields: Box<[ResultField]>,
     parameters: SemanticParameters,
     constants: ConstantPools,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
 ) -> Arc<FragmentPackage> {
     let fragment_id = builder.id();
     let result = ResultPort {
@@ -166,7 +168,7 @@ pub(super) fn package(
                 required: RequiredContracts::default(),
                 constants,
                 fragment,
-                statement_constant_policy: policy,
+
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &HarnessControl)
                     .unwrap(),
                 cuts: FragmentCuts::default(),
@@ -208,24 +210,9 @@ pub(super) fn install_claims(
     let ports = builder.node_ports(node).unwrap();
     let mut draft = builder.take_unit_builder(node).unwrap();
     register_call_requests(&mut draft, authors, constants);
-    declare_call_controls(
-        &mut draft,
-        functions,
-        constants,
-        parameters,
-        options().constants,
-        &mut work,
-    );
+    declare_call_controls(&mut draft, functions, constants, parameters, &mut work);
     let sealed = draft.seal(ports, &mut work).unwrap();
-    let unit = finish_unit(
-        functions,
-        sealed,
-        authors,
-        constants,
-        parameters,
-        options().constants,
-        &mut work,
-    );
+    let unit = finish_unit(functions, sealed, authors, constants, parameters, &mut work);
     builder.install_unit(node, Arc::new(unit)).unwrap();
     work.finish().unwrap();
 }

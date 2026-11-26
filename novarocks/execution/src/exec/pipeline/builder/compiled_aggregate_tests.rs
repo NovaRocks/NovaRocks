@@ -321,11 +321,9 @@ fn two_phase_plan(
     }
     types.extend(calls.all().map(Bound::result_type));
 
-    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
-        version(),
-        &fixture_sources,
-    )
-    .with_semantic_parameters(parameters.clone());
+    let mut plan =
+        crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(version())
+            .with_semantic_parameters(parameters.clone());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(partial).unwrap();
     plan.add_fragment(last).unwrap();
@@ -610,11 +608,9 @@ fn float_key_plan(
         &parameters,
     );
     let port_output = only.nodes()[&node].output.clone();
-    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
-        version(),
-        &fixture_sources,
-    )
-    .with_semantic_parameters(parameters.clone());
+    let mut plan =
+        crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(version())
+            .with_semantic_parameters(parameters.clone());
     plan.add_fragment(only).unwrap();
     plan.set_result_port(result_port(
         SOURCE,
@@ -737,11 +733,9 @@ fn single_phase_group_less_aggregate_on_empty_input_publishes_one_row() {
         &parameters,
     );
     let port_output = only.nodes()[&node].output.clone();
-    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
-        version(),
-        &fixture_sources,
-    )
-    .with_semantic_parameters(parameters.clone());
+    let mut plan =
+        crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(version())
+            .with_semantic_parameters(parameters.clone());
     plan.add_fragment(only).unwrap();
     let types = calls.all().map(Bound::result_type).collect::<Vec<_>>();
     plan.set_result_port(result_port(SOURCE, port_output, &types))
@@ -874,11 +868,9 @@ fn distinct_aggregate_the_owner_does_not_implement_is_an_explicit_compile_refusa
     );
     let only = finish(only, node, FragmentSink::Result, 1, &catalog, &parameters);
     let port_output = only.nodes()[&node].output.clone();
-    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
-        version(),
-        &fixture_sources,
-    )
-    .with_semantic_parameters(parameters.clone());
+    let mut plan =
+        crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(version())
+            .with_semantic_parameters(parameters.clone());
     plan.add_fragment(only).unwrap();
     plan.set_result_port(result_port(
         SOURCE,
@@ -941,11 +933,9 @@ fn zero_width_project_carries_its_row_count_into_count_star() {
         &parameters,
     );
     let port_output = only.nodes()[&node].output.clone();
-    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
-        version(),
-        &fixture_sources,
-    )
-    .with_semantic_parameters(parameters.clone());
+    let mut plan =
+        crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(version())
+            .with_semantic_parameters(parameters.clone());
     plan.add_fragment(only).unwrap();
     plan.set_result_port(result_port(SOURCE, port_output, &[count.result_type()]))
         .unwrap();
@@ -1041,7 +1031,6 @@ fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two(
             let mut plan =
                 crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
                     version(),
-                    &fixture_sources,
                 )
                 .with_semantic_parameters(parameters.clone());
             plan.add_fragment(partial).unwrap();

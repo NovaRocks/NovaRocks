@@ -76,7 +76,7 @@ pub(super) fn table_free_request_with_constant_policy(
     sql: &str,
     session: SqlSessionContext,
     control: &SqlCompileControl,
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
 ) -> SqlFinalPlanCompileRequest {
     plan_request_with_constant_policy(
         SqlStatementInput::parsed_query(novarocks_sql_testkit::parse_query(sql)),
@@ -107,7 +107,7 @@ fn plan_request_with_constant_policy(
     intent: SqlCompileIntent,
     session: SqlSessionContext,
     control: &SqlCompileControl,
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
 ) -> SqlFinalPlanCompileRequest {
     SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([84; 16]).unwrap(),

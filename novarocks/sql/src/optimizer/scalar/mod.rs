@@ -215,7 +215,7 @@ struct StoredColumnDisplay {
 /// Owns all scalar nodes for one optimize() call; interns (hash-conses) on push.
 #[derive(Clone, Debug)]
 pub(crate) struct ScalarArena {
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     nodes: Vec<ScalarNode>,
     value_types: Vec<FunctionValueType>,
     /// Function semantics resolved at scalar interning time.  It is kept
@@ -238,7 +238,7 @@ impl ScalarArena {
     }
 
     pub(crate) fn with_constant_policy(
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
     ) -> Self {
         Self {
             constant_policy,
@@ -250,7 +250,7 @@ impl ScalarArena {
         }
     }
 
-    pub(crate) fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+    pub(crate) fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy
     }
 

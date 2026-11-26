@@ -20,7 +20,7 @@
 use std::fmt;
 
 use arrow::datatypes::DataType;
-use novarocks_constant_contract::{ConstantError, ConstantPolicy, ConstantValue};
+use novarocks_constant_contract::{ConstantError, ConstantValidation, ConstantValue};
 use novarocks_functions::{
     EngineFunctionCatalog, FunctionArgument, FunctionArgumentType, FunctionBindingError,
     FunctionBindingRequest, FunctionResultType, HigherOrderBindingCandidate, PureKernelAbi,
@@ -229,7 +229,7 @@ impl ScalarBindingCatalog for EngineFunctionCatalog {
 
 pub struct TypingContext<'a> {
     pub catalog: &'a dyn ScalarBindingCatalog,
-    pub constant_policy: ConstantPolicy,
+    pub constant_policy: ConstantValidation,
     pub decimal_overflow_policy: DecimalOverflowPolicy,
 }
 

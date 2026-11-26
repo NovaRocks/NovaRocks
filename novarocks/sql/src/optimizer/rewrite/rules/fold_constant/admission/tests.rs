@@ -257,10 +257,12 @@ impl PureCompileControl for RecordingControl {
 #[test]
 fn optional_fold_declines_values_that_exceed_the_constant_pool_limit() {
     let ty = FunctionValueType::new(DataType::Utf8, false);
-    let policy = ConstantPolicy {
-        max_retained_buffer_bytes: 256,
-        ..test_constant_policy()
-    };
+    let policy = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_retained_buffer_bytes: 256,
+            ..test_constant_policy()
+        },
+    );
     let control = test_optimizer_control();
     let small = Arc::new(StringArray::from(vec!["March"])) as ArrayRef;
     let long_text = "t".repeat(2560);

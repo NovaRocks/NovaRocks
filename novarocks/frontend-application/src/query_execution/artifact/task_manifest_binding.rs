@@ -2219,7 +2219,6 @@ mod tests {
                 novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
                 novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
             ),
-            crate::application::test_constant_policy(),
             None,
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )

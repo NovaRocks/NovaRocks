@@ -15,7 +15,7 @@
 
 use super::*;
 use crate::compiler::{SqlCompileControl, build_builtin_engine_function_catalog};
-use novarocks_functions::{ConstantPolicy, ConstantValue};
+use novarocks_functions::{ConstantValidation, ConstantValue};
 use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueLogicalType};
 use std::sync::Arc;
 
@@ -23,7 +23,7 @@ fn query(sql: &str) -> ast::Query {
     let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     query.clone()
 }
-fn value(policy: ConstantPolicy, control: &SqlCompileControl) -> ConstantValue {
+fn value(policy: ConstantValidation, control: &SqlCompileControl) -> ConstantValue {
     let ty = FunctionValueType::try_with_logical_type(
         arrow::datatypes::DataType::LargeBinary,
         false,

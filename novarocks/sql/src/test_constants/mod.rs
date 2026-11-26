@@ -18,7 +18,7 @@
 //! Checked constant sources for hand-authored physical test inputs.
 //! The fixture owns each source table explicitly; consumers pass `constants()`
 //! to the actual physical author rather than synthesizing dangling references.
-use novarocks_constant_contract::{ConstantPolicy, ConstantValue};
+use novarocks_constant_contract::{ConstantValidation, ConstantValue};
 use novarocks_physical_plan as p;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{
@@ -32,19 +32,21 @@ impl PureCompileControl for Setup {
         Ok(())
     }
 }
-pub(crate) fn policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 1024,
-        max_array_nodes: 4096,
-        max_logical_elements: 1_000_000,
-        max_retained_buffer_bytes: 16_777_216,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 16,
-        max_metadata_bytes: 1_048_576,
-        max_library_validation_work: 67_108_864,
-        max_library_validation_bytes: 67_108_864,
-    }
+pub(crate) fn policy() -> ConstantValidation {
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 1024,
+            max_array_nodes: 4096,
+            max_logical_elements: 1_000_000,
+            max_retained_buffer_bytes: 16_777_216,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 16,
+            max_metadata_bytes: 1_048_576,
+            max_library_validation_work: 67_108_864,
+            max_library_validation_bytes: 67_108_864,
+        },
+    )
 }
 pub(crate) type Source = Box<dyn FnOnce(&p::ValueType) -> ConstantValue>;
 macro_rules! scalar_factory {

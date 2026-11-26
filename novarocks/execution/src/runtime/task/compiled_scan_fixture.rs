@@ -39,7 +39,7 @@ use futures::Stream;
 use futures::future::BoxFuture;
 use novarocks_connector_contract::*;
 use novarocks_expression_contract::{BinaryOperator, ExprKind, RootOrdinal, RootScope};
-use novarocks_functions::ConstantPolicy;
+use novarocks_functions::ConstantValidation;
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
@@ -510,7 +510,6 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
 
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([7; 16]).unwrap(),
-        &fixture_sources,
     );
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {
@@ -628,18 +627,20 @@ fn options(dop: usize) -> LocalCompileOptions {
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
         // Explicit fixture admission; these values are not production defaults.
-        constants: ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        },
+        constants: novarocks_functions::ConstantValidation::bounded(
+            novarocks_functions::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        ),
     }
 }
 

@@ -498,7 +498,6 @@ pub(crate) fn large_static_unit(count: usize) -> Arc<novarocks_expression::Compi
             ]),
             logical_argument_count: 3,
             expected_result_type: None,
-            constant_policy: policy(),
         },
     )
     .unwrap();

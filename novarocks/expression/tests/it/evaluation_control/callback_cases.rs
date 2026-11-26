@@ -19,7 +19,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
-use novarocks_constant_contract::{ConstantPolicy, ConstantPools, ConstantValue};
+use novarocks_constant_contract::{ConstantPools, ConstantValidation, ConstantValue};
 use novarocks_expression::{
     CompiledExprSet, CompiledExpressionInstance, CompiledFilterConjunctionInstance,
     EvaluationEnvironment, EvaluationInput, ExprEvaluationFailure, ScopeLayouts, StaticExprKind,
@@ -44,18 +44,20 @@ use novarocks_type_contract::{
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-const POLICY: ConstantPolicy = ConstantPolicy {
-    max_rows: 64,
-    max_array_nodes: 1024,
-    max_logical_elements: 4096,
-    max_retained_buffer_bytes: 1 << 20,
-    max_type_depth: 64,
-    max_type_nodes: 4096,
-    max_dictionary_depth: 64,
-    max_metadata_bytes: 1 << 20,
-    max_library_validation_work: 1 << 20,
-    max_library_validation_bytes: 1 << 20,
-};
+const POLICY: ConstantValidation = novarocks_constant_contract::ConstantValidation::bounded(
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 64,
+        max_array_nodes: 1024,
+        max_logical_elements: 4096,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 20,
+        max_library_validation_bytes: 1 << 20,
+    },
+);
 
 struct Callback(CallbackControl);
 impl Callback {
@@ -123,14 +125,7 @@ fn compile_unit<const N: usize>(
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
     register_call_requests(&mut draft, &authors, &mut constants);
-    declare_call_controls(
-        &mut draft,
-        &functions,
-        &constants,
-        &parameters,
-        POLICY,
-        &mut work,
-    );
+    declare_call_controls(&mut draft, &functions, &constants, &parameters, &mut work);
     let sealed = draft.seal(vec![port], &mut work).unwrap();
     let unit = finish_unit(
         &functions,
@@ -138,7 +133,6 @@ fn compile_unit<const N: usize>(
         &authors,
         &constants,
         &parameters,
-        POLICY,
         &mut work,
     );
     work.finish().unwrap();

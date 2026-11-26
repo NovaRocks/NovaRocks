@@ -202,7 +202,7 @@ fn finish_plan_with_partition_distributions(
     distributions: impl IntoIterator<Item = Distribution>,
 ) -> Result<PhysicalPlan, ValidationErrors> {
     let binding = connector_binding();
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     for (ordinal, distribution) in distributions.into_iter().enumerate() {
         let fragment_id = FragmentId::new(500 + u32::try_from(ordinal).unwrap());
         let mut relation = metadata_relation(

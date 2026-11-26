@@ -93,10 +93,6 @@ fn caller_request_receiver_retains_original_none_null_lambda_constraint_and_spar
     let request = &output[0].1;
     assert_eq!(request.logical_argument_count, 2);
     assert_eq!(
-        request.constant_policy,
-        policy(Some(&zero_policy())).unwrap()
-    );
-    assert_eq!(
         request.expected_result_type.as_ref(),
         t.value_type(u32::MAX)
     );

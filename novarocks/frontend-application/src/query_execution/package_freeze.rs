@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use novarocks_connector_contract::ConnectorWriteRecipeDraft;
 use novarocks_physical_plan::{
-    ConstantPolicy, FragmentId, FragmentPackage, FragmentPackageAdmission, FrozenFragmentPruning,
+    FragmentId, FragmentPackage, FragmentPackageAdmission, FrozenFragmentPruning,
     ProviderReadOccurrenceId, WriteTargetOrdinal, extract_fragment_packages,
 };
 #[cfg(test)]
@@ -231,19 +231,12 @@ pub(crate) fn freeze_fragment_packages(
     candidate: &CompletedPhysicalPlanCandidate,
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
     writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
-    statement_constant_policy: ConstantPolicy,
+
     admission: &FragmentPackageAdmission,
     limits: &PackageEncodeLimits,
     control: &dyn PureCompileControl,
 ) -> Result<BTreeMap<FragmentId, Vec<u8>>, PackageFreezeError> {
-    let packages = extract_checked_packages(
-        candidate,
-        encodings,
-        writes,
-        statement_constant_policy,
-        admission,
-        control,
-    )?;
+    let packages = extract_checked_packages(candidate, encodings, writes, admission, control)?;
     let carrier = CompiledPackageCarrier::new(
         *admission,
         *limits,
@@ -264,16 +257,11 @@ pub(crate) fn extract_checked_packages(
     candidate: &CompletedPhysicalPlanCandidate,
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
     writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
-    statement_constant_policy: ConstantPolicy,
+
     admission: &FragmentPackageAdmission,
     control: &dyn PureCompileControl,
 ) -> Result<BTreeMap<FragmentId, FragmentPackage>, PackageFreezeError> {
     let plan = candidate.plan();
-    if plan.statement_constant_policy() != statement_constant_policy {
-        return Err(PackageFreezeError::Semantics(
-            novarocks_sql::compiler::PackageSemanticsError::StatementPolicyMismatch,
-        ));
-    }
     let scans = author_frozen_reads(plan, encodings, control)?;
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
@@ -360,58 +348,6 @@ mod error_projection_tests {
     use super::*;
     use novarocks_plan_codec::PhysicalEncodeError;
     use novarocks_sql::compiler::PackageSemanticsError;
-
-    #[test]
-    fn freeze_rejects_a_policy_different_from_the_authored_plan() {
-        use novarocks_physical_plan::{
-            FragmentBuilder, FragmentSink, PipelineDopDomain, PlanBuilder, PlanVersionId,
-            StagePlacementPolicy,
-        };
-        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
-        let policy = crate::application::test_constant_policy();
-        let mut different = policy;
-        different.max_rows = policy.max_rows.checked_add(1).unwrap();
-        let fragment_id = FragmentId::new(1);
-        let mut builder = FragmentBuilder::new(fragment_id);
-        let root = builder.reserve_node_id().unwrap();
-        builder
-            .add_values(root, Box::from([Box::default()]), Box::default())
-            .unwrap();
-        let fragment = builder
-            .finish_definition(
-                root,
-                FragmentSink::Noop,
-                PipelineDopDomain {
-                    min: 1,
-                    max: 1,
-                    requires_power_of_two: true,
-                },
-                StagePlacementPolicy::Singleton,
-            )
-            .unwrap();
-        let mut builder = PlanBuilder::new(PlanVersionId::try_new([157; 16]).unwrap(), policy);
-        builder.add_fragment(fragment).unwrap();
-        let candidate = CompletedPhysicalPlanCandidate::for_program(
-            builder.finish_observed(&control).unwrap(),
-            &control,
-        )
-        .unwrap();
-        let encodings = BTreeMap::new();
-        let writes = BTreeMap::new();
-        let admission = &PackageDecodeLimits::FROZEN.admission;
-        assert!(matches!(
-            extract_checked_packages(
-                &candidate, &encodings, &writes, different, admission, &control
-            ),
-            Err(PackageFreezeError::Semantics(
-                PackageSemanticsError::StatementPolicyMismatch
-            ))
-        ));
-        let packages =
-            extract_checked_packages(&candidate, &encodings, &writes, policy, admission, &control)
-                .unwrap();
-        assert_eq!(packages[&fragment_id].statement_constant_policy(), policy);
-    }
 
     #[test]
     fn receiver_refusals_keep_original_resource_data_and_schema_authors() {

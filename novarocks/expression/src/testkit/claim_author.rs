@@ -17,7 +17,7 @@
 
 //! Checked call declarations built from actual Functions preparation.
 use super::register_constant;
-use novarocks_constant_contract::{ConstantPolicy, ConstantPools};
+use novarocks_constant_contract::{ConstantPools, ConstantValidation};
 use novarocks_expression_contract::{
     BoundExprSet, BoundExprSetBuilder, BoundFunction, ExprId, ExprKind, LegacyBindingMetadata,
     PhysicalCallRequest, SealedUnit,
@@ -42,7 +42,7 @@ pub struct ClaimAuthor {
     )]
     selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     decimal_policy: DecimalOverflowPolicy,
     expected_result_type: Option<FunctionValueType>,
     #[expect(
@@ -60,7 +60,7 @@ impl ClaimAuthor {
         arguments: Vec<FunctionArgument>,
         shape: ControlShape,
         expected_result_type: Option<FunctionValueType>,
-        constant_policy: ConstantPolicy,
+        constant_policy: ConstantValidation,
         control: &dyn PureCompileControl,
     ) -> Self {
         let bound = resolve(
@@ -84,7 +84,7 @@ impl ClaimAuthor {
         arguments: Vec<FunctionArgument>,
         shape: ControlShape,
         expected_result_type: Option<FunctionValueType>,
-        constant_policy: ConstantPolicy,
+        constant_policy: ConstantValidation,
     ) -> Self {
         let FunctionResultType::Scalar(result) = &bound.selected.result_type else {
             panic!("scalar owner")
@@ -107,7 +107,7 @@ impl ClaimAuthor {
         functions: &PureEngineFunctionCatalog,
         name: &str,
         arguments: Vec<FunctionArgument>,
-        constant_policy: ConstantPolicy,
+        constant_policy: ConstantValidation,
         control: &dyn PureCompileControl,
     ) -> Self {
         let bound = resolve(functions, name, &arguments, None, control);
@@ -241,12 +241,7 @@ pub fn register_call_requests(
         draft
             .request(
                 definition,
-                physical_call_request(
-                    original.arguments,
-                    original.expected_result_type,
-                    owner.constant_policy,
-                    constants,
-                ),
+                physical_call_request(original.arguments, original.expected_result_type, constants),
             )
             .unwrap();
     }
@@ -255,7 +250,6 @@ pub fn register_call_requests(
 pub(super) fn physical_call_request(
     arguments: &[FunctionArgument],
     expected_result_type: Option<&FunctionValueType>,
-    constant_policy: ConstantPolicy,
     constants: &mut ConstantPools,
 ) -> PhysicalCallRequest {
     let logical_argument_count = arguments.len();
@@ -284,7 +278,6 @@ pub(super) fn physical_call_request(
         arguments,
         logical_argument_count,
         expected_result_type: expected_result_type.cloned(),
-        constant_policy,
     }
 }
 
@@ -293,7 +286,6 @@ pub fn declare_call_controls(
     functions: &PureEngineFunctionCatalog,
     constants: &ConstantPools,
     parameters: &SemanticParameters,
-    policy: ConstantPolicy,
     work: &mut CompileCheckpoints<'_>,
 ) {
     let inputs = crate::CallAuthorInputs {
@@ -301,7 +293,6 @@ pub fn declare_call_controls(
             constants,
             parameters,
         },
-        constant_policy: policy,
         functions,
         decimal_overflow: &BTreeMap::new(),
     };
@@ -317,13 +308,9 @@ pub fn finish_unit(
     authors: &BTreeMap<ExprId, ClaimAuthor>,
     constants: &ConstantPools,
     parameters: &SemanticParameters,
-    policy: ConstantPolicy,
     work: &mut CompileCheckpoints<'_>,
 ) -> BoundExprSet {
-    try_finish_unit(
-        functions, sealed, authors, constants, parameters, policy, work,
-    )
-    .expect("call author")
+    try_finish_unit(functions, sealed, authors, constants, parameters, work).expect("call author")
 }
 
 /// Same completion as [`finish_unit`], preserving a recipe refusal for the caller.
@@ -333,7 +320,6 @@ pub fn try_finish_unit(
     authors: &BTreeMap<ExprId, ClaimAuthor>,
     constants: &ConstantPools,
     parameters: &SemanticParameters,
-    policy: ConstantPolicy,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BoundExprSet, crate::CallAuthorError> {
     let decimal_overflow = authors
@@ -345,7 +331,6 @@ pub fn try_finish_unit(
             constants,
             parameters,
         },
-        constant_policy: policy,
         functions,
         decimal_overflow: &decimal_overflow,
     };

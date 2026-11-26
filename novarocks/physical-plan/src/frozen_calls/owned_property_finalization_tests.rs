@@ -67,7 +67,7 @@ fn input(fixture: Fixture, cuts: FragmentCuts) -> FragmentPackageInput {
         FrozenFragmentPruning::try_new(fixture.fragment.id(), vec![], &Control::default()).unwrap();
     FragmentPackageInput {
         constants: ConstantPools::empty(),
-        statement_constant_policy: policy(),
+
         version: PlanVersionId::try_new([17; 16]).unwrap(),
         required: RequiredContracts::default(),
         fragment: fixture.fragment,

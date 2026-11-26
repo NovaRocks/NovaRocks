@@ -438,7 +438,6 @@ fn finish_change_stream_write(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         state.static_plan_carrier(),
-        state.constant_policy(),
         Some(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
                 session: write_session.as_ref(),

@@ -25,7 +25,7 @@ use arrow::{
     datatypes::{DataType, Field},
 };
 use novarocks_constant_contract::ConstantPool;
-use novarocks_functions::{ConstantPolicy, FunctionArgument, FunctionBindingError};
+use novarocks_functions::{ConstantValidation, FunctionArgument, FunctionBindingError};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType, PureCompileControl,
 };
@@ -55,19 +55,21 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 4,
-        max_array_nodes: 16,
-        max_logical_elements: 64,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 8,
-        max_type_nodes: 32,
-        max_dictionary_depth: 4,
-        max_metadata_bytes: 1 << 16,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    }
+fn policy() -> ConstantValidation {
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 4,
+            max_array_nodes: 16,
+            max_logical_elements: 64,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 8,
+            max_type_nodes: 32,
+            max_dictionary_depth: 4,
+            max_metadata_bytes: 1 << 16,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        },
+    )
 }
 struct Fixture {
     source: AggregateArgumentSource<TypedExpr, SortItem>,

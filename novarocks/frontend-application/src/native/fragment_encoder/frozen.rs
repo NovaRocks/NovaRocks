@@ -707,8 +707,7 @@ pub(crate) mod tests {
                 version: p::PlanVersionId::try_new(version).expect("nonzero version"),
                 required: p::RequiredContracts::default(),
                 fragment,
-                statement_constant_policy:
-                    novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+
                 pruning,
                 cuts,
                 result,

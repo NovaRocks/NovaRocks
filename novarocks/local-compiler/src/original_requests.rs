@@ -20,7 +20,7 @@
 use crate::expressions::ExpressionLoweringError;
 use novarocks_expression_contract::PhysicalCallRequest;
 #[cfg(test)]
-use novarocks_functions::ConstantPolicy;
+use novarocks_functions::ConstantValidation;
 #[cfg(test)]
 use novarocks_functions::FunctionArgument;
 use novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS;

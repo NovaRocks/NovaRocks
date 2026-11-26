@@ -24,7 +24,7 @@ use crate::{
     author_unit_calls, compile_expr_set_pure,
 };
 use arrow::{datatypes::Schema, error::ArrowError};
-use novarocks_constant_contract::{ConstantError, ConstantPolicy, ConstantPools};
+use novarocks_constant_contract::{ConstantError, ConstantPools, ConstantValidation};
 use novarocks_expression_contract::{
     BoundExprSet, BoundExprSetBuilder, ExprId, ExprPort, RootScope, UnitError, UnitLimits, ValueId,
 };
@@ -52,7 +52,7 @@ pub struct TextColumn {
 
 pub struct TextContext<'a> {
     pub functions: &'a PureEngineFunctionCatalog,
-    pub constant_policy: ConstantPolicy,
+    pub constant_policy: ConstantValidation,
     pub decimal_overflow_policy: DecimalOverflowPolicy,
     pub parameters: &'a SemanticParameters,
     pub allow_throw_exception: SemanticParameterRef,
@@ -67,7 +67,7 @@ pub struct TypedText<'a> {
     used_ordinals: Vec<usize>,
     layout: Option<ScopeLayout>,
     functions: &'a PureEngineFunctionCatalog,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     decimal_overflow_policy: DecimalOverflowPolicy,
 }
 
@@ -289,7 +289,6 @@ fn type_parsed<'a>(
             parameters: &parameters,
         },
         context.functions,
-        context.constant_policy,
         context.decimal_overflow_policy,
         work,
     )?;
@@ -317,7 +316,6 @@ fn freeze(
     ports: Vec<ExprPort>,
     environment: EvaluationEnvironment<'_>,
     functions: &PureEngineFunctionCatalog,
-    constant_policy: ConstantPolicy,
     decimal_overflow_policy: DecimalOverflowPolicy,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BoundExprSet, TextError> {
@@ -329,7 +327,6 @@ fn freeze(
         .collect::<BTreeMap<ExprId, DecimalOverflowPolicy>>();
     let inputs = CallAuthorInputs {
         environment,
-        constant_policy,
         functions,
         decimal_overflow: &decimal_overflow,
     };

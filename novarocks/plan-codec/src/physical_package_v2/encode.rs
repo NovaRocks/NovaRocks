@@ -879,9 +879,6 @@ fn encode_fragment_package_structural_in<'s>(
         provider_payloads,
         read_references,
         relations,
-        source_constant_policy: Some(crate::physical_call_requests_v2::encode_source_policy(
-            package.statement_constant_policy(),
-        )),
         calls: Some(calls),
         pruning: Some(pruning),
         parameters: Some(parameters),

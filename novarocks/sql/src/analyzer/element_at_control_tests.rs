@@ -167,7 +167,7 @@ fn analyze(
 fn analyze_with_policy_and_control(
     sql: &str,
     functions: &dyn SqlFunctionCatalog,
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<ResolvedQuery, crate::analyze_error::AnalyzeError> {
     let query = &novarocks_parser::parser::parse_query(sql).unwrap();
@@ -250,8 +250,7 @@ fn element_at_type_probe_keeps_original_ordinary_binding_error_without_rebinding
 fn element_at_type_probe_keeps_real_zero_row_constant_policy_author() {
     use novarocks_failure_contract::{FailureClass, FailureProjection};
 
-    let mut policy = crate::constant::test_constant_policy();
-    policy.max_rows = 0;
+    let policy = crate::constant::test_constant_validation(0);
     for sql in ["SELECT [1,2]", "SELECT element_at([1,2],1)"] {
         let error = analyze_with_policy_and_control(
             sql,
@@ -303,8 +302,7 @@ fn element_at_type_probe_keeps_original_constant_source_before_later_cancellatio
     // Obtain this cause from the real Constant author and its zero-row policy.
     // The catalog fixture returns this exact original cause once, then would
     // succeed on a retry. Cancellation becomes observable only after refusal.
-    let mut policy = crate::constant::test_constant_policy();
-    policy.max_rows = 0;
+    let policy = crate::constant::test_constant_validation(0);
     let constant = crate::constant::admit_syntax_constant(
         &crate::analysis::LiteralValue::Int(1),
         &FunctionValueType::new(DataType::Int8, false),

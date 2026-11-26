@@ -683,24 +683,26 @@ mod tests {
         use arrow::array::{Array, Int64Array};
         use arrow::datatypes::{DataType, Field};
         use novarocks_execution_contract::failure::{FailureClass, FailureProjection, domain};
-        use novarocks_physical_plan::{ConstantError, ConstantPolicy, ConstantPool, ValueType};
+        use novarocks_physical_plan::{ConstantError, ConstantPool, ConstantValidation, ValueType};
         use novarocks_sql::compiler::{SqlCompileError, SqlCompileProgressError};
         let source = ConstantPool::try_new(
             Arc::new(Field::new("value", DataType::Int64, false)),
             ValueType::new(DataType::Int64, false),
             Int64Array::from(vec![1, 2]).to_data(),
-            ConstantPolicy {
-                max_rows: 1,
-                max_array_nodes: 8,
-                max_logical_elements: 8,
-                max_retained_buffer_bytes: 4096,
-                max_type_depth: 8,
-                max_type_nodes: 8,
-                max_dictionary_depth: 8,
-                max_metadata_bytes: 32768,
-                max_library_validation_work: 1 << 20,
-                max_library_validation_bytes: 1 << 20,
-            },
+            novarocks_constant_contract::ConstantValidation::bounded(
+                novarocks_constant_contract::ConstantPolicy {
+                    max_rows: 1,
+                    max_array_nodes: 8,
+                    max_logical_elements: 8,
+                    max_retained_buffer_bytes: 4096,
+                    max_type_depth: 8,
+                    max_type_nodes: 8,
+                    max_dictionary_depth: 8,
+                    max_metadata_bytes: 32768,
+                    max_library_validation_work: 1 << 20,
+                    max_library_validation_bytes: 1 << 20,
+                },
+            ),
             novarocks_type_contract::CompilePhase::Validate,
             &SqlCompileControl::unbounded(),
         )

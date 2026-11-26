@@ -20,7 +20,7 @@
 
 use std::{alloc::Layout, collections::BTreeMap};
 
-use novarocks_constant_contract::{ConstantPolicy, ConstantValue};
+use novarocks_constant_contract::{ConstantValidation, ConstantValue};
 use novarocks_functions::{FunctionArgument, FunctionBindingRequest, MAX_CALL_EFFECT_ARGUMENTS};
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 use {
@@ -151,12 +151,7 @@ pub(super) fn transfer_neutral_requests_observed(
                 "neutral Window request has another original source",
             ));
         }
-        let record = transfer_request(
-            canonical.request(),
-            entry.captured.constant_policy(),
-            work,
-            &mut register,
-        )?;
+        let record = transfer_request(canonical.request(), work, &mut register)?;
         push(
             &mut output,
             fragment,
@@ -173,12 +168,7 @@ pub(super) fn transfer_neutral_requests_observed(
         if !belongs {
             return Err(invalid("neutral table request has another original source"));
         }
-        let record = transfer_request(
-            canonical.request(),
-            entry.captured.constant_policy(),
-            work,
-            &mut register,
-        )?;
+        let record = transfer_request(canonical.request(), work, &mut register)?;
         push(
             &mut output,
             fragment,
@@ -189,8 +179,8 @@ pub(super) fn transfer_neutral_requests_observed(
     }
     for (&(fragment, site), entry) in &journal.entries {
         work.step()?;
-        let (request, policy) = aggregate_request(entry, work)?;
-        let record = transfer_request(request, policy, work, &mut register)?;
+        let request = aggregate_request(entry, work)?;
+        let record = transfer_request(request, work, &mut register)?;
         push(
             &mut output,
             fragment,
@@ -225,12 +215,7 @@ pub(super) fn transfer_expression_request_observed(
             "neutral expression request has another original source",
         ));
     }
-    transfer_request(
-        canonical.request(),
-        captured.constant_policy(),
-        work,
-        register,
-    )
+    transfer_request(canonical.request(), work, register)
 }
 
 fn invalid(detail: &'static str) -> ContractLoweringError {
@@ -261,7 +246,7 @@ fn count_fragment(
 fn aggregate_request<'a>(
     entry: &'a LoweredAggregateSourceEntry,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(FunctionBindingRequest<'a>, ConstantPolicy), ContractLoweringError> {
+) -> Result<FunctionBindingRequest<'a>, ContractLoweringError> {
     let captured = entry.logical.captured();
     work.step()?;
     let captured = captured.ok_or(ContractLoweringError::InvalidAggregate {
@@ -307,12 +292,11 @@ fn aggregate_request<'a>(
         // captured request; absence does not synthesize computed metadata.
         captured.request()
     };
-    Ok((request, captured.constant_policy()))
+    Ok(request)
 }
 
 fn transfer_request(
     request: FunctionBindingRequest<'_>,
-    policy: ConstantPolicy,
     work: &mut CompileCheckpoints<'_>,
     register: &mut impl FnMut(
         &ConstantValue,
@@ -413,7 +397,6 @@ fn transfer_request(
         arguments,
         logical_argument_count: request.logical_argument_count,
         expected_result_type,
-        constant_policy: policy,
     })
 }
 
@@ -455,14 +438,14 @@ fn push(
 #[cfg(test)]
 pub(in crate::planner::distributed::build) fn transfer_component_request_for_test(
     request: FunctionBindingRequest<'_>,
-    policy: ConstantPolicy,
+    _policy: ConstantValidation,
     work: &mut CompileCheckpoints<'_>,
     register: &mut impl FnMut(
         &ConstantValue,
         &mut CompileCheckpoints<'_>,
     ) -> Result<ConstantReference, ContractLoweringError>,
 ) -> Result<PhysicalCallRequest, ContractLoweringError> {
-    transfer_request(request, policy, work, register)
+    transfer_request(request, work, register)
 }
 
 #[cfg(test)]

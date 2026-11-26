@@ -205,7 +205,7 @@ mod logical_finish_graph {
                 version: original.version(),
                 required: original.required(),
                 fragment,
-                statement_constant_policy: original.statement_constant_policy(),
+
                 pruning: original.pruning().clone(),
                 cuts,
                 result: original.result().cloned(),

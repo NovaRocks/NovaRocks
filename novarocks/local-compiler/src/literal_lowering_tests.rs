@@ -112,7 +112,7 @@ fn literal_package(value: ConstantValue) -> Arc<FragmentPackage> {
                 required: RequiredContracts::default(),
                 constants,
                 fragment,
-                statement_constant_policy: options(1).constants,
+
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters: SemanticParameters::try_new([]).unwrap(),

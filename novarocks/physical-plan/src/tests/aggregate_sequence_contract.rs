@@ -492,7 +492,7 @@ fn finish_two_stage_sequence(drift: BindingDrift, final_groups: FinalGroups) -> 
             .unwrap(),
     );
 
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     add_edge(
@@ -563,7 +563,7 @@ fn aggregate_sequence_rejects_an_orphan_partial() {
             )
             .unwrap(),
     );
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(fragment).unwrap();
     assert!(
         plan.finish_observed(&Unbounded)
@@ -684,7 +684,7 @@ fn aggregate_sequence_rejects_duplicate_finals() {
             .unwrap(),
     );
 
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     add_edge(
@@ -823,7 +823,7 @@ fn intermediate_state_chain_reaches_its_partial_and_final() {
             .unwrap(),
     );
 
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(middle).unwrap();
     plan.add_fragment(destination).unwrap();
@@ -1418,7 +1418,7 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
         .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(fragment).unwrap();
     plan.finish_observed(&Unbounded).map_err(|e| e.to_string())
 }

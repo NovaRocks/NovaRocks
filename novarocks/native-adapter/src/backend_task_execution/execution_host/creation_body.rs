@@ -22,7 +22,7 @@ use super::*;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field};
 use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
-use novarocks_functions::{ConstantPolicy, ConstantPool};
+use novarocks_functions::{ConstantValidation, ConstantPool};
 use novarocks_physical_plan::*;
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
@@ -50,8 +50,8 @@ pub(crate) struct Body {
     pub(crate) assignment: proto::TaskAssignment,
 }
 
-fn constant_policy() -> ConstantPolicy {
-    ConstantPolicy {
+fn constant_policy() -> ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 65536,
         max_array_nodes: 64,
         max_logical_elements: 65536,
@@ -62,7 +62,7 @@ fn constant_policy() -> ConstantPolicy {
         max_metadata_bytes: 65536,
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
-    }
+    })
 }
 fn pool(array: ArrayRef, nullable: bool) -> ConstantPool {
     let value = novarocks_functions::FunctionValueType::new(array.data_type().clone(), nullable);
@@ -211,7 +211,7 @@ fn finish(
             required: RequiredContracts::default(),
             pruning: FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control).unwrap(),
             fragment,
-            statement_constant_policy: constant_policy(),
+
             cuts,
             result,
             parameters: SemanticParameters::try_new([]).unwrap(),

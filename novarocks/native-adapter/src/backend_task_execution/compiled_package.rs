@@ -32,7 +32,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use novarocks_connector_contract::PureProviderProgramCatalog;
-use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
+use novarocks_functions::PureEngineFunctionCatalog;
 use novarocks_local_compiler::{
     FragmentCreationError, LocalCompileOptions, ProviderPreparationError,
     compile_fragment_with_creation, compile_fragment_with_creation_and_project_metadata_host,
@@ -373,7 +373,6 @@ pub struct CompiledPackageInterpreter<E: Error + Send + Sync + 'static> {
     decode_limits: PackageDecodeLimits,
     functions: Arc<PureEngineFunctionCatalog>,
     providers: Arc<PureProviderProgramCatalog<E>>,
-    constants: ConstantPolicy,
 }
 
 impl<E: Error + Send + Sync + 'static> CompiledPackageInterpreter<E> {
@@ -382,14 +381,12 @@ impl<E: Error + Send + Sync + 'static> CompiledPackageInterpreter<E> {
         decode_limits: PackageDecodeLimits,
         functions: Arc<PureEngineFunctionCatalog>,
         providers: Arc<PureProviderProgramCatalog<E>>,
-        constants: ConstantPolicy,
     ) -> Self {
         Self {
             model: model.into(),
             decode_limits,
             functions,
             providers,
-            constants,
         }
     }
 }
@@ -495,7 +492,7 @@ impl<E: Error + FailureProjection + Send + Sync + 'static> CompiledPackageInterp
             pipeline_dop: options.pipeline_dop,
             root_sink_dop,
             kernel_abi: KernelAbiVersion::CURRENT,
-            constants: self.constants,
+            constants: novarocks_functions::ConstantValidation::INPUT_DERIVED,
         };
         let program = match project_host {
             Some(project_host) => compile_fragment_with_creation_and_project_metadata_host(

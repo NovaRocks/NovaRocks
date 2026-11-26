@@ -184,7 +184,7 @@ fn package_input(
         version: crate::PlanVersionId::try_new([91; 16]).unwrap(),
         required: crate::RequiredContracts::default(),
         fragment,
-        statement_constant_policy: policy(),
+
         pruning,
         cuts: crate::FragmentCuts::default(),
         result: None,
@@ -196,11 +196,8 @@ fn package_input(
     }
 }
 fn plan_builder(fragments: &[crate::Fragment], constants: ConstantPools) -> crate::PlanBuilder {
-    let mut builder = crate::PlanBuilder::new(
-        crate::PlanVersionId::try_new([91; 16]).unwrap(),
-        crate::tests::constant_fixture::policy(),
-    )
-    .with_constant_pools(constants);
+    let mut builder = crate::PlanBuilder::new(crate::PlanVersionId::try_new([91; 16]).unwrap())
+        .with_constant_pools(constants);
     for fragment in fragments {
         builder.add_fragment(fragment.clone()).unwrap();
     }

@@ -20,7 +20,7 @@ use crate::{
     ScalarCallRequestFacts,
 };
 use novarocks_functions::{
-    AggregateStateAllocator, ConstantPolicy, KernelEvaluationControl, KernelFailure,
+    AggregateStateAllocator, ConstantValidation, KernelEvaluationControl, KernelFailure,
 };
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::time::Duration;
@@ -97,19 +97,26 @@ impl KernelEvaluationControl for HarnessControl {
 }
 
 /// Generous admission limits for harness constants.
-pub fn constant_policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 1024,
-        max_array_nodes: 4096,
-        max_logical_elements: 1_000_000,
-        max_retained_buffer_bytes: 4_194_304,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 16,
-        max_metadata_bytes: 1_048_576,
-        max_library_validation_work: 16_777_216,
-        max_library_validation_bytes: 16_777_216,
-    }
+pub fn constant_policy() -> ConstantValidation {
+    constant_validation(1_000_000)
+}
+
+/// Keep the harness type limits with a deliberately narrow element budget.
+pub fn constant_validation(max_logical_elements: u64) -> ConstantValidation {
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 1024,
+            max_array_nodes: 4096,
+            max_logical_elements,
+            max_retained_buffer_bytes: 4_194_304,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 16,
+            max_metadata_bytes: 1_048_576,
+            max_library_validation_work: 16_777_216,
+            max_library_validation_bytes: 16_777_216,
+        },
+    )
 }
 
 /// Keep each fixture reference with its real immutable backing. Pool IDs are
@@ -179,7 +186,7 @@ pub fn compile_fixture_unit(
     unit: &novarocks_expression_contract::BoundExprSet,
     environment: crate::EvaluationEnvironment<'_>,
     layouts: crate::ScopeLayouts<'_>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     catalog: &novarocks_functions::PureEngineFunctionCatalog,
 ) -> Arc<crate::CompiledExprSet> {
     let mut work = novarocks_type_contract::CompileCheckpoints::try_new(

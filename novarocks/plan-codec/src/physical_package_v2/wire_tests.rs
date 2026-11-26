@@ -110,7 +110,6 @@ fn generated_dto_presence_survives_byte_admission_without_semantic_publication()
             ..Default::default()
         }),
         types: Some(Default::default()),
-        source_constant_policy: Some(Default::default()),
         calls: Some(Default::default()),
         pruning: Some(Default::default()),
         parameters: Some(Default::default()),

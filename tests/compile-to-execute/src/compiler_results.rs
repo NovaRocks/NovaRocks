@@ -297,7 +297,6 @@ fn source_packages_with_reads(
     source: &SqlAuthoredPhysicalPlan,
     reads: BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
 ) -> BTreeMap<FragmentId, Arc<FragmentPackage>> {
-    source.require_statement_constant_policy(policy()).unwrap();
     let pruning = source
         .plan()
         .fragments()

@@ -484,10 +484,7 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
         )
         .expect("finish fragment");
 
-    let mut plan = p::PlanBuilder::new(
-        p::PlanVersionId::try_new([4; 16]).expect("version"),
-        crate::application::test_constant_policy(),
-    );
+    let mut plan = p::PlanBuilder::new(p::PlanVersionId::try_new([4; 16]).expect("version"));
     plan.insert_constant_pool(
         ints,
         pool(

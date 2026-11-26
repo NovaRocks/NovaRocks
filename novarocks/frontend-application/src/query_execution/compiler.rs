@@ -57,7 +57,7 @@ pub(crate) trait DmlQueryExecutionKernel:
 {
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog;
     fn sealed_functions(&self) -> &std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>;
-    fn constant_policy(&self) -> novarocks_functions::ConstantPolicy;
+    fn constant_policy(&self) -> novarocks_functions::ConstantValidation;
     /// The static carrier the kernel's composition chose for every plan.
     fn static_plan_carrier(
         &self,
@@ -73,7 +73,7 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
         self.sealed_functions()
     }
 
-    fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+    fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy()
     }
 
@@ -94,7 +94,7 @@ impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
         self.sealed_functions()
     }
 
-    fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+    fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy()
     }
 
@@ -1319,7 +1319,6 @@ fn finish_prepared_iceberg_write_assembly(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         DmlQueryExecutionKernel::static_plan_carrier(state),
-        DmlQueryExecutionKernel::constant_policy(state),
         Some(&write_target_facts),
         completion_control,
         capacity,

@@ -284,10 +284,7 @@ fn compile_consumer(
 
 fn builder() -> (PlanBuilder, FragmentBuilder) {
     (
-        PlanBuilder::new(
-            PlanVersionId::try_new([100; 16]).unwrap(),
-            options().constants,
-        ),
+        PlanBuilder::new(PlanVersionId::try_new([100; 16]).unwrap()),
         FragmentBuilder::new(CONSUMER),
     )
 }

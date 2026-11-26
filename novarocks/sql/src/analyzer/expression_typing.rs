@@ -19,7 +19,7 @@ use novarocks_expression::typing::{
     NodeShape, NodeTyping, ScalarBindingCatalog, TypedLiteral, TypingContext, TypingError,
 };
 use novarocks_functions::{
-    ConstantPolicy, FunctionArgument, FunctionBindingError, FunctionBindingRequest,
+    ConstantValidation, FunctionArgument, FunctionBindingError, FunctionBindingRequest,
     FunctionResultType, HigherOrderBindingCandidate, ResolvedFunctionBinding,
 };
 use novarocks_parser::{Span, ast};
@@ -544,7 +544,7 @@ fn bind_temporal_syntax(
 pub(super) fn authored_temporal_cast(
     catalog: &dyn SqlFunctionCatalog,
     settings: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     control: &dyn PureCompileControl,
     source: TypedExpr,
     target: FunctionValueType,
@@ -605,7 +605,7 @@ pub(super) fn type_value_node_with_catalog(
     shape: NodeShape<'_>,
     args: Vec<TypedExpr>,
     decimal_overflow_policy: DecimalOverflowPolicy,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     control: &dyn PureCompileControl,
     span: Span,
 ) -> Result<(FunctionValueType, Vec<TypedExpr>), AnalyzeError> {
@@ -638,7 +638,7 @@ pub(super) fn type_scalar_call_with_catalog(
     shape: NodeShape<'_>,
     args: Vec<TypedExpr>,
     decimal_overflow_policy: DecimalOverflowPolicy,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     control: &dyn PureCompileControl,
     span: Span,
 ) -> Result<BoundScalarCall, AnalyzeError> {
@@ -660,7 +660,7 @@ fn type_scalar_call_with_environment(
     shape: NodeShape<'_>,
     args: Vec<TypedExpr>,
     decimal_overflow_policy: DecimalOverflowPolicy,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     control: &dyn PureCompileControl,
     span: Span,
     statement_time: Option<novarocks_type_contract::StatementTimeEnvironment>,
@@ -747,7 +747,7 @@ fn scalar_selection_error(
 fn with_typing<T>(
     catalog: &dyn SqlFunctionCatalog,
     decimal_overflow_policy: DecimalOverflowPolicy,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     control: &dyn PureCompileControl,
     span: Span,
     action: impl FnOnce(&TypingContext<'_>, &mut CompileCheckpoints<'_>) -> Result<T, TypingError>,

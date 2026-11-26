@@ -113,7 +113,7 @@ impl SqlLogicalExplainCatalog {
         facts: &[CatalogRelationFact],
         functions: &dyn SqlFunctionCatalog,
         sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
-        policy: novarocks_functions::ConstantPolicy,
+        policy: novarocks_functions::ConstantValidation,
         environment: SqlPlanningEnvironment,
         level: ExplainLevel,
     ) -> Result<Vec<String>, SqlCompileError> {
@@ -137,7 +137,7 @@ impl SqlLogicalExplainCatalog {
         facts: &[CatalogRelationFact],
         functions: &dyn SqlFunctionCatalog,
         sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
-        policy: novarocks_functions::ConstantPolicy,
+        policy: novarocks_functions::ConstantValidation,
         environment: SqlPlanningEnvironment,
         level: ExplainLevel,
         evaluate: impl FnOnce(

@@ -46,7 +46,7 @@ use novarocks_spi::connector::MvStorageObservationPort;
 pub struct QueryPreparationKernel {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -81,7 +81,7 @@ impl QueryPreparationKernel {
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         backend_topology: BackendTopologyService,
         _exchange_port: u16,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         static_plan_carrier: CompiledPackageCarrier,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
@@ -98,7 +98,7 @@ impl QueryPreparationKernel {
         }
     }
 
-    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy
     }
 
@@ -150,7 +150,7 @@ impl QueryPreparationKernel {
 pub struct DmlExecutionKernel {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     view_service: Arc<dyn ViewService>,
@@ -174,7 +174,7 @@ pub struct DmlExecutionKernel {
 pub struct DmlPlanningServices {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     view_service: Arc<dyn ViewService>,
@@ -185,7 +185,7 @@ impl DmlPlanningServices {
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         static_plan_carrier: CompiledPackageCarrier,
         view_service: Arc<dyn ViewService>,
         system_relations: Arc<SystemTableRegistry>,
@@ -340,7 +340,7 @@ impl DmlExecutionKernel {
         }
     }
 
-    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy
     }
 
@@ -390,7 +390,7 @@ impl DmlExecutionKernel {
 /// View command dependencies.
 #[derive(Clone)]
 pub struct ViewExecutionKernel {
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
@@ -410,7 +410,7 @@ impl ViewExecutionKernel {
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         view_service: Arc<dyn ViewService>,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         system_relations: Arc<SystemTableRegistry>,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
@@ -449,7 +449,7 @@ impl ViewExecutionKernel {
     pub fn view_service(&self) -> &Arc<dyn ViewService> {
         &self.view_service
     }
-    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy
     }
 }
@@ -458,7 +458,7 @@ impl ViewExecutionKernel {
 #[derive(Clone)]
 pub struct MaintenanceExecutionKernel {
     rewrite_runtime: Option<MaintenanceRewriteRuntime>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     static_plan_carrier: CompiledPackageCarrier,
@@ -498,7 +498,7 @@ impl MaintenanceExecutionKernel {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         service: Arc<dyn TableMaintenanceService>,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         static_plan_carrier: CompiledPackageCarrier,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
@@ -571,7 +571,7 @@ impl MaintenanceExecutionKernel {
     pub(crate) fn service(&self) -> &Arc<dyn TableMaintenanceService> {
         &self.service
     }
-    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy
     }
 }

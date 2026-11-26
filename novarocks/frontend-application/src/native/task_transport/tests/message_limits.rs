@@ -122,8 +122,7 @@ fn system_fragment(
             version: p::PlanVersionId::try_new([0x72; 16]).unwrap(),
             required: p::RequiredContracts::default(),
             fragment,
-            statement_constant_policy:
-                novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+
             pruning,
             constants: p::ConstantPools::empty(),
             cuts: p::FragmentCuts::default(),

@@ -256,7 +256,7 @@ fn with_actual_call<R>(
         CallEffectInput<'_>,
         Arc<novarocks_functions::FunctionBindingSelection>,
         &novarocks_type_contract::CallEffects,
-        &ConstantPolicy,
+        &ConstantValidation,
     ) -> R,
 ) -> R {
     let project = program
@@ -326,7 +326,7 @@ fn preparation(
     input: CallEffectInput<'_>,
     selected: Arc<novarocks_functions::FunctionBindingSelection>,
     effects: &novarocks_type_contract::CallEffects,
-    policy: &ConstantPolicy,
+    policy: &ConstantValidation,
     scope: &mut Scope,
     control: &dyn PureCompileControl,
 ) -> Result<novarocks_functions::PureCallSpecialization, CheckedCallPreparationFailure<FirstH>> {
@@ -339,7 +339,6 @@ fn preparation(
                 input.context.expression().expect("actual scalar context"),
             ),
         },
-        policy,
         scope,
         control,
     )
@@ -709,7 +708,6 @@ fn nonempty_original_request() -> novarocks_expression_contract::PhysicalCallReq
         .into_boxed_slice(),
         logical_argument_count: 2,
         expected_result_type: Some(json),
-        constant_policy: options(1).constants,
     }
 }
 fn materialize_created_request<'a>(
@@ -1045,7 +1043,6 @@ fn original_request_header_gates_and_pending_control_precede_lazy_scope_creation
         arguments: Box::new([]),
         logical_argument_count: 0,
         expected_result_type: None,
-        constant_policy: options(1).constants,
     };
     let factory = Factory::new();
     let empty = materialize_created_request(&source, &pools, &factory).unwrap();

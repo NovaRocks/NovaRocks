@@ -539,34 +539,10 @@ fn original_requests_keep_missing_distinct_from_explicit_empty_and_present_zero(
     assert!(missing.call_requests.is_none());
     assert!(empty.call_requests.as_ref().unwrap().entries.is_empty());
     assert_eq!(empty.encode_to_vec(), [0x4a, 0x00]);
-    // The sender's statement policy has independent presence at package tag27;
-    // an empty policy is not silently supplied from receiving defaults.
-    let missing_policy = v2::FragmentPackage::decode([].as_slice()).unwrap();
-    let explicit_policy = v2::FragmentPackage::decode([0xda, 0x01, 0x00].as_slice()).unwrap();
-    assert!(missing_policy.source_constant_policy.is_none());
-    assert_eq!(
-        explicit_policy.source_constant_policy,
-        Some(v2::SourceConstantPolicy::default())
-    );
-    assert_eq!(explicit_policy.encode_to_vec(), [0xda, 0x01, 0x00]);
-    // Ten explicit zero fields are original source policy data. Omission is
-    // retained by Prost and is rejected by the separate typed receiving owner.
-    let bytes = [
-        0x08, 0, 0x10, 0, 0x18, 0, 0x20, 0, 0x28, 0, 0x30, 0, 0x38, 0, 0x40, 0, 0x48, 0, 0x50, 0,
-    ];
-    let zeros = v2::SourceConstantPolicy::decode(bytes.as_slice()).unwrap();
-    assert_eq!(zeros.max_rows, Some(0));
-    assert_eq!(zeros.max_array_nodes, Some(0));
-    assert_eq!(zeros.max_logical_elements, Some(0));
-    assert_eq!(zeros.max_retained_buffer_bytes, Some(0));
-    assert_eq!(zeros.max_type_depth, Some(0));
-    assert_eq!(zeros.max_type_nodes, Some(0));
-    assert_eq!(zeros.max_dictionary_depth, Some(0));
-    assert_eq!(zeros.max_metadata_bytes, Some(0));
-    assert_eq!(zeros.max_library_validation_work, Some(0));
-    assert_eq!(zeros.max_library_validation_bytes, Some(0));
-    assert_eq!(zeros.encode_to_vec(), bytes);
-    assert_ne!(zeros, v2::SourceConstantPolicy::default());
+    let reserved_policy = v2::FragmentPackage::decode([0xda, 0x01, 0x00].as_slice()).unwrap();
+    assert!(reserved_policy.encode_to_vec().is_empty());
+    let reserved_request_policy = v2::OriginalCallRequest::decode([0x2a, 0x00].as_slice()).unwrap();
+    assert!(reserved_request_policy.encode_to_vec().is_empty());
     let request = v2::OriginalCallRequest::decode([0x18, 0, 0x20, 0].as_slice()).unwrap();
     assert_eq!(request.logical_argument_count, Some(0));
     assert_eq!(request.expected_result_value_type_id, Some(0));

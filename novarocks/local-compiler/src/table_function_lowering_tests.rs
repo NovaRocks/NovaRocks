@@ -27,9 +27,9 @@ use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_expression_contract::LegacyBindingMetadata;
 use novarocks_expression_contract::{ExprKind, PhysicalCallRequest, RootOrdinal, RootScope};
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, ConstantPool, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
-    InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
+    CallEffectInput, ConstantPool, ConstantValidation, EngineFunctionCatalogBuilder,
+    FunctionArgument, FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId,
+    FunctionResultType, InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedRelationalEffects,
 };
 use novarocks_local_program::{
@@ -66,8 +66,8 @@ impl PureCompileControl for Control {
     }
 }
 
-fn constant_policy() -> ConstantPolicy {
-    ConstantPolicy {
+fn constant_policy() -> ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 16,
         max_array_nodes: 128,
         max_logical_elements: 1024,
@@ -78,7 +78,7 @@ fn constant_policy() -> ConstantPolicy {
         max_metadata_bytes: 1 << 20,
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
-    }
+    })
 }
 
 fn options() -> LocalCompileOptions {
@@ -515,7 +515,6 @@ fn fixture(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Fixture {
                 .collect(),
             logical_argument_count: function.argument_types.len(),
             expected_result_type: None,
-            constant_policy: constant_policy(),
         },
     ));
     let fragment = fragment
@@ -624,7 +623,7 @@ fn package(
         FragmentPackage::try_new(
             FragmentPackageInput {
                 constants,
-                statement_constant_policy: constant_policy(),
+
                 version: PlanVersionId::try_new([83; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,

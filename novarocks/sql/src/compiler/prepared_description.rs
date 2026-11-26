@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, NullArray};
 use arrow::datatypes::{DataType, Field, TimeUnit};
-use novarocks_functions::{ConstantPolicy, ConstantPool};
+use novarocks_functions::{ConstantPool, ConstantValidation};
 use novarocks_type_contract::{
     CompilePhase, FunctionValueType, TemporalType, ValueKind, ValueLogicalType,
 };
@@ -116,14 +116,11 @@ pub(crate) struct DescriptionAnalysis {
 impl DescriptionAnalysis {
     pub(crate) fn new(
         count: usize,
-        policy: ConstantPolicy,
+        policy: ConstantValidation,
         control: &SqlCompileControl,
     ) -> Result<Self, SqlCompileError> {
         let unknown = FunctionValueType::new(DataType::Null, true);
-        let parameters_per_pool = policy
-            .max_rows
-            .min(policy.max_logical_elements)
-            .min(u32::MAX as u64) as usize;
+        let parameters_per_pool = policy.null_pool_rows();
         if count != 0 && parameters_per_pool == 0 {
             return Err(SqlCompileError::ResourceExhausted);
         }

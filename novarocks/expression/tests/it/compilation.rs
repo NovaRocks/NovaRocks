@@ -71,19 +71,21 @@ impl PureCompileControl for Control {
         Ok(())
     }
 }
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 1024,
-        max_array_nodes: 4096,
-        max_logical_elements: 1_000_000,
-        max_retained_buffer_bytes: 16_777_216,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 16,
-        max_metadata_bytes: 1_048_576,
-        max_library_validation_work: 67_108_864,
-        max_library_validation_bytes: 67_108_864,
-    }
+fn policy() -> ConstantValidation {
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 1024,
+            max_array_nodes: 4096,
+            max_logical_elements: 1_000_000,
+            max_retained_buffer_bytes: 16_777_216,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 16,
+            max_metadata_bytes: 1_048_576,
+            max_library_validation_work: 67_108_864,
+            max_library_validation_bytes: 67_108_864,
+        },
+    )
 }
 fn limits() -> UnitLimits {
     UnitLimits {
@@ -490,7 +492,6 @@ fn higher_order_compilation_keeps_exact_captures_and_ancestor_reuse() {
             arguments: Box::new([]),
             logical_argument_count: 0,
             expected_result_type: None,
-            constant_policy: policy(),
         },
     )
     .unwrap();
@@ -587,7 +588,6 @@ fn higher_order_compilation_keeps_exact_captures_and_ancestor_reuse() {
         &sealed,
         &CallAuthorInputs {
             environment,
-            constant_policy: policy(),
             functions: &catalog,
             decimal_overflow: &overflow,
         },
@@ -964,7 +964,6 @@ fn rand_unit() -> (BoundExprSet, PureEngineFunctionCatalog, SemanticParameters) 
             arguments: Box::default(),
             logical_argument_count: 0,
             expected_result_type: None,
-            constant_policy: policy(),
         },
     )
     .unwrap();
@@ -1240,11 +1239,13 @@ fn checked_sources_are_not_readmitted_under_a_different_caller_policy() {
     let u = finish(b, vec![]);
     let c = Control::good();
     let mut w = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
-    let low = ConstantPolicy {
-        max_rows: 0,
-        max_retained_buffer_bytes: 0,
-        ..policy()
-    };
+    let low = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 0,
+            max_retained_buffer_bytes: 0,
+            ..policy()
+        },
+    );
     let p = compile_expr_set_pure(
         &u,
         EvaluationEnvironment {
@@ -2223,7 +2224,6 @@ fn original_no_arguments_invocation_keeps_full_static_request_without_input_uses
             ]),
             logical_argument_count: 3,
             expected_result_type: None,
-            constant_policy: policy(),
         },
     )
     .unwrap();

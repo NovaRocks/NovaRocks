@@ -166,8 +166,8 @@ fn pair_with_constant(cv: p::ConstantValue, unary: bool) -> p::FragmentPackage {
             p::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = p::PlanBuilder::new(p::PlanVersionId::try_new([1; 16]).unwrap(), policy)
-        .with_constant_pools(pools);
+    let mut plan =
+        p::PlanBuilder::new(p::PlanVersionId::try_new([1; 16]).unwrap()).with_constant_pools(pools);
     plan.add_fragment(fragment).unwrap();
     let plan = plan.finish_observed(&Control).unwrap();
     let fragments = p::extract_fragment_packages(
@@ -274,10 +274,6 @@ fn node_units_keep_local_zero_distinct_ports_source_pool_and_repeated_outputs() 
     let decoded =
         decode_fragment_package(&raw, &model, &PackageDecodeLimits::FROZEN, &Control).unwrap();
     assert_eq!(decoded.fragment().nodes(), package.fragment().nodes());
-    assert_eq!(
-        decoded.statement_constant_policy(),
-        package.statement_constant_policy()
-    );
     assert_eq!(
         decoded
             .fragment()

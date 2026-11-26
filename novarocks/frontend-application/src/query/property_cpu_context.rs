@@ -41,7 +41,7 @@ pub(crate) struct PropertyCpuContext {
     pub(super) window: ResultWindowAlias,
     pub(super) catalog: Arc<RwLock<novarocks_sql::planning::catalog::PlannerMemoryCatalog>>,
     pub(super) functions: Arc<dyn SqlFunctionCatalog>,
-    pub(super) policy: novarocks_functions::ConstantPolicy,
+    pub(super) policy: novarocks_functions::ConstantValidation,
 }
 impl PropertyCpuContext {
     pub(super) fn constant_port(&self) -> PropertyConstantPort<'_> {

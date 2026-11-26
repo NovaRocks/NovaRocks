@@ -1222,12 +1222,7 @@ impl TextNode {
                     .expect("original author metadata")
                     .semantic_parameters = references.into_boxed_slice();
                 let id = draft.add(lambda_scope, ty, ExprKind::FunctionCall { function, args })?;
-                let request = physical_call_request(
-                    &request_args,
-                    expected_result,
-                    context.constant_policy,
-                    constants,
-                );
+                let request = physical_call_request(&request_args, expected_result, constants);
                 draft.request(id, request)?;
                 return Ok(id);
             }

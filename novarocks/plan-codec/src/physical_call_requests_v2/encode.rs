@@ -599,22 +599,6 @@ fn reserve<T>(n: usize, w: &mut CompileCheckpoints<'_>) -> Result<Vec<T>, Error>
     w.flush()?;
     Ok(output)
 }
-pub(crate) fn encode_source_policy(
-    value: novarocks_physical_plan::ConstantPolicy,
-) -> wire::SourceConstantPolicy {
-    wire::SourceConstantPolicy {
-        max_rows: Some(value.max_rows),
-        max_array_nodes: Some(value.max_array_nodes),
-        max_logical_elements: Some(value.max_logical_elements),
-        max_retained_buffer_bytes: Some(value.max_retained_buffer_bytes),
-        max_type_depth: Some(value.max_type_depth),
-        max_type_nodes: Some(value.max_type_nodes),
-        max_dictionary_depth: Some(value.max_dictionary_depth),
-        max_metadata_bytes: Some(value.max_metadata_bytes),
-        max_library_validation_work: Some(value.max_library_validation_work),
-        max_library_validation_bytes: Some(value.max_library_validation_bytes),
-    }
-}
 pub fn encode_call_requests(
     token: PreparedCallRequestsEncode<'_, '_>,
 ) -> Result<wire::FragmentCallRequests, Error> {
@@ -671,7 +655,6 @@ fn emit_core<K: WireRequestKey>(
                             .map_err(|_| shape("request prepared logical count changed"))?,
                     ),
                     expected_result_value_type_id: ids.expected_result_type,
-                    constant_policy: Some(encode_source_policy(request.constant_policy)),
                 },
             ));
             w.step()?;
@@ -807,7 +790,6 @@ struct RequestFields {
     arguments: Vec<wire::OriginalFunctionArgument>,
     logical_argument_count: Option<u32>,
     expected_result_value_type_id: Option<u32>,
-    constant_policy: Option<wire::SourceConstantPolicy>,
 }
 trait WireRequestKey: Copy + Ord {
     type Wire;
@@ -825,7 +807,6 @@ impl WireRequestKey for PhysicalCallSite {
             arguments: f.arguments,
             logical_argument_count: f.logical_argument_count,
             expected_result_value_type_id: f.expected_result_value_type_id,
-            constant_policy: f.constant_policy,
         }
     }
 }
@@ -837,7 +818,6 @@ impl WireRequestKey for novarocks_expression_contract::ExprId {
             arguments: f.arguments,
             logical_argument_count: f.logical_argument_count,
             expected_result_value_type_id: f.expected_result_value_type_id,
-            constant_policy: f.constant_policy,
         }
     }
 }

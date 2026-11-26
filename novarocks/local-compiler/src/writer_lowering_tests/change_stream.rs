@@ -337,10 +337,7 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
             StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([31; 16]).unwrap(),
-        options(1, None).constants,
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([31; 16]).unwrap());
     for (&id, pool) in constants.entries() {
         plan.insert_constant_pool(id, pool.clone()).unwrap();
     }

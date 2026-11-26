@@ -166,7 +166,6 @@ pub fn request(function: &BoundFunction) -> PhysicalCallRequest {
         logical_argument_count: arguments.len(),
         arguments,
         expected_result_type: None,
-        constant_policy: policy(),
     }
 }
 pub fn claim(context: ExpressionEffectContext, control: ArgumentControl) -> ExpressionCallClaim {

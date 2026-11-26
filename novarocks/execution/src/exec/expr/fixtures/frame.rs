@@ -78,7 +78,6 @@ fn finish_fixture_units(
             functions,
             &constants,
             parameters,
-            policy,
             &mut work,
         );
     }
@@ -105,7 +104,6 @@ fn finish_fixture_units(
             },
             &constants,
             parameters,
-            policy,
             &mut work,
         );
         builder.install_unit(node, Arc::new(unit)).unwrap();
@@ -150,7 +148,7 @@ pub(crate) fn compile_checked_fragment_with_parameters(
                 required: RequiredContracts::default(),
                 constants,
                 fragment,
-                statement_constant_policy: options(1).constants,
+
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters,

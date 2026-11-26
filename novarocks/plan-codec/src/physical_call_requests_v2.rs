@@ -30,16 +30,17 @@ use std::fmt;
 
 mod encode;
 mod read;
+pub(crate) use encode::encode_unit_requests_in;
 pub use encode::{PreparedCallRequestsEncode, encode_call_requests, prepare_call_requests_encode};
-pub(crate) use encode::{encode_source_policy, encode_unit_requests_in};
 pub use encode::{prepare_call_requests_encode_in, prepare_call_requests_encode_with_host_in};
 pub use read::{
     CallRequestTypeOwner, DecodedCallRequests, PreparedCallRequestsDecode, decode_call_requests,
     decode_call_requests_with_creator_in, prepare_call_requests_decode,
     prepare_call_requests_decode_with_creator_in,
 };
-pub(crate) use read::{decode_call_requests_in, prepare_call_requests_decode_in};
-pub(crate) use read::{decode_unit_requests_in, policy as decode_source_policy};
+pub(crate) use read::{
+    decode_call_requests_in, decode_unit_requests_in, prepare_call_requests_decode_in,
+};
 
 /// IDs name exact complete FVT roots in the same emitted type table. They are
 /// a projection loan, not another author of the original request.

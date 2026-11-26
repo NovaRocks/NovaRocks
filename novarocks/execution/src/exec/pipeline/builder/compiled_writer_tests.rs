@@ -39,7 +39,7 @@ use novarocks_connector_contract::{
     PureProviderProgramDefinition,
 };
 use novarocks_expression_contract::RootScope;
-use novarocks_functions::ConstantPolicy;
+use novarocks_functions::ConstantValidation;
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
@@ -490,7 +490,6 @@ fn plan_with_cells(
 
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([8; 16]).unwrap(),
-        &fixture_sources,
     )
     .with_constant_pools(constants);
     plan.add_fragment(producer).unwrap();
@@ -629,18 +628,20 @@ fn compile(package: FragmentPackage, pipeline_dop: usize, root_sink: bool) -> Ar
                 root_sink_dop: root_sink.then(|| NonZeroUsize::new(1).unwrap()),
                 kernel_abi: KernelAbiVersion::CURRENT,
                 // Explicit fixture admission; not production defaults.
-                constants: ConstantPolicy {
-                    max_rows: 16,
-                    max_array_nodes: 128,
-                    max_logical_elements: 1024,
-                    max_retained_buffer_bytes: 1 << 20,
-                    max_type_depth: 64,
-                    max_type_nodes: 4096,
-                    max_dictionary_depth: 64,
-                    max_metadata_bytes: 1 << 20,
-                    max_library_validation_work: 1 << 20,
-                    max_library_validation_bytes: 1 << 20,
-                },
+                constants: novarocks_functions::ConstantValidation::bounded(
+                    novarocks_functions::ConstantPolicy {
+                        max_rows: 16,
+                        max_array_nodes: 128,
+                        max_logical_elements: 1024,
+                        max_retained_buffer_bytes: 1 << 20,
+                        max_type_depth: 64,
+                        max_type_nodes: 4096,
+                        max_dictionary_depth: 64,
+                        max_metadata_bytes: 1 << 20,
+                        max_library_validation_work: 1 << 20,
+                        max_library_validation_bytes: 1 << 20,
+                    },
+                ),
             },
             &FixtureControl,
         )
@@ -1079,18 +1080,19 @@ fn nested_insert(child: Option<i64>, source_child_nullable: bool, parent_valid: 
     )
     .unwrap();
     let source = ty(array.data_type().clone(), true);
-    let policy = ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    };
+    let policy =
+        novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 128,
+            max_logical_elements: 1024,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        });
     let pool = ConstantPool::try_new(
         Arc::new(Field::new("st", source.data_type().clone(), true)),
         source.clone(),
@@ -1146,18 +1148,19 @@ fn nested_fixed_insert(child: Option<[u8; 4]>, parent_valid: bool) -> Insert {
     )
     .unwrap();
     let source = ty(array.data_type().clone(), true);
-    let policy = ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    };
+    let policy =
+        novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 128,
+            max_logical_elements: 1024,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        });
     let pool = ConstantPool::try_new(
         Arc::new(Field::new("st", source.data_type().clone(), true)),
         source.clone(),
@@ -1612,12 +1615,11 @@ mod statistics {
             }]),
             logical_argument_count: 1,
             expected_result_type: None,
-            constant_policy: constants(),
         }
     }
 
-    fn constants() -> ConstantPolicy {
-        ConstantPolicy {
+    fn constants() -> ConstantValidation {
+        novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
             max_rows: 16,
             max_array_nodes: 128,
             max_logical_elements: 1024,
@@ -1628,7 +1630,7 @@ mod statistics {
             max_metadata_bytes: 1 << 20,
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
-        }
+        })
     }
 
     /// The input-field ID lists `[1]` and `[2]` and one empty property map,
@@ -2132,7 +2134,6 @@ mod statistics {
 
         let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
             PlanVersionId::try_new([8; 16]).unwrap(),
-            &fixture_sources,
         )
         .with_semantic_parameters(parameters);
         for (id, pool) in pools() {

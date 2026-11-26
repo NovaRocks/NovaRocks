@@ -130,15 +130,6 @@ impl SqlAuthoredPhysicalPlan {
     }
     /// Compare only original immutable metadata before package extraction.
     /// The enclosing caller retains admission and cancellation ownership.
-    pub fn require_statement_constant_policy(
-        &self,
-        policy: novarocks_functions::ConstantPolicy,
-    ) -> Result<(), super::package_semantics::PackageSemanticsError> {
-        if self.plan.statement_constant_policy() != policy {
-            return Err(super::package_semantics::PackageSemanticsError::StatementPolicyMismatch);
-        }
-        Ok(())
-    }
     pub fn plan(&self) -> &PhysicalPlan {
         &self.plan
     }

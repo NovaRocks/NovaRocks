@@ -296,7 +296,7 @@ fn package_input(fragment: Fragment) -> FragmentPackageInput {
         version: PlanVersionId::try_new([9; 16]).unwrap(),
         required: RequiredContracts::default(),
         fragment,
-        statement_constant_policy: crate::tests::constant_fixture::policy(),
+
         pruning,
         cuts: FragmentCuts::default(),
         result: None,

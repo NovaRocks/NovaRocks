@@ -23,7 +23,7 @@ use super::*;
 use arrow_array::{ArrayRef, Int64Array};
 use arrow_schema::DataType;
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder,
+    CallEffectInput, ConstantValidation, ConstantValue, EngineFunctionCatalogBuilder,
     EvaluatedArgument, FunctionArgument, FunctionBindingRequest, FunctionId, FunctionKind,
     FunctionOverloadId, FunctionResultType, InstalledPureKernel, KernelEvaluationControl,
     KernelFailure, PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
@@ -99,18 +99,20 @@ fn options(dop: usize) -> LocalCompileOptions {
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
         // Explicit fixture admission; these values are not production defaults.
-        constants: ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        },
+        constants: novarocks_functions::ConstantValidation::bounded(
+            novarocks_functions::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        ),
     }
 }
 
@@ -192,7 +194,6 @@ fn package_with_outputs(
         arguments: original_arguments,
         logical_argument_count: request.logical_argument_count,
         expected_result_type: request.expected_result_type.cloned(),
-        constant_policy: options(1).constants,
     };
     let selected = Arc::new(bound.selected.clone());
     let FunctionResultType::Scalar(result_type) = &selected.result_type else {
@@ -545,7 +546,7 @@ fn package_with_outputs(
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 fragment,
-                statement_constant_policy: options(1).constants,
+
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters,

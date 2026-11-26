@@ -26,7 +26,7 @@ use crate::planner::table::{
 use arrow::array::{
     Array, ArrayRef, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
 };
-use novarocks_functions::{ConstantPolicy, ConstantPool, ConstantValue};
+use novarocks_functions::{ConstantPool, ConstantValidation, ConstantValue};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType,
     PureCompileControl, ValueLogicalType,
@@ -69,19 +69,21 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 64,
-        max_logical_elements: 4096,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 16,
-        max_type_nodes: 128,
-        max_dictionary_depth: 4,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 24,
-        max_library_validation_bytes: 1 << 24,
-    }
+fn policy() -> ConstantValidation {
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 64,
+            max_logical_elements: 4096,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 16,
+            max_type_nodes: 128,
+            max_dictionary_depth: 4,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 24,
+            max_library_validation_bytes: 1 << 24,
+        },
+    )
 }
 fn text(
     carrier: DataType,

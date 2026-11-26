@@ -42,7 +42,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct FragmentPackageInput {
     pub constants: crate::ConstantPools,
-    pub statement_constant_policy: crate::ConstantPolicy,
+
     pub version: PlanVersionId,
     pub required: RequiredContracts,
     pub fragment: Fragment,
@@ -511,9 +511,6 @@ impl FragmentPackage {
 
     pub const fn calls(&self) -> &FrozenFragmentCalls {
         self.0.fragment.calls()
-    }
-    pub const fn statement_constant_policy(&self) -> crate::ConstantPolicy {
-        self.0.statement_constant_policy
     }
 
     pub const fn pruning(&self) -> &FrozenFragmentPruning {
@@ -1048,7 +1045,7 @@ fn extract_fragment_packages_observed(
         let package = FragmentPackage::try_new_observed(
             FragmentPackageInput {
                 constants: projected,
-                statement_constant_policy: plan.statement_constant_policy(),
+
                 version: plan.version(),
                 required: plan.required(),
                 fragment: fragment.clone(),
@@ -1235,7 +1232,6 @@ mod parameter_preallocation_review_tests {
                     arguments: Box::default(),
                     logical_argument_count: 0,
                     expected_result_type: None,
-                    constant_policy: policy,
                 },
             )
             .unwrap();
@@ -1329,7 +1325,7 @@ mod parameter_preallocation_review_tests {
         let package = FragmentPackage::try_new(
             FragmentPackageInput {
                 constants: ConstantPools::empty(),
-                statement_constant_policy: policy,
+
                 version: PlanVersionId::try_new([29; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment: fragment.clone(),
@@ -1346,8 +1342,7 @@ mod parameter_preallocation_review_tests {
             &Control,
         )
         .unwrap();
-        let mut plan =
-            PlanBuilder::new(package.version(), policy).with_semantic_parameters(parameters);
+        let mut plan = PlanBuilder::new(package.version()).with_semantic_parameters(parameters);
         plan.add_fragment(fragment.clone()).unwrap();
         let plan = plan.finish_observed(&Control).unwrap();
         let extracted = extract_fragment_packages(

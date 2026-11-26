@@ -248,7 +248,6 @@ fn mixed_phase_program() -> Arc<LocalProgram> {
     );
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([71; 16]).unwrap(),
-        &fixture_sources,
     )
     .with_semantic_parameters(parameters.clone());
     plan.add_fragment(finish(

@@ -46,7 +46,7 @@ fn scalar_context<'a>(
     current_database: &'a str,
     functions: &'a dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &'a crate::compiler::SqlCompileControl,
 ) -> super::AnalyzerContext<'a> {
     super::AnalyzerContext {
@@ -333,7 +333,7 @@ fn prepare_typed(
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<PreparedRequiredConstant, SqlCompileError> {
     validate_scalar(&expression, span, control, eligibility)?;

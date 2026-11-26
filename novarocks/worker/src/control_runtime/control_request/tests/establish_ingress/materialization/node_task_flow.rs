@@ -163,7 +163,7 @@ fn compiled_count_root() -> Arc<LocalProgram> {
                 required: RequiredContracts::default(),
                 constants: ConstantPools::empty(),
                 fragment,
-                statement_constant_policy: policy,
+
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters: SemanticParameters::try_new([]).unwrap(),

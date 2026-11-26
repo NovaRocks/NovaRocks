@@ -1049,8 +1049,7 @@ pub(super) fn compiled_fragment(
             pruning: FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control)
                 .expect("empty pruning"),
             fragment,
-            statement_constant_policy:
-                novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+
             cuts,
             result,
             parameters: SemanticParameters::try_new([]).expect("parameters"),

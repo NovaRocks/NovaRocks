@@ -382,7 +382,6 @@ fn between_actual_after_original_control_codec_roundtrip_and_invalid_four_use_re
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         };
-        source.require_statement_constant_policy(policy).unwrap();
         let mut seen = 0;
         for unit in source
             .plan()

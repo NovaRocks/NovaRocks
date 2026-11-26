@@ -56,7 +56,7 @@ use crate::query::compiler::FrontendQueryCompiler;
 pub(crate) struct QueryCompilerPorts {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -93,7 +93,7 @@ impl QueryCompilerPorts {
         mv_candidate_reader: MvCandidateReader,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         static_plan_carrier: CompiledPackageCarrier,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
@@ -163,7 +163,7 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
 pub struct DmlEnginePorts {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     view_service: Arc<dyn ViewService>,
@@ -197,7 +197,7 @@ impl DmlEnginePorts {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         connector_runtime: tokio::runtime::Handle,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         static_plan_carrier: CompiledPackageCarrier,
         view_service: Arc<dyn ViewService>,
         system_relations: Arc<SystemTableRegistry>,
@@ -378,7 +378,7 @@ pub fn iceberg_ref_command_executor(
 #[derive(Clone)]
 pub struct MaintenanceCommandPorts {
     rewrite_runtime: Option<domain::MaintenanceRewriteRuntime>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     static_plan_carrier: CompiledPackageCarrier,
@@ -405,7 +405,7 @@ impl MaintenanceCommandPorts {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         service: Arc<dyn TableMaintenanceService>,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         static_plan_carrier: CompiledPackageCarrier,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
@@ -467,7 +467,7 @@ pub struct MvCommandPorts {
     system_relations: Arc<SystemTableRegistry>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -501,7 +501,7 @@ impl MvCommandPorts {
         management_audit: Option<
             Arc<dyn novarocks_mv_application::management::ManagementAuditSink>,
         >,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         view_service: Arc<dyn ViewService>,
         system_relations: Arc<SystemTableRegistry>,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
@@ -554,7 +554,7 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
 /// Leaf ports for external-view commands.
 #[derive(Clone)]
 pub struct ViewCommandPorts {
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
@@ -571,7 +571,7 @@ impl ViewCommandPorts {
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         view_service: Arc<dyn ViewService>,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         system_relations: Arc<SystemTableRegistry>,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
@@ -670,7 +670,7 @@ pub(crate) struct MvRefreshProviderActivationPorts {
     system_relations: Arc<SystemTableRegistry>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     /// A durable MV refresh resolves an externally attached target while it
@@ -705,7 +705,7 @@ impl MvRefreshProviderActivationPorts {
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         static_plan_carrier: CompiledPackageCarrier,
         view_service: Arc<dyn ViewService>,
         system_relations: Arc<SystemTableRegistry>,
@@ -791,7 +791,7 @@ pub(crate) struct MvBackgroundPorts {
     system_relations: Arc<SystemTableRegistry>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -813,7 +813,7 @@ impl MvBackgroundPorts {
         readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         view_service: Arc<dyn ViewService>,
         system_relations: Arc<SystemTableRegistry>,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,

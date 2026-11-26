@@ -24,7 +24,9 @@ use novarocks_expression::{
     ScalarCallRequestFacts, ScopeLayouts, compile_expr_set_pure,
 };
 use novarocks_expression_contract::{RootScope, UnitError};
-use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+use novarocks_failure_contract::{
+    FailureClass, FailureProjection, RepresentationBoundary, SharedFailureCause,
+};
 use novarocks_functions::{
     AggregateStateAllocator, CompileKernelControl, ConstantValue, FunctionBindingError,
     KernelDiagnostic, KernelFailure, PureEngineFunctionCatalog, ScalarInvocationActivation,
@@ -188,18 +190,27 @@ fn evaluate_fold(
         CompiledExpressionInstance::try_new(compiled, source.root(), &kernel_control)
             .map_err(kernel_error)?;
     let selection = Selection::all(1);
-    let values = instance
-        .evaluate(
-            EvaluationInput::Batch {
-                batch: &input,
-                source: None,
-            },
-            ScalarInvocationScope::new(selection, selection),
-            ScalarInvocationActivation::Activated,
-            &kernel_control,
-            &mut FoldCallHost { control },
-        )
-        .map_err(evaluation_error)?;
+    let values = match instance.evaluate(
+        EvaluationInput::Batch {
+            batch: &input,
+            source: None,
+        },
+        ScalarInvocationScope::new(selection, selection),
+        ScalarInvocationActivation::Activated,
+        &kernel_control,
+        &mut FoldCallHost { control },
+    ) {
+        Ok(values) => values,
+        Err(ExprEvaluationFailure::Kernel(error))
+            if error.is_local_output_allocation_failure() || is_fold_output_extent(&error) =>
+        {
+            drop(instance);
+            drop(error);
+            control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+            return Ok(FoldNodeOutcome::Kept);
+        }
+        Err(error) => return Err(evaluation_error(error)),
+    };
     let (selected, array, row_errors) = values.into_parts();
     if !selected.is_all() || selected.batch_rows() != 1 {
         return Err(invalid(
@@ -215,6 +226,15 @@ fn evaluate_fold(
             None => FoldNodeOutcome::Kept,
         },
     )
+}
+
+pub(super) fn is_fold_output_extent(error: &impl FailureProjection) -> bool {
+    error.failure_fact().representation().is_some_and(|facts| {
+        matches!(
+            facts.boundary,
+            RepresentationBoundary::MinimumUnit | RepresentationBoundary::SingleOutput
+        )
+    })
 }
 
 fn invalid(message: &'static str) -> SqlCompileError {

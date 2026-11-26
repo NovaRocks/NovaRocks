@@ -70,7 +70,6 @@ fn request(arguments: Vec<FunctionArgument<crate::ConstantReference>>) -> Physic
         logical_argument_count: arguments.len(),
         arguments: arguments.into_boxed_slice(),
         expected_result_type: None,
-        constant_policy: policy(),
     }
 }
 fn mixed_request() -> PhysicalCallRequest {

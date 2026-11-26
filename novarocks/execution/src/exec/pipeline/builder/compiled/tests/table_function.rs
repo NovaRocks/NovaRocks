@@ -538,7 +538,6 @@ fn finish(
                         .collect(),
                     logical_argument_count: source.arguments.len(),
                     expected_result_type: None,
-                    constant_policy: constant_policy(),
                 },
             )
         })
@@ -796,12 +795,10 @@ fn single_program(rows: &[Row], spec: &Spec, sorted: bool) -> Result<Arc<LocalPr
         &actual_parameters,
     );
     let port = result_port(&fragment, table);
-    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
-        version(),
-        &fixture_sources,
-    )
-    .with_constant_pools(pools.0)
-    .with_semantic_parameters(actual_parameters);
+    let mut plan =
+        crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(version())
+            .with_constant_pools(pools.0)
+            .with_semantic_parameters(actual_parameters);
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(port).unwrap();
     let plan = plan
@@ -1169,12 +1166,10 @@ fn exchanged_programs(
     );
     let port = result_port(&consumer, table);
 
-    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
-        version(),
-        &fixture_sources,
-    )
-    .with_constant_pools(pools.0)
-    .with_semantic_parameters(actual_parameters);
+    let mut plan =
+        crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(version())
+            .with_constant_pools(pools.0)
+            .with_semantic_parameters(actual_parameters);
     plan.add_fragment(source).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(edge(

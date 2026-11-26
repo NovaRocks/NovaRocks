@@ -749,7 +749,6 @@ pub(super) fn package_typed(
                     .collect(),
                 logical_argument_count: call.args.len(),
                 expected_result_type: None,
-                constant_policy: constant_policy(),
             },
         ));
     }
@@ -1042,7 +1041,7 @@ pub(super) fn package_typed(
                 version: PlanVersionId::try_new([93; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,
-                statement_constant_policy: constant_policy(),
+
                 pruning: FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),

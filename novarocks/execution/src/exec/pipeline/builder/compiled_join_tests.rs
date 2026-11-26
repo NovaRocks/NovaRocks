@@ -722,10 +722,8 @@ fn single_plan_with_predicate(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
-        version(),
-        &fixture_sources,
-    );
+    let mut plan =
+        crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(version());
     if checked_right {
         plan = plan.with_semantic_parameters(
             SemanticParameters::try_new([(
@@ -858,10 +856,8 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
         )
         .unwrap();
 
-    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
-        version(),
-        &fixture_sources,
-    );
+    let mut plan =
+        crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(version());
     plan.add_fragment(left_fragment).unwrap();
     plan.add_fragment(right_fragment).unwrap();
     plan.add_fragment(join_fragment).unwrap();
@@ -1484,17 +1480,15 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
-        version(),
-        &fixture_sources,
-    )
-    .with_semantic_parameters(
-        SemanticParameters::try_new([(
-            ALLOW.id,
-            SemanticParameterValue::AllowThrowException(true),
-        )])
-        .unwrap(),
-    );
+    let mut plan =
+        crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(version())
+            .with_semantic_parameters(
+                SemanticParameters::try_new([(
+                    ALLOW.id,
+                    SemanticParameterValue::AllowThrowException(true),
+                )])
+                .unwrap(),
+            );
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(result_port(SINGLE, join, &output))
         .unwrap();
@@ -3330,10 +3324,8 @@ fn authored_naa_plan(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
-        version(),
-        &fixture_sources,
-    );
+    let mut plan =
+        crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(version());
     if late_overflow {
         plan = plan.with_semantic_parameters(
             SemanticParameters::try_new([(
@@ -3784,10 +3776,8 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
-        let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
-            version(),
-            &fixture_sources,
-        );
+        let mut plan =
+            crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(version());
         plan.add_fragment(fragment).unwrap();
         plan.set_result_port(ResultPort {
             scalar_schema: None,

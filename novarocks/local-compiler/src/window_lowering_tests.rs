@@ -31,10 +31,10 @@ use novarocks_expression_contract::{
 };
 use novarocks_functions::{
     AggregateKernelPhase, AggregatePreparationOptions, AggregateWindowPreparationOptions,
-    CallEffectInput, ConstantPolicy, ConstantPool, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionBindingRequest, FunctionKind, FunctionResultType, InstalledPureKernel,
-    PreparedPureKernel, PureCallPreparation, PureEngineFunctionCatalog, ScopedRelationalEffects,
-    WindowCallOptions,
+    CallEffectInput, ConstantPool, ConstantValidation, EngineFunctionCatalogBuilder,
+    FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionResultType,
+    InstalledPureKernel, PreparedPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
+    ScopedRelationalEffects, WindowCallOptions,
 };
 use novarocks_local_program::{
     AnalyticOutputColumn, KernelAbiVersion, LocalProgram, ProgramCallSite, ProgramNodeId,
@@ -74,8 +74,8 @@ impl PureCompileControl for Control {
     }
 }
 
-fn constant_policy() -> ConstantPolicy {
-    ConstantPolicy {
+fn constant_policy() -> ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 16,
         max_array_nodes: 128,
         max_logical_elements: 1024,
@@ -86,7 +86,7 @@ fn constant_policy() -> ConstantPolicy {
         max_metadata_bytes: 1 << 20,
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
-    }
+    })
 }
 
 fn admission() -> FragmentPackageAdmission {
@@ -545,7 +545,6 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                     .collect(),
                 logical_argument_count: call.args.len(),
                 expected_result_type: None,
-                constant_policy: constant_policy(),
             },
         ));
     }
@@ -748,7 +747,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
         FragmentPackage::try_new(
             FragmentPackageInput {
                 constants: pools,
-                statement_constant_policy: constant_policy(),
+
                 version: PlanVersionId::try_new([97; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,

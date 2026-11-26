@@ -106,7 +106,6 @@ fn zero_program() -> Arc<LocalProgram> {
     assert!(output.columns.is_empty());
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([121; 16]).unwrap(),
-        &fixture_sources,
     )
     .with_semantic_parameters(parameters.clone());
     plan.add_fragment(definition).unwrap();

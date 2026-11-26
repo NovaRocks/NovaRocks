@@ -2426,7 +2426,7 @@ fn runtime_scalar_memory_actual_scan_driver_bind_funds_original_shift_key() {
             ports: original.scopes(),
             all_ports: original.scope(novarocks_expression_contract::RootScope::AllPorts),
         },
-        authored.plan().statement_constant_policy(),
+        novarocks_functions::ConstantValidation::INPUT_DERIVED,
         &functions,
         &mut work,
     )

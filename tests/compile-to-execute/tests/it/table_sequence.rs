@@ -153,7 +153,7 @@ fn package(bounds: [i64; 3], limit: Option<u64>) -> Arc<FragmentPackage> {
                 version: PlanVersionId::try_new([41; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,
-                statement_constant_policy: policy,
+
                 pruning: FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),

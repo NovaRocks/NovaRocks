@@ -427,7 +427,6 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
             novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
             novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
         ),
-        crate::application::test_constant_policy(),
         Some(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
                 session: &sealed_recipes,

@@ -52,7 +52,7 @@ pub(crate) fn bind_write_assignment_value(
     span: Span,
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
     settings: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &SqlCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     let related = |source: &TypedExpr| {
@@ -196,7 +196,7 @@ fn bind_nested_temporal_assignment(
     target: novarocks_type_contract::FunctionValueType,
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
     settings: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &SqlCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     use crate::analysis::{ExprKind, function_argument};

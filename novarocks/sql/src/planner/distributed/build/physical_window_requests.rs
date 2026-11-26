@@ -21,9 +21,10 @@ use std::sync::Arc;
 
 use novarocks_functions::{
     AggregateKernelPhase, AggregateOrderKey, AggregatePreparationOptions,
-    AggregateWindowPreparationOptions, ConstantPolicy, FunctionArgument, FunctionBindingRequest,
-    FunctionBindingSelection, FunctionResultType, FunctionSpecializationFailure, KernelFailure,
-    MAX_CALL_EFFECT_ARGUMENTS, PureCallPreparation, ScopedRelationalEffects, WindowCallOptions,
+    AggregateWindowPreparationOptions, ConstantValidation, FunctionArgument,
+    FunctionBindingRequest, FunctionBindingSelection, FunctionResultType,
+    FunctionSpecializationFailure, KernelFailure, MAX_CALL_EFFECT_ARGUMENTS, PureCallPreparation,
+    ScopedRelationalEffects, WindowCallOptions,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionKind,
@@ -94,7 +95,7 @@ enum WindowRequestArguments<'a> {
     BorrowedCanonical {
         request: &'a Arc<CanonicalCallOperationalRequest>,
         decimal_policy: DecimalOverflowPolicy,
-        constant_policy: ConstantPolicy,
+        constant_policy: ConstantValidation,
     },
 }
 
@@ -139,7 +140,7 @@ impl AuthoredPhysicalWindowRequest<'_> {
             }
         }
     }
-    pub fn captured_constant_policy(&self) -> Option<ConstantPolicy> {
+    pub fn captured_constant_policy(&self) -> Option<ConstantValidation> {
         match &self.arguments {
             WindowRequestArguments::OwnedPhysical { .. } => None,
             WindowRequestArguments::BorrowedCanonical {
@@ -173,7 +174,7 @@ pub(crate) fn author_physical_window_request_observed<'a>(
     source: &'a WindowCallSpec,
     node: &PhysicalNode,
     pools: &ConstantPools,
-    literal_policy: ConstantPolicy,
+    literal_policy: ConstantValidation,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<AuthoredPhysicalWindowRequest<'a>, PhysicalWindowRequestError> {
     work.step()?;

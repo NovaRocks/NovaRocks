@@ -346,7 +346,7 @@ fn package_with_parameters(
                 version: PlanVersionId::try_new([57; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,
-                statement_constant_policy: constant_policy(),
+
                 pruning: FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),

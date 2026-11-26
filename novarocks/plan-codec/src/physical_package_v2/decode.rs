@@ -733,9 +733,6 @@ fn decode_fragment_package_factory_core<
 
     // Mandatory singular components have no default.
     let fragment_wire = required(wire_package.fragment.as_ref(), "package fragment is absent")?;
-    let statement_constant_policy = crate::physical_call_requests_v2::decode_source_policy(
-        wire_package.source_constant_policy.as_ref(),
-    )?;
     let calls_wire = required(
         wire_package.calls.as_ref(),
         "package frozen calls are absent",
@@ -1587,7 +1584,6 @@ fn decode_fragment_package_factory_core<
     let package = p::FragmentPackage::try_new_in(
         p::FragmentPackageInput {
             constants: pools,
-            statement_constant_policy,
             version: metadata.version,
             required: metadata.required,
             fragment,

@@ -155,7 +155,7 @@ pub(crate) fn lower_final_physical_plan(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
-    constant_policy: novarocks_constant_contract::ConstantPolicy,
+    constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     lower_final_physical_plan_inner(
@@ -179,7 +179,7 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
-    constant_policy: novarocks_constant_contract::ConstantPolicy,
+    constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     lower_final_physical_plan_inner(
@@ -215,7 +215,7 @@ pub(crate) fn lower_final_physical_write_plan(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
-    constant_policy: novarocks_constant_contract::ConstantPolicy,
+    constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     let FinalWriteLowering {
@@ -308,7 +308,7 @@ pub(crate) fn lower_final_change_stream_write_plan(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
-    constant_policy: novarocks_constant_contract::ConstantPolicy,
+    constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     let FinalChangeStreamWriteLowering {
@@ -363,7 +363,7 @@ fn lower_final_physical_plan_inner(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
-    constant_policy: novarocks_constant_contract::ConstantPolicy,
+    constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     lower_final_physical_plan_inner_with_domains(
@@ -389,7 +389,7 @@ pub(crate) fn lower_final_physical_plan_with_root_semantics(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
-    constant_policy: novarocks_constant_contract::ConstantPolicy,
+    constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     lower_final_physical_plan_inner_with_domains(
@@ -415,7 +415,7 @@ fn lower_final_physical_plan_inner_with_domains(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
-    constant_policy: novarocks_constant_contract::ConstantPolicy,
+    constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     let domains = semantics
@@ -503,7 +503,7 @@ struct ContractLoweringVisitor<'a> {
     original_emission_observer:
         Option<&'a mut dyn original_emission_test_observer::OriginalEmissionObserver>,
     root_allow_throw_exception: bool,
-    constant_policy: novarocks_constant_contract::ConstantPolicy,
+    constant_policy: novarocks_constant_contract::ConstantValidation,
     root_allow_throw_exception_used: bool,
     semantic_parameters: BTreeMap<SemanticParameterId, SemanticParameterValue>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
@@ -1610,7 +1610,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
         root_allow_throw_exception: bool,
-        constant_policy: novarocks_constant_contract::ConstantPolicy,
+        constant_policy: novarocks_constant_contract::ConstantValidation,
         control: &'a dyn PureCompileControl,
     ) -> Result<Self, ContractLoweringError> {
         let work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
@@ -1643,7 +1643,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             definition_order: BTreeMap::new(),
             completions: BTreeMap::new(),
             plan_version: version,
-            plan_builder: PlanBuilder::new(version, constant_policy),
+            plan_builder: PlanBuilder::new(version),
             call_sources: SqlLogicalSourceJournal::new(),
             provider_partition_definitions: BTreeMap::new(),
             dop_domain,
@@ -10350,17 +10350,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         column: usize,
         ty: &ValueType,
     ) -> Result<novarocks_constant_contract::ConstantPool, ContractLoweringError> {
-        let maximum = usize::try_from(self.constant_policy.max_rows)
-            .unwrap_or(usize::MAX)
-            .max(1);
-        let count = values.rows.len().saturating_sub(row).min(maximum);
-        let mut literals = Vec::new();
-        self.work.flush()?;
-        literals
-            .try_reserve_exact(count)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
-        self.work.flush()?;
-        for next in values.rows.iter().skip(row).take(count) {
+        let mut prefix = crate::constant::SyntaxLiteralPrefix::new(ty);
+        for next in values.rows.iter().skip(row) {
             self.work.step()?;
             let Some(expression) = next.get(column) else {
                 break;
@@ -10378,15 +10369,23 @@ impl<'a> ContractLoweringVisitor<'a> {
             {
                 break;
             }
-            literals.push(literal);
+            if !prefix.try_push(literal)? {
+                break;
+            }
         }
         self.work.flush()?;
-        let (pool, _) = crate::constant::admit_syntax_constant_run(
-            &literals,
-            ty,
-            self.constant_policy,
-            self.control,
-        )?;
+        let checked = values
+            .rows
+            .iter()
+            .skip(row)
+            .take(prefix.len())
+            .map(|cells| {
+                let ExprKind::Literal(literal) = &cells[column].kind else {
+                    unreachable!("the checked literal prefix contains only syntax literals");
+                };
+                literal
+            });
+        let pool = prefix.materialize(checked, self.control)?;
         self.work.flush()?;
         Ok(pool)
     }
@@ -14435,7 +14434,7 @@ mod tests {
         };
         for which in 0..4 {
             let run = |control: &Control| -> Result<(), ContractLoweringError> {
-                let mut policy = crate::constant::test_constant_policy();
+                let mut policy = crate::constant::test_constant_fixture();
                 if which == 3 {
                     // Same finite full-type boundary as the original wide
                     // table source. This is fresh syntax admission, not CV
@@ -14448,7 +14447,7 @@ mod tests {
                         catalog.snapshot(),
                         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                         false,
-                        policy,
+                        policy.into(),
                         control,
                     ) {
                         Err(error) => Err(error),
@@ -14465,7 +14464,7 @@ mod tests {
                     catalog.snapshot(),
                     novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                     false,
-                    policy,
+                    policy.into(),
                     control,
                 )?;
                 let owner = visitor.fragment_mut().reserve_node_id()?;
@@ -20276,10 +20275,12 @@ mod tests {
             .collect();
         // The existing production pool row ceiling is 4096; this fixture
         // exercises the unchanged 16,384-by-four occurrence scale across it.
-        let caps = novarocks_constant_contract::ConstantPolicy {
-            max_rows: 4096,
-            ..crate::constant::test_constant_policy()
-        };
+        let caps = novarocks_constant_contract::ConstantValidation::bounded(
+            novarocks_constant_contract::ConstantPolicy {
+                max_rows: 4096,
+                ..crate::constant::test_constant_policy()
+            },
+        );
         let control = crate::compiler::SqlCompileControl::unbounded();
         let final_plan = lower_final_physical_plan(
             &values(columns, rows),

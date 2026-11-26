@@ -78,7 +78,6 @@ fn package_data(fields: Arc<[FieldRef]>, data: p::SystemRelationData) -> p::Frag
     let pruning = p::FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control).unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
-            statement_constant_policy: crate::test_constants::policy(),
             version: p::PlanVersionId::try_new([71; 16]).unwrap(),
             required: p::RequiredContracts::default(),
             fragment,

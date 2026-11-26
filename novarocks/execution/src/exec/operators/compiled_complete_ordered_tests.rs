@@ -246,7 +246,6 @@ fn complete_fixture_with_types(
     }
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([122; 16]).unwrap(),
-        &fixture_sources,
     )
     .with_semantic_parameters(parameters.clone());
     plan.add_fragment(definition).unwrap();

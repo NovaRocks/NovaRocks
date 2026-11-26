@@ -1074,7 +1074,7 @@ mod tests {
                 ports: std::slice::from_ref(&scope),
                 all_ports: None,
             },
-            package.statement_constant_policy(),
+            novarocks_functions::ConstantValidation::INPUT_DERIVED,
             &catalog,
             &mut work,
         )

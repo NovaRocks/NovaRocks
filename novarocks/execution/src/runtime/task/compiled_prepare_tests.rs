@@ -124,7 +124,7 @@ fn instance(
 
 pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgram> {
     use novarocks_connector_contract::PureProviderProgramCatalog;
-    use novarocks_functions::ConstantPolicy;
+    use novarocks_functions::ConstantValidation;
     use novarocks_local_compiler::{
         LocalCompileOptions, compile_fragment, validate_fragment_providers,
     };
@@ -140,18 +140,19 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
     };
 
     // Explicit table-free fixture limits; no scan or runtime creator is mocked.
-    let policy = ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    };
+    let policy =
+        novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 128,
+            max_logical_elements: 1024,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        });
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([73; 16]).unwrap(),
@@ -183,7 +184,6 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
         .expect("SELECT 1 needs no provider observation")
         .into_parts()
         .0;
-    source.require_statement_constant_policy(policy).unwrap();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
     for &id in source.plan().fragments().keys() {

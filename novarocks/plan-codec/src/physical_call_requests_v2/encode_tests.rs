@@ -349,7 +349,6 @@ fn fixture_with_parameters(reference: p::ConstantReference, parameter_count: usi
                 ]),
                 logical_argument_count: 3,
                 expected_result_type: Some(int()),
-                constant_policy: data_policy(),
             },
         )
         .unwrap();
@@ -484,7 +483,6 @@ fn relation_fixture_with_result_constraint(
                     arguments: Box::default(),
                     logical_argument_count: 0,
                     expected_result_type,
-                    constant_policy: data_policy(),
                 },
             )],
             &control,
@@ -598,18 +596,6 @@ fn original_value_none_typed_null_lambda_constraint_and_all_policy_fields_have_i
         ],
         logical_argument_count: Some(3),
         expected_result_value_type_id: Some(0),
-        constant_policy: Some(wire::SourceConstantPolicy {
-            max_rows: Some(0),
-            max_array_nodes: Some(u64::MAX),
-            max_logical_elements: Some(2),
-            max_retained_buffer_bytes: Some(3),
-            max_type_depth: Some(0),
-            max_type_nodes: Some(5),
-            max_dictionary_depth: Some(u32::MAX),
-            max_metadata_bytes: Some(7),
-            max_library_validation_work: Some(8),
-            max_library_validation_bytes: Some(9),
-        }),
     }];
     assert_eq!(actual, expected);
     assert_eq!(facts.definition_count, 1);
@@ -921,7 +907,6 @@ fn two_way_request_component_returns_to_original_fragment_coverage_and_pool_name
         };
         assert_eq!(reference.pool.get(), u32::MAX);
         assert_eq!(reference.ordinal, 1);
-        assert_eq!(request.constant_policy, data_policy());
         let mut parts = f.receiving_parts();
         parts.requests = entries;
         let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Validate).unwrap();

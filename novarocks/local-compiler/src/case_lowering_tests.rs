@@ -23,11 +23,11 @@ use novarocks_failure_contract::{FailureClass, FailureProjection};
 use super::*;
 use arrow_schema::DataType;
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionArgumentType, FunctionBindingRequest, FunctionBindingSelection, FunctionId,
-    FunctionKind, FunctionOverloadId, FunctionResultType, InstalledPureKernel, PureCallPreparation,
-    PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
-    ScopedExpressionEffects,
+    CallEffectInput, ConstantValidation, ConstantValue, EngineFunctionCatalogBuilder,
+    FunctionArgument, FunctionArgumentType, FunctionBindingRequest, FunctionBindingSelection,
+    FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType, InstalledPureKernel,
+    PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
+    PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
 };
 use novarocks_local_program::{KernelAbiVersion, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{
@@ -114,18 +114,20 @@ fn options() -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        constants: ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        },
+        constants: novarocks_functions::ConstantValidation::bounded(
+            novarocks_functions::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        ),
     }
 }
 
@@ -134,7 +136,7 @@ struct Author {
     selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
     logical_argument_count: usize,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     shape: ControlShape,
 }
 impl Author {
@@ -219,7 +221,6 @@ fn original_request_sources(
                     arguments,
                     logical_argument_count: original.logical_argument_count,
                     expected_result_type: original.expected_result_type.cloned(),
-                    constant_policy: owner.constant_policy,
                 },
             )
             .unwrap();
@@ -890,7 +891,7 @@ fn package(_functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Frag
                 version: PlanVersionId::try_new([97; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 constants,
-                statement_constant_policy: options().constants,
+
                 fragment: fixture.fragment,
                 cuts: FragmentCuts::default(),
                 result: Some(result),

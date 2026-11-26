@@ -1777,18 +1777,19 @@ mod tests {
         let pure = PureFixtureControl;
         // Explicit tiny FE fixture admission. It is neither a BE grant nor a
         // production candidate/default receiving profile.
-        let policy = novarocks_functions::ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        };
+        let policy =
+            novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            });
         let item = Arc::new(arrow::datatypes::Field::new("item", DataType::Int32, false));
         let list_type = DataType::List(item.clone());
         let list = ListArray::try_new(

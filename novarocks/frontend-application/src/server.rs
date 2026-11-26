@@ -123,7 +123,7 @@ struct FrontendRoleProducts {
     unified_statistics: Arc<crate::connector::UnifiedStatisticsResolver>,
     catalog_application: Arc<dyn novarocks_catalog_application::CatalogApplicationPort>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     query_control: novarocks_query_application::session_control::QueryControlService,

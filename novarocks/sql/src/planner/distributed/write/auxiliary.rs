@@ -281,7 +281,7 @@ pub fn plan_writer_statistics(
     targets: &[WriterStatisticsTargetInput<'_>],
     functions: &dyn SqlFunctionCatalog,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<WriterAuxiliaryPlan, crate::compiler::SqlCompileError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;

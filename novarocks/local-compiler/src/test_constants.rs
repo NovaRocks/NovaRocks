@@ -17,7 +17,7 @@
 
 //! Mechanical checked-constant inputs retained by each fixture's actual pool table.
 use novarocks_expression_contract::ExprKind;
-use novarocks_functions::{ConstantPolicy, ConstantValue, FunctionValueType};
+use novarocks_functions::{ConstantValidation, ConstantValue, FunctionValueType};
 use novarocks_physical_plan::{ConstantPoolId, ConstantPools, ConstantReference};
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::sync::Arc;
@@ -45,7 +45,7 @@ macro_rules! scalar {
             pools: &mut ConstantPools,
             ty: &FunctionValueType,
             value: $ty,
-            policy: ConstantPolicy,
+            policy: ConstantValidation,
         ) -> ExprKind {
             insert(
                 pools,
@@ -70,7 +70,7 @@ scalar!(binary, from_binary, &[u8]);
 pub(crate) fn null(
     pools: &mut ConstantPools,
     ty: &FunctionValueType,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
 ) -> ExprKind {
     insert(
         pools,
@@ -86,8 +86,8 @@ pub(crate) fn null(
 }
 
 /// Explicit admission for provider fixtures with an empty constant environment.
-pub(crate) fn policy() -> ConstantPolicy {
-    ConstantPolicy {
+pub(crate) fn policy() -> ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 16,
         max_array_nodes: 128,
         max_logical_elements: 1024,
@@ -98,5 +98,5 @@ pub(crate) fn policy() -> ConstantPolicy {
         max_metadata_bytes: 1 << 20,
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
-    }
+    })
 }

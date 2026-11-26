@@ -30,7 +30,6 @@ pub use effects::author_unit_calls;
 pub use error::{CallAuthorError, CapabilityRefusal, InvariantRefusal};
 
 use crate::EvaluationEnvironment;
-use novarocks_constant_contract::ConstantPolicy;
 use novarocks_expression_contract::{BoundFunction, ExprId, ExpressionCallClaim};
 use novarocks_functions::{
     FunctionBindingSelection, FunctionResultType, PureEngineFunctionCatalog,
@@ -43,7 +42,6 @@ use std::{collections::BTreeMap, sync::Arc};
 /// after the unit is sealed; control shapes do not consult it.
 pub struct CallAuthorInputs<'a> {
     pub environment: EvaluationEnvironment<'a>,
-    pub constant_policy: ConstantPolicy,
     pub functions: &'a PureEngineFunctionCatalog,
     pub decimal_overflow: &'a BTreeMap<ExprId, DecimalOverflowPolicy>,
 }

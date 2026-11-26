@@ -52,7 +52,7 @@ fn input<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     fragment: &'a Fragment,
     occurrences: &'a AuthoredPhysicalOccurrences<'a>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     relations: &'a BTreeMap<PhysicalCallSite, PhysicalRelationalCallSourceScope<'a>>,
     expressions: &'a BTreeMap<novarocks_physical_plan::NodeId, NodeExpressionEffects>,
 ) -> PhysicalFragmentEffectsInput<'a> {
@@ -233,7 +233,7 @@ fn sql_call_fresh_composer_refuses_changed_policy_and_foreign_constant_parameter
     .unwrap();
     let mut relations = scopes(&owner, fragment, &occurrences);
     let expressions = pure_node_effects_for_test(fragment);
-    let policy = owner.plan().statement_constant_policy();
+    let policy = novarocks_functions::ConstantValidation::INPUT_DERIVED;
     let mut request = input(
         &owner,
         fragment,
@@ -299,10 +299,12 @@ fn sql_call_fresh_composer_refuses_changed_policy_and_foreign_constant_parameter
         .next()
         .unwrap()
         .decimal_overflow_policy = original;
-    let changed = ConstantPolicy {
-        max_rows: policy.max_rows + 1,
-        ..policy
-    };
+    let changed = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: policy.max_rows + 1,
+            ..policy
+        },
+    );
     assert!(matches!(
         author_sql_fragment_effects_observed(
             owner.relational_sources(),
@@ -347,7 +349,7 @@ fn sql_window_fresh_composer_uses_real_row_number_source_journal() {
                 &owner,
                 fragment,
                 &occurrences,
-                owner.plan().statement_constant_policy(),
+                novarocks_functions::ConstantValidation::INPUT_DERIVED,
                 &relations,
                 &expressions,
             ),
@@ -395,7 +397,7 @@ fn sql_table_fresh_composer_borrows_selected_list_and_whole_relation() {
                 &owner,
                 fragment,
                 &occurrences,
-                owner.plan().statement_constant_policy(),
+                novarocks_functions::ConstantValidation::INPUT_DERIVED,
                 &relations,
                 &expressions,
             ),

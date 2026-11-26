@@ -32,7 +32,7 @@ use novarocks_expression_contract::{
     PhysicalCallRequest, RootScope,
 };
 use novarocks_functions::{
-    CallArgumentUses, CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder,
+    CallArgumentUses, CallEffectInput, ConstantValidation, EngineFunctionCatalogBuilder,
     FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionResultType,
     InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog, ScopedExpressionEffects,
 };
@@ -62,8 +62,8 @@ impl PureCompileControl for Control {
         Ok(())
     }
 }
-fn constants() -> ConstantPolicy {
-    ConstantPolicy {
+fn constants() -> ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 16,
         max_array_nodes: 128,
         max_logical_elements: 1024,
@@ -74,7 +74,7 @@ fn constants() -> ConstantPolicy {
         max_metadata_bytes: 1 << 20,
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
-    }
+    })
 }
 fn functions_for_names(names: &[&str]) -> PureEngineFunctionCatalog {
     let actual = novarocks_functions::builtin::catalogue::builtin_engine_function_catalog();
@@ -253,7 +253,6 @@ fn source_for_arguments(
                 .collect(),
             logical_argument_count: types.len(),
             expected_result_type: None,
-            constant_policy: constants(),
         },
     )
     .unwrap();
@@ -361,7 +360,7 @@ fn source_for_arguments(
             required: RequiredContracts::default(),
             fragment,
             constants: ConstantPools::empty(),
-            statement_constant_policy: constants(),
+
             pruning: FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
             cuts: FragmentCuts::default(),
             result: Some(result),
@@ -404,7 +403,6 @@ pub(super) fn program_for_arguments(
         decode_limits(),
         Arc::new(functions),
         Arc::new(providers),
-        constants(),
     );
     let owner = NativeNodePreparation::new(preparation_identity(binding.execution()));
     let loan = owner.loan();

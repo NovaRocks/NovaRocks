@@ -48,8 +48,8 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
+fn policy() -> novarocks_constant_contract::ConstantPolicy {
+    novarocks_constant_contract::ConstantPolicy {
         max_rows: 1,
         max_array_nodes: 8,
         max_logical_elements: 8,

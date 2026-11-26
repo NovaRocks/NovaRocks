@@ -1097,7 +1097,7 @@ mod scan_split {
             )
             .map_err(|error| error.to_string())?;
 
-        let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap(), super::policy());
+        let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
         plan.add_fragment(producer).unwrap();
         plan.add_fragment(consumer).unwrap();
         plan.add_edge(Edge {

@@ -32,7 +32,7 @@ use arrow::{
     datatypes::{DataType, Field},
 };
 use novarocks_functions::{
-    ConstantPolicy, ConstantPool, EngineFunctionCatalog, FunctionArgument, FunctionResultType,
+    ConstantPool, ConstantValidation, EngineFunctionCatalog, FunctionArgument, FunctionResultType,
     PreparedPureKernel, ScopedExpressionEffects,
 };
 use novarocks_type_contract::{
@@ -87,19 +87,21 @@ impl Control {
 fn ty(data_type: DataType, nullable: bool) -> FunctionValueType {
     FunctionValueType::new(data_type, nullable)
 }
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 8,
-        max_array_nodes: 32,
-        max_logical_elements: 4096,
-        max_retained_buffer_bytes: 4 << 20,
-        max_type_depth: 16,
-        max_type_nodes: 64,
-        max_dictionary_depth: 4,
-        max_metadata_bytes: 65536,
-        max_library_validation_work: 64 << 20,
-        max_library_validation_bytes: 64 << 20,
-    }
+fn policy() -> ConstantValidation {
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 8,
+            max_array_nodes: 32,
+            max_logical_elements: 4096,
+            max_retained_buffer_bytes: 4 << 20,
+            max_type_depth: 16,
+            max_type_nodes: 64,
+            max_dictionary_depth: 4,
+            max_metadata_bytes: 65536,
+            max_library_validation_work: 64 << 20,
+            max_library_validation_bytes: 64 << 20,
+        },
+    )
 }
 fn list_type() -> FunctionValueType {
     ty(

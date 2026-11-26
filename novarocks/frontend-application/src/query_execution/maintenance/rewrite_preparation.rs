@@ -68,7 +68,7 @@ enum OriginalInput {
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
         carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
     },
 }
 #[expect(

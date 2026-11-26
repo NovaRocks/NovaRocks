@@ -25,7 +25,7 @@ use novarocks_expression::{
 use novarocks_expression_contract::{
     ExprId, ExprKind, ExprNode, RootOrdinal, RootScope, SealedUnit, UnitError,
 };
-use novarocks_functions::ConstantPolicy;
+use novarocks_functions::ConstantValidation;
 use novarocks_physical_plan::{ConstantPools, FragmentBuilder, FragmentId, NodeId};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, DecimalOverflowPolicy, EvaluationDemand,
@@ -42,7 +42,7 @@ pub(super) fn author_component_calls(
     unit: &SealedUnit,
     constants: &ConstantPools,
     parameters: &SemanticParameters,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     overflow: DecimalOverflowPolicy,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<UnitCallAuthorship, CallAuthorError> {
@@ -63,7 +63,6 @@ pub(super) fn author_component_calls(
                 constants,
                 parameters,
             },
-            constant_policy: policy,
             functions: &functions,
             decimal_overflow: &decimal_overflow,
         },
@@ -76,7 +75,7 @@ pub(super) fn seal_node_observed(
     node: NodeId,
     constants: &ConstantPools,
     functions: &novarocks_functions::PureEngineFunctionCatalog,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<SealedUnit, ComponentSealError> {
     let definitions = UnitDefinitions::from_draft(fragment, node);
@@ -135,7 +134,6 @@ pub(super) fn seal_node_observed(
             constants,
             parameters: &parameters,
         },
-        constant_policy: policy,
         functions,
         decimal_overflow: &decimal_overflow,
     };
@@ -185,7 +183,7 @@ impl FixtureBuilder {
     pub(super) fn seal_observed(
         mut self,
         functions: &novarocks_functions::PureEngineFunctionCatalog,
-        policy: ConstantPolicy,
+        policy: ConstantValidation,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<UnitFixture, ComponentSealError> {
         Ok(UnitFixture {

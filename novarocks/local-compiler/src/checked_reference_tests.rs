@@ -22,8 +22,10 @@ use novarocks_expression::{EvaluationEnvironment, ScopeLayouts, StaticExprKind};
 use novarocks_expression_contract::{
     BoundExprSetBuilder, ExprId, ExprKind, RootOrdinal, RootScope, UnitLimits,
 };
-use novarocks_functions::{ConstantPolicy, ConstantValue, FunctionKind, PureEngineFunctionCatalog};
 use novarocks_functions::{ConstantPool, EngineFunctionCatalogBuilder, InstalledPureKernel};
+use novarocks_functions::{
+    ConstantValidation, ConstantValue, FunctionKind, PureEngineFunctionCatalog,
+};
 use novarocks_local_program::ProgramRootRef;
 use novarocks_physical_plan::{
     ConstantPoolId, ConstantPools, ConstantReference, Fragment, FragmentBuilder, FragmentCuts,
@@ -72,8 +74,8 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
+fn policy() -> ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 1024,
         max_array_nodes: 4096,
         max_logical_elements: 1_000_000,
@@ -84,7 +86,7 @@ fn policy() -> ConstantPolicy {
         max_metadata_bytes: 1_048_576,
         max_library_validation_work: 67_108_864,
         max_library_validation_bytes: 67_108_864,
-    }
+    })
 }
 fn pool(array: ArrayRef) -> ConstantPool {
     let ty = FunctionValueType::new(array.data_type().clone(), false);

@@ -8961,7 +8961,7 @@ pub(crate) mod tests {
         use crate::compiled_runtime_filter::CompiledRuntimeFilterEndpoints;
         use novarocks_connector_contract::PureProviderProgramCatalog;
         use novarocks_functions::{
-            ConstantPolicy, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
+            ConstantValidation, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
             FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
             PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
         };
@@ -8991,8 +8991,8 @@ pub(crate) mod tests {
         }
 
         // Explicit fixture admission; these values are not production defaults.
-        pub(crate) fn constants() -> ConstantPolicy {
-            ConstantPolicy {
+        pub(crate) fn constants() -> ConstantValidation {
+            novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
                 max_rows: 16,
                 max_array_nodes: 128,
                 max_logical_elements: 1024,
@@ -9003,7 +9003,7 @@ pub(crate) mod tests {
                 max_metadata_bytes: 1 << 20,
                 max_library_validation_work: 1 << 20,
                 max_library_validation_bytes: 1 << 20,
-            }
+            })
         }
 
         /// A real sealed RAND-only subset; `SELECT 1` binds no function, but
@@ -9066,7 +9066,6 @@ pub(crate) mod tests {
                 decode_limits(),
                 functions,
                 Arc::new(providers),
-                constants(),
             )
         }
 
@@ -9112,7 +9111,6 @@ pub(crate) mod tests {
                 decode_limits(),
                 Arc::new(functions),
                 Arc::new(providers),
-                constants(),
             )
         }
 
@@ -9627,9 +9625,6 @@ pub(crate) mod tests {
                     novarocks_result_contract::FrozenRootOutput::CountOnly,
                 ))
                 .expect("the fixture declares its actual CountOnly RootV1 output");
-            owner
-                .require_statement_constant_policy(constants())
-                .expect("the original statement constant policy");
             let plan = owner.plan();
             let mut pruning = BTreeMap::new();
             let mut admissions = BTreeMap::new();
@@ -10445,7 +10440,6 @@ pub(crate) mod tests {
                 limits,
                 Arc::new(sealed_rand_subset()),
                 Arc::new(providers),
-                constants(),
             );
             let scopes = CompiledTypeScopes::new(&actual);
             let mut exact = |layout| actual.request_layout(layout);
@@ -10725,7 +10719,6 @@ pub(crate) mod tests {
                 decode_limits(),
                 Arc::new(sealed_rand_subset()),
                 Arc::new(crate::compiled_scan_binding::tests::fixture_providers()),
-                constants(),
             )))
         }
 
@@ -11270,7 +11263,6 @@ pub(crate) mod tests {
                 decode_limits(),
                 Arc::new(sealed_rand_subset()),
                 Arc::new(crate::compiled_writer_binding::tests::writer_providers()),
-                constants(),
             )))
         }
 

@@ -316,7 +316,7 @@ mod router_runtime_tests {
                 version: p::PlanVersionId::try_new([61; 16]).unwrap(),
                 required: p::RequiredContracts::default(),
                 fragment,
-                statement_constant_policy: options(None).constants,
+
                 pruning: p::FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 cuts: p::FragmentCuts {
@@ -446,7 +446,7 @@ mod router_runtime_tests {
                 version: p::PlanVersionId::try_new([60; 16]).unwrap(),
                 required: p::RequiredContracts::default(),
                 fragment,
-                statement_constant_policy: options(None).constants,
+
                 pruning: p::FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 cuts: p::FragmentCuts {

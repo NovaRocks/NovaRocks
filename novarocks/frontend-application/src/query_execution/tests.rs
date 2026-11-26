@@ -37,8 +37,8 @@ fn fragment_profile_set_preserves_fragment_profiles() {
     assert_eq!(profiles.into_profiles(), vec![profile]);
 }
 
-pub(super) fn dependency_fixture_constant_policy() -> novarocks_functions::ConstantPolicy {
-    novarocks_functions::ConstantPolicy {
+pub(super) fn dependency_fixture_constant_policy() -> novarocks_functions::ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 64,
         max_array_nodes: 1024,
         max_logical_elements: 4096,
@@ -49,7 +49,7 @@ pub(super) fn dependency_fixture_constant_policy() -> novarocks_functions::Const
         max_metadata_bytes: 1 << 20,
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
-    }
+    })
 }
 
 /// Complete genuine table-free SQL with explicit test session settings.

@@ -18,7 +18,7 @@
 //! Project one actual physical argument for the installed function owner.
 //! This leaf does not resolve names, evaluate expressions or author effects.
 
-use novarocks_functions::{ConstantError, ConstantPolicy, FunctionArgument};
+use novarocks_functions::{ConstantError, ConstantValidation, FunctionArgument};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ValueTypeError,
 };
@@ -99,7 +99,7 @@ impl PhysicalArgumentError {
 pub(crate) fn author_physical_argument_observed(
     source: &ExprNode,
     pools: &ConstantPools,
-    _literal_policy: ConstantPolicy,
+    _literal_policy: ConstantValidation,
     _phase: CompilePhase,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<FunctionArgument, PhysicalArgumentError> {

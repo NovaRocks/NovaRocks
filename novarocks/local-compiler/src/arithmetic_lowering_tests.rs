@@ -22,8 +22,8 @@ use super::*;
 use crate::test_units::PureUnitFixture;
 use arrow_schema::DataType;
 use novarocks_functions::{
-    ArithmeticPrepareError, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
-    FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
+    ArithmeticPrepareError, ConstantValidation, EngineFunctionCatalogBuilder, FunctionId,
+    FunctionKind, FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
 };
 use novarocks_local_program::{
@@ -95,18 +95,20 @@ fn options() -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        constants: ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        },
+        constants: novarocks_functions::ConstantValidation::bounded(
+            novarocks_functions::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        ),
     }
 }
 
@@ -338,7 +340,7 @@ fn package_input(fixture: &Fixture) -> FragmentPackageInput {
         required: RequiredContracts::default(),
         constants: fixture.constants.clone(),
         fragment: fixture.fragment.clone(),
-        statement_constant_policy: options().constants,
+
         pruning: FrozenFragmentPruning::try_new(fixture.fragment.id(), vec![], &Control).unwrap(),
         cuts: FragmentCuts::default(),
         result: Some(result),

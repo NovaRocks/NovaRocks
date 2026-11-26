@@ -43,7 +43,7 @@ use novarocks_spi::connector::{
 /// The same capture supplies the binding, data version and schema to collection.
 #[derive(Clone)]
 pub struct StatisticsAttemptExecutorPorts {
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
     launcher: Arc<dyn LogicalExecutionLauncher>,
     completion: CompletionFactOwners,
@@ -66,7 +66,7 @@ impl StatisticsAttemptExecutorPorts {
         ),
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
         runtime: tokio::runtime::Handle,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {

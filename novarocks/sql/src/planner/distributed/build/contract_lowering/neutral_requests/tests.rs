@@ -65,7 +65,7 @@ impl PureCompileControl for Control {
 fn assert_request(
     owner: &SqlAuthoredPhysicalPlan,
     original: FunctionBindingRequest<'_>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     actual: &PhysicalCallRequest,
     work: &mut CompileCheckpoints<'_>,
 ) {
@@ -75,7 +75,7 @@ fn assert_request(
 fn assert_request_in_pools(
     pools: &novarocks_physical_plan::ConstantPools,
     original: FunctionBindingRequest<'_>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     actual: &PhysicalCallRequest,
     work: &mut CompileCheckpoints<'_>,
 ) {

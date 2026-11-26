@@ -85,7 +85,6 @@ fn request(arguments: Vec<FunctionArgument<ConstantReference>>) -> PhysicalCallR
         logical_argument_count: arguments.len(),
         arguments: arguments.into_boxed_slice(),
         expected_result_type: None,
-        constant_policy: policy(),
     }
 }
 fn value(ty: ValueType) -> FunctionArgument<ConstantReference> {
@@ -434,7 +433,6 @@ fn static_requests_keep_original_none_some_constraint_and_reference_address() {
             let mut work = CompileCheckpoints::try_new(&setup, CompilePhase::Validate).unwrap();
             let materialized =
                 materialize_call_request_observed(retained, &pools, &mut work, 1).unwrap();
-            assert_eq!(materialized.constant_policy(), policy());
             match (
                 retained.expected_result_type.as_ref(),
                 materialized.request().expected_result_type,

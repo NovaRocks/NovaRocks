@@ -29,7 +29,7 @@ use novarocks_execution::{
 };
 use novarocks_expression_contract::{BoundFunction, LegacyBindingMetadata, PhysicalCallRequest};
 use novarocks_functions::{
-    CallArgumentUses, CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder,
+    CallArgumentUses, CallEffectInput, ConstantValidation, EngineFunctionCatalogBuilder,
     FunctionBindingRequest, FunctionKind, FunctionResultType, InstalledPureKernel,
     PureCallPreparation, PureEngineFunctionCatalog, ScopedRelationalEffects, WindowCallOptions,
 };
@@ -83,8 +83,8 @@ fn binding(bytes: u64) -> QueryMemoryBinding {
     )
     .unwrap()
 }
-fn constants() -> ConstantPolicy {
-    ConstantPolicy {
+fn constants() -> ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 16,
         max_array_nodes: 128,
         max_logical_elements: 1024,
@@ -95,7 +95,7 @@ fn constants() -> ConstantPolicy {
         max_metadata_bytes: 1 << 20,
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
-    }
+    })
 }
 
 fn functions() -> PureEngineFunctionCatalog {
@@ -138,7 +138,6 @@ fn interpreter() -> CompiledPackageInterpreter<std::convert::Infallible> {
         decode_limits(),
         Arc::new(functions()),
         Arc::new(providers),
-        constants(),
     )
 }
 fn bigint() -> FunctionValueType {
@@ -277,7 +276,6 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
                     arguments: Box::default(),
                     logical_argument_count: 0,
                     expected_result_type: None,
-                    constant_policy: constants(),
                 },
             )],
             &Control,
@@ -347,7 +345,7 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
             required: RequiredContracts::default(),
             fragment,
             constants: ConstantPools::empty(),
-            statement_constant_policy: constants(),
+
             pruning: FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
             cuts: FragmentCuts::default(),
             result: Some(result),

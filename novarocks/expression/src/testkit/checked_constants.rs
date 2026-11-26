@@ -20,7 +20,7 @@
 use super::{HarnessControl, register_constant};
 use novarocks_constant_contract::ConstantPools;
 use novarocks_expression_contract::ExprKind;
-use novarocks_functions::{ConstantPolicy, ConstantValue};
+use novarocks_functions::{ConstantValidation, ConstantValue};
 use novarocks_type_contract::{CompilePhase, FunctionValueType};
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ pub fn kind(pools: &mut ConstantPools, value: ConstantValue) -> ExprKind {
     ExprKind::Constant(register_constant(pools, &value))
 }
 
-pub fn null(ty: &FunctionValueType, policy: ConstantPolicy) -> ConstantValue {
+pub fn null(ty: &FunctionValueType, policy: ConstantValidation) -> ConstantValue {
     ConstantValue::null(
         Arc::new(ty.try_to_field("fixture").unwrap()),
         ty.clone(),
@@ -39,7 +39,7 @@ pub fn null(ty: &FunctionValueType, policy: ConstantPolicy) -> ConstantValue {
     .unwrap()
 }
 
-pub fn boolean(ty: &FunctionValueType, value: bool, policy: ConstantPolicy) -> ConstantValue {
+pub fn boolean(ty: &FunctionValueType, value: bool, policy: ConstantValidation) -> ConstantValue {
     ConstantValue::from_boolean(
         Arc::new(ty.try_to_field("fixture").unwrap()),
         ty.clone(),
@@ -51,7 +51,7 @@ pub fn boolean(ty: &FunctionValueType, value: bool, policy: ConstantPolicy) -> C
     .unwrap()
 }
 
-pub fn i64(ty: &FunctionValueType, value: i64, policy: ConstantPolicy) -> ConstantValue {
+pub fn i64(ty: &FunctionValueType, value: i64, policy: ConstantValidation) -> ConstantValue {
     ConstantValue::from_i64(
         Arc::new(ty.try_to_field("fixture").unwrap()),
         ty.clone(),
@@ -63,7 +63,7 @@ pub fn i64(ty: &FunctionValueType, value: i64, policy: ConstantPolicy) -> Consta
     .unwrap()
 }
 
-pub fn u64(ty: &FunctionValueType, value: u64, policy: ConstantPolicy) -> ConstantValue {
+pub fn u64(ty: &FunctionValueType, value: u64, policy: ConstantValidation) -> ConstantValue {
     ConstantValue::from_u64(
         Arc::new(ty.try_to_field("fixture").unwrap()),
         ty.clone(),
@@ -75,7 +75,7 @@ pub fn u64(ty: &FunctionValueType, value: u64, policy: ConstantPolicy) -> Consta
     .unwrap()
 }
 
-pub fn f64_bits(ty: &FunctionValueType, value: u64, policy: ConstantPolicy) -> ConstantValue {
+pub fn f64_bits(ty: &FunctionValueType, value: u64, policy: ConstantValidation) -> ConstantValue {
     ConstantValue::from_f64_bits(
         Arc::new(ty.try_to_field("fixture").unwrap()),
         ty.clone(),
@@ -87,7 +87,7 @@ pub fn f64_bits(ty: &FunctionValueType, value: u64, policy: ConstantPolicy) -> C
     .unwrap()
 }
 
-pub fn largeint(ty: &FunctionValueType, value: i128, policy: ConstantPolicy) -> ConstantValue {
+pub fn largeint(ty: &FunctionValueType, value: i128, policy: ConstantValidation) -> ConstantValue {
     ConstantValue::from_largeint(
         Arc::new(ty.try_to_field("fixture").unwrap()),
         ty.clone(),
@@ -99,7 +99,11 @@ pub fn largeint(ty: &FunctionValueType, value: i128, policy: ConstantPolicy) -> 
     .unwrap()
 }
 
-pub fn decimal128(ty: &FunctionValueType, value: i128, policy: ConstantPolicy) -> ConstantValue {
+pub fn decimal128(
+    ty: &FunctionValueType,
+    value: i128,
+    policy: ConstantValidation,
+) -> ConstantValue {
     ConstantValue::from_decimal128(
         Arc::new(ty.try_to_field("fixture").unwrap()),
         ty.clone(),
@@ -114,7 +118,7 @@ pub fn decimal128(ty: &FunctionValueType, value: i128, policy: ConstantPolicy) -
 pub fn decimal256(
     ty: &FunctionValueType,
     value: [u8; 32],
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
 ) -> ConstantValue {
     ConstantValue::from_decimal256_be(
         Arc::new(ty.try_to_field("fixture").unwrap()),
@@ -127,7 +131,7 @@ pub fn decimal256(
     .unwrap()
 }
 
-pub fn binary(ty: &FunctionValueType, value: &[u8], policy: ConstantPolicy) -> ConstantValue {
+pub fn binary(ty: &FunctionValueType, value: &[u8], policy: ConstantValidation) -> ConstantValue {
     ConstantValue::from_binary(
         Arc::new(ty.try_to_field("fixture").unwrap()),
         ty.clone(),
@@ -139,7 +143,7 @@ pub fn binary(ty: &FunctionValueType, value: &[u8], policy: ConstantPolicy) -> C
     .unwrap()
 }
 
-pub fn date32(ty: &FunctionValueType, value: i32, policy: ConstantPolicy) -> ConstantValue {
+pub fn date32(ty: &FunctionValueType, value: i32, policy: ConstantValidation) -> ConstantValue {
     ConstantValue::from_date32(
         Arc::new(ty.try_to_field("fixture").unwrap()),
         ty.clone(),
@@ -151,7 +155,7 @@ pub fn date32(ty: &FunctionValueType, value: i32, policy: ConstantPolicy) -> Con
     .unwrap()
 }
 
-pub fn timestamp(ty: &FunctionValueType, value: i64, policy: ConstantPolicy) -> ConstantValue {
+pub fn timestamp(ty: &FunctionValueType, value: i64, policy: ConstantValidation) -> ConstantValue {
     ConstantValue::from_timestamp(
         Arc::new(ty.try_to_field("fixture").unwrap()),
         ty.clone(),

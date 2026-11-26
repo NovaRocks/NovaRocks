@@ -366,7 +366,7 @@ fn package(
     let read = public_read(&fragment, scan, frozen).unwrap();
     let version = PlanVersionId::try_new([7; 16]).unwrap();
     // Derive cuts from a fully checked real plan, never bypass package checks.
-    let mut plan = PlanBuilder::new(version, crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version);
     plan.add_fragment(fragment.clone()).unwrap();
     let plan = crate::tests::constant_fixture::publish_plan(plan, fixture_constants).unwrap();
     let mut cuts = derive_fragment_cuts(&plan).unwrap();
@@ -375,7 +375,7 @@ fn package(
     FragmentPackage::try_new(
         FragmentPackageInput {
             constants: fixture_constants.for_fragment(&fragment),
-            statement_constant_policy: crate::tests::constant_fixture::policy(),
+
             version,
             required: RequiredContracts::default(),
             cuts: cuts.remove(&fragment.id()).unwrap(),

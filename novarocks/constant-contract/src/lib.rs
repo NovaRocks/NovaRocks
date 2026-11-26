@@ -121,10 +121,17 @@ impl ConstantValidation {
         },
         volume: None,
     };
-}
+    /// Maximum number of contiguous null scalar ordinals in one pool.
+    pub fn null_pool_rows(self) -> usize {
+        let limit = u64::from(u32::MAX);
+        let rows = self.volume.map_or(limit, |volume| {
+            volume.max_rows.min(volume.max_logical_elements).min(limit)
+        });
+        rows as usize
+    }
 
-impl From<ConstantPolicy> for ConstantValidation {
-    fn from(policy: ConstantPolicy) -> Self {
+    /// Explicit validation mode for callers that own a bounded operation.
+    pub const fn bounded(policy: ConstantPolicy) -> Self {
         Self {
             shape: ConstantTypeLimits {
                 depth: policy.max_type_depth,
@@ -141,6 +148,12 @@ impl From<ConstantPolicy> for ConstantValidation {
                 max_library_validation_bytes: policy.max_library_validation_bytes,
             }),
         }
+    }
+}
+
+impl From<ConstantPolicy> for ConstantValidation {
+    fn from(policy: ConstantPolicy) -> Self {
+        Self::bounded(policy)
     }
 }
 

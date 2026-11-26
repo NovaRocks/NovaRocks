@@ -98,19 +98,19 @@ fn inlist_signed_actual_original_control_codec_roundtrip_and_invalid_ordered_use
             sql,
             Field::new("k", DataType::Int64, true),
         );
-        let policy = novarocks_functions::ConstantPolicy {
-            max_rows: 64,
-            max_array_nodes: 1024,
-            max_logical_elements: 4096,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        };
-        source.require_statement_constant_policy(policy).unwrap();
+        let policy =
+            novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
+                max_rows: 64,
+                max_array_nodes: 1024,
+                max_logical_elements: 4096,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            });
         let mut seen = 0;
         for fragment in source.plan().fragments().values() {
             for node in fragment.nodes().values() {

@@ -100,7 +100,6 @@ pub(crate) fn with_original_relational_requests(
                     arguments,
                     logical_argument_count,
                     expected_result_type: None,
-                    constant_policy: fixture_constant_policy(),
                 },
             ));
             Ok(())

@@ -133,7 +133,7 @@ impl From<String> for FrontendQueryCompilerError {
 pub(crate) struct FrontendQueryCompiler {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     query: QueryPreparationKernel,
     view: ViewExecutionKernel,
     system_tables: SystemTableQueryKernel,
@@ -201,7 +201,7 @@ impl FrontendQueryCompiler {
         mv_candidate_reader: MvCandidateReader,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
@@ -227,7 +227,7 @@ impl FrontendQueryCompiler {
         self
     }
 
-    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy
     }
 

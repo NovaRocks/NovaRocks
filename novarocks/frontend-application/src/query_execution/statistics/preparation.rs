@@ -50,7 +50,7 @@ pub(crate) struct StatisticsComputationPlanningServices<'a> {
     pub(crate) blocking: &'a ConnectorBlockingIoSupervisor,
     pub(crate) functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     pub(crate) sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
+    pub(crate) constant_policy: novarocks_functions::ConstantValidation,
     pub(crate) static_plan_carrier: CompiledPackageCarrier,
     pub(crate) wake: Arc<dyn crate::wake::StatusIntakeWake>,
 }
@@ -309,7 +309,7 @@ pub(crate) struct StatisticsPlanCpuInput {
     program: Option<StatisticsCollectionProgram>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     static_plan_carrier: CompiledPackageCarrier,
     staged: Option<Result<StatisticsPlanParts, DistributedQueryError>>,
     started: bool,
@@ -520,7 +520,7 @@ fn build_statistics_plan_parts(
     program: &StatisticsCollectionProgram,
     functions: &novarocks_functions::EngineFunctionCatalog,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     static_plan_carrier: &CompiledPackageCarrier,
 ) -> Result<StatisticsPlanParts, DistributedQueryError> {
     let completion_control =
@@ -567,7 +567,6 @@ fn build_statistics_plan_parts(
         candidate,
         access,
         static_plan_carrier,
-        constant_policy,
         &completion_control,
         crate::query_execution::physical_encoding::encoding_capacity(execution)
             .map_err(DistributedQueryError::from_encode)?,

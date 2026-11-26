@@ -34,7 +34,7 @@ use arrow::array::{Array, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_expression_contract::{ExprKind, RootScope};
-use novarocks_functions::ConstantPolicy;
+use novarocks_functions::ConstantValidation;
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
@@ -434,7 +434,7 @@ pub(crate) fn package_with_sink_and_names(
                 version: PlanVersionId::try_new([91; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,
-                statement_constant_policy: constant_policy(),
+
                 pruning: FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),
@@ -453,8 +453,8 @@ pub(crate) fn package_with_sink_and_names(
 
 /// Explicit fixture constant admission; these values are not production
 /// defaults. Constant pools authored by a test use the same policy.
-pub(crate) fn constant_policy() -> ConstantPolicy {
-    ConstantPolicy {
+pub(crate) fn constant_policy() -> ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 16,
         max_array_nodes: 128,
         max_logical_elements: 1024,
@@ -465,7 +465,7 @@ pub(crate) fn constant_policy() -> ConstantPolicy {
         max_metadata_bytes: 1 << 20,
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
-    }
+    })
 }
 
 fn options(dop: usize) -> LocalCompileOptions {

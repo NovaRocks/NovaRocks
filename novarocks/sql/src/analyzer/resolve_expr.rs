@@ -3691,7 +3691,7 @@ fn resolve_scalar_binding(
     name: &str,
     args: &[TypedExpr],
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
     crate::analysis::resolve_function_binding(
@@ -3711,7 +3711,7 @@ pub(super) fn resolve_scalar_binding_at(
     args: &[TypedExpr],
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
     resolve_scalar_binding(
@@ -3729,7 +3729,7 @@ fn finish_selected_scalar_call(
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
     selected: &crate::binding::SqlFunctionBinding,
     args: &[TypedExpr],
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<novarocks_functions::ResolvedFunctionBinding, AnalyzeError> {
     let arguments = args
@@ -3757,7 +3757,7 @@ pub(super) fn resolved_scalar_call_at(
     args: Vec<TypedExpr>,
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     let binding = resolve_scalar_binding_at(
@@ -3959,7 +3959,7 @@ fn coerce_selected_function_argument(
     expr: TypedExpr,
     target: &novarocks_type_contract::FunctionValueType,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     if expr.value_type.same_value_domain(target) {
@@ -4173,7 +4173,7 @@ pub(super) fn bind_window_function_call_with_catalog(
     args: Vec<TypedExpr>,
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(Vec<TypedExpr>, crate::binding::SqlFunctionBinding), AnalyzeError> {
     let resolve = |args: &[TypedExpr]| {
@@ -4259,7 +4259,7 @@ pub(super) fn bind_scalar_function_call_with_catalog(
     name: &str,
     args: Vec<TypedExpr>,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<BoundScalarCall, AnalyzeError> {
     let arg_types = args
@@ -4362,7 +4362,7 @@ pub(super) fn resolve_aggregate_function_call(
     args: &[TypedExpr],
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
     resolve_aggregate_function_call_with_order(
@@ -4446,7 +4446,7 @@ fn resolve_aggregate_function_call_with_order(
     function_order_by: &[SortItem],
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
     purpose: super::QueryAnalysisPurpose,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {

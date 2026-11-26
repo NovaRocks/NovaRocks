@@ -1361,7 +1361,7 @@ pub(crate) fn count_description() -> (
         )
         .unwrap();
     let version = PlanVersionId::try_new([9; 16]).unwrap();
-    let mut plan = PlanBuilder::new(version, crate::application::test_constant_policy());
+    let mut plan = PlanBuilder::new(version);
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,

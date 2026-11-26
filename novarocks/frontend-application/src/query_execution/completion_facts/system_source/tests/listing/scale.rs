@@ -147,7 +147,6 @@ fn receive_and_run(
         PackageDecodeLimits::FROZEN,
         Arc::new(functions()),
         Arc::new(providers),
-        crate::application::test_constant_policy(),
     );
     let tracker = MemTracker::new_root("system snapshot Native component");
     tracker.install_limit_once(256 << 20).unwrap();
@@ -266,7 +265,6 @@ async fn round_trip(rows: usize, padding_bytes: usize) {
         &completed,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        crate::application::test_constant_policy(),
         &FROZEN_PACKAGE_ADMISSION,
         &control,
     )

@@ -170,7 +170,7 @@ pub(super) fn constant_key() -> (Arc<LocalProgram>, ProgramRootRef) {
             required: RequiredContracts::default(),
             constants,
             fragment,
-            statement_constant_policy: policy,
+
             pruning,
             cuts: FragmentCuts::default(),
             result: Some(result),
@@ -320,10 +320,7 @@ pub(super) fn id_key(deep: &FunctionValueType) -> (Arc<LocalProgram>, ProgramRoo
     };
     assert_leaf_roots(&producer);
     assert_leaf_roots(&consumer);
-    let mut builder = PlanBuilder::new(
-        PlanVersionId::try_new([221; 16]).unwrap(),
-        novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
-    );
+    let mut builder = PlanBuilder::new(PlanVersionId::try_new([221; 16]).unwrap());
     builder.add_fragment(producer).unwrap();
     builder.add_fragment(consumer).unwrap();
     builder

@@ -1276,7 +1276,7 @@ fn input_constant_policy_reports_the_original_row_and_column() {
     let functions = fixture();
     let parameters = parameters();
     let mut context = context(&functions, &parameters);
-    context.constant_policy.max_logical_elements = 1;
+    context.constant_policy = novarocks_expression::testkit::constant_validation(1);
     let columns = [column(
         "x",
         4,

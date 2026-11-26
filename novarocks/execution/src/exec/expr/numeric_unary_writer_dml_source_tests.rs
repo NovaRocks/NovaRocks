@@ -229,9 +229,6 @@ fn assert_writer_selections(
     functions: &EngineFunctionCatalog,
 ) {
     let control = SqlCompileControl::unbounded();
-    source
-        .require_statement_constant_policy(super::test_support::constant_policy())
-        .unwrap();
     let authored = source
         .plan()
         .fragments()
@@ -600,9 +597,6 @@ fn wide_collect_true_actual_theta_plan_freezes_with_production_limits() {
         }
     }
     assert_eq!((writers, finishes), (1, 1));
-    owner
-        .require_statement_constant_policy(FROZEN_CONSTANT_POLICY)
-        .unwrap_or_else(|e| panic!("collect1024 phase=statement-policy: {e:#?}"));
     let authored = owner
         .plan()
         .fragments()

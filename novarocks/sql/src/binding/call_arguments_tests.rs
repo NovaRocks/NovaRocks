@@ -54,7 +54,7 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn policy() -> ConstantPolicy {
+fn policy() -> ConstantValidation {
     crate::constant::test_constant_policy()
 }
 fn ty(data_type: DataType, nullable: bool) -> FunctionValueType {
@@ -246,10 +246,12 @@ fn logical_capture_cv_keeps_nonzero_ordinal_raw_bits_field_and_backing_without_r
         value_type: full_type.clone(),
     });
     let selected = binding(&args, ty(DataType::Boolean, false), 3);
-    let zero = ConstantPolicy {
-        max_rows: 0,
-        ..policy()
-    };
+    let zero = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 0,
+            ..policy()
+        },
+    );
     let captured =
         capture_logical_call_arguments(&selected, 3, &args, zero, &Control::default()).unwrap();
     assert_eq!(captured.constant_policy(), zero);
@@ -459,10 +461,12 @@ fn logical_capture_small_success_and_ordinary_tails_keep_every_original_control_
         assert_eq!(late.trace(), trace);
     }
     prefixes(&invalid_binding, 1, &invalid, false);
-    let zero = ConstantPolicy {
-        max_rows: 0,
-        ..policy()
-    };
+    let zero = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 0,
+            ..policy()
+        },
+    );
     assert!(matches!(
         capture_logical_call_arguments(&selected, 1, &args, zero, &Control::default()),
         Err(LogicalCallArgumentCaptureError::Binding(
@@ -545,10 +549,12 @@ fn authored_move_keeps_actual_none_and_original_binding_without_constant_admissi
         value_type: args[0].value_type.clone(),
         constant: None,
     };
-    let zero = ConstantPolicy {
-        max_rows: 0,
-        ..policy()
-    };
+    let zero = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 0,
+            ..policy()
+        },
+    );
     let captured = move_authored_call_arguments_observed(
         &selected,
         1,
@@ -710,10 +716,12 @@ fn authored_move_preserves_original_cv_ordinal_field_and_backing_under_zero_admi
     let original = pool.value(1).unwrap();
     let args = [column(full_type.clone())];
     let selected = binding(&args, ty(DataType::Boolean, false), 1);
-    let zero = ConstantPolicy {
-        max_rows: 0,
-        ..policy()
-    };
+    let zero = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 0,
+            ..policy()
+        },
+    );
     let captured = move_authored_call_arguments_observed(
         &selected,
         1,

@@ -95,7 +95,6 @@ fn whole_sender_emits_every_component_of_actual_checked_packages() {
         assert_eq!(out.plan_version.len(), 16, "{name}");
         assert!(out.required.is_some(), "{name}");
         assert!(out.types.is_some(), "{name}");
-        assert!(out.source_constant_policy.is_some(), "{name}");
         assert!(out.calls.is_some(), "{name}");
         assert!(out.pruning.is_some(), "{name}");
         assert!(out.parameters.is_some(), "{name}");

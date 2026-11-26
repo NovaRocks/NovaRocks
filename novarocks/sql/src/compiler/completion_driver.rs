@@ -69,7 +69,7 @@ pub struct SqlFinalPlanCompileRequest {
     functions: Arc<dyn SqlFunctionCatalog>,
 
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: SqlCompileControl,
     dop_domain: PipelineDopDomain,
     limits: CompletionLimits,
@@ -104,7 +104,7 @@ impl SqlFinalPlanCompileRequest {
         environment: SqlPlanningEnvironment,
         functions: Arc<dyn SqlFunctionCatalog>,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         control: SqlCompileControl,
         dop_domain: PipelineDopDomain,
         limits: CompletionLimits,
@@ -312,7 +312,7 @@ struct FinalPlanCommon {
     functions: Arc<dyn SqlFunctionCatalog>,
 
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     dop_domain: PipelineDopDomain,
     display_intent: SqlDisplayIntent,
     // Both variants hold Arc-backed constant collections. Cloning this source

@@ -91,18 +91,6 @@ fn request(
         logical_argument_count: args.len(),
         arguments: args,
         expected_result_type: None,
-        constant_policy: p::ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 32,
-            max_logical_elements: 128,
-            max_retained_buffer_bytes: 65536,
-            max_type_depth: 16,
-            max_type_nodes: 128,
-            max_dictionary_depth: 8,
-            max_metadata_bytes: 4096,
-            max_library_validation_work: 1_000_000,
-            max_library_validation_bytes: 1_000_000,
-        },
     }
 }
 
@@ -913,7 +901,6 @@ fn wide_package() -> p::FragmentPackage {
     .unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
-            statement_constant_policy: request(Box::default()).constant_policy,
             constants,
             version: p::PlanVersionId::try_new([4; 16]).unwrap(),
             required: p::RequiredContracts {

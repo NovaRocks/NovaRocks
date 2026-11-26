@@ -871,10 +871,7 @@ pub(super) fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([7; 16]).unwrap(),
-        options(None).constants,
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     for (&id, pool) in constants.entries() {
         plan.insert_constant_pool(id, pool.clone()).unwrap();
     }
@@ -1002,10 +999,7 @@ fn partitioned() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([7; 16]).unwrap(),
-        options(None).constants,
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     for (&id, pool) in constants.entries() {
         plan.insert_constant_pool(id, pool.clone()).unwrap();
     }
@@ -1618,10 +1612,7 @@ fn try_aggregate_topn_typed(
         .unwrap();
     let mut result = result_port(PROBE, TOPN, &[grouped]);
     result.fields[0].ty = ty.clone();
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([7; 16]).unwrap(),
-        options(None).constants,
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(result).unwrap();
     plan.add_runtime_filter(ordered_filter(
@@ -1856,7 +1847,6 @@ fn finish_with_requests(
                 arguments: Box::default(),
                 logical_argument_count: 0,
                 expected_result_type: None,
-                constant_policy: options(None).constants,
             },
         ));
         Ok(())
@@ -2080,10 +2070,7 @@ fn count_star_join() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
     );
     let gather = finish_with_requests(gather, FINAL, FragmentSink::Result, &catalog);
 
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([7; 16]).unwrap(),
-        options(None).constants,
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     for (&id, pool) in constants.entries() {
         plan.insert_constant_pool(id, pool.clone()).unwrap();
     }

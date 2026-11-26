@@ -19,7 +19,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::DataType;
-use novarocks_functions::{ConstantPolicy, FunctionArgumentType, FunctionResultType};
+use novarocks_functions::{ConstantValidation, FunctionArgumentType, FunctionResultType};
 use novarocks_parser::ast;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType,
@@ -83,7 +83,7 @@ impl PlannerTableProvider for TemporalCatalog {
 fn analyze(
     sql: &str,
     source: &TemporalCatalog,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
 ) -> Result<ResolvedQuery, AnalyzeError> {
     let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     super::analyze_with_function_catalog_and_sql_semantics(
@@ -294,8 +294,7 @@ fn extract_binding_inherits_root_policy_null_sources_and_explicit_constant_admis
     assert!(special_args[0].value_type.nullable());
     assert_eq!(special_args[0].value_type, ordinary_args[0].value_type);
     // Literal admission must consume the supplied policy, not a helper default.
-    let mut policy = crate::constant::test_constant_policy();
-    policy.max_rows = 0;
+    let policy = crate::constant::test_constant_validation(0);
     for sql in [
         "SELECT EXTRACT(YEAR FROM DATE '2024-02-29')",
         "SELECT year(DATE '2024-02-29')",

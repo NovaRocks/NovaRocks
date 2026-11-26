@@ -175,7 +175,7 @@ pub(crate) fn analyze_with_function_catalog(
     catalog: &dyn PlannerTableProvider,
     current_database: &str,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -209,7 +209,7 @@ pub(crate) fn analyze_mv_definition(
     catalog: &dyn PlannerTableProvider,
     current_database: &str,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<MvDefinitionAnalysis, AnalyzeError> {
     analyze_mv_definition_with_factory(
@@ -229,7 +229,7 @@ pub(crate) fn analyze_mv_definition_with_factory(
     current_database: &str,
     factory: crate::column_id::ColumnRefFactory,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<MvDefinitionAnalysis, AnalyzeError> {
     let views = view::ViewAnalysisStack::recording();
@@ -263,7 +263,7 @@ pub(crate) fn analyze_with_function_catalog_and_sql_semantics(
     current_database: &str,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -292,7 +292,7 @@ pub(crate) fn analyze_with_materialized_values_and_sql_semantics(
     current_database: &str,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
 ) -> Result<
@@ -326,7 +326,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     current_database: &str,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
@@ -378,7 +378,7 @@ pub(crate) fn describe_prepared_query(
     current_database: &str,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
@@ -451,7 +451,7 @@ pub(crate) fn analyze_with_factory(
     catalog: &dyn PlannerTableProvider,
     current_database: &str,
     factory: crate::column_id::ColumnRefFactory,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -480,7 +480,7 @@ pub(crate) fn analyze_with_factory_and_function_catalog(
     current_database: &str,
     factory: crate::column_id::ColumnRefFactory,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -510,7 +510,7 @@ fn analyze_with_factory_and_function_catalog_inner(
     factory: crate::column_id::ColumnRefFactory,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
 ) -> Result<
@@ -552,7 +552,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     factory: crate::column_id::ColumnRefFactory,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
@@ -752,7 +752,7 @@ pub(super) struct AnalyzerContext<'a> {
     grouping_scope: std::cell::RefCell<Option<std::rc::Rc<GroupingAnalysis>>>,
     view_stack: view::ViewAnalysisStack,
     pub(super) control: &'a crate::compiler::SqlCompileControl,
-    pub(super) constant_policy: novarocks_functions::ConstantPolicy,
+    pub(super) constant_policy: novarocks_functions::ConstantValidation,
     materialized_values: Option<crate::compiler::materialized_values::MaterializedValuesLoan<'a>>,
     statement_relation: Option<(
         &'a ast::Table,

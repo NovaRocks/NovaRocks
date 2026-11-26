@@ -75,7 +75,6 @@ fn source_packages(
         FragmentPackageAdmission, FrozenFragmentPruning, PlanLimits, PropertyProofProjectionLimits,
         extract_fragment_packages,
     };
-    source.require_statement_constant_policy(policy).unwrap();
     let pruning = source
         .plan()
         .fragments()
@@ -202,7 +201,6 @@ fn check_array_source(
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         };
-        source.require_statement_constant_policy(policy).unwrap();
         let functions = installed_builtin_owner_catalogue();
         let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
         let mut producer = None;

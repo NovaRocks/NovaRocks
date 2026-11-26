@@ -54,7 +54,7 @@ pub(crate) struct MvWriteAnalysisContext {
     pub(crate) catalog: SqlCapturedCatalog,
     pub(crate) functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     pub(crate) sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
+    pub(crate) constant_policy: novarocks_functions::ConstantValidation,
     pub(crate) control: SqlCompileControl,
     pub(crate) current_catalog: Option<String>,
     pub(crate) current_database: String,
@@ -305,7 +305,7 @@ pub(crate) struct MvWriteFinishInput {
     pub(crate) access: Option<FinalPlanRuntimeAccess<FrozenProviderRead>>,
     pub(crate) session: Arc<ConnectorWriteSession>,
     pub(crate) carrier: CompiledPackageCarrier,
-    pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
+    pub(crate) constant_policy: novarocks_functions::ConstantValidation,
     pub(crate) options: novarocks_proto_codec::lifecycle::QueryOptions,
     pub(crate) control: SqlCompileControl,
 }
@@ -385,7 +385,6 @@ impl MvWriteFinishInput {
                 candidate,
                 access,
                 &self.carrier,
-                self.constant_policy,
                 &crate::query_execution::physical_encoding::WriteTargetFacts {
                     session: self.session.as_ref(),
                 },

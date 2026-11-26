@@ -29,7 +29,7 @@ use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_expression_contract::{ExprKind, RootScope};
-use novarocks_functions::ConstantPolicy;
+use novarocks_functions::ConstantValidation;
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
@@ -261,7 +261,6 @@ fn plan_with_local_nullability(
 
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([73; 16]).unwrap(),
-        &fixture_sources,
     );
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
@@ -364,18 +363,20 @@ fn options(root_sink_dop: Option<NonZeroUsize>) -> LocalCompileOptions {
         root_sink_dop,
         kernel_abi: KernelAbiVersion::CURRENT,
         // Explicit fixture admission; these values are not production defaults.
-        constants: ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        },
+        constants: novarocks_functions::ConstantValidation::bounded(
+            novarocks_functions::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        ),
     }
 }
 
@@ -1279,7 +1280,6 @@ fn drop_distribution_key_project_plan(
 
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([73; 16]).unwrap(),
-        &fixture_sources,
     );
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();

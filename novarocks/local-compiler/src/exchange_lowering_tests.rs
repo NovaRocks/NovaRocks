@@ -29,7 +29,7 @@ use crate::{
 use arrow_schema::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{
-    ConstantPolicy, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
+    ConstantValidation, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
     InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
     PureImplementationId, PureKernelAbi,
 };
@@ -332,10 +332,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([7; 16]).unwrap(),
-        options(None).constants,
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     for (&id, pool) in constants.entries() {
         plan.insert_constant_pool(id, pool.clone()).unwrap();
     }
@@ -514,18 +511,20 @@ fn options(root_sink_dop: Option<usize>) -> LocalCompileOptions {
         root_sink_dop: root_sink_dop.map(|dop| NonZeroUsize::new(dop).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
         // Explicit fixture admission; these values are not production defaults.
-        constants: ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        },
+        constants: novarocks_functions::ConstantValidation::bounded(
+            novarocks_functions::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        ),
     }
 }
 
@@ -969,10 +968,7 @@ fn full_outer_exchange_input_packages(
     let join = NodeId::new(30);
     let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut consumer = FragmentBuilder::new(CONSUMER);
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([73; 16]).unwrap(),
-        options(None).constants,
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap());
     let mut edges = Vec::new();
     let mut inputs = Vec::new();
     let mut imported = Vec::new();

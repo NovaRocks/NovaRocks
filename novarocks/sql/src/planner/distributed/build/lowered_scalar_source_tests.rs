@@ -69,7 +69,7 @@ impl PureCompileControl for Control {
         }
     }
 }
-pub(in crate::planner::distributed::build) fn policy() -> novarocks_functions::ConstantPolicy {
+pub(in crate::planner::distributed::build) fn policy() -> novarocks_functions::ConstantValidation {
     crate::constant::test_constant_policy()
 }
 pub(in crate::planner::distributed::build) fn nullable_bounded_character(
