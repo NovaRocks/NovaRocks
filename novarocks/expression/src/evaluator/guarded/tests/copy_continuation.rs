@@ -151,6 +151,7 @@ fn copy_chain(all_true: bool, finite: bool) {
     };
     let children = [
         Child {
+            ordinal_storage: None,
             ordinals: vec![0, 1, 2],
             value: OwnedValue::Selected(
                 Arc::new(BooleanArray::from(vec![all_true; 3])),
@@ -158,10 +159,12 @@ fn copy_chain(all_true: bool, finite: bool) {
             ),
         },
         Child {
+            ordinal_storage: None,
             ordinals: vec![0, 1, 2],
             value: yes,
         },
         Child {
+            ordinal_storage: None,
             ordinals: vec![0, 1, 2],
             value: no,
         },
@@ -428,7 +431,7 @@ fn scalar_v1_alias_into_pure_b_then_take_keeps_actual_finite_a() {
     let finite_children = vec![source.continuation().unwrap()];
     let aliased = {
         let value = source.into_value(actual, &mut work).unwrap();
-        let arguments = [value.argument()];
+        let arguments = [value.argument().unwrap()];
         let mut instance =
             novarocks_functions::ScalarEvaluationInstance::instantiate_with_allocator(
                 alias_prepared(&b),
@@ -438,7 +441,7 @@ fn scalar_v1_alias_into_pure_b_then_take_keeps_actual_finite_a() {
         let output = instance.evaluate(actual, &arguments, &Control).unwrap();
         assert_eq!(
             output.values().to_data(),
-            value.argument().array().to_data()
+            value.argument().unwrap().array().to_data()
         );
         OwnedValue::from_selected(output)
     };
@@ -613,7 +616,7 @@ fn finite_constant_needs_host_only_when_its_actual_array_is_copied() {
         .into_value(Selection::all(2), &mut work)
         .unwrap();
     assert!(
-        matches!(value.argument(), EvaluatedArgument::Constant(_)),
+        matches!(value.argument(), Ok(EvaluatedArgument::Constant(_))),
         "borrowing the formal checked Constant must not eagerly require a new host"
     );
     let error = match value.materialize(Selection::all(2), b.data_type(), &mut work) {

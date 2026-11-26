@@ -79,7 +79,52 @@ impl BooleanRows {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| invalid("Boolean operand differs from its frozen carrier"))?;
-        let mut errors = output.errors().iter().peekable();
+        self.consume_rows(
+            output.errors(),
+            ordinals,
+            shape,
+            demand,
+            pure,
+            terminal,
+            |ordinal| Ok((!values.is_null(ordinal)).then(|| values.value(ordinal))),
+            work,
+        )
+    }
+
+    pub(super) fn consume_mapped(
+        &mut self,
+        value: &super::mapped::MappedValues,
+        ordinals: &[usize],
+        shape: ControlShape,
+        demand: EvaluationDemand,
+        pure: bool,
+        terminal: &mut BTreeMap<usize, RowDataError>,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<Vec<usize>, KernelFailure> {
+        self.consume_rows(
+            value.errors(),
+            ordinals,
+            shape,
+            demand,
+            pure,
+            terminal,
+            |ordinal| value.boolean(ordinal),
+            work,
+        )
+    }
+
+    fn consume_rows(
+        &mut self,
+        errors: &[RowDataError],
+        ordinals: &[usize],
+        shape: ControlShape,
+        demand: EvaluationDemand,
+        pure: bool,
+        terminal: &mut BTreeMap<usize, RowDataError>,
+        mut value_at: impl FnMut(usize) -> Result<Option<bool>, KernelFailure>,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<Vec<usize>, KernelFailure> {
+        let mut errors = errors.iter().peekable();
         let mut remaining = Vec::with_capacity(ordinals.len());
         let deciding = shape == ControlShape::Disjunction;
         for (ordinal, &parent) in ordinals.iter().enumerate() {
@@ -98,19 +143,24 @@ impl BooleanRows {
                 } else {
                     terminal.insert(parent, error.with_selected_ordinal(parent));
                 }
-            } else if values.is_null(ordinal) {
-                if shape == ControlShape::Conjunction && demand == EvaluationDemand::TruthOnly {
-                    self.decided[parent] = Some(false);
-                    self.pending.remove(&parent);
-                } else {
-                    self.saw_null[parent] = true;
-                    remaining.push(parent);
-                }
-            } else if values.value(ordinal) == deciding {
-                self.decided[parent] = Some(deciding);
-                self.pending.remove(&parent);
             } else {
-                remaining.push(parent);
+                match value_at(ordinal)? {
+                    None if shape == ControlShape::Conjunction
+                        && demand == EvaluationDemand::TruthOnly =>
+                    {
+                        self.decided[parent] = Some(false);
+                        self.pending.remove(&parent);
+                    }
+                    None => {
+                        self.saw_null[parent] = true;
+                        remaining.push(parent);
+                    }
+                    Some(value) if value == deciding => {
+                        self.decided[parent] = Some(deciding);
+                        self.pending.remove(&parent);
+                    }
+                    Some(_) => remaining.push(parent),
+                }
             }
             work.step()?;
         }

@@ -186,25 +186,23 @@ mod fold_frontiers {
     }
 
     #[test]
-    fn collection_lambda_signatures_keep_their_own_unavailable_overloads() {
+    fn collection_lambda_signatures_admit_each_installed_exact_overload() {
         let probe = Arc::new(FoldProbe::default());
-        for (sql, overload) in [
-            (
-                "SELECT array_sort(ARRAY[3,1,2], (x,y) -> 0)",
-                "builtin.scalar/array_sort/lambda-v1",
-            ),
-            (
-                "SELECT transform(ARRAY[1,2], x -> x + 1)",
-                "builtin.scalar/transform/lambda-v1",
-            ),
-            (
-                "SELECT map_filter(map(), (k,v) -> true)",
-                "builtin.scalar/map_filter/lambda-v1",
-            ),
+        for sql in [
+            "SELECT array_sort(ARRAY[3,1,2])",
+            "SELECT array_sort(ARRAY[3,1,2], (x,y) -> 0)",
+            "SELECT transform(ARRAY[1,2], x -> x + 1)",
+            "SELECT filter(ARRAY[1,2], x -> x > 1)",
+            "SELECT any_match(ARRAY[1,2], x -> x > 1)",
+            "SELECT all_match(ARRAY[1,2], x -> x > 1)",
+            "SELECT map_filter(map(), (k,v) -> true)",
+            "SELECT transform_values(map(ARRAY[1], ARRAY[2]), (k,v) -> k + v)",
+            "SELECT transform_keys(map(ARRAY[1], ARRAY[2]), (k,v) -> v)",
         ] {
-            unavailable(analyze(sql, &probe).unwrap_err(), overload);
+            analyze(sql, &probe).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
         }
     }
+
     #[test]
     fn reverse_keeps_installed_string_and_array_overloads_distinct() {
         let probe = Arc::new(FoldProbe::default());

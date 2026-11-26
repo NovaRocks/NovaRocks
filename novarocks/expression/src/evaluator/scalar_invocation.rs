@@ -73,13 +73,18 @@ impl PreparedCall<'_> {
 pub(super) enum CallInstance {
     Kernel(ScalarEvaluationInstance),
     Invocation(InvocationScalarEvaluationInstance),
+    HigherOrder {
+        instance: novarocks_functions::HigherOrderEvaluationInstance,
+        _state: Option<novarocks_functions::opaque_memory::OpaqueReservation>,
+    },
 }
 impl CallInstance {
     #[cfg(test)]
-    pub(super) fn contract(&self) -> &ScalarCallContract {
+    pub(super) fn contract(&self) -> &novarocks_functions::FunctionCallContract {
         match self {
-            Self::Kernel(instance) => instance.contract(),
-            Self::Invocation(instance) => instance.contract(),
+            Self::Kernel(instance) => instance.contract().call(),
+            Self::Invocation(instance) => instance.contract().call(),
+            Self::HigherOrder { instance, .. } => instance.contract().call(),
         }
     }
 }
@@ -248,6 +253,9 @@ pub(super) fn invoke<'a, R>(
             "whole-invocation scalar requires the lossless evaluation entry",
         )
         .into()),
+        (CallInstance::HigherOrder { .. }, _) => {
+            Err(super::invalid("higher-order instance requires its bound body continuation").into())
+        }
     }
 }
 

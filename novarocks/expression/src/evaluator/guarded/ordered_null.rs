@@ -41,7 +41,7 @@ impl<K> Frame<K> {
         self.remaining.clear();
         work.flush()?;
         visit_selected_nulls(
-            value.argument(),
+            value.argument()?,
             selection,
             work.control,
             |ordinal, _, is_null| {
@@ -63,6 +63,7 @@ impl<K> Frame<K> {
         )?;
         self.children.push(Child {
             ordinals: child.ordinals,
+            ordinal_storage: child.ordinal_storage,
             value: retain_argument(value),
         });
         Ok(())
@@ -140,6 +141,7 @@ impl<K: Ord + Clone> Frame<K> {
                 &arguments,
                 active,
                 self.activation,
+                None,
                 instances,
                 allocator,
                 work,
@@ -193,6 +195,7 @@ fn retain_argument(value: Value<'_>) -> OwnedValue {
         Value::ConstantView(value) => OwnedValue::ConstantView(value),
         Value::Column(array) => OwnedValue::Column(array),
         Value::Selected(selected) => OwnedValue::from_selected(selected),
+        Value::Mapped(value) => OwnedValue::Mapped(value),
         Value::Continued(value, owner) => retain_argument(*value).with_continuation(Some(owner)),
     }
 }

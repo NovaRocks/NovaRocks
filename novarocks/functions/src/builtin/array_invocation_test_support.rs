@@ -163,10 +163,221 @@ impl Host {
     pub(super) fn opaque_attempts(&self) -> usize {
         self.ledger.lock().unwrap().opaque_attempts
     }
+    fn opaque_bytes(&self) -> usize {
+        self.ledger.lock().unwrap().opaque
+    }
 }
 
 impl Host {
     pub(super) fn live_blocks(&self) -> usize {
         self.ledger.lock().unwrap().blocks.len()
     }
+}
+
+/// Exercise the actual catalogue-owned preparation and original scalar wrapper
+/// at the same sparse selection. Depend on the row's value, not on how its
+/// source backing was repeated.
+pub(super) fn assert_scalar_broadcast_equivalent(
+    name: &str,
+    inputs: &[(&arrow_array::ArrayRef, usize)],
+    expect_row_error: bool,
+) {
+    use crate::selected_copy::{CopyIndices, CopyOperationError, take_copy_in};
+    use crate::{
+        CallArgumentUses, CallEffectInput, EvaluatedArgument, FunctionArgument,
+        FunctionBindingRequest, FunctionKind, FunctionValueType, PreparedPureKernel,
+        PureCallPreparation, ScalarEvaluationInstance, ScopedExpressionEffects, Selection,
+    };
+    use arrow_array::UInt64Array;
+    use novarocks_type_contract::{
+        CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
+        ExpressionEffectContext, ExpressionUseId, SemanticParameters,
+    };
+    use std::error::Error as _;
+
+    let catalog = super::catalogue::builtin_engine_function_catalog();
+    let arguments = inputs
+        .iter()
+        .map(|(array, _)| FunctionArgument::Value {
+            value_type: FunctionValueType::from_legacy_declared_projection(
+                array.data_type().clone(),
+                true,
+            ),
+            constant: None,
+        })
+        .collect::<Vec<_>>();
+    let request = FunctionBindingRequest {
+        arguments: &arguments,
+        logical_argument_count: arguments.len(),
+        expected_result_type: None,
+    };
+    let compile = crate::binding_test_control();
+    let bound = catalog
+        .resolve_bound_user(name, FunctionKind::Scalar, request, compile)
+        .unwrap();
+    let selected = Arc::new(bound.selected);
+    let cx = ExpressionEffectContext {
+        use_id: ExpressionUseId::new(1),
+        region: EvaluationRegionId::new(1),
+        demand: EvaluationDemand::Value,
+    };
+    let uses = (2..2 + arguments.len() as u32)
+        .map(|id| Some(ExpressionUseId::new(id)))
+        .collect::<Vec<_>>();
+    let prepared = catalog
+        .prepare_fresh_selected(
+            CallEffectInput {
+                function_id: &bound.function_id,
+                kind: FunctionKind::Scalar,
+                selected: &selected,
+                context: cx.into(),
+                argument_uses: CallArgumentUses::SelectedChannels(&uses),
+                request,
+                environment: &[],
+                parameters: &SemanticParameters::default(),
+                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                proof_scope: CallProofScope::Unconditional,
+            },
+            selected.clone(),
+            PureCallPreparation::Scalar {
+                arguments: ScopedExpressionEffects::pure_value(cx),
+            },
+            compile,
+        )
+        .unwrap();
+    let PreparedPureKernel::Scalar(kernel) = prepared.prepared() else {
+        panic!("expected the original scalar lifecycle");
+    };
+    for ordinal in 0..arguments.len() {
+        assert!(
+            kernel.supports_scalar_broadcast(ordinal),
+            "{name}, ordinal {ordinal}"
+        );
+    }
+    assert!(!kernel.supports_scalar_broadcast(arguments.len()));
+
+    let selection = Selection::try_sparse(7, &[1, 4, 6]).unwrap();
+    let scalars = inputs
+        .iter()
+        .map(|(source, row)| source.slice(*row, 1))
+        .collect::<Vec<_>>();
+    let repeated =
+        CopyIndices::UInt64(Arc::new(UInt64Array::from(vec![0; selection.batch_rows()])));
+    let refused = Host::with_limit(usize::MAX);
+    refused.arm_opaque(0, KernelFailure::ResourceExhausted);
+    assert!(matches!(
+        take_copy_in(
+            scalars[0].clone(),
+            repeated.clone(),
+            (),
+            refused.clone(),
+            &Control::default()
+        ),
+        Err(CopyOperationError::Control(
+            KernelFailure::ResourceExhausted
+        ))
+    ));
+    refused.released();
+
+    let invoke = |mask| {
+        let is_scalar = |ordinal| (1usize << ordinal) & mask != 0;
+        let copy_host = Host::with_limit(usize::MAX);
+        let columns = scalars
+            .iter()
+            .enumerate()
+            .map(|(ordinal, scalar)| {
+                (!is_scalar(ordinal)).then(|| {
+                    take_copy_in(
+                        scalar.clone(),
+                        repeated.clone(),
+                        (),
+                        copy_host.clone(),
+                        &Control::default(),
+                    )
+                    .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let copied_bytes: usize = columns
+            .iter()
+            .flatten()
+            .map(|column| column.new_buffer_stock())
+            .sum();
+        let args = scalars
+            .iter()
+            .zip(&columns)
+            .map(|(scalar, column)| match column {
+                Some(column) => EvaluatedArgument::Column(column.values()),
+                None => EvaluatedArgument::Scalar(scalar),
+            })
+            .collect::<Vec<_>>();
+        let host = Host::with_limit(usize::MAX);
+        let mut instance = ScalarEvaluationInstance::instantiate_with_allocator(
+            Arc::clone(kernel),
+            Some(host.clone()),
+        )
+        .unwrap();
+        let output = instance
+            .evaluate(selection, &args, &Control::default())
+            .unwrap();
+        let rejected = Control {
+            refusal: Some((0, KernelFailure::DeadlineExceeded)),
+            ..Control::default()
+        };
+        assert!(matches!(
+            instance.evaluate(selection, &args, &rejected),
+            Err(KernelFailure::DeadlineExceeded)
+        ));
+        assert!(matches!(
+            instance.evaluate(selection, &args, &Control::default()),
+            Err(KernelFailure::InstanceFailed)
+        ));
+        assert_eq!(output.selection(), selection);
+        let alias = output.values().clone();
+        let errors = output.errors().to_vec();
+        drop(output);
+        drop(instance);
+        (host, alias, errors, copy_host, copied_bytes)
+    };
+    let (baseline_host, baseline, baseline_errors, baseline_copy_host, baseline_copy_bytes) =
+        invoke(0);
+    assert!(baseline_copy_bytes > 0);
+    assert_eq!(
+        baseline_errors.len(),
+        if expect_row_error { selection.len() } else { 0 }
+    );
+    for (ordinal, error) in baseline_errors.iter().enumerate() {
+        assert_eq!(error.selected_ordinal(), ordinal);
+        assert!(baseline.is_null(ordinal));
+    }
+    let retained = baseline_host.opaque_bytes();
+    for mask in 1..(1 << arguments.len()) {
+        let (host, output, errors, copy_host, copied_bytes) = invoke(mask);
+        assert_eq!(
+            output.data_type(),
+            kernel.contract().result_type().data_type()
+        );
+        assert_eq!(output.to_data(), baseline.to_data());
+        assert_eq!(errors, baseline_errors);
+        for (expected, actual) in baseline_errors.iter().zip(&errors) {
+            assert_eq!(
+                expected.source().map(ToString::to_string),
+                actual.source().map(ToString::to_string),
+            );
+        }
+        assert_eq!(host.opaque_bytes(), retained);
+        assert!(copied_bytes <= baseline_copy_bytes);
+        if mask == (1 << arguments.len()) - 1 {
+            assert_eq!(copied_bytes, 0);
+            assert_eq!(copy_host.opaque_attempts(), 0);
+        }
+        drop(output);
+        drop(errors);
+        host.released();
+        copy_host.released();
+    }
+    drop(baseline);
+    drop(baseline_errors);
+    baseline_host.released();
+    baseline_copy_host.released();
 }

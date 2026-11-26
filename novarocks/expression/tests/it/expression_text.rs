@@ -109,6 +109,112 @@ fn evaluate(expr: &TypedText<'_>, batch: &RecordBatch) -> CheckedRows {
         .unwrap()
 }
 
+#[test]
+fn collection_lambda_types_captures_and_replays_each_original_parent() {
+    use arrow::{array::ListArray, datatypes::Int32Type};
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let arrays = ListArray::from_iter_primitive::<Int32Type, _, _>([
+        Some(vec![Some(1), Some(2)]),
+        None,
+        Some(vec![Some(3)]),
+    ]);
+    let columns = [
+        column("items", 1, arrays.data_type().clone(), true),
+        column("captured", 2, DataType::Int32, false),
+        column("unused", 3, DataType::Int32, false),
+    ];
+    let data = batch(
+        &columns,
+        vec![
+            Arc::new(arrays),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+            Arc::new(Int32Array::from(vec![4, 5, 6])),
+        ],
+    );
+    let typed = compile(
+        "transform(items, x -> transform(items, y -> x + y + captured))",
+        &columns,
+        &context,
+    );
+    let [port] = typed.unit().ports() else {
+        panic!("one input port");
+    };
+    assert_eq!(
+        port.values.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        [columns[0].value, columns[1].value],
+    );
+    let outcome = evaluate(&typed, &data);
+    let Consistency::Compared { constant_shapes } = outcome.consistency else {
+        panic!("immutable lambda bodies support row consistency");
+    };
+    assert_eq!(constant_shapes, vec![CONSTANT_SHAPE; 3]);
+    assert!(outcome.batch.errors.is_empty());
+    let rows = outcome
+        .batch
+        .values
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert!(rows.is_null(1));
+    let values = |row| {
+        let outer = rows.value(row);
+        let inner = outer.as_any().downcast_ref::<ListArray>().unwrap();
+        (0..inner.len())
+            .map(|index| {
+                let values = inner.value(index);
+                values
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values(0), [vec![12, 13], vec![13, 14]]);
+    assert_eq!(values(2), [vec![36]]);
+}
+
+#[test]
+fn collection_lambda_rejects_unknown_or_non_boolean_predicate_body() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let columns = [column(
+        "items",
+        1,
+        DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Int32,
+            true,
+        ))),
+        false,
+    )];
+    for body in ["NULL", "x", "BIGINT '0'"] {
+        let result = type_expression_text(
+            &format!("filter(items, x -> {body})"),
+            &columns,
+            &context,
+            &HarnessControl,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(TextError::Typing {
+                    cause: TypingError::Binding(
+                        novarocks_functions::FunctionBindingError::NoMatchingOverload
+                    ),
+                    ..
+                })
+            ),
+            "{body}"
+        );
+    }
+}
+
 fn assert_compared(result: &CheckedRows, columns: usize, rows: usize) {
     assert_eq!(
         result.batch.shape,

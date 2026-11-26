@@ -211,6 +211,35 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
         self.check_control()?;
+        if scope.inside_lambda() {
+            let relation = match expr {
+                ast::Expr::Subquery(_) | ast::Expr::Exists(_) => true,
+                ast::Expr::Unary(unary) => {
+                    matches!(unary.expression.as_ref(), ast::Expr::Exists(_))
+                }
+                ast::Expr::Predicated(node) => matches!(
+                    &node.predicate,
+                    ast::Predicate::In(input) if matches!(input.value_list, ast::Expr::Subquery(_))
+                ),
+                _ => false,
+            };
+            if relation {
+                return Err(AnalyzeError::unsupported_expression(
+                    "Subqueries are not supported in lambda bodies",
+                    expr.span(),
+                ));
+            }
+            if matches!(
+                expr,
+                ast::Expr::GroupingOperation(_) | ast::Expr::WindowOperation(_)
+            ) {
+                return Err(AnalyzeError::at(
+                    AnalyzeErrorKind::ExpressionNotScalar,
+                    "Lambda bodies must contain only scalar expressions",
+                    expr.span(),
+                ));
+            }
+        }
         if let ast::Expr::Parameter(parameter) = expr {
             return self.analyze_prepared_parameter(parameter);
         }
@@ -342,6 +371,9 @@ impl<'a> super::AnalyzerContext<'a> {
 
             // Simple column reference
             ast::Expr::Identifier(ident) => {
+                if let Some(parameter) = scope.lambda_parameter(&ident.value) {
+                    return Ok(parameter);
+                }
                 // If the scope has a synthetic expression for this name
                 // (FULL OUTER USING column → COALESCE), return that
                 // expression directly so the merged value is computed.
@@ -799,11 +831,15 @@ impl<'a> super::AnalyzerContext<'a> {
         // Form 3: leading identifier is the column itself, the rest walk a
         // STRUCT. Falls back to producing a `Column 'X' cannot be resolved`
         // error from `scope.resolve` if even this fails.
-        let (column_id, value_type) = scope
-            .resolve_value_type(None, base_name)
-            .map_err(|message| AnalyzeError::unknown_column(message, parts[0].span))?;
-        scope.check_read_column(column_id, &parts[1..], parts[0].span)?;
-        let mut current = build_column_ref(column_id, value_type, None, base_name);
+        let mut current = if let Some(parameter) = scope.lambda_parameter(base_name) {
+            parameter
+        } else {
+            let (column_id, value_type) = scope
+                .resolve_value_type(None, base_name)
+                .map_err(|message| AnalyzeError::unknown_column(message, parts[0].span))?;
+            scope.check_read_column(column_id, &parts[1..], parts[0].span)?;
+            build_column_ref(column_id, value_type, None, base_name)
+        };
         for field in &parts[1..] {
             current = self.analyze_struct_field_access(current, field.value.clone(), field.span)?;
         }
@@ -2136,6 +2172,19 @@ impl<'a> super::AnalyzerContext<'a> {
             [name] if name.value.eq_ignore_ascii_case("normalize") => "normalize".to_owned(),
             _ => print_object_name(&func.name).to_ascii_lowercase(),
         };
+        if scope.inside_lambda()
+            && (func.window.is_some()
+                || original_name == "grouping"
+                || is_window_only_function(&original_name)
+                || is_aggregate_function(self.function_catalog, &original_name)
+                || analyzer_aggregate_alias(&original_name).is_some())
+        {
+            return Err(AnalyzeError::at(
+                AnalyzeErrorKind::ExpressionNotScalar,
+                "Lambda bodies must contain only scalar expressions",
+                func.span,
+            ));
+        }
         let original_input = if func.filter.is_some()
             && func.window.is_none()
             && (is_aggregate_function(self.function_catalog, &original_name)
@@ -2363,11 +2412,23 @@ impl<'a> super::AnalyzerContext<'a> {
         } else {
             arg_exprs.as_slice()
         };
-        if let Some(signature) = novarocks_functions::builtin::collection_lambda::signature(&name)
-            && effective_arg_exprs
-                .iter()
-                .any(|argument| matches!(argument, ast::Expr::Lambda(_)))
+        if effective_arg_exprs
+            .iter()
+            .any(|argument| matches!(argument, ast::Expr::Lambda(_)))
+            && !is_window_only_function(&name)
+            && !is_aggregate_function(self.function_catalog, &name)
         {
+            if crate::functions::builtin_disposition(&name).is_none()
+                && !self
+                    .function_catalog
+                    .recognizes_scalar_name(&name, &[], self.control)
+                    .map_err(AnalyzeError::function_resolution)?
+            {
+                return Err(AnalyzeError::unknown_function(
+                    format!("Unknown function: {name}"),
+                    func.span,
+                ));
+            }
             let [collection, ast::Expr::Lambda(lambda)] = effective_arg_exprs else {
                 return Err(AnalyzeError::unknown_function(
                     format!("No matching signature for function {name}"),
@@ -2375,36 +2436,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 ));
             };
             let collection = self.analyze_expr(collection, scope)?;
-            if lambda.arguments.len() != signature.arity()
-                || !signature.accepts_collection(&collection.value_type)
-            {
-                return Err(AnalyzeError::unknown_function(
-                    format!("No matching signature for function {name}"),
-                    func.span,
-                ));
-            }
-            return Err(AnalyzeError::function_binding(
-                novarocks_functions::FunctionBindingError::UnavailableImplementation(
-                    signature.overload(),
-                ),
-            )
-            .at_type_mismatch(func.span));
-        }
-        if effective_arg_exprs
-            .iter()
-            .any(|arg| matches!(arg, ast::Expr::Lambda(_)))
-            && !is_window_only_function(&name)
-            && !is_aggregate_function(self.function_catalog, &name)
-            && crate::functions::builtin_disposition(&name).is_none()
-            && !self
-                .function_catalog
-                .recognizes_scalar_name(&name, &[], self.control)
-                .map_err(AnalyzeError::function_resolution)?
-        {
-            return Err(AnalyzeError::unknown_function(
-                format!("Unknown function: {name}"),
-                func.span,
-            ));
+            return self.analyze_collection_lambda(func, name, collection, lambda, scope);
         }
 
         let mut args_typed = Vec::with_capacity(effective_arg_exprs.len());
@@ -3058,6 +3090,63 @@ impl<'a> super::AnalyzerContext<'a> {
                 value_type,
             })
         }
+    }
+
+    fn analyze_collection_lambda(
+        &self,
+        func: FunctionMetadata<'_>,
+        name: String,
+        collection: TypedExpr,
+        lambda: &ast::LambdaExpr,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let (candidate, collection) =
+            self.begin_collection_lambda(&name, collection, lambda.arguments.len(), func.span)?;
+        if func.window.is_some() {
+            return Err(AnalyzeError::unsupported_expression(
+                format!("function {name} is not supported with OVER clause"),
+                func.span,
+            ));
+        }
+        if let Some(filter) = func.original.and_then(|original| original.filter.as_ref()) {
+            return Err(AnalyzeError::at(
+                AnalyzeErrorKind::FunctionNotAggregate,
+                "FILTER requires an aggregate function",
+                filter.span(),
+            ));
+        }
+        if func.distinct || func.order_by.is_some() {
+            return Err(AnalyzeError::at(
+                AnalyzeErrorKind::FunctionNotAggregate,
+                "DISTINCT and ORDER BY require an aggregate function",
+                func.span,
+            ));
+        }
+        if func.null_treatment.is_some() {
+            return Err(AnalyzeError::unsupported_expression(
+                "Null treatment requires a window function",
+                func.span,
+            ));
+        }
+        let (params, body) = scope.bind_lambda(lambda, candidate.parameter_types(), self)?;
+        let lambda = TypedExpr {
+            value_type: body.value_type.clone(),
+            kind: ExprKind::LambdaFunction {
+                params,
+                body: ast::AstBox::new(body),
+            },
+        };
+        let bound = self.finish_collection_lambda(&candidate, collection, lambda, func.span)?;
+        Ok(TypedExpr {
+            value_type: bound.value_type().clone(),
+            kind: ExprKind::FunctionCall {
+                name,
+                volatility: bound.binding.semantics.volatility,
+                args: bound.args.into(),
+                distinct: false,
+                binding: bound.binding,
+            },
+        })
     }
 
     /// Extract ORDER BY clauses from within function arguments (e.g. array_agg(x ORDER BY y)).
@@ -7773,12 +7862,17 @@ mod tests {
     }
 
     #[test]
-    fn array_sort_clock_comparators_report_the_unavailable_lambda_overload() {
+    fn array_sort_comparator_keeps_integer_body_and_statement_clock() {
         use crate::analyze_error::AnalyzeErrorKind;
-        use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
+        use novarocks_type_contract::{StatementStartUtc, StatementTimeEnvironment, TimeZoneKey};
 
-        let overload = FunctionOverloadId::try_new("builtin.scalar/array_sort/lambda-v1").unwrap();
-        let expected = FunctionBindingError::UnavailableImplementation(overload).to_string();
+        let settings = crate::sql_mode::SqlSemanticSettings::default().with_statement_time(
+            StatementTimeEnvironment {
+                start: StatementStartUtc::try_new(1_700_000_000, 0).unwrap(),
+                zone: TimeZoneKey::UTC,
+            },
+        );
+        let control = crate::compiler::SqlCompileControl::unbounded();
         for clock in [
             "CURRENT_DATE",
             "CURRENT_TIME",
@@ -7789,13 +7883,145 @@ mod tests {
         ] {
             let sql = format!("SELECT array_sort([2, 1], (x, y) -> IF({clock} IS NULL, -1, 0))");
             let query = novarocks_parser::parser::parse_query(&sql).unwrap();
-            let error = super::super::analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            let (resolved, _, _) = super::super::analyze_with_function_catalog_and_sql_semantics(
+                &query,
+                &EmptyCatalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                &settings,
+                crate::constant::test_constant_policy(),
+                &control,
+            )
+            .unwrap();
+            let QueryBody::Select(select) = &resolved.body else {
+                panic!("SELECT projection");
+            };
+            let ExprKind::FunctionCall { binding, args, .. } = &select.projection[0].expr.kind
+            else {
+                panic!("selected array_sort: {sql}");
+            };
             assert_eq!(
-                error.kind(),
-                AnalyzeErrorKind::UnavailableImplementation,
-                "{sql}"
+                binding.selected.overload.as_str(),
+                "builtin.scalar/array_sort/lambda-v1"
             );
-            assert_eq!(error.message(), expected, "{sql}");
+            let ExprKind::LambdaFunction { params, body } = &args[1].kind else {
+                panic!("bound comparator: {sql}");
+            };
+            assert_eq!(params.len(), 2);
+            assert_eq!(body.value_type.data_type(), &DataType::Int32, "{sql}");
+        }
+        for body in ["NULL", "BIGINT '0'", "true"] {
+            let sql = format!("SELECT array_sort(ARRAY[2, 1], (x, y) -> {body})");
+            let query = novarocks_parser::parser::parse_query(&sql).unwrap();
+            let error = super::super::analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnknownFunction, "{sql}");
+        }
+    }
+
+    #[test]
+    fn lambda_body_resolves_nearest_parameter_ancestor_and_qualified_column() {
+        let sql = "SELECT transform(t.a, x -> transform(t.a, y -> x + y + t.x)), \
+                          transform(t.a, x -> transform(t.a, x -> x + t.x)) \
+                   FROM (VALUES (ARRAY[1, 2], 10)) AS t(a, x)";
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
+        let (resolved, _, _) = super::super::analyze(&query, &EmptyCatalog, "default").unwrap();
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("SELECT projection");
+        };
+        fn lambda(call: &crate::analysis::TypedExpr) -> &crate::analysis::TypedExpr {
+            let ExprKind::FunctionCall { args, .. } = &call.kind else {
+                panic!("higher-order call");
+            };
+            &args[1]
+        }
+        fn plus(
+            value: &crate::analysis::TypedExpr,
+        ) -> (&crate::analysis::TypedExpr, &crate::analysis::TypedExpr) {
+            let Some((novarocks_type_contract::OperatorFunction::Add, [left, right])) =
+                crate::common::binary_operator::typed_operands(value)
+            else {
+                panic!("bound addition");
+            };
+            (left, right)
+        }
+        for (index, item) in select.projection.iter().enumerate() {
+            let ExprKind::LambdaFunction {
+                params: outer,
+                body,
+            } = &lambda(&item.expr).kind
+            else {
+                panic!("outer lexical frame");
+            };
+            let ExprKind::LambdaFunction {
+                params: inner,
+                body,
+            } = &lambda(body).kind
+            else {
+                panic!("inner lexical frame");
+            };
+            let (local, captured) = plus(body);
+            assert!(
+                matches!(captured.kind, ExprKind::ColumnRef { ref qualifier, ref column, .. }
+                if qualifier.as_deref() == Some("t") && column == "x")
+            );
+            assert_ne!(inner[0].slot_id, outer[0].slot_id);
+            if index == 0 {
+                let (outer_ref, inner_ref) = plus(local);
+                assert!(
+                    matches!(outer_ref.kind, ExprKind::LambdaParamRef { slot_id, .. }
+                    if slot_id == outer[0].slot_id)
+                );
+                assert!(
+                    matches!(inner_ref.kind, ExprKind::LambdaParamRef { slot_id, .. }
+                    if slot_id == inner[0].slot_id)
+                );
+            } else {
+                assert!(
+                    matches!(local.kind, ExprKind::LambdaParamRef { slot_id, .. }
+                    if slot_id == inner[0].slot_id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lambda_diagnostics_keep_non_scalar_bodies_and_scalar_modifiers_distinct() {
+        use crate::analyze_error::AnalyzeErrorKind as K;
+        for (sql, expected) in [
+            (
+                "SELECT transform(ARRAY[1], x -> sum(x))",
+                K::ExpressionNotScalar,
+            ),
+            (
+                "SELECT transform(ARRAY[1], x -> row_number() OVER ())",
+                K::ExpressionNotScalar,
+            ),
+            (
+                "SELECT transform(ARRAY[1], x -> GROUPING(x))",
+                K::ExpressionNotScalar,
+            ),
+            (
+                "SELECT transform(ARRAY[1], x -> (SELECT 1))",
+                K::UnsupportedExpression,
+            ),
+            ("SELECT transform(ARRAY[1], x -> missing)", K::UnknownColumn),
+            (
+                "SELECT transform(ARRAY[1], x -> x) OVER ()",
+                K::UnsupportedExpression,
+            ),
+            (
+                "SELECT transform(DISTINCT ARRAY[1], x -> x)",
+                K::FunctionNotAggregate,
+            ),
+            (
+                "SELECT transform(ARRAY[1], x -> x) FILTER (WHERE true)",
+                K::FunctionNotAggregate,
+            ),
+        ] {
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
+            let error = super::super::analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(error.kind(), expected, "{sql}: {error}");
+            assert!(error.span().is_some(), "{sql}");
         }
     }
 

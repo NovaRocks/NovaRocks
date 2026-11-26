@@ -256,6 +256,7 @@ impl FunctionEffectDeclaration {
                 | ArgumentControl::TemporalSource(_)
                 | ArgumentControl::SimpleCase
                 | ArgumentControl::SearchedCase
+                | ArgumentControl::HigherOrder { .. }
         ) && self.null_behavior != FunctionNullBehavior::ControlDefined
         {
             return Err(EffectContractError::ControlMismatch);
@@ -663,6 +664,46 @@ mod tests {
     }
 
     #[test]
+    fn higher_order_requires_control_defined_null_behavior() {
+        use crate::EvaluationDemand;
+        for body_ordinal in [0, 1] {
+            for body_demand in [EvaluationDemand::Value, EvaluationDemand::TruthOnly] {
+                let argument_control = ArgumentControl::HigherOrder {
+                    body_ordinal,
+                    body_demand,
+                };
+                for null_behavior in [
+                    FunctionNullBehavior::Strict,
+                    FunctionNullBehavior::CalledOnNull,
+                ] {
+                    let declared = FunctionEffectDeclaration {
+                        argument_control,
+                        null_behavior,
+                        ..base()
+                    };
+                    assert_eq!(
+                        declared.validate(FunctionKind::Scalar),
+                        Err(EffectContractError::ControlMismatch)
+                    );
+                }
+                FunctionEffectDeclaration {
+                    argument_control,
+                    null_behavior: FunctionNullBehavior::ControlDefined,
+                    ..base()
+                }
+                .validate(FunctionKind::Scalar)
+                .unwrap();
+            }
+        }
+        FunctionEffectDeclaration {
+            null_behavior: FunctionNullBehavior::Strict,
+            ..base()
+        }
+        .validate(FunctionKind::Scalar)
+        .unwrap();
+    }
+
+    #[test]
     fn higher_order_refinement_cannot_change_body_position_or_demand() {
         use crate::EvaluationDemand;
         let mut base = base();
@@ -671,7 +712,9 @@ mod tests {
             body_demand: EvaluationDemand::Value,
         };
         let mut refined = call();
+        base.null_behavior = FunctionNullBehavior::ControlDefined;
         refined.argument_control = base.argument_control;
+        refined.null_behavior = base.null_behavior;
         refined
             .validate_refinement(&base, CallProofScope::Unconditional)
             .unwrap();

@@ -246,6 +246,81 @@ mod tests {
         assert!(frontend_constant_policy(narrower).is_err());
     }
 
+    #[test]
+    fn collection_lambda_overloads_are_installed_in_the_production_seal() {
+        use novarocks_functions::{FunctionIntrinsicRowError, PureKernelAbi};
+        use novarocks_type_contract::{ArgumentControl, EvaluationDemand, FunctionNullBehavior};
+
+        let function_set = compose_process_function_set().unwrap();
+        let seal = seal_pure_catalog(function_set.catalog()).unwrap();
+        let catalog = seal.catalog.metadata();
+        for (name, expected_row_error) in [
+            ("transform", FunctionIntrinsicRowError::NoRowError),
+            ("filter", FunctionIntrinsicRowError::NoRowError),
+            ("any_match", FunctionIntrinsicRowError::NoRowError),
+            ("all_match", FunctionIntrinsicRowError::NoRowError),
+            ("array_sort", FunctionIntrinsicRowError::MayRaise),
+            ("map_filter", FunctionIntrinsicRowError::NoRowError),
+            ("transform_keys", FunctionIntrinsicRowError::MayRaise),
+            ("transform_values", FunctionIntrinsicRowError::NoRowError),
+        ] {
+            let definition = catalog.definition(name, FunctionKind::Scalar).unwrap();
+            let declaration = definition.binding_declaration().unwrap();
+            let comparator_or_lambda = novarocks_functions::FunctionOverloadId::try_new(format!(
+                "builtin.scalar/{name}/lambda-v1"
+            ))
+            .unwrap();
+            let installed = catalog
+                .pure_overload_declaration_observed(
+                    declaration.function_id(),
+                    FunctionKind::Scalar,
+                    &comparator_or_lambda,
+                    &CompositionControl,
+                )
+                .unwrap();
+            assert_eq!(installed.implementation().abi, PureKernelAbi::HigherOrderV1);
+            assert_eq!(installed.effects().own_row_error, expected_row_error);
+            assert_eq!(
+                installed.effects().null_behavior,
+                FunctionNullBehavior::ControlDefined
+            );
+            assert_eq!(
+                installed.effects().argument_control,
+                ArgumentControl::HigherOrder {
+                    body_ordinal: 1,
+                    body_demand: EvaluationDemand::Value,
+                }
+            );
+            assert!(seal.catalog.public_function_overloads().any(|entry| {
+                entry.name == name
+                    && entry.function_id == declaration.function_id()
+                    && entry.overload_id == &comparator_or_lambda
+            }));
+            if name == "array_sort" {
+                let natural = seal
+                    .catalog
+                    .public_function_overloads()
+                    .find(|entry| entry.name == name && entry.overload_id != &comparator_or_lambda)
+                    .expect("natural and comparator sort use one public definition");
+                assert_eq!(natural.function_id, declaration.function_id());
+                let installed = catalog
+                    .pure_overload_declaration_observed(
+                        natural.function_id,
+                        FunctionKind::Scalar,
+                        natural.overload_id,
+                        &CompositionControl,
+                    )
+                    .unwrap();
+                assert_eq!(installed.implementation().abi, PureKernelAbi::ScalarV1);
+                assert_eq!(
+                    installed.effects().null_behavior,
+                    FunctionNullBehavior::Strict
+                );
+                assert_eq!(installed.effects().argument_control, ArgumentControl::Eager);
+            }
+        }
+    }
+
     /// The production seal holds exactly the definitions with installed pure
     /// owners: RAND is one, so it is sealed with its owner's own records, and
     /// the seal is a strict subset whose digest is not the metadata digest.

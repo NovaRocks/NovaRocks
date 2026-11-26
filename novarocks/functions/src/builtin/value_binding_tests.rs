@@ -796,7 +796,7 @@ fn array_constructor_infers_independently_of_outer_expected_type_and_rejects_for
 }
 
 #[test]
-fn transform_keeps_typed_lambda_capability_and_arity_refusals_distinct() {
+fn transform_keeps_the_installed_lambda_and_arity_refusals_distinct() {
     let catalog = builtin_engine_function_catalog();
     let source = value(physical(DataType::List(json_item(true))));
     let lambda = |parameters: Vec<FunctionValueType>| FunctionArgument::Lambda {
@@ -807,11 +807,30 @@ fn transform_keeps_typed_lambda_capability_and_arity_refusals_distinct() {
     };
     let arguments = [source.clone(), lambda(vec![json()])];
     let control = crate::binding_test_control();
-    assert!(matches!(
-        catalog.resolve_bound_user("transform", FunctionKind::Scalar, request(&arguments), control),
-        Err(FunctionBindingError::UnavailableImplementation(overload))
-            if overload.as_str() == "builtin.scalar/transform/lambda-v1"
-    ));
+    let binding = catalog
+        .resolve_bound_user(
+            "transform",
+            FunctionKind::Scalar,
+            request(&arguments),
+            control,
+        )
+        .unwrap();
+    assert_eq!(
+        binding.selected.overload.as_str(),
+        "builtin.scalar/transform/lambda-v1"
+    );
+    let installed = catalog
+        .pure_overload_declaration_observed(
+            &binding.function_id,
+            FunctionKind::Scalar,
+            &binding.selected.overload,
+            control,
+        )
+        .unwrap();
+    assert_eq!(
+        installed.implementation().abi,
+        crate::PureKernelAbi::HigherOrderV1
+    );
     assert!(matches!(
         catalog.resolve_bound_user(
             "array_map",
@@ -935,4 +954,162 @@ fn variant_get_text_mode_does_not_admit_raw_bytes_wide_text_or_foreign_nominal_d
             }
         }
     }
+}
+
+#[test]
+fn higher_order_binding_closes_fixed_body_types_and_keeps_exact_overload() {
+    let catalog = builtin_engine_function_catalog();
+    let control = crate::binding_test_control();
+    let source = physical(DataType::List(json_item(true)));
+    let ordinary = value(source.clone());
+    for (name, arity, body_type) in [
+        ("filter", 1, DataType::Boolean),
+        ("any_match", 1, DataType::Boolean),
+        ("all_match", 1, DataType::Boolean),
+        ("array_sort", 2, DataType::Int32),
+    ] {
+        let candidate = catalog
+            .begin_higher_order_binding(name, 0, &ordinary, 1, arity, control)
+            .unwrap();
+        assert_eq!(candidate.collection_target(), &source);
+        assert_eq!(candidate.parameter_types().len(), arity);
+        for child in candidate.parameter_types() {
+            assert_eq!(Some(child.clone()), source.child_at(0));
+        }
+        let arguments = |carrier| {
+            [
+                ordinary.clone(),
+                FunctionArgument::Lambda {
+                    parameter_types: candidate.parameter_types().clone(),
+                    result_type: FunctionValueType::new(carrier, true),
+                },
+            ]
+        };
+        for wrong in [DataType::Null, DataType::Int64] {
+            assert_eq!(
+                catalog.finish_higher_order_binding(
+                    &candidate,
+                    request(&arguments(wrong)),
+                    control
+                ),
+                Err(FunctionBindingError::NoMatchingOverload),
+                "{name}",
+            );
+        }
+        let args = arguments(body_type);
+        let selected = catalog
+            .finish_higher_order_binding(&candidate, request(&args), control)
+            .unwrap();
+        assert_eq!(&selected.function_id, candidate.function_id());
+        assert_eq!(&selected.selected.overload, candidate.overload());
+        catalog
+            .validate_frozen_selection(
+                &selected.function_id,
+                selected.kind,
+                &selected.selected,
+                request(&args),
+                control,
+            )
+            .unwrap();
+        assert!(matches!(
+            catalog.begin_higher_order_binding(name, 0, &ordinary, 0, arity, control),
+            Err(FunctionBindingError::NoMatchingOverload)
+        ));
+    }
+}
+
+#[test]
+fn higher_order_binding_retains_generic_body_and_collection_members_at_finish() {
+    let catalog = builtin_engine_function_catalog();
+    let control = crate::binding_test_control();
+    let input = physical(DataType::List(Arc::new(Field::new(
+        "input-item",
+        DataType::Int32,
+        false,
+    ))));
+    let ordinary = value(input.clone());
+    let candidate = catalog
+        .begin_higher_order_binding("transform", 0, &ordinary, 1, 1, control)
+        .unwrap();
+    assert!(!candidate.parameter_types()[0].nullable());
+    let body_type = json();
+    let arguments = [
+        ordinary,
+        FunctionArgument::Lambda {
+            parameter_types: candidate.parameter_types().clone(),
+            result_type: body_type.clone(),
+        },
+    ];
+    let bound = catalog
+        .finish_higher_order_binding(&candidate, request(&arguments), control)
+        .unwrap();
+    assert_eq!(output(&bound).child_at(0), Some(body_type));
+    assert_eq!(output(&bound).nullable(), input.nullable());
+    let other = build_builtin_engine_function_catalog().unwrap();
+    assert!(matches!(
+        other.finish_higher_order_binding(&candidate, request(&arguments), control),
+        Err(FunctionBindingError::InvalidBinding(_))
+    ));
+    let forged = [
+        arguments[0].clone(),
+        FunctionArgument::Lambda {
+            parameter_types: [FunctionValueType::new(DataType::Int32, true)].into(),
+            result_type: json(),
+        },
+    ];
+    assert_eq!(
+        catalog.finish_higher_order_binding(&candidate, request(&forged), control),
+        Err(FunctionBindingError::NoMatchingOverload),
+    );
+}
+
+#[test]
+fn higher_order_binding_retains_map_children_and_unknown_transformed_key() {
+    let catalog = builtin_engine_function_catalog();
+    let control = crate::binding_test_control();
+    let input = FunctionValueType::from_legacy_declared_projection(
+        DataType::Map(
+            Arc::new(Field::new(
+                "preserved-entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("preserved-key", DataType::Int32, false)),
+                        json_item(true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            true,
+        ),
+        false,
+    );
+    let ordinary = value(input.clone());
+    let candidate = catalog
+        .begin_higher_order_binding("transform_keys", 0, &ordinary, 1, 2, control)
+        .unwrap();
+    assert_eq!(candidate.parameter_types()[0], input.child_at(0).unwrap());
+    assert_eq!(candidate.parameter_types()[1], input.child_at(1).unwrap());
+    let arguments = [
+        ordinary,
+        FunctionArgument::Lambda {
+            parameter_types: candidate.parameter_types().clone(),
+            result_type: FunctionValueType::new(DataType::Null, true),
+        },
+    ];
+    let bound = catalog
+        .finish_higher_order_binding(&candidate, request(&arguments), control)
+        .unwrap();
+    let output = output(&bound);
+    assert!(crate::builtin::map_lookup_core::has_uninhabited_map_key(
+        output
+    ));
+    assert_eq!(output.child_at(1), input.child_at(1));
+    let (DataType::Map(input_entries, _), DataType::Map(entries, sorted)) =
+        (input.data_type(), output.data_type())
+    else {
+        panic!("Map result")
+    };
+    assert_eq!(entries.name(), input_entries.name());
+    assert!(!sorted);
 }

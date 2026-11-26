@@ -73,7 +73,11 @@ impl Owner {
                 value_stability: FunctionVolatility::Immutable,
                 own_row_error: FunctionIntrinsicRowError::NoRowError,
                 failure_behavior: FunctionFailureBehavior::Propagate,
-                null_behavior: FunctionNullBehavior::CalledOnNull,
+                null_behavior: if matches!(argument_control, ArgumentControl::HigherOrder { .. }) {
+                    FunctionNullBehavior::ControlDefined
+                } else {
+                    FunctionNullBehavior::CalledOnNull
+                },
                 argument_control,
                 instance_state: FunctionInstanceState::None,
                 observable_effects: ObservableEffects::NONE,

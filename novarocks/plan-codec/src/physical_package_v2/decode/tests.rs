@@ -239,6 +239,83 @@ fn refused(bytes: &[u8]) -> PackageDecodeError {
 }
 
 #[test]
+fn higher_order_claim_preserves_exact_body_and_rejects_non_control_null_policies() {
+    use novarocks_expression_contract::UnitError;
+    use novarocks_proto_models::physical_semantics_v2::NullBehavior;
+    use novarocks_type_contract::{
+        ArgumentControl, EffectContractError, EvaluationDemand, FunctionNullBehavior,
+    };
+
+    let package = rich_package();
+    let unit = package
+        .fragment()
+        .nodes()
+        .values()
+        .find_map(|node| node.expressions.as_ref())
+        .expect("rich fixture has a scalar call unit");
+    let selected = unit.claims().keys().next().copied().unwrap();
+    let call = &unit.control_flow().uses()[&selected];
+    let wrapper = call.arguments[0];
+    let body = unit.control_flow().uses()[&wrapper].arguments[0];
+    let decoded = decode_fragment_package(
+        &encode(&package).unwrap(),
+        &model(),
+        &decode_limits(),
+        &Control::default(),
+    )
+    .unwrap();
+    let unit = decoded
+        .fragment()
+        .nodes()
+        .values()
+        .find_map(|node| node.expressions.as_ref())
+        .unwrap();
+    let claim = &unit.claims()[&selected];
+    assert_eq!(
+        claim.effects.null_behavior,
+        FunctionNullBehavior::ControlDefined
+    );
+    assert_eq!(
+        claim.effects.argument_control,
+        ArgumentControl::HigherOrder {
+            body_ordinal: 0,
+            body_demand: EvaluationDemand::Value,
+        }
+    );
+    assert_eq!(unit.control_flow().uses()[&selected].arguments[0], wrapper);
+    assert_eq!(unit.control_flow().uses()[&wrapper].arguments[0], body);
+    assert_eq!(decoded.fragment(), package.fragment());
+
+    for null_behavior in [NullBehavior::Strict, NullBehavior::CalledOnNull] {
+        let bytes = mutated(&package, |dto| {
+            let claims = dto
+                .fragment
+                .as_mut()
+                .unwrap()
+                .nodes
+                .iter_mut()
+                .filter_map(|node| node.expressions.as_mut())
+                .find_map(|unit| {
+                    unit.claims
+                        .as_mut()
+                        .filter(|claims| !claims.entries.is_empty())
+                })
+                .expect("encoded rich fixture has its selected claims");
+            for claim in &mut claims.entries {
+                claim.effects.as_mut().unwrap().null_behavior = null_behavior as i32;
+            }
+        });
+        let error = refused(&bytes);
+        assert!(
+            matches!(&error, PackageDecodeError::Expression(
+                ExpressionCodecError::ConstructedUnit(problem),
+            ) if matches!(problem.cause(), UnitError::Effects(EffectContractError::ControlMismatch))),
+            "{null_behavior:?}: {error:?}"
+        );
+    }
+}
+
+#[test]
 fn change_stream_package_refuses_role_and_cut_downgrades() {
     let package = change_stream_packages()
         .into_iter()

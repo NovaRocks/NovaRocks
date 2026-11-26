@@ -164,3 +164,35 @@ fn array_element_owner_two_real_index_overloads_keep_nullable_item_and_called_on
         .is_err()
     );
 }
+
+#[test]
+fn scalar_broadcast_differential_for_public_array_element_at() {
+    use crate::builtin::array_invocation_test_support::assert_scalar_broadcast_equivalent;
+    use arrow_array::{ArrayRef, Int64Array, ListArray, types::Int64Type};
+    let list: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([
+        Some(vec![None]),
+        Some(vec![Some(11), None, Some(13)]),
+        None,
+    ]));
+    let index: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(-1),
+        Some(0),
+        Some(2),
+        Some(9),
+        None,
+    ]));
+    for (list_row, index_row, raises) in [
+        (1, 0, false),
+        (1, 1, true),
+        (1, 2, false),
+        (1, 3, false),
+        (1, 4, false),
+        (2, 1, false),
+    ] {
+        assert_scalar_broadcast_equivalent(
+            "element_at",
+            &[(&list, list_row), (&index, index_row)],
+            raises,
+        );
+    }
+}

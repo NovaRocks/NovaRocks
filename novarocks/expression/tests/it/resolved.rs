@@ -58,7 +58,12 @@ fn effects(control: ArgumentControl) -> FunctionEffectDeclaration {
             FunctionIntrinsicRowError::NoRowError
         },
         failure_behavior: FunctionFailureBehavior::Propagate,
-        null_behavior: if matches!(control, ArgumentControl::If | ArgumentControl::OrderedNull) {
+        null_behavior: if matches!(
+            control,
+            ArgumentControl::If
+                | ArgumentControl::OrderedNull
+                | ArgumentControl::HigherOrder { .. }
+        ) {
             FunctionNullBehavior::ControlDefined
         } else {
             FunctionNullBehavior::CalledOnNull
@@ -371,6 +376,44 @@ impl PureScalarImplementation for Owner {
         }))
     }
 }
+impl PureHigherOrderImplementation for Owner {
+    fn prepare_higher_order(
+        &self,
+        _: CallEffectInput<'_>,
+        call: Arc<HigherOrderCallContract>,
+        body: Arc<LambdaBodyContract>,
+        _: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedHigherOrderKernel>, KernelFailure> {
+        Ok(Arc::new(PreparedLambdaFixture { call, body }))
+    }
+}
+
+#[derive(Debug)]
+struct PreparedLambdaFixture {
+    call: Arc<HigherOrderCallContract>,
+    body: Arc<LambdaBodyContract>,
+}
+
+impl PreparedHigherOrderKernel for PreparedLambdaFixture {
+    fn contract(&self) -> &Arc<HigherOrderCallContract> {
+        &self.call
+    }
+
+    fn body_contract(&self) -> &Arc<LambdaBodyContract> {
+        &self.body
+    }
+
+    fn instance_retained_upper_bound(&self) -> usize {
+        0
+    }
+
+    fn create_instance(
+        &self,
+        _: &dyn KernelEvaluationControl,
+    ) -> Result<Box<dyn HigherOrderKernelInstance>, KernelFailure> {
+        panic!("the compilation fixture must not create a runtime instance")
+    }
+}
 #[derive(Debug)]
 struct Scalar {
     contract: Arc<ScalarCallContract>,
@@ -464,18 +507,22 @@ impl ScalarKernelInstance for ScalarInstance {
 
 fn catalog(owner: Arc<Owner>) -> PureEngineFunctionCatalog {
     let mut builder = EngineFunctionCatalogBuilder::new();
-    let definition = if owner.implementations[0].abi == PureKernelAbi::ControlIntrinsicV1 {
-        FunctionDefinition::try_new_pure_control(
+    let definition = match owner.implementations[0].abi {
+        PureKernelAbi::HigherOrderV1 => FunctionDefinition::try_new_pure_higher_order(
             "unit_fixture",
             FunctionVisibility::Public,
             owner.clone(),
-        )
-    } else {
-        FunctionDefinition::try_new_pure_scalar(
+        ),
+        PureKernelAbi::ControlIntrinsicV1 => FunctionDefinition::try_new_pure_control(
             "unit_fixture",
             FunctionVisibility::Public,
             owner.clone(),
-        )
+        ),
+        _ => FunctionDefinition::try_new_pure_scalar(
+            "unit_fixture",
+            FunctionVisibility::Public,
+            owner.clone(),
+        ),
     }
     .unwrap();
     builder.register(definition).unwrap();
@@ -490,11 +537,18 @@ fn catalog(owner: Arc<Owner>) -> PureEngineFunctionCatalog {
             aggregate_state_format: None,
         })
         .collect::<Vec<_>>();
-    if owner.implementations[0].overload == oid(ORDERED) {
+    let additional_builtin = if owner.implementations[0].overload == oid(ORDERED) {
+        Some("try")
+    } else if owner.implementations[0].overload == oid(HIGHER) {
+        Some("rand")
+    } else {
+        None
+    };
+    if let Some(name) = additional_builtin {
         let builtin = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
         let metadata = builtin.metadata();
-        let try_definition = metadata.definition("try", FunctionKind::Scalar).unwrap();
-        let declaration = try_definition.binding_declaration().unwrap();
+        let definition = metadata.definition(name, FunctionKind::Scalar).unwrap();
+        let declaration = definition.binding_declaration().unwrap();
         for overload in declaration.overloads() {
             let prepared = metadata
                 .pure_overload_declaration_observed(
@@ -511,9 +565,57 @@ fn catalog(owner: Arc<Owner>) -> PureEngineFunctionCatalog {
                 aggregate_state_format: None,
             });
         }
-        builder.register(try_definition.clone()).unwrap();
+        builder.register(definition.clone()).unwrap();
     }
     builder.seal_pure(installed).unwrap()
+}
+
+pub(super) fn lambda_compilation_fixture() -> (
+    BoundFunction,
+    PhysicalCallRequest,
+    PureEngineFunctionCatalog,
+) {
+    let owner = Arc::new(Owner::for_overload(HIGHER));
+    let overload = oid(HIGHER);
+    let arguments = owner.arguments(&overload);
+    let binding = BoundFunction::from_exact_signature(
+        owner.declaration.function_id().clone(),
+        overload,
+        FunctionKind::Scalar,
+        FunctionArgumentTypes::from_pure_boxed(
+            arguments
+                .iter()
+                .map(FunctionArgument::argument_type)
+                .collect(),
+        ),
+        result_type(),
+    );
+    let request = PhysicalCallRequest {
+        logical_argument_count: arguments.len(),
+        arguments: arguments
+            .into_iter()
+            .map(|argument| match argument {
+                FunctionArgument::Value {
+                    value_type,
+                    constant: None,
+                } => novarocks_function_contract::FunctionArgument::Value {
+                    value_type,
+                    constant: None,
+                },
+                FunctionArgument::Lambda {
+                    parameter_types,
+                    result_type,
+                } => novarocks_function_contract::FunctionArgument::Lambda {
+                    parameter_types,
+                    result_type,
+                },
+                _ => panic!("fixture uses only original nonconstant channels"),
+            })
+            .collect(),
+        expected_result_type: None,
+        constant_policy: policy(),
+    };
+    (binding, request, catalog(owner))
 }
 fn unit(owner: &Owner, control: ArgumentControl, hidden_call: bool) -> BoundExprSet {
     let mut builder = builder();

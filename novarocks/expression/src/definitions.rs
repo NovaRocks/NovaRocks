@@ -47,6 +47,16 @@ pub enum StaticExprKind {
     /// A checked value retaining its complete field/type and pool ordinal.
     Constant(novarocks_functions::ConstantValue),
     Input,
+    /// A syntax-only wrapper. Its use identifies the guarded body edge.
+    Lambda {
+        body: CompiledExprId,
+    },
+    /// Parameter identity retains the original lexical binder even when its
+    /// definition was lowered after the parameter's own definition.
+    LambdaParameter {
+        lambda: novarocks_expression_contract::ExprId,
+        ordinal: u32,
+    },
     /// Cast retaining its exact operation and failure mode.
     PreparedCast {
         operation: novarocks_functions::CastOperation,
@@ -168,8 +178,9 @@ impl StaticExprKind {
         mut visit: impl FnMut(CompiledExprId) -> Result<(), E>,
     ) -> Result<(), E> {
         match self {
-            Self::Constant(_) | Self::Input => {}
-            Self::PreparedCast { child, .. }
+            Self::Constant(_) | Self::Input | Self::LambdaParameter { .. } => {}
+            Self::Lambda { body: child }
+            | Self::PreparedCast { child, .. }
             | Self::Not(child)
             | Self::IsNull(child)
             | Self::IsNotNull(child) => visit(*child)?,

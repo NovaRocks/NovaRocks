@@ -15,16 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use arrow::datatypes::DataType;
-use novarocks_parser::Span;
+use novarocks_parser::{Span, ast};
 
+use crate::analysis::{ExprKind, LambdaParam, TypedExpr};
 use crate::analyze_error::AnalyzeError;
 use crate::column_id::{ColumnId, ColumnRefFactory};
-use novarocks_type_contract::{FunctionValueType, PureCompileControl};
+use novarocks_type_contract::{
+    CompileControlError, FunctionParameterTypes, FunctionValueType, PureCompileControl,
+};
 use novarocks_types::schema::ColumnDef;
 
 type ScopedField = (
@@ -61,6 +64,8 @@ pub(super) struct AnalyzerScope {
     /// `COALESCE(left.id, right.id)` so that null-padding on either side
     /// still produces the correct merged value.
     computed_columns: HashMap<String, crate::analysis::TypedExpr>,
+    lambda_frames: RefCell<Vec<Vec<LambdaParam>>>,
+    next_lambda_slot: Rc<Cell<i32>>,
 }
 
 impl AnalyzerScope {
@@ -72,7 +77,77 @@ impl AnalyzerScope {
             ordered: Vec::new(),
             canonical_qualifier: HashMap::new(),
             computed_columns: HashMap::new(),
+            lambda_frames: RefCell::default(),
+            next_lambda_slot: Rc::default(),
         }
+    }
+
+    pub(super) fn inside_lambda(&self) -> bool {
+        !self.lambda_frames.borrow().is_empty()
+    }
+
+    pub(super) fn lambda_parameter(&self, name: &str) -> Option<TypedExpr> {
+        let frames = self.lambda_frames.borrow();
+        if frames.is_empty() {
+            return None;
+        }
+        let name = name.to_lowercase();
+        frames
+            .iter()
+            .rev()
+            .flatten()
+            .find(|param| param.name == name)
+            .map(|param| TypedExpr {
+                kind: ExprKind::LambdaParamRef {
+                    name: param.name.clone(),
+                    slot_id: param.slot_id,
+                },
+                value_type: param.value_type.clone(),
+            })
+    }
+
+    pub(super) fn bind_lambda(
+        &self,
+        source: &ast::LambdaExpr,
+        types: &FunctionParameterTypes,
+        analyzer: &super::AnalyzerContext<'_>,
+    ) -> Result<(Vec<LambdaParam>, TypedExpr), AnalyzeError> {
+        if source.arguments.len() != types.len() {
+            return Err(AnalyzeError::internal(
+                "Higher-order candidate changed the lambda arity",
+            ));
+        }
+        let mut names = HashSet::with_capacity(source.arguments.len());
+        let mut frame = Vec::with_capacity(source.arguments.len());
+        for (argument, value_type) in source.arguments.iter().zip(types.iter()) {
+            analyzer.check_control()?;
+            let name = argument.name.value.to_lowercase();
+            if !names.insert(name.clone()) {
+                return Err(AnalyzeError::ambiguous_name(
+                    format!("Ambiguous lambda parameter: {}", argument.name.value),
+                    argument.span,
+                ));
+            }
+            let slot_id = self.next_lambda_slot.get();
+            self.next_lambda_slot.set(
+                slot_id
+                    .checked_add(1)
+                    .ok_or_else(|| AnalyzeError::control(CompileControlError::ResourceExhausted))?,
+            );
+            frame.push(LambdaParam {
+                name,
+                slot_id,
+                value_type: value_type.clone(),
+            });
+        }
+        self.lambda_frames.borrow_mut().push(frame);
+        let body = analyzer.analyze_expr(&source.body, self);
+        let frame = self
+            .lambda_frames
+            .borrow_mut()
+            .pop()
+            .expect("active lambda");
+        Ok((frame, body?))
     }
 
     /// Return a reference to the shared ColumnRefFactory.

@@ -48,6 +48,18 @@ impl OwnedValue {
                 }
                 (value, ordinal)
             }
+            Self::Mapped(value) => {
+                if let Ok(error) = value
+                    .errors()
+                    .binary_search_by_key(&ordinal, RowDataError::selected_ordinal)
+                {
+                    return Ok(Cell::Error(&value.errors()[error]));
+                }
+                let Some(cell) = value.value(ordinal) else {
+                    return Ok(Cell::Null);
+                };
+                cell
+            }
             Self::Continued(_, _) => unreachable!("continuation was unwrapped"),
         };
         if row >= array.len() {
@@ -95,7 +107,11 @@ pub(super) fn pattern_ordinals<K>(
         .children
         .first()
         .ok_or_else(|| internal("missing ordered regexp source"))?;
-    let mut active = Vec::new();
+    let mut active = if frame._body_memory.is_some() {
+        super::super::mapped::buffer(frame.rows.len())?
+    } else {
+        Vec::new()
+    };
     for (ordinal, &row) in frame.rows.iter().enumerate() {
         work.step()?;
         if matches!(source.value.regexp_cell(ordinal, row)?, Cell::Value(..)) {
@@ -112,6 +128,7 @@ impl TreeDriver<'_, '_> {
         arguments: &[ExpressionUseId],
         frame: &mut Frame,
         rows: &[usize],
+        lambda: Option<&LambdaFrame<'_>>,
         instances: &mut BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
         work: &mut Work<'_, '_, R>,
     ) -> Result<OwnedValue, ExprEvaluationFailure<R>> {
@@ -174,7 +191,7 @@ impl TreeDriver<'_, '_> {
             let mut len = 0;
             let mut terminal = false;
             for &child in &arguments[PATTERN_ORDINAL + 1..] {
-                let value = self.regexp_argument(child, frame, row, instances, work)?;
+                let value = self.regexp_argument(child, frame, row, lambda, instances, work)?;
                 match value.regexp_cell(0, row)? {
                     Cell::Null => {
                         terminal = true;
@@ -220,6 +237,7 @@ impl TreeDriver<'_, '_> {
         child: ExpressionUseId,
         parent: &Frame,
         row: usize,
+        lambda: Option<&LambdaFrame<'_>>,
         instances: &mut BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
         work: &mut Work<'_, '_, R>,
     ) -> Result<OwnedValue, ExprEvaluationFailure<R>> {
@@ -238,6 +256,14 @@ impl TreeDriver<'_, '_> {
         };
         // Only these re-entries nest; the compiled use graph already bounds
         // call depth. The same driver holds the exact input and instance state.
+        let body_memory = parent
+            ._body_memory
+            .as_ref()
+            .map(|memory| {
+                let input = super::super::mapped::reserve(Some(&memory.host), size_of::<usize>())?;
+                Ok::<_, KernelFailure>(BodyFrameMemory::new(&memory.host, input, None))
+            })
+            .transpose()?;
         let frame = Frame::new(
             child,
             invocation.control,
@@ -247,8 +273,9 @@ impl TreeDriver<'_, '_> {
             original,
             ScalarInvocationActivation::Activated,
             Vec::new(),
+            body_memory,
             work,
         )?;
-        self.drive(frame, instances, work)
+        self.drive(frame, lambda, None, instances, work)
     }
 }

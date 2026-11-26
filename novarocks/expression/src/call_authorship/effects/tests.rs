@@ -117,6 +117,7 @@ fn missing_or_foreign_guarded_child_summary_is_refused() {
             root,
             &requests,
             summaries,
+            &LexicalReferences::default(),
             &mut CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap(),
             &mut BTreeMap::new(),
         )
