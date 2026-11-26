@@ -23,11 +23,11 @@ use novarocks_failure_contract::{FailureClass, FailureProjection};
 use super::*;
 use arrow_schema::DataType;
 use novarocks_functions::{
-    CallEffectInput, ConstantValidation, ConstantValue, EngineFunctionCatalogBuilder,
-    FunctionArgument, FunctionArgumentType, FunctionBindingRequest, FunctionBindingSelection,
-    FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType, InstalledPureKernel,
-    PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
+    CallEffectInput, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument,
+    FunctionArgumentType, FunctionBindingRequest, FunctionBindingSelection, FunctionId,
+    FunctionKind, FunctionOverloadId, FunctionResultType, InstalledPureKernel, PureCallPreparation,
+    PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    ScopedExpressionEffects,
 };
 use novarocks_local_program::{KernelAbiVersion, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{
@@ -136,7 +136,6 @@ struct Author {
     selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
     logical_argument_count: usize,
-    constant_policy: ConstantValidation,
     shape: ControlShape,
 }
 impl Author {
@@ -272,7 +271,6 @@ fn author(
         selected,
         arguments,
         logical_argument_count,
-        constant_policy: options().constants,
         shape,
     }
 }

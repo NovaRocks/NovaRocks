@@ -26,7 +26,7 @@ use crate::test_units::PureUnitFixture;
 use arrow_schema::DataType;
 use novarocks_expression::ComparisonSite as ProgramComparisonSite;
 use novarocks_functions::{
-    CallEffectInput, ConstantValidation, EngineFunctionCatalogBuilder, FunctionBindingRequest,
+    CallEffectInput, EngineFunctionCatalogBuilder, FunctionBindingRequest,
     FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
     InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
@@ -282,7 +282,6 @@ struct Fixture {
     rand_selected: Option<Arc<FunctionBindingSelection>>,
     rand_request: Option<FunctionBindingRequest<'static>>,
     rand_definitions: Vec<ExprId>,
-    constant_policy: ConstantValidation,
     parameters: SemanticParameters,
 }
 fn input_constant(
@@ -541,7 +540,6 @@ fn fixture(
         rand_selected,
         rand_request,
         rand_definitions,
-        constant_policy: options().constants,
         parameters: SemanticParameters::default(),
     })
 }

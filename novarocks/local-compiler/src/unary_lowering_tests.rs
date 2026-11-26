@@ -23,11 +23,10 @@ use novarocks_failure_contract::{FailureClass, FailureProjection};
 use super::*;
 use arrow_schema::DataType;
 use novarocks_functions::{
-    CallEffectInput, ConstantValidation, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionArgumentType, FunctionBindingRequest, FunctionBindingSelection, FunctionId,
-    FunctionKind, FunctionOverloadId, FunctionResultType, InstalledPureKernel, PureCallPreparation,
-    PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
-    ScopedExpressionEffects,
+    CallEffectInput, EngineFunctionCatalogBuilder, FunctionArgument, FunctionArgumentType,
+    FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId,
+    FunctionResultType, InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
+    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
 };
 use novarocks_local_program::{
     KernelAbiVersion, ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId, ProgramNodeKind,
@@ -178,7 +177,6 @@ struct IfAuthor {
     selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
     logical_argument_count: usize,
-    constant_policy: ConstantValidation,
     function: BoundFunction,
 }
 impl IfAuthor {
@@ -373,7 +371,6 @@ fn fixture(
                 selected,
                 arguments,
                 logical_argument_count,
-                constant_policy: options().constants,
                 function,
             },
         ))

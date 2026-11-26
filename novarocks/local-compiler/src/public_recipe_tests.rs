@@ -143,7 +143,6 @@ fn arithmetic_fixture(
         rand_selected: None,
         rand_request: None,
         rand_definitions: vec![],
-        constant_policy: options().constants,
         parameters: SemanticParameters::try_new([(
             novarocks_type_contract::SemanticParameterId::new(7),
             novarocks_type_contract::SemanticParameterValue::AllowThrowException(true),
