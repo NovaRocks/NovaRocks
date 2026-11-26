@@ -144,6 +144,15 @@ fn workflow(
     stop: Option<(usize, CompileControlError)>,
     bad: bool,
 ) -> Result<BindingProjectionFacts, BindingCodecError> {
+    workflow_with_limits(c, stop, bad, Some(limits()))
+}
+
+fn workflow_with_limits(
+    c: &Control,
+    stop: Option<(usize, CompileControlError)>,
+    bad: bool,
+    limits: Option<BindingProjectionLimits>,
+) -> Result<BindingProjectionFacts, BindingCodecError> {
     let v = values();
     let type_sources = encode_type_table_sources(&v, &[], type_limits(), c)?;
     let types = decode_type_table(type_sources.as_wire(), type_limits(), c)?;
@@ -216,7 +225,7 @@ fn workflow(
             &type_sources,
             &inputs,
             B,
-            limits(),
+            limits,
             &mut |_| Ok(()),
             &mut work,
         )?;
@@ -238,7 +247,7 @@ fn workflow(
             &raw,
             &types,
             B,
-            limits(),
+            limits,
             &mut |_| Ok(()),
             &mut work,
         )?;
@@ -252,7 +261,7 @@ fn workflow(
         let token = prepare_function_bindings_materialization_in(
             &headers,
             B * 2,
-            limits(),
+            limits,
             &mut |_| Ok(()),
             &mut work,
         )?;
@@ -287,6 +296,18 @@ fn same_caller_chain_preserves_all_kinds_sparse_ids_lambda_and_complete_fields()
     );
     assert!(c.trace().iter().all(|(p, _)| *p == CompilePhase::Validate));
 }
+#[test]
+fn input_derived_binding_projection_preserves_chain_geometry_and_source_checks() {
+    let explicit = Control::default();
+    let input_derived = Control::default();
+    assert_eq!(
+        workflow_with_limits(&input_derived, None, false, None).unwrap(),
+        workflow(&explicit, None, false).unwrap(),
+    );
+    assert_eq!(input_derived.trace(), explicit.trace());
+    assert!(workflow_with_limits(&Control::default(), None, true, None).is_err());
+}
+
 #[test]
 fn every_actual_chain_callback_preserves_success_ordinary_tail_and_three_primary_causes() {
     for bad in [false, true] {

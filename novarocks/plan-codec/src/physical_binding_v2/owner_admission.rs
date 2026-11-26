@@ -65,7 +65,7 @@ impl Policy {
     pub(crate) fn gate(
         self,
         facts: &BindingProjectionFacts,
-        limits: BindingProjectionLimits,
+        limits: impl Into<Option<BindingProjectionLimits>>,
         admit: &mut Admit<'_>,
     ) -> Result<(), BindingCodecError> {
         self.gate_with_host(facts, limits, &mut |facts| {
@@ -79,28 +79,30 @@ impl Policy {
     pub(crate) fn gate_with_host<H>(
         self,
         facts: &BindingProjectionFacts,
-        limits: BindingProjectionLimits,
+        limits: impl Into<Option<BindingProjectionLimits>>,
         admit: &mut HostAdmit<'_, H>,
     ) -> Result<(), crate::host_projection_v2::ProjectionFailure<BindingCodecError, H>> {
         if !self.0 {
             return Ok(());
         }
-        for (value, cap) in [
-            (facts.definition_count, limits.max_definitions),
-            (facts.type_reference_count, limits.max_type_references),
-            (
-                facts.allocation_requests_upper_bound,
-                limits.max_allocation_requests,
-            ),
-            (facts.request_bytes_upper_bound, limits.max_request_bytes),
-            (
-                facts.coexisting_source_and_request_bytes_upper_bound,
-                limits.max_coexisting_source_and_request_bytes,
-            ),
-            (facts.cumulative_work_upper_bound, limits.max_work),
-        ] {
-            if value > cap {
-                return Err(CompileControlError::ResourceExhausted.into());
+        if let Some(limits) = limits.into() {
+            for (value, cap) in [
+                (facts.definition_count, limits.max_definitions),
+                (facts.type_reference_count, limits.max_type_references),
+                (
+                    facts.allocation_requests_upper_bound,
+                    limits.max_allocation_requests,
+                ),
+                (facts.request_bytes_upper_bound, limits.max_request_bytes),
+                (
+                    facts.coexisting_source_and_request_bytes_upper_bound,
+                    limits.max_coexisting_source_and_request_bytes,
+                ),
+                (facts.cumulative_work_upper_bound, limits.max_work),
+            ] {
+                if value > cap {
+                    return Err(CompileControlError::ResourceExhausted.into());
+                }
             }
         }
         match admit(facts) {

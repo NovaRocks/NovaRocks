@@ -129,33 +129,12 @@ fn bytes<T>(count: usize) -> Result<usize, BindingCodecError> {
 fn height(count: usize) -> usize {
     (usize::BITS - count.leading_zeros()) as usize
 }
-#[derive(Clone, Copy)]
-enum HeaderProfile {
-    Receiving(BindingProjectionLimits),
-}
-impl HeaderProfile {
-    fn receiving(self) -> Option<BindingProjectionLimits> {
-        match self {
-            Self::Receiving(limits) => Some(limits),
-        }
-    }
-    fn gate(
-        self,
-        policy: Policy,
-        facts: &BindingProjectionFacts,
-        admit: &mut Admit<'_>,
-    ) -> Result<(), BindingCodecError> {
-        match self {
-            Self::Receiving(limits) => policy.gate(facts, limits, admit),
-        }
-    }
-}
 fn admit_work(
     facts: &mut BindingProjectionFacts,
     count: usize,
     arguments: usize,
     type_lookup_work: usize,
-    profile: HeaderProfile,
+    limits: Option<BindingProjectionLimits>,
     policy: Policy,
     admit: &mut Admit<'_>,
 ) -> Result<(), BindingCodecError> {
@@ -178,17 +157,11 @@ fn admit_work(
             add(references, mul(facts.request_bytes_upper_bound, 4)?)?,
         )?,
     )?;
-    profile.gate(policy, facts, admit)?;
-    if profile
-        .receiving()
-        .is_some_and(|limits| facts.cumulative_work_upper_bound > limits.max_work)
-    {
+    policy.gate(facts, limits, admit)?;
+    if limits.is_some_and(|limits| facts.cumulative_work_upper_bound > limits.max_work) {
         return Err(invalid("binding header work exceeds its envelope"));
     }
-    if profile
-        .receiving()
-        .is_some_and(|limits| facts.type_reference_count > limits.max_type_references)
-    {
+    if limits.is_some_and(|limits| facts.type_reference_count > limits.max_type_references) {
         return Err(invalid(
             "binding header type references exceed their envelope",
         ));
@@ -207,7 +180,7 @@ fn preflight(
     definitions: &[wire::FunctionBindingDefinition],
     types: &DecodedTypeTable,
     source: usize,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     policy: Policy,
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
@@ -217,7 +190,7 @@ fn preflight(
         types.value_types().len(),
         size_of::<DecodedTypeTable>(),
         source,
-        HeaderProfile::Receiving(limits),
+        limits,
         policy,
         admit,
         work,
@@ -228,28 +201,20 @@ fn preflight_namespace(
     type_count: usize,
     type_header_bytes: usize,
     source: usize,
-    profile: HeaderProfile,
+    limits: Option<BindingProjectionLimits>,
     policy: Policy,
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BindingProjectionFacts, BindingCodecError> {
     let add = |a, b| policy.add(a, b, "binding header arithmetic overflow");
     let mul = |a, b| policy.mul(a, b, "binding header arithmetic overflow");
-    if !policy.0
-        && profile
-            .receiving()
-            .is_some_and(|limits| definitions.len() > limits.max_definitions)
-    {
+    if !policy.0 && limits.is_some_and(|limits| definitions.len() > limits.max_definitions) {
         return Err(invalid(
             "binding header definition count exceeds its envelope",
         ));
     }
     let request_bytes = policy.bytes::<usize>(
-        if matches!(profile, HeaderProfile::Receiving(_)) {
-            definitions.len()
-        } else {
-            0
-        },
+        definitions.len(),
         "binding header layout is unrepresentable",
     )?;
     let mut facts = BindingProjectionFacts {
@@ -266,12 +231,12 @@ fn preflight_namespace(
             definitions.len(),
             0,
             add(type_count, 1)?,
-            profile,
+            limits,
             policy,
             admit,
         )?;
     }
-    if profile.receiving().is_some_and(|limits| {
+    if limits.is_some_and(|limits| {
         request_bytes > limits.max_request_bytes
             || facts.allocation_requests_upper_bound > limits.max_allocation_requests
             || facts.coexisting_source_and_request_bytes_upper_bound
@@ -303,7 +268,7 @@ fn preflight_namespace(
         definitions.len(),
         0,
         type_lookup_work,
-        profile,
+        limits,
         policy,
         admit,
     )?;
@@ -330,7 +295,7 @@ fn preflight_namespace(
             definitions.len(),
             argument_count,
             type_lookup_work,
-            profile,
+            limits,
             policy,
             admit,
         )?;
@@ -359,7 +324,7 @@ fn preflight_namespace(
                 definitions.len(),
                 argument_count,
                 type_lookup_work,
-                profile,
+                limits,
                 policy,
                 admit,
             )?;
@@ -385,7 +350,7 @@ fn preflight_namespace(
             definitions.len(),
             argument_count,
             type_lookup_work,
-            profile,
+            limits,
             policy,
             admit,
         )?;
@@ -477,7 +442,7 @@ fn prepare<'loan, 'control: 'loan>(
     definitions: &'loan [wire::FunctionBindingDefinition],
     types: &'loan DecodedTypeTable,
     source: usize,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     policy: Policy,
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'control>,
@@ -512,7 +477,7 @@ pub fn prepare_function_binding_headers<'loan>(
         definitions,
         types,
         source_retained_bytes,
-        limits,
+        Some(limits),
         Policy(false),
         &mut |_| Ok(()),
         &mut work,
@@ -525,11 +490,13 @@ pub fn prepare_function_binding_headers<'loan>(
 }
 
 /// Same full header/index author, without entry/footer or replacement control.
+/// Passing None derives the request and work from the received definitions and
+/// the original type namespace, with admission supplied by the caller.
 pub fn prepare_function_binding_headers_in<'loan, 'control: 'loan>(
     definitions: &'loan [wire::FunctionBindingDefinition],
     types: &'loan DecodedTypeTable,
     source_retained_bytes: usize,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedFunctionBindingHeaders<'loan>, BindingCodecError> {
@@ -537,7 +504,7 @@ pub fn prepare_function_binding_headers_in<'loan, 'control: 'loan>(
         definitions,
         types,
         source_retained_bytes,
-        limits,
+        limits.into(),
         Policy(true),
         admit,
         work,
