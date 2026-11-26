@@ -140,7 +140,7 @@ SELECT contains_sequence(
     CAST(ARRAY[MAP(ARRAY['c', 'd'], ARRAY[3, 4])] AS ARRAY(MAP(VARCHAR, INTEGER)))
 );
 
--- query 12
+-- query 13
 WITH doc AS (
     SELECT CAST(ARRAY[json_scalar(DATE '2024-02-29')] AS JSON) AS v
 )
