@@ -150,7 +150,6 @@ struct Fixture {
     arguments: Vec<FunctionArgument>,
     uses: [Option<ExpressionUseId>; 1],
     parameters: SemanticParameters,
-    policy: ConstantPolicy,
 }
 impl Fixture {
     fn new() -> Self {
@@ -162,7 +161,6 @@ impl Fixture {
             Arc::new(Field::new("actual-source", DataType::Int32, false)),
             ty.clone(),
             Int32Array::from(vec![77, -9]).to_data(),
-            policy,
             CompilePhase::Validate,
             &control,
         )

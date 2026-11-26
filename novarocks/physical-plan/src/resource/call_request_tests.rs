@@ -17,7 +17,6 @@
 
 use super::*;
 use crate::{CallRequestError, PhysicalCallRequest, PhysicalCallSite};
-use novarocks_constant_contract::ConstantPolicy;
 use novarocks_function_contract::FunctionArgument;
 use novarocks_type_contract::{CompilePhase, PureCompileControl};
 use std::sync::Mutex;
@@ -46,20 +45,6 @@ impl PureCompileControl for Control {
             Some((at, cause)) if trace.len() == at => Err(cause),
             _ => Ok(()),
         }
-    }
-}
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 32,
-        max_logical_elements: 128,
-        max_retained_buffer_bytes: 65536,
-        max_type_depth: 16,
-        max_type_nodes: 128,
-        max_dictionary_depth: 8,
-        max_metadata_bytes: 4096,
-        max_library_validation_work: 1000000,
-        max_library_validation_bytes: 1048576,
     }
 }
 fn integer() -> ValueType {

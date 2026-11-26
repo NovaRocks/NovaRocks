@@ -267,22 +267,6 @@ impl novarocks_type_contract::ValueSchemaCreationScope<Arc<RequestRefusal>> for 
         Err(Arc::clone(&self.cause))
     }
 }
-fn empty_source_policy() -> crate::ConstantPolicy {
-    // This request has no constant values or pool sources to admit. The
-    // original caller explicitly supplies its policy rather than a default.
-    crate::ConstantPolicy {
-        max_rows: 0,
-        max_array_nodes: 0,
-        max_logical_elements: 0,
-        max_retained_buffer_bytes: 0,
-        max_type_depth: 0,
-        max_type_nodes: 0,
-        max_dictionary_depth: 0,
-        max_metadata_bytes: 0,
-        max_library_validation_work: 0,
-        max_library_validation_bytes: 0,
-    }
-}
 fn original_preparation_error(
     error: CheckedCallPreparationFailure<Arc<RequestRefusal>>,
 ) -> FunctionSpecializationFailure {
@@ -300,7 +284,6 @@ fn original_preparation_error(
 #[test]
 fn frozen_writer_checked_count_borrows_its_original_owner_without_type_requests() {
     let source = Source::new();
-    let policy = empty_source_policy();
     let required_input = FunctionValueType::new(DataType::Int64, false);
     let mut scope = RefusingScope::default();
     let mut good = source.loan();
@@ -338,7 +321,6 @@ fn frozen_writer_checked_count_borrows_its_original_owner_without_type_requests(
 #[test]
 fn frozen_writer_checked_preserves_phase_nullability_and_foreign_namespace_refusals() {
     let source = Source::new();
-    let policy = empty_source_policy();
     let mut scope = RefusingScope::default();
     for phase in [
         AggregateKernelPhase::Single,
@@ -414,7 +396,6 @@ fn frozen_writer_checked_preserves_phase_nullability_and_foreign_namespace_refus
 #[test]
 fn frozen_writer_checked_preserves_each_actual_control_prefix_without_tail() {
     let source = Source::new();
-    let policy = empty_source_policy();
     let baseline = Control::default();
     let mut scope = RefusingScope::default();
     prepare_frozen_writer_aggregate_with_creator_in(
