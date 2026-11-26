@@ -39,8 +39,8 @@ use crate::physical_connector_payload_v2::{
     ConnectorPayloadCodecError, ConnectorPayloadProjectionLimits, encode_connector_payloads_in,
 };
 use crate::physical_constant_v2::{
-    ConstantNamespaceProjectionLimits, ConstantWriteProjectionLimits, PhysicalConstantCodecError,
-    prepare_constant_namespace_write_in,
+    ConstantNamespaceProjectionLimits, ConstantWriteProjectionLimits, ConstantWriteRequest,
+    PhysicalConstantCodecError, encode_constant_namespace_input_derived_in,
 };
 use crate::physical_control_v2::{
     ControlCodecError, ControlProjectionLimits, encode_expression_control_observed,
@@ -289,11 +289,17 @@ pub fn encode_fragment_package_with_creator<H>(
     let result = (|| {
         let mut original_host = None;
         let encoded =
-            encode_fragment_package_structural_in(package, limits, &mut work, &mut |layout| {
-                if layout.size() == 0 {
-                    return Ok(());
-                }
-                match creation.request_layout(layout) {
+            encode_fragment_package_structural_in(package, limits, &mut work, &mut |request| {
+                let admitted = match request {
+                    ConstantWriteRequest::Layout(layout) if layout.size() != 0 => {
+                        creation.request_layout(layout)
+                    }
+                    ConstantWriteRequest::OpaqueUpperBound(bytes) if bytes != 0 => {
+                        creation.observe_opaque_upper_bound(bytes)
+                    }
+                    _ => Ok(()),
+                };
+                match admitted {
                     Ok(()) => Ok(()),
                     Err(error) => {
                         original_host = Some(error);
@@ -322,11 +328,8 @@ fn encode_fragment_package_structural_in<'s>(
     package: &'s p::FragmentPackage,
     l: &PackageEncodeLimits,
     work: &mut CompileCheckpoints<'s>,
-    snapshot_header_allocation: &mut dyn FnMut(
-        std::alloc::Layout,
-    ) -> Result<(), PackageEncodeError>,
+    request: &mut dyn FnMut(ConstantWriteRequest) -> Result<(), PackageEncodeError>,
 ) -> Result<wire::FragmentPackage, PackageEncodeError> {
-    let source = l.source_retained_bytes;
     let fragment = package.fragment();
     if fragment.nodes().values().any(|node| {
         matches!(
@@ -340,30 +343,17 @@ fn encode_fragment_package_structural_in<'s>(
         return Err(super::system_relation::SystemRelationError::Deferred.into());
     }
 
-    // Source collection on one budget. The budget gates its own limits; its
-    // parent hook is the sender itself, which keeps no second ledger.
+    // This collector borrows the package's original sources. Its allocation
+    // facts cover only the local request geometry for its indexes.
     let mut collection = |_: &_| Ok(());
-    let mut budget = TypeViewBudget::new_in(package, source, l.views, &mut collection, work)?;
+    let mut budget = TypeViewBudget::new_input_derived_in(package, &mut collection, work)?;
     let views = collect_package_type_views_in(&mut budget, work)?;
     let writer_types = views.writer_sources_in(&mut budget, work)?;
-    let bindings =
-        collect_binding_sources_in(package, &views, l.binding_sources, &mut budget, work)?;
-    let providers = collect_provider_sources_in(
-        package,
-        &views,
-        &writer_types,
-        l.provider_sources,
-        &mut budget,
-        work,
-    )?;
-    let definitions = collect_definition_sources_in(
-        package,
-        &views,
-        &bindings,
-        l.definition_sources,
-        &mut budget,
-        work,
-    )?;
+    let bindings = collect_binding_sources_in(package, &views, None, &mut budget, work)?;
+    let providers =
+        collect_provider_sources_in(package, &views, &writer_types, None, &mut budget, work)?;
+    let definitions =
+        collect_definition_sources_in(package, &views, &bindings, None, &mut budget, work)?;
     let arguments = bindings.argument_inputs_in(&mut budget, work)?;
     let function_inputs = arguments.function_inputs_in(&mut budget, work)?;
     let aggregate_inputs = bindings.aggregate_inputs_in(&mut budget, work)?;
@@ -489,17 +479,19 @@ fn encode_fragment_package_structural_in<'s>(
             &public_source_schemas,
         )?)
         .ok_or(CompileControlError::ResourceExhausted)?;
-    let constants = prepare_constant_namespace_write_in(
+    let constants = encode_constant_namespace_input_derived_in(
         package.constants(),
         definitions.constant_type_ids(),
         &types,
-        source,
-        l.constant_records,
-        l.constants,
-        seen!(new_allocation_request_bytes_upper_bound),
+        request,
         work,
-    )?
-    .emit_in(seen!(new_allocation_request_bytes_upper_bound), work)?;
+    )
+    .map_err(|error| match error {
+        crate::host_projection_v2::ProjectionFailure::Codec(cause) => {
+            PackageEncodeError::from(cause)
+        }
+        crate::host_projection_v2::ProjectionFailure::Host(cause) => cause,
+    })?;
     source = grow(source, &requested, &constants)?;
     let (parameters, _) = prepare_semantic_parameters_encode_observed_in(
         package.parameters(),
@@ -515,7 +507,7 @@ fn encode_fragment_package_structural_in<'s>(
         &payloads,
         &types,
         source,
-        l.values,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -547,7 +539,7 @@ fn encode_fragment_package_structural_in<'s>(
     .emit_in(seen!(allocation_request_bytes_upper_bound), work)?;
     source = grow(source, &requested, &envelope)?;
     let dispatch = NodeDispatchLimits {
-        node: l.node,
+        node: None,
         binding: l.bindings,
         relation: l.relations,
         writer_schema: l.writer_schema,
@@ -840,7 +832,7 @@ fn encode_fragment_package_structural_in<'s>(
         package,
         &views,
         &mut budget,
-        snapshot_header_allocation,
+        &mut |layout| request(ConstantWriteRequest::Layout(layout)),
         work,
     )?;
     // Namespaces borrow earlier ones; release them in reverse dependency order.

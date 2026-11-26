@@ -50,8 +50,9 @@ use crate::{
     },
     physical_constant_v2::{
         ConstantDecodeProjectionLimits, ConstantNamespaceProjectionLimits,
-        PhysicalConstantCodecError, prepare_constant_namespace_in,
-        prepare_constant_namespace_with_creator_in, prepare_constant_namespace_with_factory_in,
+        PhysicalConstantCodecError, prepare_constant_namespace_input_derived_in,
+        prepare_constant_namespace_input_derived_input_derived_with_creator_in,
+        prepare_constant_namespace_input_derived_input_derived_with_factory_in,
     },
     physical_control_v2::{
         ControlCodecError, ControlProjectionLimits, decode_expression_control_observed,
@@ -1031,15 +1032,10 @@ fn decode_fragment_package_factory_core<
     )?;
     invoice = invoice.max(relations.retained_invoice_floor_in(work)?);
     let (pools, pool_requests) = if let Some(factory) = factory {
-        let prepared = prepare_constant_namespace_with_factory_in(
+        let prepared = prepare_constant_namespace_input_derived_input_derived_with_factory_in(
             &wire_package.constants,
             &types,
-            invoice,
             types.source_metadata_namespace(),
-            limits.constant_policy,
-            limits.constant_records,
-            limits.constants,
-            &limits.verifier,
             factory,
             &mut |_| Ok(()),
             work,
@@ -1054,15 +1050,10 @@ fn decode_fragment_package_factory_core<
         // No source Fields/constants means no metadata namespace. Every
         // captured source occurrence still requires its original receipt.
         let source_metadata = types.source_metadata_namespace();
-        let prepared = prepare_constant_namespace_with_creator_in(
+        let prepared = prepare_constant_namespace_input_derived_input_derived_with_creator_in(
             &wire_package.constants,
             &types,
-            invoice,
             source_metadata,
-            limits.constant_policy,
-            limits.constant_records,
-            limits.constants,
-            &limits.verifier,
             creator,
             &mut |_| Ok(()),
             work,
@@ -1073,14 +1064,9 @@ fn decode_fragment_package_factory_core<
             requests,
         )
     } else {
-        let prepared = prepare_constant_namespace_in(
+        let prepared = prepare_constant_namespace_input_derived_in(
             &wire_package.constants,
             &types,
-            invoice,
-            limits.constant_policy,
-            limits.constant_records,
-            limits.constants,
-            &limits.verifier,
             &mut |_| Ok(()),
             work,
         )?;
@@ -1135,7 +1121,7 @@ fn decode_fragment_package_factory_core<
         &payloads,
         &types,
         invoice,
-        limits.values,
+        None,
         &mut |_| Ok(()),
         work,
     )?;
@@ -1230,7 +1216,7 @@ fn decode_fragment_package_factory_core<
         )?
         .emit_in(&mut |_| Ok(()), work)?;
         let dispatch = NodeDispatchLimits {
-            node: limits.node,
+            node: None,
             binding: limits.bindings,
             relation: limits.relations,
             writer_schema: limits.writer_schema,
@@ -1581,7 +1567,9 @@ fn decode_fragment_package_factory_core<
     )?;
 
     // L9: the original checked Package constructor on this same scope.
-    let package = p::FragmentPackage::try_new_in(
+    let mut original_host = None;
+    let mut admitted = 0;
+    let package = p::FragmentPackage::try_new_input_derived_in(
         p::FragmentPackageInput {
             constants: pools,
             version: metadata.version,
@@ -1596,10 +1584,26 @@ fn decode_fragment_package_factory_core<
             annotations: metadata.annotations,
             layouts,
         },
-        limits.admission,
-        &mut |_| Ok(()),
+        plan_limits,
+        invoice,
+        &mut |facts| {
+            let requested = facts.allocation_request_bytes_upper_bound;
+            if let Some(creator) = creation.as_deref_mut()
+                && requested > admitted
+                && let Err(error) = creator.observe_opaque_upper_bound(requested - admitted)
+            {
+                original_host = Some(error);
+                return Err(CompileControlError::ResourceExhausted);
+            }
+            admitted = admitted.max(requested);
+            Ok(())
+        },
         work,
-    )?;
+    );
+    if let Some(error) = original_host {
+        return Err(ProjectionFailure::Host(error));
+    }
+    let package = package?;
     Ok(match types.source_metadata_namespace() {
         Some(namespace) => package.with_original_metadata_namespace(namespace.clone()),
         None => package,

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use novarocks_connector_contract::ConnectorWriteRecipeDraft;
 use novarocks_physical_plan::{
     FragmentId, FragmentPackage, FragmentPackageAdmission, FrozenFragmentPruning,
-    ProviderReadOccurrenceId, WriteTargetOrdinal, extract_fragment_packages,
+    ProviderReadOccurrenceId, WriteTargetOrdinal, extract_fragment_packages_input_derived,
 };
 #[cfg(test)]
 use novarocks_plan_codec::physical_package_v2::PackageDecodeLimits;
@@ -264,7 +264,6 @@ pub(crate) fn extract_checked_packages(
     let plan = candidate.plan();
     let scans = author_frozen_reads(plan, encodings, control)?;
     let mut pruning = BTreeMap::new();
-    let mut admissions = BTreeMap::new();
     // This path has no pruning witness author. Empty tables grant no authority.
     for &id in plan.fragments().keys() {
         let table = FrozenFragmentPruning::try_new(id, vec![], control).map_err(|error| {
@@ -276,16 +275,21 @@ pub(crate) fn extract_checked_packages(
             }
         })?;
         pruning.insert(id, table);
-        admissions.insert(id, *admission);
     }
-    extract_fragment_packages(plan, &scans, writes, &pruning, &admissions, control).map_err(
-        |error| match error {
-            novarocks_physical_plan::FragmentPackageExtractionError::Control(cause) => {
-                PackageFreezeError::Control(cause)
-            }
-            other => PackageFreezeError::Extraction(format!("{other:?}")),
-        },
+    extract_fragment_packages_input_derived(
+        plan,
+        &scans,
+        writes,
+        &pruning,
+        admission.plan_limits,
+        control,
     )
+    .map_err(|error| match error {
+        novarocks_physical_plan::FragmentPackageExtractionError::Control(cause) => {
+            PackageFreezeError::Control(cause)
+        }
+        other => PackageFreezeError::Extraction(format!("{other:?}")),
+    })
 }
 
 /// The exact wire bytes of one checked package.
