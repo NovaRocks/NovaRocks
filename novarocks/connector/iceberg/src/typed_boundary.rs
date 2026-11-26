@@ -4024,12 +4024,6 @@ async fn plan_pinned_snapshot(
     .await
 }
 
-/// Every partition spec a table has ever had, in the order the metadata holds
-/// them.
-///
-/// A metadata relation's `partition` column is the union across specs, so the
-/// whole set is handed over rather than the default spec alone.
-
 /// The manifest-list entries of one pinned snapshot.
 ///
 /// Only the list is read: the manifests themselves are what the `$files` splits
