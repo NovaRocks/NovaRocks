@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow::array::{ListArray, MapArray};
@@ -25,6 +26,10 @@ use novarocks_fs::{
     TokioFileIoSpawner,
 };
 use novarocks_spi::connector::read_stack::SchemaTableName;
+use novarocks_spi::connector::{
+    ConnectorExecutionResources, ConnectorReservationBackend, ConnectorResourceCheckpoint,
+    ConnectorResourceClass, ConnectorResourceLedger,
+};
 
 use crate::iceberg::spec::{
     DataFileBuilder, DataFileFormat, FormatVersion, ManifestListWriter, ManifestWriterBuilder,
@@ -1179,6 +1184,148 @@ fn snapshots_reports_a_zoned_commit_time_and_a_summary_map() {
         .downcast_ref::<StringArray>()
         .expect("keys");
     assert_eq!(keys.value(0), "added-data-files");
+}
+
+#[derive(Default)]
+struct SnapshotPageCharges {
+    retained: AtomicU64,
+    reservations: AtomicU64,
+}
+
+struct SnapshotPageLedger(Arc<SnapshotPageCharges>);
+
+impl ConnectorResourceLedger for SnapshotPageLedger {
+    fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
+        Ok(ConnectorResourceCheckpoint::new(0))
+    }
+
+    fn try_reserve(
+        &self,
+        class: ConnectorResourceClass,
+        bytes: u64,
+    ) -> Result<Box<dyn ConnectorReservationBackend>, ConnectorError> {
+        assert!(matches!(
+            class,
+            ConnectorResourceClass::ReaderOutput | ConnectorResourceClass::ReaderState
+        ));
+        self.0.reservations.fetch_add(1, Ordering::Relaxed);
+        self.0.retained.fetch_add(bytes, Ordering::Relaxed);
+        Ok(Box::new(SnapshotPageReservation {
+            charges: self.0.clone(),
+            bytes,
+        }))
+    }
+}
+
+struct SnapshotPageReservation {
+    charges: Arc<SnapshotPageCharges>,
+    bytes: u64,
+}
+
+impl ConnectorReservationBackend for SnapshotPageReservation {
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
+        self.charges
+            .retained
+            .fetch_add(additional, Ordering::Relaxed);
+        self.bytes += additional;
+        Ok(())
+    }
+
+    fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
+        self.charges
+            .retained
+            .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+impl Drop for SnapshotPageReservation {
+    fn drop(&mut self) {
+        self.charges
+            .retained
+            .fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn one_snapshot_page_transfers_actual_arrow_bytes_and_refunds_on_release() {
+    let (runtime, binding, context) = runtime_and_binding();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
+    let reference = reference(
+        &warehouse,
+        IcebergSystemTableType::Snapshots,
+        Some(SNAPSHOT_ID),
+    );
+    let scan = SystemTableScan::from_metadata(reference.clone(), &warehouse.metadata).unwrap();
+    let split = super::super::IcebergReadSplit::SystemRelation(
+        SystemRelationSplit::try_new(reference).unwrap(),
+    );
+    let declaration = crate::temporal::declaration(&PrimitiveType::Timestamptz).unwrap();
+
+    // The count plan's first column alone is the minimal failing case.
+    // The wider projection also contains a nullable parent and a short string.
+    for projection in [&[0][..], &[0, 2, 3][..], &[][..]] {
+        let charges = Arc::new(SnapshotPageCharges::default());
+        let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(
+            SnapshotPageLedger(charges.clone()),
+        ));
+        let provider = provider(&binding, &context).with_execution_resources(Some(resources));
+        let requested = projection
+            .iter()
+            .map(|&ordinal| scan.columns()[ordinal].clone())
+            .collect::<Vec<_>>();
+        let budget = ConnectorPollBudget::new();
+        let stream = provider
+            .create_page_stream(&scan, &split, &requested, &budget)
+            .unwrap();
+        let mut driven = DrivenStream::new(&runtime, stream, budget);
+
+        let page = driven.next_page().unwrap().expect("single snapshot page");
+        let (rows, columns, custody) = page.into_output_parts();
+        assert_eq!(rows, 1);
+        assert_eq!(columns.len(), projection.len());
+        assert!(custody.source_holds.is_empty());
+        let expected_bytes: u64 = columns
+            .iter()
+            .map(|column| column.get_array_memory_size() as u64)
+            .sum();
+        assert_eq!(charges.retained.load(Ordering::Relaxed), expected_bytes);
+        if projection.is_empty() {
+            assert!(custody.new_output.is_none());
+            assert_eq!(charges.reservations.load(Ordering::Relaxed), 0);
+        } else {
+            assert_eq!(custody.new_output.as_ref().unwrap().bytes(), expected_bytes);
+            let committed_at = novarocks_value_arrays::decode::PreparedTemporalArray::bind(
+                declaration,
+                columns[0].as_ref(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                committed_at.value(0).unwrap(),
+                Some(
+                    crate::temporal::from_storage(declaration, 1_700_000_000_000 * 1_000).unwrap()
+                ),
+            );
+            if projection.len() == 3 {
+                assert_eq!(long_column(&columns, 1), vec![None]);
+                assert_eq!(string_column(&columns, 2), vec![Some("append".to_string())]);
+            }
+        }
+
+        assert!(driven.next_page().unwrap().is_none());
+        driven.close().unwrap();
+        assert_eq!(charges.retained.load(Ordering::Relaxed), expected_bytes);
+        drop(columns);
+        drop(custody);
+        assert_eq!(charges.retained.load(Ordering::Relaxed), 0);
+    }
 }
 
 #[test]
