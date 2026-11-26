@@ -173,7 +173,7 @@ fn admit_model(
     model: &Model,
     source: usize,
     fields: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     admit: &mut Admission<'_>,
 ) -> Result<NodeProjectionFacts, Error> {
     let facts = model.numerical_facts(source, fields, limits)?;
@@ -184,7 +184,7 @@ fn admitted_facts(
     model: &Model,
     source: usize,
     fields: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     admit: &mut Admission<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeProjectionFacts, Error> {
@@ -196,7 +196,7 @@ fn encode_preflight(
     sources: &[SchemaSource<'_>],
     types: &EncodedTypeTable<'_>,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     admit: &mut Admission<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeProjectionFacts, Error> {
@@ -213,7 +213,9 @@ fn encode_preflight(
         size_of::<EncodedTypeTable<'_>>(),
         bytes::<(u32, Arc<Field>)>(types.source_counts().1)?,
     )?;
-    resources::floor(source, source_slice.max(types_floor), work)?;
+    if limits.is_some() {
+        resources::floor(source, source_slice.max(types_floor), work)?;
+    }
     let mut max_schema_floor = 0;
     for entry in sources {
         // Shape namespace cannot retain even empty spare annotation backing.
@@ -244,11 +246,13 @@ fn encode_preflight(
             )?,
         )?;
         max_schema_floor = max_schema_floor.max(known);
-        resources::floor(
-            source,
-            source_slice.max(types_floor).max(max_schema_floor),
-            work,
-        )?;
+        if limits.is_some() {
+            resources::floor(
+                source,
+                source_slice.max(types_floor).max(max_schema_floor),
+                work,
+            )?;
+        }
         admitted_facts(&model, source, types.source_counts().1, limits, admit, work)?;
         for (field, id) in fields.iter().zip(entry.field_ids) {
             let original = types.field_observed(*id, work)?;
@@ -275,7 +279,7 @@ fn decode_preflight(
     definitions: &[wire::SchemaDefinition],
     types: &DecodedTypeTable,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     admit: &mut Admission<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(Model, NodeProjectionFacts), Error> {
@@ -494,9 +498,10 @@ pub fn prepare_schemas_encode<'loan, 'source, 'control>(
     sources: &'loan [SchemaSource<'source>],
     types: &'loan EncodedTypeTable<'source>,
     source_retained_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedSchemasEncode<'loan, 'source, 'control>, Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = prepare_schemas_encode_observed_in(
         sources,
@@ -514,10 +519,11 @@ pub fn prepare_schemas_encode_observed_in<'loan, 'source, 'control>(
     sources: &'loan [SchemaSource<'source>],
     types: &'loan EncodedTypeTable<'source>,
     source_retained_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     admit: &mut Admission<'_>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedSchemasEncode<'loan, 'source, 'control>, Error> {
+    let limits = limits.into();
     let facts = encode_preflight(sources, types, source_retained_bytes, limits, admit, work)?;
     let index = BindingIndex::prepare(sources.len(), |at| sources[at].id, work)?;
     Ok(PreparedSchemasEncode {
@@ -695,9 +701,10 @@ pub fn prepare_schemas_decode<'loan, 'control>(
     definitions: &'loan [wire::SchemaDefinition],
     types: &'loan DecodedTypeTable,
     source_retained_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedSchemasDecode<'loan, 'control>, Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = prepare_schemas_decode_observed_in(
         definitions,
@@ -714,10 +721,11 @@ pub fn prepare_schemas_decode_observed_in<'loan, 'control>(
     definitions: &'loan [wire::SchemaDefinition],
     types: &'loan DecodedTypeTable,
     source_retained_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     admit: &mut Admission<'_>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedSchemasDecode<'loan, 'control>, Error> {
+    let limits = limits.into();
     prepare_schemas_decode_core::<std::convert::Infallible>(
         definitions,
         types,
@@ -733,7 +741,7 @@ fn prepare_schemas_decode_core<'loan, 'control, H>(
     definitions: &'loan [wire::SchemaDefinition],
     types: &'loan DecodedTypeTable,
     source_retained_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     admit: &mut Admission<'_>,
     creation: Option<&mut ValueSchemaCreation<'_, H>>,
     work: &mut CompileCheckpoints<'control>,

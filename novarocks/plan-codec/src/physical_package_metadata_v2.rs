@@ -134,7 +134,7 @@ fn decode_subject(
 fn gate(
     model: &Model,
     source: usize,
-    limits: PackageMetadataProjectionLimits,
+    limits: Option<PackageMetadataProjectionLimits>,
     admit: &mut impl FnMut(&PackageMetadataProjectionFacts) -> Result<(), CompileControlError>,
 ) -> Result<PackageMetadataProjectionFacts, Error> {
     // All known numerical axes and the parent's cumulative invoice precede
@@ -158,10 +158,11 @@ fn source_floor(source: usize, known: usize) -> Result<(), Error> {
 pub fn encode_package_metadata_observed(
     input: &p::FragmentPackage,
     source_retained_bytes: usize,
-    limits: PackageMetadataProjectionLimits,
+    limits: impl Into<Option<PackageMetadataProjectionLimits>>,
     admit: &mut impl FnMut(&PackageMetadataProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(EncodedPackageMetadata, PackageMetadataProjectionFacts), Error> {
+    let limits = limits.into();
     let annotations = input.annotations();
     let mut model = Model {
         items: annotations.len(),
@@ -174,7 +175,9 @@ pub fn encode_package_metadata_observed(
         size_of::<p::FragmentPackage>(),
         resource::bytes::<p::PlanAnnotation>(annotations.len())?,
     )?;
-    source_floor(source_retained_bytes, known)?;
+    if limits.is_some() {
+        source_floor(source_retained_bytes, known)?;
+    }
     for annotation in annotations {
         model.request::<u8>(annotation.key.len(), 1)?;
         model.request::<u8>(annotation.value.len(), 1)?;
@@ -183,7 +186,9 @@ pub fn encode_package_metadata_observed(
             resource::add(annotation.key.len(), annotation.value.len())?,
         )?;
         gate(&model, source_retained_bytes, limits, admit)?;
-        source_floor(source_retained_bytes, known)?;
+        if limits.is_some() {
+            source_floor(source_retained_bytes, known)?;
+        }
         let subject = encode_subject(annotation.subject);
         work.step()?;
         subject?;
@@ -221,10 +226,11 @@ pub fn encode_package_metadata_observed(
 pub fn decode_package_metadata_observed(
     input: &wire::FragmentPackage,
     source_retained_bytes: usize,
-    limits: PackageMetadataProjectionLimits,
+    limits: impl Into<Option<PackageMetadataProjectionLimits>>,
     admit: &mut impl FnMut(&PackageMetadataProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(DecodedPackageMetadata, PackageMetadataProjectionFacts), Error> {
+    let limits = limits.into();
     let mut model = Model {
         items: input.annotations.len(),
         ..Model::default()
@@ -248,7 +254,9 @@ pub fn decode_package_metadata_observed(
             resource::bytes::<wire::PlanAnnotation>(input.annotations.capacity())?,
         )?,
     )?;
-    source_floor(source_retained_bytes, known)?;
+    if limits.is_some() {
+        source_floor(source_retained_bytes, known)?;
+    }
     for annotation in &input.annotations {
         model.request::<u8>(annotation.key.len(), 2)?;
         model.request::<u8>(annotation.value.len(), 2)?;
@@ -257,7 +265,9 @@ pub fn decode_package_metadata_observed(
             resource::add(annotation.key.capacity(), annotation.value.capacity())?,
         )?;
         gate(&model, source_retained_bytes, limits, admit)?;
-        source_floor(source_retained_bytes, known)?;
+        if limits.is_some() {
+            source_floor(source_retained_bytes, known)?;
+        }
         let subject = decode_subject(annotation.subject.as_ref());
         work.step()?;
         subject?;

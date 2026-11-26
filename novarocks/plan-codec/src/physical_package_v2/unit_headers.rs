@@ -36,7 +36,7 @@ fn floor(source: usize, known: usize) -> Result<(), E> {
 pub(super) fn encode(
     unit: &BoundExprSet,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeProjectionFacts, E> {
@@ -57,23 +57,27 @@ pub(super) fn encode(
     )?;
     model.request::<wire::ExpressionPort>(unit.ports().len(), 1)?;
     model.request::<wire::ExpressionRoot>(unit.roots().len(), 1)?;
-    floor(source, known)?;
-    admit(&model.numerical_facts(source, 0, limits)?)?;
+    if limits.is_some() {
+        floor(source, known)?;
+    }
+    admit(&model.numerical_facts(source.max(known), 0, limits)?)?;
     for port in unit.ports() {
         model.items = add(model.items, port.values.len())?;
         model.refs = add(model.refs, port.values.len())?;
         model.request::<wire::ExpressionInput>(port.values.len(), 1)?;
         known = add(known, bytes::<(ValueId, ValueType)>(port.values.len())?)?;
-        floor(source, known)?;
-        admit(&model.numerical_facts(source, 0, limits)?)?;
+        if limits.is_some() {
+            floor(source, known)?;
+        }
+        admit(&model.numerical_facts(source.max(known), 0, limits)?)?;
         work.step()?;
     }
-    model.numerical_facts(source, 0, limits)
+    model.numerical_facts(source.max(known), 0, limits)
 }
 pub(super) fn decode<H>(
     unit: &wire::ExpressionUnit,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
     mut creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
@@ -136,21 +140,23 @@ pub(super) fn decode<H>(
         )?;
         work.step().map_err(E::from)?;
     }
-    Ok(model.numerical_facts(source, 0, limits)?)
+    Ok(model.numerical_facts(source.max(known), 0, limits)?)
 }
 
 fn observe_decode<H>(
     model: &Model,
     source: usize,
     known: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
     creation: &mut Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
     previous: &mut usize,
 ) -> Result<(), crate::host_projection_v2::ProjectionFailure<E, H>> {
     use crate::host_projection_v2::ProjectionFailure as Failure;
-    floor(source, known)?;
-    let facts = model.numerical_facts(source, 0, limits)?;
+    if limits.is_some() {
+        floor(source, known)?;
+    }
+    let facts = model.numerical_facts(source.max(known), 0, limits)?;
     admit(&facts).map_err(E::from)?;
     let additional = facts
         .allocation_request_bytes_upper_bound

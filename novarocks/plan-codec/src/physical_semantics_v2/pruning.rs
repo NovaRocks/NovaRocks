@@ -394,7 +394,7 @@ fn decode_pruning_core(
 pub fn encode_frozen_pruning_observed(
     input: &FrozenFragmentPruning,
     source_retained_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(wire::FrozenPruning, NodeProjectionFacts), Error> {
@@ -406,7 +406,7 @@ pub fn decode_frozen_pruning_observed(
     fragment: FragmentId,
     input: &wire::FrozenPruning,
     source_retained_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(FrozenFragmentPruning, NodeProjectionFacts), Error> {

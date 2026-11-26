@@ -107,7 +107,7 @@ fn json_constants_validate_only_reachable_nominal_cells() {
             root,
             ty,
             array.to_data(),
-            decode_limits().constant_policy,
+            crate::physical_package_v2::FROZEN_CONSTANT_POLICY,
             CompilePhase::Decode,
             &control,
         )
@@ -211,7 +211,7 @@ fn package_wire_validates_reachable_json_in_nullable_row_array_map() {
             root,
             ty.clone(),
             rows.to_data(),
-            decode_limits().constant_policy,
+            crate::physical_package_v2::FROZEN_CONSTANT_POLICY,
             CompilePhase::Validate,
             &control,
         )

@@ -21,7 +21,7 @@ use super::PackageDecodeError;
 use crate::{
     host_projection_v2::ProjectionFailure as Failure,
     physical_expression_v2::ExpressionCodecError,
-    physical_node_v2::{Model, NodeProjectionFacts, NodeProjectionLimits, add},
+    physical_node_v2::{Model, NodeProjectionFacts, add},
 };
 use novarocks_expression_contract::{
     BoundExprSet, UnitConstructionFailure, UnitConstructionRequest, UnitConstructionStorage,
@@ -67,7 +67,6 @@ pub(super) fn construct<H, F: ValueSchemaCreationFactory<H>>(
     parts: UnitParts,
     unit_limits: UnitLimits,
     source: usize,
-    limits: NodeProjectionLimits,
     creation: Option<&mut ValueSchemaCreation<'_, H>>,
     factory: Option<&F>,
     work: &mut CompileCheckpoints<'_>,
@@ -132,6 +131,6 @@ pub(super) fn construct<H, F: ValueSchemaCreationFactory<H>>(
         BoundExprSet::try_from_parts_observed_in(parts, unit_limits, &mut observe, work)
             .map_err(failure)?
     };
-    let facts = model.numerical_facts(source, 0, limits)?;
+    let facts = model.numerical_input_derived_facts(source, 0)?;
     Ok((unit, facts))
 }

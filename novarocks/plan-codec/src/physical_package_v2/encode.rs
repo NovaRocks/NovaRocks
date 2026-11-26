@@ -19,38 +19,27 @@
 //! retain their own frozen limits. Snapshot data is a separate final component
 //! funded by its actual creator, without a whole-DTO size quota.
 
-use super::binding_sources::{BindingSourceLimits, collect_binding_sources_in};
-use super::definition_sources::{DefinitionSourceLimits, collect_definition_sources_in};
+use super::binding_sources::collect_binding_sources_in;
+use super::definition_sources::collect_definition_sources_in;
 use super::nodes::{NodeDispatchLimits, NodeEncodeContext, prepare_node_encode_in};
-use super::provider_sources::{
-    ProviderSourceError, ProviderSourceLimits, collect_provider_sources_in,
-};
-use super::type_views::{
-    TypeViewBudget, TypeViewError, TypeViewLimits, collect_package_type_views_in,
-};
+use super::provider_sources::{ProviderSourceError, collect_provider_sources_in};
+use super::type_views::{TypeViewBudget, TypeViewError, collect_package_type_views_in};
 use crate::physical_aggregate_binding_v2::encode_aggregate_bindings_in;
 use crate::physical_binding_v2::{
     BindingCodecError, BindingProjectionLimits, encode_function_bindings_in,
 };
-use crate::physical_call_requests_v2::{
-    CallRequestCodecError, CallRequestProjectionLimits, prepare_call_requests_encode_in,
-};
+use crate::physical_call_requests_v2::{CallRequestCodecError, prepare_call_requests_encode_in};
 use crate::physical_connector_payload_v2::{
     ConnectorPayloadCodecError, ConnectorPayloadProjectionLimits, encode_connector_payloads_in,
 };
 use crate::physical_constant_v2::{
-    ConstantNamespaceProjectionLimits, ConstantWriteProjectionLimits, ConstantWriteRequest,
-    PhysicalConstantCodecError, encode_constant_namespace_input_derived_in,
+    ConstantWriteRequest, PhysicalConstantCodecError, encode_constant_namespace_input_derived_in,
 };
-use crate::physical_control_v2::{
-    ControlCodecError, ControlProjectionLimits, encode_expression_control_observed,
-};
+use crate::physical_control_v2::{ControlCodecError, encode_expression_control_observed};
 use crate::physical_cuts_v2::{
     CutsProjectionLimits, EncodedCutsContext, encode_fragment_cuts_observed,
 };
-use crate::physical_expression_v2::{
-    ExpressionCodecError, ExpressionProjectionLimits, prepare_expression_definitions_in,
-};
+use crate::physical_expression_v2::{ExpressionCodecError, prepare_expression_definitions_in};
 use crate::physical_fragment_envelope_v2::prepare_fragment_envelope_encode_in;
 use crate::physical_node_v2::{NodeCodecError, NodeProjectionLimits};
 use crate::physical_package_metadata_v2::{
@@ -81,7 +70,7 @@ use crate::physical_semantics_v2::{
 use crate::physical_type_v2::{
     PackageTypeProjectionLimits, TypeCodecError, encode_borrowed_type_namespaces_sources_in,
 };
-use crate::physical_value_v2::{ValueCodecError, ValueProjectionLimits, encode_values_observed_in};
+use crate::physical_value_v2::{ValueCodecError, encode_values_observed_in};
 use crate::physical_writer_recipe_v2::{
     WriterRecipeCodecError, WriterRecipeEncodeContext, WriterRecipeProjectionLimits,
     encode_writer_recipes_observed,
@@ -102,10 +91,6 @@ use std::{cell::Cell, fmt};
 #[derive(Clone, Copy, Debug)]
 pub struct PackageEncodeLimits {
     pub source_retained_bytes: usize,
-    pub views: TypeViewLimits,
-    pub binding_sources: BindingSourceLimits,
-    pub provider_sources: ProviderSourceLimits,
-    pub definition_sources: DefinitionSourceLimits,
     /// Metadata, schemas, envelope, calls, pruning, result and node headers.
     pub node: NodeProjectionLimits,
     pub types: PackageTypeProjectionLimits,
@@ -114,14 +99,8 @@ pub struct PackageEncodeLimits {
     pub payloads: ConnectorPayloadProjectionLimits,
     pub reads: ProviderReadProjectionLimits,
     pub relations: RelationProjectionLimits,
-    pub constant_records: ConstantWriteProjectionLimits,
-    pub constants: ConstantNamespaceProjectionLimits,
     pub parameters: ParameterProjectionLimits,
-    pub values: ValueProjectionLimits,
-    pub expressions: ExpressionProjectionLimits,
-    pub requests: CallRequestProjectionLimits,
     pub writer_schema: WriterSchemaProjectionLimits,
-    pub control: ControlProjectionLimits,
     pub cuts: CutsProjectionLimits,
     pub scans: ReadScanProjectionLimits,
     pub writers: WriterRecipeProjectionLimits,
@@ -391,7 +370,7 @@ fn encode_fragment_package_structural_in<'s>(
     let (metadata, _) = encode_package_metadata_observed(
         package,
         source,
-        l.node,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -466,7 +445,7 @@ fn encode_fragment_package_structural_in<'s>(
         provider_inputs.schemas(),
         &types,
         source,
-        l.node,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?
@@ -531,7 +510,7 @@ fn encode_fragment_package_structural_in<'s>(
     let (envelope, _) = prepare_fragment_envelope_encode_in(
         fragment,
         source,
-        l.node,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?
@@ -608,7 +587,7 @@ fn encode_fragment_package_structural_in<'s>(
             let _ = super::unit_headers::encode(
                 unit,
                 source,
-                l.node,
+                None,
                 seen!(allocation_request_bytes_upper_bound),
                 work,
             )?;
@@ -690,7 +669,7 @@ fn encode_fragment_package_structural_in<'s>(
             let (claims, _) = crate::physical_semantics_v2::encode_expression_claims_in(
                 unit,
                 source,
-                l.node,
+                None,
                 &mut |facts: &crate::physical_node_v2::NodeProjectionFacts| {
                     requested.set(
                         requested
@@ -734,7 +713,7 @@ fn encode_fragment_package_structural_in<'s>(
     let (calls, _) = encode_frozen_calls_observed(
         package.calls(),
         source,
-        l.node,
+        None,
         &mut |facts: &crate::physical_node_v2::NodeProjectionFacts| {
             requested.set(
                 requested
@@ -750,7 +729,7 @@ fn encode_fragment_package_structural_in<'s>(
     let (pruning, _) = encode_frozen_pruning_observed(
         package.pruning(),
         source,
-        l.node,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -773,7 +752,7 @@ fn encode_fragment_package_structural_in<'s>(
         definitions.result_type_ids(),
         &values,
         source,
-        l.node,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?

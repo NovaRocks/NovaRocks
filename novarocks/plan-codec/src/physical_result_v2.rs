@@ -22,7 +22,7 @@
 use crate::{
     borrowed_type_resources::{
         type_binding_prefix_work_upper_bound_in, verify_type_binding,
-        verify_type_binding_admitted_in,
+        verify_type_binding_optional_work_in,
     },
     physical_node_v2::*,
     physical_type_v2::{self, DecodedTypeTable, TypeCodecError},
@@ -100,7 +100,7 @@ fn decoded_type<'a>(
 struct Admission<'loan, 'parent> {
     source: usize,
     values: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     parent: Option<&'loan mut NodeAdmit<'parent>>,
     work_peak: usize,
 }
@@ -112,7 +112,9 @@ impl Admission<'_, '_> {
         let mut facts = model.numerical_facts(self.source, self.values, self.limits)?;
         if let Some(parent) = self.parent.as_deref_mut() {
             self.work_peak = self.work_peak.max(facts.cumulative_work_upper_bound);
-            check_cap(self.work_peak, self.limits.max_work)?;
+            if let Some(limits) = self.limits {
+                check_cap(self.work_peak, limits.max_work)?;
+            }
             facts.cumulative_work_upper_bound = self.work_peak;
             parent(&facts)?;
         }
@@ -132,7 +134,7 @@ impl Admission<'_, '_> {
                     self.limits,
                     &mut |facts| {
                         *peak = (*peak).max(facts.cumulative_work_upper_bound);
-                        if *peak > self.limits.max_work {
+                        if self.limits.is_some_and(|limits| *peak > limits.max_work) {
                             return Err(CompileControlError::ResourceExhausted);
                         }
                         let mut current = *facts;
@@ -165,7 +167,7 @@ fn remaining(
     model: &Model,
     admission: &mut Admission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
-) -> Result<usize, Error> {
+) -> Result<Option<usize>, Error> {
     let facts = if admission.observed() {
         // The known comparison prefix is a replacement work ceiling, not a
         // second charge deducted from this same delegated comparison's room.
@@ -177,9 +179,13 @@ fn remaining(
     };
     admission
         .limits
-        .max_work
-        .checked_sub(facts.cumulative_work_upper_bound)
-        .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+        .map(|limits| {
+            limits
+                .max_work
+                .checked_sub(facts.cumulative_work_upper_bound)
+                .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+        })
+        .transpose()
 }
 fn compare(
     left: &FunctionValueType,
@@ -194,7 +200,7 @@ fn compare(
     let room = remaining(model, admission, w)?;
     let compared = if admission.observed() {
         let base = model.delegated_work;
-        verify_type_binding_admitted_in::<Error>(
+        verify_type_binding_optional_work_in::<Error>(
             left,
             right,
             admission.source,
@@ -261,7 +267,7 @@ fn preflight_encode(
     ids: &[u32],
     values: &EncodedValues<'_, '_, '_>,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     parent: Option<&mut NodeAdmit<'_>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeProjectionFacts, Error> {
@@ -448,7 +454,7 @@ fn preflight_decode(
     input: Option<&wire::ResultPort>,
     values: &DecodedValues<'_, '_, '_>,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     parent: Option<&mut NodeAdmit<'_>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeProjectionFacts, Error> {
@@ -839,7 +845,7 @@ pub(crate) fn prepare_result_encode_in<'input, 'values, 'loan, 'source, 'control
     ids: &'input [u32],
     values: &'values EncodedValues<'loan, 'source, 'control>,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedResultEncode<'input, 'values, 'loan, 'source, 'control>, Error> {
@@ -849,7 +855,7 @@ pub(crate) fn prepare_result_encode_in<'input, 'values, 'loan, 'source, 'control
             "result control differs from original value namespace",
         ));
     }
-    let facts = preflight_encode(input, ids, values, source, limits, Some(admit), work)?;
+    let facts = preflight_encode(input, ids, values, source, limits.into(), Some(admit), work)?;
     Ok(PreparedResultEncode {
         input,
         ids,
@@ -864,7 +870,7 @@ pub(crate) fn prepare_result_encode<'input, 'values, 'loan, 'source, 'control>(
     ids: &'input [u32],
     values: &'values EncodedValues<'loan, 'source, 'control>,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedResultEncode<'input, 'values, 'loan, 'source, 'control>, Error> {
     let mut w = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
@@ -876,7 +882,7 @@ pub(crate) fn prepare_result_encode<'input, 'values, 'loan, 'source, 'control>(
                 "result control differs from original value namespace",
             ));
         }
-        preflight_encode(input, ids, values, source, limits, None, &mut w)
+        preflight_encode(input, ids, values, source, limits.into(), None, &mut w)
     })();
     let facts = finish(w, result)?;
     Ok(PreparedResultEncode {
@@ -922,7 +928,7 @@ pub(crate) fn prepare_result_decode_in<'input, 'values, 'loan, 'wire, 'control>(
     input: Option<&'input wire::ResultPort>,
     values: &'values DecodedValues<'loan, 'wire, 'control>,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedResultDecode<'input, 'values, 'loan, 'wire, 'control>, Error> {
@@ -932,7 +938,7 @@ pub(crate) fn prepare_result_decode_in<'input, 'values, 'loan, 'wire, 'control>(
             "result control differs from original value namespace",
         ));
     }
-    let facts = preflight_decode(input, values, source, limits, Some(admit), work)?;
+    let facts = preflight_decode(input, values, source, limits.into(), Some(admit), work)?;
     Ok(PreparedResultDecode {
         input,
         values,
@@ -945,7 +951,7 @@ pub(crate) fn prepare_result_decode<'input, 'values, 'loan, 'wire, 'control>(
     input: Option<&'input wire::ResultPort>,
     values: &'values DecodedValues<'loan, 'wire, 'control>,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedResultDecode<'input, 'values, 'loan, 'wire, 'control>, Error> {
     let mut w = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
@@ -957,7 +963,7 @@ pub(crate) fn prepare_result_decode<'input, 'values, 'loan, 'wire, 'control>(
                 "result control differs from original value namespace",
             ));
         }
-        preflight_decode(input, values, source, limits, None, &mut w)
+        preflight_decode(input, values, source, limits.into(), None, &mut w)
     })();
     let facts = finish(w, result)?;
     Ok(PreparedResultDecode {
