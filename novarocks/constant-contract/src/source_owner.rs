@@ -716,6 +716,78 @@ mod tests {
     }
 
     #[test]
+    fn input_derived_paired_pool_keeps_array_and_source_past_pool_exit() {
+        use crate::ConstantValidation;
+
+        let (field, loan) = source("literal");
+        let namespace = MaterializedFieldNamespace::from_original_loans(vec![loan].into());
+        let source_drops = Arc::new(AtomicUsize::new(0));
+        let temporary_drops = Arc::new(AtomicUsize::new(0));
+        let retained_drops = Arc::new(AtomicUsize::new(0));
+        let array_drops = Arc::new(AtomicUsize::new(0));
+        let control = Control(AtomicBool::new(false));
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let pool = {
+            let mut source_request = |_: Layout| Ok::<(), ()>(());
+            let mut source_opaque = |_: usize| Ok::<(), ()>(());
+            let mut source_creation = ValueSchemaCreation::new(
+                ValueTypeStorageLifetime::pure(),
+                &mut source_request,
+                &mut source_opaque,
+            );
+            let custody = ConstantSourceOwner::try_new_with_creator_in(
+                &field,
+                &namespace,
+                8192,
+                held(&source_drops),
+                &mut source_creation,
+                &mut work,
+            )
+            .unwrap();
+            let mut temporary_request = |_: Layout| Ok::<(), ()>(());
+            let mut temporary_opaque = |_: usize| Ok::<(), ()>(());
+            let mut retained_request = |_: Layout| Ok::<(), ()>(());
+            let mut retained_opaque = |_: usize| Ok::<(), ()>(());
+            let mut temporary = ValueSchemaCreation::new(
+                held(&temporary_drops),
+                &mut temporary_request,
+                &mut temporary_opaque,
+            );
+            let mut retained = ValueSchemaCreation::new(
+                held(&retained_drops),
+                &mut retained_request,
+                &mut retained_opaque,
+            );
+            ConstantPool::try_new_with_paired_creator_in(
+                field.clone(),
+                FunctionValueType::new(DataType::Utf8, false),
+                StringArray::from(vec!["active"]).to_data(),
+                ConstantValidation::INPUT_DERIVED,
+                custody,
+                &mut temporary,
+                &mut retained,
+                held(&array_drops),
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .unwrap()
+        };
+        work.finish().unwrap();
+        assert_eq!(temporary_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(retained_drops.load(Ordering::SeqCst), 0);
+        assert!(Arc::ptr_eq(pool.field_ref(), &field));
+        let projection = pool.array_projection();
+        drop(pool);
+        assert_eq!(retained_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(array_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(projection.array().len(), 1);
+        drop(projection);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(array_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn source_creator_preserves_each_original_host_refusal_without_tail_callbacks() {
         let (field, loan) = source("literal");
         let namespace = MaterializedFieldNamespace::from_original_loans(vec![loan].into());

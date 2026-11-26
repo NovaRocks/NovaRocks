@@ -84,6 +84,66 @@ pub struct ConstantPolicy {
     pub max_library_validation_bytes: u64,
 }
 
+/// Selects the constant owner's checks independently of its source or creator.
+/// Input-derived validation retains the type shape checks and computes Arrow
+/// validation work from the actual input. It imposes no data volume quota.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConstantValidation {
+    shape: ConstantTypeLimits,
+    volume: Option<ConstantVolumeLimits>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConstantTypeLimits {
+    depth: u32,
+    nodes: u64,
+    dictionary_depth: u32,
+    metadata_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConstantVolumeLimits {
+    max_rows: u64,
+    max_array_nodes: u64,
+    max_logical_elements: u64,
+    max_retained_buffer_bytes: u64,
+    max_library_validation_work: u64,
+    max_library_validation_bytes: u64,
+}
+
+impl ConstantValidation {
+    pub const INPUT_DERIVED: Self = Self {
+        shape: ConstantTypeLimits {
+            depth: novarocks_type_contract::MAX_VALUE_TYPE_DEPTH as u32,
+            nodes: novarocks_type_contract::MAX_VALUE_TYPE_NODES as u64,
+            dictionary_depth: 8,
+            metadata_bytes: novarocks_type_contract::MAX_ARROW_FIELD_METADATA_BYTES as u64,
+        },
+        volume: None,
+    };
+}
+
+impl From<ConstantPolicy> for ConstantValidation {
+    fn from(policy: ConstantPolicy) -> Self {
+        Self {
+            shape: ConstantTypeLimits {
+                depth: policy.max_type_depth,
+                nodes: policy.max_type_nodes,
+                dictionary_depth: policy.max_dictionary_depth,
+                metadata_bytes: policy.max_metadata_bytes,
+            },
+            volume: Some(ConstantVolumeLimits {
+                max_rows: policy.max_rows,
+                max_array_nodes: policy.max_array_nodes,
+                max_logical_elements: policy.max_logical_elements,
+                max_retained_buffer_bytes: policy.max_retained_buffer_bytes,
+                max_library_validation_work: policy.max_library_validation_work,
+                max_library_validation_bytes: policy.max_library_validation_bytes,
+            }),
+        }
+    }
+}
+
 /// Derived input facts, not a MEM charge, allocation grant or process RSS.
 /// Logical/opaque-call facts are conservative upper bounds. Buffer capacity
 /// is deduplicated by Arrow's reported allocation base and capacity; hidden
@@ -208,7 +268,7 @@ pub fn preflight_flat_pool_resources_input_derived_observed<H>(
         field,
         value_type,
         input,
-        None,
+        ConstantValidation::INPUT_DERIVED,
         &mut PoolObserver::parent(&mut |facts| {
             admit(facts).map_err(ConstantCreationFailure::Creator)
         }),
@@ -227,7 +287,7 @@ fn preflight_flat_pool_resources_core<E: PoolFailure>(
         field,
         value_type,
         input,
-        Some(policy),
+        policy.into(),
         observer,
         work,
     )
@@ -237,11 +297,13 @@ fn preflight_flat_pool_resources_profile_core<E: PoolFailure>(
     field: &Field,
     value_type: &FunctionValueType,
     input: FlatConstantResourceInput,
-    policy: Option<ConstantPolicy>,
+    validation: ConstantValidation,
     observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(FlatConstantResourceBounds, ConstantPolicy), E> {
-    let type_facts = validate_type_profile_owned(field, value_type, policy, observer, work)?;
+    let type_facts =
+        validate_type_profile_owned(field, value_type, validation.shape, observer, work)?;
+    let policy = validation.volume;
     let metadata_bytes = type_facts.metadata;
     observer.step(work)?;
     let flat = is_flat_resource_carrier(field.data_type());
@@ -258,9 +320,9 @@ fn preflight_flat_pool_resources_profile_core<E: PoolFailure>(
         policy.map(|p| p.max_array_nodes),
         "constant array node limit exceeded",
     )?;
-    optional_limit(
+    limit(
         1,
-        policy.map(|p| u64::from(p.max_type_depth)),
+        u64::from(validation.shape.depth),
         "constant array depth limit exceeded",
     )?;
     optional_limit(
@@ -284,9 +346,8 @@ fn preflight_flat_pool_resources_profile_core<E: PoolFailure>(
         masks: 0,
         depth: 1,
     };
-    let envelope =
-        validation_envelope_profile_owned(counts, metadata_bytes, policy, observer, work)?;
-    let sealed = policy.unwrap_or(ConstantPolicy {
+    let envelope = validation_envelope_owned(counts, metadata_bytes, validation, observer, work)?;
+    let sealed = ConstantPolicy {
         max_rows: input.rows,
         max_array_nodes: 1,
         max_logical_elements: input.rows,
@@ -297,7 +358,7 @@ fn preflight_flat_pool_resources_profile_core<E: PoolFailure>(
         max_metadata_bytes: metadata_bytes,
         max_library_validation_work: envelope.work,
         max_library_validation_bytes: envelope.bytes,
-    });
+    };
     Ok((
         FlatConstantResourceBounds {
             metadata_bytes,
@@ -765,7 +826,7 @@ impl ConstantPool {
         field: Arc<Field>,
         value_type: FunctionValueType,
         data: ArrayData,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
@@ -774,7 +835,7 @@ impl ConstantPool {
             &field,
             &value_type,
             &data,
-            policy,
+            validation.into(),
             &mut PoolObserver::plain(),
             &mut work,
         );
@@ -818,7 +879,7 @@ impl ConstantPool {
         field: Arc<Field>,
         value_type: FunctionValueType,
         data: ArrayData,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         admit: &mut impl FnMut(&ConstantOwnerResourceFacts) -> Result<(), CompileControlError>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, ConstantError> {
@@ -829,7 +890,7 @@ impl ConstantPool {
             field,
             value_type,
             data,
-            policy,
+            validation.into(),
             novarocks_type_contract::ValueTypeStorageLifetime::pure(),
             None,
             &mut observer,
@@ -843,7 +904,7 @@ impl ConstantPool {
         field: Arc<Field>,
         value_type: FunctionValueType,
         data: ArrayData,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         admit: &mut impl FnMut(&ConstantOwnerResourceFacts) -> Result<(), H>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, ConstantCreationFailure<H>> {
@@ -855,7 +916,7 @@ impl ConstantPool {
             field,
             value_type,
             data,
-            policy,
+            validation.into(),
             novarocks_type_contract::ValueTypeStorageLifetime::pure(),
             None,
             &mut observer,
@@ -870,7 +931,7 @@ impl ConstantPool {
         field: Arc<Field>,
         value_type: FunctionValueType,
         data: ArrayData,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         storage: novarocks_type_contract::ValueTypeStorageLifetime,
         admit: &mut impl FnMut(&ConstantOwnerResourceFacts) -> Result<(), H>,
         work: &mut CompileCheckpoints<'_>,
@@ -883,7 +944,7 @@ impl ConstantPool {
             field,
             value_type,
             data,
-            policy,
+            validation.into(),
             storage,
             None,
             &mut observer,
@@ -898,7 +959,7 @@ impl ConstantPool {
         field: Arc<Field>,
         value_type: FunctionValueType,
         data: ArrayData,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         source: ConstantSourceOwner,
         creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
         admit: &mut impl FnMut(&ConstantOwnerResourceFacts) -> Result<(), ConstantCreationFailure<H>>,
@@ -925,7 +986,7 @@ impl ConstantPool {
             field,
             value_type,
             data,
-            policy,
+            validation.into(),
             storage,
             Some(source),
             &mut observer,
@@ -939,7 +1000,7 @@ impl ConstantPool {
         field: Arc<Field>,
         value_type: FunctionValueType,
         data: ArrayData,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         source: ConstantSourceOwner,
         temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
         retained: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
@@ -968,7 +1029,7 @@ impl ConstantPool {
             field,
             value_type,
             data,
-            policy,
+            validation.into(),
             storage,
             Some(source),
             &mut observer,
@@ -980,7 +1041,7 @@ impl ConstantPool {
         field: Arc<Field>,
         value_type: FunctionValueType,
         data: ArrayData,
-        policy: ConstantPolicy,
+        validation: ConstantValidation,
         storage: novarocks_type_contract::ValueTypeStorageLifetime,
         source: Option<ConstantSourceOwner>,
         observer: &mut PoolObserver<'_, E>,
@@ -1008,7 +1069,7 @@ impl ConstantPool {
                 work,
             )?;
         }
-        let facts = validate_pool_source(&field, &value_type, &data, policy, observer, work)?;
+        let facts = validate_pool_source(&field, &value_type, &data, validation, observer, work)?;
         work.flush()?;
         let validated = validate_arrow_data(&data);
         validated?;
@@ -1280,7 +1341,7 @@ impl ConstantValue {
         field: Arc<Field>,
         value_type: FunctionValueType,
         data: ArrayData,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
@@ -1290,7 +1351,7 @@ impl ConstantValue {
                 "scalar factory requires one Arrow row",
             ));
         }
-        ConstantPool::try_new(field, value_type, data, policy, phase, control)?.value(0)
+        ConstantPool::try_new(field, value_type, data, validation, phase, control)?.value(0)
     }
 }
 
@@ -1351,10 +1412,10 @@ fn field_bytes_owned<E: PoolFailure>(
 fn validate_type(
     field: &Field,
     ty: &FunctionValueType,
-    policy: ConstantPolicy,
+    validation: ConstantValidation,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<u64, ConstantError> {
-    validate_type_owned(field, ty, policy, &mut PoolObserver::plain(), work)
+    validate_type_owned(field, ty, validation, &mut PoolObserver::plain(), work)
 }
 
 struct TypeResourceFacts {
@@ -1364,16 +1425,17 @@ struct TypeResourceFacts {
 fn validate_type_owned<E: PoolFailure>(
     field: &Field,
     ty: &FunctionValueType,
-    policy: ConstantPolicy,
+    validation: ConstantValidation,
     observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<u64, E> {
-    validate_type_profile_owned(field, ty, Some(policy), observer, work).map(|facts| facts.metadata)
+    validate_type_profile_owned(field, ty, validation.shape, observer, work)
+        .map(|facts| facts.metadata)
 }
 fn validate_type_profile_owned<E: PoolFailure>(
     field: &Field,
     ty: &FunctionValueType,
-    policy: Option<ConstantPolicy>,
+    shape: ConstantTypeLimits,
     observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<TypeResourceFacts, E> {
@@ -1381,7 +1443,8 @@ fn validate_type_profile_owned<E: PoolFailure>(
         observer.work(ConstantPool::type_validation_scratch_work_upper_bound())?;
     }
     observer.step(work)?;
-    if field.is_nullable() != ty.nullable() {
+    let binding = ty.typed_binding().borrowed();
+    if field.is_nullable() != binding.value_type().nullable() {
         return Err(
             ConstantError::Invalid("constant field differs from exact value nullability").into(),
         );
@@ -1420,11 +1483,7 @@ fn validate_type_profile_owned<E: PoolFailure>(
             ValueTypeVisit::TypeNode(t) => {
                 validate_arrow_carrier_parameters_observed::<E>(t, || observer.step(work))?;
                 nodes = checked_add(nodes, 1)?;
-                optional_limit(
-                    nodes,
-                    policy.map(|p| p.max_type_nodes),
-                    "constant type node limit exceeded",
-                )?;
+                limit(nodes, shape.nodes, "constant type node limit exceeded")?;
                 if let DataType::Timestamp(_, Some(zone)) = t {
                     observe_bytes_owned(zone.as_bytes(), observer, work)?;
                     bytes = checked_add(bytes, zone.len() as u64)?;
@@ -1435,9 +1494,9 @@ fn validate_type_profile_owned<E: PoolFailure>(
             }
             ValueTypeVisit::ChildEdge(_) => {}
         }
-        optional_limit(
+        limit(
             bytes,
-            policy.map(|p| p.max_metadata_bytes),
+            shape.metadata_bytes,
             "constant metadata byte limit exceeded",
         )?;
         Ok(())
@@ -1568,27 +1627,21 @@ struct ValidationEnvelope {
     temporary: u64,
     bytes: u64,
 }
-fn validation_envelope(
-    scanned: ValidationCounts,
-    metadata: u64,
-    policy: ConstantPolicy,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<ValidationEnvelope, ConstantError> {
-    let result = validation_envelope_core(scanned, metadata, policy);
-    work.step()?;
-    result
-}
 fn validation_envelope_owned<E: PoolFailure>(
     scanned: ValidationCounts,
     metadata: u64,
-    policy: ConstantPolicy,
+    validation: impl Into<ConstantValidation>,
     observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ValidationEnvelope, E> {
-    if !observer.is_parent() {
-        return validation_envelope(scanned, metadata, policy, work).map_err(Into::into);
+    let parent = observer.is_parent();
+    let envelope =
+        validation_envelope_profile_core(scanned, metadata, validation.into().volume, parent);
+    if !parent {
+        work.step()?;
+        return envelope.map_err(Into::into);
     }
-    let envelope = validation_envelope_core_policy(scanned, metadata, policy, true)?;
+    let envelope = envelope?;
     observer.work(
         usize::try_from(envelope.work).map_err(|_| CompileControlError::ResourceExhausted)?,
     )?;
@@ -1596,47 +1649,18 @@ fn validation_envelope_owned<E: PoolFailure>(
     Ok(envelope)
 }
 
-fn validation_envelope_profile_owned<E: PoolFailure>(
-    scanned: ValidationCounts,
-    metadata: u64,
-    policy: Option<ConstantPolicy>,
-    observer: &mut PoolObserver<'_, E>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<ValidationEnvelope, E> {
-    if let Some(policy) = policy {
-        return validation_envelope_owned(scanned, metadata, policy, observer, work);
-    }
-    let envelope = validation_envelope_profile_core(scanned, metadata, None, observer.is_parent())?;
-    if observer.is_parent() {
-        observer.work(
-            usize::try_from(envelope.work).map_err(|_| CompileControlError::ResourceExhausted)?,
-        )?;
-        observer.step(work)?;
-    } else {
-        work.step()?;
-    }
-    Ok(envelope)
-}
-
 fn validation_envelope_core(
     scanned: ValidationCounts,
     metadata: u64,
-    policy: ConstantPolicy,
+    validation: impl Into<ConstantValidation>,
 ) -> Result<ValidationEnvelope, ConstantError> {
-    validation_envelope_core_policy(scanned, metadata, policy, false)
+    validation_envelope_profile_core(scanned, metadata, validation.into().volume, false)
 }
-fn validation_envelope_core_policy(
-    scanned: ValidationCounts,
-    metadata: u64,
-    policy: ConstantPolicy,
-    parent: bool,
-) -> Result<ValidationEnvelope, ConstantError> {
-    validation_envelope_profile_core(scanned, metadata, Some(policy), parent)
-}
+
 fn validation_envelope_profile_core(
     scanned: ValidationCounts,
     metadata: u64,
-    policy: Option<ConstantPolicy>,
+    policy: Option<ConstantVolumeLimits>,
     parent: bool,
 ) -> Result<ValidationEnvelope, ConstantError> {
     let add = |a: u64, b: u64| {
@@ -1704,11 +1728,11 @@ fn validate_pool_source<E: PoolFailure>(
     field: &Field,
     value_type: &FunctionValueType,
     data: &ArrayData,
-    policy: ConstantPolicy,
+    validation: ConstantValidation,
     observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ConstantResourceFacts, E> {
-    let metadata_bytes = validate_type_owned(field, value_type, policy, observer, work)?;
+    let metadata_bytes = validate_type_owned(field, value_type, validation, observer, work)?;
     if !arrow_data_types_exact_borrowed_observed::<E>(field.data_type(), data.data_type(), || {
         observer.step(work)
     })? {
@@ -1716,7 +1740,7 @@ fn validate_pool_source<E: PoolFailure>(
             ConstantError::Invalid("constant ArrayData differs from exact field carrier").into(),
         );
     }
-    preflight_owned(data, metadata_bytes, policy, observer, work)
+    preflight_owned(data, metadata_bytes, validation, observer, work)
 }
 fn validate_arrow_data(data: &ArrayData) -> Result<(), ConstantError> {
     data.validate_full()
@@ -1751,17 +1775,17 @@ fn canonical_pool_data<E: PoolFailure>(
 fn preflight_owned<E: PoolFailure>(
     data: &ArrayData,
     metadata: u64,
-    policy: ConstantPolicy,
+    validation: ConstantValidation,
     observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ConstantResourceFacts, E> {
-    limit(
+    optional_limit(
         data.len() as u64,
-        policy.max_rows,
+        validation.volume.map(|policy| policy.max_rows),
         "constant row limit exceeded",
     )?;
     let mut scanned = ScanFacts::default();
-    let max_value = scan_data(data, 1, 0, policy, &mut scanned, observer, work)?;
+    let max_value = scan_data(data, 1, 0, validation, &mut scanned, observer, work)?;
     let logical = logical_elements_observed_owned(
         data.len() as u64,
         scanned.storage_elements,
@@ -1769,9 +1793,9 @@ fn preflight_owned<E: PoolFailure>(
         observer,
         work,
     )?;
-    limit(
+    optional_limit(
         logical,
-        policy.max_logical_elements,
+        validation.volume.map(|policy| policy.max_logical_elements),
         "constant logical element limit exceeded",
     )?;
     // validate_full calls validate_data at every node; validate itself revisits
@@ -1780,7 +1804,7 @@ fn preflight_owned<E: PoolFailure>(
     let envelope = validation_envelope_owned(
         ValidationCounts::from(&scanned),
         metadata,
-        policy,
+        validation,
         observer,
         work,
     )?;
@@ -1800,7 +1824,7 @@ fn scan_data<E: PoolFailure>(
     data: &ArrayData,
     depth: u32,
     dict_depth: u32,
-    policy: ConstantPolicy,
+    validation: ConstantValidation,
     facts: &mut ScanFacts,
     observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
@@ -1808,7 +1832,7 @@ fn scan_data<E: PoolFailure>(
     observer.step(work)?;
     limit(
         u64::from(depth),
-        u64::from(policy.max_type_depth),
+        u64::from(validation.shape.depth),
         "constant array depth limit exceeded",
     )?;
     limit(
@@ -1895,20 +1919,20 @@ fn scan_data<E: PoolFailure>(
     let dict_depth = dict_depth + u32::from(matches!(data.data_type(), DataType::Dictionary(_, _)));
     limit(
         u64::from(dict_depth),
-        u64::from(policy.max_dictionary_depth),
+        u64::from(validation.shape.dictionary_depth),
         "constant dictionary depth limit exceeded",
     )?;
     facts.nodes = checked_add(facts.nodes, 1)?;
     facts.depth = facts.depth.max(u64::from(depth));
-    limit(
+    optional_limit(
         facts.nodes,
-        policy.max_array_nodes,
+        validation.volume.map(|policy| policy.max_array_nodes),
         "constant array node limit exceeded",
     )?;
     facts.storage_elements = checked_add(facts.storage_elements, data.len() as u64)?;
-    limit(
+    optional_limit(
         facts.storage_elements,
-        policy.max_logical_elements,
+        validation.volume.map(|policy| policy.max_logical_elements),
         "constant stored element limit exceeded",
     )?;
     for buffer in data
@@ -1930,9 +1954,11 @@ fn scan_data<E: PoolFailure>(
             work,
         )? {
             facts.retained = checked_add(facts.retained, capacity as u64)?;
-            limit(
+            optional_limit(
                 facts.retained,
-                policy.max_retained_buffer_bytes,
+                validation
+                    .volume
+                    .map(|policy| policy.max_retained_buffer_bytes),
                 "constant retained buffer limit exceeded",
             )?;
         }
@@ -1954,7 +1980,7 @@ fn scan_data<E: PoolFailure>(
             child,
             depth + 1,
             dict_depth,
-            policy,
+            validation,
             facts,
             observer,
             work,
@@ -1977,7 +2003,7 @@ fn scan_child<E: PoolFailure>(
     child: &ArrayData,
     depth: u32,
     dict_depth: u32,
-    policy: ConstantPolicy,
+    validation: ConstantValidation,
     facts: &mut ScanFacts,
     observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
@@ -1998,7 +2024,7 @@ fn scan_child<E: PoolFailure>(
     observer.step(work)?;
     Ok(ElementMetric {
         len: child.len() as u64,
-        max_value: scan_data(child, depth, dict_depth, policy, facts, observer, work)?,
+        max_value: scan_data(child, depth, dict_depth, validation, facts, observer, work)?,
     })
 }
 
@@ -3124,11 +3150,12 @@ impl ConstantValue {
         field: Arc<Field>,
         ty: FunctionValueType,
         value: u64,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 0, false, validation, phase, control)?;
         if ty.logical_type() != ValueLogicalType::Physical || *ty.data_type() != DataType::UInt64 {
             return Err(ConstantError::Invalid(
                 "unsigned factory requires exact Physical UInt64 type",
@@ -3138,7 +3165,7 @@ impl ConstantValue {
             field,
             ty,
             arrow_array::UInt64Array::from(vec![value]).to_data(),
-            policy,
+            validation,
             phase,
             control,
         )
@@ -3147,11 +3174,12 @@ impl ConstantValue {
         field: Arc<Field>,
         ty: FunctionValueType,
         value: i128,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 0, false, validation, phase, control)?;
         if ty.logical_type() != ValueLogicalType::LargeInt
             || *ty.data_type() != DataType::FixedSizeBinary(16)
         {
@@ -3163,17 +3191,18 @@ impl ConstantValue {
         let array =
             arrow_array::FixedSizeBinaryArray::try_from_iter([bytes.as_slice()].into_iter())
                 .map_err(ConstantError::arrow_validation)?;
-        Self::from_scalar_array(field, ty, array.to_data(), policy, phase, control)
+        Self::from_scalar_array(field, ty, array.to_data(), validation, phase, control)
     }
     pub fn from_date32(
         field: Arc<Field>,
         ty: FunctionValueType,
         value: i32,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 0, false, validation, phase, control)?;
         if ty.logical_type() != ValueLogicalType::Physical || *ty.data_type() != DataType::Date32 {
             return Err(ConstantError::Invalid(
                 "date factory requires exact Physical Date32 type",
@@ -3183,7 +3212,7 @@ impl ConstantValue {
             field,
             ty,
             arrow_array::Date32Array::from(vec![value]).to_data(),
-            policy,
+            validation,
             phase,
             control,
         )
@@ -3192,11 +3221,12 @@ impl ConstantValue {
         field: Arc<Field>,
         ty: FunctionValueType,
         value: i64,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 0, false, validation, phase, control)?;
         if ty.logical_type() != ValueLogicalType::Physical {
             return Err(ConstantError::Invalid(
                 "Time64 factory requires Physical domain",
@@ -3215,17 +3245,18 @@ impl ConstantValue {
                 ));
             }
         };
-        Self::from_scalar_array(field, ty, array, policy, phase, control)
+        Self::from_scalar_array(field, ty, array, validation, phase, control)
     }
     pub fn from_timestamp(
         field: Arc<Field>,
         ty: FunctionValueType,
         value: i64,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 0, false, validation, phase, control)?;
         if ty.logical_type() != ValueLogicalType::Physical {
             return Err(ConstantError::Invalid(
                 "Timestamp factory requires Physical domain",
@@ -3258,22 +3289,23 @@ impl ConstantValue {
                 ));
             }
         };
-        Self::from_scalar_array(field, ty, array, policy, phase, control)
+        Self::from_scalar_array(field, ty, array, validation, phase, control)
     }
 
     pub fn from_temporal(
         field: Arc<Field>,
         ty: FunctionValueType,
         value: novarocks_type_contract::TemporalValue,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
+        let validation = validation.into();
         use novarocks_type_contract::TemporalCarrier;
         let declaration = ty.value_type().temporal().ok_or(ConstantError::Invalid(
             "temporal constant factory requires a declared temporal type",
         ))?;
-        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        factory_preflight(&field, &ty, 0, false, validation, phase, control)?;
         let fixed = |bytes: &[u8]| {
             Ok::<_, ConstantError>(
                 arrow_array::FixedSizeBinaryArray::try_from_iter([bytes].into_iter())
@@ -3293,17 +3325,18 @@ impl ConstantValue {
             TemporalCarrier::Wide(bytes) => fixed(&bytes)?,
             TemporalCarrier::ZonedTimestamp(bytes) => fixed(&bytes)?,
         };
-        Self::from_scalar_array(field, ty, array, policy, phase, control)
+        Self::from_scalar_array(field, ty, array, validation, phase, control)
     }
     pub fn from_interval_month_day_nano(
         field: Arc<Field>,
         ty: FunctionValueType,
         value: (i32, i32, i64),
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 0, false, validation, phase, control)?;
         if ty.logical_type() != ValueLogicalType::Physical
             || *ty.data_type() != DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano)
         {
@@ -3313,22 +3346,23 @@ impl ConstantValue {
         }
         let value = arrow_buffer::IntervalMonthDayNano::new(value.0, value.1, value.2);
         let array = arrow_array::IntervalMonthDayNanoArray::from(vec![value]);
-        Self::from_scalar_array(field, ty, array.to_data(), policy, phase, control)
+        Self::from_scalar_array(field, ty, array.to_data(), validation, phase, control)
     }
     /// Big-endian coefficient bytes are lossless; precision/scale remain authored type facts.
     pub fn from_decimal256_be(
         field: Arc<Field>,
         ty: FunctionValueType,
         value: [u8; 32],
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
+        let validation = validation.into();
         Self::from_decimal256(
             field,
             ty,
             arrow_buffer::i256::from_be_bytes(value),
-            policy,
+            validation,
             phase,
             control,
         )
@@ -3337,16 +3371,17 @@ impl ConstantValue {
         field: Arc<Field>,
         ty: FunctionValueType,
         value: i64,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 0, false, validation, phase, control)?;
         Self::from_scalar_array(
             field,
             ty,
             arrow_array::Int64Array::from(vec![value]).to_data(),
-            policy,
+            validation,
             phase,
             control,
         )
@@ -3355,16 +3390,17 @@ impl ConstantValue {
         field: Arc<Field>,
         ty: FunctionValueType,
         value: i32,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 0, false, validation, phase, control)?;
         Self::from_scalar_array(
             field,
             ty,
             arrow_array::Int32Array::from(vec![value]).to_data(),
-            policy,
+            validation,
             phase,
             control,
         )
@@ -3373,16 +3409,17 @@ impl ConstantValue {
         field: Arc<Field>,
         ty: FunctionValueType,
         value: bool,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 0, false, validation, phase, control)?;
         Self::from_scalar_array(
             field,
             ty,
             arrow_array::BooleanArray::from(vec![value]).to_data(),
-            policy,
+            validation,
             phase,
             control,
         )
@@ -3391,16 +3428,17 @@ impl ConstantValue {
         field: Arc<Field>,
         ty: FunctionValueType,
         value: u64,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 0, false, validation, phase, control)?;
         Self::from_scalar_array(
             field,
             ty,
             arrow_array::Float64Array::from(vec![f64::from_bits(value)]).to_data(),
-            policy,
+            validation,
             phase,
             control,
         )
@@ -3409,16 +3447,17 @@ impl ConstantValue {
         field: Arc<Field>,
         ty: FunctionValueType,
         value: &str,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
+        let validation = validation.into();
         factory_preflight(
             &field,
             &ty,
             value.len() as u64,
             false,
-            policy,
+            validation,
             phase,
             control,
         )?;
@@ -3432,17 +3471,18 @@ impl ConstantValue {
                 ));
             }
         };
-        Self::from_scalar_array(field, ty, array, policy, phase, control)
+        Self::from_scalar_array(field, ty, array, validation, phase, control)
     }
     pub fn from_uuid(
         field: Arc<Field>,
         ty: FunctionValueType,
         bytes: [u8; 16],
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 16, false, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 16, false, validation, phase, control)?;
         if ty.logical_type() != ValueLogicalType::Uuid
             || *ty.data_type() != DataType::FixedSizeBinary(16)
         {
@@ -3452,23 +3492,24 @@ impl ConstantValue {
         }
         let array = arrow_array::FixedSizeBinaryArray::try_from_iter([bytes].into_iter())
             .map_err(ConstantError::arrow_validation)?;
-        Self::from_scalar_array(field, ty, array.to_data(), policy, phase, control)
+        Self::from_scalar_array(field, ty, array.to_data(), validation, phase, control)
     }
 
     pub fn from_binary(
         field: Arc<Field>,
         ty: FunctionValueType,
         value: &[u8],
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
+        let validation = validation.into();
         factory_preflight(
             &field,
             &ty,
             value.len() as u64,
             false,
-            policy,
+            validation,
             phase,
             control,
         )?;
@@ -3482,17 +3523,18 @@ impl ConstantValue {
                 ));
             }
         };
-        Self::from_scalar_array(field, ty, array, policy, phase, control)
+        Self::from_scalar_array(field, ty, array, validation, phase, control)
     }
     pub fn from_decimal128(
         field: Arc<Field>,
         ty: FunctionValueType,
         value: i128,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 0, false, validation, phase, control)?;
         let DataType::Decimal128(precision, scale) = ty.data_type() else {
             return Err(ConstantError::Invalid(
                 "decimal factory requires exact Decimal128 type",
@@ -3501,17 +3543,18 @@ impl ConstantValue {
         let array = arrow_array::Decimal128Array::from(vec![value])
             .with_precision_and_scale(*precision, *scale)
             .map_err(ConstantError::arrow_validation)?;
-        Self::from_scalar_array(field, ty, array.to_data(), policy, phase, control)
+        Self::from_scalar_array(field, ty, array.to_data(), validation, phase, control)
     }
     pub fn from_decimal256(
         field: Arc<Field>,
         ty: FunctionValueType,
         value: arrow_buffer::i256,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 0, false, validation, phase, control)?;
         let DataType::Decimal256(precision, scale) = ty.data_type() else {
             return Err(ConstantError::Invalid(
                 "decimal factory requires exact Decimal256 type",
@@ -3520,18 +3563,19 @@ impl ConstantValue {
         let array = arrow_array::Decimal256Array::from(vec![value])
             .with_precision_and_scale(*precision, *scale)
             .map_err(ConstantError::arrow_validation)?;
-        Self::from_scalar_array(field, ty, array.to_data(), policy, phase, control)
+        Self::from_scalar_array(field, ty, array.to_data(), validation, phase, control)
     }
     pub fn null(
         field: Arc<Field>,
         ty: FunctionValueType,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
-        factory_preflight(&field, &ty, 0, true, policy, phase, control)?;
+        let validation = validation.into();
+        factory_preflight(&field, &ty, 0, true, validation, phase, control)?;
         let array = arrow_array::new_null_array(field.data_type(), 1);
-        Self::from_scalar_array(field, ty, array.to_data(), policy, phase, control)
+        Self::from_scalar_array(field, ty, array.to_data(), validation, phase, control)
     }
 }
 
@@ -3548,10 +3592,11 @@ pub fn preflight_scalar_construction(
     ty: &FunctionValueType,
     payload: u64,
     null: bool,
-    policy: ConstantPolicy,
+    validation: impl Into<ConstantValidation>,
     phase: CompilePhase,
     control: &dyn PureCompileControl,
 ) -> Result<(), ConstantError> {
+    let validation = validation.into();
     control.checkpoint(phase, 0)?;
     if !null
         && !matches!(
@@ -3592,7 +3637,7 @@ pub fn preflight_scalar_construction(
             "non-NULL scalar construction requires a primitive carrier",
         ));
     }
-    factory_preflight(field, ty, payload, null, policy, phase, control)
+    factory_preflight(field, ty, payload, null, validation, phase, control)
 }
 
 fn factory_preflight(
@@ -3600,17 +3645,32 @@ fn factory_preflight(
     ty: &FunctionValueType,
     payload: u64,
     null: bool,
-    policy: ConstantPolicy,
+    validation: ConstantValidation,
     phase: CompilePhase,
     control: &dyn PureCompileControl,
 ) -> Result<(), ConstantError> {
     let mut work = CompileCheckpoints::try_new(control, phase)?;
-    let metadata = validate_type(field, ty, policy, &mut work)?;
-    limit(1, policy.max_rows, "constant factory row limit exceeded")?;
+    let metadata = validate_type(field, ty, validation, &mut work)?;
+    optional_limit(
+        1,
+        validation.volume.map(|policy| policy.max_rows),
+        "constant factory row limit exceeded",
+    )?;
     if null && !ty.nullable() {
         return Err(ConstantError::Invalid(
             "NULL factory requires nullable exact type",
         ));
+    }
+    if !null {
+        let extent_limit = match field.data_type() {
+            DataType::Utf8 | DataType::Binary => i32::MAX as u64,
+            DataType::Utf8View | DataType::BinaryView => u32::MAX as u64,
+            DataType::LargeUtf8 | DataType::LargeBinary => i64::MAX as u64,
+            _ => payload,
+        };
+        if payload > extent_limit {
+            return Err(ConstantError::offset_extent(payload, extent_limit));
+        }
     }
     let mut pending = vec![(field.data_type(), 1u64, 1u32)];
     let mut nodes = 0;
@@ -3622,19 +3682,19 @@ fn factory_preflight(
         nodes = checked_add(nodes, 1)?;
         elements = checked_add(elements, len)?;
         max_depth = max_depth.max(u64::from(depth));
-        limit(
+        optional_limit(
             nodes,
-            policy.max_array_nodes,
+            validation.volume.map(|policy| policy.max_array_nodes),
             "constant factory array node limit exceeded",
         )?;
-        limit(
+        optional_limit(
             elements,
-            policy.max_logical_elements,
+            validation.volume.map(|policy| policy.max_logical_elements),
             "constant factory element limit exceeded",
         )?;
         limit(
             u64::from(depth),
-            u64::from(policy.max_type_depth),
+            u64::from(validation.shape.depth),
             "constant factory depth limit exceeded",
         )?;
         let layout = arrow_data::layout(data_type);
@@ -3656,9 +3716,11 @@ fn factory_preflight(
             bytes = checked_add(bytes, checked_add(checked_add(len, 7)? / 8, 63)? / 64 * 64)?;
         }
         bytes = checked_add(bytes, std::mem::size_of::<ArrayData>() as u64)?;
-        limit(
+        optional_limit(
             bytes,
-            policy.max_retained_buffer_bytes,
+            validation
+                .volume
+                .map(|policy| policy.max_retained_buffer_bytes),
             "constant factory backing limit exceeded",
         )?;
         if !null {
@@ -3728,14 +3790,18 @@ fn factory_preflight(
         checked_add(checked_add(bytes, metadata)?, checked_mul(nodes, nodes)?)?,
         max_depth,
     )?;
-    limit(
+    optional_limit(
         opaque_work,
-        policy.max_library_validation_work,
+        validation
+            .volume
+            .map(|policy| policy.max_library_validation_work),
         "constant factory opaque work limit exceeded",
     )?;
-    limit(
+    optional_limit(
         checked_add(bytes, metadata)?,
-        policy.max_library_validation_bytes,
+        validation
+            .volume
+            .map(|policy| policy.max_library_validation_bytes),
         "constant factory opaque byte limit exceeded",
     )?;
     work.finish()?;

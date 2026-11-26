@@ -155,7 +155,56 @@ impl FailureProjection for ConstantBackingFailure {
         })
     }
 }
+#[derive(Debug)]
+struct ConstantOffsetExtentFailure {
+    required: u64,
+    extent_limit: u64,
+}
+
+impl fmt::Display for ConstantOffsetExtentFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "constant extent {} exceeds the carrier limit {}",
+            self.required, self.extent_limit
+        )
+    }
+}
+
+impl Error for ConstantOffsetExtentFailure {}
+
+impl FailureProjection for ConstantOffsetExtentFailure {
+    fn failure_fact(&self) -> FailureFact {
+        use novarocks_failure_contract::{
+            RepresentationBoundary, RepresentationFacts, RepresentationLayout,
+        };
+        fact(FailureClass::Representation, 13).with_representation(RepresentationFacts {
+            boundary: RepresentationBoundary::SingleOutput,
+            layout: RepresentationLayout {
+                domain: domain::CONSTANT,
+                code: NonZeroU16::new(2).unwrap(),
+            },
+            required: Some(self.required),
+            extent_limit: Some(self.extent_limit),
+            representable_prefix: None,
+        })
+    }
+}
+
 impl ConstantError {
+    /// A value or its constituent extent cannot be represented by its original carrier.
+    pub fn offset_extent(required: u64, extent_limit: u64) -> Self {
+        Self::from_domain(ConstantOffsetExtentFailure {
+            required,
+            extent_limit,
+        })
+    }
+
+    /// True for a concrete fallible reserve failure at constant construction.
+    pub fn is_local_allocation_failure(&self) -> bool {
+        matches!(self, Self::Source(source) if source.downcast_ref::<ConstantAllocationFailure>().is_some())
+    }
+
     pub(crate) fn allocation(source: std::collections::TryReserveError) -> Self {
         Self::from_domain(ConstantAllocationFailure(source))
     }

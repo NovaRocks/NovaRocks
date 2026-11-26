@@ -127,7 +127,7 @@ pub fn preflight_recursive_pool_resources_input_derived_observed<H>(
         value_type,
         node_lengths,
         input,
-        None,
+        ConstantValidation::INPUT_DERIVED,
         &mut PoolObserver::parent(&mut |facts| {
             admit(facts).map_err(ConstantCreationFailure::Creator)
         }),
@@ -148,7 +148,7 @@ fn preflight_recursive_pool_resources_core<E: PoolFailure>(
         value_type,
         node_lengths,
         input,
-        Some(policy),
+        policy.into(),
         observer,
         work,
     )
@@ -159,11 +159,13 @@ fn preflight_recursive_pool_resources_profile_core<E: PoolFailure>(
     value_type: &FunctionValueType,
     node_lengths: impl IntoIterator<Item = u64>,
     input: RecursiveConstantResourceInput,
-    policy: Option<ConstantPolicy>,
+    validation: ConstantValidation,
     observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(ConstantResourceFacts, ConstantPolicy), E> {
-    let type_facts = validate_type_profile_owned(field, value_type, policy, observer, work)?;
+    let type_facts =
+        validate_type_profile_owned(field, value_type, validation.shape, observer, work)?;
+    let policy = validation.volume;
     let metadata_bytes = type_facts.metadata;
     let mut lengths = node_lengths.into_iter();
     let mut scanned = ScanFacts::default();
@@ -171,7 +173,7 @@ fn preflight_recursive_pool_resources_profile_core<E: PoolFailure>(
         field.data_type(),
         1,
         &mut lengths,
-        policy,
+        validation,
         &mut scanned,
         observer,
         work,
@@ -206,14 +208,14 @@ fn preflight_recursive_pool_resources_profile_core<E: PoolFailure>(
     scanned.view_validation_bytes = input.view_validation_bytes_upper_bound;
     scanned.utf8_fallback_validation_bytes = input.utf8_fallback_validation_bytes_upper_bound;
     observer.step(work)?;
-    let envelope = validation_envelope_profile_owned(
+    let envelope = validation_envelope_owned(
         ValidationCounts::from(&scanned),
         metadata_bytes,
-        policy,
+        validation,
         observer,
         work,
     )?;
-    let sealed = policy.unwrap_or(ConstantPolicy {
+    let sealed = ConstantPolicy {
         max_rows: root.len,
         max_array_nodes: scanned.nodes,
         max_logical_elements: logical,
@@ -225,7 +227,7 @@ fn preflight_recursive_pool_resources_profile_core<E: PoolFailure>(
         max_metadata_bytes: metadata_bytes,
         max_library_validation_work: envelope.work,
         max_library_validation_bytes: envelope.bytes,
-    });
+    };
     Ok((
         ConstantResourceFacts {
             rows: root.len,
@@ -246,14 +248,14 @@ fn scan_nodes<E: PoolFailure>(
     ty: &DataType,
     depth: u32,
     lengths: &mut impl Iterator<Item = u64>,
-    policy: Option<ConstantPolicy>,
+    validation: ConstantValidation,
     scanned: &mut ScanFacts,
     observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ElementMetric, E> {
-    optional_limit(
+    limit(
         u64::from(depth),
-        policy.map(|p| u64::from(p.max_type_depth)),
+        u64::from(validation.shape.depth),
         "constant array depth limit exceeded",
     )?;
     limit(
@@ -269,21 +271,21 @@ fn scan_nodes<E: PoolFailure>(
     if depth == 1 {
         optional_limit(
             len,
-            policy.map(|p| p.max_rows),
+            validation.volume.map(|p| p.max_rows),
             "constant row limit exceeded",
         )?;
     }
     scanned.nodes = checked_add(scanned.nodes, 1)?;
     optional_limit(
         scanned.nodes,
-        policy.map(|p| p.max_array_nodes),
+        validation.volume.map(|p| p.max_array_nodes),
         "constant array node limit exceeded",
     )?;
     scanned.depth = scanned.depth.max(u64::from(depth));
     scanned.storage_elements = checked_add(scanned.storage_elements, len)?;
     optional_limit(
         scanned.storage_elements,
-        policy.map(|p| p.max_logical_elements),
+        validation.volume.map(|p| p.max_logical_elements),
         "constant stored element limit exceeded",
     )?;
     observer.step(work)?;
@@ -295,7 +297,7 @@ fn scan_nodes<E: PoolFailure>(
                     field.data_type(),
                     depth + 1,
                     lengths,
-                    policy,
+                    validation,
                     scanned,
                     observer,
                     work,
@@ -310,7 +312,7 @@ fn scan_nodes<E: PoolFailure>(
                         field.data_type(),
                         depth + 1,
                         lengths,
-                        policy,
+                        validation,
                         scanned,
                         observer,
                         work,
