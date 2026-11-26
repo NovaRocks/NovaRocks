@@ -119,8 +119,12 @@ fn aggregate(
     };
     // Like the Analyzer, retain this actual call's lexical DISTINCT/ORDER
     // source before moving those same channels into AggregateArgumentSource.
-    let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError)
-        .with_aggregate_state_source(state_source);
+    let binding = SqlFunctionBinding::from_plan(
+        crate::planner::BINDING_AUTHORITY,
+        resolved,
+        DecimalOverflowPolicy::ReportError,
+    )
+    .with_aggregate_state_source(state_source);
     PhysicalPlanNode {
         kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
             mode: AggMode::Single,

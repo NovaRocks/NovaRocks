@@ -93,7 +93,7 @@ fn binding(
     let mut resolved = original.resolved().clone();
     resolved.logical_argument_count = logical_count;
     resolved.selected.result_type = FunctionResultType::Scalar(result);
-    SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError)
+    SqlFunctionBinding::from_test(resolved, DecimalOverflowPolicy::ReportError)
 }
 fn value(
     argument: &FunctionArgument,
@@ -401,7 +401,7 @@ fn logical_capture_result_loan_and_order_channels_preserve_original_request_spli
         &Control::default(),
     )
     .unwrap();
-    let table = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::OutputNull);
+    let table = SqlFunctionBinding::from_test(resolved, DecimalOverflowPolicy::OutputNull);
     let captured =
         capture_logical_call_arguments(&table, 1, [&list], policy(), &Control::default()).unwrap();
     assert!(std::ptr::eq(
@@ -483,7 +483,7 @@ fn logical_capture_count_admission_precedes_iterator_and_wide_lambda_observes_re
         MAX_CALL_EFFECT_ARGUMENTS + 1
     ]
     .into();
-    let over = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::OutputNull);
+    let over = SqlFunctionBinding::from_test(resolved, DecimalOverflowPolicy::OutputNull);
     let traversed = std::cell::Cell::new(0usize);
     let control = Control::default();
     assert!(matches!(
@@ -679,7 +679,7 @@ fn authored_move_uses_the_original_bounded_collection_and_control_tails() {
         MAX_CALL_EFFECT_ARGUMENTS + 1
     ]
     .into();
-    let over = SqlFunctionBinding::new(over, DecimalOverflowPolicy::OutputNull);
+    let over = SqlFunctionBinding::from_test(over, DecimalOverflowPolicy::OutputNull);
     let control = Control::default();
     assert!(matches!(
         move_authored_call_arguments_observed(&over, 1, make(1), policy(), &control),

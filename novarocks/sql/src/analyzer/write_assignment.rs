@@ -34,12 +34,11 @@ impl super::AnalyzerContext<'_> {
         site: &SqlWriteAssignmentSite,
         span: Span,
     ) -> Result<TypedExpr, AnalyzeError> {
-        bind_write_assignment_value(
+        bind_assignment(
             source,
             site,
             span,
-            self.function_catalog,
-            &self.sql_semantics,
+            &self.binding_finalizer(),
             self.constant_policy,
             self.control,
         )
@@ -52,6 +51,24 @@ pub(crate) fn bind_write_assignment_value(
     span: Span,
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
     settings: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &SqlCompileControl,
+) -> Result<TypedExpr, AnalyzeError> {
+    let finalizer = super::BindingFinalizer::new(
+        catalog,
+        &super::DefinitionEffects::default(),
+        settings.statement_time(),
+        settings.sql_mode().decimal_overflow_policy(),
+        control,
+    );
+    bind_assignment(source, site, span, &finalizer, constant_policy, control)
+}
+
+fn bind_assignment(
+    source: TypedExpr,
+    site: &SqlWriteAssignmentSite,
+    span: Span,
+    finalizer: &super::BindingFinalizer<'_>,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &SqlCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
@@ -130,25 +147,17 @@ pub(crate) fn bind_write_assignment_value(
     {
         // The strict NULL lift preserves the original source evaluation. Its
         // typed result does not require a guarded interleave of MAP values.
-        super::value_conversion::convert_value_domain_with_catalog(
-            catalog,
+        super::value_conversion::convert_value_domain(
+            finalizer,
             source,
             target,
-            settings.sql_mode().decimal_overflow_policy(),
             constant_policy,
-            control,
+            span,
         )?
     } else if temporal_write_assignment_matches(&source.value_type, &target, control)
         .map_err(AnalyzeError::function_binding)?
     {
-        bind_nested_temporal_assignment(
-            source,
-            target,
-            catalog,
-            settings,
-            constant_policy,
-            control,
-        )?
+        bind_nested_temporal_assignment(source, target, finalizer, constant_policy, span)?
     } else {
         let mut work =
             novarocks_type_contract::CompileCheckpoints::try_new(control, CompilePhase::Validate)
@@ -175,11 +184,8 @@ pub(crate) fn bind_write_assignment_value(
             target,
             novarocks_type_contract::TrinoCastMode::StoreAssignment,
             span,
-            catalog,
-            settings,
+            finalizer,
             constant_policy,
-            control,
-            false,
         )?
     };
     if !related(&converted)? {
@@ -194,11 +200,11 @@ pub(crate) fn bind_write_assignment_value(
 fn bind_nested_temporal_assignment(
     source: TypedExpr,
     target: novarocks_type_contract::FunctionValueType,
-    catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    settings: &crate::sql_mode::SqlSemanticSettings,
+    finalizer: &super::BindingFinalizer<'_>,
     constant_policy: novarocks_functions::ConstantPolicy,
-    control: &SqlCompileControl,
+    span: Span,
 ) -> Result<TypedExpr, AnalyzeError> {
+    let control = finalizer.control;
     use crate::analysis::{ExprKind, function_argument};
     use novarocks_functions::FunctionBindingRequest;
     use novarocks_functions::builtin::value_conversion as owner;
@@ -210,7 +216,8 @@ fn bind_nested_temporal_assignment(
         .map_err(|error| AnalyzeError::internal(error.to_string()))?;
     let overload = FunctionOverloadId::try_new(owner::TEMPORAL_WRITE_ASSIGNMENT)
         .map_err(|error| AnalyzeError::internal(error.to_string()))?;
-    let resolved = catalog
+    let resolved = finalizer
+        .catalog
         .finish_scalar_binding(
             &function,
             &overload,
@@ -223,12 +230,15 @@ fn bind_nested_temporal_assignment(
         )
         .map_err(AnalyzeError::function_binding)?;
     let volatility = resolved.semantics.volatility;
-    let binding = crate::binding::SqlFunctionBinding::new_with_temporal_constraint(
+    let binding = finalizer.finish_with(
         resolved,
-        settings.sql_mode().decimal_overflow_policy(),
-        target.clone(),
-        target.nullable(),
-    );
+        "store assignment",
+        span,
+        crate::binding::SqlResultConstraintOrigin::TemporalSelected {
+            own_nullable: target.nullable(),
+        },
+        Some(target.clone()),
+    )?;
     Ok(TypedExpr {
         value_type: target,
         kind: ExprKind::FunctionCall {

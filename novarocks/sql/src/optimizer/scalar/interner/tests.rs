@@ -351,7 +351,10 @@ fn exact_selected_binding_facts_participate_even_with_identical_call_spelling() 
     assert_ne!(
         forced(
             &mut arena,
-            node(crate::binding::SqlFunctionBinding::new(
+            node(crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(())
+                ),
                 different,
                 binding.decimal_overflow_policy()
             )),
@@ -367,7 +370,10 @@ fn exact_selected_binding_facts_participate_even_with_identical_call_spelling() 
     assert_ne!(
         forced(
             &mut arena,
-            node(crate::binding::SqlFunctionBinding::new(
+            node(crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(())
+                ),
                 different,
                 binding.decimal_overflow_policy()
             )),
@@ -384,7 +390,10 @@ fn exact_selected_binding_facts_participate_even_with_identical_call_spelling() 
     assert_ne!(
         forced(
             &mut arena,
-            node(crate::binding::SqlFunctionBinding::new(
+            node(crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(())
+                ),
                 different,
                 binding.decimal_overflow_policy()
             )),
@@ -420,8 +429,13 @@ fn forced_collisions_preserve_scalar_aggregate_and_window_call_policies() {
     for kind in 0..3 {
         let selected = if kind == 0 { &scalar } else { &aggregate };
         let node = |policy| {
-            let binding =
-                crate::binding::SqlFunctionBinding::new(selected.resolved().clone(), policy);
+            let binding = crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(()),
+                ),
+                selected.resolved().clone(),
+                policy,
+            );
             match kind {
                 0 => ScalarNode::FunctionCall {
                     name: "call".into(),
@@ -473,8 +487,13 @@ fn forced_collisions_preserve_scalar_aggregate_and_window_call_policies() {
             let ScalarNode::WindowCall { binding, .. } = &mut primary_only else {
                 unreachable!()
             };
-            *binding =
-                crate::binding::SqlFunctionBinding::new(binding.resolved().clone(), ReportError);
+            *binding = crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(()),
+                ),
+                binding.resolved().clone(),
+                ReportError,
+            );
             let primary =
                 forced(&mut arena, primary_only.clone(), nullable.clone(), &control).unwrap();
             let mut aggregate_only = node(OutputNull);
@@ -485,7 +504,10 @@ fn forced_collisions_preserve_scalar_aggregate_and_window_call_policies() {
                 unreachable!()
             };
             let original = aggregate_binding.as_ref().unwrap();
-            *aggregate_binding = Some(crate::binding::SqlFunctionBinding::new(
+            *aggregate_binding = Some(crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(()),
+                ),
                 original.resolved().clone(),
                 ReportError,
             ));

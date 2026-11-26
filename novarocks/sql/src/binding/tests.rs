@@ -37,7 +37,7 @@ fn changed(
 ) -> SqlFunctionBinding {
     let mut resolved = binding.resolved().clone();
     mutate(&mut resolved);
-    SqlFunctionBinding::new(resolved, binding.decimal_overflow_policy())
+    SqlFunctionBinding::from_test(resolved, binding.decimal_overflow_policy())
 }
 fn control() -> crate::compiler::SqlCompileControl {
     crate::compiler::SqlCompileControl::unbounded()
@@ -79,7 +79,7 @@ fn borrowed_binding_author_preserves_original_scalar_interner_field_order() {
 fn observed_binding_identity_retains_policy_overload_arguments_results_and_aggregate_state() {
     let binding = actual();
     assert!(exact(&binding, &binding.clone()));
-    let other_allocation = SqlFunctionBinding::new(
+    let other_allocation = SqlFunctionBinding::from_test(
         binding.resolved().clone(),
         binding.decimal_overflow_policy(),
     );
@@ -93,7 +93,7 @@ fn observed_binding_identity_retains_policy_overload_arguments_results_and_aggre
             .unwrap()
     );
     let variants = [
-        SqlFunctionBinding::new(
+        SqlFunctionBinding::from_test(
             binding.resolved().clone(),
             DecimalOverflowPolicy::ReportError,
         ),

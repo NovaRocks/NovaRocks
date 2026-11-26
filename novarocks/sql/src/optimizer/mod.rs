@@ -2036,3 +2036,9 @@ mod is_known_rule_name_tests {
         );
     }
 }
+
+/// Proof of a new binding authored after SQL analysis.
+pub(crate) struct BindingAuthority(());
+
+const BINDING_AUTHORITY: crate::binding::PlanBindingAuthority =
+    crate::binding::PlanBindingAuthority::Optimizer(crate::optimizer::BindingAuthority(()));

@@ -22,6 +22,7 @@ mod cte_multicast;
 mod fixtures;
 mod fold_observation;
 mod implementation_availability;
+mod mv_definition_effects;
 mod numeric_negation;
 mod numeric_operators;
 mod prepared_binding;

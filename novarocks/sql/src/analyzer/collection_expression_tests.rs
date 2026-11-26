@@ -36,6 +36,7 @@ impl PlannerTableProvider for NoTables {
 fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
     AnalyzerContext {
         purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
+        effects: Default::default(),
         grouping_scope: Default::default(),
         view_stack: Default::default(),
         control,
@@ -178,10 +179,8 @@ fn full_json_list_conversion_does_not_admit_nonempty_utf8_lists() {
         source,
         json_list_target(),
         novarocks_parser::Span::new(7, 27),
-        ctx.function_catalog,
-        &ctx.sql_semantics,
+        &ctx.binding_finalizer(),
         ctx.constant_policy,
-        &control,
     )
     .unwrap_err();
     assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch);
@@ -316,10 +315,12 @@ fn null_list_conversion_preserves_each_original_control_refusal() {
             source.clone(),
             json_list_target(),
             novarocks_parser::Span::new(7, 18),
-            ctx.function_catalog,
-            &ctx.sql_semantics,
+            &super::BindingFinalizer::ordinary(
+                ctx.function_catalog,
+                ctx.sql_semantics.sql_mode().decimal_overflow_policy(),
+                control,
+            ),
             ctx.constant_policy,
-            control,
         )
     };
     let successful = Control {
@@ -357,6 +358,7 @@ fn null_json_list_conversion_plan_retains_the_explicit_carrier_step() {
         .unwrap();
     let target = json_list_target();
     let conversion = plan_conversion(
+        crate::binding::PlanBindingAuthority::Test,
         ctx.function_catalog,
         &source.value_type,
         &target,
@@ -378,6 +380,7 @@ fn null_json_list_conversion_plan_retains_the_explicit_carrier_step() {
         .unwrap();
     assert!(
         plan_conversion(
+            crate::binding::PlanBindingAuthority::Test,
             ctx.function_catalog,
             &text.value_type,
             &target,

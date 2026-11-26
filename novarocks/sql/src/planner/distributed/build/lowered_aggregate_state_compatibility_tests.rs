@@ -542,8 +542,11 @@ fn mutate_final_binding(
     let original = &spec.aggregates[0].source;
     let mut resolved = original.binding().resolved().clone();
     change(&mut resolved);
-    let mut binding =
-        SqlFunctionBinding::new(resolved, original.binding().decimal_overflow_policy());
+    let mut binding = SqlFunctionBinding::from_plan(
+        crate::planner::BINDING_AUTHORITY,
+        resolved,
+        original.binding().decimal_overflow_policy(),
+    );
     if let Some(source) = original.binding().aggregate_state_source() {
         let control = Control::default();
         let mut work =

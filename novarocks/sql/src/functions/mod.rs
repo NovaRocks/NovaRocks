@@ -791,7 +791,7 @@ pub(crate) fn test_resolved_aggregate(
         }
     }
     .unwrap_or_else(|error| panic!("test aggregate `{name}` must resolve exactly: {error}"));
-    crate::binding::SqlFunctionBinding::new(
+    crate::binding::SqlFunctionBinding::from_test(
         exact,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
     )

@@ -247,13 +247,11 @@ impl<'a> super::AnalyzerContext<'a> {
                                 coerce(expr)
                             };
                             super::resolve_expr::resolved_scalar_call_at(
-                                self.function_catalog,
+                                &self.binding_finalizer(),
                                 "coalesce",
                                 vec![padded(left_ref)?, padded(right_ref)?],
                                 col_obj.span,
-                                self.sql_semantics.sql_mode().decimal_overflow_policy(),
                                 self.constant_policy,
-                                self.control,
                             )?
                         }
                         JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti => {
@@ -1121,10 +1119,7 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok((
             Relation::Unnest(UnnestRelation {
                 args,
-                binding: crate::binding::SqlFunctionBinding::new(
-                    binding,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                ),
+                binding: self.binding_finalizer().finish(binding, "UNNEST", span)?,
                 output_columns,
                 alias: alias_name,
             }),

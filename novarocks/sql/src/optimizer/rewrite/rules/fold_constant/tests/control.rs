@@ -267,8 +267,11 @@ fn real_wide_prepared_call_keeps_entry_quantum_tail_and_all_three_original_cause
         panic!("the actual COALESCE owner returns a scalar");
     };
     let result = result.clone();
-    let binding =
-        crate::binding::SqlFunctionBinding::new(source, DecimalOverflowPolicy::OutputNull);
+    let binding = crate::binding::SqlFunctionBinding::from_plan(
+        crate::optimizer::BINDING_AUTHORITY,
+        source,
+        DecimalOverflowPolicy::OutputNull,
+    );
     let trace = check_attempt_prefixes(
         || {
             let fixture = Fixture::new();

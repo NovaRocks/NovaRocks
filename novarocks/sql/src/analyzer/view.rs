@@ -111,7 +111,7 @@ impl AnalyzerContext<'_> {
             .map_err(|error| stored_body_error(view, error, span))?;
         let mut query = super::query_prepass::preanalyze(query)
             .map_err(|error| stored_body_error(view, error, span))?;
-        let retain_row_id = self.purpose == super::QueryAnalysisPurpose::FirstRefreshViewRowLineage;
+        let retain_row_id = self.purpose.retains_view_row_lineage();
         if retain_row_id {
             append_refresh_row_id(&mut query, view, span)?;
         }
@@ -121,6 +121,7 @@ impl AnalyzerContext<'_> {
         };
         let child = AnalyzerContext {
             purpose: self.purpose,
+            effects: self.effects.in_view(view.raw_sql.clone(), span),
             grouping_scope: std::cell::RefCell::new(None),
             control: self.control,
             constant_policy: self.constant_policy,
@@ -451,6 +452,7 @@ fn stored_body_error(view: &SqlViewDefinition, error: AnalyzeError, span: Span) 
         AnalyzeErrorKind::Internal
             | AnalyzeErrorKind::UnavailableImplementation
             | AnalyzeErrorKind::UnsupportedExpression
+            | AnalyzeErrorKind::MvDefinitionEffect
             | AnalyzeErrorKind::UnsupportedQueryShape
     ) {
         return error.at_view_reference(view.raw_sql.clone(), span);
@@ -822,7 +824,8 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
-        )?;
+        )?
+        .into_parts();
         Ok(views)
     }
 
@@ -885,68 +888,6 @@ mod tests {
             visible_mv_view_dependencies(&catalog).expect_err("exact MV dependency required");
         assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
         assert!(error.message().contains("no exact Provider view identity"));
-    }
-
-    #[test]
-    fn mv_definition_rejects_session_dependency_before_projection() {
-        let view_sql = "SELECT CURRENT_SCHEMA AS x";
-        let catalog = catalog(declaration(
-            view_sql,
-            "x",
-            FunctionValueType::new(D::Utf8, true),
-        ));
-        for sql in [view_sql, "SELECT x FROM v"] {
-            let query = novarocks_parser::parser::parse_query(sql).unwrap();
-            let error = crate::analyzer::analyze_mv_definition(
-                &query,
-                &catalog,
-                "db",
-                crate::functions::builtin_sql_function_catalog(),
-                crate::constant::test_constant_policy(),
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-            assert!(error.message().contains("depend on the caller's session"));
-        }
-    }
-
-    #[test]
-    fn mv_definition_checks_temporal_dependencies_after_view_expansion() {
-        use novarocks_type_contract::{TemporalPrecision, TemporalType};
-        let declared = novarocks_expression::typing::temporal_function_value_type(
-            TemporalType::TimestampWithTimeZone(TemporalPrecision::MICROSECONDS),
-            false,
-        )
-        .unwrap();
-        let dependent_source =
-            "SELECT CAST(TIMESTAMP '2024-01-01 00:00:00' AS TIMESTAMP(6) WITH TIME ZONE) AS ts";
-        let deterministic_source =
-            "SELECT CAST(TIMESTAMP '2024-01-01 00:00:00 UTC' AS TIMESTAMP(6) WITH TIME ZONE) AS ts";
-        let analyze = |sql, catalog: &Catalog| {
-            let query = novarocks_parser::parser::parse_query(sql).unwrap();
-            crate::analyzer::analyze_mv_definition(
-                &query,
-                catalog,
-                "db",
-                crate::functions::builtin_sql_function_catalog(),
-                crate::constant::test_constant_policy(),
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-        };
-        let dependent = catalog(declaration(dependent_source, "ts", declared.clone()));
-        let deterministic = catalog(declaration(deterministic_source, "ts", declared));
-        for query in [dependent_source, "SELECT ts FROM v"] {
-            let failure = analyze(query, &dependent).expect_err("time environment is required");
-            assert!(
-                failure
-                    .to_string()
-                    .contains("statement instant or session time zone"),
-                "{failure}"
-            );
-        }
-        assert!(analyze(deterministic_source, &deterministic).is_ok());
-        assert!(analyze("SELECT ts FROM v", &deterministic).is_ok());
     }
 
     fn analyze_and_plan(

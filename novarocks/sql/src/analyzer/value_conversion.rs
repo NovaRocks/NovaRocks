@@ -22,12 +22,14 @@
 
 use arrow::datatypes::DataType;
 use novarocks_parser::Span;
-use novarocks_type_contract::{
-    FunctionValueType, PureCompileControl, preserves_value_domains_observed,
-};
+#[cfg(test)]
+use novarocks_type_contract::PureCompileControl;
+use novarocks_type_contract::{FunctionValueType, preserves_value_domains_observed};
 
+use super::BindingFinalizer;
 use crate::analysis::{ExprKind, LiteralValue, TypedExpr, function_argument};
 use crate::analyze_error::AnalyzeError;
+use crate::binding::SqlResultConstraintOrigin as Origin;
 
 impl super::AnalyzerContext<'_> {
     pub(super) fn require_boolean_predicate(
@@ -65,11 +67,8 @@ impl super::AnalyzerContext<'_> {
             target,
             mode,
             span,
-            self.function_catalog,
-            &self.sql_semantics,
+            &self.binding_finalizer(),
             self.constant_policy,
-            self.control,
-            self.purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition,
         )
     }
 
@@ -86,10 +85,8 @@ impl super::AnalyzerContext<'_> {
             source,
             target,
             span,
-            self.function_catalog,
-            &self.sql_semantics,
+            &self.binding_finalizer(),
             self.constant_policy,
-            self.control,
         )
     }
 }
@@ -99,12 +96,10 @@ pub(super) fn cast_with_trino_mode(
     target: FunctionValueType,
     mode: novarocks_type_contract::TrinoCastMode,
     span: Span,
-    catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    settings: &crate::sql_mode::SqlSemanticSettings,
+    finalizer: &BindingFinalizer<'_>,
     constant_policy: novarocks_functions::ConstantPolicy,
-    control: &dyn PureCompileControl,
-    forbid_time_dependencies: bool,
 ) -> Result<TypedExpr, AnalyzeError> {
+    let control = finalizer.control;
     use novarocks_functions::{CastPrepareError, PreparedCastRecipe};
 
     super::helpers::validate_value_type(&source.value_type, control)?;
@@ -113,15 +108,12 @@ pub(super) fn cast_with_trino_mode(
         || target.value_type().temporal().is_some()
     {
         return super::expression_typing::authored_temporal_cast(
-            catalog,
-            settings,
+            finalizer,
             constant_policy,
-            control,
             source,
             target,
             mode == novarocks_type_contract::TrinoCastMode::Try,
             span,
-            forbid_time_dependencies,
         );
     }
     let nullable =
@@ -150,7 +142,7 @@ pub(super) fn cast_with_trino_mode(
         kind: ExprKind::Cast {
             expr: novarocks_parser::ast::AstBox::new(source),
             target: target.data_type().clone(),
-            decimal_overflow_policy: settings.sql_mode().decimal_overflow_policy(),
+            decimal_overflow_policy: finalizer.decimal_overflow_policy,
             cast_mode: Some(mode),
         },
         value_type: target,
@@ -163,11 +155,10 @@ pub(super) fn cast_to_value_type(
     source: TypedExpr,
     target: FunctionValueType,
     span: Span,
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    finalizer: &BindingFinalizer<'_>,
     constant_policy: novarocks_functions::ConstantPolicy,
-    control: &dyn PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
+    let control = finalizer.control;
     super::helpers::validate_value_type(&source.value_type, control)?;
     super::helpers::validate_value_type(&target, control)?;
     control
@@ -180,15 +171,12 @@ pub(super) fn cast_to_value_type(
         || target.value_type().temporal().is_some()
     {
         return super::expression_typing::authored_temporal_cast(
-            function_catalog,
-            sql_semantics,
+            finalizer,
             constant_policy,
-            control,
             source,
             target,
             false,
             span,
-            false,
         );
     }
     // The semantic cast walk observes the actual caller's control; its
@@ -221,7 +209,7 @@ pub(super) fn cast_to_value_type(
                 cast_mode: None,
                 target: target.data_type().clone(),
                 expr: novarocks_parser::ast::AstBox::new(source),
-                decimal_overflow_policy: sql_semantics.sql_mode().decimal_overflow_policy(),
+                decimal_overflow_policy: finalizer.decimal_overflow_policy,
             },
             value_type: target,
         });
@@ -231,15 +219,8 @@ pub(super) fn cast_to_value_type(
         .map_err(AnalyzeError::control)?;
     // Resolver internals are a bounded owner operation, not a claim of
     // cooperative traversal or runtime resource authorization.
-    let result = convert_value_domain_with_catalog(
-        function_catalog,
-        source,
-        target,
-        sql_semantics.sql_mode().decimal_overflow_policy(),
-        constant_policy,
-        control,
-    )
-    .map_err(|error| error.at_type_mismatch(span))?;
+    let result = convert_value_domain(finalizer, source, target, constant_policy, span)
+        .map_err(|error| error.at_type_mismatch(span))?;
     control
         .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
         .map_err(AnalyzeError::control)?;
@@ -250,13 +231,13 @@ pub(super) fn cast_to_value_type(
 /// common target. Preserve the original expression and CV; no literal retyping
 /// or scalar CAST(None) policy participates in this conversion.
 pub(super) fn coerce_array_common_argument(
-    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    finalizer: &BindingFinalizer<'_>,
     source: TypedExpr,
     target: &FunctionValueType,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     constant_policy: novarocks_functions::ConstantPolicy,
-    control: &dyn PureCompileControl,
+    span: Span,
 ) -> Result<TypedExpr, AnalyzeError> {
+    let control = finalizer.control;
     control
         .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
         .map_err(AnalyzeError::control)?;
@@ -272,7 +253,8 @@ pub(super) fn coerce_array_common_argument(
     }
     let argument = function_argument(&source, constant_policy, control)
         .map_err(AnalyzeError::function_binding)?;
-    let bound = catalog
+    let bound = finalizer
+        .catalog
         .resolve_array_common_coercion_binding(&argument, target, control)
         .map_err(AnalyzeError::function_binding)?;
     if bound.function_id.as_str()
@@ -290,11 +272,13 @@ pub(super) fn coerce_array_common_argument(
         kind: ExprKind::FunctionCall {
             name: novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME.to_string(),
             volatility: bound.semantics.volatility,
-            binding: crate::binding::SqlFunctionBinding::new_with_array_common_constraint(
+            binding: finalizer.finish_with(
                 bound,
-                decimal_overflow_policy,
-                target.clone(),
-            ),
+                "implicit ARRAY conversion",
+                span,
+                Origin::ArrayCommonCoercion,
+                Some(target.clone()),
+            )?,
             args: (vec![source]).into(),
             distinct: false,
         },
@@ -303,14 +287,14 @@ pub(super) fn coerce_array_common_argument(
 
 /// A narrow existing binder adapter: the caller owns request observation and
 /// the supplied catalog remains the sole selected conversion authority.
-pub(super) fn convert_value_domain_with_catalog(
-    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+pub(super) fn convert_value_domain(
+    finalizer: &BindingFinalizer<'_>,
     source: TypedExpr,
     target: FunctionValueType,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     constant_policy: novarocks_functions::ConstantPolicy,
-    control: &dyn novarocks_type_contract::PureCompileControl,
+    span: Span,
 ) -> Result<TypedExpr, AnalyzeError> {
+    let control = finalizer.control;
     control
         .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
         .map_err(AnalyzeError::control)?;
@@ -330,7 +314,8 @@ pub(super) fn convert_value_domain_with_catalog(
         })?;
     let argument = function_argument(&source, constant_policy, control)
         .map_err(AnalyzeError::function_binding)?;
-    let binding = catalog
+    let binding = finalizer
+        .catalog
         .resolve_value_conversion_binding(&argument, &intermediate, control)
         .map_err(AnalyzeError::function_binding)?;
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
@@ -345,12 +330,15 @@ pub(super) fn convert_value_domain_with_catalog(
         kind: ExprKind::FunctionCall {
             name: novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME.to_string(),
             volatility: binding.semantics.volatility,
-            binding: crate::binding::SqlFunctionBinding::new_with_conversion_constraint(
+            binding: finalizer.finish_with(
                 binding,
-                decimal_overflow_policy,
-                intermediate,
-                target.clone(),
-            ),
+                "CAST",
+                span,
+                Origin::ValueDomainConversion {
+                    final_target: target.clone(),
+                },
+                Some(intermediate),
+            )?,
             args: (vec![source]).into(),
             distinct: false,
         },
@@ -370,7 +358,7 @@ pub(super) fn convert_value_domain_with_catalog(
                 cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(converted),
                 target: target.data_type().clone(),
-                decimal_overflow_policy,
+                decimal_overflow_policy: finalizer.decimal_overflow_policy,
             },
             value_type: target,
         })
@@ -437,6 +425,25 @@ fn typed_null_conversion(
         kind,
         value_type: target,
     })
+}
+
+#[cfg(test)]
+pub(super) fn convert_value_domain_with_catalog(
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    source: TypedExpr,
+    target: FunctionValueType,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn PureCompileControl,
+) -> Result<TypedExpr, AnalyzeError> {
+    let finalizer = BindingFinalizer::ordinary(catalog, decimal_overflow_policy, control);
+    convert_value_domain(
+        &finalizer,
+        source,
+        target,
+        constant_policy,
+        novarocks_parser::SYNTHETIC,
+    )
 }
 
 #[cfg(test)]

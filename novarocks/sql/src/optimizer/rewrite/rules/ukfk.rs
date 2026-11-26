@@ -1140,7 +1140,10 @@ mod tests {
                     args: args.into(),
                     distinct: false,
                     volatility: binding.semantics.volatility,
-                    binding: crate::binding::SqlFunctionBinding::new(
+                    binding: crate::binding::SqlFunctionBinding::from_plan(
+                        crate::binding::PlanBindingAuthority::Optimizer(
+                            crate::optimizer::BindingAuthority(()),
+                        ),
                         binding,
                         DecimalOverflowPolicy::OutputNull,
                     ),
@@ -1509,7 +1512,10 @@ mod tests {
             spec.source = crate::binding::AggregateArgumentSource::uncertified(
                 spec.source.arguments().to_vec(),
                 spec.source.order_by().to_vec(),
-                crate::binding::SqlFunctionBinding::new(
+                crate::binding::SqlFunctionBinding::from_plan(
+                    crate::binding::PlanBindingAuthority::Optimizer(
+                        crate::optimizer::BindingAuthority(()),
+                    ),
                     foreign,
                     spec.source.binding().decimal_overflow_policy(),
                 ),

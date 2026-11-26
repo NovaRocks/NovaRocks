@@ -23,6 +23,7 @@
 //! in the frontend.
 
 mod sql_shape;
+use crate::analyzer::QueryAnalysisPurpose;
 use crate::binding::SqlTableBindingId;
 use crate::column_id::ColumnRefFactory;
 use crate::compiler::RootDistributionRequirement;
@@ -368,7 +369,14 @@ pub fn analyze_mv_first_refresh_connector_write(
         context.constant_policy,
         context.control,
     )
-    .with_first_refresh_view_row_lineage(artifact.view_row_lineage);
+    // The physical query is generated from the admitted definition and may
+    // include internal aggregate state calls. Preserve the original view
+    // versions already captured for this artifact when projecting lineage.
+    .with_analysis_purpose(if artifact.view_row_lineage {
+        QueryAnalysisPurpose::FirstRefreshViewRowLineage
+    } else {
+        QueryAnalysisPurpose::Ordinary
+    });
     let analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
     Ok(SqlMvFirstRefreshAnalyzed {
         analyzed,
@@ -1064,6 +1072,7 @@ fn canonical_incremental_change_stream_request<'a>(
         constant_policy,
         control,
     )
+    .with_analysis_purpose(QueryAnalysisPurpose::MaterializedViewDefinition)
     .with_imv_rewrite(imv_rewrite)
 }
 
@@ -1789,6 +1798,7 @@ fn plain_join_first_refresh_logical_request<'a>(
         constant_policy,
         control,
     )
+    .with_analysis_purpose(QueryAnalysisPurpose::MaterializedViewDefinition)
 }
 
 fn build_join_first_refresh_append_logical_plan(

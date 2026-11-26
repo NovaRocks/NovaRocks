@@ -1456,7 +1456,7 @@ mod tests {
         let query = &novarocks_parser::parser::parse_query(sql).expect("parse query");
         let (resolved, _, _) =
             crate::analyzer::analyze(query, &TestCatalog, "sales").expect("analyze query");
-        SqlResolvedMvRefreshInput::from_analysis(resolved).expect("named MV output declaration")
+        SqlResolvedMvRefreshInput::checked_for_test(resolved).expect("named MV output declaration")
     }
 
     fn facts(sql: &str) -> SqlMvCreatePersistenceFacts {

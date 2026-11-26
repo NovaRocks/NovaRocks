@@ -56,7 +56,7 @@ fn output_type_rollup_fixture_with_shape(
     mv_call.source = crate::binding::AggregateArgumentSource::uncertified(
         mv_call.source.arguments().to_vec(),
         mv_call.source.order_by().to_vec(),
-        crate::binding::SqlFunctionBinding::new(
+        crate::binding::SqlFunctionBinding::from_plan(crate::optimizer::BINDING_AUTHORITY,
             mv_call.source.binding().resolved().clone(),
             policy,
         ),
@@ -123,7 +123,7 @@ fn output_type_rollup_fixture_with_shape(
     call.source = crate::binding::AggregateArgumentSource::uncertified(
         call.source.arguments().to_vec(),
         call.source.order_by().to_vec(),
-        crate::binding::SqlFunctionBinding::new(call.source.binding().resolved().clone(), policy),
+        crate::binding::SqlFunctionBinding::from_test(call.source.binding().resolved().clone(), policy),
     );
     let novarocks_functions::FunctionResultType::Scalar(selected) =
         &call.source.binding().selected.result_type

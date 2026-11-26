@@ -51,6 +51,7 @@ fn scalar_context<'a>(
 ) -> super::AnalyzerContext<'a> {
     super::AnalyzerContext {
         purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
+        effects: Default::default(),
         grouping_scope: RefCell::new(None),
         view_stack: Default::default(),
         control,
@@ -190,6 +191,7 @@ pub(crate) fn prepare(
             )
         }
     };
+    let effects = context.effects.clone();
     drop(context);
     prepare_typed(
         expression,
@@ -199,6 +201,7 @@ pub(crate) fn prepare(
         functions,
         sealed_functions,
         sql_semantics,
+        &effects,
         constant_policy,
         control,
     )
@@ -258,6 +261,7 @@ impl super::AnalyzerContext<'_> {
                 self.function_catalog.snapshot(),
                 sealed_functions,
                 &self.sql_semantics,
+                &self.effects,
                 self.constant_policy,
                 self.control,
             );
@@ -333,6 +337,7 @@ fn prepare_typed(
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    effects: &super::DefinitionEffects,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<PreparedRequiredConstant, SqlCompileError> {
@@ -341,14 +346,19 @@ fn prepare_typed(
     // This does not erase a possible NULL produced by an ordinary CAST.
     let result_type = required_target_value_type(&expression.value_type, target, control)?;
     validate_implicit_target(&expression.value_type, &result_type, target, span, control)?;
+    let finalizer = super::BindingFinalizer::new(
+        functions.as_ref(),
+        effects,
+        sql_semantics.statement_time(),
+        sql_semantics.sql_mode().decimal_overflow_policy(),
+        control,
+    );
     let expression = super::value_conversion::cast_to_value_type(
         expression,
         result_type,
         span,
-        functions.as_ref(),
-        sql_semantics,
+        &finalizer,
         constant_policy,
-        control,
     )?;
     let original_value = match &expression.kind {
         ExprKind::Constant(value) => Some(value.clone()),
