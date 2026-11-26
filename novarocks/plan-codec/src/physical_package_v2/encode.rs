@@ -366,6 +366,19 @@ fn encode_fragment_package_structural_in<'s>(
                 Ok(())
             }
         };
+        ($field:ident, funded) => {
+            &mut |facts: &_| {
+                let bytes = facts.$field;
+                if bytes > requested.get() {
+                    request(ConstantWriteRequest::OpaqueUpperBound(
+                        bytes - requested.get(),
+                    ))
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                    requested.set(bytes);
+                }
+                Ok(())
+            }
+        };
     }
     let (metadata, _) = encode_package_metadata_observed(
         package,
@@ -381,7 +394,7 @@ fn encode_fragment_package_structural_in<'s>(
         views.source_fields(),
         &writer_types,
         source,
-        l.types,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -408,16 +421,16 @@ fn encode_fragment_package_structural_in<'s>(
     let provider_bindings = encode_joint_provider_bindings_in(
         providers.provider_inputs(),
         source,
-        l.provider_bindings,
-        seen!(allocation_request_bytes_upper_bound),
+        None,
+        seen!(allocation_request_bytes_upper_bound, funded),
         work,
     )?;
     source = grow(source, &requested, &provider_bindings)?;
     let payloads = encode_connector_payloads_in(
         providers.payload_inputs(),
         source,
-        l.payloads,
-        seen!(allocation_request_bytes_upper_bound),
+        None,
+        seen!(allocation_request_bytes_upper_bound, funded),
         work,
     )?;
     source = grow(source, &requested, &payloads)?;
@@ -426,8 +439,8 @@ fn encode_fragment_package_structural_in<'s>(
         &provider_bindings,
         &payloads,
         source,
-        l.reads,
-        seen!(allocation_request_bytes_upper_bound),
+        None,
+        seen!(allocation_request_bytes_upper_bound, funded),
         work,
     )?;
     source = grow(source, &requested, &reads)?;

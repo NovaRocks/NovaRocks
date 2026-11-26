@@ -690,6 +690,31 @@ pub fn decode_fragment_package_with_type_host<
     result
 }
 
+fn fund_component<T, H>(
+    mut creation: Option<&mut ValueSchemaCreation<'_, H>>,
+    run: impl FnOnce(
+        &mut dyn FnMut(usize) -> Result<(), CompileControlError>,
+    ) -> Result<T, PackageDecodeError>,
+) -> Result<T, ProjectionFailure<PackageDecodeError, H>> {
+    let mut prior = 0;
+    let mut original_host = None;
+    let result = run(&mut |bytes| {
+        if let Some(creator) = creation.as_deref_mut()
+            && bytes > prior
+            && let Err(error) = creator.observe_opaque_upper_bound(bytes - prior)
+        {
+            original_host = Some(error);
+            return Err(CompileControlError::ResourceExhausted);
+        }
+        prior = prior.max(bytes);
+        Ok(())
+    });
+    if let Some(error) = original_host {
+        return Err(ProjectionFailure::Host(error));
+    }
+    result.map_err(ProjectionFailure::Codec)
+}
+
 fn decode_fragment_package_factory_core<
     H,
     F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
@@ -770,7 +795,7 @@ fn decode_fragment_package_factory_core<
                 crate::physical_type_v2::decode_package_type_table_with_factory_and_funding_in(
                     &wire_package,
                     invoice,
-                    limits.types,
+                    None,
                     creator,
                     factory,
                     work,
@@ -780,7 +805,7 @@ fn decode_fragment_package_factory_core<
             (Some(factory), None) => decode_package_type_table_with_factory_in(
                 &wire_package,
                 invoice,
-                limits.types,
+                None,
                 creator,
                 factory,
                 work,
@@ -788,7 +813,7 @@ fn decode_fragment_package_factory_core<
             (None, _) => decode_package_type_table_with_creator_in(
                 &wire_package,
                 invoice,
-                limits.types,
+                None,
                 creator,
                 work,
             )?,
@@ -804,7 +829,7 @@ fn decode_fragment_package_factory_core<
         crate::physical_type_v2::decode_package_type_table_with_funding_in(
             &wire_package,
             invoice,
-            limits.types,
+            None,
             &mut |facts: &PackageTypeProjectionFacts| {
                 type_requests = type_requests.max(facts.allocation_request_bytes_upper_bound);
                 Ok(())
@@ -816,7 +841,7 @@ fn decode_fragment_package_factory_core<
         decode_package_type_table_observed(
             &wire_package,
             invoice,
-            limits.types,
+            None,
             &mut |facts: &PackageTypeProjectionFacts| {
                 type_requests = type_requests.max(facts.allocation_request_bytes_upper_bound);
                 Ok(())
@@ -826,21 +851,25 @@ fn decode_fragment_package_factory_core<
     };
     invoice = add(add(invoice, type_requests)?, size_of_val(&types))?;
     // Joint mode is required: writer views exist only on joint bindings.
-    let provider_bindings = decode_joint_provider_bindings_in(
-        &wire_package.provider_bindings,
-        invoice,
-        limits.provider_bindings,
-        &mut |_| Ok(()),
-        work,
-    )?;
+    let provider_bindings = fund_component(creation.as_deref_mut(), |admit| {
+        Ok(decode_joint_provider_bindings_in(
+            &wire_package.provider_bindings,
+            invoice,
+            None,
+            &mut |facts| admit(facts.allocation_request_bytes_upper_bound),
+            work,
+        )?)
+    })?;
     invoice = invoice.max(provider_bindings.retained_invoice_floor_in(work)?);
-    let payloads = decode_connector_payloads_in(
-        &wire_package.provider_payloads,
-        invoice,
-        limits.payloads,
-        &mut |_| Ok(()),
-        work,
-    )?;
+    let payloads = fund_component(creation.as_deref_mut(), |admit| {
+        Ok(decode_connector_payloads_in(
+            &wire_package.provider_payloads,
+            invoice,
+            None,
+            &mut |facts| admit(facts.allocation_request_bytes_upper_bound),
+            work,
+        )?)
+    })?;
     invoice = invoice.max(payloads.retained_invoice_floor_in(work)?);
     let (parameters, _) = prepare_semantic_parameters_decode_observed_in(
         parameters_wire,
@@ -1007,15 +1036,17 @@ fn decode_fragment_package_factory_core<
         "read scan node ID is duplicated",
         work,
     )?;
-    let reads = decode_provider_reads_in(
-        &wire_package.read_references,
-        &provider_bindings,
-        &payloads,
-        invoice,
-        limits.reads,
-        &mut |_| Ok(()),
-        work,
-    )?;
+    let reads = fund_component(creation.as_deref_mut(), |admit| {
+        Ok(decode_provider_reads_in(
+            &wire_package.read_references,
+            &provider_bindings,
+            &payloads,
+            invoice,
+            None,
+            &mut |facts| admit(facts.allocation_request_bytes_upper_bound),
+            work,
+        )?)
+    })?;
     invoice = invoice.max(reads.retained_invoice_floor_in(work)?);
     let relations = decode_relations_in(
         &wire_package.relations,

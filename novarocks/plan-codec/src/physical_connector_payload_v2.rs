@@ -328,19 +328,21 @@ fn prefix(
     payload: usize,
     input: usize,
     requests: &Requests,
-    envelope: (usize, ConnectorPayloadProjectionLimits),
+    envelope: (usize, Option<ConnectorPayloadProjectionLimits>),
     admit: &mut Option<&mut Admit<'_>>,
 ) -> Result<ConnectorPayloadProjectionFacts, Error> {
     let (source, limits) = envelope;
     let result = numerical_facts(n, payload, input, requests, source)?;
     if let Some(callback) = admit.as_mut() {
-        if result.definition_count > limits.max_definitions
-            || result.payload_bytes > limits.max_payload_bytes
-            || result.allocation_requests_upper_bound > limits.max_allocation_requests
-            || result.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
-            || result.coexisting_source_and_request_bytes_upper_bound
-                > limits.max_coexisting_source_and_request_bytes
-            || result.cumulative_work_upper_bound > limits.max_work
+        if let Some(limits) = limits
+            && (result.definition_count > limits.max_definitions
+                || result.payload_bytes > limits.max_payload_bytes
+                || result.allocation_requests_upper_bound > limits.max_allocation_requests
+                || result.allocation_request_bytes_upper_bound
+                    > limits.max_allocation_request_bytes
+                || result.coexisting_source_and_request_bytes_upper_bound
+                    > limits.max_coexisting_source_and_request_bytes
+                || result.cumulative_work_upper_bound > limits.max_work)
         {
             return Err(CompileControlError::ResourceExhausted.into());
         }
@@ -353,29 +355,30 @@ fn facts(
     payload: usize,
     input: usize,
     requests: Requests,
-    envelope: (usize, ConnectorPayloadProjectionLimits),
+    envelope: (usize, Option<ConnectorPayloadProjectionLimits>),
     admit: &mut Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ConnectorPayloadProjectionFacts, Error> {
     let result = prefix(n, payload, input, &requests, envelope, admit)?;
-    let limits = envelope.1;
-    cap(payload, limits.max_payload_bytes, work)?;
-    cap(
-        result.allocation_requests_upper_bound,
-        limits.max_allocation_requests,
-        work,
-    )?;
-    cap(
-        result.allocation_request_bytes_upper_bound,
-        limits.max_allocation_request_bytes,
-        work,
-    )?;
-    cap(
-        result.coexisting_source_and_request_bytes_upper_bound,
-        limits.max_coexisting_source_and_request_bytes,
-        work,
-    )?;
-    cap(result.cumulative_work_upper_bound, limits.max_work, work)?;
+    if let Some(limits) = envelope.1 {
+        cap(payload, limits.max_payload_bytes, work)?;
+        cap(
+            result.allocation_requests_upper_bound,
+            limits.max_allocation_requests,
+            work,
+        )?;
+        cap(
+            result.allocation_request_bytes_upper_bound,
+            limits.max_allocation_request_bytes,
+            work,
+        )?;
+        cap(
+            result.coexisting_source_and_request_bytes_upper_bound,
+            limits.max_coexisting_source_and_request_bytes,
+            work,
+        )?;
+        cap(result.cumulative_work_upper_bound, limits.max_work, work)?;
+    }
     Ok(result)
 }
 fn raw_header<'a>(
@@ -650,9 +653,10 @@ impl<'wire, 'control> DecodedConnectorPayloads<'wire, 'control> {
 pub fn encode_connector_payloads<'source, 'control>(
     inputs: &'source [(u32, &'source ConnectorEncodedPayload)],
     source_retained_bytes: usize,
-    limits: ConnectorPayloadProjectionLimits,
+    limits: impl Into<Option<ConnectorPayloadProjectionLimits>>,
     control: &'control dyn PureCompileControl,
 ) -> Result<EncodedConnectorPayloads<'source, 'control>, Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = encode_core(
         inputs,
@@ -667,7 +671,7 @@ pub fn encode_connector_payloads<'source, 'control>(
 fn encode_core<'source, 'control>(
     inputs: &'source [(u32, &'source ConnectorEncodedPayload)],
     source: usize,
-    limits: ConnectorPayloadProjectionLimits,
+    limits: Option<ConnectorPayloadProjectionLimits>,
     control: &'control dyn PureCompileControl,
     mut admit: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
@@ -693,9 +697,19 @@ fn encode_core<'source, 'control>(
         )?)?;
         prefix(inputs.len(), 0, 0, &requests, (source, limits), &mut admit)?;
     }
-    cap(inputs.len(), limits.max_definitions, work)?;
+    if let Some(limits) = limits {
+        cap(inputs.len(), limits.max_definitions, work)?;
+    }
     let roots = bytes::<(u32, &ConnectorEncodedPayload)>(inputs.len())?;
-    source_floor(source, roots, work)?;
+    source_floor(
+        if limits.is_none() {
+            source.max(roots)
+        } else {
+            source
+        },
+        roots,
+        work,
+    )?;
     if !observed {
         requests.record(numerical_bytes::<usize>(inputs.len(), false)?)?;
         requests.record(numerical_bytes::<wire::ConnectorPayloadDefinition>(
@@ -741,7 +755,15 @@ fn encode_core<'source, 'control>(
     }
     // Inputs can alias the same payload. The root slice is independent, while
     // only the maximum individual original owner is a safe additive floor.
-    source_floor(source, add(roots, individual)?, work)?;
+    source_floor(
+        if limits.is_none() {
+            source.max(add(roots, individual)?)
+        } else {
+            source
+        },
+        add(roots, individual)?,
+        work,
+    )?;
     let facts = facts(
         inputs.len(),
         payload,
@@ -790,9 +812,10 @@ fn encode_core<'source, 'control>(
 pub fn decode_connector_payloads<'wire, 'control>(
     definitions: &'wire [wire::ConnectorPayloadDefinition],
     source_retained_bytes: usize,
-    limits: ConnectorPayloadProjectionLimits,
+    limits: impl Into<Option<ConnectorPayloadProjectionLimits>>,
     control: &'control dyn PureCompileControl,
 ) -> Result<DecodedConnectorPayloads<'wire, 'control>, Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = decode_core(
         definitions,
@@ -807,7 +830,7 @@ pub fn decode_connector_payloads<'wire, 'control>(
 fn decode_core<'wire, 'control>(
     definitions: &'wire [wire::ConnectorPayloadDefinition],
     source: usize,
-    limits: ConnectorPayloadProjectionLimits,
+    limits: Option<ConnectorPayloadProjectionLimits>,
     control: &'control dyn PureCompileControl,
     mut admit: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
@@ -840,7 +863,9 @@ fn decode_core<'wire, 'control>(
             &mut admit,
         )?;
     }
-    cap(definitions.len(), limits.max_definitions, work)?;
+    if let Some(limits) = limits {
+        cap(definitions.len(), limits.max_definitions, work)?;
+    }
     let roots = bytes::<wire::ConnectorPayloadDefinition>(definitions.len())?;
     source_floor(source, roots, work)?;
     let mut known = roots;
@@ -989,19 +1014,21 @@ fn decode_core<'wire, 'control>(
 pub fn encode_connector_payloads_in<'source, 'control>(
     inputs: &'source [(u32, &'source ConnectorEncodedPayload)],
     source: usize,
-    limits: ConnectorPayloadProjectionLimits,
+    limits: impl Into<Option<ConnectorPayloadProjectionLimits>>,
     admit: &mut impl FnMut(&ConnectorPayloadProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<EncodedConnectorPayloads<'source, 'control>, Error> {
+    let limits = limits.into();
     encode_core(inputs, source, limits, work.control(), Some(admit), work)
 }
 pub fn decode_connector_payloads_in<'wire, 'control>(
     definitions: &'wire [wire::ConnectorPayloadDefinition],
     source: usize,
-    limits: ConnectorPayloadProjectionLimits,
+    limits: impl Into<Option<ConnectorPayloadProjectionLimits>>,
     admit: &mut impl FnMut(&ConnectorPayloadProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<DecodedConnectorPayloads<'wire, 'control>, Error> {
+    let limits = limits.into();
     decode_core(
         definitions,
         source,

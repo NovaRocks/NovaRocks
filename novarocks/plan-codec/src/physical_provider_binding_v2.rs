@@ -273,14 +273,15 @@ fn numerical_facts(
 // by both legacy read sources and the joint namespace.
 fn admit_known(
     facts: &ProviderBindingProjectionFacts,
-    limits: ProviderBindingProjectionLimits,
+    limits: Option<ProviderBindingProjectionLimits>,
 ) -> Result<(), Error> {
-    if facts.definition_count > limits.max_definitions
-        || facts.allocation_requests_upper_bound > limits.max_allocation_requests
-        || facts.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
-        || facts.coexisting_source_and_request_bytes_upper_bound
-            > limits.max_coexisting_source_and_request_bytes
-        || facts.cumulative_work_upper_bound > limits.max_work
+    if let Some(limits) = limits
+        && (facts.definition_count > limits.max_definitions
+            || facts.allocation_requests_upper_bound > limits.max_allocation_requests
+            || facts.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
+            || facts.coexisting_source_and_request_bytes_upper_bound
+                > limits.max_coexisting_source_and_request_bytes
+            || facts.cumulative_work_upper_bound > limits.max_work)
     {
         return Err(CompileControlError::ResourceExhausted.into());
     }
@@ -290,7 +291,7 @@ fn prefix(
     n: usize,
     input: usize,
     requests: &Requests,
-    envelope: (usize, ProviderBindingProjectionLimits),
+    envelope: (usize, Option<ProviderBindingProjectionLimits>),
     admit: &mut Option<&mut Admit<'_>>,
 ) -> Result<(), Error> {
     let result = numerical_facts(n, input, requests, envelope.0)?;
@@ -305,7 +306,7 @@ fn facts(
     input_bytes: usize,
     requests: Requests,
     source: usize,
-    limits: ProviderBindingProjectionLimits,
+    limits: Option<ProviderBindingProjectionLimits>,
     admit: &mut Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ProviderBindingProjectionFacts, Error> {
@@ -691,9 +692,10 @@ impl<'wire, 'control> DecodedProviderBindings<'wire, 'control> {
 pub fn encode_provider_bindings<'source, 'control>(
     inputs: &'source [(u32, &'source ConnectorReadBinding)],
     source_retained_bytes: usize,
-    limits: ProviderBindingProjectionLimits,
+    limits: impl Into<Option<ProviderBindingProjectionLimits>>,
     control: &'control dyn PureCompileControl,
 ) -> Result<EncodedProviderBindings<'source, 'control>, Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = encode_core(
         BindingSources::Read(inputs),
@@ -708,9 +710,10 @@ pub fn encode_provider_bindings<'source, 'control>(
 pub fn encode_joint_provider_bindings<'source, 'control>(
     inputs: &'source [(u32, ProviderBindingSource<'source>)],
     source_retained_bytes: usize,
-    limits: ProviderBindingProjectionLimits,
+    limits: impl Into<Option<ProviderBindingProjectionLimits>>,
     control: &'control dyn PureCompileControl,
 ) -> Result<EncodedProviderBindings<'source, 'control>, Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = encode_core(
         BindingSources::Joint(inputs),
@@ -725,7 +728,7 @@ pub fn encode_joint_provider_bindings<'source, 'control>(
 fn encode_core<'source, 'control>(
     inputs: BindingSources<'source>,
     source: usize,
-    limits: ProviderBindingProjectionLimits,
+    limits: Option<ProviderBindingProjectionLimits>,
     control: &'control dyn PureCompileControl,
     mut admit: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
@@ -738,7 +741,7 @@ fn encode_core<'source, 'control>(
             "provider binding resource sum overflow",
         )
     };
-    if inputs.len() > limits.max_definitions {
+    if limits.is_some_and(|limits| inputs.len() > limits.max_definitions) {
         return Err(CompileControlError::ResourceExhausted.into());
     }
     let roots = inputs.backing_bytes()?;
@@ -758,8 +761,18 @@ fn encode_core<'source, 'control>(
     if admit.is_some() {
         prefix(inputs.len(), 0, &requests, (source, limits), &mut admit)?;
     }
-    cap(inputs.len(), limits.max_definitions, work)?;
-    floor(source, roots, work)?;
+    if let Some(limits) = limits {
+        cap(inputs.len(), limits.max_definitions, work)?;
+    }
+    floor(
+        if limits.is_none() {
+            source.max(roots)
+        } else {
+            source
+        },
+        roots,
+        work,
+    )?;
     let mut input_bytes = 0;
     let mut individual = 0;
     for at in 0..inputs.len() {
@@ -791,7 +804,15 @@ fn encode_core<'source, 'control>(
         )?;
         work.step()?;
     }
-    floor(source, add(roots, individual)?, work)?;
+    floor(
+        if limits.is_none() {
+            source.max(add(roots, individual)?)
+        } else {
+            source
+        },
+        add(roots, individual)?,
+        work,
+    )?;
     let facts = facts(
         inputs.len(),
         input_bytes,
@@ -828,9 +849,10 @@ fn encode_core<'source, 'control>(
 pub fn decode_provider_bindings<'wire, 'control>(
     definitions: &'wire [wire::ProviderBindingDefinition],
     source_retained_bytes: usize,
-    limits: ProviderBindingProjectionLimits,
+    limits: impl Into<Option<ProviderBindingProjectionLimits>>,
     control: &'control dyn PureCompileControl,
 ) -> Result<DecodedProviderBindings<'wire, 'control>, Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = decode_core(
         definitions,
@@ -845,9 +867,10 @@ pub fn decode_provider_bindings<'wire, 'control>(
 pub fn decode_joint_provider_bindings<'wire, 'control>(
     definitions: &'wire [wire::ProviderBindingDefinition],
     source_retained_bytes: usize,
-    limits: ProviderBindingProjectionLimits,
+    limits: impl Into<Option<ProviderBindingProjectionLimits>>,
     control: &'control dyn PureCompileControl,
 ) -> Result<DecodedProviderBindings<'wire, 'control>, Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = decode_core(
         definitions,
@@ -861,7 +884,7 @@ pub fn decode_joint_provider_bindings<'wire, 'control>(
 }
 fn decode_core<'wire, 'control>(
     definitions: &'wire [wire::ProviderBindingDefinition],
-    envelope: (usize, ProviderBindingProjectionLimits),
+    envelope: (usize, Option<ProviderBindingProjectionLimits>),
     control: &'control dyn PureCompileControl,
     joint: bool,
     mut admit: Option<&mut Admit<'_>>,
@@ -876,7 +899,7 @@ fn decode_core<'wire, 'control>(
             "provider binding resource sum overflow",
         )
     };
-    if definitions.len() > limits.max_definitions {
+    if limits.is_some_and(|limits| definitions.len() > limits.max_definitions) {
         return Err(CompileControlError::ResourceExhausted.into());
     }
     let roots = bytes::<wire::ProviderBindingDefinition>(definitions.len())?;
@@ -906,7 +929,9 @@ fn decode_core<'wire, 'control>(
         (source, limits),
         &mut admit,
     )?;
-    cap(definitions.len(), limits.max_definitions, work)?;
+    if let Some(limits) = limits {
+        cap(definitions.len(), limits.max_definitions, work)?;
+    }
     floor(source, roots, work)?;
     let mut input_bytes = 0;
     for definition in definitions {
@@ -1030,10 +1055,11 @@ fn decode_core<'wire, 'control>(
 pub fn encode_provider_bindings_in<'source, 'control>(
     inputs: &'source [(u32, &'source ConnectorReadBinding)],
     source: usize,
-    limits: ProviderBindingProjectionLimits,
+    limits: impl Into<Option<ProviderBindingProjectionLimits>>,
     admit: &mut impl FnMut(&ProviderBindingProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<EncodedProviderBindings<'source, 'control>, Error> {
+    let limits = limits.into();
     encode_core(
         BindingSources::Read(inputs),
         source,
@@ -1046,10 +1072,11 @@ pub fn encode_provider_bindings_in<'source, 'control>(
 pub fn encode_joint_provider_bindings_in<'source, 'control>(
     inputs: &'source [(u32, ProviderBindingSource<'source>)],
     source: usize,
-    limits: ProviderBindingProjectionLimits,
+    limits: impl Into<Option<ProviderBindingProjectionLimits>>,
     admit: &mut impl FnMut(&ProviderBindingProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<EncodedProviderBindings<'source, 'control>, Error> {
+    let limits = limits.into();
     encode_core(
         BindingSources::Joint(inputs),
         source,
@@ -1062,10 +1089,11 @@ pub fn encode_joint_provider_bindings_in<'source, 'control>(
 pub fn decode_provider_bindings_in<'wire, 'control>(
     definitions: &'wire [wire::ProviderBindingDefinition],
     source: usize,
-    limits: ProviderBindingProjectionLimits,
+    limits: impl Into<Option<ProviderBindingProjectionLimits>>,
     admit: &mut impl FnMut(&ProviderBindingProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<DecodedProviderBindings<'wire, 'control>, Error> {
+    let limits = limits.into();
     decode_core(
         definitions,
         (source, limits),
@@ -1078,10 +1106,11 @@ pub fn decode_provider_bindings_in<'wire, 'control>(
 pub fn decode_joint_provider_bindings_in<'wire, 'control>(
     definitions: &'wire [wire::ProviderBindingDefinition],
     source: usize,
-    limits: ProviderBindingProjectionLimits,
+    limits: impl Into<Option<ProviderBindingProjectionLimits>>,
     admit: &mut impl FnMut(&ProviderBindingProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<DecodedProviderBindings<'wire, 'control>, Error> {
+    let limits = limits.into();
     decode_core(
         definitions,
         (source, limits),

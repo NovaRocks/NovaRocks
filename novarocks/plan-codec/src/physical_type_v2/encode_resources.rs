@@ -147,7 +147,7 @@ impl Model {
         strict_field_roots: usize,
         writer_sources: usize,
         writer_fields: usize,
-        limits: PackageTypeProjectionLimits,
+        limits: impl Into<Option<PackageTypeProjectionLimits>>,
     ) -> Result<Self, E> {
         Self::new_core(
             source,
@@ -168,7 +168,7 @@ impl Model {
         fields: FieldRootSources<'_>,
         writer_sources: usize,
         writer_fields: usize,
-        limits: PackageTypeProjectionLimits,
+        limits: impl Into<Option<PackageTypeProjectionLimits>>,
     ) -> Result<Self, E> {
         match (values, fields) {
             (ValueRootSources::Owned(values), FieldRootSources::Owned(fields)) => Self::new(
@@ -193,8 +193,9 @@ impl Model {
         roots: RootStorage<'_>,
         writer_sources: usize,
         writer_fields: usize,
-        limits: PackageTypeProjectionLimits,
+        limits: impl Into<Option<PackageTypeProjectionLimits>>,
     ) -> Result<Self, E> {
+        let limits = limits.into();
         if !LOCKED_TOOLCHAIN || !LOCKED_FAMILY {
             return Err(E::ResourceSource("type encoder library source model drift"));
         }
@@ -205,12 +206,13 @@ impl Model {
             .payload_floor()?
             .max(array::<super::WriterTypeSource<'_>>(writer_sources)?.size())
             .max(array::<u32>(writer_fields)?.size());
-        if source < floor {
+        if limits.is_some() && source < floor {
             return Err(CompileControlError::ResourceExhausted.into());
         }
+        let source = source.max(floor);
         let field_roots = add(strict_field_roots, writer_fields)?;
         let roots = add(value_roots, field_roots)?;
-        if roots > limits.max_definitions {
+        if limits.is_some_and(|limits| roots > limits.max_definitions) {
             return Err(CompileControlError::ResourceExhausted.into());
         }
         // Strict walks inspect actual carrier/Field events below. Header and
@@ -231,12 +233,15 @@ impl Model {
         // Existing count expansion terminates at E. Every emitted C/F/V has
         // at least one expanded node. FieldIds' monotone cursor tests at most
         // root Field IDs plus automatic Field occurrences, never max(ID).
-        let lookup = btree::lookup_work_typed(add(field_roots, limits.max_expanded_nodes)?)
-            .map_err(tree_error)?;
-        model.work = add(
-            model.work,
-            mul(limits.max_expanded_nodes, add(512, mul(lookup, 8)?)?)?,
-        )?;
+        let expanded = match limits {
+            Some(limits) => limits.max_expanded_nodes,
+            None => {
+                super::TypeProjectionLimits::for_validated_source_root_count(roots)?
+                    .max_expanded_nodes
+            }
+        };
+        let lookup = btree::lookup_work_typed(add(field_roots, expanded)?).map_err(tree_error)?;
+        model.work = add(model.work, mul(expanded, add(512, mul(lookup, 8)?)?)?)?;
         model.work = add(
             model.work,
             add(
@@ -408,7 +413,7 @@ impl Model {
     }
     pub(super) fn facts(
         &self,
-        limits: PackageTypeProjectionLimits,
+        limits: impl Into<Option<PackageTypeProjectionLimits>>,
     ) -> Result<PackageTypeProjectionFacts, CompileControlError> {
         let facts = PackageTypeProjectionFacts {
             definition_count: self.definitions,
@@ -419,14 +424,15 @@ impl Model {
             coexisting_source_and_request_bytes_upper_bound: add(self.source, self.bytes)?,
             cumulative_work_upper_bound: self.work,
         };
-        if facts.definition_count > limits.max_definitions
-            || facts.expanded_node_count > limits.max_expanded_nodes
-            || facts.string_bytes > limits.max_string_bytes
-            || facts.allocation_requests_upper_bound > limits.max_allocation_requests
-            || facts.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
-            || facts.coexisting_source_and_request_bytes_upper_bound
-                > limits.max_coexisting_source_and_request_bytes
-            || facts.cumulative_work_upper_bound > limits.max_work
+        if let Some(limits) = limits.into()
+            && (facts.definition_count > limits.max_definitions
+                || facts.expanded_node_count > limits.max_expanded_nodes
+                || facts.string_bytes > limits.max_string_bytes
+                || facts.allocation_requests_upper_bound > limits.max_allocation_requests
+                || facts.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
+                || facts.coexisting_source_and_request_bytes_upper_bound
+                    > limits.max_coexisting_source_and_request_bytes
+                || facts.cumulative_work_upper_bound > limits.max_work)
         {
             return Err(CompileControlError::ResourceExhausted);
         }
@@ -435,7 +441,7 @@ impl Model {
     #[cfg(test)]
     pub(super) fn gate(
         &self,
-        limits: PackageTypeProjectionLimits,
+        limits: impl Into<Option<PackageTypeProjectionLimits>>,
         admit: &mut (
                  impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError> + ?Sized
              ),
@@ -449,7 +455,7 @@ impl Model {
     }
     pub(super) fn gate_with_host<H>(
         &self,
-        limits: PackageTypeProjectionLimits,
+        limits: impl Into<Option<PackageTypeProjectionLimits>>,
         admit: &mut (
                  impl FnMut(
             &PackageTypeProjectionFacts,
