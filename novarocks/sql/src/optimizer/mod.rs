@@ -829,6 +829,12 @@ fn op_equal(a: &Operator, b: &Operator) -> bool {
     format!("{:?}", a) == format!("{:?}", b)
 }
 
+/// Proof of a new binding authored after SQL analysis.
+pub(crate) struct BindingAuthority(());
+
+const BINDING_AUTHORITY: crate::binding::PlanBindingAuthority =
+    crate::binding::PlanBindingAuthority::Optimizer(crate::optimizer::BindingAuthority(()));
+
 #[cfg(test)]
 mod is_known_rule_name_tests {
     use super::*;
@@ -2036,9 +2042,3 @@ mod is_known_rule_name_tests {
         );
     }
 }
-
-/// Proof of a new binding authored after SQL analysis.
-pub(crate) struct BindingAuthority(());
-
-const BINDING_AUTHORITY: crate::binding::PlanBindingAuthority =
-    crate::binding::PlanBindingAuthority::Optimizer(crate::optimizer::BindingAuthority(()));
