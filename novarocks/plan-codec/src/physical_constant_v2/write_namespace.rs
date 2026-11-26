@@ -316,7 +316,8 @@ pub fn encode_constant_namespace_input_derived_in<H>(
     let mut output = Vec::new();
     work.flush().map_err(Error::from)?;
     if layout.size() != 0 {
-        request(ConstantWriteRequest::Layout(layout)).map_err(ProjectionFailure::Host)?;
+        request(ConstantWriteRequest::Layout(layout))
+            .map_err(ProjectionFailure::<Error, H>::Host)?;
         let reserved = output.try_reserve_exact(count);
         crate::allocation_exit_v2::reserve_exit::<Error>(reserved, work)?;
     }

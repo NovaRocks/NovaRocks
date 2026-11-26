@@ -700,7 +700,7 @@ fn recursive_request_count_includes_body_repair_and_empty_offset_payload_request
 
 #[test]
 fn input_derived_recursive_reader_rejects_wrong_field_nodes_before_scratch_request() {
-    use crate::ipc_flat_stream_v2::progress::Admission;
+    use crate::ipc_flat_stream_v2::progress::{Admission, IpcReaderProgressFacts};
 
     let field = Field::new(
         "root",
@@ -749,7 +749,7 @@ fn input_derived_recursive_reader_rejects_wrong_field_nodes_before_scratch_reque
         let stripped = ipc::root_as_message(bytes).unwrap();
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-        let mut observe = |_| Ok::<(), TypeCodecError>(());
+        let mut observe = |_: &IpcReaderProgressFacts| Ok::<(), TypeCodecError>(());
         let mut request = |_| -> Result<(), TypeCodecError> {
             panic!("FieldNode shape must be rejected before geometry allocation");
         };

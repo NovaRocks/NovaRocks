@@ -560,7 +560,9 @@ fn input_derived_namespace_writer_preserves_first_stream_layout_refusal() {
         &control,
     )
     .unwrap();
-    let table = encoded_fixture_types(&[(0, &value_type)], &[(0, &field)]);
+    let values = [(0, &value_type)];
+    let fields = [(0, &field)];
+    let table = encoded_fixture_types(&values, &fields);
     let mut pools = novarocks_physical_plan::ConstantPools::empty();
     pools.insert(ConstantPoolId::new(0), original).unwrap();
     let refusal = Arc::new("original allocation refusal");
@@ -653,7 +655,9 @@ fn input_derived_namespace_factory_retains_only_live_array_aliases() {
     let field = Arc::new(Field::new("original", DataType::Int32, true));
     let value_type = FunctionValueType::new(DataType::Int32, true);
     let pool = pool_with(Arc::new(array), field.clone(), value_type.clone());
-    let table = encoded_fixture_types(&[(0, &value_type)], &[(0, &field)]);
+    let values = [(0, &value_type)];
+    let fields = [(0, &field)];
+    let table = encoded_fixture_types(&values, &fields);
     let types = decode_fixture_types(&table, &[(0, field.clone())]);
     let records = [encode(&pool, 0, 0, 0)];
     let factory = Factory(Arc::new(AtomicUsize::new(0)));
