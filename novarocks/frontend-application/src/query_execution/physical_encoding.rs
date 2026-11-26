@@ -157,8 +157,8 @@ pub(crate) struct WriteTargetFacts<'a> {
     pub(crate) session: &'a dyn WriteRecipeSession,
 }
 
-/// Freeze one completed plan into compiled packages under the host's explicit
-/// admission and encode limits and the statement's own constant policy.
+/// Freeze one completed plan into compiled packages using the statement's
+/// capacity binding and the carrier's frozen plan and wire limits.
 // Design: ADR-0153 (docs/adr/ADR-0153-completed-physical-plan-is-the-static-execution-authority.md)
 pub(crate) fn encode_completed_plan(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
@@ -1474,9 +1474,7 @@ mod tests {
         }
     }
 
-    /// Package admission within the test encode limits' source/coexistence
-    /// envelope: the package's retained source floor travels in the sender's
-    /// cumulative source invoice. This is not a production sizing.
+    /// Explicit package extraction bounds for component fixtures.
     fn test_package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
         novarocks_physical_plan::FragmentPackageAdmission {
             plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,

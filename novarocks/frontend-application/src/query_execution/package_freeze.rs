@@ -23,8 +23,8 @@
 //! sealed it; the original extraction law publishes the checked packages; the
 //! v2 sender encodes them.
 //!
-//! The host provides [`CompiledPackageCarrier`] admission, encode limits and
-//! generated receiver resource model once, paired with the compiled backend.
+//! The host provides the [`CompiledPackageCarrier`] plan and wire limits and
+//! the generated receiver resource model alongside the compiled backend.
 
 use std::collections::BTreeMap;
 use std::fmt;

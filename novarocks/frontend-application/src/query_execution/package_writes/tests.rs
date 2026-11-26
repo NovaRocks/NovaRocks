@@ -555,7 +555,7 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
     )
 }
 
-/// Package admission within the test encode limits; not a production sizing.
+/// Explicit package extraction bounds for write fixtures.
 fn admission() -> p::FragmentPackageAdmission {
     p::FragmentPackageAdmission {
         plan_limits: p::PlanLimits::FROZEN,
