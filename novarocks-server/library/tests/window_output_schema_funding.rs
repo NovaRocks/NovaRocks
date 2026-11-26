@@ -46,10 +46,7 @@ use novarocks_native_adapter::backend_task_execution::{
 };
 use novarocks_physical_plan::*;
 use novarocks_plan_codec::{
-    physical_package_v2::{
-        encode_fragment_package,
-        test_support::{decode_limits, encode_limits},
-    },
+    physical_package_v2::{encode_fragment_package, test_support::decode_limits},
     resource_preflight_v2::FragmentDecodeResourceModel,
 };
 use novarocks_type_contract::*;
@@ -353,7 +350,7 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
         &Control,
     )
     .unwrap();
-    encode_fragment_package(&package, &encode_limits(), &Control)
+    encode_fragment_package(&package, &Control)
         .unwrap()
         .encode_to_vec()
 }

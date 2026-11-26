@@ -22,7 +22,7 @@ use crate::physical_package_v2::definition_sources::tests::{
 };
 use crate::physical_package_v2::encode::{PackageEncodeError, encode_fragment_package};
 use crate::physical_package_v2::provider_sources::tests::checked_read;
-use crate::physical_package_v2::test_support::{decode_limits, encode_limits};
+use crate::physical_package_v2::test_support::decode_limits;
 use crate::physical_type_v2::PackageTypeMaterializationScope;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
@@ -51,7 +51,7 @@ fn model() -> FragmentDecodeResourceModel {
     FragmentDecodeResourceModel::try_new(&Control::default()).unwrap()
 }
 fn encode(package: &p::FragmentPackage) -> Result<Vec<u8>, PackageEncodeError> {
-    Ok(encode_fragment_package(package, &encode_limits(), &Control::default())?.encode_to_vec())
+    Ok(encode_fragment_package(package, &Control::default())?.encode_to_vec())
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn json_constants_validate_only_reachable_nominal_cells() {
             root,
             ty,
             array.to_data(),
-            crate::physical_package_v2::FROZEN_CONSTANT_POLICY,
+            crate::physical_package_v2::CONSTANT_POLICY_FIXTURE,
             CompilePhase::Decode,
             &control,
         )
@@ -211,7 +211,7 @@ fn package_wire_validates_reachable_json_in_nullable_row_array_map() {
             root,
             ty.clone(),
             rows.to_data(),
-            crate::physical_package_v2::FROZEN_CONSTANT_POLICY,
+            crate::physical_package_v2::CONSTANT_POLICY_FIXTURE,
             CompilePhase::Validate,
             &control,
         )
@@ -323,7 +323,7 @@ fn many_scalar_type_roots_roundtrip_byte_identically() {
     for (rows, columns) in [(60, 1), (400, 1), (1000, 1), (1, 400)] {
         let name = format!("{rows}x{columns}");
         let package = values_package(rows, columns);
-        let dto = encode_fragment_package(&package, &encode_limits(), &Control::default())
+        let dto = encode_fragment_package(&package, &Control::default())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         let roots = dto.types.as_ref().unwrap().value_types.len();
         assert_eq!(roots, rows * columns + 2 * columns + 1, "{name}");
@@ -425,7 +425,7 @@ fn mutated(
     package: &p::FragmentPackage,
     change: impl FnOnce(&mut wire::FragmentPackage),
 ) -> Vec<u8> {
-    let mut dto = encode_fragment_package(package, &encode_limits(), &Control::default()).unwrap();
+    let mut dto = encode_fragment_package(package, &Control::default()).unwrap();
     change(&mut dto);
     dto.encode_to_vec()
 }
@@ -959,7 +959,7 @@ fn runtime_filter_package_roundtrips_its_plan_binding_slice_byte_identically() {
     }
 
     let package = &packages[&join_fragment];
-    let dto = encode_fragment_package(package, &encode_limits(), &Control::default()).unwrap();
+    let dto = encode_fragment_package(package, &Control::default()).unwrap();
     let wire_bindings = &dto.cuts.as_ref().unwrap().runtime_filter_bindings;
     use wire::runtime_filter_binding_cut::Role;
     assert_eq!(

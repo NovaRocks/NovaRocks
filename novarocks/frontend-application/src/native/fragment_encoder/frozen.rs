@@ -536,7 +536,7 @@ pub(crate) mod tests {
                 )),
                 ty.clone(),
                 &bytes,
-                novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+                novarocks_plan_codec::physical_package_v2::CONSTANT_POLICY_FIXTURE,
                 CompilePhase::Validate,
                 &control,
             )
@@ -717,7 +717,7 @@ pub(crate) mod tests {
                 annotations: Box::default(),
                 layouts: Default::default(),
             },
-            novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+            novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
             &control,
         )
         .expect("checked package");
@@ -725,8 +725,7 @@ pub(crate) mod tests {
             &package,
             &edges,
             &CompiledPackageCarrier::for_test(
-                novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-                novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+                novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
             ),
             &control,
         )
@@ -762,8 +761,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let carrier = CompiledPackageCarrier::for_test(
-            novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-            novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+            novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
         );
         let (_control, root, capacity, _positions) =
             crate::query_execution::internal_result_cpu::admitted_internal_fixture();

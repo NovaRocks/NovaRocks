@@ -42,7 +42,7 @@ use novarocks_plan_codec::physical_package_v2::PackageDecodeLimits;
 #[cfg(test)]
 use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
 use novarocks_plan_codec::physical_package_v2::{
-    PackageEncodeError, PackageEncodeLimits, encode_fragment_package_with_creator,
+    PackageEncodeError, encode_fragment_package_with_creator,
 };
 use novarocks_plan_codec::resource_preflight_v2::{
     DecodeProjectionLimits, FragmentDecodeResourceModel, ResourceModelError,
@@ -62,7 +62,7 @@ use crate::query_execution::provider_read_facts::FrozenReadEncoding;
 #[derive(Clone)]
 pub struct CompiledPackageCarrier {
     plan_limits: PlanLimits,
-    limits: PackageEncodeLimits,
+
     receiver_model: Arc<FragmentDecodeResourceModel>,
     receiver_limits: DecodeProjectionLimits,
 }
@@ -70,13 +70,13 @@ pub struct CompiledPackageCarrier {
 impl CompiledPackageCarrier {
     pub fn new(
         plan_limits: PlanLimits,
-        limits: PackageEncodeLimits,
+
         receiver_model: Arc<FragmentDecodeResourceModel>,
         receiver_limits: DecodeProjectionLimits,
     ) -> Self {
         Self {
             plan_limits,
-            limits,
+
             receiver_model,
             receiver_limits,
         }
@@ -92,14 +92,10 @@ impl CompiledPackageCarrier {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(
-        admission: FragmentPackageAdmission,
-        limits: PackageEncodeLimits,
-    ) -> Self {
+    pub(crate) fn for_test(admission: FragmentPackageAdmission) -> Self {
         let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
         Self::new(
             admission.plan_limits,
-            limits,
             Arc::new(FragmentDecodeResourceModel::try_new(&control).expect("test package model")),
             PackageDecodeLimits::FROZEN.wire,
         )
@@ -108,18 +104,12 @@ impl CompiledPackageCarrier {
     pub const fn plan_limits(&self) -> PlanLimits {
         self.plan_limits
     }
-
-    /// The limits every package is encoded under.
-    pub const fn limits(&self) -> &PackageEncodeLimits {
-        &self.limits
-    }
 }
 
 impl fmt::Debug for CompiledPackageCarrier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompiledPackageCarrier")
             .field("plan_limits", &self.plan_limits)
-            .field("limits", &self.limits)
             .field("receiver_limits", &self.receiver_limits)
             .finish_non_exhaustive()
     }
@@ -222,8 +212,7 @@ pub(crate) fn is_receiver_refusal(error: &novarocks_plan_codec::PhysicalEncodeEr
     }
 }
 
-/// Every fragment's v2 package bytes. The host admission and encode limits
-/// are caller-owned configuration; none is defaulted here. `encodings` are
+/// Every fragment's v2 package bytes under the original plan limits. `encodings` are
 /// what the freeze of each of the plan's provider reads kept; `writes` is the
 /// frozen recipe of exactly each target the plan writes.
 #[cfg(test)]
@@ -232,14 +221,13 @@ pub(crate) fn freeze_fragment_packages(
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
     writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
     admission: &FragmentPackageAdmission,
-    limits: &PackageEncodeLimits,
+
     control: &dyn PureCompileControl,
 ) -> Result<BTreeMap<FragmentId, Vec<u8>>, PackageFreezeError> {
     let packages =
         extract_checked_packages(candidate, encodings, writes, admission.plan_limits, control)?;
     let carrier = CompiledPackageCarrier::new(
         admission.plan_limits,
-        *limits,
         Arc::new(FragmentDecodeResourceModel::try_new(control)?),
         PackageDecodeLimits::FROZEN.wire,
     );
@@ -291,13 +279,10 @@ pub(crate) fn encode_checked_package(
     carrier: &CompiledPackageCarrier,
     control: &dyn PureCompileControl,
 ) -> Result<Vec<u8>, PackageFreezeError> {
-    let wire =
-        encode_fragment_package(package, carrier.limits(), control).map_err(
-            |error| match error {
-                PackageEncodeError::Control(cause) => PackageFreezeError::Control(cause),
-                other => PackageFreezeError::Encode(other),
-            },
-        )?;
+    let wire = encode_fragment_package(package, control).map_err(|error| match error {
+        PackageEncodeError::Control(cause) => PackageFreezeError::Control(cause),
+        other => PackageFreezeError::Encode(other),
+    })?;
     let bytes = wire.encode_to_vec();
     // Qualify these exact final bytes before any Native artifact/Task exists.
     // The original statement owns control and progress; the model is startup
@@ -316,14 +301,16 @@ pub(crate) fn encode_checked_package_with_creator(
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, CompileControlError>,
 ) -> Result<Vec<u8>, PackageFreezeError> {
     use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
-    let wire = encode_fragment_package_with_creator(package, carrier.limits(), creation, control)
-        .map_err(|error| match error {
-        ProjectionFailure::Host(cause)
-        | ProjectionFailure::Codec(PackageEncodeError::Control(cause)) => {
-            PackageFreezeError::Control(cause)
-        }
-        ProjectionFailure::Codec(other) => PackageFreezeError::Encode(other),
-    })?;
+    let wire =
+        encode_fragment_package_with_creator(package, creation, control).map_err(|error| {
+            match error {
+                ProjectionFailure::Host(cause)
+                | ProjectionFailure::Codec(PackageEncodeError::Control(cause)) => {
+                    PackageFreezeError::Control(cause)
+                }
+                ProjectionFailure::Codec(other) => PackageFreezeError::Encode(other),
+            }
+        })?;
     let layout = std::alloc::Layout::array::<u8>(wire.encoded_len()).map_err(|_| {
         PackageFreezeError::Control(CompileControlError::from_domain(
             novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,

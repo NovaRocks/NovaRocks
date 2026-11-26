@@ -25,9 +25,7 @@ use arrow::{
     array::{Array, StringArray},
     datatypes::DataType,
 };
-use novarocks_plan_codec::physical_package_v2::{
-    FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits, PackageEncodeLimits,
-};
+use novarocks_plan_codec::physical_package_v2::{PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits};
 use novarocks_query_application::{
     preparation::{FinalPlanCompletionDriver, ReadAccessSink},
     system_tables::{SystemTableRegistration, SystemTableRegistry, SystemTableScope},
@@ -265,13 +263,12 @@ async fn round_trip(rows: usize, padding_bytes: usize) {
         &completed,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        FROZEN_PACKAGE_ADMISSION.plan_limits,
+        PACKAGE_ADMISSION_FIXTURE.plan_limits,
         &control,
     )
     .unwrap();
     let carrier = crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
-        FROZEN_PACKAGE_ADMISSION,
-        PackageEncodeLimits::FROZEN,
+        PACKAGE_ADMISSION_FIXTURE,
     );
     let mut producers = 0;
     for package in packages.values() {

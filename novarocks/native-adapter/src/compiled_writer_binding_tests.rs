@@ -279,7 +279,7 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
     use novarocks_expression_contract::{ExprKind, RootScope};
     use novarocks_physical_plan::*;
     use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
-    use novarocks_plan_codec::physical_package_v2::test_support::encode_limits;
+
     use novarocks_spi::connector::write_stack::{root_write_result_schema, writer_output_schema};
     use novarocks_type_contract::{CompileCheckpoints, EvaluationDemand};
     use prost::Message;
@@ -653,7 +653,7 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
     )
     .unwrap();
     let producer = packages.remove(&FragmentId::new(1)).unwrap();
-    let bytes = encode_fragment_package(&producer, &encode_limits(), &Unbounded)
+    let bytes = encode_fragment_package(&producer, &Unbounded)
         .unwrap()
         .encode_to_vec();
     (bytes, exchange.get())

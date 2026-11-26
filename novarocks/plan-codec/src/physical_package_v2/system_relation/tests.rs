@@ -19,7 +19,7 @@
 //! no SQL constant-pool, VALUES, batch-count or aggregate wire quota is involved.
 use super::*;
 use crate::physical_package_v2::{
-    FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits, PackageEncodeLimits, decode_fragment_package,
+    PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits, decode_fragment_package,
     encode_fragment_package,
 };
 use crate::resource_preflight_v2::FragmentDecodeResourceModel;
@@ -91,13 +91,13 @@ fn package_data(fields: Arc<[FieldRef]>, data: p::SystemRelationData) -> p::Frag
             annotations: Box::default(),
             layouts: Default::default(),
         },
-        FROZEN_PACKAGE_ADMISSION,
+        PACKAGE_ADMISSION_FIXTURE,
         &Control,
     )
     .unwrap()
 }
 fn roundtrip(package: &p::FragmentPackage) -> p::FragmentPackage {
-    let wire = encode_fragment_package(package, &PackageEncodeLimits::FROZEN, &Control).unwrap();
+    let wire = encode_fragment_package(package, &Control).unwrap();
     decode_fragment_package(
         &wire.encode_to_vec(),
         &FragmentDecodeResourceModel::try_new(&Control).unwrap(),
@@ -168,8 +168,7 @@ fn data_is_not_subject_to_constant_or_total_wire_quotas() {
         (1, 64 * 1024 * 1024 + 1),
     ] {
         let original = string_snapshot(rows, width);
-        let encoded =
-            encode_fragment_package(&original, &PackageEncodeLimits::FROZEN, &Control).unwrap();
+        let encoded = encode_fragment_package(&original, &Control).unwrap();
         if width > 64 * 1024 * 1024 {
             assert!(encoded.encoded_len() > 64 * 1024 * 1024);
         }
@@ -202,7 +201,7 @@ fn zero_column_batches_preserve_rows() {
 #[test]
 fn receiver_rejects_wrong_schema_incomplete_frames_and_geometry() {
     let original = string_snapshot(2, 8);
-    let valid = encode_fragment_package(&original, &PackageEncodeLimits::FROZEN, &Control).unwrap();
+    let valid = encode_fragment_package(&original, &Control).unwrap();
     let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
     let fields: Arc<[FieldRef]> = Arc::from([
         Arc::new(Field::new("a", DataType::Int64, false)),
@@ -217,8 +216,7 @@ fn receiver_rejects_wrong_schema_incomplete_frames_and_geometry() {
     )
     .unwrap();
     let typed = package(fields, Arc::from([batch]));
-    let mut mismatched =
-        encode_fragment_package(&typed, &PackageEncodeLimits::FROZEN, &Control).unwrap();
+    let mut mismatched = encode_fragment_package(&typed, &Control).unwrap();
     mismatched.system_relation_units[0]
         .output_field_ids
         .swap(0, 1);
@@ -311,8 +309,7 @@ fn receiver_checks_decimal_precision_and_required_nulls() {
     )
     .unwrap();
     let original = package(fields, Arc::from([valid]));
-    let mut wire =
-        encode_fragment_package(&original, &PackageEncodeLimits::FROZEN, &Control).unwrap();
+    let mut wire = encode_fragment_package(&original, &Control).unwrap();
     let invalid = RecordBatch::try_new(
         schema,
         vec![Arc::new(
@@ -339,8 +336,7 @@ fn receiver_checks_decimal_precision_and_required_nulls() {
     )
     .unwrap();
     let original = package(fields, Arc::from([valid]));
-    let mut wire =
-        encode_fragment_package(&original, &PackageEncodeLimits::FROZEN, &Control).unwrap();
+    let mut wire = encode_fragment_package(&original, &Control).unwrap();
     let nullable = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)])),
         vec![Arc::new(Int64Array::from(vec![None::<i64>]))],
@@ -362,7 +358,7 @@ fn receiver_checks_decimal_precision_and_required_nulls() {
 #[test]
 fn raw_data_is_classified_but_full_heap_is_invoiced() {
     let package = string_snapshot(2, 1024);
-    let wire = encode_fragment_package(&package, &PackageEncodeLimits::FROZEN, &Control).unwrap();
+    let wire = encode_fragment_package(&package, &Control).unwrap();
     let raw = wire.encode_to_vec();
     let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
     let projection = model
@@ -394,13 +390,8 @@ fn raw_data_is_classified_but_full_heap_is_invoiced() {
 fn execution_refuses_deferred_and_non_singleton_snapshots() {
     let fields: Arc<[FieldRef]> = Arc::from([Arc::new(Field::new("name", DataType::Utf8, false))]);
     let deferred = package_data(fields, p::SystemRelationData::Deferred);
-    assert!(encode_fragment_package(&deferred, &PackageEncodeLimits::FROZEN, &Control).is_err());
-    let mut wire = encode_fragment_package(
-        &string_snapshot(1, 1),
-        &PackageEncodeLimits::FROZEN,
-        &Control,
-    )
-    .unwrap();
+    assert!(encode_fragment_package(&deferred, &Control).is_err());
+    let mut wire = encode_fragment_package(&string_snapshot(1, 1), &Control).unwrap();
     wire.fragment.as_mut().unwrap().nodes[0]
         .output_properties
         .as_mut()

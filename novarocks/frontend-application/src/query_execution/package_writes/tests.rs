@@ -610,8 +610,7 @@ pub(crate) fn frozen_write_fragments() -> (
                     &package,
                     plan.edges(),
                     &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
-                        novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-                        novarocks_plan_codec::physical_package_v2::test_support::encode_limits(),
+                        novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
                     ),
                     &control,
                 )
@@ -647,7 +646,7 @@ fn writer_target(plan: &p::PhysicalPlan) -> (p::NodeId, &p::WriterTarget) {
 /// carries it byte-identically.
 #[test]
 fn the_sealing_session_authors_the_written_recipe_the_package_carries() {
-    use novarocks_plan_codec::physical_package_v2::test_support::{decode_limits, encode_limits};
+    use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
     use novarocks_plan_codec::physical_package_v2::{
         decode_fragment_package, encode_fragment_package,
     };
@@ -684,8 +683,7 @@ fn the_sealing_session_authors_the_written_recipe_the_package_carries() {
             package,
             plan.edges(),
             &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
-                novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-                encode_limits(),
+                novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
             ),
             &control,
         )
@@ -700,7 +698,7 @@ fn the_sealing_session_authors_the_written_recipe_the_package_carries() {
             assert!(facts.table_writers().is_empty());
         }
 
-        let bytes = encode_fragment_package(package, &encode_limits(), &control)
+        let bytes = encode_fragment_package(package, &control)
             .unwrap_or_else(|error| panic!("fragment {id:?} encodes: {error}"))
             .encode_to_vec();
         // The recipe travels in the writer fragment's package and the finish
@@ -713,7 +711,7 @@ fn the_sealing_session_authors_the_written_recipe_the_package_carries() {
             &expected,
             "fragment {id:?} decodes its recipe"
         );
-        let again = encode_fragment_package(&decoded, &encode_limits(), &control)
+        let again = encode_fragment_package(&decoded, &control)
             .expect("re-encode")
             .encode_to_vec();
         assert_eq!(again, bytes, "fragment {id:?} roundtrips byte-identically");

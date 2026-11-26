@@ -234,7 +234,6 @@ fn finish(
     .unwrap();
     let encoded = novarocks_plan_codec::physical_package_v2::encode_fragment_package(
         &package,
-        &novarocks_plan_codec::physical_package_v2::test_support::encode_limits(),
         &Control,
     )
     .unwrap();

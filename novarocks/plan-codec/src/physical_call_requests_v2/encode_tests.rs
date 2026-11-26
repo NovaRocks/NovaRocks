@@ -92,20 +92,6 @@ fn admission() -> p::ConstantPolicy {
         max_library_validation_bytes: 1 << 28,
     }
 }
-fn data_policy() -> p::ConstantPolicy {
-    p::ConstantPolicy {
-        max_rows: 0,
-        max_array_nodes: u64::MAX,
-        max_logical_elements: 2,
-        max_retained_buffer_bytes: 3,
-        max_type_depth: 0,
-        max_type_nodes: 5,
-        max_dictionary_depth: u32::MAX,
-        max_metadata_bytes: 7,
-        max_library_validation_work: 8,
-        max_library_validation_bytes: 9,
-    }
-}
 fn limits() -> CallRequestProjectionLimits {
     CallRequestProjectionLimits {
         max_definitions: 4096,

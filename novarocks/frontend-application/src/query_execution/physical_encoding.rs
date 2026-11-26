@@ -1237,8 +1237,6 @@ mod tests {
         Vec<novarocks_physical_plan::FragmentId>,
         std::collections::BTreeMap<novarocks_physical_plan::FragmentId, Vec<u8>>,
     ) {
-        use novarocks_plan_codec::physical_package_v2::test_support::encode_limits;
-
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1256,7 +1254,6 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &test_package_admission(),
-            &encode_limits(),
             &control,
         )
         .unwrap_or_else(|error| panic!("{sql}: checked v2 packages: {error}"));
@@ -1455,9 +1452,7 @@ mod tests {
 
     #[test]
     fn a_completed_statement_freezes_v2_packages_that_roundtrip_through_the_receiver() {
-        use novarocks_plan_codec::physical_package_v2::test_support::{
-            decode_limits, encode_limits,
-        };
+        use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
         use novarocks_plan_codec::physical_package_v2::{
             decode_fragment_package, encode_fragment_package,
         };
@@ -1472,7 +1467,7 @@ mod tests {
             let decoded = decode_fragment_package(bytes, &model, &decode_limits(), &control)
                 .unwrap_or_else(|error| panic!("fragment {id:?} receives: {error}"));
             assert_eq!(decoded.fragment().id(), *id);
-            let again = encode_fragment_package(&decoded, &encode_limits(), &control)
+            let again = encode_fragment_package(&decoded, &control)
                 .expect("re-encode")
                 .encode_to_vec();
             assert_eq!(&again, bytes, "fragment {id:?} roundtrips byte-identically");
@@ -1496,10 +1491,7 @@ mod tests {
 
     /// The compiled package carrier under test sizing.
     fn compiled_carrier() -> CompiledPackageCarrier {
-        CompiledPackageCarrier::for_test(
-            test_package_admission(),
-            novarocks_plan_codec::physical_package_v2::test_support::encode_limits(),
-        )
+        CompiledPackageCarrier::for_test(test_package_admission())
     }
 
     /// Complete one table-free statement with the production Frontend
@@ -1902,8 +1894,8 @@ mod tests {
     #[test]
     fn wide_statistics_source_freezes_with_production_limits() {
         use novarocks_plan_codec::physical_package_v2::{
-            FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits,
-            PackageEncodeLimits, decode_fragment_package,
+            CONSTANT_POLICY_FIXTURE, PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits,
+            decode_fragment_package,
         };
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 
@@ -1926,7 +1918,7 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            FROZEN_CONSTANT_POLICY.into(),
+            CONSTANT_POLICY_FIXTURE.into(),
             control.clone(),
             PipelineDopDomain {
                 min: 1,
@@ -1956,8 +1948,7 @@ mod tests {
             completed.candidate(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &FROZEN_PACKAGE_ADMISSION,
-            &PackageEncodeLimits::FROZEN,
+            &PACKAGE_ADMISSION_FIXTURE,
             &control,
         )
         .unwrap_or_else(|error| panic!("wide statistics source package freeze: {error:#?}"));
@@ -1977,8 +1968,7 @@ mod tests {
     fn completed_values_receiver_refusal_freezes_no_native_artifact_and_keeps_its_cause() {
         use novarocks_failure_contract::{FailureClass, FailureProjection};
         use novarocks_plan_codec::physical_package_v2::{
-            FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits, PackageEncodeLimits,
-            encode_fragment_package,
+            PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits, encode_fragment_package,
         };
         use novarocks_plan_codec::resource_preflight_v2::{
             FragmentDecodeResourceModel, ResourceModelError,
@@ -1990,13 +1980,13 @@ mod tests {
             completed.candidate(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            FROZEN_PACKAGE_ADMISSION.plan_limits,
+            PACKAGE_ADMISSION_FIXTURE.plan_limits,
             &control,
         )
         .unwrap();
         let model = Arc::new(FragmentDecodeResourceModel::try_new(&control).unwrap());
         let first = packages.first_key_value().unwrap().1;
-        let bytes = encode_fragment_package(first, &PackageEncodeLimits::FROZEN, &control)
+        let bytes = encode_fragment_package(first, &control)
             .unwrap()
             .encode_to_vec();
         let usage = model
@@ -2009,12 +1999,8 @@ mod tests {
         receiver.max_field_occurrences = usage.field_occurrences.checked_sub(1).unwrap();
         let expected = model.preflight(&bytes, receiver, &control).unwrap_err();
         assert!(matches!(expected, ResourceModelError::Limit(_)));
-        let carrier = CompiledPackageCarrier::new(
-            FROZEN_PACKAGE_ADMISSION.plan_limits,
-            PackageEncodeLimits::FROZEN,
-            model,
-            receiver,
-        );
+        let carrier =
+            CompiledPackageCarrier::new(PACKAGE_ADMISSION_FIXTURE.plan_limits, model, receiver);
         struct TailRefusal {
             decoded: std::sync::atomic::AtomicBool,
         }
@@ -2114,8 +2100,8 @@ mod tests {
     #[test]
     fn original_information_schema_scale_values_freeze_under_the_production_receiver() {
         use novarocks_plan_codec::physical_package_v2::{
-            FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits,
-            PackageEncodeLimits, decode_fragment_package,
+            CONSTANT_POLICY_FIXTURE, PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits,
+            decode_fragment_package,
         };
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
         let rows = (0..32)
@@ -2145,7 +2131,7 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            FROZEN_CONSTANT_POLICY.into(),
+            CONSTANT_POLICY_FIXTURE.into(),
             control.clone(),
             PipelineDopDomain {
                 min: 1,
@@ -2169,14 +2155,13 @@ mod tests {
             completed.candidate(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            FROZEN_PACKAGE_ADMISSION.plan_limits,
+            PACKAGE_ADMISSION_FIXTURE.plan_limits,
             &control,
         )
         .unwrap();
         let model = Arc::new(FragmentDecodeResourceModel::try_new(&control).unwrap());
         let carrier = CompiledPackageCarrier::new(
-            FROZEN_PACKAGE_ADMISSION.plan_limits,
-            PackageEncodeLimits::FROZEN,
+            PACKAGE_ADMISSION_FIXTURE.plan_limits,
             Arc::clone(&model),
             PackageDecodeLimits::FROZEN.wire,
         );
@@ -2209,8 +2194,8 @@ mod tests {
         use crate::query_execution::package_freeze::PackageFreezeError;
         use novarocks_failure_contract::{FailureClass, FailureProjection};
         use novarocks_plan_codec::physical_package_v2::{
-            FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits,
-            PackageEncodeLimits, decode_fragment_package,
+            CONSTANT_POLICY_FIXTURE, PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits,
+            decode_fragment_package,
         };
         use novarocks_plan_codec::resource_preflight_v2::{
             FragmentDecodeResourceModel, ResourceModelError,
@@ -2245,7 +2230,7 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            FROZEN_CONSTANT_POLICY.into(),
+            CONSTANT_POLICY_FIXTURE.into(),
             control.clone(),
             PipelineDopDomain {
                 min: 1,
@@ -2279,14 +2264,13 @@ mod tests {
             completed.candidate(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            FROZEN_PACKAGE_ADMISSION.plan_limits,
+            PACKAGE_ADMISSION_FIXTURE.plan_limits,
             &control,
         )
         .unwrap();
         let model = Arc::new(FragmentDecodeResourceModel::try_new(&control).unwrap());
         let carrier = CompiledPackageCarrier::new(
-            FROZEN_PACKAGE_ADMISSION.plan_limits,
-            PackageEncodeLimits::FROZEN,
+            PACKAGE_ADMISSION_FIXTURE.plan_limits,
             Arc::clone(&model),
             PackageDecodeLimits::FROZEN.wire,
         );
@@ -2330,8 +2314,7 @@ mod tests {
                 receiver.max_field_occurrences =
                     production.usage.field_occurrences.checked_sub(1).unwrap();
                 let limited_carrier = CompiledPackageCarrier::new(
-                    FROZEN_PACKAGE_ADMISSION.plan_limits,
-                    PackageEncodeLimits::FROZEN,
+                    PACKAGE_ADMISSION_FIXTURE.plan_limits,
                     Arc::clone(&model),
                     receiver,
                 );
@@ -2390,8 +2373,8 @@ mod tests {
         use arrow::datatypes::{DataType, Field};
         use novarocks_connector_contract::{ConnectorWriteBinding, ConnectorWriteRecipeDraft};
         use novarocks_plan_codec::physical_package_v2::{
-            FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits,
-            PackageEncodeLimits, decode_fragment_package,
+            CONSTANT_POLICY_FIXTURE, PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits,
+            decode_fragment_package,
         };
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
         use novarocks_query_application::preparation::CompletedPhysicalPlanCandidate;
@@ -2445,7 +2428,7 @@ mod tests {
             &functions,
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             None,
-            FROZEN_CONSTANT_POLICY.into(),
+            CONSTANT_POLICY_FIXTURE.into(),
             control.clone(),
         ))
         .unwrap_or_else(|error| panic!("wide INSERT source analysis: {error:#?}"))
@@ -2583,7 +2566,7 @@ mod tests {
             &candidate,
             &BTreeMap::new(),
             &BTreeMap::from([(ordinal, recipe)]),
-            FROZEN_PACKAGE_ADMISSION.plan_limits,
+            PACKAGE_ADMISSION_FIXTURE.plan_limits,
             &control,
         )
         .unwrap_or_else(|error| panic!("wide INSERT checked package extraction: {error:#?}"));
@@ -2592,10 +2575,7 @@ mod tests {
         for (id, package) in &packages {
             let bytes = crate::query_execution::package_freeze::encode_checked_package(
                 package,
-                &CompiledPackageCarrier::for_test(
-                    FROZEN_PACKAGE_ADMISSION,
-                    PackageEncodeLimits::FROZEN,
-                ),
+                &CompiledPackageCarrier::for_test(PACKAGE_ADMISSION_FIXTURE),
                 &control,
             )
             .unwrap_or_else(|error| panic!("wide INSERT fragment {id:?} encode: {error:#?}"));

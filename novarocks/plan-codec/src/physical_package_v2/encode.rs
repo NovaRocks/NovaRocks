@@ -25,12 +25,10 @@ use super::nodes::{NodeDispatchLimits, NodeEncodeContext, prepare_node_encode_in
 use super::provider_sources::{ProviderSourceError, collect_provider_sources_in};
 use super::type_views::{TypeViewBudget, TypeViewError, collect_package_type_views_in};
 use crate::physical_aggregate_binding_v2::encode_aggregate_bindings_in;
-use crate::physical_binding_v2::{
-    BindingCodecError, BindingProjectionLimits, encode_function_bindings_in,
-};
+use crate::physical_binding_v2::{BindingCodecError, encode_function_bindings_in};
 use crate::physical_call_requests_v2::{CallRequestCodecError, prepare_call_requests_encode_in};
 use crate::physical_connector_payload_v2::{
-    ConnectorPayloadCodecError, ConnectorPayloadProjectionLimits, encode_connector_payloads_in,
+    ConnectorPayloadCodecError, encode_connector_payloads_in,
 };
 use crate::physical_constant_v2::{
     ConstantWriteRequest, PhysicalConstantCodecError, encode_constant_namespace_input_derived_in,
@@ -41,41 +39,33 @@ use crate::physical_cuts_v2::{
 };
 use crate::physical_expression_v2::{ExpressionCodecError, prepare_expression_definitions_in};
 use crate::physical_fragment_envelope_v2::prepare_fragment_envelope_encode_in;
-use crate::physical_node_v2::{NodeCodecError, NodeProjectionLimits};
+use crate::physical_node_v2::NodeCodecError;
 use crate::physical_package_metadata_v2::{
     PackageMetadataCodecError, encode_package_metadata_observed,
 };
 use crate::physical_provider_binding_v2::{
-    ProviderBindingCodecError, ProviderBindingProjectionLimits, encode_joint_provider_bindings_in,
+    ProviderBindingCodecError, encode_joint_provider_bindings_in,
 };
-use crate::physical_provider_read_v2::{
-    ProviderReadCodecError, ProviderReadProjectionLimits, encode_provider_reads_in,
-};
+use crate::physical_provider_read_v2::{ProviderReadCodecError, encode_provider_reads_in};
 use crate::physical_public_source_schema_v2::{
     PublicSourceSchemaCodecError, encode_public_source_schemas_pure_in,
     encoded_public_source_schemas_backing_bytes,
 };
 use crate::physical_read_scan_v2::{
-    ReadScanCodecError, ReadScanEncodeContext, ReadScanProjectionLimits, encode_read_scans_observed,
+    ReadScanCodecError, ReadScanEncodeContext, encode_read_scans_observed,
 };
-use crate::physical_relation_v2::{
-    RelationCodecError, RelationProjectionLimits, encode_relations_in,
-};
+use crate::physical_relation_v2::{RelationCodecError, encode_relations_in};
 use crate::physical_result_v2::prepare_result_encode_in;
 use crate::physical_schema_v2::{SchemaCodecError, prepare_schemas_encode_observed_in};
 use crate::physical_semantics_v2::{
-    ParameterProjectionLimits, SemanticsCodecError, encode_frozen_calls_observed,
-    encode_frozen_pruning_observed, prepare_semantic_parameters_encode_observed_in,
+    SemanticsCodecError, encode_frozen_calls_observed, encode_frozen_pruning_observed,
+    prepare_semantic_parameters_encode_observed_in,
 };
-use crate::physical_type_v2::{
-    PackageTypeProjectionLimits, TypeCodecError, encode_borrowed_type_namespaces_sources_in,
-};
+use crate::physical_type_v2::{TypeCodecError, encode_borrowed_type_namespaces_sources_in};
 use crate::physical_value_v2::{ValueCodecError, encode_values_observed_in};
 use crate::physical_writer_recipe_v2::{
-    WriterRecipeCodecError, WriterRecipeEncodeContext, WriterRecipeProjectionLimits,
-    encode_writer_recipes_observed,
+    WriterRecipeCodecError, WriterRecipeEncodeContext, encode_writer_recipes_observed,
 };
-use crate::physical_writer_schema_v2::WriterSchemaProjectionLimits;
 use novarocks_physical_plan as p;
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
@@ -84,27 +74,6 @@ use novarocks_type_contract::{
 #[cfg(test)]
 use prost::Message;
 use std::{cell::Cell, fmt};
-
-/// Host-provided component limits. No field has a default; the FE owner
-/// chooses them. `source_retained_bytes` is the checked package's retained
-/// backing, invoiced once to every component that requires a source floor.
-#[derive(Clone, Copy, Debug)]
-pub struct PackageEncodeLimits {
-    pub source_retained_bytes: usize,
-    /// Metadata, schemas, envelope, calls, pruning, result and node headers.
-    pub node: NodeProjectionLimits,
-    pub types: PackageTypeProjectionLimits,
-    pub bindings: BindingProjectionLimits,
-    pub provider_bindings: ProviderBindingProjectionLimits,
-    pub payloads: ConnectorPayloadProjectionLimits,
-    pub reads: ProviderReadProjectionLimits,
-    pub relations: RelationProjectionLimits,
-    pub parameters: ParameterProjectionLimits,
-    pub writer_schema: WriterSchemaProjectionLimits,
-    pub cuts: CutsProjectionLimits,
-    pub scans: ReadScanProjectionLimits,
-    pub writers: WriterRecipeProjectionLimits,
-}
 
 #[derive(Debug)]
 pub enum PackageEncodeError {
@@ -239,7 +208,6 @@ impl std::error::Error for PackageEncodeError {
 /// Encode one checked package on its own Encode scope of `control`.
 pub fn encode_fragment_package(
     package: &p::FragmentPackage,
-    limits: &PackageEncodeLimits,
     control: &dyn PureCompileControl,
 ) -> Result<wire::FragmentPackage, PackageEncodeError> {
     let mut request = |_: std::alloc::Layout| Ok::<_, std::convert::Infallible>(());
@@ -249,13 +217,12 @@ pub fn encode_fragment_package(
         &mut request,
         &mut opaque,
     );
-    encode_fragment_package_with_creator(package, limits, &mut creation, control)
+    encode_fragment_package_with_creator(package, &mut creation, control)
         .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
 }
 
 pub fn encode_fragment_package_with_creator<H>(
     package: &p::FragmentPackage,
-    limits: &PackageEncodeLimits,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     control: &dyn PureCompileControl,
 ) -> Result<
@@ -267,27 +234,26 @@ pub fn encode_fragment_package_with_creator<H>(
         .map_err(|e| ProjectionFailure::Codec(PackageEncodeError::Control(e)))?;
     let result = (|| {
         let mut original_host = None;
-        let encoded =
-            encode_fragment_package_structural_in(package, limits, &mut work, &mut |request| {
-                let admitted = match request {
-                    ConstantWriteRequest::Layout(layout) if layout.size() != 0 => {
-                        creation.request_layout(layout)
-                    }
-                    ConstantWriteRequest::OpaqueUpperBound(bytes) if bytes != 0 => {
-                        creation.observe_opaque_upper_bound(bytes)
-                    }
-                    _ => Ok(()),
-                };
-                match admitted {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        original_host = Some(error);
-                        Err(PackageEncodeError::Control(
-                            CompileControlError::ResourceExhausted,
-                        ))
-                    }
+        let encoded = encode_fragment_package_structural_in(package, &mut work, &mut |request| {
+            let admitted = match request {
+                ConstantWriteRequest::Layout(layout) if layout.size() != 0 => {
+                    creation.request_layout(layout)
                 }
-            });
+                ConstantWriteRequest::OpaqueUpperBound(bytes) if bytes != 0 => {
+                    creation.observe_opaque_upper_bound(bytes)
+                }
+                _ => Ok(()),
+            };
+            match admitted {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    original_host = Some(error);
+                    Err(PackageEncodeError::Control(
+                        CompileControlError::ResourceExhausted,
+                    ))
+                }
+            }
+        });
         if let Some(error) = original_host {
             return Err(ProjectionFailure::Host(error));
         }
@@ -305,7 +271,6 @@ pub fn encode_fragment_package_with_creator<H>(
 
 fn encode_fragment_package_structural_in<'s>(
     package: &'s p::FragmentPackage,
-    l: &PackageEncodeLimits,
     work: &mut CompileCheckpoints<'s>,
     request: &mut dyn FnMut(ConstantWriteRequest) -> Result<(), PackageEncodeError>,
 ) -> Result<wire::FragmentPackage, PackageEncodeError> {

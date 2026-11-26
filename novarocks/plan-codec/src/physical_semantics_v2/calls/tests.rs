@@ -16,7 +16,6 @@
 // under the License.
 
 use super::*;
-use crate::test_constants as checked;
 use arrow::datatypes::DataType;
 use novarocks_expression_contract::{BoundFunction, ExprId, ExprKind};
 use novarocks_physical_plan::*;

@@ -895,7 +895,7 @@ pub(super) fn compiled_fragment(
                 Arc::new(Field::new("v", DataType::Int64, false)),
                 ty.clone(),
                 arrow_array::Array::to_data(&array),
-                novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+                novarocks_functions::ConstantValidation::INPUT_DERIVED,
                 CompilePhase::Validate,
                 &Control,
             )
@@ -1046,7 +1046,7 @@ pub(super) fn compiled_fragment(
         }]
         .into_boxed_slice(),
     });
-    let package = FragmentPackage::try_new(
+    let package = FragmentPackage::try_new_input_derived(
         FragmentPackageInput {
             constants,
             version: PlanVersionId::try_new([0x5b; 16]).expect("version"),
@@ -1063,16 +1063,13 @@ pub(super) fn compiled_fragment(
             annotations: Box::default(),
             layouts: Default::default(),
         },
-        novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+        novarocks_physical_plan::PlanLimits::FROZEN,
         &Control,
     )
     .expect("checked package");
-    let wire = novarocks_plan_codec::physical_package_v2::encode_fragment_package(
-        &package,
-        &novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
-        &Control,
-    )
-    .expect("package codec");
+    let wire =
+        novarocks_plan_codec::physical_package_v2::encode_fragment_package(&package, &Control)
+            .expect("package codec");
     proto::FrozenFragment {
         package: wire.encode_to_vec().into(),
     }

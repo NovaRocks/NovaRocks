@@ -30,7 +30,7 @@ use novarocks_functions::{
     PureEngineFunctionCatalog, validate_installed_operator_functions,
 };
 use novarocks_native_adapter::backend_application::CompiledStaticPlan;
-use novarocks_plan_codec::physical_package_v2::{PackageDecodeLimits, PackageEncodeLimits};
+use novarocks_plan_codec::physical_package_v2::PackageDecodeLimits;
 use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 use novarocks_spi::connector::ConnectorCodecError;
 
@@ -78,7 +78,6 @@ impl CompiledPackage {
     ) -> novarocks_frontend_application::CompiledPackageCarrier {
         novarocks_frontend_application::CompiledPackageCarrier::new(
             self.decode_limits.plan_limits,
-            PackageEncodeLimits::FROZEN,
             Arc::clone(&self.decode_model),
             self.decode_limits.wire,
         )

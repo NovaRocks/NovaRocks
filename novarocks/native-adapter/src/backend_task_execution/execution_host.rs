@@ -8978,9 +8978,7 @@ pub(crate) mod tests {
             PropertyProofProjectionLimits, extract_fragment_packages,
         };
         use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
-        use novarocks_plan_codec::physical_package_v2::test_support::{
-            decode_limits, encode_limits,
-        };
+        use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
         use novarocks_sql::compiler::{
             DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
@@ -9586,7 +9584,7 @@ pub(crate) mod tests {
         }
 
         fn encode_sql_fixture_package(package: &FragmentPackage) -> Vec<u8> {
-            encode_fragment_package(package, &encode_limits(), &SqlCompileControl::unbounded())
+            encode_fragment_package(package, &SqlCompileControl::unbounded())
                 .expect("v2 bytes")
                 .encode_to_vec()
         }

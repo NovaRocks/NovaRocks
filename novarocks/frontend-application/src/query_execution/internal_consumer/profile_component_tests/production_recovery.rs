@@ -510,8 +510,7 @@ async fn run_original(successor_participations: usize, cancel_after_handoff: boo
     })
     .await;
     let carrier = crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
-        novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-        novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+        novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
     );
     let (description, plan, encoded) = if successor_participations == 1 {
         // The existing Profile scenario keeps its original SELECT 1 author.

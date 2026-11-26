@@ -392,7 +392,6 @@ impl StatisticsPlanCpuInput {
                             max_projection_work: 16 << 20,
                         },
                 },
-                novarocks_plan_codec::physical_package_v2::test_support::encode_limits(),
             ),
             staged: None,
             started: false,

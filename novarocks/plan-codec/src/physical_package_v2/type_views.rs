@@ -294,6 +294,7 @@ pub(crate) struct TypeViewBudget<'source, 'control, 'parent> {
     admit: &'parent mut dyn FnMut(&TypeViewFacts) -> Result<(), CompileControlError>,
 }
 impl<'source, 'control, 'parent> TypeViewBudget<'source, 'control, 'parent> {
+    #[cfg(test)]
     pub(crate) fn new_in(
         package: &'source p::FragmentPackage,
         source_retained_bytes: usize,

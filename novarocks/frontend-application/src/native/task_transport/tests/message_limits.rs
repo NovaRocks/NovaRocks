@@ -133,7 +133,7 @@ fn system_fragment(
             annotations: Box::default(),
             layouts: Default::default(),
         },
-        novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+        novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
         &control,
     )
     .unwrap();
@@ -141,8 +141,7 @@ fn system_fragment(
         &package,
         &BTreeMap::new(),
         &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
-            novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-            novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+            novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
         ),
         &control,
     )

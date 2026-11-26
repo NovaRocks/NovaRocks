@@ -829,7 +829,7 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
     use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
     use novarocks_physical_plan::*;
     use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
-    use novarocks_plan_codec::physical_package_v2::test_support::encode_limits;
+
     use novarocks_type_contract::{DecimalOverflowPolicy, EvaluationDemand};
     use prost::Message;
 
@@ -1144,7 +1144,7 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
     )
     .unwrap();
     let package = packages.remove(&PRODUCER).unwrap();
-    let bytes = encode_fragment_package(&package, &encode_limits(), &Unbounded)
+    let bytes = encode_fragment_package(&package, &Unbounded)
         .expect("v2 bytes")
         .encode_to_vec();
     (bytes, RECEIVER.get())

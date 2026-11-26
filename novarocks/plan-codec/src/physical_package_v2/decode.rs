@@ -37,17 +37,15 @@ use crate::{
         prepare_aggregate_bindings_materialization_in,
     },
     physical_binding_v2::{
-        BindingCodecError, BindingProjectionLimits, materialize_function_bindings_in,
-        prepare_function_binding_headers_in, prepare_function_bindings_materialization_in,
+        BindingCodecError, materialize_function_bindings_in, prepare_function_binding_headers_in,
+        prepare_function_bindings_materialization_in,
     },
     physical_call_requests_v2::{
         CallRequestCodecError, CallRequestTypeOwner, decode_call_requests_in,
         decode_call_requests_with_creator_in, prepare_call_requests_decode_in,
         prepare_call_requests_decode_with_creator_in,
     },
-    physical_connector_payload_v2::{
-        ConnectorPayloadCodecError, ConnectorPayloadProjectionLimits, decode_connector_payloads_in,
-    },
+    physical_connector_payload_v2::{ConnectorPayloadCodecError, decode_connector_payloads_in},
     physical_constant_v2::{
         PhysicalConstantCodecError, prepare_constant_namespace_input_derived_in,
         prepare_constant_namespace_input_derived_with_creator_in,
@@ -60,40 +58,33 @@ use crate::{
         prepare_expression_materialization_in,
     },
     physical_fragment_envelope_v2::prepare_fragment_envelope_decode_in,
-    physical_node_v2::{NodeCodecError, NodeProjectionLimits},
+    physical_node_v2::NodeCodecError,
     physical_package_metadata_v2::{PackageMetadataCodecError, decode_package_metadata_observed},
-    physical_provider_binding_v2::{
-        ProviderBindingCodecError, ProviderBindingProjectionLimits,
-        decode_joint_provider_bindings_in,
-    },
-    physical_provider_read_v2::{
-        ProviderReadCodecError, ProviderReadProjectionLimits, decode_provider_reads_in,
-    },
+    physical_provider_binding_v2::{ProviderBindingCodecError, decode_joint_provider_bindings_in},
+    physical_provider_read_v2::{ProviderReadCodecError, decode_provider_reads_in},
     physical_read_scan_v2::{
-        ReadScanCodecError, ReadScanDecodeContext, ReadScanProjectionLimits,
-        decode_read_scans_observed, decode_read_scans_with_creator,
+        ReadScanCodecError, ReadScanDecodeContext, decode_read_scans_observed,
+        decode_read_scans_with_creator,
     },
-    physical_relation_v2::{RelationCodecError, RelationProjectionLimits, decode_relations_in},
+    physical_relation_v2::{RelationCodecError, decode_relations_in},
     physical_result_v2::prepare_result_decode_in,
     physical_schema_v2::{
         SchemaCodecError, decode_schemas_with_factory_in, prepare_schemas_decode_observed_in,
         prepare_schemas_decode_with_creator_in,
     },
     physical_semantics_v2::{
-        ParameterProjectionLimits, SemanticsCodecError, decode_frozen_pruning_observed,
+        SemanticsCodecError, decode_frozen_pruning_observed,
         prepare_semantic_parameters_decode_observed_in,
     },
     physical_type_v2::{
-        PackageTypeProjectionFacts, PackageTypeProjectionLimits, TypeCodecError,
-        decode_package_type_table_observed, decode_package_type_table_with_creator_in,
-        decode_package_type_table_with_factory_in,
+        PackageTypeProjectionFacts, TypeCodecError, decode_package_type_table_observed,
+        decode_package_type_table_with_creator_in, decode_package_type_table_with_factory_in,
     },
     physical_value_v2::{ValueCodecError, decode_values_observed_in},
     physical_writer_recipe_v2::{
-        WriterRecipeCodecError, WriterRecipeDecodeContext, WriterRecipeProjectionLimits,
-        decode_writer_recipes_observed, decode_writer_recipes_with_factory_in,
+        WriterRecipeCodecError, WriterRecipeDecodeContext, decode_writer_recipes_observed,
+        decode_writer_recipes_with_factory_in,
     },
-    physical_writer_schema_v2::WriterSchemaProjectionLimits,
     resource_preflight_v2::{DecodeProjectionLimits, FragmentDecodeResourceModel},
 };
 
@@ -113,29 +104,10 @@ use std::{
     mem::{size_of, size_of_val},
 };
 
-/// Host-authored receiving envelopes; none of these is on the wire and no
-/// default exists. `plan_limits` is the one structural PlanLimits
-/// for the owned expression arena, the Fragment and the Package.
+/// The receiver's generated wire layout and the original structural plan limits.
 #[derive(Clone, Debug)]
 pub struct PackageDecodeLimits {
-    /// Generated-layout byte admission before Prost allocates.
     pub wire: DecodeProjectionLimits,
-    pub types: PackageTypeProjectionLimits,
-    /// Metadata, schemas, envelope, calls, pruning, result and node headers.
-    pub node: NodeProjectionLimits,
-    /// Function and aggregate headers, their owned materializations and the
-    /// per-node signature copies.
-    pub bindings: BindingProjectionLimits,
-    pub provider_bindings: ProviderBindingProjectionLimits,
-    pub payloads: ConnectorPayloadProjectionLimits,
-    pub reads: ProviderReadProjectionLimits,
-    /// The relation namespace and each Scan node's relation copy.
-    pub relations: RelationProjectionLimits,
-    pub parameters: ParameterProjectionLimits,
-    pub cuts: CutsProjectionLimits,
-    pub scans: ReadScanProjectionLimits,
-    pub writers: WriterRecipeProjectionLimits,
-    pub writer_schema: WriterSchemaProjectionLimits,
     pub plan_limits: p::PlanLimits,
 }
 

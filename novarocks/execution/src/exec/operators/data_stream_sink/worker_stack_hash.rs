@@ -82,7 +82,7 @@ fn site(program: &LocalProgram) -> ProgramRootRef {
 fn compile(package: FragmentPackage) -> (Arc<LocalProgram>, ProgramRootRef) {
     let program = super::super::conditional_compiled_selection::compile_checked(
         Arc::new(package),
-        novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY.into(),
+        novarocks_plan_codec::physical_package_v2::CONSTANT_POLICY_FIXTURE.into(),
     );
     assert_eq!(program.graph().nodes().len(), 2);
     let site = site(&program);
@@ -94,7 +94,7 @@ pub(super) fn constant_key() -> (Arc<LocalProgram>, ProgramRootRef) {
     let input = NodeId::new(10);
     let output = NodeId::new(20);
     let integer = FunctionValueType::new(DataType::Int64, false);
-    let policy = novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY;
+    let policy = novarocks_plan_codec::physical_package_v2::CONSTANT_POLICY_FIXTURE;
     assert_eq!(policy.max_type_depth, 64);
     assert_eq!(policy.max_dictionary_depth, 8);
     let pool = novarocks_functions::ConstantPool::try_new(

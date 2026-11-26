@@ -1232,8 +1232,7 @@ impl FrontendExecutionConfig {
             FrontendLogicalExecutionRuntimeConfig::for_test(),
             constant_policy,
             crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
-                novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-                novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+                novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
             ),
             Arc::new(
                 crate::query_execution::required_constant_eval::test_required_constant_interpreter(

@@ -33,8 +33,7 @@ use novarocks_local_program::ProgramNodeKind;
 use novarocks_physical_plan::StaticFunctionArgument;
 use novarocks_plan_codec::{
     physical_package_v2::{
-        decode_fragment_package, encode_fragment_package,
-        test_support::{decode_limits, encode_limits},
+        decode_fragment_package, encode_fragment_package, test_support::decode_limits,
     },
     resource_preflight_v2::FragmentDecodeResourceModel,
 };
@@ -206,14 +205,14 @@ fn check_array_source(
         let mut producer = None;
         let mut failures = vec![];
         for package in source_packages(&source, policy).into_values() {
-            let encoded = encode_fragment_package(&package, &encode_limits(), &Control)
+            let encoded = encode_fragment_package(&package, &Control)
                 .unwrap()
                 .encode_to_vec();
             let decoded = Arc::new(
                 decode_fragment_package(&encoded, &model, &decode_limits(), &Control).unwrap(),
             );
             assert_eq!(
-                encode_fragment_package(&decoded, &encode_limits(), &Control)
+                encode_fragment_package(&decoded, &Control)
                     .unwrap()
                     .encode_to_vec(),
                 encoded
