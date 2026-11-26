@@ -56,5 +56,8 @@ SELECT sum(e.data_file.record_count) AS records,
  WHERE e.status = 1;
 
 -- query 9
+SELECT * FROM iceberg_cat_${suite_uuid0}.iv38e_db_${uuid0}."t_${uuid0}$entries" LIMIT 0;
+
+-- query 10
 -- @skip_result_check=true
 DROP SCHEMA iceberg_cat_${suite_uuid0}.iv38e_db_${uuid0};

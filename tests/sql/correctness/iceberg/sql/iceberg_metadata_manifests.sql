@@ -60,5 +60,8 @@ SELECT count(*) > 0 AS has_files
   FROM iceberg_cat_${suite_uuid0}.iv38m_db_${uuid0}."v1_${uuid0}$files";
 
 -- query 11
+SELECT * FROM iceberg_cat_${suite_uuid0}.iv38m_db_${uuid0}."t_${uuid0}$manifests" LIMIT 0;
+
+-- query 12
 -- @skip_result_check=true
 DROP SCHEMA iceberg_cat_${suite_uuid0}.iv38m_db_${uuid0};

@@ -63,5 +63,8 @@ SELECT f.lower_bounds."1" AS lower_id, f.upper_bounds."1" AS upper_id,
  ORDER BY lower_id;
 
 -- query 9
+SELECT * FROM iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0}."t_${uuid0}$files" LIMIT 0;
+
+-- query 10
 -- @skip_result_check=true
 DROP SCHEMA iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0};

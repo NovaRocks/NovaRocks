@@ -12,3 +12,7 @@ true
 -- types	boolean
 has_files
 true
+
+-- query 11
+-- types	integer	varchar	bigint	integer	bigint	integer	bigint	integer	bigint	integer	bigint	array(row(contains_null boolean, contains_nan boolean, lower_bound varchar, upper_bound varchar))
+content	path	length	partition_spec_id	added_snapshot_id	added_data_files_count	added_rows_count	existing_data_files_count	existing_rows_count	deleted_data_files_count	deleted_rows_count	partition_summaries

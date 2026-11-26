@@ -19,3 +19,7 @@ us	1
 lower_id	upper_id	metrics_type
 1	1	json
 2	2	json
+
+-- query 9
+-- types	integer	varchar	varchar	integer	row(region varchar)	bigint	bigint	map(integer, bigint)	map(integer, bigint)	map(integer, bigint)	map(integer, bigint)	row("1" integer, "2" varchar, "3" integer)	row("1" integer, "2" varchar, "3" integer)	varbinary	array(bigint)	array(integer)	integer	json	bigint	bigint	bigint	varchar	bigint	varchar	bigint	bigint	bigint
+content	file_path	file_format	spec_id	partition	record_count	file_size_in_bytes	column_sizes	value_counts	null_value_counts	nan_value_counts	lower_bounds	upper_bounds	key_metadata	split_offsets	equality_ids	sort_order_id	readable_metrics	added_snapshot_id	file_sequence_number	data_sequence_number	referenced_data_file	pos	manifest_location	first_row_id	content_offset	content_size_in_bytes
