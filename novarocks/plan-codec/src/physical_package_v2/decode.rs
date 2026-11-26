@@ -1076,8 +1076,7 @@ fn decode_fragment_package_factory_core<
     };
     validate_json_constants_in(&pools, work)?;
     invoice = add(add(invoice, pool_requests)?, size_of_val(&pools))?;
-    let (requests, request_storage, _) = if let Some(creator) = creation.as_deref_mut()
-    {
+    let (requests, request_storage, _) = if let Some(creator) = creation.as_deref_mut() {
         let prepared = prepare_call_requests_decode_with_creator_in(
             fragment_wire.call_requests.as_ref(),
             CallRequestTypeOwner::Package(&types),

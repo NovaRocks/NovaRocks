@@ -280,14 +280,13 @@ fn request_each_receiving_limit_accepts_exact_boundary_and_refuses_one_under() {
         .preflight(&raw, limits(), &Control::default())
         .unwrap()
         .usage;
-    // Seven descents reach the Value's ConstantReference; these source-policy
-    // zeros never replace any receiving limit.
+    // Seven descents reach the Value's ConstantReference.
     let exact = DecodeProjectionLimits {
         max_input_bytes: raw.len(),
         max_requested_heap_bytes: usage.cumulative_requested_heap_bytes_upper,
-        max_message_occurrences: 13,
-        max_scalar_elements: 21,
-        max_field_occurrences: 31,
+        max_message_occurrences: 12,
+        max_scalar_elements: 11,
+        max_field_occurrences: 20,
         max_copied_bytes: usage.copied_bytes_upper,
         max_initialization_bytes: usage.initialization_bytes_upper,
         max_wire_depth: 7,
@@ -309,15 +308,15 @@ fn request_each_receiving_limit_accepts_exact_boundary_and_refuses_one_under() {
             ..exact
         },
         DecodeProjectionLimits {
-            max_message_occurrences: 12,
+            max_message_occurrences: 11,
             ..exact
         },
         DecodeProjectionLimits {
-            max_scalar_elements: 20,
+            max_scalar_elements: 10,
             ..exact
         },
         DecodeProjectionLimits {
-            max_field_occurrences: 30,
+            max_field_occurrences: 19,
             ..exact
         },
         DecodeProjectionLimits {
@@ -357,7 +356,7 @@ fn request_unknown_fields_and_malformed_argument_keep_the_accounted_prefix() {
         .preflight(&unknown, limits(), &Control::default())
         .unwrap();
     assert_eq!(projection.status, ResourceCursorStatus::Complete);
-    assert_eq!(projection.usage.field_occurrences, 32);
+    assert_eq!(projection.usage.field_occurrences, 21);
     assert_eq!(projection.usage.message_occurrences, 12);
     assert_eq!(projection.usage.scalar_elements, 11);
     assert_eq!(
@@ -372,7 +371,7 @@ fn request_unknown_fields_and_malformed_argument_keep_the_accounted_prefix() {
         model.preflight(
             &unknown,
             DecodeProjectionLimits {
-                max_field_occurrences: 31,
+                max_field_occurrences: 20,
                 ..limits()
             },
             &Control::default()
@@ -389,8 +388,8 @@ fn request_unknown_fields_and_malformed_argument_keep_the_accounted_prefix() {
         .preflight(&malformed, limits(), &Control::default())
         .unwrap();
     assert_eq!(projection.status, ResourceCursorStatus::MalformedPrefix);
-    assert_eq!(projection.usage.message_occurrences, 14);
-    assert_eq!(projection.usage.field_occurrences, 32);
+    assert_eq!(projection.usage.message_occurrences, 13);
+    assert_eq!(projection.usage.field_occurrences, 21);
     assert_eq!(projection.usage.scalar_elements, 11);
     assert!(
         projection.usage.cumulative_requested_heap_bytes_upper
@@ -410,7 +409,7 @@ fn request_small_success_malformed_and_limit_keep_every_original_control_prefix(
         (
             package(vec![request()]).encode_to_vec(),
             DecodeProjectionLimits {
-                max_message_occurrences: 12,
+                max_message_occurrences: 11,
                 ..limits()
             },
             true,
@@ -444,9 +443,9 @@ fn wide_request_wire_is_refused_before_prost_and_observes_real_decode_quanta() {
     let control = Control::default();
     let projection = model.preflight(&raw, limits(), &control).unwrap();
     assert_eq!(projection.status, ResourceCursorStatus::Complete);
-    assert_eq!(projection.usage.message_occurrences, 4 + 9 * 320);
+    assert_eq!(projection.usage.message_occurrences, 4 + 8 * 320);
     assert_eq!(projection.usage.scalar_elements, 11 * 320);
-    assert_eq!(projection.usage.field_occurrences, 3 + 28 * 320);
+    assert_eq!(projection.usage.field_occurrences, 3 + 17 * 320);
     // Independent entry-count floor, even before argument/Lambda backing.
     assert!(
         projection.usage.cumulative_requested_heap_bytes_upper
@@ -456,7 +455,7 @@ fn wide_request_wire_is_refused_before_prost_and_observes_real_decode_quanta() {
         model.preflight(
             &raw,
             DecodeProjectionLimits {
-                max_message_occurrences: 4 + 9 * 320 - 1,
+                max_message_occurrences: 4 + 8 * 320 - 1,
                 ..limits()
             },
             &Control::default()

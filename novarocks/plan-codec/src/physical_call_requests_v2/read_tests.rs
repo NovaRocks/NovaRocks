@@ -733,37 +733,50 @@ fn original_request_decode_new_argument_resource_at_real_pending_256_never_obser
         )
         .unwrap();
     }
-    let mut raw = wire::FragmentCallRequests {
-        entries: (0..42).map(request).collect(),
-    };
-    raw.entries[41].arguments.push(value_argument(7, None));
-    raw.entries[41].logical_argument_count = Some(1);
-    // This authentic source reaches the first real 256-unit callback precisely
-    // when admission of the last entry's new argument succeeds.
-    let c = Control::default();
-    execute(Some(&raw), &t, &p, SOURCE, limits(), &c).unwrap();
-    let trace = c.trace.lock().unwrap().clone();
-    assert_eq!(trace.iter().position(|(_, units)| *units == 256), Some(1));
-    // Admit both original outer arrays exactly, but no new argument Vec/Box.
-    // Repeating the same backing under four keys is legal and counted once as
-    // a backing floor, while each occupied key remains actual source storage.
-    let mut l = limits();
-    l.max_request_bytes = Layout::array::<PhysicalCallSite>(42).unwrap().size()
-        + Layout::array::<(PhysicalCallSite, PhysicalCallRequest)>(42)
-            .unwrap()
-            .size();
+    // Find a request whose final real argument joins the numerical prefix
+    // just before a completed quantum. Keep the emitted schema itself in the
+    // witness, since shrinking its header changes the pending work count.
+    let (raw, tight, prefix) = (32..128)
+        .find_map(|count| {
+            let mut raw = wire::FragmentCallRequests {
+                entries: (0..count).map(request).collect(),
+            };
+            let last = raw.entries.last_mut().unwrap();
+            last.arguments.push(value_argument(7, None));
+            last.logical_argument_count = Some(1);
+            let control = Control::default();
+            execute(Some(&raw), &t, &p, SOURCE, limits(), &control).unwrap();
+            let trace = control.trace.into_inner().unwrap();
+            let mut tight = limits();
+            tight.max_request_bytes = Layout::array::<PhysicalCallSite>(count as usize)
+                .unwrap()
+                .size()
+                + Layout::array::<(PhysicalCallSite, PhysicalCallRequest)>(count as usize)
+                    .unwrap()
+                    .size();
+            let control = Control::default();
+            assert!(matches!(
+                execute(Some(&raw), &t, &p, SOURCE, tight, &control),
+                Err(E::Control(CompileControlError::ResourceExhausted))
+            ));
+            let prefix = control.trace.into_inner().unwrap();
+            (trace.starts_with(&prefix)
+                && trace.get(prefix.len()) == Some(&(CompilePhase::Decode, 256)))
+            .then_some((raw, tight, prefix))
+        })
+        .expect("real argument admission immediately before a decode quantum");
     for cause in CAUSES {
         let c = Control {
-            stop: Some((1, cause)),
+            stop: Some((prefix.len(), cause)),
             ..Control::default()
         };
         assert!(matches!(
-            execute(Some(&raw), &t, &p, SOURCE, l, &c),
+            execute(Some(&raw), &t, &p, SOURCE, tight, &c),
             Err(E::Control(CompileControlError::ResourceExhausted))
         ));
         assert_eq!(
             *c.trace.lock().unwrap(),
-            [(CompilePhase::Decode, 0)],
+            prefix,
             "known numeric resource refusal must precede a later callback"
         );
     }
