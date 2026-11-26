@@ -453,3 +453,45 @@ fn uninhabited_map_key_carrier_constraint_refuses_nullable_key_and_entries() {
     }
     assert!(!super::super::map_lookup_core::has_uninhabited_map_key_carrier(&DataType::Null));
 }
+
+#[test]
+fn scalar_broadcast_differential_for_public_map_element_at() {
+    use crate::builtin::array_invocation_test_support::assert_scalar_broadcast_equivalent;
+    use arrow_array::{Array, ArrayRef, Int64Array, MapArray, StringArray, StructArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    let entries = StructArray::new(
+        vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            Arc::new(StringArray::from(vec![
+                Some("one"),
+                None,
+                Some("three"),
+                Some("four"),
+            ])),
+        ],
+        None,
+    );
+    let map: ArrayRef = Arc::new(
+        MapArray::try_new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::new(vec![0, 1, 3, 4].into()),
+            entries,
+            Some(NullBuffer::from(vec![true, true, false])),
+            false,
+        )
+        .unwrap(),
+    );
+    let key: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), Some(2), Some(7), None]));
+    for (map_row, key_row) in [(1, 0), (1, 1), (1, 2), (1, 3), (2, 0)] {
+        assert_scalar_broadcast_equivalent(
+            "element_at",
+            &[(&map, map_row), (&key, key_row)],
+            false,
+        );
+    }
+}

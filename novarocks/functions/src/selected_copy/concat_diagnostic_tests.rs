@@ -90,12 +90,47 @@ fn by_copy_original_concat_dictionary_resource_domain_does_not_apply_native_key_
     let left: ArrayRef = Arc::new(StringArray::from(vec!["first"; 70]));
     let right: ArrayRef = Arc::new(StringArray::from(vec!["second"; 70]));
     let mut invoice = super::super::take_host::CopyInvoiceTotals::default();
+    let values = [left.as_ref(), right.as_ref()];
     invoice
-        .original_dictionary_merge_scratch(&[left.as_ref(), right.as_ref()], &DataType::Int8, 2)
+        .original_dictionary_merge_scratch(&values, &DataType::Int8, &values)
         .unwrap();
     let facts = invoice.finish(0).unwrap();
     assert!(facts.operation_peak_bytes() >= 140 * size_of::<(usize, Option<&[u8]>)>());
 }
+
+#[test]
+fn by_copy_original_concat_dictionary_sparse_scratch_tracks_referenced_rows() {
+    use arrow_array::{DictionaryArray, Int32Array, StringArray, types::Int32Type};
+
+    let left = DictionaryArray::<Int32Type>::try_new(
+        Int32Array::from(vec![0, 1023]),
+        Arc::new(StringArray::from(vec!["left"; 1024])),
+    )
+    .unwrap();
+    let right = DictionaryArray::<Int32Type>::try_new(
+        Int32Array::from(vec![512, 0]),
+        Arc::new(StringArray::from(vec!["right"; 1024])),
+    )
+    .unwrap();
+    let mut invoice = super::super::take_host::CopyInvoiceTotals::default();
+    invoice
+        .original_dictionary_merge_scratch(
+            &[left.values().as_ref(), right.values().as_ref()],
+            &DataType::Int32,
+            &[&left, &right],
+        )
+        .unwrap();
+    let facts = invoice.finish(0).unwrap();
+    assert!(facts.operation_peak_bytes() < 1024 * size_of::<(usize, Option<&[u8]>)>());
+
+    let output = arrow_select::concat::concat(&[&left, &right]).unwrap();
+    let decoded = arrow_cast::cast(output.as_ref(), &DataType::Utf8).unwrap();
+    assert_eq!(
+        decoded.as_any().downcast_ref::<StringArray>().unwrap(),
+        &StringArray::from(vec!["left", "left", "right", "right"]),
+    );
+}
+
 #[test]
 fn by_copy_original_concat_run_geometry_tracks_physical_ends_not_logical_rows() {
     let mut invoice = super::super::take_host::CopyInvoiceTotals::default();

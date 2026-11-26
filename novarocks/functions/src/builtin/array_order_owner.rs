@@ -21,25 +21,30 @@ use std::sync::Arc;
 
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompilePhase,
-    EvaluationDemand, FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior,
-    ObservableEffects, PureCompileControl,
+    FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior, ObservableEffects,
+    PureCompileControl, ValueSchemaCreationScope,
 };
 
 use super::array_order::OrderOp;
 use super::catalogue::BuiltinScalarResolver;
+use super::collection_lambda::{self, CollectionLambdaSignature, PrepareCollectionLambda};
 use crate::comparison::ExtremaOrder;
 
 use crate::AggregateStateAllocator;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::kernel_control::{compile_failure, invalid};
 use crate::{
-    CallEffectInput, FunctionBindingDeclaration, FunctionBindingError, FunctionBindingRequest,
-    FunctionBindingResolver, FunctionBindingSelection, FunctionCatalogError, FunctionDefinition,
-    FunctionEffectOwner, FunctionEffectOwnerError, FunctionFailureBehavior, FunctionId,
-    FunctionIntrinsicRowError, FunctionKind, FunctionVisibility, FunctionVolatility,
-    KernelEvaluationControl, KernelFailure, PreparedScalarKernel, PureFunctionMetadataOwner,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, PureScalarImplementation,
-    ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
+    CallEffectInput, CheckedCallEffectInput, CheckedOwnerFailure, FunctionArgument,
+    FunctionBindingCreationFailure, FunctionBindingDeclaration, FunctionBindingError,
+    FunctionBindingRequest, FunctionBindingResolver, FunctionBindingSelection,
+    FunctionCatalogError, FunctionDefinition, FunctionEffectOwner, FunctionEffectOwnerError,
+    FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError, FunctionKind,
+    FunctionOverloadId, FunctionVisibility, FunctionVolatility, HigherOrderBindingShape,
+    HigherOrderCallContract, KernelEvaluationControl, KernelFailure, LambdaBodyContract,
+    PreparedHigherOrderKernel, PreparedScalarKernel, PureFunctionMetadataOwner,
+    PureHigherOrderImplementation, PureImplementationDeclaration, PureImplementationId,
+    PureKernelAbi, PureScalarImplementation, ScalarCallContract, ScalarCallInput,
+    ScalarKernelInstance, SelectedValues,
 };
 
 pub(super) fn operation(name: &str) -> Option<OrderOp> {
@@ -59,56 +64,54 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
     }
 }
 
-pub(super) fn comparator_effects() -> FunctionEffectDeclaration {
-    FunctionEffectDeclaration {
-        own_row_error: FunctionIntrinsicRowError::MayRaise,
-        argument_control: ArgumentControl::HigherOrder {
-            body_ordinal: 1,
-            body_demand: EvaluationDemand::Value,
-        },
-        ..effects()
-    }
-}
-
 pub(super) fn definition(
     name: &str,
     declaration: FunctionBindingDeclaration,
     resolver: BuiltinScalarResolver,
+    prepare_comparator: Option<PrepareCollectionLambda>,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
-    let declared_only = super::collection_lambda::signature(name)
-        .filter(|_| matches!(operation(name), Some(OrderOp::Sort)))
-        .map(|signature| signature.overload());
-    let declared_only = declared_only.as_slice();
     let owner = Arc::new(ArrayOrderOwner::new(
         name,
         declaration,
         resolver,
-        declared_only,
+        prepare_comparator,
     )?);
-    FunctionDefinition::try_new_pure_scalar_with_declared_only(
-        name,
-        FunctionVisibility::Public,
-        owner,
-        declared_only,
-    )
-    .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
+    let definition = match owner.comparator {
+        Some(comparator) if owner.prepare_comparator.is_none() => {
+            FunctionDefinition::try_new_pure_scalar_with_declared_only(
+                name,
+                FunctionVisibility::Public,
+                owner,
+                &[comparator.overload()],
+            )
+        }
+        Some(_) => FunctionDefinition::try_new_pure_scalar_higher_order(
+            name,
+            FunctionVisibility::Public,
+            owner,
+        ),
+        None => FunctionDefinition::try_new_pure_scalar(name, FunctionVisibility::Public, owner),
+    };
+    definition.map_err(|error| FunctionCatalogError::InvalidStableIdentity {
         subject: "builtin array order pure owner",
         value: error.to_string().into(),
     })
 }
 
-struct ArrayOrderOwner {
+pub(crate) struct ArrayOrderOwner {
     operation: OrderOp,
     resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
+    comparator: Option<CollectionLambdaSignature>,
+    prepare_comparator: Option<PrepareCollectionLambda>,
 }
 impl ArrayOrderOwner {
     fn new(
         name: &str,
         declaration: FunctionBindingDeclaration,
         resolver: BuiltinScalarResolver,
-        declared_only: &[crate::FunctionOverloadId],
+        prepare_comparator: Option<PrepareCollectionLambda>,
     ) -> Result<Self, FunctionCatalogError> {
         let operation =
             operation(name).ok_or_else(|| FunctionCatalogError::InvalidStableIdentity {
@@ -116,14 +119,19 @@ impl ArrayOrderOwner {
                 value: name.into(),
             })?;
         let function = format!("builtin.scalar/{name}/v1");
+        let comparator = matches!(operation, OrderOp::Sort)
+            .then(|| collection_lambda::signature(name).expect("array sort comparator overload"));
         let expected = effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 1 + declared_only.len()
+            || declaration.overloads().len() != 1 + usize::from(comparator.is_some())
             || declaration.overloads().iter().any(|overload| {
-                !declared_only.contains(&overload.identity)
-                    && (overload.aggregate.is_some()
-                        || overload.effects.as_ref() != Some(&expected))
+                let expected_comparator = comparator
+                    .filter(|comparator| comparator.owns_overload(&overload.identity))
+                    .map(|comparator| comparator.effects());
+                overload.aggregate.is_some()
+                    || overload.effects.as_ref()
+                        != Some(expected_comparator.as_ref().unwrap_or(&expected))
             })
         {
             return Err(FunctionCatalogError::InvalidStableIdentity {
@@ -133,22 +141,59 @@ impl ArrayOrderOwner {
         }
         let implementation =
             PureImplementationId::try_new(format!("builtin.scalar/{name}/selected-v1"))?;
-        let implementations = declaration
+        let mut implementations: Vec<_> = declaration
             .overloads()
             .iter()
-            .filter(|overload| !declared_only.contains(&overload.identity))
+            .filter(|overload| !comparator.is_some_and(|cmp| cmp.owns_overload(&overload.identity)))
             .map(|overload| PureImplementationDeclaration {
                 overload: overload.identity.clone(),
                 implementation: implementation.clone(),
                 abi: PureKernelAbi::ScalarV1,
             })
             .collect();
+        if let Some(comparator) = comparator
+            && prepare_comparator.is_some()
+        {
+            implementations.push(comparator.implementation()?);
+        }
         Ok(Self {
             operation,
             resolver: Arc::new(resolver),
             declaration,
-            implementations,
+            implementations: implementations.into_boxed_slice(),
+            comparator,
+            prepare_comparator,
         })
+    }
+
+    fn comparator_at(&self, overload: &FunctionOverloadId) -> Option<CollectionLambdaSignature> {
+        self.comparator.filter(|cmp| cmp.owns_overload(overload))
+    }
+
+    pub(crate) fn owns_natural_binding(
+        &self,
+        resolver: &BuiltinScalarResolver,
+        input: CallEffectInput<'_>,
+    ) -> bool {
+        std::ptr::eq(self.resolver.as_ref(), resolver)
+            && self.comparator_at(&input.selected.overload).is_none()
+    }
+
+    pub(crate) fn validate_selected_with_creator_in<H>(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        creator: &mut dyn ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingCreationFailure<H>> {
+        if let Some(comparator) = self.comparator_at(&selected.overload) {
+            comparator
+                .validate_selected(selected, request, control)
+                .map_err(Into::into)
+        } else {
+            self.resolver
+                .validate_selected_with_creator_in(selected, request, creator, control)
+        }
     }
 
     fn call_effects(&self, scope: CallProofScope) -> CallEffects {
@@ -168,11 +213,39 @@ impl ArrayOrderOwner {
 }
 
 impl FunctionBindingResolver for ArrayOrderOwner {
+    fn begin_higher_order_binding(
+        &self,
+        ordinary_ordinal: usize,
+        ordinary: &FunctionArgument,
+        lambda_ordinal: usize,
+        lambda_arity: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<HigherOrderBindingShape, FunctionBindingError> {
+        match self.comparator {
+            Some(comparator) => comparator.begin(
+                ordinary_ordinal,
+                ordinary,
+                lambda_ordinal,
+                lambda_arity,
+                control,
+            ),
+            None => Err(FunctionBindingError::NoMatchingOverload),
+        }
+    }
+
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        if let Some(comparator) = self.comparator
+            && request
+                .arguments
+                .iter()
+                .any(|argument| matches!(argument, FunctionArgument::Lambda { .. }))
+        {
+            return comparator.resolve(request, self.prepare_comparator.is_some(), control);
+        }
         self.resolver.resolve(request, control)
     }
 
@@ -182,8 +255,12 @@ impl FunctionBindingResolver for ArrayOrderOwner {
         request: FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        self.resolver
-            .select_at_overload_observed(overload, request, control)
+        if let Some(comparator) = self.comparator_at(overload) {
+            comparator.select(request, control)
+        } else {
+            self.resolver
+                .select_at_overload_observed(overload, request, control)
+        }
     }
 
     fn validate_selected(
@@ -192,13 +269,21 @@ impl FunctionBindingResolver for ArrayOrderOwner {
         request: FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
-        self.resolver.validate_selected(selected, request, control)
+        if let Some(comparator) = self.comparator_at(&selected.overload) {
+            comparator.validate_selected(selected, request, control)
+        } else {
+            self.resolver.validate_selected(selected, request, control)
+        }
     }
 }
 
 impl PureFunctionMetadataOwner for ArrayOrderOwner {
     fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
-        crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+        if self.comparator.is_some() {
+            crate::FunctionBindingResolverOwner::array_order(self)
+        } else {
+            crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+        }
     }
 
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
@@ -229,6 +314,11 @@ impl FunctionEffectOwner for ArrayOrderOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
+        if let Some(comparator) = self.comparator_at(&input.selected.overload) {
+            return comparator.refine(input, control, || {
+                comparator.validate_selected(input.selected, input.request, control)
+            });
+        }
         self.refine_selected_core(input, control, || {
             self.validate_selected(input.selected, input.request, control)
         })
@@ -240,10 +330,66 @@ impl FunctionEffectOwner for ArrayOrderOwner {
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
     {
+        if let Some(comparator) = self.comparator_at(&input.selected.overload) {
+            return comparator
+                .refine(input, control, || {
+                    checked.require_binding_author(self, input)
+                })
+                .map_err(CheckedOwnerFailure::Original);
+        }
         self.refine_selected_core(input, control, || {
             checked.require_fixed_author(self.resolver.as_ref(), input)
         })
         .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+
+impl PureHigherOrderImplementation for ArrayOrderOwner {
+    fn prepare_higher_order(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<HigherOrderCallContract>,
+        body: Arc<LambdaBodyContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedHigherOrderKernel>, KernelFailure> {
+        let comparator = self
+            .comparator_at(&input.selected.overload)
+            .ok_or_else(|| invalid("array sort does not own this comparator overload"))?;
+        comparator.prepare_exact(
+            self.prepare_comparator,
+            input,
+            contract,
+            body,
+            control,
+            || comparator.validate_selected(input.selected, input.request, control),
+        )
+    }
+
+    fn prepare_higher_order_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &CheckedCallEffectInput<'_>,
+        contract: Arc<HigherOrderCallContract>,
+        body: Arc<LambdaBodyContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedHigherOrderKernel>, CheckedOwnerFailure<KernelFailure>> {
+        let comparator = self
+            .comparator_at(&input.selected.overload)
+            .ok_or_else(|| {
+                CheckedOwnerFailure::Original(invalid(
+                    "array sort does not own this comparator overload",
+                ))
+            })?;
+        comparator
+            .prepare_exact(
+                self.prepare_comparator,
+                input,
+                contract,
+                body,
+                control,
+                || checked.require_binding_author(self, input),
+            )
+            .map_err(CheckedOwnerFailure::Original)
     }
 }
 
@@ -392,6 +538,7 @@ impl ArrayOrderOwner {
             work.step().map_err(compile_failure)?;
             if input.function_id != self.declaration.function_id()
                 || input.kind != FunctionKind::Scalar
+                || self.comparator_at(&input.selected.overload).is_some()
                 || contract.function_id() != input.function_id
                 || !std::ptr::eq(contract.selected(), input.selected)
                 || novarocks_type_contract::CallEffectContext::from(contract.context())

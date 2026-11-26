@@ -41,14 +41,18 @@ use crate::mv::domain::refresh::execution_policy::{
     non_join_incremental_write_mode, select_join_incremental_execution_mode,
 };
 use crate::mv::domain::refresh::non_join_incremental::{
-    NonJoinBaseChange, NonJoinIncrementalChangePlan, plan_non_join_incremental_changes,
+    NonJoinBaseChange, NonJoinIncrementalChangePlan, not_incremental_reason_message,
+    plan_non_join_incremental_changes,
 };
 use crate::mv::domain::refresh::pin::{RefreshSnapshotPin, RefreshSnapshotPinOccurrence};
 use crate::mv::domain::refresh::planning::{
     RefreshPlanContract, RefreshStateBaseline, RefreshStateBaselineSource,
 };
 use crate::mv::domain::refresh::repartition::select_repartition_shape;
-use crate::mv::domain::refresh::rewrite_context::{RefreshRewriteInputs, admitted_change_facts};
+use crate::mv::domain::refresh::rewrite_context::{
+    OccurrenceWindow, RefreshRewriteInputs, occurrence_window,
+    project_prepared_change_window_for_table_original,
+};
 use crate::mv::domain::refresh::schema_contract::validate_projection_target;
 use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
 use crate::mv::domain::refresh::target::IcebergMvTarget;

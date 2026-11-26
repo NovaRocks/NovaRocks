@@ -4585,6 +4585,11 @@ mod tests {
                 DataType::Int32,
             ),
             (
+                "SELECT CAST(s AS ROW(a bigint)).a FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
+                None,
+                DataType::Int64,
+            ),
+            (
                 "SELECT s.A FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
                 Some("A"),
                 DataType::Int32,
@@ -4597,13 +4602,6 @@ mod tests {
             assert_eq!(output.field_name.as_deref(), expected_name, "{sql}");
             assert_eq!(output.value_type.data_type(), &expected_type, "{sql}");
         }
-        let changing_value_type = "SELECT CAST(s AS ROW(a bigint)).a FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t";
-        let query = parse_native_query(changing_value_type).unwrap();
-        let error = analyze(&query, &TestCatalog, "default").unwrap_err();
-        assert_eq!(
-            error.kind(),
-            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
-        );
     }
 
     #[test]
@@ -6813,18 +6811,38 @@ mod tests {
     }
 
     #[test]
-    fn transform_defers_body_typing_and_rejects_invalid_lambda_arity() {
-        let error = parse_raw_and_analyze("SELECT transform(ARRAY[1, 2], x -> CAST(x AS VARCHAR))")
-            .expect_err("lambda body typing is deferred");
-        assert!(
-            error.contains("builtin.scalar/transform/lambda-v1"),
-            "{error}"
+    fn transform_types_the_original_body_and_rejects_invalid_lambda_arity() {
+        let resolved =
+            parse_raw_and_analyze("SELECT transform(ARRAY[1, 2], x -> CAST(x AS VARCHAR))")
+                .expect("the body determines the result member type");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("SELECT projection");
+        };
+        let output = &select.projection[0].expr;
+        let ExprKind::FunctionCall { binding, args, .. } = &output.kind else {
+            panic!("selected transform");
+        };
+        assert_eq!(
+            binding.selected.overload.as_str(),
+            "builtin.scalar/transform/lambda-v1"
         );
-        let error = parse_raw_and_analyze("SELECT transform(ARRAY[1], (x, y) -> x + y)")
-            .expect_err("unary lambda required");
-        assert!(
-            !error.contains("has no installed implementation"),
-            "{error}"
+        let ExprKind::LambdaFunction { params, body } = &args[1].kind else {
+            panic!("bound unary lambda");
+        };
+        assert_eq!(params.len(), 1);
+        assert_eq!(
+            params[0].value_type.data_type(),
+            &arrow::datatypes::DataType::Int32
+        );
+        let item = output.value_type.child_at(0).unwrap();
+        assert_eq!(item.value_type(), body.value_type.value_type());
+
+        let sql = "SELECT transform(ARRAY[1], (x, y) -> x + y)";
+        let query = parse_native_query(sql).unwrap();
+        let error = analyze(&query, &TestCatalog, "default").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnknownFunction
         );
     }
 
@@ -6840,24 +6858,35 @@ mod tests {
 
     #[test]
     fn in_predicate_apply_rejects_scalar_vs_array_key() {
-        let err = parse_raw_and_analyze(
+        let query = parse_native_query(
             "SELECT 1 FROM array_test s WHERE 1 NOT IN (SELECT i_1 FROM array_test t)",
         )
-        .expect_err("scalar-vs-array IN subquery should be rejected before planning");
-        assert!(
-            err.contains("does not support binary predicate operation between"),
-            "unexpected error: {err}"
+        .unwrap();
+        let error = analyze(&query, &TestCatalog, "default")
+            .expect_err("scalar-vs-array IN subquery should be rejected before planning");
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TypeMismatch
         );
     }
 
     #[test]
-    fn any_match_lambda_defers_predicate_body_typing() {
-        let error = parse_raw_and_analyze("SELECT any_match(ARRAY[1,2], x -> x < 10)")
-            .expect_err("lambda body typing is deferred");
-        assert!(
-            error.contains("builtin.scalar/any_match/lambda-v1"),
-            "{error}"
-        );
+    fn any_match_requires_the_actual_boolean_lambda_result() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        for body in ["x < 10", "CAST(NULL AS BOOLEAN)"] {
+            let sql = format!("SELECT any_match(ARRAY[1,2], x -> {body})");
+            let resolved = parse_raw_and_analyze(&sql).unwrap();
+            assert_eq!(
+                resolved.output_columns[0].value_type.data_type(),
+                &arrow::datatypes::DataType::Boolean
+            );
+        }
+        for body in ["NULL", "x", "CAST(x AS VARCHAR)"] {
+            let sql = format!("SELECT any_match(ARRAY[1,2], x -> {body})");
+            let query = parse_native_query(&sql).unwrap();
+            let error = analyze(&query, &TestCatalog, "default").unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnknownFunction, "{sql}");
+        }
     }
 
     #[test]

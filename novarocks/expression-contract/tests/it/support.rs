@@ -183,6 +183,7 @@ pub fn claim(context: ExpressionEffectContext, control: ArgumentControl) -> Expr
                     | ArgumentControl::SimpleCase
                     | ArgumentControl::SearchedCase
                     | ArgumentControl::TemporalSource(_)
+                    | ArgumentControl::HigherOrder { .. }
             ) {
                 FunctionNullBehavior::ControlDefined
             } else {

@@ -25,11 +25,11 @@ pub(super) enum ComparisonPosition {
     Binary,
     BetweenLower,
     BetweenUpper,
-    CaseWhen(u32),
 }
 
 pub(super) trait NodeRecipes {
     fn comparison_recipe(&self, position: ComparisonPosition) -> Option<&PreparedComparisonRecipe>;
+    fn case_comparison(&self, arm: u32) -> Option<&crate::primitives::PreparedNodeComparison>;
     fn null_safe_comparison_recipe(&self) -> Option<&PreparedNullSafeComparisonRecipe>;
     fn native_like_recipe(&self) -> Option<&PreparedNativeLikeRecipe>;
     fn native_inlist_recipe(&self) -> Option<&PreparedNativeInListRecipe>;
@@ -48,12 +48,11 @@ impl NodeRecipes for UnitNodeRecipes<'_> {
             ComparisonPosition::Binary => ComparisonSite::Binary(self.occurrence),
             ComparisonPosition::BetweenLower => ComparisonSite::BetweenLower(self.occurrence),
             ComparisonPosition::BetweenUpper => ComparisonSite::BetweenUpper(self.occurrence),
-            ComparisonPosition::CaseWhen(arm) => ComparisonSite::CaseWhen {
-                occurrence: self.occurrence,
-                arm,
-            },
         };
         self.unit.recipes().comparison(site)
+    }
+    fn case_comparison(&self, arm: u32) -> Option<&crate::primitives::PreparedNodeComparison> {
+        self.unit.recipes().case_comparison(self.occurrence, arm)
     }
     fn null_safe_comparison_recipe(&self) -> Option<&PreparedNullSafeComparisonRecipe> {
         self.unit.recipes().null_safe_comparison(self.occurrence)

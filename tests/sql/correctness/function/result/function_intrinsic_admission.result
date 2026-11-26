@@ -22,6 +22,10 @@ negated	narrow_type
 -- types	array(integer)
 reversed_array
 
+-- query 8
+-- types	map(integer, integer)
+filtered_map
+
 -- query 9
 -- types	array(array(integer))
 null_key_order

@@ -262,6 +262,11 @@ pub(in crate::physical_package_v2) fn checked_fixture_unit(
                 ControlShape::NoArguments => ArgumentControl::NoArguments,
                 _ => panic!("fixture requires an explicit supported scalar control"),
             };
+            effects.null_behavior = match shape {
+                ControlShape::HigherOrder { .. } => FunctionNullBehavior::ControlDefined,
+                ControlShape::Eager => FunctionNullBehavior::Strict,
+                _ => effects.null_behavior,
+            };
             Some((
                 id,
                 ExpressionCallClaim {

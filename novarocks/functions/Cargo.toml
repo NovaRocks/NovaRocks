@@ -33,8 +33,8 @@ doctest = false
 novarocks-arrow-batch-codec.workspace = true
 novarocks-failure-contract.workspace = true
 datasketches = { workspace = true, features = ["hll"] }
-arrow-arith = "60.1.0"
-arrow-ord = "60.1.0"
+arrow-arith.workspace = true
+arrow-ord.workspace = true
 regex.workspace = true
 regex-syntax = "=0.8.8"
 # Reuse the locked Unicode property author for Trino's BMP decimal digits.
@@ -50,7 +50,7 @@ xxhash-rust = { workspace = true, features = ["xxh64"] }
 hex.workspace = true
 base64.workspace = true
 arrow-array.workspace = true
-arrow-row = "60.1.0"
+arrow-row.workspace = true
 arrow-buffer.workspace = true
 arrow-cast.workspace = true
 arrow-data.workspace = true

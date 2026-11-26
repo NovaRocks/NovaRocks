@@ -24,6 +24,11 @@ use super::error::{
     comparison_author_error,
 };
 use super::{CallAuthorInputs, UnitCallAuthorship, scalar_binding_selection};
+use crate::{
+    ExprCompileError, ExprCompileFailure,
+    compiler::lambda::{self, LexicalReferences},
+    creation::ProgramCreation,
+};
 use novarocks_constant_contract::{ConstantError, ConstantTableError};
 use novarocks_expression_contract::{
     BinaryOperator, CallRequestMaterializationError, ExprId, ExprKind, ExprNode,
@@ -43,6 +48,17 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
+
+fn lexical_error(error: ExprCompileFailure<std::convert::Infallible>) -> CallAuthorError {
+    match error.into_pure() {
+        ExprCompileError::Control(cause) => CallAuthorError::Control(cause),
+        ExprCompileError::Publication(crate::ProgramCreationFailure::Capacity(_)) => {
+            CallAuthorError::Control(CompileControlError::ResourceExhausted)
+        }
+        ExprCompileError::Invalid(detail) => CallAuthorError::effects_invalid(detail),
+        error => CallAuthorError::effects(error.to_string()),
+    }
+}
 
 pub fn author_unit_calls(
     unit: &SealedUnit,
@@ -68,6 +84,8 @@ fn compose(
     let flow = unit.control_flow();
     let mut summaries = BTreeMap::new();
     let mut claims = BTreeMap::new();
+    let mut lexical_references = LexicalReferences::default();
+    let mut pure = ProgramCreation { creator: None };
     let mut active = BTreeSet::new();
     let mut stack = Vec::new();
     work.flush()?;
@@ -118,12 +136,16 @@ fn compose(
                     id,
                     &requests,
                     &summaries,
+                    &lexical_references,
                     work,
                     &mut claims,
                 )?
             } else {
                 author_primitive(unit, inputs, source, invocation, &summaries, work)?
             };
+            lexical_references
+                .record(source, invocation, &mut pure, work)
+                .map_err(lexical_error)?;
             summaries.insert(id, summary);
             active.remove(&id);
             stack.pop();
@@ -272,6 +294,7 @@ fn materialize_requests<'a>(
     Ok(requests)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn author_call(
     unit: &SealedUnit,
     inputs: &CallAuthorInputs<'_>,
@@ -279,6 +302,7 @@ fn author_call(
     use_id: ExpressionUseId,
     requests: &BTreeMap<ExprId, novarocks_expression_contract::MaterializedCallRequest<'_>>,
     summaries: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    lexical_references: &LexicalReferences,
     work: &mut CompileCheckpoints<'_>,
     claims: &mut BTreeMap<ExpressionUseId, ExpressionCallClaim>,
 ) -> Result<ScopedExpressionEffects, CallAuthorError> {
@@ -313,6 +337,7 @@ fn author_call(
         PureKernelAbi::ScalarV1
             | PureKernelAbi::ScalarInvocationV1
             | PureKernelAbi::ControlIntrinsicV1
+            | PureKernelAbi::HigherOrderV1
     ) {
         return Err(CallAuthorError::effects(format!(
             "Scalar(UnsupportedAbi({abi:?}))"
@@ -388,6 +413,17 @@ fn author_call(
             "actual scalar control differs from its installed owner",
         ));
     }
+    let body_ordinal = match (abi, shape) {
+        (PureKernelAbi::HigherOrderV1, ControlShape::HigherOrder { body_ordinal, .. }) => {
+            Some(body_ordinal as usize)
+        }
+        (PureKernelAbi::HigherOrderV1, _) | (_, ControlShape::HigherOrder { .. }) => {
+            return Err(CallAuthorError::scalar_invalid(
+                "higher-order shape differs from its exact installed ABI",
+            ));
+        }
+        _ => None,
+    };
     let decimal = *inputs
         .decimal_overflow
         .get(&source.id)
@@ -418,15 +454,17 @@ fn author_call(
                     "ordered scalar argument use has a different source definition",
                 ));
             }
-            let effects = summaries
-                .get(&child_id)
-                .copied()
-                .ok_or(CallAuthorError::effects(format!(
-                    "Scalar(MissingChildEffects({child_id:?}))"
-                )))?;
-            children = children
-                .join_control_argument(effects, flow, ordinal)
-                .map_err(|error| CallAuthorError::effects(format!("Effects({error:?})")))?;
+            if Some(ordinal) != body_ordinal {
+                let effects = summaries
+                    .get(&child_id)
+                    .copied()
+                    .ok_or(CallAuthorError::effects(format!(
+                        "Scalar(MissingChildEffects({child_id:?}))"
+                    )))?;
+                children = children
+                    .join_control_argument(effects, flow, ordinal)
+                    .map_err(|error| CallAuthorError::effects(format!("Effects({error:?})")))?;
+            }
             if let Some(source) = temporal {
                 let channel = &source.sources[ordinal];
                 if channel.use_id != child_id {
@@ -452,7 +490,23 @@ fn author_call(
         },
         None => CallArgumentUses::SelectedChannels(&argument_uses),
     };
-    let preparation = if matches!(
+    let preparation = if let Some(ordinal) = body_ordinal {
+        let edge = lambda::body_edge(|id| unit.definition(id), flow, invocation, ordinal)
+            .map_err(CallAuthorError::scalar_invalid)?;
+        PureCallPreparation::HigherOrder(
+            lexical_references
+                .preparation(
+                    &edge,
+                    flow,
+                    |id| unit.definition(id),
+                    summaries,
+                    children,
+                    &mut ProgramCreation { creator: None },
+                    work,
+                )
+                .map_err(lexical_error)?,
+        )
+    } else if matches!(
         abi,
         PureKernelAbi::ScalarV1 | PureKernelAbi::ScalarInvocationV1
     ) {
@@ -597,7 +651,9 @@ fn own_effects(
     };
     work.step()?;
     Ok(match &source.kind {
-        ExprKind::Value(_) => ScopedExpressionEffects::pure_value(context),
+        ExprKind::Value(_) | ExprKind::Lambda { .. } | ExprKind::LambdaParameter { .. } => {
+            ScopedExpressionEffects::pure_value(context)
+        }
         ExprKind::Constant(reference) => {
             inputs
                 .environment
@@ -658,14 +714,26 @@ fn own_effects(
             .map_err(comparison_author_error)?;
             recipe.own_effects(context)
         }
+        ExprKind::Case {
+            operand, when_then, ..
+        } => crate::primitives::case_own_effects(
+            operand
+                .map(|id| definition(unit, id).map(|node| &node.ty))
+                .transpose()?,
+            when_then
+                .iter()
+                .map(|(id, _)| definition(unit, *id).map(|node| &node.ty)),
+            context,
+            work,
+            comparison_author_error,
+        )?,
         ExprKind::Unary {
             op: UnaryOperator::Not,
             ..
         }
         | ExprKind::IsNull { .. }
         | ExprKind::Conjunction { .. }
-        | ExprKind::Disjunction { .. }
-        | ExprKind::Case { .. } => ScopedExpressionEffects::pure_value(context),
+        | ExprKind::Disjunction { .. } => ScopedExpressionEffects::pure_value(context),
         ExprKind::Cast {
             expr,
             target,

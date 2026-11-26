@@ -28,58 +28,53 @@ pk	member	nonmember
 4	NULL	NULL
 
 -- query 6
--- legacy
+-- types	boolean	boolean
 unknown_pair	definite_mismatch
-NULL	0
+NULL	false
 
 -- query 7
--- legacy
+-- types	boolean	boolean
 unknown_pair	definite_mismatch
-NULL	0
+NULL	false
 
 -- query 8
--- legacy
+-- types	boolean	boolean
 unknown_pair	match
-NULL	1
-
--- query 9
--- legacy
-text_differs
-0
+NULL	true
 
 -- query 10
--- legacy
+-- types	integer
 pk
 2
 3
 
 -- query 11
--- legacy
+-- types	boolean	boolean
 unknown_pair	definite_mismatch
-NULL	0
+NULL	false
 
 -- query 12
--- legacy
+-- types	integer	bigint
 x	n
 1	2
 
 -- query 13
--- legacy
+-- types	integer	boolean
 x	membership
-1	1
-2	0
+1	true
+2	false
 
 -- query 14
--- legacy
+-- types	integer	bigint
 x	n
 1	2
 
 -- query 15
--- legacy
+-- types	boolean
 membership
-1
+true
 
 -- query 16
--- legacy
+-- types	bigint
 n
 2

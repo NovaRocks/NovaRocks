@@ -49,8 +49,8 @@ use novarocks_functions::{
 use novarocks_functions::{
     EngineFunctionCatalog, FunctionArgument, FunctionArgumentType, FunctionBindingError,
     FunctionBindingRequest, FunctionDefinition, FunctionKind, FunctionResolutionError,
-    FunctionResultType, FunctionValueType, FunctionVisibility, ResolvedAggregateSignature,
-    ResolvedFunctionBinding, aggregate_types::DistinctAggregate,
+    FunctionResultType, FunctionValueType, FunctionVisibility, HigherOrderBindingCandidate,
+    ResolvedAggregateSignature, ResolvedFunctionBinding, aggregate_types::DistinctAggregate,
 };
 use novarocks_type_contract::{ValueKind, trino_can_coerce_scalar};
 
@@ -317,6 +317,35 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
             },
             control,
         )
+    }
+
+    fn begin_higher_order_binding(
+        &self,
+        name: &str,
+        ordinary_ordinal: usize,
+        ordinary: &FunctionArgument,
+        lambda_ordinal: usize,
+        lambda_arity: usize,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<HigherOrderBindingCandidate, FunctionBindingError> {
+        EngineFunctionCatalog::begin_higher_order_binding(
+            self,
+            name,
+            ordinary_ordinal,
+            ordinary,
+            lambda_ordinal,
+            lambda_arity,
+            control,
+        )
+    }
+
+    fn finish_higher_order_binding(
+        &self,
+        candidate: &HigherOrderBindingCandidate,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        EngineFunctionCatalog::finish_higher_order_binding(self, candidate, request, control)
     }
 
     fn resolve_scalar_operator_binding(

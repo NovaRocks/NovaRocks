@@ -24,7 +24,7 @@ use novarocks_expression::CompiledExprSet;
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_functions::{
     ConstantPolicy, ConstantPool, ConstantValue, KernelDiagnostic, KernelFailure,
-    PreparedPureKernel, validate_function_value_type_observed,
+    PreparedNullIfEquality, PreparedPureKernel, validate_function_value_type_observed,
 };
 use novarocks_type_contract::{
     ArgumentControl, CompileCheckpoints, CompilePhase, FunctionInstanceState, FunctionValueType,
@@ -87,7 +87,14 @@ pub(super) fn compiled_unit_can_fold(
         match call.prepared() {
             PreparedPureKernel::Scalar(kernel)
                 if kernel.instance_inline_allocation_bytes() == 0 => {}
-            PreparedPureKernel::ControlIntrinsic(_) | PreparedPureKernel::NullIf(_) => {}
+            PreparedPureKernel::ControlIntrinsic(_) => {}
+            PreparedPureKernel::NullIf(recipe) => {
+                if let PreparedNullIfEquality::Composite(recipe) = recipe.equality()
+                    && recipe.requires_allocator()
+                {
+                    return Ok(false);
+                }
+            }
             // The optional optimizer has no original evaluation allocator.
             // Ordered calls with known NULL are simplified before this step.
             PreparedPureKernel::OrderedRegexp(_) => return Ok(false),
@@ -112,7 +119,11 @@ pub(super) fn compiled_unit_can_fold(
             _ => return Err(invalid_program("unsupported frozen constant call control")),
         }
     }
-    Ok(true)
+    // Guarded primitives can use the execution allocator without an opaque
+    // scalar instance. Optional folding has no equivalent grant.
+    Ok(!compiled
+        .recipes()
+        .requires_guarded_comparison_allocator(work)?)
 }
 
 /// Admit the evaluated value using the arena declaration. Lowering can widen

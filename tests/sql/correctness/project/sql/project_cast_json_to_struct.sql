@@ -19,7 +19,7 @@
 -- Test Objective:
 -- 1. Validate CAST(JSON array as STRUCT) with positional field mapping.
 -- 2. Validate CAST(JSON object as STRUCT) with named field mapping.
--- 3. Cover missing fields (null padding), type coercion (float→int), extra fields (truncation).
+-- 3. Reject mismatched array arity and invalid fields, and verify whole-row TRY_CAST.
 -- 4. Cover nested structs, array fields, and deeply nested combinations.
 
 -- query 1
@@ -27,15 +27,18 @@
 select cast(json_parse('[1,2,3]') as ROW(col1 int, col2 int, col3 int));
 
 -- query 2
--- Array JSON → struct, fewer fields than JSON elements (truncation)
+-- A JSON array must have exactly the declared ROW arity.
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
 select cast(json_parse('[1,2,3]') as ROW(col1 int, col2 int));
 
 -- query 3
--- Array JSON → struct, more fields than JSON elements (null padding)
+-- A missing positional JSON member fails the ROW cast.
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
 select cast(json_parse('[1,2,3]') as ROW(col1 int, col2 int, col3 int, col4 int));
 
 -- query 4
--- Array JSON with string element that cannot convert to int → null in that slot
+-- A bad field fails the enclosing ROW cast.
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
 select cast(json_parse('[1,   2,    3, "a"]') as ROW(col1 int, col2 int, col3 int, col4 int));
 
 -- query 5
@@ -43,7 +46,7 @@ select cast(json_parse('[1,   2,    3, "a"]') as ROW(col1 int, col2 int, col3 in
 select cast(json_parse('[1.1, 2.2, 3.3]') as ROW(col1 double, col2 double, col3 double));
 
 -- query 6
--- Float values: last field cast from double to int (truncation)
+-- The last numeric field uses the same JSON-to-INTEGER conversion.
 select cast(json_parse('[1.1, 2.2, 3.3]') as ROW(col1 double, col2 double, col3 int));
 
 -- query 7
@@ -69,3 +72,7 @@ select cast(json_parse('{"star" : "rocks", "length": 5, "numbers": [1, 4, 7], "n
 -- query 12
 -- Array of structs: each element is a complex struct with nested array and nested struct
 select cast(json_parse('[{"star" : "rocks", "length": 5, "numbers": [1, 4, 7], "nest": [1, 2, 3]}, {"star" : "rockses", "length": 33, "numbers": [2, 5, 9], "nest": [3, 6, 9]}]') as array<ROW(star varchar(10), length int, numbers array<int>, nest ROW(col1 int, col2 int, col3 int))>);
+
+-- query 13
+-- TRY_CAST makes the entire failed ROW SQL NULL.
+SELECT TRY_CAST(json_parse('[1, 2, 3, "a"]') AS ROW(col1 INT, col2 INT, col3 INT, col4 INT));

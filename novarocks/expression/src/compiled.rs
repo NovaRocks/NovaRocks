@@ -17,7 +17,9 @@
 
 //! One immutable compiled unit and its original per-use facts.
 use crate::creation::{ProgramCreation, ProgramCreationFailure};
-use crate::primitives::{ComparisonSite, CreatedPrimitiveMap, ProgramPrimitiveError};
+use crate::primitives::{
+    ComparisonSite, CreatedPrimitiveMap, PreparedNodeComparison, ProgramPrimitiveError,
+};
 use crate::{
     CompiledExprId, ExprCompileError, ExprCompileFailure, ImmutableExpressions, InputBinding,
     ScopeLayout, ScopeLayouts,
@@ -65,7 +67,7 @@ pub struct UnitRecipes {
         CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedNativeInListRecipe>,
     arithmetic: CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedArithmeticRecipe>,
     casts: CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedCastRecipe>,
-    comparisons: CreatedPrimitiveMap<ComparisonSite, novarocks_functions::PreparedComparisonRecipe>,
+    comparisons: CreatedPrimitiveMap<ComparisonSite, PreparedNodeComparison>,
     null_safe:
         CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedNullSafeComparisonRecipe>,
 }
@@ -80,11 +82,15 @@ pub struct CompiledExprSet {
     all_ports: Option<ScopeLayout>,
     roots: Box<[CompiledRoot]>,
     effects: BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    pub(crate) lambdas: crate::compiler::lambda::CompiledLambdas,
     ids: BTreeMap<ExprId, CompiledExprId>,
     _storage: ValueTypeStorageLifetime,
 }
 #[path = "evaluator_view.rs"]
 pub mod evaluator_view;
+pub use crate::compiler::lambda::{
+    CompiledLambdaBody, CompiledLambdaCapture, LambdaCaptureSource, LambdaReuseScope,
+};
 
 fn publication<H>(e: ProgramCreationFailure<ProgramPrimitiveError, H>) -> ExprCompileFailure<H> {
     match e {
@@ -236,7 +242,7 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         factory,
     )?;
     let creation = factory.map(|f| (f, &policy));
-    let (calls, effects) = crate::compiler::prepare_core(
+    let (calls, effects, lambdas) = crate::compiler::prepare_core(
         unit,
         environment,
         &lowered,
@@ -244,6 +250,8 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         control,
         work,
         creation,
+        crate::creation::borrow_scope(&mut temporary),
+        crate::creation::borrow_scope(&mut retained),
     )?;
     let mut inputs = BTreeMap::new();
     let mut roots = Vec::new();
@@ -433,6 +441,7 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         all_ports,
         roots: roots.into_boxed_slice(),
         effects,
+        lambdas,
         ids: lowered.ids,
         _storage: storage,
     }))

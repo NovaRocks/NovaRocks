@@ -1190,3 +1190,13 @@ fn cardinality_output_layout_rejects_unrepresentable_bigint_and_validity_before_
         );
     }
 }
+
+#[test]
+fn scalar_broadcast_differential_for_list_and_map_cardinality() {
+    use crate::builtin::array_invocation_test_support::assert_scalar_broadcast_equivalent;
+    for source in [list(true), map(true, false)] {
+        for row in [1, 2, 3] {
+            assert_scalar_broadcast_equivalent("cardinality", &[(&source, row)], false);
+        }
+    }
+}

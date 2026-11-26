@@ -49,7 +49,8 @@ mod copy_buffer_peak;
 #[path = "selected_copy/list_output.rs"]
 mod list_output;
 pub(crate) use list_output::{
-    array_from_segments_in, list_child_count, list_from_segments_in, list_from_struct_children_in,
+    array_from_segments_in, empty_array_in, list_child_count, list_from_segments_in,
+    list_from_struct_children_in, map_from_struct_children_in,
 };
 #[path = "selected_copy/slice_host.rs"]
 mod slice_host;
@@ -936,7 +937,7 @@ fn visit<E: From<CopyError>>(
                 })?;
                 let selection = full_child_selection(&children, work)?;
                 if let Some(invoice) = work.3.as_deref_mut() {
-                    invoice.original_dictionary_merge_scratch(&children, key, sources.len())?;
+                    invoice.original_dictionary_merge_scratch(&children, key, sources)?;
                 }
                 // Original merge/interleave produces at most the full values
                 // domain; original fallback concatenates that domain. No key or

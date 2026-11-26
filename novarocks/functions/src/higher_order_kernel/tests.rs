@@ -144,7 +144,7 @@ impl Owner {
                 value_stability: FunctionVolatility::Immutable,
                 own_row_error: FunctionIntrinsicRowError::NoRowError,
                 failure_behavior: FunctionFailureBehavior::Propagate,
-                null_behavior: FunctionNullBehavior::CalledOnNull,
+                null_behavior: FunctionNullBehavior::ControlDefined,
                 argument_control: ArgumentControl::HigherOrder {
                     body_ordinal: 1,
                     body_demand: demand,
@@ -573,6 +573,31 @@ impl HigherOrderKernelInstance for Instance {
     fn retained_bytes(&self) -> usize {
         self.retained
     }
+    fn begin<'call, 'input: 'call>(
+        &'call mut self,
+        input: HigherOrderCallInput<'_, 'input>,
+        allocator: &Arc<dyn AggregateStateAllocator>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Box<dyn HigherOrderCall<'input> + 'call>, KernelFailure> {
+        let [first, second] = input.arguments() else {
+            panic!("fixture requires two ordinary arguments");
+        };
+        let selection = input.selection();
+        let sources = [Arc::clone(first.array()), Arc::clone(second.array())];
+        let mut batch = LambdaBodyBatchBuilder::try_new(allocator, &sources, selection.len())?;
+        for (parent, row) in selection.iter().enumerate() {
+            batch.push(
+                parent,
+                &[first.value_row(parent, row), second.value_row(parent, row)],
+            )?;
+        }
+        control.checkpoint(0)?;
+        Ok(Box::new(StagedFixture {
+            instance: self,
+            selection,
+            batch: Some(batch.finish()),
+        }))
+    }
     fn evaluate<'input>(
         &mut self,
         input: HigherOrderCallInput<'_, 'input>,
@@ -769,6 +794,226 @@ impl HigherOrderKernelInstance for Instance {
         .unwrap();
         Ok(HigherOrderOutput::new(values, evidence.into_boxed_slice()))
     }
+}
+
+struct StagedFixture<'call, 'input> {
+    instance: &'call mut Instance,
+    selection: Selection<'input>,
+    batch: Option<LambdaBodyBatch>,
+}
+
+impl<'input> HigherOrderCall<'input> for StagedFixture<'_, 'input> {
+    fn advance(
+        &mut self,
+        completed: Option<LambdaBodyBatchOutput<'input>>,
+        _control: &dyn KernelEvaluationControl,
+    ) -> Result<HigherOrderStep<'input>, KernelFailure> {
+        self.instance
+            .config
+            .evaluations
+            .fetch_add(1, Ordering::Relaxed);
+        let Some(completed) = completed else {
+            return Ok(HigherOrderStep::Request(self.batch.take().unwrap()));
+        };
+        let evidence = (0..completed.errors().len())
+            .map(|index| completed.required_parent_error(index).map(Option::unwrap))
+            .collect::<Result<Box<[_]>, _>>()?;
+        let errors = evidence
+            .iter()
+            .map(|error| {
+                if matches!(self.instance.config.mode, Mode::WrongDiagnostic) {
+                    RowDataError::new(error.error().selected_ordinal(), error.error().message())
+                } else {
+                    error.error().clone()
+                }
+            })
+            .collect();
+        let output = SelectedValues::try_new(
+            self.selection,
+            completed.values().data_type(),
+            Arc::clone(completed.values()),
+            errors,
+        )?;
+        Ok(HigherOrderStep::Complete(HigherOrderOutput::new(
+            output, evidence,
+        )))
+    }
+
+    fn instance_retained_bytes(&self) -> usize {
+        self.instance.retained_bytes()
+    }
+}
+
+fn heap_host() -> Arc<dyn AggregateStateAllocator> {
+    Arc::new(crate::UnaccountedAggregateStateAllocator)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StagedHostFailure {
+    BeforeLeafAdmission,
+    Kernel(KernelFailure),
+}
+
+impl From<KernelFailure> for StagedHostFailure {
+    fn from(error: KernelFailure) -> Self {
+        Self::Kernel(error)
+    }
+}
+
+#[test]
+fn staged_high_order_uses_one_body_and_preserves_the_required_nominal_error() {
+    use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection, FailureReason};
+
+    #[derive(Debug)]
+    struct BodyDataFailure;
+    impl std::fmt::Display for BodyDataFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("body returned an invalid value")
+        }
+    }
+    impl std::error::Error for BodyDataFailure {}
+    impl FailureProjection for BodyDataFailure {
+        fn failure_fact(&self) -> FailureFact {
+            FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(
+                    novarocks_failure_contract::domain::KERNEL,
+                    std::num::NonZeroU16::new(900).unwrap(),
+                ),
+            )
+        }
+    }
+
+    let body_error = RowDataError::from_domain(1, BodyDataFailure).unwrap();
+    let control = RuntimeControl::default();
+    let columns = columns(false);
+    let arguments = values_args(&columns);
+    let outer = Selection::try_sparse(5, &[1, 3]).unwrap();
+    for mode in [Mode::Good, Mode::WrongDiagnostic] {
+        let expects_original_error = matches!(mode, Mode::Good);
+        let owner = owner_with(mode, Init::Good);
+        let (mut instance, body) = instantiate(&owner);
+        let heap = heap_host();
+        let mut invocation = instance.begin(outer, &arguments, &heap, &control).unwrap();
+        let HigherOrderEvaluationStep::Request(request) = invocation.advance(&control).unwrap()
+        else {
+            panic!("expected a body batch");
+        };
+        let mut entries = 0;
+        request
+            .run_with::<KernelFailure>(&control, |demand| {
+                entries += 1;
+                assert!(Arc::ptr_eq(demand.contract(), body.contract()));
+                assert_eq!(demand.batch().parent_ordinals(), &[0, 1]);
+                assert_eq!(demand.batch().parameter_position(0, 0), Some(1));
+                assert_eq!(demand.batch().parameter_position(1, 1), Some(3));
+                assert_eq!(demand.row_map().parent_row(1), Some(3));
+                let output = SelectedValues::try_new(
+                    demand.row_map().all_elements(),
+                    &DataType::Int64,
+                    Arc::new(Int64Array::from(vec![Some(11), None])),
+                    Box::new([body_error.clone()]),
+                )?;
+                demand.complete(body.contract(), output)
+            })
+            .unwrap();
+        assert_eq!(entries, 1);
+        let result = invocation.advance(&control);
+        if expects_original_error {
+            let HigherOrderEvaluationStep::Complete(output) = result.unwrap() else {
+                panic!("expected one final kernel result");
+            };
+            assert_eq!(output.selection().row(1), Some(3));
+            assert!(same_row_error(&body_error, &output.errors()[0]));
+        } else {
+            assert!(matches!(result, Err(KernelFailure::Internal(_))));
+        }
+        assert!(matches!(
+            invocation.advance(&control),
+            Err(KernelFailure::InstanceFailed)
+        ));
+        assert_eq!(owner.config.evaluations.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[test]
+fn staged_higher_order_never_resumes_after_body_refusal_or_a_foreign_body() {
+    let control = RuntimeControl::default();
+    let columns = columns(false);
+    let arguments = values_args(&columns);
+    let heap = heap_host();
+    let outer = Selection::try_sparse(5, &[1, 3]).unwrap();
+    for fail_admission in [true, false] {
+        let owner = Owner::new(EvaluationDemand::Value);
+        let (mut instance, body) = instantiate(&owner);
+        let foreign = Arc::new((**body.contract()).clone());
+        let mut invocation = instance.begin(outer, &arguments, &heap, &control).unwrap();
+        let HigherOrderEvaluationStep::Request(request) = invocation.advance(&control).unwrap()
+        else {
+            panic!("expected a body batch");
+        };
+        let mut entries = 0;
+        let failure = request.run_with::<StagedHostFailure>(&control, |demand| {
+            entries += 1;
+            if fail_admission {
+                return Err(StagedHostFailure::BeforeLeafAdmission);
+            }
+            let output = SelectedValues::try_new(
+                demand.row_map().all_elements(),
+                &DataType::Int64,
+                Arc::new(Int64Array::from(vec![4, 6])),
+                Box::new([]),
+            )
+            .unwrap();
+            demand.complete(&foreign, output).map_err(Into::into)
+        });
+        if fail_admission {
+            assert_eq!(failure, Err(StagedHostFailure::BeforeLeafAdmission));
+        } else {
+            assert!(matches!(
+                failure,
+                Err(StagedHostFailure::Kernel(KernelFailure::InvalidProgram(_)))
+            ));
+        }
+        assert_eq!(entries, 1);
+        assert!(matches!(
+            invocation.advance(&control),
+            Err(KernelFailure::InstanceFailed)
+        ));
+        drop(invocation);
+        assert!(matches!(
+            instance.begin(outer, &arguments, &heap, &control),
+            Err(KernelFailure::InstanceFailed)
+        ));
+        assert_eq!(owner.config.evaluations.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn staged_higher_order_dropped_request_closes_without_any_body_or_resumption() {
+    let control = RuntimeControl::default();
+    let columns = columns(false);
+    let arguments = values_args(&columns);
+    let heap = heap_host();
+    let outer = Selection::try_sparse(5, &[1, 3]).unwrap();
+    let owner = Owner::new(EvaluationDemand::Value);
+    let (mut instance, body) = instantiate(&owner);
+    let mut invocation = instance.begin(outer, &arguments, &heap, &control).unwrap();
+    let HigherOrderEvaluationStep::Request(request) = invocation.advance(&control).unwrap() else {
+        panic!("expected a body batch");
+    };
+    drop(request);
+    assert!(matches!(
+        invocation.advance(&control),
+        Err(KernelFailure::InstanceFailed),
+    ));
+    drop(invocation);
+    assert!(matches!(
+        instance.begin(outer, &arguments, &heap, &control),
+        Err(KernelFailure::InstanceFailed),
+    ));
+    assert_eq!(owner.config.evaluations.load(Ordering::Relaxed), 1);
+    assert_eq!(body.entered.load(Ordering::Relaxed), 0);
 }
 fn columns(negative: bool) -> [ArrayRef; 4] {
     [

@@ -371,7 +371,7 @@ fn fixture_with_parameters(reference: p::ConstantReference, parameter_count: usi
                         value_stability: FunctionVolatility::Immutable,
                         own_row_error: FunctionIntrinsicRowError::NoRowError,
                         failure_behavior: FunctionFailureBehavior::Propagate,
-                        null_behavior: FunctionNullBehavior::CalledOnNull,
+                        null_behavior: FunctionNullBehavior::ControlDefined,
                         argument_control: ArgumentControl::HigherOrder {
                             body_ordinal: 2,
                             body_demand: EvaluationDemand::Value,

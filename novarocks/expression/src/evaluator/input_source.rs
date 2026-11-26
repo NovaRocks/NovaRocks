@@ -408,6 +408,8 @@ pub(super) struct ActualInvocationDomain {
     batch_rows: usize,
     rows: Vec<usize>,
     projection: Option<std::sync::Arc<InputColumnProjection>>,
+    element_allocator: Option<std::sync::Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    _element_rows: Option<novarocks_functions::opaque_memory::OpaqueReservation>,
 }
 impl ActualInvocationDomain {
     pub(super) fn root(
@@ -444,6 +446,39 @@ impl ActualInvocationDomain {
             batch_rows: actual.batch_rows(),
             rows,
             projection: input.projection().cloned(),
+            element_allocator: None,
+            _element_rows: None,
+        })
+    }
+    pub(super) fn elements(
+        rows: &[usize],
+        batch_rows: usize,
+        allocator: &std::sync::Arc<dyn novarocks_functions::AggregateStateAllocator>,
+        control: &dyn novarocks_functions::KernelEvaluationControl,
+    ) -> Result<Self, novarocks_functions::KernelFailure> {
+        let storage =
+            super::mapped::reserve(Some(allocator), super::mapped::bytes::<usize>(rows.len())?)?;
+        let mut selected = super::mapped::buffer(rows.len())?;
+        let mut work = novarocks_functions::EvaluationCheckpoints::new(control);
+        for &row in rows {
+            selected.push(row);
+            work.step()?;
+        }
+        work.flush()?;
+        let batch = RecordBatch::try_new_with_options(
+            std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+            Vec::new(),
+            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows.len())),
+        )
+        .map_err(|_| super::internal("could not construct the lambda's empty input carrier"))?;
+        work.finish()?;
+        Ok(Self {
+            batch,
+            batch_rows,
+            rows: selected,
+            projection: None,
+            element_allocator: Some(std::sync::Arc::clone(allocator)),
+            _element_rows: storage,
         })
     }
     fn mask(
@@ -489,6 +524,15 @@ impl ActualInvocationDomain {
             work.finish()?;
             return Ok(self.clone());
         }
+        if let Some(allocator) = &self.element_allocator {
+            work.finish()?;
+            return Ok(std::sync::Arc::new(Self::elements(
+                rows,
+                self.batch_rows,
+                allocator,
+                control,
+            )?));
+        }
         let mask = Self::mask(self.rows.len(), self.rows.iter().copied(), rows, &mut work)?;
         work.flush()?;
         let batch = arrow::compute::filter_record_batch(&self.batch, &mask)
@@ -505,6 +549,8 @@ impl ActualInvocationDomain {
             batch_rows: self.batch_rows,
             rows: mapped,
             projection: self.projection.clone(),
+            element_allocator: None,
+            _element_rows: None,
         }))
     }
     pub(super) fn rows(&self) -> &[usize] {

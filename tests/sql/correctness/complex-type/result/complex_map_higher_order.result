@@ -1,9 +1,9 @@
 -- query 1
--- legacy
+-- types	map(integer, integer)
 keyed
-{101:10,102:20}
+{"101":10,"102":20}
 
 -- query 2
--- legacy
+-- types	map(integer, integer)
 valued
-{1:20,2:40}
+{"1":20,"2":40}

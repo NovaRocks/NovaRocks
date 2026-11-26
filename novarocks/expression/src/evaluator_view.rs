@@ -120,13 +120,51 @@ impl CompiledExprSet {
     pub fn effects(&self) -> &BTreeMap<ExpressionUseId, ScopedExpressionEffects> {
         &self.effects
     }
+    pub fn higher_order_body(&self, id: ExpressionUseId) -> Option<&CompiledLambdaBody> {
+        self.lambdas.bodies.get(&id)
+    }
+    pub fn reuse_scope(&self, id: ExpressionUseId) -> Option<LambdaReuseScope> {
+        self.lambdas.reuse.get(&id).copied()
+    }
 }
 impl UnitRecipes {
+    pub fn requires_guarded_comparison_allocator(
+        &self,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<bool, novarocks_type_contract::CompileControlError> {
+        for recipe in self.comparisons.values() {
+            work.step()?;
+            if let crate::primitives::PreparedNodeComparison::Composite(recipe) = recipe
+                && recipe.requires_allocator()
+            {
+                return Ok(true);
+            }
+        }
+        for recipe in self.native_inlist.values() {
+            work.step()?;
+            if recipe.requires_comparison_allocator() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn comparison(
         &self,
         id: ComparisonSite,
     ) -> Option<&novarocks_functions::PreparedComparisonRecipe> {
-        self.comparisons.get(&id)
+        match self.comparisons.get(&id)? {
+            crate::primitives::PreparedNodeComparison::Ordinary(recipe) => Some(recipe),
+            crate::primitives::PreparedNodeComparison::Composite(_) => None,
+        }
+    }
+    pub(crate) fn case_comparison(
+        &self,
+        occurrence: ExpressionUseId,
+        arm: u32,
+    ) -> Option<&crate::primitives::PreparedNodeComparison> {
+        self.comparisons
+            .get(&ComparisonSite::CaseWhen { occurrence, arm })
     }
     pub fn null_safe_comparison(
         &self,

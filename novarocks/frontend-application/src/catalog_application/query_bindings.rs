@@ -34,8 +34,8 @@ use novarocks_spi::connector::read_stack::{
     ConnectorPreparedSourceRead, ConnectorReadSourceProjection, ConnectorReadSourceSelection,
 };
 use novarocks_spi::connector::{
-    ConnectorControlPlanningPin, ConnectorReadSelector, ConnectorTableHandle,
-    ConnectorTableMetadata,
+    ConnectorChangeWindowFacts, ConnectorControlPlanningPin, ConnectorReadSelector,
+    ConnectorTableHandle, ConnectorTableMetadata,
 };
 use novarocks_sql::binding::{SqlTableBindingAllocator, SqlTableBindingId, SqlTableBindingScopeId};
 use novarocks_sql::planning::catalog::{
@@ -331,21 +331,11 @@ pub struct QueryPreparedSourceRead {
 fn prepared_source_selector(
     selection: ConnectorReadSourceSelection,
     projection: ConnectorReadSourceProjection,
-    admission: Option<&novarocks_spi::connector::ConnectorChangeWindowAdmission>,
+    window_facts: Option<&ConnectorChangeWindowFacts>,
 ) -> Result<QueryPreparedSourceSelector, String> {
     use ConnectorReadSourceProjection as P;
     use ConnectorReadSourceSelection as S;
-    let incremental = matches!(
-        admission,
-        Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. })
-    );
-    let empty_delta = projection == P::Delta
-        && matches!(selection, S::ChangeWindow(_))
-        && matches!(
-            admission,
-            Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly)
-        );
-    if projection != P::To && !incremental && !empty_delta {
+    if projection != P::To && !window_facts.is_some_and(|facts| facts.permits(projection)) {
         return Err("prepared source does not authorize a From or Delta projection".into());
     }
     match (selection, projection) {
@@ -492,7 +482,7 @@ impl QueryTableBinding {
         let key = prepared_source_selector(
             receipt.request().selection(),
             projection,
-            receipt.admission(),
+            receipt.window_facts(),
         )?;
         if self.prepared_source_reads.contains_key(&key) {
             return Err("prepared source selector was installed twice".into());
@@ -1270,14 +1260,20 @@ mod tests {
         use ConnectorReadSourceSelection as S;
         use novarocks_spi::connector::read_stack::ConnectorReadChangeWindow;
         use novarocks_spi::connector::{
-            ConnectorChangeWindowAdmission as A, ConnectorChangeWindowPartitionImpact as I,
+            ConnectorChangeWindowFacts as A, ConnectorChangeWindowNegativeWeight,
+            ConnectorChangeWindowNetZeroBasis, ConnectorChangeWindowNotIncrementalReason,
+            ConnectorChangeWindowPartitionImpact as I, ConnectorChangeWindowVolume,
         };
         let window = S::ChangeWindow(ConnectorReadChangeWindow::new(7, 19));
-        let admitted = A::Incremental {
-            has_inserts: true,
-            has_deletes: false,
+        let difference = A::Difference {
+            negative_weight: ConnectorChangeWindowNegativeWeight::Absent,
             partition_impact: I::Unpartitioned,
+            volume: ConnectorChangeWindowVolume {
+                source_event_rows_upper_bound: 1,
+                source_data_file_bytes: 128,
+            },
         };
+        let net_zero = A::NetZero(ConnectorChangeWindowNetZeroBasis::ReplaceOnly);
         for selection in [S::Snapshot(19), S::CurrentAtSnapshot(19)] {
             assert_eq!(
                 prepared_source_selector(selection, P::To, None).unwrap(),
@@ -1287,32 +1283,32 @@ mod tests {
             assert!(prepared_source_selector(selection, P::Delta, None).is_err());
         }
         assert_eq!(
-            prepared_source_selector(window, P::To, Some(&admitted)).unwrap(),
+            prepared_source_selector(window, P::To, Some(&difference)).unwrap(),
             QueryPreparedSourceSelector::Snapshot(19)
         );
         assert_eq!(
-            prepared_source_selector(window, P::From, Some(&admitted)).unwrap(),
+            prepared_source_selector(window, P::From, Some(&difference)).unwrap(),
             QueryPreparedSourceSelector::Snapshot(7)
         );
         assert_eq!(
-            prepared_source_selector(window, P::Delta, Some(&admitted)).unwrap(),
+            prepared_source_selector(window, P::Delta, Some(&difference)).unwrap(),
             QueryPreparedSourceSelector::Delta {
                 from_exclusive: 7,
                 to_inclusive: 19
             }
         );
         assert_eq!(
-            prepared_source_selector(window, P::To, Some(&A::MetadataOnly)).unwrap(),
+            prepared_source_selector(window, P::To, Some(&net_zero)).unwrap(),
             QueryPreparedSourceSelector::Snapshot(19)
         );
-        let full = A::FullRebuild(
-            novarocks_spi::connector::ConnectorChangeWindowFullRebuildReason::LineageBroken {
+        let full = A::NotIncremental(
+            ConnectorChangeWindowNotIncrementalReason::SnapshotAncestryBroken {
                 from_snapshot_id: 7,
             },
         );
-        assert!(prepared_source_selector(window, P::From, Some(&A::MetadataOnly)).is_err());
+        assert!(prepared_source_selector(window, P::From, Some(&net_zero)).is_err());
         assert_eq!(
-            prepared_source_selector(window, P::Delta, Some(&A::MetadataOnly)).unwrap(),
+            prepared_source_selector(window, P::Delta, Some(&net_zero)).unwrap(),
             QueryPreparedSourceSelector::Delta {
                 from_exclusive: 7,
                 to_inclusive: 19
@@ -1320,9 +1316,7 @@ mod tests {
         );
         assert!(prepared_source_selector(window, P::From, Some(&full)).is_err());
         assert!(prepared_source_selector(window, P::Delta, Some(&full)).is_err());
-        assert!(
-            prepared_source_selector(S::Snapshot(19), P::Delta, Some(&A::MetadataOnly)).is_err()
-        );
+        assert!(prepared_source_selector(S::Snapshot(19), P::Delta, Some(&net_zero)).is_err());
     }
 
     #[test]

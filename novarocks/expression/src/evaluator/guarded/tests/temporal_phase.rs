@@ -77,6 +77,7 @@ fn frame(work: &mut Work<'_, '_>) -> Frame {
         false,
         novarocks_functions::ScalarInvocationActivation::Activated,
         vec![],
+        None,
         work,
     )
     .unwrap()
@@ -84,6 +85,7 @@ fn frame(work: &mut Work<'_, '_>) -> Frame {
 fn child(ordinals: Vec<usize>, array: ArrayRef, errors: Vec<RowDataError>) -> Child {
     Child {
         ordinals,
+        ordinal_storage: None,
         value: OwnedValue::Selected(array, errors.into_boxed_slice()),
     }
 }
@@ -321,6 +323,7 @@ fn deepest(control: &Control) -> Result<(), KernelFailure> {
         false,
         novarocks_functions::ScalarInvocationActivation::Activated,
         vec![],
+        None,
         &mut work,
     );
     let mut frame = frame?;

@@ -195,24 +195,39 @@ impl JoinInputSink {
             EvaluatedArgument, Selection, validate_evaluated_argument_observed,
         };
         use novarocks_local_program::{ProgramChannelLayoutRole, ProgramChannelSite};
-        use novarocks_type_contract::arrow_fields_exact_observed;
+        use novarocks_type_contract::{
+            CarrierNullabilityPolicy, arrow_fields_exact_with_nullability_observed,
+        };
         let actual = chunk.record_batch().schema();
-        let frozen = self.declaration.build_layout().schema();
+        let actual_slots = chunk.chunk_schema().slots();
+        let build = self.declaration.build_layout();
+        let frozen = build.schema();
         self.control.checkpoint(0)?;
-        if actual.metadata() != frozen.metadata() || actual.fields().len() != frozen.fields().len()
+        if !chunk.chunk_schema().is_typed()
+            || actual.metadata() != frozen.metadata()
+            || actual.fields().len() != frozen.fields().len()
+            || actual_slots.len() != build.slots().len()
         {
             return Err(build_contract(
                 "nested-loop payload differs from its frozen build layout",
             ));
         }
-        for (actual, frozen) in actual.fields().iter().zip(frozen.fields()) {
-            if !arrow_fields_exact_observed(actual, frozen, || self.control.checkpoint(1))? {
+        for (column, (actual_slot, array)) in actual_slots.iter().zip(chunk.columns()).enumerate() {
+            self.control.checkpoint(1)?;
+            // Exchange may widen an Arrow field's nullable flag while retaining
+            // the original signed declaration and validating reachable values.
+            if actual_slot.slot_id() != build.slots()[column]
+                || !arrow_fields_exact_with_nullability_observed(
+                    frozen.field(column),
+                    actual.field(column),
+                    CarrierNullabilityPolicy::Permissive,
+                    || self.control.checkpoint(1),
+                )?
+            {
                 return Err(build_contract(
                     "nested-loop payload field differs from its frozen declaration",
                 ));
             }
-        }
-        for (column, array) in chunk.columns().iter().enumerate() {
             let ordinal = u32::try_from(column).map_err(|_| {
                 build_contract("join build channel exceeds its frozen u32 representation")
             })?;
@@ -228,6 +243,17 @@ impl JoinInputSink {
                 .ok_or_else(|| {
                     build_contract("nested-loop payload has no original signed channel")
                 })?;
+            if !actual_slot
+                .typed_binding()
+                .borrowed()
+                .exactly_equals_observed(binding.typed_binding().borrowed(), || {
+                    self.control.checkpoint(1)
+                })?
+            {
+                return Err(build_contract(
+                    "nested-loop payload binding differs from its frozen declaration",
+                ));
+            }
             validate_evaluated_argument_observed(
                 EvaluatedArgument::Column(array),
                 Selection::all(chunk.len()),

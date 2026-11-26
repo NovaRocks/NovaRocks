@@ -1,0 +1,45 @@
+-- query 1
+-- types	bigint	row(n integer, a array(integer), m map(integer, integer))
+id	converted
+1	[7,[7],{"1":7}]
+2	NULL
+3	[null,[null],{"1":null}]
+
+-- query 2
+-- types	row(new_name bigint, old_name varchar)
+converted
+[17,"9"]
+
+-- query 4
+-- types	array(integer)	row(n bigint, flag boolean, note varchar)	map(integer, bigint)	array(json)
+numbers	record_value	mapped	json_leaf
+[1,2,null]	[7,true,null]	{"1":null,"2":4}	["null"]
+
+-- query 5
+-- types	row(n integer, flag boolean)	map(integer, bigint)	array(integer)
+wrong_arity	collided_keys	scalar_json
+NULL	NULL	NULL
+
+-- query 8
+-- types	bigint	boolean	boolean	boolean	boolean	boolean	boolean
+id	array_equal	row_not_equal	map_equal	row_in	array_identical	map_distinct
+1	NULL	true	false	NULL	true	false
+2	false	false	true	true	true	false
+3	false	true	false	false	true	false
+
+-- query 9
+-- types	bigint	row(label bigint, tail bigint)	boolean
+id	original_row	matched
+1	[1,null]	false
+2	NULL	true
+3	[3,2]	false
+
+-- query 10
+-- types	boolean	boolean	boolean
+forward	reverse	identical
+false	false	true
+
+-- query 12
+-- types	boolean	boolean
+same_date	same_string
+true	false

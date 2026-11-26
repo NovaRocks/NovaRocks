@@ -303,10 +303,12 @@ pub use publication::{
 pub use read::{
     ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorChangePartition,
     ConnectorChangePartitionField, ConnectorChangePartitionTransform,
-    ConnectorChangePartitionValue, ConnectorChangeWindowAdmission,
-    ConnectorChangeWindowFullRebuildReason, ConnectorChangeWindowPartitionImpact,
-    ConnectorChangeWindowReplaceFailure, ConnectorReadPurpose, ConnectorReadSelector,
-    ConnectorScan, ConnectorScanAdmission, ConnectorScanSelection, ConnectorSplitPlanningMetrics,
+    ConnectorChangePartitionValue, ConnectorChangeWindowExactPartitionImpact,
+    ConnectorChangeWindowFacts, ConnectorChangeWindowNegativeWeight,
+    ConnectorChangeWindowNetZeroBasis, ConnectorChangeWindowNotIncrementalReason,
+    ConnectorChangeWindowPartitionImpact, ConnectorChangeWindowPartitionImpactBuilder,
+    ConnectorChangeWindowVolume, ConnectorReadPurpose, ConnectorReadSelector, ConnectorScan,
+    ConnectorScanAdmission, ConnectorScanSelection, ConnectorSplitPlanningMetrics,
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
 };
 pub use read_session::{

@@ -579,7 +579,7 @@ fn inlist_recipe_created_callbacks_keep_original_control_and_no_request_tail() {
 fn unsupported_list_type() -> DataType {
     DataType::List(Arc::new(arrow_schema::Field::new(
         "item",
-        DataType::Float32,
+        DataType::UInt64,
         true,
     )))
 }

@@ -31,10 +31,12 @@ INSERT INTO ${case_db}.write_adaptation_types VALUES
   ROW(3,NULL,NULL,NULL,NULL,-9,-(1234567.89),-(1234567890123456.78),-(123456789012345678901234567890123456.78));
 
 -- query 2
-SELECT id,to_hex(s.raw) AS raw_hex,s.code AS code,s.label AS label,to_hex(a[1]) AS first_hex,
-       a[2] IS NULL AS second_is_null,cardinality(a) AS array_count,
-       to_hex(m['alpha']) AS map_hex,cardinality(m) AS map_count,
-       strings[3] AS third_string,d1,d9,d18,d38
+-- Read empty and NULL collections with nullable lookups.
+SELECT id,to_hex(s.raw) AS raw_hex,s.code AS code,s.label AS label,
+       to_hex(element_at(a, 1)) AS first_hex,
+       element_at(a, 2) IS NULL AS second_is_null,cardinality(a) AS array_count,
+       to_hex(element_at(m, 'alpha')) AS map_hex,cardinality(m) AS map_count,
+       element_at(strings, 3) AS third_string,d1,d9,d18,d38
 FROM ${case_db}.write_adaptation_types ORDER BY id;
 
 -- query 3

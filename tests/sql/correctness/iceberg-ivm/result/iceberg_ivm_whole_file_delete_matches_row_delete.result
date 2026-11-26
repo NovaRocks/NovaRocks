@@ -1,0 +1,51 @@
+-- query 3
+-- types	varchar	bigint
+customer	amount
+A	10
+A	10
+B	20
+B	20
+
+-- query 4
+-- types	varchar	bigint
+customer	amount
+A	10
+A	10
+B	20
+B	20
+
+-- query 8
+-- types	varchar	bigint
+customer	amount
+A	10
+B	20
+
+-- query 9
+-- types	varchar	bigint
+customer	amount
+A	10
+B	20
+
+-- query 12
+-- types	varchar	boolean	boolean
+operation	has_dvs	kept_data_files
+delete	true	true
+
+-- query 13
+-- types	varchar	boolean
+operation	removed_data_files
+delete	true
+
+-- query 15
+-- types	varchar	bigint
+customer	amount
+A	10
+A	10
+B	20
+
+-- query 16
+-- types	varchar	bigint
+customer	amount
+A	10
+A	10
+B	20

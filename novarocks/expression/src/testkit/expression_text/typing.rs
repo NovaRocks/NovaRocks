@@ -30,7 +30,10 @@ use novarocks_functions::{
     FunctionArgument, FunctionKind, FunctionResultType, ResolvedFunctionBinding,
 };
 use novarocks_parser::{Span, ast, canonical_call};
-use novarocks_type_contract::{CompileCheckpoints, FunctionValueType, OperatorFunction};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, FunctionParameterTypes, FunctionValueType,
+    OperatorFunction,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct TextTyping<'a> {
@@ -39,6 +42,7 @@ pub(super) struct TextTyping<'a> {
     used: BTreeSet<usize>,
     context: TypingContext<'a>,
     functions: &'a novarocks_functions::EngineFunctionCatalog,
+    lambda_frames: Vec<BTreeMap<String, (u32, FunctionValueType)>>,
 }
 
 impl<'a> TextTyping<'a> {
@@ -72,6 +76,7 @@ impl<'a> TextTyping<'a> {
                 decimal_overflow_policy: context.decimal_overflow_policy,
             },
             functions,
+            lambda_frames: Vec::new(),
         })
     }
 
@@ -143,6 +148,21 @@ impl<'a> TextTyping<'a> {
         }
         match expr {
             ast::Expr::Identifier(identifier) => {
+                if !self.lambda_frames.is_empty() {
+                    let name = identifier.value.to_lowercase();
+                    for (parent, frame) in self.lambda_frames.iter().rev().enumerate() {
+                        work.step()?;
+                        if let Some((ordinal, value_type)) = frame.get(&name) {
+                            return Ok(TextNode::new(
+                                value_type.clone(),
+                                TextKind::LambdaParameter {
+                                    parent,
+                                    ordinal: *ordinal,
+                                },
+                            ));
+                        }
+                    }
+                }
                 let Some(&ordinal) = self.by_name.get(&identifier.value.to_ascii_lowercase())
                 else {
                     return Err(TextError::UnknownColumn {
@@ -493,6 +513,19 @@ impl<'a> TextTyping<'a> {
         {
             return Err(legacy(name, span));
         }
+        let arguments = arguments.into_iter().collect::<Vec<_>>();
+        if arguments
+            .iter()
+            .any(|arg| matches!(arg, ast::Expr::Lambda(_)))
+        {
+            let [collection, ast::Expr::Lambda(lambda)] = arguments.as_slice() else {
+                return Err(typing_error(
+                    novarocks_functions::FunctionBindingError::NoMatchingOverload.into(),
+                    span,
+                ));
+            };
+            return self.lower_collection_lambda(&name, collection, lambda, span, work, depth);
+        }
         if scalar_typing_route(&name) == ScalarTypingRoute::Legacy {
             return Err(legacy(name, span));
         }
@@ -509,6 +542,89 @@ impl<'a> TextTyping<'a> {
             span,
             work,
         )
+    }
+
+    fn lower_collection_lambda(
+        &mut self,
+        name: &str,
+        collection: &ast::Expr,
+        lambda: &ast::LambdaExpr,
+        span: Span,
+        work: &mut CompileCheckpoints<'_>,
+        depth: usize,
+    ) -> Result<TextNode, TextError> {
+        let collection = self.lower(collection, work, depth)?;
+        let (candidate, conversion) = crate::typing::begin_collection_lambda(
+            &self.context,
+            name,
+            &collection.typing,
+            lambda.arguments.len(),
+            work,
+        )
+        .map_err(|cause| typing_error(cause, span))?;
+        let collection = apply_conversion(collection, conversion);
+        let parameter_types = candidate.parameter_types();
+        if lambda.arguments.len() != parameter_types.len() {
+            return Err(typing_error(
+                TypingError::InvalidShape("higher-order candidate changed the lambda arity"),
+                lambda.span,
+            ));
+        }
+        let mut frame = BTreeMap::new();
+        for (ordinal, (argument, value_type)) in lambda
+            .arguments
+            .iter()
+            .zip(parameter_types.iter())
+            .enumerate()
+        {
+            work.step()?;
+            let ordinal =
+                u32::try_from(ordinal).map_err(|_| CompileControlError::ResourceExhausted)?;
+            if frame
+                .insert(
+                    argument.name.value.to_lowercase(),
+                    (ordinal, value_type.clone()),
+                )
+                .is_some()
+            {
+                return Err(typing_error(
+                    TypingError::TypeMismatch(format!(
+                        "Ambiguous lambda parameter: {}",
+                        argument.name.value
+                    )),
+                    argument.span,
+                ));
+            }
+        }
+        self.lambda_frames.push(frame);
+        let body = self.lower(&lambda.body, work, depth + 1);
+        self.lambda_frames.pop();
+        let body = body?;
+        let binding = crate::typing::finish_collection_lambda(
+            &self.context,
+            &candidate,
+            &collection.typing,
+            &body.typing.value_type,
+            work,
+        )
+        .map_err(|cause| typing_error(cause, span))?;
+        if binding.admitted_execution_abi.is_none() {
+            return Err(typing_error(
+                novarocks_functions::FunctionBindingError::UnavailableImplementation(
+                    binding.selected.overload.clone(),
+                )
+                .into(),
+                span,
+            ));
+        }
+        let lambda = TextNode::new(
+            body.typing.value_type.clone(),
+            TextKind::Lambda {
+                parameter_types: candidate.parameter_types().clone(),
+                body: Box::new(body),
+            },
+        );
+        Ok(TextNode::call(binding, None, vec![collection, lambda]))
     }
 
     fn lower_literal(
@@ -733,23 +849,27 @@ fn apply_conversions(conversions: Vec<Conversion>, children: Vec<TextNode>) -> V
     children
         .into_iter()
         .zip(conversions)
-        .map(|(child, conversion)| match conversion {
-            Conversion::Keep => child,
-            Conversion::RetypeLiteral(value) => TextNode::literal(value),
-            Conversion::Cast(conversion) => TextNode::cast(child, conversion),
-            Conversion::ValueDomain(conversion) => {
-                let result = TextNode::call(
-                    conversion.binding,
-                    Some(conversion.expected_result),
-                    vec![child],
-                );
-                match conversion.tail {
-                    Some(tail) => TextNode::cast(result, tail),
-                    None => result,
-                }
-            }
-        })
+        .map(|(child, conversion)| apply_conversion(child, conversion))
         .collect()
+}
+
+fn apply_conversion(child: TextNode, conversion: Conversion) -> TextNode {
+    match conversion {
+        Conversion::Keep => child,
+        Conversion::RetypeLiteral(value) => TextNode::literal(value),
+        Conversion::Cast(conversion) => TextNode::cast(child, conversion),
+        Conversion::ValueDomain(conversion) => {
+            let result = TextNode::call(
+                conversion.binding,
+                Some(conversion.expected_result),
+                vec![child],
+            );
+            match conversion.tail {
+                Some(tail) => TextNode::cast(result, tail),
+                None => result,
+            }
+        }
+    }
 }
 
 pub(super) struct TextNode {
@@ -759,6 +879,14 @@ pub(super) struct TextNode {
 
 enum TextKind {
     Input(ValueId),
+    LambdaParameter {
+        parent: usize,
+        ordinal: u32,
+    },
+    Lambda {
+        parameter_types: FunctionParameterTypes,
+        body: Box<TextNode>,
+    },
     Literal,
     Call {
         binding: Box<ResolvedFunctionBinding>,
@@ -837,10 +965,52 @@ impl TextNode {
         context: &TextContext<'_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<ExprId, TextError> {
+        self.emit_in_scope(draft, constants, context, &mut Vec::new(), work)
+    }
+
+    fn emit_in_scope(
+        &self,
+        draft: &mut BoundExprSetBuilder,
+        constants: &mut ConstantPools,
+        context: &TextContext<'_>,
+        lambda_frames: &mut Vec<ExprId>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ExprId, TextError> {
         work.step()?;
+        let lambda_scope = lambda_frames.last().copied();
         let mut ty = self.typing.value_type.clone();
         let kind = match &self.kind {
             TextKind::Input(value) => ExprKind::Value(*value),
+            TextKind::LambdaParameter { parent, ordinal } => ExprKind::LambdaParameter {
+                lambda: *lambda_frames
+                    .iter()
+                    .rev()
+                    .nth(*parent)
+                    .ok_or(TextError::Layout(
+                        "lambda parameter has no active lexical frame",
+                    ))?,
+                ordinal: *ordinal,
+            },
+            TextKind::Lambda {
+                parameter_types,
+                body,
+            } => {
+                let lambda = draft.reserve()?;
+                lambda_frames.push(lambda);
+                let body = body.emit_in_scope(draft, constants, context, lambda_frames, work);
+                lambda_frames.pop();
+                let body = body?;
+                draft.insert(
+                    lambda,
+                    lambda_scope,
+                    emitted_type(draft, body).clone(),
+                    ExprKind::Lambda {
+                        parameter_types: parameter_types.iter().cloned().collect(),
+                        body,
+                    },
+                )?;
+                return Ok(lambda);
+            }
             TextKind::Literal => ExprKind::Constant(register_constant(
                 constants,
                 self.typing
@@ -849,7 +1019,7 @@ impl TextNode {
                     .expect("typed literal includes its checked constant"),
             )),
             TextKind::Cast { input, conversion } => {
-                let expr = input.emit(draft, constants, context, work)?;
+                let expr = input.emit_in_scope(draft, constants, context, lambda_frames, work)?;
                 let input_type = emitted_type(draft, expr);
                 ty = conversion
                     .target
@@ -864,13 +1034,15 @@ impl TextNode {
                 }
             }
             TextKind::IsNull(input, negated) => ExprKind::IsNull {
-                expr: input.emit(draft, constants, context, work)?,
+                expr: input.emit_in_scope(draft, constants, context, lambda_frames, work)?,
                 negated: *negated,
             },
             TextKind::Logical(operator, children) => {
                 let args = children
                     .iter()
-                    .map(|child| child.emit(draft, constants, context, work))
+                    .map(|child| {
+                        child.emit_in_scope(draft, constants, context, lambda_frames, work)
+                    })
                     .collect::<Result<Box<_>, _>>()?;
                 if args.iter().any(|id| emitted_type(draft, *id).nullable()) {
                     ty = ty.with_nullable(true).map_err(TextError::ValueType)?;
@@ -886,14 +1058,22 @@ impl TextNode {
                     .iter()
                     .map(|[condition, branch]| {
                         Ok((
-                            condition.emit(draft, constants, context, work)?,
-                            branch.emit(draft, constants, context, work)?,
+                            condition.emit_in_scope(
+                                draft,
+                                constants,
+                                context,
+                                lambda_frames,
+                                work,
+                            )?,
+                            branch.emit_in_scope(draft, constants, context, lambda_frames, work)?,
                         ))
                     })
                     .collect::<Result<Box<_>, TextError>>()?;
                 let else_expr = otherwise
                     .first()
-                    .map(|child| child.emit(draft, constants, context, work))
+                    .map(|child| {
+                        child.emit_in_scope(draft, constants, context, lambda_frames, work)
+                    })
                     .transpose()?;
                 ExprKind::Case {
                     ieee_float_equality: false,
@@ -909,22 +1089,38 @@ impl TextNode {
             } => {
                 let args = arguments
                     .iter()
-                    .map(|child| child.emit(draft, constants, context, work))
+                    .map(|child| {
+                        child.emit_in_scope(draft, constants, context, lambda_frames, work)
+                    })
                     .collect::<Result<Box<_>, _>>()?;
                 let mut changed = false;
                 let row_constructor = binding.function_id.as_str() == "builtin.scalar/row/v1";
                 let mut request_args = Vec::with_capacity(args.len());
                 for (&id, argument) in args.iter().zip(arguments) {
                     work.step()?;
-                    let actual = emitted_type(draft, id);
-                    changed |= if row_constructor {
-                        actual != &argument.typing.value_type
+                    let emitted = draft.definition(id).expect("the child was just emitted");
+                    changed |= if row_constructor
+                        || binding.admitted_execution_abi
+                            == Some(novarocks_functions::PureKernelAbi::HigherOrderV1)
+                    {
+                        emitted.ty != argument.typing.value_type
                     } else {
-                        actual.nullable() != argument.typing.value_type.nullable()
+                        emitted.ty.nullable() != argument.typing.value_type.nullable()
                     };
-                    request_args.push(FunctionArgument::Value {
-                        value_type: actual.clone(),
-                        constant: argument.typing.constant.clone(),
+                    request_args.push(match &emitted.kind {
+                        ExprKind::Lambda {
+                            parameter_types,
+                            body,
+                        } => FunctionArgument::Lambda {
+                            parameter_types: FunctionParameterTypes::from_pure_boxed(
+                                parameter_types.clone(),
+                            ),
+                            result_type: emitted_type(draft, *body).clone(),
+                        },
+                        _ => FunctionArgument::Value {
+                            value_type: emitted.ty.clone(),
+                            constant: argument.typing.constant.clone(),
+                        },
                     });
                 }
                 let widened_target;
@@ -1025,7 +1221,7 @@ impl TextNode {
                     .as_mut()
                     .expect("original author metadata")
                     .semantic_parameters = references.into_boxed_slice();
-                let id = draft.add(None, ty, ExprKind::FunctionCall { function, args })?;
+                let id = draft.add(lambda_scope, ty, ExprKind::FunctionCall { function, args })?;
                 let request = physical_call_request(
                     &request_args,
                     expected_result,
@@ -1036,7 +1232,7 @@ impl TextNode {
                 return Ok(id);
             }
         };
-        Ok(draft.add(None, ty, kind)?)
+        Ok(draft.add(lambda_scope, ty, kind)?)
     }
 }
 

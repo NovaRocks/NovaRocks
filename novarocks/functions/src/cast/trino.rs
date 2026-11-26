@@ -304,24 +304,21 @@ fn prepare_value(
         recipe.body = CastBody::ArrayNull;
         return Ok(recipe);
     }
+    // A TRY container catches its own failed row, never a successful NULL
+    // substituted by a child's TRY.
+    let (child_mode, failure_mode) = match mode {
+        TrinoCastMode::Try => (TrinoCastMode::Explicit, ArrayCastFailureMode::OutputNull),
+        _ => (mode, ArrayCastFailureMode::ReportError),
+    };
     if matches!((from, to), (List(_), List(_))) {
         let from = source.child_at(0).ok_or(CastPrepareError::TypeMismatch)?;
         let to = result.child_at(0).ok_or(CastPrepareError::TypeMismatch)?;
-        let child_mode = if mode == TrinoCastMode::Try {
-            TrinoCastMode::Explicit
-        } else {
-            mode
-        };
         let child = prepare_value(&from, &to, child_mode, work)?;
         if child.trino_can_return_null() && !to.nullable() {
             return Err(CastPrepareError::TypeMismatch);
         }
         recipe.body = CastBody::ExplicitArray;
-        recipe.array_failure_mode = Some(if mode == TrinoCastMode::Try {
-            ArrayCastFailureMode::OutputNull
-        } else {
-            ArrayCastFailureMode::ReportError
-        });
+        recipe.array_failure_mode = Some(failure_mode);
         recipe.children = CastChildren::Array(Box::new(child));
         return Ok(recipe);
     }
@@ -336,11 +333,6 @@ fn prepare_value(
         let target_key = result.child_at(0).ok_or(CastPrepareError::TypeMismatch)?;
         let source_value = source.child_at(1).ok_or(CastPrepareError::TypeMismatch)?;
         let target_value = result.child_at(1).ok_or(CastPrepareError::TypeMismatch)?;
-        let child_mode = if mode == TrinoCastMode::Try {
-            TrinoCastMode::Explicit
-        } else {
-            mode
-        };
         let key = prepare_value(&source_key, &target_key, child_mode, work)?;
         let value = prepare_value(&source_value, &target_value, child_mode, work)?;
         if value.trino_can_return_null() && !target_value.nullable() {
@@ -354,21 +346,72 @@ fn prepare_value(
                 .map_err(|_| CastPrepareError::Unsupported)?;
         }
         recipe.body = CastBody::ExplicitMap;
-        recipe.array_failure_mode = Some(if mode == TrinoCastMode::Try {
-            ArrayCastFailureMode::OutputNull
-        } else {
-            ArrayCastFailureMode::ReportError
-        });
+        recipe.array_failure_mode = Some(failure_mode);
         recipe.children = CastChildren::Map(Box::new([key, value]));
         return Ok(recipe);
     }
-    if matches!((from, to), (Struct(_), Struct(_))) {
-        // B7e owns recursive ROW conversion after admission of the real shape.
-        return if shape_is_legal(source.value_type(), result.value_type(), mode, work)? {
-            Err(CastPrepareError::Unsupported)
-        } else {
-            Err(CastPrepareError::Illegal)
-        };
+    if let (Struct(source_fields), Struct(target_fields)) = (from, to) {
+        if source_fields.len() != target_fields.len() {
+            return Err(CastPrepareError::Illegal);
+        }
+        work.flush()?;
+        let mut children = Vec::new();
+        children
+            .try_reserve_exact(source_fields.len())
+            .map_err(|_| CastPrepareError::Kernel(KernelFailure::ResourceExhausted))?;
+        let mut unsupported_child = false;
+        let mut may_raise = false;
+        for ordinal in 0..source_fields.len() {
+            work.step()?;
+            let from = source
+                .child_at(ordinal)
+                .ok_or(CastPrepareError::TypeMismatch)?;
+            let to = result
+                .child_at(ordinal)
+                .ok_or(CastPrepareError::TypeMismatch)?;
+            let child = match prepare_value(&from, &to, child_mode, work) {
+                Err(CastPrepareError::Unsupported) => {
+                    // Another field can still make the pair illegal. Use the
+                    // actual scalar author for both facts.
+                    unsupported_child = true;
+                    continue;
+                }
+                child => child?,
+            };
+            if child.trino_can_return_null() && !to.nullable() {
+                return Err(CastPrepareError::TypeMismatch);
+            }
+            may_raise |= child.conversion_may_raise();
+            children.push(child);
+        }
+        if unsupported_child {
+            return Err(CastPrepareError::Unsupported);
+        }
+        work.flush()?;
+        recipe.body = CastBody::ExplicitRow { may_raise };
+        recipe.array_failure_mode = Some(failure_mode);
+        recipe.children = CastChildren::Row(children.into_boxed_slice());
+        return Ok(recipe);
+    }
+
+    if matches!(from, ValueKind::Nominal(ValueLogicalType::Json))
+        && matches!(to, List(_) | Map { .. } | Struct(_))
+        && matches!(mode, TrinoCastMode::Explicit | TrinoCastMode::Try)
+    {
+        if source.data_type() != &DataType::LargeBinary {
+            return Err(CastPrepareError::Unsupported);
+        }
+        array_json::structure::validate_target(result.value_type(), result.data_type(), work)?;
+        recipe.body = CastBody::JsonStructure;
+        recipe.array_failure_mode = Some(failure_mode);
+        return Ok(recipe);
+    }
+
+    if is_timestamp_text_cast(from, to, mode) {
+        let cast = crate::builtin::TemporalTextCast::bind(source, result)
+            .ok_or(CastPrepareError::Unsupported)?;
+        recipe.body = CastBody::TemporalText(cast);
+        return Ok(recipe);
     }
 
     if !context_allows(from, to, mode) {
@@ -524,38 +567,15 @@ fn context_allows(from: &ValueKind, to: &ValueKind, mode: TrinoCastMode) -> bool
     }
 }
 
-fn shape_is_legal(
-    from: &novarocks_type_contract::ValueTypeRef,
-    to: &novarocks_type_contract::ValueTypeRef,
-    mode: TrinoCastMode,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<bool, CastPrepareError> {
-    use ValueKind::{List, Map, Scalar as Kind, Struct};
-    work.step()?;
-    if matches!(from.kind(), Kind(DataType::Null)) {
-        return Ok(true);
-    }
-    if matches!(
-        (from.kind(), to.kind()),
-        (List(_), List(_)) | (Map { .. }, Map { .. }) | (Struct(_), Struct(_))
-    ) {
-        if from.child_count() != to.child_count() {
-            return Ok(false);
-        }
-        for i in 0..from.child_count() {
-            if !shape_is_legal(
-                from.child_type_at(i).expect("declared child"),
-                to.child_type_at(i).expect("declared child"),
-                mode,
-                work,
-            )? {
-                return Ok(false);
-            }
-        }
-        return Ok(true);
-    }
-    Ok(context_allows(from.kind(), to.kind(), mode)
-        && (from.kind() == to.kind() || legal_non_identity(from.kind(), to.kind())))
+fn is_timestamp_text_cast(from: &ValueKind, to: &ValueKind, mode: TrinoCastMode) -> bool {
+    use novarocks_type_contract::{TemporalPrecision, TemporalType};
+
+    matches!(mode, TrinoCastMode::Explicit | TrinoCastMode::Try)
+        && matches!(
+            from,
+            ValueKind::Temporal(TemporalType::Timestamp(TemporalPrecision::MICROSECONDS))
+        )
+        && matches!(to, ValueKind::String)
 }
 
 fn legal_non_identity(from: &ValueKind, to: &ValueKind) -> bool {
@@ -668,7 +688,10 @@ impl Number {
     }
 }
 
-fn signed_result(value: i128, width: SignedWidth) -> Result<CastRowResult, ConversionFailure> {
+pub(super) fn signed_result(
+    value: i128,
+    width: SignedWidth,
+) -> Result<CastRowResult, ConversionFailure> {
     let accepted = match width {
         SignedWidth::I8 => i8::try_from(value).is_ok(),
         SignedWidth::I16 => i16::try_from(value).is_ok(),
@@ -928,7 +951,7 @@ fn convert_character(
     Ok(output)
 }
 
-fn parse_boolean(value: &str) -> Result<bool, ConversionFailure> {
+pub(super) fn parse_boolean(value: &str) -> Result<bool, ConversionFailure> {
     if value == "1" || value.eq_ignore_ascii_case("t") || value.eq_ignore_ascii_case("true") {
         Ok(true)
     } else if value == "0" || value.eq_ignore_ascii_case("f") || value.eq_ignore_ascii_case("false")
@@ -939,7 +962,7 @@ fn parse_boolean(value: &str) -> Result<bool, ConversionFailure> {
     }
 }
 
-fn parse_number(
+pub(super) fn parse_number(
     value: &str,
     target: Numeric,
     work: &mut EvaluationCheckpoints<'_>,
@@ -959,7 +982,7 @@ fn parse_number(
 
 /// Retain at most the target's 38 coefficients and the first discarded digit.
 /// Even a very long exponent cannot cause unbounded allocation or scaling.
-fn parse_decimal(
+pub(super) fn parse_decimal(
     value: &str,
     precision: u8,
     scale: u8,

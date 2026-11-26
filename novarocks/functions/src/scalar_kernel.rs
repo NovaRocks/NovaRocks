@@ -159,6 +159,12 @@ impl<'call, 'a> ScalarCallInput<'call, 'a> {
 /// Dispatch is once per selected batch, not once per row.
 pub trait PreparedScalarKernel: Send + Sync + fmt::Debug {
     fn contract(&self) -> &Arc<ScalarCallContract>;
+    /// Scalar (one borrowed Arrow row) and Column are equivalent at this
+    /// selected argument position. Callers still prove per-row independence
+    /// and preserve the original invocation's effects and source custody.
+    fn supports_scalar_broadcast(&self, _ordinal: usize) -> bool {
+        false
+    }
     /// Closed pure source of the complete original wrapper invocation.
     /// None explicitly leaves this source unproved; a positive source's
     /// arithmetic/model refusal must never be converted back to None.
@@ -430,6 +436,9 @@ impl ScalarEvaluationInstance {
     }
     pub fn invocation_resource_profile(&self) -> Option<crate::ScalarInvocationResourceProfile> {
         self._prepared.invocation_resource_profile()
+    }
+    pub fn supports_scalar_broadcast(&self, ordinal: usize) -> bool {
+        self._prepared.supports_scalar_broadcast(ordinal)
     }
     pub fn retained_bytes(&self) -> Result<usize, KernelFailure> {
         let bytes = self.instance.retained_bytes();

@@ -125,8 +125,10 @@ pub fn grouped_state_topn_key_supported(
 /// exact named and anonymous ROW calls.
 /// Revision 44 admits CTE multicast packages and binds their ordered physical
 /// edges to the original native exchange identities.
-/// Revision 45 replaces the SQL JSON UTF-8 carrier with native JSON v1.
-pub const PLAN_CONTRACT_REVISION: u32 = 45;
+/// Revision 45 executes collection lambda claims and requires the original
+/// higher-order overload to own NULL control.
+/// Revision 46 replaces the SQL JSON UTF-8 carrier with native JSON v1.
+pub const PLAN_CONTRACT_REVISION: u32 = 46;
 
 #[cfg(test)]
 mod tests;

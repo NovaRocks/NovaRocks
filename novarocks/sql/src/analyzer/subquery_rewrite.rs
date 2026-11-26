@@ -460,16 +460,15 @@ impl<'a> AnalyzerContext<'a> {
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
 
         let in_lhs = match &sq_info.kind {
-            SubqueryKind::InSubquery { .. } => {
+            SubqueryKind::InSubquery { negated } => {
                 let in_expr = sq_info
                     .in_expr
                     .as_ref()
                     .ok_or_else(|| AnalyzeError::internal("IN subquery missing LHS expression"))?;
                 let positional_lhs = in_expr.as_ref();
-                if self.anonymous_row(positional_lhs)?.is_some() {
-                    let SubqueryKind::InSubquery { negated } = &sq_info.kind else {
-                        unreachable!("tuple LHS only exists for IN subqueries");
-                    };
+                if self.anonymous_row(positional_lhs)?.is_some()
+                    && !has_single_row_output(&resolved_sub)
+                {
                     self.rewrite_in_subquery(select, scope, sq_info.clone(), *negated)?;
                     return Ok(true);
                 }
@@ -481,12 +480,10 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 let lhs = self.analyze_expr(in_expr, scope)?;
                 let inner_col = &resolved_sub.output_columns[0];
-                if is_composite_in_operand(&lhs.value_type)
+                let composite = has_composite_comparison(&lhs.value_type, &inner_col.value_type);
+                if composite
                     && !json_query_references_outer_scope(&resolved_sub, &inner_scope, scope)
                 {
-                    let SubqueryKind::InSubquery { negated } = &sq_info.kind else {
-                        unreachable!("only IN has a probe")
-                    };
                     self.rewrite_composite_in_value_form(
                         select,
                         resolved_sub,
@@ -521,6 +518,14 @@ impl<'a> AnalyzerContext<'a> {
                         ),
                         in_expr.span(),
                     ));
+                }
+                if composite {
+                    self.legacy_membership_pair_nullable(
+                        &lhs.value_type,
+                        &inner_col.value_type,
+                        *negated,
+                        in_expr.span(),
+                    )?;
                 }
                 Some(lhs)
             }
@@ -1856,14 +1861,23 @@ impl<'a> AnalyzerContext<'a> {
             AnalyzeError::internal("IN subquery rewrite: missing left-hand expression")
         })?;
 
-        // Multi-column LHS: `(a, b) IN (SELECT c, d FROM ...)`. The typed AST
-        // retains the LHS as an anonymous `Expr::Row` (possibly wrapped in
-        // `Expr::Nested`). Analyze each component separately and pair
-        // them with the subquery's output columns one-to-one.
+        // Both ROW spellings share one AST. A single ROW output denotes one
+        // typed value. The anonymous positional syntax otherwise retains
+        // the existing field-to-output mapping of multi-column IN.
         let positional_lhs = in_expr_ast.as_ref();
-        let lhs_items_ast: Vec<&ast::Expr> = match self.anonymous_row(positional_lhs)? {
-            Some(row) => row.fields.iter().map(|field| &field.expression).collect(),
-            None => vec![positional_lhs],
+        let positional_row = self.anonymous_row(positional_lhs)?;
+        let analyzed_right = positional_row
+            .map(|_| self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope))
+            .transpose()?;
+        let lhs_items_ast: Vec<&ast::Expr> = match positional_row {
+            Some(row)
+                if !analyzed_right
+                    .as_ref()
+                    .is_some_and(|(right, _)| has_single_row_output(right)) =>
+            {
+                row.fields.iter().map(|field| &field.expression).collect()
+            }
+            _ => vec![positional_lhs],
         };
         let lhs_typed_list: Vec<TypedExpr> = lhs_items_ast
             .iter()
@@ -1899,8 +1913,10 @@ impl<'a> AnalyzerContext<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let (resolved_sub, inner_scope) =
-            self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
+        let (resolved_sub, inner_scope) = match analyzed_right {
+            Some(analyzed) => analyzed,
+            None => self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?,
+        };
 
         if resolved_sub.output_columns.len() != lhs_typed_list.len() {
             return Err(AnalyzeError::invalid_query_shape(
@@ -2070,6 +2086,21 @@ impl<'a> AnalyzerContext<'a> {
         // and evaluate to TRUE/FALSE/NULL per row.
         let value_form = predicate_placeholder_is_value_form(select, sq_info.id);
 
+        let single_composite = lhs_typed_list.len() == 1
+            && has_composite_comparison(&lhs_typed.value_type, &sub_output_col.value_type);
+        if single_composite
+            && !json_query_references_outer_scope(&resolved_sub, &inner_scope, scope)
+        {
+            return self.rewrite_composite_in_value_form(
+                select,
+                resolved_sub,
+                lhs_typed,
+                sq_info.id,
+                negated,
+                in_expr_ast.span(),
+            );
+        }
+
         // Correlated subquery: if any predicate in the subquery WHERE references
         // an outer-scope column (e.g. `WHERE t.x = outer.y`), the wrapped
         // `Relation::Subquery` would isolate the inner SELECT and the outer
@@ -2123,21 +2154,11 @@ impl<'a> AnalyzerContext<'a> {
             ));
         }
 
-        if value_form && is_composite_in_operand(&lhs_typed.value_type) {
-            if json_query_references_outer_scope(&resolved_sub, &inner_scope, scope) {
-                return Err(AnalyzeError::unsupported_query_shape(
-                    "Composite IN requires an independent right relation",
-                    sq_info.subquery.span,
-                ));
-            }
-            return self.rewrite_composite_in_value_form(
-                select,
-                resolved_sub,
-                lhs_typed,
-                sq_info.id,
-                negated,
-                in_expr_ast.span(),
-            );
+        if single_composite {
+            return Err(AnalyzeError::unsupported_query_shape(
+                "Composite IN requires an independent right relation",
+                sq_info.subquery.span,
+            ));
         }
 
         // Build per-column equality conjuncts. For a single-column IN this
@@ -2145,6 +2166,7 @@ impl<'a> AnalyzerContext<'a> {
         // ...)` we get `a = c AND b = d` (or the null-aware variant for
         // NOT IN).
         let mut eq_conjuncts: Vec<TypedExpr> = Vec::with_capacity(lhs_typed_list.len());
+        let mut has_composite_key = false;
         for (idx, lhs_i) in lhs_typed_list.iter().enumerate() {
             self.check_control()?;
             let sub_col = &resolved_sub.output_columns[idx];
@@ -2169,7 +2191,12 @@ impl<'a> AnalyzerContext<'a> {
             // Retain the NOT IN author's ordinary equality and its exact NULL
             // domain. The explicit comparison role, rather than an arbitrary
             // equality in eligibility, permits later key extraction.
-            let nullable = lhs_i.value_type.nullable() || rhs_ref.value_type.nullable();
+            let nullable = self.legacy_membership_pair_nullable(
+                &lhs_i.value_type,
+                &rhs_ref.value_type,
+                negated,
+                in_expr_ast.span(),
+            )?;
             let eq = TypedExpr {
                 value_type: novarocks_type_contract::FunctionValueType::new(
                     DataType::Boolean,
@@ -2184,6 +2211,7 @@ impl<'a> AnalyzerContext<'a> {
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             };
+            has_composite_key |= has_composite_comparison(&lhs_i.value_type, &sub_col.value_type);
             eq_conjuncts.push(eq);
         }
         let eq_cond = {
@@ -2209,6 +2237,12 @@ impl<'a> AnalyzerContext<'a> {
             }
             acc
         };
+
+        if negated && has_composite_key && eq_cond.value_type.nullable() {
+            return Err(composite_membership_requires_independent_relation(
+                in_expr_ast.span(),
+            ));
+        }
 
         // Expose every subquery output column under `__sq_<id>` so
         // explicit references (e.g. in IN-inside-OR's match-indicator
@@ -2411,14 +2445,8 @@ impl<'a> AnalyzerContext<'a> {
             // Nullable NOT IN requires the complete comparison's three-valued
             // result. In a tuple, a FALSE field still defeats UNKNOWN in
             // another field. Nonnullable operands permit ordinary LeftAnti.
-            let either_nullable = lhs_typed_list
-                .iter()
-                .zip(resolved_sub.output_columns.iter())
-                .any(|(lhs_i, sub_col)| {
-                    lhs_i.value_type.nullable() || sub_col.value_type.nullable()
-                });
             let join_type = if negated {
-                if either_nullable {
+                if eq_cond.value_type.nullable() {
                     JoinKind::NullAwareLeftAnti
                 } else {
                     JoinKind::LeftAnti
@@ -2452,6 +2480,37 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         Ok(())
+    }
+
+    /// Positional tuples and correlated IN keep their original execution
+    /// family. The signed ARRAY recipe is the only composite relation already
+    /// supported there. In particular, nullable composite comparisons cannot
+    /// be sent to the scalar null-aware key path or treated as ordinary anti.
+    fn legacy_membership_pair_nullable(
+        &self,
+        left: &novarocks_type_contract::FunctionValueType,
+        right: &novarocks_type_contract::FunctionValueType,
+        negated: bool,
+        span: novarocks_parser::Span,
+    ) -> Result<bool, AnalyzeError> {
+        use novarocks_functions::{ComparisonOperator, PreparedComparisonRecipe};
+
+        if !has_composite_comparison(left, right) {
+            return Ok(left.nullable() || right.nullable());
+        }
+        let unsupported = || composite_membership_requires_independent_relation(span);
+        let recipe =
+            PreparedComparisonRecipe::try_new(ComparisonOperator::Eq, left, right, self.control)
+                .map_err(|error| {
+                    error
+                        .control_error()
+                        .map_or_else(&unsupported, AnalyzeError::control)
+                })?;
+        let nullable = recipe.nullable_result();
+        if negated && nullable {
+            return Err(unsupported());
+        }
+        Ok(nullable)
     }
 
     /// Every actual candidate row participates in the same ordinary equality
@@ -2618,10 +2677,17 @@ impl<'a> AnalyzerContext<'a> {
         // changes both equality and the signed three-valued result.
         let mut comparisons = Vec::with_capacity(lhs_typed.len());
         let mut either_nullable = false;
+        let mut has_composite_key = false;
         for (left, right) in lhs_typed.into_iter().zip(sub_projection) {
             self.check_control()?;
-            let nullable = left.value_type.nullable() || right.expr.value_type.nullable();
+            let nullable = self.legacy_membership_pair_nullable(
+                &left.value_type,
+                &right.expr.value_type,
+                negated,
+                subquery_span,
+            )?;
             either_nullable |= nullable;
+            has_composite_key |= has_composite_comparison(&left.value_type, &right.expr.value_type);
             comparisons.push(TypedExpr {
                 value_type: novarocks_type_contract::FunctionValueType::new(
                     DataType::Boolean,
@@ -2636,6 +2702,11 @@ impl<'a> AnalyzerContext<'a> {
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             });
+        }
+        if negated && has_composite_key && either_nullable {
+            return Err(composite_membership_requires_independent_relation(
+                subquery_span,
+            ));
         }
         let mut comparisons = comparisons.into_iter();
         let mut key_cond = comparisons
@@ -4797,11 +4868,32 @@ pub(super) fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: u
     }
 }
 
-fn is_composite_in_operand(ty: &novarocks_type_contract::FunctionValueType) -> bool {
-    matches!(
-        ty.data_type(),
-        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+fn composite_membership_requires_independent_relation(
+    span: novarocks_parser::Span,
+) -> AnalyzeError {
+    AnalyzeError::unsupported_query_shape(
+        "Composite membership in this subquery shape requires an independent single-column comparison",
+        span,
     )
+}
+
+fn has_single_row_output(query: &ResolvedQuery) -> bool {
+    matches!(
+        query.output_columns.as_slice(),
+        [column] if matches!(
+            column.value_type.value_type().kind(),
+            novarocks_type_contract::ValueKind::Struct(_)
+        )
+    )
+}
+
+fn has_composite_comparison(
+    left: &novarocks_type_contract::FunctionValueType,
+    right: &novarocks_type_contract::FunctionValueType,
+) -> bool {
+    use crate::common::binary_operator::uses_structural_comparison;
+
+    uses_structural_comparison(left.value_type()) || uses_structural_comparison(right.value_type())
 }
 
 fn mark_demand_case(condition: TypedExpr, selected: TypedExpr, otherwise: TypedExpr) -> TypedExpr {
@@ -6402,6 +6494,79 @@ mod tests {
         collect_column_ids_in_expr(&mark.predicate, &mut columns);
         assert!(columns.contains(&mark.probe_column.column_id));
         assert!(columns.contains(&build.column_id));
+    }
+
+    #[test]
+    fn composite_in_routes_single_row_and_positional_tuple_by_right_projection() {
+        let analyze_sql = |sql| {
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
+            let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
+            let (resolved, _, _) = super::super::analyze_with_function_catalog(
+                &query,
+                &catalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            let QueryBody::Select(select) = resolved.body else {
+                panic!("expected SELECT");
+            };
+            select
+        };
+
+        for (sql, clause) in [
+            (
+                "SELECT ROW(1, CAST(NULL AS INTEGER)) IN (SELECT ROW(1,2))",
+                ApplyClause::Projection,
+            ),
+            (
+                "SELECT a FROM (VALUES (1,2)) t(a,b) WHERE (a, b) NOT IN (SELECT ROW(1,2))",
+                ApplyClause::Where,
+            ),
+        ] {
+            let select = analyze_sql(sql);
+            let [spec] = select.apply_specs.as_slice() else {
+                panic!("expected one clause-owned relation mark");
+            };
+            assert_eq!(spec.clause, clause);
+            assert!(spec.relation_mark.is_some());
+            assert!(spec.output_column.value_type.nullable());
+            assert!(has_single_row_output(&spec.inner));
+            assert!(spec.correlation_column_ids.is_empty());
+        }
+
+        let tuple = analyze_sql("SELECT a FROM (VALUES (1,2)) t(a,b) WHERE (a,b) IN (SELECT 1,2)");
+        assert!(tuple.apply_specs.is_empty());
+        let Some(Relation::Join(join)) = tuple.from.as_ref() else {
+            panic!("expected the existing positional tuple join");
+        };
+        assert_eq!(join.join_type, JoinKind::LeftSemi);
+    }
+
+    #[test]
+    fn composite_in_refuses_nullable_correlated_not_in_before_anti_selection() {
+        let query = novarocks_parser::parser::parse_query(
+            "SELECT a FROM (VALUES (1,2)) t(a,b)
+             WHERE ARRAY[a, CAST(NULL AS INTEGER)] NOT IN (
+                 SELECT ARRAY[x,y] FROM (VALUES (1,2)) u(x,y) WHERE x = t.a
+             )",
+        )
+        .unwrap();
+        let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
+        let error = super::super::analyze_with_function_catalog(
+            &query,
+            &catalog,
+            "default",
+            crate::functions::builtin_sql_function_catalog(),
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(
+            "Composite membership in this subquery shape requires an independent single-column comparison"
+        ));
     }
 
     #[test]

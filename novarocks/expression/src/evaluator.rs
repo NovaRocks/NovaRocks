@@ -20,7 +20,7 @@
 //! This selected expression controller keeps state per root use and driver. The
 //! host must install its memory scopes and allocation admission before calling
 //! it, as required by the neutral kernel ABI. These controls do not mint a
-//! memory grant. Higher-order and encoded guarded-result protocols remain separate.
+//! memory grant. Nested body frames borrow the original host at their use.
 
 use input_source::FrameInput;
 
@@ -162,6 +162,7 @@ enum Value<'a> {
     ConstantView(constant_projection::CanonicalConstant),
     Column(ArrayRef),
     Selected(SelectedValues<'a>),
+    Mapped(mapped::MappedValues),
     Continued(Box<Self>, input_source::ArrayContinuation),
 }
 
@@ -183,18 +184,30 @@ impl<'a> std::ops::Deref for MaterializedValue<'a> {
     }
 }
 impl Value<'_> {
-    fn argument(&self) -> EvaluatedArgument<'_> {
-        match self {
+    fn argument(&self) -> Result<EvaluatedArgument<'_>, KernelFailure> {
+        Ok(match self {
             Self::Constant(value) => EvaluatedArgument::Constant(value),
             Self::ConstantView(value) => value.argument(),
             Self::Column(array) => EvaluatedArgument::Column(array),
             Self::Selected(value) => EvaluatedArgument::SelectedColumn(value),
-            Self::Continued(value, _) => value.argument(),
+            Self::Mapped(_) => {
+                return Err(invalid(
+                    "mapped expression value requires its selected-copy or broadcast author",
+                ));
+            }
+            Self::Continued(value, _) => return value.argument(),
+        })
+    }
+    fn data_type(&self) -> Result<&DataType, KernelFailure> {
+        match self.uncontinued() {
+            Self::Mapped(value) => Ok(value.data_type()),
+            value => Ok(value.argument()?.array().data_type()),
         }
     }
     fn errors(&self) -> &[RowDataError] {
         match self {
             Self::Selected(value) => value.errors(),
+            Self::Mapped(value) => value.errors(),
             Self::Continued(value, _) => value.errors(),
             _ => &[],
         }
@@ -220,6 +233,7 @@ impl Value<'_> {
             Self::Constant(value) => Self::Constant(value),
             Self::ConstantView(value) => Self::ConstantView(value),
             Self::Column(array) => Self::Column(owner.retain(array, work.control)?),
+            Self::Mapped(value) => Self::Mapped(value),
             Self::Selected(value) => {
                 let (selection, array, errors) = value.into_parts();
                 let array = owner.retain(array, work.control)?;
@@ -263,8 +277,17 @@ impl Value<'_> {
                 (array, errors)
             }
             Self::Column(array) if selection.is_all() => (array, Box::default()),
+            Self::Mapped(value) => {
+                if value.len() != selection.len() {
+                    return Err(invalid(
+                        "mapped value differs from its actual selected domain",
+                    ));
+                }
+                let array = value.materialize(0..selection.len(), work)?;
+                (array, value.into_errors())
+            }
             value => {
-                let argument = value.argument();
+                let argument = value.argument()?;
                 let mut indices = Vec::with_capacity(selection.len());
                 for (ordinal, row) in selection.iter().enumerate() {
                     indices.push(Some(
@@ -390,6 +413,8 @@ impl CompiledExpressionInstance {
                     }
                     StaticExprKind::Constant(_)
                     | StaticExprKind::Input
+                    | StaticExprKind::Lambda { .. }
+                    | StaticExprKind::LambdaParameter { .. }
                     | StaticExprKind::NaryAnd { .. }
                     | StaticExprKind::NaryOr { .. }
                     | StaticExprKind::Not(_)
@@ -429,6 +454,28 @@ impl CompiledExpressionInstance {
                                     .native_inlist(occurrence)
                                     .ok_or_else(|| invalid("missing mandatory IN effect recipe"))?
                                     .own_effects(invocation.context)
+                            } else if let ControlShape::Case {
+                                simple: true, arms, ..
+                            } = invocation.control
+                            {
+                                let mut own =
+                                    novarocks_type_contract::ExpressionEffects::PURE_VALUE;
+                                for arm in 0..arms {
+                                    work.step()?;
+                                    let recipe = program
+                                        .recipes()
+                                        .case_comparison(occurrence, arm)
+                                        .ok_or_else(|| {
+                                            invalid("missing mandatory CASE WHEN effect recipe")
+                                        })?;
+                                    if let crate::primitives::PreparedNodeComparison::Composite(
+                                        recipe,
+                                    ) = recipe
+                                    {
+                                        own.may_raise_row_error |= recipe.may_raise_row_error();
+                                    }
+                                }
+                                ScopedExpressionEffects::primitive(invocation.context, own)
                             } else if let StaticExprKind::PreparedBetween { plan, .. } = node.kind()
                             {
                                 let lower = program
@@ -496,9 +543,14 @@ impl CompiledExpressionInstance {
                 .ok_or_else(|| invalid("missing actual expression definition"))?;
             admit_node_result(node.data_type())?;
             match node.kind() {
-                StaticExprKind::Constant(_) | StaticExprKind::Input
+                StaticExprKind::Constant(_)
+                | StaticExprKind::Input
+                | StaticExprKind::LambdaParameter { .. }
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.is_empty() => {}
+                StaticExprKind::Lambda { .. }
+                    if invocation.control == ControlShape::LambdaBody
+                        && invocation.arguments.len() == 1 => {}
                 StaticExprKind::NaryAnd { .. } | StaticExprKind::NaryOr { .. }
                     if invocation.control
                         == (if matches!(node.kind(), StaticExprKind::NaryAnd { .. }) {
@@ -836,6 +888,7 @@ fn evaluate_scalar<'a, R, K: Ord + Clone>(
     children: &[Value<'a>],
     selection: Selection<'a>,
     activation: novarocks_functions::ScalarInvocationActivation,
+    parent_row: Option<scalar_groups::ParentRow<'_>>,
     instances: &mut BTreeMap<K, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     work: &mut Work<'_, '_, R>,
@@ -855,9 +908,15 @@ fn evaluate_scalar<'a, R, K: Ord + Clone>(
             work.step()?;
         }
         if prepared.contract().effects().null_behavior == FunctionNullBehavior::Strict {
+            if let Value::Mapped(value) = child.uncontinued() {
+                for (ordinal, blocked) in blocked.iter_mut().enumerate() {
+                    *blocked |= value.is_null(ordinal, work)?;
+                }
+                continue;
+            }
             work.flush()?;
             visit_selected_nulls(
-                child.argument(),
+                child.argument()?,
                 selection,
                 work.control,
                 |ordinal, _, is_null| {
@@ -909,23 +968,40 @@ fn evaluate_scalar<'a, R, K: Ord + Clone>(
     } else {
         Selection::try_sparse_observed(selection.batch_rows(), &active_rows, || work.step())?
     };
+    let groups = scalar_groups::Groups::plan(
+        prepared,
+        children,
+        &active_ordinals,
+        selection,
+        parent_row,
+        allocator,
+        work,
+    )?;
     let mut narrowed = Vec::new();
-    if !full_call {
+    if groups.is_none() {
         let mut indices = Vec::with_capacity(active_ordinals.len());
-        for &ordinal in &active_ordinals {
-            indices.push(Some(
-                u64::try_from(ordinal).map_err(|_| KernelFailure::ResourceExhausted)?,
-            ));
-            work.step()?;
+        if !full_call {
+            for &ordinal in &active_ordinals {
+                indices.push(Some(
+                    u64::try_from(ordinal).map_err(|_| KernelFailure::ResourceExhausted)?,
+                ));
+                work.step()?;
+            }
         }
         for child in children {
-            let output = if let Value::Selected(child_values) = child.uncontinued() {
-                let array = gather_continued(
+            let output = match child.uncontinued() {
+                Value::Mapped(value) => {
+                    Some(value.materialize(active_ordinals.iter().copied(), work)?)
+                }
+                Value::Selected(child_values) if !full_call => Some(gather_continued(
                     child_values.values(),
                     &indices,
                     child.continuation().as_ref(),
                     work,
-                )?;
+                )?),
+                _ => None,
+            };
+            let output = if let Some(array) = output {
                 Some(SelectedValues::try_new_observed::<KernelFailure>(
                     call_selection,
                     array.data_type(),
@@ -941,13 +1017,15 @@ fn evaluate_scalar<'a, R, K: Ord + Clone>(
         }
     }
     let mut arguments = Vec::with_capacity(children.len());
-    for (index, child) in children.iter().enumerate() {
-        arguments.push(if !full_call && let Some(output) = &narrowed[index] {
-            EvaluatedArgument::SelectedColumn(output)
-        } else {
-            child.argument()
-        });
-        work.step()?;
+    if groups.is_none() {
+        for (index, child) in children.iter().enumerate() {
+            arguments.push(if let Some(output) = &narrowed[index] {
+                EvaluatedArgument::SelectedColumn(output)
+            } else {
+                child.argument()?
+            });
+            work.step()?;
+        }
     }
     work.flush()?;
     if let std::collections::btree_map::Entry::Vacant(entry) = instances.entry(occurrence.clone()) {
@@ -965,47 +1043,62 @@ fn evaluate_scalar<'a, R, K: Ord + Clone>(
         work.control.checkpoint(0)?;
         entry.insert(instance);
     }
-    let output = match scalar_invocation::invoke(
-        instances
-            .get_mut(&occurrence)
-            .ok_or_else(|| internal("scalar instance was not installed"))?,
-        call_selection,
-        &arguments,
-        activation,
-        allocator,
-        work,
-    ) {
-        Ok(output) => output,
-        Err(cause) => {
-            // A real typed leaf failure owns the first cause. Do not add a
-            // completion callback that can replace it. Row Data stays Ok and
-            // retains the original lawful downstream masking path.
+    let instance = instances
+        .get_mut(&occurrence)
+        .ok_or_else(|| internal("scalar instance was not installed"))?;
+    let array = if let Some(groups) = groups {
+        groups
+            .evaluate(
+                instance,
+                prepared,
+                children,
+                selection,
+                activation,
+                &mut inherited,
+                allocator,
+                work,
+            )
+            .inspect_err(|_| {
+                work.control
+                    .operation_aborted
+                    .store(true, Ordering::Relaxed)
+            })?
+    } else {
+        let output = scalar_invocation::invoke(
+            instance,
+            call_selection,
+            &arguments,
+            activation,
+            allocator,
+            work,
+        )
+        .inspect_err(|_| {
             work.control
                 .operation_aborted
-                .store(true, Ordering::Relaxed);
-            return Err(cause);
-        }
-    };
-    let (_, array, own_errors) = output.into_parts();
-    for error in own_errors {
-        let original = active_ordinals[error.selected_ordinal()];
-        inherited.insert(original, error.with_selected_ordinal(original));
-        work.step()?;
-    }
-    let array = if full_call {
-        array
-    } else {
-        let mut indices = Vec::with_capacity(selection.len());
-        for _ in 0..selection.len() {
-            indices.push(None);
+                .store(true, Ordering::Relaxed)
+        })?;
+        let (_, array, own_errors) = output.into_parts();
+        for error in own_errors {
+            let original = active_ordinals[error.selected_ordinal()];
+            inherited.insert(original, error.with_selected_ordinal(original));
             work.step()?;
         }
-        for (call_ordinal, &original) in active_ordinals.iter().enumerate() {
-            indices[original] =
-                Some(u64::try_from(call_ordinal).map_err(|_| KernelFailure::ResourceExhausted)?);
-            work.step()?;
+        if full_call {
+            array
+        } else {
+            let mut indices = Vec::with_capacity(selection.len());
+            for _ in 0..selection.len() {
+                indices.push(None);
+                work.step()?;
+            }
+            for (call_ordinal, &original) in active_ordinals.iter().enumerate() {
+                indices[original] = Some(
+                    u64::try_from(call_ordinal).map_err(|_| KernelFailure::ResourceExhausted)?,
+                );
+                work.step()?;
+            }
+            gather(&array, &indices, work)?
         }
-        gather(&array, &indices, work)?
     };
     let mut errors = Vec::with_capacity(inherited.len());
     for error in inherited.into_values() {
@@ -1099,6 +1192,18 @@ fn admit_call_protocol(
             call.call_contract().effects().null_behavior == FunctionNullBehavior::ControlDefined
                 && guarded::supports_result(result)
         }
+        (
+            ControlShape::HigherOrder {
+                body_ordinal,
+                body_demand,
+            },
+            PreparedPureKernel::HigherOrder(prepared),
+        ) => {
+            prepared.contract().body_ordinal() == body_ordinal as usize
+                && prepared.contract().body_demand() == body_demand
+                && call.call_contract().effects().null_behavior
+                    == FunctionNullBehavior::ControlDefined
+        }
         _ => false,
     };
     if supported {
@@ -1123,11 +1228,15 @@ mod constant_projection;
 mod filter_conjunction;
 mod guarded;
 mod input_source;
+mod mapped;
 mod node_recipes;
+mod scalar_groups;
 pub(crate) mod scalar_invocation;
 mod unary;
 
 pub use filter_conjunction::CompiledFilterConjunctionInstance;
 
+#[cfg(test)]
+mod lambda_observation;
 #[cfg(test)]
 mod tests;

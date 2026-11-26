@@ -4876,9 +4876,10 @@ mod plan_splits_pruning_tests {
             CatalogNamespaceName, catalog_request::CatalogPublicationRequest, error::CatalogOutcome,
         };
         use novarocks_spi::connector::{
-            ConnectorChangeWindowAdmission, ConnectorChangeWindowFullRebuildReason,
-            ConnectorOriginalResultScope, ConnectorOriginalResultScopeCheck,
-            OriginalResultCheckError, ProviderMetadataCpuInput, ProviderMetadataCpuPort,
+            ConnectorChangeWindowFacts, ConnectorChangeWindowNetZeroBasis,
+            ConnectorChangeWindowNotIncrementalReason, ConnectorOriginalResultScope,
+            ConnectorOriginalResultScopeCheck, OriginalResultCheckError, ProviderMetadataCpuInput,
+            ProviderMetadataCpuPort,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct OriginalScope(Instant);
@@ -5069,15 +5070,17 @@ mod plan_splits_pruning_tests {
                 assert_eq!(result.request().to_revision(), request.to_revision());
                 assert_eq!(result.request().from_revision(), request.from_revision());
                 let expected = if missing_from {
-                    ConnectorChangeWindowAdmission::FullRebuild(
-                        ConnectorChangeWindowFullRebuildReason::LineageBroken {
+                    ConnectorChangeWindowFacts::NotIncremental(
+                        ConnectorChangeWindowNotIncrementalReason::SnapshotAncestryBroken {
                             from_snapshot_id: from,
                         },
                     )
                 } else {
-                    ConnectorChangeWindowAdmission::MetadataOnly
+                    ConnectorChangeWindowFacts::NetZero(
+                        ConnectorChangeWindowNetZeroBasis::SameSnapshot,
+                    )
                 };
-                assert_eq!(result.admission(), Some(&expected));
+                assert_eq!(result.window_facts(), Some(&expected));
                 // This fixture's port reports its explicit close. It is not a
                 // physical worker exit oracle; actual Source custody stays in
                 // the original receiver until the caller closes and drops it.
@@ -5114,10 +5117,11 @@ mod plan_splits_pruning_tests {
         };
         use novarocks_spi::connector::{
             ConnectorCatalogMutation, ConnectorCatalogMutationOperation,
-            ConnectorCatalogMutationRequest, ConnectorChangeWindowAdmission,
-            ConnectorChangeWindowPartitionImpact, ConnectorColumnPath,
-            ConnectorOriginalResultScope, ConnectorSchemaChange, ExternalMutationEffect,
-            ExternalMutationOutcome, ProviderMetadataCpuPort,
+            ConnectorCatalogMutationRequest, ConnectorChangeWindowFacts,
+            ConnectorChangeWindowNegativeWeight, ConnectorChangeWindowPartitionImpact,
+            ConnectorChangeWindowVolume, ConnectorColumnPath, ConnectorOriginalResultScope,
+            ConnectorSchemaChange, ExternalMutationEffect, ExternalMutationOutcome,
+            ProviderMetadataCpuPort,
         };
         use prepared_source_phase_support::{IoFixture, OriginalScope, PhasePort, written};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -5253,8 +5257,10 @@ mod plan_splits_pruning_tests {
                     let scan = metadata.prepare_source_read(&session, &request, &cpu, &original, &mut owner).await.unwrap();
                     assert_eq!(scan.to_metadata().schema().field(0).name(), "renamed");
                     owner.as_ref().unwrap().validate_owner(&ConnectorProviderBindingKey { instance_id: provider.descriptor.instance_id.clone(), incarnation: provider.incarnation }).unwrap();
-                    assert_eq!(scan.admission(), Some(&ConnectorChangeWindowAdmission::Incremental {
-                        has_inserts: true, has_deletes: false, partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
+                    assert_eq!(scan.window_facts(), Some(&ConnectorChangeWindowFacts::Difference {
+                        negative_weight: ConnectorChangeWindowNegativeWeight::Absent,
+                        partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
+                        volume: ConnectorChangeWindowVolume { source_event_rows_upper_bound: 3, source_data_file_bytes: 128 },
                     }));
                     assert!(phase.calls.load(Ordering::SeqCst) > 3, "both endpoint readers suspend and resume before the common Finish phase");
                     assert!(io.owned_reads.load(Ordering::SeqCst) - initial_owned_reads >= 4, "both nonempty manifest lists and their data manifests were actually read");

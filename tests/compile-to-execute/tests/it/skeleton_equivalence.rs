@@ -375,6 +375,49 @@ fn compare_requests(
 }
 
 #[test]
+fn collection_lambda_preserves_each_lexical_scope_across_typing_entries() {
+    let fixture = Fixture::new();
+    let columns = [
+        column(
+            "items",
+            1,
+            DataType::List(Arc::new(arrow::datatypes::Field::new(
+                "item",
+                DataType::Int32,
+                true,
+            ))),
+            false,
+        ),
+        column("captured", 2, DataType::Int32, true),
+    ];
+    let typed = fixture.equivalent(
+        "transform(items, x -> transform(items, y -> x + y + captured))",
+        &columns,
+    );
+    let unit = typed.unit();
+    let outer = unit
+        .definitions()
+        .iter()
+        .find(|expr| matches!(expr.kind, ExprKind::Lambda { .. }) && expr.lambda_scope.is_none())
+        .unwrap();
+    let inner = unit
+        .definitions()
+        .iter()
+        .find(|expr| {
+            matches!(expr.kind, ExprKind::Lambda { .. }) && expr.lambda_scope == Some(outer.id)
+        })
+        .unwrap();
+    assert!(unit.definitions().iter().any(|expr| {
+        matches!(expr.kind, ExprKind::LambdaParameter { lambda, ordinal: 0 } if lambda == outer.id)
+            && expr.lambda_scope == Some(inner.id)
+    }));
+    assert!(unit.definitions().iter().any(|expr| {
+        matches!(expr.kind, ExprKind::Value(value) if value == columns[1].value)
+            && expr.lambda_scope == Some(inner.id)
+    }));
+}
+
+#[test]
 fn migrated_calls_share_the_declared_port_and_preserve_source_occurrences() {
     let fixture = Fixture::new();
     let columns = [

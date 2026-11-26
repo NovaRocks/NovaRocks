@@ -214,7 +214,7 @@ pub enum UnsupportedPreparedSourceRead {}
 
 pub struct ProviderPreparedSourceRead<T> {
     source: T,
-    admission: Option<crate::connector::ConnectorChangeWindowAdmission>,
+    window_facts: Option<crate::connector::ConnectorChangeWindowFacts>,
     to_metadata: Arc<crate::connector::ConnectorTableMetadata>,
 }
 
@@ -225,19 +225,19 @@ impl<T> ProviderPreparedSourceRead<T> {
     ) -> Self {
         Self {
             source,
-            admission: None,
+            window_facts: None,
             to_metadata,
         }
     }
 
     pub const fn change_window(
         source: T,
-        admission: crate::connector::ConnectorChangeWindowAdmission,
+        window_facts: crate::connector::ConnectorChangeWindowFacts,
         to_metadata: Arc<crate::connector::ConnectorTableMetadata>,
     ) -> Self {
         Self {
             source,
-            admission: Some(admission),
+            window_facts: Some(window_facts),
             to_metadata,
         }
     }
@@ -870,16 +870,16 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
                 request.selection(),
                 super::runtime::ConnectorReadSourceSelection::ChangeWindow(_)
             );
-            if is_window != prepared.admission.is_some() {
+            if is_window != prepared.window_facts.is_some() {
                 return Err(ConnectorError::new(
                     crate::connector::ConnectorErrorKind::InvalidRequest,
-                    "provider source preparation decision differs from its selection",
+                    "provider source preparation window facts differ from its selection",
                 ));
             }
             Ok(super::runtime::ConnectorPreparedSourceRead::new(
                 self.binding.clone(),
                 request.clone(),
-                prepared.admission,
+                prepared.window_facts,
                 prepared.to_metadata,
                 BoundSourcePreparation::<P> {
                     facts: prepared.source,
@@ -2351,11 +2351,11 @@ mod tests {
 
     fn prepared_source(
         adapter: &ReadRuntimeAdapter<Probe>,
-        admission: Option<crate::connector::ConnectorChangeWindowAdmission>,
+        window_facts: Option<crate::connector::ConnectorChangeWindowFacts>,
     ) -> super::super::ConnectorPreparedSourceRead {
         prepared_source_with_facts(
             adapter,
-            admission,
+            window_facts,
             ProbeSourceFacts {
                 ordinal: 41,
                 _retention: None,
@@ -2365,7 +2365,7 @@ mod tests {
 
     fn prepared_source_with_facts(
         adapter: &ReadRuntimeAdapter<Probe>,
-        admission: Option<crate::connector::ConnectorChangeWindowAdmission>,
+        window_facts: Option<crate::connector::ConnectorChangeWindowFacts>,
         facts: ProbeSourceFacts,
     ) -> super::super::ConnectorPreparedSourceRead {
         use crate::connector::read_stack::{
@@ -2391,7 +2391,7 @@ mod tests {
             },
             Arc::new(41_i64),
         );
-        let request = if admission.is_some() {
+        let request = if window_facts.is_some() {
             ConnectorReadSourcePreparationRequest::change_window(
                 name,
                 prepared_source_metadata(adapter).table.clone(),
@@ -2414,7 +2414,7 @@ mod tests {
         super::super::ConnectorPreparedSourceRead::new(
             adapter.binding.clone(),
             request,
-            admission,
+            window_facts,
             prepared_source_metadata(adapter),
             BoundSourcePreparation::<Probe> { facts },
         )
@@ -2422,32 +2422,53 @@ mod tests {
 
     #[test]
     fn prepared_source_projects_only_the_capabilities_of_its_closed_decision() {
-        use crate::connector::ConnectorChangeWindowAdmission as A;
+        use crate::connector::ConnectorChangeWindowFacts as A;
         use crate::connector::read_stack::ConnectorReadSourceProjection as P;
         let provider = Arc::new(Probe::new());
         let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
-        let incremental = A::Incremental {
-            has_inserts: true,
-            has_deletes: false,
-            partition_impact: crate::connector::ConnectorChangeWindowPartitionImpact::Unpartitioned,
+        use crate::connector::{
+            ConnectorChangeWindowNegativeWeight, ConnectorChangeWindowNetZeroBasis,
+            ConnectorChangeWindowNotIncrementalReason, ConnectorChangeWindowPartitionImpact,
+            ConnectorChangeWindowVolume,
         };
-        for decision in [
-            None,
-            Some(A::MetadataOnly),
-            Some(A::FullRebuild(
-                crate::connector::ConnectorChangeWindowFullRebuildReason::LineageBroken {
-                    from_snapshot_id: 40,
-                },
-            )),
-            Some(incremental),
+        for (window_facts, permits_from, permits_delta) in [
+            (None, false, false),
+            (
+                Some(A::NetZero(ConnectorChangeWindowNetZeroBasis::SameSnapshot)),
+                false,
+                true,
+            ),
+            (
+                Some(A::NotIncremental(
+                    ConnectorChangeWindowNotIncrementalReason::SnapshotAncestryBroken {
+                        from_snapshot_id: 40,
+                    },
+                )),
+                false,
+                false,
+            ),
+            (
+                Some(A::Difference {
+                    negative_weight: ConnectorChangeWindowNegativeWeight::Absent,
+                    partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
+                    volume: ConnectorChangeWindowVolume {
+                        source_event_rows_upper_bound: 3,
+                        source_data_file_bytes: 128,
+                    },
+                }),
+                true,
+                true,
+            ),
         ] {
-            let source = prepared_source(&adapter, decision.clone());
+            let source = prepared_source(&adapter, window_facts);
             for projection in [P::To, P::From, P::Delta] {
                 let before = provider.created_calls.load(Ordering::SeqCst);
                 let result = adapter.project_prepared_source_read(&session(), &source, projection);
-                let permitted = projection == P::To
-                    || matches!(decision, Some(A::Incremental { .. }))
-                    || (projection == P::Delta && matches!(decision, Some(A::MetadataOnly)));
+                let permitted = match projection {
+                    P::To => true,
+                    P::From => permits_from,
+                    P::Delta => permits_delta,
+                };
                 assert_eq!(result.is_ok(), permitted);
                 assert_eq!(
                     provider.created_calls.load(Ordering::SeqCst),

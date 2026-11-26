@@ -24,6 +24,9 @@ use arrow_schema::DataType;
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use std::{error::Error, fmt, ops::Range};
 
+#[path = "array_json_structure.rs"]
+pub(super) mod structure;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg(test)]
 pub(super) enum Operation {

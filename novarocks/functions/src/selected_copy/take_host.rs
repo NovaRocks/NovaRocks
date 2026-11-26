@@ -31,6 +31,7 @@ use arrow_array::{Array, ArrayRef, UInt32Array, UInt64Array};
 use arrow_buffer::ArrowNativeType;
 use arrow_data::{ArrayData, transform::MutableArrayData};
 use arrow_schema::{DataType, UnionMode};
+use novarocks_type_contract::owned_resources::hashmap::{HashMapResourceError, fresh_table_layout};
 use std::sync::Arc;
 
 /// These are the two actual gather-index carriers used by the existing hosts.
@@ -533,7 +534,7 @@ impl CopyInvoiceTotals {
         &mut self,
         values: &[&dyn Array],
         key: &DataType,
-        source_count: usize,
+        sources: &[&dyn Array],
     ) -> Result<(), CopyError> {
         let value_type = values
             .first()
@@ -549,31 +550,50 @@ impl CopyInvoiceTotals {
         {
             return Ok(());
         }
-        let mut domain = 0;
-        for array in values {
-            domain = add(domain, array.len())?;
-            self.required(add(
-                array.len() / 8,
-                usize::from(!array.len().is_multiple_of(8)),
-            )?)?;
-        }
         let key_width = key
             .primitive_width()
             .ok_or(CopyError::Invalid("copy frozen primitive width is absent"))?;
-        // Actual masked-values Vec tuples (index, optional borrowed bytes),
-        // one native mapping per domain element and interleave source choices.
-        self.temporary_exact(mul(domain, size_of::<(usize, Option<&[u8]>)>())?)?;
-        self.temporary_exact(mul(domain, key_width)?)?;
-        self.temporary_exact(mul(domain, size_of::<(usize, usize)>())?)?;
-        self.metadata = add(
-            self.metadata,
-            mul(source_count, size_of::<Vec<(usize, Option<&[u8]>)>>())?,
-        )?;
-        self.metadata = add(self.metadata, mul(source_count, size_of::<Vec<u64>>())?)?;
+        let mut referenced_upper = 0;
+        for (array, source) in values.iter().zip(sources) {
+            let values = array.len();
+            let rows = source.len();
+            let selected = values.min(rows);
+            referenced_upper = add(referenced_upper, selected)?;
+            // Arrow 60.2 concat passes the source row count as the number of key
+            // lookups. Its sparse branch collects and sorts referenced indices
+            // before building a pre-sized map with at most one entry per row.
+            if values > rows.saturating_mul(256) {
+                self.temporary_exact(original_unreserved_vec_upper::<usize>(rows)?)?;
+                let table =
+                    fresh_table_layout::<usize, u64>(selected).map_err(|error| match error {
+                        HashMapResourceError::SourceModel(detail) => CopyError::Invalid(detail),
+                        HashMapResourceError::Arithmetic(_) => CopyError::arithmetic(None),
+                    })?;
+                self.temporary_exact(table.request_bytes_upper_bound)?;
+            } else {
+                self.required(add(values / 8, usize::from(!values.is_multiple_of(8)))?)?;
+                self.temporary_exact(mul(values, key_width)?)?;
+            }
+        }
+        // Selected values own index/borrowed-bytes tuples and interleave choices.
+        self.temporary_exact(mul(referenced_upper, size_of::<(usize, Option<&[u8]>)>())?)?;
+        self.temporary_exact(mul(referenced_upper, size_of::<(usize, usize)>())?)?;
+        let source_count = sources.len();
+        self.temporary_exact(mul(source_count, size_of::<&dyn Array>())?)?;
+        self.temporary_exact(mul(
+            source_count,
+            size_of::<(Vec<(usize, Option<&[u8]>)>, bool)>(),
+        )?)?;
+        // The larger KeyMapping variant holds std HashMap with four u64 ahash
+        // seeds. One word covers the enum tag and alignment on the audited targets.
+        type KeyMappingUpper = (std::collections::HashMap<usize, u64, [u64; 4]>, usize);
+        self.temporary_exact(original_unreserved_vec_upper::<KeyMappingUpper>(
+            source_count,
+        )?)?;
         // ONE original fixed interner formula, with capacity bounded by the
-        // actual full domain; no hash/equality computation or key-limit gate.
+        // referenced value count; no hash/equality computation or key-limit gate.
         // u64 has the largest installed dictionary native key width/alignment.
-        let capacity = u64::try_from(domain).map_err(|_| CopyError::arithmetic(None))?;
+        let capacity = u64::try_from(referenced_upper).map_err(|_| CopyError::arithmetic(None))?;
         let shift = capacity
             .checked_add(128)
             .ok_or_else(|| CopyError::arithmetic(None))?

@@ -220,29 +220,28 @@ impl PreparedTemporalCast {
 
 /// The original dependency-free temporal-to-VARCHAR conversion, available
 /// to collection calls which consume individual elements.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct TemporalTextCast(Pair);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TemporalTextCast(Type);
 
 impl TemporalTextCast {
-    pub(super) fn bind(source: &FunctionValueType, target: &FunctionValueType) -> Option<Self> {
+    pub(crate) fn bind(source: &FunctionValueType, target: &FunctionValueType) -> Option<Self> {
         let pair = Pair::bind(source, target)?;
-        (pair.target == Type::Text && pair.source.temporal().is_some()).then_some(Self(pair))
+        (pair.target == Type::Text && pair.source.temporal().is_some()).then_some(Self(pair.source))
     }
 
-    pub(super) fn evaluate(
+    pub(crate) fn evaluate(
         self,
         array: &dyn Array,
         row: usize,
         nullable: bool,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<Option<String>, KernelFailure> {
-        let source = Source::bind(self.0.source, array, nullable)?;
+        let source = Source::bind(self.0, array, nullable)?;
         let Some(Input::Temporal(value)) = source.value(row)? else {
             return Ok(None);
         };
         let ty = self
             .0
-            .source
             .temporal()
             .ok_or_else(|| invalid("text source has no temporal declaration"))?;
         format_cast_text(ty, value, work).map(Some)

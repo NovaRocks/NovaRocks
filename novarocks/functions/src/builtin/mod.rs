@@ -39,7 +39,7 @@ pub mod value_conversion;
 mod value_conversion_kernel;
 mod value_conversion_owner;
 mod value_conversion_temporal;
-pub(crate) use value_conversion_temporal::LosslessTemporalWiden;
+pub(crate) use value_conversion_temporal::{LosslessTemporalWiden, TemporalTextCast};
 
 pub(crate) mod binding_control;
 
@@ -229,7 +229,7 @@ pub(crate) mod array_generation_owner;
 mod array_join;
 mod array_join_owner;
 mod array_order;
-mod array_order_owner;
+pub(crate) mod array_order_owner;
 mod array_relation;
 mod array_relation_owner;
 mod array_scalar_output;

@@ -211,8 +211,10 @@ fn prepare_calls(
         control,
         &mut work,
         None,
+        None,
+        None,
     )
-    .map(|(calls, _)| calls)
+    .map(|(calls, _, _)| calls)
     .map_err(ExprCompileFailure::into_pure);
     finish(result, &mut work)
 }

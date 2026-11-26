@@ -558,3 +558,287 @@ fn join_probe_owned_root_frame_every_actual_callback_keeps_seven_causes_and_latc
 
 mod callback_cases;
 mod filter_conjunction;
+
+fn integer_lists(values: &[Option<i32>]) -> ArrayRef {
+    use arrow::array::{ListArray, types::Int32Type};
+    Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+        values.iter().map(|value| Some([*value])),
+    ))
+}
+
+fn text_lists(values: &[&str]) -> ArrayRef {
+    use arrow::array::{ListBuilder, StringBuilder};
+    let mut list = ListBuilder::new(StringBuilder::new());
+    for value in values {
+        list.values().append_value(*value);
+        list.append(true);
+    }
+    Arc::new(list.finish())
+}
+
+fn evaluate_sparse_composite_guard(
+    inputs: &[(&str, ArrayRef)],
+    rows: &[usize],
+    result: FunctionValueType,
+    author: impl FnOnce(
+        &mut BoundExprSetBuilder,
+        &mut ConstantPools,
+        &[novarocks_expression_contract::ExprId],
+        &[FunctionValueType],
+    ) -> ExprKind,
+) -> (ArrayRef, Box<[novarocks_functions::RowDataError]>) {
+    let mut draft = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: 256,
+    });
+    let types = inputs
+        .iter()
+        .map(|(_, array)| FunctionValueType::new(array.data_type().clone(), false))
+        .collect::<Vec<_>>();
+    let values = types
+        .iter()
+        .enumerate()
+        .map(|(index, ty)| (ValueId::new(index as u32), ty.clone()))
+        .collect::<Vec<_>>();
+    let sources = values
+        .iter()
+        .map(|(value, ty)| {
+            draft
+                .add(None, ty.clone(), ExprKind::Value(*value))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut constants = ConstantPools::empty();
+    let kind = author(&mut draft, &mut constants, &sources, &types);
+    let expr = draft.add(None, result, kind).unwrap();
+    let root = draft
+        .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    let schema = Arc::new(Schema::new(
+        inputs
+            .iter()
+            .zip(&types)
+            .map(|((name, _), ty)| ty.try_to_field(*name).unwrap())
+            .collect::<Vec<_>>(),
+    ));
+    let port = ExprPort {
+        values: values.into_boxed_slice(),
+    };
+    let scope = fixture_scope(&port, Arc::clone(&schema));
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let program = compile_ownerless_fixture(
+        draft,
+        vec![port],
+        EvaluationEnvironment {
+            constants: &constants,
+            parameters: &parameters,
+        },
+        ScopeLayouts {
+            ports: std::slice::from_ref(&scope),
+            all_ports: Some(&scope),
+        },
+        SQL_LITERAL_POLICY,
+    );
+    let input = RecordBatch::try_new(
+        schema,
+        inputs.iter().map(|(_, array)| array.clone()).collect(),
+    )
+    .unwrap();
+    let selection = Selection::try_sparse(input.num_rows(), rows).unwrap();
+    let output = CompiledExpressionInstance::try_new(program, root, &HarnessControl)
+        .unwrap()
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &HarnessControl,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
+    assert_eq!(output.selection(), selection);
+    let (_, values, errors) = output.into_parts();
+    (values, errors)
+}
+
+fn explicit_guard_cast(
+    draft: &mut BoundExprSetBuilder,
+    source: novarocks_expression_contract::ExprId,
+    target: &FunctionValueType,
+) -> novarocks_expression_contract::ExprId {
+    draft
+        .add(
+            None,
+            target.clone(),
+            ExprKind::Cast {
+                cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
+                expr: source,
+                target: target.data_type().clone(),
+            },
+        )
+        .unwrap()
+}
+
+#[test]
+fn simple_case_composite_selected_rows_keep_unknown_and_demanded_label_errors_separate() {
+    use arrow::array::Int32Array;
+    use novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT;
+    use novarocks_functions::DataFailureReason;
+
+    let inputs = [
+        (
+            "probe",
+            integer_lists(&[
+                Some(99),
+                Some(1),
+                Some(99),
+                None,
+                Some(99),
+                Some(2),
+                Some(2),
+                Some(5),
+            ]),
+        ),
+        ("first", integer_lists(&[Some(1); 8])),
+        (
+            "second_text",
+            text_lists(&["bad", "bad", "bad", "2", "bad", "bad", "2", "6"]),
+        ),
+        (
+            "else_text",
+            Arc::new(StringArray::from(vec![
+                "bad", "bad", "bad", "30", "bad", "777", "bad", "40",
+            ])) as ArrayRef,
+        ),
+    ];
+    let rows = [1, 3, 5, 6, 7];
+    let result_type = FunctionValueType::new(DataType::Int32, false);
+    let (output, errors) = evaluate_sparse_composite_guard(
+        &inputs,
+        &rows,
+        result_type.clone(),
+        |draft, pools, sources, types| {
+            let mut integer = |draft: &mut BoundExprSetBuilder, value| {
+                let value = ConstantValue::from_i32(
+                    Arc::new(Field::new("literal", DataType::Int32, false)),
+                    result_type.clone(),
+                    value,
+                    SQL_LITERAL_POLICY,
+                    CompilePhase::FunctionSpecialization,
+                    &HarnessControl,
+                )
+                .unwrap();
+                draft
+                    .add(
+                        None,
+                        result_type.clone(),
+                        checked_constants::kind(pools, value),
+                    )
+                    .unwrap()
+            };
+            let first_result = integer(draft, 10);
+            let second_result = integer(draft, 20);
+            let second_label = explicit_guard_cast(draft, sources[2], &types[0]);
+            let fallback = explicit_guard_cast(draft, sources[3], &result_type);
+            ExprKind::Case {
+                ieee_float_equality: false,
+                operand: Some(sources[0]),
+                when_then: Box::new([(sources[1], first_result), (second_label, second_result)]),
+                else_expr: Some(fallback),
+            }
+        },
+    );
+    assert_eq!(
+        output
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some(10), Some(30), None, Some(20), Some(40)],
+    );
+    let [error] = errors.as_ref() else {
+        panic!("only the demanded invalid label may fail");
+    };
+    assert_eq!(error.selected_ordinal(), 2);
+    assert_eq!(rows[error.selected_ordinal()], 5);
+    assert_eq!(
+        error.reason(),
+        DataFailureReason::Domain(INVALID_CAST_ARGUMENT)
+    );
+}
+
+#[test]
+fn inlist_composite_selected_rows_keep_true_over_unknown_and_report_later_demanded_errors() {
+    use arrow::array::BooleanArray;
+    use novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT;
+    use novarocks_functions::DataFailureReason;
+
+    let inputs = [
+        (
+            "probe",
+            integer_lists(&[
+                Some(99),
+                Some(1),
+                Some(99),
+                Some(2),
+                Some(99),
+                Some(3),
+                Some(5),
+                Some(5),
+            ]),
+        ),
+        (
+            "first",
+            integer_lists(&[
+                Some(0),
+                Some(1),
+                Some(0),
+                None,
+                Some(0),
+                None,
+                Some(4),
+                Some(4),
+            ]),
+        ),
+        (
+            "second_text",
+            text_lists(&["bad", "bad", "bad", "2", "bad", "4", "bad", "6"]),
+        ),
+    ];
+    let rows = [1, 3, 5, 6, 7];
+    for negated in [false, true] {
+        let (output, errors) = evaluate_sparse_composite_guard(
+            &inputs,
+            &rows,
+            FunctionValueType::new(DataType::Boolean, true),
+            |draft, _, sources, types| ExprKind::InList {
+                expr: sources[0],
+                list: Box::new([
+                    sources[1],
+                    explicit_guard_cast(draft, sources[2], &types[0]),
+                ]),
+                negated,
+            },
+        );
+        let actual = output.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(
+            actual.iter().collect::<Vec<_>>(),
+            [None, Some(!negated), None, None, Some(negated)],
+        );
+        // The original membership control still invokes both candidates.
+        // Sparse outer rows are excluded even when their candidate would fail.
+        let [after_match, after_miss] = errors.as_ref() else {
+            panic!("only the two demanded invalid candidates may fail");
+        };
+        for (error, ordinal, row) in [(after_match, 0, 1), (after_miss, 3, 6)] {
+            assert_eq!(error.selected_ordinal(), ordinal);
+            assert_eq!(rows[error.selected_ordinal()], row);
+            assert_eq!(
+                error.reason(),
+                DataFailureReason::Domain(INVALID_CAST_ARGUMENT)
+            );
+        }
+    }
+}

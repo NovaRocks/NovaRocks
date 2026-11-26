@@ -401,8 +401,315 @@ fn scope_full_type_width_and_missing_combined_layout_are_rejected() {
     work.finish().unwrap();
 }
 #[test]
-fn lambda_is_an_explicit_unsupported_compiler_shape() {
-    use novarocks_failure_contract::{FailureClass, FailureProjection};
+fn higher_order_compilation_keeps_exact_captures_and_ancestor_reuse() {
+    let (binding, request, catalog) = resolved::lambda_compilation_fixture();
+    let c = Control::good();
+    let pools = ConstantPools::empty();
+    let parameters = SemanticParameters::default();
+    let mut b = builder();
+    let outer = b.reserve().unwrap();
+    let middle = b.reserve().unwrap();
+    let inner = b.reserve().unwrap();
+    let column = ValueId::new(63);
+    let root_input = b.add(None, int(false), ExprKind::Value(column)).unwrap();
+    let capture = b
+        .add(Some(inner), int(false), ExprKind::Value(column))
+        .unwrap();
+    let x = [outer, middle, inner].map(|lambda| {
+        b.add(
+            Some(inner),
+            int(false),
+            ExprKind::LambdaParameter { lambda, ordinal: 0 },
+        )
+        .unwrap()
+    });
+    let mut compare = |left, right| {
+        b.add(
+            Some(inner),
+            boolean(true),
+            ExprKind::Binary {
+                left,
+                right,
+                op: BinaryOperator::Eq,
+                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                allow_throw_exception: None,
+            },
+        )
+        .unwrap()
+    };
+    let top_only = compare(capture, capture);
+    let outer_used = compare(x[0], capture);
+    let middle_used = compare(x[1], x[0]);
+    let current_used = compare(x[2], x[1]);
+    let conjunction = b
+        .add(
+            Some(inner),
+            boolean(true),
+            ExprKind::Conjunction {
+                args: Box::new([top_only, outer_used, middle_used, current_used]),
+            },
+        )
+        .unwrap();
+
+    let mut overflow = BTreeMap::new();
+    let rand = catalog
+        .metadata()
+        .resolve_bound_user(
+            "rand",
+            FunctionKind::Scalar,
+            novarocks_function_contract::FunctionBindingRequest {
+                arguments: &[],
+                logical_argument_count: 0,
+                expected_result_type: None,
+            },
+            &c,
+        )
+        .unwrap();
+    let FunctionResultType::Scalar(rand_type) = &rand.selected.result_type else {
+        panic!("rand returns a scalar");
+    };
+    let stateful = b
+        .add(
+            Some(middle),
+            rand_type.clone(),
+            ExprKind::FunctionCall {
+                function: BoundFunction::from_exact_signature(
+                    rand.function_id,
+                    rand.selected.overload,
+                    FunctionKind::Scalar,
+                    rand.selected.argument_types,
+                    rand_type.clone(),
+                ),
+                args: Box::new([]),
+            },
+        )
+        .unwrap();
+    b.request(
+        stateful,
+        PhysicalCallRequest {
+            arguments: Box::new([]),
+            logical_argument_count: 0,
+            expected_result_type: None,
+            constant_policy: policy(),
+        },
+    )
+    .unwrap();
+    b.definition_control(
+        stateful,
+        DefinitionControl {
+            shape: ControlShape::Eager,
+            temporal_sources: None,
+        },
+    )
+    .unwrap();
+    overflow.insert(stateful, DecimalOverflowPolicy::OutputNull);
+    let rand_predicate = b
+        .add(
+            Some(middle),
+            boolean(false),
+            ExprKind::IsNull {
+                expr: stateful,
+                negated: true,
+            },
+        )
+        .unwrap();
+    let middle_body = b.reserve().unwrap();
+    let mut add_call = |scope, wrapper, body| {
+        b.insert(
+            wrapper,
+            scope,
+            boolean(true),
+            ExprKind::Lambda {
+                body,
+                parameter_types: Box::new([int(false)]),
+            },
+        )
+        .unwrap();
+        let collection = if scope.is_some() {
+            b.add(scope, int(false), ExprKind::Value(column)).unwrap()
+        } else {
+            root_input
+        };
+        let call = b
+            .add(
+                scope,
+                boolean(true),
+                ExprKind::FunctionCall {
+                    function: binding.clone(),
+                    args: Box::new([collection, wrapper]),
+                },
+            )
+            .unwrap();
+        b.request(call, request.clone()).unwrap();
+        b.definition_control(
+            call,
+            DefinitionControl {
+                shape: ControlShape::HigherOrder {
+                    body_ordinal: 1,
+                    body_demand: EvaluationDemand::Value,
+                },
+                temporal_sources: None,
+            },
+        )
+        .unwrap();
+        overflow.insert(call, DecimalOverflowPolicy::OutputNull);
+        call
+    };
+    let inner_call = add_call(Some(middle), inner, conjunction);
+    let middle_call = add_call(Some(outer), middle, middle_body);
+    let outer_call = add_call(None, outer, middle_call);
+    b.insert(
+        middle_body,
+        Some(middle),
+        boolean(true),
+        ExprKind::Conjunction {
+            args: Box::new([inner_call, rand_predicate]),
+        },
+    )
+    .unwrap();
+    b.root(outer_call, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    let values = [(column, int(false))];
+    let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Validate).unwrap();
+    let sealed = b
+        .seal(
+            vec![ExprPort {
+                values: Box::new(values.clone()),
+            }],
+            &mut work,
+        )
+        .unwrap();
+    let environment = EvaluationEnvironment {
+        constants: &pools,
+        parameters: &parameters,
+    };
+    let authored = author_unit_calls(
+        &sealed,
+        &CallAuthorInputs {
+            environment,
+            constant_policy: policy(),
+            functions: &catalog,
+            decimal_overflow: &overflow,
+        },
+        &mut work,
+    )
+    .unwrap();
+    let u = sealed.finish(authored.claims, &mut work).unwrap();
+    work.finish().unwrap();
+    let scope = layouts(&values);
+    let scopes = ScopeLayouts {
+        ports: std::slice::from_ref(&scope),
+        all_ports: None,
+    };
+    let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
+    let program =
+        compile_expr_set_pure(&u, environment, scopes, policy(), &catalog, &mut work).unwrap();
+    work.finish().unwrap();
+
+    let only_use = |id| {
+        let mut uses = u
+            .control_flow()
+            .uses()
+            .values()
+            .filter(|use_| use_.definition == id);
+        let selected = uses.next().unwrap().context.use_id;
+        assert!(uses.next().is_none());
+        selected
+    };
+    assert!(matches!(
+        program.types().get(program.compiled_definition(inner).unwrap().index()),
+        Some(FunctionArgumentType::Lambda { parameter_types, result_type })
+            if parameter_types.as_slice() == [int(false)] && result_type == &boolean(true)
+    ));
+    assert!(matches!(
+        program.definitions().node(program.compiled_definition(x[0]).unwrap()).unwrap().kind(),
+        StaticExprKind::LambdaParameter { lambda, ordinal: 0 } if *lambda == outer
+    ));
+
+    let expected_sources = [
+        LambdaCaptureSource::Input(column),
+        LambdaCaptureSource::Parameter {
+            lambda: outer,
+            ordinal: 0,
+        },
+        LambdaCaptureSource::Parameter {
+            lambda: middle,
+            ordinal: 0,
+        },
+    ];
+    let mut last = None;
+    for (index, (call, wrapper, body)) in [
+        (outer_call, outer, middle_call),
+        (middle_call, middle, middle_body),
+        (inner_call, inner, conjunction),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let call = only_use(call);
+        let body_use = only_use(body);
+        let actual = program.higher_order_body(call).unwrap();
+        assert_eq!(actual.lambda_definition, wrapper);
+        assert_eq!(actual.body_use, body_use);
+        assert_eq!(actual.contract.call().body_edge_use(), only_use(wrapper));
+        assert_eq!(
+            actual.contract.context(),
+            u.control_flow().uses()[&body_use].context
+        );
+        assert_ne!(
+            actual.contract.context().region,
+            u.control_flow().uses()[&call].context.region
+        );
+        assert_eq!(
+            actual
+                .captures
+                .iter()
+                .map(|capture| capture.source)
+                .collect::<Vec<_>>(),
+            expected_sources[..=index]
+        );
+        assert_eq!(actual.contract.capture_types(), vec![int(false); index + 1]);
+        for capture in actual.captures.iter().take(1) {
+            assert_eq!(
+                program.input(capture.use_id),
+                Some(InputBinding {
+                    scope: RootScope::Port(0),
+                    ordinal: 0,
+                })
+            );
+        }
+        if let Some(previous) = last {
+            assert!(!Arc::ptr_eq(previous, &actual.contract));
+        }
+        last = Some(&actual.contract);
+    }
+    assert_eq!(
+        program.reuse_scope(only_use(top_only)),
+        Some(LambdaReuseScope::TopLevel)
+    );
+    assert_eq!(
+        program.reuse_scope(only_use(outer_used)),
+        Some(LambdaReuseScope::Ancestor(outer))
+    );
+    assert_eq!(
+        program.reuse_scope(only_use(middle_used)),
+        Some(LambdaReuseScope::Ancestor(middle))
+    );
+    assert_eq!(program.reuse_scope(only_use(current_used)), None);
+    // The call's ordinary source is a root column, but its child lambda
+    // closes over its actual current binder through one of its descendants.
+    assert_eq!(program.reuse_scope(only_use(inner_call)), None);
+    let stateful_use = only_use(stateful);
+    let stateful_effects = program.effects()[&stateful_use]
+        .for_use(u.control_flow().uses()[&stateful_use].context)
+        .unwrap();
+    assert!(stateful_effects.has_instance_state);
+    assert_eq!(program.reuse_scope(stateful_use), None);
+    assert_eq!(program.reuse_scope(only_use(rand_predicate)), None);
+}
+
+#[test]
+fn lambda_is_rejected_as_an_independent_value_root() {
     let mut b = builder();
     let lambda = b.reserve().unwrap();
     let body = b
@@ -417,108 +724,18 @@ fn lambda_is_an_explicit_unsupported_compiler_shape() {
         None,
         int(false),
         ExprKind::Lambda {
-            parameter_types: Box::from([int(false)]),
+            parameter_types: Box::new([int(false)]),
             body,
         },
     )
     .unwrap();
-    let parameters = TypedFactSlice::from_pure_boxed(Box::new([int(false)]));
-    let argument = FunctionArgumentType::Lambda {
-        parameter_types: parameters.clone(),
-        result_type: int(false),
-    };
-    let function = BoundFunction::from_exact_signature(
-        FunctionId::try_new("fixture/unit/lambda").unwrap(),
-        FunctionOverloadId::try_new("fixture/unit/lambda/i64").unwrap(),
-        FunctionKind::Scalar,
-        TypedFactSlice::from_pure_boxed(Box::new([argument])),
-        int(false),
-    );
-    let call = b
-        .add(
-            None,
-            int(false),
-            ExprKind::FunctionCall {
-                function,
-                args: Box::new([lambda]),
-            },
-        )
+    b.root(lambda, EvaluationDemand::Value, RootScope::AllPorts)
         .unwrap();
-    b.request(
-        call,
-        PhysicalCallRequest {
-            arguments: Box::new([novarocks_function_contract::FunctionArgument::Lambda {
-                parameter_types: parameters,
-                result_type: int(false),
-            }]),
-            logical_argument_count: 1,
-            expected_result_type: None,
-            constant_policy: policy(),
-        },
-    )
-    .unwrap();
-    let argument_control = ArgumentControl::HigherOrder {
-        body_ordinal: 0,
-        body_demand: EvaluationDemand::Value,
-    };
-    b.definition_control(
-        call,
-        DefinitionControl {
-            shape: ControlShape::HigherOrder {
-                body_ordinal: 0,
-                body_demand: EvaluationDemand::Value,
-            },
-            temporal_sources: None,
-        },
-    )
-    .unwrap();
-    b.root(call, EvaluationDemand::Value, RootScope::AllPorts)
-        .unwrap();
-    let control = Control::good();
-    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
-    let sealed = b.seal(vec![], &mut work).unwrap();
-    let claims = sealed
-        .uses()
-        .iter()
-        .filter(|(_, u)| u.definition == call)
-        .map(|(&id, u)| {
-            (
-                id,
-                ExpressionCallClaim {
-                    context: u.context,
-                    effects: CallEffects {
-                        value_stability: FunctionVolatility::Immutable,
-                        own_row_error: FunctionIntrinsicRowError::NoRowError,
-                        failure_behavior: FunctionFailureBehavior::Propagate,
-                        null_behavior: FunctionNullBehavior::CalledOnNull,
-                        argument_control,
-                        instance_state: FunctionInstanceState::None,
-                        observable_effects: ObservableEffects::NONE,
-                        environment: Box::default(),
-                        proof_scope: CallProofScope::Region(u.context.region),
-                    },
-                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    temporal_source: None,
-                },
-            )
-        })
-        .collect();
-    let u = sealed.finish(claims, &mut work).unwrap();
-    work.finish().unwrap();
-    let e = compile(
-        &u,
-        &ConstantPools::empty(),
-        &SemanticParameters::default(),
-        ScopeLayouts {
-            ports: &[],
-            all_ports: None,
-        },
-        &Control::good(),
-    )
-    .unwrap_err();
-    assert!(matches!(e, ExprCompileError::UnsupportedExpression(_)));
-    assert_eq!(e.failure_fact().class(), FailureClass::Unsupported);
+    let c = Control::good();
+    let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Validate).unwrap();
+    assert!(b.seal(vec![], &mut work).is_err());
 }
+
 #[test]
 fn all_original_control_causes_stop_at_every_actual_compile_callback() {
     let (pools, _) = checked_pool();

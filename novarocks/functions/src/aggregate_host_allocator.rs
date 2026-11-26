@@ -105,6 +105,10 @@ impl HostAggregateAllocator {
     pub(crate) fn has_host_authority(&self, host: &Arc<dyn AggregateStateAllocator>) -> bool {
         Arc::ptr_eq(&self.inner().host, host)
     }
+    /// Compare the exact retained allocation, not just its common host.
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
     pub(crate) const fn metadata_allocation_bytes() -> usize {
         Layout::new::<HostAllocatorInner>().size()
     }

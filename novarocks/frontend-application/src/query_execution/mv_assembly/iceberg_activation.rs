@@ -451,13 +451,11 @@ fn incremental_publication_write_input(
 /// input shape alone, and the difference decides whether the commit is a
 /// publication or DML.
 ///
-/// * A fast-append refresh only ever inserts, so it supersedes nothing. It sends
-///   plain data rows and declares `InsertOnlyChangeStream`, which seals one
-///   *routed* data branch accepting only `Insert` and freezes no delete
-///   artifact. Note what the declaration does not do: an effect no branch
-///   accepts is dropped by the router rather than refused, so "no delete
-///   appears" stays this mode's own precondition -- established upstream by the
-///   write-mode policy -- and is not made an enforced invariant by the routing.
+/// * A fast-append refresh requires `ConnectorChangeWindowNegativeWeight::Absent`
+///   in the prepared window facts. It declares `InsertOnlyChangeStream`, which
+///   seals one routed data branch accepting only `Insert` and freezes no delete
+///   artifact. If a delete event reaches this route, the router rejects the
+///   batch with a contract error.
 /// * A row-delta refresh replaces and retires rows, so it declares `RowMutation`
 ///   and sends row-lineage change events. The session then seals the branches a
 ///   row mutation needs and freezes the old delete artifacts they supersede.

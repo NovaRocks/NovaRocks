@@ -81,6 +81,10 @@ pub(super) struct PreparedRelation {
 }
 
 impl PreparedRelation {
+    pub(super) fn supports_scalar_broadcast(&self, ordinal: usize) -> bool {
+        ordinal < 2 && matches!(self.operation, Operation::Contains | Operation::Position)
+    }
+
     pub(super) fn prepare(
         operation: Operation,
         contract: &ScalarCallContract,

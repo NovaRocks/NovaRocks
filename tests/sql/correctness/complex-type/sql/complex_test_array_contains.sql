@@ -953,8 +953,9 @@ ROW(3, NULL, NULL, NULL),
 ROW(4, [], [], []);
 
 -- query 198
+-- Compare MAP values after matching the declared key type.
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([MAP(ARRAY['c', 'd'], ARRAY[3, 4])], array_map) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([CAST(MAP(ARRAY['c', 'd'], ARRAY[3, 4]) AS MAP(VARCHAR, INTEGER))], array_map) ORDER BY id;
 
 -- query 199
 USE ${case_db};

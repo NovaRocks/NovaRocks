@@ -23,6 +23,7 @@ use novarocks_type_contract::FunctionIntrinsicRowError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BuiltinDisposition {
     InstalledScalar(FunctionIntrinsicRowError),
+    InstalledHigherOrder,
     AggregateBoundary,
     WindowBoundary,
     LoweredOnly,
@@ -84,8 +85,8 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "acos",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    ("all_match", BuiltinDisposition::Unavailable),
-    ("any_match", BuiltinDisposition::Unavailable),
+    ("all_match", BuiltinDisposition::InstalledHigherOrder),
+    ("any_match", BuiltinDisposition::InstalledHigherOrder),
     ("any_value", BuiltinDisposition::AggregateBoundary),
     (
         "approx_count_distinct",
@@ -358,7 +359,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "exp",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    ("filter", BuiltinDisposition::Unavailable),
+    ("filter", BuiltinDisposition::InstalledHigherOrder),
     ("first_value", BuiltinDisposition::WindowBoundary),
     (
         "flatten",
@@ -519,7 +520,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "map_entries",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    ("map_filter", BuiltinDisposition::Unavailable),
+    ("map_filter", BuiltinDisposition::InstalledHigherOrder),
     (
         "map_keys",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
@@ -777,9 +778,9 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "to_utf8",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    ("transform", BuiltinDisposition::Unavailable),
-    ("transform_keys", BuiltinDisposition::Unavailable),
-    ("transform_values", BuiltinDisposition::Unavailable),
+    ("transform", BuiltinDisposition::InstalledHigherOrder),
+    ("transform_keys", BuiltinDisposition::InstalledHigherOrder),
+    ("transform_values", BuiltinDisposition::InstalledHigherOrder),
     (
         "translate",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),

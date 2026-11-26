@@ -20,9 +20,9 @@
 use novarocks_mv_application::product::{MvIncrementalJoinMode, MvIncrementalWriteMode};
 pub fn non_join_incremental_write_mode(
     is_aggregate: bool,
-    has_delete_changes: bool,
+    source_negative_weight_possible: bool,
 ) -> MvIncrementalWriteMode {
-    if is_aggregate || has_delete_changes {
+    if is_aggregate || source_negative_weight_possible {
         MvIncrementalWriteMode::RowDelta
     } else {
         MvIncrementalWriteMode::FastAppend
@@ -30,10 +30,10 @@ pub fn non_join_incremental_write_mode(
 }
 
 pub fn select_join_incremental_execution_mode(
-    left_has_delete_changes: bool,
-    right_has_delete_changes: bool,
+    left_source_negative_weight_possible: bool,
+    right_source_negative_weight_possible: bool,
 ) -> MvIncrementalJoinMode {
-    if left_has_delete_changes || right_has_delete_changes {
+    if left_source_negative_weight_possible || right_source_negative_weight_possible {
         MvIncrementalJoinMode::Coalesce
     } else {
         MvIncrementalJoinMode::AppendOnly

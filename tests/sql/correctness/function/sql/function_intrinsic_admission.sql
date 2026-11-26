@@ -41,8 +41,9 @@ SELECT next_day('2020-01-01') WHERE FALSE;
 SELECT intrinsic_definitely_unknown(1) WHERE FALSE;
 
 -- query 8
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT map_filter(map(ARRAY[1], ARRAY[10]), (k, v) -> TRUE) WHERE FALSE;
+-- A valid higher-order call still has its declared result type in an empty relation.
+SELECT map_filter(map(ARRAY[1], ARRAY[10]), (k, v) -> TRUE) AS filtered_map
+WHERE FALSE;
 
 -- query 9
 SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, ordinal) AS null_key_order
@@ -89,3 +90,8 @@ SELECT JSON_OBJECT('k' VALUE JSON '{"a":1,"a":2}' WITH UNIQUE KEYS);
 -- query 19
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT parse_json('1');
+
+-- query 20
+-- A malformed predicate body is rejected before row pruning.
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT map_filter(map(ARRAY[1], ARRAY[10]), (k, v) -> NULL) WHERE FALSE;

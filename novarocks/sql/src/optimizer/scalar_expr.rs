@@ -1000,14 +1000,34 @@ pub(crate) fn scalar_call_can_fail(binding: &crate::binding::SqlFunctionBinding)
         novarocks_functions::FunctionKind::Scalar,
         "a non-row binding cannot be consumed as a scalar function"
     );
-    scalar_invocation_can_fail(binding)
-        || match binding.semantics.intrinsic_row_error {
-            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError => false,
-            novarocks_type_contract::FunctionIntrinsicRowError::MayRaise => true,
-            novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated => {
-                unreachable!("a scalar function cannot carry a non-row intrinsic fact")
+    use novarocks_type_contract::{
+        FunctionArgumentType, FunctionIntrinsicRowError, OperatorFunction,
+    };
+    if scalar_invocation_can_fail(binding) {
+        return true;
+    }
+    match binding.semantics.intrinsic_row_error {
+        FunctionIntrinsicRowError::NoRowError => false,
+        FunctionIntrinsicRowError::MayRaise => {
+            if matches!(
+                OperatorFunction::from_function_id(&binding.function_id),
+                Some(OperatorFunction::Equal | OperatorFunction::NotEqual)
+            ) && let [
+                FunctionArgumentType::Value(left),
+                FunctionArgumentType::Value(right),
+            ] = binding.selected.argument_types.as_slice()
+            {
+                use novarocks_functions::PreparedCompositeComparisonRecipe;
+                PreparedCompositeComparisonRecipe::equal_may_raise_row_error(left)
+                    || PreparedCompositeComparisonRecipe::equal_may_raise_row_error(right)
+            } else {
+                true
             }
         }
+        FunctionIntrinsicRowError::NotRowEvaluated => {
+            unreachable!("a scalar function cannot carry a non-row intrinsic fact")
+        }
+    }
 }
 
 pub(crate) fn scalar_cast_can_fail(
@@ -1143,7 +1163,11 @@ fn prove_signed_integer_operator_total(
 /// Decimal numeric overflow, including errors from any argument expression.
 /// This effect is independent from function volatility.
 pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
-    use novarocks_type_contract::DecimalOverflowPolicy;
+    use novarocks_functions::PreparedCompositeComparisonRecipe;
+    use novarocks_type_contract::{DecimalOverflowPolicy, ValueLogicalType};
+    let comparison_can_fail = |value| {
+        PreparedCompositeComparisonRecipe::equal_may_raise_row_error(arena.value_type(value))
+    };
     let decimal = |data_type: &DataType| {
         matches!(
             data_type,
@@ -1220,7 +1244,12 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
         | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child) => can_fail(arena, *child),
         ScalarNode::InList { child, list, .. } => {
-            can_fail(arena, *child) || list.iter().any(|item| can_fail(arena, *item))
+            arena.value_type(*child).logical_type() == ValueLogicalType::Json
+                || comparison_can_fail(*child)
+                || can_fail(arena, *child)
+                || list
+                    .iter()
+                    .any(|item| comparison_can_fail(*item) || can_fail(arena, *item))
         }
         ScalarNode::Between {
             child, low, high, ..
@@ -1234,10 +1263,15 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
             else_expr,
             ..
         } => {
-            operand.is_some_and(|expr| can_fail(arena, expr))
-                || when_then
-                    .iter()
-                    .any(|(when, then)| can_fail(arena, *when) || can_fail(arena, *then))
+            operand.is_some_and(|expr| {
+                can_fail(arena, expr)
+                    || comparison_can_fail(expr)
+                    || when_then
+                        .iter()
+                        .any(|(label, _)| comparison_can_fail(*label))
+            }) || when_then
+                .iter()
+                .any(|(when, then)| can_fail(arena, *when) || can_fail(arena, *then))
                 || else_expr.is_some_and(|expr| can_fail(arena, expr))
         }
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {

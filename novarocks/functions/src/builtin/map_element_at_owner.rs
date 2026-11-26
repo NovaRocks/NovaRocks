@@ -263,6 +263,10 @@ impl PreparedScalarKernel for PreparedMapElementAt {
         &self.contract
     }
 
+    fn supports_scalar_broadcast(&self, ordinal: usize) -> bool {
+        ordinal < 2 && self.contract.function_id().as_str() == "builtin.scalar/element_at/v1"
+    }
+
     fn instance_retained_upper_bound(&self) -> usize {
         std::mem::size_of::<MapElementAtInstance>()
     }

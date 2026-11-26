@@ -651,6 +651,18 @@ pub(crate) struct PureFunctionAttachment {
     owner: Arc<dyn InstalledPureOwner>,
     metadata_owner: Arc<dyn PureFunctionMetadataOwner>,
 }
+impl PureFunctionAttachment {
+    pub(crate) fn implementation_abi(
+        &self,
+        overload: &FunctionOverloadId,
+    ) -> Option<PureKernelAbi> {
+        let index = self
+            .implementations
+            .binary_search_by(|implementation| implementation.overload.cmp(overload))
+            .ok()?;
+        Some(self.implementations[index].abi)
+    }
+}
 impl fmt::Debug for PureFunctionAttachment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

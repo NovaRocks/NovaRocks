@@ -23,7 +23,8 @@ use arrow::datatypes::DataType;
 use novarocks_constant_contract::{ConstantError, ConstantPolicy, ConstantValue};
 use novarocks_functions::{
     EngineFunctionCatalog, FunctionArgument, FunctionArgumentType, FunctionBindingError,
-    FunctionBindingRequest, FunctionResultType, ResolvedFunctionBinding,
+    FunctionBindingRequest, FunctionResultType, HigherOrderBindingCandidate, PureKernelAbi,
+    ResolvedFunctionBinding,
 };
 use novarocks_type_contract::{
     AssignmentCommonTypeError, CompileCheckpoints, CompileControlError, DecimalOverflowPolicy,
@@ -83,6 +84,23 @@ pub fn syntax_distinct_from(negated: bool) -> OperatorFunction {
 /// The caller's original statement binding authority. Implementations retain
 /// their declaration and installed implementation admission at both steps.
 pub trait ScalarBindingCatalog {
+    fn begin_higher_order_binding(
+        &self,
+        name: &str,
+        ordinary_ordinal: usize,
+        ordinary: &FunctionArgument,
+        lambda_ordinal: usize,
+        lambda_arity: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<HigherOrderBindingCandidate, FunctionBindingError>;
+
+    fn finish_higher_order_binding(
+        &self,
+        candidate: &HigherOrderBindingCandidate,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError>;
+
     fn select_scalar(
         &self,
         name: &str,
@@ -122,6 +140,35 @@ pub trait ScalarBindingCatalog {
 }
 
 impl ScalarBindingCatalog for EngineFunctionCatalog {
+    fn begin_higher_order_binding(
+        &self,
+        name: &str,
+        ordinary_ordinal: usize,
+        ordinary: &FunctionArgument,
+        lambda_ordinal: usize,
+        lambda_arity: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<HigherOrderBindingCandidate, FunctionBindingError> {
+        EngineFunctionCatalog::begin_higher_order_binding(
+            self,
+            name,
+            ordinary_ordinal,
+            ordinary,
+            lambda_ordinal,
+            lambda_arity,
+            control,
+        )
+    }
+
+    fn finish_higher_order_binding(
+        &self,
+        candidate: &HigherOrderBindingCandidate,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        EngineFunctionCatalog::finish_higher_order_binding(self, candidate, request, control)
+    }
+
     fn select_scalar(
         &self,
         name: &str,
@@ -982,6 +1029,65 @@ pub fn finish_call(
         }
     }
     work.flush()?;
+    Ok(exact)
+}
+
+/// Determine the parameter types before entering the caller's lexical body.
+pub fn begin_collection_lambda(
+    context: &TypingContext<'_>,
+    name: &str,
+    collection: &ChildTyping,
+    arity: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(HigherOrderBindingCandidate, Conversion), TypingError> {
+    work.step()?;
+    work.flush()?;
+    let candidate = context.catalog.begin_higher_order_binding(
+        name,
+        0,
+        &collection.argument(),
+        1,
+        arity,
+        work.control(),
+    )?;
+    let conversion =
+        conversion::coerce_argument(context, collection, candidate.collection_target(), work)?;
+    Ok((candidate, conversion))
+}
+
+/// Finalize the same overload using the converted argument and original body type.
+pub fn finish_collection_lambda(
+    context: &TypingContext<'_>,
+    candidate: &HigherOrderBindingCandidate,
+    collection: &ChildTyping,
+    body_type: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ResolvedFunctionBinding, TypingError> {
+    work.step()?;
+    work.flush()?;
+    let arguments = [
+        collection.argument(),
+        FunctionArgument::Lambda {
+            parameter_types: candidate.parameter_types().clone(),
+            result_type: body_type.clone(),
+        },
+    ];
+    let exact = context.catalog.finish_higher_order_binding(
+        candidate,
+        request(&arguments, None),
+        work.control(),
+    )?;
+    check_shape(&exact, arguments.len())?;
+    if &exact.function_id != candidate.function_id()
+        || &exact.selected.overload != candidate.overload()
+        || exact
+            .admitted_execution_abi
+            .is_some_and(|abi| abi != PureKernelAbi::HigherOrderV1)
+    {
+        return Err(TypingError::InvalidShape(
+            "higher-order binding changed its selected overload or ABI",
+        ));
+    }
     Ok(exact)
 }
 

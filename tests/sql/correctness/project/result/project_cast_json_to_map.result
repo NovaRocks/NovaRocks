@@ -1,69 +1,74 @@
 -- query 3
--- legacy
+-- types	integer	map(varchar, json)
 c1	m
 1	NULL
 2	NULL
 3	NULL
 4	NULL
 5	NULL
-6	{"1":'1',"2":'true',"3":'null',"4":'[5, 6, 7]',"5":'{"k51": "v51", "k52": "v52"}'}
+6	{"1":"1","2":"true","3":"null","4":"[5,6,7]","5":"{\"k51\":\"v51\",\"k52\":\"v52\"}"}
 
 -- query 4
--- legacy
+-- types	integer	map(integer, json)
 c1	m
 1	NULL
 2	NULL
 3	NULL
 4	NULL
 5	NULL
-6	{1:'1',2:'true',3:'null',4:'[5, 6, 7]',5:'{"k51": "v51", "k52": "v52"}'}
+6	{"1":"1","2":"true","3":"null","4":"[5,6,7]","5":"{\"k51\":\"v51\",\"k52\":\"v52\"}"}
 
 -- query 5
--- legacy
+-- types	integer	map(varchar, varchar)
 c1	m
 1	NULL
 2	NULL
 3	NULL
 4	NULL
 5	NULL
-6	{"1":"1","2":"true","3":null,"4":"[5, 6, 7]","5":"{\\"k51\\": \\"v51\\", \\"k52\\": \\"v52\\"}"}
+6	NULL
+7	{"1":"1","2":"true","3":null}
 
 -- query 6
--- legacy
+-- types	integer	map(integer, varchar)
 c1	m
 1	NULL
 2	NULL
 3	NULL
 4	NULL
 5	NULL
-6	{1:"1",2:"true",3:null,4:"[5, 6, 7]",5:"{\\"k51\\": \\"v51\\", \\"k52\\": \\"v52\\"}"}
+6	NULL
+7	{"1":"1","2":"true","3":null}
 
 -- query 7
--- legacy
+-- types	integer	map(varchar, array(integer))
 c1	m
 1	NULL
 2	NULL
 3	NULL
 4	NULL
 5	NULL
-6	{"1":null,"2":null,"3":null,"4":[5,6,7],"5":null}
+6	NULL
+7	{"1":null,"2":null,"3":null,"4":[5,6,7],"5":null}
 
 -- query 8
--- legacy
+-- types	integer	map(varchar, row(k51 varchar, k52 varchar))
 c1	m
 1	NULL
 2	NULL
 3	NULL
 4	NULL
 5	NULL
-6	{"1":null,"2":null,"3":null,"4":{"k51":"5","k52":"6"},"5":{"k51":"v51","k52":"v52"}}
+6	NULL
+7	{"1":null,"2":null,"3":null,"4":["5","6"],"5":["v51","v52"]}
 
 -- query 9
--- legacy
+-- types	integer	map(varchar, map(varchar, varchar))
 c1	m
 1	NULL
 2	NULL
 3	NULL
 4	NULL
 5	NULL
-6	{"1":null,"2":null,"3":null,"4":null,"5":{"k51":"v51","k52":"v52"}}
+6	NULL
+7	{"1":null,"2":null,"3":null,"4":null,"5":{"k51":"v51","k52":"v52"}}

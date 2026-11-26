@@ -32,7 +32,7 @@ pub(super) fn evaluate<'a>(
     selection: Selection<'a>,
     work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
-    let argument = child.argument();
+    let argument = child.argument()?;
     let not = if matches!(kind, UnaryIntrinsic::Not) {
         Some(NotOperand::try_new(argument.array().as_ref())?)
     } else {

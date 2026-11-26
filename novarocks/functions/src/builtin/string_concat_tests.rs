@@ -26,6 +26,7 @@ use crate::{
     PureFunctionMetadataOwner, PureScalarImplementation, ScalarEvaluationInstance,
     ScopedExpressionEffects, Selection, specialize_frozen_scalar, specialize_scalar,
 };
+use arrow_schema::Field;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
     EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
@@ -837,4 +838,43 @@ fn string_concat_complete_success_traces_and_bounded_all_seven_causes() {
     println!(
         "C12-P2 string_concat first-cause checks={checks}; cap-mask entry/tail only; other fixtures complete"
     );
+}
+
+#[test]
+fn scalar_broadcast_differential_for_variadic_array_concat() {
+    use crate::builtin::array_invocation_test_support::assert_scalar_broadcast_equivalent;
+    use arrow_array::{ListArray, StringArray, StructArray};
+    use arrow_buffer::OffsetBuffer;
+
+    let child: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("a"),
+        None,
+        Some("中🙂"),
+        Some("b"),
+    ]));
+    let row_child: ArrayRef = Arc::new(StructArray::new(
+        vec![Field::new("label", DataType::Utf8, true)].into(),
+        vec![child.clone()],
+        None,
+    ));
+    for child in [child, row_child] {
+        let source: ArrayRef = Arc::new(
+            ListArray::try_new(
+                Arc::new(Field::new("item", child.data_type().clone(), true)),
+                OffsetBuffer::new(vec![0, 1, 3, 4, 4].into()),
+                child,
+                Some(arrow_buffer::NullBuffer::from(vec![
+                    true, true, true, false,
+                ])),
+            )
+            .unwrap(),
+        );
+        assert_scalar_broadcast_equivalent(
+            "concat",
+            &[(&source, 1), (&source, 2), (&source, 0)],
+            false,
+        );
+        assert_scalar_broadcast_equivalent("concat", &[(&source, 1), (&source, 3)], false);
+        assert_scalar_broadcast_equivalent("concat", &[(&source, 1)], true);
+    }
 }

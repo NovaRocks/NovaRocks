@@ -36,6 +36,7 @@ paths = [
     "novarocks/functions/src/source_custody_resources.rs",
     "novarocks/functions/src/array_*.rs",
     "novarocks/functions/src/higher_order_*.rs",
+    "novarocks/functions/src/higher_order_kernel/**",
     "novarocks/functions/src/lambda_rows.rs",
     "novarocks/functions/src/control_values.rs",
     "novarocks/functions/src/selected_copy.rs",

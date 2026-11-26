@@ -18,7 +18,8 @@
 //! Full source/environment refinement and preparation remain separate gates.
 use super::SqlFunctionCatalog;
 use novarocks_functions::{
-    FunctionBindingError, FunctionKind, FunctionSpecializationFailure, ResolvedFunctionBinding,
+    FunctionArgument, FunctionBindingError, FunctionBindingRequest, FunctionKind,
+    FunctionSpecializationFailure, HigherOrderBindingCandidate, ResolvedFunctionBinding,
 };
 use novarocks_type_contract::PureCompileControl;
 use std::sync::Arc;
@@ -279,6 +280,38 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
             .resolve_scalar_binding(_name, _arguments, control)?;
         self.admit(binding, control)
     }
+
+    fn begin_higher_order_binding(
+        &self,
+        name: &str,
+        ordinary_ordinal: usize,
+        ordinary: &FunctionArgument,
+        lambda_ordinal: usize,
+        lambda_arity: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<HigherOrderBindingCandidate, FunctionBindingError> {
+        self.original.begin_higher_order_binding(
+            name,
+            ordinary_ordinal,
+            ordinary,
+            lambda_ordinal,
+            lambda_arity,
+            control,
+        )
+    }
+
+    fn finish_higher_order_binding(
+        &self,
+        candidate: &HigherOrderBindingCandidate,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        let binding = self
+            .original
+            .finish_higher_order_binding(candidate, request, control)?;
+        self.admit(binding, control)
+    }
+
     fn resolve_scalar_operator_binding(
         &self,
         operator: novarocks_type_contract::OperatorFunction,
