@@ -586,20 +586,25 @@ fn original_request_definition_does_not_alias_expression_occurrence_namespace() 
 }
 
 #[test]
-fn original_call_requests_retire_the_request_identity_field() {
+fn original_call_requests_reserve_retired_identity_and_policy_fields() {
     let pool = pool();
     let request = pool
         .get_message_by_name("novarocks.call_request.OriginalCallRequest")
         .unwrap();
-    assert!(request.get_field_by_name("request_id").is_none());
-    assert!(request.reserved_ranges().any(|range| range.contains(&6)));
-    assert!(request.reserved_names().any(|name| name == "request_id"));
+    for (name, number) in [("constant_policy", 5), ("request_id", 6)] {
+        assert!(request.get_field_by_name(name).is_none());
+        assert!(
+            request
+                .reserved_ranges()
+                .any(|range| range.contains(&number))
+        );
+        assert!(request.reserved_names().any(|reserved| reserved == name));
+    }
     for (name, number) in [
         ("definition", 1),
         ("arguments", 2),
         ("logical_argument_count", 3),
         ("expected_result_value_type_id", 4),
-        ("constant_policy", 5),
     ] {
         assert_eq!(request.get_field_by_name(name).unwrap().number(), number);
     }

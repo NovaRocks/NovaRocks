@@ -480,7 +480,8 @@ fn values_large_batch_and_cells_execute_with_actual_backing_and_nulls() {
     // Keep each original pool under the fixture's existing admission.
     // Selecting the same large constant for multiple rows copies each cell
     // into the materialized column, which exceeds 16 MiB in both modes.
-    let text = "x".repeat(768 * 1024);
+    let text = "x".repeat(64 * 1024);
+    let repeated_rows = 288;
     let strings = pool(
         Arc::new(StringArray::from(vec![Some(text.as_str()), None])),
         true,
@@ -490,7 +491,7 @@ fn values_large_batch_and_cells_execute_with_actual_backing_and_nulls() {
     let types = [strings.value_type().clone(), integers.value_type().clone()];
 
     for dynamic in [false, true] {
-        let mut rows = vec![vec![Cell::Constant(0, 0), Cell::Constant(1, 0)]; 24];
+        let mut rows = vec![vec![Cell::Constant(0, 0), Cell::Constant(1, 0)]; repeated_rows];
         rows.push(vec![
             Cell::Constant(0, 1),
             if dynamic {
@@ -513,7 +514,7 @@ fn values_large_batch_and_cells_execute_with_actual_backing_and_nulls() {
         assert_eq!(values.batch().is_none(), dynamic);
         assert_eq!(values.dynamic_cells().len(), usize::from(dynamic));
         if let Some(cell) = values.dynamic_cells().first() {
-            assert_eq!((cell.row, cell.column), (24, 1));
+            assert_eq!((cell.row, cell.column), (repeated_rows, 1));
         }
 
         let tracker = crate::runtime::mem_tracker::MemTracker::new_root("large Values backing");
@@ -536,7 +537,7 @@ fn values_large_batch_and_cells_execute_with_actual_backing_and_nulls() {
             assert!(batch.schema().field(0).is_nullable());
             assert!(!batch.schema().field(1).is_nullable());
             for (string, integer) in strings.iter().zip(integers.iter()) {
-                let last = seen_rows == 24;
+                let last = seen_rows == repeated_rows;
                 assert_eq!(string, (!last).then_some(text.as_str()));
                 assert_eq!(integer, Some(if last && dynamic { 7 } else { 11 }));
                 seen_rows += 1;

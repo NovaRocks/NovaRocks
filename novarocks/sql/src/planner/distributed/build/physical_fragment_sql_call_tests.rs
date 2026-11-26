@@ -209,7 +209,7 @@ fn sql_scalar_fresh_composer_preserves_original_none_and_each_actual_context() {
     }
 }
 #[test]
-fn sql_call_fresh_composer_refuses_changed_policy_and_foreign_constant_parameter_sources() {
+fn sql_call_fresh_composer_refuses_foreign_constant_parameter_sources_and_changed_scope() {
     // The remaining composer authenticates actual relational sources. Scalar
     // policy/claims were already frozen by that same statement's lowering.
     let (plan, _) = table_fixture(vec![list_value(1)], false);
@@ -294,28 +294,8 @@ fn sql_call_fresh_composer_refuses_changed_policy_and_foreign_constant_parameter
         },
         false,
     );
-    relations
-        .values_mut()
-        .next()
-        .unwrap()
-        .decimal_overflow_policy = original;
-    let changed = crate::constant::test_constant_policy();
-    assert!(matches!(
-        author_sql_fragment_effects_observed(
-            owner.relational_sources(),
-            input(
-                &owner,
-                fragment,
-                &occurrences,
-                changed,
-                &relations,
-                &expressions
-            ),
-            &Control::default()
-        ),
-        Err(PhysicalFragmentEffectsError::InvalidSource(_))
-    ));
 }
+
 #[test]
 fn sql_window_fresh_composer_uses_real_row_number_source_journal() {
     let owner = crate::compiler::compile_authored_aggregate_for_test(

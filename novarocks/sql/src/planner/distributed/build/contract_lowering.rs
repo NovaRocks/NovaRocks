@@ -20273,14 +20273,6 @@ mod tests {
                     .collect()
             })
             .collect();
-        // The existing production pool row ceiling is 4096; this fixture
-        // exercises the unchanged 16,384-by-four occurrence scale across it.
-        let caps = novarocks_constant_contract::ConstantValidation::bounded(
-            novarocks_constant_contract::ConstantPolicy {
-                max_rows: 4096,
-                ..crate::constant::test_constant_fixture()
-            },
-        );
         let control = crate::compiler::SqlCompileControl::unbounded();
         let final_plan = lower_final_physical_plan(
             &values(columns, rows),
@@ -20289,7 +20281,7 @@ mod tests {
             crate::functions::builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             false,
-            caps,
+            novarocks_constant_contract::ConstantValidation::INPUT_DERIVED,
             &control,
         )
         .unwrap()
@@ -20297,7 +20289,7 @@ mod tests {
         .unwrap()
         .plan()
         .clone();
-        assert_eq!(final_plan.constants().entries().len(), 16);
+        assert_eq!(final_plan.constants().entries().len(), 4);
         let mut occurrences = BTreeSet::new();
         let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
         assert_eq!(
@@ -20326,8 +20318,8 @@ mod tests {
                     .unwrap();
                 assert_eq!(expression.ty, ValueType::new(DataType::Utf8, true));
                 let value = checked_constant_for_test(&final_plan, expression);
-                assert_eq!(value.ordinal(), (row % 4096) as u32);
-                assert_eq!(value.pool().array().len(), 4096);
+                assert_eq!(value.ordinal(), row as u32);
+                assert_eq!(value.pool().array().len(), 16_384);
                 if row == 0 && col == 0 {
                     assert_eq!(value.try_utf8().unwrap(), None);
                 } else {
