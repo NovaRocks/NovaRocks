@@ -241,7 +241,7 @@ fn input_derived_preflight_keeps_metadata_and_reports_actual_offset_extent() {
 
     let control = Control(AtomicBool::new(false));
     let field = Field::new("source", DataType::Utf8, false)
-        .with_metadata([("source".into(), "x".repeat(64 * 1024))].into());
+        .with_metadata([("source", "x".repeat(64 * 1024))]);
     let ty = FunctionValueType::new(DataType::Utf8, false);
     let validation = ConstantValidation::INPUT_DERIVED;
     assert!(matches!(
