@@ -186,6 +186,51 @@ fn borrowed_complete_package_keeps_source_and_leaves_success_tail_to_decode_call
 }
 
 #[test]
+fn input_derived_package_keeps_original_unit_and_parameter_membership() {
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let input = parameter_input(1, &mut constants);
+    let limits = package_admission().plan_limits;
+    let original = FragmentPackage::try_new_input_derived(input.clone(), limits, &Control).unwrap();
+    let node = input.fragment.root();
+
+    let control = BorrowedControl::new(None);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let package = FragmentPackage::try_new_input_derived_in(
+        input.clone(),
+        limits,
+        package_admission().source_retained_bytes,
+        &mut |_| Ok(()),
+        &mut work,
+    )
+    .unwrap();
+    assert_no_constant_package_equal(&package, &original);
+    assert!(Arc::ptr_eq(
+        input.fragment.nodes()[&node].expressions.as_ref().unwrap(),
+        package.fragment().nodes()[&node]
+            .expressions
+            .as_ref()
+            .unwrap(),
+    ));
+    work.finish().unwrap();
+
+    let mut missing = input;
+    missing.parameters = SemanticParameters::try_new([]).unwrap();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    assert!(matches!(
+        FragmentPackage::try_new_input_derived_in(
+            missing,
+            limits,
+            package_admission().source_retained_bytes,
+            &mut |_| Ok(()),
+            &mut work,
+        ),
+        Err(FragmentPackageError::Parameter(
+            SemanticParameterError::MissingId(_)
+        ))
+    ));
+}
+
+#[test]
 fn borrowed_complete_package_parameters_keep_missing_wrong_key_unused_and_sparse_intrinsics() {
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let input = parameter_input(1, &mut fixture_constants);

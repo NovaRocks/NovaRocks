@@ -165,17 +165,18 @@ struct Counts {
     expression_ids: usize,
 }
 impl Counts {
-    fn check(&self, limits: ProviderSourceLimits) -> Result<(), Error> {
-        if self.providers > limits.max_provider_occurrences
-            || self.payloads > limits.max_payload_occurrences
-            || self.reads > limits.max_read_occurrences
-            || self.relations > limits.max_relation_occurrences
-            || self.schemas > limits.max_schema_occurrences
-            || self.scans > limits.max_scan_occurrences
-            || self.writers > limits.max_writer_occurrences
-            || self.relation_ids > limits.max_relation_fields
-            || self.field_ids > limits.max_schema_fields
-            || self.expression_ids > limits.max_connector_expression_occurrences
+    fn check(&self, limits: Option<ProviderSourceLimits>) -> Result<(), Error> {
+        if let Some(limits) = limits
+            && (self.providers > limits.max_provider_occurrences
+                || self.payloads > limits.max_payload_occurrences
+                || self.reads > limits.max_read_occurrences
+                || self.relations > limits.max_relation_occurrences
+                || self.schemas > limits.max_schema_occurrences
+                || self.scans > limits.max_scan_occurrences
+                || self.writers > limits.max_writer_occurrences
+                || self.relation_ids > limits.max_relation_fields
+                || self.field_ids > limits.max_schema_fields
+                || self.expression_ids > limits.max_connector_expression_occurrences)
         {
             return Err(CompileControlError::ResourceExhausted.into());
         }
@@ -374,7 +375,7 @@ fn visit_sources<'source>(
 struct CountPass<'buffers, 'source, 'control, 'ids> {
     sources: &'buffers ProviderSources<'source, 'ids>,
     counts: Counts,
-    limits: ProviderSourceLimits,
+    limits: Option<ProviderSourceLimits>,
     prefix: SourceInputPrefix<'source, 'control, 10>,
     paid_work: usize,
 }
@@ -451,7 +452,7 @@ pub(crate) fn collect_provider_sources_in<'source, 'ids>(
     package: &'source p::FragmentPackage,
     types: &PackageTypeViews<'source>,
     writers: &'ids [WriterTypeSource<'ids>],
-    limits: ProviderSourceLimits,
+    limits: impl Into<Option<ProviderSourceLimits>>,
     budget: &mut TypeViewBudget<'source, 'source, '_>,
     work: &mut CompileCheckpoints<'source>,
 ) -> Result<ProviderSources<'source, 'ids>, Error> {
@@ -490,7 +491,7 @@ pub(crate) fn collect_provider_sources_in<'source, 'ids>(
     let mut count = CountPass {
         sources: &sources,
         counts: empty,
-        limits,
+        limits: limits.into(),
         prefix,
         paid_work,
     };

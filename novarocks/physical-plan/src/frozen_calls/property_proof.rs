@@ -408,20 +408,29 @@ impl FrozenFragmentCalls {
         projection_limits: PropertyProofProjectionLimits,
         control: &dyn PureCompileControl,
     ) -> Result<OccurrencePropertyProof<'a>, FrozenCallError> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let result = self.property_proof_core(
+        self.property_proof_observed(
             fragment,
             limits,
-            source_retained_bytes,
-            projection_limits,
-            None,
-            &mut work,
-        );
+            Some((source_retained_bytes, projection_limits)),
+            control,
+        )
+    }
+
+    pub(crate) fn property_proof_observed<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        limits: &PlanLimits,
+        admission: Option<(usize, PropertyProofProjectionLimits)>,
+        control: &dyn PureCompileControl,
+    ) -> Result<OccurrencePropertyProof<'a>, FrozenCallError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let result = self.property_proof_core(fragment, limits, admission, None, &mut work);
         finish_frozen_calls(work, result)
     }
 
     /// Project the same source on the caller's meter without entry or finish.
     /// This scope port does not invoice the opaque structural scratch owners.
+    #[cfg(test)]
     pub(crate) fn property_proof_in<'a>(
         &'a self,
         fragment: &'a Fragment,
@@ -433,22 +442,31 @@ impl FrozenFragmentCalls {
         ) -> Result<(), CompileControlError>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<OccurrencePropertyProof<'a>, FrozenCallError> {
-        self.property_proof_core(
+        self.property_proof_with_admission_in(
             fragment,
             limits,
-            source_retained_bytes,
-            projection_limits,
-            Some(admit),
+            Some((source_retained_bytes, projection_limits)),
+            admit,
             work,
         )
+    }
+
+    pub(crate) fn property_proof_with_admission_in<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        limits: &PlanLimits,
+        admission: Option<(usize, PropertyProofProjectionLimits)>,
+        admit: &mut ResourceAdmission<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<OccurrencePropertyProof<'a>, FrozenCallError> {
+        self.property_proof_core(fragment, limits, admission, Some(admit), work)
     }
 
     fn property_proof_core<'a>(
         &'a self,
         fragment: &'a Fragment,
         limits: &PlanLimits,
-        source_retained_bytes: usize,
-        projection_limits: PropertyProofProjectionLimits,
+        admission: Option<(usize, PropertyProofProjectionLimits)>,
         mut admit: Option<&mut ResourceAdmission<'_>>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<OccurrencePropertyProof<'a>, FrozenCallError> {
@@ -461,7 +479,11 @@ impl FrozenFragmentCalls {
             if fragment.nodes().len() > limits.fragment_nodes
                 || fragment.values().len() > limits.fragment_values
                 || self.entries.len() > MAX_CONTROL_USE_REFERENCES
-                || source_retained_bytes < source_header_floor(fragment, self)?
+            {
+                return Err(FrozenCallError::TooManyItems);
+            }
+            if let Some((source, _)) = admission
+                && source < source_header_floor(fragment, self)?
             {
                 return Err(FrozenCallError::TooManyItems);
             }
@@ -484,7 +506,9 @@ impl FrozenFragmentCalls {
                 }
             }
             let projected = (|| {
-                if source_retained_bytes < source_floor_in(fragment, self, work)? {
+                if let Some((source, _)) = admission
+                    && source < source_floor_in(fragment, self, work)?
+                {
                     return Err(FrozenCallError::TooManyItems);
                 }
                 projection_facts(
@@ -494,7 +518,7 @@ impl FrozenFragmentCalls {
                         .len()
                         .checked_add(counts.claims)
                         .ok_or(FrozenCallError::TooManyItems)?,
-                    source_retained_bytes,
+                    admission.map_or(0, |(source, _)| source),
                 )
             })();
             work.step()?;
@@ -517,25 +541,22 @@ impl FrozenFragmentCalls {
                         .ok_or(FrozenCallError::TooManyItems)?,
                 )
                 .ok_or(FrozenCallError::TooManyItems)?;
-            facts.projection_work = facts
-                .projection_work
-                // The floor scans each node once; its per-port visits are
-                // the original explicit port contribution below.
-                .checked_add(fragment.nodes().len())
-                .and_then(|n| n.checked_add(counts.ports))
-                .ok_or(FrozenCallError::TooManyItems)?;
-            for (amount, maximum) in [
-                (facts.request_bytes, projection_limits.max_request_bytes),
-                (
-                    facts.coexisting_bytes,
-                    projection_limits.max_coexisting_bytes,
-                ),
-                (facts.projection_work, projection_limits.max_projection_work),
-            ] {
-                let admitted = amount <= maximum;
-                work.step()?;
-                if !admitted {
-                    return Err(FrozenCallError::TooManyItems);
+            if let Some((_, limits)) = admission {
+                facts.projection_work = facts
+                    .projection_work
+                    .checked_add(fragment.nodes().len())
+                    .and_then(|n| n.checked_add(counts.ports))
+                    .ok_or(FrozenCallError::TooManyItems)?;
+                for (amount, maximum) in [
+                    (facts.request_bytes, limits.max_request_bytes),
+                    (facts.coexisting_bytes, limits.max_coexisting_bytes),
+                    (facts.projection_work, limits.max_projection_work),
+                ] {
+                    let admitted = amount <= maximum;
+                    work.step()?;
+                    if !admitted {
+                        return Err(FrozenCallError::TooManyItems);
+                    }
                 }
             }
             work.flush()?;
@@ -563,7 +584,23 @@ impl FrozenFragmentCalls {
             }
             work.flush()?;
             if let Some(admit) = admit.as_deref_mut() {
-                self.validate_fragment_in(fragment, &mut |facts| admit(facts), work)?;
+                let mut child = novarocks_type_contract::ControlOwnedResourceFacts::default();
+                self.validate_fragment_in(
+                    fragment,
+                    &mut |facts| {
+                        child = *facts;
+                        admit(facts)
+                    },
+                    work,
+                )?;
+                if admission.is_none() {
+                    let mut resources = novarocks_type_contract::ControlResourceCounter::default();
+                    resources.merge(child).map_err(resource_error)?;
+                    resources
+                        .buffer::<NodeProof>(fragment.nodes().len(), 1)
+                        .map_err(resource_error)?;
+                    admit(&resources.facts())?;
+                }
             } else {
                 self.validate_fragment(fragment, work.control())?;
             }

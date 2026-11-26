@@ -30,7 +30,7 @@ use novarocks_type_contract::CompileCheckpoints;
 #[cfg(test)]
 mod borrowed_properties_tests;
 
-type PropertyResourceAdmission<'a> = dyn FnMut(
+pub(super) type PropertyResourceAdmission<'a> = dyn FnMut(
         &novarocks_type_contract::ControlOwnedResourceFacts,
     ) -> Result<(), novarocks_type_contract::CompileControlError>
     + 'a;
@@ -168,16 +168,24 @@ pub fn validate_fragment_output_properties_observed(
     projection_limits: crate::PropertyProofProjectionLimits,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::PropertyProofProjectionFacts, FragmentPropertyError> {
-    let mut work =
-        CompileCheckpoints::try_new(control, novarocks_type_contract::CompilePhase::Validate)?;
-    let result = validate_fragment_output_properties_core(
+    validate_fragment_output_properties_observed_with_admission(
         fragment,
         limits,
-        source_retained_bytes,
-        projection_limits,
-        None,
-        &mut work,
-    );
+        Some((source_retained_bytes, projection_limits)),
+        control,
+    )
+}
+
+pub(crate) fn validate_fragment_output_properties_observed_with_admission(
+    fragment: &Fragment,
+    limits: PlanLimits,
+    admission: Option<(usize, crate::PropertyProofProjectionLimits)>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::PropertyProofProjectionFacts, FragmentPropertyError> {
+    let mut work =
+        CompileCheckpoints::try_new(control, novarocks_type_contract::CompilePhase::Validate)?;
+    let result =
+        validate_fragment_output_properties_core(fragment, limits, admission, None, &mut work);
     if matches!(&result, Err(FragmentPropertyError::Control(_))) {
         return result;
     }
@@ -198,21 +206,29 @@ pub fn validate_fragment_output_properties_in(
     ) -> Result<(), novarocks_type_contract::CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<crate::PropertyProofProjectionFacts, FragmentPropertyError> {
-    validate_fragment_output_properties_core(
+    validate_fragment_output_properties_with_admission_in(
         fragment,
         limits,
-        source_retained_bytes,
-        projection_limits,
-        Some(admit),
+        Some((source_retained_bytes, projection_limits)),
+        admit,
         work,
     )
+}
+
+pub(crate) fn validate_fragment_output_properties_with_admission_in(
+    fragment: &Fragment,
+    limits: PlanLimits,
+    admission: Option<(usize, crate::PropertyProofProjectionLimits)>,
+    admit: &mut PropertyResourceAdmission<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<crate::PropertyProofProjectionFacts, FragmentPropertyError> {
+    validate_fragment_output_properties_core(fragment, limits, admission, Some(admit), work)
 }
 
 fn validate_fragment_output_properties_core(
     fragment: &Fragment,
     limits: PlanLimits,
-    source_retained_bytes: usize,
-    projection_limits: crate::PropertyProofProjectionLimits,
+    admission: Option<(usize, crate::PropertyProofProjectionLimits)>,
     mut admit: Option<&mut PropertyResourceAdmission<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<crate::PropertyProofProjectionFacts, FragmentPropertyError> {
@@ -221,11 +237,10 @@ fn validate_fragment_output_properties_core(
         work.flush()?;
         let proof = if let Some(parent) = admit.as_deref_mut() {
             let mut contribution = novarocks_type_contract::ControlOwnedResourceFacts::default();
-            let proof = fragment.calls().property_proof_in(
+            let proof = fragment.calls().property_proof_with_admission_in(
                 fragment,
                 &limits,
-                source_retained_bytes,
-                projection_limits,
+                admission,
                 &mut |next| {
                     contribution = *next;
                     parent(next)
@@ -235,11 +250,10 @@ fn validate_fragment_output_properties_core(
             resources.merge(contribution)?;
             proof
         } else {
-            fragment.calls().property_proof(
+            fragment.calls().property_proof_observed(
                 fragment,
                 &limits,
-                source_retained_bytes,
-                projection_limits,
+                admission,
                 work.control(),
             )?
         };
@@ -263,11 +277,17 @@ fn validate_fragment_output_properties_core(
         work.flush()?;
         structure?;
         proof.require_declared_broadcast_equivalence(work)?;
+        let guarantee_admission = if admission.is_none() {
+            admit.as_deref_mut().map(|parent| (&mut resources, parent))
+        } else {
+            None
+        };
         let facts = super::guarantee::validate_guarantees_observed(
             fragment,
             proof.facts(),
             limits,
-            projection_limits,
+            admission.map(|(_, limits)| limits),
+            guarantee_admission,
             work,
         )?;
         let mut errors = ValidationContext::with_limits(limits);
@@ -956,17 +976,32 @@ pub fn derive_fragment_output_properties_observed(
     ),
     FragmentPropertyError,
 > {
-    let mut work =
-        CompileCheckpoints::try_new(control, novarocks_type_contract::CompilePhase::Validate)?;
-    let result = derive_fragment_output_properties_core(
+    derive_fragment_output_properties_observed_with_admission(
         fragment,
         cuts,
         limits,
-        source_retained_bytes,
-        projection_limits,
-        None,
-        &mut work,
-    );
+        Some((source_retained_bytes, projection_limits)),
+        control,
+    )
+}
+
+pub(crate) fn derive_fragment_output_properties_observed_with_admission(
+    fragment: &Fragment,
+    cuts: &FragmentCuts,
+    limits: PlanLimits,
+    admission: Option<(usize, crate::PropertyProofProjectionLimits)>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<
+    (
+        BTreeMap<NodeId, crate::PhysicalProperties>,
+        crate::PropertyProofProjectionFacts,
+    ),
+    FragmentPropertyError,
+> {
+    let mut work =
+        CompileCheckpoints::try_new(control, novarocks_type_contract::CompilePhase::Validate)?;
+    let result =
+        derive_fragment_output_properties_core(fragment, cuts, limits, admission, None, &mut work);
     if matches!(&result, Err(FragmentPropertyError::Control(_))) {
         return result;
     }
@@ -996,8 +1031,7 @@ pub fn derive_fragment_output_properties_in(
         fragment,
         cuts,
         limits,
-        source_retained_bytes,
-        projection_limits,
+        Some((source_retained_bytes, projection_limits)),
         Some(admit),
         work,
     )
@@ -1007,8 +1041,7 @@ fn derive_fragment_output_properties_core(
     fragment: &Fragment,
     cuts: &FragmentCuts,
     limits: PlanLimits,
-    source_retained_bytes: usize,
-    projection_limits: crate::PropertyProofProjectionLimits,
+    admission: Option<(usize, crate::PropertyProofProjectionLimits)>,
     mut admit: Option<&mut PropertyResourceAdmission<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<
@@ -1023,11 +1056,10 @@ fn derive_fragment_output_properties_core(
         work.flush()?;
         let proof = if let Some(parent) = admit.as_deref_mut() {
             let mut contribution = novarocks_type_contract::ControlOwnedResourceFacts::default();
-            let proof = fragment.calls().property_proof_in(
+            let proof = fragment.calls().property_proof_with_admission_in(
                 fragment,
                 &limits,
-                source_retained_bytes,
-                projection_limits,
+                admission,
                 &mut |next| {
                     contribution = *next;
                     parent(next)
@@ -1037,11 +1069,10 @@ fn derive_fragment_output_properties_core(
             resources.merge(contribution)?;
             proof
         } else {
-            fragment.calls().property_proof(
+            fragment.calls().property_proof_observed(
                 fragment,
                 &limits,
-                source_retained_bytes,
-                projection_limits,
+                admission,
                 work.control(),
             )?
         };

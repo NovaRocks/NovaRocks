@@ -86,9 +86,37 @@ impl fmt::Debug for FragmentPackage {
 type PackageResourceAdmission<'a> = dyn FnMut(&novarocks_type_contract::ControlOwnedResourceFacts) -> Result<(), CompileControlError>
     + 'a;
 
+#[derive(Clone, Copy)]
+struct PackageValidationProfile {
+    plan_limits: crate::PlanLimits,
+    property_admission: Option<(usize, crate::PropertyProofProjectionLimits)>,
+}
+
+impl From<FragmentPackageAdmission> for PackageValidationProfile {
+    fn from(admission: FragmentPackageAdmission) -> Self {
+        Self {
+            plan_limits: admission.plan_limits,
+            property_admission: Some((
+                admission.source_retained_bytes,
+                admission.property_projection_limits,
+            )),
+        }
+    }
+}
+
+impl PackageValidationProfile {
+    fn input_derived(plan_limits: crate::PlanLimits) -> Self {
+        Self {
+            plan_limits,
+            property_admission: None,
+        }
+    }
+}
+
 enum PackageValidation<'borrow, 'control, 'admit> {
     Plain(&'control dyn PureCompileControl),
     Caller {
+        source_retained_bytes: usize,
         admit: &'borrow mut PackageResourceAdmission<'admit>,
         work: &'borrow mut CompileCheckpoints<'control>,
     },
@@ -112,10 +140,32 @@ impl FragmentPackage {
         admission: FragmentPackageAdmission,
         control: &dyn PureCompileControl,
     ) -> Result<Self, FragmentPackageError> {
+        Self::try_new_observed(input, admission.into(), control)
+    }
+
+    /// Check the complete package from its original source and structural limits.
+    /// The pure planning caller retains the original backing.
+    pub fn try_new_input_derived(
+        input: FragmentPackageInput,
+        limits: crate::PlanLimits,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, FragmentPackageError> {
+        Self::try_new_observed(
+            input,
+            PackageValidationProfile::input_derived(limits),
+            control,
+        )
+    }
+
+    fn try_new_observed(
+        input: FragmentPackageInput,
+        profile: PackageValidationProfile,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, FragmentPackageError> {
         control
             .checkpoint(CompilePhase::Validate, 0)
             .map_err(FragmentPackageError::Control)?;
-        Self::try_new_core(input, admission, PackageValidation::Plain(control))
+        Self::try_new_core(input, profile, PackageValidation::Plain(control))
     }
 
     /// Run all original package laws in the caller's existing scope.
@@ -128,35 +178,63 @@ impl FragmentPackage {
         admit: &mut PackageResourceAdmission<'_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, FragmentPackageError> {
-        Self::try_new_core(input, admission, PackageValidation::Caller { admit, work })
+        Self::try_new_core(
+            input,
+            admission.into(),
+            PackageValidation::Caller {
+                source_retained_bytes: admission.source_retained_bytes,
+                admit,
+                work,
+            },
+        )
+    }
+
+    /// Check the retained input in its caller's original scope.
+    /// `source_retained_bytes` bounds the actual backing of the metadata tables
+    /// visited by the opaque iterator. The caller retains this source and
+    /// admits the local scratch requests through its existing hook.
+    pub fn try_new_input_derived_in(
+        input: FragmentPackageInput,
+        limits: crate::PlanLimits,
+        source_retained_bytes: usize,
+        admit: &mut PackageResourceAdmission<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, FragmentPackageError> {
+        Self::try_new_core(
+            input,
+            PackageValidationProfile::input_derived(limits),
+            PackageValidation::Caller {
+                source_retained_bytes,
+                admit,
+                work,
+            },
+        )
     }
 
     fn try_new_core(
         input: FragmentPackageInput,
-        admission: FragmentPackageAdmission,
+        profile: PackageValidationProfile,
         mut observation: PackageValidation<'_, '_, '_>,
     ) -> Result<Self, FragmentPackageError> {
         let mut resources = novarocks_type_contract::ControlResourceCounter::default();
         match &mut observation {
             PackageValidation::Plain(control) => {
-                crate::validate_fragment_output_properties_observed(
+                crate::validation::validate_fragment_output_properties_observed_with_admission(
                     &input.fragment,
-                    admission.plan_limits,
-                    admission.source_retained_bytes,
-                    admission.property_projection_limits,
+                    profile.plan_limits,
+                    profile.property_admission,
                     *control,
                 )
                 .map_err(property_error)?;
             }
-            PackageValidation::Caller { admit, work } => {
+            PackageValidation::Caller { admit, work, .. } => {
                 // One original call/control contribution emits cumulative
                 // snapshots. Replace that contribution, never sum snapshots.
                 let mut child = novarocks_type_contract::ControlOwnedResourceFacts::default();
-                crate::validate_fragment_output_properties_in(
+                crate::validation::validate_fragment_output_properties_with_admission_in(
                     &input.fragment,
-                    admission.plan_limits,
-                    admission.source_retained_bytes,
-                    admission.property_projection_limits,
+                    profile.plan_limits,
+                    profile.property_admission,
                     &mut |next| {
                         child = *next;
                         admit(next)
@@ -187,7 +265,7 @@ impl FragmentPackage {
                     &input.fragment,
                     &input.constants,
                     true,
-                    admission.plan_limits,
+                    profile.plan_limits,
                     *control,
                 )
             }
@@ -196,7 +274,7 @@ impl FragmentPackage {
                     &input.fragment,
                     &input.constants,
                     true,
-                    admission.plan_limits,
+                    profile.plan_limits,
                     work,
                 )
             }
@@ -225,7 +303,7 @@ impl FragmentPackage {
                 visit_fragment_parameter_references(&input.fragment, *control, |_| {})
                     .map_err(parameter_error)?
             }
-            PackageValidation::Caller { admit, work } => {
+            PackageValidation::Caller { admit, work, .. } => {
                 parameter_walk_resources(&mut resources, &input.fragment, call_items, work)?;
                 admit(&resources.facts()).map_err(FragmentPackageError::Control)?;
                 visit_fragment_parameter_references_core(&input.fragment, true, work, |_| {})
@@ -250,7 +328,7 @@ impl FragmentPackage {
                         .map_err(FragmentPackageError::Control)?;
                 let result = crate::validation::validate_package(
                     &input,
-                    admission.plan_limits,
+                    profile.plan_limits,
                     semantic_items,
                     &mut resource_work,
                 );
@@ -262,11 +340,15 @@ impl FragmentPackage {
                     .map_err(FragmentPackageError::Control)?;
                 result?;
             }
-            PackageValidation::Caller { admit, work } => crate::validation::validate_package_in(
+            PackageValidation::Caller {
+                source_retained_bytes,
+                admit,
+                work,
+            } => crate::validation::validate_package_in(
                 &input,
-                admission.plan_limits,
+                profile.plan_limits,
                 semantic_items,
-                admission.source_retained_bytes,
+                *source_retained_bytes,
                 &mut resources,
                 *admit,
                 work,
@@ -283,7 +365,7 @@ impl FragmentPackage {
                     .project_observed(references, CompilePhase::Validate, *control)
                     .map_err(parameter_error)?
             }
-            PackageValidation::Caller { admit, work } => {
+            PackageValidation::Caller { admit, work, .. } => {
                 parameter_walk_resources(&mut resources, &input.fragment, call_items, work)?;
                 resources
                     .buffer::<SemanticParameterRef>(counts.total, 1)
@@ -344,23 +426,45 @@ impl FragmentPackage {
     /// mandatory. Coexisting root/call copies, maps and delegated scratch must
     /// be caller-admitted; this is not a complete allocation model or MEM grant.
     pub fn try_new_with_derived_properties(
-        mut input: FragmentPackageInput,
+        input: FragmentPackageInput,
         admission: FragmentPackageAdmission,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, FragmentPackageError> {
+        Self::try_new_derived(input, admission.into(), control)
+    }
+
+    /// Derive properties from the immutable input, then validate the rebuilt
+    /// package using the original structural limits.
+    pub fn try_new_with_input_derived_properties(
+        input: FragmentPackageInput,
+        limits: crate::PlanLimits,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, FragmentPackageError> {
+        Self::try_new_derived(
+            input,
+            PackageValidationProfile::input_derived(limits),
+            control,
+        )
+    }
+
+    fn try_new_derived(
+        mut input: FragmentPackageInput,
+        profile: PackageValidationProfile,
         control: &dyn PureCompileControl,
     ) -> Result<Self, FragmentPackageError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
             .map_err(FragmentPackageError::Control)?;
         let result = (|| {
             work.flush().map_err(FragmentPackageError::Control)?;
-            let (candidates, _) = crate::derive_fragment_output_properties_observed(
-                &input.fragment,
-                &input.cuts,
-                admission.plan_limits,
-                admission.source_retained_bytes,
-                admission.property_projection_limits,
-                control,
-            )
-            .map_err(property_error)?;
+            let (candidates, _) =
+                crate::validation::derive_fragment_output_properties_observed_with_admission(
+                    &input.fragment,
+                    &input.cuts,
+                    profile.plan_limits,
+                    profile.property_admission,
+                    control,
+                )
+                .map_err(property_error)?;
             work.step().map_err(FragmentPackageError::Control)?;
             work.flush().map_err(FragmentPackageError::Control)?;
             // No occurrence proof or other source loan survives the preceding
@@ -380,7 +484,7 @@ impl FragmentPackage {
             // Units and relation declarations stay with the original Fragment.
             // Re-admit the new property snapshot; no duplicate root/call table
             // or regenerated invocation identity exists after this transform.
-            Self::try_new(input, admission, control)
+            Self::try_new_observed(input, profile, control)
         })();
         if matches!(&result, Err(FragmentPackageError::Control(_))) {
             return result;
@@ -801,6 +905,41 @@ pub fn extract_fragment_packages(
     if !exact_count {
         return Err(FragmentPackageExtractionError::UnusedAdmission);
     }
+    extract_fragment_packages_observed(
+        plan,
+        scans,
+        writes,
+        pruning,
+        |id| admissions.get(&id).copied().map(Into::into),
+        control,
+    )
+}
+
+/// Extract the checked local fragments from the original plan. The pure
+/// source stays with its author. Freezing owns the subsequent requests.
+pub fn extract_fragment_packages_input_derived(
+    plan: &PhysicalPlan,
+    scans: &BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
+    writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
+    pruning: &BTreeMap<FragmentId, FrozenFragmentPruning>,
+    limits: crate::PlanLimits,
+    control: &dyn PureCompileControl,
+) -> Result<BTreeMap<FragmentId, FragmentPackage>, FragmentPackageExtractionError> {
+    control
+        .checkpoint(CompilePhase::Validate, 0)
+        .map_err(FragmentPackageExtractionError::Control)?;
+    let profile = PackageValidationProfile::input_derived(limits);
+    extract_fragment_packages_observed(plan, scans, writes, pruning, |_| Some(profile), control)
+}
+
+fn extract_fragment_packages_observed(
+    plan: &PhysicalPlan,
+    scans: &BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
+    writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
+    pruning: &BTreeMap<FragmentId, FrozenFragmentPruning>,
+    mut validation: impl FnMut(FragmentId) -> Option<PackageValidationProfile>,
+    control: &dyn PureCompileControl,
+) -> Result<BTreeMap<FragmentId, FragmentPackage>, FragmentPackageExtractionError> {
     crate::constants::validate_plan_constants_observed(plan, control).map_err(
         |error| match error {
             crate::ConstantReferenceError::Control(error) => {
@@ -831,7 +970,7 @@ pub fn extract_fragment_packages(
     let mut consumed_writes = std::collections::BTreeSet::new();
     let mut consumed_parameters = std::collections::BTreeSet::new();
     for fragment in plan.fragments().values() {
-        let admission = *admissions.get(&fragment.id()).ok_or(
+        let profile = validation(fragment.id()).ok_or(
             FragmentPackageExtractionError::MissingAdmission(fragment.id()),
         )?;
         let mut local_scans = BTreeMap::new();
@@ -865,7 +1004,7 @@ pub fn extract_fragment_packages(
         // before copying its potentially repeated environment references.
         crate::validation::validate_fragment_parameter_resource_usage(
             fragment,
-            admission.plan_limits,
+            profile.plan_limits,
             parameter_preallocation_items(fragment, counts),
         )
         .map_err(|error| {
@@ -906,7 +1045,7 @@ pub fn extract_fragment_packages(
                 })?
             }
         };
-        let package = FragmentPackage::try_new(
+        let package = FragmentPackage::try_new_observed(
             FragmentPackageInput {
                 constants: projected,
                 statement_constant_policy: plan.statement_constant_policy(),
@@ -936,7 +1075,7 @@ pub fn extract_fragment_packages(
                     .collect(),
                 annotations,
             },
-            admission,
+            profile,
             control,
         )
         .map_err(|error| match error {
