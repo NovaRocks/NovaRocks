@@ -103,6 +103,15 @@ pub(super) fn validate_program_columns(
                         .fields()
                         .get(ordinal)
                         .ok_or_else(|| invalid("missing system source occurrence"))?;
+                    // Preserve the original nested-projection refusal before
+                    // matching the top-level handle against the frozen scan.
+                    let declaration = check_system_column(
+                        scan.system_table_type(),
+                        column,
+                        shape,
+                        public.logical_types()[ordinal],
+                        work,
+                    )?;
                     let mut expected = None;
                     for (index, canonical) in scan.columns().iter().enumerate() {
                         work.step()?;
@@ -124,13 +133,6 @@ pub(super) fn validate_program_columns(
                     {
                         return Err(invalid("system source occurrence name/NULL differs"));
                     }
-                    let declaration = check_system_column(
-                        scan.system_table_type(),
-                        column,
-                        shape,
-                        public.logical_types()[ordinal],
-                        work,
-                    )?;
                     crate::typed_read::system_page_source::validate_system_column_value(
                         scan.system_table_type(),
                         &declaration,
