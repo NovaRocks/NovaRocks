@@ -2022,6 +2022,7 @@ mod original_stage_tests {
                 CreateStorageDeclarations {
                     visible_partition_sources,
                     properties: staged_properties,
+                    stateless_output_declarations,
                 },
             application_properties,
         } = (CreatePublicationInput::StageDeclarations { plan })
@@ -2031,6 +2032,7 @@ mod original_stage_tests {
             panic!("typed stage declarations");
         };
         assert!(Arc::ptr_eq(&properties, &staged_properties));
+        assert!(stateless_output_declarations.is_none());
         let visible = visible_partition_sources
             .iter()
             .map(AsRef::as_ref)

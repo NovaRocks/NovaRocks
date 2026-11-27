@@ -55,8 +55,10 @@ use std::num::NonZeroU64;
 const MAX_STATS_DELETE_MEMBERS: usize = 256;
 const MAX_STATS_FIELD_COMPARISONS: usize = 1024;
 use sha2::{Digest, Sha256};
+mod nested_size;
 pub(crate) mod rewrite_entries;
 pub(crate) mod scoped_capture;
+use nested_size::{NestedAverageSizeField, manifest_nested_size, nested_average_size_fields};
 use scoped_capture::{CaptureScope, ReadFailure, active as check_scoped_active};
 
 /// Mint exactly once at the provider's pinned handle boundary. Standalone
@@ -665,158 +667,6 @@ enum ReadPurpose<'a> {
     Ordinary,
     MvContentTarget,
     ManifestStatistics(&'a [&'a str]),
-}
-
-struct NestedAverageSizeField<'a> {
-    id: i32,
-    name: &'a str,
-    leaves: Vec<i32>,
-}
-
-fn nested_average_size_fields<'a>(
-    schema: &'a Schema,
-    requested: &[&str],
-    control: Option<&dyn ConnectorOperationControl>,
-) -> Result<Vec<NestedAverageSizeField<'a>>, ReadFailure> {
-    let mut selected = Vec::new();
-    for field in schema.as_struct().fields() {
-        check_read_control(control)?;
-        if !matches!(
-            field.field_type.as_ref(),
-            Type::Struct(_) | Type::List(_) | Type::Map(_)
-        ) || !requested
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(&field.name))
-        {
-            continue;
-        }
-        let mut leaves = Vec::new();
-        if !collect_size_leaves(field, 1, &mut leaves, control)? {
-            leaves.clear();
-        }
-        selected.push(NestedAverageSizeField {
-            id: field.id,
-            name: &field.name,
-            leaves,
-        });
-    }
-    Ok(selected)
-}
-
-fn collect_size_leaves(
-    field: &NestedField,
-    depth: usize,
-    leaves: &mut Vec<i32>,
-    control: Option<&dyn ConnectorOperationControl>,
-) -> Result<bool, ReadFailure> {
-    check_read_control(control)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Ok(false);
-    }
-    match field.field_type.as_ref() {
-        Type::Primitive(_) => {
-            leaves.push(field.id);
-            Ok(true)
-        }
-        Type::Struct(children) => {
-            for child in children.fields() {
-                if !collect_size_leaves(child, depth + 1, leaves, control)? {
-                    return Ok(false);
-                }
-            }
-            Ok(!children.fields().is_empty())
-        }
-        Type::List(list) => collect_size_leaves(&list.element_field, depth + 1, leaves, control),
-        Type::Map(map) => Ok(
-            collect_size_leaves(&map.key_field, depth + 1, leaves, control)?
-                && collect_size_leaves(&map.value_field, depth + 1, leaves, control)?,
-        ),
-        Type::Variant(_) => Ok(false),
-    }
-}
-
-/// A nested root owns width evidence only if this file reports every leaf from
-/// the snapshot schema. Omitted leaves and overflow do not grant a size.
-fn manifest_nested_size(
-    column_sizes: &HashMap<i32, u64>,
-    leaves: &[i32],
-    control: Option<&dyn ConnectorOperationControl>,
-) -> Result<Option<i64>, ReadFailure> {
-    if leaves.is_empty() {
-        return Ok(None);
-    }
-    let mut size = 0_i64;
-    for leaf in leaves {
-        check_read_control(control)?;
-        let Some(next) = column_sizes
-            .get(leaf)
-            .and_then(|bytes| i64::try_from(*bytes).ok())
-            .and_then(|bytes| size.checked_add(bytes))
-        else {
-            return Ok(None);
-        };
-        size = next;
-    }
-    Ok(Some(size))
-}
-
-#[cfg(test)]
-#[test]
-fn manifest_nested_size_uses_every_leaf_of_the_selected_snapshot_schema() {
-    use crate::iceberg::spec::{ListType, MapType};
-
-    let leaf = |id, name| {
-        Arc::new(NestedField::optional(
-            id,
-            name,
-            Type::Primitive(PrimitiveType::Long),
-        ))
-    };
-    let map = Type::Map(MapType::new(
-        Arc::new(NestedField::map_key_element(
-            4,
-            Type::Primitive(PrimitiveType::String),
-        )),
-        Arc::new(NestedField::map_value_element(
-            5,
-            Type::Primitive(PrimitiveType::Long),
-            false,
-        )),
-    ));
-    let schema = Schema::builder()
-        .with_fields(vec![
-            leaf(1, "scalar"),
-            Arc::new(NestedField::optional(
-                2,
-                "payload",
-                Type::Struct(StructType::new(vec![
-                    Arc::new(NestedField::optional(3, "attrs", map)),
-                    Arc::new(NestedField::optional(
-                        6,
-                        "items",
-                        Type::List(ListType::new(Arc::new(NestedField::list_element(
-                            7,
-                            Type::Primitive(PrimitiveType::Long),
-                            false,
-                        )))),
-                    )),
-                ])),
-            )),
-        ])
-        .build()
-        .unwrap();
-    let selected = nested_average_size_fields(&schema, &["scalar", "PAYLOAD"], None).unwrap();
-    assert_eq!(selected.len(), 1);
-    assert_eq!(selected[0].id, 2);
-    assert_eq!(selected[0].leaves, [4, 5, 7]);
-
-    let sizes = HashMap::from([(2, 99), (4, 1), (5, 2), (7, 3), (8, 999)]);
-    let leaves = &selected[0].leaves;
-    assert_eq!(manifest_nested_size(&sizes, leaves, None).unwrap(), Some(6));
-    let missing = HashMap::from([(2, 99), (4, 1), (5, 2), (8, 999)]);
-    assert_eq!(manifest_nested_size(&missing, leaves, None).unwrap(), None);
-    let overflow = HashMap::from([(4, i64::MAX as u64), (5, 2), (7, 3)]);
-    assert_eq!(manifest_nested_size(&overflow, leaves, None).unwrap(), None);
 }
 
 async fn observe_read_files_original<P: ObservedDataFileProjection>(

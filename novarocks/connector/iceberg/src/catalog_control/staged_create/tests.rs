@@ -395,6 +395,102 @@ fn hadoop_runtime() -> IcebergMetadataContext {
     .expect("control runtime")
 }
 
+/// Inspects the staging schema before serialization for exact nested required fields.
+#[test]
+fn stateless_mv_output_declaration_preserves_nested_required_fields() {
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_spi::connector::{ConnectorDataType, ConnectorStructField};
+    use novarocks_type_contract::FunctionValueType;
+
+    use crate::catalog_control::type_mapping::{
+        schema_fields, schema_fields_with_output_declarations,
+    };
+    use crate::iceberg::spec::Type;
+
+    let columns = [ConnectorColumnDefinition {
+        name: "payload".into(),
+        data_type: ConnectorDataType::Struct(vec![
+            ConnectorStructField {
+                name: "items".into(),
+                data_type: ConnectorDataType::Array(Box::new(ConnectorDataType::BigInt)),
+                nullable: true,
+            },
+            ConnectorStructField {
+                name: "attrs".into(),
+                data_type: ConnectorDataType::Map(
+                    Box::new(ConnectorDataType::String),
+                    Box::new(ConnectorDataType::Struct(vec![ConnectorStructField {
+                        name: "code".into(),
+                        data_type: ConnectorDataType::BigInt,
+                        nullable: true,
+                    }])),
+                ),
+                nullable: true,
+            },
+        ]),
+        nullable: true,
+        default: None,
+    }];
+    let entries = Field::new_struct(
+        "entries",
+        vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new_struct(
+                "value",
+                vec![Field::new("code", DataType::Int64, false)],
+                false,
+            ),
+        ],
+        false,
+    );
+    let declaration = FunctionValueType::new(
+        DataType::Struct(
+            vec![
+                Field::new(
+                    "items",
+                    DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                    false,
+                ),
+                Field::new("attrs", DataType::Map(Arc::new(entries), false), false),
+            ]
+            .into(),
+        ),
+        true,
+    );
+    let declarations = [declaration.value_type().clone()];
+    let exact =
+        schema_fields_with_output_declarations(&columns, FormatVersion::V3, Some(&declarations))
+            .unwrap();
+    let ordinary = schema_fields(&columns, FormatVersion::V3).unwrap();
+    let Type::Struct(exact_payload) = exact[0].field_type.as_ref() else {
+        panic!("struct")
+    };
+    let Type::Struct(ordinary_payload) = ordinary[0].field_type.as_ref() else {
+        panic!("struct")
+    };
+    let Type::Map(attrs) = exact_payload.fields()[1].field_type.as_ref() else {
+        panic!("map")
+    };
+    let Type::Struct(value) = attrs.value_field.field_type.as_ref() else {
+        panic!("map value struct")
+    };
+    let Type::List(items) = exact_payload.fields()[0].field_type.as_ref() else {
+        panic!("list")
+    };
+    assert!(!exact[0].required);
+    assert!(exact_payload.fields().iter().all(|field| field.required));
+    assert!(
+        ordinary_payload
+            .fields()
+            .iter()
+            .all(|field| !field.required)
+    );
+    assert!(!items.element_field.required);
+    assert!(attrs.key_field.required);
+    assert!(attrs.value_field.required);
+    assert!(value.fields()[0].required);
+}
+
 #[test]
 fn schema_nesting_refuses_sync_and_async_ctas_before_any_request() {
     use crate::rest_protocol::test_server::{Script, TestServer};
