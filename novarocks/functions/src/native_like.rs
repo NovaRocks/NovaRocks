@@ -366,7 +366,11 @@ impl PreparedNativeLikeRecipe {
         &self,
         context: novarocks_type_contract::ExpressionEffectContext,
     ) -> crate::ScopedExpressionEffects {
-        crate::ScopedExpressionEffects::pure_value(context)
+        crate::ScopedExpressionEffects::primitive(context, self.static_own_effects())
+    }
+
+    pub fn static_own_effects(&self) -> novarocks_type_contract::ExpressionEffects {
+        novarocks_type_contract::ExpressionEffects::PURE_VALUE
     }
     pub fn evaluate_selected<'a>(
         &self,

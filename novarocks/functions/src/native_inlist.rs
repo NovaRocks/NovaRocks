@@ -625,10 +625,21 @@ impl PreparedNativeInListRecipe {
         context: novarocks_type_contract::ExpressionEffectContext,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<crate::ScopedExpressionEffects, crate::ComparisonPrepareError> {
+        Self::static_effects_for_profile(source, candidates, result, control)
+            .map(|effects| crate::ScopedExpressionEffects::primitive(context, effects))
+    }
+
+    /// Query the exact membership recipe without publishing a candidate owner.
+    pub fn static_effects_for_profile<'a>(
+        source: &novarocks_type_contract::FunctionValueType,
+        candidates: impl ExactSizeIterator<Item = &'a novarocks_type_contract::FunctionValueType>,
+        result: &novarocks_type_contract::FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<ExpressionEffects, crate::ComparisonPrepareError> {
         Self::try_new_core::<false, std::convert::Infallible, _>(
             false, source, candidates, result, None, control,
         )
-        .map(|(_, effects)| crate::ScopedExpressionEffects::primitive(context, effects))
+        .map(|(_, effects)| effects)
         .map_err(inlist_pure_failure)
     }
 
@@ -1060,7 +1071,11 @@ impl PreparedNativeInListRecipe {
         &self,
         context: novarocks_type_contract::ExpressionEffectContext,
     ) -> crate::ScopedExpressionEffects {
-        crate::ScopedExpressionEffects::primitive(context, self.equality.effects())
+        crate::ScopedExpressionEffects::primitive(context, self.static_own_effects())
+    }
+
+    pub fn static_own_effects(&self) -> novarocks_type_contract::ExpressionEffects {
+        self.equality.effects()
     }
 }
 

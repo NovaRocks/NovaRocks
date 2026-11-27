@@ -357,24 +357,7 @@ impl BinaryOperatorOwner {
         let base = self
             .declaration
             .effect_declaration(&input.selected.overload)?;
-        let own_row_error = if matches!(
-            self.operator,
-            OperatorFunction::Equal | OperatorFunction::NotEqual
-        ) {
-            let [
-                FunctionArgumentType::Value(left),
-                FunctionArgumentType::Value(right),
-            ] = input.selected.argument_types.as_ref()
-            else {
-                return Err(FunctionBindingError::NoMatchingOverload);
-            };
-            match composite_comparison_recipe(self.operator, [left, right], control)? {
-                Some(recipe) if recipe.may_raise_row_error() => FunctionIntrinsicRowError::MayRaise,
-                _ => FunctionIntrinsicRowError::NoRowError,
-            }
-        } else {
-            base.own_row_error
-        };
+        let own_row_error = self.static_scalar_row_error_observed(input.selected, control)?;
         Ok(CallEffects {
             value_stability: base.value_stability,
             own_row_error,
@@ -524,6 +507,34 @@ impl FunctionBindingResolver for BinaryOperatorOwner {
 }
 
 impl PureFunctionMetadataOwner for BinaryOperatorOwner {
+    fn static_scalar_row_error_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionIntrinsicRowError, FunctionBindingError> {
+        let own_row_error = if matches!(
+            self.operator,
+            OperatorFunction::Equal | OperatorFunction::NotEqual
+        ) {
+            let [
+                FunctionArgumentType::Value(left),
+                FunctionArgumentType::Value(right),
+            ] = selected.argument_types.as_ref()
+            else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            match composite_comparison_recipe(self.operator, [left, right], control)? {
+                Some(recipe) if recipe.may_raise_row_error() => FunctionIntrinsicRowError::MayRaise,
+                _ => FunctionIntrinsicRowError::NoRowError,
+            }
+        } else {
+            self.declaration
+                .effect_declaration(&selected.overload)?
+                .own_row_error
+        };
+        Ok(own_row_error)
+    }
+
     fn binding_resolver_owner(self: Arc<Self>) -> FunctionBindingResolverOwner {
         FunctionBindingResolverOwner::borrowed_binary_operator(self)
     }

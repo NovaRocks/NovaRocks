@@ -212,13 +212,14 @@ impl PreparedCompositeComparisonRecipe {
     }
 
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
-        ScopedExpressionEffects::primitive(
-            context,
-            ExpressionEffects {
-                may_raise_row_error: self.may_raise_row_error(),
-                ..ExpressionEffects::PURE_VALUE
-            },
-        )
+        ScopedExpressionEffects::primitive(context, self.static_own_effects())
+    }
+
+    pub fn static_own_effects(&self) -> ExpressionEffects {
+        ExpressionEffects {
+            may_raise_row_error: self.may_raise_row_error(),
+            ..ExpressionEffects::PURE_VALUE
+        }
     }
 
     /// The caller supplies one demanded pair and excludes inherited row errors.

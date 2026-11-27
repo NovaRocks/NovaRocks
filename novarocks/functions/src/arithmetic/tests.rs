@@ -333,6 +333,7 @@ fn signed_effects_keep_actual_context_and_do_not_borrow_error_policy_as_a_safety
                 false,
             );
             let effects = recipe.own_effects(context()).for_use(context()).unwrap();
+            assert_eq!(effects, recipe.static_own_effects());
             assert!(effects.may_raise_row_error);
             assert!(!effects.has_instance_state);
             assert_eq!(

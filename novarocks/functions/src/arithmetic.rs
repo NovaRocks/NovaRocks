@@ -451,7 +451,11 @@ impl PreparedArithmeticRecipe {
         self.allow_throw_exception
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
-        let effects = match &self.algorithm {
+        ScopedExpressionEffects::primitive(context, self.static_own_effects())
+    }
+
+    pub fn static_own_effects(&self) -> ExpressionEffects {
+        match &self.algorithm {
             ArithmeticAlgorithm::Signed { .. } => ExpressionEffects {
                 may_raise_row_error: true,
                 ..ExpressionEffects::PURE_VALUE
@@ -459,8 +463,7 @@ impl PreparedArithmeticRecipe {
             ArithmeticAlgorithm::Decimal(recipe) => recipe.own_effects(),
             ArithmeticAlgorithm::LargeInt(recipe) => recipe.own_effects(),
             ArithmeticAlgorithm::Float(_) => ExpressionEffects::PURE_VALUE,
-        };
-        ScopedExpressionEffects::primitive(context, effects)
+        }
     }
 
     /// Validate both original addresses before strict SQL NULL. Inherited row

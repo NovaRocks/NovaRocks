@@ -637,6 +637,10 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
     )
     .unwrap();
     assert_eq!(effects, prepared.own_effects(context));
+    assert_eq!(
+        effects.for_use(context).unwrap(),
+        prepared.static_own_effects()
+    );
     let trace = original.trace.into_inner().unwrap();
     assert_eq!(*borrowed.trace.lock().unwrap(), trace);
     let static_profile = Compile {
