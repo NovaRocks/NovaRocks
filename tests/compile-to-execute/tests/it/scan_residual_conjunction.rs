@@ -287,25 +287,27 @@ struct ScanAndFilter {
     ),
 }
 
-fn scan_and_filter(sql: &str) -> ScanAndFilter {
+fn scan_and_filter(sql: &str, with_second_wait: bool) -> ScanAndFilter {
     use arrow::datatypes::{DataType, Field};
     use novarocks_sql_testkit::sql_source_with_declared_fields;
+    use novarocks_test_compile_to_execute::compiler_results::compiler_results_with_declared_read_fields;
 
-    let source = sql_source_with_declared_fields(
-        sql,
-        &[
-            Field::new("id", DataType::Int8, false),
-            Field::new("d", DataType::Int64, false),
-            Field::new("first_delay", DataType::Int32, false),
-            Field::new("second_delay", DataType::Int16, false),
-            Field::new("enabled", DataType::Boolean, true),
-        ],
-    );
+    let mut fields = vec![
+        Field::new("id", DataType::Int8, false),
+        Field::new("d", DataType::Int64, false),
+        Field::new("first_delay", DataType::Int32, false),
+    ];
+    if with_second_wait {
+        fields.push(Field::new("second_delay", DataType::Int16, false));
+    }
+    fields.push(Field::new("enabled", DataType::Boolean, true));
+    let source = sql_source_with_declared_fields(sql, &fields);
     let functions = installed_builtin_owner_catalogue();
-    let programs = programs_with_catalogue_and_original_inlist_source(&source, &functions);
+    let programs = compiler_results_with_declared_read_fields(&source, &fields, &functions);
     let mut scan = None;
     let mut filter = None;
-    for program in programs.values() {
+    for program in programs.into_values() {
+        let program = Arc::new(program.expect("original Scan and ordered Filter compile"));
         for node in program.graph().nodes() {
             match node.kind() {
                 ProgramNodeKind::Scan { residuals, .. } => {
@@ -433,7 +435,11 @@ fn scan_necessary_term_cuts_wait_and_row_error_domain_with_original_wait_order()
     use novarocks_expression::ExprEvaluationFailure;
 
     let source = scan_and_filter(
-        "SELECT id FROM fixture WHERE 12 / d > 3 AND sleep(CAST(first_delay AS BIGINT))          AND sleep(CAST(second_delay AS BIGINT)) AND enabled",
+        concat!(
+            "SELECT id FROM fixture WHERE 12 / d > 3 AND sleep(CAST(first_delay AS BIGINT)) ",
+            "AND sleep(CAST(second_delay AS BIGINT)) AND enabled",
+        ),
+        true,
     );
     let control = RecordedWaits::default();
     let output = source.apply(&[0, 1], &control).unwrap();
@@ -468,7 +474,8 @@ fn scan_does_not_advance_a_fallible_term_before_the_original_wait() {
     use novarocks_expression::ExprEvaluationFailure;
 
     let source = scan_and_filter(
-        "SELECT id FROM fixture WHERE sleep(CAST(first_delay AS BIGINT)) AND 12 / d > 3          AND enabled",
+        "SELECT id FROM fixture WHERE sleep(CAST(first_delay AS BIGINT)) AND 12 / d > 3 AND enabled",
+        false,
     );
     let control = RecordedWaits::default();
     let Err(ExprEvaluationFailure::RequiredRow(error)) = source.apply(&[3], &control) else {

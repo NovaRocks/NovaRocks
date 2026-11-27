@@ -1745,11 +1745,15 @@ mod tests {
             kind: ExprKind::Literal(crate::analysis::LiteralValue::Bool(false)),
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
-        let resolved = crate::analysis::select_scalar_function(
-            crate::functions::builtin_sql_function_catalog(),
-            "assert_true",
-            std::slice::from_ref(&condition),
+        let argument = crate::analysis::function_argument(
+            &condition,
             crate::constant::test_constant_policy(),
+            control,
+        )
+        .unwrap();
+        let resolved = crate::functions::bind_assert_true(
+            crate::functions::builtin_sql_function_catalog(),
+            &[argument],
             control,
         )
         .unwrap();
