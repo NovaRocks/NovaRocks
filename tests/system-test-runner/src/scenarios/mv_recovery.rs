@@ -2643,6 +2643,7 @@ mv_refresh_scheduler_max_concurrent = 1
         refresh(context, &mut conn, "orders_mv")?;
         let initial_configuration =
             rest_configuration_revision(context, &rest_uri, "ns", "orders_mv")?;
+        let initial_snapshot = load_metadata(context, &rest_uri, "ns", "orders_mv")?;
         execute(
             context,
             &mut conn,
@@ -2658,6 +2659,7 @@ mv_refresh_scheduler_max_concurrent = 1
             "INSERT INTO orders VALUES (3, 30)",
         )?;
 
+        assert_content_refresh_explain(context, &mut conn, "FullReplace")?;
         let fault_dir = context.scenario_root().join("mv-recovery-faults");
         let prepared = FileTrigger::create(
             &fault_dir.join("mv-refresh-at-data-prepared.trigger"),
@@ -2729,24 +2731,44 @@ mv_refresh_scheduler_max_concurrent = 1
         }
         require_refresh_paused(context, &mut conn, "orders_mv", true)?;
         require_refresh_paused(context, &mut conn, "parallel_mv", true)?;
-        require_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 4)?;
         require_rest_snapshot_count(context, &rest_uri, "ns", "parallel_mv", 1)?;
-        let metadata =
-            super::mv_uea7_documents::load_metadata(context, &rest_uri, "ns", "orders_mv")?;
-        let graph = super::mv_uea7_documents::wire::Graph::from_metadata(&metadata)?;
-        let last = graph
-            .snapshots
-            .last()
-            .context("configuration slot snapshot missing")?;
-        let previous = graph
-            .snapshots
-            .iter()
-            .rev()
-            .nth(1)
-            .context("publication before slot change missing")?;
+        let metadata = load_metadata(context, &rest_uri, "ns", "orders_mv")?;
+        let retained = initial_snapshot["snapshots"]
+            .as_array()
+            .context("orders_mv is missing its initial snapshot history")?;
+        let current = metadata["snapshots"]
+            .as_array()
+            .context("orders_mv is missing its committed snapshot history")?;
+        let [delete, publication, configuration] = current
+            .strip_prefix(retained.as_slice())
+            .context("refresh did not preserve the original MV history")?
+        else {
+            bail!("expected one FULL snapshot pair and one configuration change: {current:?}");
+        };
+        let table_uuid = metadata["table-uuid"]
+            .as_str()
+            .filter(|uuid| initial_snapshot["table-uuid"].as_str() == Some(*uuid))
+            .context("orders_mv changed table identity during refresh")?;
+        super::mv_uea7_storage::assert_full_refresh_snapshots(
+            table_uuid,
+            initial_snapshot["current-snapshot-id"].as_i64(),
+            delete,
+            publication,
+        )?;
+        use super::mv_uea7_documents::wire::{CONFIG, Graph, RECORD};
+        let graph = Graph::from_metadata(&metadata)?;
+        let slot = graph
+            .slots
+            .get(CONFIG)
+            .context("configuration slot missing")?;
         ensure!(
-            last.1 == previous.1,
-            "configuration slot change did not carry P bytes"
+            configuration["summary"]["novarocks.document.slot-change.v1"] == "true"
+                && configuration["parent-snapshot-id"] == publication["snapshot-id"]
+                && slot.writer == configuration["snapshot-id"].as_i64()
+                && graph.current == slot.writer
+                && publication["summary"][RECORD].is_string()
+                && configuration["summary"][RECORD] == publication["summary"][RECORD],
+            "configuration did not follow the held FULL refresh and preserve its P bytes"
         );
         let final_configuration =
             rest_configuration_revision(context, &rest_uri, "ns", "orders_mv")?;
@@ -4499,7 +4521,7 @@ impl Scenario for MvBaseIdentityReplacement {
             "read publication before replacing its base table",
         )?;
 
-        use super::mv_uea7_documents::{load_metadata, wire::Graph};
+        use super::mv_uea7_documents::wire::{Graph, MANAGEMENT};
         let old_source = load_metadata(context, &rest_uri, "ns", "orders")?;
         let old_target =
             Graph::from_metadata(&load_metadata(context, &rest_uri, "ns", "orders_mv")?)?;
@@ -4539,7 +4561,8 @@ impl Scenario for MvBaseIdentityReplacement {
             )?;
         }
         let source = load_metadata(context, &rest_uri, "ns", "orders")?;
-        let target = Graph::from_metadata(&load_metadata(context, &rest_uri, "ns", "orders_mv")?)?;
+        let published_target = load_metadata(context, &rest_uri, "ns", "orders_mv")?;
+        let target = Graph::from_metadata(&published_target)?;
         let record = target
             .snapshots
             .iter()
@@ -4564,16 +4587,41 @@ impl Scenario for MvBaseIdentityReplacement {
             "replacement P does not retain the new binding and its exact source watermark"
         );
         drop(conn);
-        // Preserve the separate restart case. An owner change before a fresh
-        // publication still exercises the original incarnation readmission.
+        // Leave the replacement source unpublished when the next incarnation starts.
         drop(replace(context, "INSERT INTO orders VALUES (10, 100)")?);
+        let unpublished_source = load_metadata(context, &rest_uri, "ns", "orders")?;
+        ensure!(
+            unpublished_source["table-uuid"]
+                .as_str()
+                .is_some_and(|uuid| uuid != source_uuid),
+            "the restart fixture did not create a distinct unpublished source identity"
+        );
 
         restart_frontend(context, "restart FE after same-name base replacement")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
         assert_mv_quarantined_after_base_replacement(context, &mut conn, catalog, "orders_mv")?;
-        context.action(
-            "verified FE restart quarantines the MV rather than bind a same-name replacement base",
+        execute(
+            context,
+            &mut conn,
+            "enable rewriting to exercise the quarantined MV candidate",
+            "SET SESSION enable_materialized_view_rewrite = true",
+        )?;
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders ORDER BY k1",
+            &[(10, 100)],
+            "read the replacement source without serving the old MV publication",
+        )?;
+        let after_refusal = load_metadata(context, &rest_uri, "ns", "orders_mv")?;
+        assert_rest_snapshot_state_unchanged(&published_target, &after_refusal)?;
+        ensure!(
+            after_refusal["table-uuid"] == published_target["table-uuid"]
+                && published_target["properties"][MANAGEMENT].is_string()
+                && after_refusal["properties"][MANAGEMENT]
+                    == published_target["properties"][MANAGEMENT],
+            "the refused readmission changed the target identity or registered a new incarnation"
         );
         Ok(())
     }
@@ -5207,40 +5255,34 @@ fn assert_mv_quarantined_after_base_replacement(
     catalog: &str,
     mv: &str,
 ) -> Result<()> {
-    context.remaining("verify MV is quarantined after same-name base replacement")?;
-    context.action("verify MV is quarantined after same-name base replacement");
-    let views = materialized_view_states(conn)?;
-    let manageability = mv_state_text(&views, mv, "manageability")?;
-    let reason = mv_state_text(&views, mv, "manageability_reason")?;
-    if manageability != "UNAVAILABLE"
-        || !reason
-            .contains("published MV base occurrence 0 no longer resolves to its frozen object")
-    {
-        bail!(
-            "same-name replacement MV is listed as {manageability:?} ({reason:?}), expected source identity quarantine; {}",
-            context.diagnostics()
+    const REFUSAL: &str = "same-name relation was rebuilt with a different object identity";
+    const ACTION: &str = "observe automatic readmission refuse the same-name source replacement";
+
+    context.action(ACTION);
+    loop {
+        let views = materialized_view_states(conn)?;
+        let manageability = mv_state_text(&views, mv, "manageability")?;
+        let reason = mv_state_text(&views, mv, "manageability_reason")?;
+        if manageability == "UNAVAILABLE" && reason == REFUSAL {
+            break;
+        }
+        ensure!(
+            manageability != "MANAGEABLE",
+            "automatic readmission made the quarantined MV manageable: {reason:?}"
         );
+        let remaining = context
+            .remaining(ACTION)
+            .with_context(|| format!("last MV manageability was {manageability:?} ({reason:?})"))?;
+        thread::sleep(POLL_INTERVAL.min(remaining));
     }
+
     let closed = status(context, conn, catalog, mv)?;
-    let challenge = property(&closed, "Challenge")?;
-    let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
-    context.remaining("reject readmission onto a same-name replacement base")?;
-    context.action("reject readmission onto a same-name replacement base");
-    let readmission_error = match conn.execute(format!(
-        "CALL novarocks_mv_resume_management('{catalog}', 'ns', '{mv}', \
-         '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
-         'the system scenario replaced the declared frontend process before this statement')"
-    )) {
-        Err(error) => error,
-        Ok(_) => bail!("a replacement base readmitted the old MV unexpectedly"),
-    };
-    let public = mv_public_error(&readmission_error)?;
-    if !public
-        .message
-        .contains("same-name relation was rebuilt with a different object identity")
-    {
-        bail!("replacement-base readmission failed for another reason: {readmission_error}");
-    }
+    ensure!(
+        property(&closed, "UnsettledEffects")? == "0"
+            && property(&closed, "PendingSlotChanges")? == "0",
+        "source identity refusal left a management barrier or an unsettled registration: {closed:?}"
+    );
+    context.action("reject REFRESH after automatic source identity refusal");
     let error = match conn.execute(format!("REFRESH MATERIALIZED VIEW {mv}")) {
         Err(error) => error,
         Ok(_) => {

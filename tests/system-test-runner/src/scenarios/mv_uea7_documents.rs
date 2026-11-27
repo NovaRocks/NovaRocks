@@ -12,6 +12,7 @@ use super::mv_uea7::{
     select_catalog_and_namespace,
 };
 use super::mv_uea7::{mv_public_error, mv_response_needs_cancel, mv_response_with_cleanup};
+use super::mv_uea7_storage::assert_full_refresh_snapshots;
 use crate::actors::sql::{self, SqlSession, StatementFailure};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
@@ -1652,10 +1653,6 @@ impl Documents {
         }
         let stable = load_metadata(context, rest, NS, "stable")?;
         let graph = save_graph(context, "continuous-refresh-300", &stable)?;
-        ensure!(
-            graph.snapshots.len() == 301,
-            "300 refreshes must retain their publications and the first full refresh delete"
-        );
         let counted = conn.execute("SELECT COUNT(*) FROM stable")?;
         ensure!(
             counted.columns.len() == 1
@@ -1680,28 +1677,62 @@ impl Documents {
             "ordinary refreshes grew private properties: first={first_private_bytes}, final={}",
             graph.private_bytes
         );
-        let (initial_delete_id, record) = &graph.snapshots[0];
-        let initial_delete = stable["snapshots"]
+        let snapshots = stable["snapshots"]
             .as_array()
-            .context("refresh snapshots missing")?
-            .iter()
-            .find(|s| s["snapshot-id"].as_i64() == Some(*initial_delete_id))
-            .context("initial full refresh delete missing")?;
+            .context("refresh snapshots missing")?;
+        let table_uuid = stable["table-uuid"]
+            .as_str()
+            .context("refresh table UUID missing")?;
         ensure!(
-            record.is_none()
-                && initial_delete["summary"]["operation"] == "delete"
-                && initial_delete["summary"]["total-records"] == "0",
-            "initial full refresh delete must contain no rows or publication"
+            graph.record_bytes.len() == 300 && snapshots.len() == graph.snapshots.len(),
+            "300 refreshes must retain exactly one original publication per refresh"
         );
-        // One original record per actual publication keeps the compact document bound.
+        let mut previous = None;
+        let mut publications = BTreeSet::new();
+        let mut sessions = BTreeSet::new();
+        let mut history = snapshots.iter().zip(&graph.snapshots);
+        for index in 0..300 {
+            let (snapshot, (id, record)) = history
+                .next()
+                .with_context(|| format!("continuous refresh {index} has no snapshot"))?;
+            let (publication, id, record) = if let Some(record) = record {
+                ensure!(
+                    snapshot["summary"]["operation"] == "append"
+                        && snapshot["parent-snapshot-id"].as_i64() == previous,
+                    "continuous append {index} did not extend its original parent"
+                );
+                (snapshot, id, record)
+            } else {
+                let (append, (id, Some(record))) = history
+                    .next()
+                    .with_context(|| format!("continuous FULL refresh {index} has no append"))?
+                else {
+                    bail!("continuous FULL refresh {index} did not publish its append");
+                };
+                assert_full_refresh_snapshots(table_uuid, previous, snapshot, append)
+                    .with_context(|| format!("continuous FULL refresh {index}"))?;
+                (append, id, record)
+            };
+            let session = publication["summary"]["novarocks.write.session.v1"]
+                .as_str()
+                .context("continuous refresh is missing its write session")?;
+            let rows = index as u64 + 3;
+            ensure!(
+                record.binding.as_deref() == Some(first_binding.as_str())
+                    && publications.insert(record.frame.as_str())
+                    && sessions.insert(session)
+                    && graph.record_logical_rows(record)? == Some(rows)
+                    && publication["summary"]["total-records"]
+                        .as_str()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        == Some(rows),
+                "refresh {index} must publish a newly written record of the first binding with the exact row total"
+            );
+            previous = Some(*id);
+        }
         ensure!(
-            graph.record_bytes.len() == 300
-                && graph.snapshots[1..].iter().all(|(_, record)| {
-                    record.as_ref().is_some_and(|record| {
-                        record.binding.as_deref() == Some(first_binding.as_str())
-                    })
-                }),
-            "ordinary refreshes must each carry one record of the first binding"
+            history.next().is_none() && previous == graph.current,
+            "all 300 refresh publications must form a chain ending at main"
         );
         let start = self.audit()?.len();
         execute(
