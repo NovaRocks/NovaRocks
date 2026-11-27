@@ -80,6 +80,10 @@ enum Request {
         source: IcebergMvCorePorts,
         target: novarocks_sql::planning::mv::SqlMvTarget,
     },
+    LoadRenewalBase {
+        source: IcebergMvCorePorts,
+        target: novarocks_sql::planning::mv::SqlMvTarget,
+    },
     ObserveCurrent {
         source: IcebergMvCorePorts,
         documents: ConnectorDocumentStorage,
@@ -152,6 +156,7 @@ enum Response {
     ),
     RebuildReadOnly(Result<(), MvApplicationError>),
     LoadReady(Box<Result<Option<LoadedKeyedMvProjection>, MvApplicationError>>),
+    LoadRenewalBase(Box<Result<Option<(LoadedKeyedMvProjection, bool)>, MvApplicationError>>),
     ObserveCurrent(Box<Result<MvKeyedObservedCurrentDocuments, MvApplicationError>>),
     ObserveFull(
         Box<
@@ -536,6 +541,16 @@ impl MvRefreshPreparationIo {
                             .in_requests(Arc::clone(&services.requests));
                         Response::LoadReady(Box::new(
                             view.load_ready(&target).await.map_err(repository_error),
+                        ))
+                    }
+                    Request::LoadRenewalBase { source, target } => {
+                        let view = source
+                            .readiness()
+                            .in_requests(Arc::clone(&services.requests));
+                        Response::LoadRenewalBase(Box::new(
+                            view.load_renewal_base(&target)
+                                .await
+                                .map_err(repository_error),
                         ))
                     }
                     Request::ObserveCurrent {
@@ -993,6 +1008,23 @@ impl MvRefreshPreparationIo {
         };
         *result
     }
+    pub(crate) async fn load_renewal_base(
+        &self,
+        source: &IcebergMvCorePorts,
+        target: novarocks_sql::planning::mv::SqlMvTarget,
+    ) -> Result<Option<(LoadedKeyedMvProjection, bool)>, MvApplicationError> {
+        let Response::LoadRenewalBase(result) = self
+            .exchange(Request::LoadRenewalBase {
+                source: source.clone(),
+                target,
+            })
+            .await
+        else {
+            panic!("MV Current renewal base response changed kind")
+        };
+        *result
+    }
+
     pub(crate) async fn definition(
         &self,
         source: &IcebergMvCorePorts,

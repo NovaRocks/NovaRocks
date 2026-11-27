@@ -141,7 +141,7 @@ EXPLAIN REFRESH MATERIALIZED VIEW rewrite_mv;
 
 -- query 13
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.rewrite_mv,publications=3,slot-changes=0,full-refreshes=3,full-refresh-last=true,logical-rows=3,total-records=3,source=fact
+-- @mv_rest_document_graph=ns_${uuid0}.rewrite_mv,publications=3,slot-changes=0,external-replaces=1,full-refreshes=3,full-refresh-last=true,logical-rows=3,total-records=3,source=fact
 REFRESH MATERIALIZED VIEW rewrite_mv;
 
 -- query 14

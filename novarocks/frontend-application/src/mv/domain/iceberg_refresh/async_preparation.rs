@@ -2228,13 +2228,13 @@ async fn reobserve_current_management_before_refresh(
         namespace: Arc::from(target.namespace.as_str()),
         table: Arc::from(target.table.as_str()),
     };
-    if !source
-        .management_entrance()?
-        .management_phase(&table)
-        .is_manageable()
-    {
+    let entrance = source.management_entrance()?;
+    if !entrance.management_phase(&table).is_manageable() {
         return Ok((false, None));
     }
+    let Some(management_base) = entrance.dependencies_for_current_renewal(&table) else {
+        return Ok((false, None));
+    };
     let lease =
         crate::connector::metadata_binding_typed(source.connector_control(), &target.catalog)?;
     let metadata = io
@@ -2272,8 +2272,17 @@ async fn reobserve_current_management_before_refresh(
     if closed {
         tracing::warn!(catalog=%target.catalog,database=%target.namespace,name=%target.table,
             "fresh Current MV management slot names another writer; management closed");
-    } else if let Some(ready) = io
-        .load_ready(
+        return Ok((true, Some(observed)));
+    }
+    let nonaggregate = !observed.interpretation.is_aggregate();
+    if nonaggregate && schema.exact_schema().metadata_version != observed.view.metadata_version {
+        return Err(RefreshError(MvApplicationError::new(
+            MvApplicationErrorKind::BindingInvalidated,
+            "MV target changed between schema and Current observation",
+        )));
+    }
+    if let Some((base, ready)) = io
+        .load_renewal_base(
             source,
             MvTarget {
                 catalog: Some(target.catalog.clone()),
@@ -2283,21 +2292,21 @@ async fn reobserve_current_management_before_refresh(
         )
         .await?
     {
-        let expected = &ready.projection.facts;
+        let expected = &base.projection.facts;
         let previous = expected.source_revision();
-        let renewal = if expected.metadata_version() == &observed.view.metadata_version {
+        let same_metadata = expected.metadata_version() == &observed.view.metadata_version;
+        let renewal = if ready && same_metadata {
             None
-        } else if metadata_only_current_matches(expected, &observed) {
+        } else if ready && metadata_only_current_matches(expected, &observed) {
             Some(CurrentRenewal::MetadataOnly(Arc::new(expected.clone())))
-        } else if schema.exact_schema().metadata_version == observed.view.metadata_version
+        } else if nonaggregate
             && !expected.interpretation().is_aggregate()
-            && !observed.interpretation.is_aggregate()
             && (observed.requires_unattributed_full_refresh()
                 || (matches!(
                     observed.applicable_publication(),
                     ApplicablePublication::Bound(_)
                 ) && observed.eligibility().rewrite_serving
-                    && observed.publication_revision != previous.publication_revision))
+                    && (!ready || observed.publication_revision != previous.publication_revision)))
             && observed.view.table == previous.target
             && observed.view.object_id == previous.target_object_id
             && observed.deployment_owner == previous.deployment_owner
@@ -2306,7 +2315,7 @@ async fn reobserve_current_management_before_refresh(
             Some(CurrentRenewal::ExactContent {
                 target: expected.target(),
                 expected: Box::new(observed.view.clone()),
-                previous: expected.management_dependencies(documents.control_runtime_id()),
+                previous: management_base,
             })
         } else {
             None
@@ -2321,7 +2330,7 @@ async fn reobserve_current_management_before_refresh(
             .await?;
         }
     }
-    Ok((closed, Some(observed)))
+    Ok((false, Some(observed)))
 }
 async fn reconcile_published_lake_projection(
     io: &MvRefreshPreparationIo,

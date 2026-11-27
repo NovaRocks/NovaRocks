@@ -1766,6 +1766,18 @@ impl ManagementEntrance {
         MvManagementPhase::Manageable
     }
 
+    /// Freeze the dependencies of an existing entrance before observing
+    /// provider Current. The later exact renewal still checks liveness and
+    /// compares this value under the management lock.
+    pub fn dependencies_for_current_renewal(
+        &self,
+        table: &ConnectorTableIdentity,
+    ) -> Option<ManagementDependencySet> {
+        lock(&self.inner.state)
+            .get(table)
+            .map(|current| current.dependencies.clone())
+    }
+
     /// Close this process's admission when a provider Current observation of
     /// the exact installed target names another owner or incarnation. An already
     /// dispatched effect is not revoked; this only stops future admissions.

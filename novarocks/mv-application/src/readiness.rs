@@ -795,6 +795,34 @@ impl MvKeyedReadinessExecution {
         Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
         MvRepositoryError,
     > {
+        self.wait_for_current_observation(target).await;
+        self.load_ready(target).await
+    }
+
+    /// A retained projection can anchor comparison with the open management
+    /// entrance even after projection installation was interrupted.
+    pub async fn load_renewal_base(
+        &self,
+        target: &MvTarget,
+    ) -> Result<
+        Option<(
+            crate::state_store_repository::keyed::LoadedKeyedMvProjection,
+            bool,
+        )>,
+        MvRepositoryError,
+    > {
+        self.wait_for_current_observation(target).await;
+        let order = self.runtime.projection_order(target.clone());
+        let cell = order.lock().await;
+        let Some(loaded) = self.repository.find_keyed_by_target(target).await? else {
+            return Ok(None);
+        };
+        let ready = matches!(self.runtime.readiness(target), TargetReadiness::Ready)
+            && cell.installed.as_ref() == Some(&loaded.version);
+        Ok(Some((loaded, ready)))
+    }
+
+    async fn wait_for_current_observation(&self, target: &MvTarget) {
         let order = self.runtime.projection_order(target.clone());
         let deadline = tokio::time::Instant::now() + OBSERVATION_SETTLE_WAIT;
         loop {
@@ -811,7 +839,6 @@ impl MvKeyedReadinessExecution {
                 break;
             }
         }
-        self.load_ready(target).await
     }
     pub async fn projection_inventory(
         &self,
