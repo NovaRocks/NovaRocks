@@ -184,6 +184,7 @@ async fn prepare_refresh_inner(
                 current_database,
                 FirstRefreshTargetFacts {
                     contract: &plan.contract,
+                    canonical_query: &refresh.canonical_query,
                     base_table_object_ids: &base_table_object_ids,
                     repartition_transition: repartition_transition.as_ref(),
                     retained_repartition_target: retained_repartition_target.as_ref(),
@@ -213,6 +214,7 @@ async fn prepare_refresh_inner(
             current_catalog,
             current_database,
             &plan.contract,
+            &refresh.canonical_query,
             &request.attempt,
             observed_binding.clone(),
             connector_context.clone(),
@@ -704,6 +706,7 @@ fn bind_property_repartition_fields(
 
 struct FirstRefreshTargetFacts<'contract, 'objects, 'transition, 'retained, 'rebuild> {
     contract: &'contract RefreshPlanContract,
+    canonical_query: &'contract novarocks_parser::ast::Query,
     base_table_object_ids: &'objects BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
     repartition_transition: Option<&'transition PreparedManagedRepartitionTransition>,
     retained_repartition_target: Option<&'retained RetainedRepartitionTarget>,
@@ -725,6 +728,7 @@ async fn prepare_frontend_first_refresh_write(
 ) -> Result<(PreparedMvFirstRefreshWrite, AdmittedMvDataPublication), PreparationError> {
     let FirstRefreshTargetFacts {
         contract,
+        canonical_query: query,
         base_table_object_ids,
         repartition_transition,
         retained_repartition_target,
@@ -852,10 +856,6 @@ async fn prepare_frontend_first_refresh_write(
         }
     };
     captured.target = Some(target_binding.clone());
-    let query = match rebuild {
-        Some(rebuild) => rebuild.candidate.query.clone(),
-        None => canonical_mv_select_query_from_source(&projection, &refresh_query_source)?,
-    };
     let runtime_bindings = match rebuild {
         Some(_) => {
             let exact = target_schema_validation.exact_schema();
@@ -873,7 +873,7 @@ async fn prepare_frontend_first_refresh_write(
         effective_interpretation,
         &runtime_bindings,
         effective_binding.occurrences.len(),
-        definition_has_join(&query),
+        definition_has_join(query),
     )?;
     let target_arrow_schema = target_binding.physical_write_schema()?.as_ref().clone();
     let target_write_fields = target_binding.write_input_fields()?;
@@ -917,7 +917,7 @@ async fn prepare_frontend_first_refresh_write(
             target_snapshot_id, ..
         } => *target_snapshot_id,
     };
-    if definition_has_join(&query) && !capabilities.has_agg_state {
+    if definition_has_join(query) && !capabilities.has_agg_state {
         let rewrite =
             crate::mv::domain::refresh::rewrite_context::freeze_refresh_rewrite_context_original(
                 io,
@@ -939,7 +939,7 @@ async fn prepare_frontend_first_refresh_write(
                     target_observation: target_schema_validation,
                     runtime_bindings: &runtime_bindings,
                     join_analysis: novarocks_sql::planning::mv::extract_refresh_join_analysis(
-                        &query,
+                        query,
                     )?,
                     aggregate: None,
                 },
@@ -1016,7 +1016,7 @@ async fn prepare_frontend_first_refresh_write(
         // layout is defined by the first branch and CREATE-time validation
         // guarantees the remaining branches share that layout.
         let aggregate_query = if branch_count > 0 {
-            crate::mv::domain::rewrite::context::first_union_branch_query(&query)?
+            crate::mv::domain::rewrite::context::first_union_branch_query(query)?
         } else {
             query.clone()
         };
@@ -1448,6 +1448,7 @@ async fn prepare_frontend_incremental_write(
     current_catalog: Option<&str>,
     current_database: &str,
     contract: &RefreshPlanContract,
+    canonical_query: &novarocks_parser::ast::Query,
     attempt: &MvRefreshAttemptIdentity,
     observed_binding: ConnectorProviderBindingKey,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -1460,14 +1461,13 @@ async fn prepare_frontend_incremental_write(
         table: contract.target.name.clone(),
     };
     let projection = io.definition(source, &target).await?;
-    let canonical_query = canonical_mv_select_query(&projection)?;
     let interpretation = projection.facts.interpretation();
-    let is_join = definition_has_join(&canonical_query);
+    let is_join = definition_has_join(canonical_query);
     let is_aggregate = !interpretation.aggregates.is_empty();
     let is_branch_union = !interpretation.branches.is_empty();
     let join_bases = if is_join {
         let (left, right) =
-            join_base_refs_for_definition(&projection, &canonical_query, &contract.base_refs)?;
+            join_base_refs_for_definition(&projection, canonical_query, &contract.base_refs)?;
         Some((left.clone(), right.clone()))
     } else {
         None
@@ -1563,7 +1563,7 @@ async fn prepare_frontend_incremental_write(
         io,
         source,
         &projection,
-        &canonical_query,
+        canonical_query,
         &connector_context,
     )
     .await?;
@@ -1581,7 +1581,7 @@ async fn prepare_frontend_incremental_write(
                 target_observation: &target_schema_validation,
                 runtime_bindings: &runtime_bindings,
                 join_analysis: novarocks_sql::planning::mv::extract_refresh_join_analysis(
-                    &canonical_query,
+                    canonical_query,
                 )?,
                 aggregate,
             },
@@ -1641,6 +1641,7 @@ async fn prepare_frontend_incremental_write(
                 current_database,
                 FirstRefreshTargetFacts {
                     contract,
+                    canonical_query,
                     base_table_object_ids: &rewrite.pinned_objects_by_occurrence()?,
                     repartition_transition: None,
                     retained_repartition_target: None,
@@ -1835,6 +1836,7 @@ async fn prepare_frontend_incremental_write(
                 current_database,
                 FirstRefreshTargetFacts {
                     contract,
+                    canonical_query,
                     base_table_object_ids: &rewrite.pinned_objects_by_occurrence()?,
                     repartition_transition: None,
                     retained_repartition_target: None,

@@ -355,7 +355,11 @@ pub(in crate::planner::distributed::build) fn table_fixture(
             .unwrap();
         outputs.push(output);
     }
-    let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
+    let binding = SqlFunctionBinding::from_plan(
+        crate::planner::BINDING_AUTHORITY,
+        resolved,
+        DecimalOverflowPolicy::ReportError,
+    );
     let input = column(1, "outer", DataType::Int64, false);
     let source = PhysicalPlanNode {
         kind: PhysicalPlanKind::TableFunction(PlanTableFunctionNode {
@@ -401,13 +405,15 @@ pub(in crate::planner::distributed::build) fn window_fixture(
             nulls_first: order.nulls_first,
         })
         .collect();
-    let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError)
-        .with_aggregate_state_source(novarocks_type_contract::AggregateStateInterpretation {
-            distinct: false,
-            order_keys: novarocks_type_contract::AggregateStateOrderKeys::from_pure_boxed(
-                order_keys,
-            ),
-        });
+    let binding = SqlFunctionBinding::from_plan(
+        crate::planner::BINDING_AUTHORITY,
+        resolved,
+        DecimalOverflowPolicy::ReportError,
+    )
+    .with_aggregate_state_source(novarocks_type_contract::AggregateStateInterpretation {
+        distinct: false,
+        order_keys: novarocks_type_contract::AggregateStateOrderKeys::from_pure_boxed(order_keys),
+    });
     let input = column(1, "k", DataType::Int64, false);
     let mut output = column(
         2,
@@ -1028,7 +1034,11 @@ fn aggregate_window_argument_limit_refuses_before_any_channel_emission() {
         ]
         .into_boxed_slice(),
     );
-    let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
+    let binding = SqlFunctionBinding::from_plan(
+        crate::planner::BINDING_AUTHORITY,
+        resolved,
+        DecimalOverflowPolicy::ReportError,
+    );
     let PhysicalPlanKind::Window(payload) = &mut source.kind else {
         unreachable!()
     };

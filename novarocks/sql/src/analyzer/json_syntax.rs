@@ -399,6 +399,7 @@ mod tests {
     fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
         AnalyzerContext {
             purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
+            effects: Default::default(),
             grouping_scope: Default::default(),
             view_stack: Default::default(),
             control,

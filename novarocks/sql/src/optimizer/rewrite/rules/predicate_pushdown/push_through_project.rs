@@ -1021,7 +1021,10 @@ mod tests {
                     name: name.into(),
                     args: vec![input],
                     distinct: false,
-                    binding: crate::binding::SqlFunctionBinding::new(
+                    binding: crate::binding::SqlFunctionBinding::from_plan(
+                        crate::binding::PlanBindingAuthority::Optimizer(
+                            crate::optimizer::BindingAuthority(()),
+                        ),
                         bound,
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     ),

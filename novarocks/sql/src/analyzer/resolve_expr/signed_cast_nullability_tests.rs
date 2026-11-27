@@ -162,12 +162,11 @@ fn implicit_decimal_function_coercion_uses_the_original_cast_null_contract() {
         let target = FunctionValueType::new(DataType::Decimal128(3, 2), false);
         let ordinary = coerce_function_argument(input.clone(), target.data_type(), policy).unwrap();
         let selected = coerce_selected_function_argument(
-            catalog.as_ref(),
+            &super::super::BindingFinalizer::ordinary(catalog.as_ref(), policy, &control),
             input.clone(),
             &target,
-            policy,
             crate::constant::test_constant_policy(),
-            &control,
+            novarocks_parser::SYNTHETIC,
         )
         .unwrap();
         for output in [ordinary, selected] {
@@ -247,12 +246,15 @@ fn primitive_null_fact_does_not_redeclare_a_nominal_largeint_conversion() {
     )
     .unwrap();
     let output = coerce_selected_function_argument(
-        catalog.as_ref(),
+        &super::super::BindingFinalizer::ordinary(
+            catalog.as_ref(),
+            DecimalOverflowPolicy::OutputNull,
+            &control,
+        ),
         input.clone(),
         &target,
-        DecimalOverflowPolicy::OutputNull,
         crate::constant::test_constant_policy(),
-        &control,
+        novarocks_parser::SYNTHETIC,
     )
     .unwrap();
     assert_eq!(output.value_type, target);

@@ -1119,11 +1119,10 @@ fn function_binding_adapters_preserve_control_at_entry_and_inside_actual_argumen
                 error: error.clone(),
                 at_entry,
             };
-            let failure = crate::analysis::resolve_function_binding(
+            let failure = crate::analysis::select_scalar_function(
                 catalog,
                 "coalesce",
                 &arguments,
-                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 crate::constant::test_constant_policy(),
                 &control,
             )
@@ -1151,11 +1150,10 @@ fn function_binding_adapters_preserve_control_at_entry_and_inside_actual_argumen
             );
         }
     }
-    let binding = crate::analysis::resolve_function_binding(
+    let binding = crate::analysis::select_scalar_function(
         catalog,
         "coalesce",
         &arguments,
-        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         crate::constant::test_constant_policy(),
         &crate::compiler::SqlCompileControl::unbounded(),
     )

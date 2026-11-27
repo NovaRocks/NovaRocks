@@ -492,7 +492,10 @@ mod tests {
                 control,
             )
             .unwrap();
-            let binding = crate::binding::SqlFunctionBinding::new(
+            let binding = crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(()),
+                ),
                 selected,
                 novarocks_type_contract::DecimalOverflowPolicy::ReportError,
             );

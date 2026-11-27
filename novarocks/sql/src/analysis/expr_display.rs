@@ -810,7 +810,7 @@ mod tests {
                     args: vec![operand].into(),
                     distinct: false,
                     volatility: resolved.semantics.volatility,
-                    binding: crate::binding::SqlFunctionBinding::new(
+                    binding: crate::binding::SqlFunctionBinding::from_test(
                         resolved,
                         novarocks_type_contract::DecimalOverflowPolicy::ReportError,
                     ),

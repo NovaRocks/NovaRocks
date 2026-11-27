@@ -2156,7 +2156,10 @@ mod tests {
                     nulls_first: true,
                     display: None,
                 }],
-                crate::binding::SqlFunctionBinding::new(
+                crate::binding::SqlFunctionBinding::from_plan(
+                    crate::binding::PlanBindingAuthority::Optimizer(
+                        crate::optimizer::BindingAuthority(()),
+                    ),
                     selected,
                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 ),

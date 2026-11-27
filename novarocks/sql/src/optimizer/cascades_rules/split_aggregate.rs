@@ -774,7 +774,10 @@ mod tests {
                     &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
-            let resolved = crate::binding::SqlFunctionBinding::new(
+            let resolved = crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(()),
+                ),
                 resolved,
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             );

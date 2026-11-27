@@ -3695,7 +3695,8 @@ fn build_candidate(
         constant_policy,
         control,
     )
-    .map_err(SqlCompileError::from)?;
+    .map_err(SqlCompileError::from)?
+    .into_parts();
     let mut returned = returned;
     let output_names = crate::analysis::schema::validate_definition_column_names(
         &resolved.output_columns,

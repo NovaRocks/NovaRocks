@@ -14296,7 +14296,8 @@ mod tests {
                 kind: ExprKind::Literal(LiteralValue::Null),
                 value_type: list_type,
             }],
-            binding: SqlFunctionBinding::new(
+            binding: SqlFunctionBinding::from_plan(
+                crate::planner::BINDING_AUTHORITY,
                 resolved,
                 novarocks_type_contract::DecimalOverflowPolicy::ReportError,
             ),
@@ -14325,7 +14326,8 @@ mod tests {
             name: "lag".into(),
             args: vec![literal.clone()],
             distinct: false,
-            binding: SqlFunctionBinding::new(
+            binding: SqlFunctionBinding::from_plan(
+                crate::planner::BINDING_AUTHORITY,
                 resolved,
                 novarocks_type_contract::DecimalOverflowPolicy::ReportError,
             ),
@@ -14385,7 +14387,8 @@ mod tests {
                 kind: ExprKind::Literal(LiteralValue::Null),
                 value_type: wide_type,
             }],
-            binding: SqlFunctionBinding::new(
+            binding: SqlFunctionBinding::from_plan(
+                crate::planner::BINDING_AUTHORITY,
                 wide_resolved,
                 novarocks_type_contract::DecimalOverflowPolicy::ReportError,
             ),
@@ -14974,7 +14977,8 @@ mod tests {
         };
         let value_type = result.clone();
         let volatility = resolved.semantics.volatility;
-        let binding = SqlFunctionBinding::new(
+        let binding = SqlFunctionBinding::from_plan(
+            crate::planner::BINDING_AUTHORITY,
             resolved,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
@@ -16358,7 +16362,8 @@ mod tests {
             unreachable!()
         };
         let result = result.clone();
-        let binding = crate::binding::SqlFunctionBinding::new(
+        let binding = crate::binding::SqlFunctionBinding::from_plan(
+            crate::planner::BINDING_AUTHORITY,
             resolved,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
@@ -16585,7 +16590,8 @@ mod tests {
         let resolved = crate::functions::builtin_sql_function_catalog()
             .resolve_scalar_binding("variant_get", &arguments, &source_control)
             .unwrap();
-        let original_binding = SqlFunctionBinding::new(
+        let original_binding = SqlFunctionBinding::from_plan(
+            crate::planner::BINDING_AUTHORITY,
             resolved,
             novarocks_type_contract::DecimalOverflowPolicy::ReportError,
         );
@@ -17759,7 +17765,8 @@ mod tests {
         let resolved = crate::functions::builtin_sql_function_catalog()
             .resolve_table_binding("unnest", &arguments, &control)
             .unwrap();
-        let binding = SqlFunctionBinding::new(
+        let binding = SqlFunctionBinding::from_plan(
+            crate::planner::BINDING_AUTHORITY,
             resolved,
             novarocks_type_contract::DecimalOverflowPolicy::ReportError,
         );
@@ -17813,7 +17820,8 @@ mod tests {
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
-        let binding = SqlFunctionBinding::new(
+        let binding = SqlFunctionBinding::from_plan(
+            crate::planner::BINDING_AUTHORITY,
             resolved,
             novarocks_type_contract::DecimalOverflowPolicy::ReportError,
         );

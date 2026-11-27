@@ -281,6 +281,12 @@ impl<'a> super::AnalyzerContext<'a> {
             _ => None,
         };
         if let Some(binding) = binding {
+            // An MV scope probe may know the type before its selected
+            // environment can be admitted. The chosen scope must consume the
+            // deferred refusal before the expression can leave analysis.
+            if self.effects.has_deferred_environment(binding.resolved()) {
+                return Ok(resolved);
+            }
             self.function_catalog
                 .admit_authored_environment_observed(binding, self.control)
                 .map_err(|error| {
@@ -930,13 +936,11 @@ impl<'a> super::AnalyzerContext<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         resolved_scalar_call_at(
-            self.function_catalog,
+            &self.binding_finalizer(),
             "__array_literal",
             args,
             array.span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
             self.constant_policy,
-            self.control,
         )
     }
 
@@ -1278,13 +1282,11 @@ impl<'a> super::AnalyzerContext<'a> {
             };
             let text = self.coerce_common_value(expr_typed, &varchar, value.span())?;
             expr_typed = resolved_scalar_call_at(
-                self.function_catalog,
+                &self.binding_finalizer(),
                 "rpad",
                 vec![text, width, space],
                 value.span(),
-                self.sql_semantics.sql_mode().decimal_overflow_policy(),
                 self.constant_policy,
-                self.control,
             )?;
         }
         let pattern_typed = operand(&predicate.pattern)?;
@@ -1319,10 +1321,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 kind: ExprKind::FunctionCall {
                     volatility: binding.semantics.volatility,
                     name: novarocks_functions::native_like::ESCAPE_FUNCTION_NAME.to_owned(),
-                    binding: crate::binding::SqlFunctionBinding::new(
-                        binding,
-                        self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                    ),
+                    binding: self
+                        .binding_finalizer()
+                        .finish(binding, "LIKE", predicate.span)?,
                     args: args.into(),
                     distinct: false,
                 },
@@ -2677,14 +2678,12 @@ impl<'a> super::AnalyzerContext<'a> {
                     ));
                 }
                 let binding = resolve_aggregate_function_call_with_order(
-                    self.function_catalog,
+                    &self.binding_finalizer(),
                     &name,
                     is_distinct,
                     &args_typed,
                     &func_order_by,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
                     self.constant_policy,
-                    self.control,
                     self.purpose,
                     AggregateCallSite::Window(func.span),
                 )?;
@@ -2737,14 +2736,12 @@ impl<'a> super::AnalyzerContext<'a> {
             let binding = if let Some(aggregate) = &aggregate_binding {
                 aggregate.clone()
             } else {
-                let (coerced, binding) = bind_window_function_call_with_catalog(
-                    self.function_catalog,
+                let (coerced, binding) = bind_window_call(
+                    &self.binding_finalizer(),
                     &name,
                     args_typed,
                     func.span,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
                     self.constant_policy,
-                    self.control,
                 )?;
                 args_typed = coerced;
                 binding
@@ -2809,14 +2806,12 @@ impl<'a> super::AnalyzerContext<'a> {
         let mut bound_aggregate = None;
         if is_aggregate_function(self.function_catalog, &name) {
             bound_aggregate = Some(resolve_aggregate_function_call_with_order(
-                self.function_catalog,
+                &self.binding_finalizer(),
                 &name,
                 is_distinct,
                 &args_typed,
                 &func_order_by,
-                self.sql_semantics.sql_mode().decimal_overflow_policy(),
                 self.constant_policy,
-                self.control,
                 self.purpose,
                 AggregateCallSite::Group(func.span),
             )?);
@@ -2909,15 +2904,19 @@ impl<'a> super::AnalyzerContext<'a> {
                             expected_result: None,
                         }
                     };
-                    self.type_scalar_call(shape, args_typed, func.span)?
+                    self.type_scalar_call_at_arguments(
+                        shape,
+                        args_typed,
+                        effective_arg_exprs,
+                        func.span,
+                    )?
                 }
-                ScalarTypingRoute::Legacy => bind_scalar_function_call_with_catalog(
-                    self.function_catalog,
+                ScalarTypingRoute::Legacy => bind_legacy_scalar_call(
+                    &self.binding_finalizer(),
                     &name,
                     args_typed,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    func.span,
                     self.constant_policy,
-                    self.control,
                 )
                 .map_err(|error| error.at_type_mismatch(func.span))?,
             };
@@ -3684,48 +3683,38 @@ impl BoundScalarCall {
     }
 }
 
-fn resolve_scalar_binding(
+fn select_scalar_binding_with_catalog(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     args: &[TypedExpr],
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
-    crate::analysis::resolve_function_binding(
-        function_catalog,
-        name,
-        args,
-        decimal_overflow_policy,
-        constant_policy,
-        control,
-    )
-    .map_err(AnalyzeError::function_binding)
+) -> Result<novarocks_functions::ResolvedFunctionBinding, AnalyzeError> {
+    crate::analysis::select_scalar_function(function_catalog, name, args, constant_policy, control)
+        .map_err(AnalyzeError::function_binding)
 }
 
 pub(super) fn resolve_scalar_binding_at(
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    finalizer: &super::BindingFinalizer<'_>,
     name: &str,
     args: &[TypedExpr],
     span: Span,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     constant_policy: novarocks_functions::ConstantPolicy,
-    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
-    resolve_scalar_binding(
-        function_catalog,
+    let binding = select_scalar_binding_with_catalog(
+        finalizer.catalog,
         name,
         args,
-        decimal_overflow_policy,
         constant_policy,
-        control,
+        finalizer.control,
     )
-    .map_err(|error| error.at_type_mismatch(span))
+    .map_err(|error| error.at_type_mismatch(span))?;
+    finalizer.finish(binding, name, span)
 }
 
 fn finish_selected_scalar_call(
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    selected: &crate::binding::SqlFunctionBinding,
+    selected: &novarocks_functions::ResolvedFunctionBinding,
     args: &[TypedExpr],
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
@@ -3750,25 +3739,19 @@ fn finish_selected_scalar_call(
 }
 
 pub(super) fn resolved_scalar_call_at(
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    finalizer: &super::BindingFinalizer<'_>,
     name: &str,
     args: Vec<TypedExpr>,
     span: Span,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     constant_policy: novarocks_functions::ConstantPolicy,
-    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
-    let binding = resolve_scalar_binding_at(
-        function_catalog,
-        name,
-        &args,
-        span,
-        decimal_overflow_policy,
-        constant_policy,
-        control,
-    )?;
+    let function_catalog = finalizer.catalog;
+    let control = finalizer.control;
+    let binding =
+        select_scalar_binding_with_catalog(function_catalog, name, &args, constant_policy, control)
+            .map_err(|error| error.at_type_mismatch(span))?;
     if !selected_call_shape_matches_observed(
-        binding.resolved(),
+        &binding,
         args.len(),
         novarocks_functions::FunctionKind::Scalar,
         control,
@@ -3793,22 +3776,20 @@ pub(super) fn resolved_scalar_call_at(
             }
             novarocks_functions::FunctionArgumentType::Value(target) if array_common => {
                 super::value_conversion::coerce_array_common_argument(
-                    function_catalog,
+                    finalizer,
                     argument,
                     target,
-                    decimal_overflow_policy,
                     constant_policy,
-                    control,
+                    span,
                 )
             }
             novarocks_functions::FunctionArgumentType::Value(target) => {
                 coerce_selected_function_argument(
-                    function_catalog,
+                    finalizer,
                     argument,
                     target,
-                    decimal_overflow_policy,
                     constant_policy,
-                    control,
+                    span,
                 )
             }
             novarocks_functions::FunctionArgumentType::Lambda { .. }
@@ -3828,13 +3809,13 @@ pub(super) fn resolved_scalar_call_at(
     let exact =
         finish_selected_scalar_call(function_catalog, &binding, &args, constant_policy, control)
             .map_err(|error| error.at_type_mismatch(span))?;
-    if !rebound_call_matches_observed(binding.resolved(), &exact, &args, control)? {
+    if !rebound_call_matches_observed(&binding, &exact, &args, control)? {
         return Err(AnalyzeError::type_mismatch(
             format!("function `{name}` lost the exact selected argument declaration"),
             span,
         ));
     }
-    let binding = crate::binding::SqlFunctionBinding::new(exact, decimal_overflow_policy);
+    let binding = finalizer.finish(exact, name, span)?;
     let result = match &binding.selected.result_type {
         novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
         novarocks_functions::FunctionResultType::Relation(_) => {
@@ -3953,13 +3934,14 @@ fn coerce_function_argument(
 
 /// The selected owner, rather than the carrier, declares an argument domain.
 fn coerce_selected_function_argument(
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    finalizer: &super::BindingFinalizer<'_>,
     expr: TypedExpr,
     target: &novarocks_type_contract::FunctionValueType,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     constant_policy: novarocks_functions::ConstantPolicy,
-    control: &dyn novarocks_type_contract::PureCompileControl,
+    span: Span,
 ) -> Result<TypedExpr, AnalyzeError> {
+    let control = finalizer.control;
+    let decimal_overflow_policy = finalizer.decimal_overflow_policy;
     if expr.value_type.same_value_domain(target) {
         let mut coerced =
             coerce_function_argument(expr, target.data_type(), decimal_overflow_policy)
@@ -3999,13 +3981,12 @@ fn coerce_selected_function_argument(
             },
         )?
     {
-        return super::value_conversion::convert_value_domain_with_catalog(
-            function_catalog,
+        return super::value_conversion::convert_value_domain(
+            finalizer,
             expr,
             value_type,
-            decimal_overflow_policy,
             constant_policy,
-            control,
+            span,
         );
     }
     // An unchanged Arrow carrier can still require a semantic conversion,
@@ -4165,6 +4146,7 @@ fn rebound_call_matches_observed(
 
 /// Window-only selected arguments use the same carrier/domain conversion
 /// author as ordinary calls, then retain the exact window selection.
+#[cfg(test)]
 pub(super) fn bind_window_function_call_with_catalog(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
@@ -4174,6 +4156,20 @@ pub(super) fn bind_window_function_call_with_catalog(
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(Vec<TypedExpr>, crate::binding::SqlFunctionBinding), AnalyzeError> {
+    let finalizer =
+        super::BindingFinalizer::ordinary(function_catalog, decimal_overflow_policy, control);
+    bind_window_call(&finalizer, name, args, span, constant_policy)
+}
+
+fn bind_window_call(
+    finalizer: &super::BindingFinalizer<'_>,
+    name: &str,
+    args: Vec<TypedExpr>,
+    span: Span,
+    constant_policy: novarocks_functions::ConstantPolicy,
+) -> Result<(Vec<TypedExpr>, crate::binding::SqlFunctionBinding), AnalyzeError> {
+    let function_catalog = finalizer.catalog;
+    let control = finalizer.control;
     let resolve = |args: &[TypedExpr]| {
         let arguments = args
             .iter()
@@ -4220,14 +4216,7 @@ pub(super) fn bind_window_function_call_with_catalog(
         .zip(binding.selected.argument_types.iter())
         .map(|(arg, target)| match target {
             novarocks_functions::FunctionArgumentType::Value(value) => {
-                coerce_selected_function_argument(
-                    function_catalog,
-                    arg,
-                    value,
-                    decimal_overflow_policy,
-                    constant_policy,
-                    control,
-                )
+                coerce_selected_function_argument(finalizer, arg, value, constant_policy, span)
             }
             novarocks_functions::FunctionArgumentType::Lambda { .. } => {
                 Err(AnalyzeError::type_mismatch(
@@ -4246,12 +4235,10 @@ pub(super) fn bind_window_function_call_with_catalog(
             span,
         ));
     }
-    Ok((
-        args,
-        crate::binding::SqlFunctionBinding::new(exact, decimal_overflow_policy),
-    ))
+    Ok((args, finalizer.finish(exact, name, span)?))
 }
 
+#[cfg(test)]
 pub(super) fn bind_scalar_function_call_with_catalog(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
@@ -4260,22 +4247,41 @@ pub(super) fn bind_scalar_function_call_with_catalog(
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<BoundScalarCall, AnalyzeError> {
+    let finalizer =
+        super::BindingFinalizer::ordinary(function_catalog, decimal_overflow_policy, control);
+    bind_legacy_scalar_call(
+        &finalizer,
+        name,
+        args,
+        novarocks_parser::SYNTHETIC,
+        constant_policy,
+    )
+}
+
+fn bind_legacy_scalar_call(
+    finalizer: &super::BindingFinalizer<'_>,
+    name: &str,
+    args: Vec<TypedExpr>,
+    span: Span,
+    constant_policy: novarocks_functions::ConstantPolicy,
+) -> Result<BoundScalarCall, AnalyzeError> {
+    let function_catalog = finalizer.catalog;
+    let control = finalizer.control;
     let arg_types = args
         .iter()
         .map(|arg| arg.value_type.data_type().clone())
         .collect::<Vec<_>>();
 
-    match resolve_scalar_binding(
+    match select_scalar_binding_with_catalog(
         function_catalog,
         name,
         &args,
-        decimal_overflow_policy,
         constant_policy,
         control,
     ) {
         Ok(binding) => {
             if !selected_call_shape_matches_observed(
-                binding.resolved(),
+                &binding,
                 args.len(),
                 novarocks_functions::FunctionKind::Scalar,
                 control,
@@ -4298,12 +4304,11 @@ pub(super) fn bind_scalar_function_call_with_catalog(
                     }
                     novarocks_functions::FunctionArgumentType::Value(value) => {
                         coerce_selected_function_argument(
-                            function_catalog,
+                            finalizer,
                             arg,
                             value,
-                            decimal_overflow_policy,
                             constant_policy,
-                            control,
+                            span,
                         )
                     }
                     novarocks_functions::FunctionArgumentType::Lambda { .. }
@@ -4326,14 +4331,14 @@ pub(super) fn bind_scalar_function_call_with_catalog(
                 constant_policy,
                 control,
             )?;
-            if !rebound_call_matches_observed(binding.resolved(), &exact, &args, control)? {
+            if !rebound_call_matches_observed(&binding, &exact, &args, control)? {
                 return Err(AnalyzeError::internal(format!(
                     "function `{name}` lost the exact selected argument declaration"
                 )));
             }
             Ok(BoundScalarCall {
                 args,
-                binding: crate::binding::SqlFunctionBinding::new(exact, decimal_overflow_policy),
+                binding: finalizer.finish(exact, name, span)?,
             })
         }
         Err(error)
@@ -4354,6 +4359,7 @@ pub(super) fn bind_scalar_function_call_with_catalog(
     }
 }
 
+#[cfg(test)]
 pub(super) fn resolve_aggregate_function_call(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
@@ -4363,15 +4369,15 @@ pub(super) fn resolve_aggregate_function_call(
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
+    let finalizer =
+        super::BindingFinalizer::ordinary(function_catalog, decimal_overflow_policy, control);
     resolve_aggregate_function_call_with_order(
-        function_catalog,
+        &finalizer,
         name,
         false,
         args,
         &[],
-        decimal_overflow_policy,
         constant_policy,
-        control,
         super::QueryAnalysisPurpose::Ordinary,
         AggregateCallSite::Group(span),
     )
@@ -4436,20 +4442,18 @@ fn approximate_aggregate_target(
     }
 }
 
-enum AggregateCallSite {
+pub(super) enum AggregateCallSite {
     Group(Span),
     Window(Span),
 }
 
-fn resolve_aggregate_function_call_with_order(
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+pub(super) fn resolve_aggregate_function_call_with_order(
+    finalizer: &super::BindingFinalizer<'_>,
     name: &str,
     distinct: bool,
     args: &[TypedExpr],
     function_order_by: &[SortItem],
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     constant_policy: novarocks_functions::ConstantPolicy,
-    control: &dyn novarocks_type_contract::PureCompileControl,
     purpose: super::QueryAnalysisPurpose,
     site: AggregateCallSite,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
@@ -4460,61 +4464,60 @@ fn resolve_aggregate_function_call_with_order(
     let (binding, span) = match site {
         AggregateCallSite::Window(span) => (
             crate::functions::resolve_sql_aggregate_window_call(
-                function_catalog,
+                finalizer.catalog,
                 name,
                 distinct,
                 args,
                 function_order_by,
                 constant_policy,
-                control,
+                finalizer.control,
             ),
             span,
         ),
         AggregateCallSite::Group(span) => (
             crate::functions::resolve_sql_aggregate_call(
-                function_catalog,
+                finalizer.catalog,
                 name,
                 distinct,
                 args,
                 function_order_by,
                 constant_policy,
-                control,
+                finalizer.control,
             ),
             span,
         ),
     };
-    binding
-        .map(|binding| crate::binding::SqlFunctionBinding::new(binding, decimal_overflow_policy))
-        .map_err(|error| {
-            if let novarocks_functions::FunctionBindingError::Control(error) = error {
-                return AnalyzeError::control(error);
-            }
-            if matches!(
+    let binding = binding.map_err(|error| {
+        if let novarocks_functions::FunctionBindingError::Control(error) = error {
+            return AnalyzeError::control(error);
+        }
+        if matches!(
+            error,
+            novarocks_functions::FunctionBindingError::UnavailableImplementation(_)
+        ) {
+            return AnalyzeError::function_binding(error).at_type_mismatch(span);
+        }
+        if purpose.is_mv_definition()
+            && args.is_empty()
+            && matches!(name, "avg" | "min")
+            && matches!(
                 error,
-                novarocks_functions::FunctionBindingError::UnavailableImplementation(_)
-            ) {
-                return AnalyzeError::function_binding(error).at_type_mismatch(span);
-            }
-            if purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition
-                && args.is_empty()
-                && matches!(name, "avg" | "min")
-                && matches!(
-                    error,
-                    novarocks_functions::FunctionBindingError::NoMatchingOverload
-                )
-            {
-                return AnalyzeError::unknown_function(
-                    format!("Unexpected parameters () for function {name}"),
-                    span,
-                );
-            }
-            let message = format!("cannot bind aggregate `{name}` for {arg_types:?}: {error}");
-            if error == novarocks_functions::FunctionBindingError::NoMatchingOverload {
-                AnalyzeError::unknown_function(message, span)
-            } else {
-                AnalyzeError::type_mismatch(message, span)
-            }
-        })
+                novarocks_functions::FunctionBindingError::NoMatchingOverload
+            )
+        {
+            return AnalyzeError::unknown_function(
+                format!("Unexpected parameters () for function {name}"),
+                span,
+            );
+        }
+        let message = format!("cannot bind aggregate `{name}` for {arg_types:?}: {error}");
+        if error == novarocks_functions::FunctionBindingError::NoMatchingOverload {
+            AnalyzeError::unknown_function(message, span)
+        } else {
+            AnalyzeError::type_mismatch(message, span)
+        }
+    })?;
+    finalizer.finish(binding, name, span)
 }
 
 fn analyzer_aggregate_alias(name: &str) -> Option<&'static str> {
@@ -4695,6 +4698,7 @@ mod tests {
     ) -> super::super::AnalyzerContext<'_> {
         super::super::AnalyzerContext {
             purpose: super::super::QueryAnalysisPurpose::Ordinary,
+            effects: Default::default(),
             grouping_scope: Default::default(),
             view_stack: Default::default(),
             control,
@@ -7272,6 +7276,7 @@ mod tests {
         let factory = Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new()));
         let context = super::super::AnalyzerContext {
             purpose: super::super::QueryAnalysisPurpose::Ordinary,
+            effects: Default::default(),
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: None,
             statement_relation: None,
@@ -8476,12 +8481,15 @@ mod tests {
         };
         let target = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
         let converted = super::coerce_selected_function_argument(
-            crate::functions::builtin_sql_function_catalog(),
+            &super::super::BindingFinalizer::ordinary(
+                crate::functions::builtin_sql_function_catalog(),
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                &control,
+            ),
             source,
             &target,
-            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             policy,
-            &control,
+            novarocks_parser::SYNTHETIC,
         )
         .unwrap();
         assert_eq!(converted.value_type, target);

@@ -537,7 +537,8 @@ fn build_relational_aggregate_change_stream(
         },
     );
     let state_all_zero_args = vec![merged_count];
-    let state_all_zero_binding = crate::analysis::resolve_function_binding(
+    let state_all_zero_binding = crate::binding::SqlFunctionBinding::resolve_for_plan(
+        crate::planner::BINDING_AUTHORITY,
         ctx.function_catalog(),
         "state_all_zero",
         &state_all_zero_args,
@@ -684,7 +685,8 @@ fn delta_state_with_row_id(
         novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
     )?;
     let mut items = Vec::with_capacity(delta_outputs.len() + 1);
-    let row_id_binding = crate::analysis::resolve_function_binding(
+    let row_id_binding = crate::binding::SqlFunctionBinding::resolve_for_plan(
+        crate::planner::BINDING_AUTHORITY,
         ctx.function_catalog(),
         "mv_group_row_id",
         &row_id_args,
@@ -741,7 +743,8 @@ fn merged_state_expr(
         | SqlImvAggregateStateRole::AvgCount => {
             let name = state_union_function(state_column)?;
             let args = vec![column_ref(old), column_ref(delta)];
-            let binding = crate::analysis::resolve_function_binding(
+            let binding = crate::binding::SqlFunctionBinding::resolve_for_plan(
+                crate::planner::BINDING_AUTHORITY,
                 ctx.function_catalog(),
                 name,
                 &args,
@@ -974,7 +977,8 @@ fn aggregate_insert_expr_for_output(
             visible_state_args(state_column, merged_state, &visible.value_type)?
         };
         let name = visible_state_function(state_column.function)?;
-        let binding = crate::analysis::resolve_function_binding(
+        let binding = crate::binding::SqlFunctionBinding::resolve_for_plan(
+            crate::planner::BINDING_AUTHORITY,
             ctx.function_catalog(),
             name,
             &args,
@@ -2420,7 +2424,11 @@ fn retraction_count_aggregate_call(
         source: crate::binding::AggregateArgumentSource::logical_update(
             args,
             Vec::new(),
-            crate::binding::SqlFunctionBinding::new(resolved, policy),
+            crate::binding::SqlFunctionBinding::from_plan(
+                crate::planner::BINDING_AUTHORITY,
+                resolved,
+                policy,
+            ),
         ),
     })
 }
@@ -2481,7 +2489,8 @@ fn signed_aggregate_call(
         source: crate::binding::AggregateArgumentSource::logical_update(
             vec![input],
             call.source.order_by().to_vec(),
-            crate::binding::SqlFunctionBinding::new(
+            crate::binding::SqlFunctionBinding::from_plan(
+                crate::planner::BINDING_AUTHORITY,
                 resolved,
                 call.source.binding().decimal_overflow_policy(),
             ),
@@ -2552,7 +2561,8 @@ fn signed_state_input(
         .iter()
         .map(|argument| crate::analysis::function_argument(argument, constant_policy, control))
         .collect::<Result<Vec<_>, _>>()?;
-    let binding = crate::binding::SqlFunctionBinding::new_with_row_constructor_constraint(
+    let binding = crate::binding::SqlFunctionBinding::from_plan_with_constraint(
+        crate::planner::BINDING_AUTHORITY,
         function_catalog.finish_scalar_binding(
             &function,
             &overload,
@@ -2564,7 +2574,8 @@ fn signed_state_input(
             control,
         )?,
         policy,
-        target,
+        crate::binding::SqlResultConstraintOrigin::RowConstructor,
+        Some(target),
     );
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
     else {

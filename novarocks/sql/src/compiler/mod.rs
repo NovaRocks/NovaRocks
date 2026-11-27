@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::analyze_error::AnalyzeError;
+use crate::analyzer::QueryAnalysisPurpose;
 pub use crate::explain::ExplainLevel;
 pub use crate::functions::{
     build_builtin_engine_function_catalog, builtin_engine_function_catalog,
@@ -1134,7 +1135,7 @@ impl novarocks_type_contract::PureCompileControl for SqlCompileControl {
 /// exist until this phase has completed.
 pub struct SqlAnalyzeRequest<'a> {
     pub(crate) write_assignments: Option<Arc<SqlWriteAssignments>>,
-    first_refresh_view_row_lineage: bool,
+    analysis_purpose: QueryAnalysisPurpose,
     pub(crate) statement: SqlStatementInput,
     pub(crate) intent: SqlCompileIntent,
     pub(crate) session: SqlSessionContext,
@@ -1152,8 +1153,8 @@ pub struct SqlAnalyzeRequest<'a> {
 }
 
 impl<'a> SqlAnalyzeRequest<'a> {
-    pub(crate) fn with_first_refresh_view_row_lineage(mut self, enabled: bool) -> Self {
-        self.first_refresh_view_row_lineage = enabled;
+    pub(crate) fn with_analysis_purpose(mut self, purpose: QueryAnalysisPurpose) -> Self {
+        self.analysis_purpose = purpose;
         self
     }
 
@@ -1193,7 +1194,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
     ) -> Self {
         Self {
             write_assignments: None,
-            first_refresh_view_row_lineage: false,
+            analysis_purpose: QueryAnalysisPurpose::Ordinary,
             statement,
             intent,
             session,
@@ -1232,7 +1233,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
     ) -> Self {
         Self {
             write_assignments: None,
-            first_refresh_view_row_lineage: false,
+            analysis_purpose: QueryAnalysisPurpose::Ordinary,
             statement: SqlStatementInput::logical_plan(plan, factory, root_semantics),
             intent,
             session,
@@ -1511,7 +1512,7 @@ pub fn analyze_mv_refresh_input(
     .map_err(SqlCompileError::Compilation)?;
     let scoped_functions = functions.snapshot_for_scalar_presence();
     let functions = scoped_functions.as_ref();
-    let (resolved, _, factory, view_dependencies) = crate::analyzer::analyze_mv_definition(
+    let admitted = crate::analyzer::analyze_mv_definition(
         &query,
         catalog.planner_table_provider(),
         &current_database,
@@ -1520,19 +1521,7 @@ pub fn analyze_mv_refresh_input(
         &control,
     )
     .map_err(SqlCompileError::from)?;
-    let names = crate::analysis::schema::validate_definition_column_names(
-        &resolved.output_columns,
-        query.span,
-    )?;
-    crate::planning::mv::validate_persistable_output(&resolved, &factory)
-        .map_err(SqlCompileError::Compilation)?;
-    Ok(
-        crate::planning::mv::SqlResolvedMvRefreshInput::from_validated_analysis(
-            resolved,
-            names,
-            view_dependencies,
-        ),
-    )
+    crate::planning::mv::SqlResolvedMvRefreshInput::from_admitted_definition(admitted, query.span)
 }
 
 /// Compile and render an IMV refresh EXPLAIN request without exposing its
@@ -1609,6 +1598,7 @@ fn imv_refresh_explain_request<'a>(
         constant_policy,
         control,
     )
+    .with_analysis_purpose(QueryAnalysisPurpose::MaterializedViewDefinition)
     .with_imv_rewrite(imv_rewrite)
 }
 
@@ -1937,7 +1927,7 @@ impl SqlCompiler {
                         },
                         request.statement.prepared_parameters.as_deref(),
                         request.table_sequence,
-                        request.first_refresh_view_row_lineage,
+                        request.analysis_purpose,
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;

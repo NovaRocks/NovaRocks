@@ -509,7 +509,13 @@ fn build_payload_coalesce_aggregate(
                 source: crate::binding::AggregateArgumentSource::logical_update(
                     aggregate_args,
                     Vec::new(),
-                    crate::binding::SqlFunctionBinding::new(resolved, policy),
+                    crate::binding::SqlFunctionBinding::from_plan(
+                        crate::binding::PlanBindingAuthority::Planner(
+                            crate::planner::BindingAuthority(()),
+                        ),
+                        resolved,
+                        policy,
+                    ),
                 ),
             }],
             output_columns,
@@ -586,7 +592,8 @@ fn build_payload_coalesce_assert_filter(
         int_literal(0, DataType::Int64),
     );
     let abs_args = vec![column_ref(net_column)];
-    let abs_binding = crate::analysis::resolve_function_binding(
+    let abs_binding = crate::binding::SqlFunctionBinding::resolve_for_plan(
+        crate::planner::BINDING_AUTHORITY,
         function_catalog,
         "abs",
         &abs_args,
@@ -671,7 +678,13 @@ fn build_key_shape_assert_join(
                     source: crate::binding::AggregateArgumentSource::logical_update(
                         insert_args,
                         Vec::new(),
-                        crate::binding::SqlFunctionBinding::new(resolved.clone(), policy),
+                        crate::binding::SqlFunctionBinding::from_plan(
+                            crate::binding::PlanBindingAuthority::Planner(
+                                crate::planner::BindingAuthority(()),
+                            ),
+                            resolved.clone(),
+                            policy,
+                        ),
                     ),
                 },
                 AggregateCall {
@@ -682,7 +695,13 @@ fn build_key_shape_assert_join(
                     source: crate::binding::AggregateArgumentSource::logical_update(
                         delete_args,
                         Vec::new(),
-                        crate::binding::SqlFunctionBinding::new(resolved, policy),
+                        crate::binding::SqlFunctionBinding::from_plan(
+                            crate::binding::PlanBindingAuthority::Planner(
+                                crate::planner::BindingAuthority(()),
+                            ),
+                            resolved,
+                            policy,
+                        ),
                     ),
                 },
             ],
@@ -1267,7 +1286,11 @@ fn assert_true_call(
         .map(|argument| crate::analysis::function_argument(argument, constant_policy, control))
         .collect::<Result<Vec<_>, _>>()?;
     let selected = crate::functions::bind_assert_true(function_catalog, &arguments, control)?;
-    let binding = crate::binding::SqlFunctionBinding::new(selected, policy);
+    let binding = crate::binding::SqlFunctionBinding::from_plan(
+        crate::planner::BINDING_AUTHORITY,
+        selected,
+        policy,
+    );
     Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::builtin_function_volatility("assert_true"),
@@ -1515,7 +1538,8 @@ pub(crate) fn join_row_key_expr(
         object_id_binary_literal(right_object_id),
         column_ref(row_id_columns.1),
     ];
-    let binding = crate::analysis::resolve_function_binding(
+    let binding = crate::binding::SqlFunctionBinding::resolve_for_plan(
+        crate::planner::BINDING_AUTHORITY,
         function_catalog,
         "join_row_key",
         &args,

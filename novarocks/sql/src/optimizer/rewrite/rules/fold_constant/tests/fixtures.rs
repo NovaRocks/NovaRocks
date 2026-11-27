@@ -120,7 +120,10 @@ impl Fixture {
                     crate::optimizer::test_optimizer_control(),
                 )
                 .expect("eligible fold fixture has an installed owner");
-            crate::binding::SqlFunctionBinding::new(
+            crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(()),
+                ),
                 resolved,
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             )

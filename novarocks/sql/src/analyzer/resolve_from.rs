@@ -247,13 +247,11 @@ impl<'a> super::AnalyzerContext<'a> {
                                 coerce(expr)
                             };
                             super::resolve_expr::resolved_scalar_call_at(
-                                self.function_catalog,
+                                &self.binding_finalizer(),
                                 "coalesce",
                                 vec![padded(left_ref)?, padded(right_ref)?],
                                 col_obj.span,
-                                self.sql_semantics.sql_mode().decimal_overflow_policy(),
                                 self.constant_policy,
-                                self.control,
                             )?
                         }
                         JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti => {
@@ -533,6 +531,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     &derived_name,
                     alias,
                     &derived_name,
+                    name_span,
                 );
             }
             return self.analyze_iceberg_metadata_scan(
@@ -667,7 +666,13 @@ impl<'a> super::AnalyzerContext<'a> {
                 .map_err(|error| AnalyzeError::unknown_table(error, name_span))?;
             if metadata.kind == MetadataTableKind::Partitions {
                 let derived_name = format!("{}$partitions", metadata.relation.table);
-                return self.analyze_derived_metadata_view(&table, &derived_name, alias, &tbl);
+                return self.analyze_derived_metadata_view(
+                    &table,
+                    &derived_name,
+                    alias,
+                    &tbl,
+                    name_span,
+                );
             }
             let qualifier = alias.map(|a| a.name.value.clone()).unwrap_or(tbl);
             return self.analyze_iceberg_metadata_scan(
@@ -1081,10 +1086,7 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok((
             Relation::Unnest(UnnestRelation {
                 args,
-                binding: crate::binding::SqlFunctionBinding::new(
-                    binding,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                ),
+                binding: self.binding_finalizer().finish(binding, "UNNEST", span)?,
                 output_columns,
                 alias: alias_name,
             }),
