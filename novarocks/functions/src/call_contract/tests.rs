@@ -54,8 +54,8 @@ struct Fixture {
 }
 impl Fixture {
     fn new(argument_count: usize) -> Self {
-        // Every key is a real admitted setting, with separate sparse identities.
-        // The fixture has no CPU kernel or runtime capability.
+        // One statement clock and one zone are selected. A distinct lexical
+        // zone is valid in the source table, but unused by this call.
         let values = [
             (
                 0,
@@ -69,26 +69,8 @@ impl Fixture {
                     novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
                 ),
             ),
-            (
-                7,
-                SemanticParameterValue::StatementStartUtc(
-                    novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
-                ),
-            ),
-            (
-                300,
-                SemanticParameterValue::StatementStartUtc(
-                    novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
-                ),
-            ),
-            (
-                19,
-                SemanticParameterValue::StatementStartUtc(
-                    novarocks_type_contract::StatementStartUtc::try_new(0, 0).unwrap(),
-                ),
-            ),
         ];
-        let environment = values[..3]
+        let environment = values
             .iter()
             .map(|(id, value)| SemanticParameterRef {
                 id: SemanticParameterId::new(*id),
@@ -270,7 +252,7 @@ impl PureCompileControl for Observe {
             Stop::Never => false,
             Stop::Entry(entry) => units == 0 && entries == entry,
             // The nested observed projection starts after the constructor's
-            // entry. With zero arguments, its six lookups are the first work
+            // entry. With zero arguments, its two lookups are the first work
             // reported after that distinct entry; type work is still pending.
             Stop::ProjectionWork => entries == 2 && units > 0,
             Stop::Quantum => units == MAX_UNOBSERVED_COMPILE_WORK,
@@ -308,7 +290,7 @@ fn exact_nonempty_frozen_parameter_closure_preserves_values_and_drops_unused_sco
     let contract =
         FunctionCallContract::from_refined(input, &receipt, fixture.selected.clone(), &observer)
             .unwrap();
-    assert_eq!(contract.parameters().entries().len(), 3);
+    assert_eq!(contract.parameters().entries().len(), 2);
     for reference in &fixture.environment {
         assert_eq!(
             contract.parameters().require(*reference).unwrap(),
@@ -335,18 +317,12 @@ fn exact_nonempty_frozen_parameter_closure_preserves_values_and_drops_unused_sco
             novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap()
         ))
     );
-    assert_eq!(
-        contract.parameters().get(SemanticParameterId::new(7)),
-        Some(&SemanticParameterValue::StatementStartUtc(
-            novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap()
-        ))
-    );
     assert!(Arc::ptr_eq(contract.selected_owner(), &fixture.selected));
     assert_eq!(contract.context(), input.context);
     assert_eq!(contract.effects(), receipt.facts());
     assert_eq!(fixture.refinements.load(Ordering::Relaxed), 1);
     assert_eq!(observer.entries.load(Ordering::Relaxed), 2);
-    assert!(observer.events.lock().unwrap().contains(&3));
+    assert!(observer.events.lock().unwrap().contains(&2));
 }
 
 #[test]
@@ -399,7 +375,7 @@ fn nonempty_projection_work_preserves_control_failures_without_invalid_program_f
             expected
         );
         assert_eq!(observer.entries.load(Ordering::Relaxed), 2);
-        assert_eq!(observer.events.lock().unwrap().as_slice(), &[0, 0, 3]);
+        assert_eq!(observer.events.lock().unwrap().as_slice(), &[0, 0, 2]);
     }
 }
 

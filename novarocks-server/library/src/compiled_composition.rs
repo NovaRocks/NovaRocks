@@ -286,7 +286,10 @@ mod tests {
                     installed.effects().null_behavior,
                     FunctionNullBehavior::Strict
                 );
-                assert_eq!(installed.effects().argument_control, ArgumentControl::Eager);
+                assert_eq!(
+                    installed.effects().argument_control,
+                    ArgumentControl::OrderedNull
+                );
             }
         }
     }

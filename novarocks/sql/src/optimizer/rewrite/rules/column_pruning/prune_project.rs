@@ -566,10 +566,11 @@ mod tests {
         let third_input = ColumnId::new_for_test(3);
         let kept = ColumnId::new_for_test(4);
         let side = ColumnId::new_for_test(5);
-        for (op, policy, must_keep) in [
-            (BinOp::Mul, OutputNull, true),
-            (BinOp::Add, ReportError, true),
-            (BinOp::Add, OutputNull, false),
+        for (carrier, op, policy, must_keep) in [
+            (DataType::Decimal128(38, 0), BinOp::Mul, OutputNull, true),
+            (DataType::Decimal128(38, 0), BinOp::Add, ReportError, true),
+            (DataType::Decimal128(38, 0), BinOp::Add, OutputNull, true),
+            (DataType::Float64, BinOp::Add, OutputNull, false),
         ] {
             let (mut ctx, arena_rc) = ctx_with_factory_and_arena();
             let mut scan = make_scan(input, unused_input, third_input);
@@ -578,29 +579,21 @@ mod tests {
             };
             scan_op.columns[1].value_type =
                 novarocks_type_contract::FunctionValueType::try_with_logical_type(
-                    DataType::Decimal128(38, 0),
+                    carrier.clone(),
                     scan_op.columns[1].value_type.nullable(),
                     scan_op.columns[1].value_type.logical_type(),
                 )
                 .unwrap();
-            scan_op.table.columns[1].data_type = DataType::Decimal128(38, 0);
+            scan_op.table.columns[1].data_type = carrier.clone();
             let items = {
                 let mut arena = arena_rc.borrow_mut();
                 let mut plain = col_ref_item(&mut arena, input, "kept");
                 plain.output_column_id = kept;
                 let source = arena.intern(
                     ScalarNode::ColumnRef(unused_input),
-                    novarocks_type_contract::FunctionValueType::new(
-                        DataType::Decimal128(38, 0),
-                        true,
-                    ),
+                    novarocks_type_contract::FunctionValueType::new(carrier.clone(), true),
                 );
-                let expr = arena.test_intern_operator(
-                    op,
-                    source,
-                    source,
-                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                );
+                let expr = arena.test_intern_operator(op, source, source, policy);
                 vec![
                     plain,
                     ScalarProjectItem {
@@ -624,14 +617,14 @@ mod tests {
                 } else {
                     HashSet::from([input])
                 }),
-                "{op:?}/{policy:?}"
+                "{carrier:?}/{op:?}/{policy:?}"
             );
             let result = PruneProjectColumns.apply(tagged, &mut ctx).unwrap();
             if must_keep {
                 assert!(matches!(result, RewriteResult::Unchanged));
             } else {
                 let RewriteResult::Changed(changed) = result else {
-                    panic!("pure nullable add should be pruned")
+                    panic!("total floating ADD should be pruned")
                 };
                 let Operator::LogicalProject(project) = changed.op else {
                     unreachable!()

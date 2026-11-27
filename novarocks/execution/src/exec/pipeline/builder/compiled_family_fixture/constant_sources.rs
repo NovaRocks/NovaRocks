@@ -361,6 +361,10 @@ impl FragmentBuilder {
         .unwrap()
     }
 
+    pub(crate) fn include_constant_pools(&mut self, pools: &p::ConstantPools) {
+        merge(&mut self.sources.0.lock().unwrap(), pools);
+    }
+
     pub(crate) fn seal_catalogue_units(&mut self) {
         let nodes = self
             .physical

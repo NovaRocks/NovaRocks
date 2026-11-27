@@ -3549,7 +3549,7 @@ fn reject_unsupported_function(function: &ast::FunctionCall) -> Result<(), Strin
         );
     }
     if is_aggregate_function(&function_name)
-        || is_window_only_function(&function_name)
+        || crate::functions::builtin_sql_function_catalog().contains_window(&function_name)
         || is_grouping_function(&function_name)
         || is_unsafe_scalar_function(&function_name)
         || function_name == "match"
@@ -3595,23 +3595,6 @@ fn is_non_deterministic_bare_identifier(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "current_timestamp" | "localtime" | "localtimestamp" | "current_date" | "current_time"
-    )
-}
-
-fn is_window_only_function(name: &str) -> bool {
-    // Keep in sync with sql::analyzer::functions::is_window_only_function.
-    matches!(
-        name,
-        "row_number"
-            | "rank"
-            | "dense_rank"
-            | "cume_dist"
-            | "percent_rank"
-            | "ntile"
-            | "lag"
-            | "lead"
-            | "first_value"
-            | "last_value"
     )
 }
 

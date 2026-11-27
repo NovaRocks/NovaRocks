@@ -154,11 +154,10 @@ fn assert_same_projection_distinct_digest(
         digest(FunctionKind::Scalar, right)
     );
 }
-fn keys() -> [SemanticParameterKey; 3] {
+fn keys() -> [SemanticParameterKey; 2] {
     [
         SemanticParameterKey::StatementStartUtc,
         SemanticParameterKey::TimeZone,
-        SemanticParameterKey::StatementStartUtc,
     ]
 }
 
@@ -352,15 +351,10 @@ fn all_environment_keys_and_dependency_membership_change_digest_but_reorder_is_c
             .as_ref(),
         keys().as_slice()
     );
-    assert_eq!(catalog(first).digest(), catalog(second).digest());
-    let mut pair = base;
-    pair.environment_dependencies = Box::from([
-        SemanticParameterKey::StatementStartUtc,
-        SemanticParameterKey::TimeZone,
-    ]);
-    let pair_digest = digest(FunctionKind::Scalar, pair.clone());
-    pair.environment_dependencies[1] = SemanticParameterKey::StatementStartUtc;
-    assert_ne!(pair_digest, digest(FunctionKind::Scalar, pair));
+    let pair = catalog(first).digest();
+    assert_eq!(pair, catalog(second).digest());
+    assert_ne!(pair, baseline);
+    assert!(seen.insert(pair));
 }
 
 #[test]

@@ -330,7 +330,7 @@ fn package_with_outputs(
         .unwrap();
     assert_eq!(
         effects.argument_control,
-        novarocks_type_contract::ArgumentControl::Eager
+        novarocks_type_contract::ArgumentControl::OrderedNull
     );
     builder
         .unit(second_project)
@@ -338,7 +338,7 @@ fn package_with_outputs(
         .definition_control(
             call_definition,
             novarocks_expression_contract::DefinitionControl {
-                shape: novarocks_type_contract::ControlShape::Eager,
+                shape: novarocks_type_contract::ControlShape::OrderedNull,
                 temporal_sources: None,
             },
         )

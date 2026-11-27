@@ -46,6 +46,6 @@ PLAN FRAGMENT 3
   11:PROJECT [k] stats={rows=50000000}
     12:PROJECT [k] stats={rows=50000000}
       13:FILTER stats={rows=50000000}
-        predicate: k > 0
+        predicate: 0 < k
         14:PROJECT [generate_series + 0 AS k] stats={rows=100000000}
           15:GENERATE_SERIES(1, 100000000, 1) stats={rows=100000000}

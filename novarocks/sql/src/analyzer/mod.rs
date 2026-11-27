@@ -8741,6 +8741,46 @@ mod tests {
     }
 
     #[test]
+    fn nr_ivm_delta_snapshot_ast_const_i64_uses_checked_integer_author() {
+        let sql = |from, to| {
+            format!(
+                "SELECT _row_id FROM TABLE(__nr_ivm_delta('cat.ns.iv_orders', {from}, {to})) AS t"
+            )
+        };
+        let resolved = parse_raw_and_analyze(&sql(
+            "-9223372036854775808 + 9223372036854775807 + 1",
+            "200",
+        ))
+        .unwrap();
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select");
+        };
+        let Some(Relation::IcebergDeltaScan(delta)) = &select.from else {
+            panic!("expected Iceberg delta scan");
+        };
+        assert_eq!((delta.from_snapshot_id, delta.to_snapshot_id), (0, 200));
+
+        for (from, to, expected) in [
+            ("- -9223372036854775808", "200", "from_snapshot_id"),
+            ("100", "-9223372036854775808 / -1", "to_snapshot_id"),
+        ] {
+            let error = parse_raw_and_analyze(&sql(from, to)).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert!(
+                error.contains("constant integer expression overflows BIGINT"),
+                "{error}"
+            );
+        }
+        let zero = parse_raw_and_analyze(&sql("1 / 0", "200")).unwrap_err();
+        assert!(
+            zero.contains("unsupported operator in constant expression: Divide"),
+            "{zero}"
+        );
+        let negative = parse_raw_and_analyze(&sql("-9223372036854775808", "200")).unwrap_err();
+        assert!(negative.contains("non-negative"), "{negative}");
+    }
+
+    #[test]
     fn analyzer_rejects_nr_ivm_delta_on_non_v3_table() {
         // `orders` is registered without row-lineage metadata columns.
         let err = parse_raw_and_analyze(

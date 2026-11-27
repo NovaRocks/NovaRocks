@@ -204,6 +204,39 @@ fn collection_lambda_rejects_unknown_or_non_boolean_predicate_body() {
     }
 }
 
+#[test]
+fn text_lambda_names_unavailable_overloads_without_typing_the_body() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    for (name, sql) in [
+        ("none_match", "none_match(ARRAY[1], x -> unknown_body)"),
+        (
+            "reduce",
+            "reduce(ARRAY[1], 0, (s, x) -> unknown_body, s -> s)",
+        ),
+        (
+            "zip_with",
+            "zip_with(ARRAY[1], ARRAY[2], (x, y) -> unknown_body)",
+        ),
+        (
+            "map_zip_with",
+            "map_zip_with(missing_map, missing_map, (k, x, y) -> unknown_body)",
+        ),
+    ] {
+        let result = type_expression_text(sql, &[], &context, &HarnessControl);
+        assert!(
+            matches!(result, Err(TextError::Typing {
+                cause: TypingError::Binding(
+                    novarocks_functions::FunctionBindingError::UnavailableImplementation(overload)
+                ),
+                ..
+            }) if overload.as_str() == format!("builtin.scalar/{name}/lambda-v1")),
+            "{name}",
+        );
+    }
+}
+
 fn assert_compared(result: &CheckedRows, columns: usize, rows: usize) {
     assert_eq!(
         result.batch.shape,

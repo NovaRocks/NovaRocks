@@ -128,6 +128,36 @@ FROM (VALUES (1, CAST(NULL AS INTEGER), 'n'), (2, 1, 'a'), (3, 2, 'b')) t(seq, k
 ORDER BY seq;
 
 -- query 13
+SELECT seq, sum(seq) OVER (
+    ORDER BY seq ROWS BETWEEN
+    -9223372036854775808 + 9223372036854775807 + 2 PRECEDING AND CURRENT ROW
+) AS running_sum
+FROM (VALUES 1, 2, 3) t(seq)
+ORDER BY seq;
+
+-- query 14
+-- @skip_result_check=true
+-- @expect_error_tier=target
+-- @expect_sql_code=sql.analyze.invalid_argument
+-- @expect_error_at=2:31
+-- @expect_error=window frame offset must be a constant integer
+SELECT sum(seq) OVER (
+    ORDER BY seq ROWS BETWEEN -(-9223372036854775808) PRECEDING AND CURRENT ROW
+)
+FROM (VALUES 1, 2, 3) t(seq);
+
+-- query 15
+-- @skip_result_check=true
+-- @expect_error_tier=target
+-- @expect_sql_code=sql.analyze.invalid_argument
+-- @expect_error_at=2:31
+-- @expect_error=window frame offset must be a constant integer
+SELECT sum(seq) OVER (
+    ORDER BY seq ROWS BETWEEN -9223372036854775808 / -1 PRECEDING AND CURRENT ROW
+)
+FROM (VALUES 1, 2, 3) t(seq);
+
+-- query 16
 -- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.b9_mixed;

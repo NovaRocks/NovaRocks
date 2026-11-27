@@ -184,6 +184,22 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
         let source = emit(&expression, &control).unwrap();
         assert!(source.unit.ports().is_empty());
         assert_eq!(source.unit.roots().len(), 1);
+        if cv.try_utf8().unwrap().is_none() {
+            assert!(source.unit.claims().is_empty());
+            assert!(source.unit.requests().is_empty());
+            let ContractExprKind::Constant(reference) = root(&source).kind else {
+                panic!("strict call becomes a typed NULL");
+            };
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+            let emitted = source
+                .constants
+                .resolve_source_observed(reference, &mut work)
+                .unwrap();
+            assert_eq!(emitted.value_type(), &ty);
+            assert!(emitted.try_utf8().unwrap().is_none());
+            work.finish().unwrap();
+            continue;
+        }
         assert_eq!(source.unit.claims().len(), 1);
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
         let receipt = source

@@ -2075,10 +2075,7 @@ mod conditional_compiled_selection {
     use arrow::{array::Int64Array, record_batch::RecordBatch};
     use novarocks_connector_contract::PureProviderProgramCatalog;
     use novarocks_expression_contract::{ExprKind, RootScope};
-    use novarocks_functions::{
-        ConstantValidation, EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
-        PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
-    };
+    use novarocks_functions::ConstantValidation;
     use novarocks_local_compiler::{
         LocalCompileOptions, compile_fragment, validate_fragment_providers,
     };
@@ -2280,35 +2277,7 @@ mod conditional_compiled_selection {
         let providers =
             PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
                 .unwrap();
-        // The compiler requires a nonempty sealed catalogue even when all
-        // roots are intrinsic. Seal the real IF owner, never a mock evaluator.
-        let actual = novarocks_functions::builtin::catalogue::builtin_engine_function_catalog();
-        let mut catalogue = EngineFunctionCatalogBuilder::new();
-        catalogue
-            .register(
-                actual
-                    .definition("if", FunctionKind::Scalar)
-                    .unwrap()
-                    .clone(),
-            )
-            .unwrap();
-        let functions = catalogue
-            .seal_pure([InstalledPureKernel {
-                function: novarocks_type_contract::FunctionId::try_new("builtin.scalar/if/v1")
-                    .unwrap(),
-                kind: FunctionKind::Scalar,
-                implementation: PureImplementationDeclaration {
-                    overload: novarocks_type_contract::FunctionOverloadId::try_new(
-                        "builtin.scalar/if/(bool,any<T>,any<T>)->any<T>;widen;legacy",
-                    )
-                    .unwrap(),
-                    implementation: PureImplementationId::try_new("builtin.scalar/if/selected-v1")
-                        .unwrap(),
-                    abi: PureKernelAbi::ControlIntrinsicV1,
-                },
-                aggregate_state_format: None,
-            }])
-            .unwrap();
+        let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
         Arc::new(
             compile_fragment(
                 validate_fragment_providers(package, &providers, &FixtureControl).unwrap(),
@@ -2352,6 +2321,11 @@ mod conditional_compiled_selection {
             applicability_instances: None,
         });
         prepare_test_operator(fixture, &mut sink);
+        let state = fixture.state().with_test_query_memory();
+        sink.compiled_control
+            .as_mut()
+            .unwrap()
+            .bind_runtime_memory(&state);
         sink
     }
 

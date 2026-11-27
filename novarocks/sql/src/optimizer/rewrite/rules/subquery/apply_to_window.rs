@@ -1810,7 +1810,7 @@ mod tests {
             BinOp::Gt,
             col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64),
             TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Int(0)),
+                kind: ExprKind::Literal(LiteralValue::Float(0.0)),
                 value_type: novarocks_type_contract::FunctionValueType::new(
                     DataType::Float64,
                     false,

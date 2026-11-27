@@ -119,8 +119,7 @@ SELECT m = other AS forward,
 FROM pairs;
 
 -- query 11
--- A successful first candidate does not suppress an actual later error.
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- Both values are evaluated. After a hit, the second comparison is not demanded.
 WITH grouped AS (
     SELECT map_agg(ARRAY[id, CAST(NULL AS BIGINT)], id) AS uncertain
     FROM TABLE(sequence(1, 1)) AS s(id)
@@ -129,7 +128,7 @@ WITH grouped AS (
            MAP(ARRAY[ARRAY[BIGINT '1', BIGINT '2']], ARRAY[BIGINT '1']) AS exact_value
     FROM grouped
 )
-SELECT exact_value IN (exact_value, uncertain)
+SELECT exact_value IN (exact_value, uncertain) AS matched
 FROM pairs;
 
 -- query 12

@@ -82,17 +82,20 @@ fn prepare(
     bindings: ScanBindings,
     output: &ResultSinkBuffer,
 ) -> ExecutionResult<PreparedPipelineExecution> {
-    let state = Arc::new(RuntimeState::for_local_execution(
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(crate::runtime::mem_tracker::MemTracker::new_root(
-            "compiled scan tests",
-        )),
-        Some(crate::runtime::execution_runtime::test_execution_runtime()),
-    ));
+    let state = Arc::new(
+        RuntimeState::for_local_execution(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                "compiled scan tests",
+            )),
+            Some(crate::runtime::execution_runtime::test_execution_runtime()),
+        )
+        .with_test_query_memory(),
+    );
     let dop = i32::try_from(program.graph().profile().pipeline_dop().get()).unwrap();
     prepare_compiled_program_pipeline_execution_with_profiler(
         Arc::clone(program),

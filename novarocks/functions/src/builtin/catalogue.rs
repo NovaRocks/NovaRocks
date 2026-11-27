@@ -911,6 +911,75 @@ fn validate_builtin_selected_domain(
     Ok(())
 }
 
+/// Existing MV state channels require a declared carrier at the source.
+/// A signature's generic UNKNOWN matching and integer widening cannot
+/// supply the serialized state or its scale.
+fn validate_mv_state_arguments(
+    function: &FunctionId,
+    arguments: &[FunctionArgument],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), FunctionBindingError> {
+    let value = |ordinal| match arguments.get(ordinal) {
+        Some(FunctionArgument::Value { value_type, .. }) => Some(value_type.data_type()),
+        _ => None,
+    };
+    let binary_count = match function.as_str() {
+        "builtin.scalar/mv_group_row_id/v1" => {
+            return if arguments.is_empty() {
+                Err(FunctionBindingError::NoMatchingOverload)
+            } else {
+                Ok(())
+            };
+        }
+        "builtin.scalar/state_all_zero/v1" => {
+            work.step()?;
+            return if matches!(
+                value(0),
+                Some(DataType::Binary | DataType::LargeBinary | DataType::Int64)
+            ) {
+                Ok(())
+            } else {
+                Err(FunctionBindingError::NoMatchingOverload)
+            };
+        }
+        "builtin.scalar/avg_state_visible/v1" => {
+            work.step()?;
+            if arguments.len() >= 3 && value(2) != Some(&DataType::Int64) {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            2
+        }
+        "builtin.scalar/count_state_union/v1"
+        | "builtin.scalar/count_distinct_state_union/v1"
+        | "builtin.scalar/approx_count_distinct_state_union/v1"
+        | "builtin.scalar/avg_state_union/v1"
+        | "builtin.scalar/sum_state_union/v1"
+        | "builtin.scalar/min_state_union/v1"
+        | "builtin.scalar/max_state_union/v1"
+        | "builtin.scalar/bool_or_state_union/v1"
+        | "builtin.scalar/bool_and_state_union/v1" => 2,
+        "builtin.scalar/count_state_visible/v1"
+        | "builtin.scalar/count_distinct_state_visible/v1"
+        | "builtin.scalar/approx_count_distinct_state_visible/v1"
+        | "builtin.scalar/sum_state_visible/v1"
+        | "builtin.scalar/min_state_visible/v1"
+        | "builtin.scalar/max_state_visible/v1"
+        | "builtin.scalar/bool_or_state_visible/v1"
+        | "builtin.scalar/bool_and_state_visible/v1" => 1,
+        _ => return Ok(()),
+    };
+    for ordinal in 0..binary_count {
+        work.step()?;
+        if !matches!(
+            value(ordinal),
+            Some(DataType::Binary | DataType::LargeBinary)
+        ) {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct BuiltinScalarResolver {
     function_id: FunctionId,
     canonical_name: Box<str>,
@@ -1303,6 +1372,7 @@ impl BuiltinScalarResolver {
         }
         let carriers = ScalarCarriers::from_values(ScalarTypes::from_values(argument_types));
         validate_builtin_selected_domain(&self.canonical_name, carriers, work)?;
+        validate_mv_state_arguments(&self.function_id, request.arguments, work)?;
         let name = self.canonical_name.as_ref();
         if let Some(operation) = super::json_sql::JsonFunction::from_name(name) {
             operation.check_arguments(argument_types.iter().map(Some), work)?;
@@ -2578,14 +2648,25 @@ fn bind_dynamic_scalar_result_with_creation<H>(
         }
     };
     if matches!(name, "variant_get" | "try_variant_get") {
-        if !(2..=3).contains(&request.arguments.len())
-            || utf8_constant(request.arguments.get(1), work)?.is_none()
-        {
-            return Err(FunctionBindingError::NoMatchingOverload.into());
+        let count = request.arguments.len();
+        if !(2..=3).contains(&count) {
+            return Err(FunctionBindingError::InvalidArguments(
+                format!("{name} expects 2 or 3 arguments, got {count}").into(),
+            )
+            .into());
         }
-        if request.arguments.len() == 3 {
+        if utf8_constant(request.arguments.get(1), work)?.is_none() {
+            return Err(FunctionBindingError::InvalidArguments(
+                format!("{name} path argument must be a string literal").into(),
+            )
+            .into());
+        }
+        if count == 3 {
             let Some(target) = utf8_constant(request.arguments.get(2), work)? else {
-                return Err(FunctionBindingError::NoMatchingOverload.into());
+                return Err(FunctionBindingError::InvalidArguments(
+                    format!("{name} type argument must be a string literal").into(),
+                )
+                .into());
             };
             with_binding_creation(borrow_creator(&mut creation), work, |cx| {
                 cx.array::<u8>(target.trim().len())
@@ -4971,6 +5052,164 @@ mod tests {
             builtin_disposition("negative"),
             Some(BuiltinDisposition::LoweredOnly)
         ));
+    }
+
+    #[test]
+    fn two_stage_collection_selection_keeps_all_eight_installed_overloads() {
+        let catalog = builtin_engine_function_catalog();
+        let integer = FunctionValueType::new(DataType::Int32, false);
+        let list = FunctionValueType::new(
+            DataType::List(Arc::new(arrow_schema::Field::new(
+                "item",
+                DataType::Int32,
+                true,
+            ))),
+            false,
+        );
+        let map = FunctionValueType::new(
+            DataType::Map(
+                Arc::new(arrow_schema::Field::new(
+                    "entries",
+                    DataType::Struct(
+                        [
+                            Arc::new(arrow_schema::Field::new("key", DataType::Int32, false)),
+                            Arc::new(arrow_schema::Field::new("value", DataType::Int32, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            false,
+        );
+        let boolean = FunctionValueType::new(DataType::Boolean, false);
+        let control = crate::binding_test_control();
+        for (name, value, arity, body) in [
+            ("any_match", &list, 1, &boolean),
+            ("all_match", &list, 1, &boolean),
+            ("filter", &list, 1, &boolean),
+            ("transform", &list, 1, &integer),
+            ("array_sort", &list, 2, &integer),
+            ("map_filter", &map, 2, &boolean),
+            ("transform_keys", &map, 2, &integer),
+            ("transform_values", &map, 2, &integer),
+        ] {
+            let argument = FunctionArgument::Value {
+                value_type: value.clone(),
+                constant: None,
+            };
+            let candidate = catalog
+                .begin_higher_order_binding(name, 0, &argument, 1, arity, control)
+                .unwrap();
+            assert_eq!(candidate.parameter_types().len(), arity);
+            let arguments = [
+                FunctionArgument::Value {
+                    value_type: candidate.collection_target().clone(),
+                    constant: None,
+                },
+                FunctionArgument::Lambda {
+                    parameter_types: candidate.parameter_types().clone(),
+                    result_type: body.clone(),
+                },
+            ];
+            let selected = catalog
+                .finish_higher_order_binding(
+                    &candidate,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: 2,
+                        expected_result_type: None,
+                    },
+                    control,
+                )
+                .unwrap();
+            assert_eq!(&selected.selected.overload, candidate.overload());
+            assert_eq!(
+                selected.admitted_execution_abi,
+                Some(crate::PureKernelAbi::HigherOrderV1)
+            );
+        }
+    }
+
+    #[test]
+    fn mv_state_scalar_owners_validate_their_original_argument_channels() {
+        let catalog = builtin_engine_function_catalog();
+        let control = crate::binding_test_control();
+        let select = |name, arguments: &[FunctionArgument]| {
+            catalog.resolve_bound_user(
+                name,
+                FunctionKind::Scalar,
+                FunctionBindingRequest {
+                    arguments,
+                    logical_argument_count: arguments.len(),
+                    expected_result_type: None,
+                },
+                control,
+            )
+        };
+        for (name, arguments) in [
+            (
+                "count_state_union",
+                vec![
+                    value_argument(DataType::Binary, false, None),
+                    value_argument(DataType::LargeBinary, false, None),
+                ],
+            ),
+            (
+                "avg_state_visible",
+                vec![
+                    value_argument(DataType::Binary, false, None),
+                    value_argument(DataType::Binary, false, None),
+                    value_argument(DataType::Int64, false, None),
+                    value_argument(DataType::Float64, true, None),
+                ],
+            ),
+            (
+                "state_all_zero",
+                vec![value_argument(DataType::Int64, false, None)],
+            ),
+            (
+                "mv_group_row_id",
+                vec![
+                    value_argument(DataType::Int32, false, None),
+                    value_argument(DataType::Utf8, false, None),
+                ],
+            ),
+        ] {
+            select(name, &arguments).unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+        for (name, arguments) in [
+            ("mv_group_row_id", vec![]),
+            (
+                "count_state_visible",
+                vec![value_argument(DataType::Utf8, false, None)],
+            ),
+            (
+                "count_state_visible",
+                vec![value_argument(DataType::Null, true, None)],
+            ),
+            (
+                "state_all_zero",
+                vec![value_argument(DataType::Int32, false, None)],
+            ),
+            (
+                "avg_state_visible",
+                vec![
+                    value_argument(DataType::Binary, false, None),
+                    value_argument(DataType::Binary, false, None),
+                    value_argument(DataType::Int32, false, None),
+                ],
+            ),
+        ] {
+            assert!(
+                matches!(
+                    select(name, &arguments),
+                    Err(FunctionBindingError::NoMatchingOverload)
+                ),
+                "{name}"
+            );
+        }
     }
 
     #[test]

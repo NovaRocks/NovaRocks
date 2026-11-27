@@ -24,8 +24,8 @@ fn binary(
     left: ScalarId,
     op: impl Into<crate::common::binary_operator::TestOperator>,
     right: ScalarId,
-    ty: DataType,
-    nullable: bool,
+    _ty: DataType,
+    _nullable: bool,
 ) -> ScalarId {
     arena.test_intern_operator(
         op,

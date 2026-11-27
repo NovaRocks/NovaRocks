@@ -319,7 +319,7 @@ fn canonical_scalar_original_none_survives_nested_and_identity_cast_constant_chi
 }
 
 #[test]
-fn canonical_scalar_cv_null_and_real_sql_keep_original_source_distinct_from_selection() {
+fn canonical_scalar_cv_and_real_sql_preserve_source_and_elide_static_null() {
     let ty = ValueType::new(DataType::Utf8, true);
     let field = Arc::new(
         ty.try_to_field("original_selected_utf8")
@@ -364,31 +364,14 @@ fn canonical_scalar_cv_null_and_real_sql_keep_original_source_distinct_from_sele
     assert_canonical(&owner, fragment, unit_node, source, &ty);
     assert_result(&owner, fragment, unit_node, source, &ty);
 
-    let null = TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::Null),
-        value_type: ValueType::new(DataType::Null, true),
+    let expression = analyze_scalar_fixture("SELECT LOWER(NULL)");
+    let ExprKind::FunctionCall { args, .. } = &expression.kind else {
+        panic!("analyzed LOWER call");
     };
-    let owner = authored(lower_call(null, DecimalOverflowPolicy::ReportError));
-    let (fragment, unit_node, source) = source_named(&owner, "lower");
-    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
-    let original = receipt.captured().request();
-    let original_cv = constant(&original.arguments[0]).unwrap();
-    assert_eq!(original_cv.value_type().data_type().clone(), DataType::Null);
-    let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
-    let typed_cv = constant(&operational[0]).unwrap();
-    let ty = nullable_bounded_character(novarocks_type_contract::CharacterKind::Char, 0);
-    assert_eq!(typed_cv.value_type(), &ty);
-    assert_ne!(
-        typed_cv.pool().backing_identity(),
-        original_cv.pool().backing_identity()
-    );
-    let emitted = physical_constant(&owner, &receipt, receipt.arguments()[0]);
-    assert_eq!(
-        typed_cv.pool().backing_identity(),
-        emitted.pool().backing_identity()
-    );
-    assert_canonical(&owner, fragment, unit_node, source, &ty);
-    assert_result(&owner, fragment, unit_node, source, &ty);
+    let expected = nullable_bounded_character(novarocks_type_contract::CharacterKind::Char, 0);
+    assert_eq!(args[0].value_type, expected);
+    let output = expression.value_type.clone();
+    assert_static_null_root(&authored(expression), &output);
 
     // Independent real analyzer/optimizer/provider completion, rather than a
     // claim that the typed Repeat fixture is a postjoin SQL optimizer route.

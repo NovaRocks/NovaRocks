@@ -19,8 +19,7 @@ use novarocks_expression::{
     testkit::{HarnessControl, constant_policy},
     typing::{
         ChildForm, ChildTyping, Conversion, LiteralEmission, LiteralSyntax, NodeShape, NodeTyping,
-        ScalarTypingRoute, TypedLiteral, TypingContext, TypingError, finish_call,
-        scalar_typing_route, type_node,
+        TypedLiteral, TypingContext, TypingError, finish_call, type_node,
     },
 };
 use novarocks_functions::{
@@ -295,10 +294,7 @@ fn literal_typing_preserves_date_json_and_exact_temporal_values() {
 }
 
 #[test]
-fn shared_route_reserves_special_handling_and_typing_propagates_original_control() {
-    assert_eq!(scalar_typing_route("trim"), ScalarTypingRoute::Shared);
-    assert_eq!(scalar_typing_route("btrim"), ScalarTypingRoute::Legacy);
-    assert_eq!(scalar_typing_route("coalesce"), ScalarTypingRoute::Shared);
+fn scalar_typing_preserves_original_control() {
     struct Stop;
     impl PureCompileControl for Stop {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
@@ -327,4 +323,29 @@ fn shared_route_reserves_special_handling_and_typing_propagates_original_control
         ),
         Err(TypingError::Control(CompileControlError::Cancelled))
     ));
+}
+
+#[test]
+fn string_calls_use_exact_catalogue_selection_and_retired_aliases_stay_unknown() {
+    let catalogue = installed_builtin_owner_catalogue();
+    let context = context(catalogue.metadata());
+    let children = [input(DataType::Utf8, false)];
+    let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
+    let shape = |name| NodeShape::CatalogCall {
+        name,
+        expected_result: None,
+    };
+    let NodeTyping::Call { selected, .. } =
+        type_node(&context, shape("trim"), &children, &mut work).unwrap()
+    else {
+        panic!("TRIM has an ordinary selected call");
+    };
+    let bound = finish_call(&context, &selected, &children, &mut work).unwrap();
+    assert_eq!(bound.function_id.as_str(), "builtin.scalar/trim/v1");
+    for retired in ["btrim", "trim_whitespace"] {
+        assert!(matches!(
+            type_node(&context, shape(retired), &children, &mut work),
+            Err(TypingError::Binding(FunctionBindingError::UnknownFunction)),
+        ));
+    }
 }

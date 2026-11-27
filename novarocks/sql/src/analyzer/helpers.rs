@@ -1095,8 +1095,9 @@ fn eval_limit_or_offset(expr: &ast::Expr, keyword: &str) -> Result<i64, AnalyzeE
 }
 
 /// Evaluate a constant integer expression (literals and simple arithmetic).
+#[recursive::recursive]
 pub(super) fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
-    match expr {
+    let value = match expr {
         ast::Expr::Literal(ast::Literal {
             kind:
                 ast::LiteralKind::Long {
@@ -1104,43 +1105,51 @@ pub(super) fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
                     ..
                 },
             ..
-        }) => Ok(*value),
+        }) => Some(*value),
         ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
-            Ok(-eval_const_i64(&unary.expression)?)
+            eval_const_i64(&unary.expression)?.checked_neg()
         }
         ast::Expr::Binary(binary) => {
             let left = eval_const_i64(&binary.left)?;
             let right = eval_const_i64(&binary.right)?;
             match binary.operator {
-                ast::BinaryOperator::Add => Ok(left + right),
-                ast::BinaryOperator::Subtract => Ok(left - right),
-                ast::BinaryOperator::Multiply => Ok(left * right),
-                ast::BinaryOperator::Divide if right != 0 => Ok(left / right),
-                ast::BinaryOperator::Modulo if right != 0 => Ok(left % right),
-                _ => Err(AnalyzeError::invalid_argument(
-                    format!(
-                        "unsupported operator in constant expression: {}",
-                        binary_operator_display(binary.operator)
-                    ),
-                    expr.span(),
-                )),
+                ast::BinaryOperator::Add => left.checked_add(right),
+                ast::BinaryOperator::Subtract => left.checked_sub(right),
+                ast::BinaryOperator::Multiply => left.checked_mul(right),
+                operator @ (ast::BinaryOperator::Divide | ast::BinaryOperator::Modulo)
+                    if right == 0 =>
+                {
+                    return Err(AnalyzeError::invalid_argument(
+                        format!("unsupported operator in constant expression: {operator:?}"),
+                        expr.span(),
+                    ));
+                }
+                ast::BinaryOperator::Divide => left.checked_div(right),
+                ast::BinaryOperator::Modulo => left.checked_rem(right),
             }
         }
-        _ => Err(AnalyzeError::invalid_literal(
-            format!(
-                "expected constant integer expression, got: {}",
-                crate::parser::expression_for_diagnostic(expr)
-            ),
+        _ => {
+            return Err(AnalyzeError::invalid_literal(
+                format!("expected constant integer expression, got: {expr:?}"),
+                expr.span(),
+            ));
+        }
+    };
+    value.ok_or_else(|| {
+        AnalyzeError::numeric_out_of_range(
+            "constant integer expression overflows BIGINT",
             expr.span(),
-        )),
-    }
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::{DataType, TimeUnit};
 
-    use super::{expr_display_name, sql_type_to_arrow};
+    use crate::analyze_error::AnalyzeErrorKind;
+
+    use super::{eval_const_i64, expr_display_name, sql_type_to_arrow};
 
     fn parse_select_expr(sql: &str) -> novarocks_parser::ast::Expr {
         let query = &novarocks_parser::parser::parse_query(sql).expect("parse SQL");
@@ -1155,6 +1164,69 @@ mod tests {
         assert!(projection_column.alias.is_none(), "anonymous projection");
         let expr = &projection_column.expression;
         expr.clone()
+    }
+
+    #[test]
+    fn ast_const_i64_accepts_parser_integer_spellings_and_checked_arithmetic() {
+        for (source, expected) in [
+            ("-9223372036854775808", i64::MIN),
+            ("-0x8000_0000_0000_0000", i64::MIN),
+            ("9223372036854775807", i64::MAX),
+            ("-9223372036854775807 - 1", i64::MIN),
+            ("-(2 + 3) * 2 / 3 % 2", -1),
+        ] {
+            let expression = parse_select_expr(&format!("SELECT {source}"));
+            assert_eq!(eval_const_i64(&expression).unwrap(), expected, "{source}");
+        }
+        assert!(novarocks_parser::parser::parse_query("SELECT 9223372036854775808").is_err());
+    }
+
+    #[test]
+    fn ast_const_i64_rejects_overflow_at_the_failing_operation() {
+        for source in [
+            "-(-9223372036854775808)",
+            "9223372036854775807 + 1",
+            "-9223372036854775808 - 1",
+            "9223372036854775807 * 2",
+            "-9223372036854775808 / -1",
+            "-9223372036854775808 % -1",
+        ] {
+            let expression = parse_select_expr(&format!("SELECT {source}"));
+            let error = eval_const_i64(&expression).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                AnalyzeErrorKind::NumericOutOfRange,
+                "{source}"
+            );
+            assert_eq!(error.span(), Some(expression.span()), "{source}");
+        }
+        let expression = parse_select_expr("SELECT (9223372036854775807 + 1) - 1");
+        let novarocks_parser::ast::Expr::Binary(outer) = &expression else {
+            panic!("expected subtraction");
+        };
+        let error = eval_const_i64(&expression).unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::NumericOutOfRange);
+        assert_eq!(error.span(), Some(outer.left.span()));
+    }
+
+    #[test]
+    fn ast_const_i64_preserves_unsupported_operand_and_zero_divisor_errors() {
+        for source in ["+1", "1.0", "CAST(1 AS BIGINT)", "abs(1)"] {
+            let expression = parse_select_expr(&format!("SELECT {source}"));
+            let error = eval_const_i64(&expression).unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::InvalidLiteral, "{source}");
+            assert_eq!(error.span(), Some(expression.span()), "{source}");
+        }
+        for (source, operator) in [("1 / 0", "Divide"), ("1 % 0", "Modulo")] {
+            let expression = parse_select_expr(&format!("SELECT {source}"));
+            let error = eval_const_i64(&expression).unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::InvalidArgument, "{source}");
+            assert_eq!(error.span(), Some(expression.span()), "{source}");
+            assert_eq!(
+                error.message(),
+                format!("unsupported operator in constant expression: {operator}")
+            );
+        }
     }
 
     fn parse_native_cast_type(sql: &str) -> novarocks_parser::ast::TypeName {

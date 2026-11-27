@@ -70,15 +70,9 @@ fn construct(
 fn legacy_and_observed_constructor_preserve_exact_error_precedence() {
     use SemanticParameterValue::*;
     let id = SemanticParameterId::new(0);
+    let zone = TimeZone(crate::TimeZoneKey::parse("UTC").unwrap());
     let mut full: Vec<_> = (0..MAX_SEMANTIC_PARAMETERS as u32)
-        .map(|id| {
-            entry(
-                id,
-                SemanticParameterValue::StatementStartUtc(
-                    crate::StatementStartUtc::try_new(0, 0).unwrap(),
-                ),
-            )
-        })
+        .map(|id| entry(id, zone.clone()))
         .collect();
     let mut duplicate_full = full.clone();
     duplicate_full.push(entry(
@@ -159,31 +153,8 @@ fn scoped_raw_values_sparse_ids_and_canonical_zone_identity_are_retained() {
             StatementStartUtc(crate::StatementStartUtc::try_new(i64::MAX, 0).unwrap()),
         ),
         entry(15, TimeZone(original)),
-        entry(
-            9,
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(0, 0).unwrap(),
-            ),
-        ),
-        entry(
-            8,
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(1, 0).unwrap(),
-            ),
-        ),
-        entry(
-            7,
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(0, 0).unwrap(),
-            ),
-        ),
         entry(16, TimeZone(crate::TimeZoneKey::parse("UTC").unwrap())),
-        entry(
-            19,
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(1, 0).unwrap(),
-            ),
-        ),
+        entry(19, TimeZone(crate::TimeZoneKey::parse("UTC").unwrap())),
     ];
     let expected = SemanticParameters::try_new(entries.clone()).unwrap();
     let c = Control::default();
@@ -196,8 +167,12 @@ fn scoped_raw_values_sparse_ids_and_canonical_zone_identity_are_retained() {
     assert_eq!(zone.name(), "+08:00");
     assert_eq!(
         output.get(SemanticParameterId::new(19)),
-        Some(&SemanticParameterValue::StatementStartUtc(
-            crate::StatementStartUtc::try_new(1, 0).unwrap()
+        output.get(SemanticParameterId::new(16))
+    );
+    assert_eq!(
+        output.get(SemanticParameterId::new(0)),
+        Some(&StatementStartUtc(
+            crate::StatementStartUtc::try_new(i64::MAX, 0).unwrap()
         ))
     );
     let trace = c.trace();

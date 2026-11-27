@@ -566,7 +566,7 @@ mod tests {
                 "WINDOW [row_number() OVER (PARTITION BY k ORDER BY k ASC)]".to_string(),
                 "  PROJECT [t.k AS k]".to_string(),
                 "    FILTER".to_string(),
-                "      predicate: t.k > 10".to_string(),
+                "      predicate: 10 < t.k".to_string(),
                 "      0:SCAN test_db.t (alias=t)".to_string(),
             ]
         );

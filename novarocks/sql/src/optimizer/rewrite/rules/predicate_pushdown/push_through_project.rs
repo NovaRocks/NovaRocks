@@ -789,7 +789,7 @@ mod tests {
         }
     }
 
-    // Test 3: AND of a pass-through ref (a = 1) and a computed-expr ref (x = 5)
+    // Test 3: AND of a pass-through ref (a = 1) and a computed-expr ref (x = 1)
     // Expected shape: Filter(Project(Filter(Scan)))
     #[test]
     fn partial_pushdown_through_project() {
@@ -798,9 +798,9 @@ mod tests {
         let x_id = col_id(2);
         let scan = scan_opt(&mut arena, &[("a", a_id)]);
         let computed_expr = crate::common::binary_operator::test_operator(
-            BinOp::Add,
+            BinOp::Mod,
             col_ref("a", a_id),
-            int_lit(1),
+            int_lit(2),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
         let passthrough_id = crate::planner::optimizer_bridge::scalar::intern_typed(
@@ -837,12 +837,32 @@ mod tests {
         );
         let pred = and(
             eq(col_ref("a", a_id), int_lit(1)),
-            eq(col_ref("x", x_id), int_lit(5)),
+            eq(col_ref("x", x_id), int_lit(1)),
         );
         let filter = filter_opt(&mut arena, pred, project);
+        let mut blocked = filter.clone();
+        let Operator::LogicalProject(project) = &mut blocked.children[0].op else {
+            panic!("expected Project under outer Filter");
+        };
+        let checked_add = crate::common::binary_operator::test_operator(
+            BinOp::Add,
+            col_ref("a", a_id),
+            int_lit(1),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
+        project.items[1].expr = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &checked_add,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         let rule = PushDownPredicateProject;
         let mut ctx = make_ctx(arena);
+        assert!(matches!(
+            rule.apply(blocked, &mut ctx).unwrap(),
+            RewriteResult::Unchanged
+        ));
         let result = rule.apply(filter, &mut ctx).unwrap();
 
         // Expected: Filter(Project(Filter(Scan)))

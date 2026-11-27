@@ -478,21 +478,26 @@ fn assert_bound_binary_operator(
         panic!("expected two ordered operands for {operator:?}");
     };
     assert_eq!(binding.function_id, operator.function_id());
-    let original_right = match &right.kind {
+    let (value, literal) = if operator == OperatorFunction::LessThan {
+        (right, left)
+    } else {
+        (left, right)
+    };
+    let original_right = match &literal.kind {
         ExprKind::Cast {
             expr,
             target,
             cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
             ..
         } => {
-            assert_eq!(target, right.value_type.data_type());
+            assert_eq!(target, literal.value_type.data_type());
             assert!(crate::optimizer::scalar_expr::lossless_signed_widening(
                 &expr.value_type,
-                &right.value_type
+                &literal.value_type
             ));
             expr.as_ref()
         }
-        _ => right,
+        _ => literal,
     };
     assert!(matches!(
         original_right.kind,
@@ -519,7 +524,7 @@ fn assert_bound_binary_operator(
             FunctionIntrinsicRowError::NoRowError
         }
     );
-    left
+    value
 }
 
 fn first_window_exprs(plan: &LogicalPlanNode) -> Vec<WindowExpr> {
@@ -1138,7 +1143,7 @@ fn p2_having_rewrites_agg_call_to_output_id_ref() {
         "AggregateCall must have a real output id"
     );
 
-    let left = assert_bound_binary_operator(&filter.predicate, OperatorFunction::GreaterThan, 10);
+    let left = assert_bound_binary_operator(&filter.predicate, OperatorFunction::LessThan, 10);
     let ExprKind::ColumnRef {
         column_id, column, ..
     } = &left.kind
@@ -1228,7 +1233,7 @@ fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
         "computed group key ColumnRef must preserve the group expression display name"
     );
 
-    let left = assert_bound_binary_operator(&filter.predicate, OperatorFunction::GreaterThan, 1);
+    let left = assert_bound_binary_operator(&filter.predicate, OperatorFunction::LessThan, 1);
     let ExprKind::ColumnRef {
         column_id, column, ..
     } = &left.kind
@@ -2800,7 +2805,7 @@ fn p2_subquery_alias_reexposes_producing_id() {
         ColumnId::UNSET,
         "subquery alias producer must expose a real ColumnId"
     );
-    let left = assert_bound_binary_operator(&filter.predicate, OperatorFunction::GreaterThan, 1);
+    let left = assert_bound_binary_operator(&filter.predicate, OperatorFunction::LessThan, 1);
     assert_eq!(
         column_ref_id(left),
         producing_id,

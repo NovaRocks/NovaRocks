@@ -141,10 +141,14 @@ fn apply_expr(
         })?;
     let inner_col_ref = scalar_utils::column_ref(arena, inner_col_oc, control)?;
 
+    let operator = crate::common::binary_operator::subquery_equality(
+        arena.data_type(lhs),
+        arena.data_type(inner_col_ref),
+    );
     let in_key = crate::optimizer::scalar::intern_scalar_operator(
         function_catalog,
         arena,
-        novarocks_type_contract::OperatorFunction::Equal,
+        operator,
         [lhs, inner_col_ref],
         policy,
         control,

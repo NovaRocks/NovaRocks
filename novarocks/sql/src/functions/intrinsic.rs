@@ -106,6 +106,10 @@ mod tests {
         for (name, expected) in [
             ("negative", BuiltinDisposition::LoweredOnly),
             ("to_unix_timestamp", BuiltinDisposition::Unavailable),
+            ("none_match", BuiltinDisposition::Unavailable),
+            ("reduce", BuiltinDisposition::Unavailable),
+            ("zip_with", BuiltinDisposition::Unavailable),
+            ("map_zip_with", BuiltinDisposition::Unavailable),
         ] {
             assert!(declared.insert(name.to_owned()), "{name}");
             assert_eq!(builtin_disposition(name), Some(expected), "{name}");

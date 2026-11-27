@@ -516,6 +516,9 @@ fn fixture_with_source_parameters(
             .attach_runtime_filter(ordered_tests::FILTER)
             .unwrap();
     }
+    if residual.is_some() {
+        builder.seal_catalogue_units();
+    }
     let definition = finish(
         builder,
         topn,
@@ -573,9 +576,10 @@ fn fixture_with_source_parameters(
         let package = packages_with_reads(&plan, &reads)
             .remove(&FragmentId::new(1))
             .unwrap();
+        let executable = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
         compile_with_providers(
             package,
-            &catalog,
+            &executable,
             2,
             true,
             &crate::runtime::task::scan::compiled_fixture::providers(),

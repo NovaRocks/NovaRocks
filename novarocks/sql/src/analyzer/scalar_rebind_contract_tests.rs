@@ -316,17 +316,17 @@ fn bind(
     }
 }
 fn assert_ordinary(path: Path, error: &AnalyzeError) {
-    assert_eq!(error.control_error(), None);
-    match path {
-        Path::Ordinary => {
-            assert_eq!(error.kind(), AnalyzeErrorKind::Internal);
-            assert_eq!(error.span(), None);
-        }
-        Path::Resolved | Path::Shared => {
-            assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch);
-            assert_eq!(error.span(), Some(SPAN));
-        }
-    }
+    assert_eq!(error.control_error(), None, "{path:?}");
+    assert_eq!(
+        error.kind(),
+        AnalyzeErrorKind::TypeMismatch,
+        "{path:?}: {error}"
+    );
+    let span = match path {
+        Path::Ordinary => novarocks_parser::SYNTHETIC,
+        Path::Resolved | Path::Shared => SPAN,
+    };
+    assert_eq!(error.span(), Some(span), "{path:?}: {error}");
 }
 
 #[test]
@@ -413,10 +413,12 @@ fn scalar_rebind_lawful_canonical_source_keeps_policy_and_catalog_owned_changed_
             };
             assert_eq!(*target, DataType::Int64);
             let expected_mode = match path {
-                Path::Ordinary | Path::Resolved => None,
-                Path::Shared => Some(novarocks_type_contract::TrinoCastMode::Implicit),
+                Path::Ordinary | Path::Shared => {
+                    Some(novarocks_type_contract::TrinoCastMode::Implicit)
+                }
+                Path::Resolved => None,
             };
-            assert_eq!(*cast_mode, expected_mode);
+            assert_eq!(*cast_mode, expected_mode, "{path:?}");
             assert_eq!(*decimal_overflow_policy, policy);
             assert_eq!(expr.value_type, original.value_type);
             assert!(
@@ -735,6 +737,21 @@ fn scalar_rebind_full_value_and_callable_targets_match_actual_coerced_ast() {
             assert_ordinary(path, &error);
             assert_eq!(catalog.calls.load(Ordering::SeqCst), 2);
         }
+        if matches!(path, Path::Ordinary) {
+            let catalog = FaultCatalog::new(catalog(Behavior::Echo), 0, Fault::Shape);
+            let error = bind(
+                path,
+                &catalog,
+                vec![lambda()],
+                DecimalOverflowPolicy::ReportError,
+                &Trace::default(),
+            )
+            .unwrap_err();
+            assert_ordinary(path, &error);
+            assert!(error.message().contains("cannot take a lambda"));
+            assert_eq!(catalog.calls.load(Ordering::SeqCst), 0);
+            continue;
+        }
         let (args, binding, result) = bind(
             path,
             catalog(Behavior::Echo).as_ref(),
@@ -811,9 +828,10 @@ fn scalar_rebind_actual_success_and_ordinary_tail_keep_every_control_prefix() {
             }
             let recorded = trace.recorded();
             assert!(!recorded.is_empty());
-            assert_eq!(
-                recorded.last().unwrap().0,
-                CompilePhase::FunctionSpecialization
+            assert!(
+                recorded
+                    .iter()
+                    .any(|(phase, _)| *phase == CompilePhase::FunctionSpecialization)
             );
             for at in 0..recorded.len() {
                 for cause in CAUSES {

@@ -1483,7 +1483,8 @@ mod tests {
     }
     #[test]
     fn same_key_in_two_lexical_refs_is_not_one_call_environment() {
-        let owner = Owner::new();
+        let mut owner = Owner::new();
+        owner.declaration.environment_dependencies = Box::new([SemanticParameterKey::TimeZone]);
         let id = FunctionId::try_new("fixture/effect").unwrap();
         let selected = selected();
         let args = [FunctionArgument::Value {
@@ -1496,24 +1497,24 @@ mod tests {
         let environment = [
             SemanticParameterRef {
                 id: SemanticParameterId::new(1),
-                expected_key: SemanticParameterKey::StatementStartUtc,
+                expected_key: SemanticParameterKey::TimeZone,
             },
             SemanticParameterRef {
                 id: SemanticParameterId::new(2),
-                expected_key: SemanticParameterKey::StatementStartUtc,
+                expected_key: SemanticParameterKey::TimeZone,
             },
         ];
         let parameters = SemanticParameters::try_new([
             (
                 environment[0].id,
-                SemanticParameterValue::StatementStartUtc(
-                    novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
+                SemanticParameterValue::TimeZone(
+                    novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
                 ),
             ),
             (
                 environment[1].id,
-                SemanticParameterValue::StatementStartUtc(
-                    novarocks_type_contract::StatementStartUtc::try_new(0, 0).unwrap(),
+                SemanticParameterValue::TimeZone(
+                    novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
                 ),
             ),
         ])
@@ -1540,7 +1541,12 @@ mod tests {
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             proof_scope: CallProofScope::Unconditional,
         };
-        assert!(refine_call_effects(&owner, input, &Control(false)).is_err());
+        assert!(matches!(
+            refine_call_effects(&owner, input, &Control(false)),
+            Err(CallEffectRefinementError::InvalidInput(
+                "call effect environment is not an exact frozen declared dependency",
+            ))
+        ));
         assert_eq!(owner.calls.load(Ordering::Relaxed), 0);
     }
 

@@ -537,7 +537,7 @@ fn case_fixture(constants: &mut crate::tests::constant_fixture::ConstantFixture)
             }),
         },
     ];
-    let first = context(0, 12, EvaluationDemand::TruthOnly);
+    let first = context(0, 12, EvaluationDemand::Value);
     let then = context(u32::MAX, 10, EvaluationDemand::Value);
     let unit = make_unit(
         definitions,
@@ -987,7 +987,7 @@ fn repeated_definition_preserves_complete_per_use_claims_and_exact_binding_borro
 // The fragment/snapshot part is also retained by property_proof_tests.
 
 #[test]
-fn one_scalar_definition_has_independent_truth_and_guarded_value_occurrences() {
+fn one_scalar_definition_has_independent_guarded_case_value_occurrences() {
     let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
     let mut fixture = case_fixture(&mut constants);
     fixture.edit_unit(|parts| {
@@ -1001,7 +1001,7 @@ fn one_scalar_definition_has_independent_truth_and_guarded_value_occurrences() {
     fixture.checked().unwrap();
     let first = &fixture.claims()[&ExpressionUseId::new(0)];
     let then = &fixture.claims()[&ExpressionUseId::new(u32::MAX)];
-    assert_eq!(first.context.demand, EvaluationDemand::TruthOnly);
+    assert_eq!(first.context.demand, EvaluationDemand::Value);
     assert_eq!(then.context.demand, EvaluationDemand::Value);
     assert_ne!(first.context.region, then.context.region);
     assert_eq!(

@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use arrow::datatypes::TimeUnit;
+use arrow::datatypes::{DataType, TimeUnit};
 
 #[test]
 fn comparison_conversions_keep_each_side_nullability_and_late_output_null_policy() {

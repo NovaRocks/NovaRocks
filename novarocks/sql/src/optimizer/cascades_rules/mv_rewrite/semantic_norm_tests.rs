@@ -204,7 +204,6 @@ fn normalization_preserves_membership_multiplicity_and_candidate_and_case_arm_or
     let mut arena = ScalarArena::new();
     let one = scalar_constant(&mut arena, selected("source", "same", vec![Some(1)], 0));
     let two = scalar_constant(&mut arena, selected("source", "same", vec![Some(2)], 0));
-    let integer = FunctionValueType::new(DataType::Int64, false);
     let boolean = FunctionValueType::new(DataType::Boolean, false);
     let add = |arena: &mut ScalarArena, left, right| {
         arena.test_intern_operator(

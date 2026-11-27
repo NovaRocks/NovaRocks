@@ -49,6 +49,22 @@ use crate::{
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
 };
 
+/// Disclosed higher-order forms whose runtime owners are outside this catalogue.
+pub(super) const UNAVAILABLE: [(&str, &str); 4] = [
+    ("none_match", "builtin.scalar/none_match/lambda-v1"),
+    ("reduce", "builtin.scalar/reduce/lambda-v1"),
+    ("zip_with", "builtin.scalar/zip_with/lambda-v1"),
+    ("map_zip_with", "builtin.scalar/map_zip_with/lambda-v1"),
+];
+
+pub fn unavailable_overload(name: &str) -> Option<FunctionOverloadId> {
+    UNAVAILABLE.iter().find_map(|&(candidate, overload)| {
+        (candidate == name).then(|| {
+            FunctionOverloadId::try_new(overload).expect("valid unavailable lambda identity")
+        })
+    })
+}
+
 #[derive(Clone, Copy)]
 enum ResultShape {
     Collection,

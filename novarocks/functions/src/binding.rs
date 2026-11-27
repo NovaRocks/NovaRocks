@@ -1209,9 +1209,12 @@ impl EngineFunctionCatalog {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         let result = (|| {
             work.step()?;
-            let definition = self
-                .definition(name, FunctionKind::Scalar)
-                .ok_or(FunctionBindingError::UnknownFunction)?;
+            let definition = self.definition(name, FunctionKind::Scalar).ok_or_else(|| {
+                crate::builtin::collection_lambda::unavailable_overload(name).map_or(
+                    FunctionBindingError::UnknownFunction,
+                    FunctionBindingError::UnavailableImplementation,
+                )
+            })?;
             if definition.visibility == FunctionVisibility::Hidden {
                 return Err(FunctionBindingError::HiddenFunction);
             }
@@ -1329,6 +1332,28 @@ impl EngineFunctionCatalog {
         request: FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.resolve_user_selection(name, kind, request, false, control)
+    }
+
+    /// Select user window syntax using the original owner's input adjustment.
+    /// The unchanged relation ABI separately consumes its declared channels.
+    pub fn resolve_window_syntax_binding(
+        &self,
+        name: &str,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.resolve_user_selection(name, FunctionKind::Window, request, true, control)
+    }
+
+    fn resolve_user_selection(
+        &self,
+        name: &str,
+        kind: FunctionKind,
+        request: FunctionBindingRequest<'_>,
+        window_syntax: bool,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         let result = (|| {
             work.step()?;
@@ -1338,7 +1363,27 @@ impl EngineFunctionCatalog {
             if definition.visibility == FunctionVisibility::Hidden {
                 return Err(FunctionBindingError::HiddenFunction);
             }
-            resolve_definition(definition, request, &mut work)
+            let adjusted = if window_syntax {
+                // Validate the actual caller's constant source even when its
+                // selected target will require a conversion.
+                validate_request(kind, request, &mut work)?;
+                let binding = exact_definition(definition)?;
+                crate::builtin::window_offset_owner::binding_arguments(
+                    binding.declaration.function_id(),
+                    request.arguments,
+                    &mut work,
+                )?
+            } else {
+                None
+            };
+            resolve_definition(
+                definition,
+                FunctionBindingRequest {
+                    arguments: adjusted.as_deref().unwrap_or(request.arguments),
+                    ..request
+                },
+                &mut work,
+            )
         })();
         finish_binding_work(result, work)
     }

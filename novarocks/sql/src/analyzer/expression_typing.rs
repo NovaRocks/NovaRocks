@@ -697,7 +697,7 @@ pub(crate) fn type_optimizer_operator(
     ))
 }
 
-fn type_scalar_call_with_finalizer(
+pub(super) fn type_scalar_call_with_finalizer(
     finalizer: &BindingFinalizer<'_>,
     shape: NodeShape<'_>,
     args: Vec<TypedExpr>,
@@ -717,7 +717,7 @@ fn type_scalar_call_with_finalizer(
                 selected,
                 conversions,
             } = typing::type_node(context, shape, &children, work)
-                .map_err(|error| scalar_selection_error(error, shape, &args))?
+                .map_err(|error| scalar_selection_error(error, shape, &args, span))?
             else {
                 return Err(TypingError::InvalidShape("expected a bound scalar call").into());
             };
@@ -767,17 +767,22 @@ fn scalar_selection_error(
     error: TypingError,
     shape: NodeShape<'_>,
     args: &[TypedExpr],
-) -> TypingError {
+    span: Span,
+) -> SqlTypingError {
     match (shape, error) {
+        (
+            NodeShape::CatalogCall { name, .. },
+            TypingError::Binding(FunctionBindingError::UnknownFunction),
+        ) => AnalyzeError::unknown_function(format!("Unknown function: {name}"), span).into(),
         (NodeShape::CatalogCall { name, .. }, TypingError::Binding(error))
             if !matches!(
                 error,
                 FunctionBindingError::UnavailableImplementation(_)
                     | FunctionBindingError::VariantTargetType(_)
+                    | FunctionBindingError::InvalidArguments(_)
                     | FunctionBindingError::ValueType(
                         novarocks_type_contract::ValueTypeError::InvalidCharacterWidth { .. }
                     )
-                    | FunctionBindingError::UnknownFunction
                     | FunctionBindingError::OperatorNotFound
                     | FunctionBindingError::HiddenFunction
                     | FunctionBindingError::NoMatchingOverload
@@ -788,8 +793,9 @@ fn scalar_selection_error(
             TypingError::TypeMismatch(format!(
                 "cannot bind scalar function `{name}` for argument types {arg_types:?}: {error}"
             ))
+            .into()
         }
-        (_, error) => error,
+        (_, error) => error.into(),
     }
 }
 

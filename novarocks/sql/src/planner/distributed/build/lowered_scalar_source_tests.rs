@@ -124,6 +124,41 @@ pub(in crate::planner::distributed::build) fn lower_call(
         value_type: ty,
     }
 }
+pub(in crate::planner::distributed::build) fn assert_static_null_root(
+    owner: &SqlAuthoredPhysicalPlan,
+    expected: &ValueType,
+) {
+    let fragment = &owner.plan().fragments()[&ROOT_FRAGMENT_ID];
+    let node = &fragment.nodes()[&fragment.root()];
+    let unit = node
+        .expressions
+        .as_ref()
+        .expect("actual output expression unit");
+    assert!(unit.claims().is_empty());
+    assert!(unit.requests().is_empty());
+    let [root] = unit.roots() else {
+        panic!("exactly one output");
+    };
+    let expression = unit.definition(root.definition).unwrap();
+    assert_eq!(&expression.ty, expected);
+    let ContractExprKind::Constant(reference) = expression.kind else {
+        panic!("strict call becomes a typed constant");
+    };
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let emitted = owner
+        .plan()
+        .constants()
+        .resolve_observed(reference, expected, &mut work)
+        .unwrap();
+    assert!(
+        emitted
+            .is_null_observed(CompilePhase::Validate, &control)
+            .unwrap()
+    );
+    work.finish().unwrap();
+}
+
 fn emission_plan(expression: TypedExpr) -> PhysicalPlanNode {
     let mut output = column(
         71,
@@ -334,8 +369,8 @@ fn bound_lambda_fixture(
     }
 }
 
-pub(in crate::planner::distributed::build) fn lower_lambda_fixture() -> TypedExpr {
-    let query = novarocks_parser::parser::parse_query("SELECT ARRAY['AA','BB']").unwrap();
+fn analyze_scalar_fixture(sql: &str) -> TypedExpr {
+    let query = novarocks_parser::parser::parse_query(sql).unwrap();
     let (query, _, _) = crate::analyzer::analyze(
         &query,
         &crate::catalog::memory::PlannerMemoryCatalog::default(),
@@ -343,9 +378,13 @@ pub(in crate::planner::distributed::build) fn lower_lambda_fixture() -> TypedExp
     )
     .unwrap();
     let crate::analysis::QueryBody::Select(select) = query.body else {
-        panic!("source array projection");
+        panic!("source projection");
     };
-    let array = select.projection.into_iter().next().unwrap().expr;
+    select.projection.into_iter().next().unwrap().expr
+}
+
+pub(in crate::planner::distributed::build) fn lower_lambda_fixture() -> TypedExpr {
+    let array = analyze_scalar_fixture("SELECT ARRAY['AA','BB']");
     let parameter_type = array.value_type.child_at(0).unwrap();
     let parameter = TypedExpr {
         kind: ExprKind::LambdaParamRef {
@@ -736,109 +775,30 @@ fn scalar_journal_loan_success_and_ordinary_errors_observe_every_original_contro
 }
 
 #[test]
-fn scalar_journal_bare_null_and_cast_null_keep_distinct_original_request_sources() {
-    // Already-typed emitter fixtures. These exercise the original bare-NULL
-    // canonicalization and Cast folding; they do not certify parser/optimizer
-    // producer reachability or strengthen the journal's request-data claim.
+fn scalar_emission_elides_strict_lower_for_typed_and_cast_null() {
     let null = TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Null),
         value_type: ValueType::new(DataType::Null, true),
     };
-    let owner = authored(lower_call(null.clone(), DecimalOverflowPolicy::ReportError));
-    let (fragment, unit_node, source) = scalar_source(&owner);
-    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
-    let captured_request = receipt.captured().request();
-    let FunctionArgument::Value {
-        value_type,
-        constant: Some(captured),
-    } = &captured_request.arguments[0]
-    else {
-        panic!("original bare NULL request")
+    let target = nullable_bounded_character(novarocks_type_contract::CharacterKind::Char, 0);
+    let typed = TypedExpr {
+        kind: null.kind.clone(),
+        value_type: target,
     };
-    assert_eq!(value_type, &ValueType::new(DataType::Null, true));
-    assert_eq!(captured.value_type(), value_type);
-    let selected_argument = &receipt
-        .captured()
-        .binding()
-        .resolved()
-        .selected
-        .argument_types[0];
-    assert_eq!(
-        selected_argument,
-        &FunctionArgumentType::Value(nullable_bounded_character(
-            novarocks_type_contract::CharacterKind::Char,
-            0,
-        ))
-    );
-    let emitted = physical_constant(&owner, &receipt, receipt.arguments()[0]);
-    assert_eq!(
-        emitted.value_type(),
-        &nullable_bounded_character(novarocks_type_contract::CharacterKind::Char, 0)
-    );
-    assert_eq!(emitted.try_utf8().unwrap(), None);
-    let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
-    let projected = constant(&operational[0]).unwrap();
-    assert_eq!(projected.value_type(), emitted.value_type());
-    assert_eq!(
-        projected.pool().backing_identity(),
-        emitted.pool().backing_identity()
-    );
-    assert_ne!(
-        projected.pool().backing_identity(),
-        captured.pool().backing_identity()
-    );
-    // Conversion authors a new typed NULL; the retained Null source is neither
-    // retyped nor presented as the resulting UTF8 constant's backing.
-    assert!(!Arc::ptr_eq(
-        captured.pool().array(),
-        emitted.pool().array()
-    ));
     let cast = TypedExpr {
         kind: ExprKind::Cast {
             cast_mode: None,
-            expr: novarocks_parser::ast::AstBox::new(null),
+            expr: null.into(),
             target: DataType::Utf8,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
         },
         value_type: ValueType::new(DataType::Utf8, true),
     };
-    // Cast(NULL) currently leaves an unreachable original NULL definition in
-    // this typed fixture. Whole-plan validation refuses that existing shape;
-    // inspect actual emission only, without claiming publication acceptance.
-    let control = Control::default();
-    let mut visitor = ContractLoweringVisitor::new(
-        version(),
-        dop(),
-        None,
-        crate::functions::builtin_sql_function_catalog().snapshot(),
-        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        policy(),
-        &control,
-    )
-    .unwrap();
-    let emitted_call = visitor
-        .lower_expression(
-            NodeId::new(74),
-            &lower_call(cast, DecimalOverflowPolicy::ReportError),
-            &BTreeMap::new(),
-        )
-        .unwrap();
-    let entry = &visitor.call_sources.expression_entries
-        [&crate::planner::distributed::build::unit_source::ScalarDefinitionAddress::new(
-            crate::planner::distributed::build::unit_source::ScalarSourceSite::Node {
-                fragment: ROOT_FRAGMENT_ID,
-                node: NodeId::new(74),
-            },
-            emitted_call,
-        )];
-    assert!(constant(&entry.captured.request().arguments[0]).is_none());
-    let emitted = visitor.fragments[&ROOT_FRAGMENT_ID]
-        .construction_unit(NodeId::new(74))
-        .unwrap()
-        .definition(entry.arguments[0])
-        .unwrap();
-    assert_eq!(emitted.ty, ValueType::new(DataType::Utf8, true));
-    assert!(matches!(emitted.kind, ContractExprKind::Constant(_)));
+    for source in [typed, cast] {
+        let expression = lower_call(source, DecimalOverflowPolicy::ReportError);
+        let ty = expression.value_type.clone();
+        assert_static_null_root(&authored(expression), &ty);
+    }
 }
 
 #[test]

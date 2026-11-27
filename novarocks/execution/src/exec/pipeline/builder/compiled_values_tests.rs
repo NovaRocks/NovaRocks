@@ -108,8 +108,6 @@ fn values_program_with_sources(
     pools: Vec<ConstantPool>,
     types: &[FunctionValueType],
 ) -> Arc<LocalProgram> {
-    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
-
     // The package constant namespace is closed: publish only cited pools.
     let mut constants = ConstantPools::empty();
     for (id, pool) in pools.iter().enumerate() {
@@ -123,6 +121,8 @@ fn values_program_with_sources(
                 .unwrap();
         }
     }
+    let fixture_sources =
+        crate::exec::operators::family_fixture::constant_sources::Sources::from_pools(constants);
     let mut builder =
         crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
             FragmentId::new(57),
@@ -191,19 +191,16 @@ fn values_program_with_sources(
                 }
                 Cell::Overflow => {
                     let operand = FunctionValueType::new(DataType::Int64, false);
-                    let mut sum = arithmetic_result_value_type_with_op(
-                        &operand,
+                    let sum = arithmetic_result_value_type_with_op(
+                        &ty,
                         &operand,
                         novarocks_type_contract::ArithmeticOperator::Add,
                     )
                     .unwrap();
-                    sum = sum
-                        .with_nullable(true)
-                        .expect("valid test root nullability");
                     assert_eq!(sum, ty, "BIGINT + BIGINT fills the nullable BIGINT column");
                     let left = builder.constant(
                         VALUES,
-                        operand.clone(),
+                        ty,
                         crate::exec::operators::family_fixture::constant_sources::i64(i64::MAX),
                     );
                     let right = builder.constant(
@@ -281,25 +278,22 @@ fn values_program_with_sources(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let parameters = if rows
-        .iter()
-        .flatten()
-        .any(|cell| matches!(cell, Cell::Overflow))
-    {
-        SemanticParameters::default()
-    } else {
-        SemanticParameters::default()
-    };
-    compile(package_with_parameters(fragment, constants, parameters), 1)
+    compile(
+        package_with_parameters(
+            fragment,
+            ConstantPools::empty(),
+            SemanticParameters::default(),
+        ),
+        1,
+    )
 }
 
 fn package_with_parameters(
     fragment: crate::exec::operators::family_fixture::constant_sources::Fragment,
-    constants: ConstantPools,
+    mut constants: ConstantPools,
     parameters: SemanticParameters,
 ) -> Arc<FragmentPackage> {
     let (fragment, sources) = fragment.into_parts();
-    let mut constants = constants;
     crate::exec::operators::family_fixture::constant_sources::merge(&mut constants, &sources);
     let output = fragment.nodes()[&fragment.root()].output.clone();
     let result = ResultPort {
@@ -383,17 +377,20 @@ fn cell_site(program: &LocalProgram, row: u32, column: u32) -> Option<ProgramRoo
 }
 
 fn failure(program: &Arc<LocalProgram>) -> ExecutionFailure {
-    let state = Arc::new(RuntimeState::for_local_execution(
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(crate::runtime::mem_tracker::MemTracker::new_root(
-            "compiled values tests",
-        )),
-        Some(crate::runtime::execution_runtime::test_execution_runtime()),
-    ));
+    let state = Arc::new(
+        RuntimeState::for_local_execution(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                "compiled values tests",
+            )),
+            Some(crate::runtime::execution_runtime::test_execution_runtime()),
+        )
+        .with_test_query_memory(),
+    );
     let output = ResultSinkBuffer::new();
     let prepared = prepare_compiled_program_pipeline_execution(
         Arc::clone(program),

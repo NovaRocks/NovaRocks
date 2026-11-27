@@ -52,4 +52,4 @@ PLAN FRAGMENT 3
      TABLE: ${case_db}.g3_pt_a
      columns: k, v
      min-max stats
-     predicates: a.v > 0 AND a.k IS NOT NULL
+     predicates: 0 < a.v AND a.k IS NOT NULL

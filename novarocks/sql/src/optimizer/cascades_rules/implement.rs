@@ -148,16 +148,17 @@ fn comparison_key(arena: &ScalarArena, expr: ScalarId) -> Option<ScalarHashJoinE
 
     let (operator, [left, right]) = crate::common::binary_operator::scalar_operands(arena, expr)?;
     let null_safe = match operator {
-        OperatorFunction::Equal => false,
+        OperatorFunction::Equal | OperatorFunction::SubqueryFloatEqual => false,
         OperatorFunction::Identical => true,
         _ => return None,
     };
-    let match_relation =
-        if !null_safe && matches!(arena.data_type(left), DataType::Float32 | DataType::Float64) {
-            JoinKeyMatch::IeeeFloat
-        } else {
-            JoinKeyMatch::Grouping
-        };
+    let match_relation = if operator == OperatorFunction::Equal
+        && matches!(arena.data_type(left), DataType::Float32 | DataType::Float64)
+    {
+        JoinKeyMatch::IeeeFloat
+    } else {
+        JoinKeyMatch::Grouping
+    };
     Some(ScalarHashJoinEqCondition {
         left,
         right,
@@ -173,18 +174,10 @@ fn append_residual_condition(
     residual: ScalarId,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(), crate::compiler::SqlCompileError> {
-    *other = Some(match other.take() {
-        Some(existing) => arena.intern_observed(
-            ScalarNode::BooleanConnective {
-                left: existing,
-                op: crate::common::BooleanOp::And,
-                right: residual,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            control,
-        )?,
-        None => residual,
-    });
+    *other = match other.take() {
+        Some(existing) => scalar_expr::combine_conjuncts(arena, vec![existing, residual], control)?,
+        None => Some(residual),
+    };
 
     Ok(())
 }
@@ -1917,13 +1910,23 @@ mod join_demotion_tests {
 
     /// Create a scan group whose logical_props report the given output columns.
     fn mk_scan_group(memo: &mut Memo, col_names: &[&str]) -> usize {
-        let output_columns: Vec<OutputColumn> = col_names
+        let columns: Vec<_> = col_names
             .iter()
-            .map(|name| OutputColumn {
+            .map(|name| (*name, DataType::Int32))
+            .collect();
+        mk_typed_scan_group(memo, &columns)
+    }
+
+    fn mk_typed_scan_group(memo: &mut Memo, columns: &[(&str, DataType)]) -> usize {
+        let output_columns: Vec<OutputColumn> = columns
+            .iter()
+            .map(|(name, data_type)| OutputColumn {
                 column_id: test_col_id(name),
                 name: (*name).into(),
-                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
-
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    data_type.clone(),
+                    false,
+                ),
                 is_internal: false,
             })
             .collect();
@@ -2106,6 +2109,31 @@ mod join_demotion_tests {
     }
 
     #[test]
+    fn appending_a_demoted_equality_keeps_residual_order_and_nullability() {
+        use crate::common::{BooleanOp, LiteralValue};
+        use novarocks_type_contract::FunctionValueType;
+
+        let mut memo = Memo::new();
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let nullable = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Null),
+            value_type: FunctionValueType::new(DataType::Boolean, true),
+        };
+        let eq = bin(col("a_id"), BinOp::Eq, col("a_name"));
+        let first = intern_typed(&mut memo.scalars, &nullable, &control).unwrap();
+        let appended = intern_typed(&mut memo.scalars, &eq, &control).unwrap();
+        let mut result = Some(first);
+        append_residual_condition(&mut memo.scalars, &mut result, appended, &control).unwrap();
+        let result = result.unwrap();
+        assert!(memo.scalars.nullable(result));
+        assert!(matches!(
+            memo.scalars.node(result),
+            ScalarNode::BooleanConnective { left, op: BooleanOp::And, right }
+                if (*left, *right) == (first, appended)
+        ));
+    }
+
+    #[test]
     fn null_safe_join_pair_stays_hash_join_key() {
         let mut memo = Memo::new();
         let left_group = mk_scan_group(&mut memo, &["a_id"]);
@@ -2143,9 +2171,9 @@ mod join_demotion_tests {
     }
 
     #[test]
-    fn mixed_integer_eq_pair_keeps_raw_hash_key_for_distribution() {
+    fn mixed_integer_eq_pair_preserves_the_selected_conversion_for_distribution() {
         let mut memo = Memo::new();
-        let left_group = mk_scan_group(&mut memo, &["a_id"]);
+        let left_group = mk_typed_scan_group(&mut memo, &[("a_id", DataType::Int64)]);
         let right_group = mk_scan_group(&mut memo, &["b_id"]);
 
         let condition = bin(
@@ -2179,14 +2207,25 @@ mod join_demotion_tests {
         let left_key = mat(&memo, phys.condition.keys()[0].left);
         let right_key = mat(&memo, phys.condition.keys()[0].right);
         assert_eq!(left_key.value_type.data_type().clone(), DataType::Int64);
-        assert_eq!(right_key.value_type.data_type().clone(), DataType::Int32);
-        assert!(
-            matches!(left_key.kind, ExprKind::ColumnRef { .. }),
-            "optimizer hash key should keep raw column refs so distribution can enforce both sides"
+        assert_eq!(right_key.value_type.data_type().clone(), DataType::Int64);
+        assert_col_id(&left_key, test_col_id("a_id"), "original BIGINT side");
+        let ExprKind::Cast { expr: source, .. } = &right_key.kind else {
+            panic!("hash key must keep the analyzer's INTEGER to BIGINT conversion");
+        };
+        assert_eq!(source.value_type.data_type(), &DataType::Int32);
+        assert_col_id(source, test_col_id("b_id"), "original INTEGER side");
+        let distribution = phys.derive_required_alternatives(
+            &memo.scalars,
+            &crate::optimizer::property::PhysicalPropertySet::any(),
+            2,
         );
-        assert!(
-            matches!(right_key.kind, ExprKind::ColumnRef { .. }),
-            "optimizer hash key should keep raw column refs so distribution can enforce both sides"
+        use crate::optimizer::derive::PropertyAlternativeKind::{BroadcastJoin, SingletonJoin};
+        assert_eq!(
+            distribution
+                .iter()
+                .map(|item| &item.kind)
+                .collect::<Vec<_>>(),
+            [&BroadcastJoin, &SingletonJoin]
         );
         assert!(
             phys.condition.residual().is_none(),
@@ -2195,20 +2234,21 @@ mod join_demotion_tests {
     }
 
     #[test]
-    fn cross_type_array_pair_has_no_hash_join_alternative() {
+    fn structural_array_pair_has_no_hash_join_alternative() {
         for comparison in [BinOp::Eq, BinOp::EqForNull] {
-            assert_cross_type_array_pair_has_no_hash_join_alternative(comparison);
+            assert_structural_array_pair_has_no_hash_join_alternative(comparison);
         }
     }
 
-    fn assert_cross_type_array_pair_has_no_hash_join_alternative(comparison: BinOp) {
+    fn assert_structural_array_pair_has_no_hash_join_alternative(comparison: BinOp) {
         let mut memo = Memo::new();
-        let left_group = mk_scan_group(&mut memo, &["a_arr"]);
-        let right_group = mk_scan_group(&mut memo, &["b_arr"]);
+        let array_type = list_type(DataType::Int64);
+        let left_group = mk_typed_scan_group(&mut memo, &[("a_arr", array_type.clone())]);
+        let right_group = mk_typed_scan_group(&mut memo, &[("b_arr", array_type.clone())]);
         let condition = bin(
-            col_typed("a_arr", list_type(DataType::Utf8)),
+            col_typed("a_arr", array_type.clone()),
             comparison,
-            col_typed("b_arr", list_type(DataType::Int64)),
+            col_typed("b_arr", array_type),
         );
         let join_mexpr = logical_join_expr(
             &mut memo,
@@ -2226,7 +2266,7 @@ mod join_demotion_tests {
             .unwrap();
         assert!(
             hash_alternatives.is_empty(),
-            "cross-type complex equality must not become a raw hash key"
+            "structural equality must not become a raw hash key"
         );
 
         let nested_alternatives = JoinToNestLoop

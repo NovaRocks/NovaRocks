@@ -395,8 +395,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   geometry/validity 预检并续接。根无 Buffer 不代表后代无 Buffer；来源持有不授予容量。
   控制结果的 carrier 准入、精确宽度/NULL 与布局预检共用 Functions `control_values.rs` 和
   `selected_copy` 作者；`FixedSizeBinary` 保持原宽度字节，不重解释成整数或变长 Binary。
-  有符号 IN helper/recipe 在 `novarocks/functions/src/native_inlist.rs`；UTF8 借用比较在
-  `novarocks/expression/src/evaluator/utf8_inlist.rs`。不得恢复旧 evaluator 或用函数名重建调用。
+  IN 借用比较与候选归约由 `novarocks/functions/src/native_inlist.rs` 保管。普通调用沿已选
+  位置规则消费实参，Boolean 的 Value/TruthOnly 和 Let 沿同一守护使用点。见
+  [ADR-0279](docs/adr/ADR-0279-argument-demand-preserves-sql-errors.md)。不得用函数名重建调用。
 
 - Iceberg UPDATE 与所有 MERGE 形状在原 v3/类型/ref 准入后只走 MOR，legacy write-mode
   属性不选算法。Provider 同一作者签发规范输入 W 与可选完整存储 T；仅对应 T 的 plain

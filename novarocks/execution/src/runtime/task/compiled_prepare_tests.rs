@@ -780,6 +780,29 @@ fn a_compiled_scan_submission_binds_its_task_source_and_runs_into_the_result_ses
         }),
         ..LocalTaskPrepareContext::default()
     };
+    use novarocks_execution_contract::{TaskFailurePhase, TaskIdentity};
+    use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId, StageId, TaskId};
+    let execution =
+        QueryExecutionId::new(submission.instance().query_id(), AttemptId::new(1).unwrap())
+            .unwrap();
+    let identity = TaskIdentity::new(
+        execution,
+        StageId::new(1).unwrap(),
+        TaskId::new(1).unwrap(),
+        BackendProcessId::new_v7(),
+    );
+    let owner = crate::runtime::task_control::test_support::owner_for(identity);
+    let runtime = crate::runtime::execution_runtime::test_execution_runtime();
+    let binding = crate::runtime::query_memory::test_query_memory_binding(
+        execution,
+        runtime.memory_authority().clone(),
+    );
+    let context = context
+        .with_result_identity(identity)
+        .with_task_control(Arc::new(owner.view(TaskFailurePhase::Execution)))
+        .with_completion_work(owner.issue_fixture_completion_work())
+        .with_execution_runtime(runtime)
+        .with_query_memory(Some(binding));
     let handle = prepare_compiled_task(submission, context).expect("compiled prepare");
     assert!(matches!(
         handle.start().join().outcome(),

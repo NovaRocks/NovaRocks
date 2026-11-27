@@ -57,8 +57,8 @@ use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompilePhase, DecimalOverflowPolicy,
     EvaluationDemand, ExpressionEffects, FunctionFailureBehavior, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionNullBehavior, FunctionValueType, FunctionVolatility,
-    ObservableEffects, RelationCallId, RelationEffectContext, SemanticParameters, WindowBound,
-    WindowFrame, WindowFrameExclusion, WindowFrameUnits,
+    ObservableEffects, OperatorFunction, RelationCallId, RelationEffectContext, SemanticParameters,
+    WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
 };
 
 use super::family_fixture::{FixtureControl, constant_policy};
@@ -111,7 +111,8 @@ pub(super) fn window_catalog_from_actual(
     builder.seal_pure(installed).unwrap()
 }
 
-/// Every installed window owner and every installed aggregate OVER owner.
+/// Every installed window owner, each original aggregate OVER fixture owner,
+/// and the exact scalar owner used by overflowing argument roots.
 pub(super) fn installed_catalog() -> PureEngineFunctionCatalog {
     window_catalog(&[
         ("row_number", FunctionKind::Window),
@@ -128,6 +129,10 @@ pub(super) fn installed_catalog() -> PureEngineFunctionCatalog {
         ("sum", FunctionKind::Aggregate),
         ("min", FunctionKind::Aggregate),
         ("max", FunctionKind::Aggregate),
+        (
+            OperatorFunction::Multiply.catalog_name(),
+            FunctionKind::Scalar,
+        ),
     ])
 }
 
@@ -367,16 +372,8 @@ pub(super) fn package_typed(
     catalog: &PureEngineFunctionCatalog,
     max_dop: u32,
 ) -> Arc<FragmentPackage> {
-    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
-
     let complete =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let mut builder =
-        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
-            FragmentId::new(43),
-            &fixture_sources,
-        );
-    let columns = typed_literal_values(&mut builder, types, literal_rows);
     // Constants: one non-null BIGINT pool, one ordinal per constant argument.
     let constants = shape
         .calls
@@ -404,6 +401,16 @@ pub(super) fn package_typed(
             .insert(ConstantPoolId::new(CONSTANT_POOL), pool.clone())
             .unwrap();
     }
+    // Scalar unit authors must see the same pool identities as the finished
+    // package when resolving and freezing checked constant occurrences.
+    let fixture_sources =
+        crate::exec::operators::family_fixture::constant_sources::Sources::from_pools(pools);
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(43),
+            &fixture_sources,
+        );
+    let columns = typed_literal_values(&mut builder, types, literal_rows);
     let pool_value = |ordinal: u32| {
         pool.as_ref()
             .expect("a constant argument has its pool")
@@ -569,7 +576,7 @@ pub(super) fn package_typed(
                     );
                     arguments.push(builder.operator(
                         WINDOW,
-                        novarocks_type_contract::OperatorFunction::Multiply,
+                        OperatorFunction::Multiply,
                         [value, max],
                     ));
                     request.push(FunctionArgument::Value {
@@ -763,8 +770,7 @@ pub(super) fn package_typed(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let (fragment, sources) = fragment.into_parts();
-    crate::exec::operators::family_fixture::constant_sources::merge(&mut pools, &sources);
+    let (fragment, pools) = fragment.into_parts();
     let fragment = fragment
         .with_call_requests_observed(requests, &FixtureControl)
         .unwrap();

@@ -24,8 +24,8 @@ use novarocks_functions::{
     ConstantError, ConstantValue, FunctionArgument, MAX_CALL_EFFECT_ARGUMENTS,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, FunctionArgumentType, FunctionValueType,
-    PureCompileControl, ValueTypeError,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
+    ValueTypeError,
 };
 use {
     novarocks_expression_contract::{ExprKind, ExprNode},
@@ -80,7 +80,6 @@ pub(in crate::planner::distributed::build) struct LoweredOperationalChannel {
 pub(in crate::planner::distributed::build) enum SqlOperationalChannelRole {
     ValueWithoutConstant,
     CapturedConstant,
-    CanonicalNull { value: ConstantValue },
     Lambda,
     DerivedVariantPath,
     DerivedVariantTypeLiteral,
@@ -519,58 +518,6 @@ impl Projection<'_> {
                     },
                 ) => {
                     exact_type(value_type, value.value_type(), work)?;
-                    verify_constant(expression, value, pools, work)?;
-                    constant_argument(value, work)?
-                }
-                (
-                    SqlOperationalChannelRole::CanonicalNull { value },
-                    FunctionArgument::Value { value_type, .. },
-                ) => {
-                    let lawful =
-                        matches!(
-                            self.kind,
-                            Some(SqlExpressionCallKind::Scalar | SqlExpressionCallKind::Window)
-                        ) && matches!(value_type.data_type(), arrow::datatypes::DataType::Null);
-                    work.step()?;
-                    require(
-                        lawful,
-                        "canonical NULL role is not an original scalar or Window NULL source",
-                    )?;
-                    let expected = self
-                        .captured
-                        .binding
-                        .resolved()
-                        .selected
-                        .argument_types
-                        .get(ordinal);
-                    work.step()?;
-                    let Some(FunctionArgumentType::Value(expected)) = expected else {
-                        return Err(SqlOperationalProjectionError::InvalidSource(
-                            "canonical NULL has no original selected Value target",
-                        ));
-                    };
-                    let nonnull_carrier =
-                        !matches!(expected.data_type(), arrow::datatypes::DataType::Null);
-                    work.step()?;
-                    require(
-                        nonnull_carrier,
-                        "canonical NULL target is still the Null carrier",
-                    )?;
-                    let mut expected = clone_type(expected, work)?;
-                    expected = expected
-                        .with_nullable(true)
-                        .expect("validated root NULL contract");
-                    work.step()?;
-                    exact_type(&expected, value.value_type(), work)?;
-                    work.flush()?;
-                    let outcome = value
-                        .is_null_observed(CompilePhase::FunctionSpecialization, work.control())
-                        .map_err(SqlOperationalProjectionError::from);
-                    let null = completed_delegate(outcome, work)?;
-                    require(
-                        null,
-                        "canonical NULL role retains a non-NULL selected value",
-                    )?;
                     verify_constant(expression, value, pools, work)?;
                     constant_argument(value, work)?
                 }

@@ -282,6 +282,8 @@ pub enum FunctionBindingError {
     NoMatchingOverload,
     OperatorNotFound,
     AmbiguousOverload,
+    /// The declared special argument form was violated at the call site.
+    InvalidArguments(Box<str>),
     InvalidBinding(Box<str>),
     VariantTargetType(novarocks_type_contract::VariantTargetTypeError),
     ValueType(novarocks_type_contract::ValueTypeError),
@@ -324,6 +326,7 @@ impl fmt::Display for FunctionBindingError {
             Self::AmbiguousOverload => {
                 formatter.write_str("multiple declared overloads match ambiguously")
             }
+            Self::InvalidArguments(message) => formatter.write_str(message),
             Self::VariantTargetType(source) => source.fmt(formatter),
             Self::ValueType(source) => write!(formatter, "invalid function binding: {source}"),
             Self::Constant(source) => write!(formatter, "invalid function binding: {source}"),
@@ -412,6 +415,7 @@ impl novarocks_failure_contract::FailureProjection for FunctionBindingError {
             Self::NoMatchingOverload => (FailureClass::Data, 8),
             Self::OperatorNotFound => (FailureClass::Data, 11),
             Self::AmbiguousOverload => (FailureClass::Data, 9),
+            Self::InvalidArguments(_) => (FailureClass::Data, 12),
             Self::InvalidBinding(_) => (FailureClass::Invariant, 10),
         };
         FailureFact::new(

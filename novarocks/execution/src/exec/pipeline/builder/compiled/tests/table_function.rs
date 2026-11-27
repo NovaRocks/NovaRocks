@@ -34,10 +34,9 @@ use novarocks_expression_contract::{
     ExprKind, LegacyBindingMetadata, PhysicalCallRequest, RootScope,
 };
 use novarocks_functions::{
-    CallEffectInput, ConstantPool, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId,
-    FunctionResultType, InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedRelationalEffects,
+    CallEffectInput, ConstantPool, FunctionArgument, FunctionBindingRequest,
+    FunctionBindingSelection, FunctionKind, FunctionResultType, PureCallPreparation,
+    PureEngineFunctionCatalog, ScopedRelationalEffects,
 };
 use novarocks_local_program::{LocalProgram, ProgramNodeKind};
 use novarocks_physical_plan::{
@@ -80,35 +79,6 @@ const POLICY: DecimalOverflowPolicy = DecimalOverflowPolicy::ReportError;
 
 /// One row: its key and one optional array per list column.
 type Row = (i64, Vec<Option<Vec<Option<i64>>>>);
-
-/// The sealed builtin UNNEST owner with its actually installed TableV1 kernel.
-fn unnest_catalog() -> PureEngineFunctionCatalog {
-    let actual =
-        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    builder
-        .register(
-            actual
-                .definition("unnest", FunctionKind::Table)
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-    builder
-        .seal_pure([InstalledPureKernel {
-            function: FunctionId::try_new("builtin.table/unnest/v1").unwrap(),
-            kind: FunctionKind::Table,
-            implementation: PureImplementationDeclaration {
-                overload: FunctionOverloadId::try_new("builtin.table/unnest/array-variadic-v1")
-                    .unwrap(),
-                implementation: PureImplementationId::try_new("builtin.table/unnest/selected-v1")
-                    .unwrap(),
-                abi: PureKernelAbi::TableV1,
-            },
-            aggregate_state_format: None,
-        }])
-        .unwrap()
-}
 
 fn list_type() -> FunctionValueType {
     FunctionValueType::new(
@@ -252,7 +222,7 @@ fn values(
 /// Add `UNNEST(args)` over `input`, whose key and list columns are given, with
 /// the spec's outputs and the output properties the physical law derives.
 struct TableSource {
-    functions: PureEngineFunctionCatalog,
+    functions: Arc<PureEngineFunctionCatalog>,
     selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
 }
@@ -273,7 +243,7 @@ fn add_table_function(
             constant: None,
         })
         .collect::<Vec<_>>();
-    let functions = unnest_catalog();
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let bound = functions
         .metadata()
         .resolve_bound_user(
@@ -473,6 +443,7 @@ fn finish(
     source_pools: &ConstantPools,
     parameters: &SemanticParameters,
 ) -> crate::exec::operators::family_fixture::constant_sources::Fragment {
+    builder.include_constant_pools(source_pools);
     builder.seal_catalogue_units();
     let fragment = builder
         .finish_structure(
@@ -489,8 +460,6 @@ fn finish(
         )
         .unwrap();
     let (fragment, constants) = fragment.into_parts();
-    let mut evaluation_pools = source_pools.clone();
-    super::super::family_fixture::constant_sources::merge(&mut evaluation_pools, &constants);
     let entries = sources
         .iter()
         .map(|(&node, source)| {
@@ -572,7 +541,7 @@ fn finish(
         let compiled = compile_expr_set_pure(
             unit,
             EvaluationEnvironment {
-                constants: &evaluation_pools,
+                constants: &constants,
                 parameters,
             },
             ScopeLayouts {
@@ -655,15 +624,6 @@ fn admission() -> FragmentPackageAdmission {
             max_coexisting_bytes: 256 * 1024 * 1024,
             max_projection_work: 16 * 1024 * 1024,
         },
-    }
-}
-
-/// The authored parameter table: ALLOW only when a faulty argument cites it.
-fn parameters(spec: &Spec) -> SemanticParameters {
-    if spec.args.iter().any(|arg| matches!(arg, Arg::Faulty(_))) {
-        SemanticParameters::default()
-    } else {
-        SemanticParameters::try_new([]).unwrap()
     }
 }
 
@@ -758,7 +718,7 @@ fn single_program(rows: &[Row], spec: &Spec, sorted: bool) -> Result<Arc<LocalPr
         values_node
     };
     let (table, _, source_call) = add_table_function(&mut builder, input, key, &lists, spec);
-    let actual_parameters = parameters(spec);
+    let actual_parameters = SemanticParameters::default();
     let fragment = finish(
         builder,
         table,
@@ -781,7 +741,8 @@ fn single_program(rows: &[Row], spec: &Spec, sorted: bool) -> Result<Arc<LocalPr
         .finish_observed(&FixtureControl)
         .unwrap_or_else(|error| panic!("the table function plan validates: {error:?}"));
     let package = packages(&plan).remove(&SOLE).unwrap();
-    try_compile(package, &unnest_catalog(), 1, true)
+    let executable = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
+    try_compile(package, &executable, 1, true)
 }
 
 /// Prepare and run the program with an explicit chunk size; a preparation
@@ -790,17 +751,20 @@ fn try_run_single(
     program: &Arc<LocalProgram>,
     batch_size: u32,
 ) -> crate::runtime::task::ExecutionResult<Vec<Chunk>> {
-    let state = Arc::new(RuntimeState::for_local_execution(
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(crate::runtime::mem_tracker::MemTracker::new_root(
-            "compiled table function tests",
-        )),
-        Some(crate::runtime::execution_runtime::test_execution_runtime()),
-    ));
+    let state = Arc::new(
+        RuntimeState::for_local_execution(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                "compiled table function tests",
+            )),
+            Some(crate::runtime::execution_runtime::test_execution_runtime()),
+        )
+        .with_test_query_memory(),
+    );
     let output = ResultSinkBuffer::new();
     let dop = i32::try_from(program.graph().profile().pipeline_dop().get()).unwrap();
     let sink = Box::new(ResultSinkFactory::new(output.clone()));
@@ -1101,7 +1065,7 @@ fn exchanged_programs(
             },
         )
         .unwrap();
-    let actual_parameters = parameters(spec);
+    let actual_parameters = SemanticParameters::default();
     let source = finish(
         source,
         union,
@@ -1163,7 +1127,7 @@ fn exchanged_programs(
         .finish_observed(&FixtureControl)
         .unwrap_or_else(|error| panic!("the exchanged table function plan validates: {error:?}"));
     let mut packages = packages(&plan);
-    let catalog = unnest_catalog();
+    let catalog = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let source = try_compile(packages.remove(&SOURCE).unwrap(), &catalog, 1, false)
         .unwrap_or_else(|error| panic!("source compiles: {error}"));
     let consumer = try_compile(packages.remove(&CONSUMER).unwrap(), &catalog, dop, true)

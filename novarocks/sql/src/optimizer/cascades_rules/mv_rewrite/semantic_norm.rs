@@ -19,7 +19,10 @@
 use crate::{
     column_id::ColumnId,
     compiler::SqlCompileError,
-    optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode},
+    optimizer::{
+        scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode},
+        scalar_expr,
+    },
 };
 use novarocks_functions::{ConstantError, ConstantValue};
 use novarocks_type_contract::{
@@ -210,16 +213,35 @@ fn normalize_inner(
             }
         }
         ScalarNode::BooleanConnective { left, op, right } => {
-            let left = required!(normalize_inner(arena, *left, base_names, control, work)?);
-            let right = required!(normalize_inner(arena, *right, base_names, control, work)?);
             let (name, argument_order) = match op {
-                crate::common::BooleanOp::And => ("and", NormArgumentOrder::Multiset),
-                crate::common::BooleanOp::Or => ("or", NormArgumentOrder::Multiset),
+                crate::common::BooleanOp::And | crate::common::BooleanOp::Or => {
+                    let name = if *op == crate::common::BooleanOp::And {
+                        "and"
+                    } else {
+                        "or"
+                    };
+                    work.flush()?;
+                    let can_commute = [*left, *right].into_iter().all(|operand| {
+                        !scalar_expr::can_fail(arena, operand)
+                            && !scalar_expr::contains_non_replica_deterministic_function(
+                                arena, operand,
+                            )
+                    });
+                    work.flush()?;
+                    let order = if can_commute {
+                        NormArgumentOrder::Multiset
+                    } else {
+                        NormArgumentOrder::Ordered
+                    };
+                    (name, order)
+                }
                 crate::common::BooleanOp::ExpandedConjunction
                 | crate::common::BooleanOp::ExpandedNegatedConjunction => {
                     ("and", NormArgumentOrder::Ordered)
                 }
             };
+            let left = required!(normalize_inner(arena, *left, base_names, control, work)?);
+            let right = required!(normalize_inner(arena, *right, base_names, control, work)?);
             NormExpr::Call {
                 value_type: value_type.clone(),
                 argument_order,

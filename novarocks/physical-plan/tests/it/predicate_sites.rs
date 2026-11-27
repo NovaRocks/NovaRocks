@@ -132,7 +132,7 @@ fn aggregate_filter(
         AggregateFilterDefinition::ComputedBoolean => draft
             .add(
                 None,
-                filter_type,
+                boolean(false),
                 ExprKind::IsNull {
                     negated: true,
                     expr: filter_input,
@@ -302,21 +302,14 @@ fn predicate_fragment(
     let leaf = draft
         .add(None, boolean(true), ExprKind::input(value))
         .unwrap();
-    let definition = if let Some(null_test) = wrappers {
+    let definition = if let Some(negated) = wrappers {
         draft
             .add(
                 None,
-                boolean(!null_test),
-                if null_test {
-                    ExprKind::IsNull {
-                        expr: leaf,
-                        negated: false,
-                    }
-                } else {
-                    ExprKind::IsNull {
-                        negated: true,
-                        expr: leaf,
-                    }
+                boolean(false),
+                ExprKind::IsNull {
+                    expr: leaf,
+                    negated,
                 },
             )
             .unwrap()
@@ -398,7 +391,7 @@ fn positive_sources_keep_nullable_truth_uses_and_original_root_responsibility() 
 }
 
 #[test]
-fn positive_sources_do_not_cross_not_or_null_testing() {
+fn positive_sources_do_not_cross_null_tests() {
     for wrapper in [false, true] {
         let (fragment, site, _) = predicate_fragment(1, Some(wrapper), 1);
         assert_eq!(

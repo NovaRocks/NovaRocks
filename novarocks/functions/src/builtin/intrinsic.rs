@@ -902,6 +902,10 @@ pub fn builtin_dispositions() -> &'static [(&'static str, BuiltinDisposition)] {
     static ALL: std::sync::LazyLock<Vec<(&str, BuiltinDisposition)>> =
         std::sync::LazyLock::new(|| {
             let mut declarations = BUILTIN_DISPOSITIONS.to_vec();
+            declarations.extend(
+                super::collection_lambda::UNAVAILABLE
+                    .map(|(name, _)| (name, BuiltinDisposition::Unavailable)),
+            );
             declarations.extend(super::json_sql::FUNCTIONS.iter().map(|(operation, name)| {
                 (
                     *name,

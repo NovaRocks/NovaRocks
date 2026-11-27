@@ -34,7 +34,7 @@ use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileContr
 use std::collections::HashMap;
 
 use super::estimate::ndv::{agg_group_rows, cap_ndv_at_rows};
-use super::estimate::selectivity::apply_filter;
+use super::estimate::selectivity::{apply_filter, range_column_and_bound};
 use super::memo::{GroupId, JoinTree, MExpr, Memo};
 use super::operator::Operator;
 use crate::column_id::ColumnId;
@@ -1082,8 +1082,8 @@ fn estimate_range_selectivity_scalar(
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<f64, SqlCompileError> {
-    let col_id = extract_column_id_scalar(arena, left);
-    let literal_val = scalar_literal_f64(arena, right, work)?;
+    let (col_id, literal, op) = range_column_and_bound(arena, left, right, op);
+    let literal_val = scalar_literal_f64(arena, literal, work)?;
     if let (Some(column_id), Some(val)) = (col_id, literal_val)
         && let Some(cs) = column_stats.get(&column_id)
     {

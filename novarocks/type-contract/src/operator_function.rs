@@ -31,6 +31,7 @@ pub enum OperatorFunction {
     Divide,
     Modulo,
     Equal,
+    SubqueryFloatEqual,
     NotEqual,
     LessThan,
     LessThanOrEqual,
@@ -46,7 +47,7 @@ pub enum OperatorFunction {
 }
 
 impl OperatorFunction {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::Negation,
         Self::BooleanNot,
         Self::Like,
@@ -57,6 +58,7 @@ impl OperatorFunction {
         Self::Divide,
         Self::Modulo,
         Self::Equal,
+        Self::SubqueryFloatEqual,
         Self::NotEqual,
         Self::LessThan,
         Self::LessThanOrEqual,
@@ -85,6 +87,7 @@ impl OperatorFunction {
             Self::Divide => "__operator_divide",
             Self::Modulo => "__operator_modulo",
             Self::Equal => "__operator_equal",
+            Self::SubqueryFloatEqual => "__subquery_float_equal",
             Self::NotEqual => "__operator_not_equal",
             Self::LessThan => "__operator_less_than",
             Self::LessThanOrEqual => "__operator_less_than_or_equal",
@@ -113,6 +116,7 @@ impl OperatorFunction {
             Self::Divide => "builtin.scalar/__operator_divide/v1",
             Self::Modulo => "builtin.scalar/__operator_modulo/v1",
             Self::Equal => "builtin.scalar/__operator_equal/v1",
+            Self::SubqueryFloatEqual => "builtin.scalar/__subquery_float_equal/v1",
             Self::NotEqual => "builtin.scalar/__operator_not_equal/v1",
             Self::LessThan => "builtin.scalar/__operator_less_than/v1",
             Self::LessThanOrEqual => "builtin.scalar/__operator_less_than_or_equal/v1",
@@ -134,6 +138,7 @@ impl OperatorFunction {
     pub const fn comparison_overload_text(self) -> Option<&'static str> {
         Some(match self {
             Self::Equal => "builtin.scalar/__operator_equal/comparison-v1",
+            Self::SubqueryFloatEqual => "builtin.scalar/__subquery_float_equal/comparison-v1",
             Self::NotEqual => "builtin.scalar/__operator_not_equal/comparison-v1",
             Self::LessThan => "builtin.scalar/__operator_less_than/comparison-v1",
             Self::LessThanOrEqual => "builtin.scalar/__operator_less_than_or_equal/comparison-v1",
@@ -196,7 +201,7 @@ impl OperatorFunction {
             Self::Multiply | Self::TemporalMultiply => "*",
             Self::Divide | Self::TemporalDivide => "/",
             Self::Modulo => "%",
-            Self::Equal => "=",
+            Self::Equal | Self::SubqueryFloatEqual => "=",
             Self::NotEqual => "<>",
             Self::LessThan => "<",
             Self::LessThanOrEqual => "<=",

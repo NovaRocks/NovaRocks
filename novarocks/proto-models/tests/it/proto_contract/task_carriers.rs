@@ -209,9 +209,18 @@ fn query_options_runtime_consumed_fields_use_native_tags() {
     assert_eq!(
         fields,
         (1..=29)
-            .filter(|tag| ![1, 6, 10, 11, 12].contains(tag))
+            .filter(|tag| ![1, 6, 9, 10, 11, 12].contains(tag))
             .collect::<Vec<_>>(),
-        "QueryOptions must keep native runtime consumed fields on tags 1..=29 except reserved 1, 6, 10, 11, 12"
+        "QueryOptions must keep native runtime consumed fields on tags 1..=29 except reserved 1, 6, 9, 10, 11, 12"
+    );
+    let pool =
+        prost_reflect::DescriptorPool::decode(novarocks_proto_models::FILE_DESCRIPTOR_SET).unwrap();
+    let options = pool.get_message_by_name("novarocks.QueryOptions").unwrap();
+    assert!(options.reserved_ranges().any(|range| range.contains(&9)));
+    assert!(
+        options
+            .reserved_names()
+            .any(|name| name == "allow_throw_exception")
     );
 }
 

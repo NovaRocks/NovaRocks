@@ -257,7 +257,7 @@ fn package(
         },
     )?;
     for (id, request, shape) in [
-        (rng_expr, rng_request, ControlShape::Eager),
+        (rng_expr, rng_request, ControlShape::OrderedNull),
         (definition, request, shape),
     ] {
         let arguments = request
@@ -370,12 +370,15 @@ fn package(
                 .copied()
                 .map(Some)
                 .collect::<Vec<_>>();
-            let options = if invocation.control == ControlShape::Eager {
-                PureCallPreparation::Scalar {
+            let options = if matches!(
+                invocation.control,
+                ControlShape::If | ControlShape::Coalesce
+            ) {
+                PureCallPreparation::ControlIntrinsic {
                     arguments: children,
                 }
             } else {
-                PureCallPreparation::ControlIntrinsic {
+                PureCallPreparation::Scalar {
                     arguments: children,
                 }
             };
@@ -564,7 +567,7 @@ fn assert_control_call(name: &str, expected: ControlShape, argument_control: Arg
     if name == "if" {
         assert_eq!(
             flow.uses()[&parent.arguments[0]].context.demand,
-            EvaluationDemand::TruthOnly
+            EvaluationDemand::Value
         );
         let otherwise = &flow.uses()[&parent.arguments[2]];
         assert_ne!(guarded.context.region, otherwise.context.region);

@@ -1148,20 +1148,13 @@ impl ScalarEmission<'_, '_> {
         visible: &BTreeMap<ColumnId, ValueId>,
         expected: &FunctionArgumentType,
     ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
-        // Preserve the original binding's canonical bare-NULL conversion.
-        // The retained original request still says what analysis authored.
-        if let Some(target) = crate::compiler::selected_scalar_call::canonical_null_target(
-            &argument.value_type,
-            expected,
-        ) {
-            let (expression, value) =
-                self.author_literal_expression_with_source(&LiteralValue::Null, target)?;
-            let channel = LoweredOperationalChannel {
-                expression,
-                role: SqlOperationalChannelRole::CanonicalNull { value },
-            };
-            self.work.step()?;
-            return Ok(channel);
+        if let FunctionArgumentType::Value(expected) = expected
+            && argument.value_type.data_type() == &DataType::Null
+            && expected.data_type() != &DataType::Null
+        {
+            return Err(ContractLoweringError::InvalidFunctionBinding {
+                detail: "typed scalar argument did not retain its selected NULL conversion".into(),
+            });
         }
         if matches!(argument.kind, ExprKind::Literal(_) | ExprKind::Constant(_)) {
             self.work.step()?;
@@ -1177,7 +1170,7 @@ impl ScalarEmission<'_, '_> {
             let expression = self.lower_constant_expression(value, expression_type(argument))?;
             return self.original_emission_channel(expression, ordinal, captured);
         }
-        let expression = self.lower_bound_argument(argument, visible, expected)?;
+        let expression = self.lower_expression(argument, visible)?;
         self.original_emission_channel(expression, ordinal, captured)
     }
 
@@ -1304,26 +1297,6 @@ impl ScalarEmission<'_, '_> {
     ) -> Result<ExprId, ContractLoweringError> {
         let scope = self.lambda_scope.last().map(|scope| scope.lambda);
         self.insert_definition(scope, ty, kind)
-    }
-
-    pub(super) fn lower_bound_argument(
-        &mut self,
-        argument: &TypedExpr,
-        visible: &BTreeMap<ColumnId, ValueId>,
-        expected: &FunctionArgumentType,
-    ) -> Result<ExprId, ContractLoweringError> {
-        if let FunctionArgumentType::Value(expected) = expected
-            && *argument.value_type.data_type() == DataType::Null
-            && *expected.data_type() != DataType::Null
-        {
-            return self.author_literal_expression(
-                &LiteralValue::Null,
-                (expected.clone())
-                    .with_nullable(true)
-                    .expect("validated root NULL contract"),
-            );
-        }
-        self.lower_expression(argument, visible)
     }
 
     pub(super) fn value_declared_type(

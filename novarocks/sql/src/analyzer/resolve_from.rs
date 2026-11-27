@@ -27,6 +27,7 @@ use crate::planning::catalog::MetadataTableKind;
 use crate::system_table::{StatementSystemRelation, SystemTableDeclaration};
 use std::sync::Arc;
 
+use super::helpers::eval_const_i64;
 use super::scope::AnalyzerScope;
 
 #[derive(Clone, Copy)]
@@ -1366,42 +1367,6 @@ fn parse_join_operator(
         ast::JoinType::Full => JoinKind::FullOuter,
     };
     (kind, criteria)
-}
-
-#[recursive::recursive]
-fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
-    match expr {
-        ast::Expr::Literal(ast::Literal {
-            kind:
-                ast::LiteralKind::Long {
-                    parsed_value: number,
-                    ..
-                },
-            ..
-        }) => Ok(*number),
-        ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
-            Ok(-eval_const_i64(&unary.expression)?)
-        }
-        ast::Expr::Binary(binary) => {
-            let left = eval_const_i64(&binary.left)?;
-            let right = eval_const_i64(&binary.right)?;
-            match binary.operator {
-                ast::BinaryOperator::Add => Ok(left + right),
-                ast::BinaryOperator::Subtract => Ok(left - right),
-                ast::BinaryOperator::Multiply => Ok(left * right),
-                ast::BinaryOperator::Divide if right != 0 => Ok(left / right),
-                ast::BinaryOperator::Modulo if right != 0 => Ok(left % right),
-                operator => Err(AnalyzeError::invalid_argument(
-                    format!("unsupported operator in constant expression: {operator:?}"),
-                    expr.span(),
-                )),
-            }
-        }
-        _ => Err(AnalyzeError::invalid_literal(
-            format!("expected constant integer expression, got: {expr:?}"),
-            expr.span(),
-        )),
-    }
 }
 
 fn derived_table_output_columns(

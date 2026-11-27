@@ -20,7 +20,7 @@ use arrow_schema::{DataType, Field, TimeUnit};
 use novarocks_constant_contract::ConstantPools;
 use novarocks_expression::testkit::checked_constants;
 use novarocks_expression_contract::{ExprKind, RootScope};
-use novarocks_functions::PureEngineFunctionCatalog;
+use novarocks_functions::{FunctionBindingError, PureEngineFunctionCatalog};
 use novarocks_local_compiler::FragmentCompileError;
 use novarocks_physical_plan::{
     FragmentBuilder, FragmentId, FragmentPackage, NodeId, ResultField, ResultValueDomain, ValueDef,
@@ -191,7 +191,9 @@ fn cast_fixture(
     )
 }
 
-fn nullsafe_fixture(ty: FunctionValueType) -> (PureEngineFunctionCatalog, Arc<FragmentPackage>) {
+fn nullsafe_fixture(
+    ty: FunctionValueType,
+) -> Result<(PureEngineFunctionCatalog, Arc<FragmentPackage>), FunctionBindingError> {
     let mut source_pools = ConstantPools::empty();
     let constants = options().constants;
     let mut builder = FragmentBuilder::new(FragmentId::new(307));
@@ -249,8 +251,7 @@ fn nullsafe_fixture(ty: FunctionValueType) -> (PureEngineFunctionCatalog, Arc<Fr
         &mut source_pools,
         novarocks_type_contract::OperatorFunction::Identical,
         vec![left, right],
-    )
-    .unwrap();
+    )?;
     let output_root = builder
         .unit(output)
         .unwrap()
@@ -290,7 +291,7 @@ fn nullsafe_fixture(ty: FunctionValueType) -> (PureEngineFunctionCatalog, Arc<Fr
         &novarocks_expression::testkit::HarnessControl,
     );
     builder.install_unit(output, Arc::new(unit)).unwrap();
-    (
+    Ok((
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue()
             .as_ref()
             .clone(),
@@ -302,7 +303,7 @@ fn nullsafe_fixture(ty: FunctionValueType) -> (PureEngineFunctionCatalog, Arc<Fr
             SemanticParameters::try_new([]).unwrap(),
             source_pools,
         ),
-    )
+    ))
 }
 
 struct CompileCallbacks {
@@ -426,18 +427,38 @@ fn standard_cast_compile_preserves_control_before_success_and_refusal() {
 }
 
 #[test]
-fn nullsafe_compilation_keeps_all_original_refusals_including_unsupported_tail() {
-    // UInt32 is a valid physical snapshot domain, but not a legacy null-safe leaf.
-    for supported in [true, false] {
-        let ty = if supported {
-            DataType::Int64
-        } else {
-            DataType::UInt32
-        };
-        let (functions, package) = nullsafe_fixture(FunctionValueType::new(ty, true));
+fn nullsafe_compilation_keeps_all_original_refusals_including_missing_catalogue_owner() {
+    // An unmatched unsigned domain has no original overload to freeze.
+    assert!(matches!(
+        nullsafe_fixture(FunctionValueType::new(DataType::UInt32, true)),
+        Err(FunctionBindingError::NoMatchingOverload)
+    ));
+    let (installed, package) =
+        nullsafe_fixture(FunctionValueType::new(DataType::Int64, true)).unwrap();
+    let subset = numeric_catalogue();
+    for (functions, supported) in [(&installed, true), (&subset, false)] {
         let recorder = CompileCallbacks::new(CompileControlError::Cancelled, usize::MAX);
-        let result = compile(&functions, package.clone(), &recorder);
-        assert_eq!(result.is_ok(), supported);
+        let result = compile(functions, package.clone(), &recorder);
+        if supported {
+            assert!(result.is_ok());
+        } else {
+            let failure = result.unwrap_err();
+            assert!(matches!(
+                failure,
+                FragmentCompileError::Owner {
+                    phase: "expressions",
+                    ..
+                }
+            ));
+            let mut cause: &(dyn std::error::Error + 'static) = &failure;
+            loop {
+                if let Some(binding) = cause.downcast_ref::<FunctionBindingError>() {
+                    assert!(matches!(binding, FunctionBindingError::UnknownFunction));
+                    break;
+                }
+                cause = cause.source().expect("original catalogue binding refusal");
+            }
+        }
         let trace = recorder.trace();
         assert!(!trace.is_empty());
         for stop_at in 1..=trace.len() {
@@ -447,7 +468,7 @@ fn nullsafe_compilation_keeps_all_original_refusals_including_unsupported_tail()
                 CompileControlError::ResourceExhausted,
             ] {
                 let refusal = CompileCallbacks::new(cause.clone(), stop_at);
-                let failure = compile(&functions, package.clone(), &refusal).unwrap_err();
+                let failure = compile(functions, package.clone(), &refusal).unwrap_err();
                 assert!(
                     matches!(failure, novarocks_local_compiler::FragmentCompileError::Control(actual) if actual == cause)
                 );

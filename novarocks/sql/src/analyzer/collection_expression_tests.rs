@@ -75,6 +75,48 @@ fn projection(query: &ast::Query) -> &ast::Expr {
     assert!(projection_column.alias.is_none(), "anonymous projection");
     &projection_column.expression
 }
+
+#[test]
+fn collection_expression_names_each_unavailable_lambda_before_body_analysis() {
+    use crate::analyze_error::AnalyzeErrorKind;
+    let control = SqlCompileControl::unbounded();
+    let ctx = context(&control);
+    for (name, sql) in [
+        (
+            "none_match",
+            "SELECT none_match(ARRAY[1], x -> unknown_body)",
+        ),
+        (
+            "reduce",
+            "SELECT reduce(ARRAY[1], 0, (s, x) -> unknown_body, s -> s)",
+        ),
+        (
+            "zip_with",
+            "SELECT zip_with(ARRAY[1], ARRAY[2], (x, y) -> unknown_body)",
+        ),
+        (
+            "map_zip_with",
+            "SELECT map_zip_with(missing_map, missing_map, (k, x, y) -> unknown_body)",
+        ),
+    ] {
+        let error = ctx
+            .analyze_expr(projection(&query(sql)), &ctx.new_scope())
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            AnalyzeErrorKind::UnavailableImplementation,
+            "{sql}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("builtin.scalar/{name}/lambda-v1")),
+            "{error}"
+        );
+        assert!(error.span().is_some());
+    }
+}
+
 fn json_list_target() -> novarocks_type_contract::FunctionValueType {
     use arrow::datatypes::{DataType, Field};
     use novarocks_type_contract::{

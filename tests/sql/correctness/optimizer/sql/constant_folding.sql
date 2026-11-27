@@ -198,7 +198,8 @@ SELECT CAST(NULL AS BOOLEAN) AND true AS folded_and;
 -- @explain_contains= OR true AS folded_or]
 SELECT CAST(NULL AS BOOLEAN) OR true AS folded_or;
 
--- @explain_contains=[NOT
+-- The selected strict NULL contract is resolved before the optional folding pass.
+-- @explain_contains=[NULL AS folded_not]
 SELECT NOT CAST(NULL AS BOOLEAN) AS folded_not;
 
 -- @explain_contains= = CAST(

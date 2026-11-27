@@ -805,14 +805,7 @@ fn actual_if_arguments_keep_distinct_unary_occurrences_and_guarded_value_childre
                 wrapper
             );
             assert_eq!(unary.control, ControlShape::Eager);
-            assert_eq!(
-                unary.context.demand,
-                if ordinal == 0 {
-                    EvaluationDemand::TruthOnly
-                } else {
-                    EvaluationDemand::Value
-                }
-            );
+            assert_eq!(unary.context.demand, EvaluationDemand::Value);
             if ordinal == 0 {
                 assert_eq!(unary.context.region, invocation.context.region);
             } else {

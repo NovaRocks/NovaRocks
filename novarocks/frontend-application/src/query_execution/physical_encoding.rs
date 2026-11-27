@@ -2620,6 +2620,67 @@ mod tests {
     }
 
     #[test]
+    fn between_keeps_its_comparisons_when_project_cse_sees_the_same_predicate() {
+        let sql = "WITH t(v) AS (SELECT CAST(120.00 AS DECIMAL(7,2)) \
+            UNION ALL SELECT CAST(90.00 AS DECIMAL(7,2))) \
+            SELECT v, v >= CAST(100 AS DECIMAL(5,0)), \
+                v <= CAST(150.000 AS DECIMAL(9,3)), \
+                v BETWEEN CAST(100.0 AS DECIMAL(6,1)) AND CAST(150 AS DECIMAL(4,0)), \
+                v NOT BETWEEN CAST(100.0 AS DECIMAL(6,1)) AND CAST(150 AS DECIMAL(4,0)) \
+            FROM t ORDER BY v";
+        let (_, encoded) = encode_with(sql, &compiled_carrier());
+        encoded.unwrap_or_else(|error| panic!("decimal comparison and BETWEEN package: {error}"));
+    }
+
+    #[test]
+    fn floating_membership_preserves_grouping_while_join_on_keeps_ieee_equality() {
+        use novarocks_physical_plan::JoinKind;
+        use novarocks_type_contract::JoinKeyMatch;
+
+        let source = "WITH l(x) AS (VALUES DOUBLE 'NaN', CAST(NULL AS DOUBLE)), \
+            r(y) AS (VALUES DOUBLE 'NaN', CAST(NULL AS DOUBLE))";
+        let has_key = |sql: &str, kind, relation| {
+            let (plan, encoded) = encode_with(&format!("{source} {sql}"), &compiled_carrier());
+            encoded.unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert!(
+                plan.fragments().values().any(|fragment| {
+                    fragment.nodes().values().any(|node| {
+                        let NodeKind::HashJoin {
+                            kind: actual,
+                            condition,
+                            ..
+                        } = &node.kind
+                        else {
+                            return false;
+                        };
+                        *actual == kind
+                            && condition
+                                .keys()
+                                .iter()
+                                .any(|key| key.match_relation == relation)
+                    })
+                }),
+                "{sql}: expected {kind:?} with {relation:?}"
+            );
+        };
+        has_key(
+            "SELECT x FROM l WHERE x IN (SELECT y FROM r)",
+            JoinKind::LeftSemi,
+            JoinKeyMatch::Grouping,
+        );
+        has_key(
+            "SELECT x FROM l WHERE x NOT IN (SELECT y FROM r)",
+            JoinKind::NullAwareLeftAnti,
+            JoinKeyMatch::Grouping,
+        );
+        has_key(
+            "SELECT x FROM l JOIN r ON x = y",
+            JoinKind::Inner,
+            JoinKeyMatch::IeeeFloat,
+        );
+    }
+
+    #[test]
     fn completed_encoding_observes_tail_after_freezing_and_preserves_first_control_failure() {
         use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
         use std::sync::Mutex;

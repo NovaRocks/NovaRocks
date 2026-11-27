@@ -23,7 +23,8 @@ use std::sync::Mutex;
 use arrow::array::StringArray;
 use novarocks_expression_contract::{BoundFunction, DefinitionControl, ExpressionCallClaim};
 use novarocks_functions::{
-    CallArgumentUses, EngineFunctionCatalog, FunctionSpecializationFailure, ScopedExpressionEffects,
+    CallArgumentUses, EngineFunctionCatalog, EngineFunctionCatalogBuilder,
+    FunctionSpecializationFailure, InstalledPureKernel, ScopedExpressionEffects,
 };
 use novarocks_physical_plan::{FrozenCallError, PhysicalCallBinding};
 use novarocks_plan_codec::physical_package_v2::{
@@ -335,7 +336,7 @@ fn source_fixture() -> SourceFixture {
             declaration
                 .effects()
                 .argument_control
-                .matches_scalar_shape(ControlShape::Eager)
+                .matches_scalar_shape(ControlShape::OrderedNull)
         );
         builder
             .unit(project)
@@ -343,7 +344,7 @@ fn source_fixture() -> SourceFixture {
             .definition_control(
                 definition,
                 DefinitionControl {
-                    shape: ControlShape::Eager,
+                    shape: ControlShape::OrderedNull,
                     temporal_sources: None,
                 },
             )
@@ -694,7 +695,7 @@ fn all_definition_source_uses_real_unnest_relational_binding_author() {
         1,
         BTreeMap::from([(table, source_call)]),
         &pools.0,
-        &parameters(&Spec::unnest(false)),
+        &SemanticParameters::default(),
     );
     let mut work = CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Encode).unwrap();
     let mut requests = Vec::new();

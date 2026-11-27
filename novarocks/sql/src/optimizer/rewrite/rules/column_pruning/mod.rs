@@ -305,7 +305,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Test 3 (ported from old column_pruning.rs):
-    //   Project[a] → Filter[b = 'x'] → Scan[a,b,c]
+    //   Project[a] → Filter[b = 7] → Scan[a,b,c]
     //   After pipeline: Scan.required_columns contains both "a" and "b"
     // -----------------------------------------------------------------------
 
@@ -323,9 +323,9 @@ mod tests {
                     BinOp::Eq,
                     col_ref(id_b, "b"),
                     TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
+                        kind: ExprKind::Literal(LiteralValue::Int(7)),
                         value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Utf8,
+                            DataType::Int32,
                             false,
                         ),
                     },

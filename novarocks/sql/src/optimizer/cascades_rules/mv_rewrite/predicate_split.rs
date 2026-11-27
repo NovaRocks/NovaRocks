@@ -501,9 +501,11 @@ mod tests {
         bin(col_ref(&a()), BinOp::Ne, int_lit(v))
     }
 
-    /// `a >= 'v'` (String literal, to exercise incomparable-type fail-closed).
+    /// The query's same-named `a` resolved in a different, string domain.
     fn ge_a_str(v: &str) -> TypedExpr {
-        bin(col_ref(&a()), BinOp::Ge, string_lit(v))
+        let mut source = col_ref(&a());
+        source.value_type = novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true);
+        bin(source, BinOp::Ge, string_lit(v))
     }
 
     /// `a LIKE 'pat'`

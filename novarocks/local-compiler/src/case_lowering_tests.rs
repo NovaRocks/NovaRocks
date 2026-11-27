@@ -516,13 +516,13 @@ fn fixture(
             let first = call(
                 &mut builder,
                 &mut authors,
-                author(functions, "rand", vec![], ControlShape::Eager),
+                author(functions, "rand", vec![], ControlShape::OrderedNull),
                 vec![],
             );
             let second = call(
                 &mut builder,
                 &mut authors,
-                author(functions, "rand", vec![], ControlShape::Eager),
+                author(functions, "rand", vec![], ControlShape::OrderedNull),
                 vec![],
             );
             let ty = FunctionValueType::new(DataType::Float64, true);
@@ -570,7 +570,7 @@ fn fixture(
                     argument(decimal.clone(), None),
                     argument(integer, Some(digit)),
                 ],
-                ControlShape::Eager,
+                ControlShape::OrderedNull,
             );
             let result_type = round.result();
             let rounded = call(&mut builder, &mut authors, round, vec![value, digits]);

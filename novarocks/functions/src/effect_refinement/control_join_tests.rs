@@ -139,7 +139,7 @@ fn checked_if_and_coalesce_guards_join_conservatively_without_rebinding_children
             ControlShape::If,
             Value,
             vec![
-                (TruthOnly, None),
+                (Value, None),
                 (Value, Some(GuardKind::IfThen)),
                 (Value, Some(GuardKind::IfElse)),
             ],
@@ -148,9 +148,9 @@ fn checked_if_and_coalesce_guards_join_conservatively_without_rebinding_children
             ControlShape::If,
             TruthOnly,
             vec![
-                (TruthOnly, None),
-                (TruthOnly, Some(GuardKind::IfThen)),
-                (TruthOnly, Some(GuardKind::IfElse)),
+                (Value, None),
+                (Value, Some(GuardKind::IfThen)),
+                (Value, Some(GuardKind::IfElse)),
             ],
         ),
         (
@@ -195,13 +195,10 @@ fn checked_simple_and_searched_case_keep_ordered_when_then_and_else_guards() {
                 arguments.push((Value, None));
             }
             for arm in 0..2 {
-                arguments.push((
-                    if simple { Value } else { TruthOnly },
-                    Some(GuardKind::CaseWhen { arm }),
-                ));
-                arguments.push((demand, Some(GuardKind::CaseThen { arm })));
+                arguments.push((Value, Some(GuardKind::CaseWhen { arm })));
+                arguments.push((Value, Some(GuardKind::CaseThen { arm })));
             }
-            arguments.push((demand, Some(GuardKind::CaseElse)));
+            arguments.push((Value, Some(GuardKind::CaseElse)));
             let flow = checked_flow(
                 ControlShape::Case {
                     simple,
@@ -350,7 +347,7 @@ fn exact_ordered_occurrences_reject_same_definition_sibling_wrong_owner_region_a
         ControlShape::If,
         Value,
         &[
-            (TruthOnly, None),
+            (Value, None),
             (Value, Some(GuardKind::IfThen)),
             (Value, Some(GuardKind::IfElse)),
         ],

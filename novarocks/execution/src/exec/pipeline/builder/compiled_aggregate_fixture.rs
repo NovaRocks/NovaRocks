@@ -1119,6 +1119,7 @@ fn try_run_in(
     tracked: bool,
 ) -> Result<(), String> {
     let dop = i32::try_from(program.graph().profile().pipeline_dop().get()).unwrap();
+    let state = Arc::new(Arc::unwrap_or_clone(state).with_test_query_memory());
     let running = prepare_compiled_program_pipeline_execution_with_profiler(
         Arc::clone(program),
         Duration::from_millis(10),

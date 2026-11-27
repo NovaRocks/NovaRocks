@@ -10905,23 +10905,6 @@ impl<'a> ContractLoweringVisitor<'a> {
         self.scalar_emission(owner).add_scoped_expression(ty, kind)
     }
 
-    /// Lowers one argument in the type its binding takes.
-    ///
-    /// A bare `NULL` has no type of its own: it is typed by where it stands,
-    /// and where it stands is an argument position the binding already names.
-    /// Left untyped, the plan would state a call whose signature and argument
-    /// disagree about a shape neither of them is wrong about.
-    fn lower_bound_argument(
-        &mut self,
-        owner: NodeId,
-        argument: &TypedExpr,
-        visible: &BTreeMap<ColumnId, ValueId>,
-        expected: &FunctionArgumentType,
-    ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission(owner)
-            .lower_bound_argument(argument, visible, expected)
-    }
-
     /// The type one already-defined value declares.
     fn value_declared_type(&mut self, value: ValueId) -> Result<ValueType, ContractLoweringError> {
         self.fragment_mut()
@@ -16270,7 +16253,7 @@ mod tests {
             stats: stats(),
             probe_runtime_filters: Vec::new(),
         };
-        let computed = column(2, "next", DataType::Int64, true);
+        let computed = column(2, "next", DataType::Int64, false);
         let project = PhysicalPlanNode {
             kind: PhysicalPlanKind::Project(PlanProjectNode {
                 items: vec![
@@ -19859,108 +19842,83 @@ mod tests {
         );
     }
     #[test]
-    fn late_comparison_ports_preserve_largeint_and_materialize_signed_assignment() {
-        let large = literal_largeint(i128::MAX);
-        let signed = literal_int(7);
-        let kinds = [
-            crate::common::binary_operator::test_operator(
-                crate::common::BinOp::Eq,
-                large.clone(),
-                signed.clone(),
-                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            )
-            .kind,
-            ExprKind::Case {
-                ieee_float_equality: false,
-                operand: Some(novarocks_parser::ast::AstBox::new(large)),
-                when_then: (vec![(
-                    signed,
-                    TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                        value_type: ValueType::new(DataType::Boolean, false),
-                    },
-                )])
-                .into(),
-                else_expr: Some(novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Bool(false)),
-                    value_type: ValueType::new(DataType::Boolean, false),
-                })),
-            },
-        ];
-        for kind in kinds {
-            let expression = TypedExpr {
-                kind,
-                value_type: ValueType::new(DataType::Boolean, false),
-            };
-            struct ConversionObserver {
-                calls: usize,
-            }
-            impl original_emission_test_observer::OriginalEmissionObserver for ConversionObserver {
-                fn observe(
-                    &mut self,
-                    view: original_emission_test_observer::OriginalEmissionView<'_>,
-                    _work: &mut CompileCheckpoints<'_>,
-                ) -> Result<(), ContractLoweringError> {
-                    self.calls += 1;
-                    let mut count = 0;
-                    for builder in view.fragments().values() {
-                        for (_, node) in builder.construction_nodes() {
-                            let Some(unit) = builder.construction_unit(node.id) else {
-                                continue;
-                            };
-                            for expression in unit.definitions() {
-                                if let ContractExprKind::FunctionCall { function, args } =
-                                    &expression.kind
-                                {
-                                    assert_eq!(
-                                        function.function_id.as_str(),
-                                        "builtin.scalar/value_domain_conversion/v1"
-                                    );
-                                    assert!(
-                                        function
-                                            .overload
-                                            .as_str()
-                                            .ends_with("signed_to_largeint/v1")
-                                    );
-                                    assert_eq!(
-                                        expression.ty.logical_type(),
-                                        novarocks_type_contract::ValueLogicalType::LargeInt
-                                    );
-                                    assert_eq!(
-                                        unit.definition(args[0]).unwrap().ty,
-                                        ValueType::new(DataType::Int64, false)
-                                    );
-                                    count += 1;
-                                }
-                            }
-                        }
-                    }
-                    assert_eq!(
-                        count, 1,
-                        "each exact signed comparison operand needs its real conversion"
-                    );
-                    Ok(())
-                }
-            }
-            let source = values(
-                vec![column(1, "answer", DataType::Boolean, false)],
-                vec![vec![expression]],
+    fn comparison_and_simple_case_publish_the_original_typed_operands() {
+        let sql =
+            "SELECT CAST(7 AS BIGINT) = 7, CASE CAST(7 AS BIGINT) WHEN 7 THEN true ELSE false END";
+        let parsed = novarocks_parser::parser::parse_query(sql).unwrap();
+        let (query, _, _) = crate::analyzer::analyze(
+            &parsed,
+            &crate::catalog::memory::PlannerMemoryCatalog::default(),
+            "default",
+        )
+        .unwrap();
+        let crate::analysis::QueryBody::Select(select) = query.body else {
+            panic!("source SELECT");
+        };
+        let rows = select
+            .projection
+            .into_iter()
+            .map(|item| item.expr)
+            .collect::<Vec<_>>();
+        let Some((crate::common::BinOp::Eq, comparison)) =
+            crate::common::binary_operator::typed_comparison(&rows[0])
+        else {
+            panic!("selected comparison");
+        };
+        let ExprKind::Case {
+            operand: Some(probe),
+            when_then,
+            ..
+        } = &rows[1].kind
+        else {
+            panic!("simple CASE");
+        };
+        for [left, right] in [comparison, [probe.as_ref(), &when_then[0].0]] {
+            assert_eq!(left.value_type, ValueType::new(DataType::Int64, false));
+            assert_eq!(right.value_type, left.value_type);
+        }
+        let plan = finish_for_test(&values(
+            vec![
+                column(
+                    1,
+                    "comparison",
+                    DataType::Boolean,
+                    rows[0].value_type.nullable(),
+                ),
+                column(
+                    2,
+                    "simple_case",
+                    DataType::Boolean,
+                    rows[1].value_type.nullable(),
+                ),
+            ],
+            vec![rows],
+        ))
+        .unwrap();
+        let fragment = &plan.fragments()[&ROOT_FRAGMENT_ID];
+        let node = &fragment.nodes()[&fragment.root()];
+        let unit = node.expressions.as_ref().unwrap();
+        let [comparison, case] = unit.roots() else {
+            panic!("two expression roots");
+        };
+        let ContractExprKind::FunctionCall { args, .. } =
+            &unit.definition(comparison.definition).unwrap().kind
+        else {
+            panic!("selected comparison was sealed");
+        };
+        let ContractExprKind::Case {
+            operand: Some(probe),
+            when_then,
+            ..
+        } = &unit.definition(case.definition).unwrap().kind
+        else {
+            panic!("simple CASE was sealed");
+        };
+        for id in [args[0], args[1], *probe, when_then[0].0] {
+            assert_eq!(
+                unit.definition(id).unwrap().ty,
+                ValueType::new(DataType::Int64, false)
             );
-            let control = crate::compiler::SqlCompileControl::unbounded();
-            let mut observer = ConversionObserver { calls: 0 };
-            let result =
-                original_emission_test_observer::lower_read_with_original_emission_observer(
-                    &source,
-                    version(),
-                    dop(),
-                    None,
-                    crate::functions::builtin_sql_function_catalog().snapshot(),
-                    crate::constant::test_constant_policy(),
-                    &control,
-                    &mut observer,
-                );
-            assert_eq!(observer.calls, 1);
-            result.unwrap().finish_observed(&control).unwrap();
         }
     }
 

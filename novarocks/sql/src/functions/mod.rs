@@ -54,8 +54,6 @@ use novarocks_functions::{
 };
 use novarocks_type_contract::{ValueKind, trino_can_coerce_scalar};
 
-#[cfg(test)]
-pub(crate) use resolver::resolve_scalar_function;
 pub(crate) use resolver::{ResolveError, ResolvedScalarFunction};
 
 /// Evaluation stability of a scalar function call.
@@ -458,9 +456,8 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         arguments: &[FunctionArgument],
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
-        self.resolve_bound_user(
+        self.resolve_window_syntax_binding(
             name,
-            FunctionKind::Window,
             FunctionBindingRequest {
                 expected_result_type: None,
                 arguments,
@@ -490,6 +487,11 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
 
     fn contains_aggregate(&self, name: &str) -> bool {
         self.definition(name, FunctionKind::Aggregate)
+            .is_some_and(|definition| definition.visibility() == FunctionVisibility::Public)
+    }
+
+    fn contains_window(&self, name: &str) -> bool {
+        self.definition(name, FunctionKind::Window)
             .is_some_and(|definition| definition.visibility() == FunctionVisibility::Public)
     }
 

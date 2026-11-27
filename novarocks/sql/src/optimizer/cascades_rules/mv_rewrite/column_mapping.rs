@@ -373,15 +373,14 @@ mod tests {
     }
 
     #[test]
-    fn normalize_sorts_commutative_args() {
+    fn normalize_keeps_selected_scalar_order_and_commutes_total_booleans() {
         let a = col(1, "a");
         let b = col(2, "b");
         let nm = names(&[(1, "a"), (2, "b")]);
 
-        // a + b == b + a (commutative arg sort).
         let ab = bin(col_ref(&a), BinOp::Add, col_ref(&b));
         let ba = bin(col_ref(&b), BinOp::Add, col_ref(&a));
-        assert_eq!(
+        assert_ne!(
             normalize(&ab, &nm).expect("a+b"),
             normalize(&ba, &nm).expect("b+a")
         );
@@ -393,6 +392,18 @@ mod tests {
             normalize(&a_lt_5, &nm).expect("a<5"),
             normalize(&five_gt_a, &nm).expect("5>a")
         );
+        let b_eq_5 = bin(col_ref(&b), BinOp::Eq, int_lit(5));
+        let division = bin(int_lit(1), BinOp::Div, col_ref(&a));
+        let errorful = bin(division, BinOp::Eq, int_lit(1));
+        use crate::common::BooleanOp::{And, ExpandedConjunction, ExpandedNegatedConjunction, Or};
+        for op in [And, Or, ExpandedConjunction, ExpandedNegatedConjunction] {
+            let equivalent_when_swapped = |left: &TypedExpr| {
+                normalize(&bin(left.clone(), op, b_eq_5.clone()), &nm).unwrap()
+                    == normalize(&bin(b_eq_5.clone(), op, left.clone()), &nm).unwrap()
+            };
+            assert_eq!(equivalent_when_swapped(&a_lt_5), matches!(op, And | Or));
+            assert!(!equivalent_when_swapped(&errorful));
+        }
     }
 
     #[test]
@@ -856,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn mv_mapping_binary_and_cast_policy_are_exact_and_commutation_is_preserved() {
+    fn mv_mapping_preserves_selected_binary_order_and_exact_cast_policy() {
         use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
         let mv_a = col(1, "a");
         let mv_b = col(2, "b");
@@ -892,8 +903,11 @@ mod tests {
                 output.clone(),
             )]);
             assert_rewritten_column(
-                rewrite_typed(&map, &binary(&query_b, &query_a, policy), &query_names).unwrap(),
+                rewrite_typed(&map, &binary(&query_a, &query_b, policy), &query_names).unwrap(),
                 &output,
+            );
+            assert!(
+                rewrite_typed(&map, &binary(&query_b, &query_a, policy), &query_names).is_none()
             );
             let foreign_policy = if policy == OutputNull {
                 ReportError
@@ -903,7 +917,7 @@ mod tests {
             assert!(
                 rewrite_typed(
                     &map,
-                    &binary(&query_b, &query_a, foreign_policy),
+                    &binary(&query_a, &query_b, foreign_policy),
                     &query_names
                 )
                 .is_none()

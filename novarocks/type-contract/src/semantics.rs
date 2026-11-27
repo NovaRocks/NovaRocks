@@ -528,9 +528,7 @@ mod tests {
             ),
             (
                 SemanticParameterId::new(9),
-                SemanticParameterValue::StatementStartUtc(
-                    crate::StatementStartUtc::try_new(1, 0).unwrap(),
-                ),
+                SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("UTC").unwrap()),
             ),
         ])
         .unwrap();
@@ -603,29 +601,27 @@ mod tests {
     fn lexical_scopes_keep_distinct_values_for_the_same_key() {
         let first = SemanticParameterRef {
             id: SemanticParameterId::new(7),
-            expected_key: SemanticParameterKey::StatementStartUtc,
+            expected_key: SemanticParameterKey::TimeZone,
         };
         let second = SemanticParameterRef {
             id: SemanticParameterId::new(u32::MAX),
-            expected_key: SemanticParameterKey::StatementStartUtc,
+            expected_key: SemanticParameterKey::TimeZone,
         };
         let table = SemanticParameters::try_new([
             (
                 first.id,
-                SemanticParameterValue::StatementStartUtc(
-                    crate::StatementStartUtc::try_new(1, 0).unwrap(),
+                SemanticParameterValue::TimeZone(
+                    crate::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
                 ),
             ),
             (
                 second.id,
-                SemanticParameterValue::StatementStartUtc(
-                    crate::StatementStartUtc::try_new(0, 0).unwrap(),
-                ),
+                SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("UTC").unwrap()),
             ),
             (
                 SemanticParameterId::new(2),
-                SemanticParameterValue::StatementStartUtc(
-                    crate::StatementStartUtc::try_new(1, 0).unwrap(),
+                SemanticParameterValue::TimeZone(
+                    crate::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
                 ),
             ),
         ])
@@ -634,20 +630,16 @@ mod tests {
         assert_eq!(projected.entries().len(), 2);
         assert_eq!(
             projected.require(first).unwrap(),
-            &SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(1, 0).unwrap()
-            )
+            &SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("Asia/Shanghai").unwrap())
         );
         assert_eq!(
             projected.require(second).unwrap(),
-            &SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(0, 0).unwrap()
-            )
+            &SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("UTC").unwrap())
         );
         assert_eq!(
             table.get(SemanticParameterId::new(2)),
-            Some(&SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(1, 0).unwrap()
+            Some(&SemanticParameterValue::TimeZone(
+                crate::TimeZoneKey::parse("Asia/Shanghai").unwrap()
             ))
         );
         assert!(matches!(
@@ -655,7 +647,7 @@ mod tests {
                 first,
                 SemanticParameterRef {
                     id: first.id,
-                    expected_key: SemanticParameterKey::TimeZone
+                    expected_key: SemanticParameterKey::StatementStartUtc
                 }
             ]),
             Err(SemanticParameterError::KeyMismatch(_))
@@ -677,19 +669,16 @@ mod tests {
             env.parameter(SemanticParameterKey::TimeZone),
             Some(SemanticParameterValue::TimeZone(zone))
         );
-        assert_eq!(env.parameter(SemanticParameterKey::StatementStartUtc), None);
     }
 
     #[test]
     fn definition_bound_is_independent_of_sparse_ids() {
+        let zones = ["UTC", "Asia/Shanghai"].map(|name| crate::TimeZoneKey::parse(name).unwrap());
         let entries = (0..MAX_SEMANTIC_PARAMETERS)
             .map(|index| {
                 (
                     SemanticParameterId::new(u32::MAX - index as u32),
-                    SemanticParameterValue::StatementStartUtc(
-                        crate::StatementStartUtc::try_new(i64::from(u8::from(index % 2 == 0)), 0)
-                            .unwrap(),
-                    ),
+                    SemanticParameterValue::TimeZone(zones[index % zones.len()]),
                 )
             })
             .collect::<Vec<_>>();

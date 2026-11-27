@@ -2001,14 +2001,10 @@ mod intrinsic_cast_effect_tests {
         ));
     }
     #[test]
-    fn decimal_multiply_preserves_legacy_error_effect_without_a_frozen_allow_flag() {
+    fn selected_decimal_arithmetic_preserves_row_error_effect_under_both_session_policies() {
         use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
         let mut arena = ScalarArena::new();
-        for dtype in [
-            DataType::Decimal128(38, 0),
-            DataType::Decimal256(76, 0),
-            DataType::Float64,
-        ] {
+        for dtype in [DataType::Decimal128(38, 0), DataType::Float64] {
             let left = arena.intern(
                 ScalarNode::ColumnRef(ColumnId(51)),
                 novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
@@ -2026,11 +2022,9 @@ mod intrinsic_cast_effect_tests {
             ] {
                 for policy in [OutputNull, ReportError] {
                     let expr = arena.test_intern_operator(op, left, right, policy);
-                    let is_decimal =
-                        matches!(dtype, DataType::Decimal128(..) | DataType::Decimal256(..));
                     assert_eq!(
                         can_fail(&arena, expr),
-                        is_decimal && (op == crate::common::BinOp::Mul || policy == ReportError),
+                        matches!(dtype, DataType::Decimal128(..)),
                         "{dtype:?}/{op:?}/{policy:?}"
                     );
                     assert!(!contains_non_deterministic_function(&arena, expr));

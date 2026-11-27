@@ -197,7 +197,14 @@ pub(super) fn comparison_recipe(
     [left, right]: [&FunctionValueType; 2],
     control: &dyn PureCompileControl,
 ) -> Result<PreparedComparisonRecipe, FunctionBindingError> {
-    let comparison = if operator.is_null_safe_comparison() {
+    let comparison = if operator == OperatorFunction::SubqueryFloatEqual {
+        if left.data_type() != right.data_type()
+            || !matches!(left.data_type(), DataType::Float32 | DataType::Float64)
+        {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        }
+        ComparisonOperator::Eq
+    } else if operator.is_null_safe_comparison() {
         use DataType::*;
         if left.value_type().temporal().is_none()
             && !matches!(
@@ -686,23 +693,19 @@ where
         let l = inputs[0].value_row(ordinal, row);
         let r = inputs[1].value_row(ordinal, row);
         let (ln, rn) = (left.is_null(l), right.is_null(r));
-        if operator.is_null_safe_comparison() {
-            let same = if ln || rn {
-                ln && rn
-            } else {
-                let (l, r) = (left.value(l), right.value(r));
-                l == r || (is_nan(l) && is_nan(r))
-            };
-            return Ok(Some(same ^ (operator == OperatorFunction::Distinct)));
-        }
+        let null_safe = operator.is_null_safe_comparison();
+        let distinct = operator == OperatorFunction::Distinct;
         if ln || rn {
-            return Ok(None);
+            return Ok(null_safe.then_some((ln && rn) ^ distinct));
+        }
+        let (left, right) = (left.value(l), right.value(r));
+        if null_safe || operator == OperatorFunction::SubqueryFloatEqual {
+            let same = left == right || (is_nan(left) && is_nan(right));
+            return Ok(Some(same ^ distinct));
         }
         let operator = operator.comparison().expect("ordinary floating comparison");
         Ok(Some(crate::comparison::ieee_float_comparison(
-            operator,
-            left.value(l),
-            right.value(r),
+            operator, left, right,
         )))
     })
 }

@@ -1082,6 +1082,13 @@ mod tests {
         }
     }
 
+    fn int32_lit(v: i32) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(i64::from(v))),
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+        }
+    }
+
     fn large_int_lit(v: i128) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::LargeInt(v)),
@@ -1233,19 +1240,23 @@ mod tests {
     }
 
     #[test]
-    fn skips_equivalence_derivation_for_incompatible_key_types() {
+    fn skips_equivalence_derivation_for_keys_compared_in_a_wider_domain() {
         let mut arena = ScalarArena::new();
         let join_eq = group(
             &mut arena,
             bool_expr(
                 col_ty("l", "a", 1, DataType::Int32),
                 BinOp::Eq,
-                col_ty("r", "b", 2, DataType::Utf8),
+                col_ty("r", "b", 2, DataType::Int64),
             ),
         );
         let left_filter = group(
             &mut arena,
-            bool_expr(col_ty("l", "a", 1, DataType::Int32), BinOp::Eq, int_lit(7)),
+            bool_expr(
+                col_ty("l", "a", 1, DataType::Int32),
+                BinOp::Eq,
+                int32_lit(7),
+            ),
         );
 
         let derived = derive_inner_join_predicates(
@@ -1261,7 +1272,7 @@ mod tests {
 
         assert!(
             derived.is_empty(),
-            "incompatible key types must not derive predicates: {:?}",
+            "equality of widened keys must not assign the original INTEGER predicate to BIGINT: {:?}",
             derived
         );
     }
@@ -1282,7 +1293,7 @@ mod tests {
             bool_expr(
                 col_meta("l", "a", 1, DataType::Int32, false),
                 BinOp::Eq,
-                int_lit(7),
+                int32_lit(7),
             ),
         );
 
@@ -1515,15 +1526,16 @@ mod tests {
     #[test]
     fn range_envelope_compares_decimal_bounds_exactly() {
         let mut arena = ScalarArena::new();
+        let probe = || col_ty("s", "price", 3, DataType::Decimal128(38, 2));
         let or_pred = bool_expr(
             crate::common::binary_operator::test_inclusive_range(
-                col("s", "price", 3),
+                probe(),
                 decimal_lit("10.25"),
                 decimal_lit("20.00"),
             ),
             crate::common::BooleanOp::Or,
             crate::common::binary_operator::test_inclusive_range(
-                col("s", "price", 3),
+                probe(),
                 decimal_lit("9.50"),
                 decimal_lit("30.00"),
             ),

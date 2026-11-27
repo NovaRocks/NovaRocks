@@ -90,11 +90,14 @@ SELECT c2['key1'] FROM ${case_db}.map_top_n ORDER BY c1;
 SELECT element_at(MAP(ARRAY[1, 2], ARRAY['a', 'b']), c1) FROM ${case_db}.map_top_n ORDER BY c1;
 
 -- query 14
--- Frozen Map keys are non-null. Match both the constructor cause and the
--- execution phase so a preparation or protocol failure cannot satisfy this case.
--- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
-SELECT MAP(ARRAY[null, 2], ARRAY['a', 'b'])[null];
+-- The strict NULL probe suppresses the undemanded constructor error.
+SELECT MAP(ARRAY[null, 2], ARRAY['a', 'b'])[null] AS skipped_constructor;
 
 -- query 15
 -- A NULL probe into a valid Map remains a successful NULL result.
 SELECT MAP(ARRAY[1, 2], ARRAY['a', 'b'])[null] AS null_probe;
+
+-- query 16
+-- A non-NULL probe demands the constructor, which rejects the NULL key.
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT MAP(ARRAY[null, 2], ARRAY['a', 'b'])[2];

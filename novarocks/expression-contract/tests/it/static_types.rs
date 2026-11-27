@@ -392,7 +392,7 @@ fn wide_case_match_type_checks_keep_every_original_control_prefix() {
             if std::ptr::eq(right, &full) {
                 run(&good).unwrap();
             } else {
-                type_error(run(&good), "CASE WHEN");
+                type_error(run(&good), "CASE compares");
             }
             let trace = good.trace();
             assert!(trace.iter().any(|(_, work)| *work == 256));

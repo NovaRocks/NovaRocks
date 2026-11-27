@@ -342,11 +342,12 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
+- [ADR-0279](ADR-0279-argument-demand-preserves-sql-errors.md) — 位置级实参需求、布尔行域、首行错误、Let 及有序候选怎样贯穿 FE、BE 和关系删行（active，部分替代 ADR-0272 的同一父行尾部提前批处理）
 - [ADR-0276](ADR-0276-plan-freezing-uses-frontend-planning-memory.md) — FE 静态片段冻结的规划侧内存归属、可失败整段编码分配和最后字节别名观测（active）
 - [ADR-0275](ADR-0275-approximate-distinct-freezes-precision-for-split.md) — 近似去重怎样从原参数取得固定精度，统一 HLL 状态并复核分阶段来源（active，部分替代 ADR-0259 的普通近似去重状态）
 - [ADR-0274](ADR-0274-window-setup-precedes-tracked-batch-output.md) — 窗口调用怎样核对原重载，在需求前完成必需检查并按实际布局和预算发射（active）
 
-- [ADR-0272](ADR-0272-collection-lambdas-use-bound-body-requests.md) — 集合 lambda 如何定稿原重载、按需请求准确体，以及如何沿原宿主保管捕获、错误与资源（active）
+- [ADR-0272](ADR-0272-collection-lambdas-use-bound-body-requests.md) — 集合 lambda 如何定稿原重载、按需请求准确体，以及如何沿原宿主保管捕获、错误与资源（active，同一父行越过停止前沿的提前批处理由 ADR-0279 部分替代）
 - [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
 - [ADR-0266](ADR-0266-array-scalar-overloads-and-host-admission.md) — 数组标量重载如何共用值关系、转换与宿主准入，以及与 Trino 484 的接口差异（active）
 - [ADR-0263](ADR-0263-trino-scalar-values-and-publication-eligibility.md) — Trino 标量定型、UUID 呈现与受影响 MV 的发布资格（active；发布资格和旧定义格式由 ADR-0267 部分替代；标量定型、行错误、UUID 及会话准入继续有效）

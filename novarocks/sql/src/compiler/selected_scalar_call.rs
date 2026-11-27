@@ -20,7 +20,6 @@
 
 use super::SqlFunctionCatalog;
 use crate::binding::SqlFunctionBinding;
-use arrow::datatypes::DataType;
 use novarocks_functions::{
     FunctionArgument, FunctionBindingError, FunctionBindingRequest, FunctionBindingSelection,
     FunctionResultType,
@@ -54,25 +53,6 @@ pub(crate) fn canonical_scalar_request_observed(
 
 /// Bare NULL follows the original selected argument's complete declaration.
 /// Both consumers create their own admitted constant through the same target.
-pub(crate) fn canonical_null_target(
-    actual: &FunctionValueType,
-    expected: &FunctionArgumentType,
-) -> Option<FunctionValueType> {
-    if let FunctionArgumentType::Value(expected) = expected
-        && *expected.data_type() != DataType::Null
-        && *actual.data_type() == DataType::Null
-    {
-        Some(
-            expected
-                .clone()
-                .with_nullable(true)
-                .expect("validated root NULL contract"),
-        )
-    } else {
-        None
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct CarrierStep {
     target: FunctionValueType,

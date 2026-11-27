@@ -1133,6 +1133,7 @@ fn compiled_window_owned_partition_subdivides_true_by_arrival_batches() {
 
 fn failing_mixed_windows(rows: &[Row], calls: Vec<Call>) -> (Arc<LocalProgram>, Chunk) {
     use novarocks_functions::FunctionKind;
+    use novarocks_type_contract::OperatorFunction;
     let shape = Shape {
         partition: vec![P],
         order: vec![key(O, true, false)],
@@ -1144,6 +1145,10 @@ fn failing_mixed_windows(rows: &[Row], calls: Vec<Call>) -> (Arc<LocalProgram>, 
         &[
             ("min_by", FunctionKind::Aggregate),
             ("lag", FunctionKind::Window),
+            (
+                OperatorFunction::Multiply.catalog_name(),
+                FunctionKind::Scalar,
+            ),
         ],
         &actual,
     );
@@ -1173,7 +1178,7 @@ fn compiled_window_mixed_required_faults_follow_original_call_order() {
             vec![offset, by]
         };
         let (program, input) = failing_mixed_windows(&rows, calls);
-        let state = RuntimeState::default();
+        let state = RuntimeState::default().with_test_query_memory();
         let mut operator = tracked_operator(&program, NonZeroU32::new(1).unwrap(), &state);
         let mut driver = TestDriver::new(operator.as_mut(), &state);
         driver.input_without_output(input).unwrap();

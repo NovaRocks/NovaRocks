@@ -114,6 +114,20 @@ impl QueryMemoryBinding {
     }
 }
 #[cfg(test)]
+pub(crate) fn test_query_memory_binding(
+    execution: QueryExecutionId,
+    authority: Arc<MemoryAuthority>,
+) -> QueryMemoryBinding {
+    let account = authority
+        .create_account(
+            novarocks_memory::AccountKind::Work,
+            novarocks_memory::ExternalRef::NONE,
+        )
+        .expect("test query memory account");
+    QueryMemoryBinding::try_new(execution, authority, account).expect("test query memory binding")
+}
+
+#[cfg(test)]
 #[path = "query_memory_tests.rs"]
 mod tests;
 

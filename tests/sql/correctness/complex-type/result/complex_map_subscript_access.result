@@ -75,6 +75,11 @@ NULL
 NULL
 NULL
 
+-- query 14
+-- types	varchar(1)
+skipped_constructor
+NULL
+
 -- query 15
 -- types	varchar(1)
 null_probe

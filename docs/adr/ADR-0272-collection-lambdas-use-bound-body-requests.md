@@ -5,6 +5,10 @@ domain: [sql-compiler, execution-functions]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0279
+    scope: "第 3 条中越过同一父行停止前沿的提前批处理，以及由此产生的外层失败时机"
+    link: "ADR-0279-argument-demand-preserves-sql-errors.md"
 date: 2026-11-25
 provenance:
   - "discussion: 2026-11-25 collection lambda typing, demand and host custody"

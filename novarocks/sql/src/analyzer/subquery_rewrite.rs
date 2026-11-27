@@ -847,8 +847,7 @@ impl<'a> AnalyzerContext<'a> {
         })?;
 
         // Build the equality condition plus the lifted WHERE.
-        let eq_cond = self.analyze_binary_operator(
-            novarocks_type_contract::OperatorFunction::Equal,
+        let eq_cond = self.analyze_subquery_equality(
             lhs_typed.clone(),
             TypedExpr {
                 kind: ExprKind::ColumnRef {
@@ -1209,8 +1208,7 @@ impl<'a> AnalyzerContext<'a> {
             None
         };
 
-        let eq_cond = self.analyze_binary_operator(
-            novarocks_type_contract::OperatorFunction::Equal,
+        let eq_cond = self.analyze_subquery_equality(
             lhs_typed.clone(),
             TypedExpr {
                 kind: ExprKind::ColumnRef {
@@ -2174,12 +2172,7 @@ impl<'a> AnalyzerContext<'a> {
                 negated,
                 in_expr_ast.span(),
             )?;
-            let eq = self.analyze_binary_operator(
-                novarocks_type_contract::OperatorFunction::Equal,
-                lhs_i.clone(),
-                rhs_ref,
-                in_expr_ast.span(),
-            )?;
+            let eq = self.analyze_subquery_equality(lhs_i.clone(), rhs_ref, in_expr_ast.span())?;
             debug_assert_eq!(eq.value_type.nullable(), nullable);
             has_composite_key |= has_composite_comparison(&lhs_i.value_type, &sub_col.value_type);
             eq_conjuncts.push(eq);
@@ -2648,12 +2641,7 @@ impl<'a> AnalyzerContext<'a> {
             )?;
             either_nullable |= nullable;
             has_composite_key |= has_composite_comparison(&left.value_type, &right.expr.value_type);
-            let equality = self.analyze_binary_operator(
-                novarocks_type_contract::OperatorFunction::Equal,
-                left,
-                right.expr,
-                subquery_span,
-            )?;
+            let equality = self.analyze_subquery_equality(left, right.expr, subquery_span)?;
             debug_assert_eq!(equality.value_type.nullable(), nullable);
             comparisons.push(equality);
         }

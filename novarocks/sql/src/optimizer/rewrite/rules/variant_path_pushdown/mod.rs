@@ -255,27 +255,19 @@ mod tests {
         }
     }
 
-    /// Return whichever side of a binary predicate is a ColumnRef.
-    /// ScalarArena normalizes commutative ops (including Eq) by ScalarId ordering,
-    /// so after a round-trip through the arena the left/right positions may swap.
-    fn binary_column_ref_side(expr: &TypedExpr) -> &TypedExpr {
-        match &expr.kind {
-            ExprKind::BooleanConnective { left, right, .. }
-            | ExprKind::Let {
-                initializer: left,
-                body: right,
-                ..
-            } => {
-                if matches!(left.kind, ExprKind::ColumnRef { .. }) {
-                    left
-                } else if matches!(right.kind, ExprKind::ColumnRef { .. }) {
-                    right
-                } else {
-                    panic!("expected one side to be ColumnRef, got left={left:?}, right={right:?}")
-                }
-            }
-            other => panic!("expected BinaryOp, got {other:?}"),
-        }
+    fn equality_column_operand(expr: &TypedExpr) -> &TypedExpr {
+        use novarocks_type_contract::OperatorFunction;
+        let Some((OperatorFunction::Equal, [column, comparison])) =
+            crate::common::binary_operator::typed_operands(expr)
+        else {
+            panic!("expected the original selected equality: {expr:?}");
+        };
+        assert!(matches!(column.kind, ExprKind::ColumnRef { .. }));
+        assert!(matches!(
+            comparison.kind,
+            ExprKind::Literal(LiteralValue::Int(10))
+        ));
+        column
     }
 
     #[test]
@@ -332,7 +324,7 @@ mod tests {
         assert!(synthetic_output.value_type.nullable());
         assert!(synthetic_output.is_internal);
 
-        let rewritten_left = binary_column_ref_side(&filter.predicate);
+        let rewritten_left = equality_column_operand(&filter.predicate);
         assert_eq!(
             column_ref_id(rewritten_left),
             descriptor.synthetic_column_id()
@@ -490,7 +482,7 @@ mod tests {
         let synthetic_id = scan.variant_columns[0].synthetic_column_id();
         assert_eq!(column_ref_id(&project.items[0].expr), synthetic_id);
         assert_eq!(
-            column_ref_id(binary_column_ref_side(&filter.predicate)),
+            column_ref_id(equality_column_operand(&filter.predicate)),
             synthetic_id
         );
     }
@@ -595,7 +587,7 @@ mod tests {
         };
         assert_eq!(scan.variant_columns.len(), 1);
         assert_eq!(
-            column_ref_id(binary_column_ref_side(&scan.predicates[0])),
+            column_ref_id(equality_column_operand(&scan.predicates[0])),
             scan.variant_columns[0].synthetic_column_id()
         );
     }

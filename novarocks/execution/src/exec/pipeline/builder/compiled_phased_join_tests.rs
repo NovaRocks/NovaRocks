@@ -164,7 +164,7 @@ fn b3_phased_e2_f2_q4_preserves_compiled_hash_and_nl_multisets() {
                 tails: 0,
             },
         );
-        let runtime = RuntimeState::default();
+        let runtime = RuntimeState::default().with_test_query_memory();
         let error = runtime.error_state();
         let tracker = MemTracker::new_root("B3 actual phased probe fixture");
         let construction = super::super::aggregate_fixture::runtime_construction_factory(
@@ -260,7 +260,7 @@ fn empty_build_probe(
             tails: 0,
         },
     );
-    let runtime = RuntimeState::default();
+    let runtime = RuntimeState::default().with_test_query_memory();
     let error = runtime.error_state();
     let tracker = MemTracker::new_root("B3 zero physical build control");
     let construction = super::super::aggregate_fixture::runtime_construction_factory(
@@ -457,7 +457,7 @@ fn b3_independent_t_sources_wait_for_q_and_last_page_handoff_with_partial_consum
             },
             Some(handoff.clone()),
         ));
-        let runtime = RuntimeState::default();
+        let runtime = RuntimeState::default().with_test_query_memory();
         let error = runtime.error_state();
         let tracker = MemTracker::new_root("B3 actual Q T handoff fixture");
         let construction = super::super::aggregate_fixture::runtime_construction_factory(

@@ -62,27 +62,19 @@ fn table() -> SemanticParameters {
         ),
         (
             SemanticParameterId::new(2),
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(0, 0).unwrap(),
-            ),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("Asia/Shanghai").unwrap()),
         ),
         (
             SemanticParameterId::new(3),
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(1, 0).unwrap(),
-            ),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("+08:00").unwrap()),
         ),
         (
             SemanticParameterId::new(4),
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(0, 0).unwrap(),
-            ),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("Asia/Shanghai").unwrap()),
         ),
         (
             SemanticParameterId::new(u32::MAX),
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(1, 0).unwrap(),
-            ),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("-07:30").unwrap()),
         ),
     ])
     .unwrap()
@@ -110,8 +102,8 @@ fn exact_values_sparse_ids_and_input_are_preserved() {
     );
     assert_eq!(
         output.get(SemanticParameterId::new(u32::MAX)),
-        Some(&SemanticParameterValue::StatementStartUtc(
-            crate::StatementStartUtc::try_new(1, 0).unwrap()
+        Some(&SemanticParameterValue::TimeZone(
+            crate::TimeZoneKey::parse("-07:30").unwrap()
         ))
     );
     assert_eq!(
@@ -288,13 +280,10 @@ fn intermediate_failure_accounts_all_completed_references_without_overreading() 
         ..Default::default()
     };
     let consumed = AtomicUsize::new(0);
-    let refs = std::iter::repeat_n(
-        reference(u32::MAX, SemanticParameterKey::StatementStartUtc),
-        1025,
-    )
-    .inspect(|_| {
-        consumed.fetch_add(1, Ordering::Relaxed);
-    });
+    let refs = std::iter::repeat_n(reference(u32::MAX, SemanticParameterKey::TimeZone), 1025)
+        .inspect(|_| {
+            consumed.fetch_add(1, Ordering::Relaxed);
+        });
     assert_eq!(
         input.project_observed(refs, CompilePhase::Encode, &control),
         Err(SemanticParameterProjectionError::Control(
@@ -314,12 +303,11 @@ fn intermediate_failure_accounts_all_completed_references_without_overreading() 
 
 #[test]
 fn maximum_valid_definition_table_projects_without_a_second_validation_pass() {
+    let zones = ["UTC", "Asia/Shanghai"].map(|name| crate::TimeZoneKey::parse(name).unwrap());
     let input = SemanticParameters::try_new((0..MAX_SEMANTIC_PARAMETERS).map(|id| {
         (
             SemanticParameterId::new(id as u32),
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(i64::from(u8::from(id % 2 == 0)), 0).unwrap(),
-            ),
+            SemanticParameterValue::TimeZone(zones[id % zones.len()]),
         )
     }))
     .unwrap();
@@ -330,7 +318,7 @@ fn maximum_valid_definition_table_projects_without_a_second_validation_pass() {
             input
                 .entries()
                 .keys()
-                .map(|id| reference(id.get(), SemanticParameterKey::StatementStartUtc)),
+                .map(|id| reference(id.get(), SemanticParameterKey::TimeZone)),
             CompilePhase::Decode,
             &control,
         )

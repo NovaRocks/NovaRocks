@@ -915,7 +915,7 @@ pub(super) fn compile(
     pipeline_dop: usize,
     result: bool,
 ) -> Arc<LocalProgram> {
-    let catalog = novarocks_functions::testkit::rng_subset();
+    let catalog = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     try_compile(package, &catalog, pipeline_dop, result)
         .unwrap_or_else(|error| panic!("join fragment compiles: {error}"))
 }
@@ -1474,17 +1474,20 @@ fn key_and_residual_row_errors_are_required_errors_of_their_own_roots() {
             ExchangeBindings::default(),
             None,
             1,
-            Arc::new(RuntimeState::for_local_execution(
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(crate::runtime::mem_tracker::MemTracker::new_root(
-                    "compiled join tests",
-                )),
-                Some(crate::runtime::execution_runtime::test_execution_runtime()),
-            )),
+            Arc::new(
+                RuntimeState::for_local_execution(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                        "compiled join tests",
+                    )),
+                    Some(crate::runtime::execution_runtime::test_execution_runtime()),
+                )
+                .with_test_query_memory(),
+            ),
             Arc::new(NoopTaskEventSink),
         )
         .expect("the join prepares its drivers");
@@ -2998,7 +3001,7 @@ fn b3_residual_gathers_only_original_referenced_columns_from_published_pages() {
         },
         None,
     ));
-    let runtime = RuntimeState::default();
+    let runtime = RuntimeState::default().with_test_query_memory();
     let error = runtime.error_state();
     let tracker = MemTracker::new_root("B3 real minimal residual projection");
     let factory = super::aggregate_fixture::runtime_construction_factory(
@@ -3456,17 +3459,20 @@ fn b3_naa_required_eligibility_error_keeps_sparse_original_pair_row_after_earlie
         ExchangeBindings::default(),
         None,
         1,
-        Arc::new(RuntimeState::for_local_execution(
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(crate::runtime::mem_tracker::MemTracker::new_root(
-                "NAA original sparse E row",
-            )),
-            Some(crate::runtime::execution_runtime::test_execution_runtime()),
-        )),
+        Arc::new(
+            RuntimeState::for_local_execution(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                    "NAA original sparse E row",
+                )),
+                Some(crate::runtime::execution_runtime::test_execution_runtime()),
+            )
+            .with_test_query_memory(),
+        ),
         Arc::new(NoopTaskEventSink),
     )
     .unwrap();
@@ -3562,15 +3568,18 @@ fn nested_loop_left_mark_preserves_a_late_required_error_after_true() {
         ExchangeBindings::default(),
         None,
         1,
-        Arc::new(RuntimeState::for_local_execution(
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(tracker.clone()),
-            Some(crate::runtime::execution_runtime::test_execution_runtime()),
-        )),
+        Arc::new(
+            RuntimeState::for_local_execution(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(tracker.clone()),
+                Some(crate::runtime::execution_runtime::test_execution_runtime()),
+            )
+            .with_test_query_memory(),
+        ),
         Arc::new(NoopTaskEventSink),
     )
     .unwrap();

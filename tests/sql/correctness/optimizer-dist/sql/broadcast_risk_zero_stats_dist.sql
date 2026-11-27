@@ -30,7 +30,7 @@ SET SESSION disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
 -- @result_not_contains=BROADCAST EXCHANGE
 -- @result_not_contains=memory=inf
 -- @result_contains=GENERATE_SERIES(1, 100000000, 1)
--- @result_contains=predicate: k > 0
+-- @result_contains=predicate: 0 < k
 EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 WITH big_probe AS (
     SELECT generate_series AS k

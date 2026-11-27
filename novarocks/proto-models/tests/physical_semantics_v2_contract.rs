@@ -112,7 +112,13 @@ fn all_parameter_variants_preserve_raw_values_and_oneof_presence() {
             .unwrap()
             .fields()
             .count(),
-        3
+        2
+    );
+    assert!(descriptor.reserved_ranges().any(|range| range.contains(&4)));
+    assert!(
+        descriptor
+            .reserved_names()
+            .any(|name| name == "allow_throw_exception")
     );
     for entry in &parameters.entries {
         let absent = v2::SemanticParameter {
@@ -136,9 +142,22 @@ fn all_parameter_variants_preserve_raw_values_and_oneof_presence() {
 }
 
 #[test]
-fn all_nine_effect_fields_higher_order_channels_and_both_proof_scopes_survive() {
+fn call_effect_fields_strict_positions_and_proof_scopes_survive() {
     let value = effects(v2::proof_scope::Kind::RegionId(0));
     roundtrip(&value);
+    let strict = v2::CallEffects {
+        null_behavior: v2::NullBehavior::StrictPositions as i32,
+        argument_control: Some(v2::ArgumentControl {
+            kind: Some(v2::argument_control::Kind::Simple(
+                v2::SimpleArgumentControl::OrderedNull as i32,
+            )),
+        }),
+        strict_argument_ordinals: vec![0, u32::MAX],
+        ..value.clone()
+    };
+    roundtrip(&strict);
+    assert_ne!(strict.encode_to_vec(), value.encode_to_vec());
+
     let unconditional = effects(v2::proof_scope::Kind::Unconditional(control::Empty {}));
     roundtrip(&unconditional);
     assert_ne!(value.encode_to_vec(), unconditional.encode_to_vec());
@@ -169,6 +188,7 @@ fn all_nine_effect_fields_higher_order_channels_and_both_proof_scopes_survive() 
             (7, "observable_effects".into()),
             (8, "environment".into()),
             (9, "proof_scope".into()),
+            (10, "strict_argument_ordinals".into()),
         ]
     );
     for simple in [

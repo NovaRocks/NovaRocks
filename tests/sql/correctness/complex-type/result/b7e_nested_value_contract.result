@@ -39,6 +39,11 @@ id	original_row	matched
 forward	reverse	identical
 false	false	true
 
+-- query 11
+-- types	boolean
+matched
+true
+
 -- query 13
 -- types	boolean	boolean
 same_date	same_string

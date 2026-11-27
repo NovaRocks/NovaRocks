@@ -16,7 +16,6 @@
 // under the License.
 
 use super::*;
-use novarocks_functions::{FunctionArgumentType, FunctionBindingRequest};
 use novarocks_physical_plan::ConstantPools;
 
 fn project_with_pools(
@@ -189,73 +188,6 @@ fn operational_channels_nonzero_some_preserves_full_source_field_and_backing() {
         receipt.captured().binding().decimal_overflow_policy(),
         DecimalOverflowPolicy::ReportError
     );
-}
-
-#[test]
-fn operational_channels_canonical_null_keeps_distinct_emission_and_exact_original_catalogue() {
-    let argument = TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::Null),
-        value_type: ValueType::new(DataType::Null, true),
-    };
-    let owner = authored(lower_call(argument, DecimalOverflowPolicy::OutputNull));
-    let (fragment, unit_node, source) = scalar_source(&owner);
-    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
-    let original = constant(&receipt.captured().request().arguments[0]).unwrap();
-    let arguments = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
-    let projected = constant(&arguments[0]).unwrap();
-    let emitted = physical_constant(&owner, &receipt, receipt.arguments()[0]);
-    assert_eq!(original.value_type(), &ValueType::new(DataType::Null, true));
-    let char_zero = nullable_bounded_character(novarocks_type_contract::CharacterKind::Char, 0);
-    assert_eq!(projected.value_type(), &char_zero);
-    assert_eq!(projected.try_utf8().unwrap(), None);
-    assert_ne!(
-        projected.pool().backing_identity(),
-        original.pool().backing_identity()
-    );
-    assert!(Arc::ptr_eq(
-        projected.pool().array(),
-        emitted.pool().array()
-    ));
-    assert!(Arc::ptr_eq(
-        projected.pool().field_ref(),
-        emitted.pool().field_ref()
-    ));
-    // Projection reuses the actual typed emission's backing while preserving
-    // the distinct captured Null source.
-    let bound = receipt.captured().binding().resolved();
-    let catalogue = owner.function_catalog();
-    assert!(
-        catalogue
-            .select_exact_overload_observed(
-                &bound.function_id,
-                bound.kind,
-                &bound.selected.overload,
-                receipt.captured().request(),
-                &Control::default(),
-            )
-            .is_err()
-    );
-    let selected = catalogue
-        .select_exact_overload_observed(
-            &bound.function_id,
-            bound.kind,
-            &bound.selected.overload,
-            FunctionBindingRequest {
-                arguments: &arguments,
-                logical_argument_count: 1,
-                expected_result_type: Some(&source.ty),
-            },
-            &Control::default(),
-        )
-        .unwrap();
-    assert_eq!(selected.overload, bound.selected.overload);
-    assert_eq!(
-        selected.argument_types.as_ref(),
-        &[FunctionArgumentType::Value(char_zero.clone())]
-    );
-    assert_eq!(selected.result_type, FunctionResultType::Scalar(char_zero));
-    // This asserts metadata selection only; no call effects, final snapshot or
-    // whole FE publication proof is constructed by this fixture.
 }
 
 #[test]

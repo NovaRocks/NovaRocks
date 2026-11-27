@@ -1620,6 +1620,8 @@ fn single_join(null_safe: bool) -> Arc<LocalProgram> {
 fn run_join(program: &Arc<LocalProgram>, session: Arc<FakeSession>) -> ExecutionResult<Rows> {
     let output = ResultSinkBuffer::new();
     let sink: Box<dyn OperatorFactory> = result_sink(program, SINGLE_FINST, &output);
+    let runtime = state(Some(session), Duration::from_secs(1), None);
+    let runtime = Arc::new(Arc::unwrap_or_clone(runtime).with_test_query_memory());
     prepare_compiled_program_pipeline_execution(
         Arc::clone(program),
         Duration::from_millis(10),
@@ -1627,7 +1629,7 @@ fn run_join(program: &Arc<LocalProgram>, session: Arc<FakeSession>) -> Execution
         ExchangeBindings::default(),
         Some((SINGLE_FINST.high(), SINGLE_FINST.low())),
         1,
-        state(Some(session), Duration::from_secs(1), None),
+        runtime,
         Arc::new(NoopTaskEventSink),
     )?
     .start()
@@ -2998,7 +3000,7 @@ fn b3_input_keeps_required_key_row_failure_and_fails_rf_without_empty_completion
         },
         None,
     ));
-    let runtime = RuntimeState::default();
+    let runtime = RuntimeState::default().with_test_query_memory();
     let error = runtime.error_state();
     let tracker = MemTracker::new_root("B3 original required key error and RF failure");
     let construction = super::aggregate_fixture::runtime_construction_factory(

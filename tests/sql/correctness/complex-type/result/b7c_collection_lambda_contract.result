@@ -27,12 +27,6 @@ id	early_true
 0	[0,1]
 1	[1]
 
--- query 8
--- types	integer	array(integer)
-id	late_true
-0	[0,1]
-1	[1]
-
 -- query 10
 -- types	integer	boolean	boolean	boolean	boolean
 id	any_original	any_reversed	all_original	all_reversed

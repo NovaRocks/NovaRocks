@@ -472,11 +472,15 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
             .expressions
             .as_ref()
             .unwrap();
-        assert!(
-            unit.control_flow()
-                .regions()
-                .values()
-                .all(|region| region.guard.is_none())
+        let guards = unit
+            .control_flow()
+            .regions()
+            .values()
+            .filter_map(|region| region.guard.map(|guard| guard.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            guards,
+            [novarocks_type_contract::GuardKind::OrderedNullAfterArgument { ordinal: 0 }]
         );
     }
     let fragment = builder
@@ -546,7 +550,7 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
     .unwrap();
     let package = Arc::new(packages.remove(&FRAGMENT).unwrap());
     let validated = validate_fragment_providers(package, &providers(), &FixtureControl).unwrap();
-    let functions = novarocks_functions::testkit::rng_subset();
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     Arc::new(
         compile_fragment(validated, &functions, options(dop), &FixtureControl)
             .unwrap_or_else(|error| panic!("the scan fixture compiles: {error}")),

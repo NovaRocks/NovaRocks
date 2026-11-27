@@ -599,6 +599,39 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
+    /// Freeze the original window overload against its converted channels.
+    fn finish_window_binding(
+        &self,
+        original: &novarocks_functions::ResolvedFunctionBinding,
+        arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        use novarocks_functions::{FunctionBindingError, FunctionBindingRequest, FunctionKind};
+        if original.kind != FunctionKind::Window
+            || original.logical_argument_count != arguments.len()
+        {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        }
+        let selected = self.select_exact_overload_observed(
+            &original.function_id,
+            FunctionKind::Window,
+            &original.selected.overload,
+            FunctionBindingRequest {
+                arguments,
+                logical_argument_count: arguments.len(),
+                expected_result_type: None,
+            },
+            control,
+        )?;
+        Ok(novarocks_functions::ResolvedFunctionBinding {
+            selected: selected.as_ref().clone(),
+            ..original.clone()
+        })
+    }
+
     fn resolve_table_binding(
         &self,
         _name: &str,
@@ -616,6 +649,11 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
     }
 
     fn contains_aggregate(&self, name: &str) -> bool;
+
+    /// Whether the exact catalogue owns this public Window function name.
+    fn contains_window(&self, _name: &str) -> bool {
+        false
+    }
 
     fn resolve_distinct_aggregate(
         &self,
@@ -1707,7 +1745,8 @@ impl From<novarocks_functions::FunctionBindingError> for SqlCompileError {
     fn from(error: novarocks_functions::FunctionBindingError) -> Self {
         match error {
             novarocks_functions::FunctionBindingError::Control(error) => error.into(),
-            error @ novarocks_functions::FunctionBindingError::VariantTargetType(_) => {
+            error @ (novarocks_functions::FunctionBindingError::VariantTargetType(_)
+            | novarocks_functions::FunctionBindingError::InvalidArguments(_)) => {
                 Self::Analyze(AnalyzeError::function_binding(error))
             }
             error @ novarocks_functions::FunctionBindingError::UnavailableImplementation(_) => {

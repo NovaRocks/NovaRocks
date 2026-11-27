@@ -22,7 +22,7 @@ PLAN FRAGMENT 1
            TABLE: ${case_db}.oq6_alias_base
            columns: k, v
            min-max stats
-           predicates: v > 10
+           predicates: 10 < v
 
 -- query 6
 -- types	varchar

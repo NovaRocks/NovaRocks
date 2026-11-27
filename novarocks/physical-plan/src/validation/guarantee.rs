@@ -31,7 +31,8 @@ use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompileControlError, ControlShape, EvaluationDemand,
     FunctionArgumentType, FunctionFailureBehavior, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionKind, FunctionNullBehavior, FunctionVolatility,
-    OperatorFunction, ValueLogicalType, owned_resources::btree,
+    OperatorFunction, TrinoCastMode, ValueKind, ValueLogicalType, owned_resources::btree,
+    trino_can_coerce,
 };
 use std::alloc::Layout;
 
@@ -90,6 +91,8 @@ pub(super) fn validate_guarantees_observed(
                 {
                     // The exact atom proof reads the retained request, claim,
                     // and each value whose source will be skipped at execution.
+                    // A signed literal widening can add one definition lookup
+                    // and one fixed scalar coercion check to the comparison.
                     let mut own_work = add(value_lookup, 32, limits)?;
                     for count in [
                         unit.requests().len(),
@@ -310,27 +313,26 @@ fn prove_provider_comparison(
     let (Some(left), Some(right)) = (unit.definition(*left), unit.definition(*right)) else {
         return Ok(false);
     };
-    let (column, constant, reference) = match (&left.kind, &right.kind) {
-        (
-            ExprKind::Value(novarocks_expression_contract::ValueAddress::Input(column)),
-            ExprKind::Constant(reference),
-        ) => (column, right, reference),
-        (
-            ExprKind::Constant(reference),
-            ExprKind::Value(novarocks_expression_contract::ValueAddress::Input(column)),
-        ) => (column, left, reference),
-        _ => return Ok(false),
+    let (column, bound) = if let Some(column) = left.kind.input_value() {
+        (column, right)
+    } else if let Some(column) = right.kind.input_value() {
+        (column, left)
+    } else {
+        return Ok(false);
     };
-    let provider_value = fragment.values().get(column);
+    let provider_value = fragment.values().get(&column);
     work.step()?;
     if !matches!(provider_value.map(|value| &value.origin),
         Some(ValueOrigin::ProviderField { scan_node, .. }) if *scan_node == scan)
-        || constant.ty.nullable()
+        || bound.ty.nullable()
         || !supports_provider_scan_comparison(&left.ty)
         || !supports_provider_scan_comparison(&right.ty)
         || left.ty.data_type() != right.ty.data_type()
         || left.ty.value_type().temporal() != right.ty.value_type().temporal()
     {
+        return Ok(false);
+    }
+    if !prove_provider_comparison_bound(unit, bound, work)? {
         return Ok(false);
     }
     let [
@@ -351,8 +353,9 @@ fn prove_provider_comparison(
     }
     work.step()?;
 
-    // The original call request ties the constant argument to its checked
-    // pool address. Package validation checks the immutable pool separately.
+    // A direct constant channel names its checked pool address. A widening
+    // still has a cast as its original argument and no direct constant channel.
+    // Package validation separately checks the pool at the actual leaf.
     let request = unit.requests().get(&definition.id);
     work.step()?;
     let Some(request) = request else {
@@ -369,15 +372,54 @@ fn prove_provider_comparison(
         else {
             return Ok(false);
         };
-        if value_type != &source.ty
-            || *constant != matches!(source.kind, ExprKind::Constant(_)).then_some(*reference)
-        {
+        let expected = match source.kind {
+            ExprKind::Constant(reference) => Some(reference),
+            _ => None,
+        };
+        if value_type != &source.ty || *constant != expected {
             return Ok(false);
         }
         work.step()?;
     }
 
     prove_provider_call_effects(unit, ordinal, definition, false, work)
+}
+
+fn prove_provider_comparison_bound(
+    unit: &BoundExprSet,
+    bound: &ExprNode,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, FragmentPropertyError> {
+    if matches!(bound.kind, ExprKind::Constant(_)) {
+        return Ok(true);
+    }
+    let ExprKind::Cast {
+        expr,
+        target,
+        cast_mode: TrinoCastMode::Implicit,
+    } = &bound.kind
+    else {
+        return Ok(false);
+    };
+    let source = unit.definition(*expr);
+    work.step()?;
+    let Some(source) = source else {
+        return Ok(false);
+    };
+    // The only conversion admitted here is a strict signed-integer widening of
+    // one non-null constant. General implicit coercions can round or fail.
+    let signed_integer = |expr: &ExprNode| {
+        matches!(expr.ty.value_type().kind(), ValueKind::Scalar(carrier)
+            if carrier == expr.ty.data_type()
+                && matches!(carrier, DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64))
+    };
+    Ok(matches!(source.kind, ExprKind::Constant(_))
+        && !source.ty.nullable()
+        && signed_integer(source)
+        && signed_integer(bound)
+        && target == bound.ty.data_type()
+        && source.ty.data_type() != target
+        && trino_can_coerce(source.ty.value_type(), bound.ty.value_type(), work)?)
 }
 
 fn prove_provider_membership(

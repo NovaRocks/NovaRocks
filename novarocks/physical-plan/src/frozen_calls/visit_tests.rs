@@ -572,7 +572,7 @@ fn observed_visitor_keeps_guarded_shared_definition_occurrences_independent() {
     let first = &uses[&ExpressionUseId::new(0)];
     let second = &uses[&ExpressionUseId::new(u32::MAX)];
     assert_eq!(first.definition, second.definition);
-    assert_eq!(first.context.demand, EvaluationDemand::TruthOnly);
+    assert_eq!(first.context.demand, EvaluationDemand::Value);
     assert_eq!(second.context.demand, EvaluationDemand::Value);
     assert_ne!(first.context.region, second.context.region);
     assert_ne!(

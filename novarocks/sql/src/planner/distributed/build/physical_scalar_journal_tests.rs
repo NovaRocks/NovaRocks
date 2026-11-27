@@ -17,12 +17,12 @@
 
 use super::*;
 use crate::{
-    analysis::{ExprKind as TypedKind, LiteralValue as TypedLiteral, TypedExpr},
+    analysis::{ExprKind as TypedKind, TypedExpr},
     compiler::SqlAuthoredPhysicalPlan,
     planner::distributed::build::{
         SqlSourceJournalError,
         contract_lowering::lowered_scalar_source_tests::{
-            authored, lower_call as lower, nullable_bounded_character,
+            authored, lower_call as lower,
             operational_tests::selected_source_owner as selected_owner, policy, text,
         },
     },
@@ -332,59 +332,6 @@ fn scalar_journal_conversion_retains_original_none_and_true_intermediate_constra
     assert_eq!(emitted.ordinal(), 1);
     assert!(Arc::ptr_eq(emitted.pool().array(), pool.array()));
     assert!(Arc::ptr_eq(emitted.pool().field_ref(), &field));
-}
-
-#[test]
-fn scalar_journal_canonical_null_loans_actual_typed_cv_without_retagging_original() {
-    let owner = authored(lower(
-        TypedExpr {
-            kind: TypedKind::Literal(TypedLiteral::Null),
-            value_type: FunctionValueType::new(DataType::Null, true),
-        },
-        DecimalOverflowPolicy::OutputNull,
-    ));
-    let (fragment, node, expression) = source(&owner, "lower");
-    let control = Control::default();
-    let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
-    let entry = owner
-        .checked_expression_call_source_observed(fragment, node, expression, &mut work)
-        .unwrap();
-    let original = cv(&entry.captured().request().arguments[0]).unwrap();
-    let request = author_physical_scalar_request_from_journal_observed(&entry, &mut work).unwrap();
-    let actual = cv(&request.request().arguments[0]).unwrap();
-    assert_eq!(
-        original.value_type(),
-        &FunctionValueType::new(DataType::Null, true)
-    );
-    assert_eq!(
-        actual.value_type(),
-        &nullable_bounded_character(novarocks_type_contract::CharacterKind::Char, 0)
-    );
-    assert_eq!(actual.try_utf8().unwrap(), None);
-    assert_ne!(
-        original.pool().backing_identity(),
-        actual.pool().backing_identity()
-    );
-    let ExprKind::FunctionCall { args, .. } = &expression.kind else {
-        unreachable!()
-    };
-    let ExprKind::Constant(reference) = node
-        .expressions
-        .as_ref()
-        .unwrap()
-        .definition(args[0])
-        .unwrap()
-        .kind
-    else {
-        unreachable!()
-    };
-    let emitted = emitted_cv(&owner, reference);
-    assert!(Arc::ptr_eq(actual.pool().array(), emitted.pool().array()));
-    assert!(Arc::ptr_eq(
-        actual.pool().field_ref(),
-        emitted.pool().field_ref()
-    ));
-    work.finish().unwrap();
 }
 
 #[test]

@@ -255,6 +255,19 @@ fn collect_cse_semantic_guard_ids(
     id: ScalarId,
     guards: &mut HashSet<ScalarId>,
 ) {
+    use crate::common::BooleanOp::{ExpandedConjunction, ExpandedNegatedConjunction};
+
+    if let ScalarNode::BooleanConnective {
+        op: ExpandedConjunction | ExpandedNegatedConjunction,
+        left,
+        right,
+    } = scalars.node(id)
+    {
+        // The generated comparison calls and their conjunction occupy one
+        // source control position. Keep that shape even when one comparison
+        // also appears independently in this operator.
+        guards.extend([id, *left, *right]);
+    }
     if let Some((probe, _)) = crate::common::binary_operator::scalar_in_list(scalars, id)
         && is_complex_data_type(scalars.data_type(probe))
         && !scalar_contains_column_ref(scalars, probe)
@@ -1475,31 +1488,63 @@ mod tests {
         )
     }
 
-    fn add(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
-        arena.test_intern_operator(
-            BinOp::Add,
-            left,
-            right,
+    fn bitwise_call(
+        arena: &mut ScalarArena,
+        name: &str,
+        left: ScalarId,
+        right: ScalarId,
+    ) -> ScalarId {
+        use novarocks_functions::{
+            FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionResultType,
+        };
+        let arguments = [left, right].map(|argument| FunctionArgument::Value {
+            value_type: arena.value_type(argument).clone(),
+            constant: None,
+        });
+        let selected = crate::functions::builtin_engine_function_catalog()
+            .resolve_bound_user(
+                name,
+                FunctionKind::Scalar,
+                FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: 2,
+                    expected_result_type: None,
+                },
+                crate::optimizer::test_optimizer_control(),
+            )
+            .expect("positive CSE fixtures select an installed total scalar call");
+        let FunctionResultType::Scalar(result) = &selected.selected.result_type else {
+            panic!("expected a scalar CSE fixture");
+        };
+        let result = result.clone();
+        let volatility = selected.semantics.volatility;
+        let binding = crate::binding::SqlFunctionBinding::from_plan(
+            crate::optimizer::BINDING_AUTHORITY,
+            selected,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
+        arena.intern(
+            ScalarNode::FunctionCall {
+                name: name.to_owned(),
+                args: vec![left, right],
+                binding,
+                distinct: false,
+                volatility,
+            },
+            result,
         )
     }
 
-    fn mul(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
-        arena.test_intern_operator(
-            BinOp::Mul,
-            left,
-            right,
-            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        )
+    fn bit_or(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
+        bitwise_call(arena, "bitwise_or", left, right)
+    }
+
+    fn bit_and(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
+        bitwise_call(arena, "bitwise_and", left, right)
     }
 
     fn gt(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
-        arena.test_intern_operator(
-            BinOp::Gt,
-            left,
-            right,
-            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        )
+        lt(arena, right, left)
     }
 
     fn lt(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
@@ -1509,6 +1554,22 @@ mod tests {
             right,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
+    }
+
+    fn call_pair(arena: &ScalarArena, expr: ScalarId, function: &str) -> [ScalarId; 2] {
+        let ScalarNode::FunctionCall { args, binding, .. } = arena.node(expr) else {
+            panic!("expected an installed call to {function}");
+        };
+        assert_eq!(binding.function_id.as_str(), function);
+        args.as_slice().try_into().expect("binary original call")
+    }
+
+    fn assert_cse_range(arena: &ScalarArena, lower: ScalarId, upper: ScalarId, column: ColumnId) {
+        let [_, lower_probe] = call_pair(arena, lower, "builtin.scalar/__operator_less_than/v1");
+        let [upper_probe, _] = call_pair(arena, upper, "builtin.scalar/__operator_less_than/v1");
+        for probe in [lower_probe, upper_probe] {
+            assert!(matches!(arena.node(probe), ScalarNode::ColumnRef(id) if *id == column));
+        }
     }
 
     fn and(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
@@ -1622,14 +1683,14 @@ mod tests {
     }
 
     #[test]
-    fn repeated_binary_op_is_common_candidate() {
+    fn repeated_total_call_is_common_candidate() {
         let mut arena = ScalarArena::new();
         let a = col(&mut arena, 1);
         let b = col(&mut arena, 2);
-        let a_plus_b = add(&mut arena, a, b);
-        let root = add(&mut arena, a_plus_b, a);
+        let a_or_b = bit_or(&mut arena, a, b);
+        let root = bit_or(&mut arena, a_or_b, a);
 
-        assert_eq!(pick_commons(&arena, &[a_plus_b, root]), vec![a_plus_b]);
+        assert_eq!(pick_commons(&arena, &[a_or_b, root]), vec![a_or_b]);
     }
 
     #[test]
@@ -1637,7 +1698,7 @@ mod tests {
         let mut arena = ScalarArena::new();
         let a = col(&mut arena, 1);
         let b = col(&mut arena, 2);
-        let root = add(&mut arena, a, b);
+        let root = bit_or(&mut arena, a, b);
 
         assert_eq!(pick_commons(&arena, &[a, root]), Vec::<ScalarId>::new());
     }
@@ -1761,10 +1822,10 @@ mod tests {
             vec![],
             crate::functions::FunctionVolatility::Volatile,
         );
-        let rand_plus_a = add(&mut arena, rand, a);
+        let rand_or_a = bit_or(&mut arena, rand, a);
 
         assert_eq!(
-            pick_commons(&arena, &[rand_plus_a, rand_plus_a]),
+            pick_commons(&arena, &[rand_or_a, rand_or_a]),
             Vec::<ScalarId>::new()
         );
     }
@@ -1788,12 +1849,12 @@ mod tests {
         let b = col(&mut arena, 2);
         let c = col(&mut arena, 3);
         let d = col(&mut arena, 4);
-        let c_plus_d = add(&mut arena, c, d);
-        let a_plus_b = add(&mut arena, a, b);
+        let c_or_d = bit_or(&mut arena, c, d);
+        let a_or_b = bit_or(&mut arena, a, b);
 
         assert_eq!(
-            pick_commons(&arena, &[c_plus_d, a_plus_b, c_plus_d, a_plus_b]),
-            vec![c_plus_d, a_plus_b]
+            pick_commons(&arena, &[c_or_d, a_or_b, c_or_d, a_or_b]),
+            vec![c_or_d, a_or_b]
         );
     }
 
@@ -1802,15 +1863,15 @@ mod tests {
         let mut arena = ScalarArena::new();
         let a = col(&mut arena, 1);
         let b = col(&mut arena, 2);
-        let a_plus_b = add(&mut arena, a, b);
+        let a_or_b = bit_or(&mut arena, a, b);
         let cse_ref = arena.intern(
             ScalarNode::ColumnRef(ColumnId(99)),
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let mut subst = std::collections::HashMap::new();
-        subst.insert(a_plus_b, cse_ref);
+        subst.insert(a_or_b, cse_ref);
 
-        let root = add(&mut arena, a_plus_b, a);
+        let root = bit_or(&mut arena, a_or_b, a);
         let rewritten = super::substitute(
             &mut arena,
             root,
@@ -1819,19 +1880,15 @@ mod tests {
         )
         .unwrap();
 
-        match arena.node(rewritten) {
-            ScalarNode::BooleanConnective { left, right, .. } => {
-                assert!(matches!(
-                    arena.node(*left),
-                    ScalarNode::ColumnRef(ColumnId(99))
-                ));
-                assert!(matches!(
-                    arena.node(*right),
-                    ScalarNode::ColumnRef(ColumnId(1))
-                ));
-            }
-            other => panic!("unexpected node: {other:?}"),
-        }
+        let [left, right] = call_pair(&arena, rewritten, "builtin.scalar/bitwise_or/v1");
+        assert!(matches!(
+            arena.node(left),
+            ScalarNode::ColumnRef(ColumnId(99))
+        ));
+        assert!(matches!(
+            arena.node(right),
+            ScalarNode::ColumnRef(ColumnId(1))
+        ));
     }
 
     #[test]
@@ -1840,25 +1897,24 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 1);
         let b = col(&mut arena, 2);
-        let a_plus_b = add(&mut arena, a, b);
-        let doubled = add(&mut arena, a_plus_b, a_plus_b);
+        let a_or_b = bit_or(&mut arena, a, b);
+        let doubled = bit_or(&mut arena, a_or_b, a_or_b);
 
         let (items, subst) = super::build_commons(
             &mut arena,
             &mut factory,
-            &[a_plus_b, doubled],
+            &[a_or_b, doubled],
             crate::optimizer::test_optimizer_control(),
         )
         .unwrap();
 
         assert_eq!(items.len(), 2);
         let first_cse = items[0].output_column_id;
-        assert!(matches!(
-            arena.node(items[1].expr),
-            ScalarNode::BooleanConnective { left, right, .. }
-                if !matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == first_cse)
-                    && !matches!(arena.node(*right), ScalarNode::ColumnRef(column_id) if *column_id == first_cse)
-        ));
+        let operands = call_pair(&arena, items[1].expr, "builtin.scalar/bitwise_or/v1");
+        for operand in operands {
+            assert!(!matches!(arena.node(operand), ScalarNode::ColumnRef(id) if *id == first_cse));
+            assert_eq!(operand, a_or_b);
+        }
         assert!(matches!(
             arena.node(*subst.get(&doubled).expect("doubled replacement")),
             ScalarNode::ColumnRef(column_id) if *column_id == items[1].output_column_id
@@ -1876,7 +1932,7 @@ mod tests {
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
-        let body = add(&mut arena, lambda_param, captured);
+        let body = bit_or(&mut arena, lambda_param, captured);
         let lambda = arena.intern(
             ScalarNode::Lambda {
                 params: vec!["x".to_string()],
@@ -1901,8 +1957,8 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let a_plus_b = add(&mut arena, a, b);
-        let doubled = add(&mut arena, a_plus_b, a_plus_b);
+        let a_or_b = bit_or(&mut arena, a, b);
+        let doubled = bit_or(&mut arena, a_or_b, a_or_b);
         let child = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
@@ -1927,7 +1983,7 @@ mod tests {
         let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: vec![
-                    project_item(a_plus_b, 110, "x"),
+                    project_item(a_or_b, 110, "x"),
                     project_item(doubled, 111, "y"),
                 ],
                 output_qualifier: None,
@@ -1968,20 +2024,26 @@ mod tests {
         };
         assert_eq!(cse_project.items[2].output_name, "__cse_0");
         let common_col = cse_project.items[2].output_column_id;
-        assert!(matches!(
-            arena.node(cse_project.items[2].expr),
-            ScalarNode::BooleanConnective { .. }
-        ));
+        assert_eq!(
+            call_pair(
+                &arena,
+                cse_project.items[2].expr,
+                "builtin.scalar/bitwise_or/v1"
+            ),
+            [a, b],
+        );
         assert!(matches!(
             arena.node(project.items[0].expr),
             ScalarNode::ColumnRef(column_id) if *column_id == common_col
         ));
-        assert!(matches!(
-            arena.node(project.items[1].expr),
-            ScalarNode::BooleanConnective { left, right, .. }
-                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == common_col)
-                    && matches!(arena.node(*right), ScalarNode::ColumnRef(column_id) if *column_id == common_col)
-        ));
+        let operands = call_pair(
+            &arena,
+            project.items[1].expr,
+            "builtin.scalar/bitwise_or/v1",
+        );
+        for operand in operands {
+            assert!(matches!(arena.node(operand), ScalarNode::ColumnRef(id) if *id == common_col));
+        }
         assert_eq!(
             node.output_columns
                 .iter()
@@ -2080,8 +2142,8 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 1);
         let b = col(&mut arena, 2);
-        let a_plus_b = add(&mut arena, a, b);
-        let doubled = add(&mut arena, a_plus_b, a_plus_b);
+        let a_or_b = bit_or(&mut arena, a, b);
+        let doubled = bit_or(&mut arena, a_or_b, a_or_b);
         let values = values_node(vec![output_column(1, "a"), output_column(2, "b")]);
         let child = OptimizedOperatorNode {
             op: Operator::PhysicalRepeat(RepeatOp {
@@ -2103,10 +2165,7 @@ mod tests {
         };
         let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
-                items: vec![
-                    project_item(a_plus_b, 3, "x"),
-                    project_item(doubled, 4, "y"),
-                ],
+                items: vec![project_item(a_or_b, 3, "x"), project_item(doubled, 4, "y")],
                 output_qualifier: None,
             }),
             children: vec![child],
@@ -2148,8 +2207,8 @@ mod tests {
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
         let c = col(&mut arena, 103);
-        let b_plus_c = add(&mut arena, b, c);
-        let doubled = add(&mut arena, b_plus_c, b_plus_c);
+        let b_or_c = bit_or(&mut arena, b, c);
+        let doubled = bit_or(&mut arena, b_or_c, b_or_c);
         let lambda_param = arena.intern(
             ScalarNode::LambdaParamRef {
                 name: "x".to_string(),
@@ -2157,7 +2216,7 @@ mod tests {
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
-        let lambda_body = add(&mut arena, lambda_param, a);
+        let lambda_body = bit_or(&mut arena, lambda_param, a);
         let lambda = arena.intern(
             ScalarNode::Lambda {
                 params: vec!["x".to_string()],
@@ -2187,7 +2246,7 @@ mod tests {
         let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: vec![
-                    project_item(b_plus_c, 110, "x"),
+                    project_item(b_or_c, 110, "x"),
                     project_item(doubled, 111, "y"),
                     project_item(lambda, 112, "lambda_capture"),
                 ],
@@ -2229,11 +2288,11 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let a_plus_b = add(&mut arena, a, b);
+        let a_or_b = bit_or(&mut arena, a, b);
         let (prelude, _) = super::build_commons(
             &mut arena,
             &mut factory,
-            &[a_plus_b],
+            &[a_or_b],
             crate::optimizer::test_optimizer_control(),
         )
         .unwrap();
@@ -2300,11 +2359,11 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let a_plus_b = add(&mut arena, a, b);
+        let a_or_b = bit_or(&mut arena, a, b);
         let (prelude, _) = super::build_commons(
             &mut arena,
             &mut factory,
-            &[a_plus_b],
+            &[a_or_b],
             crate::optimizer::test_optimizer_control(),
         )
         .unwrap();
@@ -2373,11 +2432,11 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let a_plus_b = add(&mut arena, a, b);
+        let a_or_b = bit_or(&mut arena, a, b);
         let (prelude, _) = super::build_commons(
             &mut arena,
             &mut factory,
-            &[a_plus_b],
+            &[a_or_b],
             crate::optimizer::test_optimizer_control(),
         )
         .unwrap();
@@ -2459,11 +2518,11 @@ mod tests {
         let b = col(&mut arena, 102);
         let x = col(&mut arena, 201);
         let y = col(&mut arena, 202);
-        let x_plus_y = add(&mut arena, x, y);
+        let x_or_y = bit_or(&mut arena, x, y);
         let (prelude, _) = super::build_commons(
             &mut arena,
             &mut factory,
-            &[x_plus_y],
+            &[x_or_y],
             crate::optimizer::test_optimizer_control(),
         )
         .unwrap();
@@ -2537,11 +2596,11 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let a_plus_b = add(&mut arena, a, b);
+        let a_or_b = bit_or(&mut arena, a, b);
         let (prelude, _) = super::build_commons(
             &mut arena,
             &mut factory,
-            &[a_plus_b],
+            &[a_or_b],
             crate::optimizer::test_optimizer_control(),
         )
         .unwrap();
@@ -2615,11 +2674,14 @@ mod tests {
             .find(|item| item.output_name == "__cse_0")
             .expect("CSE project item")
             .expr;
+        let [left, right] = call_pair(&arena, cse_expr, "builtin.scalar/bitwise_or/v1");
         assert!(matches!(
-            arena.node(cse_expr),
-            ScalarNode::BooleanConnective { left, right, .. }
-                if matches!(arena.node(*left), ScalarNode::ColumnRef(ColumnId(101)))
-                    && matches!(arena.node(*right), ScalarNode::ColumnRef(ColumnId(102)))
+            arena.node(left),
+            ScalarNode::ColumnRef(ColumnId(101))
+        ));
+        assert!(matches!(
+            arena.node(right),
+            ScalarNode::ColumnRef(ColumnId(102))
         ));
     }
 
@@ -2629,11 +2691,11 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let a_plus_b = add(&mut arena, a, b);
+        let a_or_b = bit_or(&mut arena, a, b);
         let ten = int_lit(&mut arena, 10);
         let twenty = int_lit(&mut arena, 20);
-        let lower = gt(&mut arena, a_plus_b, ten);
-        let upper = lt(&mut arena, a_plus_b, twenty);
+        let lower = gt(&mut arena, a_or_b, ten);
+        let upper = lt(&mut arena, a_or_b, twenty);
         let predicate = and(&mut arena, lower, upper);
         let stale_filter_estimate = CostEstimate {
             cpu_cost: 1.0,
@@ -2701,16 +2763,7 @@ mod tests {
         let ScalarNode::BooleanConnective { left, right, .. } = arena.node(filter.predicate) else {
             panic!("expected conjunction");
         };
-        assert!(matches!(
-            arena.node(*left),
-            ScalarNode::BooleanConnective { left, .. }
-                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
-        ));
-        assert!(matches!(
-            arena.node(*right),
-            ScalarNode::BooleanConnective { left, .. }
-                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
-        ));
+        assert_cse_range(&arena, *left, *right, cse_column);
         assert_eq!(
             node.output_columns
                 .iter()
@@ -2741,11 +2794,11 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let a_plus_b = add(&mut arena, a, b);
+        let a_or_b = bit_or(&mut arena, a, b);
         let ten = int_lit(&mut arena, 10);
         let twenty = int_lit(&mut arena, 20);
-        let lower = gt(&mut arena, a_plus_b, ten);
-        let upper = lt(&mut arena, a_plus_b, twenty);
+        let lower = gt(&mut arena, a_or_b, ten);
+        let upper = lt(&mut arena, a_or_b, twenty);
         let predicate = and(&mut arena, lower, upper);
         let child = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
@@ -2804,11 +2857,11 @@ mod tests {
         let b = col(&mut arena, 102);
         let x = col(&mut arena, 201);
         let y = col(&mut arena, 202);
-        let x_plus_y = add(&mut arena, x, y);
+        let x_or_y = bit_or(&mut arena, x, y);
         let ten = int_lit(&mut arena, 10);
         let twenty = int_lit(&mut arena, 20);
-        let lower = gt(&mut arena, x_plus_y, ten);
-        let upper = lt(&mut arena, x_plus_y, twenty);
+        let lower = gt(&mut arena, x_or_y, ten);
+        let upper = lt(&mut arena, x_or_y, twenty);
         let predicate = and(&mut arena, lower, upper);
         let values = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
@@ -2892,16 +2945,7 @@ mod tests {
         let ScalarNode::BooleanConnective { left, right, .. } = arena.node(filter.predicate) else {
             panic!("expected conjunction");
         };
-        assert!(matches!(
-            arena.node(*left),
-            ScalarNode::BooleanConnective { left, .. }
-                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
-        ));
-        assert!(matches!(
-            arena.node(*right),
-            ScalarNode::BooleanConnective { left, .. }
-                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
-        ));
+        assert_cse_range(&arena, *left, *right, cse_column);
         assert_eq!(
             node.output_columns
                 .iter()
@@ -2917,7 +2961,7 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let a_mul_b = mul(&mut arena, a, b);
+        let a_and_b = bit_and(&mut arena, a, b);
         let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
         let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
@@ -2929,7 +2973,7 @@ mod tests {
                         name: "sum".to_string(),
                         distinct: false,
                         source: crate::binding::AggregateArgumentSource::uncertified(
-                            vec![a_mul_b],
+                            vec![a_and_b],
                             vec![],
                             crate::functions::test_resolved_aggregate(
                                 "sum",
@@ -2943,7 +2987,7 @@ mod tests {
                         name: "avg".to_string(),
                         distinct: false,
                         source: crate::binding::AggregateArgumentSource::uncertified(
-                            vec![a_mul_b],
+                            vec![a_and_b],
                             vec![],
                             crate::functions::test_resolved_aggregate(
                                 "avg",
@@ -2984,10 +3028,10 @@ mod tests {
             .iter()
             .find(|item| item.output_name == "__cse_0")
             .expect("CSE project item");
-        assert!(matches!(
-            crate::common::binary_operator::scalar_operands(&arena, cse_item.expr),
-            Some((novarocks_type_contract::OperatorFunction::Multiply, _))
-        ));
+        assert_eq!(
+            call_pair(&arena, cse_item.expr, "builtin.scalar/bitwise_and/v1"),
+            [a, b],
+        );
         let cse_column = cse_item.output_column_id;
         let Operator::PhysicalHashAggregate(aggregate) = &node.op else {
             panic!("expected physical aggregate");
@@ -3007,7 +3051,7 @@ mod tests {
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
         let grouping = col(&mut arena, 109);
-        let a_plus_b = add(&mut arena, a, b);
+        let a_or_b = bit_or(&mut arena, a, b);
         let values = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
         let repeat = OptimizedOperatorNode {
             op: Operator::PhysicalRepeat(RepeatOp {
@@ -3047,7 +3091,7 @@ mod tests {
                         name: "sum".to_string(),
                         distinct: false,
                         source: crate::binding::AggregateArgumentSource::uncertified(
-                            vec![a_plus_b],
+                            vec![a_or_b],
                             vec![],
                             crate::functions::test_resolved_aggregate(
                                 "sum",
@@ -3061,7 +3105,7 @@ mod tests {
                         name: "avg".to_string(),
                         distinct: false,
                         source: crate::binding::AggregateArgumentSource::uncertified(
-                            vec![a_plus_b],
+                            vec![a_or_b],
                             vec![],
                             crate::functions::test_resolved_aggregate(
                                 "avg",
@@ -3124,7 +3168,7 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let a_mul_b = mul(&mut arena, a, b);
+        let a_and_b = bit_and(&mut arena, a, b);
         let child = values_node(vec![
             output_column(301, "sum_state"),
             output_column(302, "avg_state"),
@@ -3139,7 +3183,7 @@ mod tests {
                         name: "sum".to_string(),
                         distinct: false,
                         source: crate::binding::AggregateArgumentSource::uncertified(
-                            vec![a_mul_b],
+                            vec![a_and_b],
                             vec![],
                             crate::functions::test_resolved_aggregate(
                                 "sum",
@@ -3153,7 +3197,7 @@ mod tests {
                         name: "avg".to_string(),
                         distinct: false,
                         source: crate::binding::AggregateArgumentSource::uncertified(
-                            vec![a_mul_b],
+                            vec![a_and_b],
                             vec![],
                             crate::functions::test_resolved_aggregate(
                                 "avg",
@@ -3191,7 +3235,7 @@ mod tests {
             panic!("expected physical aggregate");
         };
         for spec in &aggregate.aggregates {
-            assert_eq!(spec.source.arguments()[0], a_mul_b);
+            assert_eq!(spec.source.arguments()[0], a_and_b);
         }
     }
 
@@ -3201,7 +3245,7 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let a_mul_b = mul(&mut arena, a, b);
+        let a_and_b = bit_and(&mut arena, a, b);
         let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
         let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
@@ -3214,7 +3258,7 @@ mod tests {
                         distinct: false,
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![a],
-                            vec![sort_key(a_mul_b)],
+                            vec![sort_key(a_and_b)],
                             crate::functions::test_resolved_aggregate(
                                 "array_agg",
                                 &[DataType::Int64],
@@ -3228,7 +3272,7 @@ mod tests {
                         distinct: false,
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![b],
-                            vec![sort_key(a_mul_b)],
+                            vec![sort_key(a_and_b)],
                             crate::functions::test_resolved_aggregate(
                                 "array_agg",
                                 &[DataType::Int64],
@@ -3297,12 +3341,12 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let a_mul_b = mul(&mut arena, a, b);
+        let a_and_b = bit_and(&mut arena, a, b);
         let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
         let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalSort(SortOp {
-                items: vec![sort_key(a_mul_b)],
-                analytic_partition_exprs: vec![a_mul_b],
+                items: vec![sort_key(a_and_b)],
+                analytic_partition_exprs: vec![a_and_b],
                 partition_limit: None,
                 topn_type: None,
             }),
@@ -3350,11 +3394,11 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let a_mul_b = mul(&mut arena, a, b);
+        let a_and_b = bit_and(&mut arena, a, b);
         let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
         let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalTopN(TopNOp {
-                items: vec![sort_key(a_mul_b), sort_key(a_mul_b)],
+                items: vec![sort_key(a_and_b), sort_key(a_and_b)],
                 limit: Some(10),
                 offset: None,
                 phase: TopNPhase::Final,
@@ -3402,26 +3446,26 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let a_mul_b = mul(&mut arena, a, b);
+        let a_and_b = bit_and(&mut arena, a, b);
         let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
         let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalWindow(WindowOp {
                 window_exprs: vec![ScalarWindowSpec {
                     output_column_id: ColumnId::new_for_test(201),
                     name: "sum".to_string(),
-                    args: vec![a_mul_b],
+                    args: vec![a_and_b],
                     distinct: false,
                     binding: crate::optimizer::scalar::test_window_binding(
                         &arena,
                         "sum",
-                        &[a_mul_b],
+                        &[a_and_b],
                         DataType::Int64,
                         true,
                     ),
                     function_order_by: vec![],
                     aggregate_binding: None,
-                    partition_by: vec![a_mul_b],
-                    order_by: vec![sort_key(a_mul_b)],
+                    partition_by: vec![a_and_b],
+                    order_by: vec![sort_key(a_and_b)],
                     window_frame: None,
                     ignore_nulls: false,
                 }],
@@ -3482,10 +3526,10 @@ mod tests {
         let right_b = col(&mut arena, 201);
         let two = int_lit(&mut arena, 2);
         let ten = int_lit(&mut arena, 10);
-        let left_a_times_two = mul(&mut arena, left_a, two);
-        let lower = gt(&mut arena, left_a_times_two, right_b);
-        let upper_bound = add(&mut arena, right_b, ten);
-        let upper = lt(&mut arena, left_a_times_two, upper_bound);
+        let masked_left_a = bit_and(&mut arena, left_a, two);
+        let lower = gt(&mut arena, masked_left_a, right_b);
+        let upper_bound = bit_or(&mut arena, right_b, ten);
+        let upper = lt(&mut arena, masked_left_a, upper_bound);
         let condition = and(&mut arena, lower, upper);
         let left = values_node(vec![output_column(101, "left_a")]);
         let right = values_node(vec![output_column(201, "right_b")]);
@@ -3528,16 +3572,7 @@ mod tests {
         else {
             panic!("expected conjunction");
         };
-        assert!(matches!(
-            arena.node(*left),
-            ScalarNode::BooleanConnective { left, .. }
-                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
-        ));
-        assert!(matches!(
-            arena.node(*right),
-            ScalarNode::BooleanConnective { left, .. }
-                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
-        ));
+        assert_cse_range(&arena, *left, *right, cse_column);
     }
 
     #[test]
@@ -3549,10 +3584,10 @@ mod tests {
         let right_key = col(&mut arena, 202);
         let two = int_lit(&mut arena, 2);
         let ten = int_lit(&mut arena, 10);
-        let right_b_times_two = mul(&mut arena, right_b, two);
-        let lower = gt(&mut arena, right_b_times_two, left_a);
-        let upper_bound = add(&mut arena, left_a, ten);
-        let upper = lt(&mut arena, right_b_times_two, upper_bound);
+        let masked_right_b = bit_and(&mut arena, right_b, two);
+        let lower = gt(&mut arena, masked_right_b, left_a);
+        let upper_bound = bit_or(&mut arena, left_a, ten);
+        let upper = lt(&mut arena, masked_right_b, upper_bound);
         let condition = and(&mut arena, lower, upper);
         let left = values_node(vec![output_column(101, "left_a")]);
         let right = values_node(vec![
@@ -3612,16 +3647,7 @@ mod tests {
         else {
             panic!("expected conjunction");
         };
-        assert!(matches!(
-            arena.node(*left),
-            ScalarNode::BooleanConnective { left, .. }
-                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
-        ));
-        assert!(matches!(
-            arena.node(*right),
-            ScalarNode::BooleanConnective { left, .. }
-                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
-        ));
+        assert_cse_range(&arena, *left, *right, cse_column);
     }
 
     #[test]
@@ -3632,9 +3658,9 @@ mod tests {
         let right_b = col(&mut arena, 201);
         let ten = int_lit(&mut arena, 10);
         let twenty = int_lit(&mut arena, 20);
-        let left_times_right = mul(&mut arena, left_a, right_b);
-        let lower = gt(&mut arena, left_times_right, ten);
-        let upper = lt(&mut arena, left_times_right, twenty);
+        let left_and_right = bit_and(&mut arena, left_a, right_b);
+        let lower = gt(&mut arena, left_and_right, ten);
+        let upper = lt(&mut arena, left_and_right, twenty);
         let condition = and(&mut arena, lower, upper);
         let left = values_node(vec![output_column(101, "left_a")]);
         let right = values_node(vec![output_column(201, "right_b")]);
@@ -3675,9 +3701,9 @@ mod tests {
         let one = int_lit(&mut arena, 1);
         let ten = int_lit(&mut arena, 10);
         let twenty = int_lit(&mut arena, 20);
-        let shared_plus_one = add(&mut arena, shared, one);
-        let lower = gt(&mut arena, shared_plus_one, ten);
-        let upper = lt(&mut arena, shared_plus_one, twenty);
+        let shared_or_one = bit_or(&mut arena, shared, one);
+        let lower = gt(&mut arena, shared_or_one, ten);
+        let upper = lt(&mut arena, shared_or_one, twenty);
         let condition = and(&mut arena, lower, upper);
         let left = values_node(vec![output_column(101, "shared_left")]);
         let right = values_node(vec![output_column(101, "shared_right")]);
@@ -3725,7 +3751,7 @@ mod tests {
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
-        let lambda_body = add(&mut arena, lambda_param, right_b);
+        let lambda_body = bit_or(&mut arena, lambda_param, right_b);
         let lambda = arena.intern(
             ScalarNode::Lambda {
                 params: vec!["x".to_string()],
@@ -3806,8 +3832,8 @@ mod tests {
             let mut arena = ScalarArena::new();
             let a = col(&mut arena, 101);
             let b = col(&mut arena, 102);
-            let repeated = add(&mut arena, a, b);
-            let doubled = add(&mut arena, repeated, repeated);
+            let repeated = bit_or(&mut arena, a, b);
+            let doubled = bit_or(&mut arena, repeated, repeated);
             let mut node = OptimizedOperatorNode {
                 op: Operator::PhysicalProject(ProjectOp {
                     items: vec![
@@ -3982,22 +4008,27 @@ mod intrinsic_eligibility_tests {
         }
     }
     #[test]
-    fn legacy_nullable_decimal_multiply_cannot_be_hoisted_as_an_error_free_expression() {
+    fn selected_decimal_arithmetic_cannot_be_hoisted_as_an_error_free_expression() {
         use crate::analysis::BinOp;
 
         let mut arena = ScalarArena::new();
-        let child = arena.intern(
-            ScalarNode::ColumnRef(ColumnId(1)),
-            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(38, 0), true),
-        );
-        for (op, expected) in [(BinOp::Mul, false), (BinOp::Add, true)] {
-            let expr = arena.test_intern_operator(
-                op,
-                child,
-                child,
-                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        for (carrier, total) in [
+            (DataType::Decimal128(38, 0), false),
+            (DataType::Float64, true),
+        ] {
+            let child = arena.intern(
+                ScalarNode::ColumnRef(ColumnId(1)),
+                novarocks_type_contract::FunctionValueType::new(carrier.clone(), true),
             );
-            assert_eq!(eligible(&arena, expr), expected, "{op:?}");
+            for op in [BinOp::Mul, BinOp::Add] {
+                let expr = arena.test_intern_operator(
+                    op,
+                    child,
+                    child,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                );
+                assert_eq!(eligible(&arena, expr), total, "{carrier:?}/{op:?}");
+            }
         }
     }
 }

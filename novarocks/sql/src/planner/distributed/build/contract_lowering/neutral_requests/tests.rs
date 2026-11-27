@@ -267,62 +267,6 @@ fn neutral_sql_scalar_none_folded_constants_and_nonzero_cv_keep_original_identit
     assert!(Arc::ptr_eq(resolved.pool().array(), pool.array()));
     assert!(Arc::ptr_eq(resolved.pool().field_ref(), &field));
     work.finish().unwrap();
-
-    let owner = scalar::authored(scalar::lower_call(
-        TypedExpr {
-            kind: TypedKind::Literal(crate::analysis::LiteralValue::Null),
-            value_type: ValueType::new(DataType::Null, true),
-        },
-        DecimalOverflowPolicy::OutputNull,
-    ));
-    assert_expression_requests(&owner);
-    let (fragment, unit_node, source) = scalar::scalar_source(&owner);
-    let control = Control::default();
-    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
-    let entry = owner
-        .checked_expression_call_source_observed(fragment, unit_node, source, &mut work)
-        .unwrap();
-    let original_request = entry.captured().request();
-    let FunctionArgument::Value {
-        constant: Some(original_null),
-        ..
-    } = &original_request.arguments[0]
-    else {
-        panic!("original bare NULL")
-    };
-    let actual = unit_node
-        .expressions
-        .as_ref()
-        .unwrap()
-        .requests()
-        .get(&source.id)
-        .unwrap();
-    let StaticFunctionArgument::Value {
-        value_type,
-        constant: Some(reference),
-    } = &actual.arguments[0]
-    else {
-        panic!("actual canonical typed NULL")
-    };
-    assert_eq!(
-        original_null.value_type(),
-        &ValueType::new(DataType::Null, true)
-    );
-    assert_eq!(
-        value_type,
-        &scalar::nullable_bounded_character(novarocks_type_contract::CharacterKind::Char, 0)
-    );
-    let canonical_null = owner
-        .plan()
-        .constants()
-        .resolve_observed(*reference, value_type, &mut work)
-        .unwrap();
-    assert_eq!(canonical_null.try_utf8().unwrap(), None);
-    assert_ne!(
-        canonical_null.pool().backing_identity(),
-        original_null.pool().backing_identity()
-    );
-    work.finish().unwrap();
 }
 
 #[test]

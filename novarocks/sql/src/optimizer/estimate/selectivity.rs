@@ -238,8 +238,8 @@ fn estimate_range_selectivity(
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
     // Try to use min/max range if available.
-    let col_id = extract_column_id(arena, left);
-    let literal_val = extract_literal_f64(arena, right);
+    let (col_id, literal, op) = range_column_and_bound(arena, left, right, op);
+    let literal_val = extract_literal_f64(arena, literal);
 
     if let (Some(column_id), Some(val)) = (col_id, literal_val)
         && let Some(cs) = column_stats.get(&column_id)
@@ -258,6 +258,31 @@ fn estimate_range_selectivity(
         }
     }
     0.5 // default for range predicates
+}
+
+pub(crate) fn range_column_and_bound(
+    arena: &ScalarArena,
+    left: ScalarId,
+    right: ScalarId,
+    op: BinOp,
+) -> (Option<ColumnId>, ScalarId, BinOp) {
+    let column = extract_column_id(arena, left);
+    if column.is_none()
+        && let Some(right_column) = extract_column_id(arena, right)
+    {
+        // Selected > and >= calls use reversed operands. Orient the estimate
+        // around the column without changing the selected expression.
+        let reversed = match op {
+            BinOp::Lt => BinOp::Gt,
+            BinOp::Le => BinOp::Ge,
+            BinOp::Gt => BinOp::Lt,
+            BinOp::Ge => BinOp::Le,
+            _ => return (column, right, op),
+        };
+        (Some(right_column), left, reversed)
+    } else {
+        (column, right, op)
+    }
 }
 
 fn extract_literal_f64(arena: &ScalarArena, expr: ScalarId) -> Option<f64> {
@@ -445,6 +470,32 @@ mod tests {
             (selectivity - (1.0 / 201.0)).abs() < 1e-12,
             "expected inclusive numeric-domain selectivity, got {selectivity}"
         );
+    }
+
+    #[test]
+    fn selected_range_operators_use_the_column_on_either_side() {
+        let stats = HashMap::from([(
+            ColumnId::new_for_test(1),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 10.0,
+                ..ColumnStatistic::for_test_with_ndv(11.0, Confidence::Exact)
+            },
+        )]);
+        for (op, expected) in [
+            (BinOp::Lt, 0.7),
+            (BinOp::Le, 0.8),
+            (BinOp::Gt, 0.3),
+            (BinOp::Ge, 0.4),
+        ] {
+            let predicate = crate::common::binary_operator::test_operator(
+                op,
+                col("range_key", 1),
+                int_lit(7),
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            );
+            assert_eq!(estimate_typed(&predicate, &stats), expected, "{op:?}");
+        }
     }
 
     #[test]

@@ -311,6 +311,7 @@ fn state(tracker: Arc<MemTracker>) -> RuntimeState {
         Some(tracker),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     )
+    .with_test_query_memory()
 }
 fn construction(
     tracker: &Arc<MemTracker>,

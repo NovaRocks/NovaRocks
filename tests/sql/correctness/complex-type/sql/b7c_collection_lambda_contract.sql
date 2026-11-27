@@ -77,7 +77,8 @@ SELECT id, filter(a, x -> id = 0 OR 1 / x > 0) AS early_true
 FROM ${case_db}.b7c_small ORDER BY id;
 
 -- query 8
--- NovaRocks' ordinary Boolean region retains the deciding TRUE after the buffered row error.
+-- An error in the demanded first term is retained before the deciding TRUE.
+-- @expect_trino_error=DIVISION_BY_ZERO,USER_ERROR
 SELECT id, filter(a, x -> 1 / x > 0 OR id = 0) AS late_true
 FROM ${case_db}.b7c_small ORDER BY id;
 

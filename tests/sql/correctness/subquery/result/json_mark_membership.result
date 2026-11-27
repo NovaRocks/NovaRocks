@@ -59,3 +59,8 @@ id
 -- types	bigint
 hi
 12
+
+-- query 21
+-- types	boolean
+null_probe
+NULL

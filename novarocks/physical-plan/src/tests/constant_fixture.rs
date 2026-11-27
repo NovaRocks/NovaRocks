@@ -80,6 +80,19 @@ impl ConstantFixture {
             .unwrap(),
         )
     }
+    pub(crate) fn i32(&mut self, value: i32, ty: &ValueType) -> ExprKind {
+        self.insert(
+            ConstantValue::from_i32(
+                Arc::new(ty.try_to_field("fixture").unwrap()),
+                ty.clone(),
+                value,
+                policy(),
+                CompilePhase::Validate,
+                &Control,
+            )
+            .unwrap(),
+        )
+    }
     pub(crate) fn boolean(&mut self, value: bool, ty: &ValueType) -> ExprKind {
         self.insert(
             ConstantValue::from_boolean(

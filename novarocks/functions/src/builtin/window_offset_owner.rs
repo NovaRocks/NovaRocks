@@ -19,10 +19,12 @@
 
 use std::sync::Arc;
 
+use arrow_schema::DataType;
 use novarocks_type_contract::{
-    ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompilePhase,
-    FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior, ObservableEffects,
-    PureCompileControl,
+    ArgumentControl, AssignmentCommonTypeError, CallEffects, CallProofScope, CompileCheckpoints,
+    CompilePhase, FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior,
+    FunctionValueType, ObservableEffects, PureCompileControl, ValueLogicalType,
+    assignment_common_value_type,
 };
 
 use super::catalogue::BuiltinScalarResolver;
@@ -47,6 +49,86 @@ pub(super) fn operation(name: &str) -> Option<OffsetOperation> {
         "lag" => Some(OffsetOperation::Lag),
         _ => None,
     }
+}
+
+/// Initial selection for the original offset overload. Exact rebind consumes
+/// the converted argument declarations and never reselects a window by name.
+pub(crate) fn binding_arguments(
+    function: &FunctionId,
+    arguments: &[FunctionArgument],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<Vec<FunctionArgument>>, FunctionBindingError> {
+    if !matches!(
+        function.as_str(),
+        "builtin.window/lead/v1" | "builtin.window/lag/v1"
+    ) {
+        return Ok(None);
+    }
+    let [value, offset, rest @ ..] = arguments else {
+        return Ok(None);
+    };
+    let FunctionArgument::Value {
+        value_type: offset_type,
+        ..
+    } = offset
+    else {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    };
+    if rest.len() > 1
+        || offset_type.logical_type() != ValueLogicalType::Physical
+        || !matches!(
+            offset_type.data_type(),
+            DataType::Null | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        )
+    {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    }
+    let offset_target = FunctionValueType::new(DataType::Int64, offset_type.nullable());
+    let retarget = |argument: &FunctionArgument, target: FunctionValueType| {
+        if matches!(argument, FunctionArgument::Value { value_type, .. } if value_type == &target) {
+            argument.clone()
+        } else {
+            FunctionArgument::Value {
+                value_type: target,
+                constant: None,
+            }
+        }
+    };
+    let mut arguments = Vec::with_capacity(2 + rest.len());
+    if let [default] = rest {
+        let (
+            FunctionArgument::Value { value_type, .. },
+            FunctionArgument::Value {
+                value_type: default_type,
+                ..
+            },
+        ) = (value, default)
+        else {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        };
+        let common =
+            assignment_common_value_type(value_type, default_type, work).map_err(|error| {
+                match error {
+                    AssignmentCommonTypeError::Control(cause) => {
+                        FunctionBindingError::Control(cause)
+                    }
+                    _ => FunctionBindingError::NoMatchingOverload,
+                }
+            })?;
+        let target = |original: &FunctionValueType| {
+            common
+                .with_nullable(original.nullable())
+                .map_err(|cause| FunctionBindingError::InvalidBinding(cause.to_string().into()))
+        };
+        arguments.push(retarget(value, target(value_type)?));
+        arguments.push(retarget(offset, offset_target));
+        arguments.push(retarget(default, target(default_type)?));
+    } else {
+        arguments.push(value.clone());
+        arguments.push(retarget(offset, offset_target));
+    }
+    work.step()?;
+    Ok(Some(arguments))
 }
 
 /// Complete partition input is required; no scalar row-error or NULL mask applies.

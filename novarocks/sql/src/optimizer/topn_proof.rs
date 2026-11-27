@@ -392,14 +392,8 @@ mod tests {
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(7))),
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
-        let expr = arena.test_intern_operator(
-            crate::common::BinOp::Add,
-            unset,
-            lit,
-            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        );
-
-        assert!(collect_column_ids(&arena, expr).is_empty());
+        assert!(collect_column_ids(&arena, unset).is_empty());
+        assert!(collect_column_ids(&arena, lit).is_empty());
     }
 
     #[test]

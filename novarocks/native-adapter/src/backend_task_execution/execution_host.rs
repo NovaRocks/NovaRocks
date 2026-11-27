@@ -10683,7 +10683,7 @@ pub(crate) mod tests {
             .with_compiled_package_compiler(Arc::new(CompiledPackageInterpreter::new(
                 FragmentDecodeResourceModel::try_new(&Unbounded).expect("decode model"),
                 decode_limits(),
-                Arc::new(sealed_rand_subset()),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 Arc::new(crate::compiled_scan_binding::tests::fixture_providers()),
             )))
         }

@@ -1052,11 +1052,20 @@ mod tests {
         .unwrap();
         assert_eq!(arena.value_type(rebuilt), &json);
         assert!(matches!(arena.node(rebuilt),ScalarNode::Nested(id) if *id==replacement));
-        let pair = arena.test_intern_operator(
-            BinOp::Eq,
-            source,
-            replacement,
-            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        let condition = arena.intern(
+            ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
+                crate::common::LiteralValue::Bool(true),
+            )),
+            FunctionValueType::new(DataType::Boolean, false),
+        );
+        let pair = arena.intern(
+            ScalarNode::Case {
+                ieee_float_equality: false,
+                operand: None,
+                when_then: vec![(condition, source)],
+                else_expr: Some(replacement),
+            },
+            json,
         );
         let mut calls = 0;
         let rejected = remap_column_refs(

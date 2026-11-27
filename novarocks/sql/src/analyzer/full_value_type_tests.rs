@@ -1168,49 +1168,41 @@ fn function_binding_adapters_preserve_control_at_entry_and_inside_actual_argumen
 }
 
 #[test]
-fn legacy_type_inspection_never_falls_back_after_request_control_failure() {
+fn scalar_selection_preserves_request_control_even_for_unmatched_calls() {
+    use novarocks_functions::{FunctionArgument, FunctionBindingError};
     let catalog = crate::functions::builtin_sql_function_catalog();
+    let arguments = [FunctionArgument::Value {
+        value_type: FunctionValueType::new(DataType::Int64, false),
+        constant: None,
+    }];
     for error in [
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,
         CompileControlError::ResourceExhausted,
     ] {
-        // Unknown ordinary names and known dynamic fallback names must both
-        // retain a failure from the actual signature owner.
         for name in ["unregistered_control_probe", "map_keys"] {
-            let failure = super::functions::legacy_scalar_return_type_with_catalog(
-                catalog,
-                name,
-                &[DataType::Int64],
-                &StopAt {
-                    error: error.clone(),
-                    at_entry: true,
-                },
-            )
-            .unwrap_err();
-            assert_eq!(failure.control_error(), Some(error.clone()));
-            let failure = super::functions::infer_scalar_return_type_with_catalog(
-                catalog,
-                name,
-                &[DataType::Int64],
-                &StopAt {
-                    error: error.clone(),
-                    at_entry: true,
-                },
-            )
-            .unwrap_err();
+            let failure = catalog
+                .resolve_scalar_binding(
+                    name,
+                    &arguments,
+                    &StopAt {
+                        error: error.clone(),
+                        at_entry: true,
+                    },
+                )
+                .unwrap_err();
             assert_eq!(failure.control_error(), Some(error.clone()));
         }
     }
     assert_eq!(
-        super::functions::legacy_scalar_return_type_with_catalog(
-            catalog,
-            "unregistered_control_probe",
-            &[DataType::Int64],
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .unwrap(),
-        None
+        catalog
+            .resolve_scalar_binding(
+                "unregistered_control_probe",
+                &arguments,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap_err(),
+        FunctionBindingError::UnknownFunction,
     );
 }
 

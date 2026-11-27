@@ -368,9 +368,10 @@ fn selected_cv_numeric_width_scale_and_nominal_domain_share_values_reader() {
         work.finish().unwrap();
         assert_eq!(actual.map(f64::to_bits), expected.map(f64::to_bits));
 
-        // Unsupported numeric-statistics sources stay unknown rather than
-        // becoming implicit casts; a typed predicate uses that same source.
-        if expected.is_none() {
+        // UUID supports ordinary equality without supplying range statistics.
+        // JSON is checked above through the reader, since ordinary SQL '='
+        // does not select a JSON overload.
+        if value.value_type().logical_type() == ValueLogicalType::Uuid {
             let output = column(1, value.value_type().clone());
             let lhs = column_scalar(&mut memo, &output);
             let predicate = binary(&mut memo, BinOp::Eq, lhs, id);

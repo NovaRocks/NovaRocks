@@ -36,3 +36,10 @@ seq	sorted_position	ascending_values	descending_values	explicit_first
 1	3	a,b,n	b,a,n	n,a,b
 2	1	a,b,n	b,a,n	n,a,b
 3	2	a,b,n	b,a,n	n,a,b
+
+-- query 13
+-- types	integer	bigint
+seq	running_sum
+1	1
+2	3
+3	5

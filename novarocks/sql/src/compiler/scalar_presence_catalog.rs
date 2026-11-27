@@ -419,6 +419,20 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
             .resolve_window_binding(_name, _arguments, control)?;
         self.admit(binding, control)
     }
+    fn finish_window_binding(
+        &self,
+        original: &novarocks_functions::ResolvedFunctionBinding,
+        arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        let binding = self
+            .original
+            .finish_window_binding(original, arguments, control)?;
+        self.admit(binding, control)
+    }
     fn resolve_table_binding(
         &self,
         _name: &str,
@@ -435,6 +449,9 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
     }
     fn contains_aggregate(&self, name: &str) -> bool {
         self.original.contains_aggregate(name)
+    }
+    fn contains_window(&self, name: &str) -> bool {
+        self.original.contains_window(name)
     }
     fn resolve_distinct_aggregate(
         &self,

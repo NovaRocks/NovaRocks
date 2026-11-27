@@ -490,6 +490,29 @@ impl RuntimeState {
         self.query_memory = binding;
         self
     }
+    #[cfg(test)]
+    pub(crate) fn with_test_query_memory(self) -> Self {
+        use novarocks_types::{AttemptId, QueryExecutionId};
+
+        let execution = self.error_state.task_identity().map_or_else(
+            || {
+                QueryExecutionId::new(
+                    self.query_id.unwrap_or_else(|| QueryId::new(37, 305)),
+                    AttemptId::new(1).unwrap(),
+                )
+                .unwrap()
+            },
+            |task| task.query_execution_id(),
+        );
+        let authority = self.execution_runtime().map_or_else(
+            crate::runtime::execution_runtime::test_memory_authority,
+            |runtime| std::sync::Arc::clone(runtime.memory_authority()),
+        );
+        self.with_query_memory(Some(
+            crate::runtime::query_memory::test_query_memory_binding(execution, authority),
+        ))
+    }
+
     pub(crate) fn query_memory(&self) -> Option<&crate::runtime::query_memory::QueryMemoryBinding> {
         self.query_memory.as_ref()
     }

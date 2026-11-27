@@ -37,8 +37,8 @@ SET SESSION disable_optimizer_rules = 'PushDownPredicateJoin,JoinReorder,JoinCom
 -- Positive control: a.k=b.k=c.k and a.k=7 imply both derived predicates
 -- while JoinPredicateMoveAround is enabled. The disabled control below
 -- continues to require their absence.
--- @result_contains=7 = b.k
--- @result_contains=7 = c.k
+-- @result_contains=b.k = 7
+-- @result_contains=c.k = 7
 EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT a.payload, b.payload, c.payload
 FROM (SELECT k, payload FROM ${case_db}.residual_mad_a WHERE k = 7) a

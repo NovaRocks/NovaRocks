@@ -326,8 +326,34 @@ fn nested_identity_lambda_expression() -> (TypedExpr, ValueType) {
         )),
         true,
     );
+    let DataType::List(item) = array_type.data_type() else {
+        unreachable!();
+    };
+    let DataType::Struct(fields) = item.data_type() else {
+        unreachable!();
+    };
+    let row = arrow::array::StructArray::new(
+        fields.clone(),
+        vec![Arc::new(StringArray::from(vec!["nested"]))],
+        None,
+    );
+    let values = arrow::array::ListArray::new(
+        item.clone(),
+        arrow::buffer::OffsetBuffer::new(vec![0, 1].into()),
+        Arc::new(row),
+        None,
+    );
+    let pool = ConstantPool::try_new(
+        Arc::new(array_type.try_to_field("original_array").unwrap()),
+        array_type.clone(),
+        values.to_data(),
+        policy(),
+        CompilePhase::Validate,
+        &Control::default(),
+    )
+    .unwrap();
     let array = TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::Null),
+        kind: ExprKind::Constant(pool.value(0).unwrap()),
         value_type: array_type,
     };
     let expression = bound_lambda_fixture(lambda, array, DecimalOverflowPolicy::ReportError);

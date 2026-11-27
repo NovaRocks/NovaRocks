@@ -97,7 +97,6 @@ fn declaration_environment_rejects_each_duplicate_after_original_header_checks()
     let keys = [
         SemanticParameterKey::StatementStartUtc,
         SemanticParameterKey::TimeZone,
-        SemanticParameterKey::StatementStartUtc,
     ];
     let mut declaration = FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Stable,

@@ -22,46 +22,20 @@ use novarocks_type_contract::{
     CharacterKind, FunctionOverloadId, ValueKind, trino_can_coerce_scalar,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScalarTypingRoute {
-    Shared,
-    Legacy,
-}
-/// Callers supply a resolved, lowercase scalar name. A name's entire
-/// family stays on the SQL owner as long as that owner applies any special
-/// typing rule to it. Ordinary resolution still distinguishes function kinds.
-pub fn scalar_typing_route(name: &str) -> ScalarTypingRoute {
-    match name {
-        // SQL-specific rewrites or validation.
-        "__array_element_at" | "__map_element_at"
-       | "flatten" | "variant_get" | "try_variant_get" | "named_struct"
-       | "map_keys" | "map_values" | "array_min"
-       | "array_max" | "__array_struct_subfield"
-        // SQL's implicit string conversion.
-       | "group_concat" | "string_agg" | "starts_with" | "ends_with" | "btrim" | "trim_whitespace"
-        // High-order calls need SQL's lambda argument author.
-       | "transform" | "any_match" | "all_match" | "none_match"
-       | "filter" | "array_sort" | "map_filter"
-       | "transform_keys" | "transform_values" | "reduce" | "zip_with" | "map_zip_with"
-        // Materialized view state families use dedicated SQL validation.
-       | "count_state_union" | "count_state_visible"
-       | "count_distinct_state_union" | "count_distinct_state_visible"
-       | "approx_count_distinct_state_union" | "approx_count_distinct_state_visible"
-       | "avg_state_union" | "avg_state_visible" | "sum_state_union" | "sum_state_visible"
-       | "min_state_union" | "min_state_visible" | "max_state_union" | "max_state_visible"
-       | "bool_or_state_union" | "bool_or_state_visible" | "bool_and_state_union"
-       | "bool_and_state_visible" | "state_all_zero" | "mv_group_row_id" => ScalarTypingRoute::Legacy,
-        _ => ScalarTypingRoute::Shared,
-    }
-}
-
-/// Recognize frozen string signatures with no installed implementation after
-/// the catalogue has declined the actual arguments.
-pub(super) fn unavailable_string_binding(
+/// Project existing unavailable declarations after actual catalogue selection.
+pub(super) fn selection_error(
     name: &str,
     children: &[ChildTyping],
     error: FunctionBindingError,
 ) -> TypingError {
+    if error == FunctionBindingError::UnknownFunction
+        && novarocks_functions::builtin::intrinsic::builtin_disposition(name)
+            == Some(novarocks_functions::builtin::intrinsic::BuiltinDisposition::LoweredOnly)
+    {
+        return TypingError::Unsupported(format!(
+            "builtin function `{name}` has no admitted selected scalar implementation"
+        ));
+    }
     if !matches!(
         error,
         FunctionBindingError::UnknownFunction | FunctionBindingError::NoMatchingOverload

@@ -678,19 +678,6 @@ impl AnalyzeError {
         self.source.as_ref()
     }
 
-    pub(crate) fn invalid_literal_source<E>(cause: E, span: Span) -> Self
-    where
-        E: std::error::Error
-            + novarocks_failure_contract::OuterFailureProjection
-            + Send
-            + Sync
-            + 'static,
-    {
-        let mut error = Self::domain_source(cause);
-        error.kind = AnalyzeErrorKind::InvalidLiteral;
-        error.span = Some(span);
-        error
-    }
     pub(crate) fn numeric_out_of_range(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::NumericOutOfRange, message, span)
     }
@@ -829,6 +816,10 @@ impl AnalyzeError {
                 error.kind = AnalyzeErrorKind::InvalidLiteral;
                 error
             }
+            error @ novarocks_functions::FunctionBindingError::InvalidArguments(_) => Self {
+                kind: AnalyzeErrorKind::InvalidArgument,
+                ..Self::internal(error.to_string())
+            },
             error @ novarocks_functions::FunctionBindingError::UnavailableImplementation(_) => {
                 Self {
                     kind: AnalyzeErrorKind::UnavailableImplementation,
@@ -891,6 +882,8 @@ impl AnalyzeError {
                 | AnalyzeErrorKind::UnknownFunction
                 | AnalyzeErrorKind::OperatorNotFound
                 | AnalyzeErrorKind::UnknownType
+                | AnalyzeErrorKind::InvalidArgument
+                | AnalyzeErrorKind::InvalidLiteral
                 | AnalyzeErrorKind::AmbiguousFunctionCall
         ) {
             Self {

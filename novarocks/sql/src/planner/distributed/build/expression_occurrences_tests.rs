@@ -339,12 +339,9 @@ fn occurrence_shared_sparse_if_definition_keeps_value_truth_domains_and_ignores_
         assert_eq!(use_.control, ControlShape::If);
         assert_eq!(use_.context.demand, demand);
         assert_eq!(child(&uses, id, 0).context.region, use_.context.region);
-        assert_eq!(
-            child(&uses, id, 0).context.demand,
-            EvaluationDemand::TruthOnly
-        );
-        assert_guard(&uses, id, 1, GuardKind::IfThen, demand);
-        assert_guard(&uses, id, 2, GuardKind::IfElse, demand);
+        assert_eq!(child(&uses, id, 0).context.demand, EvaluationDemand::Value);
+        assert_guard(&uses, id, 1, GuardKind::IfThen, EvaluationDemand::Value);
+        assert_guard(&uses, id, 2, GuardKind::IfElse, EvaluationDemand::Value);
         assert_ne!(
             child(&uses, id, 0).context.use_id,
             child(&uses, id, 2).context.use_id
@@ -362,7 +359,7 @@ fn occurrence_shared_sparse_if_definition_keeps_value_truth_domains_and_ignores_
     );
 }
 #[test]
-fn occurrence_installed_coalesce_and_lower_have_exact_guarded_and_eager_edges() {
+fn occurrence_installed_coalesce_and_lower_preserve_both_ordered_shapes() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let source = || {
         let mut b = FixtureBuilder::new();
@@ -419,7 +416,7 @@ fn occurrence_installed_coalesce_and_lower_have_exact_guarded_and_eager_edges() 
         EvaluationDemand::Value,
     );
     let lower = child(&uses, root, 1);
-    assert_eq!(lower.control, ControlShape::Eager);
+    assert_eq!(lower.control, ControlShape::OrderedNull);
     assert_eq!(
         child(&uses, lower.context.use_id, 0).context.region,
         lower.context.region
@@ -505,11 +502,7 @@ fn occurrence_intrinsic_boolean_and_both_case_shapes_preserve_order_and_hand_gua
                 id,
                 first + arm * 2,
                 GuardKind::CaseWhen { arm: arm as u32 },
-                if simple {
-                    EvaluationDemand::Value
-                } else {
-                    EvaluationDemand::TruthOnly
-                },
+                EvaluationDemand::Value,
             );
             assert_guard(
                 &uses,
@@ -536,8 +529,8 @@ fn occurrence_intrinsic_boolean_and_both_case_shapes_preserve_order_and_hand_gua
             ControlShape::Eager
         );
         assert_eq!(
-            child(&uses, conjunction.context.use_id, 1).context.region,
-            conjunction.context.region
+            child(&uses, conjunction.context.use_id, 1).context.demand,
+            EvaluationDemand::Value
         );
     }
     prefixes(

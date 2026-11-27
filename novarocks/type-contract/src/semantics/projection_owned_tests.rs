@@ -73,33 +73,23 @@ fn source() -> SemanticParameters {
         ),
         (
             SemanticParameterId::new(2),
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(0, 0).unwrap(),
-            ),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("UTC").unwrap()),
         ),
         (
             SemanticParameterId::new(3),
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(1, 0).unwrap(),
-            ),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("+08:00").unwrap()),
         ),
         (
             SemanticParameterId::new(4),
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(0, 0).unwrap(),
-            ),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("UTC").unwrap()),
         ),
         (
             SemanticParameterId::new(5),
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(1, 0).unwrap(),
-            ),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("+08:00").unwrap()),
         ),
         (
             SemanticParameterId::new(u32::MAX),
-            SemanticParameterValue::StatementStartUtc(
-                crate::StatementStartUtc::try_new(1, 0).unwrap(),
-            ),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("-07:30").unwrap()),
         ),
     ])
     .unwrap()
@@ -142,7 +132,7 @@ fn immutable_projection_actual_unique_entry_loans_preserve_full_values_after_sou
             .map(|(id, value)| reference(id.get(), value.key()))
             .collect();
         refs.push(reference(1, SemanticParameterKey::TimeZone));
-        refs.push(reference(u32::MAX, SemanticParameterKey::StatementStartUtc));
+        refs.push(reference(u32::MAX, SemanticParameterKey::TimeZone));
         let mut captured = Vec::new();
         let mut header_counts = Vec::new();
         let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
@@ -200,20 +190,20 @@ fn immutable_projection_actual_unique_entry_loans_preserve_full_values_after_sou
     );
     assert_eq!(
         output.get(SemanticParameterId::new(2)),
-        Some(&SemanticParameterValue::StatementStartUtc(
-            crate::StatementStartUtc::try_new(0, 0).unwrap()
+        Some(&SemanticParameterValue::TimeZone(
+            crate::TimeZoneKey::parse("UTC").unwrap()
         ))
     );
     assert_eq!(
         output.get(SemanticParameterId::new(3)),
-        Some(&SemanticParameterValue::StatementStartUtc(
-            crate::StatementStartUtc::try_new(1, 0).unwrap()
+        Some(&SemanticParameterValue::TimeZone(
+            crate::TimeZoneKey::parse("+08:00").unwrap()
         ))
     );
     assert_eq!(
         output.get(SemanticParameterId::new(u32::MAX)),
-        Some(&SemanticParameterValue::StatementStartUtc(
-            crate::StatementStartUtc::try_new(1, 0).unwrap()
+        Some(&SemanticParameterValue::TimeZone(
+            crate::TimeZoneKey::parse("-07:30").unwrap()
         ))
     );
     let Some(SemanticParameterValue::TimeZone(zone)) = output.get(SemanticParameterId::new(1))
@@ -239,11 +229,7 @@ fn immutable_projection_success_and_ordinary_actual_callbacks_preserve_first_cau
     let c = Control::default();
     let good = reference(1, SemanticParameterKey::TimeZone);
     for refs in [
-        vec![
-            good,
-            reference(3, SemanticParameterKey::StatementStartUtc),
-            good,
-        ],
+        vec![good, reference(3, SemanticParameterKey::TimeZone), good],
         vec![good, reference(100, SemanticParameterKey::TimeZone)],
         vec![good, reference(1, SemanticParameterKey::StatementStartUtc)],
     ] {
@@ -347,7 +333,7 @@ fn immutable_projection_captured_clone_and_header_refusals_have_no_after_callbac
 fn immutable_projection_header_admission_precedes_pending255_without_own_scope() {
     let input = source();
     let c = Control::default();
-    let r = reference(u32::MAX, SemanticParameterKey::StatementStartUtc);
+    let r = reference(u32::MAX, SemanticParameterKey::TimeZone);
     for cause in CAUSES {
         c.arm(Some((1, cause)));
         let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();

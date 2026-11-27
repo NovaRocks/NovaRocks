@@ -26,7 +26,7 @@ use crate::runtime::task::ExecutionFailureCause;
 use arrow::datatypes::DataType;
 use novarocks_functions::FunctionKind;
 
-use novarocks_type_contract::FunctionValueType;
+use novarocks_type_contract::{FunctionValueType, OperatorFunction};
 fn whole_invocation_probe(step: usize, later_root_error: bool) {
     use WindowBound::{CurrentRow, UnboundedPreceding};
     let shape = Shape {
@@ -94,6 +94,10 @@ fn whole_invocation_probe(step: usize, later_root_error: bool) {
             &[
                 ("max_by", FunctionKind::Aggregate),
                 ("min_by", FunctionKind::Aggregate),
+                (
+                    OperatorFunction::Multiply.catalog_name(),
+                    FunctionKind::Scalar,
+                ),
             ],
             &actual,
         );
@@ -135,8 +139,9 @@ fn whole_invocation_probe(step: usize, later_root_error: bool) {
             Arc::new(RuntimeErrorState::default()),
         ),
     );
+    let state = RuntimeState::default().with_test_query_memory();
+    operator.bind_runtime_state(&state).unwrap();
     operator.prepare().unwrap();
-    let state = RuntimeState::default();
     let mut processor = TestDriver::new(operator.as_mut(), &state);
     let mut earlier = None;
     for start in (0..4).step_by(step) {

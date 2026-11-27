@@ -19,9 +19,8 @@ use super::{TextColumn, TextContext, TextError, register_constant};
 use crate::testkit::claim_author::{legacy_scalar_function, physical_call_request};
 use crate::typing::{
     CarrierConversion, ChildForm, ChildTyping, Conversion, LiteralEmission, LiteralSyntax,
-    LiteralValue, NodeShape, NodeTyping, ScalarTypingRoute, TypedLiteral, TypingContext,
-    TypingError, finish_call, scalar_typing_route, syntax_arithmetic, syntax_comparison,
-    syntax_distinct_from, type_node,
+    LiteralValue, NodeShape, NodeTyping, TypedLiteral, TypingContext, TypingError, finish_call,
+    syntax_arithmetic, syntax_comparison, syntax_distinct_from, type_node,
 };
 use arrow::datatypes::DataType;
 use novarocks_constant_contract::ConstantPools;
@@ -527,6 +526,19 @@ impl<'a> TextTyping<'a> {
             .iter()
             .any(|arg| matches!(arg, ast::Expr::Lambda(_)))
         {
+            if self
+                .functions
+                .definition(&name, FunctionKind::Scalar)
+                .is_none()
+                && let Some(overload) =
+                    novarocks_functions::builtin::collection_lambda::unavailable_overload(&name)
+            {
+                return Err(typing_error(
+                    novarocks_functions::FunctionBindingError::UnavailableImplementation(overload)
+                        .into(),
+                    span,
+                ));
+            }
             let [collection, ast::Expr::Lambda(lambda)] = arguments.as_slice() else {
                 return Err(typing_error(
                     novarocks_functions::FunctionBindingError::NoMatchingOverload.into(),
@@ -534,9 +546,6 @@ impl<'a> TextTyping<'a> {
                 ));
             };
             return self.lower_collection_lambda(&name, collection, lambda, span, work, depth);
-        }
-        if scalar_typing_route(&name) == ScalarTypingRoute::Legacy {
-            return Err(legacy(name, span));
         }
         let children = arguments
             .into_iter()

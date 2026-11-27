@@ -323,6 +323,64 @@ fn window_canonical_arithmetic_default_retains_the_selected_shape_and_refusals()
 }
 
 #[test]
+fn window_frame_ast_const_i64_keeps_signed_literal_and_arithmetic_offsets() {
+    let source = SourceCatalog {
+        offset_nullable: false,
+    };
+    let functions = crate::functions::builtin_sql_function_catalog();
+    for (bound, expected) in [
+        (
+            "-9223372036854775808 PRECEDING",
+            WindowBound::Preceding(i64::MIN),
+        ),
+        (
+            "-9223372036854775808 + 9223372036854775807 + 2 FOLLOWING",
+            WindowBound::Following(1),
+        ),
+    ] {
+        let sql = format!(
+            "SELECT first_value(v) OVER (ORDER BY v ROWS BETWEEN {bound} AND 3 FOLLOWING) FROM source"
+        );
+        let query = analyze(&sql, &source, functions).unwrap();
+        let ExprKind::WindowCall {
+            window_frame: Some(frame),
+            ..
+        } = &projection(&query, 0).kind
+        else {
+            panic!("expected analyzed window frame");
+        };
+        assert_eq!(frame.start, expected);
+        assert_eq!(frame.end, WindowBound::Following(3));
+    }
+}
+
+#[test]
+fn window_frame_ast_const_i64_preserves_the_original_diagnostic() {
+    let source = SourceCatalog {
+        offset_nullable: false,
+    };
+    let functions = crate::functions::builtin_sql_function_catalog();
+    for bound in [
+        "-(-9223372036854775808) PRECEDING",
+        "-9223372036854775808 / -1 FOLLOWING",
+        "1 / 0 PRECEDING",
+        "CAST(1 AS BIGINT) FOLLOWING",
+    ] {
+        let sql = format!(
+            "SELECT first_value(v) OVER (ORDER BY v ROWS BETWEEN {bound} AND 3 FOLLOWING) FROM source"
+        );
+        let error = analyze(&sql, &source, functions).unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            "window frame offset must be a constant integer"
+        );
+        let span = error.span().expect("original frame bound span");
+        assert_eq!(&sql[span.start()..span.end()], bound);
+    }
+}
+
+#[test]
 fn window_canonical_first_last_normalization_keeps_complete_selected_result() {
     let query = analyze("SELECT first_value(j) IGNORE NULLS OVER (ORDER BY v ASC NULLS LAST ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING), last_value(nested) OVER (ORDER BY v DESC NULLS FIRST ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING), nested FROM source",
         &SourceCatalog { offset_nullable: false }, crate::functions::builtin_sql_function_catalog()).unwrap();
@@ -463,7 +521,18 @@ fn window_canonical_sole_helper_keeps_success_and_ordinary_control_prefixes() {
             if count == 3 {
                 assert_eq!(
                     actual[2].value_type,
+                    FunctionValueType::new(DataType::Int64, true)
+                );
+                let ExprKind::Cast { expr: original, .. } = &actual[2].kind else {
+                    panic!("the window owner selects BIGINT for the original INTEGER default");
+                };
+                assert_eq!(
+                    original.value_type,
                     FunctionValueType::new(DataType::Int32, true)
+                );
+                assert_eq!(
+                    source_column(original),
+                    source_column(projection(&query, 2))
                 );
             }
         } else {
@@ -527,6 +596,16 @@ impl FaultCatalog {
             windows: Arc::new(AtomicUsize::new(0)),
         }
     }
+
+    fn check_window_binding(&self) -> Result<usize, FunctionBindingError> {
+        let at = self.windows.fetch_add(1, Ordering::SeqCst);
+        if let WindowFault::Control(index, cause) = self.fault.clone()
+            && at == index
+        {
+            return Err(FunctionBindingError::Control(cause));
+        }
+        Ok(at)
+    }
 }
 impl SqlFunctionCatalog for FaultCatalog {
     fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog> {
@@ -564,15 +643,20 @@ impl SqlFunctionCatalog for FaultCatalog {
         args: &[FunctionArgument],
         control: &dyn PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
-        let at = self.windows.fetch_add(1, Ordering::SeqCst);
-        if let WindowFault::Control(index, cause) = self.fault.clone()
-            && at == index
-        {
-            // A retry delegates successfully, exposing a swallowed refusal.
-            return Err(FunctionBindingError::Control(cause));
-        }
+        let at = self.check_window_binding()?;
+        assert_eq!(at, 0, "called the window name resolver after selection");
+        crate::functions::builtin_sql_function_catalog().resolve_window_binding(name, args, control)
+    }
+    fn finish_window_binding(
+        &self,
+        original: &ResolvedFunctionBinding,
+        args: &[FunctionArgument],
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        let at = self.check_window_binding()?;
+        assert_eq!(at, 1, "called the window finish before selection");
         let mut binding = crate::functions::builtin_sql_function_catalog()
-            .resolve_window_binding(name, args, control)?;
+            .finish_window_binding(original, args, control)?;
         if at == 1 {
             match self.fault {
                 WindowFault::StaleRebound => {
@@ -606,6 +690,9 @@ impl SqlFunctionCatalog for FaultCatalog {
     }
     fn contains_aggregate(&self, name: &str) -> bool {
         crate::functions::builtin_sql_function_catalog().contains_aggregate(name)
+    }
+    fn contains_window(&self, name: &str) -> bool {
+        crate::functions::builtin_sql_function_catalog().contains_window(name)
     }
     fn resolve_aggregate_signature(
         &self,

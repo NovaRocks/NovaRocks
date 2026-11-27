@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::parser::expression_for_diagnostic;
 use arrow::datatypes::{DataType, TimeUnit};
-use novarocks_expression::typing::{NodeShape, ScalarTypingRoute, scalar_typing_route};
+use novarocks_expression::typing::NodeShape;
 use novarocks_parser::Span;
 use novarocks_parser::ast;
 use novarocks_parser::printer::print_object_name;
@@ -34,33 +34,6 @@ use super::helpers::{eval_const_i64, expr_display_name};
 use super::scope::AnalyzerScope;
 
 type WindowSpecAnalysis = (Vec<TypedExpr>, Vec<SortItem>, Option<WindowFrame>);
-
-fn scalar_signature_is_unknown(
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    name: &str,
-    arg_types: &[DataType],
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<bool, AnalyzeError> {
-    match function_catalog.resolve_scalar_signature(name, arg_types, control) {
-        Err(error @ novarocks_functions::FunctionResolutionError::Control(_)) => {
-            Err(AnalyzeError::function_resolution(error))
-        }
-        Err(crate::functions::ResolveError::UnknownFunction) => Ok(true),
-        _ => Ok(false),
-    }
-}
-fn scalar_function_is_unknown(
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    name: &str,
-    arg_types: &[DataType],
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<bool, AnalyzeError> {
-    Ok(
-        scalar_signature_is_unknown(function_catalog, name, arg_types, control)?
-            && legacy_scalar_return_type_with_catalog(function_catalog, name, arg_types, control)?
-                .is_none(),
-    )
-}
 
 pub(crate) fn unsupported_predicate_reason(node: &ast::PredicatedExpr) -> Option<&'static str> {
     match &node.predicate {
@@ -1574,6 +1547,19 @@ impl<'a> super::AnalyzerContext<'a> {
         ))
     }
 
+    pub(super) fn analyze_subquery_equality(
+        &self,
+        left: TypedExpr,
+        right: TypedExpr,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let operator = crate::common::binary_operator::subquery_equality(
+            left.value_type.data_type(),
+            right.value_type.data_type(),
+        );
+        self.analyze_binary_operator(operator, left, right, span)
+    }
+
     /// Analyze original logical terms in source order, then balance only the
     /// typed IR. Each term keeps its actual materialized-source identity.
     fn analyze_boolean_chain(
@@ -1652,21 +1638,6 @@ impl<'a> super::AnalyzerContext<'a> {
             novarocks_type_contract::TrinoCastMode::Implicit,
             span,
         )
-    }
-
-    fn coerce_window_operand(
-        &self,
-        source: TypedExpr,
-        target: &novarocks_type_contract::FunctionValueType,
-        span: Span,
-    ) -> Result<TypedExpr, AnalyzeError> {
-        if source.value_type.data_type() == &DataType::Null
-            && matches!(&source.kind, ExprKind::Literal(LiteralValue::Null))
-        {
-            let target = super::helpers::with_nullability(target.clone(), true);
-            return self.cast_to_value_type(source, target, span);
-        }
-        self.coerce_common_value(source, target, span)
     }
 
     fn analyze_binary_op(
@@ -2002,7 +1973,7 @@ impl<'a> super::AnalyzerContext<'a> {
         if scope.inside_lambda()
             && (func.window.is_some()
                 || original_name == "grouping"
-                || is_window_only_function(&original_name)
+                || self.function_catalog.contains_window(&original_name)
                 || is_aggregate_function(self.function_catalog, &original_name)
                 || analyzer_aggregate_alias(&original_name).is_some())
         {
@@ -2242,19 +2213,30 @@ impl<'a> super::AnalyzerContext<'a> {
         if effective_arg_exprs
             .iter()
             .any(|argument| matches!(argument, ast::Expr::Lambda(_)))
-            && !is_window_only_function(&name)
+            && !self.function_catalog.contains_window(&name)
             && !is_aggregate_function(self.function_catalog, &name)
         {
-            if crate::functions::builtin_disposition(&name).is_none()
-                && !self
-                    .function_catalog
-                    .recognizes_scalar_name(&name, &[], self.control)
-                    .map_err(AnalyzeError::function_resolution)?
-            {
-                return Err(AnalyzeError::unknown_function(
-                    format!("Unknown function: {name}"),
-                    func.span,
-                ));
+            let known_scalar = self
+                .function_catalog
+                .recognizes_scalar_name(&name, &[], self.control)
+                .map_err(AnalyzeError::function_resolution)?;
+            if !known_scalar {
+                if let Some(overload) =
+                    novarocks_functions::builtin::collection_lambda::unavailable_overload(&name)
+                {
+                    return Err(AnalyzeError::function_binding(
+                        novarocks_functions::FunctionBindingError::UnavailableImplementation(
+                            overload,
+                        ),
+                    )
+                    .at_type_mismatch(func.span));
+                }
+                if crate::functions::builtin_disposition(&name).is_none() {
+                    return Err(AnalyzeError::unknown_function(
+                        format!("Unknown function: {name}"),
+                        func.span,
+                    ));
+                }
             }
             let [collection, ast::Expr::Lambda(lambda)] = effective_arg_exprs else {
                 return Err(AnalyzeError::unknown_function(
@@ -2460,38 +2442,30 @@ impl<'a> super::AnalyzerContext<'a> {
 
         // Check for window function: func(...) OVER (...)
         if let Some(window_type) = func.window {
-            let window_only = is_window_only_function(&name);
+            let window_only = self.function_catalog.contains_window(&name);
             let aggregate_binding = if window_only {
                 None
             } else {
                 if !self.function_catalog.contains_aggregate(&name) {
-                    // Legacy declarations are type-inspection facts, not installed selected bindings.
-                    // A custom contribution of the same name is resolved by its own catalog identity.
-                    if scalar_signature_is_unknown(
-                        self.function_catalog,
-                        &name,
-                        &arg_types,
-                        self.control,
-                    )? && matches!(
-                        crate::functions::builtin_disposition(&name),
-                        Some(
-                            crate::functions::BuiltinDisposition::Unavailable
-                                | crate::functions::BuiltinDisposition::LoweredOnly
-                        )
-                    ) {
-                        return Err(AnalyzeError::unsupported_expression(
-                            format!(
-                                "builtin function `{name}` has no admitted selected scalar implementation"
-                            ),
-                            func.span,
-                        ));
-                    }
-                    if scalar_function_is_unknown(
-                        self.function_catalog,
-                        &name,
-                        &arg_types,
-                        self.control,
-                    )? {
+                    let known_scalar = self
+                        .function_catalog
+                        .recognizes_scalar_name(&name, &arg_types, self.control)
+                        .map_err(AnalyzeError::function_resolution)?;
+                    if !known_scalar {
+                        if matches!(
+                            crate::functions::builtin_disposition(&name),
+                            Some(
+                                crate::functions::BuiltinDisposition::Unavailable
+                                    | crate::functions::BuiltinDisposition::LoweredOnly
+                            )
+                        ) {
+                            return Err(AnalyzeError::unsupported_expression(
+                                format!(
+                                    "builtin function `{name}` has no admitted selected scalar implementation"
+                                ),
+                                func.span,
+                            ));
+                        }
                         return Err(AnalyzeError::unknown_function(
                             format!("Unknown function: {name}"),
                             func.span,
@@ -2534,22 +2508,6 @@ impl<'a> super::AnalyzerContext<'a> {
                             frame.span,
                         ));
                     }
-                }
-                if let [value, _, default] = args_typed.as_mut_slice() {
-                    let common = self.require_common_trino_type(
-                        &value.value_type,
-                        &default.value_type,
-                        func.span,
-                    )?;
-                    *value = self.coerce_window_operand(value.clone(), &common, func.span)?;
-                    *default = self.coerce_window_operand(default.clone(), &common, func.span)?;
-                }
-                if let Some(offset) = args_typed.get_mut(1) {
-                    let bigint = novarocks_type_contract::FunctionValueType::new(
-                        DataType::Int64,
-                        offset.value_type.nullable(),
-                    );
-                    *offset = self.coerce_window_operand(offset.clone(), &bigint, func.span)?;
                 }
             }
             let (partition_by, order_by, window_frame) =
@@ -2625,13 +2583,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 original_arguments[0].span(),
             )?;
             args_typed.insert(0, condition);
-            arg_types[0] = DataType::Boolean;
         }
 
-        let mut bound_scalar = None;
-        let mut bound_aggregate = None;
         if is_aggregate_function(self.function_catalog, &name) {
-            bound_aggregate = Some(resolve_aggregate_function_call_with_order(
+            let signature = resolve_aggregate_function_call_with_order(
                 &self.binding_finalizer(),
                 &name,
                 is_distinct,
@@ -2640,141 +2595,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 self.constant_policy,
                 self.purpose,
                 AggregateCallSite::Group(func.span),
-            )?);
-        } else {
-            if matches!(name.as_str(), "variant_get" | "try_variant_get") {
-                if !(2..=3).contains(&args_typed.len()) {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!("{name} expects 2 or 3 arguments, got {}", args_typed.len()),
-                        func.span,
-                    ));
-                }
-                if !matches!(
-                    args_typed[1].kind,
-                    ExprKind::Literal(LiteralValue::String(_))
-                ) {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!("{name} path argument must be a string literal"),
-                        func.span,
-                    ));
-                }
-                if args_typed.len() == 3
-                    && !matches!(
-                        args_typed[2].kind,
-                        ExprKind::Literal(LiteralValue::String(_))
-                    )
-                {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!("{name} type argument must be a string literal"),
-                        func.span,
-                    ));
-                }
-            }
-            validate_scalar_function_call_typed(&name, &args_typed)
-                .map_err(|message| AnalyzeError::type_mismatch(message, func.span))?;
-            let route = scalar_typing_route(&name);
-            let unknown = match route {
-                ScalarTypingRoute::Shared => !self
-                    .function_catalog
-                    .recognizes_scalar_name(&name, &arg_types, self.control)
-                    .map_err(AnalyzeError::function_resolution)?,
-                ScalarTypingRoute::Legacy => scalar_signature_is_unknown(
-                    self.function_catalog,
-                    &name,
-                    &arg_types,
-                    self.control,
-                )?,
-            };
-            // Legacy declarations are type-inspection facts, not installed selected bindings.
-            // A custom contribution of the same name is resolved by its own catalog identity.
-            if unknown && !matches!(name.as_str(), "format" | "$overlay") {
-                if matches!(
-                    crate::functions::builtin_disposition(&name),
-                    Some(
-                        crate::functions::BuiltinDisposition::Unavailable
-                            | crate::functions::BuiltinDisposition::LoweredOnly
-                    )
-                ) {
-                    return Err(AnalyzeError::unsupported_expression(
-                        format!(
-                            "builtin function `{name}` has no admitted selected scalar implementation"
-                        ),
-                        func.span,
-                    ));
-                }
-                if legacy_scalar_return_type_with_catalog(
-                    self.function_catalog,
-                    &name,
-                    &arg_types,
-                    self.control,
-                )?
-                .is_none()
-                {
-                    return Err(AnalyzeError::unknown_function(
-                        format!("Unknown function: {name}"),
-                        func.span,
-                    ));
-                }
-            }
-            let ordinals = match route {
-                ScalarTypingRoute::Shared => None,
-                ScalarTypingRoute::Legacy => self.described_arguments(&args_typed),
-            };
-            let bound = match route {
-                ScalarTypingRoute::Shared => {
-                    let shape = if func.original.is_none() && name == "coalesce" {
-                        NodeShape::Coalesce
-                    } else {
-                        NodeShape::CatalogCall {
-                            name: &name,
-                            expected_result: None,
-                        }
-                    };
-                    self.type_scalar_call_at_arguments(
-                        shape,
-                        args_typed,
-                        effective_arg_exprs,
-                        func.span,
-                    )?
-                }
-                ScalarTypingRoute::Legacy => bind_legacy_scalar_call(
-                    &self.binding_finalizer(),
-                    &name,
-                    args_typed,
-                    func.span,
-                    self.constant_policy,
-                )
-                .map_err(|error| error.at_type_mismatch(func.span))?,
-            };
-            self.observe_argument_types(
-                ordinals,
-                bound.args.iter().map(|argument| Some(&argument.value_type)),
             )?;
-            // This overload is also exposed by Trino's named array concat call.
-            if bound.binding.function_id.as_str() == "builtin.scalar/concat/v1"
-                && bound.binding.logical_argument_count > 127
-            {
-                return Err(AnalyzeError::too_many_arguments(
-                    "Too many arguments for function call concat()",
-                    func.span,
-                ));
-            }
-            arg_types = bound
-                .args
-                .iter()
-                .map(|arg| arg.value_type.data_type().clone())
-                .collect();
-            args_typed = bound.args;
-            bound_scalar = Some(bound.binding);
-        }
-
-        if is_aggregate_function(self.function_catalog, &name) {
-            // Aggregate function
-            let signature = self.with_aggregate_state_source(
-                bound_aggregate.expect("catalog-classified aggregate must be resolved"),
-                is_distinct,
-                &func_order_by,
-            )?;
+            let signature =
+                self.with_aggregate_state_source(signature, is_distinct, &func_order_by)?;
             self.observe_argument_types(
                 self.described_arguments(&args_typed),
                 signature
@@ -2788,7 +2611,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     }),
             )?;
             let value_type = crate::functions::aggregate_result_type(&signature).clone();
-            Ok(TypedExpr {
+            return Ok(TypedExpr {
                 kind: ExprKind::AggregateCall {
                     occurrence: crate::analysis::AggregateOccurrence::new(),
                     filter: None,
@@ -2799,87 +2622,55 @@ impl<'a> super::AnalyzerContext<'a> {
                     resolved: signature,
                 },
                 value_type,
-            })
-        } else {
-            // Scalar function
-            let mut return_type = match bound_scalar.as_ref() {
-                Some(binding) => match &binding.selected.result_type {
-                    novarocks_functions::FunctionResultType::Scalar(result) => {
-                        result.data_type().clone()
-                    }
-                    novarocks_functions::FunctionResultType::Relation(_) => {
-                        unreachable!("scalar function cannot have a relation result")
-                    }
-                },
-                None => infer_scalar_return_type_with_catalog(
-                    self.function_catalog,
-                    &name,
-                    &arg_types,
-                    self.control,
-                )?,
-            };
-            // variant_get / try_variant_get: the path argument and optional
-            // 3rd result-type argument are string literals (Spark-aligned).
-            // Surface the type argument as the expression's static type;
-            // reject non-literal arguments up front.
-            if matches!(name.as_str(), "variant_get" | "try_variant_get") {
-                if !(2..=3).contains(&args_typed.len()) {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!("{name} expects 2 or 3 arguments, got {}", args_typed.len()),
-                        func.span,
-                    ));
-                }
-                match &args_typed[1].kind {
-                    ExprKind::Literal(LiteralValue::String(_)) => {}
-                    _ => {
-                        return Err(AnalyzeError::invalid_argument(
-                            format!("{name} path argument must be a string literal"),
-                            func.span,
-                        ));
-                    }
-                }
-                if args_typed.len() == 3 {
-                    match &args_typed[2].kind {
-                        ExprKind::Literal(LiteralValue::String(t)) => {
-                            return_type =
-                                novarocks_types::value::variant::variant_get_target_type(t)
-                                    .map_err(|message| {
-                                        AnalyzeError::invalid_literal_source(message, func.span)
-                                    })?;
-                        }
-                        _ => {
-                            return Err(AnalyzeError::invalid_argument(
-                                format!("{name} type argument must be a string literal"),
-                                func.span,
-                            ));
-                        }
-                    }
-                }
-            }
-            let binding = bound_scalar.expect("non-macro scalar function must be bound");
-            let bound_result = match &binding.selected.result_type {
-                novarocks_functions::FunctionResultType::Scalar(result) => result,
-                novarocks_functions::FunctionResultType::Relation(_) => {
-                    unreachable!("scalar function cannot have a relation result")
-                }
-            };
-            assert_eq!(
-                bound_result.data_type(),
-                &return_type,
-                "analyzer result type must match the exact scalar binding"
-            );
-            let value_type = bound_result.clone();
-            Ok(TypedExpr {
-                kind: ExprKind::FunctionCall {
-                    volatility: self.function_catalog.volatility(&name),
-                    name,
-                    args: (args_typed).into(),
-                    distinct: is_distinct,
-                    binding,
-                },
-                value_type,
-            })
+            });
         }
+
+        let shape = if func.original.is_none() && name == "coalesce" {
+            NodeShape::Coalesce
+        } else {
+            NodeShape::CatalogCall {
+                name: &name,
+                expected_result: None,
+            }
+        };
+        let bound = self
+            .type_scalar_call_at_arguments(shape, args_typed, effective_arg_exprs, func.span)
+            .map_err(|error| {
+                if error.kind() == AnalyzeErrorKind::UnknownFunction
+                    && matches!(
+                        crate::functions::builtin_disposition(&name),
+                        Some(
+                            crate::functions::BuiltinDisposition::Unavailable
+                                | crate::functions::BuiltinDisposition::LoweredOnly
+                        )
+                    )
+                {
+                    AnalyzeError::unsupported_expression(
+                        format!("builtin function `{name}` has no admitted selected scalar implementation"),
+                        func.span,
+                    )
+                } else {
+                    error
+                }
+            })?;
+        if bound.binding.function_id.as_str() == "builtin.scalar/concat/v1"
+            && bound.binding.logical_argument_count > 127
+        {
+            return Err(AnalyzeError::too_many_arguments(
+                "Too many arguments for function call concat()",
+                func.span,
+            ));
+        }
+        Ok(TypedExpr {
+            value_type: bound.value_type().clone(),
+            kind: ExprKind::FunctionCall {
+                volatility: bound.binding.semantics.volatility,
+                name,
+                args: bound.args.into(),
+                distinct: is_distinct,
+                binding: bound.binding,
+            },
+        })
     }
 
     fn analyze_collection_lambda(
@@ -3985,36 +3776,35 @@ fn bind_window_call(
 ) -> Result<(Vec<TypedExpr>, crate::binding::SqlFunctionBinding), AnalyzeError> {
     let function_catalog = finalizer.catalog;
     let control = finalizer.control;
-    let resolve = |args: &[TypedExpr]| {
-        let arguments = args
-            .iter()
+    let make_arguments = |args: &[TypedExpr]| {
+        args.iter()
             .map(|argument| crate::analysis::function_argument(argument, constant_policy, control))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(AnalyzeError::function_binding)?;
-        function_catalog
-            .resolve_window_binding(name, &arguments, control)
-            .map_err(|error| {
-                if let novarocks_functions::FunctionBindingError::Control(error) = error {
-                    return AnalyzeError::control(error);
-                }
-                if matches!(
-                    error,
-                    novarocks_functions::FunctionBindingError::UnavailableImplementation(_)
-                ) {
-                    return AnalyzeError::function_binding(error).at_type_mismatch(span);
-                }
-                AnalyzeError::type_mismatch(
-                    format!(
-                        "cannot bind window function `{name}` for argument types {:?}: {error}",
-                        args.iter()
-                            .map(|argument| argument.value_type.data_type().clone())
-                            .collect::<Vec<_>>()
-                    ),
-                    span,
-                )
-            })
+            .map_err(AnalyzeError::function_binding)
     };
-    let binding = resolve(&args)?;
+    let arguments = make_arguments(&args)?;
+    let binding = function_catalog
+        .resolve_window_binding(name, &arguments, control)
+        .map_err(|error| {
+            if let novarocks_functions::FunctionBindingError::Control(error) = error {
+                return AnalyzeError::control(error);
+            }
+            if matches!(
+                error,
+                novarocks_functions::FunctionBindingError::UnavailableImplementation(_)
+            ) {
+                return AnalyzeError::function_binding(error).at_type_mismatch(span);
+            }
+            AnalyzeError::type_mismatch(
+                format!(
+                    "cannot bind window function `{name}` for argument types {:?}: {error}",
+                    args.iter()
+                        .map(|argument| argument.value_type.data_type().clone())
+                        .collect::<Vec<_>>()
+                ),
+                span,
+            )
+        })?;
     if !selected_call_shape_matches_observed(
         &binding,
         args.len(),
@@ -4026,10 +3816,33 @@ fn bind_window_call(
             span,
         ));
     }
+    let preserves_original_offset_source = matches!(
+        binding.function_id.as_str(),
+        "builtin.window/lead/v1" | "builtin.window/lag/v1"
+    );
     let args = args
         .into_iter()
         .zip(binding.selected.argument_types.iter())
         .map(|(arg, target)| match target {
+            novarocks_functions::FunctionArgumentType::Value(value)
+                if preserves_original_offset_source
+                    && arg.value_type.data_type() != value.data_type()
+                    && crate::optimizer::scalar_expr::lossless_signed_widening(
+                        &arg.value_type,
+                        value,
+                    ) =>
+            {
+                // Window declarations retain the original value, including the
+                // width at which a nested integer operation can fail.
+                super::value_conversion::cast_with_trino_mode(
+                    arg,
+                    value.clone(),
+                    novarocks_type_contract::TrinoCastMode::Implicit,
+                    span,
+                    finalizer,
+                    constant_policy,
+                )
+            }
             novarocks_functions::FunctionArgumentType::Value(value) => {
                 coerce_selected_function_argument(finalizer, arg, value, constant_policy, span)
             }
@@ -4046,7 +3859,10 @@ fn bind_window_call(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let exact = resolve(&args)?;
+    let arguments = make_arguments(&args)?;
+    let exact = function_catalog
+        .finish_window_binding(&binding, &arguments, control)
+        .map_err(|error| AnalyzeError::function_binding(error).at_type_mismatch(span))?;
     if !rebound_call_matches_observed(&binding, &exact, &args, control)? {
         return Err(AnalyzeError::type_mismatch(
             format!("window function `{name}` changed selected identity after argument coercion"),
@@ -4067,118 +3883,17 @@ pub(super) fn bind_scalar_function_call_with_catalog(
 ) -> Result<BoundScalarCall, AnalyzeError> {
     let finalizer =
         super::BindingFinalizer::ordinary(function_catalog, decimal_overflow_policy, control);
-    bind_legacy_scalar_call(
+    super::expression_typing::type_scalar_call_with_finalizer(
         &finalizer,
-        name,
+        NodeShape::CatalogCall {
+            name,
+            expected_result: None,
+        },
         args,
+        &[],
+        constant_policy,
         novarocks_parser::SYNTHETIC,
-        constant_policy,
     )
-}
-
-fn bind_legacy_scalar_call(
-    finalizer: &super::BindingFinalizer<'_>,
-    name: &str,
-    args: Vec<TypedExpr>,
-    span: Span,
-    constant_policy: novarocks_functions::ConstantValidation,
-) -> Result<BoundScalarCall, AnalyzeError> {
-    let function_catalog = finalizer.catalog;
-    let control = finalizer.control;
-    let arg_types = args
-        .iter()
-        .map(|arg| arg.value_type.data_type().clone())
-        .collect::<Vec<_>>();
-
-    match select_scalar_binding_with_catalog(
-        function_catalog,
-        name,
-        &args,
-        constant_policy,
-        control,
-    ) {
-        Ok(binding) => {
-            if !selected_call_shape_matches_observed(
-                &binding,
-                args.len(),
-                novarocks_functions::FunctionKind::Scalar,
-                control,
-            )? {
-                return Err(AnalyzeError::internal(format!(
-                    "function `{name}` selected an invalid call shape"
-                )));
-            }
-
-            let args = args
-                .into_iter()
-                .zip(binding.selected.argument_types.iter())
-                .map(|(arg, target)| match target {
-                    novarocks_functions::FunctionArgumentType::Value(_)
-                        if matches!(arg.kind, ExprKind::LambdaFunction { .. }) =>
-                    {
-                        Err(AnalyzeError::internal(format!(
-                            "function `{name}` selected a value target for a lambda argument"
-                        )))
-                    }
-                    novarocks_functions::FunctionArgumentType::Value(value) => {
-                        coerce_selected_function_argument(
-                            finalizer,
-                            arg,
-                            value,
-                            constant_policy,
-                            span,
-                        )
-                    }
-                    novarocks_functions::FunctionArgumentType::Lambda { .. }
-                        if matches!(arg.kind, ExprKind::LambdaFunction { .. }) =>
-                    {
-                        Ok(arg)
-                    }
-                    novarocks_functions::FunctionArgumentType::CandidateGroup { .. } => Err(
-                        AnalyzeError::internal("ordinary syntax selected a grouped IN argument"),
-                    ),
-                    novarocks_functions::FunctionArgumentType::Lambda { .. } => {
-                        Err(AnalyzeError::internal(format!(
-                            "function `{name}` selected a lambda target for a value argument"
-                        )))
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            validate_scalar_function_call_typed(name, &args).map_err(AnalyzeError::internal)?;
-            let exact = finish_selected_scalar_call(
-                function_catalog,
-                &binding,
-                &args,
-                constant_policy,
-                control,
-            )?;
-            if !rebound_call_matches_observed(&binding, &exact, &args, control)? {
-                return Err(AnalyzeError::internal(format!(
-                    "function `{name}` lost the exact selected argument declaration"
-                )));
-            }
-            Ok(BoundScalarCall {
-                args,
-                binding: finalizer.finish(exact, name, span)?,
-                operand_order: Default::default(),
-            })
-        }
-        Err(error)
-            if error.control_error().is_some()
-                || error.source_failure().is_some()
-                || matches!(
-                    error.kind(),
-                    crate::analyze_error::AnalyzeErrorKind::UnavailableImplementation
-                        | crate::analyze_error::AnalyzeErrorKind::UnknownFunction
-                        | crate::analyze_error::AnalyzeErrorKind::AmbiguousFunctionCall
-                ) =>
-        {
-            Err(error)
-        }
-        Err(error) => Err(AnalyzeError::internal(format!(
-            "cannot bind scalar function `{name}` for argument types {arg_types:?}: {error}"
-        ))),
-    }
 }
 
 #[cfg(test)]
@@ -9231,9 +8946,12 @@ mod tests {
                 let sql = format!("select {left} {op} {right} from unary_input");
                 let expr = analyze(&sql).unwrap();
                 assert_eq!(expr.value_type.data_type(), &DataType::Decimal256(55, 15));
-                let ExprKind::BooleanConnective { left, right, .. } = expr.kind else {
-                    panic!("expected frozen arithmetic");
+                let Some((operator, [left, right])) =
+                    crate::common::binary_operator::typed_operands(&expr)
+                else {
+                    panic!("expected selected arithmetic");
                 };
+                assert_eq!(operator.sql(), op);
                 let (source, decimal) = if reverse {
                     (left, right)
                 } else {
@@ -9269,7 +8987,9 @@ mod tests {
                 "{sql}"
             );
             assert!(
-                error.message().contains("no frozen result rule"),
+                error.message().starts_with("operator ")
+                    && error.message().contains("does not accept")
+                    && error.message().contains("FixedSizeBinary(16)"),
                 "{sql}: {error}"
             );
         }
@@ -9590,7 +9310,7 @@ mod tests {
         let QueryBody::Select(select) = &query.body else {
             panic!("SELECT")
         };
-        let Some((BinOp::Gt, [_, right])) =
+        let Some((BinOp::Lt, [right, _])) =
             crate::common::binary_operator::typed_comparison(&select.projection[0].expr)
         else {
             panic!("comparison")

@@ -1154,15 +1154,11 @@ mod tests {
         let outer_ids: HashSet<ColumnId> = [OUTER1, OUTER2].into();
         let inner_ids: HashSet<ColumnId> = [T2_A, T2_B].into();
         for conj in &new_apply.correlation_conjuncts {
-            let all_refs: HashSet<ColumnId> = {
-                let ExprKind::BooleanConnective { left, right, .. } = &conj.kind else {
-                    panic!("conjunct must be BinaryOp");
-                };
-                collect_column_id_refs(left)
-                    .union(&collect_column_id_refs(right))
-                    .copied()
-                    .collect()
-            };
+            assert!(matches!(
+                crate::common::binary_operator::typed_comparison(conj),
+                Some((BinOp::Eq, _))
+            ));
+            let all_refs = collect_column_id_refs(conj);
             assert!(
                 all_refs.iter().any(|id| outer_ids.contains(id)),
                 "conjunct must reference an outer id"

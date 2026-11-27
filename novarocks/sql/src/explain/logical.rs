@@ -662,7 +662,18 @@ fn expression(
         return Err(fmt::Error);
     }
     let next = depth + 1;
-    if let Some((operator, operands)) = crate::common::binary_operator::typed_operands(expr) {
+    if let Some((operator, mut operands)) = crate::common::binary_operator::typed_operands(expr) {
+        if matches!(
+            operator,
+            novarocks_type_contract::OperatorFunction::Equal
+                | novarocks_type_contract::OperatorFunction::Identical
+        ) && matches!(
+            operands[0].kind,
+            ExprKind::Literal(_) | ExprKind::Constant(_)
+        ) && matches!(operands[1].kind, ExprKind::ColumnRef { .. })
+        {
+            operands.swap(0, 1);
+        }
         for (ordinal, operand) in operands.into_iter().enumerate() {
             if ordinal == 1 {
                 write!(out, " {} ", operator.sql())?;

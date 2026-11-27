@@ -41,7 +41,6 @@ pub mod syntax_constant;
 mod temporal;
 pub use conversion::operator_decimal_float;
 pub use literal::{LiteralEmission, LiteralSyntax, TypedLiteral, supports_typed_string};
-pub use route::{ScalarTypingRoute, scalar_typing_route};
 pub use syntax_constant::{LiteralValue, admit_syntax_constant};
 pub use temporal::{
     TemporalSyntax, at_zone_syntax, bind_extract, bind_temporal_syntax, clock_syntax,
@@ -1023,7 +1022,7 @@ fn type_catalog_call(
     let binding = context
         .catalog
         .select_scalar(name, request(&arguments, expected_result), work.control())
-        .map_err(|error| route::unavailable_string_binding(name, children, error))?;
+        .map_err(|error| route::selection_error(name, children, error))?;
     type_selected_call(context, binding, expected_result, children, work)
 }
 

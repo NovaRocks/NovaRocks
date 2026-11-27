@@ -37,6 +37,19 @@ pub(crate) fn comparison_op(operator: OperatorFunction) -> BinOp {
     }
 }
 
+/// Subquery membership keys use grouping equality for floating-point
+/// values while retaining SQL NULL propagation.
+pub(crate) fn subquery_equality(left: &DataType, right: &DataType) -> OperatorFunction {
+    if [left, right]
+        .into_iter()
+        .any(|ty| matches!(ty, DataType::Float32 | DataType::Float64))
+    {
+        OperatorFunction::SubqueryFloatEqual
+    } else {
+        OperatorFunction::Equal
+    }
+}
+
 pub(crate) fn contains_internal_wide_type(value: &ValueTypeRef) -> bool {
     match value.kind() {
         ValueKind::Nominal(ValueLogicalType::LargeInt) => true,

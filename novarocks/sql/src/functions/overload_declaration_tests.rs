@@ -88,7 +88,7 @@ fn sql_overload_declaration_borrows_same_installed_records_with_exact_lifecycle_
             "abs",
             FunctionKind::Scalar,
             PureKernelAbi::ScalarV1,
-            ArgumentControl::Eager,
+            ArgumentControl::OrderedNull,
             FunctionInstanceState::None,
             FunctionNullBehavior::Strict,
             FunctionIntrinsicRowError::NoRowError,

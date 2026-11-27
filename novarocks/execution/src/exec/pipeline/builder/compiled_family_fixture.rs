@@ -516,17 +516,20 @@ fn try_run_in(
     tracker: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
 ) -> Result<Vec<Chunk>, String> {
     let tracked = tracker.is_some();
-    let state = Arc::new(RuntimeState::for_local_execution(
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(tracker.unwrap_or_else(|| {
-            crate::runtime::mem_tracker::MemTracker::new_root("compiled family fixture")
-        })),
-        Some(crate::runtime::execution_runtime::test_execution_runtime()),
-    ));
+    let state = Arc::new(
+        RuntimeState::for_local_execution(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(tracker.unwrap_or_else(|| {
+                crate::runtime::mem_tracker::MemTracker::new_root("compiled family fixture")
+            })),
+            Some(crate::runtime::execution_runtime::test_execution_runtime()),
+        )
+        .with_test_query_memory(),
+    );
     let output = ResultSinkBuffer::new();
     let dop = i32::try_from(program.graph().profile().pipeline_dop().get()).unwrap();
     let prepared = prepare_compiled_program_pipeline_execution(

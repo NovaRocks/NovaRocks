@@ -27,14 +27,15 @@ use novarocks_execution::{
     },
 };
 use novarocks_execution_contract::TaskIdentity;
+use novarocks_expression::{
+    CallAuthorInputs, EvaluationEnvironment, author_call_controls, author_unit_calls,
+};
 use novarocks_expression_contract::{
-    BoundFunction, DefinitionControl, ExprKind, ExpressionCallClaim, LegacyBindingMetadata,
-    PhysicalCallRequest, RootScope,
+    BoundFunction, ExprKind, LegacyBindingMetadata, PhysicalCallRequest, RootScope,
 };
 use novarocks_functions::{
-    CallArgumentUses, CallEffectInput, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionBindingRequest, FunctionKind, FunctionResultType, InstalledPureKernel,
-    PureCallPreparation, PureEngineFunctionCatalog, ScopedExpressionEffects,
+    EngineFunctionCatalogBuilder, FunctionArgument, FunctionBindingRequest, FunctionKind,
+    FunctionResultType, InstalledPureKernel, PureEngineFunctionCatalog,
 };
 use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_native_adapter::backend_task_execution::node_test_support::NativeNodePreparation;
@@ -155,7 +156,7 @@ fn source_for_arguments(
         .metadata()
         .resolve_bound_user(name, FunctionKind::Scalar, request, &Control)
         .unwrap();
-    let selected = Arc::new(bound.selected.clone());
+    let selected = &bound.selected;
     let FunctionResultType::Scalar(result_type) = &selected.result_type else {
         panic!("exact scalar integer fixture")
     };
@@ -216,14 +217,6 @@ fn source_for_arguments(
     let root = unit
         .root(expr, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
-    unit.definition_control(
-        expr,
-        DefinitionControl {
-            shape: ControlShape::Eager,
-            temporal_sources: None,
-        },
-    )
-    .unwrap();
     unit.request(
         expr,
         PhysicalCallRequest {
@@ -257,55 +250,25 @@ fn source_for_arguments(
         )
         .unwrap();
     let ports = builder.node_ports(project).unwrap();
-    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
-    let sealed = builder
-        .take_unit_builder(project)
-        .unwrap()
-        .seal(ports, &mut work)
-        .unwrap();
-    assert_eq!(sealed.root_use_ids().len(), 1);
-    let use_id = sealed.root_use_ids()[root.get() as usize];
-    let invocation = &sealed.uses()[&use_id];
-    let context = invocation.context;
     let parameters = SemanticParameters::try_new([]).unwrap();
-    let argument_uses = invocation
-        .arguments
-        .iter()
-        .copied()
-        .map(Some)
-        .collect::<Vec<_>>();
-    work.flush().unwrap();
-    let token = functions
-        .prepare_fresh(
-            CallEffectInput {
-                context: context.into(),
-                argument_uses: CallArgumentUses::SelectedChannels(&argument_uses),
-                function_id: &bound.function_id,
-                kind: FunctionKind::Scalar,
-                selected: &selected,
-                request,
-                environment: &[],
-                parameters: &parameters,
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Region(context.region),
-            },
-            selected.clone(),
-            PureCallPreparation::Scalar {
-                arguments: ScopedExpressionEffects::pure_value(context),
-            },
-            &Control,
-        )
-        .unwrap();
-    let claims = BTreeMap::from([(
-        use_id,
-        ExpressionCallClaim {
-            context,
-            effects: token.call_contract().effects().clone(),
-            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            temporal_source: None,
+    let constants = ConstantPools::empty();
+    let decimal_overflow = BTreeMap::from([(expr, DecimalOverflowPolicy::ReportError)]);
+    let call_inputs = CallAuthorInputs {
+        environment: EvaluationEnvironment {
+            constants: &constants,
+            parameters: &parameters,
         },
-    )]);
-    let unit = sealed.finish(claims, &mut work).unwrap();
+        functions,
+        decimal_overflow: &decimal_overflow,
+    };
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+    let mut draft = builder.take_unit_builder(project).unwrap();
+    for (definition, control) in author_call_controls(&draft, &call_inputs, &mut work).unwrap() {
+        draft.definition_control(definition, control).unwrap();
+    }
+    let sealed = draft.seal(ports, &mut work).unwrap();
+    let authored = author_unit_calls(&sealed, &call_inputs, &mut work).unwrap();
+    let unit = sealed.finish(authored.claims, &mut work).unwrap();
     work.finish().unwrap();
     builder.install_unit(project, Arc::new(unit)).unwrap();
     let fragment = builder
@@ -342,8 +305,7 @@ fn source_for_arguments(
             version: PlanVersionId::try_new([63; 16]).unwrap(),
             required: RequiredContracts::default(),
             fragment,
-            constants: ConstantPools::empty(),
-
+            constants,
             pruning: FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
             cuts: FragmentCuts::default(),
             result: Some(result),

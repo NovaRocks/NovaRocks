@@ -194,7 +194,7 @@ mod window_default;
 mod window_ntile;
 mod window_ntile_owner;
 mod window_offset;
-mod window_offset_owner;
+pub(crate) mod window_offset_owner;
 mod window_ranking;
 mod window_ranking_owner;
 

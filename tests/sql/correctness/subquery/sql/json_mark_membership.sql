@@ -46,12 +46,11 @@ SELECT id FROM json_mark_probe WHERE CASE WHEN json_parse(txt) IN (SELECT json_p
 SELECT json_parse(txt) IN (SELECT txt FROM json_mark_rhs) FROM json_mark_probe;
 -- @expect_error=[sql.analyze.unsupported_query_shape]
 SELECT json_parse(p.txt) IN (SELECT json_parse(r.txt) FROM json_mark_rhs r WHERE r.txt=p.txt) FROM json_mark_probe p;
--- The strict dynamic candidate still runs after a hit and with a SQL NULL probe.
+-- A hit still demands candidate values. A SQL NULL probe skips them.
 INSERT INTO json_mark_probe VALUES (99, 'not JSON');
 -- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
 SELECT JSON '1' IN (JSON '1', json_parse(txt)) FROM json_mark_probe WHERE id = 99;
--- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
-SELECT json_parse(NULL) IN (json_parse(txt)) FROM json_mark_probe WHERE id = 99;
+SELECT json_parse(NULL) IN (json_parse(txt)) AS null_probe FROM json_mark_probe WHERE id = 99;
 -- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
 SELECT JSON '1' IN (SELECT json_parse(txt) FROM json_mark_probe WHERE id = 99);
 DROP TABLE json_mark_probe;

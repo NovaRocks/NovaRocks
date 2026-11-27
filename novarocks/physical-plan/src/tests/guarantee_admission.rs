@@ -26,7 +26,7 @@ use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompileControlError,
     CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
     ExpressionControlFlow, ExpressionDefinitionMembership, ExpressionUseId, FunctionInstanceState,
-    FunctionNullBehavior, ObservableEffects, PureCompileControl,
+    FunctionNullBehavior, ObservableEffects, PureCompileControl, TrinoCastMode,
 };
 
 use super::*;
@@ -67,7 +67,18 @@ enum Predicate {
     IntrinsicDescendant(FunctionVolatility),
     ClosedComparison {
         wrong_overload: bool,
-        column_argument: bool,
+        bound: ComparisonBound,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ComparisonBound {
+    Constant,
+    Column,
+    Cast {
+        mode: TrinoCastMode,
+        narrow_source: bool,
+        nullable: bool,
     },
 }
 
@@ -360,21 +371,58 @@ fn fixture_with_guarantee_count(
         Predicate::Function(volatility) => define_call(&mut builder, scan, volatility),
         Predicate::ClosedComparison {
             wrong_overload,
-            column_argument,
+            bound,
         } => {
             use novarocks_type_contract::{FunctionArgumentType, OperatorFunction, TypedFactSlice};
             let operand = ty(DataType::Int64, false);
-            let result = ty(DataType::Boolean, false);
             let left = builder
                 .define(scan, operand.clone(), ExprKind::input(source))
                 .unwrap();
-            let right = if column_argument {
-                left
-            } else {
-                builder
-                    .define(scan, operand.clone(), fixture_constants.i64(7, &operand))
-                    .unwrap()
+            let (right, right_type) = match bound {
+                ComparisonBound::Constant => (
+                    builder
+                        .define(scan, operand.clone(), fixture_constants.i64(7, &operand))
+                        .unwrap(),
+                    operand.clone(),
+                ),
+                ComparisonBound::Column => (left, operand.clone()),
+                ComparisonBound::Cast {
+                    mode,
+                    narrow_source,
+                    nullable,
+                } => {
+                    let input_type = ty(
+                        if narrow_source {
+                            DataType::Int32
+                        } else {
+                            DataType::Int64
+                        },
+                        nullable,
+                    );
+                    let input = if nullable {
+                        fixture_constants.null(&input_type)
+                    } else if narrow_source {
+                        fixture_constants.i32(7, &input_type)
+                    } else {
+                        fixture_constants.i64(7, &input_type)
+                    };
+                    let input = builder.define(scan, input_type, input).unwrap();
+                    let right_type = ty(DataType::Int64, nullable);
+                    let right = builder
+                        .define(
+                            scan,
+                            right_type.clone(),
+                            ExprKind::Cast {
+                                expr: input,
+                                target: DataType::Int64,
+                                cast_mode: mode,
+                            },
+                        )
+                        .unwrap();
+                    (right, right_type)
+                }
             };
+            let result = ty(DataType::Boolean, right_type.nullable());
             let operator = OperatorFunction::Equal;
             let overload = if wrong_overload {
                 "fixture/guarantee/other-comparison"
@@ -387,7 +435,7 @@ fn fixture_with_guarantee_count(
                 kind: FunctionKind::Scalar,
                 argument_types: TypedFactSlice::from_pure_boxed(Box::new([
                     FunctionArgumentType::Value(operand.clone()),
-                    FunctionArgumentType::Value(operand),
+                    FunctionArgumentType::Value(right_type),
                 ])),
                 result_type: result.clone(),
                 legacy_metadata: function(FunctionVolatility::Immutable).legacy_metadata,
@@ -740,7 +788,7 @@ fn accepts_only_the_exact_basic_provider_call_with_its_original_column_and_const
             fixture(
                 Predicate::ClosedComparison {
                     wrong_overload: false,
-                    column_argument: false,
+                    bound: ComparisonBound::Constant,
                 },
                 Some(kind),
                 residual,
@@ -751,16 +799,56 @@ fn accepts_only_the_exact_basic_provider_call_with_its_original_column_and_const
         )
         .unwrap();
 
-        for (wrong_overload, column_argument) in [(true, false), (false, true)] {
+        for (wrong_overload, bound) in [
+            (true, ComparisonBound::Constant),
+            (false, ComparisonBound::Column),
+        ] {
             assert_missing_proof(fixture(
                 Predicate::ClosedComparison {
                     wrong_overload,
-                    column_argument,
+                    bound,
                 },
                 Some(kind),
                 residual,
                 false,
             ));
+        }
+    }
+}
+
+#[test]
+fn provider_comparison_widening_accepts_only_the_original_nonnull_literal() {
+    for (kind, residual) in [
+        (PredicateGuaranteeKind::Exact, false),
+        (PredicateGuaranteeKind::PruningOnly, true),
+    ] {
+        let build = |mode, narrow_source, nullable| {
+            fixture(
+                Predicate::ClosedComparison {
+                    wrong_overload: false,
+                    bound: ComparisonBound::Cast {
+                        mode,
+                        narrow_source,
+                        nullable,
+                    },
+                },
+                Some(kind),
+                residual,
+                false,
+            )
+        };
+        FragmentPackage::try_new(
+            build(TrinoCastMode::Implicit, true, false),
+            admission(),
+            &Control,
+        )
+        .unwrap();
+        for input in [
+            build(TrinoCastMode::Explicit, true, false),
+            build(TrinoCastMode::Implicit, false, false),
+            build(TrinoCastMode::Implicit, true, true),
+        ] {
+            assert_missing_proof(input);
         }
     }
 }

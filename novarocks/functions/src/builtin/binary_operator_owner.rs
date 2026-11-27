@@ -111,7 +111,7 @@ fn operator_definition(
             operator,
             name,
             "comparison",
-            "(comparable T,comparable T)",
+            comparison_pattern(operator),
             "boolean",
             if matches!(
                 operator,
@@ -222,6 +222,14 @@ pub(crate) struct BinaryOperatorOwner {
 }
 
 const WIDE_ARITHMETIC_PATTERN: &str = "(internal largeint or numeric,internal largeint or numeric)";
+
+fn comparison_pattern(operator: OperatorFunction) -> &'static str {
+    if operator == OperatorFunction::SubqueryFloatEqual {
+        "(floating T,floating T)"
+    } else {
+        "(comparable T,comparable T)"
+    }
+}
 
 struct ResolvedTypes {
     pattern: &'static str,
@@ -352,7 +360,7 @@ impl BinaryOperatorOwner {
                 work.control(),
             )?;
             ResolvedTypes {
-                pattern: "(comparable T,comparable T)",
+                pattern: comparison_pattern(self.operator),
                 arguments: args,
                 result: FunctionValueType::new(
                     DataType::Boolean,
@@ -563,7 +571,7 @@ impl FunctionBindingResolver for BinaryOperatorOwner {
                         work.control(),
                     )?;
                     (
-                        "(comparable T,comparable T)",
+                        comparison_pattern(self.operator),
                         DataType::Boolean,
                         ValueLogicalType::Physical,
                         !self.operator.is_null_safe_comparison() && nullable,
