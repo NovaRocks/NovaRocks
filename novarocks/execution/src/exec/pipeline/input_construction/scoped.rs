@@ -32,9 +32,7 @@ use std::{
 /// allowance is substituted for a new construction's finite bounds.
 #[derive(Clone, Copy, Debug)]
 pub struct InputConstructionProfile {
-    pub max_requests: usize,
     pub max_request_bytes: usize,
-    pub max_opaque_requests: usize,
     pub max_opaque_bytes: usize,
     pub max_work: usize,
     pub max_depth: usize,
@@ -104,7 +102,7 @@ impl CreatorGuard {
             .exact_bytes
             .checked_add(layout.size())
             .ok_or_else(exhausted)?;
-        if count > self.profile.max_requests || bytes > self.profile.max_request_bytes {
+        if bytes > self.profile.max_request_bytes {
             return Err(exhausted());
         }
         if bytes
@@ -132,8 +130,7 @@ impl CreatorGuard {
             .work
             .checked_add(bound.work_upper)
             .ok_or_else(exhausted)?;
-        if count > self.profile.max_opaque_requests
-            || bytes > self.profile.max_opaque_bytes
+        if bytes > self.profile.max_opaque_bytes
             || work > self.profile.max_work
             || bytes
                 .checked_add(usage.exact_bytes)
@@ -205,13 +202,12 @@ impl ObservedInputConstructionFactory {
         model: Arc<dyn InputConstructionOperationModel>,
         decoded_source_custody: Option<Arc<dyn DecodedInputSourceCustody>>,
     ) -> Result<Arc<Self>, ConstructionFailure> {
-        if profile.max_requests == 0
-            || profile.max_request_bytes == 0
+        if profile.max_request_bytes == 0
             || profile.max_work == 0
             || profile.max_request_bytes > i64::MAX as usize
             || profile.max_opaque_bytes > i64::MAX as usize
             || profile.max_depth == 0
-            || profile.max_depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH
+            || profile.max_depth > novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH
         {
             return Err(ConstructionFailure::InvalidSource(
                 "input construction profile is invalid".into(),
@@ -234,7 +230,7 @@ impl ObservedInputConstructionFactory {
         host: Arc<dyn InputConstructionRequestHost>,
     ) -> Result<Arc<CreatorGuard>, ConstructionFailure> {
         let layout = Self::schema_scope_allocation_layouts()?[0];
-        if profile.max_requests < 1 || layout.size() > profile.max_request_bytes {
+        if layout.size() > profile.max_request_bytes {
             return Err(exhausted());
         }
         host.request(layout)?;
@@ -362,9 +358,7 @@ mod tests {
 
     fn profile() -> InputConstructionProfile {
         InputConstructionProfile {
-            max_requests: 256,
             max_request_bytes: 1 << 20,
-            max_opaque_requests: 256,
             max_opaque_bytes: 1 << 20,
             max_work: 1 << 20,
             max_depth: 64,

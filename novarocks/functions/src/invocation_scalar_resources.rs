@@ -193,12 +193,11 @@ pub(crate) fn argument_metadata_geometry(
     use novarocks_type_contract::{
         ValueTypeVisit,
         owned_resources::{hashmap, vec},
-        validate_value_type_structure_with_scratch_observed,
+        validate_value_type_structure_observed,
     };
-    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     let mut work = crate::kernel_input::EvaluationCheckpoints::new(control);
     let mut geometry = AllocationGeometry::default();
-    validate_value_type_structure_with_scratch_observed(ty, &mut scratch, |event| {
+    validate_value_type_structure_observed(ty, |event| {
         work.step()?;
         if let ValueTypeVisit::Field(field) = event {
             let entries = field.metadata().len();

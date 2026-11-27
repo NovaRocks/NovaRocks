@@ -501,15 +501,9 @@ fn source_fields_in<
     work: &mut CompileCheckpoints<'_>,
     visit: &mut impl FnMut(&Field, &mut CompileCheckpoints<'_>) -> Result<(), E>,
 ) -> Result<(), E> {
-    // Original borrowed grammar uses fixed stack scratch. Initialization is
-    // opaque, with control on both sides; it reports no completed visits.
-    work.flush()?;
-    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
-    work.flush()?;
     visit(field, work)?;
-    novarocks_type_contract::validate_arrow_layout_structure_with_scratch_observed::<E>(
+    novarocks_type_contract::validate_arrow_layout_structure_observed::<E>(
         field.data_type(),
-        &mut scratch,
         |event| {
             work.step()?;
             if let ValueTypeVisit::Field(child) = event {

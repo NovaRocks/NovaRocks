@@ -156,20 +156,9 @@ impl GeometryWork for GeometryObserver<'_> {
     }
     fn validate_root(&mut self, field: &arrow::datatypes::Field) -> Result<(), Self::Error> {
         observe_work(self.0)?;
-        self.0.observe(
-            0,
-            &[],
-            crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
-                units: novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound(),
-            },
-        )?;
-        let mut scratch: novarocks_type_contract::owned_resources::type_validation::TypeValidationScratch<'_> =
-            [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
-        observe_work(self.0)?;
-        novarocks_type_contract::validate_arrow_layout_structure_with_profile_and_scratch_observed(
+        novarocks_type_contract::validate_arrow_layout_structure_with_profile_observed(
             field.data_type(),
             novarocks_type_contract::ArrowTypeProfile::Value,
-            &mut scratch,
             |_| observe_work(self.0),
         )?;
         Ok(())
@@ -200,17 +189,6 @@ impl UnitObserver for UnitConstruction<'_> {
                 .map_err(|error| ExchangeFailure::Execution(error.into()))?;
         }
         observe_work(self.temporary)
-    }
-    fn before_type_scratch(&mut self, work_upper: usize) -> Result<(), Self::Error> {
-        self.checkpoint()?;
-        self.temporary.observe(
-            0,
-            &[],
-            crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
-                units: work_upper,
-            },
-        )?;
-        Ok(())
     }
     fn before_allocation(&mut self, layout: Layout) -> Result<(), Self::Error> {
         if self.constructing_schema {

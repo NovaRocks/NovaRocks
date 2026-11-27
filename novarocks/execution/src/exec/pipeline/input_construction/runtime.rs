@@ -475,9 +475,7 @@ mod tests {
     use novarocks_type_contract::ValueTypeStorageLifetime;
     fn profile() -> super::super::InputConstructionProfile {
         super::super::InputConstructionProfile {
-            max_requests: 256,
             max_request_bytes: i64::MAX as usize,
-            max_opaque_requests: 256,
             max_opaque_bytes: i64::MAX as usize,
             max_work: usize::MAX,
             max_depth: 64,

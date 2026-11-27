@@ -114,10 +114,10 @@ struct ConstantVolumeLimits {
 impl ConstantValidation {
     pub const INPUT_DERIVED: Self = Self {
         shape: ConstantTypeLimits {
-            depth: novarocks_type_contract::MAX_VALUE_TYPE_DEPTH as u32,
-            nodes: novarocks_type_contract::MAX_VALUE_TYPE_NODES as u64,
-            dictionary_depth: 8,
-            metadata_bytes: novarocks_type_contract::MAX_ARROW_FIELD_METADATA_BYTES as u64,
+            depth: novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH as u32,
+            nodes: u64::MAX,
+            dictionary_depth: novarocks_type_contract::MAX_VALUE_TYPE_DEPTH as u32,
+            metadata_bytes: u64::MAX,
         },
         volume: None,
     };
@@ -823,18 +823,6 @@ impl ConstantPool {
         std::alloc::Layout::new::<ElementMetric>()
     }
 
-    /// Actual caller-owned fixed scratch of the sole borrowed type grammar.
-    /// This stack layout is not a heap request or an allocation grant.
-    pub fn type_validation_scratch_layout() -> std::alloc::Layout {
-        novarocks_type_contract::owned_resources::type_validation::scratch_layout()
-    }
-    /// One opaque initialization writes the complete fixed scratch backing.
-    /// Byte work, rather than slot count, covers the actual original layout;
-    /// Parent callers admit it before the first source observation.
-    pub fn type_validation_scratch_work_upper_bound() -> usize {
-        novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound()
-    }
-
     pub fn try_new(
         field: Arc<Field>,
         value_type: FunctionValueType,
@@ -1452,9 +1440,6 @@ fn validate_type_profile_owned<E: PoolFailure>(
     observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<TypeResourceFacts, E> {
-    if observer.is_parent() {
-        observer.work(ConstantPool::type_validation_scratch_work_upper_bound())?;
-    }
     observer.step(work)?;
     let binding = ty.typed_binding().borrowed();
     if field.is_nullable() != binding.value_type().nullable() {
@@ -1478,18 +1463,6 @@ fn validate_type_profile_owned<E: PoolFailure>(
     }
     let mut bytes = field_bytes_owned(field, observer, work)?;
     let mut nodes = 0u64;
-    let parent = observer.is_parent();
-    let mut scratch = if parent {
-        work.flush()?;
-        // Fixed stack initialization is opaque; its actual layout and full
-        // work were admitted before the first source-validation callback.
-        let scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
-        observer.step(work)?;
-        work.flush()?;
-        Some(scratch)
-    } else {
-        None
-    };
     let mut observe = |visit| -> Result<(), E> {
         observer.step(work)?;
         match visit {
@@ -1514,18 +1487,10 @@ fn validate_type_profile_owned<E: PoolFailure>(
         )?;
         Ok(())
     };
-    if parent {
-        novarocks_type_contract::validate_arrow_layout_structure_with_scratch_observed::<E>(
-            field.data_type(),
-            scratch.as_mut().expect("parent scratch is initialized"),
-            &mut observe,
-        )?;
-    } else {
-        novarocks_type_contract::validate_arrow_layout_structure_observed::<E>(
-            field.data_type(),
-            &mut observe,
-        )?;
-    }
+    novarocks_type_contract::validate_arrow_layout_structure_observed::<E>(
+        field.data_type(),
+        &mut observe,
+    )?;
     Ok(TypeResourceFacts {
         metadata: bytes,
         nodes,
@@ -1850,7 +1815,7 @@ fn scan_data<E: PoolFailure>(
     )?;
     limit(
         u64::from(depth),
-        novarocks_type_contract::MAX_VALUE_TYPE_DEPTH as u64,
+        novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH as u64,
         "constant array exceeds intrinsic Arrow type depth",
     )?;
     validate_arrow_carrier_parameters_observed::<E>(data.data_type(), || observer.step(work))?;

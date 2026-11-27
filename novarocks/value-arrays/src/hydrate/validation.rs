@@ -94,6 +94,9 @@ pub(super) fn validate_assignment<E>(
     work: &mut Work<'_, E>,
     observe: &mut HydrateObserver<'_, E>,
 ) -> Result<(), ValueFailure<E>> {
+    crate::carrier::visit_carrier_shape(source.data_type(), |_| {
+        work(1).map_err(ValueFailure::Caller)
+    })?;
     if !parameterized_shape(source, proof.source(), options, work)? {
         return Err(ValueError::Invariant(ValueViolation::Layout).into());
     }
@@ -219,6 +222,9 @@ fn validate_structure<E>(
             Self::Contract
         }
     }
+    crate::carrier::visit_carrier_shape(source.data_type(), |_| {
+        work(1).map_err(ValueFailure::Caller)
+    })?;
     let matches = if options.dictionary_value_layout.is_some()
         || options.projection.projects_byte_layouts()
         || options.projection == HydrateProjection::FrozenNamesAndNullability

@@ -36,8 +36,8 @@ use arrow_array::{
 use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_type_contract::{
-    ArrowTypeProfile, MAX_VALUE_TYPE_NODES, ValueSchemaCreation, ValueTypeError, ValueTypeVisit,
-    validate_arrow_layout_structure_with_profile_and_scratch_observed,
+    ArrowTypeProfile, ValueSchemaCreation, ValueTypeError, ValueTypeVisit,
+    validate_arrow_layout_structure_with_profile_observed,
 };
 use std::alloc::Layout;
 
@@ -180,23 +180,19 @@ fn declaration_counts<H, W: ConstructionWork + ?Sized>(
     for field in schema.fields() {
         work.step().map_err(IpcConstructionError::Control)?;
         counts.field(field)?;
-        // Stack initialization is bracketed by control, not billed as a fake
-        // completed field visit loop. The sole type-contract grammar owns the
-        // validated carrier walk; this model does not interpret annotations.
-        work.flush().map_err(IpcConstructionError::Control)?;
-        let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
-        work.flush().map_err(IpcConstructionError::Control)?;
-        validate_arrow_layout_structure_with_profile_and_scratch_observed::<
-            IpcConstructionError<H, W::Error>,
-        >(field.data_type(), profile, &mut scratch, |visit| {
-            work.step().map_err(IpcConstructionError::Control)?;
-            match visit {
-                ValueTypeVisit::Field(field) => counts.field(field)?,
-                ValueTypeVisit::TypeNode(ty) => counts.ty(ty)?,
-                _ => {}
-            }
-            Ok(())
-        })?;
+        validate_arrow_layout_structure_with_profile_observed::<IpcConstructionError<H, W::Error>>(
+            field.data_type(),
+            profile,
+            |visit| {
+                work.step().map_err(IpcConstructionError::Control)?;
+                match visit {
+                    ValueTypeVisit::Field(field) => counts.field(field)?,
+                    ValueTypeVisit::TypeNode(ty) => counts.ty(ty)?,
+                    _ => {}
+                }
+                Ok(())
+            },
+        )?;
     }
     Ok(counts)
 }
@@ -256,12 +252,12 @@ pub fn observe_stream_writer_schema_construction<'a, H, W: ConstructionWork + ?S
             union_id_requests: counts.union_requests,
         },
         SchemaResourceSource {
-            // Preserve this Arrow library owner's existing conservative model.
-            // Codec-owned source walkers supply their captured node count instead.
+            // The flat path visits one carrier at a time. A nested schema's
+            // captured forest also bounds any one observed subtree.
             walker_node_bound: if counts.types == counts.fields {
                 1
             } else {
-                MAX_VALUE_TYPE_NODES
+                counts.types
             },
             // Actual copied name/parameter byte operations are known here.
             // This is a work bound; it is never an original source invoice.

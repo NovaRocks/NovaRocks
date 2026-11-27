@@ -102,14 +102,6 @@ impl BatchRecipe {
         let mut declarations = Vec::new();
         reserve(&mut declarations, fields.len(), observer)?;
         let mut count = 0i64;
-        observer
-            .before_type_scratch(
-                novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound(
-                ),
-            )
-            .map_err(CodecError::Observer)?;
-        let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
-        observer.checkpoint().map_err(CodecError::Observer)?;
         for input in fields {
             observer.checkpoint().map_err(CodecError::Observer)?;
             if !input.field.metadata().is_empty() {
@@ -120,10 +112,9 @@ impl BatchRecipe {
             observer.checkpoint().map_err(CodecError::Observer)?;
             // Shared traversal enforces current depth/node/field grammar before
             // recursive Arrow constructors can run. It allocates no shadow tree.
-            novarocks_type_contract::validate_arrow_layout_structure_with_profile_and_scratch_observed(
+            novarocks_type_contract::validate_arrow_layout_structure_with_profile_observed(
                 input.field.data_type(),
                 novarocks_type_contract::ArrowTypeProfile::Value,
-                &mut scratch,
                 |visit| {
                     observer.checkpoint().map_err(CodecError::Observer)?;
                     if let ValueTypeVisit::Field(field) = visit
@@ -578,14 +569,6 @@ impl BatchRecipe {
         }
         let mut tags = Vec::new();
         reserve(&mut tags, self.policies.len(), observer)?;
-        observer
-            .before_type_scratch(
-                novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound(
-                ),
-            )
-            .map_err(CodecError::Observer)?;
-        let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
-        observer.checkpoint().map_err(CodecError::Observer)?;
         for (ordinal, ((array, field), policy)) in batch
             .columns()
             .iter()
@@ -594,9 +577,13 @@ impl BatchRecipe {
             .enumerate()
         {
             observer.checkpoint().map_err(CodecError::Observer)?;
+            novarocks_type_contract::validate_arrow_layout_structure_with_profile_observed(
+                array.data_type(),
+                novarocks_type_contract::ArrowTypeProfile::Value,
+                |_| observer.checkpoint().map_err(CodecError::Observer),
+            )?;
             let normalized;
             let actual = if self.nullability[ordinal] == CarrierNullabilityPolicy::Permissive {
-                novarocks_type_contract::validate_arrow_layout_structure_with_profile_and_scratch_observed(array.data_type(), novarocks_type_contract::ArrowTypeProfile::Value, &mut scratch, |_| observer.checkpoint().map_err(CodecError::Observer))?;
                 let mut count = 0;
                 let mut dictionaries = Vec::new();
                 normalized = rebuild_type(

@@ -48,26 +48,11 @@ pub fn representation_construction_profile()
 -> Result<InputConstructionProfile, novarocks_type_contract::CompileControlError> {
     let max_bytes = usize::try_from(i64::MAX)
         .map_err(|_| novarocks_type_contract::CompileControlError::ResourceExhausted)?;
-    let max_requests = novarocks_type_contract::MAX_VALUE_TYPE_NODES
-        .checked_mul(novarocks_type_contract::MAX_VALUE_TYPE_NODES)
-        .and_then(|nodes| nodes.checked_mul(64))
-        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
-    let opaque_per_node = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH
-        .checked_add(2)
-        .and_then(|depth| depth.checked_mul(12))
-        .and_then(|requests| requests.checked_add(32))
-        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
-    let max_opaque_requests = novarocks_type_contract::MAX_VALUE_TYPE_NODES
-        .checked_mul(novarocks_type_contract::MAX_VALUE_TYPE_NODES)
-        .and_then(|nodes| nodes.checked_mul(opaque_per_node))
-        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
     Ok(InputConstructionProfile {
-        max_requests,
         max_request_bytes: max_bytes,
-        max_opaque_requests,
         max_opaque_bytes: max_bytes,
         max_work: usize::MAX,
-        max_depth: novarocks_type_contract::MAX_VALUE_TYPE_DEPTH,
+        max_depth: novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH,
     })
 }
 

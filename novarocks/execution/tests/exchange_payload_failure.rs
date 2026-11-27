@@ -62,9 +62,7 @@ fn packet_refusal_keeps_exact_facts_across_direct_and_arrow_writes() {
     let tracker = MemTracker::new_root("exchange packet test");
     let factory = try_runtime_input_construction_factory(
         InputConstructionProfile {
-            max_requests: 10000,
             max_request_bytes: 4 * 1024 * 1024,
-            max_opaque_requests: 10000,
             max_opaque_bytes: 4 * 1024 * 1024,
             max_work: 100000,
             max_depth: 64,

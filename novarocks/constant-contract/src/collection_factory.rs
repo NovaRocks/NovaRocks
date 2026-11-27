@@ -436,7 +436,7 @@ fn empty_recipe<E: super::PoolFailure>(
     )?;
     limit(
         u64::from(depth),
-        novarocks_type_contract::MAX_VALUE_TYPE_DEPTH as u64,
+        novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH as u64,
         "empty collection intrinsic depth exceeded",
     )?;
     let dictionary_depth = dictionary_depth + u32::from(matches!(ty, DataType::Dictionary(_, _)));

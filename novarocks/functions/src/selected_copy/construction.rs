@@ -28,7 +28,10 @@ use crate::{KernelControlObservation, KernelEvaluationControl};
 use arrow_array::{Array, ArrayRef};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
-use novarocks_type_contract::{ArrowTypeDepth, ArrowTypeProfile, ValueLayout, ValueSchemaCreation};
+use novarocks_type_contract::{
+    ArrowTypeProfile, ValueLayout, ValueSchemaCreation, ValueTypeError,
+    visit_arrow_layout_nodes_observed,
+};
 
 pub fn preflight_interleave_construction<H>(
     ty: &DataType,
@@ -1145,141 +1148,52 @@ fn values_copy_kind_with_profile(
     profile: ArrowTypeProfile,
     mut observe: impl FnMut() -> Result<(), crate::KernelFailure>,
 ) -> Result<ValuesCopyKind, CopyError> {
-    fn visit(
-        ty: &DataType,
-        depth: ArrowTypeDepth,
-        profile: ArrowTypeProfile,
-        visited: &mut usize,
-        observe: &mut impl FnMut() -> Result<(), crate::KernelFailure>,
-    ) -> Result<(), CopyError> {
-        observe().map_err(CopyError::Control)?;
-        *visited = visited
-            .checked_add(1)
-            .ok_or_else(|| CopyError::arithmetic(None))?;
-        if depth.check(profile).is_err() || *visited > novarocks_type_contract::MAX_VALUE_TYPE_NODES
-        {
-            return Err(CopyError::Invalid(
-                "Values copy type exceeds the frozen recursive type bounds",
-            ));
-        }
-        if ty.primitive_width().is_some() {
-            return Ok(());
-        }
-        match ty {
-            DataType::Null
-            | DataType::Boolean
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Binary
-            | DataType::LargeBinary
-            | DataType::Utf8View
-            | DataType::BinaryView
-            | DataType::FixedSizeBinary(_) => Ok(()),
-            DataType::List(child)
-            | DataType::LargeList(child)
-            | DataType::ListView(child)
-            | DataType::LargeListView(child)
-            | DataType::FixedSizeList(child, _) => visit(
-                child.data_type(),
-                depth
-                    .value_child()
-                    .map_err(crate::KernelFailure::from)
-                    .map_err(CopyError::Control)?,
-                profile,
-                visited,
-                observe,
-            ),
-            DataType::Map(child, _) => visit(
-                child.data_type(),
-                depth
-                    .map_entries()
-                    .map_err(crate::KernelFailure::from)
-                    .map_err(CopyError::Control)?,
-                profile,
-                visited,
-                observe,
-            ),
-            DataType::Struct(fields) => {
-                for field in fields {
-                    visit(
-                        field.data_type(),
-                        depth
-                            .value_child()
-                            .map_err(crate::KernelFailure::from)
-                            .map_err(CopyError::Control)?,
-                        profile,
-                        visited,
-                        observe,
-                    )?;
-                }
-                Ok(())
-            }
-            DataType::Union(fields, _) => {
-                if fields.is_empty() {
-                    return Err(CopyError::unsupported(ty));
-                }
-                for (_, field) in fields.iter() {
-                    visit(
-                        field.data_type(),
-                        depth
-                            .value_child()
-                            .map_err(crate::KernelFailure::from)
-                            .map_err(CopyError::Control)?,
-                        profile,
-                        visited,
-                        observe,
-                    )?;
-                }
-                Ok(())
-            }
-            DataType::Dictionary(key, value) => {
-                visit(
-                    key,
-                    depth
-                        .encoding_child()
-                        .map_err(crate::KernelFailure::from)
-                        .map_err(CopyError::Control)?,
-                    profile,
-                    visited,
-                    observe,
-                )?;
-                visit(
-                    value,
-                    depth
-                        .encoding_child()
-                        .map_err(crate::KernelFailure::from)
-                        .map_err(CopyError::Control)?,
-                    profile,
-                    visited,
-                    observe,
-                )
-            }
-            DataType::RunEndEncoded(ends, values) => {
-                visit(
-                    ends.data_type(),
-                    depth
-                        .encoding_child()
-                        .map_err(crate::KernelFailure::from)
-                        .map_err(CopyError::Control)?,
-                    profile,
-                    visited,
-                    observe,
-                )?;
-                visit(
-                    values.data_type(),
-                    depth
-                        .encoding_child()
-                        .map_err(crate::KernelFailure::from)
-                        .map_err(CopyError::Control)?,
-                    profile,
-                    visited,
-                    observe,
-                )
-            }
-            _ => Err(CopyError::unsupported(ty)),
+    enum VisitError {
+        Type,
+        Caller(CopyError),
+    }
+    impl From<ValueTypeError> for VisitError {
+        fn from(_: ValueTypeError) -> Self {
+            Self::Type
         }
     }
-    visit(ty, ArrowTypeDepth::ROOT, profile, &mut 0, &mut observe)?;
+    visit_arrow_layout_nodes_observed(ty, profile, |ty, _| {
+        observe().map_err(|cause| VisitError::Caller(CopyError::Control(cause)))?;
+        if ty.primitive_width().is_some()
+            || matches!(
+                ty,
+                DataType::Null
+                    | DataType::Boolean
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Binary
+                    | DataType::LargeBinary
+                    | DataType::Utf8View
+                    | DataType::BinaryView
+                    | DataType::FixedSizeBinary(_)
+                    | DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::ListView(_)
+                    | DataType::LargeListView(_)
+                    | DataType::FixedSizeList(..)
+                    | DataType::Map(..)
+                    | DataType::Struct(_)
+                    | DataType::Dictionary(..)
+                    | DataType::RunEndEncoded(..)
+            )
+            || matches!(ty, DataType::Union(fields, _) if !fields.is_empty())
+        {
+            Ok(())
+        } else {
+            Err(VisitError::Caller(CopyError::unsupported(ty)))
+        }
+    })
+    .map_err(|error| match error {
+        VisitError::Type => {
+            CopyError::Invalid("Values copy type violates the Arrow layout contract")
+        }
+        VisitError::Caller(error) => error,
+    })?;
     Ok(
         if ty.primitive_width().is_some()
             || matches!(

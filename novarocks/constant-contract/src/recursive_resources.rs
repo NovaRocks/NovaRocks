@@ -260,7 +260,7 @@ fn scan_nodes<E: PoolFailure>(
     )?;
     limit(
         u64::from(depth),
-        novarocks_type_contract::MAX_VALUE_TYPE_DEPTH as u64,
+        novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH as u64,
         "constant array exceeds intrinsic Arrow type depth",
     )?;
     let next = lengths.next();

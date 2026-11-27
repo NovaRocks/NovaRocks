@@ -71,6 +71,7 @@ where
             ChunkViolation::HydrationBinding,
         )));
     }
+    let mut path = [ArrayPathStep::ListItem; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     for (index, (slot, array)) in chunk
         .chunk_schema()
         .slots()
@@ -82,10 +83,10 @@ where
             array.data_type(),
             slot.slot_id(),
             index,
-            &[],
+            &mut path,
+            0,
             &mut keep,
             &mut work,
-            &mut 0,
         )? {
             return Ok(true);
         }
@@ -97,48 +98,30 @@ fn dictionary_demand<E, K, W>(
     source: &DataType,
     slot: SlotId,
     occurrence: usize,
-    path: &[ArrayPathStep],
+    path: &mut [ArrayPathStep],
+    depth: usize,
     keep: &mut K,
     work: &mut W,
-    nodes: &mut usize,
 ) -> Result<bool, E>
 where
     E: From<ChunkConstructionFailure>,
     K: FnMut(SlotId, usize, &[ArrayPathStep], &DataType) -> bool,
     W: FnMut(usize, &[ArrayPathStep], &DataType) -> Result<(), E>,
 {
-    work(occurrence, path, source)?;
-    *nodes = nodes.checked_add(1).ok_or_else(|| {
-        E::from(ChunkConstructionFailure::from(
-            novarocks_type_contract::ValueTypeError::TooManyNodes,
-        ))
-    })?;
-    if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
-        return Err(E::from(ChunkConstructionFailure::from(
-            novarocks_type_contract::ValueTypeError::TooManyNodes,
-        )));
-    }
-    if path.len() >= novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(E::from(ChunkConstructionFailure::from(
-            novarocks_type_contract::ValueTypeError::TooDeep,
-        )));
-    }
-    if matches!(source, DataType::Dictionary(_, _)) && !keep(slot, occurrence, path, source) {
+    work(occurrence, &path[..depth], source)?;
+    if matches!(source, DataType::Dictionary(_, _))
+        && !keep(slot, occurrence, &path[..depth], source)
+    {
         return Ok(true);
     }
-    let mut next = [ArrayPathStep::ListItem; novarocks_type_contract::MAX_VALUE_TYPE_DEPTH];
-    next[..path.len()].copy_from_slice(path);
     let mut child = |ty: &DataType, step: ArrayPathStep| {
-        next[path.len()] = step;
-        dictionary_demand(
-            ty,
-            slot,
-            occurrence,
-            &next[..path.len() + 1],
-            keep,
-            work,
-            nodes,
-        )
+        let entry = path.get_mut(depth).ok_or_else(|| {
+            E::from(ChunkConstructionFailure::from(
+                novarocks_type_contract::ValueTypeError::TooDeep,
+            ))
+        })?;
+        *entry = step;
+        dictionary_demand(ty, slot, occurrence, path, depth + 1, keep, work)
     };
     match source {
         DataType::Dictionary(_, values) => child(values, ArrayPathStep::DictionaryValue),

@@ -223,21 +223,7 @@ fn parent_pool_keeps_original_field_buffer_ordinal_float_bits_and_typed_null() {
         ConstantPool::backing_allocation_layout().size()
             + Layout::new::<RequiredFrame<'_>>().size()
     );
-    assert_eq!(
-        ConstantPool::type_validation_scratch_layout(),
-        Layout::new::<
-            [Option<novarocks_type_contract::TypeTraversalFrame<'_>>;
-                novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
-        >()
-    );
-    assert_eq!(
-        ConstantPool::type_validation_scratch_work_upper_bound(),
-        ConstantPool::type_validation_scratch_layout().size()
-    );
-    assert!(
-        last.cumulative_work_upper_bound
-            >= ConstantPool::type_validation_scratch_work_upper_bound()
-    );
+    assert!(last.cumulative_work_upper_bound > 0);
 }
 
 #[test]
@@ -382,7 +368,7 @@ fn every_actual_small_success_and_ordinary_caller_tail_preserves_first_cause() {
 }
 
 #[test]
-fn known_backing_frame_metric_and_scratch_work_refuse_before_pending_callbacks() {
+fn known_backing_frame_and_metric_requests_refuse_before_pending_callbacks() {
     let input = wide(4);
     let arc = ConstantPool::backing_allocation_layout().size();
     let frame = Layout::new::<RequiredFrame<'_>>().size();
@@ -393,10 +379,6 @@ fn known_backing_frame_metric_and_scratch_work_refuse_before_pending_callbacks()
         (0, 2),
         (1, arc - 1),
         (1, arc + frame + metrics - 1),
-        (
-            2,
-            arc + frame + metrics + ConstantPool::type_validation_scratch_work_upper_bound() - 1,
-        ),
     ] {
         for pending in [0, 254, 255] {
             for cause in CAUSES {
@@ -411,10 +393,10 @@ fn known_backing_frame_metric_and_scratch_work_refuse_before_pending_callbacks()
                     input.data.clone(),
                     policy(),
                     &mut |f| {
-                        let n = match axis {
-                            0 => f.allocation_requests_upper_bound,
-                            1 => f.allocation_request_bytes_upper_bound,
-                            _ => f.cumulative_work_upper_bound,
+                        let n = if axis == 0 {
+                            f.allocation_requests_upper_bound
+                        } else {
+                            f.allocation_request_bytes_upper_bound
                         };
                         if n > cap {
                             Err(CompileControlError::ResourceExhausted)
@@ -434,6 +416,23 @@ fn known_backing_frame_metric_and_scratch_work_refuse_before_pending_callbacks()
             }
         }
     }
+}
+
+#[test]
+fn input_derived_pool_has_no_fixed_field_count_or_fixed_type_workspace() {
+    let actual = 4161;
+    let input = wide(actual);
+    let pool = ConstantPool::try_new(
+        input.field.clone(),
+        input.ty.clone(),
+        input.data.clone(),
+        crate::ConstantValidation::INPUT_DERIVED,
+        PHASE,
+        &Control::new(None),
+    )
+    .unwrap();
+    assert_eq!(pool.data().child_data().len(), actual);
+    assert_eq!(pool.resource_facts().array_nodes, actual as u64 + 1);
 }
 
 #[test]
@@ -701,10 +700,7 @@ fn actual_nested_unknown_source_attributes_are_retained_counted_and_never_semant
         root_bytes + child_bytes
     );
     assert!(child_bytes > 2048);
-    assert!(
-        snapshots.last().unwrap().cumulative_work_upper_bound
-            >= ConstantPool::type_validation_scratch_work_upper_bound()
-    );
+    assert!(snapshots.last().unwrap().cumulative_work_upper_bound > child_bytes as usize);
     assert_eq!(
         parent.value_type().value_type().child_type_at(0).unwrap(),
         child_type.value_type()
