@@ -547,6 +547,7 @@ async fn build_frontend_role_products(
     // MV product.
     let catalog_runtime = host.take_catalog_role_runtime()?;
     let mv_execution_services = crate::query::mv_action::MvExecutionServices {
+        query_memory_budget_bytes: host.optimizer_query_mem_limit_bytes(),
         client: host.logical_execution_client(),
         launcher: logical_execution_launcher.clone(),
         completion: crate::query_execution::completion_facts::CompletionFactOwners::new(

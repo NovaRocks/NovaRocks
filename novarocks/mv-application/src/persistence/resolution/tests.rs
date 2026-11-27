@@ -5,11 +5,13 @@
 
 use super::*;
 use crate::persistence::codec::{
-    PendingEvidence, PendingVerificationRequirement, SourceVersionWindow,
+    PendingEvidence, PendingVerificationRequirement, RecoveryRecord, RecoverySource,
+    SourceVersionWindow,
 };
 use crate::persistence::identity::NativeDataVersion;
 use crate::persistence::keyed_documents::{
-    keyed_view_fixture, require_readable_keyed_format, resolve_current_keyed_documents,
+    keyed_recovery_publication_document_set, keyed_view_fixture, require_readable_keyed_format,
+    resolve_current_keyed_documents,
 };
 use novarocks_spi::connector::{ConnectorMutationOperationId, SnapshotFileTotals};
 use uuid::Uuid;
@@ -66,6 +68,35 @@ fn bound_publication_uses_its_own_markers() {
     );
     assert!(observed.eligibility().inactive.contains(&stale));
     assert!(!observed.eligibility().strict_recovery_required);
+}
+
+#[test]
+fn recovery_record_requires_its_new_publication_on_the_same_snapshot() {
+    let (catalog, mut view) = keyed_view_fixture(Some(17), true);
+    let old = resolve_current_keyed_documents(view.clone(), catalog.clone()).unwrap();
+    let mut next = old.publication.unwrap();
+    let recovered = next.publication_id;
+    next.publication_id = PublicationIdentity::try_new(vec![9; 16]).unwrap();
+    let recovery = RecoveryRecord {
+        recovered_from: vec![RecoverySource::Invalid {
+            publication: recovered,
+        }],
+        operation: ConnectorMutationOperationId::from_bytes([9; 16]),
+        recovered_at_ms: 123,
+    };
+    view.current_records = keyed_recovery_publication_document_set(&old.versions, &next, &recovery)
+        .unwrap()
+        .records;
+    let rebuilt = resolve_current_keyed_documents(view.clone(), catalog.clone()).unwrap();
+    assert_eq!(rebuilt.publication, Some(next));
+    assert_eq!(rebuilt.recovery, Some(recovery.clone()));
+
+    let mut different_operation = recovery;
+    different_operation.operation = ConnectorMutationOperationId::from_bytes([8; 16]);
+    view.current_records[1] = different_operation.encode().unwrap();
+    assert!(resolve_current_keyed_documents(view.clone(), catalog.clone()).is_err());
+    view.current_records.remove(0);
+    assert!(resolve_current_keyed_documents(view, catalog).is_err());
 }
 
 #[test]

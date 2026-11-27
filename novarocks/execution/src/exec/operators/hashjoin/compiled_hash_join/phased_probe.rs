@@ -98,6 +98,7 @@ impl OperatorFactory for CompiledJoinProbeProcessorFactory {
             active: false,
             normal: false,
             b0_ready: false,
+            awaiting_build_at_eos: false,
             conversions: ValueConversionContext::default(),
         }))
     }
@@ -296,6 +297,7 @@ struct JoinProbe {
     active: bool,
     normal: bool,
     b0_ready: bool,
+    awaiting_build_at_eos: bool,
     conversions: ValueConversionContext,
 }
 impl JoinProbe {
@@ -380,6 +382,25 @@ impl JoinProbe {
         }
         self.release();
         Ok(StepResult::new(None, NextStep::Finished, 0))
+    }
+    fn finish_after_build(&mut self) -> ExecutionResult<StepResult> {
+        let completion = &self.frame()?.completion;
+        let observable = completion.observable();
+        let observed_generation = observable.generation();
+        if completion.published()?.is_none() {
+            return Ok(StepResult::new(
+                None,
+                NextStep::Wait(WaitFact {
+                    reason: WaitReason::Dependency,
+                    observable,
+                    observed_generation,
+                    deadline: None,
+                }),
+                0,
+            ));
+        }
+        self.awaiting_build_at_eos = false;
+        self.normal_after_output()
     }
     fn step_result(
         &mut self,
@@ -697,6 +718,9 @@ impl TransformKernel for JoinProbe {
                 return self.normal_after_output();
             }
             let Some(cursor) = admitted.as_mut() else {
+                if self.awaiting_build_at_eos {
+                    return self.finish_after_build();
+                }
                 return Ok(StepResult::new(None, NextStep::NeedInput, 0));
             };
             self.frame()?.completion.check()?;
@@ -751,6 +775,15 @@ impl TransformKernel for JoinProbe {
             Err(build_contract(
                 "join probe reached EOS with admitted candidate work",
             ))
+        } else if self.loaded.is_none()
+            && self.declaration.participants.tails == 0
+            && self.declaration.program.input_completion()
+                == novarocks_local_program::InputCompletion::MustDrain
+        {
+            // With no tail, Q alone keeps E alive. An empty Q still owes the
+            // strict build input its genuine EOS before releasing demand.
+            self.awaiting_build_at_eos = true;
+            self.finish_after_build()
         } else {
             self.normal_after_output()
         };

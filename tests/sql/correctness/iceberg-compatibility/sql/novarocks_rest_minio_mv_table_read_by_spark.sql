@@ -74,8 +74,7 @@ SPARK_SQL
 view_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql")"
 echo "$view_out" | tr -s '[:space:]' ' ' | grep -F "2 20" >/dev/null
 echo "$view_out" | tr -s '[:space:]' ' ' | grep -F "3 30" >/dev/null
-# A visible-column read must not return the internal apply-key column that the
-# MV table physically carries.
+# Check that the visible projection exposes no internal column.
 if echo "$view_out" | grep -F "__nova_base_row_id" >/dev/null; then
   echo "visible-column MV read leaked internal column __nova_base_row_id" >&2
   exit 1
@@ -83,9 +82,7 @@ fi
 printf 'SPARK_MV_TABLE_READ_OK\n'
 
 -- query 8
--- Contrast: the same MV table exposes the internal apply-key
--- column at schema level. Uses DESCRIBE rather than SELECT * so the assertion
--- is stable against column ordering/formatting rather than parsing data rows.
+-- Check the entire stored column list independently of the visible SELECT.
 -- @result_contains=SPARK_MV_SCHEMA_OK
 shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-mv-schema-XXXXXX.sql")"
@@ -93,8 +90,12 @@ trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
 DESCRIBE ice_rest.${case_db}.mv_nr_interop_${uuid0};
 SPARK_SQL
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql" \
-  | grep -F "__nova_base_row_id" >/dev/null
+describe_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql")"
+columns="$(printf '%s\n' "$describe_out" | awk -F '\t' '$1 ~ /^[[:alpha:]_][[:alnum:]_]*$/ && $2 != "" {print $1 " " $2}')"
+if [ "$columns" != "$(printf 'id bigint\namount int')" ]; then
+  printf 'unexpected Spark MV columns:\n%s\n' "$columns" >&2
+  exit 1
+fi
 printf 'SPARK_MV_SCHEMA_OK\n'
 
 -- query 9

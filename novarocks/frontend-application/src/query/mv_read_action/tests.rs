@@ -271,12 +271,15 @@ impl Fixture {
                 }
             };
             Box::new(MvExplainPreparationInput {
+                optimizer_settings: Default::default(),
+                query_memory_budget_bytes: 2 * 1024 * 1024 * 1024,
+                session_properties: None,
                 ports,
                 current_catalog: Some("ice".into()),
                 current_database: if source.is_some() { "sales" } else { "db" }.into(),
                 statement: crate::mv::domain::application::MvRefreshRequest {
                     name_parts: vec![if source.is_some() { "mv" } else { "missing_mv" }.into()],
-                    full: false,
+                    mode: crate::mv::domain::application::MvRefreshRequestMode::IncrementalAllowed,
                 },
                 level,
                 context: novarocks_spi::connector::ConnectorRequestContext::try_new(

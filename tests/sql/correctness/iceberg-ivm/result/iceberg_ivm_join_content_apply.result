@@ -1,0 +1,20 @@
+-- query 2
+-- types	varchar	varchar	bigint
+start_label	end_label	multiplicity
+left	old	4
+
+-- query 4
+-- types	varchar	varchar	bigint
+start_label	end_label	multiplicity
+left	new	1
+left	old	1
+
+-- query 6
+-- types	bigint
+rows_visible
+0
+
+-- query 8
+-- types	bigint
+rows_visible
+0

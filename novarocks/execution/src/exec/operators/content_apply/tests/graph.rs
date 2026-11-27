@@ -312,6 +312,7 @@ fn program() -> Arc<LocalProgram> {
         node(
             2,
             ProgramNodeKind::ContentApply(ProgramContentApply {
+                demand_filters: Box::default(),
                 weighted_input: ProgramNodeId::new(0),
                 target_input: ProgramNodeId::new(1),
                 weighted_content: Box::from([weighted.slots()[0]]),
@@ -735,23 +736,43 @@ fn withdrawing_after_a_target_page_cannot_publish_delete_verification() {
     )
     .unwrap();
     let handoff = LocalExchanger::new_handoff(2, 1, 1);
+    use crate::runtime_filter as rf;
+    let schema = rf::RuntimeFilterMembershipSchema::new(
+        &DataType::Int64,
+        rf::RuntimeFilterNullSemantics::NullSafeEqual,
+    )
+    .unwrap();
+    let (session, report_demand) =
+        crate::exec::pipeline::builder::observe_int64_membership_producer(11, schema.digest());
+    let contract = rf::RuntimeFilterProducerContract::membership(
+        rf::RuntimeFilterBindingId::new(11),
+        rf::RuntimeFilterChannelId::new(11),
+        rf::RuntimeFilterExecutionContract::Membership(schema),
+    )
+    .unwrap();
+    let demand = crate::exec::operators::hashjoin::native_runtime_filter::NativeRuntimeFilterProducerFactory::from_content_demand(
+        &[(0, contract)], |_| Ok(DataType::Int64), session,
+    ).unwrap();
     let kind = SummaryKind::DeleteVerification;
     let summary_state = TaskSummaryState::new(kind, 1, tracker.clone()).unwrap();
-    let stages = Arc::new(ContentApplyStages::new(
-        program.clone(),
-        ProgramNodeId::new(2),
-        StageParticipants {
-            inputs: 1,
-            finalizers: NonZeroUsize::MIN,
-            probes: 1,
-            tails: 1,
-        },
-        handoff.clone(),
-        summary_state.clone(),
-        tracker,
-        std::num::NonZeroU32::new(1).unwrap(),
-        error,
-    ));
+    let stages = Arc::new(
+        ContentApplyStages::new(
+            program.clone(),
+            ProgramNodeId::new(2),
+            StageParticipants {
+                inputs: 1,
+                finalizers: NonZeroUsize::MIN,
+                probes: 1,
+                tails: 1,
+            },
+            handoff.clone(),
+            summary_state.clone(),
+            tracker,
+            std::num::NonZeroU32::new(1).unwrap(),
+            error,
+        )
+        .with_demand_producer(Some(demand)),
+    );
     let bind = |mut operator: Box<dyn Operator>| {
         operator.set_construction_factory(construction.clone());
         operator.prepare().unwrap();
@@ -776,6 +797,7 @@ fn withdrawing_after_a_target_page_cannot_publish_delete_verification() {
             .unwrap()
             .create(1, 0),
     );
+    assert_eq!(report_demand(), (Default::default(), false, None));
 
     let input = |id: usize| {
         let node = &program.graph().nodes()[id];
@@ -808,6 +830,10 @@ fn withdrawing_after_a_target_page_cannot_publish_delete_verification() {
         finalize.drive_for_test(&state).unwrap().next,
         NextStep::Finished
     )));
+    assert_eq!(
+        report_demand(),
+        ([10, 20].into_iter().collect(), false, Some((0, 2)))
+    );
 
     assert!(matches!(
         probe.try_push_for_test(&state, RawInput::for_test(input(1))),

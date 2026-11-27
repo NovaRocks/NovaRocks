@@ -58,6 +58,9 @@ mod async_publication;
 mod publication;
 #[path = "statistics/scoped_cpu.rs"]
 pub(crate) mod scoped_cpu;
+use scoped_cpu::scoped_prepared_source::{
+    IcebergObservedSourceReadFacts, frozen_current_source_schema, frozen_snapshot_schema,
+};
 
 const STATISTICS_OPERATION_KIND: &str = "statistics-publish";
 const STATISTICS_PUBLICATION_EVIDENCE_VERSION: u16 = 3;
@@ -149,19 +152,79 @@ impl StatisticsReader for IcebergMetadata {
             validate_context(&request.context)?;
             let table = self.table_payload(&request.table)?;
             let table_info = base_table_info(&table, "statistics read")?;
-            let expected = pinned_data_version(table_info)?;
+            let owner = novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: self.descriptor().instance_id.clone(),
+                incarnation: self.incarnation(),
+            };
+            let manifest_volume = request
+                .metrics
+                .metrics()
+                .contains(&StatisticsMetric::DataFileBytes)
+                && request.metrics.metrics().iter().all(|metric| {
+                    matches!(
+                        metric,
+                        StatisticsMetric::RowCount | StatisticsMetric::DataFileBytes
+                    )
+                });
+            let (snapshot_id, observed) = if let Some(source) = &request.observed_source {
+                if request.row_mutation_current.is_some() || request.narrowed_read.is_some() {
+                    return Err(invalid(
+                        "Iceberg statistics cannot combine separate original read observations",
+                    ));
+                }
+                let (snapshot, original) = original_statistics_pin(source, &owner, &table)?;
+                (snapshot, Some(original))
+            } else {
+                (table_info.current_snapshot_id, None)
+            };
+            let uuid = table_info
+                .table_uuid
+                .as_deref()
+                .ok_or_else(|| corrupt("Iceberg table payload is missing its table UUID"))?;
+            let expected = statistics_data_version(uuid, snapshot_id)?;
             if request.data_version != expected {
                 return Err(invalid(
                     "Iceberg statistics request does not match its resolved table pin",
                 ));
             }
-            let snapshot_id = table_info.current_snapshot_id.ok_or_else(|| {
+            if snapshot_id.is_none()
+                && request.row_mutation_current.is_none()
+                && request.narrowed_read.is_none()
+                && manifest_volume
+            {
+                let metrics = request
+                    .metrics
+                    .metrics()
+                    .iter()
+                    .cloned()
+                    .map(|metric| {
+                        let state =
+                            StatisticsMetricState::Available(StatisticsMetricObservation::new(
+                                StatisticsMetricValue::U64(0),
+                                expected.clone(),
+                                StatisticsMetricSource::CurrentManifest,
+                                StatisticsNumericNature::Exact,
+                                StatisticsBasisRelation::Identical,
+                            ));
+                        (metric, state)
+                    })
+                    .collect();
+                return StatisticsEvidence::try_new(
+                    expected,
+                    StatisticsEvidenceRevision::try_new(Bytes::from(format!(
+                        "iceberg-empty-manifests:{uuid}"
+                    )))?,
+                    StatisticsRowCoverage::AllVisibleRows,
+                    metrics,
+                );
+            }
+            let snapshot_id = snapshot_id.ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     "Iceberg table has no current snapshot for statistics",
                 )
             })?;
-            let physical = if let Some(source) = &request.row_mutation_current {
+            let access = if let Some(source) = &request.row_mutation_current {
                 if source.identity().namespace.as_ref() != table.namespace
                     || source.identity().table.as_ref() != table.table
                     || source.snapshot_id() != Some(snapshot_id)
@@ -170,13 +233,8 @@ impl StatisticsReader for IcebergMetadata {
                         "Iceberg statistics differ from the original row mutation source",
                     ));
                 }
-                let original = scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts::for_row_mutation_current(
-                    source,
-                    &novarocks_spi::connector::ConnectorProviderBindingKey {
-                        instance_id: self.descriptor().instance_id.clone(),
-                        incarnation: self.incarnation(),
-                    },
-                )?;
+                let original =
+                    IcebergObservedSourceReadFacts::for_row_mutation_current(source, &owner)?;
                 if table_info.table_uuid.as_deref()
                     != Some(original.access.metadata().uuid().to_string().as_str())
                 {
@@ -184,7 +242,12 @@ impl StatisticsReader for IcebergMetadata {
                         "Iceberg statistics differ from the original table UUID",
                     ));
                 }
-                original.access.reacquired_request_scoped(
+                Some(&original.access)
+            } else {
+                observed.map(|source| &source.access)
+            };
+            let physical = if let Some(access) = access {
+                access.reacquired_request_scoped(
                     self.runtime()
                         .resources()
                         .planning_binding()
@@ -202,6 +265,21 @@ impl StatisticsReader for IcebergMetadata {
                     .map_err(unavailable)?
             };
             let metadata = physical.table.metadata();
+            if table_info.table_uuid.as_deref() != Some(metadata.uuid().to_string().as_str()) {
+                return Err(invalid(
+                    "Iceberg statistics loaded a different table object",
+                ));
+            }
+            use crate::metadata::TableMetadataProjection;
+            let schema = match observed.map(|source| source.projection) {
+                Some(TableMetadataProjection::SnapshotTo(snapshot)) => {
+                    frozen_snapshot_schema(metadata, snapshot, metadata.current_schema_id())?
+                }
+                Some(TableMetadataProjection::CurrentSnapshotTo(snapshot)) => {
+                    frozen_current_source_schema(metadata, snapshot)?
+                }
+                Some(TableMetadataProjection::Current) | None => metadata.current_schema().clone(),
+            };
             // Deliberately no currentness check. The query was planned on this
             // snapshot; the table moving on afterwards does not make that snapshot's
             // statistics wrong, it only makes them describe an older state — which
@@ -224,6 +302,7 @@ impl StatisticsReader for IcebergMetadata {
             let files = files_result?;
             project_statistics_evidence(
                 metadata,
+                &schema,
                 table_info,
                 snapshot_id,
                 &expected,
@@ -234,9 +313,42 @@ impl StatisticsReader for IcebergMetadata {
     }
 }
 
+pub(crate) fn original_statistics_pin<'a>(
+    source: &'a novarocks_spi::connector::ConnectorProcessLocalPayload,
+    owner: &novarocks_spi::connector::ConnectorProviderBindingKey,
+    table: &IcebergTablePayload,
+) -> Result<(Option<i64>, &'a IcebergObservedSourceReadFacts), ConnectorError> {
+    use crate::metadata::TableMetadataProjection;
+
+    source.validate_owner(owner)?;
+    let original = source.value::<IcebergObservedSourceReadFacts>(owner.instance_id.as_str())?;
+    let info = base_table_info(table, "original statistics read")?;
+    let access = &original.access;
+    let ident = access.identifier();
+    let metadata = access.metadata();
+    if ident.namespace().to_url_string() != table.namespace
+        || ident.name() != table.table
+        || info.table_uuid.as_deref() != Some(metadata.uuid().to_string().as_str())
+        || info.current_snapshot_id != metadata.current_snapshot_id()
+        || info.schema_id != metadata.current_schema_id()
+        || table.metadata_location.as_deref() != access.metadata_location()
+    {
+        return Err(invalid(
+            "Iceberg statistics differ from their original table observation",
+        ));
+    }
+    let snapshot = match original.projection {
+        TableMetadataProjection::Current => metadata.current_snapshot_id(),
+        TableMetadataProjection::SnapshotTo(snapshot)
+        | TableMetadataProjection::CurrentSnapshotTo(snapshot) => Some(snapshot),
+    };
+    Ok((snapshot, original))
+}
+
 /// Only the file facts needed by table statistics; a scoped read borrows its
 /// original read snapshot instead of cloning the scan/delete graph.
 trait StatisticsFileFacts {
+    fn file_size(&self) -> i64;
     fn record_count(&self) -> Option<i64>;
     fn stats(&self) -> Option<&HashMap<String, crate::scan_model::IcebergColumnStats>>;
     fn has_deletes(&self) -> bool;
@@ -244,6 +356,9 @@ trait StatisticsFileFacts {
     fn partition_values(&self) -> Option<&crate::iceberg::spec::Struct>;
 }
 impl StatisticsFileFacts for DataFileWithStats {
+    fn file_size(&self) -> i64 {
+        self.size
+    }
     fn record_count(&self) -> Option<i64> {
         self.record_count
     }
@@ -261,6 +376,9 @@ impl StatisticsFileFacts for DataFileWithStats {
     }
 }
 impl StatisticsFileFacts for crate::read_model::IcebergReadFile {
+    fn file_size(&self) -> i64 {
+        self.size
+    }
     fn record_count(&self) -> Option<i64> {
         self.record_count
     }
@@ -279,14 +397,14 @@ impl StatisticsFileFacts for crate::read_model::IcebergReadFile {
 }
 fn project_statistics_evidence<F: StatisticsFileFacts>(
     metadata: &crate::iceberg::spec::TableMetadata,
+    schema: &crate::iceberg::spec::Schema,
     table_info: &crate::scan_model::IcebergTableInfo,
     snapshot_id: i64,
     expected: &StatisticsDataVersion,
     request: &StatisticsReadRequest,
     files: &[F],
 ) -> Result<StatisticsEvidence, ConnectorError> {
-    let arrow_schema =
-        crate::scalar_integer_domain::metadata_sql_schema(metadata, metadata.current_schema())?;
+    let arrow_schema = crate::scalar_integer_domain::metadata_sql_schema(metadata, schema)?;
     for file in files {
         for field in arrow_schema.fields() {
             let domain = match field.data_type() {
@@ -311,8 +429,7 @@ fn project_statistics_evidence<F: StatisticsFileFacts>(
             }
         }
     }
-    let field_ids = metadata
-        .current_schema()
+    let field_ids = schema
         .as_struct()
         .fields()
         .iter()
@@ -470,6 +587,7 @@ fn manifest_numeric_nature(
     has_deletes: bool,
 ) -> StatisticsNumericNature {
     match metric {
+        StatisticsMetric::DataFileBytes => StatisticsNumericNature::Exact,
         StatisticsMetric::AverageSize { .. } => StatisticsNumericNature::TwoSidedApproximate,
         _ if !has_deletes => StatisticsNumericNature::Exact,
         StatisticsMetric::RowCount
@@ -1189,6 +1307,15 @@ fn manifest_metric<F: StatisticsFileFacts>(
         ))
     };
     match metric {
+        StatisticsMetric::DataFileBytes => files
+            .iter()
+            .try_fold(0_u64, |total, file| {
+                total.checked_add(u64::try_from(file.file_size()).ok()?)
+            })
+            .map(|value| available(StatisticsMetricValue::U64(value)))
+            .unwrap_or_else(|| {
+                incomplete("Iceberg manifest does not report complete data file bytes")
+            }),
         StatisticsMetric::RowCount => files
             .iter()
             .try_fold(0_u64, |total, file| {
@@ -1951,6 +2078,26 @@ mod tests {
             StatisticsMetricState::Available(observation) => Some(observation.numeric_nature()),
             _ => None,
         }
+    }
+
+    #[test]
+    fn statistics_manifest_volume_keeps_physical_bytes_across_row_deletes() {
+        let files = [
+            manifest_file(Some(4), "k", true),
+            manifest_file(Some(3), "k", false),
+        ];
+        let basis = StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).unwrap();
+        let metric = |metric| match manifest_metric(&metric, &files, &HashMap::new(), true, &basis)
+        {
+            StatisticsMetricState::Available(observation) => observation,
+            other => panic!("expected mandatory manifest field: {other:?}"),
+        };
+        let bytes = metric(StatisticsMetric::DataFileBytes);
+        assert_eq!(bytes.value(), &StatisticsMetricValue::U64(128));
+        assert_eq!(bytes.numeric_nature(), StatisticsNumericNature::Exact);
+        let rows = metric(StatisticsMetric::RowCount);
+        assert_eq!(rows.value(), &StatisticsMetricValue::U64(7));
+        assert_eq!(rows.numeric_nature(), StatisticsNumericNature::UpperBound);
     }
 
     #[test]

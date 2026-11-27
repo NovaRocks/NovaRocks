@@ -50,6 +50,14 @@ pub(crate) struct PlannedRequestedRefresh {
     pub(crate) canonical_query: Arc<ast::Query>,
     pub(crate) target_binding: ConnectorProviderBindingKey,
     pub(crate) full_overwrite: bool,
+    pub(crate) explicit_recovery:
+        Option<Vec<novarocks_mv_application::persistence::codec::RecoverySource>>,
+
+    pub(crate) can_incrementally_refresh: bool,
+    pub(crate) replay: Option<Arc<crate::mv::domain::refresh::pending_fence::PendingFence>>,
+
+    pub(crate) original_current:
+        novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
     pub(crate) rebuild: Option<RefreshRebuildBinding>,
 }
 
@@ -149,6 +157,19 @@ pub(crate) async fn prepare_refresh_binding_candidate(
     schema: &MvSchemaValidationObservation,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<RefreshBindingObservation, RefreshError> {
+    prepare_refresh_binding_candidate_with_replay(io, source, stored, target, schema, None, context)
+        .await
+}
+
+async fn prepare_refresh_binding_candidate_with_replay(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    stored: &StoredKeyedMvProjection,
+    target: &MvTargetBinding,
+    schema: &MvSchemaValidationObservation,
+    replay: Option<&BTreeMap<u32, novarocks_spi::connector::ConnectorExactSemanticRevision>>,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<RefreshBindingObservation, RefreshError> {
     use crate::mv::domain::persistence::source_bindings::observe_mv_binding;
     use crate::query_execution::mv_assembly::refresh_preparation::pure_reader::capture_visible_refresh_analysis;
     use novarocks_mv_application::persistence::{
@@ -217,6 +238,24 @@ pub(crate) async fn prepare_refresh_binding_candidate(
             cause: Box::new(cause),
         }
     };
+    let old = stored.facts.interpretation();
+    if !old.is_aggregate()
+        && old.target.fields.iter().any(|field| {
+            use novarocks_mv_application::persistence::codec::PhysicalFieldLogicalIdentity as Field;
+            matches!(
+                field.logical_identity,
+                Field::ApplyKey(_) | Field::Branch(_)
+            ) && exact
+                .fields
+                .iter()
+                .any(|current| current.field_id == field.target_field_id && !current.nullable)
+        })
+    {
+        return Ok(incompatible(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Legacy MV storage requires hidden maintenance fields that the visible result cannot supply",
+        ).into()));
+    }
     let control =
         crate::query_execution::planning::sql_compile_control_from_connector_request(context);
     let property = derive_fragment_property(&analysis, &control)?;
@@ -231,7 +270,8 @@ pub(crate) async fn prepare_refresh_binding_candidate(
             source_observations: &observed.relations,
             runtime_layout: &runtime_layout,
             target_identity: &property.identity,
-            apply_key_column_name: Some(refresh_contract.apply_key.column_name),
+            apply_key_column_name: is_aggregate_identity(&property.identity)
+                .then_some(refresh_contract.apply_key.column_name),
             branch_column_name: identity_needs_branch_id_column(&property.identity)
                 .then_some(BRANCH_ID_COLUMN_NAME),
         },
@@ -276,7 +316,7 @@ pub(crate) async fn prepare_refresh_binding_candidate(
         mapping,
     )
     .map_err(|error| RefreshError::user(error.to_string()))?;
-    io.install_analyzed_refresh_sources(source, &sql, &bindings, &observed, context)?;
+    io.install_analyzed_refresh_sources(source, &sql, &bindings, &observed, replay, context)?;
     io.captured_sources()
         .capture_views(bindings.freeze_statement_views().await?)?;
     Ok(RefreshBindingObservation::Complete(Box::new(
@@ -298,6 +338,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     target: MvTarget,
     full_sources: bool,
     session_properties: Option<&SessionPropertyInputs>,
+    expected_replay: Option<&crate::mv::domain::refresh::pending_fence::PendingFence>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PlannedRequestedRefresh, RefreshError> {
     let iceberg_target =
@@ -330,7 +371,49 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         .target_binding(source, &iceberg_target, connector_context)
         .await
         .map_err(RefreshError::from)?;
+    let strict_recovery = observed_current.as_ref().is_some_and(|current| {
+        !current.interpretation.is_aggregate() && current.eligibility().strict_recovery_required
+    });
+    if let Some(expected) = expected_replay {
+        use novarocks_mv_application::persistence::codec::RefreshPolicy;
+        let current = observed_current.as_ref().ok_or_else(|| {
+            RefreshError::user("MV strict retry lost its original managed Current")
+        })?;
+        if current.configuration.paused
+            || current.configuration.refresh_policy == RefreshPolicy::Manual
+        {
+            return Err(RefreshError::user(
+                "MV strict retry stopped by its refresh policy",
+            ));
+        }
+        if !strict_recovery || !expected.is_present(&current.view) {
+            return Err(RefreshError::user(
+                "MV strict retry no longer has its original Pending",
+            ));
+        }
+    }
+    let explicit_rebuild = stmt.is_explicit_rebuild();
+    if !explicit_rebuild
+        && observed_current.as_ref().is_some_and(|current| {
+            !current.interpretation.is_aggregate()
+                && current.eligibility().explicit_rebuild_required
+        })
+    {
+        return Err(RefreshError::user("MV target requires an explicit rebuild"));
+    }
     let validation = match observed_current.as_ref() {
+        Some(observed) if strict_recovery || explicit_rebuild => {
+            if observed.view.object_id != mv_definition.facts.source_revision().target_object_id
+                || observed.view.current_snapshot != target_binding.current_snapshot_id()
+            {
+                Err(RefreshError::user(
+                    "MV strict recovery target changed before preparation",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
         Some(observed) => crate::mv::domain::refresh::target::validate_target_snapshot_observed(
             &iceberg_target,
             &mv_definition,
@@ -377,7 +460,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         Some(inputs) => novarocks_mv_application::session_properties::manual_refresh_is_full(
             inputs,
             &target_binding_key,
-            stmt.full,
+            stmt.is_full(),
         )
         .map_err(|message| {
             RefreshError(MvApplicationError::new(
@@ -385,11 +468,13 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
                 message,
             ))
         })?,
-        None => stmt.full,
+        None => stmt.is_full(),
     };
     let full_statement = (full_sources || full_overwrite).then(|| {
         let mut full = stmt.clone();
-        full.full = true;
+        if !full.is_explicit_rebuild() {
+            full.mode = crate::mv::domain::application::MvRefreshRequestMode::Full;
+        }
         full
     });
     let stmt = full_statement.as_ref().unwrap_or(stmt);
@@ -406,6 +491,243 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             "MV refresh requires the original managed Current observation",
         ));
     };
+    if strict_recovery && !explicit_rebuild {
+        if stmt.is_full() {
+            return Err(RefreshError::user(
+                "MV has unresolved content verification and requires an explicit rebuild",
+            ));
+        }
+        let proof = crate::mv::domain::refresh::recovery::prove_strict_recovery(
+            io,
+            source,
+            &observed_current,
+            &target_binding,
+            connector_context,
+        )
+        .await?;
+        if expected_replay.is_some_and(|expected| {
+            expected.publication() != proof.fence.publication()
+                || expected.evidence() != proof.fence.evidence()
+        }) {
+            return Err(RefreshError::user(
+                "MV strict retry selected a different verification obligation",
+            ));
+        }
+        let RefreshBindingObservation::Complete(candidate) =
+            prepare_refresh_binding_candidate_with_replay(
+                io,
+                source,
+                &mv_definition,
+                &target_binding,
+                &target_schema_observation,
+                Some(&proof.targets),
+                connector_context,
+            )
+            .await?
+        else {
+            return Err(RefreshError::user(
+                "MV strict recovery original semantics are unavailable",
+            ));
+        };
+        if candidate.versions != proof.baseline.versions {
+            return Err(RefreshError::user(
+                "MV strict recovery original binding or storage mapping no longer compiles",
+            ));
+        }
+        let mut baseline = refresh_state_baseline;
+        let RefreshStateBaseline::SnapshotBacked {
+            previous_sources, ..
+        } = &mut baseline;
+        previous_sources.clear();
+        let mut bases = Vec::new();
+        for (occurrence, prior) in proof
+            .baseline
+            .versions
+            .binding_document
+            .occurrences
+            .iter()
+            .zip(&proof.baseline.publication.inputs)
+        {
+            let table = occurrence_table(occurrence);
+            let occurrence_id = SqlMvRelationOccurrenceId::new(occurrence.occurrence_id);
+            previous_sources.push(
+                crate::mv::domain::refresh::planning::RefreshStateBaselineSource {
+                    occurrence_id,
+                    table: table.clone(),
+                    semantic_revision: restore_exact_query_revision(
+                        &prior.object_id,
+                        &prior.native_data_version,
+                    )?,
+                },
+            );
+            bases.push(RefreshBaseRelationOccurrence {
+                occurrence_id,
+                table,
+            });
+        }
+        io.capture_refresh_sources(
+            source,
+            &proof.baseline.versions.binding_document,
+            &baseline,
+            false,
+            connector_context,
+        )
+        .await?;
+        let retained = io.captured_sources();
+        let mut snapshots = BTreeMap::new();
+        for base in &bases {
+            let captured = retained.require(&base.table)?;
+            let previous = crate::mv::domain::refresh::planning::baseline_revision_for_occurrence(
+                &baseline, base,
+            )?;
+            let receipt = captured.receipt(Some(previous)).ok_or_else(|| {
+                RefreshError::user("MV strict recovery could not reopen an original source window")
+            })?;
+            if !matches!(
+                receipt.window_facts(),
+                Some(
+                    novarocks_spi::connector::ConnectorChangeWindowFacts::NetZero(_)
+                        | novarocks_spi::connector::ConnectorChangeWindowFacts::Difference { .. }
+                )
+            ) {
+                return Err(RefreshError::user(format!(
+                    "MV strict recovery original source window is unavailable for {}",
+                    base.display()
+                )));
+            }
+            snapshots.insert(base.occurrence_id, captured.snapshot);
+        }
+        return Ok(PlannedRequestedRefresh {
+            plan: build_iceberg_refresh_plan(
+                &mv_definition,
+                target,
+                stmt,
+                current_catalog,
+                current_database,
+                &bases,
+                snapshots,
+                ExecutableRefreshDecision::Incremental,
+                baseline,
+                crate::mv::domain::model::AffectedTargetPartitions::not_derived(
+                    "strict content recovery",
+                ),
+            ),
+            canonical_query: Arc::clone(&candidate.query),
+            target_binding: target_binding_key,
+            full_overwrite: false,
+            explicit_recovery: None,
+            can_incrementally_refresh: false,
+            replay: Some(proof.fence),
+            original_current: observed_current,
+            rebuild: None,
+        });
+    }
+    if explicit_rebuild {
+        use novarocks_mv_application::persistence::codec::{Marker, RecoverySource};
+        if observed_current.interpretation.is_aggregate() {
+            return Err(RefreshError::user(
+                "Explicit content rebuild requires a non-aggregate MV",
+            ));
+        }
+        let mut recovered_from = observed_current
+            .eligibility()
+            .active
+            .iter()
+            .filter_map(|marker| match marker {
+                Marker::Pending {
+                    publication,
+                    evidence,
+                } => Some(RecoverySource::Pending {
+                    publication: publication.clone(),
+                    attempt: evidence.attempt,
+                }),
+                Marker::Invalid { publication, .. } => Some(RecoverySource::Invalid {
+                    publication: publication.clone(),
+                }),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if let novarocks_mv_application::persistence::resolution::ApplicablePublication::RetiredPublication(retired) =
+            observed_current.applicable_publication()
+        {
+            recovered_from.insert(RecoverySource::Invalid { publication: retired.retired_publication.clone() });
+        }
+        if recovered_from.is_empty() {
+            return Err(RefreshError::user(
+                "Explicit rebuild has no original Pending or Invalid obligation",
+            ));
+        }
+        let RefreshBindingObservation::Complete(candidate) = prepare_refresh_binding_candidate(
+            io,
+            source,
+            &mv_definition,
+            &target_binding,
+            &target_schema_observation,
+            connector_context,
+        )
+        .await?
+        else {
+            return Err(RefreshError::user(
+                "Explicit rebuild cannot rebind the existing MV storage",
+            ));
+        };
+        let candidate = *candidate;
+        let mut baseline = refresh_state_baseline;
+        let RefreshStateBaseline::SnapshotBacked {
+            previous_sources, ..
+        } = &mut baseline;
+        previous_sources.clear();
+        io.capture_refresh_sources(
+            source,
+            &candidate.observed.document,
+            &baseline,
+            true,
+            connector_context,
+        )
+        .await?;
+        let retained = io.captured_sources();
+        let mut bases = Vec::new();
+        let mut snapshots = BTreeMap::new();
+        for occurrence in &candidate.observed.document.occurrences {
+            let table = occurrence_table(occurrence);
+            let occurrence_id = SqlMvRelationOccurrenceId::new(occurrence.occurrence_id);
+            snapshots.insert(occurrence_id, retained.require(&table)?.snapshot);
+            bases.push(RefreshBaseRelationOccurrence {
+                occurrence_id,
+                table,
+            });
+        }
+        let plan = build_iceberg_refresh_plan(
+            &mv_definition,
+            target,
+            stmt,
+            current_catalog,
+            current_database,
+            &bases,
+            snapshots,
+            ExecutableRefreshDecision::FirstRefresh,
+            baseline,
+            crate::mv::domain::model::AffectedTargetPartitions::not_derived(
+                "explicit content rebuild",
+            ),
+        );
+        // The original statement reserve supplies the publication operation
+        // identity after this read-only preparation phase.
+        return Ok(PlannedRequestedRefresh {
+            plan,
+            canonical_query: Arc::clone(&candidate.query),
+            target_binding: target_binding_key,
+            full_overwrite: true,
+            explicit_recovery: Some(recovered_from.into_iter().collect()),
+            can_incrementally_refresh: false,
+            replay: None,
+            original_current: observed_current,
+            rebuild: Some(RefreshRebuildBinding {
+                candidate,
+                markers_remove: BTreeSet::new(),
+            }),
+        });
+    }
     if observed_current.view.metadata_version
         != target_schema_observation.exact_schema().metadata_version
         || observed_current.versions.binding.identity()
@@ -436,7 +758,15 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         .map_err(|error| RefreshError::user(error.to_string()))?;
     let root = observed_current.root_binding_revision();
     let scope = observed_current.publication_evidence(&root);
-    let mut clear = marker_eligibility(scope, &markers).inactive;
+    let eligibility = marker_eligibility(scope, &markers);
+    if eligibility.strict_recovery_required && stmt.is_full() {
+        return Err(RefreshError::user(
+            "MV has unresolved content verification and requires an explicit rebuild",
+        ));
+    }
+    let can_incrementally_refresh =
+        eligibility.automatic_refresh && !eligibility.automatic_reuse_blocked;
+    let mut clear = eligibility.inactive;
     let classified = classify_refresh_observation(
         RebuildEvidence::from(&observed_current.versions),
         analyzed
@@ -513,7 +843,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         io.write_binding_marker(
             source,
             target_binding.planning_pin(),
-            observed_current,
+            observed_current.clone(),
             &mv_definition.facts,
             marker,
             connector_context.clone(),
@@ -545,6 +875,29 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             previous_sources, ..
         } = &mut baseline;
         previous_sources.clear();
+        let documents = target_binding
+            .planning_pin()
+            .derive_document_storage_lease()?;
+        let after_marker = io
+            .observe_current(
+                source,
+                &documents,
+                crate::mv::domain::staged_create::keyed_request(
+                    &documents,
+                    observed_current.view.table.clone(),
+                    observed_current.view.object_id.clone(),
+                    connector_context.clone(),
+                ),
+            )
+            .await?;
+        if after_marker.eligibility().strict_recovery_required
+            || after_marker.eligibility().explicit_rebuild_required
+            || after_marker.view.current_snapshot != observed_current.view.current_snapshot
+        {
+            return Err(RefreshError::user(
+                "MV rebuild observation changed after the binding marker",
+            ));
+        }
         return Ok(PlannedRequestedRefresh {
             plan: build_iceberg_refresh_plan(
                 &mv_definition,
@@ -563,6 +916,10 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             canonical_query: Arc::clone(&candidate.query),
             target_binding: target_binding_key,
             full_overwrite: true,
+            explicit_recovery: None,
+            can_incrementally_refresh: false,
+            replay: None,
+            original_current: after_marker,
             rebuild: Some(RefreshRebuildBinding {
                 candidate,
                 markers_remove: clear,
@@ -573,7 +930,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         source,
         &candidate.observed.document,
         &refresh_state_baseline,
-        stmt.full || full_sources,
+        stmt.is_full() || full_sources,
         connector_context,
     )
     .await?;
@@ -584,6 +941,10 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         canonical_query: Arc::clone(&canonical_select_query),
         target_binding: target_binding_key.clone(),
         full_overwrite,
+        explicit_recovery: None,
+        can_incrementally_refresh,
+        replay: None,
+        original_current: observed_current.clone(),
         rebuild: None,
     };
     // Driver dispatch: plan-side dispatch is capability-driven, matching the
@@ -591,7 +952,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     // observation L was validated against, never from a persisted contract.
     let runtime_bindings = validate_projection_target(&mv_definition, &target_schema_observation)
         .map_err(RefreshError::from)?;
-    validate_published_refresh_aggregate_contracts(&mv_definition, stmt.full)?;
+    validate_published_refresh_aggregate_contracts(&mv_definition, stmt.is_full())?;
     let caps = RefreshCapabilities::from_canonical_facts(
         mv_definition.facts.interpretation(),
         &runtime_bindings,
@@ -748,7 +1109,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
                 base_snapshots: &refresh_statuses,
                 label: &refresh_label,
             },
-            stmt.full,
+            stmt.is_full(),
         )
         .map_err(RefreshError::from)?;
         let has_previous = base_occurrences
@@ -868,7 +1229,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             base_snapshots: &pre_pin_statuses,
             label: &refresh_label,
         },
-        stmt.full,
+        stmt.is_full(),
     )
     .map_err(RefreshError::from)?;
     let base_observation = io.schema(source, base_ref, connector_context).await?;
@@ -917,7 +1278,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             base_snapshots: &refresh_statuses,
             label: &refresh_label,
         },
-        stmt.full,
+        stmt.is_full(),
     )
     .map_err(RefreshError::from)?;
     let mode = decision.mode();
@@ -1041,7 +1402,7 @@ pub(crate) async fn plan_iceberg_union_projection_mv_refresh(
             base_snapshots: &refresh_statuses,
             label: &refresh_label,
         },
-        stmt.full,
+        stmt.is_full(),
     )
     .map_err(RefreshError::from)?;
     let mode = decision.mode();
@@ -1217,7 +1578,7 @@ pub(crate) async fn plan_iceberg_all_bases_aggregate_mv_refresh(
             base_snapshots: &refresh_statuses,
             label: &refresh_label,
         },
-        stmt.full,
+        stmt.is_full(),
     )
     .map_err(RefreshError::from)?;
     let mode = decision.mode();
@@ -1399,7 +1760,7 @@ pub(crate) async fn plan_iceberg_aggregate_mv_refresh(
                     base_snapshots: &refresh_statuses,
                     label: &refresh_label,
                 },
-                stmt.full,
+                stmt.is_full(),
             )
             .map_err(RefreshError::from)?;
             let mode = decision.mode();
@@ -1527,7 +1888,7 @@ pub(crate) async fn plan_iceberg_aggregate_mv_refresh(
                     base_snapshots: &refresh_statuses,
                     label: &refresh_label,
                 },
-                stmt.full,
+                stmt.is_full(),
             )
             .map_err(RefreshError::from)?;
             let has_previous = base_occurrences

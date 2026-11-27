@@ -34,6 +34,7 @@ pub(crate) enum PartitionPruningPolicy {
 /// The compact row-identity discriminant needed by refresh execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RefreshIdentity {
+    Content,
     BaseRowId,
     JoinRowKey,
     GroupRowId,
@@ -46,8 +47,8 @@ pub struct RefreshCapabilities {
     pub(crate) snapshot_policy: BaseSnapshotPolicy,
     pub has_agg_state: bool,
     pub(crate) identity: RefreshIdentity,
-    pub apply_key_column: String,
-    pub(crate) apply_key_value_type: ApplyKeyValueType,
+    pub apply_key_column: Option<String>,
+    pub(crate) apply_key_value_type: Option<ApplyKeyValueType>,
     pub(crate) partition_pruning: PartitionPruningPolicy,
 }
 
@@ -95,6 +96,20 @@ impl RefreshCapabilities {
             BaseSnapshotPolicy::SingleBase
         };
 
+        if !has_agg && interpretation.apply_key.is_none() {
+            if has_branch || !bindings.apply_key.is_empty() || !bindings.branches.is_empty() {
+                return Err("content MV retains a foreign apply or branch binding".to_string());
+            }
+            return Ok(RefreshCapabilities {
+                snapshot_policy,
+                has_agg_state: false,
+                identity: RefreshIdentity::Content,
+                apply_key_column: None,
+                apply_key_value_type: None,
+                partition_pruning: PartitionPruningPolicy::BestEffort,
+            });
+        }
+
         let apply_key_kind = interpretation
             .apply_key_kind()
             .ok_or("keyed refresh requires an apply key")?;
@@ -124,8 +139,8 @@ impl RefreshCapabilities {
             snapshot_policy,
             has_agg_state: has_agg,
             identity,
-            apply_key_column: apply_key.name.clone(),
-            apply_key_value_type,
+            apply_key_column: Some(apply_key.name.clone()),
+            apply_key_value_type: Some(apply_key_value_type),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         })
     }
@@ -193,9 +208,15 @@ mod tests {
         assert_eq!(capabilities.snapshot_policy, BaseSnapshotPolicy::SingleBase);
         assert!(!capabilities.has_agg_state);
         assert_eq!(capabilities.identity, RefreshIdentity::BaseRowId);
-        assert_eq!(capabilities.apply_key_value_type, ApplyKeyValueType::Int64);
+        assert_eq!(
+            capabilities.apply_key_value_type,
+            Some(ApplyKeyValueType::Int64)
+        );
         // The physical name is the provider's, never a persisted one.
-        assert_eq!(capabilities.apply_key_column, "__nova_row_id");
+        assert_eq!(
+            capabilities.apply_key_column.as_deref(),
+            Some("__nova_row_id")
+        );
     }
 
     #[test]
@@ -217,7 +238,7 @@ mod tests {
             BaseSnapshotPolicy::JoinPairPartialInitialSkip
         );
         assert_eq!(join.identity, RefreshIdentity::JoinRowKey);
-        assert_eq!(join.apply_key_value_type, ApplyKeyValueType::Utf8);
+        assert_eq!(join.apply_key_value_type, Some(ApplyKeyValueType::Utf8));
 
         let fan_in = RefreshCapabilities::from_canonical_facts(
             &interpretation,
@@ -262,7 +283,7 @@ mod tests {
         );
         assert_eq!(
             capabilities.apply_key_value_type,
-            ApplyKeyValueType::BranchUtf8
+            Some(ApplyKeyValueType::BranchUtf8)
         );
     }
 

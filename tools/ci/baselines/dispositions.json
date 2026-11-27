@@ -502,26 +502,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_a11_base_drop_referenced",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-7B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_a11_base_type_change_referenced",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-7B3",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_aggregate",
       "failure": {
         "class": "error_code",
@@ -569,36 +549,6 @@
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.aggregate/min_state/derived-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B1a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 4 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
       "owner": "UEA-5E B1a",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_key_update_multiplicity",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 5 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-7B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_refresh_logical_plan",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-7B3",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ivm/iceberg_ivm_join_two_base_delta",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-7B3",
       "expires": "2026-12-15"
     },
     {
@@ -669,16 +619,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.aggregate/count_state/derived-v1; owner B1, I5; remove after capability repair and native verification",
       "owner": "B1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-mv-apply/iceberg_mv_join_incremental_delete",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy; owner B8, B1, I5; remove after capability repair and native verification",
-      "owner": "UEA-7B3",
       "expires": "2026-12-15"
     },
     {

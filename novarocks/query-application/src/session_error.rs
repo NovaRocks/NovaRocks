@@ -142,6 +142,14 @@ impl QueryServiceError {
         }
     }
 
+    /// Keep the original typed admission refusal while reporting temporary
+    /// service unavailability at the client-facing boundary.
+    pub fn unavailable_with_cause(cause: novarocks_failure_contract::SharedFailureCause) -> Self {
+        let mut error = Self::new(QueryServiceErrorKind::Unavailable, cause.detail());
+        error.failure_cause = Some(cause);
+        error
+    }
+
     /// A business projection may retain its original typed calculation cause.
     /// The descriptor selects the public error; the cause remains available
     /// to the original owner and is never reconstructed from its display text.

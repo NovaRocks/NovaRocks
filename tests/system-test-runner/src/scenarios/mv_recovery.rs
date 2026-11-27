@@ -3,12 +3,9 @@ pub(super) mod control_plan;
 
 use novarocks_query_application::api::ExecutionFailurePresentation;
 
+use super::mv_uea7::{ManagedMvRestFixture, property, status, wait_for_status_phase};
 use super::mv_uea7::{
-    ManagedMvRestFixture, property, require_status_phase, status, wait_for_status_phase,
-};
-use super::mv_uea7::{
-    mv_properties, mv_public_error, mv_response_needs_cancel, mv_response_with_cleanup, mv_rows,
-    mv_text_lines,
+    mv_public_error, mv_response_needs_cancel, mv_response_with_cleanup, mv_rows, mv_text_lines,
 };
 use crate::actors::sql::{SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{
@@ -17,7 +14,10 @@ use crate::scenario::{
 use anyhow::{Context, Result, bail, ensure};
 use control_plan::FeLaunchIntent;
 use novarocks_cluster_harness::TestClusterOwner;
-use novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan;
+use novarocks_cluster_harness::publication_catalog::{
+    PublicationAction, PublicationCatalogFixture, PublicationFault, RetainedMvCommit,
+};
+use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
 use reqwest::blocking::Client;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const RESTART_MAINTENANCE_CADENCE: &str = "iceberg_maintenance_tick_interval_ms = 1000\n";
+
+fn configure_restart_maintenance_cadence(launch: &mut ScenarioLaunchConfig) {
+    // A restart can need one pass for catalog rediscovery and another after
+    // the fixture has proved settlement and supplied the declaration.
+    let overlay = launch.config_overlay.fe.get_or_insert_with(String::new);
+    overlay.push_str("\n[standalone_server]\n");
+    overlay.push_str(RESTART_MAINTENANCE_CADENCE);
+}
 
 /// The task protocol's only fault that fails a participant which was admitted,
 /// published RUNNING, and then failed on its own. It replaces the retired
@@ -47,10 +56,899 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(MvLegacyInterpretationRebuild::default()),
         Box::new(MvRefreshConfigurationInterleaving::default()),
         Box::new(MvStagedPublishedRecovery::default()),
+        Box::new(MvContentPendingRecovery::default()),
+        Box::new(MvContentPendingRecovery {
+            mode: ContentRecoveryMode::SlotChange,
+            ..Default::default()
+        }),
+        Box::new(MvContentPendingRecovery {
+            mode: ContentRecoveryMode::Budget,
+            ..Default::default()
+        }),
+        Box::new(MvNameGraceRestart::default()),
+        Box::new(MvLateContentEffect::new(RetainedMvCommit::Publication)),
+        Box::new(MvLateContentEffect::new(RetainedMvCommit::Retirement)),
+        Box::new(MvLateContentEffect::new(RetainedMvCommit::PendingMarker)),
         Box::new(MvFirstRefreshStaging::default()),
         Box::new(MvBaseIdentityReplacement::default()),
         Box::new(MvLakePublicationRestartRebuild::default()),
     ]
+}
+
+#[derive(Default)]
+struct MvNameGraceRestart {
+    fixture: Mutex<Option<(ManagedMvRestFixture, PublicationCatalogFixture)>>,
+}
+
+impl Scenario for MvNameGraceRestart {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_recovery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
+    fn name(&self) -> &'static str {
+        "mv/name-grace-restart"
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (rest, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_name_grace")?;
+        configure_restart_maintenance_cadence(&mut launch);
+        let proxy = PublicationCatalogFixture::start(rest.rest_uri().to_owned())?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?;
+        ensure!(slot.is_none(), "managed MV fixture was initialized twice");
+        *slot = Some((rest, proxy));
+        Ok(launch)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        use super::mv_uea7_documents::load_metadata;
+
+        const CATALOG: &str = "system_mv_name_grace";
+        const TARGET: &str = "orders_mv";
+        const CREATE: &str = "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders";
+        const READ: &str = "SELECT k1, v2 FROM orders_mv ORDER BY k1";
+        require_three_backends(context)?;
+        let (create_catalog, rest_uri, proxy) = {
+            let fixture = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?;
+            let (rest, proxy) = fixture
+                .as_ref()
+                .context("managed MV fixture is missing after cluster launch")?;
+            (
+                rest.create_catalog_sql()
+                    .replace(rest.rest_uri(), proxy.uri()),
+                rest.rest_uri().to_owned(),
+                proxy.control()?,
+            )
+        };
+        let mut conn = connect(context)?;
+        setup_orders_fixture_rest(context, &mut conn, CATALOG, &create_catalog, true)?;
+        execute(
+            context,
+            &mut conn,
+            "create the original MV generation",
+            CREATE,
+        )?;
+        refresh(context, &mut conn, TARGET)?;
+        let original = load_metadata(context, &rest_uri, "ns", TARGET)?;
+
+        context.handle().defer_fe_mv_startup_isolation();
+        let fault = proxy.arm_next_for_table(
+            PublicationAction::CatalogMutation.as_str(),
+            PublicationFault::BeforeDispatchHoldAcrossFrontendExit.as_str(),
+            "ns",
+            TARGET,
+        )?;
+        let user = context.sql_user().to_owned();
+        let port = context.trino_port();
+        let deadline = context.deadline();
+        let original_drop = spawn_cancellable_sql_actor(move |cancellation| {
+            let mut session = SqlSession::new(&user, port, deadline)?;
+            session.execute(format!("USE {CATALOG}.ns"))?;
+            run_original_mv_statement(
+                &mut session,
+                "DROP MATERIALIZED VIEW orders_mv",
+                deadline,
+                &cancellation,
+            )
+        });
+        fault.wait_until_retained(deadline)?;
+        context
+            .handle()
+            .kill_fe()
+            .context("kill the FE while the proxy owns its original DROP")?;
+        expect_refresh_failure_after_fe_exit(
+            context,
+            original_drop,
+            "join the original DROP client after FE exit",
+        )?;
+        drop(conn);
+        restart_frontend(
+            context,
+            "restart FE while the original DROP remains retained",
+        )?;
+
+        let mut conn = connect(context)?;
+        select_catalog_and_database(context, &mut conn, CATALOG)?;
+        let blocked = conn
+            .execute(CREATE)
+            .expect_err("startup grace must fence a same-name CREATE");
+        let refusal = mv_public_error(&blocked)?;
+        ensure!(
+            refusal.message.contains("MV name operations")
+                && refusal
+                    .message
+                    .contains("deployment settlement declaration"),
+            "same-name CREATE did not receive the startup grace refusal: {refusal:?}"
+        );
+        assert_rows(
+            context,
+            &mut conn,
+            READ,
+            &[(1, 10), (2, 20)],
+            "read the old generation during name grace",
+        )?;
+        refresh_nonaggregate_after_restart(context, &mut conn, CATALOG, TARGET)?;
+
+        let evidence = fault.finish()?;
+        ensure!(
+            evidence.summary().contains("downstream-success"),
+            "retained old DROP did not succeed at the catalog: {}",
+            evidence.summary()
+        );
+        let loaded = Client::builder()
+            .no_proxy()
+            .timeout(context.remaining("confirm the old DROP landed at REST")?)
+            .build()?
+            .get(format!(
+                "{}/v1/namespaces/ns/tables/{TARGET}",
+                rest_uri.trim_end_matches('/')
+            ))
+            .send()?;
+        ensure!(
+            loaded.status() == reqwest::StatusCode::NOT_FOUND,
+            "old generation was still visible at REST after the original DROP"
+        );
+
+        context
+            .handle()
+            .declare_fe_mv_startup_effects_settled(deadline)?;
+        execute(
+            context,
+            &mut conn,
+            "create the successor generation after ending startup grace",
+            CREATE,
+        )?;
+        refresh(context, &mut conn, TARGET)?;
+        let successor = load_metadata(context, &rest_uri, "ns", TARGET)?;
+        ensure!(
+            original["table-uuid"].as_str().is_some()
+                && successor["table-uuid"].as_str().is_some()
+                && original["table-uuid"] != successor["table-uuid"],
+            "same-name CREATE did not publish a new exact table identity"
+        );
+        assert_rows(
+            context,
+            &mut conn,
+            READ,
+            &[(1, 10), (2, 20)],
+            "read the successor generation after the old DROP completed",
+        )
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?
+            .take();
+        if let Some((mut rest, mut proxy)) = fixture {
+            control_plan::with_cleanup(proxy.shutdown(), rest.shutdown())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct MvLateContentEffect {
+    owner: MvNameGraceRestart,
+    kind: RetainedMvCommit,
+    initial_fault: super::native_sql_controls::SqlIntentOwner,
+}
+
+impl MvLateContentEffect {
+    const REFRESH: &str = "REFRESH MATERIALIZED VIEW orders_mv";
+
+    fn new(kind: RetainedMvCommit) -> Self {
+        Self {
+            owner: MvNameGraceRestart::default(),
+            kind,
+            initial_fault: Default::default(),
+        }
+    }
+
+    fn run_refresh_with_missing_insert(
+        &self,
+        context: &mut ScenarioContext,
+        conn: &mut SqlSession,
+    ) -> Result<()> {
+        let selected = self.initial_fault.take(0)?;
+        let pending = conn.submit(Self::REFRESH)?;
+        let (pending, observation) = selected.arm_pending(context, pending, Self::REFRESH)?;
+        let cancel = pending.cancel_handle();
+        let updated = conn.run_pending(pending);
+        let hits = (|| {
+            let mut hits = 0;
+            for &(index, kind) in &selected.faults {
+                hits += usize::from(context.handle().selected_query_lifecycle_fault_hit(
+                    index,
+                    kind,
+                    &selected.token,
+                )?);
+            }
+            ensure!(
+                hits == 1,
+                "the original one-row content insertion had {hits} fault hits"
+            );
+            Ok(())
+        })();
+        let mut cleanup = if mv_response_needs_cancel(&updated) {
+            cancel
+                .delete(selected.deadline)
+                .map_err(anyhow::Error::from)
+        } else {
+            Ok(())
+        };
+        for &(index, kind) in &selected.faults {
+            let ended =
+                context
+                    .handle()
+                    .end_selected_query_lifecycle_fault(index, kind, &selected.token);
+            cleanup = control_plan::with_cleanup(cleanup, ended);
+        }
+        cleanup = control_plan::with_cleanup(
+            cleanup,
+            context
+                .handle()
+                .drain_query_lifecycle_statement_binding(&observation, selected.deadline),
+        );
+        mv_response_with_cleanup(updated, control_plan::with_cleanup(hits, cleanup))??;
+        Ok(())
+    }
+}
+
+impl Scenario for MvLateContentEffect {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_recovery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
+    fn name(&self) -> &'static str {
+        match self.kind {
+            RetainedMvCommit::Publication => "mv/content-late-landing",
+            RetainedMvCommit::Retirement => "mv/content-late-retirement",
+            RetainedMvCommit::PendingMarker => "mv/content-late-pending-marker",
+        }
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        self.owner.launch_config(scenario_root)
+    }
+
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        if self.kind != RetainedMvCommit::Retirement {
+            return Ok(None);
+        }
+        let fault = novarocks_failpoint::QueryLifecycleFaultKind::MvContentApplyDropInsert.as_str();
+        let mut plan = self.initial_fault.freeze(
+            vec![super::native_sql_controls::StatementSpec {
+                sql: Self::REFRESH.into(),
+                faults: (0..cluster_size).map(|index| (index, fault)).collect(),
+                observations: vec![],
+            }],
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+        )?;
+        let successor = plan.reserve_launch(RoleSlot::Frontend)?;
+        plan.authorize_ordinary_launch(&successor, binary.to_path_buf())?;
+        plan.validate_selected_intents(cluster_size)?;
+        Ok(Some(plan))
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        use super::mv_uea7_documents::load_metadata;
+
+        const CATALOG: &str = "system_mv_name_grace";
+        const TARGET: &str = "orders_mv";
+        const READ: &str = "SELECT k1, v2 FROM orders_mv ORDER BY k1";
+        require_three_backends(context)?;
+        let (create_catalog, rest_uri, proxy) = {
+            let fixture = self
+                .owner
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?;
+            let (rest, proxy) = fixture.as_ref().context("managed MV fixture is missing")?;
+            (
+                rest.create_catalog_sql()
+                    .replace(rest.rest_uri(), proxy.uri()),
+                rest.rest_uri().to_owned(),
+                proxy.control()?,
+            )
+        };
+
+        let mut conn = connect(context)?;
+        setup_orders_fixture_rest(context, &mut conn, CATALOG, &create_catalog, false)?;
+        execute(
+            context,
+            &mut conn,
+            "keep separate cold and visible input files",
+            "ALTER TABLE orders ADD COLUMN payload VARCHAR",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "write the filtered source file",
+            "INSERT INTO orders SELECT -id, -id, to_hex(sha256(to_utf8(CAST(id AS VARCHAR)))) FROM TABLE(sequence(1, 4096)) AS cold(id)",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "seed visible rows",
+            "INSERT INTO orders VALUES (1, 10, 'first'), (2, 20, 'retained')",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "create a visible projection MV",
+            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders WHERE v2 > 0",
+        )?;
+        refresh(context, &mut conn, TARGET)?;
+        execute(
+            context,
+            &mut conn,
+            "remove a source occurrence",
+            "DELETE FROM orders WHERE k1 = 1",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "add the next source occurrence",
+            "INSERT INTO orders VALUES (3, 30, 'next')",
+        )?;
+        assert_content_refresh_explain(context, &mut conn, "ContentLocate")?;
+
+        if self.kind == RetainedMvCommit::Retirement {
+            self.run_refresh_with_missing_insert(context, &mut conn)?;
+            assert_rows(
+                context,
+                &mut conn,
+                READ,
+                &[(2, 20)],
+                "verify the original target is missing the injected row",
+            )?;
+            execute(
+                context,
+                &mut conn,
+                "retract the missing source occurrence",
+                "DELETE FROM orders WHERE k1 = 3",
+            )?;
+            assert_content_refresh_explain(context, &mut conn, "ContentLocate")?;
+        }
+
+        let original = load_metadata(context, &rest_uri, "ns", TARGET)?;
+        let original_snapshot = original["current-snapshot-id"]
+            .as_i64()
+            .context("the original visible MV has no Current snapshot")?;
+        context.handle().defer_fe_mv_startup_isolation();
+        let fault = proxy.retain_mv_commit("ns", TARGET, self.kind)?;
+        let deadline = context.deadline();
+        let old_refresh = spawn_refresh(
+            context.sql_user().to_owned(),
+            context.trino_port(),
+            CATALOG,
+            TARGET,
+            deadline,
+        );
+        fault.wait_until_retained(deadline)?;
+        context
+            .handle()
+            .kill_fe()
+            .context("kill the FE while the proxy owns its original main-advancing publication")?;
+        expect_refresh_failure_after_fe_exit(
+            context,
+            old_refresh,
+            "join the old refresh after the FE exits",
+        )?;
+        drop(conn);
+        restart_frontend(context, "replace FE while the stale request remains held")?;
+
+        let mut conn = connect(context)?;
+        select_catalog_and_database(context, &mut conn, CATALOG)?;
+        require_nonaggregate_management_after_restart(context, &mut conn, CATALOG, TARGET)?;
+        let strategy = if self.kind == RetainedMvCommit::PendingMarker {
+            "ContentLocate"
+        } else {
+            "StrictRecovery"
+        };
+        assert_content_refresh_explain(context, &mut conn, strategy)?;
+        if self.kind == RetainedMvCommit::Retirement {
+            let retirement = conn
+                .execute(Self::REFRESH)
+                .expect_err("the successor must report the genuine delete deficit");
+            ensure!(
+                mv_public_error(&retirement)?
+                    .message
+                    .contains("requires an explicit rebuild"),
+                "the replacement FE did not retire the original insufficient target"
+            );
+        } else {
+            refresh(context, &mut conn, TARGET)?;
+            assert_rows(
+                context,
+                &mut conn,
+                READ,
+                &[(2, 20), (3, 30)],
+                "read the successor publication",
+            )?;
+        }
+        let successor = load_metadata(context, &rest_uri, "ns", TARGET)?;
+        let successor_snapshot = successor["current-snapshot-id"]
+            .as_i64()
+            .context("the replacement FE produced no Current snapshot")?;
+        ensure!(
+            successor_snapshot != original_snapshot,
+            "the replacement FE did not advance main before releasing the old request"
+        );
+        if self.kind == RetainedMvCommit::Retirement {
+            let selected = successor["snapshots"]
+                .as_array()
+                .and_then(|snapshots| {
+                    snapshots.iter().find(|snapshot| {
+                        snapshot["snapshot-id"].as_i64() == Some(successor_snapshot)
+                    })
+                })
+                .context("REST did not retain the replacement FE's Current retirement snapshot")?;
+            ensure!(
+                selected["summary"]
+                    .get("novarocks.doc.v2.record.novarocks.mv~retirement")
+                    .is_some()
+                    && selected["summary"]
+                        .get("novarocks.doc.v2.record.novarocks.mv~publication")
+                        .is_none(),
+                "the replacement FE's Current snapshot does not prove retirement"
+            );
+        }
+
+        let evidence = fault.finish()?;
+        let trace = evidence.summary();
+        fs::write(
+            context.scenario_root().join("retained-mv-request.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "original_snapshot":original_snapshot,
+                "successor_snapshot":successor_snapshot,
+                "effect":self.kind,
+                "events":evidence.trace(),
+            }))?,
+        )?;
+        ensure!(
+            trace.contains("downstream-conflict")
+                && trace.matches("request-forwarded").count() == 1,
+            "old publication did not encounter one actual conditional conflict: {trace}"
+        );
+        let after_release = load_metadata(context, &rest_uri, "ns", TARGET)?;
+        assert_rest_snapshot_state_unchanged(&successor, &after_release)?;
+        if self.kind == RetainedMvCommit::PendingMarker {
+            let marker_properties = |metadata: &serde_json::Value| {
+                metadata["properties"]
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|props| {
+                        props
+                            .iter()
+                            .filter(|(key, _)| {
+                                key.starts_with("novarocks.doc.v2.mark.novarocks.mv~pending~")
+                            })
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            ensure!(
+                marker_properties(&successor) == marker_properties(&after_release),
+                "the old Pending marker entered the successor's metadata"
+            );
+        }
+        let status = status(context, &mut conn, CATALOG, TARGET)?;
+        ensure!(
+            property(&status, "UnsettledEffects")? == "0",
+            "the stale effect created an MV management barrier"
+        );
+        context
+            .handle()
+            .declare_fe_mv_startup_effects_settled(deadline)?;
+        if self.kind == RetainedMvCommit::Retirement {
+            execute(
+                context,
+                &mut conn,
+                "make the base bag distinct from retired storage",
+                "INSERT INTO orders VALUES (4, 40, 'new')",
+            )?;
+            execute(
+                context,
+                &mut conn,
+                "allow ordinary rewrite selection",
+                "SET SESSION enable_materialized_view_rewrite = true",
+            )?;
+            assert_rows(
+                context,
+                &mut conn,
+                "SELECT k1, v2 FROM orders WHERE v2 > 0 ORDER BY k1",
+                &[(2, 20), (4, 40)],
+                "prove a reader does not use the retired target",
+            )
+        } else {
+            assert_rows(
+                context,
+                &mut conn,
+                READ,
+                &[(2, 20), (3, 30)],
+                "prove the old request did not alter the reader's bag",
+            )
+        }
+    }
+
+    fn teardown(&self) -> Result<()> {
+        self.owner.teardown()
+    }
+}
+#[derive(Default)]
+struct MvContentPendingRecovery {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+    mode: ContentRecoveryMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ContentRecoveryMode {
+    #[default]
+    Restart,
+    SlotChange,
+    Budget,
+}
+
+impl MvContentPendingRecovery {
+    const CATALOG: &str = "system_mv_content_pending";
+    const TARGET: &str = "orders_mv";
+    const CLOSE_TOKEN: &str = "content-pending-exact-enumeration-close";
+}
+
+impl Scenario for MvContentPendingRecovery {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_recovery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
+    fn name(&self) -> &'static str {
+        match self.mode {
+            ContentRecoveryMode::Restart => "mv/content-strict-recovery-restart",
+            ContentRecoveryMode::SlotChange => "mv/content-pending-slot-change",
+            ContentRecoveryMode::Budget => "mv/content-deployment-budget",
+        }
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, mut launch) = ManagedMvRestFixture::start(scenario_root, Self::CATALOG)?;
+        if self.mode != ContentRecoveryMode::Budget {
+            configure_restart_maintenance_cadence(&mut launch);
+        }
+        if self.mode == ContentRecoveryMode::Budget {
+            launch
+                .config_overlay
+                .fe
+                .get_or_insert_with(String::new)
+                .push_str("\n[runtime]\noptimizer_query_mem_limit_bytes = 1\n");
+        }
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?;
+        ensure!(slot.is_none(), "managed MV fixture was initialized twice");
+        *slot = Some(fixture);
+        Ok(launch)
+    }
+
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        if self.mode == ContentRecoveryMode::Budget {
+            return Ok(None);
+        }
+        control_plan::plan(
+            cluster_size,
+            binary,
+            deadline,
+            vec![
+                FeLaunchIntent::MvActions(vec![control_plan::close_content_target(
+                    Self::CATALOG,
+                    "ns",
+                    Self::TARGET,
+                    Self::CLOSE_TOKEN,
+                )]),
+                FeLaunchIntent::Ordinary,
+            ],
+        )
+        .map(Some)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?
+            .as_ref()
+            .context("managed MV fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
+        let mut conn = connect(context)?;
+        setup_orders_fixture_rest(
+            context,
+            &mut conn,
+            Self::CATALOG,
+            &create_catalog_sql,
+            false,
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "widen the original source files",
+            "ALTER TABLE orders ADD COLUMN payload VARCHAR",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "write a separate filtered source file",
+            "INSERT INTO orders SELECT -id, -id, to_hex(sha256(to_utf8(CAST(id AS VARCHAR)))) FROM TABLE(sequence(1, 4096)) AS cold(id)",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "seed the visible source rows",
+            "INSERT INTO orders VALUES (1, 10, 'first'), (2, 20, 'retained')",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "create a projection MV",
+            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL', partitioning = ARRAY['k1']) AS SELECT k1, v2 FROM orders WHERE v2 > 0",
+        )?;
+        refresh(context, &mut conn, Self::TARGET)?;
+        execute(
+            context,
+            &mut conn,
+            "retract a visible source row",
+            "DELETE FROM orders WHERE k1 = 1",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "append the next visible source row",
+            "INSERT INTO orders VALUES (3, 30, 'next')",
+        )?;
+        if self.mode == ContentRecoveryMode::Budget {
+            let plan = query(
+                context,
+                &mut conn,
+                "EXPLAIN REFRESH MATERIALIZED VIEW orders_mv",
+                "prove the original deployment budget rejects the content candidate",
+            )?;
+            let lines = mv_text_lines(&plan)?;
+            ensure!(
+                lines
+                    .iter()
+                    .any(|(line,)| line == "MV refresh: FullReplace")
+                    && lines.iter().any(|(line,)| {
+                        line.starts_with("ContentLocate unavailable: MV content location estimate")
+                            && line.contains("exceeds its deployment budget 1 bytes")
+                    }),
+                "a low deployment budget did not select its admitted complete fallback: {lines:?}"
+            );
+            refresh(context, &mut conn, Self::TARGET)?;
+            assert_rows(
+                context,
+                &mut conn,
+                "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+                &[(2, 20), (3, 30)],
+                "validate the independent source bag after the admitted FullReplace",
+            )?;
+            execute(
+                context,
+                &mut conn,
+                "disable MV rewrite for the full source check",
+                "SET SESSION enable_materialized_view_rewrite = false",
+            )?;
+            return assert_rows(
+                context,
+                &mut conn,
+                "SELECT k1, v2 FROM orders WHERE v2 > 0 ORDER BY k1",
+                &[(2, 20), (3, 30)],
+                "read the complete original source after admission rejects ContentLocate",
+            );
+        }
+        assert_content_refresh_explain(context, &mut conn, "ContentLocate")?;
+
+        context.action("close the exact content target scan before its original end");
+        let failed = conn
+            .execute("REFRESH MATERIALIZED VIEW orders_mv")
+            .expect_err("incomplete target enumeration must fail the refresh");
+        let failure = mv_public_error(&failed)
+            .context("incomplete target enumeration must report a public statement error")?;
+        ensure!(
+            failure
+                .message
+                .contains("complete scan enumeration and delivery"),
+            "refresh did not report its missing enumeration proof: {failure:?}"
+        );
+        let log = context.handle().fe_server_info_log()?;
+        ensure!(
+            log.lines().any(|line| line.contains(
+                novarocks_failpoint::observation_marker::MV_CONTENT_TARGET_ENUMERATION_CLOSED
+            ) && line.contains(Self::CLOSE_TOKEN)),
+            "the exact content-target control did not consume its grant"
+        );
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(1, 10), (2, 20)],
+            "prove no data publication after incomplete target enumeration",
+        )?;
+        assert_content_refresh_explain(context, &mut conn, "StrictRecovery")?;
+        if self.mode == ContentRecoveryMode::SlotChange {
+            execute(
+                context,
+                &mut conn,
+                "change the scheduling slot while the original content window is Pending",
+                "ALTER MATERIALIZED VIEW orders_mv SET PROPERTIES refresh_paused = true",
+            )?;
+            assert_content_refresh_explain(context, &mut conn, "StrictRecovery")?;
+        }
+
+        drop(conn);
+        restart_frontend(
+            context,
+            "replace the FE while the original content window is Pending",
+        )?;
+        let mut conn = connect(context)?;
+        select_catalog_and_database(context, &mut conn, Self::CATALOG)?;
+        require_nonaggregate_management_after_restart(
+            context,
+            &mut conn,
+            Self::CATALOG,
+            Self::TARGET,
+        )?;
+        assert_content_refresh_explain(context, &mut conn, "StrictRecovery")?;
+        let before_pruning = context.handle().fe_server_info_log()?;
+        refresh(context, &mut conn, Self::TARGET)?;
+        if self.mode == ContentRecoveryMode::SlotChange {
+            let slot = query(
+                context,
+                &mut conn,
+                &format!(
+                    "SELECT refresh_paused FROM system.runtime.materialized_view_states \
+                     WHERE catalog_name = '{}' AND schema_name = 'ns' AND name = '{}'",
+                    Self::CATALOG,
+                    Self::TARGET
+                ),
+                "read the persisted scheduling slot after strict recovery",
+            )?;
+            ensure!(
+                slot.rows == [vec![TrinoValue::Boolean(true)]],
+                "strict recovery did not preserve the paused scheduling slot: {:?}",
+                slot.rows
+            );
+        }
+        let after_pruning = context.handle().fe_server_info_log()?;
+        let original_ledger = |text: &str| {
+            text.lines()
+                .filter(|line| {
+                    line.contains(novarocks_failpoint::observation_marker::MV_SCAN_PRUNING_COVERAGE)
+                        && line.contains("basis=DynamicFilter")
+                        && line.contains("identity_digest=")
+                        && line.split_whitespace().any(|field| {
+                            field
+                                .strip_prefix("files=")
+                                .and_then(|count| count.parse::<u64>().ok())
+                                .is_some_and(|count| count != 0)
+                        })
+                })
+                .count()
+        };
+        ensure!(
+            original_ledger(&after_pruning) > original_ledger(&before_pruning),
+            "the successful exact target enumeration did not account for demand-based file pruning"
+        );
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(2, 20), (3, 30)],
+            "compare the recovered MV with the independently derived source rows",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "disable MV rewrite for the full source check",
+            "SET SESSION enable_materialized_view_rewrite = false",
+        )?;
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders WHERE v2 > 0 ORDER BY k1",
+            &[(2, 20), (3, 30)],
+            "verify the full source result for the recovered window",
+        )
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?
+            .take();
+        fixture.map_or(Ok(()), |mut fixture| fixture.shutdown())
+    }
+}
+
+fn assert_content_refresh_explain(
+    context: &mut ScenarioContext,
+    conn: &mut SqlSession,
+    strategy: &str,
+) -> Result<()> {
+    let explain = query(
+        context,
+        conn,
+        "EXPLAIN REFRESH MATERIALIZED VIEW orders_mv",
+        "inspect the chosen content refresh strategy",
+    )?;
+    let expected = format!("MV refresh: {strategy}");
+    let lines = mv_text_lines(&explain)?;
+    ensure!(
+        lines.iter().any(|(line,)| line == &expected),
+        "missing {expected:?} in refresh plan: {lines:?}"
+    );
+    Ok(())
 }
 
 #[derive(Default)]
@@ -73,7 +971,9 @@ impl Scenario for MvStateStoreRestart {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let (fixture, launch) = ManagedMvRestFixture::start(scenario_root, "system_mv_restart")?;
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_restart")?;
+        configure_restart_maintenance_cadence(&mut launch);
         let mut slot = self
             .fixture
             .lock()
@@ -142,28 +1042,7 @@ impl Scenario for MvStateStoreRestart {
             &[(1, 10), (2, 20)],
             "read existing MV after FE restart",
         )?;
-        require_status_phase(
-            context,
-            &mut conn,
-            catalog,
-            "orders_mv",
-            "AWAITING_EFFECT_SETTLEMENT",
-            "confirm management is closed after FE restart",
-        )?;
-        let closed = status(context, &mut conn, catalog, "orders_mv")?;
-        let challenge = property(&closed, "Challenge")?;
-        let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
-        context.action("declare the old FE isolated and resume exact MV management");
-        let resumed: Vec<(String, Option<String>)> = mv_properties(&conn
-            .execute(format!(
-                "CALL novarocks_mv_resume_management('{catalog}', 'ns', 'orders_mv', \
-                 '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
-                 'the system scenario replaced the declared frontend process before this statement')"
-            ))
-            .context("resume managed MV after StateStore restart")?)?;
-        if property(&resumed, "SettledEffects")? != "1" {
-            bail!("StateStore restart readmission did not settle the old incarnation");
-        }
+        require_nonaggregate_management_after_restart(context, &mut conn, catalog, "orders_mv")?;
         refresh(context, &mut conn, "orders_mv")?;
         execute(
             context,
@@ -260,6 +1139,7 @@ mv_refresh_scheduler_failure_backoff_ms = 100
 mv_refresh_scheduler_max_failure_backoff_ms = 1000
 "#,
         );
+        fe_overlay.push_str(RESTART_MAINTENANCE_CADENCE);
         launch.config_overlay.fe = Some(fe_overlay);
         Ok(launch)
     }
@@ -498,7 +1378,12 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
         restart_frontend(context, "restart FE after interrupted scheduler refresh")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
-        resume_management_after_fe_restart(context, &mut conn, catalog, "orders_mv_recovery")?;
+        require_nonaggregate_management_after_restart(
+            context,
+            &mut conn,
+            catalog,
+            "orders_mv_recovery",
+        )?;
         wait_for_rows(
             context,
             &mut conn,
@@ -520,7 +1405,7 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             );
         }
         context.action("verified the scheduler consumed its transient preparation fault");
-        context.action("scheduler caught up after explicit FE readmission and one transient preparation failure");
+        context.action("scheduler caught up automatically after FE restart and one transient preparation failure");
         Ok(())
     }
 
@@ -1896,6 +2781,7 @@ impl Scenario for MvLegacyInterpretationRebuild {
             frontend: ScenarioBinary::Compatible,
             backends: vec![ScenarioBinary::Compatible; 3],
         };
+        configure_restart_maintenance_cadence(&mut launch);
         let mut slot = self
             .fixture
             .lock()
@@ -2123,7 +3009,9 @@ impl Scenario for MvStagedPublishedRecovery {
         fs::create_dir_all(&fault_dir).with_context(|| {
             format!("create MV recovery fault directory {}", fault_dir.display())
         })?;
-        let (fixture, launch) = ManagedMvRestFixture::start(scenario_root, "system_mv_recovery")?;
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_recovery")?;
+        configure_restart_maintenance_cadence(&mut launch);
         let mut slot = self
             .fixture
             .lock()
@@ -2240,7 +3128,7 @@ impl Scenario for MvStagedPublishedRecovery {
             &[(1, 10), (2, 20)],
             "verify the committed publication survived the unrecorded crash",
         )?;
-        resume_and_refresh_after_fe_restart(context, &mut conn, catalog, "orders_mv")?;
+        refresh_nonaggregate_after_restart(context, &mut conn, catalog, "orders_mv")?;
         assert_rows(
             context,
             &mut conn,
@@ -2297,7 +3185,7 @@ impl Scenario for MvStagedPublishedRecovery {
             &[(1, 10), (2, 20), (3, 30)],
             "verify published snapshot remains visible after recovery",
         )?;
-        resume_and_refresh_after_fe_restart(context, &mut conn, catalog, "orders_mv")?;
+        refresh_nonaggregate_after_restart(context, &mut conn, catalog, "orders_mv")?;
         context.action("staged and published crash windows converged through public MV behavior");
         Ok(())
     }
@@ -2534,8 +3422,9 @@ impl Scenario for MvBaseIdentityReplacement {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let (fixture, launch) =
+        let (fixture, mut launch) =
             ManagedMvRestFixture::start(scenario_root, "system_mv_base_identity")?;
+        configure_restart_maintenance_cadence(&mut launch);
         let mut slot = self
             .fixture
             .lock()
@@ -2709,8 +3598,9 @@ impl Scenario for MvLakePublicationRestartRebuild {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let (fixture, launch) =
+        let (fixture, mut launch) =
             ManagedMvRestFixture::start(scenario_root, "system_mv_lake_rebuild")?;
+        configure_restart_maintenance_cadence(&mut launch);
         let mut slot = self
             .fixture
             .lock()
@@ -2826,8 +3716,8 @@ impl Scenario for MvLakePublicationRestartRebuild {
             &[(1, 10), (2, 20)],
             "read MV rediscovered from canonical lake publication",
         )?;
-        resume_and_refresh_after_fe_restart(context, &mut conn, catalog, "orders_mv")?;
-        context.action("verified MV wipe, restart, readmission and refresh from lake documents");
+        refresh_nonaggregate_after_restart(context, &mut conn, catalog, "orders_mv")?;
+        context.action("verified MV wipe, restart and automatic refresh from lake documents");
         Ok(())
     }
 
@@ -3919,45 +4809,34 @@ fn expect_refresh_failure_after_fe_exit(
     }
 }
 
-fn resume_and_refresh_after_fe_restart(
+fn refresh_nonaggregate_after_restart(
     context: &mut ScenarioContext,
     conn: &mut SqlSession,
     catalog: &str,
     mv: &str,
 ) -> Result<()> {
-    resume_management_after_fe_restart(context, conn, catalog, mv)?;
+    require_nonaggregate_management_after_restart(context, conn, catalog, mv)?;
     refresh(context, conn, mv)
 }
 
-fn resume_management_after_fe_restart(
+fn require_nonaggregate_management_after_restart(
     context: &mut ScenarioContext,
     conn: &mut SqlSession,
     catalog: &str,
     mv: &str,
 ) -> Result<()> {
-    let closed = wait_for_status_phase(
+    let available = wait_for_status_phase(
         context,
         conn,
         catalog,
         mv,
-        "AWAITING_EFFECT_SETTLEMENT",
-        "wait for post-crash MV management to require effect settlement",
+        "MANAGEABLE",
+        "wait for automatic management admission after FE replacement",
     )?;
-    let challenge = property(&closed, "Challenge")?;
-    let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
-    context.action("declare the crashed FE isolated and resume exact MV management");
-    let resumed: Vec<(String, Option<String>)> = mv_properties(
-        &conn
-            .execute(format!(
-                "CALL novarocks_mv_resume_management('{catalog}', 'ns', '{mv}', \
-             '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
-             'the system scenario replaced the declared frontend process before this statement')"
-            ))
-            .context("resume managed MV after frontend replacement")?,
-    )?;
-    if property(&resumed, "SettledEffects")? != "1" {
-        bail!("frontend replacement did not settle the old FE effect");
-    }
+    ensure!(
+        property(&available, "UnsettledEffects")? == "0",
+        "non-aggregate MV shows an unsettled effect after automatic management admission"
+    );
     Ok(())
 }
 

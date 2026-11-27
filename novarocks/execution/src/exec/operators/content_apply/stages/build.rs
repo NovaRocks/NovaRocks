@@ -26,6 +26,7 @@ use crate::exec::{
         BulkBuildGraph, BulkInput, CaptureBuilder, CaptureWork, CompleteInput, EvaluatedPage,
         IndexPurpose,
     },
+    operators::hashjoin::native_runtime_filter::NativeRuntimeFilterProducerSet,
     pipeline::{
         driver_step::DriverStep,
         step::{NextStep, StepResult},
@@ -37,6 +38,7 @@ use crate::exec::{
         stage_completion::RemainingDemand,
     },
 };
+use novarocks_failure_contract::{FailureClass, FailureProjection};
 
 pub(super) enum Finalize {
     Collect,
@@ -46,6 +48,11 @@ pub(super) enum Finalize {
         weights: Vec<CapturedWeights>,
     },
     Weights(WeightFinalizer),
+    Demand {
+        index: ContentApplyIndex,
+        next_key: usize,
+        producer: NativeRuntimeFilterProducerSet,
+    },
     Done,
 }
 
@@ -181,14 +188,58 @@ pub(super) fn drive_finalize(
                     unreachable!()
                 };
                 let index = finalizer.finish(&work)?;
+                if let Some(factory) = &host.stages.demand_producer {
+                    let mut producer = factory.create_for_driver(1, 0)?;
+                    producer.bind(1)?;
+                    *state = Finalize::Demand {
+                        index,
+                        next_key: 0,
+                        producer,
+                    };
+                    return Ok(StepResult::new(None, NextStep::Runnable, 0));
+                }
                 let keys = index.len();
-                // Demand interests use this one finalized index publication.
                 frame
                     .inputs
                     .publish(funded_shared(work.owner, index)?, keys)?;
                 return Ok(StepResult::new(None, NextStep::Finished, 0));
             }
             return Ok(StepResult::new(None, NextStep::Yield, 0));
+        }
+        Finalize::Demand {
+            index,
+            next_key,
+            producer,
+        } => {
+            if producer.accepts_input() && *next_key < index.len() {
+                let count = (index.len() - *next_key)
+                    .min(host.stages.output_rows.get())
+                    .min(ctx.work().remaining() as usize);
+                if count == 0 || !ctx.work().try_consume(count as u32) {
+                    return Ok(StepResult::new(None, NextStep::Yield, 0));
+                }
+                let end = *next_key + count;
+                match index.export_demand(*next_key..end, &work) {
+                    Ok(demand) => producer.submit(demand.arrays())?,
+                    Err(cause) if cause.failure_fact().class() == FailureClass::Resource => {
+                        producer.fail(crate::runtime_filter::RuntimeFilterProducerFailure::UpstreamUnavailable)?;
+                    }
+                    Err(cause) => return Err(cause),
+                }
+                *next_key = end;
+            }
+            if *next_key == index.len() || !producer.accepts_input() {
+                producer.finish()?;
+                let Finalize::Demand { index, .. } = std::mem::replace(state, Finalize::Done)
+                else {
+                    unreachable!()
+                };
+                let keys = index.len();
+                frame
+                    .inputs
+                    .publish(funded_shared(work.owner, index)?, keys)?;
+                return Ok(StepResult::new(None, NextStep::Finished, 0));
+            }
         }
         Finalize::Done => return Ok(StepResult::new(None, NextStep::Finished, 0)),
     }

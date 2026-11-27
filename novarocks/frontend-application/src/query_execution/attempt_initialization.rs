@@ -929,10 +929,6 @@ pub(crate) struct AttemptInitializing {
 
 impl AttemptInitializing {
     /// The MV native phase selects this before any of the attempt's reads open.
-    #[expect(
-        dead_code,
-        reason = "RWM-10c MV native initialization selects complete split enumeration."
-    )]
     pub(crate) fn require_enumeration_coverage(&mut self) {
         assert!(
             self.progress.state.next_scan == 0 && self.progress.expected.is_none(),
@@ -942,15 +938,10 @@ impl AttemptInitializing {
     }
 
     #[cfg(novarocks_dev_controls)]
-    #[expect(
-        dead_code,
-        reason = "RWM-10c MV native initialization binds the granted target close."
-    )]
     pub(crate) fn bind_content_target_early_close(
         &mut self,
-        scan: crate::query_execution::split_assignment::ScanNodeKey,
         fault: crate::mv::test_controls::ContentTargetEnumerationClose,
-    ) {
+    ) -> Result<(), &'static str> {
         assert!(
             self.progress.state.next_scan == 0 && self.progress.expected.is_none(),
             "control must bind before source opening"
@@ -960,6 +951,22 @@ impl AttemptInitializing {
             state.early_close.is_none(),
             "only one original target-close grant"
         );
+        let artifacts = state
+            .artifacts
+            .as_ref()
+            .expect("original frozen content target plan");
+        let mut targets = artifacts.typed_scans().filter(|&(fragment, node)| {
+            artifacts
+                .share_connector_attempt_access(fragment, node)
+                .is_some_and(|entry| entry.content_target)
+        });
+        let (fragment, node) = targets
+            .next()
+            .ok_or("MV content target close has no exact frozen scan")?;
+        if targets.next().is_some() {
+            return Err("MV content target close has multiple frozen scans");
+        }
+        let scan = crate::query_execution::split_assignment::ScanNodeKey::new(fragment, node);
         state.early_close = Some(
             crate::query_execution::split_assignment::ContentTargetEarlyClose {
                 execution: state.execution_id,
@@ -967,6 +974,7 @@ impl AttemptInitializing {
                 fault,
             },
         );
+        Ok(())
     }
 
     #[expect(
@@ -1149,10 +1157,6 @@ impl AttemptReady {
 
     /// The original covered attempt can have zero scans. Its empty roster
     /// still has an execution identity, even when no split pump is created.
-    #[expect(
-        dead_code,
-        reason = "RWM-10c publication receives original enumeration receipts."
-    )]
     pub(crate) fn enumeration_receipts(
         &self,
     ) -> Option<Arc<super::split_assignment::SplitEnumerationReceipts>> {

@@ -19,6 +19,26 @@ use std::collections::BTreeMap;
 
 use super::*;
 
+#[test]
+fn content_demand_binding_rejects_any_producer_coverage() {
+    let (_, mut filter) = super::content_apply_contract::runtime_filter_content_apply_fixture();
+    let mut errors = crate::validation::ValidationContext::new();
+    crate::validation::validate_runtime_filter_matrix(&filter, true, "content demand", &mut errors);
+    assert!(errors.into_vec().is_empty());
+    filter.availability_coverage.nodes[1] = RuntimeFilterCoverageNode::AnyOf {
+        children: Box::new([0]),
+    };
+    filter.terminal_coverage = filter.availability_coverage.clone();
+    let mut errors = crate::validation::ValidationContext::new();
+    crate::validation::validate_runtime_filter_matrix(&filter, true, "content demand", &mut errors);
+    assert!(
+        errors
+            .into_vec()
+            .iter()
+            .any(|error| error.message().contains("AllOf coverage"))
+    );
+}
+
 const PARTITIONED_FILTER: u32 = 101;
 const PARTITIONED_PRODUCER_FRAGMENT: u32 = 101;
 const PARTITIONED_CONSUMER_FRAGMENT: u32 = 900;

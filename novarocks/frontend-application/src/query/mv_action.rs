@@ -49,7 +49,9 @@ use novarocks_query_application::{
     },
     session_error::{QueryServiceError, QueryServiceErrorKind},
 };
-use novarocks_spi::connector::{ConnectorInstanceId, ConnectorRequestContext};
+use novarocks_spi::connector::{
+    ConnectorInstanceId, ConnectorOperationControl, ConnectorRequestContext,
+};
 use novarocks_sql::planning::mv::SqlMvTarget;
 use novarocks_workload_control::{WorkError, WorkScope};
 use std::{
@@ -61,6 +63,7 @@ use std::{
 /// created by copying these handles into the original command.
 #[derive(Clone)]
 pub(crate) struct MvExecutionServices {
+    pub(crate) query_memory_budget_bytes: u64,
     pub(crate) client: novarocks_query_application::api::QueryExecutionClient,
     #[cfg(novarocks_dev_controls)]
     pub(crate) controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
@@ -119,6 +122,51 @@ impl From<QueryServiceError> for MvPhaseFailure {
     }
 }
 
+/// Classify original evidence before rendering SQL or feeding the retry owner.
+pub(crate) fn classify_refresh_execution_failure(
+    error: &QueryServiceError,
+) -> novarocks_mv_application::refresh_failure::MvRefreshFailureClass {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, ResourceScope};
+    use novarocks_mv_application::refresh_failure::MvRefreshFailureClass as Class;
+    use novarocks_spi::connector::ConnectorErrorKind;
+
+    let cause = error.failure_cause();
+    let fact = error
+        .execution_failure()
+        .map(|failure| failure.fact())
+        .or_else(|| cause.map(|cause| cause.failure_fact()));
+    if cause
+        .and_then(|cause| cause.downcast_ref::<WorkError>())
+        .is_some_and(|error| {
+            matches!(
+                error,
+                WorkError::Capacity(_) | WorkError::CapacityWaitTimeout
+            )
+        })
+    {
+        return Class::TemporaryShortage;
+    }
+    if let Some(fact) = fact {
+        if fact.reason() == ConnectorErrorKind::Unavailable.failure_fact().reason() {
+            return Class::TemporaryShortage;
+        }
+        match fact
+            .resource()
+            .and_then(|resource| resource.constraint_scope)
+        {
+            Some(ResourceScope::Query) => return Class::RecoveryUnavailable,
+            Some(ResourceScope::Process) => return Class::TemporaryShortage,
+            _ => {}
+        }
+        if fact.class() == FailureClass::Data
+            || fact.reason() == ConnectorErrorKind::Unsupported.failure_fact().reason()
+        {
+            return Class::InvalidDataOrFormat;
+        }
+    }
+    Class::IncompleteEvidence
+}
+
 pub(crate) struct CreateRequest {
     pub(crate) target: SqlMvTarget,
     pub(crate) statement: crate::mv::domain::application::MvCreateStatement,
@@ -169,6 +217,7 @@ pub(super) enum StepRequest {
         target: SqlMvTarget,
         statement: MvRefreshRequest,
         repartition: Option<MvRepartitionFields>,
+        replay: Option<Arc<crate::mv::domain::refresh::pending_fence::PendingFence>>,
     },
     Unsupported {
         display_name: String,
@@ -214,6 +263,8 @@ struct MvCommandOriginal {
     graph: Option<dependencies::DependencyPreparation>,
     steps: std::collections::VecDeque<StepRequest>,
     active: Option<step::MvStepOriginal>,
+    retry: Option<RefreshRetryWait>,
+    retries: u32,
     retired: Vec<step::MvStepOriginal>,
     context_for_next: ConnectorRequestContext,
     progress_refusal: Option<WorkError>,
@@ -223,6 +274,12 @@ struct MvCommandOriginal {
     health: Option<StatementNativeHealthFailure>,
     completion: MvCommandCompletionReceiving,
     performed_publication: bool,
+}
+
+struct RefreshRetryWait {
+    request: StepRequest,
+    delay: std::pin::Pin<Box<tokio::time::Sleep>>,
+    failure: MvPhaseFailure,
 }
 
 pub(crate) fn prepare(
@@ -320,6 +377,8 @@ pub(crate) fn prepare_in(
             graph: None,
             steps: Default::default(),
             active: None,
+            retry: None,
+            retries: 0,
             retired: Vec::new(),
             context_for_next,
             progress_refusal: None,
@@ -553,6 +612,35 @@ impl MvCommandOriginal {
             if self.selected.is_some() {
                 break;
             }
+            if let Some(retry) = self.retry.as_mut() {
+                use std::future::Future;
+                if let Some(reason) = QueryCancellationView::governed(
+                    owner.cancellation().clone(),
+                    owner.timeout_ms(),
+                )
+                .reason()
+                {
+                    self.selected = Some(Err(crate::query::cancellation_error(reason).into()));
+                    self.retry.take();
+                    break;
+                }
+                let previous = self.retired.last().expect("retired original retry attempt");
+                if !previous.physical_exit_observed() || retry.delay.as_mut().poll(cx).is_pending()
+                {
+                    return Poll::Pending;
+                }
+                let retry = self.retry.take().unwrap();
+                if self
+                    .context_for_next
+                    .original_operation_control()
+                    .check_active()
+                    .is_err()
+                {
+                    self.selected = Some(Err(retry.failure));
+                    break;
+                }
+                self.steps.push_front(retry.request);
+            }
             if self.active.is_none() {
                 let Some(request) = self.steps.pop_front() else {
                     self.selected = Some(Ok(()));
@@ -585,13 +673,36 @@ impl MvCommandOriginal {
                         self.performed_publication |=
                             self.active.as_ref().unwrap().performed_publication();
                     }
-                    self.retired.push(self.active.take().unwrap());
+                    let active = self.active.take().unwrap();
+                    let request = result.as_ref().err().and_then(|failure| {
+                        use novarocks_mv_application::refresh_failure::MvRefreshFailureClass as Class;
+                        (classify_refresh_execution_failure(&failure.service) == Class::TemporaryShortage)
+                            .then(|| active.strict_retry_request()).flatten()
+                    });
+                    self.retired.push(active);
+                    if let (Some(request), Err(failure)) = (request, &result) {
+                        self.retries = self.retries.saturating_add(1);
+                        let delay = self.input.product.strict_refresh_retry_delay(self.retries);
+                        let now = tokio::time::Instant::now();
+                        if let Some(wake_at) = now.checked_add(delay)
+                            && wake_at
+                                < tokio::time::Instant::from_std(self.context_for_next.deadline())
+                        {
+                            self.retry = Some(RefreshRetryWait {
+                                request,
+                                delay: Box::pin(tokio::time::sleep_until(wake_at)),
+                                failure: failure.clone(),
+                            });
+                            continue;
+                        }
+                    }
                     match result {
                         Err(error) => {
                             self.selected = Some(Err(error));
                             break;
                         }
                         Ok(()) => {
+                            self.retries = 0;
                             self.context_for_next =
                                 self.context_for_next.clone().after_external_effect();
                         }

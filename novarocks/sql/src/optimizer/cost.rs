@@ -720,6 +720,12 @@ fn scan_bound_table_statistics(
 }
 
 fn scan_input_cost_size(scan: &ScanOp, input: &CostInput<'_>) -> f64 {
+    if let Some(bytes) = input
+        .stats_input
+        .and_then(|stats| stats.query_stats().file_bytes(scan.stats_ref?))
+    {
+        return finite_non_negative_cost(bytes as f64);
+    }
     let Some(table_stats) = scan_bound_table_statistics(scan, input.stats_input) else {
         return scan_cost_size(scan, input.own_stats);
     };
@@ -2334,6 +2340,37 @@ mod tests {
             estimate.cpu_cost >= 2000.0,
             "scan payload must use pre-predicate table rows, not filtered output rows: {estimate:?}"
         );
+    }
+
+    #[test]
+    fn mv_scan_volume_cost_uses_frozen_physical_bytes_before_projection() {
+        use crate::optimizer::stats_input::{OptimizerStatsInput, QueryStatsSnapshot, StatsRef};
+        let mut op = two_column_scan_op(Some(vec!["narrow"]));
+        let Operator::PhysicalScan(scan) = &mut op else {
+            panic!("expected scan");
+        };
+        let reference = StatsRef::new(3);
+        scan.stats_ref = Some(reference);
+        let cost = |file_bytes| {
+            let mut query_stats = QueryStatsSnapshot::empty();
+            query_stats.set_file_bytes(reference, file_bytes);
+            let input = OptimizerStatsInput::from_query_stats(&query_stats);
+            let statistics = stats(10.0, 8.0);
+            compute_cost_estimate(&CostInput {
+                op: &op,
+                own_stats: &statistics,
+                child_stats: &[],
+                child_outputs: &[],
+                required_output: &PhysicalPropertySet::any(),
+                alt_kind: &PropertyAlternativeKind::Default,
+                scalars: None,
+                stats_input: Some(&input),
+                options: &CostOptions::default(),
+            })
+            .cpu_cost
+        };
+        assert!(cost(4_096) > cost(512));
+        assert!(cost(0) < cost(512));
     }
 
     #[test]

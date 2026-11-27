@@ -108,6 +108,57 @@ struct Class {
     key: StoredKey,
     next: Option<usize>,
 }
+
+/// Known resident structures for a single bulk owner. Payload-width evidence,
+/// transient build peaks and runtime resource admission have their own authors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentKeyIndexSizing {
+    pub hash_buckets: usize,
+    pub hash_directory_bytes: u128,
+    pub index_header_bytes: u128,
+    pub class_bytes: u128,
+    pub assignment_bytes: u128,
+    pub representative_coordinate_bytes: u128,
+    pub total_bytes: u128,
+}
+
+/// Model one full Task with all occurrences and one class per occurrence.
+/// Data-dependent Direct selection is not available before capture. Use the
+/// actual Hash backing as the sizing reference, with no NDV or distribution guess.
+pub fn estimate_content_key_index<'a>(
+    rows: u128,
+    types: impl IntoIterator<Item = &'a arrow::datatypes::DataType>,
+) -> Option<ContentKeyIndexSizing> {
+    use std::alloc::Layout;
+
+    let rows = usize::try_from(rows).ok()?;
+    let (hash_buckets, hash_directory_bytes) = HashLayout::fresh_table_bytes::<Directory>(rows)?;
+    let index_header_bytes = if rows == 0 {
+        0
+    } else {
+        std::mem::size_of::<KeyIndex>() as u128
+    };
+    let class_bytes = Layout::array::<Class>(rows).ok()?.size() as u128;
+    let assignment_bytes = Layout::array::<super::BulkMatch>(rows).ok()?.size() as u128;
+    let coordinate_row_bytes = types.into_iter().try_fold(0u128, |total, ty| {
+        total.checked_add(super::owned_batch::coordinate_bytes(ty) as u128)
+    })?;
+    let representative_coordinate_bytes = (rows as u128).checked_mul(coordinate_row_bytes)?;
+    let total_bytes = hash_directory_bytes
+        .checked_add(index_header_bytes)?
+        .checked_add(class_bytes)?
+        .checked_add(assignment_bytes)?
+        .checked_add(representative_coordinate_bytes)?;
+    Some(ContentKeyIndexSizing {
+        hash_buckets,
+        hash_directory_bytes,
+        index_header_bytes,
+        class_bytes,
+        assignment_bytes,
+        representative_coordinate_bytes,
+        total_bytes,
+    })
+}
 /// Immutable coordinates for the already compacted class prefix. Chunk rows
 /// are work/storage geometry, never a limit on legal keys or input rows.
 #[derive(Clone, Copy)]
@@ -1709,4 +1760,42 @@ fn fixed_node_cost(ty: &arrow::datatypes::DataType, has_nulls: bool) -> Option<u
     )
     .ok()?;
     exact?.checked_add(opaque?)
+}
+
+#[cfg(test)]
+mod content_size_tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+    use std::mem::size_of;
+
+    #[test]
+    fn estimates_the_exact_directory_request_and_original_entry_layouts() {
+        let tracker = MemTracker::new_root("content sizing original table");
+        for rows in [0usize, 1, 3, 4, 7, 8, 15, 113] {
+            let estimate = estimate_content_key_index(rows as u128, [&DataType::Int64]).unwrap();
+            let mut directory =
+                HashTable::<Directory, _>::new_in(AggregateAllocator::new(tracker.clone()));
+            directory.try_reserve(rows, |entry| entry.table).unwrap();
+            assert_eq!(estimate.hash_directory_bytes, tracker.current() as u128);
+            assert_eq!(estimate.class_bytes, (rows * size_of::<Class>()) as u128);
+            assert_eq!(
+                estimate.assignment_bytes,
+                (rows * size_of::<super::super::BulkMatch>()) as u128
+            );
+            assert_eq!(estimate.representative_coordinate_bytes, 0);
+            drop(directory);
+            assert_eq!(tracker.current(), 0);
+        }
+    }
+
+    #[test]
+    fn accounts_for_each_variable_representative_coordinate_without_allocating() {
+        let fixed = estimate_content_key_index(4, [&DataType::Int64]).unwrap();
+        let variable = estimate_content_key_index(4, [&DataType::Int64, &DataType::Utf8]).unwrap();
+        let bytes = 4 * super::super::owned_batch::coordinate_bytes(&DataType::Utf8) as u128;
+        assert_eq!(variable.hash_directory_bytes, fixed.hash_directory_bytes);
+        assert_eq!(variable.representative_coordinate_bytes, bytes);
+        assert_eq!(variable.total_bytes, fixed.total_bytes + bytes);
+        assert!(estimate_content_key_index(u128::MAX, [&DataType::Int64]).is_none());
+    }
 }

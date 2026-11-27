@@ -526,6 +526,7 @@ fn statistics_request(
         novarocks_spi::connector::ConnectorInstanceId::parse("lake.catalog").expect("instance id");
     novarocks_spi::connector::StatisticsReadRequest {
         row_mutation_current: None,
+        observed_source: None,
         table: ConnectorTableHandle::try_new(owner, bytes::Bytes::from_static(b"table-v1"))
             .expect("table handle"),
         narrowed_read,

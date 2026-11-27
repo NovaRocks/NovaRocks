@@ -5,6 +5,10 @@ domain: [frontend-mv, provider-spi, sql-compiler]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0278
+    scope: "New non-aggregate interpretations omit apply keys and branch storage roles."
+    link: "ADR-0278-mv-maintains-visible-tuples-and-replays-verification.md"
 partially-supersedes:
   - id: ADR-0259
     scope: "Items 4 and 5 on published result semantics, legacy interpretation layouts and contract rebinding after an engine change."

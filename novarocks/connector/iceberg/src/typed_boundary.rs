@@ -41,7 +41,7 @@
 
 mod row_mutation_current;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -1663,6 +1663,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             || request.selection() != source.request.selection()
             || request.from_revision() != source.request.from_revision()
             || request.to_revision() != source.request.to_revision()
+            || request.exact_partition_slice() != source.request.exact_partition_slice()
             || request.observed_table() != source.request.observed_table()
         {
             return Err(invalid(
@@ -1690,6 +1691,13 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             .as_ref()
             .ok_or_else(|| invalid("source projection requires a request binding"))?;
         self.check_request_active()?;
+        if request.exact_partition_slice().is_some()
+            && source.relations.to.exact_source_slice().is_none()
+        {
+            return Err(invalid(
+                "unaligned source partition slice is not an executable projection",
+            ));
+        }
         let relation = match projection {
             ConnectorReadSourceProjection::To => {
                 crate::typed_read::IcebergRuntimeRelation::Table(source.relations.to.clone())
@@ -3108,6 +3116,16 @@ impl IcebergTypedBoundary {
         let mut pinned_seen = 0_usize;
         for read_file in read_files {
             self.check_request_active()?;
+            if let Some(slice) = handle.exact_source_slice() {
+                if !slice.includes(&read_file)? {
+                    record_pruned_data_file(
+                        &mut pruning,
+                        SplitPruningBasis::PartitionSelection,
+                        &read_file,
+                    )?;
+                    continue;
+                }
+            }
             if let Some(pinned) = pinned {
                 if !pinned.contains(&read_file.path) {
                     if handle.has_mv_partition_selection() {
@@ -3337,7 +3355,7 @@ impl IcebergTypedBoundary {
 
 /// Validate the persisted target identity and ordered partition contract
 /// against one provider metadata generation before any file can be excluded.
-fn validate_mv_target_partition_selection(
+pub(crate) fn validate_mv_target_partition_selection(
     metadata: &TableMetadata,
     selection: &ConnectorMvTargetPartitionSelection,
 ) -> Result<(), ConnectorError> {
@@ -3433,21 +3451,10 @@ fn select_mv_target_files(
     if snapshot.snapshot_id != Some(selection.snapshot_id()) {
         return None;
     }
-    let current_spec_id = metadata.default_partition_spec_id();
+    let matcher = ExactMvTargetPartitions::from_validated(metadata, selection);
     let mut selected = Vec::new();
     for file in &snapshot.files {
-        if file.partition_spec_id != Some(current_spec_id) {
-            return None;
-        }
-        let values = file.partition_values.as_ref()?.fields();
-        if values.len() != selection.partition_fields().len() {
-            return None;
-        }
-        let mut comparable = Vec::with_capacity(values.len());
-        for value in values {
-            comparable.push(mv_target_partition_value(value.as_ref())?);
-        }
-        if selection.keys().iter().any(|key| key == &comparable) {
+        if matcher.matches(file.partition_spec_id?, file.partition_values.as_ref()?)? {
             selected.push(file.path.as_str());
             if selected.len() > crate::typed_read::table_handle::MAX_PINNED_DATA_FILES {
                 return None;
@@ -3455,6 +3462,91 @@ fn select_mv_target_files(
         }
     }
     IcebergPinnedDataFileSet::try_new(selected).ok()
+}
+
+/// Comparable partition tuples on one checked target layout. Unknown tuples
+/// remain explicit for callers that cannot safely exclude the file.
+pub(crate) struct ExactMvTargetPartitions<'a> {
+    spec_id: i32,
+    field_count: usize,
+    keys: HashSet<&'a [ConnectorMvPartitionValue]>,
+}
+
+impl<'a> ExactMvTargetPartitions<'a> {
+    pub(crate) fn check(
+        metadata: &TableMetadata,
+        selection: &'a ConnectorMvTargetPartitionSelection,
+    ) -> Result<Self, ConnectorError> {
+        validate_mv_target_partition_selection(metadata, selection)?;
+        let partition_type = metadata
+            .default_partition_spec()
+            .partition_type(metadata.current_schema())
+            .map_err(|error| corrupt(error.to_string()))?;
+        if selection.keys().iter().any(|key| {
+            key.iter()
+                .zip(partition_type.fields())
+                .any(|(value, field)| !mv_partition_key_value_has_type(value, &field.field_type))
+        }) {
+            return Err(invalid(
+                "MV target selection has a noncanonical partition value",
+            ));
+        }
+        Ok(Self::from_validated(metadata, selection))
+    }
+
+    fn from_validated(
+        metadata: &TableMetadata,
+        selection: &'a ConnectorMvTargetPartitionSelection,
+    ) -> Self {
+        Self {
+            spec_id: metadata.default_partition_spec_id(),
+            field_count: selection.partition_fields().len(),
+            keys: selection.keys().iter().map(Vec::as_slice).collect(),
+        }
+    }
+
+    pub(crate) fn matches(&self, spec_id: i32, partition: &Struct) -> Option<bool> {
+        let fields = partition.fields();
+        if spec_id != self.spec_id || fields.len() != self.field_count {
+            return None;
+        }
+        let key = fields
+            .iter()
+            .map(|value| mv_target_partition_value(value.as_ref()))
+            .collect::<Option<Vec<_>>>()?;
+        Some(self.keys.contains(key.as_slice()))
+    }
+}
+
+fn mv_partition_key_value_has_type(value: &ConnectorMvPartitionValue, ty: &Type) -> bool {
+    let ConnectorMvPartitionValue::String(value) = value else {
+        return true;
+    };
+    let Type::Primitive(ty) = ty else {
+        return false;
+    };
+    fn canonical<T: std::str::FromStr + std::fmt::Display>(value: &str) -> bool {
+        value
+            .parse::<T>()
+            .is_ok_and(|parsed| parsed.to_string() == value)
+    }
+    match ty {
+        PrimitiveType::Boolean => canonical::<bool>(value),
+        PrimitiveType::Int | PrimitiveType::Date => canonical::<i32>(value),
+        PrimitiveType::Long
+        | PrimitiveType::Time
+        | PrimitiveType::Timestamp
+        | PrimitiveType::Timestamptz
+        | PrimitiveType::TimestampNs
+        | PrimitiveType::TimestamptzNs => canonical::<i64>(value),
+        PrimitiveType::Float => canonical::<f32>(value),
+        PrimitiveType::Double => canonical::<f64>(value),
+        PrimitiveType::String => true,
+        PrimitiveType::Decimal { .. }
+        | PrimitiveType::Uuid
+        | PrimitiveType::Fixed(_)
+        | PrimitiveType::Binary => false,
+    }
 }
 
 /// The same primitive spelling as Iceberg's change-window partition impact.
@@ -3857,6 +3949,7 @@ fn same_source_table(actual: &IcebergTableHandle, expected: &IcebergTableHandle)
     actual.schema_table_name() == expected.schema_table_name()
         && actual.snapshot_id() == expected.snapshot_id()
         && actual.read_domain() == expected.read_domain()
+        && actual.exact_source_slice() == expected.exact_source_slice()
 }
 
 pub(crate) fn frozen_prepared_source_relations(
@@ -4915,6 +5008,78 @@ mod mv_target_selection_tests {
         assert_eq!(pinned.len(), 1);
         assert!(pinned.contains("file:///emea.parquet"));
         assert!(!pinned.contains("file:///apac.parquet"));
+    }
+
+    #[test]
+    fn partition_replacement_source_slice_prunes_complete_to_and_rejects_unaligned_spec() {
+        use crate::typed_read::exact_source_slice::IcebergExactSourcePartitionSlice;
+        use novarocks_spi::connector::read_stack::{
+            ConnectorExactSourcePartitionField, ConnectorExactSourcePartitionSlice,
+        };
+        use novarocks_spi::connector::{
+            ConnectorChangePartitionTransform, ConnectorChangePartitionValue,
+        };
+
+        let (_executor, _warehouse, boundary, _) =
+            super::prepared_source_relation_tests::inventory_fixture();
+        let (metadata, selection, snapshot) = fixture();
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            1024,
+            16 * 1024,
+        )
+        .unwrap();
+        let predicate = |transform| {
+            ConnectorExactSourcePartitionSlice::try_new(
+                vec![ConnectorExactSourcePartitionField {
+                    source_field_id: selection.partition_fields()[0]
+                        .source_target_field_id()
+                        .clone(),
+                    transform,
+                }],
+                vec![vec![ConnectorChangePartitionValue::String("emea".into())]].into(),
+            )
+            .unwrap()
+        };
+        let exact = IcebergExactSourcePartitionSlice::prove(
+            predicate(ConnectorChangePartitionTransform::Identity),
+            &metadata,
+            &snapshot.files,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(exact.volume().record_count, 1);
+        assert_eq!(exact.volume().file_size_in_bytes, 1);
+        let schema = projection_schema_for_pinned_snapshot(&metadata, 41).unwrap();
+        let name = SchemaTableName::try_new("db", "source").unwrap();
+        let handle = pinned_table_handle_with_schema(&name, &metadata, Some(41), schema, None)
+            .unwrap()
+            .with_exact_source_slice(exact);
+        let planned = boundary
+            .planned_files_from_observation(
+                &handle,
+                41,
+                snapshot.files.clone(),
+                &Constraint::of_summary(TupleDomain::all()),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        assert_eq!(planned.files.len(), 1);
+        assert_eq!(planned.files[0].read_file.path, "file:///emea.parquet");
+        let (basis, files) = planned.pruning.entries().next().unwrap();
+        assert_eq!(basis, SplitPruningBasis::PartitionSelection);
+        assert_eq!(files.file_count, 1);
+        let rejected = IcebergExactSourcePartitionSlice::prove(
+            predicate(ConnectorChangePartitionTransform::Bucket {
+                buckets: 16.try_into().unwrap(),
+            }),
+            &metadata,
+            &snapshot.files,
+            &context,
+        )
+        .unwrap_err();
+        assert_eq!(rejected.kind(), ConnectorErrorKind::Unsupported);
     }
 
     #[test]

@@ -110,6 +110,8 @@ const READ_VARIABLE_PREFIX: &str = "r";
 /// ends. The encoding is read once, when the plan is put on the wire, and dies
 /// with the plan version.
 pub(crate) struct FrozenProviderRead {
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) content_target: bool,
     pub(crate) access: ConnectorReadAttemptAccess,
     /// The generation this read was frozen against, held open for as long as
     /// the plan may run. Releasing it earlier would let the provider retire a
@@ -1523,6 +1525,11 @@ fn finish_read_from_opened(
             FrozenReadAccess {
                 binding: need.binding(),
                 access: FrozenProviderRead {
+                    #[cfg(novarocks_dev_controls)]
+                    content_target: matches!(
+                        need.relation(),
+                        ProviderReadRelationNeed::MvContentTarget { .. }
+                    ),
                     access,
                     generation: planning_pin.clone(),
                     catalog: catalog_properties,

@@ -969,12 +969,6 @@ pub(super) fn provider_relation_need_from_sql_scan(
                 crate::planner::table::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
             ),
         },
-        SqlScanKind::MvTargetLocator { facts } => ProviderReadRelationNeed::MvTarget {
-            relation,
-            target_table_uuid: facts.target_table_uuid.clone(),
-            target_snapshot_id: facts.target_snapshot_id,
-            use_affected_partitions: false,
-        },
         SqlScanKind::ConnectorRead
         => {
             return Err(CompletionProtocolError::InvalidNeed {
@@ -3686,9 +3680,11 @@ fn table_identity_bytes(identity: &TableIdentity) -> Result<u64, CompletionProto
 }
 
 fn statistics_metric_bytes(metric: &StatisticsMetric) -> Result<u64, CompletionProtocolError> {
-    use StatisticsMetric::{AverageSize, Maximum, Minimum, NullCount, RowCount, ThetaNdv};
+    use StatisticsMetric::{
+        AverageSize, DataFileBytes, Maximum, Minimum, NullCount, RowCount, ThetaNdv,
+    };
     match metric {
-        RowCount => Ok(0),
+        RowCount | DataFileBytes => Ok(0),
         NullCount { column }
         | Minimum { column }
         | Maximum { column }

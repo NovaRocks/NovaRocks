@@ -39,6 +39,7 @@ use crate::{
         hash_table::key_index::{BulkDomain, CaptureBuilder, SealedCapture},
         operators::{
             compiled_expression::RuntimeKernelControl,
+            hashjoin::native_runtime_filter::NativeRuntimeFilterProducerFactory,
             local_exchanger::LocalExchanger,
             logical_change_summary::{SummaryUnitObligation, TaskSummaryState},
         },
@@ -78,6 +79,7 @@ pub(crate) struct ContentApplyStages {
     tracker: Arc<MemTracker>,
     output_rows: NonZeroUsize,
     error: Arc<RuntimeErrorState>,
+    demand_producer: Option<NativeRuntimeFilterProducerFactory>,
     prepared: OnceLock<ExecutionResult<Arc<Frame>>>,
 }
 
@@ -113,8 +115,17 @@ impl ContentApplyStages {
             tracker,
             output_rows: output_rows.try_into().expect("u32 fits the supported host"),
             error,
+            demand_producer: None,
             prepared: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn with_demand_producer(
+        mut self,
+        producer: Option<NativeRuntimeFilterProducerFactory>,
+    ) -> Self {
+        self.demand_producer = producer;
+        self
     }
 
     fn spec(&self) -> ExecutionResult<&ProgramContentApply> {
@@ -448,6 +459,12 @@ impl ContentOperator {
             }
             Ok(())
         })();
+        let abandoned_demand = match &mut self.state {
+            State::Finalize(Finalize::Demand { producer, .. }) => {
+                producer.fail(crate::runtime_filter::RuntimeFilterProducerFailure::Cancelled)
+            }
+            _ => Ok(()),
+        };
         match &mut self.state {
             State::Capture { writer, weights } => {
                 *writer = None;
@@ -461,7 +478,7 @@ impl ContentOperator {
             }
         }
         self.host.prepared = None;
-        outcome
+        outcome.and(abandoned_demand)
     }
 }
 

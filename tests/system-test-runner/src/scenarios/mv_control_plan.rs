@@ -50,6 +50,18 @@ pub(in crate::scenarios) fn action(id: &str, parameters: Value) -> DomainGrant {
     }
 }
 
+pub(in crate::scenarios) fn close_content_target(
+    catalog: &str,
+    namespace: &str,
+    mv: &str,
+    token: &str,
+) -> DomainGrant {
+    action(
+        "close-content-target-enumeration",
+        json!({"action":"mv-content-target-enumeration-close","catalog":catalog,"namespace":namespace,"mv":mv,"token":token}),
+    )
+}
+
 pub(in crate::scenarios) fn observation(
     id: &str,
     catalog: &str,

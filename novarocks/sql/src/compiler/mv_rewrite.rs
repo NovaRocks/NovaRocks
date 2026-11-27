@@ -291,6 +291,7 @@ pub struct SqlImvBaseSnapshotFacts {
     qualifier_at_binding: String,
     snapshot_id: i64,
     table_object_id: ConnectorTableObjectId,
+    equivalent_context_from: Option<i64>,
 }
 
 impl SqlImvBaseSnapshotFacts {
@@ -313,7 +314,15 @@ impl SqlImvBaseSnapshotFacts {
             qualifier_at_binding,
             snapshot_id,
             table_object_id,
+            equivalent_context_from: None,
         })
+    }
+
+    /// The original window proves that the frozen To can provide the context
+    /// rows needed from this predecessor. Delta scans retain both endpoints.
+    pub fn with_equivalent_context_from(mut self, from_snapshot_id: i64) -> Self {
+        self.equivalent_context_from = Some(from_snapshot_id);
+        self
     }
 
     fn into_snapshot(self) -> SqlImvBaseSnapshot {
@@ -323,6 +332,7 @@ impl SqlImvBaseSnapshotFacts {
             qualifier_at_binding: self.qualifier_at_binding,
             snapshot_id: self.snapshot_id,
             table_object_id: self.table_object_id,
+            equivalent_context_from: self.equivalent_context_from,
         }
     }
 }
@@ -536,6 +546,32 @@ pub struct SqlImvContentField {
 }
 
 impl SqlImvRewriteSnapshotHandle {
+    /// Authorizes only fields whose original storage mapping allows pruning.
+    pub fn with_content_demand_fields(mut self, fields: Vec<bytes::Bytes>) -> Result<Self, String> {
+        let snapshot = &self.0;
+        if snapshot.content_target.is_none() || snapshot.content_demand_ordinals.is_some() {
+            return Err("content demand requires a frozen target layout".into());
+        }
+        let fields_len = fields.len();
+        let fields = fields
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let ordinals = snapshot
+            .schema_contract
+            .target
+            .visible_columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| fields.contains(&column.target_field_id))
+            .map(|(ordinal, _)| u32::try_from(ordinal).map_err(|_| "too many content fields"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if fields.len() != fields_len || ordinals.len() != fields.len() {
+            return Err("content demand fields differ from the frozen mapped target".into());
+        }
+        Arc::make_mut(&mut self.0).content_demand_ordinals = Some(ordinals.into());
+        Ok(self)
+    }
+
     pub fn with_content_target(mut self, fields: Vec<SqlImvContentField>) -> Result<Self, String> {
         let snapshot = &self.0;
         if snapshot.content_target.is_some()
@@ -632,6 +668,7 @@ pub(crate) struct SqlImvBaseSnapshot {
     pub(crate) qualifier_at_binding: String,
     pub(crate) snapshot_id: i64,
     pub(crate) table_object_id: ConnectorTableObjectId,
+    pub(crate) equivalent_context_from: Option<i64>,
 }
 
 /// SQL classification of the two physical aggregate-state roles used by the
@@ -1085,6 +1122,33 @@ impl SqlImvJoinContractFacts {
                 predicates: predicates.into_iter().map(|facts| facts.inner).collect(),
             },
         })
+    }
+
+    /// Keep the original relation orientation even when a predicate was
+    /// written with the opposite operand order or uses two aliases of one table.
+    pub fn content_key_field_pairs(
+        &self,
+        left: SqlMvRelationOccurrenceId,
+        right: SqlMvRelationOccurrenceId,
+    ) -> Option<Vec<(&[u8], &[u8])>> {
+        if left == right {
+            return None;
+        }
+        self.inner
+            .predicates
+            .iter()
+            .map(
+                |key| match (key.left.occurrence_id, key.right.occurrence_id) {
+                    pair if pair == (left, right) => {
+                        Some((key.left.field_id.as_ref(), key.right.field_id.as_ref()))
+                    }
+                    pair if pair == (right, left) => {
+                        Some((key.right.field_id.as_ref(), key.left.field_id.as_ref()))
+                    }
+                    _ => None,
+                },
+            )
+            .collect()
     }
 }
 
@@ -1560,6 +1624,7 @@ pub(crate) struct SqlImvRewriteSnapshot {
     pub(crate) target_columns: Arc<[novarocks_types::schema::ColumnDef]>,
     pub(crate) target_file_metadata: Option<Arc<[novarocks_types::schema::ColumnDef; 2]>>,
     pub(crate) content_target: Option<Arc<[novarocks_types::schema::ColumnDef]>>,
+    pub(crate) content_demand_ordinals: Option<Arc<[u32]>>,
     /// SQL projection of the persisted MV planning contract frozen at
     /// admission. Resolving or mutating the serialized contract remains in
     /// the application facade.
@@ -1620,6 +1685,14 @@ impl SqlImvRewriteSnapshot {
                     base.table.fqn()
                 ));
             }
+            if let Some(from) = base.equivalent_context_from
+                && previous_snapshot_ids.get(&base.occurrence_id) != Some(&from)
+            {
+                return Err(format!(
+                    "IMV equivalent context for {} names a different predecessor",
+                    base.table.fqn()
+                ));
+            }
         }
         if target_columns.is_empty() {
             return Err("IMV rewrite snapshot target has no SQL column facts".to_string());
@@ -1636,6 +1709,7 @@ impl SqlImvRewriteSnapshot {
             target_columns,
             target_file_metadata: None,
             content_target: None,
+            content_demand_ordinals: None,
             schema_contract,
             aggregate_execution,
         })
@@ -1709,6 +1783,7 @@ pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
                 qualifier_at_binding: "b".to_string(),
                 snapshot_id: 22,
                 table_object_id: test_object_id("object-b"),
+                equivalent_context_from: None,
             }]),
             previous_snapshot_ids,
             previous_table_object_ids,
@@ -2253,6 +2328,7 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
                     qualifier_at_binding: "l".to_string(),
                     snapshot_id: 22,
                     table_object_id: test_object_id("object-l"),
+                    equivalent_context_from: None,
                 },
                 SqlImvBaseSnapshot {
                     occurrence_id: SqlMvRelationOccurrenceId::new(42),
@@ -2260,6 +2336,7 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
                     qualifier_at_binding: "r".to_string(),
                     snapshot_id: 44,
                     table_object_id: test_object_id("object-r"),
+                    equivalent_context_from: None,
                 },
             ]),
             BTreeMap::from([

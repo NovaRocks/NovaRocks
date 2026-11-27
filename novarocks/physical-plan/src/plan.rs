@@ -1642,6 +1642,9 @@ pub enum RuntimeFilterProducerTarget {
     JoinBuildKey {
         equality: crate::RuntimeFilterEqualityWitnessId,
     },
+    ContentDemand {
+        content_ordinal: u32,
+    },
     AggregateTopNKey {
         group_key_ordinal: u32,
         /// Exact TopN whose monotonic bound is contributed by this
@@ -1698,6 +1701,10 @@ pub enum RuntimeFilterConsumerTarget {
         lineage: Box<[RuntimeFilterLineageStep]>,
     },
     AggregateTopNScanField {
+        producer: crate::RuntimeFilterWitnessId,
+        lineage: Box<[RuntimeFilterLineageStep]>,
+    },
+    ContentDemandScanField {
         producer: crate::RuntimeFilterWitnessId,
         lineage: Box<[RuntimeFilterLineageStep]>,
     },

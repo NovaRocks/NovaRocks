@@ -23,6 +23,14 @@ pub use crate::mv_refresh::{
 };
 pub use crate::planner::imv_rewrite::content_apply::{ContentKeyInadmissible, content_route_keys};
 pub use crate::planner::vocabulary::ApplyKeySource;
+mod maintenance_cost;
+pub use maintenance_cost::{
+    SqlMvCostScanVersion, SqlMvCostScanVolume, SqlMvRefreshCostInput, cost_mv_refresh_candidate,
+};
+mod join_amplification;
+pub use join_amplification::{
+    SqlMvContentJoinKey, SqlMvContentJoinSource, estimate_content_join_amplification,
+};
 use novarocks_parser::{
     ast::{self as ast, Expr, ObjectName, Query, Select, SelectItem, SetExpr},
     printer,

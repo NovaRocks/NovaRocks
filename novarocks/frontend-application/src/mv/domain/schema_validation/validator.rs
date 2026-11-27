@@ -39,7 +39,7 @@ pub(crate) fn validate_schema_contract(
     current_target: &MvSchemaValidationObservation,
 ) -> Result<Vec<MvOccurrenceFieldRebind>, SqlCompileError> {
     require_projection_occurrence(projection, occurrence)?;
-    require_source_row_lineage(current_base)?;
+    require_source_contract(projection, current_base)?;
     require_target_v3(current_target)?;
     validate_projection_target(projection, current_target)?;
     validate_relation_occurrence_schema(occurrence, current_base).map_err(Into::into)
@@ -73,7 +73,7 @@ pub(crate) fn validate_join_schema_contract(
             )
             .into());
         }
-        require_source_row_lineage(observation)?;
+        require_source_contract(projection, observation)?;
         renames.extend(validate_relation_occurrence_schema(
             occurrence,
             observation,
@@ -121,13 +121,15 @@ fn require_projection_occurrence(
     }
 }
 
-fn require_source_row_lineage(
+fn require_source_contract(
+    projection: &StoredKeyedMvProjection,
     observation: &MvSourceSchemaObservation,
 ) -> Result<(), SqlCompileError> {
     let table = observation.table();
-    crate::mv::domain::refresh::target_apply::ensure_base_row_lineage_contract(
+    crate::mv::domain::refresh::target_apply::ensure_base_source_contract(
         observation,
         &format!("{}.{}", table.namespace, table.table),
+        projection.facts.interpretation().is_aggregate(),
     )
 }
 
@@ -148,7 +150,7 @@ mod tests {
     use novarocks_spi::connector::{
         ConnectorCommittedVersion, ConnectorInstanceId, ConnectorRequestContext,
         ConnectorTableIdentity, MvObservedSourceField,
-        MvSchemaValidationObservation as SpiObservation,
+        MvSchemaValidationObservation as SpiObservation, MvSourceFormatVersion,
     };
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -185,12 +187,12 @@ mod tests {
         occurrence: &BindingOccurrence,
         rename_amount: bool,
     ) -> MvSourceSchemaObservation {
-        source_observation_with_lineage(occurrence, rename_amount, true, true)
+        source_observation_with_lineage(occurrence, rename_amount, MvSourceFormatVersion::V3, true)
     }
     fn source_observation_with_lineage(
         occurrence: &BindingOccurrence,
         rename_amount: bool,
-        format_v3: bool,
+        format_version: MvSourceFormatVersion,
         selected_snapshot_has_row_range: bool,
     ) -> MvSourceSchemaObservation {
         let context = context();
@@ -227,7 +229,7 @@ mod tests {
                 )
                 .unwrap(),
                 Bytes::from_static(b"fixture-schema"),
-                format_v3,
+                format_version,
                 Some(1),
                 selected_snapshot_has_row_range,
                 fields,
@@ -336,17 +338,44 @@ mod tests {
         );
     }
     #[test]
-    fn source_projection_requires_v3_and_selected_snapshot_row_range() {
+    fn non_aggregate_sources_require_v2_or_v3_without_row_lineage() {
         let projection = projection();
+        assert!(!projection.facts.interpretation().is_aggregate());
         let occurrence = &projection.facts.binding().occurrences[0];
         let target = target_observation(&projection);
+        for version in [MvSourceFormatVersion::V2, MvSourceFormatVersion::V3] {
+            let source = source_observation_with_lineage(occurrence, false, version, false);
+            validate_schema_contract(&projection, occurrence, &source, &target).unwrap();
+        }
+        let source =
+            source_observation_with_lineage(occurrence, false, MvSourceFormatVersion::V1, false);
+        let error =
+            validate_schema_contract(&projection, occurrence, &source, &target).unwrap_err();
+        assert!(
+            error.to_string().contains("Iceberg format-version=2 or 3"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn aggregate_source_requires_v3_and_selected_snapshot_row_range() {
+        let projection = projection();
+        let occurrence = &projection.facts.binding().occurrences[0];
         for (format, lineage, expected) in [
-            (false, false, "Iceberg format-version=3"),
-            (true, false, "selected snapshot 1 has no row lineage"),
+            (MvSourceFormatVersion::V2, false, "Iceberg format-version=3"),
+            (
+                MvSourceFormatVersion::V3,
+                false,
+                "selected snapshot 1 has no row lineage",
+            ),
         ] {
             let source = source_observation_with_lineage(occurrence, false, format, lineage);
-            let error =
-                validate_schema_contract(&projection, occurrence, &source, &target).unwrap_err();
+            let error = crate::mv::domain::refresh::target_apply::ensure_base_source_contract(
+                &source,
+                "sales.orders",
+                true,
+            )
+            .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
             let SqlCompileError::CompilationSource(source) = &error else {
                 panic!("lineage admission must preserve its typed MV refusal");
@@ -368,7 +397,7 @@ mod tests {
                 source.failure_fact()
             );
 
-            if format {
+            if format == MvSourceFormatVersion::V3 {
                 assert!(error.to_string().contains("perform a v3 commit"), "{error}");
                 assert!(error.to_string().contains("OPTIMIZE"), "{error}");
             }

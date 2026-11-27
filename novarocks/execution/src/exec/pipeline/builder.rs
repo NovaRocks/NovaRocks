@@ -54,6 +54,8 @@ pub(crate) use compiled::family_fixture::{
     values_chunk_program,
 };
 #[cfg(test)]
+pub(crate) use compiled::observe_int64_membership_producer;
+#[cfg(test)]
 pub(crate) use compiled::ordered_scan_with_numeric_membership_fixture;
 #[cfg(test)]
 pub(crate) use compiled::{compiled_statistics_finish_fixture, compiled_statistics_writer_fixture};

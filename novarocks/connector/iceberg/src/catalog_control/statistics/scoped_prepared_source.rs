@@ -23,8 +23,8 @@ use crate::change_planning::ChangeWindowPlan;
 use crate::iceberg::spec::SchemaRef;
 use crate::loaded_table::{IcebergAttemptTableAccess, IcebergPhysicalTable};
 use novarocks_spi::connector::read_stack::{
-    ConnectorReadSourcePreparationRequest, ConnectorReadSourceSelection,
-    adapter::ProviderPreparedSourceRead,
+    ConnectorExactPartitionSliceOutcome, ConnectorReadSourcePreparationRequest,
+    ConnectorReadSourceSelection, adapter::ProviderPreparedSourceRead,
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorChangeWindowFacts, ConnectorExactSemanticRevision,
@@ -176,6 +176,7 @@ impl Work {
                 self.physical = Some(physical.clone());
                 Ok(())
             }
+            Phase::Finish if self.request.exact_partition_slice().is_some() => self.finish(None),
             Phase::Finish => {
                 let physical = self.physical.as_ref().expect("frozen source physical view");
                 let window_facts = crate::change_planning::finish_change_window(
@@ -328,6 +329,12 @@ impl Work {
         self.schema = Some(schema);
         match self.request.selection() {
             ConnectorReadSourceSelection::Snapshot(_)
+            | ConnectorReadSourceSelection::CurrentAtSnapshot(_)
+                if self.request.exact_partition_slice().is_some() =>
+            {
+                Ok(())
+            }
+            ConnectorReadSourceSelection::Snapshot(_)
             | ConnectorReadSourceSelection::CurrentAtSnapshot(_) => self.finish(None),
             ConnectorReadSourceSelection::ChangeWindow(window) => {
                 match crate::change_planning::prepare_change_window(
@@ -393,7 +400,7 @@ impl Work {
             )
             .map_err(crate::metadata::metadata_creation_error)
         })?;
-        let relations = crate::typed_boundary::frozen_prepared_source_relations(
+        let mut relations = crate::typed_boundary::frozen_prepared_source_relations(
             self.request.name(),
             physical.table.metadata(),
             self.request.selection(),
@@ -401,6 +408,21 @@ impl Work {
             self.pin_schema_id.expect("original schema fallback"),
             window_facts.as_ref(),
         )?;
+        if let Some(predicate) = self.request.exact_partition_slice() {
+            let snapshot = self.endpoints[1]
+                .as_ref()
+                .expect("original sliced To observation");
+            match crate::typed_read::exact_source_slice::IcebergExactSourcePartitionSlice::prove(
+                predicate.clone(),
+                physical.table.metadata(),
+                &snapshot.files,
+                &self.context,
+            ) {
+                Ok(slice) => relations.to = relations.to.with_exact_source_slice(slice),
+                Err(error) if error.kind() == ConnectorErrorKind::Unsupported => {}
+                Err(error) => return Err(error),
+            }
+        }
         self.result = Some(Ok(Arc::new(IcebergPreparedSourceRead {
             owner: ConnectorProviderBindingKey {
                 instance_id: self.descriptor.instance_id.clone(),
@@ -595,44 +617,64 @@ impl IcebergMetadataCpuOriginal {
             return Ok(());
         }
         finished?;
-        for index in 0..2 {
-            let snapshot = {
+        let first_endpoint = {
+            let loan = BodyLoan::take(self);
+            let CpuBody::PreparedSource(body) = &loan.body.as_ref().unwrap().body else {
+                return Err(invalid("foreign prepared source"));
+            };
+            usize::from(body.request.exact_partition_slice().is_some())
+        };
+        for index in first_endpoint..2 {
+            let (snapshot, id, sliced) = {
                 let mut loan = BodyLoan::take(self);
                 let CpuBody::PreparedSource(body) = &mut loan.body.as_mut().unwrap().body else {
                     return Err(invalid("foreign prepared source"));
                 };
-                let ConnectorReadSourceSelection::ChangeWindow(window) = body.request.selection()
-                else {
-                    return Err(invalid("snapshot source entered window discovery"));
+                let physical = body.physical.as_ref().expect("frozen source physical view");
+                let schema = body.schema.as_ref().expect("frozen source schema");
+                let sliced = body.request.exact_partition_slice().is_some();
+                let (id, kind) = if sliced {
+                    let id = body.request.selection().to_snapshot_id();
+                    let domain = crate::read_snapshot::mint_read_domain(
+                        physical.table.metadata(),
+                        id,
+                        schema,
+                    )
+                    .map_err(corrupt)?;
+                    (
+                        id,
+                        super::scoped_snapshot::SnapshotReadKind::PreparedSource { domain },
+                    )
+                } else {
+                    let ConnectorReadSourceSelection::ChangeWindow(window) =
+                        body.request.selection()
+                    else {
+                        return Err(invalid("snapshot source entered window discovery"));
+                    };
+                    (
+                        [window.from_snapshot_id(), window.to_snapshot_id()][index],
+                        super::scoped_snapshot::SnapshotReadKind::ChangeWindow {
+                            schema: schema.clone(),
+                        },
+                    )
                 };
-                let id = [window.from_snapshot_id(), window.to_snapshot_id()][index];
                 let source = Self::read_snapshot_source_for_generation(
                     body.descriptor.clone(),
                     body.incarnation,
-                    body.physical.as_ref().unwrap().table.clone(),
+                    physical.table.clone(),
                     id,
                     body.context.clone(),
                     body.original.clone(),
-                    super::scoped_snapshot::SnapshotReadKind::ChangeWindow {
-                        schema: body.schema.as_ref().unwrap().clone(),
-                    },
+                    kind,
                 );
                 body.snapshot = Some(Arc::clone(&source));
-                source
+                (source, id, sliced)
             };
-            let id = {
-                let loan = BodyLoan::take(self);
-                let CpuBody::PreparedSource(body) = &loan.body.as_ref().unwrap().body else {
-                    return Err(invalid("foreign prepared source"));
-                };
-                let ConnectorReadSourceSelection::ChangeWindow(window) = body.request.selection()
-                else {
-                    return Err(invalid("snapshot source entered window discovery"));
-                };
-                [window.from_snapshot_id(), window.to_snapshot_id()][index]
+            let finished = if sliced {
+                super::scoped_snapshot::drive_read_snapshot(&snapshot, cpu).await
+            } else {
+                super::scoped_snapshot::drive_change_window_snapshot(&snapshot, cpu, id).await
             };
-            let finished =
-                super::scoped_snapshot::drive_change_window_snapshot(&snapshot, cpu, id).await;
             if let Some(error) = snapshot.selected_read_snapshot_error() {
                 let mut loan = BodyLoan::take(self);
                 let CpuBody::PreparedSource(body) = &mut loan.body.as_mut().unwrap().body else {
@@ -718,10 +760,27 @@ impl IcebergMetadataCpuOriginal {
                 window_facts,
                 Arc::clone(&source.to_metadata),
             ),
-            None => ProviderPreparedSourceRead::snapshot(
-                Arc::clone(&source),
-                Arc::clone(&source.to_metadata),
-            ),
+            None => {
+                if source.request.exact_partition_slice().is_some() {
+                    let outcome = source
+                        .relations
+                        .to
+                        .exact_source_slice()
+                        .map_or(ConnectorExactPartitionSliceOutcome::NotAligned, |slice| {
+                            ConnectorExactPartitionSliceOutcome::Proven(slice.volume())
+                        });
+                    ProviderPreparedSourceRead::exact_partition_slice(
+                        Arc::clone(&source),
+                        Arc::clone(&source.to_metadata),
+                        outcome,
+                    )
+                } else {
+                    ProviderPreparedSourceRead::snapshot(
+                        Arc::clone(&source),
+                        Arc::clone(&source.to_metadata),
+                    )
+                }
+            }
         })
     }
 }

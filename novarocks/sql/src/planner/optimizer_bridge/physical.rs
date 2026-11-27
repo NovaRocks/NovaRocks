@@ -40,6 +40,26 @@ use crate::planner::physical::{
     PhysicalTopNNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
 };
 
+/// The optimizer can omit a demand channel when the original weighted child
+/// has a usable NDV and serialized-width estimate for the field. The actual
+/// producer remains responsible for enforcing the existing artifact budget.
+fn content_demand_exceeds_artifact_budget(weighted: &OptimizedOperatorNode, ordinal: u32) -> bool {
+    let Some(column) = weighted.output_columns.get(ordinal as usize) else {
+        return false;
+    };
+    let Some(statistics) = weighted.stats.column_statistics.get(&column.column_id) else {
+        return false;
+    };
+    let Some((distinct, _)) = statistics.ndv.trusted_value() else {
+        return false;
+    };
+    let width = statistics.average_row_size;
+    statistics.confidence > Confidence::Fallback
+        && width.is_finite()
+        && width > 0.0
+        && distinct * width > crate::planner::distributed::RUNTIME_FILTER_ARTIFACT_BYTES as f64
+}
+
 struct BridgeCtx<'a> {
     scalars: &'a ScalarArena,
     next_scan_column: std::cell::Cell<u32>,
@@ -379,6 +399,14 @@ impl BridgeCtx<'_> {
             })),
             Operator::PhysicalContentApply(op) => Ok(PhysicalPlanKind::ContentApply {
                 route_keys: op.route_keys.clone(),
+                demand_keys: op
+                    .demand_keys
+                    .iter()
+                    .copied()
+                    .filter(|ordinal| {
+                        !content_demand_exceeds_artifact_budget(&node.children[0], *ordinal)
+                    })
+                    .collect(),
             }),
             Operator::PhysicalChangeEventExpand(op) => {
                 let events = op

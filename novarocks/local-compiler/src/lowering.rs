@@ -891,6 +891,10 @@ fn lower_with_creation<
         // placement. Keep that placement fact, not a guessed distribution.
         // Network join admissibility was checked by orient_join above.
         let join_placed = probe_input.is_some() && node.inputs.iter().all(checked_input_placement);
+        // ContentApply drops the output partition key. Its two inputs still
+        // prove the same single-copy owner in the checked physical plan.
+        let content_placed = matches!(node.kind, NodeKind::ContentApply(_))
+            && node.inputs.iter().all(checked_input_placement);
         // The cut can place each row exactly once with or without a visible
         // routing key after the exchange.
         let exchange_placed = matches!(node.kind, NodeKind::ExchangeSource { .. })
@@ -905,6 +909,7 @@ fn lower_with_creation<
             || projected_placement
             || repeat_placed
             || join_placed
+            || content_placed
             || partial_groups
             || union_placed
             || ((transparent || partial_rows)
@@ -1685,6 +1690,7 @@ fn lower_with_creation<
                 spec,
                 planned,
                 &channels_plan,
+                runtime_filters.take_content_demand(source, &mut source_requirements, work)?,
                 work,
                 creation,
             )?,
@@ -2548,6 +2554,7 @@ fn lower_content_apply<H>(
     spec: &novarocks_physical_plan::ContentApplySpec,
     planned: &crate::channels::NodeChannels,
     channels: &crate::channels::PlannedChannels,
+    demand_filters: Box<[(usize, novarocks_local_program::StaticFilterProducer)]>,
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
@@ -2622,6 +2629,7 @@ fn lower_content_apply<H>(
                 spec_id: channels.data_slot(*target, spec.target.spec_id)?,
                 partition: channels.data_slot(*target, spec.target.partition)?,
             },
+            demand_filters,
             summary_slots,
         }),
         layout.finish_with_creation(&planned.slots, work, creation)?,

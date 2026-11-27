@@ -575,6 +575,7 @@ pub struct ProgramContentApply {
     pub route_keys: Box<[u32]>,
     pub weight: SlotId,
     pub target: ProgramContentApplyTarget,
+    pub demand_filters: Box<[(usize, crate::StaticFilterProducer)]>,
     /// The ordered DeleteVerification layout, independent of the data port.
     pub summary_slots: [SlotId; 4],
 }
@@ -2096,6 +2097,11 @@ fn node_filter_ids(
                 add(filter.producer.binding_id())?;
             }
         }
+        ProgramNodeKind::ContentApply(spec) => {
+            for (_, producer) in &spec.demand_filters {
+                add(producer.binding_id())?;
+            }
+        }
         ProgramNodeKind::Join {
             runtime_filters,
             runtime_filter_consumers,
@@ -2148,6 +2154,28 @@ fn validate_relationships(
         ProgramNodeKind::ContentApply(spec) => {
             let weighted = nodes[spec.weighted_input.index()].output_layout();
             let target = nodes[spec.target_input.index()].output_layout();
+            for (ordinal, producer) in &spec.demand_filters {
+                work.step()?;
+                let ty = spec
+                    .weighted_content
+                    .get(*ordinal)
+                    .and_then(|slot| weighted.value_binding(*slot))
+                    .ok_or(LocalProgramError::LayoutMismatch)?;
+                let crate::StaticFilterContract::Membership {
+                    canonical,
+                    value_type,
+                } = producer.contract()
+                else {
+                    return Err(LocalProgramError::InvalidRequirement.into());
+                };
+                if producer.kind() != crate::FilterProducerKind::Membership
+                    || producer.reduction() != crate::FilterReduction::SetUnion
+                    || canonical.null_semantics() != crate::FilterNullSemantics::NullSafeEqual
+                    || ty.value_type() != value_type.value_type()
+                {
+                    return Err(LocalProgramError::InvalidRequirement.into());
+                }
+            }
             for (layout, content, extra) in [
                 (weighted, spec.weighted_content.as_ref(), &[spec.weight][..]),
                 (

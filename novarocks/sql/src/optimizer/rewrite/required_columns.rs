@@ -1678,6 +1678,7 @@ mod tests {
         let expr = OptExpr::new(
             Operator::LogicalContentApply(ContentApplyOp {
                 route_keys: Box::new([0]),
+                demand_keys: Box::default(),
                 output_columns: vec![make_output_column(ColumnId::new_for_test(7), "value")],
             }),
             Vec::from(projects),

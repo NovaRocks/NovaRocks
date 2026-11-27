@@ -24,10 +24,9 @@
 //! the documents, and assuming there was none is the one assumption that can
 //! corrupt the target.
 //!
-//! So management closes on exactly that possibility. The barrier stands for
-//! everything the old incarnation could have dispatched, and only evidence
-//! that the old writer can no longer act retires it. Reading the view is
-//! unaffected: a published materialization is what the lake says it is.
+//! Aggregate targets retain a barrier for the old writer's possible effects.
+//! Non-aggregate targets enter exact SameOwner re-observation and register
+//! their management slot before the new incarnation writes.
 
 use novarocks_mv_application::management::{
     EffectDisposition, EffectIdentity, EffectResponsibility, EffectScope, EffectTerminalFact,
@@ -39,9 +38,8 @@ use novarocks_spi::connector::CatalogHandle;
 
 /// Close management on one target this process rediscovered from the lake.
 ///
-/// Returns whether a barrier was installed. A target this process itself
-/// wrote, or one owned by another deployment, gets none: the first has nothing
-/// to recover, and the second is not this deployment's to close.
+/// Returns whether a same-deployment continuation was installed for a
+/// target last written by a different process incarnation.
 pub(crate) fn close_recovered_target_management(
     entrance: &ManagementEntrance,
     catalog: CatalogHandle,

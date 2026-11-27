@@ -54,16 +54,19 @@ USE lnp3d_pkg_${uuid0}.ns_${uuid0};
 SELECT name, manageability, manageability_reason FROM system.runtime.materialized_view_states WHERE catalog_name = 'lnp3d_pkg_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 6
+-- @skip_result_check=true
 -- @retry_count=40
 -- @retry_interval_ms=250
--- @skip_result_check=true
--- @result_contains=AWAITING_EFFECT_SETTLEMENT
+-- @result_rows_where=Property=UnsettledEffects
+-- @result_rows_count=1
+-- @result_rows_expect=Value=0
+-- @result_not_contains=AWAITING_EFFECT_SETTLEMENT
 CALL novarocks_mv_management_status('lnp3d_pkg_${uuid0}', 'ns_${uuid0}', 'a_mv');
 
 -- query 7
--- @mv_resume_management=a_mv,catalog=lnp3d_pkg_${uuid0},database=ns_${uuid0}
 -- @skip_result_check=true
-SELECT 1;
+-- @result_not_contains=ExplicitRebuildRequired
+EXPLAIN REFRESH MATERIALIZED VIEW lnp3d_pkg_${uuid0}.ns_${uuid0}.a_mv;
 
 -- query 8
 -- @cleanup=true

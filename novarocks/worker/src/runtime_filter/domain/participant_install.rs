@@ -59,6 +59,7 @@ pub struct BackendFrontendFeedbackPublication {
     publisher_owner: BackendMaterializationOwner,
     contract_digest: [u8; 32],
     max_encoded_domain_bytes: usize,
+    publish_empty_content_demand: bool,
 }
 
 impl BackendFrontendFeedbackPublication {
@@ -74,6 +75,7 @@ impl BackendFrontendFeedbackPublication {
             publisher_owner,
             contract_digest,
             max_encoded_domain_bytes,
+            publish_empty_content_demand: false,
         })
     }
 
@@ -87,6 +89,15 @@ impl BackendFrontendFeedbackPublication {
 
     pub const fn max_encoded_domain_bytes(&self) -> usize {
         self.max_encoded_domain_bytes
+    }
+
+    pub fn with_empty_content_demand(mut self, enabled: bool) -> Self {
+        self.publish_empty_content_demand = enabled;
+        self
+    }
+
+    pub const fn publishes_empty_content_demand(&self) -> bool {
+        self.publish_empty_content_demand
     }
 }
 
@@ -435,6 +446,13 @@ impl BackendChannelInstall {
         if self.lifecycle != BackendChannelLifecycle::CompleteOnce
             || self.producers.is_empty()
             || schema.digest() != publication.contract_digest()
+            || (publication.publishes_empty_content_demand()
+                && (schema.null_semantics() != novarocks_execution::runtime_filter::RuntimeFilterNullSemantics::NullSafeEqual
+                    || self.availability_coverage != self.terminal_coverage
+                    || !matches!(&self.terminal_coverage, BackendCoverage::AllOf(children)
+                        if matches!(children.as_slice(), [BackendCoverage::Witness(witness)]
+                            if self.producers.len() == 1 && self.producers.values().all(|producer|
+                                producer.coverage_witness() == *witness)))))
             || !self
                 .outbound_materialization_groups
                 .values()

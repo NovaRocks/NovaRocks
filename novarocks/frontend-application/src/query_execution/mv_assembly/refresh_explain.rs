@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::mv::domain::application::MvRefreshRequest;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
+use crate::mv::domain::refresh::strategy::RefreshStrategy;
 use crate::mv::domain::refresh::target::resolve_refresh_target;
 use crate::mv::domain::rewrite::context::IcebergMvRewriteContext;
 
@@ -12,7 +13,7 @@ use crate::mv::domain::rewrite::context::IcebergMvRewriteContext;
 fn compile_captured_refresh_explain(
     ports: &IcebergMvCorePorts,
     rewrite: &IcebergMvRewriteContext,
-    target_binding_id: novarocks_sql::binding::SqlTableBindingId,
+    imv_rewrite: novarocks_sql::compiler::SqlImvPlanningInput,
     catalog: &dyn novarocks_sql::compiler::SqlCatalogSnapshot,
     level: novarocks_sql::compiler::ExplainLevel,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -20,10 +21,7 @@ fn compile_captured_refresh_explain(
     novarocks_sql::compiler::compile_imv_refresh_explain_lines(
         novarocks_sql::compiler::SqlImvRefreshExplainContext {
             canonical_query: Box::new((*rewrite.canonical_select_query).clone()),
-            imv_rewrite: novarocks_sql::compiler::SqlImvPlanningInput::new(
-                rewrite.to_sql_rewrite_snapshot(target_binding_id)?,
-                novarocks_sql::compiler::SqlImvRewriteValidation::None,
-            ),
+            imv_rewrite,
             current_catalog: rewrite.current_catalog.clone(),
             current_database: rewrite.current_database.clone(),
             optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings::default(),
@@ -55,6 +53,10 @@ fn empty_refresh_explain_lines(
 
 /// Read-only inputs; no refresh identity, publication admission or writer.
 pub(crate) struct MvExplainPreparationInput {
+    pub(crate) query_memory_budget_bytes: u64,
+    pub(crate) optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings,
+    pub(crate) session_properties:
+        Option<Arc<novarocks_query_application::sql::session::registry::SessionPropertyInputs>>,
     pub(crate) ports: IcebergMvCorePorts,
     pub(crate) current_catalog: Option<String>,
     pub(crate) current_database: String,
@@ -119,6 +121,51 @@ async fn explain_original_inner(
     {
         return Err("EXPLAIN REFRESH observed a different MV generation".into());
     }
+    let provider = novarocks_spi::connector::ConnectorProviderBindingKey {
+        instance_id: binding
+            .planning_pin()
+            .binding()
+            .descriptor()
+            .instance_id
+            .clone(),
+        incarnation: binding.planning_pin().binding().incarnation(),
+    };
+    let full = match &input.session_properties {
+        Some(properties) => novarocks_mv_application::session_properties::manual_refresh_is_full(
+            properties,
+            &provider,
+            input.statement.is_full(),
+        )?,
+        None => input.statement.is_full(),
+    };
+    let eligibility = current.eligibility();
+    if eligibility.explicit_rebuild_required || (full && eligibility.strict_recovery_required) {
+        return Ok(vec!["MV refresh: ExplicitRebuildRequired".into()]);
+    }
+    if eligibility.strict_recovery_required {
+        use crate::mv::domain::refresh::recovery::prove_strict_recovery;
+        let lines = match prove_strict_recovery(io, ports, &current, &binding, context).await {
+            Ok(recovery) => {
+                let requirement = recovery.fence.requirement();
+                vec![
+                    "MV refresh: StrictRecovery".into(),
+                    format!(
+                        "Frozen ContentLocate estimate: {} bytes; budget: {} bytes",
+                        requirement.estimate_bytes(),
+                        requirement.budget()
+                    ),
+                    format!("Original source windows: {}", recovery.targets.len()),
+                ]
+            }
+            Err(error) => vec![
+                "MV refresh: StrictRecoveryRequired".into(),
+                error.0.to_string(),
+            ],
+        };
+        return Ok(lines);
+    }
+    let can_incrementally_refresh =
+        eligibility.automatic_refresh && !eligibility.automatic_reuse_blocked;
     let analyzed =
         prepare_refresh_binding_candidate(io, ports, &projection, &binding, &schema, context).await;
     let markers = current
@@ -166,7 +213,7 @@ async fn explain_original_inner(
         ports,
         &candidate.observed.document,
         &baseline,
-        input.statement.full,
+        full,
         context,
     )
     .await?;
@@ -179,12 +226,29 @@ async fn explain_original_inner(
             &runtime_bindings,
             &baseline,
             query,
-            input.statement.full,
+            full,
             context,
         )
         .await?;
     if let Some(lines) = empty_refresh_explain_lines(decision) {
         return Ok(lines);
+    }
+    use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
+    let nonaggregate = !projection.facts.interpretation().is_aggregate();
+    if nonaggregate {
+        match decision {
+            ExecutableRefreshDecision::FirstRefresh => {
+                return Ok(vec![if full {
+                    "MV refresh: FullReplace".into()
+                } else {
+                    "MV refresh: FirstRefresh".into()
+                }]);
+            }
+            ExecutableRefreshDecision::MetadataOnly => {
+                return Ok(vec!["MV refresh: MetadataOnly".into()]);
+            }
+            ExecutableRefreshDecision::SkipEmpty | ExecutableRefreshDecision::Incremental => {}
+        }
     }
     let pin = io.capture_pin(ports, &projection, context).await?;
     let aggregate = super::refresh_preparation::pure_reader::frozen_refresh_aggregate_analysis(
@@ -201,6 +265,7 @@ async fn explain_original_inner(
             io,
             RefreshRewriteInputs {
                 rebuild_layout: None,
+                recovery_publication: None,
                 connector_control: ports.connector_control(),
                 connector_context: context,
                 projection: Arc::new(projection),
@@ -214,6 +279,75 @@ async fn explain_original_inner(
             },
         )
         .await?;
+    let mut lines = Vec::new();
+    let content_strategy = if nonaggregate {
+        let (decision, replacement) =
+            super::refresh_preparation::pure_reader::choose_content_strategy(
+                io,
+                ports,
+                &rewrite,
+                &binding,
+                context,
+                can_incrementally_refresh,
+                input.query_memory_budget_bytes,
+                &input.optimizer_settings,
+            )
+            .await?;
+        for (candidate, cost) in &decision.costs {
+            let (name, basis) = match candidate {
+                RefreshStrategy::AppendOnly => (
+                    "AppendOnly",
+                    "exact change-window volume and source manifests",
+                ),
+                RefreshStrategy::ContentLocate(_) => (
+                    "ContentLocate",
+                    "exact change-window volume, source and target manifests",
+                ),
+                RefreshStrategy::PartitionReplace => {
+                    ("PartitionReplace", "exact sliced source manifests")
+                }
+                RefreshStrategy::FullReplace => ("FullReplace", "complete source manifests"),
+                RefreshStrategy::MetadataOnly => continue,
+            };
+            lines.push(format!("MV optimizer cost {name}: {cost:.6} ({basis})"));
+        }
+        if let Some(rejection) = decision.content_rejection {
+            lines.push(format!("ContentLocate unavailable: {rejection}"));
+        }
+        match &decision.strategy {
+            RefreshStrategy::ContentLocate(requirement) => {
+                lines.insert(0, "MV refresh: ContentLocate".into());
+                lines.push(format!(
+                    "ContentLocate estimate: {} bytes, deployment query memory budget: {} bytes",
+                    requirement.estimate_bytes(),
+                    requirement.budget(),
+                ));
+            }
+            RefreshStrategy::AppendOnly => lines.insert(0, "MV refresh: AppendOnly".into()),
+            RefreshStrategy::MetadataOnly => {
+                lines.insert(0, "MV refresh: MetadataOnly".into());
+                return Ok(lines);
+            }
+            RefreshStrategy::FullReplace => {
+                lines.insert(0, "MV refresh: FullReplace".into());
+                return Ok(lines);
+            }
+            RefreshStrategy::PartitionReplace => {
+                let replacement =
+                    replacement.ok_or("MV EXPLAIN lost its admitted replacement scope")?;
+                lines.insert(0, "MV refresh: PartitionReplace".into());
+                if let crate::mv::domain::model::AffectedTargetPartitions::Known { partitions } =
+                    replacement.affected
+                {
+                    lines.push(format!("Affected target partitions: {}", partitions.len()));
+                }
+                return Ok(lines);
+            }
+        }
+        Some(decision.strategy)
+    } else {
+        None
+    };
     let table = novarocks_types::naming::TableIdentity {
         catalog: target.catalog.clone(),
         namespace: target.namespace.clone(),
@@ -261,15 +395,28 @@ async fn explain_original_inner(
         io,
     )
     .await?;
-    compile_captured_refresh_explain(
+    use novarocks_sql::compiler::{SqlImvPlanningInput, SqlImvRewriteValidation};
+    let sql_snapshot = match &content_strategy {
+        Some(RefreshStrategy::ContentLocate(_)) => {
+            rewrite.to_sql_content_rewrite_snapshot(target_binding_id, binding.metadata())?
+        }
+        _ => rewrite.to_sql_rewrite_snapshot(target_binding_id)?,
+    };
+    let mut imv = SqlImvPlanningInput::new(sql_snapshot, SqlImvRewriteValidation::None);
+    imv = match content_strategy {
+        Some(RefreshStrategy::AppendOnly) => imv.for_append_only(),
+        Some(RefreshStrategy::ContentLocate(_)) => imv.for_content_location(),
+        _ => imv,
+    };
+    lines.extend(compile_captured_refresh_explain(
         ports,
         &rewrite,
-        target_binding_id,
+        imv,
         &captured.catalog,
         input.level,
         context,
-    )
-    .map_err(Into::into)
+    )?);
+    Ok(lines)
 }
 
 #[cfg(test)]

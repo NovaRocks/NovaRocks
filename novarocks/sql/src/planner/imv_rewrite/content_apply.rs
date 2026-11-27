@@ -103,6 +103,17 @@ pub(super) fn assemble(
             novarocks_parser::SYNTHETIC,
         )
     })?;
+    let mut demand_keys = Vec::new();
+    for &ordinal in snapshot
+        .content_demand_ordinals
+        .as_deref()
+        .unwrap_or_default()
+    {
+        let ty = &read_types[ordinal as usize];
+        if novarocks_local_program::is_semantic_filter_key_type(ty) {
+            demand_keys.push(ordinal);
+        }
+    }
 
     let columns = plan_output_columns(&plan)?;
     let weight = ImvActionColumn::declared(&columns)
@@ -232,6 +243,7 @@ pub(super) fn assemble(
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::ContentApply(ContentApplyOp {
             route_keys,
+            demand_keys: demand_keys.into_boxed_slice(),
             output_columns: apply_output,
         }),
         vec![weighted, target],

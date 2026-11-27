@@ -39,8 +39,8 @@ use novarocks_failure_contract::SharedFailureCause;
 use novarocks_mv_application::{
     management::{
         CreateIntent, EffectDisposition, EffectIdentity, EffectScope, ManagedMvTarget,
-        ManagementAdmissionError, ManagementEntrance, ManagementEntranceObligation,
-        ManagementRequest,
+        ManagementAdmissionError, ManagementCreateAdmission, ManagementEntrance,
+        ManagementEntranceObligation, ManagementRequest,
     },
     persistence::create_documents::MvCreateDocuments,
     product::{MvCreatePublicationOutcome, MvCreatedTarget, MvStagedTarget, MvTarget},
@@ -89,7 +89,7 @@ pub(crate) struct CreateOriginalInput {
     pub(crate) operation_id: uuid::Uuid,
     pub(crate) context: ConnectorRequestContext,
     pub(crate) cancellation: QueryCancellationView,
-    pub(crate) name_metadata_cpu: CurrentProjectionMetadataCpu,
+    pub(crate) name_metadata_cpu: Arc<CurrentProjectionMetadataCpu>,
     pub(crate) io: Arc<MetadataIoAdmission>,
     pub(crate) cpu: MvRefreshTurnCustody,
 }
@@ -97,6 +97,18 @@ pub(crate) struct CreateOriginalInput {
 pub(crate) struct CreatePhaseFailure {
     pub(crate) service: QueryServiceError,
     pub(crate) domain: Option<MvApplicationError>,
+}
+impl CreatePhaseFailure {
+    pub(crate) fn name_admission(error: ManagementAdmissionError) -> Self {
+        let cause = SharedFailureCause::new(error);
+        Self {
+            domain: Some(
+                MvApplicationError::new(MvApplicationErrorKind::Unavailable, cause.detail())
+                    .with_original_failure(cause.clone()),
+            ),
+            service: QueryServiceError::unavailable_with_cause(cause),
+        }
+    }
 }
 impl From<MvApplicationError> for CreatePhaseFailure {
     fn from(domain: MvApplicationError) -> Self {
@@ -522,6 +534,18 @@ impl CreateOriginal {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some()
     }
+    pub(crate) fn observed_projection_cpu(
+        &self,
+    ) -> Result<Option<Arc<CurrentProjectionMetadataCpu>>, MvApplicationError> {
+        if !self.observed_create_publication() {
+            return Ok(None);
+        }
+        let body = self
+            .state
+            .try_loan()
+            .ok_or_else(|| invalid("CREATE Body is still borrowed"))?;
+        Ok(Some(Arc::clone(&body.input.name_metadata_cpu)))
+    }
     pub(crate) fn created_target(&self) -> Result<Option<MvCreatedTarget>, MvApplicationError> {
         if !self.observed_create_publication()
             && self
@@ -776,6 +800,34 @@ impl CreateOriginal {
 }
 
 impl Body {
+    async fn capture_name_absence(
+        &mut self,
+        name_capture: &Arc<CurrentMetadataCapture>,
+    ) -> Result<bool, CreatePhaseFailure> {
+        match name_capture
+            .capture(
+                &self.input.planning,
+                &self.input.name_metadata_cpu,
+                ConnectorTableObjectCaptureRequest {
+                    table: self.table.clone(),
+                    resolution: ConnectorTableResolution::StrictBaseTable,
+                    selector: ConnectorTableObjectSelector::Current,
+                    context: self.input.context.clone(),
+                },
+            )
+            .await
+        {
+            Err(CaptureFailure::Provider(error))
+                if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound =>
+            {
+                Ok(true)
+            }
+            Err(error) => Err(error.into_application().into()),
+            Ok(binding) if binding.metadata.identity == self.table => Ok(false),
+            Ok(_) => Err(invalid("CREATE name observation returned another target").into()),
+        }
+    }
+
     async fn prepare(
         &mut self,
         name_capture: &Arc<CurrentMetadataCapture>,
@@ -784,72 +836,62 @@ impl Body {
             return Err(invalid("CREATE management was already requested").into());
         }
         let entrance = self.entrance.clone();
-        entrance.check_name_startup_grace().map_err(|error| {
-            MvApplicationError::new(MvApplicationErrorKind::Unavailable, error.to_string())
-        })?;
-        if let Some(effect) = entrance.unresolved_named_drop(&self.catalog, &self.table) {
-            match name_capture
-                .capture(
-                    &self.input.planning,
-                    &self.input.name_metadata_cpu,
-                    ConnectorTableObjectCaptureRequest {
-                        table: self.table.clone(),
-                        resolution: ConnectorTableResolution::StrictBaseTable,
-                        selector: ConnectorTableObjectSelector::Current,
-                        context: self.input.context.clone(),
-                    },
-                )
-                .await
-            {
-                Err(CaptureFailure::Provider(error))
-                    if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound =>
-                {
-                    entrance.observe_named_drop_absence(&self.catalog, &self.table, effect);
-                }
-                Err(error) => return Err(error.into_application().into()),
-                Ok(binding) if binding.metadata.identity == self.table => {}
-                Ok(_) => {
-                    return Err(invalid("CREATE name observation returned another target").into());
-                }
-            }
+        entrance
+            .check_name_startup_grace()
+            .map_err(CreatePhaseFailure::name_admission)?;
+        if let Some(effect) = entrance.unresolved_named_drop(&self.catalog, &self.table)
+            && self.capture_name_absence(name_capture).await?
+        {
+            entrance.observe_named_drop_absence(&self.catalog, &self.table, effect);
         }
         let cancellation = self.input.cancellation.clone();
-        let mut wait = Box::pin(entrance.acquire_async(
-            ManagementRequest::for_create_intent(
-                self.intent.clone(),
-                EffectScope::CATALOG_AND_OBJECT_DELETION,
-            ),
-            async move {
-                let _ = cancellation.cancelled().await;
-            },
-        ));
-        poll_fn(|cx| match wait.as_mut().poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(result) => {
-                self.management = Some(result);
-                Poll::Ready(())
+        let admission = entrance
+            .acquire_create_async(
+                ManagementRequest::for_create_intent(
+                    self.intent.clone(),
+                    EffectScope::CATALOG_AND_OBJECT_DELETION,
+                ),
+                async move {
+                    let _ = cancellation.cancelled().await;
+                },
+            )
+            .await;
+        self.management = Some(match admission {
+            Ok(ManagementCreateAdmission::Ready(admission)) => Ok(admission),
+            Ok(ManagementCreateAdmission::ObserveName(obligation)) => {
+                if obligation.target().catalog() != &self.catalog
+                    || obligation.target().table() != &self.table
+                {
+                    return Err(invalid("CREATE name observation changed catalog or target").into());
+                }
+                if self.capture_name_absence(name_capture).await? {
+                    obligation.admit_after_observed_absence()
+                } else {
+                    Err(ManagementAdmissionError::TargetAlreadyExists)
+                }
             }
-        })
-        .await;
-        drop(wait);
+            Err(error) => Err(error),
+        });
         self.management
             .as_ref()
             .unwrap()
             .as_ref()
             .map_err(|error| {
+                if error.is_retryable_name_admission() {
+                    return CreatePhaseFailure::name_admission(*error);
+                }
                 MvApplicationError::new(
                     if matches!(
                         error,
                         ManagementAdmissionError::Cancelled | ManagementAdmissionError::Stopping
                     ) {
                         MvApplicationErrorKind::ShutdownCancelled
-                    } else if error.is_retryable_name_admission() {
-                        MvApplicationErrorKind::Unavailable
                     } else {
                         MvApplicationErrorKind::Engine
                     },
                     format!("admit CREATE: {error}"),
                 )
+                .into()
             })?;
         self.admission = Some(
             self.document_storage
@@ -1112,7 +1154,7 @@ impl Body {
                     .await;
                 if let Ok(ConnectorStagedCreatePublicationAdjudicationOutcome::Published {
                     receipt,
-                    ..
+                    finalization,
                 }) = observed
                 {
                     let target = self.exact_staged_target()?;
@@ -1126,11 +1168,15 @@ impl Body {
                         .observed_create_receipt
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(receipt);
-                    return Err(mutation(
-                        MvApplicationErrorKind::KnownCommittedFinalizeFailed,
-                        &failure,
-                    )
-                    .into());
+                    self.terminal = Some(Ok(()));
+                    return match finalization {
+                        ExternalMutationFinalization::Complete => Ok(()),
+                        ExternalMutationFinalization::Failed(failure) => Err(mutation(
+                            MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+                            &failure,
+                        )
+                        .into()),
+                    };
                 }
                 self.record_terminal(EffectDisposition::CommitUnknown)?;
                 Err(mutation(MvApplicationErrorKind::CommitUnknown, &failure).into())
@@ -1262,29 +1308,37 @@ impl Body {
         }
     }
     async fn project(&mut self, state: &State) -> Result<(), CreatePhaseFailure> {
-        let needed = state
-            .publication
-            .observation()
-            .needed_committed()
-            .ok_or_else(|| invalid("CREATE Current requires actual Needed"))?;
-        if needed.effect != ExternalMutationEffect::Applied
-            || state.publication.observation().applied_receipt().is_none()
-        {
-            return Err(invalid("CREATE NoOp or Unknown cannot install Current").into());
+        let observed_publication = state
+            .observed_create_receipt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        let observation = state.publication.observation();
+        if !observed_publication {
+            let needed = observation
+                .needed_committed()
+                .ok_or_else(|| invalid("CREATE Current requires actual Needed"))?;
+            if needed.effect != ExternalMutationEffect::Applied
+                || observation.applied_receipt().is_none()
+            {
+                return Err(invalid("CREATE NoOp or Unknown cannot install Current").into());
+            }
         }
-        // Management terminal precedes Current. A failed Current may not
-        // leave a committed create masquerading as unsettled/uncommitted.
         self.record_applied_terminal().map_err(committed_failure)?;
-        let context = state
-            .publication
-            .observation()
-            .finalization_context()
-            .ok_or_else(|| invalid("CREATE has no original finite finalization Context"))?
-            .map_err(provider)?;
+        let context = if observed_publication {
+            // Adjudication proves publication. Its subsequent Current read
+            // uses the original live business scope.
+            self.input.context.clone().after_external_effect()
+        } else {
+            observation
+                .finalization_context()
+                .ok_or_else(|| invalid("CREATE has no original finite finalization Context"))?
+                .map_err(provider)?
+        };
         let project = self
             .project
             .as_ref()
-            .ok_or_else(|| invalid("CREATE Current has no existing-obligation borrower"))?;
+            .ok_or_else(|| invalid("CREATE Current has no original observation borrower"))?;
         let view = self
             .input
             .ports
@@ -1828,7 +1882,7 @@ mod original_stage_tests {
                 },
                 object_id,
                 Bytes::from_static(b"schema-1"),
-                true,
+                novarocks_spi::connector::MvSourceFormatVersion::V3,
                 Some(1),
                 true,
                 vec![
@@ -2360,14 +2414,14 @@ mod original_stage_tests {
                 session_properties: Arc::default(),
                 operation_id,
                 context,
-                name_metadata_cpu: CurrentProjectionMetadataCpu::business(
+                name_metadata_cpu: Arc::new(CurrentProjectionMetadataCpu::business(
                     cpu.runtime(),
                     scope.clone(),
                     window.clone(),
                     cancellation.clone(),
                     tokio::runtime::Handle::current(),
                     wake.clone(),
-                ),
+                )),
                 cancellation,
                 io: io.clone(),
                 cpu: turn,

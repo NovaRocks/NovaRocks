@@ -289,18 +289,10 @@ pub(crate) struct EnumerationReceipt {
 }
 
 impl EnumerationReceipt {
-    #[expect(
-        dead_code,
-        reason = "RWM-10c publication reads and reports the scan's original coverage."
-    )]
     pub(crate) fn scan(&self) -> ScanNodeKey {
         self.scan
     }
 
-    #[expect(
-        dead_code,
-        reason = "RWM-10c publication reads and reports the scan's original pruning."
-    )]
     pub(crate) fn pruning(&self) -> &SplitPruningLedger {
         &self.pruning
     }
@@ -327,6 +319,17 @@ impl SplitEnumerationReceipts {
             self.execution, receipt.execution,
             "receipt belongs to the original attempt"
         );
+        for (basis, files) in receipt.pruning().entries() {
+            tracing::info!(
+                marker = novarocks_failpoint::observation_marker::MV_SCAN_PRUNING_COVERAGE,
+                execution_id = ?receipt.execution,
+                scan = %receipt.scan(),
+                basis = ?basis,
+                files = files.file_count,
+                identity_digest = ?files.identity_digest,
+                "MV scan accounted for pruned files at natural end"
+            );
+        }
         let mut scans = self
             .scans
             .lock()
@@ -339,13 +342,6 @@ impl SplitEnumerationReceipts {
     }
 
     /// Capture all original receipts only for this exact execution.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "RWM-10c publication consumes the original split coverage."
-        )
-    )]
     pub(crate) fn complete(
         &self,
         execution: QueryExecutionId,

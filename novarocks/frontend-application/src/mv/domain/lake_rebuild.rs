@@ -58,9 +58,8 @@ pub struct LakeRebuildContext<'a> {
     pub catalog_application: Option<&'a dyn novarocks_catalog_application::CatalogApplicationPort>,
     pub connector_control: &'a dyn ConnectorControlResolver,
     pub readiness: &'a MvReadinessPort,
-    /// Closes management on every target rediscovered from a writer this
-    /// process is not. Absent only where there is no management authority at
-    /// all, in which case nothing could reopen the target anyway.
+    /// Receives same-deployment restart evidence and installs the exact
+    /// continuation needed by a rediscovered target.
     pub management_entrance: Option<&'a novarocks_mv_application::management::ManagementEntrance>,
 }
 

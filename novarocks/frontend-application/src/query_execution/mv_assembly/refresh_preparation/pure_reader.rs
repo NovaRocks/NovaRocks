@@ -23,7 +23,11 @@ use super::io_gate::MvRefreshPreparationIo;
 use super::*;
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::mv::domain::application::{MvApplicationError, MvRepartitionFields};
+use crate::mv::domain::refresh::pending_fence::PendingFence;
 use crate::mv::domain::refresh::planning::RefreshBaseRelationOccurrence;
+use crate::mv::domain::refresh::strategy::{
+    RefreshStrategy, RefreshStrategyDecision, RefreshStrategyFacts,
+};
 use crate::mv::domain::refresh::target_binding::MvTargetBinding;
 use crate::mv::domain::rewrite::context::IcebergMvRewriteContext;
 use novarocks_spi::connector::{
@@ -32,6 +36,8 @@ use novarocks_spi::connector::{
 };
 
 pub(crate) struct MvRefreshPreparationInput {
+    pub(crate) query_memory_budget_bytes: u64,
+    pub(crate) optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings,
     pub(crate) source: IcebergMvCorePorts,
     pub(crate) session_properties:
         Option<Arc<novarocks_query_application::sql::session::registry::SessionPropertyInputs>>,
@@ -40,6 +46,8 @@ pub(crate) struct MvRefreshPreparationInput {
     pub(crate) statement: MvRefreshRequest,
     pub(crate) connector_context: novarocks_spi::connector::ConnectorRequestContext,
     pub(crate) repartition_fields: Option<MvRepartitionFields>,
+    pub(crate) replay: Option<Arc<PendingFence>>,
+
     pub(crate) request: MvRefreshPreparationRequest,
 }
 
@@ -49,11 +57,13 @@ pub(crate) struct MvRefreshPrepared {
     pub(crate) prepared: PreparedMvRefresh,
     pub(crate) target_binding: Option<MvTargetBinding>,
     pub(crate) rewrite: Option<Arc<IcebergMvRewriteContext>>,
+    pub(crate) strategy: Option<RefreshStrategyDecision>,
 }
 #[derive(Default)]
 struct CapturedPreparation {
     target: Option<MvTargetBinding>,
     rewrite: Option<Arc<IcebergMvRewriteContext>>,
+    strategy: Option<RefreshStrategyDecision>,
 }
 
 pub(crate) async fn prepare_refresh(
@@ -92,6 +102,7 @@ async fn prepare_refresh_inner(
             request.target.clone(),
             repartition_fields.is_some(),
             input.session_properties.as_deref(),
+            input.replay.as_deref(),
             connector_context,
         ).await?;
     let mut plan = refresh.plan;
@@ -159,7 +170,7 @@ async fn prepare_refresh_inner(
         } => target_table_uuid.clone(),
     };
     let full_overwrite = refresh.full_overwrite;
-    let work = match plan.contract.decision {
+    let mut work = match plan.contract.decision {
         ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
         ExecutableRefreshDecision::MetadataOnly => {
             let (write, admitted) = prepare_metadata_only_publication(
@@ -216,6 +227,13 @@ async fn prepare_refresh_inner(
             &plan.contract,
             &refresh.canonical_query,
             &request.attempt,
+            (
+                refresh.can_incrementally_refresh,
+                input.query_memory_budget_bytes,
+                &input.optimizer_settings,
+            ),
+            &refresh.original_current,
+            refresh.replay.as_ref(),
             observed_binding.clone(),
             connector_context.clone(),
         )
@@ -233,6 +251,15 @@ async fn prepare_refresh_inner(
                     admitted,
                 }
             }
+            PreparedIncrementalRefreshWork::PartitionReplace {
+                write,
+                admitted,
+                overlays,
+            } => PreparedMvRefreshWork::DataProducing {
+                write: PreparedMvRefreshWrite::first_refresh(write, io.captured_sources())
+                    .with_partition_replacement_overlays(overlays),
+                admitted,
+            },
             PreparedIncrementalRefreshWork::MetadataOnly => {
                 let (write, admitted) = prepare_metadata_only_publication(
                     io,
@@ -249,6 +276,33 @@ async fn prepare_refresh_inner(
             }
         },
     };
+    if let PreparedMvRefreshWork::DataProducing { write, admitted } = &mut work
+        && write.publication_intent().technique() == MvRefreshPublicationTechnique::Full
+        && !refresh.original_current.interpretation.is_aggregate()
+    {
+        use novarocks_mv_application::persistence::{
+            codec::RecoveryRecord,
+            resolution::{FrozenMvMarkerKeys, rebuild_mv_marker_policy},
+        };
+        let (policy, recovery) = match refresh.explicit_recovery {
+            Some(recovered_from) => (
+                rebuild_mv_marker_policy(),
+                Some(RecoveryRecord {
+                    recovered_from,
+                    operation: novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
+                        request.attempt.publication_id.to_bytes(),
+                    ),
+                    recovered_at_ms: crate::mv::domain::staged_create::now_unix_millis()?,
+                }),
+            ),
+            None => (
+                FrozenMvMarkerKeys::capture(&refresh.original_current.view)
+                    .into_full_refresh_policy(),
+                None,
+            ),
+        };
+        admitted.bind_full_refresh_markers(policy, recovery)?;
+    }
     Ok(MvRefreshPrepared {
         prepared: PreparedMvRefresh {
             attempt: request.attempt,
@@ -267,6 +321,7 @@ async fn prepare_refresh_inner(
         },
         target_binding: captured.target,
         rewrite: captured.rewrite,
+        strategy: captured.strategy,
     })
 }
 
@@ -887,7 +942,7 @@ async fn prepare_frontend_first_refresh_write(
             Arc::new(target_arrow_schema),
             target_field_ids,
             partition_spec_id,
-            capabilities.apply_key_column.clone(),
+            capabilities.apply_key_column.clone().unwrap_or_default(),
         )?;
     let pin = pin_contract_bases(
         io,
@@ -922,6 +977,7 @@ async fn prepare_frontend_first_refresh_write(
             crate::mv::domain::refresh::rewrite_context::freeze_refresh_rewrite_context_original(
                 io,
                 RefreshRewriteInputs {
+                    recovery_publication: None,
                     connector_control: source.connector_control(),
                     connector_context: &connector_context,
                     projection: Arc::new(projection.clone()),
@@ -1441,6 +1497,282 @@ fn project_occurrence_window_facts(
     Ok(facts)
 }
 
+/// Compute the same non-aggregate decision for execution and read-only EXPLAIN.
+// Design: ADR-0278 (docs/adr/ADR-0278-mv-maintains-visible-tuples-and-replays-verification.md)
+pub(crate) async fn choose_content_strategy(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    rewrite: &IcebergMvRewriteContext,
+    target: &MvTargetBinding,
+    context: &ConnectorRequestContext,
+    can_incrementally_refresh: bool,
+    budget: u64,
+    optimizer_settings: &novarocks_sql::compiler::SessionOptimizerSettings,
+) -> Result<
+    (
+        RefreshStrategyDecision,
+        Option<super::super::partition_replace::PreparedPartitionReplacement>,
+    ),
+    PreparationError,
+> {
+    let windows = rewrite
+        .base_refs
+        .iter()
+        .map(|base| {
+            project_occurrence_window_facts(
+                io,
+                source,
+                rewrite,
+                base,
+                rewrite.previous_snapshot_id(base)?,
+                rewrite.pinned_snapshot_id(base)?,
+                context,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let window_refs = windows.iter().collect::<Vec<_>>();
+    let is_join = definition_has_join(&rewrite.canonical_select_query);
+    let facts = RefreshStrategyFacts {
+        windows: &window_refs,
+        force_full: false,
+        pending_verification: false,
+        can_incrementally_refresh,
+        append_admitted: !is_join
+            || crate::mv::domain::iceberg_join_branch::is_append_only_join_delta_eligible(
+                &rewrite.canonical_select_query,
+            ),
+        partition_admitted: false,
+        complete_to_available: true,
+    };
+    let admission = if facts.can_locate_content() {
+        estimate_content_admission(
+            io, source, rewrite, target, context, &windows, is_join, budget,
+        )
+        .await?
+    } else {
+        Err("MV content location is ineligible for the observed source windows".to_string())
+    };
+    let mut decision = facts.decide(|| admission)?;
+    if decision.strategy == RefreshStrategy::MetadataOnly || !can_incrementally_refresh {
+        return Ok((decision, None));
+    }
+    let partition = super::super::partition_replace::prepare_partition_replacement(
+        io,
+        source,
+        rewrite,
+        target.partition(),
+        context,
+        &windows,
+    )
+    .await?;
+    let mut candidates = vec![(decision.strategy.clone(), None)];
+    if partition.is_some() {
+        candidates.push((RefreshStrategy::PartitionReplace, partition.as_ref()));
+    }
+    if decision.strategy != RefreshStrategy::FullReplace {
+        candidates.push((RefreshStrategy::FullReplace, None));
+    }
+    if candidates.len() == 1 {
+        return Ok((decision, None));
+    }
+    let mut best = None;
+    for (strategy, scoped) in candidates {
+        let cost = super::super::refresh_cost::cost_candidate(
+            io,
+            source,
+            rewrite,
+            target,
+            context,
+            optimizer_settings,
+            &strategy,
+            scoped,
+        )
+        .await?;
+        if best.is_none_or(|best| cost < best) {
+            decision.strategy = strategy.clone();
+            best = Some(cost);
+        }
+        decision.costs.push((strategy, cost));
+    }
+    let partition = partition.filter(|_| decision.strategy == RefreshStrategy::PartitionReplace);
+    Ok((decision, partition))
+}
+
+async fn estimate_content_admission(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    rewrite: &IcebergMvRewriteContext,
+    target: &MvTargetBinding,
+    context: &ConnectorRequestContext,
+    windows: &[ConnectorChangeWindowFacts],
+    is_join: bool,
+    budget: u64,
+) -> Result<
+    Result<novarocks_mv_application::persistence::codec::PendingVerificationRequirement, String>,
+    PreparationError,
+> {
+    use crate::query_execution::mv_assembly::content_estimate::{
+        ContentEstimateColumn, ContentJoinAmplification, ContentSourceStatistics,
+        estimate_content_apply, has_average_size, needs_average_size,
+    };
+    use novarocks_mv_application::persistence::codec::{
+        MappingPushdownClass, PendingVerificationRequirement,
+    };
+    use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
+
+    let fields = rewrite.content_target_fields(target.metadata())?;
+    let declarations = fields
+        .iter()
+        .map(|field| field.read_column.declared_value_type())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if let Err(cause) = novarocks_sql::planning::mv::content_route_keys(&declarations) {
+        return Ok(Err(cause.to_string()));
+    }
+    if rewrite.target_snapshot_id.is_none() {
+        return Ok(Err(
+            "MV content location has no retained target snapshot".to_string()
+        ));
+    }
+
+    let target_metrics = fields
+        .iter()
+        .zip(&declarations)
+        .filter(|(_, declaration)| needs_average_size(declaration))
+        .map(|(field, _)| StatisticsMetric::AverageSize {
+            column: Arc::from(field.read_column.name.as_str()),
+        })
+        .collect::<Vec<_>>();
+    let target_statistics = if target_metrics.is_empty() {
+        None
+    } else {
+        io.content_statistics(
+            target.planning_pin(),
+            target.metadata(),
+            StatisticsMetricRequest::try_new(target_metrics)?,
+            context,
+        )
+        .await?
+    };
+
+    let captured = io.captured_sources();
+    let mut coordinates = vec![None; fields.len()];
+    let mut source_metrics = BTreeMap::<u32, std::collections::BTreeSet<StatisticsMetric>>::new();
+    let mapping = &rewrite.mv_definition.facts.mapping().columns;
+    if let (Some(direct), Some(analyzed)) =
+        (captured.direct_output_sources(), captured.analyzed_fields())
+    {
+        for (index, ((output, _), declaration)) in rewrite
+            .runtime_bindings
+            .outputs
+            .iter()
+            .zip(&declarations)
+            .enumerate()
+        {
+            if !needs_average_size(declaration)
+                || mapping[index].pushdown != MappingPushdownClass::Identity
+            {
+                continue;
+            }
+            if target_statistics
+                .as_ref()
+                .is_some_and(|evidence| has_average_size(evidence, &fields[index].read_column.name))
+            {
+                continue;
+            }
+            let Some(reference) = direct.get(output) else {
+                continue;
+            };
+            let Some(field) = analyzed
+                .get(&reference.occurrence_id)
+                .and_then(|fields| {
+                    fields
+                        .iter()
+                        .find(|field| field.field_id == reference.field_id)
+                })
+                .filter(|field| field.source_type == mapping[index].storage_type)
+            else {
+                continue;
+            };
+            let name = field.name.as_str();
+            source_metrics
+                .entry(reference.occurrence_id)
+                .or_default()
+                .insert(StatisticsMetric::AverageSize {
+                    column: Arc::from(name),
+                });
+            coordinates[index] = Some((reference.occurrence_id, name));
+        }
+    }
+    let mut source_statistics = BTreeMap::new();
+    for (occurrence_id, metrics) in source_metrics {
+        let base = rewrite
+            .base_refs
+            .iter()
+            .find(|base| base.occurrence_id.get() == occurrence_id)
+            .ok_or("MV content statistics lost its exact source occurrence")?;
+        let pinned = captured.require(&base.table)?;
+        let metadata = pinned.metadata()?;
+        if let Some(evidence) = io
+            .content_statistics(
+                &pinned.planning_pin,
+                &metadata,
+                StatisticsMetricRequest::try_new(metrics.into_iter().collect())?,
+                context,
+            )
+            .await?
+        {
+            source_statistics.insert(occurrence_id, evidence);
+        }
+    }
+    let columns = fields
+        .iter()
+        .zip(&declarations)
+        .zip(coordinates)
+        .map(|((field, declaration), coordinate)| ContentEstimateColumn {
+            storage_column: field.read_column.name.as_str(),
+            storage_type: declaration,
+            source: coordinate.and_then(|(occurrence_id, source_column)| {
+                source_statistics
+                    .get(&occurrence_id)
+                    .map(|statistics| ContentSourceStatistics {
+                        occurrence_id,
+                        source_column,
+                        statistics,
+                    })
+            }),
+        })
+        .collect::<Vec<_>>();
+    let join = if is_join {
+        crate::query_execution::mv_assembly::content_estimate::estimate_join_amplification(
+            io, source, rewrite, context, windows,
+        )
+        .await?
+    } else {
+        ContentJoinAmplification::NotJoined
+    };
+    let estimate =
+        match estimate_content_apply(windows.iter(), &columns, target_statistics.as_ref(), join) {
+            Ok(estimate) => estimate,
+            Err(cause) => return Ok(Err(cause.to_string())),
+        };
+    if i64::try_from(budget).is_err() {
+        return Ok(Err(format!(
+            "MV deployment memory budget {budget} bytes exceeds the Native option range"
+        )));
+    }
+    if estimate.estimate_bytes > u128::from(budget) {
+        return Ok(Err(format!(
+            "MV content location estimate {} bytes exceeds its deployment budget {budget} bytes",
+            estimate.estimate_bytes,
+        )));
+    }
+    Ok(
+        PendingVerificationRequirement::content_locate(estimate.estimate_bytes as u64, budget)
+            .map_err(|cause| cause.to_string()),
+    )
+}
+
 async fn prepare_frontend_incremental_write(
     io: &MvRefreshPreparationIo,
     captured: &mut CapturedPreparation,
@@ -1450,6 +1782,13 @@ async fn prepare_frontend_incremental_write(
     contract: &RefreshPlanContract,
     canonical_query: &novarocks_parser::ast::Query,
     attempt: &MvRefreshAttemptIdentity,
+    nonaggregate_admission: (
+        bool,
+        u64,
+        &novarocks_sql::compiler::SessionOptimizerSettings,
+    ),
+    original_current: &novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+    replay: Option<&Arc<PendingFence>>,
     observed_binding: ConnectorProviderBindingKey,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedIncrementalRefreshWork, PreparationError> {
@@ -1461,6 +1800,15 @@ async fn prepare_frontend_incremental_write(
         table: contract.target.name.clone(),
     };
     let projection = io.definition(source, &target).await?;
+    let projection = if replay.is_some() {
+        StoredKeyedMvProjection {
+            mv_id: projection.mv_id,
+            facts: novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection::try_from_current(original_current.clone())?,
+        }
+    } else {
+        projection
+    };
+
     let interpretation = projection.facts.interpretation();
     let is_join = definition_has_join(canonical_query);
     let is_aggregate = !interpretation.aggregates.is_empty();
@@ -1567,11 +1915,12 @@ async fn prepare_frontend_incremental_write(
         &connector_context,
     )
     .await?;
-    let rewrite =
+    let mut rewrite =
         crate::mv::domain::refresh::rewrite_context::freeze_refresh_rewrite_context_original(
             io,
             RefreshRewriteInputs {
                 rebuild_layout: None,
+                recovery_publication: replay.and_then(|fence| fence.recovery_publication()),
                 connector_control: source.connector_control(),
                 connector_context: &connector_context,
                 projection: Arc::new(projection),
@@ -1587,6 +1936,222 @@ async fn prepare_frontend_incremental_write(
             },
         )
         .await?;
+
+    if !is_aggregate {
+        let (decision, replacement) = if let Some(fence) = replay {
+            (
+                RefreshStrategyDecision {
+                    strategy: RefreshStrategy::ContentLocate(fence.requirement()),
+                    content_rejection: None,
+                    costs: Vec::new(),
+                },
+                None,
+            )
+        } else {
+            choose_content_strategy(
+                io,
+                source,
+                &rewrite,
+                &target_binding,
+                &connector_context,
+                nonaggregate_admission.0,
+                nonaggregate_admission.1,
+                nonaggregate_admission.2,
+            )
+            .await?
+        };
+        let strategy = decision.strategy.clone();
+        captured.strategy = Some(decision);
+        if strategy == RefreshStrategy::MetadataOnly {
+            return Ok(PreparedIncrementalRefreshWork::MetadataOnly);
+        }
+        if matches!(
+            strategy,
+            RefreshStrategy::FullReplace | RefreshStrategy::PartitionReplace
+        ) {
+            let overlays = replacement.as_ref().map(|proof| proof.reads.clone());
+            let (rebuild, mut admitted) = prepare_frontend_first_refresh_write(
+                io,
+                captured,
+                source,
+                current_catalog,
+                current_database,
+                FirstRefreshTargetFacts {
+                    contract,
+                    canonical_query,
+                    base_table_object_ids: &rewrite.pinned_objects_by_occurrence()?,
+                    repartition_transition: None,
+                    retained_repartition_target: None,
+                    rebuild: None,
+                },
+                attempt,
+                observed_binding,
+                connector_context,
+            )
+            .await?;
+            if let (RefreshStrategy::PartitionReplace, Some(proof), Some(overlays)) =
+                (&strategy, replacement, overlays)
+            {
+                admitted.bind_partition_replace(proof.target)?;
+                return Ok(PreparedIncrementalRefreshWork::PartitionReplace {
+                    write: rebuild.into_full_overwrite(),
+                    admitted,
+                    overlays,
+                });
+            }
+            if strategy == RefreshStrategy::PartitionReplace {
+                return Err(
+                    "MV partition replacement lost its admitted source or target scope".into(),
+                );
+            }
+            return Ok(PreparedIncrementalRefreshWork::FullRebuild(
+                rebuild.into_full_overwrite(),
+                admitted,
+            ));
+        }
+        let mut verified_current = None;
+        let mode = match strategy {
+            RefreshStrategy::AppendOnly => MvIncrementalWriteMode::FastAppend,
+            RefreshStrategy::ContentLocate(_) if replay.is_some() => {
+                let fence = replay
+                    .expect("strict recovery reuses the original fence")
+                    .clone();
+                fence.verify(original_current)?;
+                io.retain_pending_fence(
+                    Arc::clone(&fence),
+                    target_binding.planning_pin().clone(),
+                    Arc::new(rewrite.mv_definition.facts.clone()),
+                )?;
+                verified_current = Some((fence, original_current.clone()));
+                MvIncrementalWriteMode::RowDelta
+            }
+            RefreshStrategy::ContentLocate(requirement) => {
+                let fence = Arc::new(PendingFence::freeze(
+                    original_current,
+                    &rewrite,
+                    attempt,
+                    requirement,
+                )?);
+                let planning = target_binding.planning_pin();
+                io.retain_pending_fence(
+                    Arc::clone(&fence),
+                    planning.clone(),
+                    Arc::new(rewrite.mv_definition.facts.clone()),
+                )?;
+                let documents = planning.derive_document_storage_lease()?;
+                let observed = io
+                    .observe_current(
+                        source,
+                        &documents,
+                        crate::mv::domain::staged_create::keyed_request(
+                            &documents,
+                            original_current.view.table.clone(),
+                            original_current.view.object_id.clone(),
+                            connector_context.clone(),
+                        ),
+                    )
+                    .await?;
+                if observed.view != original_current.view {
+                    return Err("MV Current changed before its Pending fence".into());
+                }
+                io.write_binding_marker(
+                    source,
+                    planning,
+                    observed,
+                    &rewrite.mv_definition.facts,
+                    fence.marker(),
+                    connector_context.clone(),
+                )
+                .await?;
+                let observed = io
+                    .observe_current(
+                        source,
+                        &documents,
+                        crate::mv::domain::staged_create::keyed_request(
+                            &documents,
+                            original_current.view.table.clone(),
+                            original_current.view.object_id.clone(),
+                            connector_context.clone(),
+                        ),
+                    )
+                    .await?;
+                fence.verify(&observed)?;
+                verified_current = Some((fence, observed));
+                MvIncrementalWriteMode::RowDelta
+            }
+            _ => unreachable!(
+                "non-writing refresh strategies returned before change-stream preparation"
+            ),
+        };
+        let (target_binding, pending) = if let Some((fence, observed)) = verified_current {
+            // Pending changes the catalog pointer even though main still names the
+            // same snapshot. Position deletes must freeze the complete generation
+            // that actually contains the verified fence.
+            let planning = target_binding.planning_pin();
+            let identity = target_binding.identity();
+            let current = io
+                .source_table_metadata(
+                    planning,
+                    connector_context.clone(),
+                    &identity.namespace,
+                    &identity.table,
+                )
+                .await?;
+            let schema = crate::mv::domain::storage_observation::observe_schema_validation(
+                source.storage_observation(),
+                planning,
+                &current,
+                connector_context.clone(),
+            )?;
+            if schema.exact_schema().metadata_version != observed.view.metadata_version {
+                return Err("MV Current changed after its Pending fence was verified".into());
+            }
+            let projection = StoredKeyedMvProjection {
+                mv_id: rewrite.mv_definition.mv_id,
+                facts: novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection::try_from_current(observed)?,
+            };
+            let bindings = validate_projection_target(&projection, &schema)?;
+            if projection.facts.versions() != rewrite.mv_definition.facts.versions()
+                || projection.facts.publication() != rewrite.mv_definition.facts.publication()
+                || bindings != rewrite.runtime_bindings
+            {
+                return Err(
+                    "MV Pending fence changed the exact logical or storage bindings".into(),
+                );
+            }
+            Arc::get_mut(&mut rewrite)
+                .expect("the refresh has not shared its frozen rewrite")
+                .mv_definition = Arc::new(projection);
+            let current = crate::mv::domain::refresh::target_binding::complete_target_binding(
+                source.storage_observation(),
+                planning.clone(),
+                current,
+                &connector_context,
+            )?;
+            captured.target = Some(current.clone());
+            (current, Some(fence))
+        } else {
+            (target_binding, None)
+        };
+        captured.rewrite = Some(Arc::clone(&rewrite));
+        return prepare_canonical_incremental_write(
+            io,
+            source,
+            &rewrite,
+            &target_binding,
+            target,
+            contract,
+            attempt,
+            current_database,
+            *target_snapshot_id,
+            observed_binding,
+            connector_context,
+            pending,
+            mode,
+            MvIncrementalRewriteEvidence::None,
+        )
+        .await;
+    }
 
     captured.rewrite = Some(Arc::clone(&rewrite));
     if let Some((left_ref, right_ref)) = join_bases.as_ref() {
@@ -1871,18 +2436,57 @@ async fn prepare_frontend_incremental_write(
             (mode, evidence)
         }
     };
+    prepare_canonical_incremental_write(
+        io,
+        source,
+        &rewrite,
+        &target_binding,
+        target,
+        contract,
+        attempt,
+        current_database,
+        *target_snapshot_id,
+        observed_binding,
+        connector_context,
+        None,
+        mode,
+        evidence,
+    )
+    .await
+}
+
+async fn prepare_canonical_incremental_write(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    rewrite: &IcebergMvRewriteContext,
+    target_binding: &MvTargetBinding,
+    target: IcebergMvTarget,
+    contract: &RefreshPlanContract,
+    attempt: &MvRefreshAttemptIdentity,
+    current_database: &str,
+    target_snapshot_id: Option<i64>,
+    observed_binding: ConnectorProviderBindingKey,
+    connector_context: ConnectorRequestContext,
+    pending: Option<Arc<PendingFence>>,
+    mode: MvIncrementalWriteMode,
+    evidence: MvIncrementalRewriteEvidence,
+) -> Result<PreparedIncrementalRefreshWork, PreparationError> {
+    let RefreshStateBaseline::SnapshotBacked {
+        definition_fingerprint,
+        ..
+    } = &contract.state_baseline;
     let request = MvIncrementalWriteRequest::try_new(
         target.catalog.clone(),
         target.namespace.clone(),
         target.table.clone(),
         attempt.staging_branch(),
         current_database.to_string(),
-        *target_snapshot_id,
+        target_snapshot_id,
         observed_binding,
         attempt.write_operation_id(),
         target_binding.handle().clone(),
     )?;
-    let admitted_publication = io
+    let mut admitted_publication = io
         .admit(
             source,
             target_binding.planning_pin(),
@@ -1892,6 +2496,9 @@ async fn prepare_frontend_incremental_write(
             &connector_context,
         )
         .await?;
+    if let Some(pending) = pending {
+        admitted_publication.bind_content_pending(pending)?;
+    }
     let publication_intent = mv_refresh_publication_intent(
         io,
         source.connector_control(),
@@ -1903,7 +2510,7 @@ async fn prepare_frontend_incremental_write(
             .source_revision()
             .target_object_id
             .clone(),
-        *target_snapshot_id,
+        target_snapshot_id,
         &admitted_publication,
         MvRefreshPublicationTechnique::Incremental,
         &rewrite.pinned_snapshots_by_occurrence()?,
@@ -1918,7 +2525,7 @@ async fn prepare_frontend_incremental_write(
     let frozen_base_overlays = crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_base_query_local_overlays_from_captured_inputs_original(io,
         source.connector_control(),
         &connector_context,
-        &rewrite,
+        rewrite,
     ).await?;
     let admitted_publication = AdmittedMvDataPublication::try_new(
         admitted_publication,
@@ -1927,7 +2534,7 @@ async fn prepare_frontend_incremental_write(
     MvIncrementalWritePreparer::prepare(
         request,
         crate::query_execution::mv_assembly::first_refresh_staging::frozen_logical_context_from_rewrite(
-            &rewrite,
+            rewrite,
             contract.affected_partitions.clone(),
             Some(frozen_base_overlays),
         )?,

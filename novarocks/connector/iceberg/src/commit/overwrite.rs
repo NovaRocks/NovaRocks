@@ -181,7 +181,7 @@ pub(super) async fn prepare_filtered_delete_snapshot_change(
     full_refresh: bool,
 ) -> crate::iceberg::Result<super::staging::PreparedChange> {
     let mut properties = snapshot_file_summary_with_mode(&[], removed, true)?;
-    if full_refresh
+    if (full_refresh || intent.protocol().is_partition_replace())
         && matches!(
             intent.protocol(),
             super::model::CommitProtocol::MvRefresh { .. }

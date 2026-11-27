@@ -50,6 +50,7 @@ pub struct NameStartupGraceObservation {
     pub discovery_complete: bool,
 }
 
+// Design: ADR-0278 (docs/adr/ADR-0278-mv-maintains-visible-tuples-and-replays-verification.md)
 pub(super) struct NameLifecycle {
     state: NameStartupGrace,
     last_reported: Option<NameStartupGrace>,

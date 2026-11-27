@@ -99,6 +99,9 @@ impl MvCommandExecutor {
         })?;
         let request = Box::new(
             crate::query_execution::mv_assembly::refresh_explain::MvExplainPreparationInput {
+                query_memory_budget_bytes: services.query_memory_budget_bytes,
+                optimizer_settings: context.session().optimizer_settings().clone(),
+                session_properties: Some(Arc::clone(context.session().property_inputs())),
                 ports: self.ports.clone(),
                 current_catalog: catalog.map(str::to_owned),
                 current_database: context.session().current_database().to_owned(),
@@ -121,6 +124,35 @@ impl MvCommandExecutor {
         )
     }
 
+    /// Prepare the explicit rebuild domain operation for the caller that owns
+    /// authorization. The SQL REFRESH path only constructs ordinary refreshes.
+    #[expect(
+        dead_code,
+        reason = "The governed explicit rebuild operation is wired to its caller in RWM-10d."
+    )]
+    pub fn prepare_explicit_rebuild(
+        &self,
+        target: novarocks_sql::planning::mv::SqlMvTarget,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        CommandError,
+    > {
+        self.prepare_command_request(
+            crate::query::mv_action::MvCommandRequest::Refresh {
+                statement: MvRefreshRequest {
+                    name_parts: vec![target.database.clone(), target.name.clone()],
+                    mode: crate::mv::domain::application::MvRefreshRequestMode::ExplicitRebuild,
+                },
+                requested: target,
+                session_properties: Arc::clone(context.session().property_inputs()),
+            },
+            context,
+            command_context,
+        )
+    }
+
     pub(crate) fn prepare_trino_refresh(
         &self,
         refresh: novarocks_parser::ast::TrinoRefreshMaterializedView,
@@ -139,7 +171,7 @@ impl MvCommandExecutor {
         .map_err(crate::query::procedure_command_error)?;
         let statement = MvRefreshRequest {
             name_parts: vec![target.namespace.clone(), target.table.clone()],
-            full: false,
+            mode: crate::mv::domain::application::MvRefreshRequestMode::IncrementalAllowed,
         };
         if explain {
             return self.prepare_refresh_explain(
@@ -533,7 +565,7 @@ fn alter_command_for_target(
         MvCommandRequest::Repartition {
             statement: MvRefreshRequest {
                 name_parts: statement.name_parts,
-                full: false,
+                mode: crate::mv::domain::application::MvRefreshRequestMode::IncrementalAllowed,
             },
             target,
             fields,

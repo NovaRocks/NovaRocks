@@ -18,6 +18,76 @@
 use super::*;
 #[cfg(test)]
 use crate::tests::unit_fixture::DefinitionFixture;
+use std::collections::BTreeMap;
+
+#[test]
+fn content_demand_waits_only_on_the_weighted_input() {
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (apply, mut filter) = super::content_apply_contract::runtime_filter_content_apply_fixture();
+    let application = &apply.nodes()[&filter.producers[0].endpoint.node];
+    let mut fragments = BTreeMap::new();
+    let mut edges = BTreeMap::new();
+    let mut sources = Vec::new();
+    for (index, &destination_node) in application.inputs.iter().enumerate() {
+        let mut source = FragmentBuilder::new(FragmentId::new((20 + index) as u32));
+        let (root, value) = append_single_copy_literal(&mut source, &mut constants);
+        let NodeKind::ExchangeSource { edge, .. } = &apply.nodes()[&destination_node].kind else {
+            unreachable!()
+        };
+        let source = source
+            .finish_fixture_definition(
+                root,
+                FragmentSink::Stream { edge: *edge },
+                dop(),
+                StagePlacementPolicy::Singleton,
+            )
+            .unwrap();
+        let destination_value = apply.nodes()[&destination_node].output.columns[0];
+        edges.insert(
+            *edge,
+            Edge {
+                id: *edge,
+                kind: EdgeKind::Stream,
+                role: OutputRole::Relational,
+                delivery: DeliveryRequirement::MustDrain,
+                source: EdgeSource {
+                    port: FragmentOutputPort::Root,
+                    fragment: source.id(),
+                    projection: Box::new([value]),
+                },
+                destination: EdgeDestination {
+                    fragment: apply.id(),
+                    node: destination_node,
+                    receive_mapping: Box::new([(value, destination_value)]),
+                },
+                partitioning: EdgePartitioning {
+                    source: Distribution::Singleton,
+                    source_multiplicity: RowMultiplicity::SingleCopy,
+                    destination: Distribution::Singleton,
+                    destination_multiplicity: RowMultiplicity::SingleCopy,
+                    routing_only: Box::default(),
+                },
+            },
+        );
+        sources.push((source.id(), root));
+        fragments.insert(source.id(), source);
+    }
+    fragments.insert(apply.id(), apply);
+    for (index, (fragment, node)) in sources.into_iter().enumerate() {
+        filter.consumers[0].endpoint.fragment = fragment;
+        filter.consumers[0].endpoint.node = node;
+        let resolution =
+            crate::wait_graph::WaitGraph::build(&fragments, &edges, std::slice::from_ref(&filter))
+                .unwrap()
+                .resolve()
+                .unwrap();
+        assert!(resolution.is_acyclic());
+        assert_eq!(
+            resolution.filter_downgrades.len(),
+            if index == 0 { 1 } else { 0 }
+        );
+    }
+}
 
 fn broadcast() -> PhysicalProperties {
     PhysicalProperties {

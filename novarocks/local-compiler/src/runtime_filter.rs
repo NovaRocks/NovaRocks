@@ -104,6 +104,7 @@ struct PlannedJoinConsumer {
 #[derive(Default)]
 pub(crate) struct PlannedRuntimeFilters {
     producers: BTreeMap<NodeId, Vec<PlannedProducer>>,
+    content_producers: BTreeMap<NodeId, Vec<PlannedProducer>>,
     aggregate_producers: BTreeMap<NodeId, Vec<ordered::PlannedAggregateProducer>>,
     join_consumers: BTreeMap<NodeId, Vec<PlannedJoinConsumer>>,
     consumers: BTreeMap<NodeId, Vec<PlannedConsumer>>,
@@ -520,6 +521,41 @@ pub(super) fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
         )
         .into());
     }
+    if let RuntimeFilterProducerTarget::ContentDemand { content_ordinal } = producer.target {
+        let (contract, null_semantics) = membership_contract(filter, node, factory, work)?;
+        if null_semantics != FilterNullSemantics::NullSafeEqual
+            || producer.completion != RuntimeFilterCompletion::ProducerClosed
+            || producer.contribution_kinds.as_ref()
+                != [
+                    RuntimeFilterContributionKind::ValueDomainDelta,
+                    RuntimeFilterContributionKind::ProducerClosed,
+                ]
+        {
+            return Err(
+                FragmentCompileError::Invalid("content demand producer contract differs").into(),
+            );
+        }
+        let requirement = requirement_id(binding, node)?;
+        let producer = StaticFilterProducer::try_new(
+            binding.binding_id,
+            filter.id.get(),
+            FilterProducerKind::Membership,
+            contract,
+            FilterReduction::SetUnion,
+        )
+        .map_err(static_filter)?;
+        planned
+            .content_producers
+            .entry(node)
+            .or_default()
+            .push(PlannedProducer {
+                requirement,
+                key_ordinal: content_ordinal as usize,
+                producer,
+            });
+        work.step()?;
+        return Ok(());
+    }
     let RuntimeFilterProducerTarget::JoinBuildKey { equality } = producer.target else {
         return ordered::plan_producer(
             package,
@@ -682,7 +718,8 @@ pub(super) fn plan_consumer<H, F: ValueSchemaCreationFactory<H>>(
         .into());
     }
     match consumer.target {
-        RuntimeFilterConsumerTarget::ScanField { .. } => {}
+        RuntimeFilterConsumerTarget::ScanField { .. }
+        | RuntimeFilterConsumerTarget::ContentDemandScanField { .. } => {}
         RuntimeFilterConsumerTarget::JoinProbeKey { .. } => {
             return plan_join_consumer(package, filter, binding, index, planned, factory, work);
         }
@@ -931,6 +968,26 @@ fn plan_join_consumer<H, F: ValueSchemaCreationFactory<H>>(
 }
 
 impl PlannedRuntimeFilters {
+    pub(crate) fn take_content_demand(
+        &mut self,
+        node: NodeId,
+        requirements: &mut Vec<BindingRequirement>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Box<[(usize, StaticFilterProducer)]>, FragmentCompileError> {
+        let producers = self.content_producers.remove(&node).unwrap_or_default();
+        let mut sites = Vec::new();
+        crate::assert_rows::reserve_vec(&mut sites, producers.len(), work)?;
+        crate::assert_rows::reserve_vec(requirements, producers.len(), work)?;
+        for producer in producers {
+            work.step()?;
+            requirements.push(BindingRequirement::RuntimeFilter {
+                binding_id: producer.requirement,
+            });
+            sites.push((producer.key_ordinal, producer.producer));
+        }
+        Ok(sites.into_boxed_slice())
+    }
+
     /// The number of compiler-authored consumer key definitions and roots.
     pub(crate) fn consumer_count(&self) -> Result<usize, FragmentCompileError> {
         let mut count = 0usize;
@@ -1144,6 +1201,7 @@ impl PlannedRuntimeFilters {
     /// Every admitted endpoint was taken by exactly its lowered owner.
     pub(crate) fn finish(&self) -> Result<(), FragmentCompileError> {
         if !self.aggregate_producers.is_empty()
+            || !self.content_producers.is_empty()
             || !self.producers.is_empty()
             || !self.consumers.is_empty()
             || !self.join_consumers.is_empty()

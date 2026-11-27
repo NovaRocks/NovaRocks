@@ -64,6 +64,8 @@ pub(super) enum Schema {
     BindingChange,
     InvalidDefinitionMarker,
     InvalidMarker,
+    RecoveryRecord,
+    RecoverySource,
     RetirementRecord,
 }
 
@@ -341,6 +343,13 @@ const NEEDS_REBUILD: &[Field] = &[repeated_message(1, Schema::BindingChange)];
 const BINDING_CHANGE: &[Field] = &[scalar(1), bytes(2), bytes(3)];
 const INVALID_DEFINITION: &[Field] = &[scalar(1), bytes(2)];
 const INVALID_MARKER: &[Field] = &[bytes(1)];
+const RECOVERY_RECORD: &[Field] = &[
+    scalar(1),
+    bytes(2),
+    scalar(3),
+    repeated_message(4, Schema::RecoverySource),
+];
+const RECOVERY_SOURCE: &[Field] = &[bytes(1), bytes(2)];
 const RETIREMENT_RECORD: &[Field] = &[
     scalar(1),
     bytes(2),
@@ -392,6 +401,8 @@ impl Schema {
             Self::BindingChange => BINDING_CHANGE,
             Self::InvalidDefinitionMarker => INVALID_DEFINITION,
             Self::InvalidMarker => INVALID_MARKER,
+            Self::RecoveryRecord => RECOVERY_RECORD,
+            Self::RecoverySource => RECOVERY_SOURCE,
             Self::RetirementRecord => RETIREMENT_RECORD,
         }
     }

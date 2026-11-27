@@ -692,6 +692,13 @@ enum PendingRuntimeFilterBuild {
         direction: SortDirection,
         null_ordering: NullOrdering,
     },
+    ContentDemand {
+        fragment: FragmentId,
+        node: NodeId,
+        content_ordinal: u32,
+        weighted: ValueId,
+        target_edge: EdgeId,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -722,6 +729,7 @@ fn runtime_filter_placement(
     let (producer_fragment, join) = match build {
         PendingRuntimeFilterBuild::Join { fragment, .. } => (*fragment, true),
         PendingRuntimeFilterBuild::AggregateTopN { fragment, .. } => (*fragment, false),
+        PendingRuntimeFilterBuild::ContentDemand { fragment, .. } => (*fragment, false),
     };
     let mut consumers = Vec::new();
     let mut seen = BTreeSet::new();
@@ -1191,7 +1199,7 @@ fn materialize_runtime_filter(
     let witness = RuntimeFilterWitnessId::new(id.get());
     let policy = RuntimeFilterPolicy {
         max_contribution_bytes: 1024,
-        max_artifact_bytes: 4096,
+        max_artifact_bytes: crate::planner::distributed::RUNTIME_FILTER_ARTIFACT_BYTES,
         deadline_ms: 30_000,
         max_retries: 3,
     };
@@ -1201,6 +1209,86 @@ fn materialize_runtime_filter(
     };
 
     match build {
+        PendingRuntimeFilterBuild::ContentDemand {
+            fragment,
+            node,
+            content_ordinal,
+            weighted,
+            target_edge,
+        } => {
+            let [PendingRuntimeFilterConsumerPlacement::Scan(target)] =
+                placement.consumers.as_slice()
+            else {
+                return Err(invalid(
+                    "content demand has no exact target scan field".into(),
+                ));
+            };
+            let producer = &fragments[fragment];
+            let weighted_input = producer.nodes()[node].inputs[0];
+            let build_edges = subtree_inbound_edges(producer, weighted_input);
+            let non_build_edges = fragment_inbound_edges(producer)
+                .difference(&build_edges)
+                .copied()
+                .collect();
+            let coverage = all_of_runtime_filter_witness(witness);
+            Ok(RuntimeFilter {
+                id,
+                kind: RuntimeFilterKind::InList,
+                domain: RuntimeFilterDomain::Membership {
+                    ty: producer.values()[weighted].ty.clone(),
+                    null_semantics: RuntimeFilterNullSemantics::NullSafeEqual,
+                },
+                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+                reduction: RuntimeFilterReduction::SetUnion,
+                availability_coverage: coverage.clone(),
+                terminal_coverage: coverage,
+                equality_witnesses: Box::default(),
+                producers: Box::new([RuntimeFilterProducer {
+                    witness,
+                    endpoint: RuntimeFilterEndpoint {
+                        fragment: *fragment,
+                        node: *node,
+                        values: Box::new([*weighted]),
+                    },
+                    apply_point: novarocks_physical_plan::RuntimeFilterApplyPoint::NodeInput {
+                        input_ordinal: 0,
+                    },
+                    contribution_kinds: Box::new([
+                        RuntimeFilterContributionKind::ValueDomainDelta,
+                        RuntimeFilterContributionKind::ProducerClosed,
+                    ]),
+                    completion: RuntimeFilterCompletion::ProducerClosed,
+                    progress: RuntimeFilterProducerProgress {
+                        build_edges: build_edges.into_iter().collect(),
+                        non_build_edges,
+                    },
+                    target: RuntimeFilterProducerTarget::ContentDemand {
+                        content_ordinal: *content_ordinal,
+                    },
+                }]),
+                consumers: Box::new([RuntimeFilterConsumer {
+                    endpoint: RuntimeFilterEndpoint {
+                        fragment: target.fragment,
+                        node: target.node,
+                        values: Box::new([target.value]),
+                    },
+                    apply_point: novarocks_physical_plan::RuntimeFilterApplyPoint::ScanSource,
+                    capabilities: Box::new([
+                        RuntimeFilterArtifactCapability::Membership,
+                        RuntimeFilterArtifactCapability::EmptyDomain,
+                    ]),
+                    activation: RuntimeFilterConsumerActivation::BlockingSnapshot,
+                    target: RuntimeFilterConsumerTarget::ContentDemandScanField {
+                        producer: witness,
+                        lineage: Box::new([RuntimeFilterLineageStep::ExchangeMapping {
+                            edge: *target_edge,
+                            mapping_ordinal: *content_ordinal,
+                        }]),
+                    },
+                }]),
+                policy,
+            })
+        }
         PendingRuntimeFilterBuild::Join {
             fragment,
             node,
@@ -2511,9 +2599,10 @@ impl<'a> ContractLoweringVisitor<'a> {
             PhysicalPlanKind::ChangeEventExpand(expand) => {
                 self.lower_change_event_expand(plan, expand)
             }
-            PhysicalPlanKind::ContentApply { route_keys } => {
-                self.lower_content_apply(plan, route_keys)
-            }
+            PhysicalPlanKind::ContentApply {
+                route_keys,
+                demand_keys,
+            } => self.lower_content_apply(plan, route_keys, demand_keys),
         }?;
         self.record_runtime_filter_probes(plan, &lowered)?;
         self.annotate_node(plan, &lowered)?;
@@ -2690,6 +2779,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         &mut self,
         plan: &PhysicalPlanNode,
         route_keys: &[u32],
+        demand_keys: &[u32],
     ) -> Result<LoweredNode, ContractLoweringError> {
         use novarocks_physical_plan::{
             ContentApplySpec, ContentApplyTarget, SummaryAuthor, SummaryKind, SummaryOutput,
@@ -2739,18 +2829,66 @@ impl<'a> ContractLoweringVisitor<'a> {
                 })
                 .collect::<Result<Box<[_]>, _>>()?;
             let source = self.lower_exchange_source(input, "ContentApply")?;
-            self.append_exchange(
+            let exact_source = (source.fragment, source.node, source.output.clone());
+            let exchange = self.append_exchange(
                 source,
                 &input.output_columns,
                 ExchangeLayout::Hash {
                     keys,
                     scheme: scheme.clone(),
                 },
-            )
+            )?;
+            Ok::<_, ContractLoweringError>((exchange, exact_source))
         };
-        let weighted = lower_input(weighted)?;
-        let target = lower_input(target)?;
+        let (weighted, _) = lower_input(weighted)?;
+        let (target, (target_fragment, target_scan, source_values)) = lower_input(target)?;
         let node = self.fragment_mut().reserve_node_id()?;
+        for &content_ordinal in demand_keys {
+            self.work.step()?;
+            let ordinal = content_ordinal as usize;
+            if ordinal >= width {
+                return Err(invalid_write(
+                    "content demand ordinal exceeds the visible layout".into(),
+                ));
+            }
+            let value = self.fragment_mut().value(target.output[ordinal]).ok_or(
+                ContractLoweringError::IdentitySpaceExhausted("content target value"),
+            )?;
+            let ValueOrigin::ExchangeImport {
+                edge: target_edge, ..
+            } = value.origin
+            else {
+                return Err(invalid_write(
+                    "content demand target requires its original exchange".into(),
+                ));
+            };
+            let filter_id = self
+                .runtime_filter_builds
+                .last_key_value()
+                .map_or(Some(0), |(id, _)| id.checked_add(1))
+                .ok_or(ContractLoweringError::IdentitySpaceExhausted(
+                    "content demand channel",
+                ))?;
+            self.runtime_filter_builds.insert(
+                filter_id,
+                PendingRuntimeFilterBuild::ContentDemand {
+                    fragment: self.current_fragment,
+                    node,
+                    content_ordinal,
+                    weighted: weighted.output[ordinal],
+                    target_edge,
+                },
+            );
+            self.runtime_filter_probes.insert(
+                filter_id,
+                vec![PendingRuntimeFilterProbe {
+                    fragment: target_fragment,
+                    node: target_scan,
+                    value: source_values[ordinal],
+                    scan_source: true,
+                }],
+            );
+        }
         let mut data = Vec::with_capacity(plan.output_columns.len());
         let mut columns = BTreeMap::new();
         for (ordinal, column) in plan.output_columns.iter().enumerate() {

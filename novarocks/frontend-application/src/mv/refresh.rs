@@ -35,12 +35,19 @@ pub(crate) fn bind_publication_documents(
     let declaration = session.pending_publication_declaration().map_err(|error| {
         MvApplicationError::from_connector(MvApplicationErrorKind::InvalidRequest, error)
     })?;
+    let logical_result_rows = if admitted.partition_replace().is_some() {
+        None
+    } else {
+        logical_result_rows
+    };
     let documents = admitted
         .publication_document_set(intent.publication_id(), logical_result_rows)
         .map_err(invalid)?;
     let publication = novarocks_spi::connector::KeyedPublicationIntent {
         declaration,
         documents,
+        full_refresh_markers: admitted.full_refresh_markers().cloned(),
+        partition_replace: admitted.partition_replace().cloned(),
     };
     session
         .bind_keyed_document_publication(publication)

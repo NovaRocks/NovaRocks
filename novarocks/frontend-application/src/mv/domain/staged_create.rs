@@ -63,7 +63,7 @@ pub(crate) fn now_management_timestamp() -> Result<ManagementTimestamp, String> 
     now_unix_millis().map(ManagementTimestamp::from_unix_millis)
 }
 
-fn now_unix_millis() -> Result<u64, String> {
+pub(crate) fn now_unix_millis() -> Result<u64, String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "system clock is before the Unix epoch".to_string())?;
@@ -411,6 +411,8 @@ pub(crate) struct CommittedMvMarker {
     pub(crate) operation: uuid::Uuid,
     pub(crate) key: novarocks_spi::connector::ConnectorMarkerKey,
     pub(crate) value: novarocks_spi::connector::ConnectorMarkerValue,
+    pub(crate) original_view: Option<novarocks_spi::connector::KeyedDocumentView>,
+    pub(crate) completion_error: Option<super::application::MvApplicationError>,
 }
 
 pub(crate) async fn install_marked_current_projection_async_in(
@@ -510,7 +512,15 @@ impl MvConvergence {
     ) -> Result<(), String> {
         if let Self::CommittedMarker { expected, marker } = self
             && (!metadata_only_current_matches(expected, observed)
-                || observed.view.markers.get(&marker.key) != Some(&marker.value))
+                || observed.view.markers.get(&marker.key) != Some(&marker.value)
+                || marker.original_view.as_ref().is_some_and(|original| {
+                    let mut expected = original.clone();
+                    expected
+                        .markers
+                        .insert(marker.key.clone(), marker.value.clone());
+                    expected.metadata_version = observed.view.metadata_version.clone();
+                    expected != observed.view
+                }))
         {
             return Err("MV marker settlement observed a different binding or marker".into());
         }
@@ -1337,7 +1347,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
         ),
         novarocks_mv_application::readiness::MvProjectionError,
     > {
-        use novarocks_mv_application::persistence::keyed_documents::decode_current_keyed_documents;
+        use novarocks_mv_application::persistence::keyed_documents::resolve_current_keyed_documents;
         use novarocks_mv_application::readiness::{MvProjectionError, MvProjectionErrorKind};
         let conflict = |e: String| MvProjectionError::new(MvProjectionErrorKind::SourceConflict, e);
         self.registration.claim_current()?;
@@ -1455,7 +1465,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             .complete_keyed_current_observation_async(pending, &documents, observation.clone())
             .await
             .map_err(current_projection_observation)?;
-        let mut observed = decode_current_keyed_documents(view, request.catalog().clone())
+        let mut observed = resolve_current_keyed_documents(view, request.catalog().clone())
             .map_err(MvProjectionError::from)?;
         let convergence = self
             .entrance
@@ -1525,7 +1535,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 .resolve_pending_slot_changes_async(&documents, registered_request.clone())
                 .await
                 .map_err(current_projection_connector)?;
-            observed = decode_current_keyed_documents(view, request.catalog().clone())
+            observed = resolve_current_keyed_documents(view, request.catalog().clone())
                 .map_err(MvProjectionError::from)?;
         } else if convergence.reinstall_current_projection {
             let pending=state.begin_current_observation(novarocks_mv_application::management::ManagementObservationRequestId::from_bytes(*uuid::Uuid::now_v7().as_bytes())).map_err(|e|conflict(format!("begin resolved MV observation: {e:?}")))?;
@@ -1533,7 +1543,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 .complete_keyed_current_observation_async(pending, &documents, observation)
                 .await
                 .map_err(current_projection_observation)?;
-            observed = decode_current_keyed_documents(view, request.catalog().clone())
+            observed = resolve_current_keyed_documents(view, request.catalog().clone())
                 .map_err(MvProjectionError::from)?;
         }
         validate_current_publication_carrier(self.published, &observed).map_err(conflict)?;
@@ -1566,7 +1576,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
         ),
         novarocks_mv_application::readiness::MvProjectionError,
     > {
-        use novarocks_mv_application::persistence::keyed_documents::decode_current_keyed_documents;
+        use novarocks_mv_application::persistence::keyed_documents::resolve_current_keyed_documents;
         use novarocks_mv_application::readiness::{MvProjectionError, MvProjectionErrorKind};
         let conflict = |e: String| MvProjectionError::new(MvProjectionErrorKind::SourceConflict, e);
         let catalog = request
@@ -1667,7 +1677,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
         let (phase, view) = state
             .complete_keyed_current_observation(pending, &documents, observation.clone())
             .map_err(|e| conflict(format!("complete MV observation: {e:?}")))?;
-        let mut observed = decode_current_keyed_documents(view, request.catalog().clone())
+        let mut observed = resolve_current_keyed_documents(view, request.catalog().clone())
             .map_err(|e| conflict(e.to_string()))?;
         let convergence = self
             .entrance
@@ -1727,14 +1737,14 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             self.entrance
                 .resolve_pending_slot_changes(&documents, registered_request.clone())
                 .map_err(|e| conflict(e.to_string()))?;
-            observed = decode_current_keyed_documents(view, request.catalog().clone())
+            observed = resolve_current_keyed_documents(view, request.catalog().clone())
                 .map_err(|e| conflict(e.to_string()))?;
         } else if convergence.reinstall_current_projection {
             let pending=state.begin_current_observation(novarocks_mv_application::management::ManagementObservationRequestId::from_bytes(*uuid::Uuid::now_v7().as_bytes())).map_err(|e|conflict(format!("begin resolved MV observation: {e:?}")))?;
             let (_, view) = state
                 .complete_keyed_current_observation(pending, &documents, observation)
                 .map_err(|e| conflict(format!("complete resolved MV observation: {e:?}")))?;
-            observed = decode_current_keyed_documents(view, request.catalog().clone())
+            observed = resolve_current_keyed_documents(view, request.catalog().clone())
                 .map_err(|e| conflict(e.to_string()))?;
         }
         validate_current_publication_carrier(self.published, &observed).map_err(conflict)?;
@@ -1780,6 +1790,11 @@ pub(crate) struct AdmittedMvPublication {
     repartitioned: bool,
     replacement: Option<novarocks_mv_application::persistence::keyed_documents::MvKeyedVersions>,
     markers_remove: std::collections::BTreeSet<novarocks_spi::connector::ConnectorMarkerKey>,
+    content_pending: Option<Arc<super::refresh::pending_fence::PendingFence>>,
+    full_refresh_markers: Option<novarocks_spi::connector::KeyedFullRefreshMarkers>,
+    partition_replace:
+        Option<novarocks_spi::connector::read_stack::ConnectorMvTargetPartitionSelection>,
+    explicit_recovery: Option<novarocks_mv_application::persistence::codec::RecoveryRecord>,
     released_pending: std::sync::OnceLock<
         std::collections::BTreeSet<novarocks_spi::connector::ConnectorMarkerKey>,
     >,
@@ -1787,6 +1802,22 @@ pub(crate) struct AdmittedMvPublication {
 }
 
 impl AdmittedMvPublication {
+    pub(crate) fn bind_content_pending(
+        &mut self,
+        fence: Arc<super::refresh::pending_fence::PendingFence>,
+    ) -> Result<(), String> {
+        if self.interpretation.is_aggregate()
+            || self.content_pending.is_some()
+            || self.replacement.is_some()
+        {
+            return Err("MV publication cannot bind this Pending fence".into());
+        }
+        self.previous_logical_rows = fence.baseline_rows();
+        self.markers_remove.insert(fence.key().clone());
+        self.content_pending = Some(fence);
+        Ok(())
+    }
+
     pub(crate) const fn admission(&self) -> &ConnectorDocumentManagementAdmission {
         &self.admission
     }
@@ -1912,6 +1943,9 @@ impl AdmittedMvPublication {
                 return Err("MV configuration slot changed after computation".into());
             }
         }
+        if let Some(fence) = &self.content_pending {
+            fence.verify(documents)?;
+        }
         Ok(())
     }
 
@@ -2036,12 +2070,16 @@ impl AdmittedMvPublication {
                 inputs: inputs.inputs().to_vec(),
                 logical_result_rows,
             };
-        let mut documents =
-            novarocks_mv_application::persistence::keyed_documents::keyed_publication_document_set(
-                &versions,
-                &publication,
-            )
-            .map_err(|e| format!("encode MV publication record: {e}"))?;
+        use novarocks_mv_application::persistence::keyed_documents::{
+            keyed_publication_document_set, keyed_recovery_publication_document_set,
+        };
+        let mut documents = match &self.explicit_recovery {
+            Some(record) => {
+                keyed_recovery_publication_document_set(&versions, &publication, record)
+            }
+            None => keyed_publication_document_set(&versions, &publication),
+        }
+        .map_err(|e| format!("encode MV publication record: {e}"))?;
         documents
             .markers_remove
             .extend(self.markers_remove.iter().cloned());
@@ -2085,6 +2123,55 @@ pub(crate) struct AdmittedMvDataPublication {
 }
 
 impl AdmittedMvDataPublication {
+    pub(crate) fn bind_partition_replace(
+        &mut self,
+        selection: novarocks_spi::connector::read_stack::ConnectorMvTargetPartitionSelection,
+    ) -> Result<(), String> {
+        if self.publication.interpretation.is_aggregate()
+            || self.publication.content_pending.is_some()
+            || self.publication.partition_replace.is_some()
+        {
+            return Err("MV publication cannot bind this partition replacement scope".into());
+        }
+        self.publication.partition_replace = Some(selection);
+        Ok(())
+    }
+
+    pub(crate) fn partition_replace(
+        &self,
+    ) -> Option<&novarocks_spi::connector::read_stack::ConnectorMvTargetPartitionSelection> {
+        self.publication.partition_replace.as_ref()
+    }
+
+    pub(crate) fn bind_full_refresh_markers(
+        &mut self,
+        frozen: novarocks_spi::connector::KeyedFullRefreshMarkers,
+        recovery: Option<novarocks_mv_application::persistence::codec::RecoveryRecord>,
+    ) -> Result<(), String> {
+        if self.publication.interpretation.is_aggregate()
+            || self.publication.content_pending.is_some()
+            || self.publication.full_refresh_markers.is_some()
+            || (self.publication.partition_replace.is_some() && recovery.is_some())
+        {
+            return Err("MV full refresh cannot bind those marker requirements".into());
+        }
+        self.publication.full_refresh_markers = Some(frozen);
+        self.publication.explicit_recovery = recovery;
+        Ok(())
+    }
+
+    pub(crate) fn full_refresh_markers(
+        &self,
+    ) -> Option<&novarocks_spi::connector::KeyedFullRefreshMarkers> {
+        self.publication.full_refresh_markers.as_ref()
+    }
+
+    pub(crate) fn content_pending(
+        &self,
+    ) -> Option<&Arc<super::refresh::pending_fence::PendingFence>> {
+        self.publication.content_pending.as_ref()
+    }
+
     pub(crate) const fn previous_logical_rows(&self) -> Option<u64> {
         self.publication.previous_logical_rows
     }
@@ -2227,6 +2314,10 @@ impl MvPublicationAdmissionParts {
             repartitioned: false,
             replacement: None,
             markers_remove: Default::default(),
+            content_pending: None,
+            full_refresh_markers: None,
+            partition_replace: None,
+            explicit_recovery: None,
             released_pending: std::sync::OnceLock::new(),
             configuration_slot_update: self.configuration_slot_update,
         }

@@ -61,13 +61,14 @@ SELECT 1;
 -- @skip_result_check=true
 -- @result_rows_where=Property=UnsettledEffects
 -- @result_rows_count=1
--- @result_rows_expect=Value=1
+-- @result_rows_expect=Value=0
+-- @result_not_contains=AWAITING_EFFECT_SETTLEMENT
 CALL novarocks_mv_management_status('mvunknown_${uuid0}', 'ns_${uuid0}', 'target_mv');
 
 -- query 11
 -- @skip_result_check=true
--- @mv_resume_management=target_mv,catalog=mvunknown_${uuid0},database=ns_${uuid0}
-SELECT 1;
+RESET SESSION "mvunknown_${uuid0}".incremental_refresh_enabled;
+REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 12
 -- @skip_result_check=true

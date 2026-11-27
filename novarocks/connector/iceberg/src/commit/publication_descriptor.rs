@@ -27,6 +27,10 @@ use uuid::Uuid;
 pub(crate) enum AttributionPlan {
     ObserveOnly,
     KeyedSnapshot(super::mv_dispatch::KeyedSnapshotSelection),
+    FencedKeyedMarkers {
+        table_uuid: Uuid,
+        properties: std::collections::BTreeMap<String, String>,
+    },
     KeyedSlotChange {
         table_uuid: Uuid,
         snapshot_id: i64,
@@ -70,6 +74,10 @@ pub(crate) enum PositiveAttributionObservation {
         observed: super::mv_dispatch::KeyedSnapshotObservation,
     },
     KeyedSlotWriter(KeyedSlotWriterObservation),
+    KeyedMarkers {
+        table_uuid: Uuid,
+        properties: std::collections::BTreeMap<String, String>,
+    },
     SnapshotMarker {
         table_uuid: Uuid,
         snapshot_id: i64,
@@ -127,6 +135,16 @@ impl AttributionPlan {
                     observed,
                 }
             }),
+            Self::FencedKeyedMarkers { properties, .. } => {
+                let properties = properties
+                    .keys()
+                    .map(|key| Some((key.clone(), metadata.properties().get(key)?.clone())))
+                    .collect::<Option<_>>()?;
+                Some(PositiveAttributionObservation::KeyedMarkers {
+                    table_uuid: metadata.uuid(),
+                    properties,
+                })
+            }
             Self::Snapshot {
                 snapshot_id,
                 marker_key,
@@ -187,6 +205,16 @@ impl AttributionPlan {
                     observed,
                 },
             ) => *table_uuid == selection.table_uuid && selection.matches(observed),
+            (
+                Self::FencedKeyedMarkers {
+                    table_uuid: expected_uuid,
+                    properties: expected,
+                },
+                PositiveAttributionObservation::KeyedMarkers {
+                    table_uuid,
+                    properties,
+                },
+            ) => expected_uuid == table_uuid && expected == properties,
             (
                 Self::KeyedSlotChange {
                     table_uuid,
@@ -271,7 +299,8 @@ impl AttributionPlan {
     fn table_uuid(&self) -> Option<Uuid> {
         match self {
             Self::KeyedSnapshot(selection) => Some(selection.table_uuid),
-            Self::KeyedSlotChange { table_uuid, .. }
+            Self::FencedKeyedMarkers { table_uuid, .. }
+            | Self::KeyedSlotChange { table_uuid, .. }
             | Self::Snapshot { table_uuid, .. }
             | Self::ManagedRepartition { table_uuid, .. }
             | Self::Property { table_uuid, .. }
@@ -533,9 +562,10 @@ impl PublicationDescriptor {
             }
         }
         if matches!(attribution, AttributionPlan::ObserveOnly)
-            && let Some(slot_change) = keyed_slot_attribution(request, table_uuid)?
+            && let Some(keyed) = fenced_marker_attribution(request, table_uuid)?
+                .or(keyed_slot_attribution(request, table_uuid)?)
         {
-            attribution = slot_change;
+            attribution = keyed;
         }
         let bytes = request.canonical_rest_bytes()?;
         let mut descriptor = Self::catalog_with_key(
@@ -573,6 +603,40 @@ impl PublicationDescriptor {
         Ok(())
     }
 }
+fn fenced_marker_attribution(
+    request: &FrozenRequest,
+    table_uuid: Uuid,
+) -> Result<Option<AttributionPlan>> {
+    use crate::document_storage::keyed::{envelope, keys};
+    use crate::iceberg::TableUpdate;
+
+    if request.shape() != super::model::RequestShape::FencedMarkers {
+        return Ok(None);
+    }
+    let mut properties = std::collections::BTreeMap::new();
+    for update in request.updates() {
+        let TableUpdate::SetProperties { updates } = update else {
+            return Ok(None);
+        };
+        for (key, value) in updates {
+            if !matches!(
+                keys::parse_key(key, false).map_err(super::slot_change::document_error)?,
+                Some(keys::DocumentKey::Marker(_))
+            ) {
+                return Ok(None);
+            }
+            envelope::decode_marker(key, value).map_err(super::slot_change::document_error)?;
+            properties.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(
+        (!properties.is_empty()).then_some(AttributionPlan::FencedKeyedMarkers {
+            table_uuid,
+            properties,
+        }),
+    )
+}
+
 fn keyed_slot_attribution(
     request: &FrozenRequest,
     table_uuid: Uuid,

@@ -46,6 +46,8 @@ pub use novarocks_connector_contract::{ConnectorReadBinding, ConnectorReadRelati
 
 mod source_preparation;
 pub use source_preparation::{
+    ConnectorExactPartitionSliceOutcome, ConnectorExactPartitionSliceVolume,
+    ConnectorExactSourcePartitionField, ConnectorExactSourcePartitionSlice,
     ConnectorPreparedSourceRead, ConnectorPreparedSourceReadFuture,
     ConnectorReadSourcePreparationRequest, ConnectorReadSourceProjection,
     ConnectorReadSourceSelection, ConnectorReadSplitPreparation,

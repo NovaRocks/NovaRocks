@@ -195,7 +195,7 @@ fn schema_catalog_contains_exactly_four_current_accelerator_subjects() {
         assert_eq!(
             catalog.latest(subject).unwrap().id(),
             if subject == "mv.accelerator_projection" {
-                6
+                7
             } else {
                 3
             }
@@ -205,7 +205,7 @@ fn schema_catalog_contains_exactly_four_current_accelerator_subjects() {
         catalog.entry("mv.accelerator_projection", 3).unwrap().id(),
         3
     );
-    for version in [3, 4, 5, 6] {
+    for version in [3, 4, 5, 6, 7] {
         let entry = catalog.entry("mv.accelerator_projection", version).unwrap();
         let json: serde_json::Value = serde_json::from_str(entry.raw_schema()).unwrap();
         let fields = json["fields"].as_array().unwrap();
@@ -329,7 +329,7 @@ fn keyed_projection_requires_binding_and_preserves_file_total_semantics() {
 }
 
 #[test]
-fn projection_preserves_its_witness_without_inventing_one_for_v5() {
+fn projection_preserves_history_and_eligibility_across_writer_versions() {
     use crate::persistence::keyed_documents::{
         MvKeyedDocumentProjection, keyed_view_fixture, resolve_current_keyed_documents,
     };
@@ -352,33 +352,47 @@ fn projection_preserves_its_witness_without_inventing_one_for_v5() {
         Some(true)
     );
 
-    let schema = schema_catalog()
-        .unwrap()
-        .entry("mv.accelerator_projection", 5)
-        .unwrap();
-    let datum = apache_avro::to_value(projection_dto(&original)).unwrap();
-    let apache_avro::types::Value::Record(mut fields) = datum else {
-        unreachable!()
-    };
-    fields.retain(|(name, _)| name != "never_published");
-    let payload =
-        apache_avro::to_avro_datum(schema.schema(), apache_avro::types::Value::Record(fields))
-            .unwrap();
-    let fingerprint = schema.fingerprint().as_bytes();
-    let mut envelope = new.as_bytes()[..6].to_vec();
-    envelope.extend_from_slice(&schema.id().to_be_bytes());
-    envelope.extend_from_slice(&(fingerprint.len() as u16).to_be_bytes());
-    envelope.extend_from_slice(fingerprint);
-    envelope.extend_from_slice(Uuid::now_v7().as_bytes());
-    envelope.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    envelope.extend_from_slice(&payload);
-    let legacy = Value::try_from(Bytes::from(envelope)).unwrap();
-    let cached = decode_keyed_projection(&key, &legacy).unwrap().value;
+    use crate::persistence::keyed_documents::MvCurrentDataEligibility;
     assert_eq!(
-        cached.facts.source_revision(),
-        original.facts.source_revision()
+        decode_keyed_projection(&key, &new)
+            .unwrap()
+            .value
+            .facts
+            .data_eligibility(),
+        Some(MvCurrentDataEligibility::NeverPublished),
     );
-    assert_eq!(cached.facts.never_published, None);
+    for version in [5, 6] {
+        let schema = schema_catalog()
+            .unwrap()
+            .entry("mv.accelerator_projection", version)
+            .unwrap();
+        let datum = apache_avro::to_value(projection_dto(&original)).unwrap();
+        let apache_avro::types::Value::Record(mut fields) = datum else {
+            unreachable!()
+        };
+        fields.retain(|(name, _)| {
+            name != "data_eligibility" && (version >= 6 || name != "never_published")
+        });
+        let payload =
+            apache_avro::to_avro_datum(schema.schema(), apache_avro::types::Value::Record(fields))
+                .unwrap();
+        let fingerprint = schema.fingerprint().as_bytes();
+        let mut envelope = new.as_bytes()[..6].to_vec();
+        envelope.extend_from_slice(&schema.id().to_be_bytes());
+        envelope.extend_from_slice(&(fingerprint.len() as u16).to_be_bytes());
+        envelope.extend_from_slice(fingerprint);
+        envelope.extend_from_slice(Uuid::now_v7().as_bytes());
+        envelope.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        envelope.extend_from_slice(&payload);
+        let legacy = Value::try_from(Bytes::from(envelope)).unwrap();
+        let cached = decode_keyed_projection(&key, &legacy).unwrap().value;
+        assert_eq!(
+            cached.facts.source_revision(),
+            original.facts.source_revision()
+        );
+        assert_eq!(cached.facts.never_published, (version >= 6).then_some(true));
+        assert_eq!(cached.facts.data_eligibility(), None);
+    }
 
     let mut same_zero_totals = view;
     same_zero_totals.before_first_data_publication = false;

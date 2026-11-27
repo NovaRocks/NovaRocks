@@ -1360,6 +1360,8 @@ fn application_document_publication_for(
     let publication = KeyedPublicationIntent {
         declaration: declaration.clone(),
         documents: keyed,
+        full_refresh_markers: None,
+        partition_replace: None,
     };
     (declaration, publication)
 }

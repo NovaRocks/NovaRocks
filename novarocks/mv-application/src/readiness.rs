@@ -497,6 +497,7 @@ impl MvKeyedReadinessExecution {
         let unchanged = expected.as_ref().is_some_and(|old| {
             old.projection.facts.source_revision() == facts.source_revision()
                 && old.projection.facts.never_published == facts.never_published
+                && old.projection.facts.data_eligibility() == facts.data_eligibility()
         });
         if expected.is_none()
             && let Some(existing) = self
@@ -1099,6 +1100,7 @@ impl MvKeyedReadinessExecution {
         let unchanged = expected.as_ref().is_some_and(|old| {
             old.projection.facts.source_revision() == facts.source_revision()
                 && old.projection.facts.never_published == facts.never_published
+                && old.projection.facts.data_eligibility() == facts.data_eligibility()
         });
         if expected.is_none()
             && let Some(existing) = self

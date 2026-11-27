@@ -211,7 +211,17 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
             metadata.identity.clone(),
             observed.object_id,
             observed.schema_version,
-            observed.format_v3,
+            match observed.format_version {
+                novarocks_connector_iceberg::iceberg::spec::FormatVersion::V1 => {
+                    novarocks_spi::connector::MvSourceFormatVersion::V1
+                }
+                novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2 => {
+                    novarocks_spi::connector::MvSourceFormatVersion::V2
+                }
+                novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3 => {
+                    novarocks_spi::connector::MvSourceFormatVersion::V3
+                }
+            },
             observed.selected_snapshot_id,
             observed.selected_snapshot_has_row_range,
             fields,

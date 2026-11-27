@@ -55,8 +55,11 @@ pub(super) fn projection(payload: &[u8], schema: i32) -> Result<(), String> {
     } else {
         None
     };
-    if schema == 6 {
+    if schema >= 6 {
         input.optional(Datum::boolean)?;
+    }
+    if schema >= 7 {
+        input.optional(Datum::string)?;
     }
     if !input.remaining.is_empty() {
         return Err("MV Accelerator Avro payload has trailing bytes".into());

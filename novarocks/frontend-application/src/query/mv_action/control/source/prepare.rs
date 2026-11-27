@@ -521,7 +521,7 @@ impl ControlSource {
 }
 fn management_failure(error: ManagementAdmissionError) -> MvProviderFailure {
     if error.is_retryable_name_admission() {
-        MvProviderFailure::new(MvProviderFailureKind::Unavailable, error.to_string())
+        shared(SharedFailureCause::new(error))
     } else {
         invalid(error)
     }

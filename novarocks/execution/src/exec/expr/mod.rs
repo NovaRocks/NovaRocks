@@ -169,8 +169,6 @@ mod e08s1_owned_lifecycle_tests;
 #[cfg(test)]
 mod late_call_sql_source_tests;
 
-
-
 #[cfg(test)]
 mod environment_sql_source_tests;
 

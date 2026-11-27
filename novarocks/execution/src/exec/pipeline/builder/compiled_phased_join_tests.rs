@@ -424,6 +424,152 @@ fn empty_build_in_drain_fragment_waits_for_probe_eos() {
 }
 
 #[test]
+fn empty_probe_in_drain_fragment_keeps_the_build_exchange_live() {
+    use crate::exec::operators::ExchangeSourceFactory;
+    use crate::runtime::task::io::ExchangeReceiverKey;
+    use novarocks_execution_contract::{ExchangeCloseDisposition, ExchangeStreamClose};
+
+    for spec in [
+        Spec::hash(JoinKind::Inner, false),
+        Spec::nested(JoinKind::Inner, true),
+    ] {
+        let mut packages = packages(&exchange_plan(
+            spec,
+            Placement::Broadcast,
+            &[],
+            &RIGHT_ROWS[..1],
+            FragmentInputCompletion::MustDrain,
+        ));
+        let program = compile(packages.remove(&JOIN).unwrap(), JOIN_DOP, false);
+        let probe_source = compile(packages.remove(&LEFT_SOURCE).unwrap(), 1, false);
+        let build_source = compile(packages.remove(&RIGHT_SOURCE).unwrap(), 1, false);
+        let fixture = Fixture::new();
+        let instance = JOIN_FINSTS[0];
+        let bindings = register_all(
+            &fixture,
+            &program,
+            instance,
+            &BTreeMap::from([
+                (LEFT_SOURCE.get(), vec![LEFT_FINST]),
+                (RIGHT_SOURCE.get(), vec![RIGHT_FINST]),
+            ]),
+            &fixture.port,
+        );
+        let transmitter = LoopbackTransmitter::new(fixture.transport.clone());
+        let run_source = |source: &Arc<LocalProgram>, sender| {
+            try_run_in_fixture(
+                &fixture,
+                source,
+                stream_sink(
+                    &fixture,
+                    source,
+                    sender,
+                    vec![destination(instance, sender, 0, 1)],
+                    &transmitter,
+                ),
+                ExchangeBindings::default(),
+                sender,
+            )
+            .unwrap();
+        };
+        let runtime = fixture.state(instance);
+        let error = runtime.error_state();
+        let tracker = runtime.mem_tracker().unwrap();
+        let construction = fixture.creation(instance);
+        let drain_exchange = |source_fragment: FragmentId, sender| {
+            let input = program
+                .exchange_inputs()
+                .values()
+                .find(|input| input.source_fragment == source_fragment.get())
+                .unwrap();
+            let node = i32::try_from(input.receiver_node).unwrap();
+            let mut source =
+                ExchangeSourceFactory::new_compiled(node, bindings.get(node).unwrap()).create(1, 0);
+            bind(source.as_mut(), &runtime, &tracker, &construction);
+            let chunks = TestDriver::new(source.as_mut(), &runtime)
+                .collect_until_finished()
+                .unwrap();
+            let key = ExchangeReceiverKey {
+                task_key: instance,
+                node_id: node,
+            };
+            let stream = fixture.stream(sender, instance, node, 0);
+            assert!(matches!(
+                fixture
+                    .port
+                    .stream_close_facts(key, &[stream])
+                    .unwrap()
+                    .as_slice(),
+                [ExchangeStreamClose {
+                    disposition: ExchangeCloseDisposition::Consumed { .. },
+                    ..
+                }]
+            ));
+            chunks
+        };
+        let declaration = declaration(
+            &program,
+            JoinParticipants {
+                inputs: 1,
+                finalizers: NonZeroUsize::MIN,
+                probes: 1,
+                tails: 0,
+            },
+        );
+        let mut build = CompiledJoinInputSinkFactory::new(declaration.clone(), error.clone(), None)
+            .create(1, 0);
+        let mut finalize_build =
+            CompiledJoinFinalizeSourceFactory::new(declaration.clone(), error.clone()).create(1, 0);
+        let mut probe =
+            CompiledJoinProbeProcessorFactory::new(declaration, error.clone()).create(1, 0);
+        for operator in [&mut build, &mut finalize_build, &mut probe] {
+            bind(operator.as_mut(), &runtime, &tracker, &construction);
+        }
+
+        run_source(&probe_source, LEFT_FINST);
+        assert!(drain_exchange(LEFT_SOURCE, LEFT_FINST).is_empty());
+        let mut probe = TestDriver::new(probe.as_mut(), &runtime);
+        probe.signal_eos().unwrap();
+        let NextStep::Wait(wait) = probe.advance_to_boundary().unwrap().next else {
+            panic!("strict empty probe must retain demand while build is still open");
+        };
+        assert!(!wait.is_ready());
+        let mut turn = TurnWork::new(NonZeroU64::MIN, 64);
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut step = DriverStep::new(&error, &mut turn, &mut conversions);
+        assert!(matches!(
+            build.poll_control(&mut step).unwrap(),
+            ControlStep::Active
+        ));
+
+        run_source(&build_source, RIGHT_FINST);
+        let chunks = drain_exchange(RIGHT_SOURCE, RIGHT_FINST);
+        assert_eq!(chunks.iter().map(|chunk| chunk.len()).sum::<usize>(), 1);
+        let mut build = TestDriver::new(build.as_mut(), &runtime);
+        for chunk in chunks {
+            build.input_without_output(chunk).unwrap();
+        }
+        build.signal_eos().unwrap();
+        assert!(matches!(
+            build.advance_to_boundary().unwrap().next,
+            NextStep::Finished
+        ));
+        finalize(std::slice::from_mut(&mut finalize_build), &runtime);
+        assert!(wait.is_ready());
+        assert!(probe.collect_until_finished().unwrap().is_empty());
+        for operator in [
+            build.operator_mut(),
+            probe.operator_mut(),
+            finalize_build.as_mut(),
+        ] {
+            operator.begin_exit().unwrap();
+            operator.close().unwrap();
+        }
+        assert!(runtime.error().is_none());
+    }
+}
+
+#[test]
 fn b3_b0_retains_receiver_owned_throwing_probe_key_and_original_required_error() {
     let mut packages = packages(&overflow_plan(Overflow::ProbeKey));
     let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);

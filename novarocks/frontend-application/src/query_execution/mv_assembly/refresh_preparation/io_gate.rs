@@ -35,12 +35,13 @@ use novarocks_spi::connector::{
     ConnectorControlPlanningPin, ConnectorError, ConnectorOriginalResultScope,
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
     ConnectorTablePreparation, ConnectorTableRequest, ConnectorTableResolution,
-    ProviderMetadataCpuPort,
+    ProviderMetadataCpuPort, StatisticsEvidence, StatisticsMetricRequest, StatisticsReadRequest,
 };
 
 use super::captured_sources::CapturedRefreshSources;
 /// Concrete inputs only. There is no callback or caller-supplied future.
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
+use crate::mv::domain::refresh::pending_fence::PendingFence;
 use crate::mv::domain::staged_create::{
     AdmittedMvPublication, CurrentProjectionRegistration, MvPublicationAdmissionReceiving,
 };
@@ -82,6 +83,10 @@ enum Request {
         documents: ConnectorDocumentStorage,
         request: KeyedDocumentObservationRequest,
     },
+    ObserveFull {
+        documents: ConnectorDocumentStorage,
+        request: KeyedDocumentObservationRequest,
+    },
     WriteBindingMarker {
         source: IcebergMvCorePorts,
         planning: ConnectorControlPlanningPin,
@@ -111,6 +116,10 @@ enum Request {
         context: ConnectorRequestContext,
     },
 
+    ContentStatistics {
+        planning_pin: ConnectorControlPlanningPin,
+        request: StatisticsReadRequest,
+    },
     CompleteTableObservation {
         planning_pin: ConnectorControlPlanningPin,
         original: ConnectorTableMetadata,
@@ -142,10 +151,17 @@ enum Response {
     RebuildReadOnly(Result<(), MvApplicationError>),
     LoadReady(Result<Option<LoadedKeyedMvProjection>, MvApplicationError>),
     ObserveCurrent(Result<MvKeyedObservedCurrentDocuments, MvApplicationError>),
+    ObserveFull(
+        Result<
+            novarocks_spi::connector::FullKeyedDocumentView,
+            novarocks_spi::connector::KeyedDocumentReadError,
+        >,
+    ),
     CloseMismatch(Result<bool, MvApplicationError>),
     WriteBindingMarker(Result<(), MvApplicationError>),
     Admit(Result<(), MvApplicationError>),
     InstallCurrent(Result<(), MvApplicationError>),
+    ContentStatistics(Result<StatisticsEvidence, ConnectorError>),
     MetadataReady,
     ViewMetadataReady,
     SourceRead(Result<(), ConnectorError>),
@@ -251,6 +267,11 @@ struct SourceWindowControl {
 }
 
 pub(crate) struct MvRefreshPreparationIo {
+    pending_fence: OnceLock<(
+        Arc<PendingFence>,
+        ConnectorControlPlanningPin,
+        Arc<MvKeyedDocumentProjection>,
+    )>,
     state: Mutex<Option<State>>,
     poisoned: AtomicBool,
     retired_originals: Mutex<Option<Vec<Retained>>>,
@@ -299,6 +320,7 @@ impl MvRefreshPreparationIo {
             ),
         );
         Self {
+            pending_fence: OnceLock::new(),
             state: Mutex::new(Some(State::Idle)),
             poisoned: AtomicBool::new(false),
             retired_originals: Mutex::new(Some(Vec::new())),
@@ -348,6 +370,27 @@ impl MvRefreshPreparationIo {
             panic!("original MV gate returned another response to refresh graph");
         };
         result
+    }
+
+    pub(crate) fn retain_pending_fence(
+        &self,
+        fence: Arc<PendingFence>,
+        planning: ConnectorControlPlanningPin,
+        projection: Arc<MvKeyedDocumentProjection>,
+    ) -> Result<(), &'static str> {
+        self.pending_fence
+            .set((fence, planning, projection))
+            .map_err(|_| "MV preparation already owns a Pending fence")
+    }
+
+    pub(crate) fn pending_fence(
+        &self,
+    ) -> Option<&(
+        Arc<PendingFence>,
+        ConnectorControlPlanningPin,
+        Arc<MvKeyedDocumentProjection>,
+    )> {
+        self.pending_fence.get()
     }
 
     pub(crate) async fn write_binding_marker(
@@ -436,6 +479,30 @@ impl MvRefreshPreparationIo {
             let current_metadata_cpu = Arc::clone(&self.current_metadata_cpu);
             let operation: Operation = Box::pin(async move {
                 match request {
+                    Request::ContentStatistics {
+                        planning_pin,
+                        request,
+                    } => {
+                        let result = if let Some(statistics) = planning_pin.binding().statistics() {
+                            let version = request.data_version.clone();
+                            let result = statistics.read_statistics_async(request).await;
+                            result.and_then(|evidence| {
+                                if evidence.data_version() != &version {
+                                    return Err(ConnectorError::new(
+                                        novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                                        "MV content statistics returned a different data version",
+                                    ));
+                                }
+                                Ok(evidence)
+                            })
+                        } else {
+                            Err(ConnectorError::new(
+                                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                                "Original MV table pin has no statistics reader",
+                            ))
+                        };
+                        Response::ContentStatistics(result)
+                    }
                     Request::RefreshGraph { readiness } => {
                         let view = readiness.in_requests(Arc::clone(&services.requests));
                         Response::RefreshGraph(
@@ -483,6 +550,9 @@ impl MvRefreshPreparationIo {
                                 .map_err(query_error),
                         )
                     }
+                    Request::ObserveFull { documents, request } => Response::ObserveFull(
+                        documents.observe_full_keyed_documents_async(request).await,
+                    ),
                     Request::WriteBindingMarker {
                         source,
                         planning,
@@ -505,6 +575,7 @@ impl MvRefreshPreparationIo {
                         .await;
                         let result = match result {
                             Ok(Some(marker)) => {
+                                let completion_error = marker.completion_error.clone();
                                 // A metadata-only renewal may already have consumed the
                                 // initial Current. Marker settlement owns a new observation.
                                 let gate = original_gate
@@ -545,6 +616,7 @@ impl MvRefreshPreparationIo {
                                             }
                                             failure
                                         })
+                                        .and_then(|()| completion_error.map_or(Ok(()), Err))
                                     }
                                     Err(error) => Err(MvApplicationError::new(
                                         MvApplicationErrorKind::KnownCommittedFinalizeFailed, error,
@@ -946,6 +1018,26 @@ impl MvRefreshPreparationIo {
         };
         result
     }
+    pub(crate) async fn observe_full(
+        &self,
+        documents: &ConnectorDocumentStorage,
+        request: KeyedDocumentObservationRequest,
+    ) -> Result<novarocks_spi::connector::FullKeyedDocumentView, MvApplicationError> {
+        let Response::ObserveFull(result) = self
+            .exchange(Request::ObserveFull {
+                documents: documents.clone(),
+                request,
+            })
+            .await
+        else {
+            panic!("MV full observation response changed kind")
+        };
+        result
+            .map_err(
+                novarocks_mv_application::persistence::documents::MvDocumentError::KeyedStorage,
+            )
+            .map_err(document_error)
+    }
     pub(crate) async fn close_mismatch(
         &self,
         source: &IcebergMvCorePorts,
@@ -1065,6 +1157,63 @@ impl MvRefreshPreparationIo {
                 .create_prepared_table(preparation, creation)
         })
         .map_err(crate::connector::schema_creation::connector_schema_error)
+    }
+
+    pub(crate) async fn content_statistics(
+        &self,
+        planning_pin: &ConnectorControlPlanningPin,
+        metadata: &ConnectorTableMetadata,
+        metrics: StatisticsMetricRequest,
+        context: &ConnectorRequestContext,
+    ) -> Result<Option<StatisticsEvidence>, ConnectorError> {
+        context.original_operation_control().check_active()?;
+        let Some(data_version) = metadata.statistics_data_version.clone() else {
+            return Ok(None);
+        };
+        if planning_pin.binding().descriptor().instance_id != *metadata.table.owner() {
+            return Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                "MV content statistics metadata belongs to another connector",
+            ));
+        }
+        let context =
+            crate::connector::context_for_planning_pin_typed(planning_pin, context.clone())?;
+        let source = metadata.source_read_facts().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                "MV statistics have no original source observation",
+            )
+        })?;
+        let Response::ContentStatistics(result) = self
+            .exchange(Request::ContentStatistics {
+                planning_pin: planning_pin.clone(),
+                request: StatisticsReadRequest {
+                    table: metadata.table.clone(),
+                    row_mutation_current: None,
+                    observed_source: Some(source.clone()),
+                    narrowed_read: None,
+                    data_version,
+                    metrics,
+                    context,
+                },
+            })
+            .await
+        else {
+            panic!("MV content statistics response changed kind");
+        };
+        match result {
+            Ok(evidence) => Ok(Some(evidence)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    novarocks_spi::connector::ConnectorErrorKind::Unsupported
+                        | novarocks_spi::connector::ConnectorErrorKind::NotFound
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) async fn complete_table_observation(

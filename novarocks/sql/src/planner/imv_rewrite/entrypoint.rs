@@ -1112,35 +1112,6 @@ pub(crate) mod tests {
         dead_code,
         reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
     )]
-    fn locator_join_left_input(plan: &LogicalPlanNode) -> &LogicalPlanNode {
-        let LogicalPlanKind::Project(_) = &plan.kind else {
-            panic!("expected root Project over target locator join, got {plan:?}");
-        };
-        let join_plan = plan.unary_input();
-        let LogicalPlanKind::Join(join) = &join_plan.kind else {
-            panic!("expected target locator Join under root Project, got {join_plan:?}");
-        };
-        assert_eq!(join.join_type, JoinKind::LeftOuter);
-        let LogicalPlanKind::Scan(scan) = &join_plan.right().kind else {
-            panic!("expected target locator scan on join right side");
-        };
-        assert!(
-            matches!(
-                scan.table.source,
-                ScanSource::Sql(SqlScanSource {
-                    kind: SqlScanKind::MvTargetLocator { .. },
-                    ..
-                })
-            ),
-            "join right side must be target locator scan"
-        );
-        join_plan.left()
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
-    )]
     fn find_delta_scan(plan: &LogicalPlanNode) -> Option<&PlanScanNode> {
         match &plan.kind {
             LogicalPlanKind::Scan(scan)
@@ -1422,7 +1393,7 @@ pub(crate) mod tests {
         );
         assert!(!kinds.iter().any(|k| matches!(
             k,
-            SqlScanKind::MvTargetLocator { .. } | SqlScanKind::MvTargetState { .. }
+            SqlScanKind::MvContentTarget { .. } | SqlScanKind::MvTargetState { .. }
         )));
         assert_eq!(
             joins, 0,
@@ -1470,7 +1441,7 @@ pub(crate) mod tests {
         assert_ne!(windows[0], windows[1]);
         assert!(!kinds.iter().any(|kind| matches!(
             kind,
-            SqlScanKind::MvTargetLocator { .. } | SqlScanKind::MvTargetState { .. }
+            SqlScanKind::MvContentTarget { .. } | SqlScanKind::MvTargetState { .. }
         )));
         assert_eq!(joins, 0);
     }

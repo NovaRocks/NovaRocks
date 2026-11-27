@@ -17,13 +17,9 @@
 
 -- @sequential=true
 -- @order_sensitive=true
--- @tags=mv,iceberg,ivm,negative,v3_required
--- Test Objective:
--- 1. CREATE MATERIALIZED VIEW over a non-v3 (default v2) Iceberg base must
---    fail fast with a clear error pointing at format-version.
--- 2. CREATE MATERIALIZED VIEW over a v3 base without write.row-lineage=true
---    succeeds once its selected v3 snapshot has a row range.
--- IVM is Iceberg-v3-only by design; this case locks in that contract.
+-- @tags=mv,iceberg,ivm,source_admission
+-- Non-aggregate definitions accept v2 and v3 sources. Aggregate definitions
+-- still require v3, and v1 sources remain outside either refresh contract.
 
 -- query 1
 -- @skip_result_check=true
@@ -41,11 +37,16 @@ CREATE TABLE ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v3_no_lineage (
   amount BIGINT
 ) WITH (format_version = 3);
 INSERT INTO ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v3_no_lineage VALUES ROW(1, 10);
+CREATE TABLE ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v1 (
+  order_id INT,
+  amount BIGINT
+) WITH (format_version = 1);
+INSERT INTO ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v1 VALUES ROW(1, 10);
 
 USE ice_ivm_reject_v2_${uuid0}.ns_${uuid0};
 
 -- query 2
--- @expect_error=Iceberg format-version=3
+-- @skip_result_check=true
 CREATE MATERIALIZED VIEW mv_over_v2 AS SELECT order_id, amount FROM orders_v2;
 
 -- query 3
@@ -53,9 +54,24 @@ CREATE MATERIALIZED VIEW mv_over_v2 AS SELECT order_id, amount FROM orders_v2;
 CREATE MATERIALIZED VIEW mv_over_v3_no_lineage AS SELECT order_id, amount FROM orders_v3_no_lineage;
 
 -- query 4
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_error=Iceberg format-version=2 or 3
+CREATE MATERIALIZED VIEW mv_over_v1 AS SELECT order_id, amount FROM orders_v1;
+
+-- query 5
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_error=Iceberg format-version=3
+CREATE MATERIALIZED VIEW mv_aggregate_over_v2 AS
+SELECT order_id, count(*) AS n FROM orders_v2 GROUP BY order_id;
+
+-- query 6
 -- @cleanup=true
 -- @skip_result_check=true
+DROP MATERIALIZED VIEW IF EXISTS mv_aggregate_over_v2;
+DROP MATERIALIZED VIEW IF EXISTS mv_over_v1;
+DROP MATERIALIZED VIEW IF EXISTS mv_over_v2;
 DROP MATERIALIZED VIEW IF EXISTS mv_over_v3_no_lineage;
+DROP TABLE ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v1;
 DROP TABLE ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v2 ;
 DROP TABLE ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v3_no_lineage ;
 DROP SCHEMA ice_ivm_reject_v2_${uuid0}.ns_${uuid0};

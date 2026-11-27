@@ -23,6 +23,10 @@ pub const ICEBERG_MUTATION_EVIDENCE_VERSION: u16 = 3;
 pub const ICEBERG_STATISTICS_EVIDENCE_VERSION: u16 = 1;
 pub const ICEBERG_STAGED_PUBLICATION_PROOF_VERSION: u16 = 1;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct IcebergStagedPublicationProofV1 {
     pub version: u16,
@@ -88,6 +92,8 @@ pub enum IcebergMutationEvidenceTarget {
         table_uuid: String,
         operation_id: [u8; 16],
         properties: std::collections::BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        fenced: bool,
     },
     KeyedSlotChange {
         namespace: String,

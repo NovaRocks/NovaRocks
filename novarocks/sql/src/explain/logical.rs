@@ -440,7 +440,7 @@ fn has_scan_label(source: &ScanSource) -> bool {
         | SqlScanKind::FrozenInputSet {
             version: crate::planner::table::SqlTableVersionSelector::Snapshot(_),
         }
-        | SqlScanKind::MvTargetState { .. } | SqlScanKind::MvTargetLocator { .. } | SqlScanKind::MvContentTarget { .. }))
+        | SqlScanKind::MvTargetState { .. } | SqlScanKind::MvContentTarget { .. }))
 }
 
 struct ScanLabel<'a>(&'a ScanSource);
@@ -468,20 +468,6 @@ impl fmt::Display for ScanLabel<'_> {
                 "IcebergMvContentTarget target={}.{}.{} snapshot_id={target_snapshot_id}",
                 source.table.catalog, source.table.namespace, source.table.table,
             ),
-            SqlScanKind::MvTargetLocator { facts } => {
-                write!(
-                    out,
-                    "IcebergMvTargetLocator target={}.{}.{} apply_key={}",
-                    source.table.catalog,
-                    source.table.namespace,
-                    source.table.table,
-                    facts.apply_key_column
-                )?;
-                if let Some(branch) = &facts.branch_id_column {
-                    write!(out, " branch_id={branch}")?;
-                }
-                Ok(())
-            }
             SqlScanKind::MvTargetState { facts } => {
                 write!(
                     out,

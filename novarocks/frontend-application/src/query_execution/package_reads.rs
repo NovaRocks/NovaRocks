@@ -451,3 +451,5 @@ fn scan_dynamic_filters(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::runtime_filter_test_column;

@@ -159,7 +159,11 @@ INSERT INTO orders (id, customer, amount) VALUES ROW(16, 'A', 10), ROW(17, 'B', 
 
 -- query 21
 -- @skip_result_check=true
--- @result_contains=source: IcebergDeltaTable from_snapshot_id=
+-- @result_contains=MV refresh: FullReplace
+-- @result_contains=MV optimizer cost AppendOnly:
+-- @result_contains=exact change-window volume and source manifests
+-- @result_contains=MV optimizer cost FullReplace:
+-- @result_contains=complete source manifests
 EXPLAIN REFRESH MATERIALIZED VIEW orders_maintenance_mv;
 
 -- query 22
@@ -197,7 +201,12 @@ WHERE r.name = 'main' AND p.phase = 'a9_source_before';
 
 -- query 26
 -- @skip_result_check=true
--- @result_contains=source: IcebergDeltaTable from_snapshot_id=
+-- @result_contains_any=MV refresh: ContentLocate
+-- @result_contains_any=MV refresh: FullReplace
+-- @result_contains=MV optimizer cost ContentLocate:
+-- @result_contains=exact change-window volume, source and target manifests
+-- @result_contains=MV optimizer cost FullReplace:
+-- @result_contains=complete source manifests
 EXPLAIN REFRESH MATERIALIZED VIEW orders_maintenance_mv;
 
 -- query 27
@@ -205,7 +214,7 @@ EXPLAIN REFRESH MATERIALIZED VIEW orders_maintenance_mv;
 REFRESH MATERIALIZED VIEW orders_maintenance_mv;
 
 -- query 28
--- The single direct publication and file effects witness the incremental write.
+-- The single direct publication and file effects witness the selected refresh write.
 SELECT s.parent_id = p.snapshot_id AS direct_child,
        p.publication IS NOT NULL
          AND element_at(s.summary, 'novarocks.doc.v2.record.novarocks.mv~publication') <> p.publication AS new_publication,

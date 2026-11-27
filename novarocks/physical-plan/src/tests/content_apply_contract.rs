@@ -258,6 +258,83 @@ fn build(shape: Shape) -> Result<Fragment, ValidationErrors> {
     )
 }
 
+pub(super) fn runtime_filter_content_apply_fixture() -> (Fragment, RuntimeFilter) {
+    let fragment = build(Shape::Valid).unwrap();
+    let apply = &fragment.nodes()[&fragment.nodes()[&fragment.root()].inputs[0]];
+    let NodeKind::ContentApply(spec) = &apply.kind else {
+        unreachable!()
+    };
+    let witness = RuntimeFilterWitnessId::new(1);
+    let coverage = RuntimeFilterCoverage {
+        nodes: Box::new([
+            RuntimeFilterCoverageNode::Witness(witness),
+            RuntimeFilterCoverageNode::AllOf {
+                children: Box::new([0]),
+            },
+        ]),
+        root: 1,
+    };
+    let filter = RuntimeFilter {
+        id: RuntimeFilterId::new(1),
+        kind: RuntimeFilterKind::InList,
+        domain: RuntimeFilterDomain::Membership {
+            ty: ty(DataType::Int64, false),
+            null_semantics: RuntimeFilterNullSemantics::NullSafeEqual,
+        },
+        lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+        reduction: RuntimeFilterReduction::SetUnion,
+        availability_coverage: coverage.clone(),
+        terminal_coverage: coverage,
+        producers: Box::new([RuntimeFilterProducer {
+            witness,
+            endpoint: RuntimeFilterEndpoint {
+                fragment: fragment.id(),
+                node: apply.id,
+                values: spec.weighted_content.clone(),
+            },
+            apply_point: RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 },
+            completion: RuntimeFilterCompletion::ProducerClosed,
+            contribution_kinds: Box::new([
+                RuntimeFilterContributionKind::ValueDomainDelta,
+                RuntimeFilterContributionKind::ProducerClosed,
+            ]),
+            progress: RuntimeFilterProducerProgress {
+                build_edges: Box::new([EdgeId::new(5)]),
+                non_build_edges: Box::new([EdgeId::new(6)]),
+            },
+            target: RuntimeFilterProducerTarget::ContentDemand { content_ordinal: 0 },
+        }]),
+        consumers: Box::new([RuntimeFilterConsumer {
+            endpoint: RuntimeFilterEndpoint {
+                fragment: fragment.id(),
+                node: apply.inputs[1],
+                values: spec.target_content.clone(),
+            },
+            apply_point: RuntimeFilterApplyPoint::ScanSource,
+            activation: RuntimeFilterConsumerActivation::BlockingSnapshot,
+            capabilities: Box::new([
+                RuntimeFilterArtifactCapability::Membership,
+                RuntimeFilterArtifactCapability::EmptyDomain,
+            ]),
+            target: RuntimeFilterConsumerTarget::ContentDemandScanField {
+                producer: witness,
+                lineage: Box::new([RuntimeFilterLineageStep::ExchangeMapping {
+                    edge: EdgeId::new(6),
+                    mapping_ordinal: 0,
+                }]),
+            },
+        }]),
+        equality_witnesses: Box::default(),
+        policy: RuntimeFilterPolicy {
+            max_contribution_bytes: 1024,
+            max_artifact_bytes: 4096,
+            deadline_ms: 30_000,
+            max_retries: 3,
+        },
+    };
+    (fragment, filter)
+}
+
 #[test]
 fn content_apply_publishes_data_and_verification_on_distinct_ports() {
     let fragment = build(Shape::Valid).unwrap();

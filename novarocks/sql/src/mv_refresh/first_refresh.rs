@@ -22,6 +22,7 @@
 //! connector writer at the native distributed root without materializing data
 //! in the frontend.
 
+mod partition_sources;
 mod sql_shape;
 use crate::analyzer::QueryAnalysisPurpose;
 use crate::binding::SqlTableBindingId;
@@ -41,6 +42,7 @@ use novarocks_parser::{ast, build};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+pub use self::partition_sources::{SqlMvPartitionSourceBinding, bind_mv_partition_sources};
 pub use self::sql_shape::{SqlMvSnapshotPin, SqlMvSnapshotPinOccurrence};
 use self::sql_shape::{
     branch_union_queries, pin_state_sql, prepare_projection_full_read_sql,
@@ -268,6 +270,7 @@ pub(crate) struct MvFirstRefreshPhysicalQuery {
 pub struct SqlMvFirstRefreshArtifact {
     physical: MvFirstRefreshPhysicalQuery,
     captured_sources: bool,
+    partition_sources: Option<Vec<SqlMvPartitionSourceBinding>>,
 }
 
 impl SqlMvFirstRefreshArtifact {
@@ -275,7 +278,13 @@ impl SqlMvFirstRefreshArtifact {
         Self {
             physical,
             captured_sources: false,
+            partition_sources: None,
         }
+    }
+
+    pub fn with_partition_sources(mut self, bindings: Vec<SqlMvPartitionSourceBinding>) -> Self {
+        self.partition_sources = Some(bindings);
+        self
     }
 
     pub fn root_hash_column(&self) -> &str {
@@ -359,6 +368,7 @@ pub fn analyze_mv_first_refresh_connector_write(
 ) -> Result<SqlMvFirstRefreshAnalyzed, crate::compiler::SqlCompileError> {
     let root_distribution = first_refresh_distribution(artifact.root_hash_column());
     let settings = context.optimizer_settings.clone();
+    let control = context.control.clone();
     let request = crate::compiler::SqlAnalyzeRequest::new(
         crate::compiler::SqlStatementInput::parsed_query(artifact.physical.query),
         crate::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
@@ -377,7 +387,10 @@ pub fn analyze_mv_first_refresh_connector_write(
         context.control,
     )
     .with_analysis_purpose(QueryAnalysisPurpose::Ordinary);
-    let analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
+    let mut analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
+    if let Some(sources) = artifact.partition_sources {
+        bind_mv_partition_sources(&mut analyzed, &sources, &control)?;
+    }
     Ok(SqlMvFirstRefreshAnalyzed {
         analyzed,
         sink: context.sink,
@@ -1121,7 +1134,8 @@ fn add_join_incremental_change_stream_effect(
                 .map(|column| column.column_id.0)
                 .max()
                 .unwrap_or(0)
-                + 1,
+                .checked_add(1)
+                .ok_or_else(|| "IMV change-stream output column id overflowed".to_owned())?,
         ),
         name: crate::common::change_stream::ROW_MUTATION_EFFECT_COLUMN.to_string(),
         value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1142,7 +1156,7 @@ fn add_join_incremental_change_stream_effect(
     // The old change-op column selects an event but is not a provider input.
     // Keep the signed input occurrences in their original order so provider
     // route ordinals still name the same fields after expansion.
-    let routed_outputs = output_columns
+    let mut routed_outputs = output_columns
         .iter()
         .filter(|column| {
             action_output
@@ -1166,6 +1180,44 @@ fn add_join_incremental_change_stream_effect(
             })
         })
         .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
+
+    if content_apply {
+        let file = row_lineage_output.as_ref().ok_or_else(|| {
+            "MV content application has no file locator for its delete route".to_owned()
+        })?;
+        let locator_ordinal = routed_outputs
+            .iter()
+            .position(|column| column.column_id == file.column_id)
+            .ok_or_else(|| "MV content application lost its file locator".to_owned())?;
+        let last_lineage_column_id = effect_output
+            .column_id
+            .0
+            .checked_add(2)
+            .ok_or_else(|| "MV content application lineage column id overflowed".to_owned())?;
+        // The signed writer layout places the lineage fields before the file
+        // locator. Leave them unassigned so Iceberg mints fresh lineage for
+        // inserts. The delete route consumes the original locators only.
+        let lineage = [
+            (
+                crate::common::ICEBERG_ROW_ID_COL,
+                last_lineage_column_id - 1,
+            ),
+            (
+                crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
+                last_lineage_column_id,
+            ),
+        ]
+        .map(|(name, id)| crate::analysis::OutputColumn {
+            column_id: crate::column_id::ColumnId(id),
+            name: name.to_string(),
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                true,
+            ),
+            is_internal: true,
+        });
+        routed_outputs.splice(locator_ordinal..locator_ordinal, lineage);
+    }
 
     let not_deleted = action_output
         .as_ref()
@@ -2693,7 +2745,7 @@ mod tests {
                     let ScanSource::Sql(source) = &scan.table.source;
                     assert!(!matches!(
                         source.kind,
-                        SqlScanKind::MvTargetLocator { .. } | SqlScanKind::MvTargetState { .. }
+                        SqlScanKind::MvContentTarget { .. } | SqlScanKind::MvTargetState { .. }
                     ));
                     if matches!(source.kind, SqlScanKind::Delta { .. }) {
                         *sources += 1;
@@ -2853,6 +2905,93 @@ mod tests {
             "every branch must select itself; the expand emits one row per matching event, so an \
              unconditional branch would duplicate rows rather than lose a race"
         );
+    }
+
+    #[test]
+    fn content_application_routes_positions_and_leaves_insert_lineage_fresh() {
+        use crate::common::{
+            CHANGE_OP_COLUMN, ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL,
+            ICEBERG_ROW_ID_COL, ICEBERG_ROW_POS_COL,
+        };
+        use crate::optimizer::operator::{ContentApplyOp, Operator};
+        use arrow::datatypes::{DataType, Fields};
+        use novarocks_spi::connector::ConnectorRowMutationEffect;
+        use novarocks_type_contract::FunctionValueType;
+
+        let mut file = incremental_column(2, ICEBERG_FILE_PATH_COL);
+        file.value_type = FunctionValueType::new(DataType::Utf8, true);
+        let mut spec = incremental_column(4, "_spec_id");
+        spec.value_type = FunctionValueType::new(DataType::Int32, true);
+        let mut partition = incremental_column(5, "_partition");
+        partition.value_type = FunctionValueType::new(DataType::Struct(Fields::empty()), true);
+        let mut action = incremental_column(6, CHANGE_OP_COLUMN);
+        action.value_type = FunctionValueType::new(DataType::Int8, false);
+        let columns = vec![
+            incremental_column(1, "k"),
+            file,
+            incremental_column(3, ICEBERG_ROW_POS_COL),
+            spec,
+            partition,
+            action,
+        ];
+        let mut content = incremental_producer(columns.clone());
+        content.op = Operator::PhysicalContentApply(ContentApplyOp {
+            route_keys: Box::from([0]),
+            demand_keys: Box::new([]),
+            output_columns: columns,
+        });
+        let producer = add_join_incremental_change_stream_effect(
+            content,
+            &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(),
+            SqlMvIncrementalWriteMode::RowDelta,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("content application binds the managed writer layout");
+        assert_eq!(
+            producer
+                .output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "k",
+                ICEBERG_ROW_ID_COL,
+                ICEBERG_LAST_UPDATED_SEQ_COL,
+                ICEBERG_FILE_PATH_COL,
+                ICEBERG_ROW_POS_COL,
+                "_spec_id",
+                "_partition",
+                crate::common::change_stream::ROW_MUTATION_EFFECT_COLUMN,
+            ],
+        );
+        assert_eq!(
+            incremental_events(&producer),
+            [
+                ConnectorRowMutationEffect::Delete,
+                ConnectorRowMutationEffect::Insert
+            ],
+        );
+        let Operator::PhysicalChangeEventExpand(expand) = &producer.op else {
+            unreachable!("incremental_events verified the expansion");
+        };
+        for column in &producer.output_columns[1..3] {
+            assert_eq!(
+                column.value_type,
+                FunctionValueType::new(DataType::Int64, true)
+            );
+            assert!(expand.events.iter().all(|event| {
+                event
+                    .assignments
+                    .iter()
+                    .all(|assignment| assignment.output_column_id != column.column_id)
+            }));
+        }
+        for locator in &producer.output_columns[3..7] {
+            assert!(expand.events[0].assignments.iter().any(|assignment| {
+                assignment.output_column_id == locator.column_id && assignment.expr.is_some()
+            }));
+        }
     }
 
     #[test]

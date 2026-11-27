@@ -52,13 +52,24 @@ pub(super) fn reconcile_async<'a>(
         let request = &original.request;
         let evidence = &request.evidence;
         let target = validated_reconciliation_target(provider, evidence)?;
-        if evidence.operation_kind() == "keyed-documents"
-            && matches!(
-                &target,
-                IcebergMutationEvidenceTarget::KeyedSlotChange { .. }
-            )
-        {
-            return reconcile_keyed_slot(provider, evidence, &request.context, receiving).await;
+        if evidence.operation_kind() == "keyed-documents" {
+            match &target {
+                IcebergMutationEvidenceTarget::KeyedSlotChange { .. } => {
+                    return reconcile_keyed_slot(provider, evidence, &request.context, receiving)
+                        .await;
+                }
+                IcebergMutationEvidenceTarget::KeyedMarkers { fenced: true, .. } => {
+                    return reconcile_keyed_markers(
+                        provider,
+                        evidence,
+                        &target,
+                        &request.context,
+                        receiving,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
         }
         let namespace = evidence.operation_kind() == "create-namespace"
             && matches!(
@@ -76,7 +87,7 @@ pub(super) fn reconcile_async<'a>(
             );
         if !namespace && !table {
             return Err(unsupported(
-                "asynchronous reconciliation requires ordinary CREATE TABLE, CREATE SCHEMA or exact slot-change evidence",
+                "asynchronous reconciliation requires ordinary CREATE TABLE, CREATE SCHEMA or exact keyed mutation evidence",
             ));
         }
         let (journal, entry, descriptor) = match recover_reconciliation(evidence, &request.context)?
@@ -137,11 +148,9 @@ async fn reconcile_keyed_slot(
     context: &ConnectorRequestContext,
     receiving: &ConnectorCatalogMutationReceiving,
 ) -> Result<ReconciliationOutcome, ConnectorError> {
-    use crate::commit::publication_descriptor::{
-        KeyedSlotWriterObservation, PositiveAttributionObservation,
-    };
+    use crate::commit::publication_descriptor::PositiveAttributionObservation;
     use novarocks_spi::connector::{
-        CommitConclusion, CommitProof, ConnectorDocumentStorageObservation, UnknownCommitIdentity,
+        CommitConclusion, CommitProof, ConnectorDocumentStorageObservation,
     };
 
     let (journal, entry, descriptor) = match recover_reconciliation(evidence, context)? {
@@ -163,18 +172,7 @@ async fn reconcile_keyed_slot(
         Arc::clone(provider.runtime()),
     );
     let decoded = storage.decode_keyed_slot_change_evidence(request.clone(), evidence.clone())?;
-    let UnknownCommitIdentity::SlotWriter { slot } = &decoded.identity else {
-        return Err(invalid(
-            "Original pure slot change has no exact SlotWriter witness",
-        ));
-    };
-    let observed = KeyedSlotWriterObservation {
-        table_uuid: uuid::Uuid::from_slice(request.object_id.as_bytes())
-            .map_err(|_| invalid("Original slot target has an invalid table UUID"))?,
-        snapshot_id: decoded.preselected_snapshot,
-        parent: decoded.asserted_parent,
-        slot: (slot.owner.clone(), slot.name.clone()),
-    };
+    let observed = slot_writer_observation(&request.object_id, &decoded)?;
     let attribution = PositiveAttributionObservation::KeyedSlotWriter(observed.clone());
     if !descriptor.attribution.matches_observation(&attribution) {
         return Err(invalid(
@@ -230,6 +228,133 @@ async fn reconcile_keyed_slot(
             format!("Keyed slot resolution was refused by its original journal: {error}"),
         ));
     }
+    finish_keyed_reconciliation(&journal, entry, context, receiving).await
+}
+
+async fn reconcile_keyed_markers(
+    provider: &IcebergMetadata,
+    evidence: &ExternalMutationEvidence,
+    target: &IcebergMutationEvidenceTarget,
+    context: &ConnectorRequestContext,
+    receiving: &ConnectorCatalogMutationReceiving,
+) -> Result<ReconciliationOutcome, ConnectorError> {
+    use crate::commit::publication_descriptor::PositiveAttributionObservation;
+    use crate::document_storage::keyed;
+
+    let (journal, entry, descriptor) = match recover_reconciliation(evidence, context)? {
+        RecoveredReconciliation::Ready(outcome) => return Ok(outcome),
+        RecoveredReconciliation::Pending {
+            journal,
+            entry,
+            descriptor,
+        } => (journal, entry, descriptor),
+    };
+    let original_scope = journal
+        .keyed_observation_request()
+        .ok_or_else(|| invalid("Keyed markers have no original document observation scope"))?;
+    let IcebergMutationEvidenceTarget::KeyedMarkers {
+        namespace,
+        table,
+        table_uuid,
+        operation_id,
+        properties,
+        fenced: true,
+    } = target
+    else {
+        return Err(invalid(
+            "Keyed marker reconciliation requires marker evidence",
+        ));
+    };
+    if &*original_scope.target.namespace != namespace
+        || &*original_scope.target.table != table
+        || original_scope.object_id.as_bytes().as_ref() != table_uuid.as_bytes()
+        || *operation_id != evidence.operation_id().to_bytes()
+    {
+        return Err(invalid(
+            "Marker evidence differs from its original target or operation",
+        ));
+    }
+    let table_uuid = uuid::Uuid::parse_str(table_uuid)
+        .map_err(|_| invalid("Original marker target has an invalid table UUID"))?;
+    let expected = PositiveAttributionObservation::KeyedMarkers {
+        table_uuid,
+        properties: properties.clone(),
+    };
+    if !descriptor.attribution.matches_observation(&expected) {
+        return Err(invalid(
+            "Marker evidence differs from its original fenced property update",
+        ));
+    }
+
+    let freshness = context.clone().after_external_effect();
+    let loaded = match provider
+        .runtime()
+        .observe_table_classified_for_request_with_snapshots_async(
+            namespace,
+            table,
+            &freshness,
+            crate::catalog::SnapshotLoading::Refs,
+        )
+        .await
+    {
+        Ok(table) => table,
+        Err((_, error)) => {
+            return Ok(unresolved_reconciliation(
+                evidence,
+                format!("Exact keyed marker observation remains unresolved: {error}"),
+            ));
+        }
+    };
+    let table_metadata = loaded.table.metadata();
+    if table_metadata.uuid() != table_uuid {
+        return Ok(unresolved_reconciliation(
+            evidence,
+            "Original marker target was replaced",
+        ));
+    }
+    keyed::view::parse_properties(table_metadata.properties())
+        .map_err(crate::document_storage::observation::keyed_read_error)?;
+    let Some(observed) = descriptor
+        .attribution
+        .observe_table_metadata(table_metadata)
+    else {
+        return Ok(journal.catalog_entry_outcome(entry));
+    };
+    if !descriptor.attribution.matches_observation(&observed) {
+        return Ok(journal.catalog_entry_outcome(entry));
+    }
+    if let Err(error) = journal.append_positive_proof_with_finalization(
+        descriptor.key,
+        observed,
+        provider
+            .runtime()
+            .novarocks_catalog()
+            .positive_attribution_finalization(),
+    ) {
+        let original = journal.catalog_entry_outcome(entry);
+        if !matches!(original, ExternalMutationOutcome::CommitUnknown { .. }) {
+            return Ok(original);
+        }
+        return Ok(unresolved_reconciliation(
+            evidence,
+            format!("Keyed marker resolution was refused by its original journal: {error}"),
+        ));
+    }
+    provider
+        .runtime()
+        .control_state()
+        .invalidate_table_cache(namespace, table);
+    finish_keyed_reconciliation(&journal, entry, context, receiving).await
+}
+
+async fn finish_keyed_reconciliation(
+    journal: &crate::commit::attempt::observation::PublicationJournal<
+        ConnectorCatalogMutationReceipt,
+    >,
+    entry: crate::commit::attempt::observation::JournalEntryRef,
+    context: &ConnectorRequestContext,
+    receiving: &ConnectorCatalogMutationReceiving,
+) -> Result<ReconciliationOutcome, ConnectorError> {
     let needed = match journal.catalog_entry_outcome(entry) {
         ExternalMutationOutcome::KnownCommitted {
             effect,
@@ -239,11 +364,64 @@ async fn reconcile_keyed_slot(
         } => receiving.record_needed_committed(effect, &receipt, &finalization),
         _ => Ok(()),
     };
-    // Cleanup consumes the original selection and artifact ledger only after
-    // the Provider recorded the exact D14 proof and its independent verdict.
-    if let Err(error) = journal.settle_keyed_slot_cleanup_in(entry, context).await {
+    // Cleanup consumes the original selection and artifact ledger after the
+    // Provider records the exact publication proof and its verdict.
+    if let Err(error) = journal
+        .settle_keyed_document_cleanup_in(entry, context)
+        .await
+    {
         journal.record_entry_cleanup(entry, ExternalMutationFinalization::Failed(failure(&error)));
     }
     needed?;
     Ok(journal.catalog_entry_outcome(entry))
+}
+
+fn slot_writer_observation(
+    object_id: &novarocks_spi::connector::ConnectorTableObjectId,
+    evidence: &novarocks_spi::connector::UnknownCommitEvidence,
+) -> Result<crate::commit::publication_descriptor::KeyedSlotWriterObservation, ConnectorError> {
+    use crate::commit::publication_descriptor::KeyedSlotWriterObservation;
+    use novarocks_spi::connector::UnknownCommitIdentity;
+
+    let UnknownCommitIdentity::SlotWriter { slot } = &evidence.identity else {
+        return Err(invalid(
+            "Original pure slot change has no exact SlotWriter witness",
+        ));
+    };
+    let table_uuid = std::str::from_utf8(object_id.as_bytes())
+        .ok()
+        .and_then(|encoded| uuid::Uuid::parse_str(encoded).ok())
+        .ok_or_else(|| invalid("Original slot target has an invalid table UUID"))?;
+    Ok(KeyedSlotWriterObservation {
+        table_uuid,
+        snapshot_id: evidence.preselected_snapshot,
+        parent: evidence.asserted_parent,
+        slot: (slot.owner.clone(), slot.name.clone()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_spi::connector::{
+        ConnectorSlotName, ConnectorTableObjectId, UnknownCommitEvidence, UnknownCommitIdentity,
+    };
+
+    #[test]
+    fn keyed_slot_d14_uses_iceberg_encoded_object_identity() {
+        let table_uuid = uuid::Uuid::now_v7();
+        let object =
+            ConnectorTableObjectId::try_new(bytes::Bytes::from(table_uuid.to_string())).unwrap();
+        let evidence = UnknownCommitEvidence {
+            asserted_parent: Some(8),
+            preselected_snapshot: 10,
+            identity: UnknownCommitIdentity::SlotWriter {
+                slot: ConnectorSlotName::try_new("novarocks.mv", "management").unwrap(),
+            },
+        };
+        let observed = slot_writer_observation(&object, &evidence).unwrap();
+        assert_eq!(observed.table_uuid, table_uuid);
+        assert_eq!(observed.snapshot_id, 10);
+        assert_eq!(observed.parent, Some(8));
+    }
 }

@@ -242,12 +242,7 @@ impl MvCreateStepOriginal {
             .management_entrance()
             .map_err(service)?
             .check_name_startup_grace()
-            .map_err(|error| {
-                domain_failure(MvApplicationError::new(
-                    MvApplicationErrorKind::Unavailable,
-                    error.to_string(),
-                ))
-            })?;
+            .map_err(|error| phase_failure(CreatePhaseFailure::name_admission(error)))?;
         let cancellation =
             QueryCancellationView::governed(owner.cancellation().clone(), owner.timeout_ms());
         let runtime = self.input.services.blocking.runtime().clone();
@@ -427,14 +422,14 @@ impl MvCreateStepOriginal {
             }
             let cancellation =
                 QueryCancellationView::governed(owner.cancellation().clone(), owner.timeout_ms());
-            let name_metadata_cpu = CurrentProjectionMetadataCpu::business(
+            let name_metadata_cpu = Arc::new(CurrentProjectionMetadataCpu::business(
                 self.cpu.clone(),
                 self.root.clone(),
                 self.window.clone(),
                 cancellation.clone(),
                 self.input.services.blocking.runtime().clone(),
                 self.wake.clone(),
-            );
+            ));
             self.in_foreign = true;
             let constructed = CreateOriginal::new(CreateOriginalInput {
                 plan,
@@ -496,6 +491,7 @@ impl MvCreateStepOriginal {
             result: &mut self.phase_result,
             primary: &mut self.primary,
             store,
+            requests: &self.requests,
             io: &self.io,
             root: &self.root,
             window: &self.window,
@@ -606,6 +602,7 @@ struct CreatePort<'a> {
     result: &'a mut Option<Result<(), CreatePhaseFailure>>,
     primary: &'a mut Option<MvPhaseFailure>,
     store: &'a StateStoreOriginalOwner,
+    requests: &'a Arc<dyn StateStoreExecutionRequests>,
     io: &'a Arc<MetadataIoAdmission>,
     root: &'a WorkScope,
     window: &'a ResultWindowAlias,
@@ -693,6 +690,10 @@ impl MvCreateProgressPort for CreatePort<'_> {
     ) -> Poll<Result<(), MvProviderFailure>> {
         if self.phase.is_none() {
             let result = (|| -> Result<(), CreatePhaseFailure> {
+                if let Some(cpu) = self.source.observed_projection_cpu()? {
+                    *self.phase = Some(self.source.project(Arc::clone(self.requests), cpu));
+                    return Ok(());
+                }
                 let needed = self
                     .source
                     .needed_committed()

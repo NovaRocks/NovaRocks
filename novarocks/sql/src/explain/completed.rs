@@ -2351,6 +2351,9 @@ fn runtime_filter_producer_target(
         novarocks_physical_plan::RuntimeFilterProducerTarget::JoinBuildKey { equality } => {
             format!("JoinBuildKey(equality={})", equality.get())
         }
+        novarocks_physical_plan::RuntimeFilterProducerTarget::ContentDemand { content_ordinal } => {
+            format!("ContentDemand(content_ordinal={content_ordinal})")
+        }
         novarocks_physical_plan::RuntimeFilterProducerTarget::AggregateTopNKey {
             group_key_ordinal,
             topn,
@@ -2395,6 +2398,15 @@ impl fmt::Display for RuntimeFilterConsumerTargetDisplay<'_> {
             } => write!(
                 formatter,
                 "AggregateTopNScanField(producer={}, lineage=[{}])",
+                producer.get(),
+                format_runtime_filter_lineage(lineage)
+            ),
+            novarocks_physical_plan::RuntimeFilterConsumerTarget::ContentDemandScanField {
+                producer,
+                lineage,
+            } => write!(
+                formatter,
+                "ContentDemandScanField(producer={}, lineage=[{}])",
                 producer.get(),
                 format_runtime_filter_lineage(lineage)
             ),

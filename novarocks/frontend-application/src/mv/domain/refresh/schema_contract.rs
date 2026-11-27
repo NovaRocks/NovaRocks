@@ -257,7 +257,7 @@ mod tests {
                 },
                 ConnectorTableObjectId::try_new(Bytes::copy_from_slice(object)).unwrap(),
                 Bytes::from_static(b"source-schema-after-rename"),
-                true,
+                novarocks_spi::connector::MvSourceFormatVersion::V3,
                 Some(1),
                 true,
                 fields,

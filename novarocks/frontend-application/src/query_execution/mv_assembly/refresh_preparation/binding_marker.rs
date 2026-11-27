@@ -17,6 +17,7 @@ use novarocks_mv_application::{
 };
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceiving,
+    ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
     ConnectorControlPlanningPin, ConnectorDocumentManagementAdmissionRequest,
     ConnectorDocumentManagementOperation, ConnectorError, ConnectorMutationOperationId,
     ConnectorOperationControl, ConnectorRequestContext, ExternalMutationFinalization,
@@ -24,7 +25,7 @@ use novarocks_spi::connector::{
 };
 use std::{collections::BTreeMap, future::Future};
 
-pub(super) async fn write_binding_marker(
+pub(crate) async fn write_binding_marker(
     source: &IcebergMvCorePorts,
     planning: &ConnectorControlPlanningPin,
     observed: MvKeyedObservedCurrentDocuments,
@@ -36,6 +37,16 @@ pub(super) async fn write_binding_marker(
         .original_operation_control()
         .check_active()
         .map_err(connector)?;
+    let fenced = matches!(
+        marker,
+        Marker::Pending { .. } | Marker::PendingReleased { .. }
+    );
+    if fenced && observed.interpretation.is_aggregate() {
+        return Err(engine(
+            "MV content verification requires a non-aggregate admission",
+        ));
+    }
+    let original_view = fenced.then(|| observed.view.clone());
     let (key, value) = marker.encode().map_err(|error| {
         MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
             .with_original_failure(SharedFailureCause::new(error))
@@ -89,9 +100,16 @@ pub(super) async fn write_binding_marker(
         admission,
         expected_metadata: observed.view.metadata_version,
         expected_snapshot: observed.view.current_snapshot,
-        mutation: KeyedMutation::Markers(KeyedMarkerWrite {
-            markers: BTreeMap::from([(key.clone(), value.clone())]),
-        }),
+        mutation: {
+            let write = KeyedMarkerWrite {
+                markers: BTreeMap::from([(key.clone(), value.clone())]),
+            };
+            if fenced {
+                KeyedMutation::FencedMarkers(write)
+            } else {
+                KeyedMutation::Markers(write)
+            }
+        },
     };
     let mutation = planning.derive_mutation_lease().map_err(connector)?;
     let receiving = ConnectorCatalogMutationReceiving::default();
@@ -108,16 +126,48 @@ pub(super) async fn write_binding_marker(
             crate::mv::domain::staged_create::now_management_timestamp().map_err(engine)?,
         ))
         .map_err(|error| engine(format!("Dispatch MV marker responsibility: {error:?}")))?;
-    let dispatched =
-        crate::connector::mutation::dispatch_catalog_mutation_once_with_lease_async_in(
-            &mutation,
-            operation,
-            ConnectorCatalogMutationOperation::KeyedDocuments { intent },
-            context,
-            &receiving,
+    let request = ConnectorCatalogMutationRequest {
+        operation_id: operation,
+        target: documents.owner().clone(),
+        operation: ConnectorCatalogMutationOperation::KeyedDocuments { intent },
+        context,
+    };
+    let dispatched = mutation.execute_async_in(request.clone(), &receiving).await;
+    let unknown = match receiving.observation().validated_outcome() {
+        Some(Ok(ExternalMutationOutcome::CommitUnknown { evidence, failure })) if fenced => {
+            Some((evidence.clone(), failure.clone()))
+        }
+        _ => None,
+    };
+    let reconciled = ConnectorCatalogMutationReceiving::default();
+    let reconciliation = if let Some((evidence, _)) = &unknown {
+        Some(
+            mutation
+                .reconcile_async_in(
+                    &request,
+                    ConnectorCatalogMutationReconcileRequest {
+                        evidence: evidence.clone(),
+                        context: request.context.clone().after_external_effect(),
+                    },
+                    &reconciled,
+                )
+                .await,
         )
-        .await;
-    let result = receiving.observation();
+    } else {
+        None
+    };
+    let selected = reconciled.observation();
+    let (source, dispatched) = if matches!(
+        selected.validated_outcome(),
+        Some(Ok(ExternalMutationOutcome::KnownCommitted { .. }
+            | ExternalMutationOutcome::KnownUncommitted { .. }))
+    ) {
+        (&reconciled, reconciliation.unwrap())
+    } else {
+        (&receiving, dispatched)
+    };
+    drop(selected);
+    let result = source.observation();
     let (disposition, outcome) = match result.raw_outcome() {
         Some(Ok(ExternalMutationOutcome::KnownCommitted { finalization, .. })) => (
             EffectDisposition::KnownCommitted,
@@ -159,14 +209,38 @@ pub(super) async fn write_binding_marker(
         ),
     };
     drop(result);
-    management
-        .record_terminal(disposition)
-        .map_err(|error| engine(format!("Record MV marker outcome: {error:?}")))?;
+    if let Some((evidence, _)) = &unknown
+        && disposition == EffectDisposition::CommitUnknown
+    {
+        management
+            .defer_content_marker_observation(evidence)
+            .map_err(|error| engine(format!("Defer original MV marker observation: {error:?}")))?;
+    } else {
+        management
+            .record_terminal(disposition)
+            .map_err(|error| engine(format!("Record MV marker outcome: {error:?}")))?;
+    }
+    let mut completion_error = unknown.map(|(_, error)| {
+        MvApplicationError::new(MvApplicationErrorKind::CommitUnknown, error.to_string())
+            .with_original_failure(SharedFailureCause::new(error))
+    });
+    if disposition == EffectDisposition::KnownCommitted && fenced {
+        completion_error = outcome.err().or(completion_error);
+        return Ok(Some(CommittedMvMarker {
+            operation: uuid::Uuid::from_bytes(operation.to_bytes()),
+            key,
+            value,
+            original_view,
+            completion_error,
+        }));
+    }
     outcome.map(|()| {
         Some(CommittedMvMarker {
             operation: uuid::Uuid::from_bytes(operation.to_bytes()),
             key,
             value,
+            original_view,
+            completion_error,
         })
     })
 }

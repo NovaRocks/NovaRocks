@@ -302,7 +302,7 @@ fn drop_content_apply_insert(
         return Ok(false);
     };
     scope.record_hit().map_err(evidence)?;
-    tracing::info!(
+    eprintln!(
         "{} execution_id={}:{}:{} driver_id={} task_key={:x}:{:x} token={}",
         novarocks_failpoint::observation_marker::MV_CONTENT_APPLY_INSERT_DROPPED,
         scope.execution_id.query_id().high(),
@@ -2399,6 +2399,12 @@ fn validate_native_strict_inputs(
         .filter(|close| strict_nodes.contains(&close.stream.destination_node()))
     {
         if !matches!(close.disposition, ExchangeCloseDisposition::Consumed { .. }) {
+            tracing::warn!(
+                task = %descriptor.identity(),
+                stream = ?close.stream,
+                disposition = ?close.disposition,
+                "required inbound exchange stream was not consumed"
+            );
             return Err(ExecutionFailure::from_domain(
                 NativeInboundCloseFailure::StrictWithdrawn(close.stream),
             ));

@@ -46,11 +46,6 @@ use crate::mv::domain::refresh::contract::ImvRefreshContract;
 use crate::mv::domain::refresh::definition::{
     mv_definition_fingerprint, read_stored_mv_query, stored_mv_identity,
 };
-#[cfg(test)]
-use crate::mv::domain::refresh::execution_policy::{
-    non_join_incremental_write_mode, select_join_incremental_execution_mode,
-    should_use_join_delta_append_only_fast_path,
-};
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
 use crate::mv::domain::refresh::planning::{
     RefreshBaseRelationOccurrence, RefreshPlanContract, RefreshPlanningInput, RefreshStateBaseline,
@@ -65,10 +60,14 @@ use crate::mv::domain::refresh::schema_contract::{
 use crate::mv::domain::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
 };
+#[cfg(test)]
+use crate::mv::domain::refresh::strategy::{
+    non_join_incremental_write_mode, select_join_incremental_execution_mode,
+    should_use_join_delta_append_only_fast_path,
+};
 use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
 use crate::mv::domain::refresh::target_apply::{
-    apply_key_table_column, branch_id_table_column, ensure_base_row_lineage_contract,
-    join_apply_key_table_column,
+    branch_id_table_column, ensure_base_source_contract,
 };
 use crate::mv::domain::refresh::target_binding::MvTargetBinding;
 use crate::mv::domain::schema_validation::{
@@ -105,10 +104,13 @@ use novarocks_sql::planning::mv::MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_sql::planning::mv::UnionBranchKind;
 use novarocks_sql::planning::mv::{
-    MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
-    MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
-    MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvAggregateLayoutScope,
+    MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME, SqlMvAggregateLayoutScope,
     SqlMvApplyKeySourceFacts, extract_join_aliases, mv_apply_key_source_from_column_name,
+};
+#[cfg(test)]
+use novarocks_sql::planning::mv::{
+    MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
+    MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME,
 };
 use novarocks_sql::semantic::TableColumnDef;
 use novarocks_types::naming::TableIdentity;
@@ -250,7 +252,7 @@ pub(crate) struct MvStagedStorage {
 
 pub(crate) struct IcebergMvCreatePlan {
     pub(crate) target: IcebergMvTarget,
-    pub(crate) refresh_contract: ImvRefreshContract,
+    pub(crate) apply_key_column_name: Option<&'static str>,
     pub(crate) property: RefreshFragmentProperty,
     pub(crate) base_refs: Vec<TableIdentity>,
     pub(crate) dependencies: Vec<CreateMvDependencyRequest>,
@@ -380,10 +382,12 @@ pub(crate) fn finish_mv_create_preparation(
         created_at_ms,
         resolved_dependencies,
     } = shape;
+    let aggregate = is_aggregate_identity(&property.identity);
     for base_ref in &resolved_dependencies.base_refs {
-        ensure_base_row_lineage_contract(
+        ensure_base_source_contract(
             observed_base(&base_field_observations, base_ref)?,
             &base_ref.fqn(),
+            aggregate,
         )?;
     }
     if let Some(pk_cols) = stmt.primary_key.as_deref() {
@@ -414,44 +418,36 @@ pub(crate) fn finish_mv_create_preparation(
             ("partitioned composed aggregate Iceberg MV is not supported".to_string()).into(),
         );
     }
-    let apply_key_column_name = refresh_contract.apply_key.column_name;
-    if analysis
-        .output_columns
-        .iter()
-        .any(|column| column.name.eq_ignore_ascii_case(apply_key_column_name))
-    {
-        return Err((format!(
-            "Iceberg MV output column name {apply_key_column_name} is reserved for internal apply key"
-        )).into());
+    let apply_key_column_name = aggregate.then_some(refresh_contract.apply_key.column_name);
+    let needs_branch = identity_needs_branch_id_column(&property.identity);
+    if let Some(name) = apply_key_column_name {
+        if analysis
+            .output_columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(name))
+        {
+            return Err(format!(
+                "Iceberg MV output column name {name} is reserved for internal apply key"
+            )
+            .into());
+        }
     }
-    if identity_needs_branch_id_column(&property.identity)
+    if needs_branch
         && analysis
             .output_columns
             .iter()
             .any(|column| column.name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME))
     {
-        return Err((format!(
+        return Err(format!(
             "Iceberg MV output column name {BRANCH_ID_COLUMN_NAME} is reserved for internal branch id"
-        )).into());
+        ).into());
     }
     let mut columns =
         create_target_columns_from_property(&property, &canonical_select_query, &analysis)?;
-    if identity_needs_physical_apply_key_column(&property.identity) {
-        columns.push(create_apply_key_table_column(&refresh_contract.apply_key)?);
-    }
-    let branch_id_column_name = identity_needs_branch_id_column(&property.identity).then(|| {
+    let branch_id_column_name = needs_branch.then(|| {
         columns.push(branch_id_table_column());
         BRANCH_ID_COLUMN_NAME.to_string()
     });
-    let expected_apply_key_field_id = columns
-        .iter()
-        .position(|column| column.name.eq_ignore_ascii_case(apply_key_column_name))
-        .and_then(|idx| i32::try_from(idx + 1).ok())
-        .ok_or_else(|| {
-            format!(
-                "Iceberg MV target columns are missing apply-key column {apply_key_column_name}"
-            )
-        })?;
     let aggregate_state_hidden_columns = aggregate_state_hidden_columns_from_property(
         &property,
         &canonical_select_query,
@@ -461,20 +457,27 @@ pub(crate) fn finish_mv_create_preparation(
         representative_aggregate_layout(&property, &canonical_select_query, &analysis)?
             .map(|layout| layout.runtime_layout().clone())
             .unwrap_or_else(stateless_mv_runtime_layout);
-    let mut application_properties = vec![
-        (
-            APPLY_KEY_COLUMN_PROPERTY.to_string(),
-            apply_key_column_name.to_string(),
-        ),
-        (
-            APPLY_KEY_SOURCE_PROPERTY.to_string(),
-            create_apply_key_source_property(&refresh_contract.apply_key).to_string(),
-        ),
-        (
-            APPLY_KEY_FIELD_ID_PROPERTY.to_string(),
-            expected_apply_key_field_id.to_string(),
-        ),
-    ];
+    let mut application_properties = Vec::new();
+    if let Some(name) = apply_key_column_name {
+        let field_id = columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(name))
+            .and_then(|idx| i32::try_from(idx + 1).ok())
+            .ok_or_else(|| {
+                format!("Iceberg aggregate MV target is missing apply-key column {name}")
+            })?;
+        application_properties.extend([
+            (APPLY_KEY_COLUMN_PROPERTY.to_string(), name.to_string()),
+            (
+                APPLY_KEY_SOURCE_PROPERTY.to_string(),
+                create_apply_key_source_property(&refresh_contract.apply_key).to_string(),
+            ),
+            (
+                APPLY_KEY_FIELD_ID_PROPERTY.to_string(),
+                field_id.to_string(),
+            ),
+        ]);
+    }
     if !aggregate_state_hidden_columns.is_empty() {
         application_properties.push((
             HIDDEN_COLUMNS_PROPERTY.to_string(),
@@ -492,7 +495,7 @@ pub(crate) fn finish_mv_create_preparation(
     };
     Ok(Arc::new(IcebergMvCreatePlan {
         target,
-        refresh_contract,
+        apply_key_column_name,
         property,
         base_refs: resolved_dependencies.base_refs,
         dependencies: resolved_dependencies.dependencies,
@@ -639,7 +642,7 @@ pub(crate) fn build_create_documents_for_prepared_target(
             source_observations: &prepared.source_field_observations,
             prepared_target,
             target_identity: &prepared.property.identity,
-            apply_key_column_name: Some(prepared.refresh_contract.apply_key.column_name),
+            apply_key_column_name: prepared.apply_key_column_name,
             branch_column_name: prepared.branch_id_column_name.as_deref(),
             configuration: create_configuration_document(&seed.refresh)?,
         },
@@ -650,7 +653,11 @@ fn base_table_descriptor_from_observation(
     observation: &MvSourceSchemaObservation,
 ) -> BaseTableDescriptor {
     BaseTableDescriptor {
-        format_version: if observation.is_format_v3() { 3 } else { 2 },
+        format_version: match observation.format_version() {
+            novarocks_spi::connector::MvSourceFormatVersion::V1 => 1,
+            novarocks_spi::connector::MvSourceFormatVersion::V2 => 2,
+            novarocks_spi::connector::MvSourceFormatVersion::V3 => 3,
+        },
         columns: observation
             .fields()
             .iter()
@@ -707,8 +714,7 @@ fn validate_branch_union_contract(
 /// Validate one D relation occurrence of a UNION ALL projection/filter MV
 /// against its exact source observation and the exact target generation.
 ///
-/// `branch_count` is the query's own branch count; L's branch interpretations
-/// are the persisted counterpart, so a mismatch is still an error.
+/// One original relation occurrence supplies each row-preserving UNION branch.
 fn validate_union_projection_schema_contract_for_base(
     iceberg_target: &IcebergMvTarget,
     projection: &StoredKeyedMvProjection,
@@ -717,30 +723,13 @@ fn validate_union_projection_schema_contract_for_base(
     base_observation: &MvSourceSchemaObservation,
     target_observation: &MvSchemaValidationObservation,
 ) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
-    let interpretation = projection.facts.interpretation();
-    if interpretation.branches.len() != branch_count {
+    let source_count = projection.facts.binding().occurrences.len();
+    if source_count != branch_count {
         return Err(format!(
-            "iceberg UNION ALL projection/filter MV {}.{}.{} interpretation has {} branches, query has {}",
-            iceberg_target.catalog,
-            iceberg_target.namespace,
-            iceberg_target.table,
-            interpretation.branches.len(),
-            branch_count
+            "Iceberg UNION ALL MV {}.{}.{} has {source_count} bound source occurrences for {branch_count} branches",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
         ).into());
     }
-    if interpretation.apply_key_kind() != Some(ApplyKeyKind::BaseRowId) {
-        return Err(format!(
-            "iceberg UNION ALL projection/filter MV {}.{}.{} must use BaseRowId inner apply keys",
-            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-        )
-        .into());
-    }
-    validate_branch_id_field(projection, target_observation).map_err(|error| {
-        format!(
-            "iceberg UNION ALL projection/filter MV {}.{}.{} branch binding is invalid: {error}",
-            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-        )
-    })?;
     let renames =
         validate_schema_contract(projection, occurrence, base_observation, target_observation)?;
     if renames.is_empty() {
@@ -904,37 +893,13 @@ fn inner_row_identity(identity: &TargetIdentity) -> &TargetIdentity {
     }
 }
 
-/// A physical apply-key column is materialized iff each output row is
-/// identified by a base or join row id (`BaseRowId` / `JoinRowKey`), whose
-/// apply key is stored as a real target column. Group-row identities
-/// (`GroupRowId`) derive their apply key from the group keys, so no physical
-/// column is added. The `BranchScoped` wrapper is transparent here — what
-/// matters is the per-row inner identity. This reproduces the legacy
-/// strategy-based gating (ProjectionFilter / JoinProjectionFilter /
-/// UnionProjectionFilter required the column; the aggregate strategies did
-/// not).
-fn identity_needs_physical_apply_key_column(identity: &TargetIdentity) -> bool {
-    matches!(
-        inner_row_identity(identity),
-        TargetIdentity::BaseRowId | TargetIdentity::JoinRowKey(_, _)
-    )
+fn is_aggregate_identity(identity: &TargetIdentity) -> bool {
+    matches!(inner_row_identity(identity), TargetIdentity::GroupRowId(_))
 }
 
-/// A `__branch_id__` discriminant column is materialized iff the output is a
-/// UNION ALL (the identity top is `BranchScoped`). Reproduces the legacy gating
-/// (UnionProjectionFilter / BranchUnionAggregate required it).
+/// Only aggregate UNION branches carry a stored discriminator.
 fn identity_needs_branch_id_column(identity: &TargetIdentity) -> bool {
-    matches!(identity, TargetIdentity::BranchScoped(_))
-}
-
-fn create_apply_key_table_column(apply_key: &ApplyKeyContract) -> Result<TableColumnDef, String> {
-    match apply_key.column_name {
-        HIDDEN_APPLY_KEY_COLUMN_NAME => Ok(apply_key_table_column()),
-        JOIN_APPLY_KEY_COLUMN_NAME => Ok(join_apply_key_table_column()),
-        other => Err(format!(
-            "Iceberg MV refresh contract apply-key column {other} is not a physical target apply-key column"
-        )),
-    }
+    matches!(identity, TargetIdentity::BranchScoped(_)) && is_aggregate_identity(identity)
 }
 
 fn base_snapshot_status_for_refresh(
@@ -1362,8 +1327,8 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::SingleBase,
             has_agg_state: false,
             identity: RefreshIdentity::BaseRowId,
-            apply_key_column: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Int64,
+            apply_key_column: Some(HIDDEN_APPLY_KEY_COLUMN_NAME.to_string()),
+            apply_key_value_type: Some(ApplyKeyValueType::Int64),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
@@ -1375,8 +1340,8 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::SingleBase,
             has_agg_state: true,
             identity: RefreshIdentity::GroupRowId,
-            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
+            apply_key_column: Some(GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string()),
+            apply_key_value_type: Some(ApplyKeyValueType::Utf8),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
@@ -1391,8 +1356,8 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
             has_agg_state: false,
             identity: RefreshIdentity::JoinRowKey,
-            apply_key_column: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
+            apply_key_column: Some(JOIN_APPLY_KEY_COLUMN_NAME.to_string()),
+            apply_key_value_type: Some(ApplyKeyValueType::Utf8),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
@@ -1407,8 +1372,8 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
             has_agg_state: true,
             identity: RefreshIdentity::GroupRowId,
-            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
+            apply_key_column: Some(GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string()),
+            apply_key_value_type: Some(ApplyKeyValueType::Utf8),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
@@ -1420,8 +1385,8 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
             has_agg_state: true,
             identity: RefreshIdentity::GroupRowId,
-            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
+            apply_key_column: Some(GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string()),
+            apply_key_value_type: Some(ApplyKeyValueType::Utf8),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
@@ -1433,8 +1398,8 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
             has_agg_state: false,
             identity: RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::BaseRowId)),
-            apply_key_column: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::BranchInt64,
+            apply_key_column: Some(HIDDEN_APPLY_KEY_COLUMN_NAME.to_string()),
+            apply_key_value_type: Some(ApplyKeyValueType::BranchInt64),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
@@ -1449,8 +1414,8 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
             has_agg_state: false,
             identity: RefreshIdentity::JoinRowKey,
-            apply_key_column: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
+            apply_key_column: Some(JOIN_APPLY_KEY_COLUMN_NAME.to_string()),
+            apply_key_value_type: Some(ApplyKeyValueType::Utf8),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
 
@@ -1464,8 +1429,8 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
             has_agg_state: true,
             identity: RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::GroupRowId)),
-            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::BranchUtf8,
+            apply_key_column: Some(GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string()),
+            apply_key_value_type: Some(ApplyKeyValueType::BranchUtf8),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         let err = select_repartition_shape(&branch_union_aggregate)
@@ -1476,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_gating_matches_legacy_strategy_gating() {
+    fn only_aggregate_union_keeps_branch_discriminator() {
         use crate::mv::domain::analysis::refresh_property::TargetIdentity;
 
         let base_row = TargetIdentity::BaseRowId;
@@ -1488,20 +1453,10 @@ mod tests {
         let union_proj = TargetIdentity::BranchScoped(Box::new(TargetIdentity::BaseRowId));
         let union_agg = TargetIdentity::BranchScoped(Box::new(group_row.clone()));
 
-        // Physical apply-key column: required for base/join row identities
-        // (ProjectionFilter / JoinProjectionFilter / UnionProjectionFilter),
-        // not for group-row identities (the aggregate strategies).
-        assert!(identity_needs_physical_apply_key_column(&base_row));
-        assert!(identity_needs_physical_apply_key_column(&join_row));
-        assert!(identity_needs_physical_apply_key_column(&union_proj));
-        assert!(!identity_needs_physical_apply_key_column(&group_row));
-        assert!(!identity_needs_physical_apply_key_column(&union_agg));
-
-        // Branch id column: required iff the identity top is BranchScoped.
         assert!(!identity_needs_branch_id_column(&base_row));
         assert!(!identity_needs_branch_id_column(&join_row));
         assert!(!identity_needs_branch_id_column(&group_row));
-        assert!(identity_needs_branch_id_column(&union_proj));
+        assert!(!identity_needs_branch_id_column(&union_proj));
         assert!(identity_needs_branch_id_column(&union_agg));
     }
 

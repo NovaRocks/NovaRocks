@@ -600,10 +600,29 @@ pub(crate) fn build(
                         json!({"action":"known-committed-hold","catalog":target.catalog,"namespace":target.namespace,"mv":target.mv,"directory":transport}),
                     );
                 }
-                let mut faults = crate::fault_injection::configured_query_lifecycle_faults(meta)
-                    .into_iter()
-                    .map(|fault| (fault.be_index, fault.kind.as_str()))
-                    .collect::<Vec<_>>();
+                let configured = crate::fault_injection::configured_query_lifecycle_faults(meta);
+                let mut faults = Vec::new();
+                for fault in &configured {
+                    if fault.kind == novarocks_failpoint::QueryLifecycleFaultKind::MvContentTargetEnumerationClose
+                    {
+                        ensure!(configured.len() == 1, "the exact FE content-target fault must own the step");
+                        ensure_single_submitted_statement(step)?;
+                        let target = step_context.refresh_target(&step.sql)?;
+                        add(
+                            refs.get_mut(&fe_key).unwrap(),
+                            "mv",
+                            json!({
+                                "action":fault.kind.as_str(),
+                                "catalog":target.catalog,
+                                "namespace":target.namespace,
+                                "mv":target.mv,
+                                "token":format!("sql-content-target-close-{sequence}")
+                            }),
+                        );
+                    } else {
+                        faults.push((fault.be_index, fault.kind.as_str()));
+                    }
+                }
                 if let Some(index) = meta.restart_be_after_establish_participation_index {
                     faults.push((index, "restart-after-establish-participation"));
                 }

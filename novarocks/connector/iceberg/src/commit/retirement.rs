@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! An exact retirement reuses the original publication's manifest entries.
+//! An exact retirement reuses the fixed main snapshot's manifest entries.
 
 use super::{
     model::{CommitProtocol, OperationIntent, OperationToken, RequestShape},
@@ -26,6 +26,13 @@ use crate::document_storage::keyed::{envelope, keys, record};
 use crate::iceberg::{Error, ErrorKind, Result, TableUpdate, spec::Operation};
 use async_trait::async_trait;
 use novarocks_spi::connector::KeyedRetirement;
+
+fn conflict(detail: &'static str) -> Error {
+    super::new_manifests::commit_validation_error_for(
+        super::model::CommitOperation::RefreshMaterializedView,
+        detail,
+    )
+}
 
 pub(crate) struct RetirementPreparer {
     pub(crate) retirement: KeyedRetirement,
@@ -58,20 +65,44 @@ impl Preparer for RetirementPreparer {
                 "Materialized view retirement has no parent",
             )
         })?;
-        let mut carried = carry_records_and_closure(metadata)?;
         let retired = &retirement.retired_record;
         let retired_key = keys::record_key(&retired.owner, &retired.name);
-        if carried.summary.remove(&retired_key)
-            != Some(record::encode_record(retired).map_err(document_error)?)
+        let exact = record::encode_record(retired).map_err(document_error)?;
+        let baseline = metadata
+            .snapshot_by_id(retirement.baseline_snapshot_id)
+            .ok_or_else(|| {
+                conflict("Materialized view retirement baseline is no longer retained")
+            })?;
+        if baseline.summary().additional_properties.get(&retired_key) != Some(&exact) {
+            return Err(conflict(
+                "Materialized view retirement baseline has a different publication",
+            ));
+        }
+        let current = &parent.summary().additional_properties;
+        if current
+            .get(&retired_key)
+            .is_some_and(|publication| publication != &exact)
         {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Materialized view retirement no longer sees the exact admitted publication",
+            return Err(conflict(
+                "Materialized view retirement main has a different publication",
             ));
         }
         let witness = &retirement.record;
+        let witness_key = keys::record_key(&witness.owner, &witness.name);
+        if current.contains_key(&witness_key) {
+            return Err(conflict(
+                "Materialized view main already carries a retirement",
+            ));
+        }
+        let mut carried = carry_records_and_closure(metadata)?;
+        carried.summary.remove(&retired_key);
+        if retired.owner == "novarocks.mv" && retired.name == "publication" {
+            carried
+                .summary
+                .remove(&keys::record_key(&retired.owner, "recovery"));
+        }
         carried.summary.insert(
-            keys::record_key(&witness.owner, &witness.name),
+            witness_key,
             record::encode_record(witness).map_err(document_error)?,
         );
         let (marker, value) = &retirement.invalid_marker;
@@ -186,6 +217,7 @@ mod tests {
             KeyedRetirement {
                 operation_id,
                 retired_publication: LakePublicationId::new_v7(),
+                baseline_snapshot_id: current,
                 expected_root: binding.identity(),
                 retired_record,
                 record,
@@ -319,5 +351,142 @@ mod tests {
             ICEBERG_COMMIT_VALIDATION_CONFLICT
         );
         assert_eq!(failure.message(), crate::commit::model::MV_MAIN_ADVANCED);
+    }
+
+    #[tokio::test]
+    async fn recovered_retirement_checks_explicit_history_and_keeps_its_main_condition() {
+        use novarocks_failure_contract::{
+            FailureProjection, connector_reason::ICEBERG_COMMIT_VALIDATION_CONFLICT,
+        };
+
+        let fixture = Fixture::new();
+        let id = ConnectorMutationOperationId::from_bytes([22; 16]);
+        let (baseline, retirement) =
+            retired_parent(fixture.metadata_with_data_and_delete_manifests().await, id);
+        let advance = fixture.intent(&baseline, "main", vec![]);
+        let (advanced, _) = fixture
+            .stage(
+                baseline,
+                &advance,
+                &crate::commit::fast_append::FastAppendPreparer,
+            )
+            .await;
+        let current_id = advanced.current_snapshot_id().unwrap();
+        assert_ne!(retirement.baseline_snapshot_id, current_id);
+        let publication_key = keys::record_key(
+            &retirement.retired_record.owner,
+            &retirement.retired_record.name,
+        );
+        assert!(
+            !advanced
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties
+                .contains_key(&publication_key)
+        );
+
+        enum Current {
+            Unattributed,
+            Carried,
+            Replaced,
+            BaselineExpired,
+        }
+
+        for case in [
+            Current::Unattributed,
+            Current::Carried,
+            Current::Replaced,
+            Current::BaselineExpired,
+        ] {
+            let mut retirement = retirement.clone();
+            let mut metadata = serde_json::to_value(&advanced).unwrap();
+            let snapshot = metadata["snapshots"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|candidate| candidate["snapshot-id"] == current_id)
+                .unwrap();
+            match case {
+                Current::Unattributed => {}
+                Current::Carried => {
+                    snapshot["summary"][&publication_key] =
+                        record::encode_record(&retirement.retired_record)
+                            .unwrap()
+                            .into();
+                    let recovery = ConnectorSnapshotRecord {
+                        owner: retirement.retired_record.owner.clone(),
+                        name: "recovery".into(),
+                        binding: None,
+                        payload: Bytes::from_static(b"original recovery audit"),
+                    };
+                    snapshot["summary"][keys::record_key(&recovery.owner, &recovery.name)] =
+                        record::encode_record(&recovery).unwrap().into();
+                }
+                Current::Replaced => {
+                    let mut different = retirement.retired_record.clone();
+                    different.payload = Bytes::from_static(b"different publication");
+                    snapshot["summary"][&publication_key] =
+                        record::encode_record(&different).unwrap().into();
+                }
+                Current::BaselineExpired => retirement.baseline_snapshot_id = i64::MAX,
+            }
+            let metadata: TableMetadata = serde_json::from_value(metadata).unwrap();
+            let original = fixture.operation.begin_attempt().unwrap();
+            let operation = IcebergCommitOperation::new(
+                OperationToken::from_mutation(id),
+                metadata.location(),
+                original.read_binding(),
+                fixture.operation.request_context().clone(),
+                fixture.operation.runtime().clone(),
+                OperationLimits::default(),
+            )
+            .unwrap();
+            let attempt = operation.begin_attempt().unwrap();
+            let intent = retirement_intent(&operation, &metadata, &retirement);
+            let mut staging = StagingEngine::begin(
+                StagingBase::Existing {
+                    metadata,
+                    metadata_location: "file:///strict-recovery-base.json".into(),
+                },
+                &intent,
+                &attempt,
+            )
+            .unwrap();
+            let result = staging
+                .stage(&RetirementPreparer {
+                    retirement: retirement.clone(),
+                })
+                .await;
+            match case {
+                Current::Unattributed | Current::Carried => {
+                    result.unwrap();
+                    let after = staging.metadata();
+                    let snapshot = after.current_snapshot().unwrap();
+                    let records = crate::document_storage::keyed::view::parse_snapshot_records(
+                        &snapshot.summary().additional_properties,
+                        true,
+                    )
+                    .unwrap();
+                    assert_eq!(records, vec![retirement.record]);
+                    assert_eq!(snapshot.parent_snapshot_id(), Some(current_id));
+                    assert!(staging.freeze().unwrap().requirements().contains(
+                        &TableRequirement::RefSnapshotIdMatch {
+                            r#ref: "main".into(),
+                            snapshot_id: Some(current_id),
+                        },
+                    ));
+                }
+                Current::Replaced | Current::BaselineExpired => {
+                    let failure =
+                        crate::commit::attempt::before_dispatch_failure(&result.unwrap_err());
+                    assert_eq!(
+                        failure.failure_fact().reason(),
+                        ICEBERG_COMMIT_VALIDATION_CONFLICT
+                    );
+                    assert!(operation.artifacts().unwrap().is_empty());
+                }
+            }
+        }
     }
 }

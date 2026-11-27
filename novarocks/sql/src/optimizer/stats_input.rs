@@ -181,6 +181,8 @@ pub(crate) struct SqlTableStatisticsEvidence {
 pub(crate) struct SqlStatisticsSnapshot {
     entries:
         HashMap<SqlTableBindingId, Result<SqlTableStatisticsEvidence, SqlStatisticsFatalError>>,
+    pub(crate) mv_scan_volumes: Vec<crate::planning::mv::SqlMvCostScanVolume>,
+    pub(crate) require_mv_scan_volumes: bool,
 }
 
 impl SqlStatisticsSnapshot {
@@ -239,6 +241,7 @@ pub(crate) struct QueryStatsEntry {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct QueryStatsSnapshot {
     entries: HashMap<StatsRef, QueryStatsEntry>,
+    file_bytes: HashMap<StatsRef, u128>,
 }
 
 /// Frozen base-table statistics used by the optimizer, displayed by the plan.
@@ -262,6 +265,14 @@ impl QueryStatsSnapshot {
                 stats,
             },
         );
+    }
+
+    pub(crate) fn set_file_bytes(&mut self, stats_ref: StatsRef, bytes: u128) {
+        self.file_bytes.insert(stats_ref, bytes);
+    }
+
+    pub(crate) fn file_bytes(&self, stats_ref: StatsRef) -> Option<u128> {
+        self.file_bytes.get(&stats_ref).copied()
     }
 
     pub(crate) fn get(&self, stats_ref: StatsRef) -> Option<&BaseTableStatistics> {

@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::runtime_filter::runtime_filter_producer;
 use super::*;
 use crate::exec::operators::NoopSinkFactory;
 use crate::exec::operators::content_apply::{
     ContentApplyFactory, ContentApplyPhase, ContentApplyStages,
 };
+use crate::exec::operators::hashjoin::native_runtime_filter::NativeRuntimeFilterProducerFactory;
 use crate::exec::pipeline::operator::ConstructionFailure;
 use crate::exec::shared_stage::{arithmetic, stage_completion::StageParticipants};
 use novarocks_local_program::StaticSummaryAuthor;
 use novarocks_result_contract::SummaryKind;
 use std::num::NonZeroUsize;
 
+// Design: ADR-0278 (docs/adr/ADR-0278-mv-maintains-visible-tuples-and-replays-verification.md)
 pub(super) fn assemble(
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,
@@ -71,16 +74,53 @@ pub(super) fn assemble(
         .ok_or_else(arithmetic)?;
     let handoff =
         LocalExchanger::new_handoff(producers, participants.probes, ctx.operator_buffer_chunks);
-    let stages = Arc::new(ContentApplyStages::new(
-        program.clone(),
-        id,
-        participants,
-        handoff.clone(),
-        summary,
-        tracker,
-        ctx.output_batch_rows,
-        error.clone(),
-    ));
+    let ProgramNodeKind::ContentApply(spec) = program.graph().nodes()[id.index()].kind() else {
+        return Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            "content demand factory does not belong to content application",
+        ));
+    };
+    let demand = if let Some((_, first)) = spec.demand_filters.first() {
+        let session =
+            runtime_filter_session(&ctx.runtime_filter_execution, first.binding_id())?.clone();
+        let contracts = spec
+            .demand_filters
+            .iter()
+            .map(|(ordinal, producer)| Ok((*ordinal, runtime_filter_producer(producer)?)))
+            .collect::<ExecutionResult<Vec<_>>>()?;
+        let layout = program.graph().nodes()[spec.weighted_input.index()].output_layout();
+        Some(NativeRuntimeFilterProducerFactory::from_content_demand(
+            &contracts,
+            |ordinal| {
+                spec.weighted_content
+                    .get(ordinal)
+                    .and_then(|slot| layout.value_binding(*slot))
+                    .map(|binding| binding.layout().data_type().clone())
+                    .ok_or_else(|| {
+                        program_failure(
+                            FragmentBindingErrorKind::InvalidAssignment,
+                            "content demand key has no original weighted field",
+                        )
+                    })
+            },
+            session,
+        )?)
+    } else {
+        None
+    };
+    let stages = Arc::new(
+        ContentApplyStages::new(
+            program.clone(),
+            id,
+            participants,
+            handoff.clone(),
+            summary,
+            tracker,
+            ctx.output_batch_rows,
+            error.clone(),
+        )
+        .with_demand_producer(demand),
+    );
     let factory = |phase| Box::new(ContentApplyFactory::new(stages.clone(), phase));
     weighted
         .pipeline

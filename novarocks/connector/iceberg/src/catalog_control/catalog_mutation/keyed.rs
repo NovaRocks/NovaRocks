@@ -48,7 +48,10 @@ pub(super) fn catalog_operation(documents: &KeyedMutationIntent) -> CatalogOpera
     }
 }
 
-struct MarkerPreparer(KeyedMarkerWrite);
+struct MarkerPreparer {
+    write: KeyedMarkerWrite,
+    expected_metadata: Option<novarocks_spi::connector::ConnectorCommittedVersion>,
+}
 #[async_trait::async_trait]
 impl Preparer for MarkerPreparer {
     async fn prepare(
@@ -56,13 +59,53 @@ impl Preparer for MarkerPreparer {
         view: &StagedView<'_>,
         _intent: &OperationIntent,
     ) -> crate::iceberg::Result<PreparedChange> {
-        let updates =
-            keyed::write::marker_properties(view.metadata(), &self.0).map_err(document_error)?;
+        let updates = keyed::write::marker_properties(view.metadata(), &self.write)
+            .map_err(document_error)?;
+        if let Some(expected) = &self.expected_metadata {
+            let location = observation::metadata_location(expected).map_err(document_error)?;
+            let actual =
+                observation::committed_version_from_metadata(view.metadata(), Some(&location))
+                    .map_err(document_error)?;
+            // Preflight also checks the actual catalog pointer in the frozen
+            // request. Together these are the complete admitted version.
+            if &actual != expected {
+                return Err(fenced_marker_base_changed());
+            }
+        }
         Ok(PreparedChange {
-            requirements: vec![],
+            requirements: Vec::new(),
             updates: vec![TableUpdate::SetProperties { updates }],
         })
     }
+}
+
+fn validate_fenced_marker_base(
+    frozen: &FrozenRequest,
+    documents: &KeyedMutationIntent,
+) -> crate::iceberg::Result<()> {
+    if !matches!(&documents.mutation, KeyedMutation::FencedMarkers(_)) {
+        return Ok(());
+    }
+    let expected_location =
+        observation::metadata_location(&documents.expected_metadata).map_err(document_error)?;
+    if !matches!(frozen.base(), BaseIdentity::Existing { metadata_location, parent, .. }
+        if metadata_location == &expected_location && *parent == documents.expected_snapshot)
+        || !frozen.requirements().iter().any(|requirement| {
+            matches!(requirement,
+            crate::iceberg::TableRequirement::RefSnapshotIdMatch { r#ref, snapshot_id }
+            if r#ref == "main" && *snapshot_id == documents.expected_snapshot)
+        })
+    {
+        return Err(fenced_marker_base_changed());
+    }
+    Ok(())
+}
+
+fn fenced_marker_base_changed() -> crate::iceberg::Error {
+    crate::iceberg::Error::new(
+        crate::iceberg::ErrorKind::CatalogCommitConflicts,
+        "Fenced marker metadata base or main changed before dispatch",
+    )
 }
 
 fn prepare_slot_storage_prefix(
@@ -228,10 +271,23 @@ fn mutation_intent(
     token: OperationToken,
     summary: std::collections::BTreeMap<String, String>,
 ) -> Result<OperationIntent, ConnectorError> {
+    let snapshot_loading = match &documents.mutation {
+        KeyedMutation::Retirement(retirement)
+            if Some(retirement.baseline_snapshot_id) != documents.expected_snapshot =>
+        {
+            SnapshotLoading::All
+        }
+        _ => SnapshotLoading::Refs,
+    };
     let (shape, dependencies, protocol) = match &documents.mutation {
         KeyedMutation::Markers(_) => (
             RequestShape::MetadataOnly,
             vec![Dependency::NoRead],
+            CommitProtocol::Legacy,
+        ),
+        KeyedMutation::FencedMarkers(_) => (
+            RequestShape::FencedMarkers,
+            vec![Dependency::RefUnchanged],
             CommitProtocol::Legacy,
         ),
         KeyedMutation::SlotChange(change)
@@ -291,7 +347,7 @@ fn mutation_intent(
         summary,
         token,
     })
-    .map(|intent| intent.with_snapshot_loading(SnapshotLoading::Refs))
+    .map(|intent| intent.with_snapshot_loading(snapshot_loading))
     .map_err(|error| invalid(error.to_string()))
 }
 
@@ -404,7 +460,8 @@ pub(super) fn execute(
             let target = preflight_documents.admission.target();
             let operation_id = preflight_request.operation_id.to_bytes();
             let target = match &preflight_documents.mutation {
-                KeyedMutation::Markers(_) => {
+                KeyedMutation::Markers(_) | KeyedMutation::FencedMarkers(_) => {
+                    validate_fenced_marker_base(frozen, &preflight_documents)?;
                     let properties = frozen
                         .updates()
                         .iter()
@@ -421,6 +478,7 @@ pub(super) fn execute(
                         table_uuid: uuid.to_string(),
                         operation_id,
                         properties,
+                        fenced: frozen.shape() == RequestShape::FencedMarkers,
                     }
                 }
                 KeyedMutation::SlotChange(change)
@@ -487,7 +545,13 @@ pub(super) fn execute(
     let evidence_policy = inner.evidence_policy();
     let publisher = journal.observe_prepared(inner);
     let preparer: Option<Box<dyn Preparer + Send + Sync>> = match &documents.mutation {
-        KeyedMutation::Markers(markers) => Some(Box::new(MarkerPreparer(markers.clone()))),
+        KeyedMutation::Markers(markers) | KeyedMutation::FencedMarkers(markers) => {
+            Some(Box::new(MarkerPreparer {
+                write: markers.clone(),
+                expected_metadata: matches!(&documents.mutation, KeyedMutation::FencedMarkers(_))
+                    .then(|| documents.expected_metadata.clone()),
+            }))
+        }
         KeyedMutation::SlotChange(change)
         | KeyedMutation::SlotChangeWithTableProperties { change, .. } => {
             Some(Box::new(SlotChangePreparer {
@@ -760,7 +824,8 @@ pub(super) async fn execute_async(
             let target = preflight_documents.admission.target();
             let operation_id = preflight_request.operation_id.to_bytes();
             let target = match &preflight_documents.mutation {
-                KeyedMutation::Markers(_) => {
+                KeyedMutation::Markers(_) | KeyedMutation::FencedMarkers(_) => {
+                    validate_fenced_marker_base(frozen, &preflight_documents)?;
                     let properties = frozen
                         .updates()
                         .iter()
@@ -777,6 +842,7 @@ pub(super) async fn execute_async(
                         table_uuid: uuid.to_string(),
                         operation_id,
                         properties,
+                        fenced: frozen.shape() == RequestShape::FencedMarkers,
                     }
                 }
                 KeyedMutation::SlotChange(change)
@@ -842,7 +908,13 @@ pub(super) async fn execute_async(
     };
     let publisher = journal.observe_catalog_prepared(inner, receiving, &request.context);
     let preparer: Option<Box<dyn Preparer + Send + Sync>> = match &documents.mutation {
-        KeyedMutation::Markers(markers) => Some(Box::new(MarkerPreparer(markers.clone()))),
+        KeyedMutation::Markers(markers) | KeyedMutation::FencedMarkers(markers) => {
+            Some(Box::new(MarkerPreparer {
+                write: markers.clone(),
+                expected_metadata: matches!(&documents.mutation, KeyedMutation::FencedMarkers(_))
+                    .then(|| documents.expected_metadata.clone()),
+            }))
+        }
         KeyedMutation::SlotChange(change)
         | KeyedMutation::SlotChangeWithTableProperties { change, .. } => {
             Some(Box::new(SlotChangePreparer {

@@ -5051,7 +5051,7 @@ fn a_create_publication_receipt_releases_only_its_original_name() {
     assert!(entrance.unsettled_effects(mv.table()).is_empty());
     assert_eq!(
         entrance.management_phase(mv.table()),
-        MvManagementPhase::NotObserved
+        MvManagementPhase::AwaitingConvergence
     );
 }
 

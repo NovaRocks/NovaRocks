@@ -1690,6 +1690,19 @@ fn published_membership(
     (values, contains_null, close)
 }
 
+pub(crate) fn observe_int64_membership_producer(
+    binding: u32,
+    digest: [u8; 32],
+) -> (
+    execution::RuntimeFilterSessionRef,
+    impl Fn() -> (BTreeSet<i64>, bool, Option<(u32, u64)>),
+) {
+    let observed = Arc::new(RecordingProducer::default());
+    let session = FakeSession::producers(&[(binding, &observed)]);
+    let report = move || published_membership(&observed.events.lock().unwrap(), digest);
+    (session, report)
+}
+
 // The build driver publishes exactly the membership of its evaluated build
 // keys: NULL keys included as a NULL fact, for whichever NULL semantics the
 // key's equality fixes, then closes its one partition after the build.

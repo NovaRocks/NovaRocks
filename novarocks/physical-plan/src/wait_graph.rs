@@ -319,6 +319,10 @@ impl WaitGraph {
                         RuntimeFilterProducerTarget::AggregateTopNKey { .. },
                         NodeKind::Aggregate { .. },
                     ) => 0,
+                    (
+                        RuntimeFilterProducerTarget::ContentDemand { .. },
+                        NodeKind::ContentApply(_),
+                    ) => 0,
                     _ => {
                         return Err(WaitGraphError::InvalidFilterProducer {
                             filter: filter.id,

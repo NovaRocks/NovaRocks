@@ -81,8 +81,9 @@ use super::{
     CreateIntent, CreateIntentResponsibility, DeploymentOwner, EffectDisposition, EffectIdentity,
     EffectResponsibility, EffectScope, ManagedMvTarget, ManagementClock, ManagementContinuation,
     ManagementObservationError, ManagementObservationPhase, ManagementObservationState,
-    ManagementTimestamp, NameStartupGrace, NameStartupGraceObservation, ProcessIncarnation,
-    RemoteEffectPolicy, StartupIsolationEvidence, SystemManagementClock, UnsettledEffect,
+    ManagementTimestamp, NameStartupGrace, NameStartupGraceEnd, NameStartupGraceObservation,
+    ProcessIncarnation, RemoteEffectPolicy, StartupIsolationEvidence, SystemManagementClock,
+    UnsettledEffect,
 };
 
 /// Fresh deletion-only preparation for an already installed exact target.
@@ -370,6 +371,24 @@ struct TargetAdmissionState {
     ready: bool,
     incarnation_mismatch: bool,
     owner_mismatch: bool,
+}
+
+impl TargetAdmissionState {
+    fn can_retire_after_startup_name_absence(&self, catalog: &CatalogHandle) -> bool {
+        self.target.catalog() == catalog
+            && !self.is_aggregate
+            && self.unsettled.is_empty()
+            && self.pending_slot_changes.is_empty()
+            && self.pending_committed_effect.is_none()
+            && matches!(
+                self.pending_continuation.as_ref(),
+                None | Some(ManagementContinuation::SameOwner { .. })
+            )
+            && self.pending_observation.is_none()
+            && self.retired_drop_slots.is_none()
+            && !self.incarnation_mismatch
+            && !self.owner_mismatch
+    }
 }
 
 impl ManagementEntrance {
@@ -968,7 +987,7 @@ impl ManagementEntrance {
         use crate::persistence::{
             documents::MvDocumentError,
             keyed_documents::{
-                decode_current_keyed_documents, observe_current_keyed_view_with_management,
+                observe_current_keyed_view_with_management, resolve_current_keyed_documents,
             },
         };
         let control = lease.control_runtime_id();
@@ -979,7 +998,7 @@ impl ManagementEntrance {
                 "keyed observation Current management names another owner or incarnation".into(),
             ));
         }
-        let documents = decode_current_keyed_documents(view, catalog)?;
+        let documents = resolve_current_keyed_documents(view, catalog)?;
         let mut states = lock(&self.inner.state);
         let current = states.get_mut(&documents.view.table).ok_or_else(|| {
             MvDocumentError::Contract("keyed observation target has not been admitted".into())
@@ -1045,7 +1064,7 @@ impl ManagementEntrance {
         use crate::persistence::{
             documents::MvDocumentError,
             keyed_documents::{
-                decode_current_keyed_documents, observe_current_keyed_view_with_management_async,
+                observe_current_keyed_view_with_management_async, resolve_current_keyed_documents,
             },
         };
         let control = lease.control_runtime_id();
@@ -1057,7 +1076,7 @@ impl ManagementEntrance {
                 "keyed observation Current management names another owner or incarnation".into(),
             ));
         }
-        let documents = decode_current_keyed_documents(view, catalog)?;
+        let documents = resolve_current_keyed_documents(view, catalog)?;
         let mut states = lock(&self.inner.state);
         let current = states.get_mut(&documents.view.table).ok_or_else(|| {
             MvDocumentError::Contract("keyed observation target has not been admitted".into())
@@ -1560,6 +1579,57 @@ impl ManagementEntrance {
             .ok_or(ManagementAdmissionError::Cancelled)
     }
 
+    /// A successor CREATE may need to confirm the exact current name after
+    /// startup isolation settles previous process effects.
+    pub async fn acquire_create_async(
+        &self,
+        request: ManagementRequest,
+        cancelled: impl Future<Output = ()>,
+    ) -> Result<ManagementCreateAdmission, ManagementAdmissionError> {
+        if request.create_intent.is_none() {
+            return Err(ManagementAdmissionError::InvalidRequest);
+        }
+        let mut ticket = self.request(request, MvActivityOwner::Create)?;
+        let activity = ticket
+            .activity
+            .acquire_waiting_async(cancelled)
+            .await?
+            .ok_or(ManagementAdmissionError::Cancelled)?;
+        let request = ticket
+            .request
+            .take()
+            .ok_or(ManagementAdmissionError::InvalidRequest)?;
+        let admission = ManagementEntranceObligation {
+            entrance: Arc::downgrade(&self.inner),
+            request,
+            activity: Some(activity),
+            dispatched: None,
+        };
+        match validate_request_against_state(&self.inner, &admission.request) {
+            Ok(()) => Ok(ManagementCreateAdmission::Ready(admission)),
+            Err(ManagementAdmissionError::TargetAlreadyExists)
+                if matches!(
+                    lock(&self.inner.names).state(),
+                    NameStartupGrace::Ended(
+                        NameStartupGraceEnd::Lifetime | NameStartupGraceEnd::Declaration
+                    )
+                ) =>
+            {
+                let target = lock(&self.inner.state)
+                    .get(&admission.request.table)
+                    .filter(|state| {
+                        state.can_retire_after_startup_name_absence(&admission.request.catalog)
+                    })
+                    .map(|state| state.target.clone())
+                    .ok_or(ManagementAdmissionError::TargetAlreadyExists)?;
+                Ok(ManagementCreateAdmission::ObserveName(
+                    ManagementCreateNameObservationObligation { admission, target },
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Acquire one automatic action through the same FIFO as every other MV
     /// management effect. The action carrier is intentionally consumed here so
     /// callers must construct a fresh exact observation and operation identity
@@ -1919,6 +1989,58 @@ pub struct ManagementEntranceObligation {
     dispatched: Option<DispatchedEffect>,
 }
 
+pub enum ManagementCreateAdmission {
+    Ready(ManagementEntranceObligation),
+    ObserveName(ManagementCreateNameObservationObligation),
+}
+
+/// Holds the original CREATE's exclusive activity turn through a fresh name
+/// observation. Dropping the obligation releases the turn without dispatch.
+pub struct ManagementCreateNameObservationObligation {
+    admission: ManagementEntranceObligation,
+    target: ManagedMvTarget,
+}
+
+impl ManagementCreateNameObservationObligation {
+    pub fn target(&self) -> &ManagedMvTarget {
+        &self.target
+    }
+
+    /// The original metadata owner observed the exact name absent. Retire
+    /// only the stale local admission. No effect receives a conclusion here.
+    pub fn admit_after_observed_absence(
+        self,
+    ) -> Result<ManagementEntranceObligation, ManagementAdmissionError> {
+        let entrance = self
+            .admission
+            .entrance
+            .upgrade()
+            .ok_or(ManagementAdmissionError::EntranceDropped)?;
+        check_name_startup_grace(&entrance)?;
+        {
+            let names = lock(&entrance.names);
+            if names.isolated(self.target.table()) {
+                return Err(ManagementAdmissionError::NameIsolated);
+            }
+            let mut state = lock(&entrance.state);
+            if let Some(current) = state.get(self.target.table()) {
+                if current.target != self.target {
+                    return Err(ManagementAdmissionError::TargetReplaced);
+                }
+                if !current.can_retire_after_startup_name_absence(self.target.catalog()) {
+                    return Err(ManagementAdmissionError::ReadmissionIncomplete);
+                }
+                if let Some(observation) = &current.installed_observation {
+                    observation.close();
+                }
+                state.remove(self.target.table());
+            }
+        }
+        validate_request_against_state(&entrance, &self.admission.request)?;
+        Ok(self.admission)
+    }
+}
+
 enum DispatchedEffect {
     Exact(EffectResponsibility),
     CreateIntent(CreateIntentResponsibility),
@@ -2176,22 +2298,63 @@ impl ManagementEntranceObligation {
         {
             return Err(ManagementAdmissionError::InvalidEffect);
         }
-        record_unknown_effect_with_evidence(
-            &self.entrance,
-            responsibility.clone(),
-            Some(super::PublicationRecoveryEvidence {
-                original: original.without_process_local_payload(),
-                observation,
-            }),
-        )?;
+        if !self.exact_non_aggregate_target(responsibility)? {
+            record_unknown_effect_with_evidence(
+                &self.entrance,
+                responsibility.clone(),
+                Some(super::PublicationRecoveryEvidence {
+                    original: original.without_process_local_payload(),
+                    observation,
+                }),
+            )?;
+        }
         self.dispatched.take();
         self.activity.take();
         Ok(())
     }
 
-    /// An original staged-publication adjudication can release the name
-    /// reservation. It does not install a Current projection or dispose
-    /// the Provider's original staged ownership.
+    /// The durable marker protocol owns late effects for non-aggregate
+    /// refreshes. Release only this exact local update's admission.
+    pub fn defer_content_marker_observation(
+        mut self,
+        original: &novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<(), ManagementAdmissionError> {
+        let Some(DispatchedEffect::Exact(responsibility)) = self.dispatched.as_ref() else {
+            return Err(ManagementAdmissionError::EffectNotDispatched);
+        };
+        if self.request.operation != ConnectorDocumentManagementOperation::SingleTargetUpdate
+            || responsibility.identity().to_bytes() != original.operation_id().to_bytes()
+            || responsibility.target().table().instance_id != original.descriptor().instance_id
+            || original.operation_kind() != "keyed-documents"
+            || !self.exact_non_aggregate_target(responsibility)?
+        {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        self.dispatched.take();
+        self.activity.take();
+        Ok(())
+    }
+
+    fn exact_non_aggregate_target(
+        &self,
+        original: &EffectResponsibility,
+    ) -> Result<bool, ManagementAdmissionError> {
+        let entrance = self
+            .entrance
+            .upgrade()
+            .ok_or(ManagementAdmissionError::EntranceDropped)?;
+        let states = lock(&entrance.state);
+        let current = states
+            .get(&self.request.table)
+            .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
+        if current.target != *original.target() {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        Ok(!current.is_aggregate)
+    }
+
+    /// An original staged-publication adjudication releases the name
+    /// reservation and requires exact committed Current convergence.
     pub fn observe_applied_create_name(
         &mut self,
         receipt: &novarocks_spi::connector::ConnectorStagedCreateReceipt,
@@ -2208,6 +2371,7 @@ impl ManagementEntranceObligation {
         {
             return Err(ManagementAdmissionError::InvalidEffect);
         }
+        record_committed(&self.entrance, responsibility.clone())?;
         settle_name_effect(
             &self.entrance,
             &self.request,
@@ -2498,6 +2662,38 @@ impl fmt::Display for ManagementAdmissionError {
 }
 
 impl std::error::Error for ManagementAdmissionError {}
+
+impl novarocks_failure_contract::FailureProjection for ManagementAdmissionError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        use std::num::NonZeroU16;
+
+        let (class, code) = match self {
+            Self::StartupGrace { .. } => (FailureClass::Dependency, 938),
+            Self::NameIsolated => (FailureClass::Dependency, 939),
+            Self::Stopping | Self::Cancelled => {
+                return FailureFact::stop_observation(FailureReason::new(
+                    domain::METADATA,
+                    NonZeroU16::new(940).unwrap(),
+                ));
+            }
+            Self::InvalidRequest => (FailureClass::Data, 941),
+            Self::TargetAlreadyExists
+            | Self::TargetReplaced
+            | Self::DependencyChanged
+            | Self::EffectUnsettled
+            | Self::ReadmissionIncomplete => (FailureClass::Dependency, 942),
+            Self::InvalidEffect
+            | Self::EffectNotDispatched
+            | Self::CreateTargetNotBound
+            | Self::EntranceDropped => (FailureClass::Invariant, 943),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::METADATA, NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
 
 impl ManagementAdmissionError {
     pub const fn is_retryable_name_admission(self) -> bool {

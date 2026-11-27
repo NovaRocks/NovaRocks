@@ -171,7 +171,7 @@ mod tests {
         PlanWindowNode, WindowExpr,
     };
     use crate::planner::table::{
-        ScanSource, SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
     };
     use novarocks_types::schema::ColumnDef;
 
@@ -254,7 +254,7 @@ mod tests {
         ))
     }
 
-    fn sql_target_locator_source() -> ScanSource {
+    fn sql_content_target_source() -> ScanSource {
         let binding = SqlTableBindingId::new(
             SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("scope")),
             NonZeroU32::new(1).expect("ordinal"),
@@ -266,13 +266,9 @@ mod tests {
                 namespace: "db".to_string(),
                 table: "pf_mv".to_string(),
             },
-            SqlScanKind::MvTargetLocator {
-                facts: SqlMvTargetLocatorScan {
-                    target_table_uuid: "uuid-pf-mv".to_string(),
-                    target_snapshot_id: Some(99),
-                    apply_key_column: "__nova_base_row_id".to_string(),
-                    branch_id_column: Some("__branch_id".to_string()),
-                },
+            SqlScanKind::MvContentTarget {
+                target_table_uuid: "uuid-pf-mv".to_string(),
+                target_snapshot_id: 99,
             },
         ))
     }
@@ -337,16 +333,15 @@ mod tests {
             "{version_verbose}"
         );
 
-        let locator_plan = scan_plan_with_source("pf_mv", sql_target_locator_source());
+        let content_plan = scan_plan_with_source("pf_mv", sql_content_target_source());
 
-        let locator_normal = explain_plan(&locator_plan, ExplainLevel::Normal).join("\n");
-        assert!(!locator_normal.contains("source:"), "{locator_normal}");
-        let locator_verbose = explain_plan(&locator_plan, ExplainLevel::Verbose).join("\n");
+        let content_normal = explain_plan(&content_plan, ExplainLevel::Normal).join("\n");
+        assert!(!content_normal.contains("source:"), "{content_normal}");
+        let content_verbose = explain_plan(&content_plan, ExplainLevel::Verbose).join("\n");
         assert!(
-            locator_verbose.contains(
-                "source: IcebergMvTargetLocator target=ice.db.pf_mv apply_key=__nova_base_row_id branch_id=__branch_id"
-            ),
-            "{locator_verbose}"
+            content_verbose
+                .contains("source: IcebergMvContentTarget target=ice.db.pf_mv snapshot_id=99"),
+            "{content_verbose}"
         );
     }
 

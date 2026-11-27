@@ -79,6 +79,10 @@ pub(super) struct CanonicalKeyRead<'a> {
     pub(super) payload: Option<&'a [u8]>,
 }
 impl OwnedCanonicalColumn {
+    pub(super) const fn coordinate_bytes() -> usize {
+        std::mem::size_of::<Location>() + std::mem::size_of::<u128>()
+    }
+
     pub(super) fn from_compacted(
         built: Vec<BuiltArray>,
         binding: FunctionValueType,

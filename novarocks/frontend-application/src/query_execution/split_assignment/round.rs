@@ -647,12 +647,26 @@ mod tests {
         }
     }
 
-    fn assignment(close_calls: Arc<AtomicUsize>) -> RoundSplitAssignment {
-        let execution_id = QueryExecutionId::new(
+    fn fixture_execution() -> QueryExecutionId {
+        QueryExecutionId::new(
             QueryId::new(9, 9),
             AttemptId::new(1).expect("attempt id must be valid"),
         )
-        .expect("execution id must be valid");
+        .expect("execution id must be valid")
+    }
+
+    fn assignment(close_calls: Arc<AtomicUsize>) -> RoundSplitAssignment {
+        assignment_with_source(
+            Box::new(CloseCountingSource { close_calls }),
+            DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
+        )
+    }
+
+    fn assignment_with_source(
+        source: Box<dyn ConnectorReadSplitSource>,
+        initial_wait: Duration,
+    ) -> RoundSplitAssignment {
+        let execution_id = fixture_execution();
         RoundSplitAssignment::new(
             execution_id,
             Arc::new(NeverSend),
@@ -660,9 +674,7 @@ mod tests {
             1,
             vec![RoundSplitSource {
                 scan: crate::query_execution::split_assignment::ScanNodeKey::new(1u32, 7),
-                source: super::super::SupervisedSplitSource::fixture(Box::new(
-                    CloseCountingSource { close_calls },
-                )),
+                source: super::super::SupervisedSplitSource::fixture(source),
                 encoder: Arc::new(InertCodec),
                 feedback: Arc::new(
                     RuntimeFilterFeedbackState::new(execution_id, Default::default())
@@ -674,8 +686,145 @@ mod tests {
                 _backing: None,
             }],
             TaskUpdateRetryPolicy::default(),
-            DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
+            initial_wait,
         )
+    }
+
+    #[test]
+    fn runtime_filter_content_demand_delays_the_original_target_split_source() {
+        use crate::runtime_filter::{
+            feedback::TaskRuntimeFilterFeedback,
+            install_encoder::{
+                FrontendRuntimeFilterFeedbackChannel, FrontendRuntimeFilterFeedbackDeclaration,
+                FrontendRuntimeFilterFeedbackPublisherOwner,
+                FrontendRuntimeFilterFeedbackPublisherSlot,
+                FrontendRuntimeFilterFeedbackScanBinding,
+                FrontendRuntimeFilterFeedbackWaitEligibility,
+            },
+        };
+        use novarocks_execution::runtime_filter::{
+            contribution::{MembershipValues, ValueDomainDelta},
+            feedback_domain::RuntimeFilterFeedbackDomain,
+        };
+        use novarocks_proto_models::filter;
+        use novarocks_types::BackendProcessId;
+
+        struct TargetSource(Arc<AtomicUsize>);
+        impl ConnectorReadSplitSource for TargetSource {
+            fn initial_dynamic_filter_wait_request(&self) -> Duration {
+                Duration::from_secs(60)
+            }
+            fn next_batch(
+                &mut self,
+                _size: usize,
+                filter: &ConnectorReadDynamicFilterSnapshot,
+            ) -> Result<ConnectorSplitBatch<ConnectorReadSplit>, ConnectorError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                assert!(filter.is_empty_content_demand());
+                Ok(ConnectorSplitBatch::natural_end(
+                    Vec::new(),
+                    Default::default(),
+                ))
+            }
+            fn is_finished(&self) -> bool {
+                false
+            }
+            fn close(&mut self) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+        }
+
+        let next_calls = Arc::new(AtomicUsize::new(0));
+        let mut round = assignment_with_source(
+            Box::new(TargetSource(next_calls.clone())),
+            Duration::from_secs(60),
+        );
+        let source = round.sources[0].as_mut().unwrap();
+        let execution = fixture_execution();
+        let process = BackendProcessId::new_v7();
+        let feedback = Arc::new(
+            RuntimeFilterFeedbackState::new(
+                execution,
+                FrontendRuntimeFilterFeedbackDeclaration::new([
+                    FrontendRuntimeFilterFeedbackChannel {
+                        channel_id: 13,
+                        contract_digest: [9; 32],
+                        max_encoded_domain_bytes: 1024,
+                        publishers: vec![FrontendRuntimeFilterFeedbackPublisherSlot {
+                            participant_id: 1,
+                            backend_process_id: process,
+                            owner: FrontendRuntimeFilterFeedbackPublisherOwner::Aggregator,
+                        }],
+                        scan_bindings: vec![FrontendRuntimeFilterFeedbackScanBinding {
+                            fragment_id: 1,
+                            plan_node_id: 7,
+                            binding_id: 17,
+                            data_type: arrow::datatypes::DataType::Int64,
+                        }],
+                        wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
+                        content_demand: true,
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        source.feedback = feedback.clone();
+        source.feedback_bindings = vec![(
+            17,
+            crate::query_execution::package_reads::runtime_filter_test_column(),
+        )];
+
+        let RoundSplitEnumeration::Ready(request) = round.enumerate_once().unwrap() else {
+            panic!("target source must register its initial wait");
+        };
+        assert!(
+            round
+                .adopt_enumeration(RoundSplitAssignment::enumerate_source(*request))
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            round.enumerate_once().unwrap(),
+            RoundSplitEnumeration::Idle(_)
+        ));
+        assert_eq!(next_calls.load(Ordering::SeqCst), 0);
+
+        let payload = RuntimeFilterFeedbackDomain::Exact(ValueDomainDelta::new(
+            MembershipValues::int64([]),
+            false,
+        ))
+        .encode(1024)
+        .unwrap();
+        let envelope = filter::RuntimeFilterEnvelope {
+            kind: filter::RuntimeFilterEnvelopeKind::DegradedLogical as i32,
+            query_id: Some(novarocks_proto_models::common::UniqueId {
+                hi: execution.query_id().high(),
+                lo: execution.query_id().low(),
+            }),
+            channel_id: 13,
+            deployment_epoch: execution.attempt_id().get(),
+            schema_digest: vec![9; 32],
+            payload,
+            ..Default::default()
+        };
+        feedback
+            .admit_task_feedback(
+                &TaskRuntimeFilterFeedback::parse(&envelope).unwrap(),
+                process,
+            )
+            .unwrap();
+        let RoundSplitEnumeration::Ready(request) = round.enumerate_once().unwrap() else {
+            panic!("complete demand releases the target scan");
+        };
+        let (_, batch) = round
+            .adopt_enumeration(RoundSplitAssignment::enumerate_source(*request))
+            .unwrap()
+            .unwrap();
+        assert!(batch.is_empty());
+        assert!(batch.no_more_splits());
+        assert_eq!(next_calls.load(Ordering::SeqCst), 1);
+        round.close();
     }
 
     #[test]

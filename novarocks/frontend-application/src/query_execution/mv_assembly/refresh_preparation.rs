@@ -37,9 +37,6 @@ use crate::mv::domain::refresh::capabilities::RefreshCapabilities;
 use crate::mv::domain::refresh::definition::{
     mv_definition_fingerprint, read_stored_mv_query, stored_mv_identity,
 };
-use crate::mv::domain::refresh::execution_policy::{
-    non_join_incremental_write_mode, select_join_incremental_execution_mode,
-};
 use crate::mv::domain::refresh::non_join_incremental::{
     NonJoinBaseChange, NonJoinIncrementalChangePlan, not_incremental_reason_message,
     plan_non_join_incremental_changes,
@@ -55,6 +52,9 @@ use crate::mv::domain::refresh::rewrite_context::{
 };
 use crate::mv::domain::refresh::schema_contract::validate_projection_target;
 use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
+use crate::mv::domain::refresh::strategy::{
+    non_join_incremental_write_mode, select_join_incremental_execution_mode,
+};
 use crate::mv::domain::refresh::target::IcebergMvTarget;
 use crate::mv::domain::staged_create::AdmittedMvDataPublication;
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
@@ -258,10 +258,15 @@ enum PreparedIncrementalRefreshWork {
     MetadataOnly,
     ChangeStream(PreparedMvIncrementalWrite, AdmittedMvDataPublication),
     FullRebuild(PreparedMvFirstRefreshWrite, AdmittedMvDataPublication),
+    PartitionReplace {
+        write: PreparedMvFirstRefreshWrite,
+        admitted: AdmittedMvDataPublication,
+        overlays: super::partition_replace::PreparedPartitionReplacementReads,
+    },
 }
 
 pub(crate) mod async_facts;
 pub(crate) mod captured_sources;
 
-mod binding_marker;
+pub(crate) mod binding_marker;
 pub(crate) mod pure_reader;

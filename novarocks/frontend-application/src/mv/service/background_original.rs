@@ -547,7 +547,7 @@ impl ScheduledCall {
             );
             let statement = crate::mv::domain::application::MvRefreshRequest {
                 name_parts: vec![self.request.target.name.clone()],
-                full: false,
+                mode: crate::mv::domain::application::MvRefreshRequestMode::IncrementalAllowed,
             };
             let action = crate::query::mv_action::prepare_in(
                 self.request.target.catalog.clone(),
@@ -828,9 +828,15 @@ impl SchedulerOriginal {
             {
                 Ok(true) => ScheduledRefreshDisposition::Completed,
                 Ok(false) => ScheduledRefreshDisposition::NoOp,
-                Err(error) => match call.completion.observed_failure() {
-                    Some(domain) => application_disposition(domain.clone()),
-                    None => scheduler_service_disposition(error),
+                Err(error) => match crate::query::mv_action::classify_refresh_execution_failure(error) {
+                    novarocks_mv_application::refresh_failure::MvRefreshFailureClass::TemporaryShortage
+                    | novarocks_mv_application::refresh_failure::MvRefreshFailureClass::RecoveryUnavailable => {
+                        scheduler_service_disposition(error)
+                    }
+                    _ => match call.completion.observed_failure() {
+                        Some(domain) => application_disposition(domain.clone()),
+                        None => scheduler_service_disposition(error),
+                    },
                 },
             };
             let completed = matches!(disposition, ScheduledRefreshDisposition::Completed);
@@ -901,6 +907,14 @@ fn scheduler_service_disposition(error: &QueryServiceError) -> ScheduledRefreshD
     .with_execution_failure(error.execution_failure().cloned());
     if error.external_effect_disposition().is_some_and(|d|matches!(d,novarocks_query_application::api::StatementExternalEffectDisposition::KnownCommitted|novarocks_query_application::api::StatementExternalEffectDisposition::CommitUnknown)) {
         return ScheduledRefreshDisposition::TerminalFailure(failure);
+    }
+    use novarocks_mv_application::refresh_failure::MvRefreshFailureClass as Class;
+    match crate::query::mv_action::classify_refresh_execution_failure(error) {
+        Class::TemporaryShortage => {
+            return ScheduledRefreshDisposition::TransientUnavailable(failure);
+        }
+        Class::RecoveryUnavailable => return ScheduledRefreshDisposition::TerminalFailure(failure),
+        _ => {}
     }
     match error.kind() {
         QueryServiceErrorKind::Interrupted => {

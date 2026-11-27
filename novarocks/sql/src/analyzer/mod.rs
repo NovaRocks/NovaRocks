@@ -4891,7 +4891,6 @@ mod tests {
                 SqlScanKind::Metadata { .. } => 4,
                 SqlScanKind::Delta { .. } => 5,
                 SqlScanKind::MvTargetState { .. } => 6,
-                SqlScanKind::MvTargetLocator { .. } => 7,
                 SqlScanKind::MvContentTarget { .. } => 9,
             }])
         {

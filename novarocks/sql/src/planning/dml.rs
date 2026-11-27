@@ -87,6 +87,21 @@ impl DmlStatisticsSnapshot {
     /// statistics representation. The public input is immutable data only;
     /// provider handles, leases, and resolver callbacks cannot cross this
     /// boundary.
+    pub fn with_mv_scan_volumes(
+        mut self,
+        volumes: Vec<crate::planning::mv::SqlMvCostScanVolume>,
+    ) -> Result<Self, String> {
+        let mut keys = std::collections::HashSet::new();
+        if volumes
+            .iter()
+            .any(|volume| !keys.insert((volume.binding, volume.version)))
+        {
+            return Err("MV statistics repeats a frozen scan volume".to_string());
+        }
+        self.0.mv_scan_volumes = volumes;
+        Ok(self)
+    }
+
     pub fn from_evidence(entries: impl IntoIterator<Item = DmlStatisticsEvidence>) -> Self {
         use crate::optimizer::stats_input::{
             BaseTableStatistics, SqlTableStatisticsEvidence, StatsMissingReason,
@@ -152,7 +167,7 @@ fn match_failure(
 /// confidence rather than a veto: a value that bounds the truth, or estimates
 /// it in both directions, is still better input than the missing-stats
 /// fallback. What it must never do is claim to be exact.
-fn evidence_to_base_statistics(
+pub(super) fn evidence_to_base_statistics(
     evidence: &novarocks_spi::connector::StatisticsEvidence,
     columns: &[novarocks_types::schema::ColumnDef],
 ) -> crate::optimizer::stats_input::BaseTableStatistics {
@@ -1358,6 +1373,8 @@ pub fn dml_change_stream_optimizer_settings() -> crate::optimizer::options::Sess
     // A generated mutation plan carries before/after rows over independent
     // branches. A query runtime filter can describe only one branch, so it
     // must not suppress locator rows required by a DELETE route.
+    // ContentApply authors its own target demand after the complete weighted
+    // input. That filter is placed during lowering from its admitted fields.
     crate::optimizer::options::SessionOptimizerSettings {
         enable_global_runtime_filter: Some(false),
         ..Default::default()

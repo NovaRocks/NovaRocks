@@ -542,7 +542,13 @@ fn packages_with_content(
             root,
             FragmentSink::Router { effect, routes },
             dop_domain(),
-            StagePlacementPolicy::Singleton,
+            if with_content_apply {
+                StagePlacementPolicy::Spread {
+                    max_instances: None,
+                }
+            } else {
+                StagePlacementPolicy::Singleton
+            },
         )
         .unwrap();
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([31; 16]).unwrap());

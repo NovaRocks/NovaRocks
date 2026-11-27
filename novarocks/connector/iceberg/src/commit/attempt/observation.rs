@@ -934,9 +934,9 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         Ok(())
     }
 
-    /// Finish the cleanup of the exact slot effect after this caller appended
-    /// its one D14 proof to the original entry. No new artifact ledger is made.
-    pub(crate) async fn settle_keyed_slot_cleanup_in(
+    /// Finish cleanup after the original entry records its keyed proof. The
+    /// observation uses the original artifact ledger.
+    pub(crate) async fn settle_keyed_document_cleanup_in(
         &self,
         entry: JournalEntryRef,
         current: &ConnectorRequestContext,
@@ -963,13 +963,14 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             if !matches!(
                 same.checked.descriptor.attribution,
                 AttributionPlan::KeyedSlotChange { .. }
+                    | AttributionPlan::FencedKeyedMarkers { .. }
             ) || (same.positive_proof.is_none() && same.negative_slot_proof.is_none())
                 || same
                     .cleanup_report
                     .as_ref()
                     .is_some_and(|prior| !matches!(prior, IcebergCleanupReport::NotAttempted))
             {
-                return Err(invalid("Keyed cleanup has no unsettled exact D14 report"));
+                return Err(invalid("Keyed cleanup has no unsettled exact report"));
             }
         }
         let report = match self.entry_phase(entry) {
@@ -987,7 +988,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             }
             _ => {
                 return Err(invalid(
-                    "Keyed cleanup requires the original exact D14 conclusion",
+                    "Keyed cleanup requires the original exact publication conclusion",
                 ));
             }
         };
@@ -1259,7 +1260,8 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 snapshot_id,
                 ..
             } => CommitProof::applied(Some(snapshot_id)).with_table_uuid(table_uuid.to_string()),
-            PositiveAttributionObservation::PropertyMarker { table_uuid, .. } => {
+            PositiveAttributionObservation::PropertyMarker { table_uuid, .. }
+            | PositiveAttributionObservation::KeyedMarkers { table_uuid, .. } => {
                 CommitProof::applied(None).with_table_uuid(table_uuid.to_string())
             }
             PositiveAttributionObservation::ExactMetadata {
@@ -3027,6 +3029,7 @@ mod tests {
 
     #[tokio::test]
     async fn keyed_slot_d14_settles_only_original_owned_cleanup() {
+        use crate::commit::model::{ArtifactKind, ArtifactWriter};
         use novarocks_spi::connector::{
             CatalogHandle, CatalogVersion, ConnectorTableIdentity, ConnectorTableObjectId,
             KeyedDocumentObservationRequest,
@@ -3082,10 +3085,8 @@ mod tests {
                         namespace: "db".into(),
                         table: "mv".into(),
                     },
-                    object_id: ConnectorTableObjectId::try_new(Bytes::copy_from_slice(
-                        table_uuid.as_bytes(),
-                    ))
-                    .unwrap(),
+                    object_id: ConnectorTableObjectId::try_new(Bytes::from(table_uuid.to_string()))
+                        .unwrap(),
                     context: context.clone(),
                 },
             }));
@@ -3119,7 +3120,7 @@ mod tests {
             assert_eq!(entry, original_entry);
             assert!(
                 observing
-                    .settle_keyed_slot_cleanup_in(entry, &context)
+                    .settle_keyed_document_cleanup_in(entry, &context)
                     .await
                     .is_err()
             );
@@ -3161,14 +3162,14 @@ mod tests {
             }
             assert!(path.exists(), "proof is distinct from actual cleanup");
             observing
-                .settle_keyed_slot_cleanup_in(entry, &context)
+                .settle_keyed_document_cleanup_in(entry, &context)
                 .await
                 .unwrap();
             assert!(!path.exists());
             assert_eq!(received_path.exists(), committed);
             assert!(
                 observing
-                    .settle_keyed_slot_cleanup_in(entry, &context)
+                    .settle_keyed_document_cleanup_in(entry, &context)
                     .await
                     .is_err()
             );

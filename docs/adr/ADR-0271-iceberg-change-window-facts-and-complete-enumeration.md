@@ -5,6 +5,10 @@ domain: [provider-spi, frontend-mv]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0278
+    scope: "Ruling 7 non-aggregate write-mode selection uses evidence, cost, and admission for multiple strategies."
+    link: "ADR-0278-mv-maintains-visible-tuples-and-replays-verification.md"
 partially-supersedes: [ADR-0207]
 date: 2026-11-25
 provenance:

@@ -492,6 +492,7 @@ pub(crate) struct RepeatOp {
 #[derive(Clone, Debug)]
 pub(crate) struct ContentApplyOp {
     pub(crate) route_keys: Box<[u32]>,
+    pub(crate) demand_keys: Box<[u32]>,
     pub(crate) output_columns: Vec<OutputColumn>,
 }
 

@@ -136,9 +136,6 @@ pub enum SqlScanKind {
     MvTargetState {
         facts: SqlMvTargetStateScan,
     },
-    MvTargetLocator {
-        facts: SqlMvTargetLocatorScan,
-    },
 }
 
 /// Canonical table identity attached to a compiler scan fact.  This is kept
@@ -385,17 +382,6 @@ pub struct SqlMvTargetStateScan {
     pub(crate) partition_constraint: SqlMvTargetStatePartitionConstraint,
 }
 
-/// Metadata for an IMV target-locator scan source. It is a refresh-only
-/// placeholder that reads the MV target at the refresh-before snapshot and
-/// projects the physical apply-key columns plus Iceberg `_file` / `_pos`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SqlMvTargetLocatorScan {
-    pub(crate) target_table_uuid: String,
-    pub(crate) target_snapshot_id: Option<i64>,
-    pub(crate) apply_key_column: String,
-    pub(crate) branch_id_column: Option<String>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchScope {
     pub(crate) branch_id_column_name: String,
@@ -459,18 +445,6 @@ impl SqlMvTargetStateScan {
             row_filter,
             partition
         )
-    }
-}
-
-impl SqlMvTargetLocatorScan {
-    /// See `SqlMvTargetStateScan::fqn`: identity belongs to the enclosing
-    /// tokenized source, not to locator facts.
-    #[allow(
-        dead_code,
-        reason = "Target-locator names are retained for planner diagnostics."
-    )]
-    pub(crate) fn fqn(&self) -> &'static str {
-        "token-bound MV target"
     }
 }
 
@@ -649,13 +623,6 @@ impl TableCompletionRetainedBytes {
                             self.add_string(&scope.branch_id_column_name);
                         }
                     }
-                }
-            }
-            SqlScanKind::MvTargetLocator { facts } => {
-                self.add_string(&facts.target_table_uuid);
-                self.add_string(&facts.apply_key_column);
-                if let Some(branch_id_column) = &facts.branch_id_column {
-                    self.add_string(branch_id_column);
                 }
             }
             SqlScanKind::ConnectorRead

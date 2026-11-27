@@ -23,7 +23,7 @@ use crate::mv::domain::refresh::contract::{
     JoinRefreshContract,
 };
 pub(crate) use novarocks_sql::planning::mv::{RefreshFragmentProperty, TargetIdentity};
-use novarocks_sql::planning::mv::{SqlImvRefreshShape, SqlImvRefreshContractFacts};
+use novarocks_sql::planning::mv::{SqlImvRefreshContractFacts, SqlImvRefreshShape};
 
 pub(crate) fn derive_imv_refresh_contract(
     analysis: &crate::mv::domain::analysis::MvAnalysis,

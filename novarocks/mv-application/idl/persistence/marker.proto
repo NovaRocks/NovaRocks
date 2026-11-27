@@ -86,3 +86,18 @@ message RetirementRecord {
   optional uint64 insufficient_keys = 6;
   optional bytes content_fingerprint = 7;
 }
+
+// One explicit rebuild. The publication paired with this record is identified
+// by the shared operation and remains in its existing snapshot record format.
+message RecoveryRecord {
+  optional uint32 format_version = 1;
+  optional bytes operation = 2;
+  optional uint64 recovered_at_ms = 3;
+  repeated RecoverySource recovered_from = 4;
+}
+
+message RecoverySource {
+  optional bytes publication = 1;
+  // Absent for Invalid, present for Pending.
+  optional bytes pending_attempt = 2;
+}

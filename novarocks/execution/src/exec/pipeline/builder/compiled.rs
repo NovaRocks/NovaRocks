@@ -306,6 +306,11 @@ fn node_runtime_filter_bindings(kind: &ProgramNodeKind) -> Vec<u32> {
             .iter()
             .map(|filter| filter.producer.binding_id())
             .collect(),
+        ProgramNodeKind::ContentApply(spec) => spec
+            .demand_filters
+            .iter()
+            .map(|(_, producer)| producer.binding_id())
+            .collect(),
         ProgramNodeKind::Join {
             runtime_filters,
             runtime_filter_consumers,
@@ -1738,6 +1743,8 @@ mod join_tests;
 #[cfg(test)]
 #[path = "compiled_runtime_filter_tests.rs"]
 mod runtime_filter_tests;
+#[cfg(test)]
+pub(crate) use runtime_filter_tests::observe_int64_membership_producer;
 #[cfg(test)]
 pub(crate) use runtime_filter_tests::ordered_scan_with_numeric_membership_fixture;
 

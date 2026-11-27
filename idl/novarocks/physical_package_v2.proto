@@ -1442,6 +1442,7 @@ message RuntimeFilterProducerTarget {
   oneof kind {
     uint32 join_build_equality_id = 1;
     RuntimeFilterAggregateTopNKey aggregate_topn_key = 2;
+    uint32 content_demand_ordinal = 3;
   }
 }
 message RuntimeFilterAggregateTopNKey {
@@ -1480,6 +1481,7 @@ message RuntimeFilterConsumerTarget {
     uint32 join_probe_equality_id = 1;
     RuntimeFilterScanField scan_field = 2;
     RuntimeFilterAggregateTopNScanField aggregate_topn_scan_field = 3;
+    RuntimeFilterContentDemandScanField content_demand_scan_field = 4;
   }
 }
 message RuntimeFilterScanField {
@@ -1487,6 +1489,10 @@ message RuntimeFilterScanField {
   repeated RuntimeFilterLineageStep lineage = 2;
 }
 message RuntimeFilterAggregateTopNScanField {
+  optional uint32 producer_witness_id = 1;
+  repeated RuntimeFilterLineageStep lineage = 2;
+}
+message RuntimeFilterContentDemandScanField {
   optional uint32 producer_witness_id = 1;
   repeated RuntimeFilterLineageStep lineage = 2;
 }

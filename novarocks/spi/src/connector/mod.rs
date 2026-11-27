@@ -264,8 +264,8 @@ pub use mv_storage_observation::{
     MvObservedSourceField, MvRefreshBaseObservation, MvRefreshTargetObservation,
     MvSchemaValidationObservation, MvSourceBindingFact, MvSourceBindingObservation,
     MvSourceFieldBinding, MvSourceFieldCoordinate, MvSourceFieldKind, MvSourceFieldPath,
-    MvSourceObjectKind, MvSourcePathBinding, MvSourceSchemaObservation, MvStorageObservationPort,
-    UnavailableMvStorageObservationPort,
+    MvSourceFormatVersion, MvSourceObjectKind, MvSourcePathBinding, MvSourceSchemaObservation,
+    MvStorageObservationPort, UnavailableMvStorageObservationPort,
 };
 pub use original_result_scope::{
     ConnectorOriginalResultScope, ConnectorOriginalResultScopeCheck, OriginalResultCheckClass,

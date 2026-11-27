@@ -56,6 +56,9 @@ use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
 use crate::commit::staging::StagingBase;
 use crate::commit::staging::{PreparedChange, Preparer, StagedView};
 use async_trait::async_trait;
+use novarocks_spi::connector::{
+    KeyedFullRefreshMarkers, read_stack::ConnectorMvTargetPartitionSelection,
+};
 #[cfg(test)]
 use std::sync::Mutex;
 
@@ -354,6 +357,8 @@ struct WriteRecipe<'a> {
     prefix: PreparedChange,
     output_facts: crate::write_codec::IcebergWrittenOutputFacts,
     keyed_documents: Option<novarocks_spi::connector::KeyedPublication>,
+    full_refresh_markers: Option<KeyedFullRefreshMarkers>,
+    partition_replace: Option<Arc<ConnectorMvTargetPartitionSelection>>,
     repartition: Option<managed_repartition::RepartitionPublication<'a>>,
 }
 
@@ -391,6 +396,26 @@ impl<'a> WriteRecipe<'a> {
         }
         let mut summary = session_snapshot_properties_for_commit(handle)?;
         let keyed_documents = documents.map(|intent| intent.documents.clone());
+        let full_refresh_markers = documents.and_then(|intent| intent.full_refresh_markers.clone());
+        let partition_replace = documents.and_then(|intent| intent.partition_replace.as_ref());
+        let mut session_protocol = handle.commit_protocol();
+        if let Some(selection) = partition_replace {
+            use crate::commit::model::MvRefreshMode;
+            if facts.base_snapshot_id() != Some(selection.snapshot_id())
+                || !matches!(
+                    session_protocol,
+                    WriteSessionCommitProtocol::RefreshMaterializedView(MvRefreshMode::Full)
+                )
+            {
+                return Err(invalid(
+                    "Iceberg partition replacement lost its original main",
+                ));
+            }
+            crate::typed_boundary::validate_mv_target_partition_selection(&source, selection)?;
+            session_protocol = WriteSessionCommitProtocol::RefreshMaterializedView(
+                MvRefreshMode::PartitionReplace,
+            );
+        }
         if let Some(keyed) = &keyed_documents {
             for record in &keyed.records {
                 let key =
@@ -483,7 +508,7 @@ impl<'a> WriteRecipe<'a> {
             fixed_mutation,
             equality_delete: handle.flavor()
                 == crate::commit::write_stack::domain::IcebergWriteFlavor::EqualityDelete,
-            session_protocol: handle.commit_protocol(),
+            session_protocol,
             writer,
             mv_dependencies,
             rewrite_removals: handle.frozen_rewrite_removals().cloned(),
@@ -499,6 +524,8 @@ impl<'a> WriteRecipe<'a> {
             prefix,
             output_facts: Default::default(),
             keyed_documents,
+            full_refresh_markers,
+            partition_replace: partition_replace.cloned().map(Arc::new),
             repartition,
         })
     }
@@ -583,6 +610,10 @@ impl<'a> WriteRecipe<'a> {
         })
         .and_then(|intent| {
             let intent = intent.with_compact_stage(self.leading_stage().as_slice().len())?;
+            let intent = match &self.partition_replace {
+                Some(selection) => intent.with_partition_replace(Arc::clone(selection))?,
+                None => intent,
+            };
             Ok(
                 if matches!(
                     self.session_protocol,
@@ -674,6 +705,7 @@ impl crate::commit::dependency::RemovedDataFiles for materialized::MaterializedD
 struct KeyedPublicationPreparer {
     documents: novarocks_spi::connector::KeyedPublication,
     full_refresh: bool,
+    full_refresh_markers: Option<KeyedFullRefreshMarkers>,
 }
 #[async_trait]
 impl Preparer for KeyedPublicationPreparer {
@@ -689,6 +721,24 @@ impl Preparer for KeyedPublicationPreparer {
             publication_updates, publication_updates_from_snapshot,
         };
         let metadata = view.metadata();
+        let rebuilt_documents;
+        let documents = match &self.full_refresh_markers {
+            Some(KeyedFullRefreshMarkers::ClearObserved { owner, names }) => {
+                let mut documents = self.documents.clone();
+                // Recompute this category's removals from exactly this round.
+                documents
+                    .markers_remove
+                    .retain(|key| &key.owner != owner || !names.contains(&key.name));
+                documents.markers_remove.extend(
+                    crate::commit::mv_dispatch::observed_marker_keys(metadata, owner)?
+                        .into_iter()
+                        .filter(|key| names.contains(&key.name)),
+                );
+                rebuilt_documents = documents;
+                &rebuilt_documents
+            }
+            _ => &self.documents,
+        };
         let prepared = if self.full_refresh {
             // The staged append already names the new records. Validate the
             // actual attempt's preceding publication before adding their closure.
@@ -700,13 +750,9 @@ impl Preparer for KeyedPublicationPreparer {
                     })
                 })
                 .transpose()?;
-            publication_updates_from_snapshot(
-                metadata,
-                predecessor.map(AsRef::as_ref),
-                &self.documents,
-            )
+            publication_updates_from_snapshot(metadata, predecessor.map(AsRef::as_ref), documents)
         } else {
-            publication_updates(metadata, &self.documents)
+            publication_updates(metadata, documents)
         }
         .map_err(format_error)?;
         for (key, value) in &prepared.summary {
@@ -723,6 +769,30 @@ impl Preparer for KeyedPublicationPreparer {
     }
 }
 
+struct FullRefreshDelete<'a> {
+    delete: crate::commit::filter_delete::FilterDeletePreparer,
+    markers: Option<&'a KeyedFullRefreshMarkers>,
+}
+
+#[async_trait]
+impl Preparer for FullRefreshDelete<'_> {
+    async fn prepare(
+        &self,
+        view: &StagedView<'_>,
+        intent: &OperationIntent,
+    ) -> crate::iceberg::Result<PreparedChange> {
+        if let Some(KeyedFullRefreshMarkers::Fenced { owner, keys }) = self.markers {
+            crate::commit::mv_dispatch::require_full_refresh_marker_keys(
+                view.metadata(),
+                owner,
+                keys,
+                intent.protocol().operation(),
+            )?;
+        }
+        self.delete.prepare(view, intent).await
+    }
+}
+
 pub(crate) struct WriteStatisticsPreparer {
     pub(crate) op_kind: CommitOpKind,
     pub(crate) drafts: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
@@ -733,9 +803,10 @@ impl Preparer for WriteStatisticsPreparer {
     async fn prepare(
         &self,
         view: &StagedView<'_>,
-        _intent: &OperationIntent,
+        intent: &OperationIntent,
     ) -> crate::iceberg::Result<PreparedChange> {
-        if self.drafts.is_empty() {
+        // Partition replacements collect statistics over only the recomputed slice.
+        if self.drafts.is_empty() || intent.protocol().is_partition_replace() {
             return Ok(PreparedChange::default());
         }
         let metadata = view.metadata();
@@ -878,6 +949,11 @@ impl IcebergWriteSessionControl {
                 })
                 .transpose()?;
             let files = received.take_compact_files();
+            if recipe.partition_replace.is_some() && files.has_delete_effects() {
+                return Err(invalid(
+                    "Iceberg partition replacement requires only appended data",
+                ));
+            }
             let stage = recipe.leading_stage().as_slice().len();
             recipe.output_facts.data_files = files.counts.data.files;
             recipe.output_facts.data_rows = files.counts.data.rows;
@@ -1096,6 +1172,7 @@ impl IcebergWriteSessionControl {
                 .map(|documents| KeyedPublicationPreparer {
                     documents,
                     full_refresh,
+                    full_refresh_markers: recipe.full_refresh_markers,
                 });
             let delete;
             let mut preparers: Vec<&dyn Preparer> = Vec::new();
@@ -1104,7 +1181,13 @@ impl IcebergWriteSessionControl {
                     preparers.push(keyed.as_ref().expect("frozen keyed publication"));
                 }
                 Some(LeadingStage::FullRefreshDelete) => {
-                    delete = crate::commit::filter_delete::FilterDeletePreparer::for_full_refresh();
+                    delete = FullRefreshDelete {
+                        delete:
+                            crate::commit::filter_delete::FilterDeletePreparer::for_full_refresh(),
+                        markers: keyed
+                            .as_ref()
+                            .and_then(|keyed| keyed.full_refresh_markers.as_ref()),
+                    };
                     preparers.push(&delete);
                 }
                 None => {}
@@ -2053,10 +2136,10 @@ mod keyed_preparation_tests {
     use crate::iceberg::spec::FormatVersion;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorDocumentFormat, ConnectorDocumentVersion, ConnectorSnapshotRecord,
-        KeyedPublication,
+        ConnectorDocumentFormat, ConnectorDocumentVersion, ConnectorMarkerKey,
+        ConnectorMarkerValue, ConnectorSnapshotRecord, KeyedPublication,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     fn document(name: &str, bytes: usize) -> ConnectorDocumentVersion {
         ConnectorDocumentVersion::try_new(
@@ -2115,6 +2198,187 @@ mod keyed_preparation_tests {
         .unwrap()
     }
 
+    fn marker(owner: &str, name: &str, binding: &str) -> ConnectorMarkerKey {
+        ConnectorMarkerKey {
+            owner: owner.into(),
+            name: name.into(),
+            binding: binding.into(),
+        }
+    }
+
+    fn marker_properties(
+        keys: &[ConnectorMarkerKey],
+        content: &'static [u8],
+    ) -> HashMap<String, String> {
+        use crate::document_storage::keyed::{envelope::encode_marker, keys::marker_key};
+        keys.iter()
+            .map(|key| {
+                let value = ConnectorMarkerValue {
+                    format: ConnectorDocumentFormat::try_new(&key.owner, &key.name, 1).unwrap(),
+                    content: Bytes::from_static(content),
+                };
+                (marker_key(key), encode_marker(key, &value).unwrap())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn full_refresh_checks_frozen_marker_keys_before_staging_data() {
+        use crate::commit::staging::StagingEngine;
+        use novarocks_failure_contract::{FailureProjection, connector_reason};
+        let fixture = Fixture::new();
+        let owner = "novarocks.mv";
+        let pending = marker(owner, "pending", "old");
+        let release = marker(owner, "pending-released", "old");
+        let fresh_pending = marker(owner, "pending", "new");
+        let foreign = marker("novarocks.other", "pending", "own");
+        let keys = BTreeSet::from([pending.clone(), release.clone()]);
+        let policy = KeyedFullRefreshMarkers::Fenced {
+            owner: owner.into(),
+            keys,
+        };
+        let round = |keys: &[ConnectorMarkerKey]| {
+            fixture
+                .metadata(FormatVersion::V2)
+                .into_builder(None)
+                .set_properties(marker_properties(keys, b"opaque round value"))
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata
+        };
+        let unchanged = round(&[pending.clone(), release.clone(), foreign.clone()]);
+        crate::commit::mv_dispatch::require_full_refresh_marker_keys(
+            &unchanged,
+            owner,
+            &BTreeSet::from([pending.clone(), release.clone()]),
+            crate::commit::model::CommitOperation::RefreshMaterializedView,
+        )
+        .unwrap();
+
+        let advanced = round(&[pending, release, foreign, fresh_pending]);
+        let documents = publication(document("binding", 1));
+        let intent = intent(&fixture, &advanced, &documents);
+        // The first preparer is the same one used by managed FullRefresh.
+        let prep = FullRefreshDelete {
+            delete: crate::commit::filter_delete::FilterDeletePreparer::for_full_refresh(),
+            markers: Some(&policy),
+        };
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let mut engine = StagingEngine::begin(
+            StagingBase::Existing {
+                metadata: advanced,
+                metadata_location: "file://advanced.metadata.json".into(),
+            },
+            &intent,
+            &attempt,
+        )
+        .unwrap();
+        let error = engine.stage(&prep).await.unwrap_err();
+        let conflict = attempt::before_dispatch_failure(&error);
+        assert_eq!(conflict.kind(), ConnectorMutationFailureKind::Conflict);
+        assert!(fixture.operation.artifacts().unwrap().is_empty());
+        let conflict = crate::commit::mv_dispatch::require_full_refresh_marker_keys(
+            engine.metadata(),
+            owner,
+            &BTreeSet::new(),
+            crate::commit::model::CommitOperation::RefreshMaterializedView,
+        )
+        .unwrap_err();
+        assert_eq!(
+            attempt::before_dispatch_failure(&conflict)
+                .failure_fact()
+                .reason(),
+            connector_reason::ICEBERG_COMMIT_VALIDATION_CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn full_rebuild_clears_round_obligations_and_keeps_its_keyed_record() {
+        use crate::commit::staging::StagingEngine;
+        use crate::document_storage::keyed::{keys::marker_key, view::parse_snapshot_records};
+        let fixture = Fixture::new();
+        let owner = "novarocks.mv";
+        let old = marker(owner, "pending", "gone");
+        let pending = marker(owner, "pending", "new");
+        let invalid = marker(owner, "invalid", "old");
+        let release = marker(owner, "pending-released", "old");
+        let foreign = marker("novarocks.other", "pending", "own");
+        let retained = marker(owner, "needs-rebuild", "keep");
+        let base = fixture
+            .metadata(FormatVersion::V2)
+            .into_builder(None)
+            .set_properties(marker_properties(
+                &[
+                    pending.clone(),
+                    invalid.clone(),
+                    release.clone(),
+                    foreign.clone(),
+                    retained.clone(),
+                ],
+                b"opaque round value",
+            ))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let mut documents = publication(document("binding", 1));
+        let recovery = ConnectorSnapshotRecord {
+            owner: owner.into(),
+            name: "recovery".into(),
+            binding: None,
+            payload: Bytes::from_static(b"original recovery evidence"),
+        };
+        documents.records.push(recovery.clone());
+        documents.markers_remove.insert(old);
+        let intent = intent(&fixture, &base, &documents);
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let mut engine = StagingEngine::begin(
+            StagingBase::Existing {
+                metadata: base,
+                metadata_location: "file://advanced.metadata.json".into(),
+            },
+            &intent,
+            &attempt,
+        )
+        .unwrap();
+        engine
+            .stage(&crate::commit::fast_append::FastAppendPreparer)
+            .await
+            .unwrap();
+        engine
+            .stage(&KeyedPublicationPreparer {
+                documents,
+                full_refresh: true,
+                full_refresh_markers: Some(KeyedFullRefreshMarkers::ClearObserved {
+                    owner: owner.into(),
+                    names: ["invalid", "pending", "pending-released"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                }),
+            })
+            .await
+            .unwrap();
+        let metadata = engine.metadata();
+        let records = parse_snapshot_records(
+            &metadata
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties,
+            true,
+        )
+        .unwrap();
+        assert!(records.contains(&recovery));
+        for removed in [pending, invalid, release] {
+            assert!(!metadata.properties().contains_key(&marker_key(&removed)));
+        }
+        for retained in [foreign, retained] {
+            assert!(metadata.properties().contains_key(&marker_key(&retained)));
+        }
+    }
+
     #[tokio::test]
     async fn keyed_publication_accepts_large_attempt_properties_before_writing_any_manifest() {
         use crate::commit::staging::StagingEngine;
@@ -2165,6 +2429,7 @@ mod keyed_preparation_tests {
             .stage(&KeyedPublicationPreparer {
                 documents,
                 full_refresh: false,
+                full_refresh_markers: None,
             })
             .await
             .expect("large existing private properties do not prevent keyed preparation");
@@ -2203,6 +2468,7 @@ mod keyed_preparation_tests {
             .stage(&KeyedPublicationPreparer {
                 documents: documents.clone(),
                 full_refresh: false,
+                full_refresh_markers: None,
             })
             .await
             .unwrap();

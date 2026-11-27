@@ -1218,7 +1218,7 @@ impl MvStorageObservationPort for SourceFixture {
                 self.object()
             },
             metadata.version.clone().unwrap(),
-            true,
+            novarocks_spi::connector::MvSourceFormatVersion::V3,
             Some(1),
             true,
             self.observed_source_fields(initial),

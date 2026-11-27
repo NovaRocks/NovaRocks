@@ -92,7 +92,7 @@ pub struct IcebergStorageTargetField {
 pub struct IcebergStorageSourceSchemaObservation {
     pub object_id: ConnectorTableObjectId,
     pub schema_version: Bytes,
-    pub format_v3: bool,
+    pub format_version: FormatVersion,
     pub selected_snapshot_id: Option<i64>,
     pub selected_snapshot_has_row_range: bool,
     pub fields: Vec<IcebergStorageSourceField>,
@@ -617,7 +617,7 @@ fn create_source_observation(
     Ok(IcebergStorageSourceSchemaObservation {
         object_id,
         schema_version,
-        format_v3: target.format_v3,
+        format_version: table.format_version(),
         selected_snapshot_id: table.current_snapshot_id(),
         selected_snapshot_has_row_range: table
             .current_snapshot()
@@ -765,7 +765,7 @@ fn selected_source_schema_observation(
     Ok(IcebergStorageSourceSchemaObservation {
         object_id: iceberg_object_id_from_uuid(uuid)?,
         schema_version: exact_schema_version(schema.schema_id()),
-        format_v3: matches!(table.format_version(), FormatVersion::V3),
+        format_version: table.format_version(),
         selected_snapshot_id: Some(selected_snapshot_id),
         selected_snapshot_has_row_range: table
             .snapshot_by_id(selected_snapshot_id)
@@ -1268,7 +1268,7 @@ mod tests {
         .unwrap()
         .metadata;
         let observation = create_source_observation(&table, &context(4096)).unwrap();
-        assert!(observation.format_v3);
+        assert_eq!(observation.format_version, FormatVersion::V3);
         assert_eq!(observation.selected_snapshot_id, Some(11));
         assert!(!observation.selected_snapshot_has_row_range);
     }

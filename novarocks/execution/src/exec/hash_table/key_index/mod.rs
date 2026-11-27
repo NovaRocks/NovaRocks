@@ -45,6 +45,7 @@ mod statistics;
 mod store;
 mod strategy;
 mod table;
+pub use table::{ContentKeyIndexSizing, estimate_content_key_index};
 #[cfg(test)]
 mod tests;
 

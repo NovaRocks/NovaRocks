@@ -30,9 +30,9 @@ use crate::commit::model::{AddedContent, ArtifactWriter, CommitOperation, Frozen
 use crate::commit::overwrite::preparer_tests::{Fixture, data, raw_entries};
 use crate::commit::staging::{ManifestEntryWrite, StagingBase, StagingEngine, write_manifest};
 use crate::iceberg::spec::{
-    DataFile, DataFileBuilder, DataFileFormat, Datum, FieldSummary, FormatVersion,
+    DataFile, DataFileBuilder, DataFileFormat, Datum, FieldSummary, FormatVersion, Literal,
     ManifestContentType, ManifestEntry, ManifestList, ManifestStatus, NestedField, Operation,
-    PrimitiveType, Schema, SortOrder, Struct, TableMetadataBuilder, Transform,
+    PrimitiveLiteral, PrimitiveType, Schema, SortOrder, Struct, TableMetadataBuilder, Transform,
     UnboundPartitionSpecBuilder,
 };
 use crate::typed_read::IcebergColumnHandle;
@@ -674,6 +674,195 @@ fn assert_summary(metadata: &TableMetadata, expected: &[(&str, &str)], absent: &
             "{key} should be absent: {summary:?}"
         );
     }
+}
+
+fn partition_replace_intent(
+    fixture: &Fixture,
+    base: &TableMetadata,
+    transform: novarocks_spi::connector::MvExactPartitionTransform,
+    added: Vec<AddedContent>,
+) -> OperationIntent {
+    use crate::commit::model::{
+        CommitProtocol, FileChanges, MvRefreshMode, OperationIntentParts, RequestShape,
+        StartSnapshot, TableTarget, WriterSchemaSpec,
+    };
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        MvExactPartitionField,
+        read_stack::{ConnectorMvPartitionValue, ConnectorMvTargetPartitionSelection},
+    };
+    let snapshot = base.current_snapshot().unwrap();
+    let field = &base.default_partition_spec().fields()[0];
+    let selection = ConnectorMvTargetPartitionSelection::try_new(
+        crate::document_storage::observation::table_object_id(base).unwrap(),
+        crate::storage_inspector::exact_partition_spec_version(base.default_partition_spec_id()),
+        vec![
+            MvExactPartitionField::try_new(
+                Bytes::copy_from_slice(&field.field_id.to_be_bytes()),
+                Bytes::copy_from_slice(&field.source_id.to_be_bytes()),
+                transform,
+            )
+            .unwrap(),
+        ],
+        vec![
+            vec![ConnectorMvPartitionValue::String("10".into())],
+            vec![ConnectorMvPartitionValue::Null],
+        ],
+        snapshot.snapshot_id(),
+    )
+    .unwrap();
+    OperationIntent::new(OperationIntentParts {
+        target: TableTarget {
+            ident: crate::iceberg::TableIdent::from_strs(["db", "mv"]).unwrap(),
+            uuid: Some(base.uuid()),
+        },
+        target_ref: "main".into(),
+        start: Some(StartSnapshot {
+            snapshot_id: snapshot.snapshot_id(),
+            sequence_number: snapshot.sequence_number(),
+        }),
+        changes: FileChanges {
+            added,
+            removed: vec![],
+        },
+        dependencies: vec![],
+        protocol: CommitProtocol::MvRefresh {
+            mode: MvRefreshMode::PartitionReplace,
+            admitted: Default::default(),
+            writer: WriterSchemaSpec {
+                schema_id: base.current_schema_id(),
+                default_spec_id: base.default_partition_spec_id(),
+            },
+        },
+        shape: RequestShape::SnapshotProducing,
+        summary: Default::default(),
+        token: fixture.operation.token(),
+    })
+    .unwrap()
+    .with_partition_replace(Arc::new(selection))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn partition_replace_keeps_unselected_files_and_inherits_filtered_totals() {
+    use crate::commit::fast_append::FullRefreshAppendFixture;
+    use novarocks_spi::connector::MvExactPartitionTransform;
+    let fixture = Fixture::new();
+    let partition = |value: Option<i32>| {
+        Struct::from_iter([value.map(|value| Literal::Primitive(PrimitiveLiteral::Int(value)))])
+    };
+    let null_path = "file:///null.parquet";
+    let new_path = "file:///replacement.parquet";
+    let initial = conditional_metadata(PrimitiveType::Int, Some(Transform::Identity));
+    let spec_id = initial.default_partition_spec_id();
+    let initial = seed(
+        &fixture,
+        initial,
+        vec![
+            data(A, 3, partition(Some(10))),
+            data(B, 2, partition(Some(20))),
+            data(null_path, 1, partition(None)),
+        ],
+    )
+    .await;
+    let added =
+        AddedContent::new_logical_data(data(new_path, 4, partition(Some(10))), spec_id).unwrap();
+    let intent = partition_replace_intent(
+        &fixture,
+        &initial,
+        MvExactPartitionTransform::Identity,
+        vec![added],
+    );
+    let attempt = fixture.operation.begin_attempt().unwrap();
+    let mut engine = StagingEngine::begin(
+        StagingBase::Existing {
+            metadata: initial,
+            metadata_location: "file:///partition-replace.metadata.json".into(),
+        },
+        &intent,
+        &attempt,
+    )
+    .unwrap();
+    engine
+        .stage(&FilterDeletePreparer::for_full_refresh())
+        .await
+        .unwrap();
+    assert_summary(
+        engine.metadata(),
+        &[("deleted-data-files", "2"), ("total-records", "2")],
+        &[],
+    );
+    engine.stage(&FullRefreshAppendFixture(None)).await.unwrap();
+    let metadata = engine.metadata().clone();
+    assert_eq!(
+        metadata
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .additional_properties["total-records"],
+        "6"
+    );
+    let request = engine.freeze().unwrap();
+    crate::commit::mv_dispatch::FullRefreshStageWitness::verify(&request).unwrap();
+    let entries = raw_entries(&metadata, "main", &attempt).await;
+    let remaining: std::collections::BTreeSet<_> = entries
+        .iter()
+        .filter(|entry| entry.is_alive())
+        .map(|entry| entry.data_file().file_path())
+        .collect();
+    assert_eq!(remaining, [B, new_path].into_iter().collect());
+}
+
+#[tokio::test]
+async fn partition_replace_rejects_live_files_with_only_historical_partition_proof() {
+    use novarocks_failure_contract::{
+        FailureProjection, connector_reason::ICEBERG_COMMIT_VALIDATION_CONFLICT,
+    };
+    use novarocks_spi::connector::MvExactPartitionTransform;
+    let fixture = Fixture::new();
+    let initial = conditional_metadata(PrimitiveType::Int, Some(Transform::Identity));
+    let initial = seed(
+        &fixture,
+        initial,
+        vec![data(
+            A,
+            3,
+            Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Int(10)))]),
+        )],
+    )
+    .await;
+    let bucket = UnboundPartitionSpecBuilder::new()
+        .add_partition_field(2, "part_bucket", Transform::Bucket(16))
+        .unwrap();
+    let evolved = initial
+        .into_builder(None)
+        .add_partition_spec(bucket.build())
+        .unwrap()
+        .set_default_partition_spec(-1)
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+    let intent = partition_replace_intent(
+        &fixture,
+        &evolved,
+        MvExactPartitionTransform::Bucket { num_buckets: 16 },
+        vec![],
+    );
+    let error = execute(
+        &fixture,
+        evolved,
+        &intent,
+        &FilterDeletePreparer::for_full_refresh(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        crate::commit::attempt::before_dispatch_failure(&error)
+            .failure_fact()
+            .reason(),
+        ICEBERG_COMMIT_VALIDATION_CONFLICT
+    );
 }
 
 #[tokio::test]

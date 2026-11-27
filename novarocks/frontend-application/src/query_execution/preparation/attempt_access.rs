@@ -36,6 +36,8 @@ pub(crate) struct LogicalExecutionAccessScope {
 pub(crate) type ConnectorAttemptAccessPlan = LogicalExecutionAccessScope;
 
 pub(crate) struct ConnectorAttemptAccessEntry {
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) content_target: bool,
     catalog_properties: CatalogProperties,
     planning_pin: ConnectorControlPlanningPin,
     access: ConnectorReadAttemptAccess,
@@ -49,12 +51,14 @@ pub(crate) struct ConnectorAttemptAccessEntry {
 /// frozen read - the pairing the plan was published with says so - and the
 /// physical fragment and node identities are the ones the wire carries, so the
 /// key is a translation rather than a lookup that could miss.
-pub(crate) type FrozenReadCapability = (
-    novarocks_sql::binding::SqlTableBindingId,
-    ConnectorReadAttemptAccess,
-    ConnectorControlPlanningPin,
-    CatalogProperties,
-);
+pub(crate) struct FrozenReadCapability {
+    pub(crate) binding: novarocks_sql::binding::SqlTableBindingId,
+    pub(crate) access: ConnectorReadAttemptAccess,
+    pub(crate) generation: ConnectorControlPlanningPin,
+    pub(crate) catalog: CatalogProperties,
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) content_target: bool,
+}
 
 /// Proof of the immutable static plan's complete placement validation. The
 /// temporary scan indexes leave on the CPU; no extra mapping graph is retained.
@@ -111,7 +115,14 @@ impl PreparedAttemptAccess {
                 let novarocks_physical_plan::NodeKind::Scan { occurrence, .. } = &node.kind else {
                     continue;
                 };
-                let (binding, access, generation, catalog) = reads
+                let FrozenReadCapability {
+                    binding,
+                    access,
+                    generation,
+                    catalog,
+                    #[cfg(novarocks_dev_controls)]
+                    content_target,
+                } = reads
                     .remove(occurrence)
                     .expect("same original read prepared for this placement");
                 let node_id =
@@ -120,6 +131,8 @@ impl PreparedAttemptAccess {
                 entries.insert(
                     destination,
                     Arc::new(ConnectorAttemptAccessEntry {
+                        #[cfg(novarocks_dev_controls)]
+                        content_target,
                         catalog_properties: catalog,
                         planning_pin: generation,
                         rewritten_target_binding: access.rewritten_target_fact().map(|_| binding),
@@ -146,13 +159,19 @@ pub(crate) fn attempt_access_for_completed_plan(
             let novarocks_physical_plan::NodeKind::Scan { occurrence, .. } = &node.kind else {
                 continue;
             };
-            let (binding, access, generation, catalog) =
-                reads.remove(occurrence).ok_or_else(|| {
-                    format!(
-                        "completed plan scans provider read occurrence {} with no frozen read",
-                        occurrence.get()
-                    )
-                })?;
+            let FrozenReadCapability {
+                binding,
+                access,
+                generation,
+                catalog,
+                #[cfg(novarocks_dev_controls)]
+                content_target,
+            } = reads.remove(occurrence).ok_or_else(|| {
+                format!(
+                    "completed plan scans provider read occurrence {} with no frozen read",
+                    occurrence.get()
+                )
+            })?;
             let node_id = i32::try_from(node.id.get()).map_err(|_| {
                 format!("scan node {} exceeds the wire node identity", node.id.get())
             })?;
@@ -161,6 +180,8 @@ pub(crate) fn attempt_access_for_completed_plan(
                 .insert(
                     (fragment_id, node_id),
                     Arc::new(ConnectorAttemptAccessEntry {
+                        #[cfg(novarocks_dev_controls)]
+                        content_target,
                         catalog_properties: catalog,
                         planning_pin: generation,
                         rewritten_target_binding: access.rewritten_target_fact().map(|_| binding),
@@ -234,6 +255,8 @@ impl ConnectorAttemptAccessEntry {
             planning_pin.binding().descriptor()
         );
         Arc::new(Self {
+            #[cfg(novarocks_dev_controls)]
+            content_target: false,
             catalog_properties,
             planning_pin,
             access,

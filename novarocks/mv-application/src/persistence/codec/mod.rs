@@ -23,11 +23,13 @@ pub(crate) mod binding_model;
 pub mod keyed;
 pub(crate) mod mapping_codec;
 mod markers;
+mod recovery_record;
 mod retirement_record;
 
 pub use binding_model::*;
 pub use mapping_codec::*;
 pub use markers::*;
+pub use recovery_record::*;
 pub use retirement_record::*;
 mod model;
 mod wire;

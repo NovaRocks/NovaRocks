@@ -1576,7 +1576,8 @@ fn runtime_filter_consumer_requires_a_producer_for_its_exact_equality_witness() 
     match &mut filter.consumers[0].target {
         RuntimeFilterConsumerTarget::JoinProbeKey { equality }
         | RuntimeFilterConsumerTarget::ScanField { equality, .. } => *equality = second.id,
-        RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => {
+        RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
+        | RuntimeFilterConsumerTarget::ContentDemandScanField { .. } => {
             panic!("null-safe join fixture must use a join equality target")
         }
     }

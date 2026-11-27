@@ -1797,7 +1797,8 @@ fn add_runtime_filter_usage_core<P: TypeValidationPolicy>(
         usage.add_item_counts([consumer.endpoint.values.len(), consumer.capabilities.len()]);
         match &consumer.target {
             crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. }
-            | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { lineage, .. } => {
+            | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { lineage, .. }
+            | crate::RuntimeFilterConsumerTarget::ContentDemandScanField { lineage, .. } => {
                 usage.add_items(lineage.len());
             }
             crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => {}

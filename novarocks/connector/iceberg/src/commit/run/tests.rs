@@ -171,6 +171,8 @@ async fn prepare_keyed(fixture: &Fixture, payload: &'static [u8]) -> PreparedKey
         intent: KeyedPublicationIntent {
             declaration: declaration.clone(),
             documents,
+            full_refresh_markers: None,
+            partition_replace: None,
         },
         declaration,
         base_snapshot_id,

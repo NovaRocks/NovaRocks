@@ -541,6 +541,12 @@ pub(crate) fn apply_pre_query_with_token(
         server.arm_terminal_snapshot_conflict(index)?;
     }
     for fault in configured_query_lifecycle_faults(meta) {
+        if fault.kind
+            == novarocks_failpoint::QueryLifecycleFaultKind::MvContentTargetEnumerationClose
+        {
+            // The exact MV action belongs to the selected FE role grant.
+            continue;
+        }
         match token {
             Some(token) => server.arm_selected_query_lifecycle_fault(
                 fault.be_index,

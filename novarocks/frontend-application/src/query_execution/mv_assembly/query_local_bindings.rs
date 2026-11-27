@@ -118,62 +118,7 @@ pub(crate) fn bind_imv_target_query_table_from_metadata(
         mv_partition_selection: None,
         planning_pin: planning_pin.clone(),
     };
-    let selection = affected_partitions
-        .and_then(|affected| match affected {
-            AffectedTargetPartitions::Known { partitions } => Some(partitions),
-            AffectedTargetPartitions::Unpartitioned | AffectedTargetPartitions::NotDerived { .. } => None,
-        })
-        // A bounded carrier is an optimization. When the exact Known set is
-        // too large to carry, read the whole pinned snapshot instead.
-        .filter(|partitions| {
-            partitions.len() <= MAX_MV_TARGET_PARTITION_KEYS
-                && partitions.iter().flat_map(|key| &key.fields).all(|field| {
-                    !matches!(&field.value, MvPartitionValue::String(value) if value.len() > MAX_MV_TARGET_PARTITION_VALUE_BYTES)
-                })
-        })
-        .zip(frozen_snapshot_id)
-        .map(|(partitions, snapshot_id)| {
-            let target = &rewrite.interpretation().target;
-            let fields = target.partition_fields.iter().map(|field| {
-                let transform = match field.transform {
-                    TargetPartitionTransform::Identity => MvExactPartitionTransform::Identity,
-                    TargetPartitionTransform::Year => MvExactPartitionTransform::Year,
-                    TargetPartitionTransform::Month => MvExactPartitionTransform::Month,
-                    TargetPartitionTransform::Day => MvExactPartitionTransform::Day,
-                    TargetPartitionTransform::Hour => MvExactPartitionTransform::Hour,
-                    TargetPartitionTransform::Bucket { num_buckets } => MvExactPartitionTransform::Bucket { num_buckets },
-                    TargetPartitionTransform::Truncate { width } => MvExactPartitionTransform::Truncate { width },
-                    TargetPartitionTransform::Void => MvExactPartitionTransform::Void,
-                };
-                MvExactPartitionField::try_new(
-                    bytes::Bytes::copy_from_slice(field.partition_field_id.as_bytes()),
-                    bytes::Bytes::copy_from_slice(field.source_target_field_id.as_bytes()),
-                    transform,
-                ).map_err(|error| error.to_string())
-            }).collect::<Result<Vec<_>, String>>()?;
-            let keys = partitions.iter().map(|partition| {
-                if partition.spec_version != target.partition_spec_version
-                    || partition.fields.len() != target.partition_fields.len() {
-                    return Err("MV affected partition key disagrees with canonical target spec".to_string());
-                }
-                partition.fields.iter().zip(&target.partition_fields).map(|(value, field)| {
-                    if value.partition_field_id != field.partition_field_id {
-                        return Err("MV affected partition field order disagrees with canonical target".to_string());
-                    }
-                    Ok(match &value.value {
-                        MvPartitionValue::Null => ConnectorMvPartitionValue::Null,
-                        MvPartitionValue::String(value) => ConnectorMvPartitionValue::String(value.as_str().into()),
-                    })
-                }).collect::<Result<Vec<_>, String>>()
-            }).collect::<Result<Vec<_>, String>>()?;
-            ConnectorMvTargetPartitionSelection::try_new(
-                rewrite.mv_definition.facts.source_revision().target_object_id.clone(),
-                bytes::Bytes::copy_from_slice(target.partition_spec_version.as_bytes()),
-                fields,
-                keys,
-                snapshot_id,
-            ).map_err(|error| error.to_string())
-        }).transpose()?;
+    let selection = target_partition_selection(rewrite, affected_partitions, false)?;
     let mut affected_read = target_read.clone();
     affected_read.mv_partition_selection = selection;
     let mv_target_read = MvTargetReadAdmission {
@@ -203,38 +148,20 @@ pub(crate) fn bind_imv_target_query_table_from_metadata(
         &target_table_uuid,
         frozen_snapshot_id,
     );
-    let [apply_key] = rewrite.runtime_bindings.apply_key.as_slice() else {
-        return Err("MV target binding requires one exact apply-key field".to_string());
-    };
-    let branch_column = match rewrite.runtime_bindings.branches.as_slice() {
-        [] => None,
-        [(_, first), rest @ ..] => {
-            if rest
-                .iter()
-                .any(|(_, field)| field.field_id != first.field_id || field.name != first.name)
-            {
-                return Err(
-                    "MV target binding has conflicting exact branch discriminator fields"
-                        .to_string(),
-                );
-            }
-            Some(first.name.clone())
-        }
-    };
-    let apply_key_column = apply_key.name.clone();
     store.resolve_or_insert_with_id(key, |binding| {
-        let resolved = novarocks_sql::planning::catalog::materialize_mv_target_locator_table(
-            novarocks_sql::planning::catalog::SqlMvTargetLocatorTableFacts::try_new(
-                target.catalog.clone(),
-                target.namespace.clone(),
-                target.table.clone(),
-                target_table_uuid.clone(),
-                frozen_snapshot_id,
-                apply_key_column.clone(),
-                branch_column.clone(),
+        let resolved = novarocks_sql::planning::catalog::materialize_connector_read_table(
+            novarocks_sql::planning::catalog::ConnectorReadTableFacts {
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+                columns: Vec::new(),
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                schema: Arc::new(metadata.format_schema().clone()),
                 binding,
-            )?,
-        )
+                selector: target_read.selector,
+                planning_facts: metadata.planning_facts.clone(),
+            },
+        )?
         .into_resolved_table();
         Ok(QueryTableBinding {
             resolved,
@@ -318,6 +245,81 @@ pub(crate) async fn freeze_imv_base_query_local_overlays_from_captured_inputs_or
         }
     }
     freeze_captured_source_overlays(&sources)
+}
+
+pub(crate) fn target_partition_replacement_selection(
+    rewrite: &IcebergMvRewriteContext,
+    affected_partitions: &AffectedTargetPartitions,
+) -> Result<Option<ConnectorMvTargetPartitionSelection>, String> {
+    target_partition_selection(rewrite, Some(affected_partitions), true)
+}
+
+fn target_partition_selection(
+    rewrite: &IcebergMvRewriteContext,
+    affected_partitions: Option<&AffectedTargetPartitions>,
+    exact_replacement: bool,
+) -> Result<Option<ConnectorMvTargetPartitionSelection>, String> {
+    affected_partitions
+        .and_then(|affected| match affected {
+            AffectedTargetPartitions::Known { partitions } => Some(partitions),
+            AffectedTargetPartitions::Unpartitioned | AffectedTargetPartitions::NotDerived { .. } => None,
+        })
+        // A bounded carrier is an optimization. When the exact Known set is
+        // too large to carry, read the whole pinned snapshot instead.
+        .filter(|partitions| {
+            exact_replacement || (partitions.len() <= MAX_MV_TARGET_PARTITION_KEYS
+                && partitions.iter().flat_map(|key| &key.fields).all(|field| {
+                    !matches!(&field.value, MvPartitionValue::String(value) if value.len() > MAX_MV_TARGET_PARTITION_VALUE_BYTES)
+                }))
+        })
+        .zip(rewrite.target_snapshot_id)
+        .map(|(partitions, snapshot_id)| {
+            let target = &rewrite.interpretation().target;
+            let fields = target.partition_fields.iter().map(|field| {
+                let transform = match field.transform {
+                    TargetPartitionTransform::Identity => MvExactPartitionTransform::Identity,
+                    TargetPartitionTransform::Year => MvExactPartitionTransform::Year,
+                    TargetPartitionTransform::Month => MvExactPartitionTransform::Month,
+                    TargetPartitionTransform::Day => MvExactPartitionTransform::Day,
+                    TargetPartitionTransform::Hour => MvExactPartitionTransform::Hour,
+                    TargetPartitionTransform::Bucket { num_buckets } => MvExactPartitionTransform::Bucket { num_buckets },
+                    TargetPartitionTransform::Truncate { width } => MvExactPartitionTransform::Truncate { width },
+                    TargetPartitionTransform::Void => MvExactPartitionTransform::Void,
+                };
+                MvExactPartitionField::try_new(
+                    bytes::Bytes::copy_from_slice(field.partition_field_id.as_bytes()),
+                    bytes::Bytes::copy_from_slice(field.source_target_field_id.as_bytes()),
+                    transform,
+                ).map_err(|error| error.to_string())
+            }).collect::<Result<Vec<_>, String>>()?;
+            let keys = partitions.iter().map(|partition| {
+                if partition.spec_version != target.partition_spec_version
+                    || partition.fields.len() != target.partition_fields.len() {
+                    return Err("MV affected partition key disagrees with canonical target spec".to_string());
+                }
+                partition.fields.iter().zip(&target.partition_fields).map(|(value, field)| {
+                    if value.partition_field_id != field.partition_field_id {
+                        return Err("MV affected partition field order disagrees with canonical target".to_string());
+                    }
+                    Ok(match &value.value {
+                        MvPartitionValue::Null => ConnectorMvPartitionValue::Null,
+                        MvPartitionValue::String(value) => ConnectorMvPartitionValue::String(value.as_str().into()),
+                    })
+                }).collect::<Result<Vec<_>, String>>()
+            }).collect::<Result<Vec<_>, String>>()?;
+            let seal = if exact_replacement {
+                ConnectorMvTargetPartitionSelection::for_exact_replacement
+            } else {
+                ConnectorMvTargetPartitionSelection::try_new
+            };
+            seal(
+                rewrite.mv_definition.facts.source_revision().target_object_id.clone(),
+                bytes::Bytes::copy_from_slice(target.partition_spec_version.as_bytes()),
+                fields,
+                keys,
+                snapshot_id,
+            ).map_err(|error| error.to_string())
+        }).transpose()
 }
 
 /// Used by early schema analysis, first SQL and final activation alike.

@@ -30,10 +30,10 @@ use crate::mv::domain::rewrite::context::{
 use crate::mv::domain::storage_observation::{
     MvSchemaValidationObservation, MvSourceSchemaObservation,
 };
-use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
-use novarocks_mv_application::persistence::{
-    keyed_documents::StoredKeyedMvProjection, runtime_bindings::MvExactTargetSchemaFacts,
+use novarocks_mv_application::persistence::keyed_documents::{
+    MvStrictRecoveryPublication, StoredKeyedMvProjection,
 };
+use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorChangeWindowFacts, ConnectorChangeWindowNegativeWeight,
@@ -78,31 +78,27 @@ pub(crate) fn occurrence_window(
 }
 
 /// Assemble the one canonical rewrite value from already frozen D/L/P/C and
-/// provider facts. Runtime handles and a second Current observation are not
-/// accepted at this boundary.
+/// provider facts. The caller lends its original target and schema observation.
 pub(crate) fn build_neutral_refresh_rewrite_context(
     projection: Arc<StoredKeyedMvProjection>,
     rebuild_layout: Option<Arc<MvRewriteRebuildLayout>>,
+    recovery_publication: Option<Arc<MvStrictRecoveryPublication>>,
     current: Vec<MvRewriteSourceSnapshot>,
     previous: Vec<MvRewriteSourceSnapshot>,
-    target_table_uuid: String,
-    target_arrow_schema: arrow::datatypes::SchemaRef,
-    target_write_fields: Arc<[novarocks_spi::connector::ConnectorWriteFieldRequest]>,
-    exact_target: MvExactTargetSchemaFacts,
+    target_binding: &MvTargetBinding,
+    target_observation: &MvSchemaValidationObservation,
     analysis: MvRewriteAnalysisFacts,
-) -> Result<Arc<IcebergMvRewriteContext>, String> {
+) -> Result<IcebergMvRewriteContext, String> {
     IcebergMvRewriteContext::from_parts(
         projection,
         rebuild_layout,
+        recovery_publication,
         current,
         previous,
-        target_table_uuid,
-        target_arrow_schema,
-        target_write_fields,
-        exact_target,
+        target_binding,
+        target_observation,
         analysis,
     )
-    .map(Arc::new)
 }
 
 /// Everything one attempt already froze, assembled into the single rewrite
@@ -113,6 +109,7 @@ pub(crate) struct RefreshRewriteInputs<'a> {
     pub connector_context: &'a ConnectorRequestContext,
     pub projection: Arc<StoredKeyedMvProjection>,
     pub rebuild_layout: Option<Arc<MvRewriteRebuildLayout>>,
+    pub recovery_publication: Option<Arc<MvStrictRecoveryPublication>>,
     pub pin: &'a RefreshSnapshotPin,
     pub state_baseline: &'a RefreshStateBaseline,
     pub target_binding: &'a MvTargetBinding,
@@ -194,9 +191,10 @@ pub(crate) async fn freeze_refresh_rewrite_context_original(
             .cloned()
             .ok_or("MV rewrite lacks the original analyzed output lineage")?,
     })?;
-    build_neutral_refresh_rewrite_context(
+    let mut rewrite = build_neutral_refresh_rewrite_context(
         Arc::clone(&inputs.projection),
         inputs.rebuild_layout,
+        inputs.recovery_publication,
         rewrite_current_sources(inputs.pin),
         rewrite_history_sources_original(
             io,
@@ -205,13 +203,12 @@ pub(crate) async fn freeze_refresh_rewrite_context_original(
             inputs.connector_context,
         )
         .await?,
-        inputs.target_binding.table_uuid().to_string(),
-        inputs.target_binding.physical_write_schema()?,
-        inputs.target_binding.write_input_fields()?,
-        inputs.target_observation.exact_schema().clone(),
+        inputs.target_binding,
+        inputs.target_observation,
         analysis,
-    )
-    .map_err(Into::into)
+    )?;
+    rewrite.retain_equivalent_source_contexts(&io.captured_sources())?;
+    Ok(Arc::new(rewrite))
 }
 
 pub(crate) async fn rewrite_history_sources_original(

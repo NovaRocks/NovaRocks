@@ -28,7 +28,9 @@ use novarocks_spi::connector::{
 };
 
 use crate::mv::domain::model::AffectedTargetPartitions;
-use novarocks_spi::connector::read_stack::ConnectorPreparedSourceRead;
+use novarocks_spi::connector::read_stack::{
+    ConnectorExactSourcePartitionField, ConnectorPreparedSourceRead,
+};
 use novarocks_spi::connector::{
     ConnectorChangeWindowFacts, ConnectorChangeWindowPartitionImpact, ConnectorControlPlanningPin,
     ConnectorError, ConnectorErrorKind,
@@ -209,24 +211,6 @@ fn map_partition_fields(
     connector_partition: &ConnectorChangePartition,
     direct: Option<&MvDirectOutputSources>,
 ) -> Result<Option<MvPartitionKey>, PartitionMappingFailure> {
-    let occurrence = projection
-        .facts
-        .binding()
-        .occurrences
-        .iter()
-        .find(|occurrence| occurrence.occurrence_id == source_occurrence_id)
-        .ok_or("connector partition impact names no D source occurrence")?;
-    if occurrence.catalog_at_binding != source_observation.table().instance_id.as_str()
-        || !novarocks_mv_application::persistence::exact_revision::persisted_object_names(
-            &occurrence.object_id,
-            source_observation.table_object_id(),
-        )
-        .map_err(PartitionMappingFailure::Connector)?
-    {
-        return Err(
-            "connector partition impact does not belong to an exact D source occurrence".into(),
-        );
-    }
     for field in connector_partition.fields() {
         if !source_observation
             .fields()
@@ -240,41 +224,31 @@ fn map_partition_fields(
         }
     }
     let interpretation = projection.facts.interpretation();
-    let canonical = &interpretation.target.partition_fields;
-    if canonical.len() != target_partition.fields.len() || canonical.is_empty() {
-        return Err("target partition observation disagrees with canonical L".into());
-    }
-    let mut fields = Vec::with_capacity(canonical.len());
-    for (binding, observed) in canonical.iter().zip(&target_partition.fields) {
-        if !target_transform_matches(&binding.transform, &observed.transform) {
-            return Err("target partition transform disagrees with canonical L".into());
-        }
-        let output_binding = interpretation
-            .outputs
-            .iter()
-            .find(|output| output.target_field_id == binding.source_target_field_id)
-            .ok_or("target partition source has no output binding in canonical L")?;
-        let source = direct
-            .and_then(|sources| sources.get(&output_binding.output_id))
-            .filter(|source| source.occurrence_id == source_occurrence_id)
-            .ok_or(PartitionMappingFailure::NotDerived(
-                "target partition output has no analyzed direct source field",
-            ))?;
-        let source_id = &source.field_id;
-        let source_field = source_observation
-            .fields()
-            .iter()
-            .find(|field| field.field_id == *source_id)
-            .ok_or("direct target partition source is absent from the exact observation")?;
-        if source_field.source_type != output_binding.source_type {
-            return Err("direct target partition source changes its value type".into());
-        }
+    let Some(direct) = direct else {
+        return Err(PartitionMappingFailure::NotDerived(
+            "target partition output has no analyzed direct source field",
+        ));
+    };
+    let coordinates = source_partition_fields(
+        projection,
+        source_occurrence_id,
+        source_observation,
+        target_partition,
+        direct,
+    )?;
+    let mut fields = Vec::with_capacity(coordinates.len());
+    for (binding, coordinate) in interpretation
+        .target
+        .partition_fields
+        .iter()
+        .zip(coordinates)
+    {
         let impact = connector_partition
             .fields()
             .iter()
             .find(|field| {
-                field.source_field_identity().as_ref() == source_id.as_bytes()
-                    && impact_transform_matches(&binding.transform, field.transform())
+                field.source_field_identity() == &coordinate.source_field_id
+                    && field.transform() == coordinate.transform
             })
             .ok_or(PartitionMappingFailure::NotDerived(
                 "source partition impact cannot derive the target transform",
@@ -293,6 +267,119 @@ fn map_partition_fields(
         interpretation.target.partition_spec_version.clone(),
         fields,
     )))
+}
+
+/// Invert the same direct lineage used to derive the affected target keys.
+pub(crate) fn exact_source_partition_fields(
+    projection: &StoredKeyedMvProjection,
+    source_occurrence_id: u32,
+    source: &MvSourceSchemaObservation,
+    target_partition: &MvPartitionContract,
+    direct: &MvDirectOutputSources,
+) -> Result<Option<Vec<ConnectorExactSourcePartitionField>>, ConnectorError> {
+    match source_partition_fields(
+        projection,
+        source_occurrence_id,
+        source,
+        target_partition,
+        direct,
+    ) {
+        Ok(fields) => Ok(Some(fields)),
+        Err(PartitionMappingFailure::NotDerived(_)) => Ok(None),
+        Err(PartitionMappingFailure::Connector(error)) => Err(error),
+    }
+}
+
+fn source_partition_fields(
+    projection: &StoredKeyedMvProjection,
+    source_occurrence_id: u32,
+    source_observation: &MvSourceSchemaObservation,
+    target_partition: &MvPartitionContract,
+    direct: &MvDirectOutputSources,
+) -> Result<Vec<ConnectorExactSourcePartitionField>, PartitionMappingFailure> {
+    let occurrence = projection
+        .facts
+        .binding()
+        .occurrences
+        .iter()
+        .find(|occurrence| occurrence.occurrence_id == source_occurrence_id)
+        .ok_or("connector partition impact names no D source occurrence")?;
+    if occurrence.catalog_at_binding != source_observation.table().instance_id.as_str()
+        || !novarocks_mv_application::persistence::exact_revision::persisted_object_names(
+            &occurrence.object_id,
+            source_observation.table_object_id(),
+        )
+        .map_err(PartitionMappingFailure::Connector)?
+    {
+        return Err(
+            "connector partition impact does not belong to an exact D source occurrence".into(),
+        );
+    }
+    let interpretation = projection.facts.interpretation();
+    let canonical = &interpretation.target.partition_fields;
+    if canonical.len() != target_partition.fields.len() || canonical.is_empty() {
+        return Err("target partition observation disagrees with canonical L".into());
+    }
+    canonical
+        .iter()
+        .zip(&target_partition.fields)
+        .map(|(binding, observed)| {
+            if !target_transform_matches(&binding.transform, &observed.transform) {
+                return Err("target partition transform disagrees with canonical L".into());
+            }
+            let output_binding = interpretation
+                .outputs
+                .iter()
+                .find(|output| output.target_field_id == binding.source_target_field_id)
+                .ok_or("target partition source has no output binding in canonical L")?;
+            let source = direct
+                .get(&output_binding.output_id)
+                .filter(|source| source.occurrence_id == source_occurrence_id)
+                .ok_or(PartitionMappingFailure::NotDerived(
+                    "target partition output has no analyzed direct source field",
+                ))?;
+            let source_field = source_observation
+                .fields()
+                .iter()
+                .find(|field| field.field_id == source.field_id)
+                .ok_or("direct target partition source is absent from the exact observation")?;
+            if source_field.source_type != output_binding.source_type {
+                return Err(PartitionMappingFailure::NotDerived(
+                    "direct target partition source changes its value type",
+                ));
+            }
+            let transform = source_partition_transform(&binding.transform).ok_or(
+                PartitionMappingFailure::NotDerived(
+                    "source partition transform cannot derive the target",
+                ),
+            )?;
+            Ok(ConnectorExactSourcePartitionField {
+                source_field_id: bytes::Bytes::copy_from_slice(source.field_id.as_bytes()),
+                transform,
+            })
+        })
+        .collect()
+}
+
+fn source_partition_transform(
+    transform: &TargetPartitionTransform,
+) -> Option<ConnectorChangePartitionTransform> {
+    use ConnectorChangePartitionTransform as Source;
+    use TargetPartitionTransform as Target;
+    Some(match transform {
+        Target::Identity => Source::Identity,
+        Target::Year => Source::Year,
+        Target::Month => Source::Month,
+        Target::Day => Source::Day,
+        Target::Hour => Source::Hour,
+        Target::Bucket { num_buckets } => Source::Bucket {
+            buckets: (*num_buckets).try_into().ok()?,
+        },
+        Target::Truncate { width } => Source::Truncate {
+            width: (*width).try_into().ok()?,
+        },
+        Target::Void => return None,
+    })
 }
 
 fn target_transform_matches(
@@ -314,30 +401,6 @@ fn target_transform_matches(
             TargetPartitionTransform::Truncate { width: left },
             MvPartitionTransformContract::Truncate { width: right },
         ) => left == right,
-        _ => false,
-    }
-}
-
-fn impact_transform_matches(
-    binding: &TargetPartitionTransform,
-    impact: ConnectorChangePartitionTransform,
-) -> bool {
-    match (binding, impact) {
-        (TargetPartitionTransform::Identity, ConnectorChangePartitionTransform::Identity)
-        | (TargetPartitionTransform::Year, ConnectorChangePartitionTransform::Year)
-        | (TargetPartitionTransform::Month, ConnectorChangePartitionTransform::Month)
-        | (TargetPartitionTransform::Day, ConnectorChangePartitionTransform::Day)
-        | (TargetPartitionTransform::Hour, ConnectorChangePartitionTransform::Hour) => true,
-        (
-            TargetPartitionTransform::Bucket { num_buckets },
-            ConnectorChangePartitionTransform::Bucket { buckets },
-        ) => *num_buckets == buckets.get(),
-        (
-            TargetPartitionTransform::Truncate { width },
-            ConnectorChangePartitionTransform::Truncate {
-                width: impact_width,
-            },
-        ) => *width == impact_width.get(),
         _ => false,
     }
 }
@@ -396,7 +459,7 @@ mod tests {
                 },
                 ConnectorTableObjectId::try_new(Bytes::from_static(object)).unwrap(),
                 Bytes::from_static(&[1]),
-                true,
+                novarocks_spi::connector::MvSourceFormatVersion::V3,
                 Some(1),
                 true,
                 vec![
@@ -539,6 +602,37 @@ mod tests {
         assert_eq!(
             changed, original,
             "field derivation must not compare an opaque prepared spec token with Current default spec"
+        );
+    }
+
+    #[test]
+    fn partition_replacement_inverse_does_not_need_a_changed_tuple() {
+        let projection = partitioned_projection();
+        let fields = exact_source_partition_fields(
+            &projection,
+            7,
+            &observation(&[11]),
+            &target_partition(),
+            &direct_source(&projection),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].source_field_id, Bytes::from_static(&[1]));
+        assert_eq!(
+            fields[0].transform,
+            ConnectorChangePartitionTransform::Identity
+        );
+        assert!(
+            exact_source_partition_fields(
+                &projection,
+                7,
+                &observation(&[11]),
+                &target_partition(),
+                &MvDirectOutputSources::new(),
+            )
+            .unwrap()
+            .is_none()
         );
     }
 

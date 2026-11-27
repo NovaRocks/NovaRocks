@@ -470,10 +470,6 @@ impl MvTestControls {
         )
     }
 
-    #[expect(
-        dead_code,
-        reason = "RWM-10c moves the original MV control to the admitted content target."
-    )]
     pub(crate) fn claim_content_target_enumeration_close(
         &self,
         catalog: &str,
