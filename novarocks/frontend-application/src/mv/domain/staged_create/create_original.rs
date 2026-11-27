@@ -943,17 +943,19 @@ impl Body {
         .await?;
         if !matches!(
             self.cpu_result.as_ref(),
-            Some(Ok(MvWriteActivationOutput::Create(
-                CreatePublicationOutput::StageDeclarations { .. }
-            )))
+            Some(Ok(MvWriteActivationOutput::Create(output)))
+                if matches!(output.as_ref(), CreatePublicationOutput::StageDeclarations { .. })
         ) {
             return Err(invalid("CREATE declaration turn returned another output").into());
         }
-        let Some(Ok(MvWriteActivationOutput::Create(CreatePublicationOutput::StageDeclarations {
+        let Some(Ok(MvWriteActivationOutput::Create(output))) = self.cpu_result.take() else {
+            unreachable!()
+        };
+        let CreatePublicationOutput::StageDeclarations {
             columns,
             storage,
             application_properties,
-        }))) = self.cpu_result.take()
+        } = *output
         else {
             unreachable!()
         };
@@ -971,6 +973,7 @@ impl Body {
                 self.operation,
                 self.table.clone(),
                 columns,
+                storage.stateless_output_declarations,
                 storage.visible_partition_sources,
                 storage.properties,
                 application_properties,
@@ -1046,17 +1049,19 @@ impl Body {
         .await?;
         if !matches!(
             self.cpu_result.as_ref(),
-            Some(Ok(MvWriteActivationOutput::Create(
-                CreatePublicationOutput::Publication { .. }
-            )))
+            Some(Ok(MvWriteActivationOutput::Create(output)))
+                if matches!(output.as_ref(), CreatePublicationOutput::Publication { .. })
         ) {
             return Err(invalid("CREATE publication turn returned another output").into());
         }
-        let Some(Ok(MvWriteActivationOutput::Create(CreatePublicationOutput::Publication {
+        let Some(Ok(MvWriteActivationOutput::Create(output))) = self.cpu_result.take() else {
+            unreachable!()
+        };
+        let CreatePublicationOutput::Publication {
             begin,
             intent,
             documents,
-        }))) = self.cpu_result.take()
+        } = *output
         else {
             unreachable!()
         };

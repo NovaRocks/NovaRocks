@@ -207,7 +207,7 @@ impl MvWritePreparationCustody {
                 .take()
                 .expect("same original analysis receiver")
             {
-                Ok(MvWriteActivationOutput::Analyzed(analyzed)) => analyzed,
+                Ok(MvWriteActivationOutput::Analyzed(analyzed)) => *analyzed,
                 Err(error) => return Err(F::Domain(error)),
                 _ => {
                     return Err(F::Domain(contract_error(
@@ -254,7 +254,7 @@ impl MvWritePreparationCustody {
                 .take()
                 .expect("same original optimizer receiver")
             {
-                Ok(MvWriteActivationOutput::ProviderNeeds(needs)) => needs,
+                Ok(MvWriteActivationOutput::ProviderNeeds(needs)) => *needs,
                 Err(error) => return Err(F::Domain(error)),
                 _ => {
                     return Err(F::Domain(contract_error(

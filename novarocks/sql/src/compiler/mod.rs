@@ -2839,7 +2839,6 @@ mod tests {
                         },
                     },
                 ),
-                ..Default::default()
             };
         }
         crate::planner::imv_rewrite::entrypoint::ImvRewriteOutcome {

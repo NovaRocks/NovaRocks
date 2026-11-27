@@ -261,7 +261,7 @@ impl WriteBeginReceiving {
             .is_some_and(|input| {
                 matches!(
                     &input.finish_publication,
-                    WritePublicationState::Pending { declaration } if declaration == expected
+                    WritePublicationState::Pending { declaration } if declaration.as_ref() == expected
                 )
             })
     }

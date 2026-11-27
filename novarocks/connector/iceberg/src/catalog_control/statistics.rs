@@ -47,7 +47,7 @@ use sha2::{Digest, Sha256};
 
 use crate::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1;
 use crate::iceberg::spec::Type;
-use crate::manifest::{DataFileWithStats, extract_data_files_with_stats_at_with_control};
+use crate::manifest::{DataFileWithStats, extract_data_files_with_requested_average_sizes_at};
 use crate::metadata::{IcebergMetadata, IcebergTablePayload};
 use crate::statistics_ancestry::AncestorNdv;
 use crate::statistics_basis::basis_relation;
@@ -292,10 +292,20 @@ impl StatisticsReader for IcebergMetadata {
             // table with no Puffin ended up with no statistics at all.
             let table_for_files = physical.table.clone();
             let control = request.context.clone();
-            let files_result = extract_data_files_with_stats_at_with_control(
+            let average_size_columns = request
+                .metrics
+                .metrics()
+                .iter()
+                .filter_map(|metric| match metric {
+                    StatisticsMetric::AverageSize { column } => Some(column.as_ref()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let files_result = extract_data_files_with_requested_average_sizes_at(
                 &table_for_files,
                 snapshot_id,
-                Some(&control as &dyn ConnectorOperationControl),
+                &control,
+                &average_size_columns,
             )
             .await;
             self.validate_context(&request.context)?;

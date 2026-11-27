@@ -53,7 +53,7 @@ impl PreparedMvNativeWriteAssembly {
         let mut options = self
             .query_options
             .take()
-            .map(|options| options.as_proto().clone())
+            .map(|options| *options.as_proto())
             .unwrap_or_default();
         options.query_mem_limit = budget;
         self.query_options = Some(QueryOptions::from_proto(options));

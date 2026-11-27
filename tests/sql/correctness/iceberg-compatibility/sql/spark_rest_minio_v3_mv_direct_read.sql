@@ -60,7 +60,17 @@ if ! describe_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-s
   exit 1
 fi
 printf '%s\n' "$describe_out"
-columns="$(printf '%s\n' "$describe_out" | awk -F '\t' '$1 ~ /^[[:alpha:]_][[:alnum:]_]*$/ && $2 != "" {print $1 " " $2}')"
+columns="$(printf '%s\n' "$describe_out" | awk -F '\t' '
+  function trim(field) {
+    sub(/^[[:space:]]+/, "", field)
+    sub(/[[:space:]]+$/, "", field)
+    return field
+  }
+  NF >= 2 {
+    name = trim($1)
+    type = trim($2)
+    if (name != "" && type != "") print name " " type
+  }')"
 if [ "$columns" != "$(printf 'id bigint\nmetric int')" ]; then
   printf 'unexpected Spark MV columns:\n%s\n' "$columns" >&2
   exit 1

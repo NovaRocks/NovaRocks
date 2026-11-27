@@ -3887,7 +3887,7 @@ impl MvStartupGrace {
         })
     }
 
-    fn configure_launch(&self, rendered: &str) -> Result<String> {
+    fn configure_launch(&self, rendered: &str, automatic_restart: bool) -> Result<String> {
         let mut config: Value = rendered.parse().context("parse rendered FE config")?;
         let root = config
             .as_table_mut()
@@ -3902,6 +3902,13 @@ impl MvStartupGrace {
             "launch_nonce".into(),
             Value::String(self.launch_nonce.clone()),
         );
+        if automatic_restart {
+            // The fixture proves settlement after restart. The successor must
+            // have time to read the declaration inside the restart deadline.
+            table_mut(root, "standalone_server")
+                .entry("iceberg_maintenance_tick_interval_ms")
+                .or_insert(Value::Integer(1000));
+        }
         toml::to_string(&config).context("serialize FE startup isolation config")
     }
 
@@ -3926,8 +3933,11 @@ impl MvStartupGrace {
         }
         self.launch_nonce = next_fragment_failure_token(0);
         let rendered = fs::read_to_string(config_path).context("read retiring FE config")?;
-        fs::write(config_path, self.configure_launch(&rendered)?)
-            .context("write successor FE startup isolation config")
+        fs::write(
+            config_path,
+            self.configure_launch(&rendered, self.automatic)?,
+        )
+        .context("write successor FE startup isolation config")
     }
 
     fn publish(&self, observation: &MvStartupObservation<'_>) -> Result<()> {
@@ -4474,7 +4484,7 @@ impl CrossProcessCluster {
         // Write FE config.
         let fe_config_path = runtime_dir.path().join("fe.toml");
         let rendered_fe_config =
-            mv_startup_grace.configure_launch(&render(ClusterProcessRole::Fe, 0)?)?;
+            mv_startup_grace.configure_launch(&render(ClusterProcessRole::Fe, 0)?, false)?;
         fs::write(&fe_config_path, &rendered_fe_config)
             .with_context(|| format!("write {}", fe_config_path.display()))?;
         let effective_launch_config_evidence =
@@ -7260,7 +7270,7 @@ mod tests {
                 .unwrap();
         let previous_nonce = grace.launch_nonce.clone();
         let config_path = runtime.path().join("fe.toml");
-        std::fs::write(&config_path, grace.configure_launch("").unwrap()).unwrap();
+        std::fs::write(&config_path, grace.configure_launch("", false).unwrap()).unwrap();
         let marker = novarocks_failpoint::observation_marker::MV_NAME_STARTUP_GRACE;
         let old_log = format!(
             "{marker} state=\"ended\" incarnation=\"previous\" prior_incarnations=\"\" discovery_complete=true end_reason=\"no_restart_evidence\"\n"
@@ -7279,6 +7289,10 @@ mod tests {
         assert_eq!(
             config["mv_management"]["startup_isolation"]["launch_nonce"].as_str(),
             Some(grace.launch_nonce.as_str())
+        );
+        assert_eq!(
+            config["standalone_server"]["iceberg_maintenance_tick_interval_ms"].as_integer(),
+            Some(1000)
         );
         let active = format!(
             "{marker} state=\"active\" incarnation=\"successor\" prior_incarnations=\"discovered,previous\" discovery_complete=false end_reason=\"\""

@@ -277,11 +277,23 @@ pub(crate) struct IcebergMvCreatePlan {
     pub(crate) application_properties: Vec<(String, String)>,
 }
 impl IcebergMvCreatePlan {
+    pub(crate) fn stateless_output_declarations(
+        &self,
+    ) -> Option<&[novarocks_sql::planning::mv::SqlMvPersistenceOutputFacts]> {
+        self.apply_key_column_name
+            .is_none()
+            .then(|| self.create_persistence_facts.outputs())
+    }
+
     pub(crate) fn staged_write_fields(
         &self,
         handle: &novarocks_spi::connector::ConnectorStagedTableHandle,
     ) -> Result<Vec<novarocks_spi::connector::ConnectorWriteFieldRequest>, MvApplicationError> {
-        staged_target_write_fields_from_handle(handle, &self.columns)
+        staged_target_write_fields_from_handle(
+            handle,
+            &self.columns,
+            self.stateless_output_declarations(),
+        )
     }
 
     /// Same pure document seed; no stage or Provider permission is created.
@@ -420,17 +432,16 @@ pub(crate) fn finish_mv_create_preparation(
     }
     let apply_key_column_name = aggregate.then_some(refresh_contract.apply_key.column_name);
     let needs_branch = identity_needs_branch_id_column(&property.identity);
-    if let Some(name) = apply_key_column_name {
-        if analysis
+    if let Some(name) = apply_key_column_name
+        && analysis
             .output_columns
             .iter()
             .any(|column| column.name.eq_ignore_ascii_case(name))
-        {
-            return Err(format!(
-                "Iceberg MV output column name {name} is reserved for internal apply key"
-            )
-            .into());
-        }
+    {
+        return Err(format!(
+            "Iceberg MV output column name {name} is reserved for internal apply key"
+        )
+        .into());
     }
     if needs_branch
         && analysis
@@ -530,6 +541,7 @@ fn create_declaration_error(message: String) -> MvApplicationError {
 fn staged_target_write_fields_from_handle(
     handle: &novarocks_spi::connector::ConnectorStagedTableHandle,
     columns: &[TableColumnDef],
+    output_declarations: Option<&[novarocks_sql::planning::mv::SqlMvPersistenceOutputFacts]>,
 ) -> Result<Vec<novarocks_spi::connector::ConnectorWriteFieldRequest>, MvApplicationError> {
     let prepared = handle.document_target().ok_or_else(|| {
         create_declaration_error(
@@ -561,18 +573,32 @@ fn staged_target_write_fields_from_handle(
                     "MV staged target declaration changed".to_string(),
                 ));
             }
-            let data_type = novarocks_sql::literal::sql_type_to_arrow_type(&declaration.data_type)
-                .map_err(create_declaration_error)?;
-            let binding = novarocks_types::execution_value_type_from_declaration(
-                &declaration.data_type,
-                &data_type,
-                declaration.nullable,
-                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-            )
-            .map_err(|error| create_declaration_error(error.to_string()))?;
-            let value_type =
+            let value_type = if let Some(outputs) = output_declarations {
+                let output = outputs
+                    .get(ordinal)
+                    .filter(|output| {
+                        output.output_ordinal() as usize == ordinal
+                            && output.name() == field.name()
+                            && output.nullable() == field.nullable()
+                    })
+                    .ok_or_else(|| {
+                        create_declaration_error("MV analyzed output declaration changed".into())
+                    })?;
+                output.function_value_type().clone()
+            } else {
+                let data_type =
+                    novarocks_sql::literal::sql_type_to_arrow_type(&declaration.data_type)
+                        .map_err(create_declaration_error)?;
+                let binding = novarocks_types::execution_value_type_from_declaration(
+                    &declaration.data_type,
+                    &data_type,
+                    declaration.nullable,
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                )
+                .map_err(|error| create_declaration_error(error.to_string()))?;
                 novarocks_type_contract::FunctionValueType::try_from_typed_binding(binding)
-                    .map_err(|error| create_declaration_error(error.to_string()))?;
+                    .map_err(|error| create_declaration_error(error.to_string()))?
+            };
             novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
                 arrow::datatypes::Field::new(
                     field.name(),

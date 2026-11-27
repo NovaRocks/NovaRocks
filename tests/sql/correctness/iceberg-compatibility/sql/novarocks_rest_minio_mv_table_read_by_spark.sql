@@ -91,9 +91,19 @@ cat > "$tmp_sql" <<'SPARK_SQL'
 DESCRIBE ice_rest.${case_db}.mv_nr_interop_${uuid0};
 SPARK_SQL
 describe_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql")"
-columns="$(printf '%s\n' "$describe_out" | awk -F '\t' '$1 ~ /^[[:alpha:]_][[:alnum:]_]*$/ && $2 != "" {print $1 " " $2}')"
+columns="$(printf '%s\n' "$describe_out" | awk -F '\t' '
+  function trim(field) {
+    sub(/^[[:space:]]+/, "", field)
+    sub(/[[:space:]]+$/, "", field)
+    return field
+  }
+  NF >= 2 {
+    name = trim($1)
+    type = trim($2)
+    if (name != "" && type != "") print name " " type
+  }')"
 if [ "$columns" != "$(printf 'id bigint\namount int')" ]; then
-  printf 'unexpected Spark MV columns:\n%s\n' "$columns" >&2
+  printf 'unexpected Spark MV columns:\n%s\nSpark DESCRIBE output:\n%s\n' "$columns" "$describe_out" >&2
   exit 1
 fi
 printf 'SPARK_MV_SCHEMA_OK\n'

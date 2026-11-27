@@ -221,21 +221,14 @@ async fn prepare_refresh_inner(
         ExecutableRefreshDecision::Incremental => match prepare_frontend_incremental_write(
             io,
             &mut captured,
-            source,
-            current_catalog,
-            current_database,
+            input,
             &plan.contract,
             &refresh.canonical_query,
             &request.attempt,
-            (
-                refresh.can_incrementally_refresh,
-                input.query_memory_budget_bytes,
-                &input.optimizer_settings,
-            ),
+            refresh.can_incrementally_refresh,
             &refresh.original_current,
             refresh.replay.as_ref(),
             observed_binding.clone(),
-            connector_context.clone(),
         )
         .await?
         {
@@ -1776,22 +1769,24 @@ async fn estimate_content_admission(
 async fn prepare_frontend_incremental_write(
     io: &MvRefreshPreparationIo,
     captured: &mut CapturedPreparation,
-    source: &IcebergMvCorePorts,
-    current_catalog: Option<&str>,
-    current_database: &str,
+    input: &MvRefreshPreparationInput,
     contract: &RefreshPlanContract,
     canonical_query: &novarocks_parser::ast::Query,
     attempt: &MvRefreshAttemptIdentity,
-    nonaggregate_admission: (
-        bool,
-        u64,
-        &novarocks_sql::compiler::SessionOptimizerSettings,
-    ),
+    can_incrementally_refresh: bool,
     original_current: &novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
     replay: Option<&Arc<PendingFence>>,
     observed_binding: ConnectorProviderBindingKey,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedIncrementalRefreshWork, PreparationError> {
+    let source = &input.source;
+    let current_catalog = input.current_catalog.as_deref();
+    let current_database = input.current_database.as_str();
+    let connector_context = input.connector_context.clone();
+    let nonaggregate_admission = (
+        can_incrementally_refresh,
+        input.query_memory_budget_bytes,
+        &input.optimizer_settings,
+    );
     let target = IcebergMvTarget {
         catalog: contract.target.catalog.clone().ok_or_else(|| {
             "Iceberg MV incremental refresh target has no connector catalog".to_string()
@@ -2455,6 +2450,10 @@ async fn prepare_frontend_incremental_write(
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Each original plan, observation, and destination is explicit at write admission."
+)]
 async fn prepare_canonical_incremental_write(
     io: &MvRefreshPreparationIo,
     source: &IcebergMvCorePorts,

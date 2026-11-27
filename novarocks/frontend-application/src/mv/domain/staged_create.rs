@@ -430,7 +430,10 @@ pub(crate) async fn install_marked_current_projection_async_in(
         expected.target(),
         marker.operation,
         None,
-        MvConvergence::CommittedMarker { expected, marker },
+        MvConvergence::CommittedMarker {
+            expected,
+            marker: Box::new(marker),
+        },
         context.after_external_effect(),
     )
     .await
@@ -493,7 +496,7 @@ enum MvConvergence {
     CommittedMarker {
         expected:
             Arc<novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection>,
-        marker: CommittedMvMarker,
+        marker: Box<CommittedMvMarker>,
     },
     /// A previous writer's unresolved effects were declared unable to land,
     /// and the target is being readmitted under this process. The permits are

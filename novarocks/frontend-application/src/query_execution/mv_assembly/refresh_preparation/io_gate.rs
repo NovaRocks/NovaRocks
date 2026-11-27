@@ -149,12 +149,14 @@ enum Response {
         Result<crate::mv::domain::dependency::refresh::MvRefreshGraphFacts, MvApplicationError>,
     ),
     RebuildReadOnly(Result<(), MvApplicationError>),
-    LoadReady(Result<Option<LoadedKeyedMvProjection>, MvApplicationError>),
-    ObserveCurrent(Result<MvKeyedObservedCurrentDocuments, MvApplicationError>),
+    LoadReady(Box<Result<Option<LoadedKeyedMvProjection>, MvApplicationError>>),
+    ObserveCurrent(Box<Result<MvKeyedObservedCurrentDocuments, MvApplicationError>>),
     ObserveFull(
-        Result<
-            novarocks_spi::connector::FullKeyedDocumentView,
-            novarocks_spi::connector::KeyedDocumentReadError,
+        Box<
+            Result<
+                novarocks_spi::connector::FullKeyedDocumentView,
+                novarocks_spi::connector::KeyedDocumentReadError,
+            >,
         >,
     ),
     CloseMismatch(Result<bool, MvApplicationError>),
@@ -530,9 +532,9 @@ impl MvRefreshPreparationIo {
                         let view = source
                             .readiness()
                             .in_requests(Arc::clone(&services.requests));
-                        Response::LoadReady(
+                        Response::LoadReady(Box::new(
                             view.load_ready(&target).await.map_err(repository_error),
-                        )
+                        ))
                     }
                     Request::ObserveCurrent {
                         source,
@@ -543,16 +545,16 @@ impl MvRefreshPreparationIo {
                             .readiness()
                             .in_requests(Arc::clone(&services.requests))
                             .candidate_reader();
-                        Response::ObserveCurrent(
+                        Response::ObserveCurrent(Box::new(
                             reader
                                 .observe_current_application_async(&documents, request)
                                 .await
                                 .map_err(query_error),
-                        )
+                        ))
                     }
-                    Request::ObserveFull { documents, request } => Response::ObserveFull(
+                    Request::ObserveFull { documents, request } => Response::ObserveFull(Box::new(
                         documents.observe_full_keyed_documents_async(request).await,
-                    ),
+                    )),
                     Request::WriteBindingMarker {
                         source,
                         planning,
@@ -974,7 +976,7 @@ impl MvRefreshPreparationIo {
         else {
             panic!("MV readiness response changed kind")
         };
-        result
+        *result
     }
     pub(crate) async fn definition(
         &self,
@@ -1016,7 +1018,7 @@ impl MvRefreshPreparationIo {
         else {
             panic!("MV Current response changed kind")
         };
-        result
+        *result
     }
     pub(crate) async fn observe_full(
         &self,
@@ -1032,7 +1034,7 @@ impl MvRefreshPreparationIo {
         else {
             panic!("MV full observation response changed kind")
         };
-        result
+        (*result)
             .map_err(
                 novarocks_mv_application::persistence::documents::MvDocumentError::KeyedStorage,
             )

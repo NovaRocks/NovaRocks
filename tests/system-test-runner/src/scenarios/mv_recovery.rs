@@ -2848,18 +2848,18 @@ impl Scenario for MvLegacyInterpretationRebuild {
                 "read the original producer's materialized rows",
             )?;
             let metadata = load_metadata(context, &rest_uri, "ns", "orders_mv")?;
-            assert_legacy_mv_generation(&metadata)?;
+            let keyed_apply_layout = old_mv_uses_keyed_apply_layout(&metadata)?;
             fs::write(
                 context.scenario_root().join("old-mv-metadata.json"),
                 serde_json::to_vec_pretty(&metadata)?,
             )?;
-            Ok(metadata)
+            Ok((metadata, keyed_apply_layout))
         })();
         let old_exit = old
             .shutdown()
             .context("stop the original FE and all three BEs");
-        let metadata = match (produced, old_exit) {
-            (Ok(metadata), Ok(())) => metadata,
+        let (metadata, keyed_apply_layout) = match (produced, old_exit) {
+            (Ok(produced), Ok(())) => produced,
             (Err(e), Ok(())) | (Ok(_), Err(e)) => return Err(e),
             (Err(production), Err(cleanup)) => {
                 bail!("{production:#}; old producer cleanup: {cleanup:#}")
@@ -2880,50 +2880,18 @@ impl Scenario for MvLegacyInterpretationRebuild {
         )?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
-        let states = materialized_view_states(&mut conn)?;
-        ensure!(
-            mv_state_text(&states, "orders_mv", "manageability")? == "RETIRED",
-            "runtime MV inventory did not identify the retired target"
-        );
-        let inventory = query(
-            context,
-            &mut conn,
-            &format!(
-                "SELECT name, comment, definition FROM system.metadata.materialized_views WHERE catalog_name = '{catalog}' AND schema_name = 'ns' AND name = 'orders_mv'"
-            ),
-            "discover the old MV without a local Accelerator",
-        )?;
-        ensure!(
-            matches!(inventory.rows.as_slice(), [row] if matches!(row.as_slice(),
-                [TrinoValue::Text(name), TrinoValue::Text(comment), TrinoValue::Null]
-                if name == "orders_mv" && comment.contains("DROP only"))),
-            "old MV metadata inventory omitted or misclassified the target"
-        );
-        for sql in [
-            "SELECT * FROM orders_mv",
-            "REFRESH MATERIALIZED VIEW orders_mv",
-        ] {
-            context.action(format!("reject retired MV command {sql}"));
-            let error = conn
-                .execute(sql)
-                .expect_err("retired MV command must fail closed");
-            let public = mv_public_error(&error)?;
-            ensure!(
-                public.message.contains("LegacyFormat") || public.message.contains("DROP only"),
-                "retired MV command returned another error: {}",
-                public.message
-            );
+        if keyed_apply_layout {
+            assert_keyed_apply_layout_needs_rebuild(
+                context, &mut conn, catalog, &rest_uri, &metadata,
+            )?;
+        } else {
+            assert_legacy_mv_is_retired(context, &mut conn, catalog, &rest_uri, &metadata)?;
         }
-        let after_refusal = load_metadata(context, &rest_uri, "ns", "orders_mv")?;
-        ensure!(
-            after_refusal == metadata,
-            "retired MV reads or refresh mutated exact lake metadata"
-        );
 
         execute(
             context,
             &mut conn,
-            "drop the retired object through its original managed target",
+            "drop the old object through its original managed target",
             "DROP MATERIALIZED VIEW IF EXISTS orders_mv",
         )?;
         let status = Client::builder()
@@ -2938,7 +2906,7 @@ impl Scenario for MvLegacyInterpretationRebuild {
             .status();
         ensure!(
             status == reqwest::StatusCode::NOT_FOUND,
-            "REST still sees retired target: {status}"
+            "REST still sees the old target: {status}"
         );
         execute(
             context,
@@ -2955,13 +2923,10 @@ impl Scenario for MvLegacyInterpretationRebuild {
         refresh(context, &mut conn, "orders_mv")?;
         let rebuilt = load_metadata(context, &rest_uri, "ns", "orders_mv")?;
         let graph = Graph::from_metadata(&rebuilt)?;
+        assert_keyed_mv_layout(&rebuilt, &graph, false)?;
         ensure!(
-            rebuilt["table-uuid"] != metadata["table-uuid"]
-                && graph
-                    .snapshots
-                    .iter()
-                    .any(|(id, p)| Some(*id) == graph.current && p.is_some()),
-            "recreated MV did not publish a new table identity and current binding"
+            rebuilt["table-uuid"] != metadata["table-uuid"],
+            "recreated MV did not publish a new table identity"
         );
         assert_rows(
             context,
@@ -2983,6 +2948,106 @@ impl Scenario for MvLegacyInterpretationRebuild {
         };
         fixture.shutdown()
     }
+}
+
+fn assert_legacy_mv_is_retired(
+    context: &mut ScenarioContext,
+    conn: &mut SqlSession,
+    catalog: &str,
+    rest_uri: &str,
+    metadata: &serde_json::Value,
+) -> Result<()> {
+    let states = materialized_view_states(conn)?;
+    ensure!(
+        mv_state_text(&states, "orders_mv", "manageability")? == "RETIRED",
+        "runtime MV inventory did not identify the retired target"
+    );
+    let inventory = query(
+        context,
+        conn,
+        &format!(
+            "SELECT name, comment, definition FROM system.metadata.materialized_views WHERE catalog_name = '{catalog}' AND schema_name = 'ns' AND name = 'orders_mv'"
+        ),
+        "discover the old MV without a local Accelerator",
+    )?;
+    ensure!(
+        matches!(inventory.rows.as_slice(), [row] if matches!(row.as_slice(),
+            [TrinoValue::Text(name), TrinoValue::Text(comment), TrinoValue::Null]
+            if name == "orders_mv" && comment.contains("DROP only"))),
+        "old MV metadata inventory omitted or misclassified the target"
+    );
+    for sql in [
+        "SELECT * FROM orders_mv",
+        "REFRESH MATERIALIZED VIEW orders_mv",
+    ] {
+        context.action(format!("reject retired MV command {sql}"));
+        let error = conn
+            .execute(sql)
+            .expect_err("retired MV command must fail closed");
+        let public = mv_public_error(&error)?;
+        ensure!(
+            public.message.contains("LegacyFormat") || public.message.contains("DROP only"),
+            "retired MV command returned another error: {}",
+            public.message
+        );
+    }
+    ensure!(
+        &load_metadata(context, rest_uri, "ns", "orders_mv")? == metadata,
+        "retired MV reads or refresh mutated exact lake metadata"
+    );
+    Ok(())
+}
+
+fn assert_keyed_apply_layout_needs_rebuild(
+    context: &mut ScenarioContext,
+    conn: &mut SqlSession,
+    catalog: &str,
+    rest_uri: &str,
+    metadata: &serde_json::Value,
+) -> Result<()> {
+    require_nonaggregate_management_after_restart(context, conn, catalog, "orders_mv")?;
+    assert_content_refresh_explain(context, conn, "NeedsRebuild")?;
+    context.action("reject a refresh against the old required apply key");
+    let error = conn
+        .execute("REFRESH MATERIALIZED VIEW orders_mv")
+        .expect_err("old apply layout must require replacement");
+    let public = mv_public_error(&error)?;
+    ensure!(
+        public.error_name == "NOT_SUPPORTED"
+            && public
+                .message
+                .contains("Legacy MV storage requires hidden maintenance fields"),
+        "old apply layout returned {}: {}",
+        public.error_name,
+        public.message
+    );
+    let after_refusal = load_metadata(context, rest_uri, "ns", "orders_mv")?;
+    assert_rest_snapshot_state_unchanged(metadata, &after_refusal)?;
+    execute(
+        context,
+        conn,
+        "enable query rewriting after the rebuild refusal",
+        "SET SESSION enable_materialized_view_rewrite = true",
+    )?;
+    let plan = mv_text_lines(&query(
+        context,
+        conn,
+        "EXPLAIN SELECT k1, v2 FROM orders ORDER BY k1",
+        "verify the old target is unavailable to rewriting",
+    )?)?;
+    ensure!(
+        !plan
+            .iter()
+            .any(|(line,)| line.contains("rewritten with mv: orders_mv")),
+        "query rewrite selected the old apply layout: {plan:?}"
+    );
+    assert_rows(
+        context,
+        conn,
+        "SELECT k1, v2 FROM orders ORDER BY k1",
+        &[(1, 10), (2, 20)],
+        "verify the original query still reads the source",
+    )
 }
 
 #[derive(Default)]
@@ -3847,10 +3912,90 @@ fn externally_drop_rest_table(
     Ok(())
 }
 
-/// Reproduce the pre-fix CREATE encoding on an unpublished target. The test
-/// writer first advances the physical Iceberg schema ID, then writes that
-/// exact nonzero ID into L in the former big-endian order. No P exists yet,
-/// so no historical publication reference is rewritten by this fixture.
+/// Select the independently checked migration by the producer's actual B
+/// format. The keyed layout is rebuildable through DROP and CREATE, while
+/// the retired layout retains its original DROP-only assertions.
+fn old_mv_uses_keyed_apply_layout(metadata: &serde_json::Value) -> Result<bool> {
+    use super::mv_uea7_documents::wire::{Graph, ROOT, Version};
+
+    let properties = &metadata["properties"];
+    let root = properties[ROOT]
+        .as_str()
+        .context("old MV has no keyed root")?;
+    let binding: Version = serde_json::from_str(
+        properties[format!("novarocks.doc.v2.rev.{root}")]
+            .as_str()
+            .context("old MV has no binding envelope")?,
+    )?;
+    if binding.format.version == 2 {
+        assert_keyed_mv_layout(metadata, &Graph::from_metadata(metadata)?, true)?;
+        return Ok(true);
+    }
+    assert_legacy_mv_generation(metadata)?;
+    Ok(false)
+}
+
+fn assert_keyed_mv_layout(
+    metadata: &serde_json::Value,
+    graph: &super::mv_uea7_documents::wire::Graph,
+    expects_apply_key: bool,
+) -> Result<()> {
+    let interpretation = graph
+        .versions
+        .get(&graph.interpretation)
+        .context("keyed MV lacks its referenced interpretation")?;
+    let binding = graph
+        .versions
+        .get(&graph.binding)
+        .context("keyed MV lacks its original binding")?;
+    ensure!(
+        binding.format.version == 2 && interpretation.format.version == 3,
+        "keyed MV did not use the expected B2/L3 format"
+    );
+    let apply_key = optional_protobuf_bytes_field(&interpretation.bytes()?, 6)?;
+    ensure!(
+        apply_key.as_ref().is_none_or(|field| !field.is_empty())
+            && apply_key.is_some() == expects_apply_key,
+        "unexpected apply-key presence in the keyed interpretation"
+    );
+    let fields = metadata["schemas"]
+        .as_array()
+        .and_then(|schemas| {
+            schemas
+                .iter()
+                .find(|schema| schema["schema-id"] == metadata["current-schema-id"])
+        })
+        .and_then(|schema| schema["fields"].as_array())
+        .context("keyed MV lacks its current Iceberg schema")?;
+    if expects_apply_key {
+        ensure!(
+            fields
+                .iter()
+                .any(|field| field["name"] == "__nova_base_row_id" && field["required"] == true),
+            "old keyed MV lacks its required physical apply key"
+        );
+    } else {
+        ensure!(
+            fields
+                .iter()
+                .map(|field| field["name"].as_str())
+                .eq([Some("k1"), Some("v2")]),
+            "recreated MV schema differs from its two visible columns"
+        );
+    }
+    ensure!(
+        graph.snapshots.iter().any(|(id, publication)| {
+            Some(*id) == graph.current
+                && publication
+                    .as_ref()
+                    .and_then(|record| record.binding.as_deref())
+                    == Some(graph.binding.as_str())
+        }),
+        "keyed MV lacks a Current publication on its binding"
+    );
+    Ok(())
+}
+
 fn assert_legacy_mv_generation(metadata: &serde_json::Value) -> Result<()> {
     use super::mv_uea7_documents::wire::{RECORD, ROOT, Version, record};
 
@@ -3916,6 +4061,14 @@ pub(super) fn protobuf_bytes_field(
     input: &[u8],
     expected_field: u64,
 ) -> Result<std::ops::Range<usize>> {
+    optional_protobuf_bytes_field(input, expected_field)?
+        .context("L document lacks its target schema field")
+}
+
+fn optional_protobuf_bytes_field(
+    input: &[u8],
+    expected_field: u64,
+) -> Result<Option<std::ops::Range<usize>>> {
     let mut offset = 0;
     let mut selected = None;
     while offset < input.len() {
@@ -3941,7 +4094,7 @@ pub(super) fn protobuf_bytes_field(
             wire => bail!("unsupported L fixture protobuf wire type {wire}"),
         }
     }
-    selected.context("L document lacks its target schema field")
+    Ok(selected)
 }
 
 fn protobuf_varint(input: &[u8], offset: &mut usize) -> Result<u64> {

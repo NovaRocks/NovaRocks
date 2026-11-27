@@ -1014,16 +1014,16 @@ async fn forward_request(
         return temporary_failure("publication fixture stopped before forwarding");
     }
     if let Some(armed) = fault.as_ref() {
-        record_fault_event(&state, armed, "request-forwarded");
+        record_fault_event(state, armed, "request-forwarded");
     }
     if let Some((action, namespace, table)) = mutation_target.as_ref() {
-        record_mutation(&state, *action, namespace, table, false);
+        record_mutation(state, *action, namespace, table, false);
     }
     let method = parts.method.clone();
     let request_body_bytes = bytes.len() as u64;
     let forwarded_at = Instant::now();
     let (response, response_body_bytes) =
-        proxy_request(&state, parts.method, parts.uri, parts.headers, bytes).await;
+        proxy_request(state, parts.method, parts.uri, parts.headers, bytes).await;
     if let Some((TargetMutationAction::TableCommit, namespace, table)) = mutation_target.as_ref() {
         let mut mutations = state.mutations.lock().expect("publication mutation mutex");
         let counts = mutations
@@ -1037,7 +1037,7 @@ async fn forward_request(
     let roundtrip_nanos = u64::try_from(forwarded_at.elapsed().as_nanos())
         .expect("catalog request duration exceeds u64 nanoseconds");
     record_traffic(
-        &state,
+        state,
         &method,
         response.status(),
         request_body_bytes,
@@ -1050,12 +1050,12 @@ async fn forward_request(
     if response.status().is_success()
         && let Some((action, namespace, table)) = mutation_target.as_ref()
     {
-        record_mutation(&state, *action, namespace, table, true);
+        record_mutation(state, *action, namespace, table, true);
     }
     if let Some(armed) = fault.as_ref() {
-        record_fault_event(&state, armed, "downstream-response");
+        record_fault_event(state, armed, "downstream-response");
         if response.status().is_success() {
-            record_fault_event(&state, armed, "downstream-success");
+            record_fault_event(state, armed, "downstream-success");
         } else if armed.fault == PublicationFault::BeforeDispatchHoldAcrossFrontendExit
             && response.status() == StatusCode::CONFLICT
         {
@@ -1087,24 +1087,24 @@ async fn forward_request(
                 );
             }
             PublicationFault::AfterCommitHoldForFrontendKill => {
-                record_fault_event(&state, &armed, "response-held-after-downstream-success");
+                record_fault_event(state, &armed, "response-held-after-downstream-success");
                 let mut stopped = state.stopped.clone();
                 tokio::select! {
                     _ = armed.release.notified() => {},
                     _ = stopped.changed() => {},
                 }
-                record_fault_event(&state, &armed, "response-dropped-after-downstream-success");
+                record_fault_event(state, &armed, "response-dropped-after-downstream-success");
                 return temporary_failure("publication REST response released after frontend kill");
             }
             PublicationFault::IncompleteDiscovery => {
                 // A valid empty list means discovery completed with no
                 // namespaces. The MV contract needs an actual standard REST
                 // read failure so SPI classifies this catalog as Incomplete.
-                record_fault_event(&state, &armed, "discovery-response-replaced");
+                record_fault_event(state, &armed, "discovery-response-replaced");
                 return temporary_failure("catalog discovery read failed");
             }
             PublicationFault::CorruptPackage => {
-                record_fault_event(&state, &armed, "package-response-corrupted");
+                record_fault_event(state, &armed, "package-response-corrupted");
                 return response_with_headers(
                     StatusCode::OK,
                     HeaderMap::new(),

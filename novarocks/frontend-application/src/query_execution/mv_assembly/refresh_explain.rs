@@ -116,8 +116,9 @@ async fn explain_original_inner(
     );
     let current = io.observe_current(ports, &documents, request).await?;
     if current.view.metadata_version != schema.exact_schema().metadata_version
-        || current.versions.binding.identity() != projection.facts.versions().binding.identity()
-        || current.publication_revision != projection.facts.source_revision().publication_revision
+        || current.view.object_id != projection.facts.source_revision().target_object_id
+        || current.view.current_snapshot != binding.current_snapshot_id()
+        || &current.versions != projection.facts.versions()
     {
         return Err("EXPLAIN REFRESH observed a different MV generation".into());
     }
@@ -163,6 +164,12 @@ async fn explain_original_inner(
             ],
         };
         return Ok(lines);
+    }
+    // A strict replay may start from an unattributed Current after physical
+    // maintenance. Its proof owns the historical P check. Only ordinary
+    // planning requires the ready projection to describe Current's P.
+    if current.publication_revision != projection.facts.source_revision().publication_revision {
+        return Err("EXPLAIN REFRESH observed a different MV generation".into());
     }
     let can_incrementally_refresh =
         eligibility.automatic_refresh && !eligibility.automatic_reuse_blocked;

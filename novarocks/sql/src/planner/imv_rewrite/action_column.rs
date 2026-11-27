@@ -1123,7 +1123,6 @@ mod tests {
                 target_state: TargetStateProof { present: false },
                 signed_state_aggregate: SignedStateAggregateProof { present: false },
             }),
-            ..Default::default()
         };
 
         validate_with_change_stream(&project, &descriptor)

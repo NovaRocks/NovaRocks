@@ -92,7 +92,7 @@ struct Frame {
 }
 
 impl ContentApplyStages {
-    #[expect(
+    #[allow(
         clippy::too_many_arguments,
         reason = "Each installed stage and Task owner is explicit"
     )]

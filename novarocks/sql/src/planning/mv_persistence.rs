@@ -262,6 +262,10 @@ impl SqlMvPersistenceOutputFacts {
         self.value_type.value_type()
     }
 
+    pub fn function_value_type(&self) -> &FunctionValueType {
+        &self.value_type
+    }
+
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }

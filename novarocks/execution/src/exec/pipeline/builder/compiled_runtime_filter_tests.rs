@@ -1638,10 +1638,9 @@ fn run_join(program: &Arc<LocalProgram>, session: Arc<FakeSession>) -> Execution
 
 /// The union of every membership contribution `events` submitted, and the
 /// partition and sequence it closed with.
-fn published_membership(
-    events: &[ProducerEvent],
-    digest: [u8; 32],
-) -> (BTreeSet<i64>, bool, Option<(u32, u64)>) {
+pub(crate) type PublishedMembership = (BTreeSet<i64>, bool, Option<(u32, u64)>);
+
+fn published_membership(events: &[ProducerEvent], digest: [u8; 32]) -> PublishedMembership {
     let mut values = BTreeSet::new();
     let mut contains_null = false;
     let mut close = None;
@@ -1695,7 +1694,7 @@ pub(crate) fn observe_int64_membership_producer(
     digest: [u8; 32],
 ) -> (
     execution::RuntimeFilterSessionRef,
-    impl Fn() -> (BTreeSet<i64>, bool, Option<(u32, u64)>),
+    impl Fn() -> PublishedMembership,
 ) {
     let observed = Arc::new(RecordingProducer::default());
     let session = FakeSession::producers(&[(binding, &observed)]);

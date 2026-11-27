@@ -94,9 +94,9 @@ enum TerminalDecision {
 enum WritePublicationState {
     Ordinary,
     Pending {
-        declaration: ConnectorDocumentPublicationDeclaration,
+        declaration: Box<ConnectorDocumentPublicationDeclaration>,
     },
-    Bound(KeyedPublicationIntent),
+    Bound(Box<KeyedPublicationIntent>),
 }
 
 /// One distributed write's frontend session.
@@ -230,7 +230,9 @@ impl ConnectorWriteSession {
             write_stack_pin,
             catalog_properties,
             request,
-            WritePublicationState::Pending { declaration },
+            WritePublicationState::Pending {
+                declaration: Box::new(declaration),
+            },
             receiving,
         )
         .await
@@ -548,7 +550,7 @@ impl ConnectorWriteSession {
         &self,
     ) -> Result<ConnectorDocumentPublicationDeclaration, ConnectorError> {
         match &*self.lock_finish_publication()? {
-            WritePublicationState::Pending { declaration } => Ok(declaration.clone()),
+            WritePublicationState::Pending { declaration } => Ok(declaration.as_ref().clone()),
             WritePublicationState::Ordinary => Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "ordinary connector write session declared no application-document publication",
@@ -580,7 +582,7 @@ impl ConnectorWriteSession {
             )),
             WritePublicationState::Pending { declaration } => {
                 publication.validate_for(declaration)?;
-                *state = WritePublicationState::Bound(publication);
+                *state = WritePublicationState::Bound(Box::new(publication));
                 Ok(())
             }
             WritePublicationState::Bound(_) => Err(ConnectorError::new(
@@ -874,7 +876,7 @@ impl ConnectorWriteSession {
                 "application-document publication must be bound before finish",
             )),
             WritePublicationState::Bound(publication) => Ok(
-                ConnectorWriteFinishPublication::KeyedDocuments(publication.clone()),
+                ConnectorWriteFinishPublication::KeyedDocuments(publication.as_ref().clone()),
             ),
         }
     }

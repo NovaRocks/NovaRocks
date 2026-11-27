@@ -238,13 +238,11 @@ pub(crate) fn build_change_stream_descriptor(plan: &LogicalPlanNode) -> ImvChang
     if let Some(aggregate) = build_union_change_stream_descriptor(plan) {
         return ImvChangeStreamDescriptor {
             aggregate: Some(aggregate),
-            ..Default::default()
         };
     }
     if let Some(aggregate) = build_relational_change_stream_descriptor(plan) {
         return ImvChangeStreamDescriptor {
             aggregate: Some(aggregate),
-            ..Default::default()
         };
     }
     ImvChangeStreamDescriptor::default()
@@ -738,7 +736,6 @@ mod tests {
                 target_state: TargetStateProof { present: true },
                 signed_state_aggregate: SignedStateAggregateProof { present: true },
             }),
-            ..Default::default()
         };
         let aggregate_merge_join = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
@@ -867,7 +864,6 @@ mod tests {
                 target_state: TargetStateProof { present: true },
                 signed_state_aggregate: SignedStateAggregateProof { present: true },
             }),
-            ..Default::default()
         };
 
         let err = descriptor

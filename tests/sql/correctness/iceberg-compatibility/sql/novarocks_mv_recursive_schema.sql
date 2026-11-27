@@ -57,6 +57,8 @@ workspace="${NOVAROCKS_WORKSPACE_ROOT:-.}"
 
 -- query 5
 -- @skip_result_check=true
+-- @result_contains=MV refresh: ContentLocate
+EXPLAIN REFRESH MATERIALIZED VIEW recursive_mv;
 REFRESH MATERIALIZED VIEW recursive_mv;
 
 -- query 6

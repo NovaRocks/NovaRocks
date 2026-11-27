@@ -16,6 +16,28 @@
 // under the License.
 
 // Loaded after iceberg-delete-applicability/generate.scala.
+object MvRefreshCostFixture {
+  val Column = "refresh_cost_payload"
+
+  // Put reproducible unprojected bytes only in the untouched file. Full
+  // refresh sees its actual manifest bytes, while the signed change window
+  // still includes just the retracted file and the new rows.
+  def padUnchangedRows(rows: Seq[Record]): Seq[Record] = {
+    val random = new java.util.Random(731L)
+    val bytesPerRow = (2 * 1024 * 1024) / rows.size
+    rows.foreach { row =>
+      val bytes = new Array[Byte](bytesPerRow)
+      random.nextBytes(bytes)
+      row.setField(Column, java.nio.ByteBuffer.wrap(bytes))
+    }
+    rows
+  }
+
+  def requireColdVolume(file: DataFile): Unit =
+    require(file.fileSizeInBytes() >= 1024 * 1024,
+      "Untouched Parquet fixture file does not carry its expected physical scan volume")
+}
+
 // Parquet page encodings are observed here. Arrow DictionaryArray carriers are
 // a separate execution-layer contract and are not claimed by this fixture.
 object VisibleContentEncodingsFixture {
@@ -106,12 +128,13 @@ object VisibleContentEncodingsFixture {
   }
   def initialize(namespace: String): Unit = {
     val session = org.apache.spark.sql.SparkSession.active
-    session.sql("CREATE TABLE ice_rest." + namespace + ".encoded_source (id BIGINT NOT NULL, label STRING, items ARRAY<BIGINT>, attrs MAP<STRING,BIGINT>, rec STRUCT<code:BIGINT,note:STRING>) USING iceberg TBLPROPERTIES ('format-version'='3','write.row-lineage'='true')")
+    session.sql("CREATE TABLE ice_rest." + namespace + ".encoded_source (id BIGINT NOT NULL, label STRING, items ARRAY<BIGINT>, attrs MAP<STRING,BIGINT>, rec STRUCT<code:BIGINT,note:STRING>, " + MvRefreshCostFixture.Column + " BINARY) USING iceberg TBLPROPERTIES ('format-version'='3','write.row-lineage'='true')")
     val t = source(namespace)
     def rows(base: Long) = (0 until 256).map(i => template(t, base + i, "same")) ++
       Seq(template(t,base+256,"reordered"),template(t,base+257,"null"),template(t,base+258,"empty"))
     val dictionary = write(t,rows(1L),true,"dictionary")
-    val plain = write(t,rows(1001L),false,"plain")
+    val plain = write(t,MvRefreshCostFixture.padUnchangedRows(rows(1001L)),false,"plain")
+    MvRefreshCostFixture.requireColdVolume(plain)
     val encodings = Vector(labelEncoding(t,dictionary.location(),true),labelEncoding(t,plain.location(),false))
     t.newAppend().appendFile(dictionary).appendFile(plain).commit(); t.refresh()
     require(scan(t).size == 2 && scan(t).forall(_.deletes().isEmpty), "Initial source files differ from the frozen fixture")
@@ -122,15 +145,21 @@ object VisibleContentEncodingsFixture {
   }
   def mutate(namespace: String): Unit = {
     val t = source(namespace); val before = t.currentSnapshot().snapshotId()
-    val dictionary = scan(t).filter(_.file().location().contains("/sdk-dictionary-")).map(_.file())
+    val initial = scan(t)
+    val dictionary = initial.filter(_.file().location().contains("/sdk-dictionary-")).map(_.file())
     require(dictionary.size == 1 && dictionary.head.recordCount() == 259, "Dictionary source file is not exact")
+    val unchanged = initial.filterNot(_.file().location() == dictionary.head.location())
+    require(unchanged.size == 1 && unchanged.head.deletes().isEmpty, "Untouched plain source file is not exact")
+    MvRefreshCostFixture.requireColdVolume(unchanged.head.file())
     val fresh = write(t,Seq(template(t,2001L,"changed"),template(t,2002L,"changed"),template(t,2003L,"reordered")),false,"plain-delta")
     val encoding = labelEncoding(t,fresh.location(),false)
     val vectors = dv(t,Seq((dictionary.head.location(),0L)))
     require(vectors.size == 1 && vectors.head.format() == FileFormat.PUFFIN && vectors.head.recordCount() == 1, "Retraction did not write one real source DV")
     t.newRowDelta().addRows(fresh).addDeletes(vectors.head).commit(); t.refresh()
     require(t.currentSnapshot().snapshotId() != before, "Source delta did not publish a new endpoint")
-    require(scan(t).exists(task => task.file().location() == dictionary.head.location() && task.deletes().asScala.exists(_.location() == vectors.head.location())), "Source DV is not actually attached")
+    val current = scan(t)
+    require(current.exists(task => task.file().location() == dictionary.head.location() && task.deletes().asScala.exists(_.location() == vectors.head.location())), "Source DV is not actually attached")
+    require(current.exists(task => task.file().location() == unchanged.head.file().location() && task.deletes().isEmpty), "Untouched plain source file changed across the window")
     emit(obj("record" -> "visible_encoding_source", "stage" -> "delta", "from_snapshot" -> before,
       "snapshot" -> t.currentSnapshot().snapshotId(), "added" -> describe(fresh), "deletes" -> vectors.map(describe), "encodings" -> Vector(encoding),
       "negative_occurrences" -> 1, "positive_occurrences" -> 3))
@@ -285,7 +314,8 @@ object RecursiveTypeFixture {
       Types.NestedField.optional(206,"detail",Types.StructType.of(
         Types.NestedField.required(207,"code",Types.LongType.get()),
         Types.NestedField.optional(208,"note",Types.StringType.get()))))),
-    Types.NestedField.optional(300,"ordered",Types.MapType.ofOptional(301,302,Types.StringType.get(),Types.LongType.get())))
+    Types.NestedField.optional(300,"ordered",Types.MapType.ofOptional(301,302,Types.StringType.get(),Types.LongType.get())),
+    Types.NestedField.optional(400,MvRefreshCostFixture.Column,Types.BinaryType.get()))
   case class FieldFact(path: String,id: Int,required: Boolean,kind: String)
   def facts(schema: Schema): Vector[FieldFact] = {
     var visited=0
@@ -305,8 +335,9 @@ object RecursiveTypeFixture {
   def assertSchema(t: Table,isTarget: Boolean): Vector[FieldFact] = {
     require(metadata(t).formatVersion()==3,"Recursive table no longer has the exact format-v3 contract")
     schemaJson(t)
-    val actual = facts(t.schema()); val expected = facts(sourceSchema).filter(_.path != "id")
-    val selected = if (isTarget) actual else actual.filter(_.path != "id")
+    val sourceOnly = Set("id", MvRefreshCostFixture.Column)
+    val actual = facts(t.schema()); val expected = facts(sourceSchema).filterNot(f => sourceOnly.contains(f.path))
+    val selected = if (isTarget) actual else actual.filterNot(f => sourceOnly.contains(f.path))
     require(selected.map(f => (f.path,f.required,f.kind)) == expected.map(f => (f.path,f.required,f.kind)),"Exact recursive required/type/path contract changed")
     require(actual.map(_.id).distinct.size == actual.size,"Provider field IDs are not unique within this schema")
     if (!isTarget) require(actual.map(f => (f.path,f.required,f.kind)) == facts(sourceSchema).map(f => (f.path,f.required,f.kind)),"Source schema constraints changed")
@@ -441,13 +472,16 @@ object RecursiveTypeFixture {
       Map("format-version"->"3","write.row-lineage"->"true").asJava)
     val before=Option(t.currentSnapshot()).map(_.snapshotId())
     require(before.isEmpty,"New recursive source unexpectedly has a prior snapshot")
-    val file=write(t,Vector("same","same","reverse","null","empty","note-null").zipWithIndex.map { case(k,i) => row(t,i+1,k) },"initial")
-    t.newAppend().appendFile(file).commit(); t.refresh(); assertSchema(t,false); assertParquetIds(t)
+    val rows=Vector("same","same","reverse","null","empty","note-null").zipWithIndex.map { case(k,i) => row(t,i+1,k) }
+    val file=write(t,rows.take(2),"initial")
+    val unchanged=write(t,MvRefreshCostFixture.padUnchangedRows(rows.drop(2)),"unchanged")
+    MvRefreshCostFixture.requireColdVolume(unchanged)
+    t.newAppend().appendFile(file).appendFile(unchanged).commit(); t.refresh(); assertSchema(t,false); assertParquetIds(t)
     // The actual SDK Parquet reader must preserve a,b and b,a as distinct sequences.
     val sdk=sdkBag(t); require(sdk==expected("initial") && sdk==sparkBag(ns,Source),"SDK and Spark actual ordered content disagree")
     require(sdk.keys.exists(_.contains("\"ordered\":{\"a\":1,\"b\":null}")) && sdk.keys.exists(_.contains("\"ordered\":{\"b\":null,\"a\":1}")),"Actual SDK/Spark read path did not preserve both Map orders")
-    val tasks=boundedScan(t); require(tasks.size==1 && tasks.head.file().location()==file.location() && deletes(tasks).isEmpty,"Initial committed source files differ from the exact append")
-    require(t.currentSnapshot().snapshotId()>0 && countSummary(t,"total-data-files")==1 && countSummary(t,"total-records")==6,"Initial source snapshot totals differ")
+    val tasks=boundedScan(t); require(tasks.map(_.file().location()).toSet==Set(file.location(),unchanged.location()) && deletes(tasks).isEmpty,"Initial committed source files differ from the exact append")
+    require(t.currentSnapshot().snapshotId()>0 && countSummary(t,"total-data-files")==2 && countSummary(t,"total-records")==6,"Initial source snapshot totals differ")
     boundedEmit(obj("record"->"recursive_source_initial","source_uuid"->metadata(t).uuid().toString,"schema_id"->t.schema().schemaId(),"schema_json"->schemaJson(t),"from_snapshot"->null,"to_snapshot"->t.currentSnapshot().snapshotId(),"snapshot"->t.currentSnapshot().snapshotId(),"fields"->assertSchema(t,false).map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),"added_files"->tasks.map(task=>fileFact(task.file())),"data_files"->tasks.map(task=>fileFact(task.file())),"delete_files"->Vector.empty[JsonNode],"summary"->summary(t),"bag"->sdk.toVector.sortBy(_._1).map { case(k,v) => obj("content"->k,"count"->v) }))
     println("RECURSIVE_SOURCE_READY")
   }
@@ -455,8 +489,12 @@ object RecursiveTypeFixture {
     val t=table(ns,Source); assertSchema(t,false)
     val sourceUuid=metadata(t).uuid().toString; val schemaBefore=schemaJson(t); val schemaId=t.schema().schemaId(); val from=t.currentSnapshot().snapshotId()
     require(from>0,"Recursive mutation has no exact source baseline")
-    val files=boundedScan(t).filter(_.file().location().contains("/recursive-initial-")).map(_.file())
-    require(files.size==1 && files.head.recordCount()==6,"Frozen initial source file changed")
+    val initial=boundedScan(t)
+    val files=initial.filter(_.file().location().contains("/recursive-initial-")).map(_.file())
+    require(files.size==1 && files.head.recordCount()==2,"Frozen two-row retraction file changed")
+    val unchanged=initial.filter(_.file().location().contains("/recursive-unchanged-"))
+    require(unchanged.size==1 && unchanged.head.deletes().isEmpty,"Untouched recursive source file is not exact")
+    MvRefreshCostFixture.requireColdVolume(unchanged.head.file())
     val added=write(t,Vector(row(t,7,"changed"),row(t,8,"changed")),"delta")
     val dvs=dv(t,Seq((files.head.location(),0L)))
     require(dvs.size==1 && dvs.head.recordCount()==1 && dvs.head.format()==FileFormat.PUFFIN && dvs.head.referencedDataFile()==files.head.location(),"Source retraction lacks an exact real single-row DV reference")
@@ -467,6 +505,7 @@ object RecursiveTypeFixture {
     assertParquetIds(t)
     val tasks=boundedScan(t); val liveDeletes=deletes(tasks); val actualAdded=tasks.filter(_.file().location()==added.location())
     require(actualAdded.size==1 && actualAdded.head.file().recordCount()==2 && liveDeletes.size==1 && liveDeletes.head.location()==dvs.head.location() && liveDeletes.head.referencedDataFile()==files.head.location(),"Actual source delta files do not match exact committed additions/DV")
+    require(tasks.exists(task => task.file().location()==unchanged.head.file().location() && task.deletes().isEmpty),"Untouched recursive source file changed across the window")
     boundedEmit(obj("record"->"recursive_source_changed","source_uuid"->sourceUuid,"schema_id"->schemaId,"from_snapshot"->from,"to_snapshot"->t.currentSnapshot().snapshotId(),"snapshot"->t.currentSnapshot().snapshotId(),"schema_json"->schemaJson(t),"fields"->assertSchema(t,false).map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),"added_files"->actualAdded.map(task=>fileFact(task.file())),"data_files"->tasks.map(task=>fileFact(task.file())),"delete_files"->liveDeletes.map(fileFact),"summary"->summary(t),"bag"->sdkBag(t).toVector.sortBy(_._1).map { case(k,v)=>obj("content"->k,"count"->v) }))
     println("RECURSIVE_SOURCE_CHANGED")
   }

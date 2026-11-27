@@ -1319,6 +1319,7 @@ fn typed_mv_staged_preflight_binds_visible_partition_and_refuses_hidden_partitio
                 original.operation_id,
                 original.table,
                 columns,
+                None,
                 vec!["id".into()],
                 properties.into(),
                 BTreeMap::from([(

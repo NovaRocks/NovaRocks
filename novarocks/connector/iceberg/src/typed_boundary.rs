@@ -3116,15 +3116,15 @@ impl IcebergTypedBoundary {
         let mut pinned_seen = 0_usize;
         for read_file in read_files {
             self.check_request_active()?;
-            if let Some(slice) = handle.exact_source_slice() {
-                if !slice.includes(&read_file)? {
-                    record_pruned_data_file(
-                        &mut pruning,
-                        SplitPruningBasis::PartitionSelection,
-                        &read_file,
-                    )?;
-                    continue;
-                }
+            if let Some(slice) = handle.exact_source_slice()
+                && !slice.includes(&read_file)?
+            {
+                record_pruned_data_file(
+                    &mut pruning,
+                    SplitPruningBasis::PartitionSelection,
+                    &read_file,
+                )?;
+                continue;
             }
             if let Some(pinned) = pinned {
                 if !pinned.contains(&read_file.path) {

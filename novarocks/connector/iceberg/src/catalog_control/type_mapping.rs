@@ -22,7 +22,7 @@ use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorDataType, ConnectorDefaultValue, ConnectorError,
     ConnectorErrorKind,
 };
-use novarocks_type_contract::TemporalType;
+use novarocks_type_contract::{TemporalType, ValueKind, ValueTypeRef};
 
 use crate::iceberg::spec::{
     FormatVersion, ListType, Literal, MapType, NestedField, PrimitiveLiteral, PrimitiveType,
@@ -33,6 +33,19 @@ pub(crate) fn schema_fields(
     columns: &[ConnectorColumnDefinition],
     format_version: FormatVersion,
 ) -> Result<Vec<Arc<NestedField>>, ConnectorError> {
+    schema_fields_with_output_declarations(columns, format_version, None)
+}
+
+pub(super) fn schema_fields_with_output_declarations(
+    columns: &[ConnectorColumnDefinition],
+    format_version: FormatVersion,
+    output_declarations: Option<&[ValueTypeRef]>,
+) -> Result<Vec<Arc<NestedField>>, ConnectorError> {
+    if output_declarations.is_some_and(|outputs| outputs.len() != columns.len()) {
+        return Err(invalid(
+            "MV output declarations differ from the staged columns",
+        ));
+    }
     let mut next_id = i32::try_from(columns.len())
         .map_err(|_| invalid("too many Iceberg columns"))?
         .checked_add(1)
@@ -42,7 +55,14 @@ pub(crate) fn schema_fields(
         .enumerate()
         .map(|(index, column)| {
             let id = i32::try_from(index + 1).map_err(|_| invalid("too many Iceberg columns"))?;
-            column_field(id, column, format_version, &mut next_id).map(Arc::new)
+            let declaration = output_declarations.map(|outputs| &outputs[index]);
+            if declaration.is_some_and(|value| value.nullable() != column.nullable) {
+                return Err(invalid(
+                    "MV output nullability differs from the staged column",
+                ));
+            }
+            column_field_with_output(id, column, format_version, &mut next_id, declaration)
+                .map(Arc::new)
         })
         .collect()
 }
@@ -53,7 +73,18 @@ pub(crate) fn column_field(
     format_version: FormatVersion,
     next_id: &mut i32,
 ) -> Result<NestedField, ConnectorError> {
-    let field_type = iceberg_type(&column.data_type, format_version, next_id)?;
+    column_field_with_output(id, column, format_version, next_id, None)
+}
+
+fn column_field_with_output(
+    id: i32,
+    column: &ConnectorColumnDefinition,
+    format_version: FormatVersion,
+    next_id: &mut i32,
+    declaration: Option<&ValueTypeRef>,
+) -> Result<NestedField, ConnectorError> {
+    let field_type =
+        iceberg_type_with_output(&column.data_type, format_version, next_id, declaration)?;
     let mut field = NestedField::new(
         id,
         column.name.as_ref(),
@@ -88,6 +119,27 @@ pub(crate) fn iceberg_type(
     format_version: FormatVersion,
     next_id: &mut i32,
 ) -> Result<Type, ConnectorError> {
+    iceberg_type_with_output(data_type, format_version, next_id, None)
+}
+
+fn iceberg_type_with_output(
+    data_type: &ConnectorDataType,
+    format_version: FormatVersion,
+    next_id: &mut i32,
+    declaration: Option<&ValueTypeRef>,
+) -> Result<Type, ConnectorError> {
+    let wrong_shape = || invalid("MV output shape differs from the staged column");
+    if declaration.is_some_and(|value| {
+        value.child_count() != 0
+            && !matches!(
+                data_type,
+                ConnectorDataType::Array(_)
+                    | ConnectorDataType::Map(_, _)
+                    | ConnectorDataType::Struct(_)
+            )
+    }) {
+        return Err(wrong_shape());
+    }
     let primitive = |value| Ok(Type::Primitive(value));
     match data_type {
         ConnectorDataType::Boolean => primitive(PrimitiveType::Boolean),
@@ -153,23 +205,55 @@ pub(crate) fn iceberg_type(
         }
         ConnectorDataType::Variant => Ok(Type::Variant(crate::iceberg::spec::VariantType)),
         ConnectorDataType::Array(element) => {
+            let item = match declaration.map(ValueTypeRef::kind) {
+                None => None,
+                Some(ValueKind::List(item) | ValueKind::FixedSizeList { item, .. }) => Some(item),
+                Some(_) => return Err(wrong_shape()),
+            };
             let element_id = allocate_id(next_id)?;
-            let element_type = iceberg_type(element, format_version, next_id)?;
+            let element_type = iceberg_type_with_output(element, format_version, next_id, item)?;
             Ok(Type::List(ListType::new(Arc::new(
-                NestedField::list_element(element_id, element_type, false),
+                NestedField::list_element(
+                    element_id,
+                    element_type,
+                    item.is_some_and(|item| !item.nullable()),
+                ),
             ))))
         }
         ConnectorDataType::Map(key, value) => {
+            let (key_declaration, value_declaration) = match declaration.map(ValueTypeRef::kind) {
+                None => (None, None),
+                Some(ValueKind::Map { key, value }) if !key.nullable() => (Some(key), Some(value)),
+                Some(_) => return Err(wrong_shape()),
+            };
             let key_id = allocate_id(next_id)?;
-            let key_type = iceberg_type(key, format_version, next_id)?;
+            let key_type = iceberg_type_with_output(key, format_version, next_id, key_declaration)?;
             let value_id = allocate_id(next_id)?;
-            let value_type = iceberg_type(value, format_version, next_id)?;
+            let value_type =
+                iceberg_type_with_output(value, format_version, next_id, value_declaration)?;
             Ok(Type::Map(MapType::new(
                 Arc::new(NestedField::map_key_element(key_id, key_type)),
-                Arc::new(NestedField::map_value_element(value_id, value_type, false)),
+                Arc::new(NestedField::map_value_element(
+                    value_id,
+                    value_type,
+                    value_declaration.is_some_and(|value| !value.nullable()),
+                )),
             )))
         }
         ConnectorDataType::Struct(fields) => {
+            let output_fields = match declaration.map(ValueTypeRef::kind) {
+                None => None,
+                Some(ValueKind::Struct(children))
+                    if children.len() == fields.len()
+                        && children
+                            .iter()
+                            .zip(fields)
+                            .all(|(child, field)| child.name() == field.name.as_ref()) =>
+                {
+                    Some(children)
+                }
+                Some(_) => return Err(wrong_shape()),
+            };
             // Design: ADR-0265 (docs/adr/ADR-0265-row-declarations-and-canonical-map-keys.md)
             for (index, field) in fields.iter().enumerate() {
                 if field.name.is_empty() {
@@ -191,13 +275,20 @@ pub(crate) fn iceberg_type(
             let fields = fields
                 .iter()
                 .zip(ids)
-                .map(|(field, id)| {
-                    let field_type = iceberg_type(&field.data_type, format_version, next_id)?;
+                .enumerate()
+                .map(|(ordinal, (field, id))| {
+                    let output = output_fields.map(|children| children[ordinal].value_type());
+                    let field_type = iceberg_type_with_output(
+                        &field.data_type,
+                        format_version,
+                        next_id,
+                        output,
+                    )?;
                     Ok(Arc::new(NestedField::new(
                         id,
                         field.name.as_ref(),
                         field_type,
-                        !field.nullable,
+                        !output.map_or(field.nullable, ValueTypeRef::nullable),
                     )))
                 })
                 .collect::<Result<Vec<_>, ConnectorError>>()?;
@@ -343,6 +434,98 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::ConnectorStructField;
     use novarocks_type_contract::TemporalPrecision;
+
+    #[test]
+    fn stateless_mv_output_declaration_preserves_nested_required_fields() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_type_contract::FunctionValueType;
+
+        let columns = [ConnectorColumnDefinition {
+            name: "payload".into(),
+            data_type: ConnectorDataType::Struct(vec![
+                ConnectorStructField {
+                    name: "items".into(),
+                    data_type: ConnectorDataType::Array(Box::new(ConnectorDataType::BigInt)),
+                    nullable: true,
+                },
+                ConnectorStructField {
+                    name: "attrs".into(),
+                    data_type: ConnectorDataType::Map(
+                        Box::new(ConnectorDataType::String),
+                        Box::new(ConnectorDataType::Struct(vec![ConnectorStructField {
+                            name: "code".into(),
+                            data_type: ConnectorDataType::BigInt,
+                            nullable: true,
+                        }])),
+                    ),
+                    nullable: true,
+                },
+            ]),
+            nullable: true,
+            default: None,
+        }];
+        let entries = Field::new_struct(
+            "entries",
+            vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new_struct(
+                    "value",
+                    vec![Field::new("code", DataType::Int64, false)],
+                    false,
+                ),
+            ],
+            false,
+        );
+        let declaration = FunctionValueType::new(
+            DataType::Struct(
+                vec![
+                    Field::new(
+                        "items",
+                        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                        false,
+                    ),
+                    Field::new("attrs", DataType::Map(Arc::new(entries), false), false),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let declarations = [declaration.value_type().clone()];
+        let exact = schema_fields_with_output_declarations(
+            &columns,
+            FormatVersion::V3,
+            Some(&declarations),
+        )
+        .unwrap();
+        let ordinary = schema_fields(&columns, FormatVersion::V3).unwrap();
+        let Type::Struct(exact_payload) = exact[0].field_type.as_ref() else {
+            panic!("struct")
+        };
+        let Type::Struct(ordinary_payload) = ordinary[0].field_type.as_ref() else {
+            panic!("struct")
+        };
+        let Type::Map(attrs) = exact_payload.fields()[1].field_type.as_ref() else {
+            panic!("map")
+        };
+        let Type::Struct(value) = attrs.value_field.field_type.as_ref() else {
+            panic!("map value struct")
+        };
+        let Type::List(items) = exact_payload.fields()[0].field_type.as_ref() else {
+            panic!("list")
+        };
+        assert!(!exact[0].required);
+        assert!(exact_payload.fields().iter().all(|field| field.required));
+        assert!(
+            ordinary_payload
+                .fields()
+                .iter()
+                .all(|field| !field.required)
+        );
+        assert!(!items.element_field.required);
+        assert!(attrs.key_field.required);
+        assert!(attrs.value_field.required);
+        assert!(value.fields()[0].required);
+    }
 
     #[test]
     fn temporal_defaults_use_the_version_precision_once() {

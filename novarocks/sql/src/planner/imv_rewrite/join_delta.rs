@@ -1586,7 +1586,6 @@ mod tests {
                 target_state: TargetStateProof { present: true },
                 signed_state_aggregate: SignedStateAggregateProof { present: true },
             }),
-            ..Default::default()
         };
         ctx.set_extension::<ImvExtension>(ext);
         let arena_rc = ctx.scalar_arena();

@@ -214,18 +214,49 @@ EXPLAIN REFRESH MATERIALIZED VIEW orders_maintenance_mv;
 REFRESH MATERIALIZED VIEW orders_maintenance_mv;
 
 -- query 28
--- The single direct publication and file effects witness the selected refresh write.
-SELECT s.parent_id = p.snapshot_id AS direct_child,
-       p.publication IS NOT NULL
-         AND element_at(s.summary, 'novarocks.doc.v2.record.novarocks.mv~publication') <> p.publication AS new_publication,
-       COALESCE(CAST(element_at(s.summary, 'added-data-files') AS BIGINT), 0) > 0
-         OR COALESCE(CAST(element_at(s.summary, 'deleted-data-files') AS BIGINT), 0) > 0
-         OR COALESCE(CAST(element_at(s.summary, 'added-delete-files') AS BIGINT), 0) > 0
-         OR COALESCE(CAST(element_at(s.summary, 'removed-delete-files') AS BIGINT), 0) > 0 AS changed_files
-FROM "orders_maintenance_mv$snapshots" AS s
-JOIN "orders_maintenance_mv$refs" AS r ON s.snapshot_id = r.snapshot_id
-CROSS JOIN refresh_checkpoints AS p
-WHERE r.name = 'main' AND p.phase = 'a9_target_before';
+-- ContentLocate publishes one row delta. FullReplace publishes a witnessed
+-- delete and append in one commit under the same original parent.
+WITH publication AS (
+    SELECT s.snapshot_id, s.parent_id, s.operation, s.summary,
+           p.snapshot_id AS baseline, p.publication AS old_publication,
+           d.parent_id AS delete_parent, d.operation AS delete_operation, d.summary AS delete_summary,
+           element_at(s.summary, 'novarocks.write.session.v1') AS write_session,
+           CAST(json_parse(element_at(d.summary, 'novarocks.mv.full-refresh-stage.v1')) AS ROW(
+               version BIGINT, asserted_parent BIGINT, delete_snapshot BIGINT,
+               append_snapshot BIGINT, operation_id ARRAY(BIGINT)
+           )) AS stage_witness
+    FROM "orders_maintenance_mv$snapshots" AS s
+    JOIN "orders_maintenance_mv$refs" AS r ON s.snapshot_id = r.snapshot_id
+    LEFT JOIN "orders_maintenance_mv$snapshots" AS d ON s.parent_id = d.snapshot_id
+    CROSS JOIN refresh_checkpoints AS p
+    WHERE r.name = 'main' AND p.phase = 'a9_target_before'
+)
+SELECT write_session IS NOT NULL AND (
+           (parent_id = baseline AND operation IN ('delete', 'overwrite')
+            AND COALESCE(CAST(element_at(summary, 'added-position-delete-files') AS BIGINT), 0) > 0)
+           OR (delete_parent = baseline AND delete_operation = 'delete' AND operation = 'append'
+               AND stage_witness.version = 1
+               AND stage_witness.asserted_parent = baseline
+               AND stage_witness.delete_snapshot = parent_id
+               AND stage_witness.append_snapshot = snapshot_id
+               AND cardinality(stage_witness.operation_id) = 16
+               AND all_match(stage_witness.operation_id, b -> b BETWEEN 0 AND 255)
+               AND array_join(transform(stage_witness.operation_id, b ->
+                   substr('0123456789abcdef', b / 16 + 1, 1)
+                   || substr('0123456789abcdef', b % 16 + 1, 1)), '') = replace(write_session, '-', '')
+               AND element_at(delete_summary, 'novarocks.write.session.v1') IS NULL
+               AND element_at(delete_summary, 'novarocks.doc.v2.record.novarocks.mv~publication') IS NULL
+               AND CAST(element_at(delete_summary, 'total-records') AS BIGINT) = 0
+               AND CAST(element_at(delete_summary, 'total-data-files') AS BIGINT) = 0
+               AND CAST(element_at(delete_summary, 'total-delete-files') AS BIGINT) = 0)
+       ) AS exact_publication_chain,
+       old_publication IS NOT NULL
+         AND element_at(summary, 'novarocks.doc.v2.record.novarocks.mv~publication') <> old_publication AS new_publication,
+       COALESCE(CAST(element_at(summary, 'added-data-files') AS BIGINT), 0) > 0
+         OR COALESCE(CAST(element_at(summary, 'deleted-data-files') AS BIGINT), 0) > 0
+         OR COALESCE(CAST(element_at(summary, 'added-delete-files') AS BIGINT), 0) > 0
+         OR COALESCE(CAST(element_at(summary, 'removed-delete-files') AS BIGINT), 0) > 0 AS changed_files
+FROM publication;
 
 -- query 29
 -- @imv_equivalence_check=orders_maintenance_mv

@@ -187,6 +187,31 @@ pub(crate) async fn build_read_snapshot_at_with_control(
     snapshot_id: i64,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
 ) -> Result<IcebergReadSnapshot, ConnectorError> {
+    let domain = read_domain_at(table, snapshot_id)?;
+    build_read_snapshot_in_domain(table, domain, control).await
+}
+
+pub(crate) async fn build_statistics_read_snapshot_at(
+    table: &Table,
+    snapshot_id: i64,
+    control: Option<&dyn ConnectorOperationControl>,
+    average_size_columns: &[&str],
+) -> Result<IcebergReadSnapshot, ConnectorError> {
+    let domain = read_domain_at(table, snapshot_id)?;
+    build_read_snapshot_with_purpose(
+        table,
+        domain,
+        control,
+        None,
+        ReadPurpose::ManifestStatistics(average_size_columns),
+    )
+    .await
+}
+
+fn read_domain_at(
+    table: &Table,
+    snapshot_id: i64,
+) -> Result<Arc<ReadDomain>, ConnectorError> {
     let metadata = table.metadata();
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
@@ -194,8 +219,7 @@ pub(crate) async fn build_read_snapshot_at_with_control(
     let schema = snapshot
         .schema(metadata)
         .map_err(|e| read_snapshot_error(format!("resolve snapshot schema: {e}")))?;
-    let domain = mint_read_domain(metadata, snapshot_id, &schema).map_err(read_snapshot_error)?;
-    build_read_snapshot_in_domain(table, domain, control).await
+    mint_read_domain(metadata, snapshot_id, &schema).map_err(read_snapshot_error)
 }
 
 /// Validate all live delete content before an MV target's predicate,
@@ -432,17 +456,19 @@ pub(crate) async fn build_read_snapshot_with_prepared_list(
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
     prepared: Option<&PreparedReadManifestList>,
 ) -> Result<IcebergReadSnapshot, ConnectorError> {
+    build_read_snapshot_with_purpose(table, domain, control, prepared, ReadPurpose::Ordinary).await
+}
+
+async fn build_read_snapshot_with_purpose(
+    table: &Table,
+    domain: Arc<ReadDomain>,
+    control: Option<&dyn ConnectorOperationControl>,
+    prepared: Option<&PreparedReadManifestList>,
+    purpose: ReadPurpose<'_>,
+) -> Result<IcebergReadSnapshot, ConnectorError> {
     let snapshot_id = domain.endpoint().snapshot_id();
     let files = observe_read_files_original::<DataFile>(
-        table,
-        domain,
-        control,
-        None,
-        None,
-        None,
-        None,
-        prepared,
-        ReadPurpose::Ordinary,
+        table, domain, control, None, None, None, None, prepared, purpose,
     )
     .await
     .map_err(ReadFailure::into_connector)?;
@@ -637,10 +663,163 @@ impl std::hash::Hash for ManifestReferenceKey<'_> {
 const CONFLICTING_MANIFEST_REFERENCE: &str =
     "Iceberg snapshot repeats one manifest path with conflicting descriptors";
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ReadPurpose {
+#[derive(Clone, Copy)]
+enum ReadPurpose<'a> {
     Ordinary,
     MvContentTarget,
+    ManifestStatistics(&'a [&'a str]),
+}
+
+struct NestedAverageSizeField<'a> {
+    id: i32,
+    name: &'a str,
+    leaves: Vec<i32>,
+}
+
+fn nested_average_size_fields<'a>(
+    schema: &'a Schema,
+    requested: &[&str],
+    control: Option<&dyn ConnectorOperationControl>,
+) -> Result<Vec<NestedAverageSizeField<'a>>, ReadFailure> {
+    let mut selected = Vec::new();
+    for field in schema.as_struct().fields() {
+        check_read_control(control)?;
+        if !matches!(
+            field.field_type.as_ref(),
+            Type::Struct(_) | Type::List(_) | Type::Map(_)
+        ) || !requested
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&field.name))
+        {
+            continue;
+        }
+        let mut leaves = Vec::new();
+        if !collect_size_leaves(field, 1, &mut leaves, control)? {
+            leaves.clear();
+        }
+        selected.push(NestedAverageSizeField {
+            id: field.id,
+            name: &field.name,
+            leaves,
+        });
+    }
+    Ok(selected)
+}
+
+fn collect_size_leaves(
+    field: &NestedField,
+    depth: usize,
+    leaves: &mut Vec<i32>,
+    control: Option<&dyn ConnectorOperationControl>,
+) -> Result<bool, ReadFailure> {
+    check_read_control(control)?;
+    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        return Ok(false);
+    }
+    match field.field_type.as_ref() {
+        Type::Primitive(_) => {
+            leaves.push(field.id);
+            Ok(true)
+        }
+        Type::Struct(children) => {
+            for child in children.fields() {
+                if !collect_size_leaves(child, depth + 1, leaves, control)? {
+                    return Ok(false);
+                }
+            }
+            Ok(!children.fields().is_empty())
+        }
+        Type::List(list) => collect_size_leaves(&list.element_field, depth + 1, leaves, control),
+        Type::Map(map) => Ok(
+            collect_size_leaves(&map.key_field, depth + 1, leaves, control)?
+                && collect_size_leaves(&map.value_field, depth + 1, leaves, control)?,
+        ),
+        Type::Variant(_) => Ok(false),
+    }
+}
+
+/// A nested root owns width evidence only if this file reports every leaf from
+/// the snapshot schema. Omitted leaves and overflow do not grant a size.
+fn manifest_nested_size(
+    column_sizes: &HashMap<i32, u64>,
+    leaves: &[i32],
+    control: Option<&dyn ConnectorOperationControl>,
+) -> Result<Option<i64>, ReadFailure> {
+    if leaves.is_empty() {
+        return Ok(None);
+    }
+    let mut size = 0_i64;
+    for leaf in leaves {
+        check_read_control(control)?;
+        let Some(next) = column_sizes
+            .get(leaf)
+            .and_then(|bytes| i64::try_from(*bytes).ok())
+            .and_then(|bytes| size.checked_add(bytes))
+        else {
+            return Ok(None);
+        };
+        size = next;
+    }
+    Ok(Some(size))
+}
+
+#[cfg(test)]
+#[test]
+fn manifest_nested_size_uses_every_leaf_of_the_selected_snapshot_schema() {
+    use crate::iceberg::spec::{ListType, MapType};
+
+    let leaf = |id, name| {
+        Arc::new(NestedField::optional(
+            id,
+            name,
+            Type::Primitive(PrimitiveType::Long),
+        ))
+    };
+    let map = Type::Map(MapType::new(
+        Arc::new(NestedField::map_key_element(
+            4,
+            Type::Primitive(PrimitiveType::String),
+        )),
+        Arc::new(NestedField::map_value_element(
+            5,
+            Type::Primitive(PrimitiveType::Long),
+            false,
+        )),
+    ));
+    let schema = Schema::builder()
+        .with_fields(vec![
+            leaf(1, "scalar"),
+            Arc::new(NestedField::optional(
+                2,
+                "payload",
+                Type::Struct(StructType::new(vec![
+                    Arc::new(NestedField::optional(3, "attrs", map)),
+                    Arc::new(NestedField::optional(
+                        6,
+                        "items",
+                        Type::List(ListType::new(Arc::new(NestedField::list_element(
+                            7,
+                            Type::Primitive(PrimitiveType::Long),
+                            false,
+                        )))),
+                    )),
+                ])),
+            )),
+        ])
+        .build()
+        .unwrap();
+    let selected = nested_average_size_fields(&schema, &["scalar", "PAYLOAD"], None).unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].id, 2);
+    assert_eq!(selected[0].leaves, [4, 5, 7]);
+
+    let sizes = HashMap::from([(2, 99), (4, 1), (5, 2), (7, 3), (8, 999)]);
+    let leaves = &selected[0].leaves;
+    assert_eq!(manifest_nested_size(&sizes, leaves, None).unwrap(), Some(6));
+    let missing = HashMap::from([(2, 99), (4, 1), (5, 2), (8, 999)]);
+    assert_eq!(manifest_nested_size(&missing, leaves, None).unwrap(), None);
+    let overflow = HashMap::from([(4, i64::MAX as u64), (5, 2), (7, 3)]);
+    assert_eq!(manifest_nested_size(&overflow, leaves, None).unwrap(), None);
 }
 
 async fn observe_read_files_original<P: ObservedDataFileProjection>(
@@ -652,7 +831,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
     mut referenced_specs: Option<&mut crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ReferencedSpecInventory>,
     mut rewrite_entries: Option<&mut rewrite_entries::RewriteEntries>,
     prepared: Option<&PreparedReadManifestList>,
-    purpose: ReadPurpose,
+    purpose: ReadPurpose<'_>,
 ) -> Result<Vec<P::File>, ReadFailure> {
     check_read_control(control)?;
     check_scoped_active(capture)?;
@@ -678,6 +857,12 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
         .iter()
         .map(|f| (f.id, f.name.clone()))
         .collect();
+    let nested_sizes = match purpose {
+        ReadPurpose::ManifestStatistics(columns) => {
+            nested_average_size_fields(&schema, columns, control)?
+        }
+        _ => Vec::new(),
+    };
     let loaded_manifest_list;
     let entries = match (prepared, io) {
         (Some(prepared), None) => {
@@ -803,7 +988,8 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                 continue;
             }
             let df = entry.raw.data_file();
-            if purpose == ReadPurpose::MvContentTarget && df.content_type() == DataContentType::Data
+            if matches!(purpose, ReadPurpose::MvContentTarget)
+                && df.content_type() == DataContentType::Data
             {
                 // This preflight validates live delete content. The ordinary
                 // split-opening path still authors all data file facts.
@@ -860,7 +1046,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                         typed_partition,
                         metrics,
                     )?;
-                    if purpose == ReadPurpose::MvContentTarget
+                    if matches!(purpose, ReadPurpose::MvContentTarget)
                         && !matches!(delete.file.kind, DeleteKind::DeletionVector { .. })
                     {
                         return Err(ReadFailure::Original(
@@ -923,7 +1109,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
             }
         })?;
         let deletes = metadata_delete_load_view(&logical);
-        files.push(df.into_file(
+        files.push(df.into_file_with_nested_sizes(
             FinalReadFileFacts {
                 partition_spec_id: data.partition().spec_id(),
                 data_sequence_number: data.sequence().get(),
@@ -933,6 +1119,8 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                 deletes,
             },
             &field_id_to_name,
+            &nested_sizes,
+            control,
         )?);
     }
     if let Some(inventory) = referenced_specs {
@@ -983,6 +1171,16 @@ trait ObservedDataFileProjection: Sized {
         facts: FinalReadFileFacts,
         field_id_to_name: &HashMap<i32, String>,
     ) -> Result<Self::File, String>;
+
+    fn into_file_with_nested_sizes(
+        self,
+        facts: FinalReadFileFacts,
+        field_id_to_name: &HashMap<i32, String>,
+        _nested_sizes: &[NestedAverageSizeField<'_>],
+        _control: Option<&dyn ConnectorOperationControl>,
+    ) -> Result<Self::File, ReadFailure> {
+        self.into_file(facts, field_id_to_name).map_err(Into::into)
+    }
 }
 
 impl ObservedDataFileProjection for DataFile {
@@ -1001,33 +1199,74 @@ impl ObservedDataFileProjection for DataFile {
         facts: FinalReadFileFacts,
         field_id_to_name: &HashMap<i32, String>,
     ) -> Result<Self::File, String> {
-        Ok(IcebergReadFile {
-            path: self.file_path().to_string(),
-            size: i64::try_from(self.file_size_in_bytes())
-                .map_err(|_| format!("file size too large: {}", self.file_path()))?,
-            record_count: Some(
-                i64::try_from(self.record_count()).map_err(|_| "record count too large")?,
-            ),
-            column_stats: column_stats(&self, field_id_to_name),
-            partition_spec_id: Some(facts.partition_spec_id),
-            partition_key: iceberg_partition_key(&facts.partition_values),
-            partition_values: Some(facts.partition_values),
-            manifest_path: Some(facts.manifest_path),
-            first_row_id: facts.first_row_id,
-            data_sequence_number: Some(facts.data_sequence_number),
-            manifest: Arc::new(IcebergDataFileMetadata {
-                file_format: self.file_format(),
-                split_offsets: self.split_offsets().unwrap_or_default().to_vec(),
-                key_metadata: self.key_metadata().unwrap_or_default().to_vec(),
-                value_counts: self.value_counts().clone(),
-                null_value_counts: self.null_value_counts().clone(),
-                nan_value_counts: self.nan_value_counts().clone(),
-                lower_bounds: self.lower_bounds().clone(),
-                upper_bounds: self.upper_bounds().clone(),
-            }),
-            deletes: facts.deletes,
-        })
+        project_read_file(&self, facts, field_id_to_name)
     }
+
+    fn into_file_with_nested_sizes(
+        self,
+        facts: FinalReadFileFacts,
+        field_id_to_name: &HashMap<i32, String>,
+        nested_sizes: &[NestedAverageSizeField<'_>],
+        control: Option<&dyn ConnectorOperationControl>,
+    ) -> Result<Self::File, ReadFailure> {
+        let mut file = project_read_file(&self, facts, field_id_to_name)?;
+        for field in nested_sizes {
+            let size = manifest_nested_size(self.column_sizes(), &field.leaves, control)?;
+            if let Some(stats) = file
+                .column_stats
+                .as_mut()
+                .and_then(|stats| stats.get_mut(field.name))
+            {
+                stats.column_size = size;
+            } else if let Some(size) = size {
+                file.column_stats.get_or_insert_with(HashMap::new).insert(
+                    field.name.to_owned(),
+                    IcebergColumnStats {
+                        field_id: Some(field.id),
+                        column_size: Some(size),
+                        null_count: None,
+                        value_count: None,
+                        lower_bound: None,
+                        upper_bound: None,
+                    },
+                );
+            }
+        }
+        Ok(file)
+    }
+}
+
+fn project_read_file(
+    file: &DataFile,
+    facts: FinalReadFileFacts,
+    field_id_to_name: &HashMap<i32, String>,
+) -> Result<IcebergReadFile, String> {
+    Ok(IcebergReadFile {
+        path: file.file_path().to_string(),
+        size: i64::try_from(file.file_size_in_bytes())
+            .map_err(|_| format!("file size too large: {}", file.file_path()))?,
+        record_count: Some(
+            i64::try_from(file.record_count()).map_err(|_| "record count too large")?,
+        ),
+        column_stats: column_stats(file, field_id_to_name),
+        partition_spec_id: Some(facts.partition_spec_id),
+        partition_key: iceberg_partition_key(&facts.partition_values),
+        partition_values: Some(facts.partition_values),
+        manifest_path: Some(facts.manifest_path),
+        first_row_id: facts.first_row_id,
+        data_sequence_number: Some(facts.data_sequence_number),
+        manifest: Arc::new(IcebergDataFileMetadata {
+            file_format: file.file_format(),
+            split_offsets: file.split_offsets().unwrap_or_default().to_vec(),
+            key_metadata: file.key_metadata().unwrap_or_default().to_vec(),
+            value_counts: file.value_counts().clone(),
+            null_value_counts: file.null_value_counts().clone(),
+            nan_value_counts: file.nan_value_counts().clone(),
+            lower_bounds: file.lower_bounds().clone(),
+            upper_bounds: file.upper_bounds().clone(),
+        }),
+        deletes: facts.deletes,
+    })
 }
 
 /// Only fields consumed by the scoped manifest projection are copied while the
