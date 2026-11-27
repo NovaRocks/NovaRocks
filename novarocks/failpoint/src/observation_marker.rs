@@ -126,6 +126,7 @@ marker_registry! {
     MEM_1_M07_HMS_LISTING_BUILD => ("NOVAROCKS_MEM_1_M07_HMS_LISTING_BUILD", Fixture, Unconditional, ["build_identity", "commit", "hms_listing_observe"]),
     MEM_1_M07_ROOT_OBSERVATION_BUILD => ("NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_BUILD", Fixture, Unconditional, ["build_identity", "commit", "root_observation"]),
     MEM_1_M07_ROOT_OBSERVATION_FE => ("NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_FE", Fixture, Unconditional, ["frontend_process_id"]),
+    MV_ACTION_ACTUAL_EXIT => ("NOVAROCKS_MV_ACTION_ACTUAL_EXIT", MaterializedView, Unconditional, ["backend", "client_query_id", "execution_id", "external_effect", "session_key", "stage", "statement_generation", "status_version", "task"]),
     MV_SCAN_PRUNING_COVERAGE => ("NOVAROCKS_MV_SCAN_PRUNING_COVERAGE", MaterializedView, Unconditional, ["execution_id", "scan", "basis", "files", "identity_digest"]),
     MV_CONTENT_TARGET_ENUMERATION_CLOSED => ("NOVAROCKS_MV_CONTENT_TARGET_ENUMERATION_CLOSED", MaterializedView, FaultInjection, ["execution_id", "scan", "token"]),
     MV_CONTENT_APPLY_INSERT_DROPPED => ("NOVAROCKS_MV_CONTENT_APPLY_INSERT_DROPPED", MaterializedView, FaultInjection, ["execution_id", "driver_id", "task_key", "token"]),

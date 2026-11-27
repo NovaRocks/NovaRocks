@@ -274,6 +274,8 @@ struct MvCommandOriginal {
     health: Option<StatementNativeHealthFailure>,
     completion: MvCommandCompletionReceiving,
     performed_publication: bool,
+    #[cfg(novarocks_dev_controls)]
+    exit_observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
 
 struct RefreshRetryWait {
@@ -350,6 +352,14 @@ pub(crate) fn prepare_in(
     // This is only a borrowed original identity. No Native window/position is
     // acquired until a real data assembly reaches MvNativePhase.
     let context_for_next = context.clone();
+    #[cfg(novarocks_dev_controls)]
+    let exit_observation = if matches!(&request, MvCommandRequest::Refresh { .. }) {
+        execution
+            .test_statement_nomination()
+            .and_then(|nomination| services.launcher.resolve_statement_observation(nomination))
+    } else {
+        None
+    };
     let input = Arc::new(CommandInput {
         state_store,
         current_catalog,
@@ -388,6 +398,8 @@ pub(crate) fn prepare_in(
             health: None,
             completion,
             performed_publication: false,
+            #[cfg(novarocks_dev_controls)]
+            exit_observation,
         }),
     }))
 }
@@ -834,6 +846,10 @@ impl MvCommandOriginal {
         if pending {
             Poll::Pending
         } else {
+            #[cfg(novarocks_dev_controls)]
+            if let Some(observation) = self.exit_observation.take() {
+                observation.observe_mv_action_actual_exit(self.observed_effect());
+            }
             Poll::Ready(Ok(()))
         }
     }

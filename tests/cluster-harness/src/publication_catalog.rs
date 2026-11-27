@@ -273,6 +273,8 @@ pub enum RetainedMvCommit {
     Publication,
     Retirement,
     PendingMarker,
+    PendingReleased,
+    ManagementSlot,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -462,9 +464,24 @@ impl FixtureControl {
         table: &str,
         kind: RetainedMvCommit,
     ) -> Result<FixtureFaultGuard> {
+        self.fault_mv_commit(
+            namespace,
+            table,
+            kind,
+            PublicationFault::BeforeDispatchHoldAcrossFrontendExit,
+        )
+    }
+
+    pub fn fault_mv_commit(
+        &self,
+        namespace: &str,
+        table: &str,
+        kind: RetainedMvCommit,
+        fault: PublicationFault,
+    ) -> Result<FixtureFaultGuard> {
         self.arm_next_target(
             PublicationAction::TableCommit.as_str(),
-            PublicationFault::BeforeDispatchHoldAcrossFrontendExit.as_str(),
+            fault.as_str(),
             Some(ExactTableTarget {
                 namespace: namespace.to_owned(),
                 table: table.to_owned(),
@@ -784,21 +801,30 @@ async fn arm_next_fault(
     let lost_response = request.fault == PublicationFault::AfterCommitBeforeResponseHideTableLoad;
     let retain_through_exit =
         request.fault == PublicationFault::BeforeDispatchHoldAcrossFrontendExit;
-    let exact_table_supported = if lost_response {
-        request.action == PublicationAction::TableCommit
+    let exact_effect = request.retained_mv_commit.is_some();
+    let table_commit = request.action == PublicationAction::TableCommit;
+    let exact_effect_supported = table_commit
+        && matches!(
+            request.fault,
+            PublicationFault::BeforeDispatchForbidden
+                | PublicationFault::BeforeDispatchHoldAcrossFrontendExit
+                | PublicationFault::AfterCommitBeforeResponse
+                | PublicationFault::AfterCommitBeforeResponseHideTableLoad
+                | PublicationFault::AfterCommitHoldForFrontendKill
+        );
+    let exact_table_supported = if exact_effect {
+        exact_effect_supported
+    } else if lost_response {
+        table_commit
     } else if retain_through_exit {
-        matches!(
-            request.action,
-            PublicationAction::TableCommit | PublicationAction::CatalogMutation
-        )
+        request.action == PublicationAction::CatalogMutation
     } else {
         request.action == PublicationAction::TableLoad
             && request.fault == PublicationFault::CorruptPackage
     };
     if (retain_through_exit && state.retained_requests.is_none())
-        || (request.retained_mv_commit.is_some()
-            != (retain_through_exit && request.action == PublicationAction::TableCommit))
-        || ((lost_response || retain_through_exit) && request.target.is_none())
+        || (exact_effect && !exact_effect_supported)
+        || ((lost_response || retain_through_exit || exact_effect) && request.target.is_none())
         || request.target.as_ref().is_some_and(|target| {
             !exact_table_supported
                 || target.namespace.is_empty()
@@ -1426,13 +1452,18 @@ fn is_retained_mv_commit(body: &[u8], kind: RetainedMvCommit) -> bool {
     let Some(updates) = request["updates"].as_array().filter(|_| guarded) else {
         return false;
     };
-    if kind == RetainedMvCommit::PendingMarker {
+    let marker_prefix = match kind {
+        RetainedMvCommit::PendingMarker => Some("novarocks.doc.v2.mark.novarocks.mv~pending~"),
+        RetainedMvCommit::PendingReleased => {
+            Some("novarocks.doc.v2.mark.novarocks.mv~pending-released~")
+        }
+        _ => None,
+    };
+    if let Some(prefix) = marker_prefix {
         return matches!(updates.as_slice(), [update]
         if update["action"] == "set-properties"
             && update["updates"].as_object().is_some_and(|properties|
-                properties.keys().any(|key| {
-                    key.starts_with("novarocks.doc.v2.mark.novarocks.mv~pending~")
-                })));
+                properties.keys().any(|key| key.starts_with(prefix))));
     }
     let Some(main) = updates.iter().find_map(|update| {
         (update["action"] == "set-snapshot-ref" && update["ref-name"] == "main")
@@ -1441,14 +1472,35 @@ fn is_retained_mv_commit(body: &[u8], kind: RetainedMvCommit) -> bool {
     }) else {
         return false;
     };
+    const SLOT_CHANGE: &str = "novarocks.document.slot-change.v1";
+    if kind == RetainedMvCommit::ManagementSlot {
+        const MANAGEMENT: &str = "novarocks.doc.v2.slot.novarocks.storage~management";
+        let writes_original_slot = updates.iter().any(|update| {
+            update["action"] == "set-properties"
+                && update["updates"][MANAGEMENT]
+                    .as_str()
+                    .and_then(|slot| serde_json::from_str::<Value>(slot).ok())
+                    .is_some_and(|slot| slot["writer"].as_i64() == Some(main))
+        });
+        return writes_original_slot
+            && updates.iter().any(|update| {
+                update["action"] == "add-snapshot"
+                    && update["snapshot"]["snapshot-id"].as_i64() == Some(main)
+                    && update["snapshot"]["summary"]["operation"] == "replace"
+                    && update["snapshot"]["summary"][SLOT_CHANGE] == "true"
+            });
+    }
     let key = match kind {
         RetainedMvCommit::Publication => "novarocks.doc.v2.record.novarocks.mv~publication",
         RetainedMvCommit::Retirement => "novarocks.doc.v2.record.novarocks.mv~retirement",
-        RetainedMvCommit::PendingMarker => unreachable!("metadata marker handled above"),
+        RetainedMvCommit::PendingMarker
+        | RetainedMvCommit::PendingReleased
+        | RetainedMvCommit::ManagementSlot => unreachable!("other effect handled above"),
     };
     updates.iter().any(|update| {
         update["action"] == "add-snapshot"
             && update["snapshot"]["snapshot-id"].as_i64() == Some(main)
+            && update["snapshot"]["summary"][SLOT_CHANGE] != "true"
             && update["snapshot"]["summary"].get(key).is_some()
     })
 }
@@ -1727,12 +1779,13 @@ mod tests {
     #[test]
     fn retained_mv_effects_match_only_the_original_guarded_wire_shape() {
         let guard = json!({"type":"assert-ref-snapshot-id", "ref":"main", "snapshot-id":8});
-        let marker = json!({
-            "requirements":[guard.clone()],
-            "updates":[{"action":"set-properties","updates":{
-                "novarocks.doc.v2.mark.novarocks.mv~pending~original":"opaque"
-            }}]
-        });
+        let marker_commit = |kind: &str| {
+            let key = format!("novarocks.doc.v2.mark.novarocks.mv~{kind}~original");
+            json!({
+                "requirements":[guard.clone()],
+                "updates":[{"action":"set-properties","updates":{(key):"opaque"}}]
+            })
+        };
         let snapshot_commit = |record: &str| {
             json!({
                 "requirements":[guard.clone()],
@@ -1742,8 +1795,21 @@ mod tests {
                 ]
             })
         };
+        let mut slot = snapshot_commit("novarocks.doc.v2.record.novarocks.mv~publication");
+        slot["updates"][0]["snapshot"]["summary"]["operation"] = json!("replace");
+        slot["updates"][0]["snapshot"]["summary"]["novarocks.document.slot-change.v1"] =
+            json!("true");
+        slot["updates"].as_array_mut().unwrap().push(json!({
+            "action":"set-properties",
+            "updates":{"novarocks.doc.v2.slot.novarocks.storage~management":"{\"writer\":9}"}
+        }));
         let candidates = [
-            (marker, RetainedMvCommit::PendingMarker),
+            (marker_commit("pending"), RetainedMvCommit::PendingMarker),
+            (
+                marker_commit("pending-released"),
+                RetainedMvCommit::PendingReleased,
+            ),
+            (slot, RetainedMvCommit::ManagementSlot),
             (
                 snapshot_commit("novarocks.doc.v2.record.novarocks.mv~publication"),
                 RetainedMvCommit::Publication,
@@ -1756,6 +1822,8 @@ mod tests {
         for (mut candidate, exact) in candidates {
             for kind in [
                 RetainedMvCommit::PendingMarker,
+                RetainedMvCommit::PendingReleased,
+                RetainedMvCommit::ManagementSlot,
                 RetainedMvCommit::Publication,
                 RetainedMvCommit::Retirement,
             ] {

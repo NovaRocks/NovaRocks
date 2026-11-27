@@ -1,5 +1,6 @@
 #[path = "mv_control_plan.rs"]
 pub(super) mod control_plan;
+mod unknown_registration;
 
 use novarocks_query_application::api::ExecutionFailurePresentation;
 
@@ -16,7 +17,8 @@ use anyhow::{Context, Result, bail, ensure};
 use control_plan::FeLaunchIntent;
 use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_cluster_harness::publication_catalog::{
-    PublicationAction, PublicationCatalogFixture, PublicationFault, RetainedMvCommit,
+    FixtureControl, MutationCounts, PublicationAction, PublicationCatalogFixture, PublicationFault,
+    RetainedMvCommit,
 };
 use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
 use novarocks_failpoint::observation_marker::{
@@ -70,9 +72,18 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
             ..Default::default()
         }),
         Box::new(MvNameGraceRestart::default()),
-        Box::new(MvLateContentEffect::new(RetainedMvCommit::Publication)),
-        Box::new(MvLateContentEffect::new(RetainedMvCommit::Retirement)),
-        Box::new(MvLateContentEffect::new(RetainedMvCommit::PendingMarker)),
+        Box::new(MvContentEffect::new(RetainedMvCommit::Publication)),
+        Box::new(MvContentEffect::new(RetainedMvCommit::Retirement)),
+        Box::new(MvContentEffect::new(RetainedMvCommit::PendingMarker)),
+        Box::new(MvContentEffect::unknown(RetainedMvCommit::Publication)),
+        Box::new(MvContentEffect::unknown(RetainedMvCommit::Retirement)),
+        Box::new(MvContentEffect::unknown(RetainedMvCommit::PendingMarker)),
+        Box::new(unknown_registration::MvUnknownRegistration::new(
+            unknown_registration::RegistrationEffect::PendingReleased,
+        )),
+        Box::new(unknown_registration::MvUnknownRegistration::new(
+            unknown_registration::RegistrationEffect::ManagementSlot,
+        )),
         Box::new(MvFirstRefreshStaging::default()),
         Box::new(MvBaseIdentityReplacement::default()),
         Box::new(MvLakePublicationRestartRebuild::default()),
@@ -264,20 +275,29 @@ impl Scenario for MvNameGraceRestart {
     }
 }
 
-struct MvLateContentEffect {
+struct MvContentEffect {
     owner: MvNameGraceRestart,
     kind: RetainedMvCommit,
+    unknown: bool,
     initial_fault: super::native_sql_controls::SqlIntentOwner,
 }
 
-impl MvLateContentEffect {
+impl MvContentEffect {
     const REFRESH: &str = "REFRESH MATERIALIZED VIEW orders_mv";
 
     fn new(kind: RetainedMvCommit) -> Self {
         Self {
             owner: MvNameGraceRestart::default(),
             kind,
+            unknown: false,
             initial_fault: Default::default(),
+        }
+    }
+
+    fn unknown(kind: RetainedMvCommit) -> Self {
+        Self {
+            unknown: true,
+            ..Self::new(kind)
         }
     }
 
@@ -331,7 +351,7 @@ impl MvLateContentEffect {
     }
 }
 
-impl Scenario for MvLateContentEffect {
+impl Scenario for MvContentEffect {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
         crate::scenarios::declarations::for_module(
             "mv_recovery",
@@ -342,10 +362,16 @@ impl Scenario for MvLateContentEffect {
     }
 
     fn name(&self) -> &'static str {
-        match self.kind {
-            RetainedMvCommit::Publication => "mv/content-late-landing",
-            RetainedMvCommit::Retirement => "mv/content-late-retirement",
-            RetainedMvCommit::PendingMarker => "mv/content-late-pending-marker",
+        match (self.unknown, self.kind) {
+            (false, RetainedMvCommit::Publication) => "mv/content-late-landing",
+            (false, RetainedMvCommit::Retirement) => "mv/content-late-retirement",
+            (false, RetainedMvCommit::PendingMarker) => "mv/content-late-pending-marker",
+            (true, RetainedMvCommit::Publication) => "mv/content-unknown-publication",
+            (true, RetainedMvCommit::Retirement) => "mv/content-unknown-retirement",
+            (true, RetainedMvCommit::PendingMarker) => "mv/content-unknown-pending-marker",
+            (_, RetainedMvCommit::PendingReleased | RetainedMvCommit::ManagementSlot) => {
+                unreachable!("these effects have separate scenarios")
+            }
         }
     }
 
@@ -376,8 +402,10 @@ impl Scenario for MvLateContentEffect {
             binary,
             deadline,
         )?;
-        let successor = plan.reserve_launch(RoleSlot::Frontend)?;
-        plan.authorize_ordinary_launch(&successor, binary.to_path_buf())?;
+        if !self.unknown {
+            let successor = plan.reserve_launch(RoleSlot::Frontend)?;
+            plan.authorize_ordinary_launch(&successor, binary.to_path_buf())?;
+        }
         plan.validate_selected_intents(cluster_size)?;
         Ok(Some(plan))
     }
@@ -405,45 +433,7 @@ impl Scenario for MvLateContentEffect {
         };
 
         let mut conn = connect(context)?;
-        setup_orders_fixture_rest(context, &mut conn, CATALOG, &create_catalog, false)?;
-        execute(
-            context,
-            &mut conn,
-            "keep separate cold and visible input files",
-            "ALTER TABLE orders ADD COLUMN payload VARCHAR",
-        )?;
-        execute(
-            context,
-            &mut conn,
-            "write the filtered source file",
-            "INSERT INTO orders SELECT -id, -id, to_hex(sha256(to_utf8(CAST(id AS VARCHAR)))) FROM TABLE(sequence(1, 4096)) AS cold(id)",
-        )?;
-        execute(
-            context,
-            &mut conn,
-            "seed visible rows",
-            "INSERT INTO orders VALUES (1, 10, 'first'), (2, 20, 'retained')",
-        )?;
-        execute(
-            context,
-            &mut conn,
-            "create a visible projection MV",
-            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders WHERE v2 > 0",
-        )?;
-        refresh(context, &mut conn, TARGET)?;
-        execute(
-            context,
-            &mut conn,
-            "remove a source occurrence",
-            "DELETE FROM orders WHERE k1 = 1",
-        )?;
-        execute(
-            context,
-            &mut conn,
-            "add the next source occurrence",
-            "INSERT INTO orders VALUES (3, 30, 'next')",
-        )?;
-        assert_content_refresh_explain(context, &mut conn, "ContentLocate")?;
+        prepare_content_effect_source(context, &mut conn, CATALOG, &create_catalog)?;
 
         if self.kind == RetainedMvCommit::Retirement {
             self.run_refresh_with_missing_insert(context, &mut conn)?;
@@ -464,6 +454,11 @@ impl Scenario for MvLateContentEffect {
         }
 
         let original = load_metadata(context, &rest_uri, "ns", TARGET)?;
+        if self.unknown {
+            return observe_unknown_content_effect(
+                context, &mut conn, &rest_uri, &proxy, self.kind, &original,
+            );
+        }
         let original_snapshot = original["current-snapshot-id"]
             .as_i64()
             .context("the original visible MV has no Current snapshot")?;
@@ -628,11 +623,284 @@ impl Scenario for MvLateContentEffect {
         self.owner.teardown()
     }
 }
+fn prepare_content_effect_source(
+    context: &mut ScenarioContext,
+    conn: &mut SqlSession,
+    catalog: &str,
+    create_catalog: &str,
+) -> Result<()> {
+    setup_orders_fixture_rest(context, conn, catalog, create_catalog, false)?;
+    execute(
+        context,
+        conn,
+        "keep separate cold and visible input files",
+        "ALTER TABLE orders ADD COLUMN payload VARCHAR",
+    )?;
+    execute(
+        context,
+        conn,
+        "write the filtered source file",
+        "INSERT INTO orders SELECT -id, -id, to_hex(sha256(to_utf8(CAST(id AS VARCHAR)))) FROM TABLE(sequence(1, 4096)) AS cold(id)",
+    )?;
+    execute(
+        context,
+        conn,
+        "seed visible rows",
+        "INSERT INTO orders VALUES (1, 10, 'first'), (2, 20, 'retained')",
+    )?;
+    execute(
+        context,
+        conn,
+        "create a visible projection MV",
+        "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders WHERE v2 > 0",
+    )?;
+    refresh(context, conn, "orders_mv")?;
+    execute(
+        context,
+        conn,
+        "remove a source occurrence",
+        "DELETE FROM orders WHERE k1 = 1",
+    )?;
+    execute(
+        context,
+        conn,
+        "add the next source occurrence",
+        "INSERT INTO orders VALUES (3, 30, 'next')",
+    )?;
+    assert_content_refresh_explain(context, conn, "ContentLocate")
+}
+
+fn require_no_unknown_content_barrier(
+    context: &mut ScenarioContext,
+    conn: &mut SqlSession,
+) -> Result<()> {
+    context.action("observe zero unsettled effects on the original target");
+    let state = status(context, conn, "system_mv_name_grace", "orders_mv")?;
+    ensure!(
+        property(&state, "UnsettledEffects")? == "0",
+        "the lost response created an MV management barrier: {state:?}"
+    );
+    Ok(())
+}
+
+fn observe_unknown_content_effect(
+    context: &mut ScenarioContext,
+    conn: &mut SqlSession,
+    rest_uri: &str,
+    proxy: &FixtureControl,
+    kind: RetainedMvCommit,
+    original: &serde_json::Value,
+) -> Result<()> {
+    const TARGET: &str = "orders_mv";
+    const READ: &str = "SELECT k1, v2 FROM orders_mv ORDER BY k1";
+    const SOURCE: &str = "SELECT k1, v2 FROM orders WHERE v2 > 0 ORDER BY k1";
+    const PUBLICATION: &str = "novarocks.doc.v2.record.novarocks.mv~publication";
+    const RETIREMENT: &str = "novarocks.doc.v2.record.novarocks.mv~retirement";
+    const PENDING: &str = "novarocks.doc.v2.mark.novarocks.mv~pending~";
+    const INVALID: &str = "novarocks.doc.v2.mark.novarocks.mv~invalid~";
+    let original_snapshot = original["current-snapshot-id"]
+        .as_i64()
+        .context("the original MV has no Current snapshot")?;
+    execute(
+        context,
+        conn,
+        "disable MV rewrite for the independent source bag",
+        "SET SESSION enable_materialized_view_rewrite = false",
+    )?;
+    let response_fault = if kind == RetainedMvCommit::Publication {
+        PublicationFault::AfterCommitBeforeResponseHideTableLoad
+    } else {
+        PublicationFault::AfterCommitBeforeResponse
+    };
+    let fault = proxy.fault_mv_commit("ns", TARGET, kind, response_fault)?;
+    context.action("drop the original MV response after its exact REST effect commits");
+    let response = conn.execute(MvContentEffect::REFRESH);
+    let evidence = fault.finish()?;
+    let committed = load_metadata(context, rest_uri, "ns", TARGET)?;
+    let committed_snapshot = committed["current-snapshot-id"]
+        .as_i64()
+        .context("REST did not retain the current MV snapshot")?;
+    fs::write(
+        context.scenario_root().join("unknown-content-effect.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "effect": kind,
+            "original_snapshot": original_snapshot,
+            "committed_snapshot": committed_snapshot,
+            "response": response.as_ref().err().map(ToString::to_string),
+            "events": evidence.trace(),
+        }))?,
+    )?;
+    let trace = evidence.summary();
+    ensure!(
+        trace.contains("response-dropped-after-downstream-success")
+            && trace.matches("request-forwarded").count() == 1,
+        "the selected effect did not lose one actual successful response: {trace}"
+    );
+    let failure = response.expect_err("refresh must report the original response loss");
+    let failure = mv_public_error(&failure)?;
+    require_no_unknown_content_barrier(context, conn)?;
+    if kind == RetainedMvCommit::PendingMarker {
+        // A proved committed Pending may receive the original NotStarted
+        // release. The failed statement cannot publish target rows.
+        assert_rest_snapshot_state_unchanged(original, &committed)?;
+        let old = original["properties"]
+            .as_object()
+            .context("missing original MV properties")?;
+        let properties = committed["properties"]
+            .as_object()
+            .context("missing committed MV properties")?;
+        let newly_pending = properties
+            .keys()
+            .filter(|key| key.starts_with(PENDING) && !old.contains_key(*key))
+            .collect::<Vec<_>>();
+        let [key] = newly_pending.as_slice() else {
+            bail!(
+                "the lost response did not produce exactly one Pending marker: {newly_pending:?}"
+            );
+        };
+        let release = key.replacen("~pending~", "~pending-released~", 1);
+        let strategy = if properties.contains_key(&release) {
+            "ContentLocate"
+        } else {
+            "StrictRecovery"
+        };
+        assert_content_refresh_explain(context, conn, strategy)?;
+        refresh(context, conn, TARGET)?;
+        let expected = [(2, 20), (3, 30)];
+        assert_rows(
+            context,
+            conn,
+            READ,
+            &expected,
+            "publish the same original source window",
+        )?;
+        require_no_unknown_content_barrier(context, conn)?;
+        return assert_rows(
+            context,
+            conn,
+            SOURCE,
+            &expected,
+            "compare recovery with the independent source bag",
+        );
+    }
+    ensure!(
+        committed_snapshot != original_snapshot,
+        "the selected REST effect did not advance main"
+    );
+    let snapshot = committed["snapshots"]
+        .as_array()
+        .and_then(|snapshots| {
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot["snapshot-id"].as_i64() == Some(committed_snapshot))
+        })
+        .context("REST did not retain the committed content snapshot")?;
+    if kind == RetainedMvCommit::Retirement {
+        ensure!(
+            snapshot["summary"].get(RETIREMENT).is_some()
+                && snapshot["summary"].get(PUBLICATION).is_none()
+                && committed["properties"]
+                    .as_object()
+                    .is_some_and(|properties| {
+                        properties.keys().any(|key| key.starts_with(INVALID))
+                    }),
+            "the lost retirement response has no durable retirement and Invalid evidence"
+        );
+        let next = conn
+            .execute(MvContentEffect::REFRESH)
+            .expect_err("the next refresh must still respect Invalid");
+        ensure!(
+            mv_public_error(&next)?
+                .message
+                .contains("requires an explicit rebuild"),
+            "the next refresh did not confirm the original retirement: {next}"
+        );
+        let after = load_metadata(context, rest_uri, "ns", TARGET)?;
+        assert_rest_snapshot_state_unchanged(&committed, &after)?;
+        return require_no_unknown_content_barrier(context, conn);
+    }
+    ensure!(
+        kind == RetainedMvCommit::Publication
+            && failure.error_name == "ICEBERG_COMMIT_ERROR"
+            && failure.error_type == "EXTERNAL"
+            && failure.message.contains("[CommitUnknown]")
+            && snapshot["summary"].get(PUBLICATION).is_some()
+            && snapshot["summary"].get(RETIREMENT).is_none(),
+        "the lost data publication response did not preserve its typed outcome and durable record: {failure:?}"
+    );
+    assert_rows(
+        context,
+        conn,
+        READ,
+        &[(2, 20), (3, 30)],
+        "read the already committed publication",
+    )?;
+    execute(
+        context,
+        conn,
+        "retract a new source occurrence",
+        "DELETE FROM orders WHERE k1 = 2",
+    )?;
+    execute(
+        context,
+        conn,
+        "add a new source occurrence",
+        "INSERT INTO orders VALUES (4, 40, 'successor')",
+    )?;
+    refresh(context, conn, TARGET)?;
+    let expected = [(3, 30), (4, 40)];
+    assert_rows(
+        context,
+        conn,
+        READ,
+        &expected,
+        "refresh from the already committed watermark",
+    )?;
+    require_no_unknown_content_barrier(context, conn)?;
+    assert_rows(
+        context,
+        conn,
+        SOURCE,
+        &expected,
+        "compare the successor with the independent source bag",
+    )
+}
+
 #[derive(Default)]
 struct MvContentPendingRecovery {
-    fixture: Mutex<Option<ManagedMvRestFixture>>,
+    fixture: Mutex<Option<ContentRecoveryFixture>>,
     mode: ContentRecoveryMode,
 }
+
+struct ContentRecoveryFixture {
+    rest: ManagedMvRestFixture,
+    proxy: Option<PublicationCatalogFixture>,
+}
+
+struct CommittedContentWindow {
+    phase: &'static str,
+    token: &'static str,
+    retract: &'static str,
+    append: &'static str,
+    expected: [(i32, i64); 2],
+}
+
+const COMMITTED_CONTENT_WINDOWS: [CommittedContentWindow; 2] = [
+    CommittedContentWindow {
+        phase: "write-committed",
+        token: "content-write-committed",
+        retract: "DELETE FROM orders WHERE k1 = 2",
+        append: "INSERT INTO orders VALUES (4, 40, 'next-write')",
+        expected: [(3, 30), (4, 40)],
+    },
+    CommittedContentWindow {
+        phase: "publication-committed",
+        token: "content-publication-committed",
+        retract: "DELETE FROM orders WHERE k1 = 3",
+        append: "INSERT INTO orders VALUES (5, 50, 'next-publication')",
+        expected: [(4, 40), (5, 50)],
+    },
+];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ContentRecoveryMode {
@@ -646,6 +914,8 @@ impl MvContentPendingRecovery {
     const CATALOG: &str = "system_mv_content_pending";
     const TARGET: &str = "orders_mv";
     const CLOSE_TOKEN: &str = "content-pending-exact-enumeration-close";
+    const MV_READ: &str = "SELECT k1, v2 FROM orders_mv ORDER BY k1";
+    const SOURCE_READ: &str = "SELECT k1, v2 FROM orders WHERE v2 > 0 ORDER BY k1";
 }
 
 impl Scenario for MvContentPendingRecovery {
@@ -678,19 +948,29 @@ impl Scenario for MvContentPendingRecovery {
                 .get_or_insert_with(String::new)
                 .push_str("\n[runtime]\noptimizer_query_mem_limit_bytes = 1\n");
         }
+        let proxy = if self.mode != ContentRecoveryMode::SlotChange {
+            Some(PublicationCatalogFixture::start(
+                fixture.rest_uri().to_owned(),
+            )?)
+        } else {
+            None
+        };
         let mut slot = self
             .fixture
             .lock()
             .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?;
         ensure!(slot.is_none(), "managed MV fixture was initialized twice");
-        *slot = Some(fixture);
+        *slot = Some(ContentRecoveryFixture {
+            rest: fixture,
+            proxy,
+        });
         Ok(launch)
     }
 
     fn test_session_plan(
         &self,
         _: &ScenarioLaunchConfig,
-        _: &Path,
+        scenario_root: &Path,
         cluster_size: usize,
         binary: &Path,
         deadline: Instant,
@@ -698,33 +978,57 @@ impl Scenario for MvContentPendingRecovery {
         if self.mode == ContentRecoveryMode::Budget {
             return Ok(None);
         }
-        control_plan::plan(
-            cluster_size,
-            binary,
-            deadline,
-            vec![
-                FeLaunchIntent::MvActions(vec![control_plan::close_content_target(
+        let mut launches = vec![FeLaunchIntent::MvActions(vec![
+            control_plan::close_content_target(
+                Self::CATALOG,
+                "ns",
+                Self::TARGET,
+                Self::CLOSE_TOKEN,
+            ),
+        ])];
+        if self.mode == ContentRecoveryMode::Restart {
+            for window in &COMMITTED_CONTENT_WINDOWS {
+                launches.push(FeLaunchIntent::MvActions(vec![control_plan::recovery(
+                    window.token,
                     Self::CATALOG,
                     "ns",
                     Self::TARGET,
-                    Self::CLOSE_TOKEN,
-                )]),
-                FeLaunchIntent::Ordinary,
-            ],
-        )
-        .map(Some)
+                    window.phase,
+                    window.token,
+                    &scenario_root.join("content-committed-faults"),
+                )?]));
+            }
+        }
+        launches.push(FeLaunchIntent::Ordinary);
+        control_plan::plan(cluster_size, binary, deadline, launches).map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
-        let create_catalog_sql = self
-            .fixture
-            .lock()
-            .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?
-            .as_ref()
-            .context("managed MV fixture is missing after cluster launch")?
-            .create_catalog_sql()
-            .to_owned();
+        let (create_catalog_sql, rest_uri, proxy) = {
+            let fixture = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?;
+            let fixture = fixture
+                .as_ref()
+                .context("managed MV fixture is missing after cluster launch")?;
+            let sql = fixture.rest.create_catalog_sql();
+            let rest_uri = fixture.rest.rest_uri();
+            let catalog_sql = match &fixture.proxy {
+                Some(proxy) => sql.replace(rest_uri, proxy.uri()),
+                None => sql.to_owned(),
+            };
+            (
+                catalog_sql,
+                rest_uri.to_owned(),
+                fixture
+                    .proxy
+                    .as_ref()
+                    .map(|proxy| proxy.control())
+                    .transpose()?,
+            )
+        };
         let mut conn = connect(context)?;
         setup_orders_fixture_rest(
             context,
@@ -771,6 +1075,11 @@ impl Scenario for MvContentPendingRecovery {
             "INSERT INTO orders VALUES (3, 30, 'next')",
         )?;
         if self.mode == ContentRecoveryMode::Budget {
+            let proxy = proxy
+                .as_ref()
+                .context("budget scenario has no REST recorder")?;
+            let before = proxy.mutation_counts("ns", Self::TARGET);
+            let status_before = status(context, &mut conn, Self::CATALOG, Self::TARGET)?;
             let plan = query(
                 context,
                 &mut conn,
@@ -788,7 +1097,32 @@ impl Scenario for MvContentPendingRecovery {
                     }),
                 "a low deployment budget did not select its admitted complete fallback: {lines:?}"
             );
+            let after_explain = proxy.mutation_counts("ns", Self::TARGET);
             refresh(context, &mut conn, Self::TARGET)?;
+            assert_content_refresh_explain(context, &mut conn, "MetadataOnly")?;
+            let after_refresh = proxy.mutation_counts("ns", Self::TARGET);
+            let status_after = status(context, &mut conn, Self::CATALOG, Self::TARGET)?;
+            fs::write(
+                context
+                    .scenario_root()
+                    .join("content-budget-target-commits.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "target": Self::TARGET,
+                    "before": before.table_commit_forwarded,
+                    "after_explain": after_explain.table_commit_forwarded,
+                    "after_refresh": after_refresh.table_commit_forwarded,
+                    "status_before": status_before,
+                    "status_after": status_after,
+                }))?,
+            )?;
+            require_content_commit_count(before, after_explain, 0)?;
+            require_content_commit_count(before, after_refresh, 1)?;
+            for name in ["Phase", "UnsettledEffects"] {
+                ensure!(
+                    property(&status_before, name)? == property(&status_after, name)?,
+                    "budget refusal changed the target management status {name}"
+                );
+            }
             assert_rows(
                 context,
                 &mut conn,
@@ -812,6 +1146,10 @@ impl Scenario for MvContentPendingRecovery {
         }
         assert_content_refresh_explain(context, &mut conn, "ContentLocate")?;
 
+        let before_enumeration = proxy
+            .as_ref()
+            .map(|proxy| content_catalog_observation(context, &rest_uri, proxy))
+            .transpose()?;
         context.action("close the exact content target scan before its original end");
         let failed = conn
             .execute("REFRESH MATERIALIZED VIEW orders_mv")
@@ -839,6 +1177,29 @@ impl Scenario for MvContentPendingRecovery {
             "prove no data publication after incomplete target enumeration",
         )?;
         assert_content_refresh_explain(context, &mut conn, "StrictRecovery")?;
+        let original_pending =
+            if let Some((proxy, (before, counts))) = proxy.as_ref().zip(before_enumeration) {
+                let (after, after_counts) = content_catalog_observation(context, &rest_uri, proxy)?;
+                assert_rest_snapshot_state_unchanged(&before, &after)?;
+                require_content_commit_count(counts, after_counts, 1)?;
+                let properties = after["properties"]
+                    .as_object()
+                    .context("the Pending MV has no table properties")?;
+                let mut added_pending = properties.iter().filter(|(key, _)| {
+                    key.starts_with("novarocks.doc.v2.mark.novarocks.mv~pending~")
+                        && before["properties"].get(key.as_str()).is_none()
+                });
+                let (key, value) = added_pending
+                    .next()
+                    .context("the original Pending is absent")?;
+                ensure!(
+                    added_pending.next().is_none(),
+                    "the unlanded ContentLocate wrote more than one Pending"
+                );
+                Some((key.clone(), value.clone()))
+            } else {
+                None
+            };
         if self.mode == ContentRecoveryMode::SlotChange {
             execute(
                 context,
@@ -865,10 +1226,38 @@ impl Scenario for MvContentPendingRecovery {
         assert_content_refresh_explain(context, &mut conn, "StrictRecovery")?;
         // This MANUAL view has no background refresh. The only statement in
         // this FE log interval is the successful strict replay.
+        let before_replay = proxy
+            .as_ref()
+            .map(|proxy| content_catalog_observation(context, &rest_uri, proxy))
+            .transpose()?;
         let before_pruning = context.handle().fe_server_info_log()?;
         let refreshed = refresh(context, &mut conn, Self::TARGET);
         let pruning = record_content_recovery_pruning(context, &before_pruning);
         refreshed?;
+        if let Some(((proxy, (before, counts)), (key, value))) =
+            proxy.as_ref().zip(before_replay).zip(original_pending)
+        {
+            let (after, after_counts) = content_catalog_observation(context, &rest_uri, proxy)?;
+            let (snapshot, record) = current_content_publication(&after)?;
+            ensure!(
+                before["properties"].get(key.as_str()) == Some(&value)
+                    && after["properties"].get(key.as_str()).is_none()
+                    && current_content_publication(&before)?.1 != record,
+                "strict replay did not atomically consume the original Pending and publish a new P"
+            );
+            require_content_commit_count(counts, after_counts, 1)?;
+            fs::write(
+                context.scenario_root().join("content-strict-replay.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "replayed_pending_key": key,
+                    "baseline_snapshot_after_readmission": before["current-snapshot-id"],
+                    "committed_snapshot": snapshot,
+                    "publication": record.frame,
+                    "forwarded_commits": after_counts.table_commit_forwarded - counts.table_commit_forwarded,
+                    "successful_commits": after_counts.table_commit_succeeded - counts.table_commit_succeeded,
+                }))?,
+            )?;
+        }
         if self.mode == ContentRecoveryMode::SlotChange {
             let slot = query(
                 context,
@@ -907,7 +1296,13 @@ impl Scenario for MvContentPendingRecovery {
             &[(2, 20), (3, 30)],
             "verify the full source result for the recovered window",
         )?;
-        pruning
+        pruning?;
+        if let Some(proxy) = proxy {
+            for window in &COMMITTED_CONTENT_WINDOWS {
+                conn = Self::restart_at_content_commit(context, conn, &rest_uri, &proxy, window)?;
+            }
+        }
+        Ok(())
     }
 
     fn teardown(&self) -> Result<()> {
@@ -916,8 +1311,213 @@ impl Scenario for MvContentPendingRecovery {
             .lock()
             .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?
             .take();
-        fixture.map_or(Ok(()), |mut fixture| fixture.shutdown())
+        match fixture {
+            Some(ContentRecoveryFixture {
+                mut rest,
+                proxy: Some(mut proxy),
+            }) => control_plan::with_cleanup(proxy.shutdown(), rest.shutdown()),
+            Some(ContentRecoveryFixture {
+                mut rest,
+                proxy: None,
+            }) => rest.shutdown(),
+            None => Ok(()),
+        }
     }
+}
+
+impl MvContentPendingRecovery {
+    fn restart_at_content_commit(
+        context: &mut ScenarioContext,
+        mut conn: SqlSession,
+        rest_uri: &str,
+        proxy: &FixtureControl,
+        window: &CommittedContentWindow,
+    ) -> Result<SqlSession> {
+        execute(
+            context,
+            &mut conn,
+            "change the content window",
+            window.retract,
+        )?;
+        execute(context, &mut conn, "add the replacement row", window.append)?;
+        assert_content_refresh_explain(context, &mut conn, "ContentLocate")?;
+        let (baseline, counts_before) = content_catalog_observation(context, rest_uri, proxy)?;
+        let trigger = FileTrigger::create(
+            &context
+                .scenario_root()
+                .join("content-committed-faults")
+                .join(format!("mv-refresh-at-{}.trigger", window.phase)),
+            &format!("token={}\n", window.token),
+        )?;
+        let producer = spawn_refresh(
+            context.sql_user().to_owned(),
+            context.trino_port(),
+            Self::CATALOG,
+            Self::TARGET,
+            context.deadline(),
+        );
+        wait_for_fe_marker(
+            context,
+            &producer,
+            &format!(
+                "{} phase={} token={}",
+                novarocks_failpoint::observation_marker::MV_RECOVERY_PHASE,
+                window.phase,
+                window.token,
+            ),
+            "observe the ContentLocate Action holding its actual commit",
+        )?;
+
+        let (committed, counts_held) = content_catalog_observation(context, rest_uri, proxy)?;
+        let (snapshot, record) = current_content_publication(&committed)?;
+        let (_, baseline_publication) = current_content_publication(&baseline)?;
+        let committed_snapshot = committed["snapshots"]
+            .as_array()
+            .context("the committed MV has no snapshot list")?
+            .iter()
+            .find(|entry| entry["snapshot-id"].as_i64() == Some(snapshot))
+            .context("the committed MV lacks its Current snapshot")?;
+        let summary = &committed_snapshot["summary"];
+        ensure!(
+            record != baseline_publication
+                && committed_snapshot["parent-snapshot-id"] == baseline["current-snapshot-id"]
+                && committed["refs"]["main"]["snapshot-id"].as_i64() == Some(snapshot)
+                && summary["added-records"].as_str() == Some("1")
+                && summary["added-position-deletes"]
+                    .as_str()
+                    .and_then(|count| count.parse::<u64>().ok())
+                    .is_some_and(|count| count > 0),
+            "{} did not publish a new ContentLocate record and its one-insert row delta under the original main",
+            window.phase,
+        );
+        require_content_commit_count(counts_before, counts_held, 2).with_context(|| {
+            format!(
+                "{} must commit one Pending and one publication",
+                window.phase
+            )
+        })?;
+
+        context.action(format!(
+            "kill FE at the original ContentLocate {}",
+            window.phase
+        ));
+        context.handle().kill_fe()?;
+        trigger.remove()?;
+        expect_refresh_failure_after_fe_exit(
+            context,
+            producer,
+            "join the original ContentLocate client after FE exit",
+        )?;
+        drop(conn);
+        restart_frontend(context, "restart after the committed ContentLocate Action")?;
+        let mut conn = connect(context)?;
+        select_catalog_and_database(context, &mut conn, Self::CATALOG)?;
+        assert_rows(
+            context,
+            &mut conn,
+            Self::MV_READ,
+            &window.expected,
+            "read the committed ContentLocate rows after FE replacement",
+        )?;
+        require_nonaggregate_management_after_restart(
+            context,
+            &mut conn,
+            Self::CATALOG,
+            Self::TARGET,
+        )?;
+        let admitted = load_metadata(context, rest_uri, "ns", Self::TARGET)?;
+        let (_, admitted_record) = current_content_publication(&admitted)?;
+        ensure!(
+            admitted_record == record,
+            "automatic slot readmission lost the exact committed ContentLocate record"
+        );
+        let readmitted_counts = proxy.mutation_counts("ns", Self::TARGET);
+        refresh(context, &mut conn, Self::TARGET)?;
+        let refreshed = load_metadata(context, rest_uri, "ns", Self::TARGET)?;
+        assert_rest_snapshot_state_unchanged(&admitted, &refreshed)?;
+        ensure!(
+            proxy.mutation_counts("ns", Self::TARGET) == readmitted_counts,
+            "refresh dispatched another target mutation for a ContentLocate window already committed"
+        );
+
+        execute(
+            context,
+            &mut conn,
+            "disable MV rewrite for the full source check",
+            "SET SESSION enable_materialized_view_rewrite = false",
+        )?;
+        assert_rows(
+            context,
+            &mut conn,
+            Self::SOURCE_READ,
+            &window.expected,
+            "read the full original source at the committed window",
+        )?;
+        fs::write(
+            context
+                .scenario_root()
+                .join(format!("content-{}.json", window.phase)),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "phase": window.phase,
+                "baseline_snapshot": baseline["current-snapshot-id"],
+                "committed_snapshot": snapshot,
+                "readmitted_snapshot": admitted["current-snapshot-id"],
+                "publication": record.frame,
+                "added_records": summary["added-records"],
+                "added_position_deletes": summary["added-position-deletes"],
+                "forwarded_commits": counts_held.table_commit_forwarded - counts_before.table_commit_forwarded,
+                "successful_commits": counts_held.table_commit_succeeded - counts_before.table_commit_succeeded,
+                "pending_catalog_requests_at_hold": counts_held.table_commit_pending,
+            }))?,
+        )?;
+        Ok(conn)
+    }
+}
+
+fn current_content_publication(
+    metadata: &serde_json::Value,
+) -> Result<(i64, super::mv_uea7_documents::wire::Record)> {
+    let graph = super::mv_uea7_documents::wire::Graph::from_metadata(metadata)?;
+    let snapshot = graph.current.context("the MV has no Current snapshot")?;
+    let record = graph
+        .snapshots
+        .into_iter()
+        .find(|(id, _)| *id == snapshot)
+        .and_then(|(_, record)| record)
+        .context("the MV has no Current publication record")?;
+    Ok((snapshot, record))
+}
+
+fn content_catalog_observation(
+    context: &ScenarioContext,
+    rest_uri: &str,
+    proxy: &FixtureControl,
+) -> Result<(serde_json::Value, MutationCounts)> {
+    let target = MvContentPendingRecovery::TARGET;
+    Ok((
+        load_metadata(context, rest_uri, "ns", target)?,
+        proxy.mutation_counts("ns", target),
+    ))
+}
+
+fn require_content_commit_count(
+    before: MutationCounts,
+    after: MutationCounts,
+    count: usize,
+) -> Result<()> {
+    ensure!(
+        after
+            .table_commit_forwarded
+            .checked_sub(before.table_commit_forwarded)
+            == Some(count)
+            && after
+                .table_commit_succeeded
+                .checked_sub(before.table_commit_succeeded)
+                == Some(count)
+            && after.table_commit_pending == 0,
+        "expected {count} successful target commits with no pending request, observed {before:?} to {after:?}"
+    );
+    Ok(())
 }
 
 fn record_content_recovery_pruning(context: &mut ScenarioContext, before: &str) -> Result<()> {
