@@ -9,6 +9,7 @@ use super::mv_uea7::{
     mv_public_error, mv_response_needs_cancel, mv_response_with_cleanup, mv_rows, mv_text_lines,
 };
 use super::mv_uea7_documents::load_metadata;
+use super::native_sql_controls::SelectedStatement;
 use crate::actors::sql::{SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{
     Scenario, ScenarioBinary, ScenarioBinaryLayout, ScenarioContext, ScenarioLaunchConfig,
@@ -22,7 +23,8 @@ use novarocks_cluster_harness::publication_catalog::{
 };
 use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
 use novarocks_failpoint::observation_marker::{
-    MV_SCAN_PRUNING_COVERAGE, RF_SPLIT_INITIAL_WAIT_RESOLVED,
+    MV_ACTION_ACTUAL_EXIT, MV_SCAN_PRUNING_COVERAGE, ObservationAction,
+    RF_SPLIT_INITIAL_WAIT_RESOLVED, WRITER_DIAGNOSTIC,
 };
 use reqwest::blocking::Client;
 use std::fs;
@@ -914,6 +916,8 @@ impl MvContentPendingRecovery {
     const CATALOG: &str = "system_mv_content_pending";
     const TARGET: &str = "orders_mv";
     const CLOSE_TOKEN: &str = "content-pending-exact-enumeration-close";
+    const REPLAY_OBSERVATION_TOKEN: &str = "content-strict-replay";
+    const REFRESH: &str = "REFRESH MATERIALIZED VIEW orders_mv";
     const MV_READ: &str = "SELECT k1, v2 FROM orders_mv ORDER BY k1";
     const SOURCE_READ: &str = "SELECT k1, v2 FROM orders WHERE v2 > 0 ORDER BY k1";
 }
@@ -987,8 +991,8 @@ impl Scenario for MvContentPendingRecovery {
             ),
         ])];
         if self.mode == ContentRecoveryMode::Restart {
-            for window in &COMMITTED_CONTENT_WINDOWS {
-                launches.push(FeLaunchIntent::MvActions(vec![control_plan::recovery(
+            for (ordinal, window) in COMMITTED_CONTENT_WINDOWS.iter().enumerate() {
+                let actions = vec![control_plan::recovery(
                     window.token,
                     Self::CATALOG,
                     "ns",
@@ -996,7 +1000,16 @@ impl Scenario for MvContentPendingRecovery {
                     window.phase,
                     window.token,
                     &scenario_root.join("content-committed-faults"),
-                )?]));
+                )?];
+                let launch = if ordinal == 0 {
+                    FeLaunchIntent::ObservedMvWriter {
+                        actions,
+                        token: Self::REPLAY_OBSERVATION_TOKEN,
+                    }
+                } else {
+                    FeLaunchIntent::MvActions(actions)
+                };
+                launches.push(launch);
             }
         }
         launches.push(FeLaunchIntent::Ordinary);
@@ -1231,7 +1244,11 @@ impl Scenario for MvContentPendingRecovery {
             .map(|proxy| content_catalog_observation(context, &rest_uri, proxy))
             .transpose()?;
         let before_pruning = context.handle().fe_server_info_log()?;
-        let refreshed = refresh(context, &mut conn, Self::TARGET);
+        let refreshed = if self.mode == ContentRecoveryMode::Restart {
+            Self::observe_strict_replay(context, &mut conn)
+        } else {
+            refresh(context, &mut conn, Self::TARGET)
+        };
         let pruning = record_content_recovery_pruning(context, &before_pruning);
         refreshed?;
         if let Some(((proxy, (before, counts)), (key, value))) =
@@ -1326,6 +1343,82 @@ impl Scenario for MvContentPendingRecovery {
 }
 
 impl MvContentPendingRecovery {
+    fn observe_strict_replay(context: &mut ScenarioContext, conn: &mut SqlSession) -> Result<()> {
+        context.action("submit the original strict replay with its finite Native observation");
+        let deadline = context.deadline();
+        let selected = SelectedStatement {
+            sql: Self::REFRESH.into(),
+            token: Self::REPLAY_OBSERVATION_TOKEN.into(),
+            faults: Vec::new(),
+            deadline,
+        };
+        let pending = conn.submit(Self::REFRESH)?;
+        let client_query_id = pending.query_id.clone();
+        let cancel = pending.cancel_handle();
+        let (pending, observation) = selected.arm_pending(context, pending, Self::REFRESH)?;
+        let response = conn.run_pending(pending);
+        let cancellation = if mv_response_needs_cancel(&response) {
+            cancel.delete(deadline).map_err(anyhow::Error::from)
+        } else {
+            Ok(())
+        };
+        let recorded = (|| {
+            mv_response_with_cleanup(response, cancellation)??;
+            let root = context
+                .handle()
+                .await_statement_root_installed(&observation, deadline)?;
+            let (session_key, statement_generation) = context
+                .handle()
+                .query_lifecycle_statement_token(&observation, deadline)?;
+            let terminal = context
+                .handle()
+                .await_query_lifecycle_statement_observation(&observation, true, deadline)?;
+            let execution = root.root.query_execution_id();
+            let execution_id = format!(
+                "{}:{}:{}",
+                execution.query_id().high(),
+                execution.query_id().low(),
+                execution.attempt_id().get()
+            );
+            ensure!(
+                terminal.execution_id.as_deref() == Some(execution_id.as_str())
+                    && terminal.failure_fact.is_none()
+                    && terminal.worker_participations_converged,
+                "strict replay did not converge its exact original Worker participations: {terminal:?}"
+            );
+            let action_exit = wait_for_strict_replay_action_exit(
+                context,
+                &client_query_id,
+                &execution_id,
+                session_key,
+                statement_generation,
+                root,
+            )?;
+            let summary_evidence = strict_replay_summary_evidence(context, &selected, root.root)?;
+            fs::write(
+                context
+                    .scenario_root()
+                    .join("strict-replay-original-action.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "client_query_id": client_query_id,
+                    "session_key": session_key,
+                    "statement_generation": statement_generation,
+                    "execution_id": execution_id,
+                    "root": root.root.to_string(),
+                    "installed_status_version": root.status_version.get(),
+                    "worker_participations_converged": terminal.worker_participations_converged,
+                    "action_actual_exit": action_exit,
+                    "original_root_summary_events": summary_evidence,
+                }))?,
+            )?;
+            Ok(())
+        })();
+        let drained = context
+            .handle()
+            .drain_query_lifecycle_statement_binding(&observation, deadline);
+        control_plan::with_cleanup(recorded, drained)
+    }
+
     fn restart_at_content_commit(
         context: &mut ScenarioContext,
         mut conn: SqlSession,
@@ -1378,15 +1471,35 @@ impl MvContentPendingRecovery {
             .find(|entry| entry["snapshot-id"].as_i64() == Some(snapshot))
             .context("the committed MV lacks its Current snapshot")?;
         let summary = &committed_snapshot["summary"];
+        fs::write(
+            context
+                .scenario_root()
+                .join(format!("held-content-{}.json", window.phase)),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "baseline_snapshot": baseline["current-snapshot-id"],
+                "committed_snapshot": committed_snapshot,
+                "committed_main": committed["refs"]["main"]["snapshot-id"],
+                "publication_changed": record != baseline_publication,
+                "catalog_before": format!("{counts_before:?}"),
+                "catalog_held": format!("{counts_held:?}"),
+            }))?,
+        )?;
+        let positional = summary["added-position-deletes"]
+            .as_str()
+            .map(str::parse::<u64>)
+            .transpose()?
+            .unwrap_or_default();
+        let removed = summary["deleted-records"]
+            .as_str()
+            .map(str::parse::<u64>)
+            .transpose()?
+            .unwrap_or_default();
         ensure!(
             record != baseline_publication
                 && committed_snapshot["parent-snapshot-id"] == baseline["current-snapshot-id"]
                 && committed["refs"]["main"]["snapshot-id"].as_i64() == Some(snapshot)
                 && summary["added-records"].as_str() == Some("1")
-                && summary["added-position-deletes"]
-                    .as_str()
-                    .and_then(|count| count.parse::<u64>().ok())
-                    .is_some_and(|count| count > 0),
+                && positional.checked_add(removed) == Some(1),
             "{} did not publish a new ContentLocate record and its one-insert row delta under the original main",
             window.phase,
         );
@@ -1464,7 +1577,8 @@ impl MvContentPendingRecovery {
                 "readmitted_snapshot": admitted["current-snapshot-id"],
                 "publication": record.frame,
                 "added_records": summary["added-records"],
-                "added_position_deletes": summary["added-position-deletes"],
+                "added_position_deletes": positional,
+                "deleted_records": removed,
                 "forwarded_commits": counts_held.table_commit_forwarded - counts_before.table_commit_forwarded,
                 "successful_commits": counts_held.table_commit_succeeded - counts_before.table_commit_succeeded,
                 "pending_catalog_requests_at_hold": counts_held.table_commit_pending,
@@ -1518,6 +1632,123 @@ fn require_content_commit_count(
         "expected {count} successful target commits with no pending request, observed {before:?} to {after:?}"
     );
     Ok(())
+}
+
+fn wait_for_strict_replay_action_exit(
+    context: &mut ScenarioContext,
+    client_query_id: &str,
+    execution_id: &str,
+    session_key: u64,
+    statement_generation: u64,
+    root: novarocks_cluster_harness::InstalledStatementRoot,
+) -> Result<String> {
+    loop {
+        let log = context.handle().fe_log_contents()?;
+        let mut exits = log.lines().filter(|line| {
+            line.starts_with(MV_ACTION_ACTUAL_EXIT)
+                && strict_replay_marker_field(line, "client_query_id") == Some(client_query_id)
+        });
+        if let Some(exit) = exits.next() {
+            let identity = root.root;
+            ensure!(
+                exits.next().is_none()
+                    && strict_replay_marker_field(exit, "execution_id") == Some(execution_id)
+                    && strict_replay_marker_field(exit, "session_key").and_then(|n| n.parse().ok())
+                        == Some(session_key)
+                    && strict_replay_marker_field(exit, "statement_generation")
+                        .and_then(|n| n.parse().ok())
+                        == Some(statement_generation)
+                    && strict_replay_marker_field(exit, "backend")
+                        == Some(identity.backend_process_id().to_string().as_str())
+                    && strict_replay_marker_field(exit, "stage").and_then(|n| n.parse().ok())
+                        == Some(identity.stage_id().get())
+                    && strict_replay_marker_field(exit, "task").and_then(|n| n.parse().ok())
+                        == Some(identity.task_id().get())
+                    && strict_replay_marker_field(exit, "status_version")
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .is_some_and(|observed| observed >= root.status_version.get())
+                    && strict_replay_marker_field(exit, "external_effect")
+                        == Some("known_committed"),
+                "strict replay did not retain its original Root, committed effect and actual Action exit: {exit}"
+            );
+            return Ok(exit.to_owned());
+        }
+        let remaining = context.remaining("observe the original strict-replay Action exit")?;
+        thread::sleep(POLL_INTERVAL.min(remaining));
+    }
+}
+
+fn strict_replay_summary_evidence(
+    context: &mut ScenarioContext,
+    selected: &SelectedStatement,
+    root: novarocks_execution_contract::TaskIdentity,
+) -> Result<Vec<String>> {
+    use novarocks_result_contract::SummaryKind;
+
+    let handle = context.handle();
+    let action = ObservationAction::ExchangeSnapshot.as_str();
+    let mut root_index = None;
+    for index in 0..handle.be_count() {
+        let Some(binding) =
+            handle.selected_native_observation_binding(index, action, &selected.token, None)?
+        else {
+            continue;
+        };
+        ensure!(
+            binding.execution()? == root.query_execution_id(),
+            "writer observation attached a foreign Native execution"
+        );
+        if binding.process()? == root.backend_process_id() {
+            ensure!(
+                root_index.replace(index).is_none(),
+                "the strict-replay Root matched multiple writer observers"
+            );
+        }
+    }
+    let index = root_index.context("no authenticated writer observer for the installed Root")?;
+    let log = handle.be_log_contents(index)?;
+    let root_task = root.to_string();
+    let events = log
+        .lines()
+        .filter(|line| {
+            line.starts_with(WRITER_DIAGNOSTIC)
+                && strict_replay_marker_field(line, "task") == Some(root_task.as_str())
+                && matches!(
+                    strict_replay_marker_field(line, "event"),
+                    Some("summary_input_handoff" | "summary_input_consumed")
+                )
+        })
+        .collect::<Vec<_>>();
+    for kind in SummaryKind::ALL {
+        let kind_name = kind.to_string();
+        let value_prefix = match kind {
+            SummaryKind::WriteCounts => "WriteCounts(",
+            SummaryKind::DeleteVerification => "DeleteVerification(",
+        };
+        let mut end = events.iter().enumerate().filter(|(_, line)| {
+            strict_replay_marker_field(line, "event") == Some("summary_input_consumed")
+                && strict_replay_marker_field(line, "kind") == Some(kind_name.as_str())
+        });
+        let (end_index, _) = end
+            .next()
+            .with_context(|| format!("missing original Root {kind} EOS"))?;
+        ensure!(end.next().is_none(), "duplicate original Root {kind} EOS");
+        ensure!(
+            events[..end_index].iter().any(|line| {
+                strict_replay_marker_field(line, "event") == Some("summary_input_handoff")
+                    && strict_replay_marker_field(line, "value")
+                        .is_some_and(|value| value.starts_with(value_prefix))
+            }),
+            "the original Root observed {kind} EOS without its typed input handoff"
+        );
+    }
+    Ok(events.into_iter().map(str::to_owned).collect())
+}
+
+fn strict_replay_marker_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    line.split_ascii_whitespace()
+        .filter_map(|token| token.split_once('='))
+        .find_map(|(name, value)| (name == field).then_some(value))
 }
 
 fn record_content_recovery_pruning(context: &mut ScenarioContext, before: &str) -> Result<()> {

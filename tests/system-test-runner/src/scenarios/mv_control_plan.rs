@@ -23,6 +23,7 @@ use crate::scenarios::native_sql_controls::SelectedStatement;
 use crate::scenarios::paimon::scan_statement_actor::{ScanActor, combine};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
+use novarocks_failpoint::observation_marker::ObservationAction;
 use novarocks_failpoint::session::DomainGrant;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -40,6 +41,10 @@ pub(in crate::scenarios) enum FeLaunchIntent {
     Ordinary,
     MvActions(Vec<DomainGrant>),
     ObservedMvActions(Vec<DomainGrant>),
+    ObservedMvWriter {
+        actions: Vec<DomainGrant>,
+        token: &'static str,
+    },
 }
 
 pub(in crate::scenarios) fn action(id: &str, parameters: Value) -> DomainGrant {
@@ -214,6 +219,47 @@ pub(in crate::scenarios) fn plan(
         "MV plan has no frontend launch"
     );
     let mut plan = ClusterTestSessionPlan::new(original_deadline)?;
+    let mut observed_writer = frontend_launches.iter().filter_map(|launch| match launch {
+        FeLaunchIntent::ObservedMvWriter { token, .. } => Some(*token),
+        _ => None,
+    });
+    let writer_token = observed_writer.next();
+    ensure!(
+        observed_writer.next().is_none(),
+        "MV plan declares more than one observed writer launch"
+    );
+    let writer_transport = writer_token
+        .map(|_| plan.reserve_transport("mv-content-writer-observation"))
+        .transpose()?;
+    let mut writer_bindings = Vec::new();
+    let mut backends = Vec::new();
+    for index in 0..cluster_size {
+        let backend = plan.reserve_launch(RoleSlot::Backend(index))?;
+        let grant = if let Some((token, root)) = writer_token.zip(writer_transport.as_ref()) {
+            let action = ObservationAction::ExchangeSnapshot.as_str();
+            writer_bindings.push(DomainGrant {
+                domain: "native-observation".into(),
+                grant_id: format!("bind-mv-writer-{index}"),
+                parameters: json!({
+                    "action": format!("bind-{action}"), "root": root, "backend_index": index,
+                    "statement_run_token": token, "target_session_id": backend.session_id,
+                    "target_process_receipt": backend.process_receipt,
+                }),
+            });
+            Some(DomainGrant {
+                domain: "native-observation".into(),
+                grant_id: format!("mv-writer-{index}"),
+                parameters: json!({
+                    "action": action, "root": root, "backend_index": index,
+                    "statement_run_token": token, "target_session_id": backend.session_id,
+                    "max_events": 16384,
+                }),
+            })
+        } else {
+            None
+        };
+        backends.push((backend, grant));
+    }
     for intent in frontend_launches {
         let reference = plan.reserve_launch(RoleSlot::Frontend)?;
         let grants = match intent {
@@ -226,6 +272,11 @@ pub(in crate::scenarios) fn plan(
                 grants.push(statement_observer(&plan)?);
                 grants
             }
+            FeLaunchIntent::ObservedMvWriter { mut actions, .. } => {
+                actions.push(statement_observer(&plan)?);
+                actions.append(&mut writer_bindings);
+                actions
+            }
         };
         ensure!(
             !grants.is_empty(),
@@ -234,9 +285,20 @@ pub(in crate::scenarios) fn plan(
         plan.set_launch_binary(&reference, binary.to_path_buf())?;
         plan.authorize_launch(&reference, grants, mv_requirements())?;
     }
-    for index in 0..cluster_size {
-        let reference = plan.reserve_launch(RoleSlot::Backend(index))?;
-        plan.authorize_ordinary_launch(&reference, binary.to_path_buf())?;
+    for (reference, grant) in backends {
+        if let Some(grant) = grant {
+            plan.set_launch_binary(&reference, binary.to_path_buf())?;
+            plan.authorize_launch(
+                &reference,
+                vec![grant],
+                vec![
+                    ("novarocks-server".into(), "test-controls".into()),
+                    ("novarocks-native-adapter".into(), "test-controls".into()),
+                ],
+            )?;
+        } else {
+            plan.authorize_ordinary_launch(&reference, binary.to_path_buf())?;
+        }
     }
     plan.validate_selected_intents(cluster_size)?;
     Ok(plan)

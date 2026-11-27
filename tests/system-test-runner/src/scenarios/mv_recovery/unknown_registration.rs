@@ -156,7 +156,18 @@ fn lose_pending_release(
     )?;
     context.action("lose the release-marker response after an exact known publication refusal");
     let result = conn.execute(MvContentEffect::REFRESH);
+    fs::write(
+        context.scenario_root().join("release-client-terminal.json"),
+        serde_json::to_vec_pretty(&json!({
+            "response": result.as_ref().err().map(ToString::to_string),
+            "publication_refusal": refusal.trace(),
+            "release_at_client_terminal": lost.trace(),
+        }))?,
+    )?;
     let refusal = refusal.finish()?;
+    // The public error can arrive while the original Action still owns the
+    // release. Keep the marker fault armed until that original request enters.
+    lost.wait_until_entered(context.deadline())?;
     let lost = lost.finish()?;
     let refused = result.expect_err("the original forbidden publication unexpectedly succeeded");
     let public = super::mv_public_error(&refused)?;
