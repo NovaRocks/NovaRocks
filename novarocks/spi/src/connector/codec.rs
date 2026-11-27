@@ -930,7 +930,14 @@ mod tests {
     fn codec_revision_and_limits_are_finite() {
         assert!(ConnectorCodecRevision::try_new(0).is_err());
         assert!(ConnectorDecodeLimits::try_new(0, 1, 1, 1, 1).is_err());
-        assert!(ConnectorDecodeLimits::try_new(1, 1, 1, 1, 65).is_err());
+        assert!(
+            ConnectorDecodeLimits::try_new(1, 1, 1, 1, MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH)
+                .is_ok()
+        );
+        assert!(
+            ConnectorDecodeLimits::try_new(1, 1, 1, 1, MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH + 1)
+                .is_err()
+        );
     }
 
     #[test]

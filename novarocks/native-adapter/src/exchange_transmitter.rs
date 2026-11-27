@@ -279,6 +279,11 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         use novarocks_task_codec::exchange_unit_codec as codec;
         let stream = frame.receiver.stream;
         let sequence = frame.receiver.item.sequence();
+        #[cfg(novarocks_dev_controls)]
+        let carries_data = matches!(
+            frame.receiver.item,
+            novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitItem::Unit { .. }
+        );
         // Keep the original pre-dispatch binding check: a conflicting
         // observation scope still refuses this request before any I/O.
         #[cfg(novarocks_dev_controls)]
@@ -354,6 +359,14 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
                     FieldPath::root("exchange_unit_response"),
                 ) {
                     Ok(codec::DecodedExchangeDeliveryOutcome::Observed { verdict, facts }) => {
+                        #[cfg(novarocks_dev_controls)]
+                        if carries_data && facts.custody_through >= sequence.get() {
+                            observe_grant_only(
+                                observer.as_deref(),
+                                stream,
+                                "data_custody_received",
+                            );
+                        }
                         ExchangeCallOutcome::Observed(ExchangeUnitReceipt { verdict, facts })
                     }
                     Ok(codec::DecodedExchangeDeliveryOutcome::Refused(fact)) => {

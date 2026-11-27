@@ -148,6 +148,7 @@ marker_registry! {
     TASK_CONSTANT_IPC_RECORD => ("NOVAROCKS_TASK_CONSTANT_IPC_RECORD", Task, Observation(TaskProtocol), ["backend", "body_bytes", "execution_id", "fragment", "pool_id", "retained_bytes", "rows", "stage", "task"]),
     TASK_VALUES_BACKING => ("NOVAROCKS_TASK_VALUES_BACKING", Task, Observation(TaskProtocol), ["backend", "backing", "columns", "execution_id", "fragment", "node_id", "retained_bytes", "rows", "stage", "task"]),
     TASK_VALUES_SOURCE => ("NOVAROCKS_TASK_VALUES_SOURCE", Task, Observation(TaskProtocol), ["backend", "column", "execution_id", "first_ordinal", "fragment", "length", "node_id", "pool_id", "stage", "task"]),
+    TASK_VALUES_CAST_SOURCE => ("NOVAROCKS_TASK_VALUES_CAST_SOURCE", Task, Observation(TaskProtocol), ["backend", "column", "execution_id", "first_ordinal", "fragment", "length", "node_id", "pool_id", "stage", "task"]),
     TASK_CREATE_ACK_DROPPED => ("NOVAROCKS_TASK_CREATE_ACK_DROPPED", Task, FaultInjection, ["backend_index", "execution_id", "stage", "task", "token"]),
     TASK_CREATE_APPLIED => ("NOVAROCKS_TASK_CREATE_APPLIED", Task, Observation(TaskProtocol), ["backend", "execution_id", "stage", "task"]),
     TASK_CREATE_BEFORE_WORKER_HELD => ("NOVAROCKS_TASK_CREATE_BEFORE_WORKER_HELD", Task, FaultInjection, ["backend_index", "execution_id", "outbound_edges", "process_id", "stage", "task", "token"]),
