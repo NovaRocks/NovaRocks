@@ -41,8 +41,9 @@ use crate::{
     StaticSinkProgram, StaticValues,
 };
 
-/// Matches the native task-codec preflight, which runs before protobuf decode.
-pub const MAX_PROGRAM_NODE_DEPTH: usize = 64;
+/// Limit for the portion of a LocalProgram path that uses recursive pipeline
+/// construction. Linear projection and aggregate steps use a worklist.
+pub const MAX_RECURSIVE_PIPELINE_BUILD_DEPTH: usize = 64;
 pub const MAX_PROGRAM_NODES: usize = 65_536;
 /// A flat DAG must also bound its expanded execution shape; sharing nodes must
 /// not permit exponential pipeline construction.
@@ -739,6 +740,14 @@ pub enum ProgramNodeKind {
 impl ProgramNodeKind {
     pub const fn summary_authorship(&self) -> Option<crate::SummaryKind> {
         None
+    }
+
+    /// The unary pipeline steps built iteratively by Execution.
+    pub const fn linear_pipeline_input(&self) -> Option<ProgramNodeId> {
+        match self {
+            Self::Project { input, .. } | Self::Aggregate { input, .. } => Some(*input),
+            _ => None,
+        }
     }
 
     fn try_for_each_child<E>(
@@ -1501,7 +1510,8 @@ impl LocalProgramGraph {
             if duplicate {
                 return Err(LocalProgramError::DuplicateNativeNode.into());
             }
-            let mut depth = 1usize;
+            let recursive_step = usize::from(node.kind.linear_pipeline_input().is_none());
+            let mut depth = recursive_step;
             let mut expanded = 1usize;
             node.kind.try_for_each_child(|child| {
                 let valid = child.index() < index;
@@ -1509,13 +1519,13 @@ impl LocalProgramGraph {
                 if !valid {
                     return Err(LocalProgramError::InvalidChild.into());
                 }
-                depth = depth.max(depths[child.index()] + 1);
+                depth = depth.max(depths[child.index()] + recursive_step);
                 let next = expanded.checked_add(expansions[child.index()]);
                 work.step()?;
                 expanded = next.ok_or(LocalProgramError::ExpandedLimit)?;
                 Ok::<(), ProgramCompileError>(())
             })?;
-            let too_deep = depth > MAX_PROGRAM_NODE_DEPTH;
+            let too_deep = depth > MAX_RECURSIVE_PIPELINE_BUILD_DEPTH;
             work.step()?;
             if too_deep {
                 return Err(LocalProgramError::TooDeep.into());
@@ -2983,6 +2993,60 @@ mod tests {
         assert!(matches!(
             unbound,
             Err(LocalProgramError::InvalidRequirement)
+        ));
+    }
+
+    #[test]
+    fn linear_pipeline_steps_do_not_consume_recursive_depth() {
+        let build = |recursive_steps| {
+            let (values, layout) = values();
+            let mut nodes = vec![ProgramNode::new(
+                1,
+                ProgramNodeKind::Values { values },
+                layout.clone(),
+            )];
+            for _ in 0..recursive_steps {
+                let ordinal = nodes.len();
+                nodes.push(ProgramNode::new(
+                    i32::try_from(ordinal + 1).unwrap(),
+                    ProgramNodeKind::Limit {
+                        input: ProgramNodeId::new(ordinal - 1),
+                        limit: Some(1),
+                        offset: 0,
+                    },
+                    layout.clone(),
+                ));
+            }
+            for _ in 0..2 * MAX_RECURSIVE_PIPELINE_BUILD_DEPTH {
+                let ordinal = nodes.len();
+                nodes.push(ProgramNode::new(
+                    i32::try_from(ordinal + 1).unwrap(),
+                    ProgramNodeKind::Project {
+                        input: ProgramNodeId::new(ordinal - 1),
+                        is_subordinate: false,
+                        validate_final_result_input: false,
+                        exprs: vec![crate::test_support::root(0, 0)],
+                        expr_slot_ids: vec![SlotId::new(1)],
+                        expr_slot_schemas: None,
+                        output_indices: None,
+                    },
+                    layout.clone(),
+                ));
+            }
+            let root = ProgramNodeId::new(nodes.len() - 1);
+            LocalProgramGraph::try_new(
+                nodes,
+                root,
+                &read_units(&layout),
+                profile(&layout),
+                BindingRequirements::try_new(vec![]).unwrap(),
+            )
+        };
+
+        assert!(build(MAX_RECURSIVE_PIPELINE_BUILD_DEPTH - 1).is_ok());
+        assert!(matches!(
+            build(MAX_RECURSIVE_PIPELINE_BUILD_DEPTH),
+            Err(LocalProgramError::TooDeep)
         ));
     }
 

@@ -46,6 +46,10 @@ SQL 逻辑嵌套、Arrow 物理结构、Iceberg 私有 protobuf 的位置和 Par
 6. **私有位置。** Iceberg ColumnIdentity 的逻辑深度以原列身份根计，私有校验以列和递归身份计 D+1 个位置。外层 split、predicate 和 change-window 消息是独立的有限文法。把这些信封计入列身份会让同一个深类型只在某些读路径失败。Provider 私有 codec 按此在 Prost 解码前核对形状。SDK manifest 边界继续按 ADR-0214 的原文档和解码作者检查。
 7. **MOR 身份。** 每次成功签发 preparation 后生成不透明进程内身份。克隆保留同一身份，相同 `operation_id` 的独立签发得到不同身份。读写按原表、快照和签发身份核对，再沿原 Session 及发布校验。源 schema 与重新读取的当前表以及 temporal source 的内容比较继续使用显式字段编码。
 
+## 流水线构造
+
+原分布式 Map aggregate 验收用例的失败包有一条 190 个物理节点的路径，其中有 63 个 Aggregate、126 个 Project 和一个 Exchange source。Project 和 Aggregate 的流水线构造沿同一输入顺序用受检工作列表推进。LocalCompiler 和 LocalProgram 对仍需递归构造的步骤保留 64 层保护。展开节点数、表达式控制与计划形状仍由原作者核对。该用例的原始失败包经修改后的本地编译器重放成功。
+
 ## 栈验证
 
 在 dev 和 release 中用每种生产线程允许的最小配置验证。D 深的值走原生准入和实际消费。进程隔离的 2D 样本由白盒探查交给实际线程和适用的库入口，覆盖 List、Struct、Map、支持的 Dictionary 叶和最坏混合形状。记录实际栈容量、类型及操作、构建身份、返回和真正退出。形状在 2D 上通过给出所测路径的余量下界。更早生效的格式能力拒绝和真实栈溢出分别取证。

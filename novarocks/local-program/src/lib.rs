@@ -79,7 +79,7 @@ pub use program::{
     AggregateTopNFilter, AnalyticOutputColumn, AssertRowsMode, ChangeEventOutputExpr,
     ChangeEventSpec, FilterConsumerAtExpr, FilterConsumerAtJoinKey, FilterProducerAtExpr,
     JoinDistributionMode, JoinType, LocalProgramError, LocalProgramGraph, LocalSortMode,
-    MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH, MAX_PROGRAM_NODES,
+    MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODES, MAX_RECURSIVE_PIPELINE_BUILD_DEPTH,
     NestedLoopJoinType, PartitionRank, ProgramAssertionApplicability, ProgramCompileError,
     ProgramJoinCondition, ProgramJoinKey, ProgramNode, ProgramNodeKind, ProgramPositionShardInput,
     ProgramScanSource, ProgramWriteLayoutEffects, ProjectExpressionSlot, ProjectExpressionSlots,

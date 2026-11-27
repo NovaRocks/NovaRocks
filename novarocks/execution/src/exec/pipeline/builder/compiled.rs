@@ -655,33 +655,131 @@ impl OperatorFactory for ProfiledCompiledFactory {
     }
 }
 
+enum LinearPipelineStep<'a> {
+    Project(ProgramNodeId),
+    Aggregate(
+        ProgramNodeId,
+        Option<&'a CompiledOrderedFilterContext>,
+        CompiledAggregateProcessorFactory,
+    ),
+}
+
 fn build_node(
     program: &Arc<LocalProgram>,
-    id: ProgramNodeId,
+    mut id: ProgramNodeId,
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
     ordered: Option<&CompiledOrderedFilterContext>,
 ) -> ExecutionResult<PipelineBuildResult> {
-    let node = program.graph().nodes().get(id.index()).ok_or_else(|| {
-        program_failure(
-            FragmentBindingErrorKind::MissingAssignment,
-            format!("missing compiled program node {}", id.index()),
-        )
-    })?;
-    for kind in novarocks_result_contract::SummaryKind::ALL {
-        if ctx
-            .summary_authors
-            .declares(kind, novarocks_local_program::StaticSummaryAuthor::Node(id))
+    // A sequence of unary projections and aggregates can grow independently
+    // of the depth of a value. Assemble that sequence in input-to-output
+    // order without one Rust call frame per operator.
+    let mut pending = Vec::new();
+    let mut build = loop {
+        let node = program.graph().nodes().get(id.index()).ok_or_else(|| {
+            program_failure(
+                FragmentBindingErrorKind::MissingAssignment,
+                format!("missing compiled program node {}", id.index()),
+            )
+        })?;
+        for kind in novarocks_result_contract::SummaryKind::ALL {
+            if ctx
+                .summary_authors
+                .declares(kind, novarocks_local_program::StaticSummaryAuthor::Node(id))
+            {
+                // Every currently admitted node family declares no authorship.
+                // A future family must take the exact obligation in its factory arm.
+                return Err(
+                    crate::exec::operators::logical_change_summary::summary_failure(
+                        crate::exec::operators::logical_change_summary::SummaryFailure::Author(
+                            kind,
+                        ),
+                    ),
+                );
+            }
+        }
+        let Some(input) = node.kind().linear_pipeline_input() else {
+            break build_recursive_node(program, id, node, ctx, error, ordered)?;
+        };
+        pending
+            .try_reserve(1)
+            .map_err(|_| novarocks_functions::KernelFailure::ResourceExhausted)?;
+        let step = match node.kind() {
+            ProgramNodeKind::Project { .. } => LinearPipelineStep::Project(id),
+            ProgramNodeKind::Aggregate { topn_filters, .. } => {
+                let ordered = ordered.filter(|_| !topn_filters.is_empty());
+                let factory = if ordered.is_some() {
+                    CompiledAggregateProcessorFactory::prepare_ordered(
+                        Arc::clone(program),
+                        id,
+                        Arc::clone(error),
+                    )?
+                } else {
+                    CompiledAggregateProcessorFactory::try_new(
+                        Arc::clone(program),
+                        id,
+                        Arc::clone(error),
+                    )?
+                };
+                LinearPipelineStep::Aggregate(id, ordered, factory)
+            }
+            _ => unreachable!("linear pipeline input comes only from Project and Aggregate"),
+        };
+        pending.push(step);
+        id = input;
+    };
+    for step in pending.into_iter().rev() {
+        let input_pipeline_id = build.pipeline.id;
+        let input_factories = build.pipeline.factories.len();
+        let input_extra_pipelines = build.extra_pipelines.len();
+        let id = match step {
+            LinearPipelineStep::Project(id) => {
+                build
+                    .pipeline
+                    .factories
+                    .push(Box::new(CompiledProjectProcessorFactory::try_new(
+                        Arc::clone(program),
+                        id,
+                        Arc::clone(error),
+                    )?));
+                id
+            }
+            LinearPipelineStep::Aggregate(id, ordered, factory) => {
+                build = finish_linear_aggregate(program, id, ctx, ordered, factory, build)?;
+                id
+            }
+        };
+        let node = &program.graph().nodes()[id.index()];
+        // An aggregate can append a sink to its input and make a new
+        // pipeline. Both tails belong to this node. Earlier factories have
+        // already received their provenance and are left in place.
+        for pipeline in std::iter::once(&mut build.pipeline)
+            .chain(build.extra_pipelines[input_extra_pipelines..].iter_mut())
         {
-            // Every currently admitted node family declares no authorship.
-            // A future family must take the exact obligation in its factory arm.
-            return Err(
-                crate::exec::operators::logical_change_summary::summary_failure(
-                    crate::exec::operators::logical_change_summary::SummaryFailure::Author(kind),
-                ),
+            let start = if pipeline.id == input_pipeline_id {
+                input_factories
+            } else {
+                0
+            };
+            let factories = pipeline.factories.split_off(start);
+            pipeline.factories.extend(
+                factories
+                    .into_iter()
+                    .map(|factory| with_compiled_profile(factory, node)),
             );
         }
     }
+    Ok(build)
+}
+
+fn build_recursive_node(
+    program: &Arc<LocalProgram>,
+    id: ProgramNodeId,
+    node: &novarocks_local_program::ProgramNode,
+    ctx: &mut PipelineBuildContext,
+    error: &Arc<RuntimeErrorState>,
+    ordered: Option<&CompiledOrderedFilterContext>,
+) -> ExecutionResult<PipelineBuildResult> {
     let node_id = display_id(id)?;
     let mut build = match node.kind() {
         ProgramNodeKind::SystemRelation { .. } => {
@@ -725,17 +823,8 @@ fn build_node(
             ));
             Ok(build)
         }
-        ProgramNodeKind::Project { input, .. } => {
-            let mut build = build_node(program, *input, ctx, error, ordered)?;
-            build
-                .pipeline
-                .factories
-                .push(Box::new(CompiledProjectProcessorFactory::try_new(
-                    Arc::clone(program),
-                    id,
-                    Arc::clone(error),
-                )?));
-            Ok(build)
+        ProgramNodeKind::Project { .. } | ProgramNodeKind::Aggregate { .. } => {
+            unreachable!("linear operators are assembled by the worklist")
         }
         ProgramNodeKind::Filter { input, .. } => {
             let mut build = build_node(program, *input, ctx, error, ordered)?;
@@ -1015,83 +1104,6 @@ fn build_node(
             build.stream = StreamDesc::single();
             Ok(build)
         }
-        ProgramNodeKind::Aggregate {
-            input,
-            topn_filters,
-            ..
-        } => {
-            // Preserve the original driver-local Partial -> exchange -> Final
-            // chronology. Grouped states hash actual emitted key slots; a
-            // group-less state uses the original Single exchange.
-            let mut factory = if ordered.is_some() && !topn_filters.is_empty() {
-                CompiledAggregateProcessorFactory::prepare_ordered(
-                    Arc::clone(program),
-                    id,
-                    Arc::clone(error),
-                )?
-            } else {
-                CompiledAggregateProcessorFactory::try_new(
-                    Arc::clone(program),
-                    id,
-                    Arc::clone(error),
-                )?
-            };
-            let complete = factory.completes_groups();
-            let mut build = build_node(program, *input, ctx, error, ordered)?;
-            if factory.requires_local_update_stages() && build.pipeline.dop > 1 {
-                let partition_slots = factory.local_group_partition_slots();
-                let (partial, final_stage) = factory.into_local_update_stages()?;
-                build.pipeline.factories.push(Box::new(partial));
-                build = if partition_slots.is_empty() {
-                    gather_to_one(build, ctx, node_id)
-                } else {
-                    let partitions = build.pipeline.dop as usize;
-                    let layout = program.graph().nodes()[id.index()].output_layout();
-                    let keys = frozen_routing_keys(layout, &partition_slots)?;
-                    use novarocks_type_contract::PartitionHashAlgorithm;
-                    let algorithm = PartitionHashAlgorithm::for_grouping_keys(
-                        keys.iter().map(|(_, ty)| ty.data_type()),
-                    );
-                    if algorithm == PartitionHashAlgorithm::NativeExchangeV2 {
-                        shuffle_compiled_map_group_keys(build, ctx, node_id, keys, partitions)
-                    } else {
-                        shuffle_compiled_group_input_slots(
-                            build,
-                            ctx,
-                            node_id,
-                            partition_slots,
-                            partitions,
-                        )
-                    }
-                };
-                factory = final_stage;
-            } else {
-                if complete {
-                    build = gather_to_one(build, ctx, node_id);
-                } else {
-                    build.stream = StreamDesc::any(build.pipeline.dop);
-                }
-            }
-            if let Some(ordered) = ordered.filter(|_| !topn_filters.is_empty()) {
-                let session = ctx.runtime_filter_execution.session.as_ref().ok_or_else(|| {
-                    novarocks_functions::KernelFailure::InvalidProgram(
-                        novarocks_functions::KernelDiagnostic::new(
-                            "compiled ordered Aggregate TopN has no Task runtime-filter session",
-                        ),
-                    )
-                })?;
-                // The processor that now owns the original endpoint acquires
-                // its producer using this actual pipeline's width.
-                factory.install_ordered(
-                    Arc::clone(session),
-                    build.pipeline.dop,
-                    &ordered.host,
-                    &ordered.control,
-                )?;
-            }
-            build.pipeline.factories.push(Box::new(factory));
-            Ok(build)
-        }
         ProgramNodeKind::Analytic { input, .. } => {
             // M1 evaluates every partition on one driver: the instance input
             // is gathered, in the order its sorted source emits it.
@@ -1355,30 +1367,106 @@ fn build_node(
             ),
         )),
     }?;
+    profile_created_factories(&mut build, node);
+    Ok(build)
+}
+
+fn finish_linear_aggregate(
+    program: &Arc<LocalProgram>,
+    id: ProgramNodeId,
+    ctx: &mut PipelineBuildContext,
+    ordered: Option<&CompiledOrderedFilterContext>,
+    mut factory: CompiledAggregateProcessorFactory,
+    mut build: PipelineBuildResult,
+) -> ExecutionResult<PipelineBuildResult> {
+    let node_id = display_id(id)?;
+    // Preserve the original Partial -> exchange -> Final driver placement.
+    let complete = factory.completes_groups();
+    if factory.requires_local_update_stages() && build.pipeline.dop > 1 {
+        let partition_slots = factory.local_group_partition_slots();
+        let (partial, final_stage) = factory.into_local_update_stages()?;
+        build.pipeline.factories.push(Box::new(partial));
+        build = if partition_slots.is_empty() {
+            gather_to_one(build, ctx, node_id)
+        } else {
+            let partitions = build.pipeline.dop as usize;
+            let layout = program.graph().nodes()[id.index()].output_layout();
+            let keys = frozen_routing_keys(layout, &partition_slots)?;
+            use novarocks_type_contract::PartitionHashAlgorithm;
+            let algorithm = PartitionHashAlgorithm::for_grouping_keys(
+                keys.iter().map(|(_, ty)| ty.data_type()),
+            );
+            if algorithm == PartitionHashAlgorithm::NativeExchangeV2 {
+                shuffle_compiled_map_group_keys(build, ctx, node_id, keys, partitions)
+            } else {
+                shuffle_compiled_group_input_slots(build, ctx, node_id, partition_slots, partitions)
+            }
+        };
+        factory = final_stage;
+    } else {
+        if complete {
+            build = gather_to_one(build, ctx, node_id);
+        } else {
+            build.stream = StreamDesc::any(build.pipeline.dop);
+        }
+    }
+    if let Some(ordered) = ordered {
+        let session = ctx
+            .runtime_filter_execution
+            .session
+            .as_ref()
+            .ok_or_else(|| {
+                novarocks_functions::KernelFailure::InvalidProgram(
+                    novarocks_functions::KernelDiagnostic::new(
+                        "compiled ordered Aggregate TopN has no Task runtime-filter session",
+                    ),
+                )
+            })?;
+        // The processor that now owns the original endpoint acquires
+        // its producer using this actual pipeline's width.
+        factory.install_ordered(
+            Arc::clone(session),
+            build.pipeline.dop,
+            &ordered.host,
+            &ordered.control,
+        )?;
+    }
+    build.pipeline.factories.push(Box::new(factory));
+    Ok(build)
+}
+
+fn profile_created_factories(
+    build: &mut PipelineBuildResult,
+    node: &novarocks_local_program::ProgramNode,
+) {
     for pipeline in std::iter::once(&mut build.pipeline).chain(build.extra_pipelines.iter_mut()) {
         pipeline.factories = pipeline
             .factories
             .drain(..)
-            .map(|factory| {
-                if factory.compiled_operator_profile().is_some() {
-                    return factory;
-                }
-                let label = match node.kind() {
-                    ProgramNodeKind::Values { .. } => "ValuesSource".to_string(),
-                    ProgramNodeKind::SystemRelation { .. } => "SystemRelationSource".to_string(),
-                    _ => factory.name().to_string(),
-                };
-                Box::new(ProfiledCompiledFactory {
-                    inner: factory,
-                    identity: Arc::new(crate::runtime::profile::CompiledOperatorProfile {
-                        sources: node.physical_sources().into(),
-                        label,
-                    }),
-                }) as Box<dyn OperatorFactory>
-            })
+            .map(|factory| with_compiled_profile(factory, node))
             .collect();
     }
-    Ok(build)
+}
+
+fn with_compiled_profile(
+    factory: Box<dyn OperatorFactory>,
+    node: &novarocks_local_program::ProgramNode,
+) -> Box<dyn OperatorFactory> {
+    if factory.compiled_operator_profile().is_some() {
+        return factory;
+    }
+    let label = match node.kind() {
+        ProgramNodeKind::Values { .. } => "ValuesSource".to_string(),
+        ProgramNodeKind::SystemRelation { .. } => "SystemRelationSource".to_string(),
+        _ => factory.name().to_string(),
+    };
+    Box::new(ProfiledCompiledFactory {
+        inner: factory,
+        identity: Arc::new(crate::runtime::profile::CompiledOperatorProfile {
+            sources: node.physical_sources().into(),
+            label,
+        }),
+    })
 }
 
 /// All contribution receivers feed one file-hash exchange whose producer
